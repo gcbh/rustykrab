@@ -58,6 +58,10 @@ All configuration is via environment variables. No plaintext config files.
 | `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama server address |
 | `OPENCLAW_AUTH_TOKEN` | auto-generated | Bearer token for API auth |
 | `OPENCLAW_MASTER_KEY` | auto-generated | Encryption key for secrets at rest |
+| `TELEGRAM_BOT_TOKEN` | — | Telegram bot token from @BotFather |
+| `TELEGRAM_ALLOWED_CHATS` | — | Comma-separated chat IDs allowed to use the bot |
+| `TELEGRAM_WEBHOOK_URL` | — | Public webhook URL (omit for long-polling mode) |
+| `TELEGRAM_WEBHOOK_SECRET` | — | Secret token for webhook validation |
 | `RUST_LOG` | — | Log level (`info`, `debug`, `openclaw_gateway=debug`) |
 
 ### Persisting credentials
@@ -101,6 +105,46 @@ curl -X DELETE http://127.0.0.1:3000/api/conversations/{id} \
   -H "Authorization: Bearer $OPENCLAW_AUTH_TOKEN"
 ```
 
+### Telegram
+
+Talk to your agent through Telegram.
+
+**1. Create a bot** — message [@BotFather](https://t.me/BotFather) on Telegram, use `/newbot`, and save the token.
+
+**2. Get your chat ID** — message [@userinfobot](https://t.me/userinfobot) to find your numeric chat ID.
+
+**3a. Long-polling mode (local dev, no public IP needed):**
+
+```bash
+export TELEGRAM_BOT_TOKEN=123456:ABC-DEF...
+export TELEGRAM_ALLOWED_CHATS=your_chat_id
+cargo run --release -p openclaw-cli
+```
+
+That's it — message your bot on Telegram and the agent responds.
+
+**3b. Webhook mode (production, requires public URL):**
+
+```bash
+export TELEGRAM_BOT_TOKEN=123456:ABC-DEF...
+export TELEGRAM_ALLOWED_CHATS=your_chat_id
+export TELEGRAM_WEBHOOK_SECRET=$(openssl rand -hex 16)
+export TELEGRAM_WEBHOOK_URL=https://your-domain.com/webhook/telegram
+cargo run --release -p openclaw-cli
+```
+
+If running locally, use ngrok or Cloudflare Tunnel to expose port 3000:
+
+```bash
+ngrok http 3000
+# Then set TELEGRAM_WEBHOOK_URL=https://xxxx.ngrok.io/webhook/telegram
+```
+
+**Security notes:**
+- `TELEGRAM_ALLOWED_CHATS` is **required** — without it, the bot denies all messages
+- Webhook mode validates the `X-Telegram-Bot-Api-Secret-Token` header
+- The webhook endpoint (`/webhook/telegram`) bypasses bearer auth but uses Telegram's own secret token
+
 ### WebChat UI
 
 Open `http://127.0.0.1:3000` in a browser for the embedded WebChat interface.
@@ -130,6 +174,7 @@ openclaw-cli          Binary entrypoint, wires everything together
   |     +-- http_request    HTTP client tool (GET/POST/PUT/DELETE/PATCH)
   |
   +-- openclaw-channels   Communication channel abstractions
+  |     +-- telegram        Telegram bot (long-polling + webhook + chat allowlist)
   |     +-- webchat         In-process mpsc-backed channel for the WebChat UI
   |
   +-- openclaw-skills     Skill system with ed25519 signature verification

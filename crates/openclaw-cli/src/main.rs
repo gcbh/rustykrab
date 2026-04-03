@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -53,7 +54,6 @@ async fn main() -> anyhow::Result<()> {
         }
         _ => {
             let api_key = std::env::var("ANTHROPIC_API_KEY").unwrap_or_else(|_| {
-                // Try reading from the encrypted store.
                 if let Ok(key) = store.secrets().get("anthropic_api_key") {
                     return key;
                 }
@@ -77,8 +77,51 @@ async fn main() -> anyhow::Result<()> {
     // --- Log provider status ---
     tracing::info!(provider = provider.name(), "model provider configured");
 
+    // --- Telegram channel (optional) ---
+    let mut state = openclaw_gateway::AppState::new(store, first_tool, auth_token);
+
+    if let Ok(bot_token) = std::env::var("TELEGRAM_BOT_TOKEN") {
+        let allowed_chats: HashSet<i64> = std::env::var("TELEGRAM_ALLOWED_CHATS")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|s| s.trim().parse().ok())
+            .collect();
+
+        let webhook_secret = std::env::var("TELEGRAM_WEBHOOK_SECRET").ok();
+
+        let mut tg = openclaw_channels::TelegramChannel::new(bot_token, allowed_chats.clone());
+        if let Some(secret) = webhook_secret {
+            tg = tg.with_webhook_secret(secret);
+        }
+
+        let tg = Arc::new(tg);
+        state = state.with_telegram(tg.clone());
+
+        // If a webhook URL is configured, register it. Otherwise, start long-polling.
+        if let Ok(webhook_url) = std::env::var("TELEGRAM_WEBHOOK_URL") {
+            tg.set_webhook(&webhook_url).await?;
+            tracing::info!("Telegram: webhook mode");
+        } else {
+            let tg_poll = tg.clone();
+            tokio::spawn(async move {
+                if let Err(e) = tg_poll.start_polling().await {
+                    tracing::error!("Telegram polling error: {e}");
+                }
+            });
+            tracing::info!("Telegram: long-polling mode");
+        }
+
+        if allowed_chats.is_empty() {
+            tracing::warn!(
+                "TELEGRAM_ALLOWED_CHATS not set — bot will deny all chats. \
+                 Set it to a comma-separated list of chat IDs."
+            );
+        } else {
+            tracing::info!(chats = ?allowed_chats, "Telegram allowed chats configured");
+        }
+    }
+
     // --- Gateway with security middleware ---
-    let state = openclaw_gateway::AppState::new(store, first_tool, auth_token);
     let app = openclaw_gateway::router(state);
 
     // Bind to loopback only — never 0.0.0.0.

@@ -1,3 +1,4 @@
+use openclaw_channels::TelegramChannel;
 use openclaw_store::Store;
 use std::sync::Arc;
 
@@ -12,6 +13,7 @@ pub struct AppState {
     pub auth_token: String,
     pub rate_limiter: Arc<RateLimiter>,
     pub origin_policy: OriginPolicy,
+    pub telegram: Option<Arc<TelegramChannel>>,
 }
 
 impl AppState {
@@ -26,6 +28,7 @@ impl AppState {
             auth_token,
             rate_limiter: Arc::new(RateLimiter::new(RateLimitConfig::default())),
             origin_policy: OriginPolicy::default(),
+            telegram: None,
         }
     }
 
@@ -38,6 +41,12 @@ impl AppState {
     /// Override the rate limit configuration.
     pub fn with_rate_limit(mut self, config: RateLimitConfig) -> Self {
         self.rate_limiter = Arc::new(RateLimiter::new(config));
+        self
+    }
+
+    /// Attach a Telegram channel.
+    pub fn with_telegram(mut self, telegram: Arc<TelegramChannel>) -> Self {
+        self.telegram = Some(telegram);
         self
     }
 }

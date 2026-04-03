@@ -3,6 +3,7 @@ pub mod origin;
 pub mod rate_limit;
 mod routes;
 mod state;
+mod telegram_webhook;
 mod webchat;
 
 pub use auth::generate_token;
@@ -17,6 +18,7 @@ use axum::Router;
 pub fn router(state: AppState) -> Router {
     Router::new()
         .merge(routes::api_routes())
+        .merge(telegram_webhook::telegram_routes())
         .merge(webchat::static_routes())
         .layer(middleware::from_fn_with_state(
             state.clone(),
