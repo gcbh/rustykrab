@@ -20,7 +20,12 @@ pub async fn require_auth(
     }
 
     // Static assets are public (the WebChat UI).
-    if !request.uri().path().starts_with("/api/") {
+    if !request.uri().path().starts_with("/api/") && !request.uri().path().starts_with("/webhook/") {
+        return Ok(next.run(request).await);
+    }
+
+    // Webhook endpoints use their own auth (e.g. Telegram secret token).
+    if request.uri().path().starts_with("/webhook/") {
         return Ok(next.run(request).await);
     }
 
