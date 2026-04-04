@@ -8,6 +8,19 @@ use crate::types::{Message, ToolSchema};
 pub struct ModelResponse {
     pub message: Message,
     pub usage: Usage,
+    /// The stop reason from the model — tells us if there are more tool calls.
+    pub stop_reason: StopReason,
+}
+
+/// Why the model stopped generating.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StopReason {
+    /// Model finished with a text response.
+    EndTurn,
+    /// Model wants to use one or more tools.
+    ToolUse,
+    /// Model hit the max token limit (response may be truncated).
+    MaxTokens,
 }
 
 /// Token usage for a single request.
@@ -15,6 +28,15 @@ pub struct ModelResponse {
 pub struct Usage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
+}
+
+/// A chunk of a streaming response.
+#[derive(Debug, Clone)]
+pub enum StreamEvent {
+    /// A partial text token.
+    TextDelta(String),
+    /// Streaming is complete; here's the full response.
+    Done(ModelResponse),
 }
 
 /// Trait implemented by every model provider (e.g. Anthropic, OpenAI).
@@ -29,4 +51,23 @@ pub trait ModelProvider: Send + Sync {
         messages: &[Message],
         tools: &[ToolSchema],
     ) -> Result<ModelResponse>;
+
+    /// Stream a response, sending chunks through the callback.
+    ///
+    /// Default implementation falls back to non-streaming `chat()`.
+    /// Providers that support streaming should override this.
+    async fn chat_stream(
+        &self,
+        messages: &[Message],
+        tools: &[ToolSchema],
+        on_event: &(dyn Fn(StreamEvent) + Send + Sync),
+    ) -> Result<ModelResponse> {
+        let response = self.chat(messages, tools).await?;
+        // Emit the full text as a single event, then done.
+        if let Some(text) = response.message.content.as_text() {
+            on_event(StreamEvent::TextDelta(text.to_string()));
+        }
+        on_event(StreamEvent::Done(response.clone()));
+        Ok(response)
+    }
 }

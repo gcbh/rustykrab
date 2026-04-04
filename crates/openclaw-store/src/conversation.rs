@@ -21,6 +21,7 @@ impl ConversationStore {
             messages: Vec::new(),
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            summary: None,
         };
         self.save(&conv)?;
         Ok(conv)
