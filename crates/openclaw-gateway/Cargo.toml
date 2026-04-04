@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 openclaw-core.workspace = true
 openclaw-store.workspace = true
+openclaw-agent.workspace = true
 openclaw-channels.workspace = true
 axum = { workspace = true, features = ["ws"] }
 tokio.workspace = true

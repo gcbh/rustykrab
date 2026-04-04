@@ -1,3 +1,4 @@
+use openclaw_agent::HarnessProfile;
 use openclaw_channels::{SignalChannel, TelegramChannel};
 use openclaw_store::Store;
 use std::sync::Arc;
@@ -15,6 +16,7 @@ pub struct AppState {
     pub origin_policy: OriginPolicy,
     pub telegram: Option<Arc<TelegramChannel>>,
     pub signal: Option<Arc<SignalChannel>>,
+    pub harness_profile: HarnessProfile,
 }
 
 impl AppState {
@@ -31,6 +33,7 @@ impl AppState {
             origin_policy: OriginPolicy::default(),
             telegram: None,
             signal: None,
+            harness_profile: HarnessProfile::default(),
         }
     }
 
@@ -55,6 +58,12 @@ impl AppState {
     /// Attach a Signal channel.
     pub fn with_signal(mut self, signal: Arc<SignalChannel>) -> Self {
         self.signal = Some(signal);
+        self
+    }
+
+    /// Set the harness profile.
+    pub fn with_harness_profile(mut self, profile: HarnessProfile) -> Self {
+        self.harness_profile = profile;
         self
     }
 }

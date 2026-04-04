@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Instant;
 
 use chrono::Utc;
 use openclaw_core::capability::Capability;
@@ -11,6 +12,7 @@ use openclaw_core::{Error, Result, Tool};
 use uuid::Uuid;
 
 use crate::sandbox::{Sandbox, SandboxPolicy};
+use crate::trace::{ExecutionTracer, ToolTrace};
 
 /// Configuration for the agent runner.
 #[derive(Debug, Clone)]
@@ -59,6 +61,7 @@ pub struct AgentRunner {
     tools: Vec<Arc<dyn Tool>>,
     sandbox: Arc<dyn Sandbox>,
     config: AgentConfig,
+    tracer: ExecutionTracer,
 }
 
 impl AgentRunner {
@@ -72,12 +75,18 @@ impl AgentRunner {
             tools,
             sandbox,
             config: AgentConfig::default(),
+            tracer: ExecutionTracer::new(),
         }
     }
 
     pub fn with_config(mut self, config: AgentConfig) -> Self {
         self.config = config;
         self
+    }
+
+    /// Access the execution tracer for this runner.
+    pub fn tracer(&self) -> &ExecutionTracer {
+        &self.tracer
     }
 
     /// Run the agent loop on a conversation within a session's capability scope.
@@ -96,9 +105,12 @@ impl AgentRunner {
         let mut consecutive_errors = 0;
 
         for iteration in 0..self.config.max_iterations {
+            self.tracer.record_iteration();
+
             // Compress memory when estimated tokens exceed the budget.
             if self.should_compress(conv) {
                 self.compress_memory(conv).await?;
+                self.tracer.record_compression();
             }
 
             let ModelResponse {
@@ -119,9 +131,9 @@ impl AgentRunner {
                     "executing tool calls"
                 );
 
-                // Execute all tool calls in parallel.
+                // Execute all tool calls in parallel, recording traces.
                 let results = self
-                    .execute_tools_parallel(calls, session)
+                    .execute_tools_parallel_traced(calls, session)
                     .await;
 
                 // Track errors for reflection.
@@ -158,6 +170,14 @@ impl AgentRunner {
                     conv.messages.push(tool_msg);
                 }
                 conv.updated_at = Utc::now();
+
+                // Inject trace-informed guidance if tools are failing.
+                if let Some(trace_guidance) = self.tracer.summary_for_prompt() {
+                    // Only inject trace context every few iterations to avoid noise.
+                    if iteration > 0 && iteration % 5 == 0 {
+                        self.inject_trace_context(conv, &trace_guidance);
+                    }
+                }
 
                 // Reflection on repeated errors.
                 if had_errors {
@@ -199,20 +219,28 @@ impl AgentRunner {
         )))
     }
 
-    /// Execute multiple tool calls in parallel using tokio::JoinSet.
-    async fn execute_tools_parallel(
+    /// Execute multiple tool calls in parallel, recording execution traces.
+    async fn execute_tools_parallel_traced(
         &self,
         calls: Vec<&ToolCall>,
         session: &Session,
     ) -> Vec<Result<ToolResult>> {
         if calls.len() == 1 {
-            // Single call — no need for JoinSet overhead.
-            let result = self.execute_tool_checked(calls[0], session).await;
+            let call = calls[0];
+            let start = Instant::now();
+            let result = self.execute_tool_checked(call, session).await;
+            self.tracer.record(ToolTrace {
+                tool_name: call.name.clone(),
+                success: result.is_ok(),
+                duration: start.elapsed(),
+                error: result.as_ref().err().map(|e| e.to_string()),
+            });
             return vec![result];
         }
 
         // Spawn all tool executions concurrently.
         let mut handles = Vec::with_capacity(calls.len());
+        let call_names: Vec<String> = calls.iter().map(|c| c.name.clone()).collect();
 
         for call in calls {
             let call = call.clone();
@@ -222,15 +250,34 @@ impl AgentRunner {
             let session_id = session.id;
 
             handles.push(tokio::spawn(async move {
-                execute_single_tool(&call, &tools, &sandbox, &session_caps, session_id).await
+                let start = Instant::now();
+                let result =
+                    execute_single_tool(&call, &tools, &sandbox, &session_caps, session_id).await;
+                (result, call.name.clone(), start.elapsed())
             }));
         }
 
         let mut results = Vec::with_capacity(handles.len());
-        for handle in handles {
+        for (i, handle) in handles.into_iter().enumerate() {
             match handle.await {
-                Ok(result) => results.push(result),
-                Err(e) => results.push(Err(Error::Internal(format!("task panicked: {e}")))),
+                Ok((result, name, duration)) => {
+                    self.tracer.record(ToolTrace {
+                        tool_name: name,
+                        success: result.is_ok(),
+                        duration,
+                        error: result.as_ref().err().map(|e| e.to_string()),
+                    });
+                    results.push(result);
+                }
+                Err(e) => {
+                    self.tracer.record(ToolTrace {
+                        tool_name: call_names.get(i).cloned().unwrap_or_default(),
+                        success: false,
+                        duration: std::time::Duration::ZERO,
+                        error: Some(format!("task panicked: {e}")),
+                    });
+                    results.push(Err(Error::Internal(format!("task panicked: {e}"))));
+                }
             }
         }
 
@@ -250,6 +297,18 @@ impl AgentRunner {
             session.id,
         )
         .await
+    }
+
+    /// Inject trace-informed context so the model can adapt its strategy.
+    fn inject_trace_context(&self, conv: &mut Conversation, trace_summary: &str) {
+        conv.messages.push(Message {
+            id: Uuid::new_v4(),
+            role: Role::System,
+            content: MessageContent::Text(format!(
+                "[Harness observation]\n{trace_summary}"
+            )),
+            created_at: Utc::now(),
+        });
     }
 
     /// Inject a reflection message when the agent keeps hitting errors.

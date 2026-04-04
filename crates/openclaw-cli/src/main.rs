@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use openclaw_agent::HarnessProfile;
 use openclaw_core::model::ModelProvider;
 use tracing_subscriber::EnvFilter;
 
@@ -16,6 +17,11 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|| std::path::PathBuf::from("."))
         .join("openclaw");
     std::fs::create_dir_all(&data_dir)?;
+
+    // --- Harness profile ---
+    // Load from file or use a preset. Supported: default, coding, research, creative
+    let profile = load_harness_profile(&data_dir)?;
+    tracing::info!(profile = %profile.name, "harness profile loaded");
 
     // --- Master key for credential encryption ---
     let master_key = std::env::var("OPENCLAW_MASTER_KEY")
@@ -78,7 +84,8 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(provider = provider.name(), "model provider configured");
 
     // --- Build gateway state ---
-    let mut state = openclaw_gateway::AppState::new(store, first_tool, auth_token);
+    let mut state = openclaw_gateway::AppState::new(store, first_tool, auth_token)
+        .with_harness_profile(profile);
 
     // --- Telegram channel (optional) ---
     if let Ok(bot_token) = std::env::var("TELEGRAM_BOT_TOKEN") {
@@ -195,4 +202,29 @@ async fn main() -> anyhow::Result<()> {
     .await?;
 
     Ok(())
+}
+
+/// Load harness profile from file or env var preset.
+///
+/// Priority:
+/// 1. `data_dir/harness.toml` — full custom profile
+/// 2. `OPENCLAW_HARNESS` env var — one of: default, coding, research, creative
+/// 3. Fallback to default profile
+fn load_harness_profile(data_dir: &std::path::Path) -> anyhow::Result<HarnessProfile> {
+    let profile_path = data_dir.join("harness.toml");
+    if profile_path.exists() {
+        let contents = std::fs::read_to_string(&profile_path)?;
+        let profile: HarnessProfile = toml::from_str(&contents)?;
+        return Ok(profile);
+    }
+
+    let preset = std::env::var("OPENCLAW_HARNESS").unwrap_or_else(|_| "default".to_string());
+    let profile = match preset.to_lowercase().as_str() {
+        "coding" => HarnessProfile::coding(),
+        "research" => HarnessProfile::research(),
+        "creative" => HarnessProfile::creative(),
+        _ => HarnessProfile::default(),
+    };
+
+    Ok(profile)
 }

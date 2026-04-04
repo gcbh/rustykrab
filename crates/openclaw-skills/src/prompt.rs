@@ -9,6 +9,10 @@ use openclaw_core::types::ToolSchema;
 ///
 /// This builder injects structured guidance that significantly improves
 /// tool-use accuracy across all models, especially open-source ones.
+///
+/// Meta-Harness integration: the builder can incorporate execution trace
+/// data so the model learns from its own session history — tools that
+/// keep failing get flagged, successful patterns are reinforced.
 pub struct SystemPromptBuilder {
     sections: Vec<String>,
 }
@@ -61,6 +65,25 @@ impl SystemPromptBuilder {
         );
 
         self.sections.push(guidance);
+        self
+    }
+
+    /// Add trace-informed tool guidance.
+    ///
+    /// This is the key Meta-Harness insight: by showing the model its own
+    /// execution history, it can adapt its strategy. Tools with high failure
+    /// rates get explicit warnings; the model sees which tools it has used
+    /// most and can adjust.
+    pub fn with_trace_summary(mut self, trace_summary: &str) -> Self {
+        if !trace_summary.is_empty() {
+            self.sections.push(trace_summary.to_string());
+        }
+        self
+    }
+
+    /// Add a task-type-specific guidance section.
+    pub fn with_task_guidance(mut self, guidance: &str) -> Self {
+        self.sections.push(guidance.to_string());
         self
     }
 
