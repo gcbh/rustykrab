@@ -9,11 +9,63 @@ use openclaw_core::Error;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+/// Configuration for Ollama model inference.
+#[derive(Debug, Clone)]
+pub struct OllamaConfig {
+    /// Temperature for sampling (0.0 = deterministic, 0.7 = creative).
+    pub temperature: f32,
+    /// Context window size in tokens.
+    pub num_ctx: u32,
+    /// Number of parallel inference slots.
+    pub num_parallel: u32,
+    /// Top-p nucleus sampling threshold.
+    pub top_p: f32,
+    /// Number of tokens to predict (-1 = unlimited, 0 = fill context).
+    pub num_predict: i32,
+}
+
+impl Default for OllamaConfig {
+    fn default() -> Self {
+        Self {
+            temperature: 0.1,
+            num_ctx: 65536,
+            num_parallel: 6,
+            top_p: 0.9,
+            num_predict: -1,
+        }
+    }
+}
+
+impl OllamaConfig {
+    /// Configuration optimized for tool-calling tasks (low temperature).
+    pub fn tool_calling() -> Self {
+        Self {
+            temperature: 0.0,
+            num_ctx: 65536,
+            num_parallel: 6,
+            top_p: 0.9,
+            num_predict: 4096,
+        }
+    }
+
+    /// Configuration for creative drafting (higher temperature).
+    pub fn creative() -> Self {
+        Self {
+            temperature: 0.7,
+            num_ctx: 65536,
+            num_parallel: 6,
+            top_p: 0.95,
+            num_predict: -1,
+        }
+    }
+}
+
 /// Ollama provider for local models (Qwen, Llama, Mistral, etc.).
 pub struct OllamaProvider {
     client: reqwest::Client,
     base_url: String,
     model: String,
+    config: OllamaConfig,
 }
 
 impl OllamaProvider {
@@ -22,12 +74,28 @@ impl OllamaProvider {
             client: reqwest::Client::new(),
             base_url: "http://localhost:11434".to_string(),
             model: model.into(),
+            config: OllamaConfig::default(),
         }
     }
 
     pub fn with_base_url(mut self, url: impl Into<String>) -> Self {
         self.base_url = url.into();
         self
+    }
+
+    pub fn with_config(mut self, config: OllamaConfig) -> Self {
+        self.config = config;
+        self
+    }
+
+    pub fn with_temperature(mut self, temperature: f32) -> Self {
+        self.config.temperature = temperature;
+        self
+    }
+
+    /// Get the model name.
+    pub fn model(&self) -> &str {
+        &self.model
     }
 
     fn build_messages(messages: &[Message]) -> Vec<OllamaMessage> {
@@ -169,6 +237,12 @@ impl ModelProvider for OllamaProvider {
             "model": self.model,
             "messages": ollama_messages,
             "stream": false,
+            "options": {
+                "temperature": self.config.temperature,
+                "num_ctx": self.config.num_ctx,
+                "top_p": self.config.top_p,
+                "num_predict": self.config.num_predict,
+            },
         });
 
         if !ollama_tools.is_empty() {
