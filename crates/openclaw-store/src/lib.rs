@@ -1,4 +1,5 @@
 mod conversation;
+pub mod keychain;
 mod memory;
 mod secret;
 

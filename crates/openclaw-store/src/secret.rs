@@ -1,19 +1,29 @@
-use hmac::{Hmac, Mac};
+use aes_gcm::aead::Aead;
+use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
+use argon2::Argon2;
 use openclaw_core::Error;
-use sha2::Sha256;
+use rand::RngCore;
 
-type HmacSha256 = Hmac<Sha256>;
+/// The salt length used for Argon2 key derivation.
+const SALT_LEN: usize = 16;
+/// The nonce length for AES-256-GCM (96 bits).
+const NONCE_LEN: usize = 12;
 
 /// Encrypted credential store backed by a sled tree.
 ///
-/// Secrets are encrypted at rest using HMAC-SHA256 as a key derivation
-/// function to produce per-key encryption keys, then XOR'd with the
-/// derived keystream. This prevents plaintext API keys on disk
-/// (addressing the `~/.clawdbot/.env` plaintext credential class of bugs).
+/// Secrets are encrypted at rest using AES-256-GCM (authenticated encryption
+/// with associated data). Each secret gets its own random salt and nonce,
+/// stored alongside the ciphertext. The encryption key is derived from the
+/// master key + a per-secret salt using Argon2id.
 ///
-/// Note: For production use, upgrade to AES-256-GCM with a proper KDF
-/// like Argon2. This provides a meaningful baseline that's still far
-/// better than the plaintext storage in the original Node.js OpenClaw.
+/// Storage format per entry: `[salt (16 bytes)][nonce (12 bytes)][ciphertext+tag]`
+///
+/// Properties:
+/// - **Confidentiality**: AES-256 encryption
+/// - **Integrity**: GCM authentication tag detects any tampering
+/// - **Key hardening**: Argon2id makes brute-forcing the master key expensive
+/// - **Unique keys**: Per-secret salt ensures identical plaintexts produce
+///   different ciphertexts and compromising one key doesn't reveal others
 #[derive(Clone)]
 pub struct SecretStore {
     tree: sled::Tree,
@@ -27,7 +37,7 @@ impl SecretStore {
 
     /// Store a secret value under the given name.
     pub fn set(&self, name: &str, value: &str) -> Result<(), Error> {
-        let encrypted = self.encrypt(name, value.as_bytes());
+        let encrypted = self.encrypt(name, value.as_bytes())?;
         self.tree
             .insert(name.as_bytes(), encrypted)
             .map_err(|e| Error::Storage(e.to_string()))?;
@@ -41,7 +51,7 @@ impl SecretStore {
             .get(name.as_bytes())
             .map_err(|e| Error::Storage(e.to_string()))?
             .ok_or_else(|| Error::NotFound(format!("secret '{name}'")))?;
-        let plaintext = self.decrypt(name, &encrypted);
+        let plaintext = self.decrypt(name, &encrypted)?;
         String::from_utf8(plaintext)
             .map_err(|e| Error::Storage(format!("invalid utf-8 in secret: {e}")))
     }
@@ -66,33 +76,77 @@ impl SecretStore {
         Ok(names)
     }
 
-    /// Derive a per-key keystream and XOR with data.
-    fn encrypt(&self, key_name: &str, data: &[u8]) -> Vec<u8> {
-        let keystream = self.derive_keystream(key_name, data.len());
-        data.iter().zip(keystream.iter()).map(|(a, b)| a ^ b).collect()
+    /// Encrypt data with AES-256-GCM. Returns `salt || nonce || ciphertext+tag`.
+    ///
+    /// The secret name is used as associated data (AAD), binding the
+    /// ciphertext to its key name — moving a ciphertext to a different
+    /// key name will fail authentication.
+    fn encrypt(&self, key_name: &str, data: &[u8]) -> Result<Vec<u8>, Error> {
+        // Generate random salt and nonce.
+        let mut salt = [0u8; SALT_LEN];
+        let mut nonce_bytes = [0u8; NONCE_LEN];
+        rand::thread_rng().fill_bytes(&mut salt);
+        rand::thread_rng().fill_bytes(&mut nonce_bytes);
+
+        // Derive a per-secret encryption key via Argon2id.
+        let derived_key = self.derive_key(&salt)?;
+        let cipher = Aes256Gcm::new_from_slice(&derived_key)
+            .map_err(|e| Error::Storage(format!("cipher init: {e}")))?;
+
+        let nonce = Nonce::from_slice(&nonce_bytes);
+
+        // Encrypt with the secret name as AAD.
+        let ciphertext = cipher
+            .encrypt(nonce, aes_gcm::aead::Payload {
+                msg: data,
+                aad: key_name.as_bytes(),
+            })
+            .map_err(|e| Error::Storage(format!("encryption failed: {e}")))?;
+
+        // Pack: salt || nonce || ciphertext+tag
+        let mut packed = Vec::with_capacity(SALT_LEN + NONCE_LEN + ciphertext.len());
+        packed.extend_from_slice(&salt);
+        packed.extend_from_slice(&nonce_bytes);
+        packed.extend_from_slice(&ciphertext);
+        Ok(packed)
     }
 
-    /// Decryption is symmetric (XOR is its own inverse).
-    fn decrypt(&self, key_name: &str, data: &[u8]) -> Vec<u8> {
-        self.encrypt(key_name, data)
-    }
-
-    /// Produce a keystream of `len` bytes using HMAC-SHA256 in counter mode.
-    fn derive_keystream(&self, key_name: &str, len: usize) -> Vec<u8> {
-        let mut stream = Vec::with_capacity(len);
-        let mut counter: u32 = 0;
-
-        while stream.len() < len {
-            let mut mac =
-                HmacSha256::new_from_slice(&self.master_key).expect("HMAC accepts any key size");
-            mac.update(key_name.as_bytes());
-            mac.update(&counter.to_le_bytes());
-            let block = mac.finalize().into_bytes();
-            stream.extend_from_slice(&block);
-            counter += 1;
+    /// Decrypt data. Input format: `salt || nonce || ciphertext+tag`.
+    fn decrypt(&self, key_name: &str, data: &[u8]) -> Result<Vec<u8>, Error> {
+        if data.len() < SALT_LEN + NONCE_LEN {
+            return Err(Error::Storage("ciphertext too short".into()));
         }
 
-        stream.truncate(len);
-        stream
+        let salt = &data[..SALT_LEN];
+        let nonce_bytes = &data[SALT_LEN..SALT_LEN + NONCE_LEN];
+        let ciphertext = &data[SALT_LEN + NONCE_LEN..];
+
+        let derived_key = self.derive_key(salt)?;
+        let cipher = Aes256Gcm::new_from_slice(&derived_key)
+            .map_err(|e| Error::Storage(format!("cipher init: {e}")))?;
+
+        let nonce = Nonce::from_slice(nonce_bytes);
+
+        cipher
+            .decrypt(nonce, aes_gcm::aead::Payload {
+                msg: ciphertext,
+                aad: key_name.as_bytes(),
+            })
+            .map_err(|e| Error::Storage(format!(
+                "decryption failed (wrong key or tampered data): {e}"
+            )))
+    }
+
+    /// Derive a 256-bit encryption key from the master key + salt using Argon2id.
+    ///
+    /// Argon2id is resistant to both side-channel and GPU/ASIC brute-force
+    /// attacks. Even if the database is stolen, the attacker must spend
+    /// significant time/memory per guess of the master key.
+    fn derive_key(&self, salt: &[u8]) -> Result<[u8; 32], Error> {
+        let mut key = [0u8; 32];
+        Argon2::default()
+            .hash_password_into(&self.master_key, salt, &mut key)
+            .map_err(|e| Error::Storage(format!("key derivation failed: {e}")))?;
+        Ok(key)
     }
 }

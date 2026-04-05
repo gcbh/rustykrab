@@ -24,15 +24,10 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(profile = %profile.name, "harness profile loaded");
 
     // --- Master key for credential encryption ---
-    let master_key = std::env::var("OPENCLAW_MASTER_KEY")
-        .unwrap_or_else(|_| {
-            tracing::warn!(
-                "OPENCLAW_MASTER_KEY not set — generating ephemeral key. \
-                 Secrets will not survive restart."
-            );
-            openclaw_gateway::generate_token()
-        })
-        .into_bytes();
+    // On macOS: stored in the system Keychain (Secure Enclave / Touch ID protected).
+    // On Linux: falls back to OPENCLAW_MASTER_KEY env var or ephemeral key.
+    let master_key = openclaw_store::keychain::resolve_master_key()
+        .expect("failed to resolve master encryption key");
 
     let store = openclaw_store::Store::open(data_dir.join("db"), master_key)?;
 
