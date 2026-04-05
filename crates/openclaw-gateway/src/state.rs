@@ -1,4 +1,4 @@
-use openclaw_agent::HarnessProfile;
+use openclaw_agent::{HarnessProfile, HarnessRouter};
 use openclaw_channels::{SignalChannel, TelegramChannel};
 use openclaw_store::Store;
 use std::sync::Arc;
@@ -16,7 +16,11 @@ pub struct AppState {
     pub origin_policy: OriginPolicy,
     pub telegram: Option<Arc<TelegramChannel>>,
     pub signal: Option<Arc<SignalChannel>>,
+    /// Base harness profile (used as fallback and template).
     pub harness_profile: HarnessProfile,
+    /// Auto-router that classifies messages and selects profiles on-the-fly.
+    /// None = static profile mode (uses harness_profile directly).
+    pub harness_router: Option<Arc<HarnessRouter>>,
 }
 
 impl AppState {
@@ -34,6 +38,7 @@ impl AppState {
             telegram: None,
             signal: None,
             harness_profile: HarnessProfile::default(),
+            harness_router: None,
         }
     }
 
@@ -65,5 +70,23 @@ impl AppState {
     pub fn with_harness_profile(mut self, profile: HarnessProfile) -> Self {
         self.harness_profile = profile;
         self
+    }
+
+    /// Enable auto-routing: a cheap model classifies each message and
+    /// selects the right harness profile on-the-fly.
+    pub fn with_harness_router(mut self, router: Arc<HarnessRouter>) -> Self {
+        self.harness_router = Some(router);
+        self
+    }
+
+    /// Get the harness profile for a given user message.
+    /// If a router is configured, classifies the message automatically.
+    /// Otherwise, returns the static base profile.
+    pub async fn profile_for(&self, user_message: &str) -> HarnessProfile {
+        if let Some(router) = &self.harness_router {
+            router.route(user_message).await
+        } else {
+            self.harness_profile.clone()
+        }
     }
 }
