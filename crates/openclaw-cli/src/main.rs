@@ -77,8 +77,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // --- Tools ---
-    let tools = openclaw_tools::builtin_tools();
-    let first_tool: Arc<dyn openclaw_core::Tool> = tools.into_iter().next().unwrap();
+    let tools = openclaw_tools::builtin_tools(store.secrets());
 
     // --- Log provider status ---
     tracing::info!(provider = provider.name(), "model provider configured");
@@ -91,7 +90,7 @@ async fn main() -> anyhow::Result<()> {
     let router = Arc::new(HarnessRouter::new(classifier).with_base(profile));
 
     // --- Build gateway state ---
-    let mut state = openclaw_gateway::AppState::new(store, first_tool, provider, auth_token)
+    let mut state = openclaw_gateway::AppState::new(store, tools, provider, auth_token)
         .with_harness_router(router);
 
     // --- Telegram channel (optional) ---
