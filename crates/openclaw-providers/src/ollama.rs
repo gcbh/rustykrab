@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use chrono::Utc;
 use openclaw_core::error::Result;
-use openclaw_core::model::{ModelProvider, ModelResponse, Usage};
+use openclaw_core::model::{ModelProvider, ModelResponse, StopReason, Usage};
 use openclaw_core::types::{
     Message, MessageContent, Role, ToolCall, ToolSchema,
 };
@@ -10,15 +10,6 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// Ollama provider for local models (Qwen, Llama, Mistral, etc.).
-///
-/// Connects to a local Ollama instance (default `http://localhost:11434`).
-/// Supports tool calling via the Ollama chat API, which is compatible
-/// with models that have been fine-tuned for function calling.
-///
-/// Recommended models:
-/// - `qwen3:32b` — best tool-use quality per GB
-/// - `llama4-scout` — good MoE option if you have 32GB+ VRAM
-/// - `mistral-small` — lightweight fallback
 pub struct OllamaProvider {
     client: reqwest::Client,
     base_url: String,
@@ -39,7 +30,6 @@ impl OllamaProvider {
         self
     }
 
-    /// Convert internal messages to Ollama chat format.
     fn build_messages(messages: &[Message]) -> Vec<OllamaMessage> {
         messages
             .iter()
@@ -67,6 +57,21 @@ impl OllamaProvider {
                             },
                         }]),
                     }),
+                    MessageContent::MultiToolCall(calls) => Some(OllamaMessage {
+                        role: role.to_string(),
+                        content: None,
+                        tool_calls: Some(
+                            calls
+                                .iter()
+                                .map(|c| OllamaToolCall {
+                                    function: OllamaFunction {
+                                        name: c.name.clone(),
+                                        arguments: c.arguments.clone(),
+                                    },
+                                })
+                                .collect(),
+                        ),
+                    }),
                     MessageContent::ToolResult(result) => Some(OllamaMessage {
                         role: role.to_string(),
                         content: Some(
@@ -79,7 +84,6 @@ impl OllamaProvider {
             .collect()
     }
 
-    /// Convert tool schemas to Ollama's tool format.
     fn build_tools(tools: &[ToolSchema]) -> Vec<OllamaTool> {
         tools
             .iter()
@@ -94,33 +98,43 @@ impl OllamaProvider {
             .collect()
     }
 
-    /// Parse Ollama response into internal types.
     fn parse_response(resp: OllamaResponse) -> Result<ModelResponse> {
         let msg = resp.message;
 
-        // Check for tool calls first.
+        // Collect all tool calls.
         if let Some(tool_calls) = msg.tool_calls {
-            if let Some(tc) = tool_calls.into_iter().next() {
+            if !tool_calls.is_empty() {
+                let calls: Vec<ToolCall> = tool_calls
+                    .into_iter()
+                    .map(|tc| ToolCall {
+                        id: Uuid::new_v4().to_string(),
+                        name: tc.function.name,
+                        arguments: tc.function.arguments,
+                    })
+                    .collect();
+
+                let content = if calls.len() == 1 {
+                    MessageContent::ToolCall(calls.into_iter().next().unwrap())
+                } else {
+                    MessageContent::MultiToolCall(calls)
+                };
+
                 return Ok(ModelResponse {
                     message: Message {
                         id: Uuid::new_v4(),
                         role: Role::Assistant,
-                        content: MessageContent::ToolCall(ToolCall {
-                            id: Uuid::new_v4().to_string(),
-                            name: tc.function.name,
-                            arguments: tc.function.arguments,
-                        }),
+                        content,
                         created_at: Utc::now(),
                     },
                     usage: Usage {
                         prompt_tokens: resp.prompt_eval_count.unwrap_or(0),
                         completion_tokens: resp.eval_count.unwrap_or(0),
                     },
+                    stop_reason: StopReason::ToolUse,
                 });
             }
         }
 
-        // Text response.
         Ok(ModelResponse {
             message: Message {
                 id: Uuid::new_v4(),
@@ -132,6 +146,7 @@ impl OllamaProvider {
                 prompt_tokens: resp.prompt_eval_count.unwrap_or(0),
                 completion_tokens: resp.eval_count.unwrap_or(0),
             },
+            stop_reason: StopReason::EndTurn,
         })
     }
 }

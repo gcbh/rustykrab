@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use chrono::Utc;
 use openclaw_core::error::Result;
-use openclaw_core::model::{ModelProvider, ModelResponse, Usage};
+use openclaw_core::model::{ModelProvider, ModelResponse, StopReason, Usage};
 use openclaw_core::types::{
     Message, MessageContent, Role, ToolCall, ToolSchema,
 };
@@ -78,6 +78,20 @@ impl AnthropicProvider {
                             }]),
                         });
                     }
+                    MessageContent::MultiToolCall(ref calls) => {
+                        let blocks = calls
+                            .iter()
+                            .map(|c| ContentBlock::ToolUse {
+                                id: c.id.clone(),
+                                name: c.name.clone(),
+                                input: c.arguments.clone(),
+                            })
+                            .collect();
+                        api_messages.push(ApiMessage {
+                            role: "assistant".to_string(),
+                            content: ApiContent::Blocks(blocks),
+                        });
+                    }
                     _ => {}
                 },
                 Role::Tool => {
@@ -111,29 +125,51 @@ impl AnthropicProvider {
     }
 
     /// Parse the API response into our internal types.
+    /// Supports multiple tool calls in a single response (parallel tool use).
     fn parse_response(resp: ApiResponse) -> Result<ModelResponse> {
         let usage = Usage {
             prompt_tokens: resp.usage.input_tokens,
             completion_tokens: resp.usage.output_tokens,
         };
 
-        // Check for tool use in the response content blocks.
-        for block in &resp.content {
-            if let ResponseBlock::ToolUse { id, name, input } = block {
-                return Ok(ModelResponse {
-                    message: Message {
-                        id: Uuid::new_v4(),
-                        role: Role::Assistant,
-                        content: MessageContent::ToolCall(ToolCall {
-                            id: id.clone(),
-                            name: name.clone(),
-                            arguments: input.clone(),
-                        }),
-                        created_at: Utc::now(),
-                    },
-                    usage,
-                });
-            }
+        let stop_reason = match resp.stop_reason.as_deref() {
+            Some("tool_use") => StopReason::ToolUse,
+            Some("max_tokens") => StopReason::MaxTokens,
+            _ => StopReason::EndTurn,
+        };
+
+        // Collect all tool use blocks.
+        let tool_calls: Vec<ToolCall> = resp
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ResponseBlock::ToolUse { id, name, input } => Some(ToolCall {
+                    id: id.clone(),
+                    name: name.clone(),
+                    arguments: input.clone(),
+                }),
+                _ => None,
+            })
+            .collect();
+
+        // If there are tool calls, return them (single or multi).
+        if !tool_calls.is_empty() {
+            let content = if tool_calls.len() == 1 {
+                MessageContent::ToolCall(tool_calls.into_iter().next().unwrap())
+            } else {
+                MessageContent::MultiToolCall(tool_calls)
+            };
+
+            return Ok(ModelResponse {
+                message: Message {
+                    id: Uuid::new_v4(),
+                    role: Role::Assistant,
+                    content,
+                    created_at: Utc::now(),
+                },
+                usage,
+                stop_reason,
+            });
         }
 
         // Otherwise, extract text.
@@ -155,6 +191,7 @@ impl AnthropicProvider {
                 created_at: Utc::now(),
             },
             usage,
+            stop_reason,
         })
     }
 }
@@ -259,6 +296,8 @@ struct ApiTool {
 struct ApiResponse {
     content: Vec<ResponseBlock>,
     usage: ApiUsage,
+    #[serde(default)]
+    stop_reason: Option<String>,
 }
 
 #[derive(Deserialize)]

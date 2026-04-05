@@ -62,6 +62,11 @@ All configuration is via environment variables. No plaintext config files.
 | `TELEGRAM_ALLOWED_CHATS` | — | Comma-separated chat IDs allowed to use the bot |
 | `TELEGRAM_WEBHOOK_URL` | — | Public webhook URL (omit for long-polling mode) |
 | `TELEGRAM_WEBHOOK_SECRET` | — | Secret token for webhook validation |
+| `SIGNAL_ACCOUNT` | — | Your Signal phone number (E.164, e.g. `+1234567890`) |
+| `SIGNAL_CLI_URL` | `http://localhost:8080` | signal-cli-rest-api URL |
+| `SIGNAL_ALLOWED_NUMBERS` | — | Comma-separated E.164 numbers allowed to message |
+| `SIGNAL_WEBHOOK_URL` | — | Webhook URL (omit for polling mode) |
+| `SIGNAL_WEBHOOK_SECRET` | — | Shared secret for webhook validation |
 | `RUST_LOG` | — | Log level (`info`, `debug`, `openclaw_gateway=debug`) |
 
 ### Persisting credentials
@@ -145,6 +150,54 @@ ngrok http 3000
 - Webhook mode validates the `X-Telegram-Bot-Api-Secret-Token` header
 - The webhook endpoint (`/webhook/telegram`) bypasses bearer auth but uses Telegram's own secret token
 
+### Signal (E2E encrypted)
+
+The most secure messaging option. Uses [signal-cli-rest-api](https://github.com/bbernhard/signal-cli-rest-api) as a bridge — all messages are end-to-end encrypted via the Signal protocol.
+
+**1. Run signal-cli-rest-api in Docker:**
+
+```bash
+docker run -d --name signal-api \
+  -p 8080:8080 \
+  -v $HOME/.local/share/signal-cli:/home/.local/share/signal-cli \
+  -e MODE=normal \
+  bbernhard/signal-cli-rest-api
+```
+
+**2. Register your phone number** (one-time setup):
+
+```bash
+# Request a verification code via SMS
+curl -X POST 'http://localhost:8080/v1/register/+1234567890'
+
+# Verify with the code you received
+curl -X POST 'http://localhost:8080/v1/register/+1234567890/verify/123456'
+```
+
+**3. Start OpenClaw with Signal:**
+
+```bash
+export SIGNAL_ACCOUNT=+1234567890
+export SIGNAL_ALLOWED_NUMBERS=+1987654321,+1555555555
+cargo run --release -p openclaw-cli
+```
+
+Now message the registered number from an allowed phone — the agent responds via Signal.
+
+**Webhook mode** (optional, for lower latency):
+
+```bash
+export SIGNAL_WEBHOOK_URL=http://localhost:3000/webhook/signal
+export SIGNAL_WEBHOOK_SECRET=$(openssl rand -hex 16)
+cargo run --release -p openclaw-cli
+```
+
+**Security notes:**
+- All messages are E2E encrypted by the Signal protocol — neither the server nor OpenClaw sees plaintext on the wire
+- `SIGNAL_ALLOWED_NUMBERS` is **required** — without it, the bot denies all messages
+- signal-cli-rest-api runs on localhost only — no external exposure
+- Use a dedicated phone number for the bot, not your personal number
+
 ### WebChat UI
 
 Open `http://127.0.0.1:3000` in a browser for the embedded WebChat interface.
@@ -174,6 +227,7 @@ openclaw-cli          Binary entrypoint, wires everything together
   |     +-- http_request    HTTP client tool (GET/POST/PUT/DELETE/PATCH)
   |
   +-- openclaw-channels   Communication channel abstractions
+  |     +-- signal          Signal via signal-cli-rest-api (E2E encrypted)
   |     +-- telegram        Telegram bot (long-polling + webhook + chat allowlist)
   |     +-- webchat         In-process mpsc-backed channel for the WebChat UI
   |

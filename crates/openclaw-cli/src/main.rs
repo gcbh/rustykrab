@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use openclaw_agent::{HarnessProfile, HarnessRouter};
 use openclaw_core::model::ModelProvider;
 use tracing_subscriber::EnvFilter;
 
@@ -16,6 +17,11 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|| std::path::PathBuf::from("."))
         .join("openclaw");
     std::fs::create_dir_all(&data_dir)?;
+
+    // --- Harness profile ---
+    // Load from file or use a preset. Supported: default, coding, research, creative
+    let profile = load_harness_profile(&data_dir)?;
+    tracing::info!(profile = %profile.name, "harness profile loaded");
 
     // --- Master key for credential encryption ---
     let master_key = std::env::var("OPENCLAW_MASTER_KEY")
@@ -77,9 +83,18 @@ async fn main() -> anyhow::Result<()> {
     // --- Log provider status ---
     tracing::info!(provider = provider.name(), "model provider configured");
 
-    // --- Telegram channel (optional) ---
-    let mut state = openclaw_gateway::AppState::new(store, first_tool, auth_token);
+    // --- Harness router (auto-selects profile per message) ---
+    // Reuses the main provider for classification to avoid model swapping.
+    // The classification prompt is ~50 tokens — negligible overhead on any model.
+    let classifier: Arc<dyn ModelProvider> = provider.clone();
 
+    let router = Arc::new(HarnessRouter::new(classifier).with_base(profile));
+
+    // --- Build gateway state ---
+    let mut state = openclaw_gateway::AppState::new(store, first_tool, auth_token)
+        .with_harness_router(router);
+
+    // --- Telegram channel (optional) ---
     if let Ok(bot_token) = std::env::var("TELEGRAM_BOT_TOKEN") {
         let allowed_chats: HashSet<i64> = std::env::var("TELEGRAM_ALLOWED_CHATS")
             .unwrap_or_default()
@@ -97,7 +112,6 @@ async fn main() -> anyhow::Result<()> {
         let tg = Arc::new(tg);
         state = state.with_telegram(tg.clone());
 
-        // If a webhook URL is configured, register it. Otherwise, start long-polling.
         if let Ok(webhook_url) = std::env::var("TELEGRAM_WEBHOOK_URL") {
             tg.set_webhook(&webhook_url).await?;
             tracing::info!("Telegram: webhook mode");
@@ -121,6 +135,65 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // --- Signal channel (optional) ---
+    if let Ok(account_number) = std::env::var("SIGNAL_ACCOUNT") {
+        let base_url = std::env::var("SIGNAL_CLI_URL")
+            .unwrap_or_else(|_| "http://localhost:8080".to_string());
+
+        let allowed_numbers: HashSet<String> = std::env::var("SIGNAL_ALLOWED_NUMBERS")
+            .unwrap_or_default()
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        let webhook_secret = std::env::var("SIGNAL_WEBHOOK_SECRET").ok();
+
+        let mut sig =
+            openclaw_channels::SignalChannel::new(base_url.clone(), account_number.clone(), allowed_numbers.clone());
+        if let Some(secret) = webhook_secret {
+            sig = sig.with_webhook_secret(secret);
+        }
+
+        let sig = Arc::new(sig);
+        state = state.with_signal(sig.clone());
+
+        // Health check — verify signal-cli-rest-api is running.
+        match sig.health_check().await {
+            Ok(()) => tracing::info!("signal-cli-rest-api connected"),
+            Err(e) => tracing::error!("signal-cli-rest-api not reachable: {e}"),
+        }
+
+        // Webhook or polling mode.
+        if let Ok(webhook_url) = std::env::var("SIGNAL_WEBHOOK_URL") {
+            if let Err(e) = sig.register_webhook(&webhook_url).await {
+                tracing::error!("failed to register Signal webhook: {e}");
+            } else {
+                tracing::info!("Signal: webhook mode");
+            }
+        } else {
+            let sig_poll = sig.clone();
+            tokio::spawn(async move {
+                if let Err(e) = sig_poll.start_polling().await {
+                    tracing::error!("Signal polling error: {e}");
+                }
+            });
+            tracing::info!("Signal: polling mode");
+        }
+
+        if allowed_numbers.is_empty() {
+            tracing::warn!(
+                "SIGNAL_ALLOWED_NUMBERS not set — bot will deny all messages. \
+                 Set it to a comma-separated list of E.164 phone numbers."
+            );
+        } else {
+            tracing::info!(
+                numbers = ?allowed_numbers,
+                "Signal allowed numbers configured"
+            );
+        }
+    }
+
     // --- Gateway with security middleware ---
     let app = openclaw_gateway::router(state);
 
@@ -136,4 +209,29 @@ async fn main() -> anyhow::Result<()> {
     .await?;
 
     Ok(())
+}
+
+/// Load harness profile from file or env var preset.
+///
+/// Priority:
+/// 1. `data_dir/harness.toml` — full custom profile
+/// 2. `OPENCLAW_HARNESS` env var — one of: default, coding, research, creative
+/// 3. Fallback to default profile
+fn load_harness_profile(data_dir: &std::path::Path) -> anyhow::Result<HarnessProfile> {
+    let profile_path = data_dir.join("harness.toml");
+    if profile_path.exists() {
+        let contents = std::fs::read_to_string(&profile_path)?;
+        let profile: HarnessProfile = toml::from_str(&contents)?;
+        return Ok(profile);
+    }
+
+    let preset = std::env::var("OPENCLAW_HARNESS").unwrap_or_else(|_| "default".to_string());
+    let profile = match preset.to_lowercase().as_str() {
+        "coding" => HarnessProfile::coding(),
+        "research" => HarnessProfile::research(),
+        "creative" => HarnessProfile::creative(),
+        _ => HarnessProfile::default(),
+    };
+
+    Ok(profile)
 }

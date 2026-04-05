@@ -2,6 +2,7 @@ pub mod auth;
 pub mod origin;
 pub mod rate_limit;
 mod routes;
+mod signal_webhook;
 mod state;
 mod telegram_webhook;
 mod webchat;
@@ -19,6 +20,7 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .merge(routes::api_routes())
         .merge(telegram_webhook::telegram_routes())
+        .merge(signal_webhook::signal_routes())
         .merge(webchat::static_routes())
         .layer(middleware::from_fn_with_state(
             state.clone(),

@@ -1,4 +1,5 @@
 mod conversation;
+mod memory;
 mod secret;
 
 use std::path::Path;
@@ -6,6 +7,7 @@ use std::path::Path;
 use openclaw_core::Error;
 
 pub use conversation::ConversationStore;
+pub use memory::{MemoryEntry, MemoryStore};
 pub use secret::SecretStore;
 
 /// Top-level database handle wrapping a sled instance.
@@ -42,6 +44,15 @@ impl Store {
             .open_tree("secrets")
             .expect("failed to open secrets tree");
         SecretStore::new(tree, self.master_key.clone())
+    }
+
+    /// Return a handle for conversation memory/RAG operations.
+    pub fn memories(&self) -> MemoryStore {
+        let tree = self
+            .db
+            .open_tree("memories")
+            .expect("failed to open memories tree");
+        MemoryStore::new(tree)
     }
 
     /// Flush all pending writes to disk.
