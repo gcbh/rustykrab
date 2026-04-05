@@ -53,8 +53,13 @@ mod canvas;
 // Device tools
 mod nodes;
 
-// HTTP (original)
+// HTTP
 mod http_request;
+mod http_session;
+
+// Credentials (from main)
+mod credential_read;
+mod credential_write;
 
 // --- Public re-exports ---
 
@@ -115,12 +120,23 @@ pub use nodes::NodesTool;
 
 // HTTP
 pub use http_request::HttpRequestTool;
+pub use http_session::HttpSessionTool;
+
+// Credentials
+pub use credential_read::CredentialReadTool;
+pub use credential_write::CredentialWriteTool;
 
 /// Collect all built-in tools that require no external backend into a Vec.
-pub fn builtin_tools() -> Vec<std::sync::Arc<dyn openclaw_core::Tool>> {
+///
+/// Tools that need access to the secret store (credential_read, credential_write)
+/// require a `SecretStore` handle. The remaining tools are stateless or self-contained.
+pub fn builtin_tools(
+    secrets: openclaw_store::SecretStore,
+) -> Vec<std::sync::Arc<dyn openclaw_core::Tool>> {
     vec![
         // HTTP
         std::sync::Arc::new(HttpRequestTool::new()),
+        std::sync::Arc::new(HttpSessionTool::new()),
         // Filesystem
         std::sync::Arc::new(ReadTool::new()),
         std::sync::Arc::new(WriteTool::new()),
@@ -144,6 +160,9 @@ pub fn builtin_tools() -> Vec<std::sync::Arc<dyn openclaw_core::Tool>> {
         std::sync::Arc::new(CanvasTool::new()),
         // Devices
         std::sync::Arc::new(NodesTool::new()),
+        // Credentials
+        std::sync::Arc::new(CredentialReadTool::new(secrets.clone())),
+        std::sync::Arc::new(CredentialWriteTool::new(secrets)),
     ]
 }
 

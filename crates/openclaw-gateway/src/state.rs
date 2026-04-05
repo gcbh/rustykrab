@@ -11,7 +11,7 @@ use crate::rate_limit::{RateLimitConfig, RateLimiter};
 #[derive(Clone)]
 pub struct AppState {
     pub store: Store,
-    pub tools: Arc<dyn openclaw_core::Tool>,
+    pub tools: Vec<Arc<dyn openclaw_core::Tool>>,
     pub provider: Arc<dyn ModelProvider>,
     pub auth_token: String,
     pub rate_limiter: Arc<RateLimiter>,
@@ -28,7 +28,7 @@ pub struct AppState {
 impl AppState {
     pub fn new(
         store: Store,
-        tools: Arc<dyn openclaw_core::Tool>,
+        tools: Vec<Arc<dyn openclaw_core::Tool>>,
         provider: Arc<dyn ModelProvider>,
         auth_token: String,
     ) -> Self {
