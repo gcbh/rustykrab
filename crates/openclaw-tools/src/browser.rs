@@ -3,6 +3,8 @@ use openclaw_core::types::ToolSchema;
 use openclaw_core::{Result, Tool};
 use serde_json::{json, Value};
 
+use crate::security;
+
 /// A built-in tool that controls a headless browser for web automation.
 pub struct BrowserTool {
     client: reqwest::Client,
@@ -75,6 +77,10 @@ impl Tool for BrowserTool {
                     .as_str()
                     .ok_or_else(|| openclaw_core::Error::ToolExecution("missing url for navigate action".into()))?;
 
+                // SSRF protection
+                security::validate_url(url)
+                    .map_err(|e| openclaw_core::Error::ToolExecution(e))?;
+
                 if let Some(ws_url) = &browser_ws_url {
                     // Send navigate command to browser automation endpoint
                     let resp = self
@@ -123,6 +129,12 @@ impl Tool for BrowserTool {
             }
             "content" => {
                 let url = args["url"].as_str();
+
+                // SSRF protection for content URLs
+                if let Some(u) = url {
+                    security::validate_url(u)
+                        .map_err(|e| openclaw_core::Error::ToolExecution(e))?;
+                }
 
                 if let Some(ws_url) = &browser_ws_url {
                     let mut payload = json!({"action": "content"});

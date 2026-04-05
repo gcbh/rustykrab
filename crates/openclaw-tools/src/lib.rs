@@ -1,3 +1,6 @@
+// Security utilities
+pub mod security;
+
 // Filesystem tools
 mod apply_patch;
 mod edit;

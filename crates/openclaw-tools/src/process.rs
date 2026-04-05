@@ -3,7 +3,18 @@ use openclaw_core::types::ToolSchema;
 use openclaw_core::{Result, Tool};
 use serde_json::{json, Value};
 
+/// Commands allowed to be started as background processes.
+const ALLOWED_PROCESS_COMMANDS: &[&str] = &[
+    "python3", "python", "node", "npm", "npx", "cargo", "make",
+    "docker", "docker-compose", "kubectl",
+    "git", "ssh", "java", "go", "ruby",
+    "tail", "watch",
+];
+
 /// A built-in tool that manages background processes: start, stop, or list.
+///
+/// Security: Only allowlisted commands can be started as background
+/// processes. Shell metacharacters and command substitution are rejected.
 pub struct ProcessTool;
 
 impl ProcessTool {
@@ -18,6 +29,32 @@ impl Default for ProcessTool {
     }
 }
 
+/// Validate that a command is safe to spawn as a background process.
+fn validate_process_command(command: &str) -> std::result::Result<(), String> {
+    // Reject shell metacharacters that enable injection
+    if command.contains("$(") || command.contains('`')
+        || command.contains("<(") || command.contains(">(")
+        || command.contains("${")
+        || command.contains(';') || command.contains("&&")
+        || command.contains("||") || command.contains('|')
+    {
+        return Err("shell operators, pipes, and command substitution are not allowed in process commands".into());
+    }
+
+    let base_cmd = command.trim().split_whitespace().next().unwrap_or("");
+    let cmd_name = base_cmd.rsplit('/').next().unwrap_or(base_cmd);
+
+    if !ALLOWED_PROCESS_COMMANDS.contains(&cmd_name) {
+        return Err(format!(
+            "command '{}' is not allowed as a background process. Allowed: {}",
+            cmd_name,
+            ALLOWED_PROCESS_COMMANDS.join(", ")
+        ));
+    }
+
+    Ok(())
+}
+
 #[async_trait]
 impl Tool for ProcessTool {
     fn name(&self) -> &str {
@@ -25,7 +62,7 @@ impl Tool for ProcessTool {
     }
 
     fn description(&self) -> &str {
-        "Manage background processes: start, stop, or list."
+        "Manage background processes: start, stop, or list. Only allowlisted commands can be started."
     }
 
     fn schema(&self) -> ToolSchema {
@@ -67,12 +104,26 @@ impl Tool for ProcessTool {
                     )
                 })?;
 
-                let child = tokio::process::Command::new("sh")
-                    .arg("-c")
-                    .arg(command)
+                // Validate command against allowlist
+                validate_process_command(command).map_err(|e| {
+                    openclaw_core::Error::ToolExecution(format!("command rejected: {e}"))
+                })?;
+
+                // Parse the command into parts and execute directly (no shell)
+                let parts: Vec<&str> = command.trim().split_whitespace().collect();
+                let (program, cmd_args) = parts.split_first().ok_or_else(|| {
+                    openclaw_core::Error::ToolExecution("empty command".into())
+                })?;
+
+                let child = tokio::process::Command::new(program)
+                    .args(cmd_args)
                     .stdin(std::process::Stdio::null())
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::null())
+                    .env_clear()
+                    .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+                    .env("HOME", std::env::var("HOME").unwrap_or_default())
+                    .env("LANG", "C.UTF-8")
                     .spawn()
                     .map_err(|e| openclaw_core::Error::ToolExecution(e.to_string()))?;
 
@@ -93,6 +144,13 @@ impl Tool for ProcessTool {
                 let pid = args["pid"].as_i64().ok_or_else(|| {
                     openclaw_core::Error::ToolExecution("missing pid for 'stop' action".into())
                 })?;
+
+                // Validate PID is positive and reasonable
+                if pid <= 1 {
+                    return Err(openclaw_core::Error::ToolExecution(
+                        "cannot stop PID 0 or 1 (system processes)".into(),
+                    ));
+                }
 
                 let output = tokio::process::Command::new("kill")
                     .arg(pid.to_string())

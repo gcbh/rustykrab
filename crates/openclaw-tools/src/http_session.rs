@@ -6,6 +6,8 @@ use openclaw_core::types::ToolSchema;
 use openclaw_core::{Error, Result, Tool};
 use serde_json::{json, Value};
 
+use crate::security;
+
 /// A cookie-aware HTTP client with named sessions.
 ///
 /// Unlike the stateless `http_request` tool, this maintains cookies
@@ -125,6 +127,11 @@ impl Tool for HttpSessionTool {
         let url = args["url"]
             .as_str()
             .ok_or_else(|| Error::ToolExecution("missing url".into()))?;
+
+        // SSRF protection: validate URL before making request
+        security::validate_url(url)
+            .map_err(|e| Error::ToolExecution(e))?;
+
         let method = args["method"]
             .as_str()
             .unwrap_or("GET")

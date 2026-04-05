@@ -3,6 +3,8 @@ use openclaw_core::types::ToolSchema;
 use openclaw_core::{Result, Tool};
 use serde_json::{json, Value};
 
+use crate::security;
+
 /// A built-in tool that applies a unified diff patch to one or more files.
 pub struct ApplyPatchTool;
 
@@ -237,7 +239,13 @@ impl Tool for ApplyPatchTool {
         for file_diff in &file_diffs {
             let path = &file_diff.path;
 
-            let original = tokio::fs::read_to_string(path)
+            // Validate each file path from the patch for traversal attacks
+            let safe_path = security::validate_path(path)
+                .map_err(|e| openclaw_core::Error::ToolExecution(
+                    format!("patch path rejected for '{path}': {e}"),
+                ))?;
+
+            let original = tokio::fs::read_to_string(&safe_path)
                 .await
                 .map_err(|e| openclaw_core::Error::ToolExecution(
                     format!("failed to read {path}: {e}"),
@@ -248,7 +256,7 @@ impl Tool for ApplyPatchTool {
                     format!("failed to apply hunks to {path}: {e}"),
                 ))?;
 
-            tokio::fs::write(path, &patched)
+            tokio::fs::write(&safe_path, &patched)
                 .await
                 .map_err(|e| openclaw_core::Error::ToolExecution(
                     format!("failed to write {path}: {e}"),

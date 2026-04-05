@@ -90,10 +90,16 @@ impl AgentRunner {
     }
 
     /// Run the agent loop on a conversation within a session's capability scope.
+    ///
+    /// Each call creates a fresh ExecutionTracer to prevent cross-session
+    /// information leakage (H8).
     pub async fn run(&self, conv: &mut Conversation, session: &Session) -> Result<()> {
         if session.is_expired() {
             return Err(Error::Auth("session has expired".into()));
         }
+
+        // Create a per-run tracer to prevent cross-session data leaks (H8)
+        let tracer = ExecutionTracer::new();
 
         let schemas: Vec<ToolSchema> = self
             .tools
@@ -105,12 +111,17 @@ impl AgentRunner {
         let mut consecutive_errors = 0;
 
         for iteration in 0..self.config.max_iterations {
-            self.tracer.record_iteration();
+            tracer.record_iteration();
+
+            // Check session expiry on each iteration (not just at start)
+            if session.is_expired() {
+                return Err(Error::Auth("session expired during execution".into()));
+            }
 
             // Compress memory when estimated tokens exceed the budget.
             if self.should_compress(conv) {
                 self.compress_memory(conv).await?;
-                self.tracer.record_compression();
+                tracer.record_compression();
             }
 
             let ModelResponse {
@@ -133,7 +144,7 @@ impl AgentRunner {
 
                 // Execute all tool calls in parallel, recording traces.
                 let results = self
-                    .execute_tools_parallel_traced(calls, session)
+                    .execute_tools_parallel_traced(calls, session, &tracer)
                     .await;
 
                 // Track errors for reflection.
@@ -172,7 +183,7 @@ impl AgentRunner {
                 conv.updated_at = Utc::now();
 
                 // Inject trace-informed guidance if tools are failing.
-                if let Some(trace_guidance) = self.tracer.summary_for_prompt() {
+                if let Some(trace_guidance) = tracer.summary_for_prompt() {
                     // Only inject trace context every few iterations to avoid noise.
                     if iteration > 0 && iteration % 5 == 0 {
                         self.inject_trace_context(conv, &trace_guidance);
@@ -224,12 +235,13 @@ impl AgentRunner {
         &self,
         calls: Vec<&ToolCall>,
         session: &Session,
+        tracer: &ExecutionTracer,
     ) -> Vec<Result<ToolResult>> {
         if calls.len() == 1 {
             let call = calls[0];
             let start = Instant::now();
             let result = self.execute_tool_checked(call, session).await;
-            self.tracer.record(ToolTrace {
+            tracer.record(ToolTrace {
                 tool_name: call.name.clone(),
                 success: result.is_ok(),
                 duration: start.elapsed(),
@@ -261,7 +273,7 @@ impl AgentRunner {
         for (i, handle) in handles.into_iter().enumerate() {
             match handle.await {
                 Ok((result, name, duration)) => {
-                    self.tracer.record(ToolTrace {
+                    tracer.record(ToolTrace {
                         tool_name: name,
                         success: result.is_ok(),
                         duration,
@@ -270,7 +282,7 @@ impl AgentRunner {
                     results.push(result);
                 }
                 Err(e) => {
-                    self.tracer.record(ToolTrace {
+                    tracer.record(ToolTrace {
                         tool_name: call_names.get(i).cloned().unwrap_or_default(),
                         success: false,
                         duration: std::time::Duration::ZERO,
@@ -536,7 +548,7 @@ impl AgentRunner {
 async fn execute_single_tool(
     call: &ToolCall,
     tools: &[Arc<dyn Tool>],
-    sandbox: &Arc<dyn Sandbox>,
+    _sandbox: &Arc<dyn Sandbox>,
     capabilities: &openclaw_core::capability::CapabilitySet,
     session_id: uuid::Uuid,
 ) -> Result<ToolResult> {
@@ -567,14 +579,61 @@ async fn execute_single_tool(
         ..SandboxPolicy::default()
     };
 
-    sandbox
-        .execute(&call.name, call.arguments.clone(), &policy)
-        .await?;
+    // Enforce sandbox policy BEFORE tool execution.
+    // Check that the tool's required capabilities match the policy.
+    enforce_sandbox_policy(&call.name, &policy)?;
 
-    let output = tool.execute(call.arguments.clone()).await?;
+    // Execute tool within sandbox timeout
+    let timeout_duration = std::time::Duration::from_secs(policy.timeout_secs);
+    let tool_clone = tool.clone();
+    let args_clone = call.arguments.clone();
+
+    let output = tokio::time::timeout(timeout_duration, async move {
+        tool_clone.execute(args_clone).await
+    })
+    .await
+    .map_err(|_| Error::ToolExecution(format!(
+        "tool '{}' exceeded sandbox timeout of {}s",
+        call.name, policy.timeout_secs
+    )))??;
 
     Ok(ToolResult {
         call_id: call.id.clone(),
         output,
     })
+}
+
+/// Enforce sandbox policy constraints before tool execution.
+///
+/// Maps tool names to required capabilities and rejects calls
+/// that violate the policy.
+fn enforce_sandbox_policy(tool_name: &str, policy: &SandboxPolicy) -> Result<()> {
+    match tool_name {
+        // Tools requiring filesystem read
+        "read" | "pdf" if !policy.allow_fs_read => {
+            Err(Error::Auth(format!(
+                "tool '{tool_name}' requires filesystem read access, which is denied by policy"
+            )))
+        }
+        // Tools requiring filesystem write
+        "write" | "edit" | "apply_patch" if !policy.allow_fs_write => {
+            Err(Error::Auth(format!(
+                "tool '{tool_name}' requires filesystem write access, which is denied by policy"
+            )))
+        }
+        // Tools requiring process spawning
+        "exec" | "process" | "code_execution" if !policy.allow_spawn => {
+            Err(Error::Auth(format!(
+                "tool '{tool_name}' requires process spawning, which is denied by policy"
+            )))
+        }
+        // Tools requiring network access
+        "http_request" | "http_session" | "web_fetch" | "web_search"
+        | "x_search" | "browser" if !policy.allow_net => {
+            Err(Error::Auth(format!(
+                "tool '{tool_name}' requires network access, which is denied by policy"
+            )))
+        }
+        _ => Ok(()),
+    }
 }

@@ -45,6 +45,9 @@ impl ToolStats {
 /// by recording what worked and what didn't, the agent can adapt its
 /// strategy mid-conversation (trace-informed tool guidance) and the
 /// harness can be tuned offline using historical trace data.
+///
+/// Security: Each session should get its own ExecutionTracer instance
+/// to prevent cross-session information leakage (H8).
 #[derive(Debug, Clone)]
 pub struct ExecutionTracer {
     inner: Arc<Mutex<TracerInner>>,
@@ -67,9 +70,18 @@ impl ExecutionTracer {
         }
     }
 
+    /// Acquire the inner lock, recovering from poison if needed.
+    /// This prevents cascade panics when a thread panics while holding the lock (H9).
+    fn lock_inner(&self) -> std::sync::MutexGuard<'_, TracerInner> {
+        self.inner.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("tracer mutex was poisoned, recovering");
+            poisoned.into_inner()
+        })
+    }
+
     /// Record a tool execution outcome.
     pub fn record(&self, trace: ToolTrace) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.lock_inner();
         let stats = inner.stats.entry(trace.tool_name.clone()).or_default();
         stats.calls += 1;
         stats.total_duration += trace.duration;
@@ -83,29 +95,27 @@ impl ExecutionTracer {
 
     /// Increment the iteration counter.
     pub fn record_iteration(&self) {
-        self.inner.lock().unwrap().iterations += 1;
+        self.lock_inner().iterations += 1;
     }
 
     /// Increment the compression counter.
     pub fn record_compression(&self) {
-        self.inner.lock().unwrap().compressions += 1;
+        self.lock_inner().compressions += 1;
     }
 
     /// Get aggregated stats for all tools.
     pub fn tool_stats(&self) -> HashMap<String, ToolStats> {
-        self.inner.lock().unwrap().stats.clone()
+        self.lock_inner().stats.clone()
     }
 
     /// Get the full trace log.
     pub fn traces(&self) -> Vec<ToolTrace> {
-        self.inner.lock().unwrap().traces.clone()
+        self.lock_inner().traces.clone()
     }
 
     /// Get tools with a failure rate above the given threshold (0.0–1.0).
     pub fn unreliable_tools(&self, failure_threshold: f64) -> Vec<(String, ToolStats)> {
-        self.inner
-            .lock()
-            .unwrap()
+        self.lock_inner()
             .stats
             .iter()
             .filter(|(_, s)| s.calls >= 2 && s.success_rate() < (1.0 - failure_threshold))
@@ -115,7 +125,7 @@ impl ExecutionTracer {
 
     /// Get the most-used tools, ordered by call count descending.
     pub fn most_used(&self, limit: usize) -> Vec<(String, ToolStats)> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.lock_inner();
         let mut sorted: Vec<_> = inner
             .stats
             .iter()
@@ -129,7 +139,7 @@ impl ExecutionTracer {
     /// Generate a compact text summary of the session's trace data,
     /// suitable for injection into the system prompt.
     pub fn summary_for_prompt(&self) -> Option<String> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.lock_inner();
         if inner.traces.is_empty() {
             return None;
         }
@@ -149,7 +159,7 @@ impl ExecutionTracer {
                 stats.successes, stats.calls,
             );
             if stats.failures > 0 {
-                line.push_str(" ⚠ has failures");
+                line.push_str(" — has failures");
             }
             lines.push(line);
         }
@@ -162,7 +172,7 @@ impl ExecutionTracer {
 
         if !unreliable.is_empty() {
             lines.push(String::new());
-            lines.push("⚠ UNRELIABLE TOOLS — consider alternative approaches:".to_string());
+            lines.push("UNRELIABLE TOOLS — consider alternative approaches:".to_string());
             for (name, stats) in unreliable {
                 lines.push(format!(
                     "  - {name}: only {:.0}% success rate over {} calls",

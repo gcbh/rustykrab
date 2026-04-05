@@ -1148,6 +1148,7 @@ dependencies = [
  "chrono",
  "hmac",
  "openclaw-core",
+ "rand 0.8.5",
  "serde",
  "serde_json",
  "sha2",
@@ -1169,6 +1170,8 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+ "url",
+ "uuid",
 ]
 
 [[package]]

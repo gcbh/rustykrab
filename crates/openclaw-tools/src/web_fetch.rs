@@ -3,6 +3,8 @@ use openclaw_core::types::ToolSchema;
 use openclaw_core::{Error, Result, Tool};
 use serde_json::{json, Value};
 
+use crate::security;
+
 /// Maximum characters to return from a fetched page to avoid context explosion.
 const MAX_CONTENT_LENGTH: usize = 50_000;
 
@@ -69,6 +71,11 @@ impl Tool for WebFetchTool {
         let url = args["url"]
             .as_str()
             .ok_or_else(|| Error::ToolExecution("missing url".into()))?;
+
+        // SSRF protection: validate URL before making request
+        security::validate_url(url)
+            .map_err(|e| Error::ToolExecution(e))?;
+
         let include_links = args["include_links"].as_bool().unwrap_or(false);
 
         let resp = self

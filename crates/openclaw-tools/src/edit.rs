@@ -3,7 +3,12 @@ use openclaw_core::types::ToolSchema;
 use openclaw_core::{Result, Tool};
 use serde_json::{json, Value};
 
+use crate::security;
+
 /// A built-in tool that replaces an exact string match in a file.
+///
+/// Security: Validates paths to prevent traversal attacks and blocks
+/// access to sensitive system directories.
 pub struct EditTool;
 
 impl EditTool {
@@ -69,7 +74,11 @@ impl Tool for EditTool {
             .ok_or_else(|| openclaw_core::Error::ToolExecution("missing new_string".into()))?;
         let replace_all = args["replace_all"].as_bool().unwrap_or(false);
 
-        let content = tokio::fs::read_to_string(path)
+        // Validate path for traversal and blocked directories
+        let safe_path = security::validate_path(path)
+            .map_err(|e| openclaw_core::Error::ToolExecution(format!("path rejected: {e}")))?;
+
+        let content = tokio::fs::read_to_string(&safe_path)
             .await
             .map_err(|e| openclaw_core::Error::ToolExecution(
                 format!("failed to read {path}: {e}"),
@@ -100,7 +109,7 @@ impl Tool for EditTool {
             (result, 1)
         };
 
-        tokio::fs::write(path, &new_content)
+        tokio::fs::write(&safe_path, &new_content)
             .await
             .map_err(|e| openclaw_core::Error::ToolExecution(
                 format!("failed to write {path}: {e}"),

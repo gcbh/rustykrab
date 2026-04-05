@@ -3,7 +3,12 @@ use openclaw_core::types::ToolSchema;
 use openclaw_core::{Result, Tool};
 use serde_json::{json, Value};
 
+use crate::security;
+
 /// A built-in tool that extracts text content from PDF files.
+///
+/// Security: Path traversal protection and sanitized inputs to
+/// external commands (pdftotext, python3).
 pub struct PdfTool;
 
 impl PdfTool {
@@ -16,6 +21,24 @@ impl Default for PdfTool {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Validate a page range string (e.g., "1-5", "3").
+/// Only allows digits and a single dash.
+fn validate_page_range(pages: &str) -> std::result::Result<(), String> {
+    if pages.is_empty() {
+        return Err("empty page range".into());
+    }
+    for ch in pages.chars() {
+        if !ch.is_ascii_digit() && ch != '-' {
+            return Err(format!("invalid character in page range: '{ch}'"));
+        }
+    }
+    // Ensure at most one dash
+    if pages.matches('-').count() > 1 {
+        return Err("page range must have at most one dash (e.g., '1-5')".into());
+    }
+    Ok(())
 }
 
 #[async_trait]
@@ -54,16 +77,28 @@ impl Tool for PdfTool {
             .as_str()
             .ok_or_else(|| openclaw_core::Error::ToolExecution("missing path".into()))?;
 
+        // Validate path for traversal attacks
+        let safe_path = security::validate_path(path)
+            .map_err(|e| openclaw_core::Error::ToolExecution(format!("path rejected: {e}")))?;
+
         let pages = args["pages"].as_str();
 
+        // Validate page range if provided
+        if let Some(p) = pages {
+            validate_page_range(p)
+                .map_err(|e| openclaw_core::Error::ToolExecution(format!("invalid page range: {e}")))?;
+        }
+
+        let safe_path_str = safe_path.to_string_lossy();
+
         // Try pdftotext first
-        let result = try_pdftotext(path, pages).await;
+        let result = try_pdftotext(&safe_path_str, pages).await;
 
         let (content, pages_extracted) = match result {
             Ok(v) => v,
             Err(_) => {
                 // Fallback to python3
-                try_python_pdf(path, pages)
+                try_python_pdf(&safe_path_str, pages)
                     .await
                     .map_err(|e| openclaw_core::Error::ToolExecution(
                         format!("failed to extract PDF text (tried pdftotext and python3): {e}")
@@ -83,13 +118,17 @@ async fn try_pdftotext(path: &str, pages: Option<&str>) -> std::result::Result<(
     let mut cmd = tokio::process::Command::new("pdftotext");
 
     if let Some(page_range) = pages {
-        // pdftotext uses -f (first) and -l (last) flags
+        // page_range already validated to contain only digits and dash
         let parts: Vec<&str> = page_range.split('-').collect();
         if let Some(first) = parts.first() {
-            cmd.arg("-f").arg(first);
+            if !first.is_empty() {
+                cmd.arg("-f").arg(first);
+            }
         }
         if let Some(last) = parts.get(1) {
-            cmd.arg("-l").arg(last);
+            if !last.is_empty() {
+                cmd.arg("-l").arg(last);
+            }
         }
     }
 
@@ -114,13 +153,18 @@ async fn try_pdftotext(path: &str, pages: Option<&str>) -> std::result::Result<(
 }
 
 async fn try_python_pdf(path: &str, pages: Option<&str>) -> std::result::Result<(String, u64), String> {
+    // Sanitize path for Python string: escape backslashes and quotes
+    let escaped_path = path.replace('\\', "\\\\").replace('"', "\\\"");
+
+    // page_range is already validated to only contain digits and dash
     let page_filter = pages.unwrap_or("");
+
     let script = format!(
         r#"
 import sys
 try:
     import PyPDF2
-    reader = PyPDF2.PdfReader("{path}")
+    reader = PyPDF2.PdfReader("{escaped_path}")
     page_range = "{page_filter}"
     total = len(reader.pages)
     if page_range:

@@ -6,6 +6,11 @@ use std::time::Duration;
 use tokio::time::timeout;
 
 /// A built-in tool that executes Python code in a sandboxed environment.
+///
+/// Security improvements:
+/// - Uses unique temp files per invocation (UUID-based) to prevent race conditions
+/// - Cleans up temp files in all code paths
+/// - Enforces timeout limits
 pub struct CodeExecutionTool;
 
 impl CodeExecutionTool {
@@ -43,7 +48,7 @@ impl Tool for CodeExecutionTool {
                     },
                     "timeout_secs": {
                         "type": "integer",
-                        "description": "Timeout in seconds (default: 30)"
+                        "description": "Timeout in seconds (default: 30, max: 120)"
                     }
                 },
                 "required": ["code"]
@@ -56,11 +61,19 @@ impl Tool for CodeExecutionTool {
             .as_str()
             .ok_or_else(|| openclaw_core::Error::ToolExecution("missing code".into()))?;
 
-        let timeout_secs = args["timeout_secs"].as_u64().unwrap_or(30);
+        let timeout_secs = args["timeout_secs"].as_u64().unwrap_or(30).min(120);
 
-        // Write code to a temporary file
-        let tmp_dir = std::env::temp_dir();
-        let tmp_file = tmp_dir.join(format!("openclaw_exec_{}.py", std::process::id()));
+        // Use UUID for unique temp file names to prevent race conditions
+        // across concurrent sessions (fixes predictable PID-based naming)
+        let unique_id = uuid::Uuid::new_v4();
+        let tmp_dir = std::env::temp_dir().join("openclaw_sandbox");
+
+        // Create sandbox temp directory with restricted scope
+        tokio::fs::create_dir_all(&tmp_dir)
+            .await
+            .map_err(|e| openclaw_core::Error::ToolExecution(e.to_string()))?;
+
+        let tmp_file = tmp_dir.join(format!("exec_{}.py", unique_id));
 
         tokio::fs::write(&tmp_file, code)
             .await
@@ -68,6 +81,13 @@ impl Tool for CodeExecutionTool {
 
         let future = tokio::process::Command::new("python3")
             .arg(&tmp_file)
+            .env_clear()
+            .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+            .env("HOME", std::env::temp_dir())
+            .env("LANG", "C.UTF-8")
+            // Prevent Python from importing from arbitrary locations
+            .env("PYTHONDONTWRITEBYTECODE", "1")
+            .current_dir(&tmp_dir)
             .output();
 
         let result = timeout(Duration::from_secs(timeout_secs), future).await;

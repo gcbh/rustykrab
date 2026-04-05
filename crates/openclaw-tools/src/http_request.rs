@@ -3,7 +3,12 @@ use openclaw_core::types::ToolSchema;
 use openclaw_core::{Result, Tool};
 use serde_json::{json, Value};
 
+use crate::security;
+
 /// A built-in tool that makes HTTP requests.
+///
+/// Security: URLs are validated to prevent SSRF attacks. Requests to
+/// private/internal IP ranges and cloud metadata endpoints are blocked.
 pub struct HttpRequestTool {
     client: reqwest::Client,
 }
@@ -66,6 +71,10 @@ impl Tool for HttpRequestTool {
         let url = args["url"]
             .as_str()
             .ok_or_else(|| openclaw_core::Error::ToolExecution("missing url".into()))?;
+
+        // SSRF protection: validate URL before making request
+        security::validate_url(url)
+            .map_err(|e| openclaw_core::Error::ToolExecution(e))?;
 
         let mut req = match method.as_str() {
             "POST" => self.client.post(url),

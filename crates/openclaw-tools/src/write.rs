@@ -3,7 +3,12 @@ use openclaw_core::types::ToolSchema;
 use openclaw_core::{Result, Tool};
 use serde_json::{json, Value};
 
+use crate::security;
+
 /// A built-in tool that writes content to a file.
+///
+/// Security: Validates paths to prevent traversal attacks and blocks
+/// writes to sensitive system directories.
 pub struct WriteTool;
 
 impl WriteTool {
@@ -57,17 +62,24 @@ impl Tool for WriteTool {
             .as_str()
             .ok_or_else(|| openclaw_core::Error::ToolExecution("missing content".into()))?;
 
-        let file_path = std::path::Path::new(path);
+        // Validate path for traversal and blocked directories
+        let safe_path = security::validate_path(path)
+            .map_err(|e| openclaw_core::Error::ToolExecution(format!("path rejected: {e}")))?;
+
+        let file_path = std::path::Path::new(&safe_path);
         if let Some(parent) = file_path.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(|e| openclaw_core::Error::ToolExecution(
-                    format!("failed to create directories for {path}: {e}"),
-                ))?;
+            // Re-validate the parent directory
+            if !parent.as_os_str().is_empty() {
+                tokio::fs::create_dir_all(parent)
+                    .await
+                    .map_err(|e| openclaw_core::Error::ToolExecution(
+                        format!("failed to create directories for {path}: {e}"),
+                    ))?;
+            }
         }
 
         let bytes = content.len();
-        tokio::fs::write(path, content)
+        tokio::fs::write(&safe_path, content)
             .await
             .map_err(|e| openclaw_core::Error::ToolExecution(
                 format!("failed to write {path}: {e}"),

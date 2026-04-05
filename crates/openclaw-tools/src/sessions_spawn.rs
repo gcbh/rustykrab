@@ -7,6 +7,9 @@ use serde_json::{json, Value};
 
 use super::session_manager::SessionManager;
 
+/// Maximum depth for nested session spawning (H7).
+const MAX_SPAWN_DEPTH: u64 = 5;
+
 /// A tool that spawns a new sub-session with an optional system prompt.
 pub struct SessionsSpawnTool {
     manager: Arc<dyn SessionManager>,
@@ -51,6 +54,14 @@ impl Tool for SessionsSpawnTool {
     }
 
     async fn execute(&self, args: Value) -> Result<Value> {
+        // H7: Check current recursion depth before spawning
+        let current_depth = args["_depth"].as_u64().unwrap_or(0);
+        if current_depth >= MAX_SPAWN_DEPTH {
+            return Err(openclaw_core::Error::ToolExecution(format!(
+                "maximum session spawn depth ({MAX_SPAWN_DEPTH}) exceeded"
+            )));
+        }
+
         let system_prompt = args["system_prompt"].as_str();
         let capabilities = args["capabilities"]
             .as_array()

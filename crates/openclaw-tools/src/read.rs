@@ -3,7 +3,15 @@ use openclaw_core::types::ToolSchema;
 use openclaw_core::{Result, Tool};
 use serde_json::{json, Value};
 
+use crate::security;
+
+/// Maximum file size to read (10 MB).
+const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
+
 /// A built-in tool that reads the contents of a file.
+///
+/// Security: Validates paths to prevent traversal attacks and blocks
+/// access to sensitive system directories.
 pub struct ReadTool;
 
 impl ReadTool {
@@ -58,7 +66,24 @@ impl Tool for ReadTool {
             .as_str()
             .ok_or_else(|| openclaw_core::Error::ToolExecution("missing path".into()))?;
 
-        let content = tokio::fs::read_to_string(path)
+        // Validate path for traversal and blocked directories
+        let safe_path = security::validate_path(path)
+            .map_err(|e| openclaw_core::Error::ToolExecution(format!("path rejected: {e}")))?;
+
+        // Check file size before reading
+        let metadata = tokio::fs::metadata(&safe_path)
+            .await
+            .map_err(|e| openclaw_core::Error::ToolExecution(format!("failed to stat {path}: {e}")))?;
+
+        if metadata.len() > MAX_FILE_SIZE {
+            return Err(openclaw_core::Error::ToolExecution(format!(
+                "file is too large ({} bytes, max {} bytes). Use offset/limit to read a portion.",
+                metadata.len(),
+                MAX_FILE_SIZE
+            )));
+        }
+
+        let content = tokio::fs::read_to_string(&safe_path)
             .await
             .map_err(|e| openclaw_core::Error::ToolExecution(format!("failed to read {path}: {e}")))?;
 

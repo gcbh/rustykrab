@@ -201,11 +201,11 @@ impl SignalChannel {
         payload: &[u8],
         secret_header: Option<&str>,
     ) -> Result<()> {
-        // Validate webhook secret if configured.
+        // Validate webhook secret if configured (using constant-time comparison).
         if let Some(ref secret) = self.webhook_secret {
             let header = secret_header
                 .ok_or_else(|| Error::Auth("missing X-Signal-Webhook-Secret header".into()))?;
-            if header != secret {
+            if !constant_time_eq(header, secret) {
                 return Err(Error::Auth("invalid Signal webhook secret".into()));
             }
         }
@@ -324,6 +324,17 @@ impl SignalChannel {
     pub fn account_number(&self) -> &str {
         &self.account_number
     }
+}
+
+/// Constant-time string comparison to prevent timing attacks on webhook secrets.
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.bytes()
+        .zip(b.bytes())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
 }
 
 /// Percent-encode a phone number for URL path segments.
