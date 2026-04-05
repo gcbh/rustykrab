@@ -2,8 +2,9 @@ use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use openclaw_agent::{HarnessProfile, HarnessRouter};
+use openclaw_agent::{HarnessProfile, HarnessRouter, OrchestrationPipeline};
 use openclaw_core::model::ModelProvider;
+use openclaw_core::orchestration::OrchestrationConfig;
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -24,15 +25,10 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(profile = %profile.name, "harness profile loaded");
 
     // --- Master key for credential encryption ---
-    let master_key = std::env::var("OPENCLAW_MASTER_KEY")
-        .unwrap_or_else(|_| {
-            tracing::warn!(
-                "OPENCLAW_MASTER_KEY not set — generating ephemeral key. \
-                 Secrets will not survive restart."
-            );
-            openclaw_gateway::generate_token()
-        })
-        .into_bytes();
+    // On macOS: stored in the system Keychain (Secure Enclave / Touch ID protected).
+    // On Linux: falls back to OPENCLAW_MASTER_KEY env var or ephemeral key.
+    let master_key = openclaw_store::keychain::resolve_master_key()
+        .expect("failed to resolve master encryption key");
 
     let store = openclaw_store::Store::open(data_dir.join("db"), master_key)?;
 
@@ -89,9 +85,35 @@ async fn main() -> anyhow::Result<()> {
 
     let router = Arc::new(HarnessRouter::new(classifier).with_base(profile));
 
+    // --- Orchestration pipeline (optional, enabled via OPENCLAW_ORCHESTRATION=true) ---
+    let orchestration_config = load_orchestration_config(&data_dir)?;
+    let orchestration_enabled = std::env::var("OPENCLAW_ORCHESTRATION")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false);
+
+    let orchestration_pipeline = if orchestration_enabled {
+        let sandbox = Arc::new(openclaw_agent::ProcessSandbox::new());
+        let pipeline = OrchestrationPipeline::new(
+            provider.clone(),
+            tools.clone(),
+            sandbox,
+            orchestration_config.clone(),
+        );
+        tracing::info!("orchestration pipeline enabled");
+        Some(Arc::new(pipeline))
+    } else {
+        tracing::info!("orchestration pipeline disabled (set OPENCLAW_ORCHESTRATION=true to enable)");
+        None
+    };
+
     // --- Build gateway state ---
     let mut state = openclaw_gateway::AppState::new(store, tools, provider, auth_token)
-        .with_harness_router(router);
+        .with_harness_router(router)
+        .with_orchestration_config(orchestration_config);
+
+    if let Some(pipeline) = orchestration_pipeline {
+        state = state.with_orchestration_pipeline(pipeline);
+    }
 
     // --- Telegram channel (optional) ---
     if let Ok(bot_token) = std::env::var("TELEGRAM_BOT_TOKEN") {
@@ -208,6 +230,49 @@ async fn main() -> anyhow::Result<()> {
     .await?;
 
     Ok(())
+}
+
+/// Load orchestration config from file or defaults.
+///
+/// Priority:
+/// 1. `data_dir/orchestration.toml` — full custom config
+/// 2. Env vars for key settings
+/// 3. Fallback to defaults
+fn load_orchestration_config(data_dir: &std::path::Path) -> anyhow::Result<OrchestrationConfig> {
+    let config_path = data_dir.join("orchestration.toml");
+    if config_path.exists() {
+        let contents = std::fs::read_to_string(&config_path)?;
+        let config: OrchestrationConfig = toml::from_str(&contents)?;
+        tracing::info!("loaded orchestration config from {}", config_path.display());
+        return Ok(config);
+    }
+
+    let mut config = OrchestrationConfig::default();
+
+    // Allow env var overrides for key settings.
+    if let Ok(val) = std::env::var("ORCHESTRATION_MAX_RECURSION_DEPTH") {
+        if let Ok(depth) = val.parse() {
+            config.max_recursion_depth = depth;
+        }
+    }
+    if let Ok(val) = std::env::var("ORCHESTRATION_CONSISTENCY_SAMPLES") {
+        if let Ok(samples) = val.parse() {
+            config.consistency_samples = samples;
+        }
+    }
+    if let Ok(val) = std::env::var("ORCHESTRATION_MAX_REFINEMENT_ITERATIONS") {
+        if let Ok(iters) = val.parse() {
+            config.max_refinement_iterations = iters;
+        }
+    }
+    if let Ok(model) = std::env::var("ORCHESTRATION_FALLBACK_MODEL") {
+        config.fallback_model = Some(model);
+    }
+    if let Ok(model) = std::env::var("ORCHESTRATION_PRIMARY_MODEL") {
+        config.primary_model = Some(model);
+    }
+
+    Ok(config)
 }
 
 /// Load harness profile from file or env var preset.

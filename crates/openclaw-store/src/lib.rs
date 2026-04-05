@@ -1,4 +1,6 @@
 mod conversation;
+pub mod keychain;
+mod knowledge_graph;
 mod memory;
 mod secret;
 
@@ -7,6 +9,7 @@ use std::path::Path;
 use openclaw_core::Error;
 
 pub use conversation::ConversationStore;
+pub use knowledge_graph::{KnowledgeGraph, SubGraph};
 pub use memory::{MemoryEntry, MemoryStore};
 pub use secret::SecretStore;
 
@@ -53,6 +56,23 @@ impl Store {
             .open_tree("memories")
             .expect("failed to open memories tree");
         MemoryStore::new(tree)
+    }
+
+    /// Return a handle for the persistent knowledge graph.
+    pub fn knowledge_graph(&self) -> KnowledgeGraph {
+        let entities = self
+            .db
+            .open_tree("kg_entities")
+            .expect("failed to open kg_entities tree");
+        let relations = self
+            .db
+            .open_tree("kg_relations")
+            .expect("failed to open kg_relations tree");
+        let entity_names = self
+            .db
+            .open_tree("kg_entity_names")
+            .expect("failed to open kg_entity_names tree");
+        KnowledgeGraph::new(entities, relations, entity_names)
     }
 
     /// Flush all pending writes to disk.

@@ -1,30 +1,34 @@
-use hmac::{Hmac, Mac};
+use aes_gcm::aead::Aead;
+use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
+use argon2::Argon2;
 use openclaw_core::Error;
-use sha2::Sha256;
+use rand::RngCore;
 
-type HmacSha256 = Hmac<Sha256>;
+/// The salt length used for Argon2 key derivation.
+const SALT_LEN: usize = 16;
+/// The nonce length for AES-256-GCM (96 bits).
+const NONCE_LEN: usize = 12;
 
 /// Encrypted credential store backed by a sled tree.
 ///
-/// Secrets are encrypted at rest using HMAC-SHA256 as a key derivation
-/// function to produce per-key encryption keys with a unique nonce,
-/// then XOR'd with the derived keystream. An HMAC authentication tag
-/// is appended to each ciphertext to detect tampering.
+/// Secrets are encrypted at rest using AES-256-GCM (authenticated encryption
+/// with associated data). Each secret gets its own random salt and nonce,
+/// stored alongside the ciphertext. The encryption key is derived from the
+/// master key + a per-secret salt using Argon2id.
 ///
-/// Wire format: [nonce (16 bytes)] [ciphertext (N bytes)] [auth tag (32 bytes)]
+/// Storage format per entry: `[salt (16 bytes)][nonce (12 bytes)][ciphertext+tag]`
 ///
-/// This prevents plaintext API keys on disk and detects tampering
-/// (addressing the `~/.clawdbot/.env` plaintext credential class of bugs).
+/// Properties:
+/// - **Confidentiality**: AES-256 encryption
+/// - **Integrity**: GCM authentication tag detects any tampering
+/// - **Key hardening**: Argon2id makes brute-forcing the master key expensive
+/// - **Unique keys**: Per-secret salt ensures identical plaintexts produce
+///   different ciphertexts and compromising one key doesn't reveal others
 #[derive(Clone)]
 pub struct SecretStore {
     tree: sled::Tree,
     master_key: Vec<u8>,
 }
-
-/// Length of the random nonce prepended to each ciphertext.
-const NONCE_LEN: usize = 16;
-/// Length of the HMAC-SHA256 authentication tag.
-const TAG_LEN: usize = 32;
 
 impl SecretStore {
     pub(crate) fn new(tree: sled::Tree, master_key: Vec<u8>) -> Self {
@@ -33,10 +37,10 @@ impl SecretStore {
 
     /// Store a secret value under the given name.
     pub fn set(&self, name: &str, value: &str) -> Result<(), Error> {
-        // Validate secret name
+        // Validate secret name to prevent injection and normalization attacks
         Self::validate_name(name)?;
 
-        let encrypted = self.encrypt(name, value.as_bytes());
+        let encrypted = self.encrypt(name, value.as_bytes())?;
         self.tree
             .insert(name.as_bytes(), encrypted)
             .map_err(|e| Error::Storage(e.to_string()))?;
@@ -76,6 +80,9 @@ impl SecretStore {
     }
 
     /// Validate that a secret name is well-formed.
+    ///
+    /// Prevents Unicode normalization attacks and ensures key names
+    /// are safe for use as HMAC/AAD inputs.
     fn validate_name(name: &str) -> Result<(), Error> {
         if name.is_empty() || name.len() > 256 {
             return Err(Error::Storage("secret name must be 1-256 characters".into()));
@@ -89,93 +96,77 @@ impl SecretStore {
         Ok(())
     }
 
-    /// Encrypt data with a per-key keystream and authentication tag.
+    /// Encrypt data with AES-256-GCM. Returns `salt || nonce || ciphertext+tag`.
     ///
-    /// Format: [nonce (16 bytes)] [ciphertext] [HMAC tag (32 bytes)]
-    fn encrypt(&self, key_name: &str, data: &[u8]) -> Vec<u8> {
-        // Generate random nonce for this encryption
-        use rand::RngCore;
-        let mut nonce = [0u8; NONCE_LEN];
-        rand::thread_rng().fill_bytes(&mut nonce);
+    /// The secret name is used as associated data (AAD), binding the
+    /// ciphertext to its key name — moving a ciphertext to a different
+    /// key name will fail authentication.
+    fn encrypt(&self, key_name: &str, data: &[u8]) -> Result<Vec<u8>, Error> {
+        // Generate random salt and nonce.
+        let mut salt = [0u8; SALT_LEN];
+        let mut nonce_bytes = [0u8; NONCE_LEN];
+        rand::thread_rng().fill_bytes(&mut salt);
+        rand::thread_rng().fill_bytes(&mut nonce_bytes);
 
-        // Derive keystream using nonce for uniqueness
-        let keystream = self.derive_keystream(key_name, &nonce, data.len());
-        let ciphertext: Vec<u8> = data
-            .iter()
-            .zip(keystream.iter())
-            .map(|(a, b)| a ^ b)
-            .collect();
+        // Derive a per-secret encryption key via Argon2id.
+        let derived_key = self.derive_key(&salt)?;
+        let cipher = Aes256Gcm::new_from_slice(&derived_key)
+            .map_err(|e| Error::Storage(format!("cipher init: {e}")))?;
 
-        // Compute authentication tag over nonce + ciphertext
-        let mut mac =
-            HmacSha256::new_from_slice(&self.master_key).expect("HMAC accepts any key size");
-        mac.update(b"auth:");
-        mac.update(key_name.as_bytes());
-        mac.update(&nonce);
-        mac.update(&ciphertext);
-        let tag = mac.finalize().into_bytes();
+        let nonce = Nonce::from_slice(&nonce_bytes);
 
-        // Wire format: nonce || ciphertext || tag
-        let mut result = Vec::with_capacity(NONCE_LEN + ciphertext.len() + TAG_LEN);
-        result.extend_from_slice(&nonce);
-        result.extend_from_slice(&ciphertext);
-        result.extend_from_slice(&tag);
-        result
+        // Encrypt with the secret name as AAD.
+        let ciphertext = cipher
+            .encrypt(nonce, aes_gcm::aead::Payload {
+                msg: data,
+                aad: key_name.as_bytes(),
+            })
+            .map_err(|e| Error::Storage(format!("encryption failed: {e}")))?;
+
+        // Pack: salt || nonce || ciphertext+tag
+        let mut packed = Vec::with_capacity(SALT_LEN + NONCE_LEN + ciphertext.len());
+        packed.extend_from_slice(&salt);
+        packed.extend_from_slice(&nonce_bytes);
+        packed.extend_from_slice(&ciphertext);
+        Ok(packed)
     }
 
-    /// Decrypt data, verifying the authentication tag first.
+    /// Decrypt data. Input format: `salt || nonce || ciphertext+tag`.
     fn decrypt(&self, key_name: &str, data: &[u8]) -> Result<Vec<u8>, Error> {
-        if data.len() < NONCE_LEN + TAG_LEN {
-            return Err(Error::Storage("encrypted data too short".into()));
+        if data.len() < SALT_LEN + NONCE_LEN {
+            return Err(Error::Storage("ciphertext too short".into()));
         }
 
-        let nonce = &data[..NONCE_LEN];
-        let ciphertext = &data[NONCE_LEN..data.len() - TAG_LEN];
-        let stored_tag = &data[data.len() - TAG_LEN..];
+        let salt = &data[..SALT_LEN];
+        let nonce_bytes = &data[SALT_LEN..SALT_LEN + NONCE_LEN];
+        let ciphertext = &data[SALT_LEN + NONCE_LEN..];
 
-        // Verify authentication tag BEFORE decryption
-        let mut mac =
-            HmacSha256::new_from_slice(&self.master_key).expect("HMAC accepts any key size");
-        mac.update(b"auth:");
-        mac.update(key_name.as_bytes());
-        mac.update(nonce);
-        mac.update(ciphertext);
+        let derived_key = self.derive_key(salt)?;
+        let cipher = Aes256Gcm::new_from_slice(&derived_key)
+            .map_err(|e| Error::Storage(format!("cipher init: {e}")))?;
 
-        mac.verify_slice(stored_tag)
-            .map_err(|_| Error::Storage("secret integrity check failed — data may be tampered".into()))?;
+        let nonce = Nonce::from_slice(nonce_bytes);
 
-        // Decrypt
-        let keystream = self.derive_keystream(key_name, nonce, ciphertext.len());
-        let plaintext: Vec<u8> = ciphertext
-            .iter()
-            .zip(keystream.iter())
-            .map(|(a, b)| a ^ b)
-            .collect();
-
-        Ok(plaintext)
+        cipher
+            .decrypt(nonce, aes_gcm::aead::Payload {
+                msg: ciphertext,
+                aad: key_name.as_bytes(),
+            })
+            .map_err(|e| Error::Storage(format!(
+                "decryption failed (wrong key or tampered data): {e}"
+            )))
     }
 
-    /// Produce a keystream of `len` bytes using HMAC-SHA256 in counter mode.
+    /// Derive a 256-bit encryption key from the master key + salt using Argon2id.
     ///
-    /// Uses key_name + nonce + counter to derive unique keystream per
-    /// encryption operation.
-    fn derive_keystream(&self, key_name: &str, nonce: &[u8], len: usize) -> Vec<u8> {
-        let mut stream = Vec::with_capacity(len);
-        let mut counter: u32 = 0;
-
-        while stream.len() < len {
-            let mut mac =
-                HmacSha256::new_from_slice(&self.master_key).expect("HMAC accepts any key size");
-            mac.update(b"derive:");
-            mac.update(key_name.as_bytes());
-            mac.update(nonce);
-            mac.update(&counter.to_le_bytes());
-            let block = mac.finalize().into_bytes();
-            stream.extend_from_slice(&block);
-            counter += 1;
-        }
-
-        stream.truncate(len);
-        stream
+    /// Argon2id is resistant to both side-channel and GPU/ASIC brute-force
+    /// attacks. Even if the database is stolen, the attacker must spend
+    /// significant time/memory per guess of the master key.
+    fn derive_key(&self, salt: &[u8]) -> Result<[u8; 32], Error> {
+        let mut key = [0u8; 32];
+        Argon2::default()
+            .hash_password_into(&self.master_key, salt, &mut key)
+            .map_err(|e| Error::Storage(format!("key derivation failed: {e}")))?;
+        Ok(key)
     }
 }

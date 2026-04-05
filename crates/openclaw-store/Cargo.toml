@@ -15,4 +15,10 @@ chrono.workspace = true
 tracing.workspace = true
 hmac.workspace = true
 sha2.workspace = true
+aes-gcm.workspace = true
+argon2.workspace = true
 rand.workspace = true
+hex.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework.workspace = true

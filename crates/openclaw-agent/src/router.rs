@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use openclaw_core::model::ModelProvider;
+use openclaw_core::orchestration::TaskComplexity;
 use openclaw_core::types::{Message, MessageContent, Role};
 use uuid::Uuid;
 
@@ -36,6 +37,19 @@ Categories:
 
 User message: ";
 
+/// Complexity classification prompt.
+const COMPLEXITY_PROMPT: &str = "\
+Rate the complexity of this user message. Reply with ONLY one word, nothing else.
+
+Levels:
+- trivial: simple greeting, acknowledgment, yes/no question
+- simple: single fact lookup, one-step task, calendar check
+- moderate: multi-step task, requires gathering info from multiple sources
+- complex: needs research, synthesis, drafting with quality requirements
+- critical: high-stakes decision, ambiguous situation, needs careful analysis
+
+User message: ";
+
 impl HarnessRouter {
     /// Create a router with a fast classifier model.
     ///
@@ -57,6 +71,39 @@ impl HarnessRouter {
     pub fn with_base(mut self, base: HarnessProfile) -> Self {
         self.base = base;
         self
+    }
+
+    /// Classify the complexity of a user message for pipeline routing.
+    ///
+    /// Returns a TaskComplexity that determines which orchestration
+    /// pipeline stages to run.
+    pub async fn classify_complexity(&self, user_message: &str) -> TaskComplexity {
+        let truncated = truncate_for_classification(user_message);
+        let prompt = format!("{COMPLEXITY_PROMPT}{truncated}");
+
+        let messages = vec![Message {
+            id: Uuid::new_v4(),
+            role: Role::User,
+            content: MessageContent::Text(prompt),
+            created_at: chrono::Utc::now(),
+        }];
+
+        match self.classifier.chat(&messages, &[]).await {
+            Ok(response) => {
+                let text = response
+                    .message
+                    .content
+                    .as_text()
+                    .unwrap_or("simple")
+                    .trim()
+                    .to_lowercase();
+                parse_complexity(&text)
+            }
+            Err(e) => {
+                tracing::debug!("complexity classification failed: {e}");
+                TaskComplexity::Simple
+            }
+        }
     }
 
     /// Classify a user message and return the appropriate harness profile.
@@ -81,18 +128,7 @@ impl HarnessRouter {
 
     /// Classify the user's message into a TaskType.
     async fn classify(&self, user_message: &str) -> openclaw_core::Result<TaskType> {
-        // Truncate long messages — we only need the first ~200 chars for classification.
-        let truncated = if user_message.len() > 200 {
-            &user_message[..user_message
-                .char_indices()
-                .take_while(|(i, _)| *i < 200)
-                .last()
-                .map(|(i, c)| i + c.len_utf8())
-                .unwrap_or(200)]
-        } else {
-            user_message
-        };
-
+        let truncated = truncate_for_classification(user_message);
         let prompt = format!("{CLASSIFY_PROMPT}{truncated}");
 
         let messages = vec![Message {
@@ -135,6 +171,38 @@ impl HarnessRouter {
     }
 }
 
+/// Truncate a message for classification (first ~200 chars).
+fn truncate_for_classification(text: &str) -> &str {
+    if text.len() > 200 {
+        &text[..text
+            .char_indices()
+            .take_while(|(i, _)| *i < 200)
+            .last()
+            .map(|(i, c)| i + c.len_utf8())
+            .unwrap_or(200)]
+    } else {
+        text
+    }
+}
+
+/// Parse a model response into a TaskComplexity.
+fn parse_complexity(text: &str) -> TaskComplexity {
+    let lower = text.to_lowercase();
+    if lower.contains("trivial") {
+        TaskComplexity::Trivial
+    } else if lower.contains("simple") {
+        TaskComplexity::Simple
+    } else if lower.contains("moderate") {
+        TaskComplexity::Moderate
+    } else if lower.contains("complex") {
+        TaskComplexity::Complex
+    } else if lower.contains("critical") {
+        TaskComplexity::Critical
+    } else {
+        TaskComplexity::Simple
+    }
+}
+
 /// Parse a model response into a TaskType. Generous matching — accepts
 /// partial matches, surrounding text, etc. Falls back to General.
 fn parse_task_type(text: &str) -> TaskType {
@@ -155,6 +223,16 @@ fn parse_task_type(text: &str) -> TaskType {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_parse_complexity() {
+        assert_eq!(parse_complexity("trivial"), TaskComplexity::Trivial);
+        assert_eq!(parse_complexity("simple"), TaskComplexity::Simple);
+        assert_eq!(parse_complexity("moderate"), TaskComplexity::Moderate);
+        assert_eq!(parse_complexity("complex"), TaskComplexity::Complex);
+        assert_eq!(parse_complexity("critical"), TaskComplexity::Critical);
+        assert_eq!(parse_complexity("unknown"), TaskComplexity::Simple);
+    }
 
     #[test]
     fn test_parse_task_type() {
