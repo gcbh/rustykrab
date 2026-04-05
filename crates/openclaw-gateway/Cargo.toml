@@ -16,6 +16,7 @@ serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 uuid.workspace = true
+chrono.workspace = true
 rust-embed.workspace = true
 mime_guess = "2"
 rand.workspace = true

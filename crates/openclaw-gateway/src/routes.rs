@@ -2,9 +2,11 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use chrono::Utc;
+use serde::Deserialize;
 use uuid::Uuid;
 
-use openclaw_core::types::Conversation;
+use openclaw_core::types::{Conversation, Message, MessageContent, Role};
 
 use crate::AppState;
 
@@ -14,7 +16,13 @@ pub fn api_routes() -> Router<AppState> {
         .route("/api/conversations", get(list_conversations))
         .route("/api/conversations/{id}", get(get_conversation))
         .route("/api/conversations/{id}", axum::routing::delete(delete_conversation))
+        .route("/api/conversations/{id}/messages", post(send_message))
         .route("/api/health", get(health))
+}
+
+#[derive(Deserialize)]
+struct SendMessageRequest {
+    content: String,
 }
 
 async fn health() -> &'static str {
@@ -65,4 +73,51 @@ async fn delete_conversation(
         .delete(id)
         .map(|_| StatusCode::NO_CONTENT)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+/// Send a user message to a conversation and get an assistant response.
+async fn send_message(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<SendMessageRequest>,
+) -> Result<Json<Message>, StatusCode> {
+    // Load the conversation.
+    let mut conv = state
+        .store
+        .conversations()
+        .get(id)
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+
+    // Add the user message.
+    let user_msg = Message {
+        id: Uuid::new_v4(),
+        role: Role::User,
+        content: MessageContent::Text(body.content),
+        created_at: Utc::now(),
+    };
+    conv.messages.push(user_msg);
+    conv.updated_at = Utc::now();
+
+    // Call the model provider.
+    let response = state
+        .provider
+        .chat(&conv.messages, &[])
+        .await
+        .map_err(|e| {
+            tracing::error!("model error: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    // Add assistant response to conversation.
+    conv.messages.push(response.message.clone());
+    conv.updated_at = Utc::now();
+
+    // Persist.
+    state
+        .store
+        .conversations()
+        .save(&conv)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(response.message))
 }

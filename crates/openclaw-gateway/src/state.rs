@@ -1,5 +1,6 @@
 use openclaw_agent::{HarnessProfile, HarnessRouter};
 use openclaw_channels::{SignalChannel, TelegramChannel};
+use openclaw_core::model::ModelProvider;
 use openclaw_store::Store;
 use std::sync::Arc;
 
@@ -11,6 +12,7 @@ use crate::rate_limit::{RateLimitConfig, RateLimiter};
 pub struct AppState {
     pub store: Store,
     pub tools: Arc<dyn openclaw_core::Tool>,
+    pub provider: Arc<dyn ModelProvider>,
     pub auth_token: String,
     pub rate_limiter: Arc<RateLimiter>,
     pub origin_policy: OriginPolicy,
@@ -27,11 +29,13 @@ impl AppState {
     pub fn new(
         store: Store,
         tools: Arc<dyn openclaw_core::Tool>,
+        provider: Arc<dyn ModelProvider>,
         auth_token: String,
     ) -> Self {
         Self {
             store,
             tools,
+            provider,
             auth_token,
             rate_limiter: Arc::new(RateLimiter::new(RateLimitConfig::default())),
             origin_policy: OriginPolicy::default(),

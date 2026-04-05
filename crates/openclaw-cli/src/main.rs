@@ -91,7 +91,7 @@ async fn main() -> anyhow::Result<()> {
     let router = Arc::new(HarnessRouter::new(classifier).with_base(profile));
 
     // --- Build gateway state ---
-    let mut state = openclaw_gateway::AppState::new(store, first_tool, auth_token)
+    let mut state = openclaw_gateway::AppState::new(store, first_tool, provider, auth_token)
         .with_harness_router(router);
 
     // --- Telegram channel (optional) ---
