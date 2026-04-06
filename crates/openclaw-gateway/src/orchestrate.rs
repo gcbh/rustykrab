@@ -39,6 +39,18 @@ async fn prepare_agent(
         builder = builder.with_memory(summary);
     }
 
+    // Inject SKILL.md catalog (only satisfied skills).
+    let satisfied: Vec<_> = state
+        .skill_registry
+        .md_skills()
+        .into_iter()
+        .filter(|s| s.validation.is_satisfied())
+        .collect();
+    if !satisfied.is_empty() {
+        let refs: Vec<&openclaw_skills::SkillMd> = satisfied.iter().map(|s| s.as_ref()).collect();
+        builder = builder.with_available_skills(&refs);
+    }
+
     let system_prompt = builder.build();
 
     // 4. Inject system prompt as first message.

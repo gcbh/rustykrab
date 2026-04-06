@@ -5,6 +5,7 @@ use std::sync::Arc;
 use openclaw_agent::{HarnessProfile, HarnessRouter, OrchestrationPipeline};
 use openclaw_core::model::ModelProvider;
 use openclaw_core::orchestration::OrchestrationConfig;
+use openclaw_skills::SkillRegistry;
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -18,6 +19,12 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|| std::path::PathBuf::from("."))
         .join("openclaw");
     std::fs::create_dir_all(&data_dir)?;
+
+    // --- CLI subcommands ---
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() >= 2 && args[1] == "skill" {
+        return handle_skill_subcommand(&data_dir, &args[2..]);
+    }
 
     // --- Harness profile ---
     // Load from file or use a preset. Supported: default, coding, research, creative
@@ -105,10 +112,28 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
+    // --- Load SKILL.md skills ---
+    let skills_dir = data_dir.join("skills");
+    std::fs::create_dir_all(&skills_dir)?;
+    let mut skill_registry = SkillRegistry::new();
+    match openclaw_skills::load_skills_from_dir(&skills_dir) {
+        Ok(loaded) => {
+            let count = loaded.len();
+            for s in loaded {
+                skill_registry.register_md(Arc::new(s));
+            }
+            if count > 0 {
+                tracing::info!(count, "SKILL.md skills loaded");
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "failed to scan skills directory"),
+    }
+
     // --- Build gateway state ---
     let mut state = openclaw_gateway::AppState::new(store, tools, provider, auth_token)
         .with_harness_router(router)
-        .with_orchestration_config(orchestration_config);
+        .with_orchestration_config(orchestration_config)
+        .with_skill_registry(Arc::new(skill_registry));
 
     if let Some(pipeline) = orchestration_pipeline {
         state = state.with_orchestration_pipeline(pipeline);
@@ -297,4 +322,85 @@ fn load_harness_profile(data_dir: &std::path::Path) -> anyhow::Result<HarnessPro
     };
 
     Ok(profile)
+}
+
+/// Handle `skill list` and `skill install <path>` subcommands.
+fn handle_skill_subcommand(data_dir: &std::path::Path, args: &[String]) -> anyhow::Result<()> {
+    let skills_dir = data_dir.join("skills");
+    std::fs::create_dir_all(&skills_dir)?;
+
+    let sub = args.first().map(|s| s.as_str()).unwrap_or("list");
+    match sub {
+        "list" => {
+            let skills = openclaw_skills::load_skills_from_dir(&skills_dir)?;
+            if skills.is_empty() {
+                println!("No skills installed.");
+                println!("  Skills directory: {}", skills_dir.display());
+                println!("  Place skill directories containing SKILL.md here.");
+                return Ok(());
+            }
+            println!("{:<24} {:<10} {}", "NAME", "STATUS", "DESCRIPTION");
+            println!("{}", "-".repeat(60));
+            for s in &skills {
+                let status = if s.validation.is_satisfied() {
+                    "ready"
+                } else {
+                    "unmet"
+                };
+                println!(
+                    "{:<24} {:<10} {}",
+                    s.frontmatter.name, status, s.frontmatter.description
+                );
+                if !s.validation.missing_env.is_empty() {
+                    println!("  missing env: {}", s.validation.missing_env.join(", "));
+                }
+                if !s.validation.missing_bins.is_empty() {
+                    println!("  missing bins: {}", s.validation.missing_bins.join(", "));
+                }
+            }
+        }
+        "install" => {
+            let src = args
+                .get(1)
+                .ok_or_else(|| anyhow::anyhow!("usage: skill install <path>"))?;
+            let src_path = std::path::Path::new(src);
+            if !src_path.is_dir() {
+                anyhow::bail!("source path is not a directory: {}", src_path.display());
+            }
+            let skill_md = src_path.join("SKILL.md");
+            if !skill_md.is_file() {
+                anyhow::bail!("no SKILL.md found in {}", src_path.display());
+            }
+            let name = src_path
+                .file_name()
+                .ok_or_else(|| anyhow::anyhow!("cannot determine skill name from path"))?;
+            let dest = skills_dir.join(name);
+            copy_dir_recursive(src_path, &dest)?;
+            println!("Installed skill to {}", dest.display());
+        }
+        _ => {
+            eprintln!("Unknown skill subcommand: {sub}");
+            eprintln!("Usage:");
+            eprintln!("  openclaw-cli skill list              List installed skills");
+            eprintln!("  openclaw-cli skill install <path>    Install a skill directory");
+            std::process::exit(1);
+        }
+    }
+    Ok(())
+}
+
+/// Recursively copy a directory.
+fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> anyhow::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        let dest_path = dst.join(entry.file_name());
+        if ty.is_dir() {
+            copy_dir_recursive(&entry.path(), &dest_path)?;
+        } else {
+            std::fs::copy(entry.path(), &dest_path)?;
+        }
+    }
+    Ok(())
 }

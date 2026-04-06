@@ -1,3 +1,4 @@
+use crate::skill_md::SkillMd;
 use openclaw_core::types::ToolSchema;
 
 /// Builds optimized system prompts that improve model tool-use reliability.
@@ -114,6 +115,38 @@ impl SystemPromptBuilder {
              Show your reasoning briefly before making tool calls."
                 .to_string(),
         );
+        self
+    }
+
+    /// Inject a compact `<available_skills>` XML catalog of SKILL.md skills.
+    ///
+    /// This is appended at prompt build time so the model knows which skills
+    /// exist without loading their full body.
+    pub fn with_available_skills(mut self, skills: &[&SkillMd]) -> Self {
+        if skills.is_empty() {
+            return self;
+        }
+        let mut xml = String::from("<available_skills>\n");
+        for s in skills {
+            let name = &s.frontmatter.name;
+            let desc = &s.frontmatter.description;
+            let loc = s.path.display();
+            xml.push_str(&format!(
+                "  <skill name=\"{name}\" description=\"{desc}\" location=\"{loc}\" />\n"
+            ));
+        }
+        xml.push_str("</available_skills>");
+        self.sections.push(xml);
+        self
+    }
+
+    /// Wrap a skill's full body in `<skill_instructions>` XML.
+    ///
+    /// Used JIT when a skill is activated during a conversation turn.
+    pub fn with_active_skill(mut self, name: &str, body: &str) -> Self {
+        self.sections.push(format!(
+            "<skill_instructions name=\"{name}\">\n{body}\n</skill_instructions>"
+        ));
         self
     }
 

@@ -2,6 +2,7 @@ use openclaw_agent::{HarnessProfile, HarnessRouter, OrchestrationPipeline, Proce
 use openclaw_channels::{SignalChannel, TelegramChannel};
 use openclaw_core::model::ModelProvider;
 use openclaw_core::orchestration::OrchestrationConfig;
+use openclaw_skills::SkillRegistry;
 use openclaw_store::Store;
 use std::sync::{Arc, RwLock};
 
@@ -31,6 +32,8 @@ pub struct AppState {
     pub orchestration_pipeline: Option<Arc<OrchestrationPipeline>>,
     /// Orchestration configuration.
     pub orchestration_config: OrchestrationConfig,
+    /// Skill registry for SKILL.md-based skills.
+    pub skill_registry: Arc<SkillRegistry>,
 }
 
 impl AppState {
@@ -54,6 +57,7 @@ impl AppState {
             harness_router: None,
             orchestration_pipeline: None,
             orchestration_config: OrchestrationConfig::default(),
+            skill_registry: Arc::new(SkillRegistry::new()),
         }
     }
 
@@ -103,6 +107,12 @@ impl AppState {
     /// Enable the orchestration pipeline for recursive agentic patterns.
     pub fn with_orchestration_pipeline(mut self, pipeline: Arc<OrchestrationPipeline>) -> Self {
         self.orchestration_pipeline = Some(pipeline);
+        self
+    }
+
+    /// Set the skill registry.
+    pub fn with_skill_registry(mut self, registry: Arc<SkillRegistry>) -> Self {
+        self.skill_registry = registry;
         self
     }
 
