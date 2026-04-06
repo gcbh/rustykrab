@@ -60,6 +60,17 @@ async fn main() -> anyhow::Result<()> {
             let p = openclaw_providers::OllamaProvider::new(model).with_base_url(base_url);
             Arc::new(p)
         }
+        "claude-cli" | "claude_cli" => {
+            let mut p = openclaw_providers::ClaudeCliProvider::new();
+            if let Ok(model) = std::env::var("CLAUDE_CLI_MODEL") {
+                p = p.with_model(model);
+            }
+            if let Ok(binary) = std::env::var("CLAUDE_CLI_BINARY") {
+                p = p.with_binary(binary);
+            }
+            tracing::info!("using Claude CLI provider (subscription auth)");
+            Arc::new(p)
+        }
         _ => {
             let api_key = std::env::var("ANTHROPIC_API_KEY").unwrap_or_else(|_| {
                 if let Ok(key) = store.secrets().get("anthropic_api_key") {
