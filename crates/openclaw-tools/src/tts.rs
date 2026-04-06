@@ -76,6 +76,10 @@ impl Tool for TtsTool {
 
         let api_key = std::env::var("TTS_API_KEY").unwrap_or_default();
 
+        // Path traversal protection: validate output path before writing
+        let safe_output_path = crate::security::validate_path(output_path)
+            .map_err(|e| openclaw_core::Error::ToolExecution(format!("output path validation failed: {e}")))?;
+
         let text_length = text.len();
 
         let mut req = self.client.post(&api_url).json(&json!({
@@ -97,7 +101,7 @@ impl Tool for TtsTool {
             .await
             .map_err(|e| openclaw_core::Error::ToolExecution(format!("failed to read TTS response: {e}")))?;
 
-        tokio::fs::write(output_path, &audio_bytes)
+        tokio::fs::write(&safe_output_path, &audio_bytes)
             .await
             .map_err(|e| openclaw_core::Error::ToolExecution(format!("failed to save audio file: {e}")))?;
 

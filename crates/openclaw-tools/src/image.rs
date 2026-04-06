@@ -60,6 +60,10 @@ impl Tool for ImageTool {
             .ok_or_else(|| openclaw_core::Error::ToolExecution("missing source".into()))?;
 
         let image_bytes = if source.starts_with("http://") || source.starts_with("https://") {
+            // SSRF protection: validate URL before making request
+            crate::security::validate_url(source)
+                .map_err(|e| openclaw_core::Error::ToolExecution(format!("URL validation failed: {e}")))?;
+
             self.client
                 .get(source)
                 .send()
@@ -70,7 +74,11 @@ impl Tool for ImageTool {
                 .map_err(|e| openclaw_core::Error::ToolExecution(format!("failed to read image bytes: {e}")))?
                 .to_vec()
         } else {
-            tokio::fs::read(source)
+            // Path traversal protection: validate path before reading
+            let safe_path = crate::security::validate_path(source)
+                .map_err(|e| openclaw_core::Error::ToolExecution(format!("path validation failed: {e}")))?;
+
+            tokio::fs::read(&safe_path)
                 .await
                 .map_err(|e| openclaw_core::Error::ToolExecution(format!("failed to read image file: {e}")))?
         };

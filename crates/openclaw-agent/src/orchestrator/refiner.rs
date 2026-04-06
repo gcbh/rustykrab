@@ -91,8 +91,8 @@ impl RefinementLoop {
     /// Run the critique pass.
     async fn critique(&self, request: &str, response: &str) -> Result<String> {
         let prompt = CRITIQUE_PROMPT
-            .replace("{request}", request)
-            .replace("{response}", response);
+            .replace("{request}", &format!("<user_input>\n{request}\n</user_input>"))
+            .replace("{response}", &format!("<agent_response>\n{response}\n</agent_response>"));
 
         let messages = vec![Message {
             id: Uuid::new_v4(),
@@ -118,9 +118,9 @@ impl RefinementLoop {
         critique: &str,
     ) -> Result<String> {
         let prompt = REFINE_PROMPT
-            .replace("{request}", request)
-            .replace("{response}", response)
-            .replace("{critique}", critique);
+            .replace("{request}", &format!("<user_input>\n{request}\n</user_input>"))
+            .replace("{response}", &format!("<agent_response>\n{response}\n</agent_response>"))
+            .replace("{critique}", &format!("<agent_response>\n{critique}\n</agent_response>"));
 
         let messages = vec![Message {
             id: Uuid::new_v4(),

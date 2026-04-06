@@ -136,6 +136,19 @@ pub fn validate_url(url: &str) -> Result<(), String> {
         return Err("requests to cloud metadata endpoint are blocked (SSRF protection)".into());
     }
 
+    // Resolve hostname and check all IPs against private ranges to prevent DNS rebinding
+    let port = parsed.port().unwrap_or(if parsed.scheme() == "https" { 443 } else { 80 });
+    if let Ok(addrs) = std::net::ToSocketAddrs::to_socket_addrs(&(host, port)) {
+        for addr in addrs {
+            let ip = addr.ip();
+            if is_private_ip(&ip) {
+                return Err(format!(
+                    "URL resolves to private IP {ip} — possible SSRF"
+                ));
+            }
+        }
+    }
+
     Ok(())
 }
 

@@ -99,10 +99,13 @@ impl Tool for ImageGenerateTool {
             .map_err(|e| openclaw_core::Error::ToolExecution(format!("failed to read response: {e}")))?;
 
         let saved_path = if let Some(path) = output_path {
-            tokio::fs::write(path, &resp_bytes)
+            // Path traversal protection: validate output path before writing
+            let safe_path = crate::security::validate_path(path)
+                .map_err(|e| openclaw_core::Error::ToolExecution(format!("output path validation failed: {e}")))?;
+            tokio::fs::write(&safe_path, &resp_bytes)
                 .await
                 .map_err(|e| openclaw_core::Error::ToolExecution(format!("failed to save image: {e}")))?;
-            path.to_string()
+            safe_path.to_string_lossy().to_string()
         } else {
             String::new()
         };

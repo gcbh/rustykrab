@@ -270,14 +270,19 @@ impl TelegramChannel {
 }
 
 /// Constant-time string comparison to prevent timing attacks on webhook secrets.
+/// Compares all bytes up to the length of the longer string
+/// so that the length of neither input is leaked through timing.
 fn constant_time_eq(a: &str, b: &str) -> bool {
-    if a.len() != b.len() {
-        return false;
+    let a_bytes = a.as_bytes();
+    let b_bytes = b.as_bytes();
+    let len = a_bytes.len().max(b_bytes.len());
+    let mut result = (a_bytes.len() != b_bytes.len()) as u8;
+    for i in 0..len {
+        let x = a_bytes.get(i).copied().unwrap_or(0);
+        let y = b_bytes.get(i).copied().unwrap_or(0);
+        result |= x ^ y;
     }
-    a.bytes()
-        .zip(b.bytes())
-        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
-        == 0
+    result == 0
 }
 
 // --- Telegram Bot API wire types ---

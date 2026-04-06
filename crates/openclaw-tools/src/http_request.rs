@@ -16,7 +16,11 @@ pub struct HttpRequestTool {
 impl HttpRequestTool {
     pub fn new() -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .redirect(reqwest::redirect::Policy::limited(10))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
         }
     }
 }
@@ -98,6 +102,12 @@ impl Tool for HttpRequestTool {
             .text()
             .await
             .map_err(|e| openclaw_core::Error::ToolExecution(e.to_string()))?;
+
+        if body.len() > 5_000_000 {
+            return Err(openclaw_core::Error::ToolExecution(
+                "response exceeds 5MB size limit".into(),
+            ));
+        }
 
         Ok(json!({
             "status": status,

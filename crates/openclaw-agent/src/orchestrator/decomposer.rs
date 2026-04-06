@@ -70,7 +70,9 @@ impl Decomposer {
             Message {
                 id: Uuid::new_v4(),
                 role: Role::User,
-                content: MessageContent::Text(user_request.to_string()),
+                content: MessageContent::Text(format!(
+                    "<user_input>\n{user_request}\n</user_input>"
+                )),
                 created_at: Utc::now(),
             },
         ];

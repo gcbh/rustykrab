@@ -20,15 +20,22 @@ pub enum Role {
     Tool,
 }
 
+// TODO: This is a breaking change from the previous `#[serde(untagged)]` format.
+// Existing persisted conversations in sled will fail to deserialize.
+// A migration pass should be added to convert old data on first load.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
+#[serde(tag = "type", content = "data")]
 pub enum MessageContent {
+    #[serde(rename = "text")]
     Text(String),
+    #[serde(rename = "tool_call")]
     ToolCall(ToolCall),
+    #[serde(rename = "tool_result")]
     ToolResult(ToolResult),
     /// Multiple tool calls in a single assistant turn.
     /// Enables parallel tool execution — the model can request
     /// several tools at once and receive all results before continuing.
+    #[serde(rename = "multi_tool_call")]
     MultiToolCall(Vec<ToolCall>),
 }
 

@@ -89,7 +89,10 @@ pub fn resolve_master_key() -> Result<Vec<u8>, Error> {
     // Priority 1: environment variable (for CI, Docker, non-macOS deployments).
     if let Ok(env_key) = std::env::var("OPENCLAW_MASTER_KEY") {
         tracing::info!("using master key from OPENCLAW_MASTER_KEY env var");
-        return Ok(env_key.into_bytes());
+        return hex::decode(env_key.trim())
+            .map_err(|e| Error::Storage(format!(
+                "OPENCLAW_MASTER_KEY must be a hex-encoded string: {e}"
+            )));
     }
 
     // Priority 2: macOS Keychain.
@@ -115,7 +118,10 @@ pub fn resolve_master_key() -> Result<Vec<u8>, Error> {
 pub fn resolve_master_key() -> Result<Vec<u8>, Error> {
     if let Ok(env_key) = std::env::var("OPENCLAW_MASTER_KEY") {
         tracing::info!("using master key from OPENCLAW_MASTER_KEY env var");
-        return Ok(env_key.into_bytes());
+        return hex::decode(env_key.trim())
+            .map_err(|e| Error::Storage(format!(
+                "OPENCLAW_MASTER_KEY must be a hex-encoded string: {e}"
+            )));
     }
 
     tracing::warn!(

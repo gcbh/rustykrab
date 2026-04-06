@@ -64,10 +64,20 @@ impl Tool for CredentialReadTool {
                     .ok_or_else(|| Error::ToolExecution("missing name for 'get' action".into()))?;
 
                 match self.secrets.get(name) {
-                    Ok(value) => Ok(json!({
-                        "name": name,
-                        "value": value,
-                    })),
+                    Ok(value) => {
+                        // Mask the secret value to prevent leaking full secrets
+                        // into the conversation. The full value remains available
+                        // in the SecretStore for tools that need it directly.
+                        let masked = if value.len() > 8 {
+                            format!("{}...{}", &value[..4], &value[value.len()-4..])
+                        } else {
+                            "*".repeat(value.len())
+                        };
+                        Ok(json!({
+                            "name": name,
+                            "value": masked,
+                        }))
+                    }
                     Err(openclaw_core::Error::NotFound(_)) => Ok(json!({
                         "error": format!("no secret found with name '{name}'"),
                         "hint": "Use action 'list' to see available secret names",

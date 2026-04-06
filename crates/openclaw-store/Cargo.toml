@@ -19,6 +19,7 @@ aes-gcm.workspace = true
 argon2.workspace = true
 rand.workspace = true
 hex.workspace = true
+zeroize.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework.workspace = true

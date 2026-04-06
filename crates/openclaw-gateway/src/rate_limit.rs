@@ -83,6 +83,16 @@ impl RateLimiter {
         }
 
         record.attempts.push(now);
+
+        // Prune stale entries to prevent unbounded memory growth
+        if records.len() > 10_000 {
+            let stale_cutoff = now - (self.config.lockout * 2);
+            records.retain(|_, rec| {
+                rec.locked_until.map(|l| l > now).unwrap_or(true)
+                    || rec.attempts.last().map(|&t| t > stale_cutoff).unwrap_or(false)
+            });
+        }
+
         true
     }
 }

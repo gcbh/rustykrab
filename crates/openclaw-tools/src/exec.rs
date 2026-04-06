@@ -55,11 +55,21 @@ fn truncate_output(s: String) -> String {
 
 /// Validate that all commands in a potentially piped command are allowed.
 fn validate_command(command: &str) -> std::result::Result<(), String> {
+    // Block newline injection (could bypass allowlist via multi-line commands)
+    if command.contains('\n') || command.contains('\r') {
+        return Err("command contains newline characters".into());
+    }
+    // Block all variable expansion (not just ${...} but also bare $VAR)
+    if command.contains('$') {
+        return Err("command contains variable expansion ($)".into());
+    }
+    // Block shell redirects (could write/overwrite arbitrary files)
+    if command.contains('>') || command.contains('<') {
+        return Err("command contains redirects".into());
+    }
+
     // Reject dangerous shell operators: $(...), `...`, process substitution
-    if command.contains("$(") || command.contains('`')
-        || command.contains("<(") || command.contains(">(")
-        || command.contains("${")
-    {
+    if command.contains('`') {
         return Err("command substitution and variable expansion are not allowed".into());
     }
 

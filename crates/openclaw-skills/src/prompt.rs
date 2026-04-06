@@ -133,9 +133,9 @@ impl SystemPromptBuilder {
         }
         let mut xml = String::from("<available_skills>\n");
         for s in skills {
-            let name = &s.frontmatter.name;
-            let desc = &s.frontmatter.description;
-            let loc = s.path.display();
+            let name = escape_xml(&s.frontmatter.name);
+            let desc = escape_xml(&s.frontmatter.description);
+            let loc = escape_xml(&s.path.display().to_string());
             xml.push_str(&format!(
                 "  <skill name=\"{name}\" description=\"{desc}\" location=\"{loc}\" />\n"
             ));
@@ -150,7 +150,8 @@ impl SystemPromptBuilder {
     /// Used JIT when a skill is activated during a conversation turn.
     pub fn with_active_skill(mut self, name: &str, body: &str) -> Self {
         self.sections.push(format!(
-            "<skill_instructions name=\"{name}\">\n{body}\n</skill_instructions>"
+            "<skill_instructions name=\"{}\">\n{body}\n</skill_instructions>",
+            escape_xml(name)
         ));
         self
     }
@@ -165,6 +166,15 @@ impl Default for SystemPromptBuilder {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Escape XML special characters to prevent injection in skill names/descriptions.
+fn escape_xml(s: &str) -> String {
+    s.replace('&', "&amp;")
+     .replace('<', "&lt;")
+     .replace('>', "&gt;")
+     .replace('"', "&quot;")
+     .replace('\'', "&apos;")
 }
 
 /// Produce a human-readable summary of a JSON Schema parameters object.

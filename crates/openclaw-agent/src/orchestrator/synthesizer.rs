@@ -68,8 +68,8 @@ impl Synthesizer {
         }
 
         let prompt = SYNTHESIZE_PROMPT
-            .replace("{request}", original_request)
-            .replace("{results}", &results_text);
+            .replace("{request}", &format!("<user_input>\n{original_request}\n</user_input>"))
+            .replace("{results}", &format!("<agent_response>\n{results_text}\n</agent_response>"));
 
         let messages = vec![Message {
             id: Uuid::new_v4(),

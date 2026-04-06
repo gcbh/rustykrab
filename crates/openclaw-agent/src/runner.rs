@@ -670,15 +670,17 @@ impl AgentRunner {
 
 /// Sanitize and truncate error messages before they flow into the conversation.
 /// This prevents internal path and stack trace leakage to the model/client.
+/// Takes only the first line (no stack traces) and truncates to 200 chars.
 fn sanitize_error(e: &str) -> String {
-    e.chars().take(200).collect()
+    let first_line = e.lines().next().unwrap_or(e);
+    first_line.chars().take(200).collect()
 }
 
 /// Standalone function so it can be moved into a tokio::spawn.
 async fn execute_single_tool(
     call: &ToolCall,
     tools: &[Arc<dyn Tool>],
-    _sandbox: &Arc<dyn Sandbox>,
+    sandbox: &Arc<dyn Sandbox>,
     capabilities: &openclaw_core::capability::CapabilitySet,
     session_id: uuid::Uuid,
 ) -> Result<ToolResult> {
@@ -728,6 +730,12 @@ async fn execute_single_tool(
     // Check that the tool's required capabilities match the policy.
     enforce_sandbox_policy(&call.name, &policy)?;
 
+    // Run sandbox enforcement check (validates the sandbox layer agrees)
+    sandbox.execute(&call.name, call.arguments.clone(), &policy).await
+        .map_err(|e| Error::Auth(format!(
+            "sandbox denied tool '{}': {e}", call.name
+        )))?;
+
     // Execute tool within sandbox timeout
     let timeout_duration = std::time::Duration::from_secs(policy.timeout_secs);
     let tool_clone = tool.clone();
@@ -755,13 +763,15 @@ async fn execute_single_tool(
 fn enforce_sandbox_policy(tool_name: &str, policy: &SandboxPolicy) -> Result<()> {
     match tool_name {
         // Tools requiring filesystem read
-        "read" | "pdf" if !policy.allow_fs_read => {
+        "read" | "pdf" | "image" if !policy.allow_fs_read => {
             Err(Error::Auth(format!(
                 "tool '{tool_name}' requires filesystem read access, which is denied by policy"
             )))
         }
         // Tools requiring filesystem write
-        "write" | "edit" | "apply_patch" if !policy.allow_fs_write => {
+        "write" | "edit" | "apply_patch" | "tts" | "image_generate" | "skill_create" | "canvas"
+            if !policy.allow_fs_write =>
+        {
             Err(Error::Auth(format!(
                 "tool '{tool_name}' requires filesystem write access, which is denied by policy"
             )))
@@ -774,17 +784,29 @@ fn enforce_sandbox_policy(tool_name: &str, policy: &SandboxPolicy) -> Result<()>
         }
         // Tools requiring network access
         "http_request" | "http_session" | "web_fetch" | "web_search"
-        | "x_search" | "browser" if !policy.allow_net => {
+        | "x_search" | "browser" | "gmail" | "image_generate" | "tts" if !policy.allow_net => {
             Err(Error::Auth(format!(
                 "tool '{tool_name}' requires network access, which is denied by policy"
             )))
         }
-        _ => {
-            tracing::debug!(
-                tool = tool_name,
-                "tool not covered by sandbox policy allow-list, passing through"
-            );
+        // Tools that don't require special capabilities (pure in-memory or store-backed)
+        "read" | "pdf" | "image" | "write" | "edit" | "apply_patch" | "tts"
+        | "image_generate" | "skill_create" | "canvas" | "exec" | "process"
+        | "code_execution" | "http_request" | "http_session" | "web_fetch"
+        | "web_search" | "x_search" | "browser" | "gmail"
+        | "memory_save" | "memory_search" | "memory_get" | "memory_delete"
+        | "credential_read" | "credential_write"
+        | "message" | "gateway" | "nodes" | "cron" | "subagents"
+        | "sessions_spawn" | "sessions_send" | "sessions_list"
+        | "sessions_yield" | "sessions_history" | "session_status"
+        | "session_manager" | "agents_list" => {
             Ok(())
+        }
+        _ => {
+            tracing::warn!(tool = tool_name, "unknown tool denied by sandbox policy");
+            Err(Error::Auth(format!(
+                "tool '{tool_name}' is not recognized by sandbox policy and was denied"
+            )))
         }
     }
 }

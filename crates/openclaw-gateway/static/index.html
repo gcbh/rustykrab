@@ -1381,8 +1381,13 @@
     html = html.replace(/\*(.+?)\*/g, '<em>$1</em>');
     // Strikethrough
     html = html.replace(/~~(.+?)~~/g, '<s>$1</s>');
-    // Links [text](url)
-    html = html.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+    // Links [text](url) — only allow http(s) and mailto schemes to prevent XSS via javascript: URLs
+    html = html.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_, text, url) => {
+      if (/^https?:\/\//i.test(url) || /^mailto:/i.test(url)) {
+        return `<a href="${url}" target="_blank" rel="noopener">${text}</a>`;
+      }
+      return text;
+    });
     return html;
   }
 
