@@ -1,7 +1,7 @@
 mod conversation;
 pub mod keychain;
 mod knowledge_graph;
-mod memory;
+pub mod memory;
 mod secret;
 
 use std::path::Path;

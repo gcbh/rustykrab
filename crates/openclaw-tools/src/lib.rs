@@ -30,7 +30,9 @@ mod subagents;
 
 // Memory tools
 pub mod memory_backend;
+mod memory_delete;
 mod memory_get;
+mod memory_save;
 mod memory_search;
 
 // Messaging tools
@@ -59,6 +61,9 @@ mod nodes;
 // HTTP
 mod http_request;
 mod http_session;
+
+// Email tools
+mod gmail;
 
 // Credentials (from main)
 mod credential_read;
@@ -98,7 +103,9 @@ pub use subagents::SubagentsTool;
 
 // Memory
 pub use memory_backend::MemoryBackend;
+pub use memory_delete::MemoryDeleteTool;
 pub use memory_get::MemoryGetTool;
+pub use memory_save::MemorySaveTool;
 pub use memory_search::MemorySearchTool;
 
 // Messaging
@@ -127,6 +134,9 @@ pub use nodes::NodesTool;
 // HTTP
 pub use http_request::HttpRequestTool;
 pub use http_session::HttpSessionTool;
+
+// Email
+pub use gmail::GmailTool;
 
 // Credentials
 pub use credential_read::CredentialReadTool;
@@ -169,6 +179,8 @@ pub fn builtin_tools(
         std::sync::Arc::new(CanvasTool::new()),
         // Devices
         std::sync::Arc::new(NodesTool::new()),
+        // Email
+        std::sync::Arc::new(GmailTool::new(secrets.clone())),
         // Credentials
         std::sync::Arc::new(CredentialReadTool::new(secrets.clone())),
         std::sync::Arc::new(CredentialWriteTool::new(secrets)),
@@ -196,8 +208,10 @@ pub fn memory_tools(
     backend: std::sync::Arc<dyn MemoryBackend>,
 ) -> Vec<std::sync::Arc<dyn openclaw_core::Tool>> {
     vec![
+        std::sync::Arc::new(MemorySaveTool::new(backend.clone())),
         std::sync::Arc::new(MemorySearchTool::new(backend.clone())),
-        std::sync::Arc::new(MemoryGetTool::new(backend)),
+        std::sync::Arc::new(MemoryGetTool::new(backend.clone())),
+        std::sync::Arc::new(MemoryDeleteTool::new(backend)),
     ]
 }
 

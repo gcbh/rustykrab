@@ -33,7 +33,12 @@ impl SystemPromptBuilder {
              - Always use tools when you need external information. Never guess or make up data.\n\
              - If a tool call fails, read the error message carefully and try a different approach.\n\
              - Think step by step. For complex tasks, break them into smaller tool calls.\n\
-             - When you have the answer, respond directly. Do not make unnecessary tool calls."
+             - When you have the answer, respond directly. Do not make unnecessary tool calls.\n\
+             - MEMORY: Use memory_save to store important facts, decisions, user preferences, \
+               and error resolutions with descriptive tags. Your context window is limited — \
+               facts you don't save will be lost when old messages scroll out. When you learn \
+               something important, save it immediately. Relevant memories are automatically \
+               recalled based on conversation keywords."
         ));
         self
     }

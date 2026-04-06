@@ -7,6 +7,7 @@ use openclaw_core::capability::CapabilitySet;
 use openclaw_core::session::Session;
 use openclaw_core::types::{Conversation, Message, MessageContent, Role};
 use openclaw_skills::SystemPromptBuilder;
+use openclaw_store::memory::extract_keywords;
 
 use crate::AppState;
 
@@ -35,8 +36,29 @@ async fn prepare_agent(
     if let Some(task_guidance) = profile.task_type_guidance() {
         builder = builder.with_task_guidance(task_guidance);
     }
-    if let Some(ref summary) = conv.summary {
-        builder = builder.with_memory(summary);
+    // Associative memory recall: extract keywords from the user's message,
+    // match against stored memory tags, and inject relevant facts.
+    // No LLM call — just keyword extraction + tag matching.
+    let keywords = extract_keywords(user_content);
+    if !keywords.is_empty() {
+        match state.store.memories().recall(conv.id, &keywords) {
+            Ok(memories) if !memories.is_empty() => {
+                let mut recall_text = String::from("RECALLED MEMORIES (relevant to this message):\n");
+                for mem in memories.iter().take(10) {
+                    recall_text.push_str(&format!("- [{}] {}\n", mem.id, mem.fact));
+                }
+                builder = builder.with_memory(&recall_text);
+                tracing::info!(
+                    count = memories.len(),
+                    keywords = ?keywords,
+                    "associative recall matched memories"
+                );
+            }
+            Ok(_) => {} // no matches — that's fine
+            Err(e) => {
+                tracing::warn!("associative recall failed: {e}");
+            }
+        }
     }
 
     // Inject SKILL.md catalog (only satisfied skills).

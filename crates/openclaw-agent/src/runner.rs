@@ -146,9 +146,11 @@ impl AgentRunner {
                 return Err(Error::Auth("session expired during execution".into()));
             }
 
-            // Compress memory when estimated tokens exceed the budget.
-            if self.should_compress(conv) {
-                self.compress_memory(conv).await?;
+            // Sliding window: drop oldest messages when context exceeds budget.
+            // No LLM call — the agent is responsible for saving important
+            // facts via the memory_save tool before they scroll out.
+            if self.should_truncate(conv) {
+                self.truncate_oldest(conv);
                 tracer.record_compression();
             }
 
@@ -297,9 +299,8 @@ impl AgentRunner {
                 return Err(Error::Auth("session expired during execution".into()));
             }
 
-            if self.should_compress(conv) {
-                on_event(AgentEvent::Compressing);
-                self.compress_memory(conv).await?;
+            if self.should_truncate(conv) {
+                self.truncate_oldest(conv);
                 tracer.record_compression();
             }
 
@@ -587,35 +588,23 @@ impl AgentRunner {
         total.saturating_sub(summary_budget).saturating_sub(response_budget)
     }
 
-    /// Maximum tokens the summary should occupy.
-    fn summary_token_budget(&self) -> usize {
-        (self.config.max_context_tokens as f64 * self.config.summary_budget_ratio) as usize
-    }
-
-    /// Determine whether the conversation needs compression.
-    fn should_compress(&self, conv: &Conversation) -> bool {
+    /// Determine whether the conversation needs truncation.
+    fn should_truncate(&self, conv: &Conversation) -> bool {
         let estimated = Self::estimate_conversation_tokens(conv);
         let budget = self.live_message_budget();
-        // Trigger compression when we've used 85% of the live budget.
         estimated > (budget as f64 * 0.85) as usize
     }
 
-    /// Compress older messages into a summary to stay within context limits.
+    /// Sliding window truncation: drop oldest messages to stay within
+    /// the context budget. No LLM call — the agent is responsible for
+    /// saving important facts via the memory_save tool before they
+    /// scroll out of context.
     ///
-    /// Uses a token-aware budget: drops the oldest messages until the
-    /// remaining messages fit within the live-message budget, then asks
-    /// the model to summarize the dropped portion within the summary
-    /// token budget.
-    async fn compress_memory(&self, conv: &mut Conversation) -> Result<()> {
-        let live_budget = self.live_message_budget();
-        let summary_budget = self.summary_token_budget();
-        // Approximate max chars for the summary (inverse of token estimate).
-        let summary_max_chars = (summary_budget as f64 * 3.5) as usize;
-
-        // Find the split point: walk backwards from the end, accumulating
-        // tokens, until we've filled about 60% of the live budget.
-        // This keeps a healthy buffer for the next few turns.
-        let target = (live_budget as f64 * 0.60) as usize;
+    /// Keeps the system message at index 0 (if present) and retains
+    /// ~60% of the live budget worth of recent messages.
+    fn truncate_oldest(&self, conv: &mut Conversation) {
+        let budget = self.live_message_budget();
+        let target = (budget as f64 * 0.60) as usize;
         let mut keep_tokens = 0;
         let mut keep_from = conv.messages.len();
 
@@ -646,101 +635,36 @@ impl AgentRunner {
             keep_from = i;
         }
 
-        // Don't compress if there's almost nothing to drop.
+        // Don't truncate if there's almost nothing to drop.
         if keep_from <= 2 {
-            return Ok(());
+            return;
         }
 
-        let old_messages = &conv.messages[..keep_from];
+        // Preserve the system message at index 0 if present.
+        let system_msg = if conv
+            .messages
+            .first()
+            .map(|m| m.role == Role::System)
+            .unwrap_or(false)
+        {
+            Some(conv.messages[0].clone())
+        } else {
+            None
+        };
 
-        // Build the text of messages to summarize.
-        let mut summary_text = String::new();
-        for msg in old_messages {
-            let role = match msg.role {
-                Role::System => continue,
-                Role::User => "User",
-                Role::Assistant => "Assistant",
-                Role::Tool => "Tool",
-            };
-            if let Some(text) = msg.content.as_text() {
-                summary_text.push_str(&format!("{role}: {text}\n"));
-            }
-        }
+        let dropped = keep_from;
+        conv.messages = conv.messages.split_off(keep_from);
 
-        if summary_text.is_empty() {
-            return Ok(());
-        }
-
-        // Incorporate existing summary for continuity.
-        let existing_summary = conv
-            .summary
-            .as_deref()
-            .map(|s| format!("Previous summary: {s}\n\n"))
-            .unwrap_or_default();
-
-        let summary_prompt = vec![Message {
-            id: Uuid::new_v4(),
-            role: Role::User,
-            content: MessageContent::Text(format!(
-                "{existing_summary}Summarize this conversation concisely, preserving \
-                 key facts, decisions, tool results, and any information needed to \
-                 continue the conversation. Your summary MUST be under \
-                 {summary_max_chars} characters.\n\n{summary_text}"
-            )),
-            created_at: Utc::now(),
-        }];
-
-        let response = self.provider.chat(&summary_prompt, &[]).await?;
-        let mut summary = response
-            .message
-            .content
-            .as_text()
-            .unwrap_or("(summary failed)")
-            .to_string();
-
-        // Hard-truncate if the model exceeded the budget (shouldn't happen
-        // often, but guarantees we don't blow the context on re-injection).
-        if Self::estimate_tokens(&summary) > summary_budget {
-            // Truncate to stay within budget, leaving room for the ellipsis.
-            let max_bytes = summary_max_chars.min(summary.len());
-            // Find a clean char boundary.
-            let truncate_at = summary
-                .char_indices()
-                .take_while(|(i, _)| *i < max_bytes)
-                .last()
-                .map(|(i, c)| i + c.len_utf8())
-                .unwrap_or(max_bytes);
-            summary.truncate(truncate_at);
-            summary.push_str("…");
-            tracing::warn!("summary exceeded token budget, truncated");
+        // Re-insert the system message at the front.
+        if let Some(sys) = system_msg {
+            conv.messages.insert(0, sys);
         }
 
         tracing::info!(
-            dropped = keep_from,
-            kept = conv.messages.len() - keep_from,
-            summary_tokens = Self::estimate_tokens(&summary),
-            summary_budget = summary_budget,
-            "compressed conversation memory"
+            dropped,
+            kept = conv.messages.len(),
+            "sliding window truncated oldest messages"
         );
-
-        // Drop old messages and store summary.
-        conv.messages = conv.messages.split_off(keep_from);
-        conv.summary = Some(summary.clone());
-
-        // Insert summary as a system-level context message at the start.
-        conv.messages.insert(
-            0,
-            Message {
-                id: Uuid::new_v4(),
-                role: Role::System,
-                content: MessageContent::Text(format!(
-                    "[Conversation summary from earlier messages]\n{summary}"
-                )),
-                created_at: Utc::now(),
-            },
-        );
-
-        Ok(())
     }
 }
 
