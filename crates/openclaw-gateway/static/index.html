@@ -311,6 +311,37 @@
   }
   .message.user .message-meta { text-align: right; }
 
+  /* Agent status bar (shown during orchestration) */
+  .agent-status {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 16px;
+    margin: 4px 0;
+    font-size: 12px;
+    color: var(--text-secondary);
+    border-radius: var(--radius-sm);
+    background: var(--bg-grouped);
+    animation: fadeIn 0.15s ease;
+    max-width: 85%;
+  }
+  .agent-status .status-icon {
+    flex-shrink: 0;
+    width: 14px;
+    height: 14px;
+  }
+  .agent-status .status-icon.spinning {
+    animation: spin 1s linear infinite;
+  }
+  @keyframes spin {
+    from { transform: rotate(0deg); }
+    to { transform: rotate(360deg); }
+  }
+  .agent-status.tool-start { color: var(--tint); }
+  .agent-status.tool-end { color: #34c759; }
+  .agent-status.tool-error { color: #ff3b30; }
+  .agent-status.thinking { color: var(--text-tertiary); }
+
   /* Typing indicator */
   .typing-indicator {
     display: flex;
@@ -768,15 +799,57 @@
   // ── SSE stream event handler ──────────────────────────────
   function handleStreamEvent(data) {
     if (data.type === 'delta') {
+      removeAgentStatus();
       streamBuffer += data.delta;
       updateStreamingMessage(streamBuffer);
+    } else if (data.type === 'tool_start') {
+      showAgentStatus('tool-start', `Using ${data.delta}`, true);
+    } else if (data.type === 'tool_end') {
+      showAgentStatus('tool-end', `${data.delta} done`, false);
+    } else if (data.type === 'tool_error') {
+      showAgentStatus('tool-error', `${data.delta} failed`, false);
+    } else if (data.type === 'thinking') {
+      showAgentStatus('thinking', data.delta, true);
     } else if (data.type === 'done') {
+      removeAgentStatus();
       finalizeStreamingMessage(data.message);
     } else if (data.type === 'error') {
+      removeAgentStatus();
       removeTypingIndicator();
       isSending = false;
       updateSendButton();
     }
+  }
+
+  const STATUS_ICONS = {
+    'tool-start': '<svg class="status-icon spinning" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10" stroke-dasharray="31.4 31.4" stroke-dashoffset="10"/></svg>',
+    'tool-end': '<svg class="status-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg>',
+    'tool-error': '<svg class="status-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>',
+    'thinking': '<svg class="status-icon spinning" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10" stroke-dasharray="31.4 31.4" stroke-dashoffset="10"/></svg>',
+  };
+
+  function showAgentStatus(type, text, isActive) {
+    removeTypingIndicator();
+    let el = msgContainer.querySelector('.agent-status');
+    if (!el) {
+      el = document.createElement('div');
+      el.className = 'agent-status';
+      msgContainer.appendChild(el);
+    }
+    el.className = `agent-status ${type}`;
+    el.innerHTML = `${STATUS_ICONS[type] || ''}<span>${escapeHtml(text)}</span>`;
+    scrollToBottom();
+    // Auto-clear completed statuses after a short delay
+    if (!isActive) {
+      setTimeout(() => {
+        if (el.classList.contains(type)) el.remove();
+      }, 2000);
+    }
+  }
+
+  function removeAgentStatus() {
+    const el = msgContainer.querySelector('.agent-status');
+    if (el) el.remove();
   }
 
   // ── Conversations ─────────────────────────────────────────
@@ -958,6 +1031,7 @@
       streamEl.classList.remove('streaming-message');
     }
     removeTypingIndicator();
+    removeAgentStatus();
     streamBuffer = '';
     isSending = false;
     updateSendButton();
