@@ -299,9 +299,62 @@
   .bubble code {
     font-family: var(--font-mono);
     font-size: 14px;
+    background: var(--bg-grouped);
+    padding: 2px 5px;
+    border-radius: 4px;
+  }
+  .bubble pre code {
+    background: none;
+    padding: 0;
+    border-radius: 0;
   }
 
+  .bubble p { margin: 0; }
   .bubble p + p { margin-top: 8px; }
+  .bubble h1, .bubble h2, .bubble h3, .bubble h4 {
+    margin: 12px 0 6px 0;
+    line-height: 1.3;
+  }
+  .bubble h1 { font-size: 1.3em; }
+  .bubble h2 { font-size: 1.15em; }
+  .bubble h3 { font-size: 1.05em; }
+  .bubble h4 { font-size: 1em; }
+  .bubble ul, .bubble ol {
+    margin: 6px 0;
+    padding-left: 24px;
+  }
+  .bubble li { margin: 2px 0; }
+  .bubble li > ul, .bubble li > ol { margin: 2px 0; }
+  .bubble blockquote {
+    border-left: 3px solid var(--text-tertiary);
+    margin: 8px 0;
+    padding: 4px 12px;
+    color: var(--text-secondary);
+  }
+  .bubble hr {
+    border: none;
+    border-top: 1px solid var(--border);
+    margin: 10px 0;
+  }
+  .bubble a {
+    color: var(--tint);
+    text-decoration: underline;
+  }
+  .bubble table {
+    border-collapse: collapse;
+    margin: 8px 0;
+    font-size: 14px;
+    width: 100%;
+  }
+  .bubble th, .bubble td {
+    border: 1px solid var(--border);
+    padding: 6px 10px;
+    text-align: left;
+  }
+  .bubble th {
+    background: var(--bg-grouped);
+    font-weight: 600;
+  }
 
   .message-meta {
     font-size: 11px;
@@ -1190,26 +1243,146 @@
   }
 
   function formatMessageText(text) {
-    // Basic markdown-like formatting
-    let html = escapeHtml(text);
-
-    // Code blocks (``` ... ```)
-    html = html.replace(/```(\w*)\n([\s\S]*?)```/g, (_, lang, code) => {
-      return `<pre><code>${code.trim()}</code></pre>`;
+    // Split out fenced code blocks first to protect them from inline parsing.
+    const codeBlocks = [];
+    let processed = text.replace(/```(\w*)\n([\s\S]*?)```/g, (_, lang, code) => {
+      const idx = codeBlocks.length;
+      codeBlocks.push(`<pre><code>${escapeHtml(code.trimEnd())}</code></pre>`);
+      return `\x00CODEBLOCK${idx}\x00`;
     });
 
-    // Inline code
-    html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
+    // Split into lines for block-level parsing.
+    const lines = processed.split('\n');
+    const output = [];
+    let i = 0;
 
+    while (i < lines.length) {
+      const line = lines[i];
+
+      // Headings
+      const headingMatch = line.match(/^(#{1,4})\s+(.+)$/);
+      if (headingMatch) {
+        const level = headingMatch[1].length;
+        output.push(`<h${level}>${inlineFormat(headingMatch[2])}</h${level}>`);
+        i++;
+        continue;
+      }
+
+      // Horizontal rule
+      if (/^(---|\*\*\*|___)$/.test(line.trim())) {
+        output.push('<hr>');
+        i++;
+        continue;
+      }
+
+      // Table (header row with pipes)
+      if (line.includes('|') && i + 1 < lines.length && /^\s*\|?[\s:]*-+[\s:]*/.test(lines[i + 1])) {
+        let tableHtml = '<table><thead><tr>';
+        const headers = line.split('|').map(c => c.trim()).filter(c => c);
+        for (const h of headers) {
+          tableHtml += `<th>${inlineFormat(h)}</th>`;
+        }
+        tableHtml += '</tr></thead><tbody>';
+        i += 2; // skip header and separator
+        while (i < lines.length && lines[i].includes('|')) {
+          tableHtml += '<tr>';
+          const cells = lines[i].split('|').map(c => c.trim()).filter(c => c);
+          for (const c of cells) {
+            tableHtml += `<td>${inlineFormat(c)}</td>`;
+          }
+          tableHtml += '</tr>';
+          i++;
+        }
+        tableHtml += '</tbody></table>';
+        output.push(tableHtml);
+        continue;
+      }
+
+      // Blockquote
+      if (line.startsWith('> ')) {
+        const quoteLines = [];
+        while (i < lines.length && lines[i].startsWith('> ')) {
+          quoteLines.push(lines[i].slice(2));
+          i++;
+        }
+        output.push(`<blockquote>${quoteLines.map(l => inlineFormat(l)).join('<br>')}</blockquote>`);
+        continue;
+      }
+
+      // Unordered list
+      if (/^[\s]*[-*+]\s/.test(line)) {
+        const listItems = [];
+        while (i < lines.length && /^[\s]*[-*+]\s/.test(lines[i])) {
+          listItems.push(lines[i].replace(/^[\s]*[-*+]\s/, ''));
+          i++;
+        }
+        output.push('<ul>' + listItems.map(li => `<li>${inlineFormat(li)}</li>`).join('') + '</ul>');
+        continue;
+      }
+
+      // Ordered list
+      if (/^[\s]*\d+[.)]\s/.test(line)) {
+        const listItems = [];
+        while (i < lines.length && /^[\s]*\d+[.)]\s/.test(lines[i])) {
+          listItems.push(lines[i].replace(/^[\s]*\d+[.)]\s/, ''));
+          i++;
+        }
+        output.push('<ol>' + listItems.map(li => `<li>${inlineFormat(li)}</li>`).join('') + '</ol>');
+        continue;
+      }
+
+      // Code block placeholder
+      if (line.match(/^\x00CODEBLOCK\d+\x00$/)) {
+        const idx = parseInt(line.match(/\d+/)[0]);
+        output.push(codeBlocks[idx]);
+        i++;
+        continue;
+      }
+
+      // Empty line
+      if (line.trim() === '') {
+        i++;
+        continue;
+      }
+
+      // Paragraph: collect consecutive non-empty, non-block lines
+      const paraLines = [];
+      while (i < lines.length && lines[i].trim() !== '' &&
+             !lines[i].match(/^#{1,4}\s/) &&
+             !lines[i].match(/^[\s]*[-*+]\s/) &&
+             !lines[i].match(/^[\s]*\d+[.)]\s/) &&
+             !lines[i].startsWith('> ') &&
+             !lines[i].match(/^\x00CODEBLOCK\d+\x00$/) &&
+             !(/^(---|\*\*\*|___)$/.test(lines[i].trim()))) {
+        paraLines.push(lines[i]);
+        i++;
+      }
+      if (paraLines.length > 0) {
+        output.push(`<p>${paraLines.map(l => inlineFormat(l)).join('<br>')}</p>`);
+      }
+    }
+
+    // Re-inject code blocks that might appear inside other elements
+    let result = output.join('');
+    result = result.replace(/\x00CODEBLOCK(\d+)\x00/g, (_, idx) => codeBlocks[parseInt(idx)]);
+    return result;
+  }
+
+  // Inline markdown formatting (bold, italic, code, links, strikethrough).
+  function inlineFormat(text) {
+    let html = escapeHtml(text);
+    // Inline code (before other formatting to protect contents)
+    html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
+    // Bold + italic
+    html = html.replace(/\*\*\*(.+?)\*\*\*/g, '<strong><em>$1</em></strong>');
     // Bold
     html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
-
     // Italic
     html = html.replace(/\*(.+?)\*/g, '<em>$1</em>');
-
-    // Line breaks
-    html = html.replace(/\n/g, '<br>');
-
+    // Strikethrough
+    html = html.replace(/~~(.+?)~~/g, '<s>$1</s>');
+    // Links [text](url)
+    html = html.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
     return html;
   }
 
