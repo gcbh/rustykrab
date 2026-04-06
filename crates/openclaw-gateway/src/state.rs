@@ -3,7 +3,7 @@ use openclaw_channels::{SignalChannel, TelegramChannel};
 use openclaw_core::model::ModelProvider;
 use openclaw_core::orchestration::OrchestrationConfig;
 use openclaw_store::Store;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use crate::origin::OriginPolicy;
 use crate::rate_limit::{RateLimitConfig, RateLimiter};
@@ -14,7 +14,7 @@ pub struct AppState {
     pub store: Store,
     pub tools: Vec<Arc<dyn openclaw_core::Tool>>,
     pub provider: Arc<dyn ModelProvider>,
-    pub auth_token: String,
+    pub auth_token: Arc<RwLock<String>>,
     pub rate_limiter: Arc<RateLimiter>,
     pub origin_policy: OriginPolicy,
     pub telegram: Option<Arc<TelegramChannel>>,
@@ -44,7 +44,7 @@ impl AppState {
             store,
             tools,
             provider,
-            auth_token,
+            auth_token: Arc::new(RwLock::new(auth_token)),
             rate_limiter: Arc::new(RateLimiter::new(RateLimitConfig::default())),
             origin_policy: OriginPolicy::default(),
             telegram: None,
@@ -110,6 +110,15 @@ impl AppState {
     pub fn with_orchestration_config(mut self, config: OrchestrationConfig) -> Self {
         self.orchestration_config = config;
         self
+    }
+
+    /// Rotate the auth token: generates a new random token, stores it,
+    /// and returns the new value. The old token is immediately invalidated.
+    pub fn rotate_token(&self) -> String {
+        let new_token = crate::auth::generate_token();
+        let mut guard = self.auth_token.write().unwrap();
+        *guard = new_token.clone();
+        new_token
     }
 
     /// Get the harness profile for a given user message.

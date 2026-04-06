@@ -28,6 +28,7 @@ pub fn api_routes() -> Router<AppState> {
             post(send_message_stream),
         )
         .route("/api/health", get(health))
+        .route("/api/logout", post(logout))
 }
 
 #[derive(Deserialize)]
@@ -37,6 +38,16 @@ struct SendMessageRequest {
 
 async fn health() -> &'static str {
     "ok"
+}
+
+/// Rotate the auth token, invalidating the current session.
+/// The new token is printed to the server's stdout so the operator can
+/// retrieve it. The old token is immediately invalid.
+async fn logout(State(state): State<AppState>) -> StatusCode {
+    let new_token = state.rotate_token();
+    tracing::info!("auth token rotated via /api/logout");
+    println!("\n  New OPENCLAW_AUTH_TOKEN={new_token}\n");
+    StatusCode::NO_CONTENT
 }
 
 async fn create_conversation(

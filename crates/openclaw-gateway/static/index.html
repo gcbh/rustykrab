@@ -609,6 +609,12 @@
       </button>
     </div>
     <div class="conversation-list" id="conversationList"></div>
+    <div style="padding:12px;border-top:1px solid var(--border);">
+      <button class="btn-icon" id="logoutBtn" title="Logout" style="width:100%;display:flex;align-items:center;gap:8px;padding:8px;border-radius:8px;font-size:13px;color:var(--text-secondary);">
+        <svg viewBox="0 0 24 24" style="width:16px;height:16px;"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
+        Logout
+      </button>
+    </div>
   </nav>
 
   <!-- Main -->
@@ -693,10 +699,23 @@
         ...(opts.headers || {}),
       },
     });
+    if (res.status === 401) {
+      forceReauth();
+      throw new Error('Session expired');
+    }
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     if (res.status === 204) return null;
     return res.json();
   };
+
+  function forceReauth() {
+    token = '';
+    localStorage.removeItem('openclaw_token');
+    authModal.style.display = 'flex';
+    authError.style.display = 'none';
+    tokenInput.value = '';
+    tokenInput.focus();
+  }
 
   // ── Auth ──────────────────────────────────────────────────
   function checkAuth() {
@@ -734,6 +753,11 @@
 
   tokenInput.addEventListener('keydown', (e) => {
     if (e.key === 'Enter') authSubmit.click();
+  });
+
+  $('#logoutBtn').addEventListener('click', async () => {
+    try { await api('/api/logout', { method: 'POST' }); } catch {}
+    forceReauth();
   });
 
   // ── Init ──────────────────────────────────────────────────

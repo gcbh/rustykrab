@@ -41,8 +41,9 @@ pub async fn require_auth(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "));
 
+    let current_token = state.auth_token.read().unwrap().clone();
     match token {
-        Some(t) if constant_time_eq(t, &state.auth_token) => Ok(next.run(request).await),
+        Some(t) if constant_time_eq(t, &current_token) => Ok(next.run(request).await),
         _ => {
             // Track auth failures for rate limiting
             tracing::warn!(
