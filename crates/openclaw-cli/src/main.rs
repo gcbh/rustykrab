@@ -6,19 +6,33 @@ use openclaw_agent::{HarnessProfile, HarnessRouter, OrchestrationPipeline};
 use openclaw_core::model::ModelProvider;
 use openclaw_core::orchestration::OrchestrationConfig;
 use openclaw_skills::SkillRegistry;
+use tracing_subscriber::fmt;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .init();
-
     // --- Data directory ---
     let data_dir = dirs::data_local_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("."))
         .join("openclaw");
     std::fs::create_dir_all(&data_dir)?;
+
+    // --- Logging: stdout + rolling file ---
+    let log_dir = data_dir.join("logs");
+    std::fs::create_dir_all(&log_dir)?;
+
+    let file_appender = tracing_appender::rolling::daily(&log_dir, "openclaw.log");
+    let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
+
+    let env_filter = EnvFilter::from_default_env();
+
+    tracing_subscriber::registry()
+        .with(env_filter)
+        .with(fmt::layer().with_writer(std::io::stdout))
+        .with(fmt::layer().with_writer(non_blocking).with_ansi(false))
+        .init();
 
     // --- CLI subcommands ---
     let args: Vec<String> = std::env::args().collect();
