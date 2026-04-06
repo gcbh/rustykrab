@@ -1,35 +1,22 @@
 use async_trait::async_trait;
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use openclaw_core::types::ToolSchema;
 use openclaw_core::{Error, Result, Tool};
 use openclaw_store::SecretStore;
 use serde_json::{json, Value};
-use std::collections::HashMap;
-use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tracing::{debug, warn};
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
-const GOOGLE_AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
-const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
-const GMAIL_API_BASE: &str = "https://gmail.googleapis.com/gmail/v1/users/me";
-
-const GMAIL_SCOPES: &str =
-    "https://www.googleapis.com/auth/gmail.modify \
-     https://www.googleapis.com/auth/gmail.send \
-     https://www.googleapis.com/auth/gmail.readonly";
+const IMAP_HOST: &str = "imap.gmail.com";
+const IMAP_PORT: u16 = 993;
+const SMTP_HOST: &str = "smtp.gmail.com";
 
 // SecretStore keys
-const KEY_CLIENT_ID: &str = "gmail_client_id";
-const KEY_CLIENT_SECRET: &str = "gmail_client_secret";
-const KEY_ACCESS_TOKEN: &str = "gmail_access_token";
-const KEY_REFRESH_TOKEN: &str = "gmail_refresh_token";
-const KEY_TOKEN_EXPIRES_AT: &str = "gmail_token_expires_at";
+const KEY_EMAIL: &str = "gmail_email";
+const KEY_APP_PASSWORD: &str = "gmail_app_password";
 
-/// Maximum messages to enrich with metadata after a search.
+/// Maximum messages to return from a search.
 const MAX_SEARCH_RESULTS: usize = 50;
 
 // ---------------------------------------------------------------------------
@@ -38,240 +25,73 @@ const MAX_SEARCH_RESULTS: usize = 50;
 
 pub struct GmailTool {
     secrets: SecretStore,
-    client: reqwest::Client,
 }
 
 impl GmailTool {
     pub fn new(secrets: SecretStore) -> Self {
-        Self {
-            secrets,
-            client: reqwest::Client::new(),
-        }
+        Self { secrets }
     }
 
-    // -----------------------------------------------------------------------
-    // OAuth helpers
-    // -----------------------------------------------------------------------
-
-    /// Retrieve a valid access token, refreshing if expired.
-    async fn get_valid_token(&self) -> Result<String> {
-        let access_token = self
-            .secrets
-            .get(KEY_ACCESS_TOKEN)
-            .map_err(|_| Error::ToolExecution("Gmail not authenticated. Run gmail(action='auth') first.".into()))?;
-
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-
-        let expires_at: u64 = self
-            .secrets
-            .get(KEY_TOKEN_EXPIRES_AT)
-            .unwrap_or_else(|_| "0".to_string())
-            .parse()
-            .unwrap_or(0);
-
-        if now >= expires_at.saturating_sub(60) {
-            debug!("Gmail access token expired, refreshing");
-            return self.refresh_token().await;
-        }
-
-        Ok(access_token)
-    }
-
-    /// Exchange the refresh token for a new access token.
-    async fn refresh_token(&self) -> Result<String> {
-        let client_id = self.secrets.get(KEY_CLIENT_ID)
-            .map_err(|_| Error::ToolExecution("gmail_client_id not set".into()))?;
-        let client_secret = self.secrets.get(KEY_CLIENT_SECRET)
-            .map_err(|_| Error::ToolExecution("gmail_client_secret not set".into()))?;
-        let refresh_token = self.secrets.get(KEY_REFRESH_TOKEN)
-            .map_err(|_| Error::ToolExecution("gmail_refresh_token not found — re-run auth".into()))?;
-
-        let params = [
-            ("grant_type", "refresh_token"),
-            ("client_id", &client_id),
-            ("client_secret", &client_secret),
-            ("refresh_token", &refresh_token),
-        ];
-
-        let resp = self
-            .client
-            .post(GOOGLE_TOKEN_URL)
-            .form(&params)
-            .send()
-            .await
-            .map_err(|e| Error::ToolExecution(format!("token refresh request failed: {e}")))?;
-
-        let body: Value = parse_gmail_response(resp).await?;
-
-        let new_access = body["access_token"]
-            .as_str()
-            .ok_or_else(|| Error::ToolExecution("no access_token in refresh response".into()))?;
-        let expires_in = body["expires_in"].as_u64().unwrap_or(3600);
-
-        let expires_at = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs()
-            + expires_in;
-
-        self.secrets.set(KEY_ACCESS_TOKEN, new_access)
-            .map_err(|e| Error::ToolExecution(format!("failed to store access token: {e}")))?;
-        self.secrets.set(KEY_TOKEN_EXPIRES_AT, &expires_at.to_string())
-            .map_err(|e| Error::ToolExecution(format!("failed to store token expiry: {e}")))?;
-
-        // If Google returns a new refresh token, update it
-        if let Some(new_refresh) = body["refresh_token"].as_str() {
-            self.secrets.set(KEY_REFRESH_TOKEN, new_refresh)
-                .map_err(|e| Error::ToolExecution(format!("failed to store refresh token: {e}")))?;
-        }
-
-        Ok(new_access.to_string())
-    }
-
-    /// Make an authenticated Gmail API request with one 401 retry.
-    async fn gmail_request(
-        &self,
-        method: reqwest::Method,
-        url: &str,
-        body: Option<&Value>,
-    ) -> Result<Value> {
-        let token = self.get_valid_token().await?;
-
-        let mut req = self.client.request(method.clone(), url)
-            .bearer_auth(&token);
-        if let Some(b) = body {
-            req = req.json(b);
-        }
-
-        let resp = req.send().await
-            .map_err(|e| Error::ToolExecution(format!("Gmail request failed: {e}")))?;
-
-        if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
-            debug!("Gmail 401 — refreshing token and retrying");
-            let new_token = self.refresh_token().await?;
-
-            let mut retry = self.client.request(method, url)
-                .bearer_auth(&new_token);
-            if let Some(b) = body {
-                retry = retry.json(b);
-            }
-
-            let resp2 = retry.send().await
-                .map_err(|e| Error::ToolExecution(format!("Gmail retry failed: {e}")))?;
-            return parse_gmail_response(resp2).await;
-        }
-
-        parse_gmail_response(resp).await
-    }
-
-    // -----------------------------------------------------------------------
-    // Action: auth
-    // -----------------------------------------------------------------------
-
-    async fn action_auth(&self) -> Result<Value> {
-        let client_id = self.secrets.get(KEY_CLIENT_ID).map_err(|_| {
+    /// Get email and app password from the credential store.
+    fn get_credentials(&self) -> Result<(String, String)> {
+        let email = self.secrets.get(KEY_EMAIL).map_err(|_| {
             Error::ToolExecution(
-                "gmail_client_id not found. Store it with: \
-                 credential_write(action='set', name='gmail_client_id', value='YOUR_CLIENT_ID')"
+                "gmail_email not found. Store it with: \
+                 credential_write(action='set', name='gmail_email', value='you@gmail.com')"
                     .into(),
             )
         })?;
-        let client_secret = self.secrets.get(KEY_CLIENT_SECRET).map_err(|_| {
+        let password = self.secrets.get(KEY_APP_PASSWORD).map_err(|_| {
             Error::ToolExecution(
-                "gmail_client_secret not found. Store it with: \
-                 credential_write(action='set', name='gmail_client_secret', value='YOUR_SECRET')"
+                "gmail_app_password not found. Store it with: \
+                 credential_write(action='set', name='gmail_app_password', value='YOUR_APP_PASSWORD')"
                     .into(),
             )
         })?;
+        Ok((email, password))
+    }
 
-        // Bind a TCP listener on an ephemeral port
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .map_err(|e| Error::ToolExecution(format!("failed to bind listener: {e}")))?;
-        let port = listener
-            .local_addr()
-            .map_err(|e| Error::ToolExecution(format!("failed to get local addr: {e}")))?
-            .port();
-        let redirect_uri = format!("http://127.0.0.1:{port}");
+    /// Connect to Gmail IMAP with TLS.
+    fn connect_imap(&self) -> Result<imap::Session<native_tls::TlsStream<std::net::TcpStream>>> {
+        let (email, password) = self.get_credentials()?;
+        let tls = native_tls::TlsConnector::builder()
+            .build()
+            .map_err(|e| Error::ToolExecution(format!("TLS setup failed: {e}")))?;
+        let client = imap::connect((IMAP_HOST, IMAP_PORT), IMAP_HOST, &tls)
+            .map_err(|e| Error::ToolExecution(format!("IMAP connect failed: {e}")))?;
+        let session = client
+            .login(&email, &password)
+            .map_err(|e| Error::ToolExecution(format!("IMAP login failed: {}", e.0)))?;
+        Ok(session)
+    }
 
-        // Build the authorization URL
-        let auth_url = format!(
-            "{GOOGLE_AUTH_URL}?{}",
-            urlencoded(&[
-                ("client_id", client_id.as_str()),
-                ("redirect_uri", redirect_uri.as_str()),
-                ("response_type", "code"),
-                ("scope", GMAIL_SCOPES),
-                ("access_type", "offline"),
-                ("prompt", "consent"),
-            ])
-        );
+    // -----------------------------------------------------------------------
+    // Action: setup
+    // -----------------------------------------------------------------------
 
-        // Try to open browser
-        open_browser(&auth_url);
-
-        let auth_msg = format!(
-            "Opening browser for Gmail authorization.\n\
-             If the browser didn't open, visit:\n{auth_url}"
-        );
-
-        // Wait for the callback (120s timeout)
-        let code = tokio::time::timeout(
-            std::time::Duration::from_secs(120),
-            accept_oauth_callback(&listener),
-        )
-        .await
-        .map_err(|_| Error::ToolExecution("OAuth callback timed out after 120s".into()))?
-        .map_err(|e| Error::ToolExecution(format!("OAuth callback failed: {e}")))?;
-
-        // Exchange code for tokens
-        let params = [
-            ("grant_type", "authorization_code"),
-            ("code", code.as_str()),
-            ("client_id", client_id.as_str()),
-            ("client_secret", client_secret.as_str()),
-            ("redirect_uri", redirect_uri.as_str()),
-        ];
-
-        let resp = self
-            .client
-            .post(GOOGLE_TOKEN_URL)
-            .form(&params)
-            .send()
-            .await
-            .map_err(|e| Error::ToolExecution(format!("token exchange failed: {e}")))?;
-
-        let body: Value = parse_gmail_response(resp).await?;
-
-        let access_token = body["access_token"]
+    async fn action_setup(&self, args: &Value) -> Result<Value> {
+        let email = args["email"]
             .as_str()
-            .ok_or_else(|| Error::ToolExecution("no access_token in response".into()))?;
-        let refresh_token = body["refresh_token"]
+            .ok_or_else(|| Error::ToolExecution("missing 'email' parameter".into()))?;
+        let app_password = args["app_password"]
             .as_str()
-            .ok_or_else(|| Error::ToolExecution("no refresh_token in response".into()))?;
-        let expires_in = body["expires_in"].as_u64().unwrap_or(3600);
+            .ok_or_else(|| Error::ToolExecution("missing 'app_password' parameter".into()))?;
 
-        let expires_at = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs()
-            + expires_in;
+        self.secrets
+            .set(KEY_EMAIL, email)
+            .map_err(|e| Error::ToolExecution(format!("failed to store email: {e}")))?;
+        self.secrets
+            .set(KEY_APP_PASSWORD, app_password)
+            .map_err(|e| Error::ToolExecution(format!("failed to store app password: {e}")))?;
 
-        // Store all tokens
-        self.secrets.set(KEY_ACCESS_TOKEN, access_token)
-            .map_err(|e| Error::ToolExecution(format!("failed to store access token: {e}")))?;
-        self.secrets.set(KEY_REFRESH_TOKEN, refresh_token)
-            .map_err(|e| Error::ToolExecution(format!("failed to store refresh token: {e}")))?;
-        self.secrets.set(KEY_TOKEN_EXPIRES_AT, &expires_at.to_string())
-            .map_err(|e| Error::ToolExecution(format!("failed to store expiry: {e}")))?;
+        // Verify credentials by connecting to IMAP.
+        let mut session = self.connect_imap()?;
+        let _ = session.logout();
 
         Ok(json!({
             "status": "authenticated",
-            "message": auth_msg,
-            "expires_in_seconds": expires_in,
+            "email": email,
+            "message": "Gmail credentials stored and verified via IMAP."
         }))
     }
 
@@ -280,66 +100,101 @@ impl GmailTool {
     // -----------------------------------------------------------------------
 
     async fn action_search(&self, args: &Value) -> Result<Value> {
-        let query = args["query"].as_str().unwrap_or("is:inbox");
-        let max_results = args["max_results"].as_u64().unwrap_or(20).min(MAX_SEARCH_RESULTS as u64);
-        let page_token = args["page_token"].as_str();
+        let query = args["query"].as_str().unwrap_or("ALL");
+        let max_results = args["max_results"]
+            .as_u64()
+            .unwrap_or(20)
+            .min(MAX_SEARCH_RESULTS as u64) as usize;
+        let mailbox = args["mailbox"].as_str().unwrap_or("INBOX");
 
-        let mut url = format!(
-            "{GMAIL_API_BASE}/messages?q={}&maxResults={max_results}",
-            urlencoded_value(query),
-        );
-        if let Some(pt) = page_token {
-            url.push_str(&format!("&pageToken={pt}"));
-        }
+        // IMAP is blocking, run in spawn_blocking.
+        let secrets = self.secrets.clone();
+        let query = query.to_string();
+        let mailbox = mailbox.to_string();
 
-        let list: Value = self.gmail_request(reqwest::Method::GET, &url, None).await?;
+        tokio::task::spawn_blocking(move || {
+            let (email, password) = get_creds(&secrets)?;
+            let mut session = connect_imap_blocking(&email, &password)?;
 
-        let messages = list["messages"].as_array();
-        if messages.is_none() || messages.unwrap().is_empty() {
-            return Ok(json!({
-                "messages": [],
-                "result_size_estimate": 0,
-                "next_page_token": list.get("nextPageToken"),
-            }));
-        }
+            session
+                .select(&mailbox)
+                .map_err(|e| Error::ToolExecution(format!("select {mailbox} failed: {e}")))?;
 
-        let msg_ids: Vec<&str> = messages
-            .unwrap()
-            .iter()
-            .filter_map(|m| m["id"].as_str())
-            .collect();
+            // Use Gmail's X-GM-RAW extension for full search syntax,
+            // falling back to standard IMAP SEARCH.
+            let uids = session
+                .uid_search(&format!("X-GM-RAW \"{query}\""))
+                .or_else(|_| session.uid_search(&query))
+                .map_err(|e| Error::ToolExecution(format!("search failed: {e}")))?;
 
-        // Fetch metadata for each message
-        let mut enriched = Vec::with_capacity(msg_ids.len());
-        for id in &msg_ids {
-            let meta_url = format!(
-                "{GMAIL_API_BASE}/messages/{id}?format=metadata&metadataHeaders=Subject&metadataHeaders=From&metadataHeaders=Date"
-            );
-            match self.gmail_request(reqwest::Method::GET, &meta_url, None).await {
-                Ok(meta) => {
-                    let headers = extract_headers(&meta);
-                    enriched.push(json!({
-                        "id": id,
-                        "thread_id": meta.get("threadId"),
-                        "subject": headers.get("Subject").unwrap_or(&String::new()),
-                        "from": headers.get("From").unwrap_or(&String::new()),
-                        "date": headers.get("Date").unwrap_or(&String::new()),
-                        "snippet": meta.get("snippet").and_then(|s| s.as_str()).unwrap_or(""),
-                        "label_ids": meta.get("labelIds"),
-                    }));
-                }
-                Err(e) => {
-                    warn!("Failed to fetch metadata for message {id}: {e}");
-                    enriched.push(json!({ "id": id, "error": e.to_string() }));
-                }
+            // Take the most recent UIDs (highest numbers = newest).
+            let mut uid_list: Vec<u32> = uids.into_iter().collect();
+            uid_list.sort_unstable_by(|a, b| b.cmp(a));
+            uid_list.truncate(max_results);
+
+            if uid_list.is_empty() {
+                let _ = session.logout();
+                return Ok(json!({ "messages": [], "count": 0 }));
             }
-        }
 
-        Ok(json!({
-            "messages": enriched,
-            "result_size_estimate": list.get("resultSizeEstimate"),
-            "next_page_token": list.get("nextPageToken"),
-        }))
+            let uid_set = uid_list
+                .iter()
+                .map(|u| u.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+
+            let fetches = session
+                .uid_fetch(&uid_set, "(UID ENVELOPE FLAGS)")
+                .map_err(|e| Error::ToolExecution(format!("fetch failed: {e}")))?;
+
+            let mut messages = Vec::new();
+            for fetch in fetches.iter() {
+                let envelope = match fetch.envelope() {
+                    Some(e) => e,
+                    None => continue,
+                };
+
+                let subject = envelope
+                    .subject
+                    .as_ref()
+                    .map(|s| decode_imap_string(s))
+                    .unwrap_or_default();
+                let from = envelope
+                    .from
+                    .as_ref()
+                    .and_then(|addrs| addrs.first())
+                    .map(|a| format_address(a))
+                    .unwrap_or_default();
+                let date = envelope
+                    .date
+                    .as_ref()
+                    .map(|d| decode_imap_string(d))
+                    .unwrap_or_default();
+
+                let flags: Vec<String> = fetch
+                    .flags()
+                    .iter()
+                    .map(|f| format!("{f:?}"))
+                    .collect();
+
+                messages.push(json!({
+                    "uid": fetch.uid.unwrap_or(0),
+                    "subject": subject,
+                    "from": from,
+                    "date": date,
+                    "flags": flags,
+                }));
+            }
+
+            let _ = session.logout();
+
+            Ok(json!({
+                "messages": messages,
+                "count": messages.len(),
+            }))
+        })
+        .await
+        .map_err(|e| Error::ToolExecution(format!("task join failed: {e}")))?
     }
 
     // -----------------------------------------------------------------------
@@ -347,29 +202,87 @@ impl GmailTool {
     // -----------------------------------------------------------------------
 
     async fn action_read(&self, args: &Value) -> Result<Value> {
-        let message_id = args["message_id"]
-            .as_str()
-            .ok_or_else(|| Error::ToolExecution("missing message_id".into()))?;
+        let uid: u32 = args["uid"]
+            .as_u64()
+            .ok_or_else(|| Error::ToolExecution("missing 'uid' (use search to find UIDs)".into()))?
+            as u32;
+        let mailbox = args["mailbox"].as_str().unwrap_or("INBOX");
 
-        let url = format!("{GMAIL_API_BASE}/messages/{message_id}?format=full");
-        let msg: Value = self.gmail_request(reqwest::Method::GET, &url, None).await?;
+        let secrets = self.secrets.clone();
+        let mailbox = mailbox.to_string();
 
-        let headers = extract_headers(&msg);
-        let body_text = extract_body(&msg);
+        tokio::task::spawn_blocking(move || {
+            let (email, password) = get_creds(&secrets)?;
+            let mut session = connect_imap_blocking(&email, &password)?;
 
-        Ok(json!({
-            "id": msg.get("id"),
-            "thread_id": msg.get("threadId"),
-            "label_ids": msg.get("labelIds"),
-            "snippet": msg.get("snippet"),
-            "subject": headers.get("Subject").unwrap_or(&String::new()),
-            "from": headers.get("From").unwrap_or(&String::new()),
-            "to": headers.get("To").unwrap_or(&String::new()),
-            "cc": headers.get("Cc").unwrap_or(&String::new()),
-            "date": headers.get("Date").unwrap_or(&String::new()),
-            "message_id_header": headers.get("Message-ID").or_else(|| headers.get("Message-Id")).unwrap_or(&String::new()),
-            "body": body_text,
-        }))
+            session
+                .select(&mailbox)
+                .map_err(|e| Error::ToolExecution(format!("select {mailbox} failed: {e}")))?;
+
+            let fetches = session
+                .uid_fetch(uid.to_string(), "(UID RFC822 FLAGS ENVELOPE)")
+                .map_err(|e| Error::ToolExecution(format!("fetch uid {uid} failed: {e}")))?;
+
+            let fetch = fetches
+                .iter()
+                .next()
+                .ok_or_else(|| Error::ToolExecution(format!("message uid {uid} not found")))?;
+
+            let raw_body = fetch.body().unwrap_or_default();
+            let parsed = mail_parser::MessageParser::default()
+                .parse(raw_body)
+                .ok_or_else(|| Error::ToolExecution("failed to parse email".into()))?;
+
+            let subject = parsed.subject().unwrap_or("").to_string();
+            let from = parsed
+                .from()
+                .and_then(|a| a.first())
+                .map(|a| {
+                    a.name()
+                        .map(|n| format!("{n} <{}>", a.address().unwrap_or("")))
+                        .unwrap_or_else(|| a.address().unwrap_or("").to_string())
+                })
+                .unwrap_or_default();
+            let to = parsed
+                .to()
+                .and_then(|a| a.first())
+                .and_then(|a| a.address())
+                .unwrap_or("")
+                .to_string();
+            let date = parsed.date().map(|d| d.to_string()).unwrap_or_default();
+            let body_text = parsed
+                .body_text(0)
+                .unwrap_or_else(|| {
+                    parsed
+                        .body_html(0)
+                        .map(|h| strip_html_tags(&h).into())
+                        .unwrap_or_default()
+                })
+                .to_string();
+
+            // Truncate very long bodies to avoid blowing up context.
+            let body_text = if body_text.len() > 8000 {
+                format!("{}…\n[truncated, {} chars total]", &body_text[..body_text.floor_char_boundary(8000)], body_text.len())
+            } else {
+                body_text
+            };
+
+            let flags: Vec<String> = fetch.flags().iter().map(|f| format!("{f:?}")).collect();
+
+            let _ = session.logout();
+
+            Ok(json!({
+                "uid": uid,
+                "subject": subject,
+                "from": from,
+                "to": to,
+                "date": date,
+                "body": body_text,
+                "flags": flags,
+            }))
+        })
+        .await
+        .map_err(|e| Error::ToolExecution(format!("task join failed: {e}")))?
     }
 
     // -----------------------------------------------------------------------
@@ -385,142 +298,202 @@ impl GmailTool {
             .as_str()
             .ok_or_else(|| Error::ToolExecution("missing 'body'".into()))?;
         let cc = args["cc"].as_str();
-        let bcc = args["bcc"].as_str();
-        let thread_id = args["thread_id"].as_str();
         let in_reply_to = args["in_reply_to"].as_str();
 
-        let raw = build_rfc2822_message(to, subject, body, cc, bcc, in_reply_to);
-        let encoded = base64_url_encode(raw.as_bytes());
+        let (email, password) = self.get_credentials()?;
 
-        let mut payload = json!({ "raw": encoded });
-        if let Some(tid) = thread_id {
-            payload["threadId"] = json!(tid);
+        let mut message_builder = lettre::message::Message::builder()
+            .from(email.parse().map_err(|e| Error::ToolExecution(format!("invalid from address: {e}")))?)
+            .to(to.parse().map_err(|e| Error::ToolExecution(format!("invalid to address: {e}")))?)
+            .subject(subject);
+
+        if let Some(cc_addr) = cc {
+            message_builder = message_builder.cc(
+                cc_addr.parse().map_err(|e| Error::ToolExecution(format!("invalid cc address: {e}")))?
+            );
+        }
+        if let Some(reply_id) = in_reply_to {
+            message_builder = message_builder.in_reply_to(reply_id.to_string());
         }
 
-        let url = format!("{GMAIL_API_BASE}/messages/send");
-        let result = self.gmail_request(reqwest::Method::POST, &url, Some(&payload)).await?;
+        let email_msg = message_builder
+            .body(body.to_string())
+            .map_err(|e| Error::ToolExecution(format!("failed to build email: {e}")))?;
+
+        let creds = lettre::transport::smtp::authentication::Credentials::new(
+            email.clone(),
+            password,
+        );
+
+        // SMTP is blocking in lettre's sync transport; use async transport.
+        use lettre::{AsyncSmtpTransport, AsyncTransport, Tokio1Executor};
+
+        let mailer = AsyncSmtpTransport::<Tokio1Executor>::relay(SMTP_HOST)
+            .map_err(|e| Error::ToolExecution(format!("SMTP relay setup failed: {e}")))?
+            .credentials(creds)
+            .build();
+
+        mailer
+            .send(email_msg)
+            .await
+            .map_err(|e| Error::ToolExecution(format!("send failed: {e}")))?;
 
         Ok(json!({
             "status": "sent",
-            "id": result.get("id"),
-            "thread_id": result.get("threadId"),
-            "label_ids": result.get("labelIds"),
+            "to": to,
+            "subject": subject,
         }))
     }
 
     // -----------------------------------------------------------------------
-    // Action: draft
-    // -----------------------------------------------------------------------
-
-    async fn action_draft(&self, args: &Value) -> Result<Value> {
-        let to = args["to"].as_str().unwrap_or("");
-        let subject = args["subject"].as_str().unwrap_or("(no subject)");
-        let body = args["body"]
-            .as_str()
-            .ok_or_else(|| Error::ToolExecution("missing 'body'".into()))?;
-        let cc = args["cc"].as_str();
-        let bcc = args["bcc"].as_str();
-        let thread_id = args["thread_id"].as_str();
-        let in_reply_to = args["in_reply_to"].as_str();
-
-        let raw = build_rfc2822_message(to, subject, body, cc, bcc, in_reply_to);
-        let encoded = base64_url_encode(raw.as_bytes());
-
-        let mut message = json!({ "raw": encoded });
-        if let Some(tid) = thread_id {
-            message["threadId"] = json!(tid);
-        }
-
-        let payload = json!({ "message": message });
-        let url = format!("{GMAIL_API_BASE}/drafts");
-        let result = self.gmail_request(reqwest::Method::POST, &url, Some(&payload)).await?;
-
-        Ok(json!({
-            "status": "draft_created",
-            "draft_id": result.get("id"),
-            "message_id": result.get("message").and_then(|m| m.get("id")),
-            "thread_id": result.get("message").and_then(|m| m.get("threadId")),
-        }))
-    }
-
-    // -----------------------------------------------------------------------
-    // Action: labels
+    // Action: labels (list mailboxes)
     // -----------------------------------------------------------------------
 
     async fn action_labels(&self) -> Result<Value> {
-        let url = format!("{GMAIL_API_BASE}/labels");
-        let result = self.gmail_request(reqwest::Method::GET, &url, None).await?;
+        let secrets = self.secrets.clone();
 
-        let labels = result["labels"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .map(|l| {
-                        json!({
-                            "id": l.get("id"),
-                            "name": l.get("name"),
-                            "type": l.get("type"),
-                        })
+        tokio::task::spawn_blocking(move || {
+            let (email, password) = get_creds(&secrets)?;
+            let mut session = connect_imap_blocking(&email, &password)?;
+
+            let mailboxes = session
+                .list(Some(""), Some("*"))
+                .map_err(|e| Error::ToolExecution(format!("list mailboxes failed: {e}")))?;
+
+            let labels: Vec<Value> = mailboxes
+                .iter()
+                .map(|mb| {
+                    json!({
+                        "name": mb.name(),
+                        "delimiter": mb.delimiter().map(|c| c.to_string()),
                     })
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+                })
+                .collect();
 
-        Ok(json!({ "labels": labels }))
+            let _ = session.logout();
+
+            Ok(json!({ "labels": labels }))
+        })
+        .await
+        .map_err(|e| Error::ToolExecution(format!("task join failed: {e}")))?
     }
 
     // -----------------------------------------------------------------------
-    // Action: modify
+    // Action: move (move message to a different mailbox/label)
     // -----------------------------------------------------------------------
 
-    async fn action_modify(&self, args: &Value) -> Result<Value> {
-        let message_id = args["message_id"]
+    async fn action_move(&self, args: &Value) -> Result<Value> {
+        let uid: u32 = args["uid"]
+            .as_u64()
+            .ok_or_else(|| Error::ToolExecution("missing 'uid'".into()))?
+            as u32;
+        let from_mailbox = args["mailbox"].as_str().unwrap_or("INBOX");
+        let to_mailbox = args["to_mailbox"]
             .as_str()
-            .ok_or_else(|| Error::ToolExecution("missing message_id".into()))?;
+            .ok_or_else(|| Error::ToolExecution("missing 'to_mailbox'".into()))?;
 
-        let mut payload = json!({});
+        let secrets = self.secrets.clone();
+        let from_mailbox = from_mailbox.to_string();
+        let to_mailbox = to_mailbox.to_string();
 
-        if let Some(add) = args.get("add_labels") {
-            payload["addLabelIds"] = add.clone();
-        }
-        if let Some(remove) = args.get("remove_labels") {
-            payload["removeLabelIds"] = remove.clone();
-        }
+        tokio::task::spawn_blocking(move || {
+            let (email, password) = get_creds(&secrets)?;
+            let mut session = connect_imap_blocking(&email, &password)?;
 
-        let url = format!("{GMAIL_API_BASE}/messages/{message_id}/modify");
-        let result = self.gmail_request(reqwest::Method::POST, &url, Some(&payload)).await?;
+            session
+                .select(&from_mailbox)
+                .map_err(|e| Error::ToolExecution(format!("select {from_mailbox} failed: {e}")))?;
 
-        Ok(json!({
-            "status": "modified",
-            "id": result.get("id"),
-            "label_ids": result.get("labelIds"),
-        }))
+            session
+                .uid_mv(uid.to_string(), &to_mailbox)
+                .map_err(|e| Error::ToolExecution(format!("move failed: {e}")))?;
+
+            let _ = session.logout();
+
+            Ok(json!({
+                "status": "moved",
+                "uid": uid,
+                "from": from_mailbox,
+                "to": to_mailbox,
+            }))
+        })
+        .await
+        .map_err(|e| Error::ToolExecution(format!("task join failed: {e}")))?
     }
 
     // -----------------------------------------------------------------------
-    // Action: trash / untrash
+    // Action: trash
     // -----------------------------------------------------------------------
 
     async fn action_trash(&self, args: &Value) -> Result<Value> {
-        let message_id = args["message_id"]
-            .as_str()
-            .ok_or_else(|| Error::ToolExecution("missing message_id".into()))?;
+        let uid: u32 = args["uid"]
+            .as_u64()
+            .ok_or_else(|| Error::ToolExecution("missing 'uid'".into()))?
+            as u32;
+        let mailbox = args["mailbox"].as_str().unwrap_or("INBOX");
 
-        let url = format!("{GMAIL_API_BASE}/messages/{message_id}/trash");
-        self.gmail_request(reqwest::Method::POST, &url, None).await?;
+        let secrets = self.secrets.clone();
+        let mailbox = mailbox.to_string();
 
-        Ok(json!({ "status": "trashed", "message_id": message_id }))
+        tokio::task::spawn_blocking(move || {
+            let (email, password) = get_creds(&secrets)?;
+            let mut session = connect_imap_blocking(&email, &password)?;
+
+            session
+                .select(&mailbox)
+                .map_err(|e| Error::ToolExecution(format!("select {mailbox} failed: {e}")))?;
+
+            session
+                .uid_mv(uid.to_string(), "[Gmail]/Trash")
+                .map_err(|e| Error::ToolExecution(format!("trash failed: {e}")))?;
+
+            let _ = session.logout();
+
+            Ok(json!({ "status": "trashed", "uid": uid }))
+        })
+        .await
+        .map_err(|e| Error::ToolExecution(format!("task join failed: {e}")))?
     }
 
-    async fn action_untrash(&self, args: &Value) -> Result<Value> {
-        let message_id = args["message_id"]
-            .as_str()
-            .ok_or_else(|| Error::ToolExecution("missing message_id".into()))?;
+    // -----------------------------------------------------------------------
+    // Action: mark_read / mark_unread
+    // -----------------------------------------------------------------------
 
-        let url = format!("{GMAIL_API_BASE}/messages/{message_id}/untrash");
-        self.gmail_request(reqwest::Method::POST, &url, None).await?;
+    async fn action_mark(&self, args: &Value, read: bool) -> Result<Value> {
+        let uid: u32 = args["uid"]
+            .as_u64()
+            .ok_or_else(|| Error::ToolExecution("missing 'uid'".into()))?
+            as u32;
+        let mailbox = args["mailbox"].as_str().unwrap_or("INBOX");
 
-        Ok(json!({ "status": "untrashed", "message_id": message_id }))
+        let secrets = self.secrets.clone();
+        let mailbox = mailbox.to_string();
+
+        tokio::task::spawn_blocking(move || {
+            let (email, password) = get_creds(&secrets)?;
+            let mut session = connect_imap_blocking(&email, &password)?;
+
+            session
+                .select(&mailbox)
+                .map_err(|e| Error::ToolExecution(format!("select {mailbox} failed: {e}")))?;
+
+            if read {
+                session
+                    .uid_store(uid.to_string(), "+FLAGS (\\Seen)")
+                    .map_err(|e| Error::ToolExecution(format!("mark read failed: {e}")))?;
+            } else {
+                session
+                    .uid_store(uid.to_string(), "-FLAGS (\\Seen)")
+                    .map_err(|e| Error::ToolExecution(format!("mark unread failed: {e}")))?;
+            }
+
+            let _ = session.logout();
+
+            let status = if read { "marked_read" } else { "marked_unread" };
+            Ok(json!({ "status": status, "uid": uid }))
+        })
+        .await
+        .map_err(|e| Error::ToolExecution(format!("task join failed: {e}")))?
     }
 }
 
@@ -535,9 +508,9 @@ impl Tool for GmailTool {
     }
 
     fn description(&self) -> &str {
-        "Interact with Gmail via the REST API. Supports OAuth2 authentication, searching, \
-         reading, sending, drafting, labelling, and trashing messages. Requires gmail_client_id \
-         and gmail_client_secret credentials to be stored first."
+        "Interact with Gmail via IMAP/SMTP using an app password. Supports searching, \
+         reading, sending, listing labels, moving messages, marking read/unread, and trashing. \
+         Requires gmail_email and gmail_app_password credentials to be stored first."
     }
 
     fn schema(&self) -> ToolSchema {
@@ -549,62 +522,56 @@ impl Tool for GmailTool {
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["auth", "search", "read", "send", "draft", "labels", "modify", "trash", "untrash"],
+                        "enum": ["setup", "search", "read", "send", "labels", "move", "trash", "mark_read", "mark_unread"],
                         "description": "Action to perform"
+                    },
+                    "email": {
+                        "type": "string",
+                        "description": "Gmail address (for 'setup' action)"
+                    },
+                    "app_password": {
+                        "type": "string",
+                        "description": "Gmail app password (for 'setup' action)"
                     },
                     "query": {
                         "type": "string",
-                        "description": "Gmail search query (for 'search' action, e.g. 'is:unread from:boss@example.com')"
+                        "description": "Search query (for 'search' action). Supports Gmail search syntax e.g. 'is:unread from:boss@example.com'"
                     },
                     "max_results": {
                         "type": "integer",
                         "description": "Max messages to return (search, default 20, max 50)"
                     },
-                    "page_token": {
+                    "mailbox": {
                         "type": "string",
-                        "description": "Pagination token from a previous search"
+                        "description": "Mailbox/label to operate on (default 'INBOX')"
                     },
-                    "message_id": {
-                        "type": "string",
-                        "description": "Gmail message ID (for read/modify/trash/untrash)"
+                    "uid": {
+                        "type": "integer",
+                        "description": "Message UID (for read/move/trash/mark_read/mark_unread)"
                     },
                     "to": {
                         "type": "string",
-                        "description": "Recipient email address (for send/draft)"
+                        "description": "Recipient email address (for send)"
                     },
                     "subject": {
                         "type": "string",
-                        "description": "Email subject (for send/draft)"
+                        "description": "Email subject (for send)"
                     },
                     "body": {
                         "type": "string",
-                        "description": "Email body text (for send/draft)"
+                        "description": "Email body text (for send)"
                     },
                     "cc": {
                         "type": "string",
-                        "description": "CC recipients, comma-separated (for send/draft)"
-                    },
-                    "bcc": {
-                        "type": "string",
-                        "description": "BCC recipients, comma-separated (for send/draft)"
-                    },
-                    "thread_id": {
-                        "type": "string",
-                        "description": "Thread ID to reply within (for send/draft)"
+                        "description": "CC recipient (for send)"
                     },
                     "in_reply_to": {
                         "type": "string",
-                        "description": "Message-ID header of the message being replied to (for send/draft)"
+                        "description": "Message-ID to reply to (for send)"
                     },
-                    "add_labels": {
-                        "type": "array",
-                        "items": { "type": "string" },
-                        "description": "Label IDs to add (for modify)"
-                    },
-                    "remove_labels": {
-                        "type": "array",
-                        "items": { "type": "string" },
-                        "description": "Label IDs to remove (for modify)"
+                    "to_mailbox": {
+                        "type": "string",
+                        "description": "Destination mailbox/label (for 'move' action)"
                     }
                 },
                 "required": ["action"]
@@ -618,17 +585,17 @@ impl Tool for GmailTool {
             .ok_or_else(|| Error::ToolExecution("missing action".into()))?;
 
         match action {
-            "auth" => self.action_auth().await,
+            "setup" => self.action_setup(&args).await,
             "search" => self.action_search(&args).await,
             "read" => self.action_read(&args).await,
             "send" => self.action_send(&args).await,
-            "draft" => self.action_draft(&args).await,
             "labels" => self.action_labels().await,
-            "modify" => self.action_modify(&args).await,
+            "move" => self.action_move(&args).await,
             "trash" => self.action_trash(&args).await,
-            "untrash" => self.action_untrash(&args).await,
+            "mark_read" => self.action_mark(&args, true).await,
+            "mark_unread" => self.action_mark(&args, false).await,
             other => Err(Error::ToolExecution(format!(
-                "unknown action '{other}', expected one of: auth, search, read, send, draft, labels, modify, trash, untrash"
+                "unknown action '{other}', expected one of: setup, search, read, send, labels, move, trash, mark_read, mark_unread"
             ))),
         }
     }
@@ -638,214 +605,56 @@ impl Tool for GmailTool {
 // Module-private helpers
 // ---------------------------------------------------------------------------
 
-/// Parse a Gmail API response: check status, decode JSON.
-async fn parse_gmail_response(resp: reqwest::Response) -> Result<Value> {
-    let status = resp.status();
-    let body = resp
-        .text()
-        .await
-        .map_err(|e| Error::ToolExecution(format!("failed to read response body: {e}")))?;
-
-    if !status.is_success() {
-        return Err(Error::ToolExecution(format!(
-            "Gmail API error (HTTP {status}): {body}"
-        )));
-    }
-
-    if body.is_empty() {
-        return Ok(json!({}));
-    }
-
-    serde_json::from_str(&body)
-        .map_err(|e| Error::ToolExecution(format!("failed to parse Gmail response: {e}")))
+/// Get credentials from SecretStore (for use in spawn_blocking closures).
+fn get_creds(secrets: &SecretStore) -> Result<(String, String)> {
+    let email = secrets.get(KEY_EMAIL).map_err(|_| {
+        Error::ToolExecution("gmail_email not configured. Run gmail(action='setup') first.".into())
+    })?;
+    let password = secrets.get(KEY_APP_PASSWORD).map_err(|_| {
+        Error::ToolExecution(
+            "gmail_app_password not configured. Run gmail(action='setup') first.".into(),
+        )
+    })?;
+    Ok((email, password))
 }
 
-/// Accept the OAuth redirect on the loopback listener, extract the `code` parameter.
-async fn accept_oauth_callback(listener: &tokio::net::TcpListener) -> Result<String> {
-    let (mut stream, _) = listener
-        .accept()
-        .await
-        .map_err(|e| Error::ToolExecution(format!("accept failed: {e}")))?;
-
-    let mut buf = vec![0u8; 4096];
-    let n = stream
-        .read(&mut buf)
-        .await
-        .map_err(|e| Error::ToolExecution(format!("read failed: {e}")))?;
-    let request = String::from_utf8_lossy(&buf[..n]);
-
-    // Extract the GET path
-    let path = request
-        .lines()
-        .next()
-        .and_then(|line| line.split_whitespace().nth(1))
-        .ok_or_else(|| Error::ToolExecution("invalid HTTP request from OAuth callback".into()))?;
-
-    // Parse query parameters
-    let query_string = path.split('?').nth(1).unwrap_or("");
-    let params: HashMap<String, String> =
-        url::form_urlencoded::parse(query_string.as_bytes())
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect();
-
-    // Check for error
-    if let Some(err) = params.get("error") {
-        let html = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n\
-             <html><body><h2>Authorization Failed</h2><p>{err}</p>\
-             <p>You can close this window.</p></body></html>"
-        );
-        let _ = stream.write_all(html.as_bytes()).await;
-        return Err(Error::ToolExecution(format!("OAuth error: {err}")));
-    }
-
-    let code = params
-        .get("code")
-        .ok_or_else(|| Error::ToolExecution("no 'code' parameter in OAuth callback".into()))?
-        .clone();
-
-    // Send success page
-    let html = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n\
-                <html><body><h2>Gmail Authorization Successful</h2>\
-                <p>You can close this window and return to the agent.</p></body></html>";
-    let _ = stream.write_all(html.as_bytes()).await;
-
-    Ok(code)
+/// Connect to Gmail IMAP (blocking, for use in spawn_blocking).
+fn connect_imap_blocking(
+    email: &str,
+    password: &str,
+) -> Result<imap::Session<native_tls::TlsStream<std::net::TcpStream>>> {
+    let tls = native_tls::TlsConnector::builder()
+        .build()
+        .map_err(|e| Error::ToolExecution(format!("TLS setup failed: {e}")))?;
+    let client = imap::connect((IMAP_HOST, IMAP_PORT), IMAP_HOST, &tls)
+        .map_err(|e| Error::ToolExecution(format!("IMAP connect failed: {e}")))?;
+    let session = client
+        .login(email, password)
+        .map_err(|e| Error::ToolExecution(format!("IMAP login failed: {}", e.0)))?;
+    Ok(session)
 }
 
-/// Open a URL in the default browser.
-fn open_browser(url: &str) {
-    #[cfg(target_os = "macos")]
-    let cmd = "open";
-    #[cfg(target_os = "linux")]
-    let cmd = "xdg-open";
-    #[cfg(target_os = "windows")]
-    let cmd = "start";
-
-    if let Err(e) = std::process::Command::new(cmd).arg(url).spawn() {
-        warn!("Failed to open browser: {e}");
-    }
+/// Decode an IMAP string (may be UTF-7 encoded).
+fn decode_imap_string(s: &[u8]) -> String {
+    String::from_utf8_lossy(s).to_string()
 }
 
-/// Extract headers from a Gmail message payload into a HashMap.
-fn extract_headers(msg: &Value) -> HashMap<String, String> {
-    let mut map = HashMap::new();
-    if let Some(headers) = msg
-        .get("payload")
-        .and_then(|p| p.get("headers"))
-        .and_then(|h| h.as_array())
-    {
-        for h in headers {
-            if let (Some(name), Some(value)) = (h["name"].as_str(), h["value"].as_str()) {
-                map.insert(name.to_string(), value.to_string());
-            }
-        }
-    }
-    map
-}
+/// Format an IMAP address into a readable string.
+fn format_address(addr: &imap_proto::types::Address) -> String {
+    let name = addr.name.as_ref().map(|n| decode_imap_string(n));
+    let mailbox = addr.mailbox.as_ref().map(|m| decode_imap_string(m));
+    let host = addr.host.as_ref().map(|h| decode_imap_string(h));
 
-/// Extract the best text body from a Gmail message payload.
-///
-/// Prefers text/plain, falls back to text/html with tag stripping.
-/// Handles multipart messages by recursing through MIME parts.
-fn extract_body(msg: &Value) -> String {
-    let payload = match msg.get("payload") {
-        Some(p) => p,
-        None => return String::new(),
+    let email_addr = match (mailbox, host) {
+        (Some(m), Some(h)) => format!("{m}@{h}"),
+        (Some(m), None) => m,
+        _ => String::new(),
     };
 
-    // Try to find body in parts first (multipart messages)
-    if let Some(text) = find_body_in_parts(payload, "text/plain") {
-        return text;
+    match name {
+        Some(ref n) if !n.is_empty() => format!("{n} <{email_addr}>"),
+        _ => email_addr,
     }
-    if let Some(html) = find_body_in_parts(payload, "text/html") {
-        return strip_html_tags(&html);
-    }
-
-    // Single-part message: body is directly on payload
-    if let Some(data) = payload
-        .get("body")
-        .and_then(|b| b.get("data"))
-        .and_then(|d| d.as_str())
-    {
-        if let Ok(decoded) = base64_url_decode(data) {
-            let mime_type = payload
-                .get("mimeType")
-                .and_then(|m| m.as_str())
-                .unwrap_or("");
-            if mime_type.contains("html") {
-                return strip_html_tags(&decoded);
-            }
-            return decoded;
-        }
-    }
-
-    String::new()
-}
-
-/// Recursively search MIME parts for a body with the given MIME type.
-fn find_body_in_parts(part: &Value, target_mime: &str) -> Option<String> {
-    let mime_type = part.get("mimeType").and_then(|m| m.as_str()).unwrap_or("");
-
-    if mime_type == target_mime {
-        if let Some(data) = part.get("body").and_then(|b| b.get("data")).and_then(|d| d.as_str()) {
-            if let Ok(decoded) = base64_url_decode(data) {
-                return Some(decoded);
-            }
-        }
-    }
-
-    // Recurse into sub-parts
-    if let Some(parts) = part.get("parts").and_then(|p| p.as_array()) {
-        for p in parts {
-            if let Some(found) = find_body_in_parts(p, target_mime) {
-                return Some(found);
-            }
-        }
-    }
-
-    None
-}
-
-/// Build a minimal RFC 2822 message.
-fn build_rfc2822_message(
-    to: &str,
-    subject: &str,
-    body: &str,
-    cc: Option<&str>,
-    bcc: Option<&str>,
-    in_reply_to: Option<&str>,
-) -> String {
-    let mut msg = String::with_capacity(256 + body.len());
-    msg.push_str(&format!("To: {to}\r\n"));
-    if let Some(cc_val) = cc {
-        msg.push_str(&format!("Cc: {cc_val}\r\n"));
-    }
-    if let Some(bcc_val) = bcc {
-        msg.push_str(&format!("Bcc: {bcc_val}\r\n"));
-    }
-    msg.push_str(&format!("Subject: {subject}\r\n"));
-    if let Some(reply_to) = in_reply_to {
-        msg.push_str(&format!("In-Reply-To: {reply_to}\r\n"));
-        msg.push_str(&format!("References: {reply_to}\r\n"));
-    }
-    msg.push_str("Content-Type: text/plain; charset=UTF-8\r\n");
-    msg.push_str("\r\n");
-    msg.push_str(body);
-    msg
-}
-
-/// Base64 URL-safe encode (no padding).
-fn base64_url_encode(data: &[u8]) -> String {
-    URL_SAFE_NO_PAD.encode(data)
-}
-
-/// Base64 URL-safe decode.
-fn base64_url_decode(data: &str) -> std::result::Result<String, String> {
-    let bytes = URL_SAFE_NO_PAD
-        .decode(data)
-        .map_err(|e| format!("base64 decode error: {e}"))?;
-    String::from_utf8(bytes).map_err(|e| format!("UTF-8 decode error: {e}"))
 }
 
 /// Strip HTML tags and decode common entities.
@@ -862,7 +671,6 @@ fn strip_html_tags(html: &str) -> String {
         }
     }
 
-    // Decode common HTML entities
     result
         .replace("&amp;", "&")
         .replace("&lt;", "<")
@@ -870,16 +678,4 @@ fn strip_html_tags(html: &str) -> String {
         .replace("&quot;", "\"")
         .replace("&#39;", "'")
         .replace("&nbsp;", " ")
-}
-
-/// URL-encode a set of key-value pairs.
-fn urlencoded(params: &[(&str, &str)]) -> String {
-    url::form_urlencoded::Serializer::new(String::new())
-        .extend_pairs(params)
-        .finish()
-}
-
-/// URL-encode a single value.
-fn urlencoded_value(value: &str) -> String {
-    url::form_urlencoded::byte_serialize(value.as_bytes()).collect()
 }

@@ -17,6 +17,11 @@ tokio.workspace = true
 base64.workspace = true
 uuid.workspace = true
 url = "2"
+imap.workspace = true
+imap-proto = "0.10"
+native-tls.workspace = true
+lettre.workspace = true
+mail-parser.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

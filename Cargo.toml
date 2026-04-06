@@ -65,6 +65,12 @@ aes-gcm = "0.10"
 argon2 = "0.5"
 security-framework = "3"
 
+# Email (IMAP + SMTP)
+imap = "2"
+native-tls = "0.2"
+lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "tokio1-native-tls", "builder"] }
+mail-parser = "0.9"
+
 # Internal crates
 openclaw-core = { path = "crates/openclaw-core" }
 openclaw-store = { path = "crates/openclaw-store" }
