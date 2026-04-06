@@ -86,7 +86,7 @@ impl Default for HarnessProfile {
             trace_informed_guidance: true,
             trace_injection_interval: 5,
             task_type: TaskType::General,
-            max_iterations: 30,
+            max_iterations: 80,
             max_consecutive_errors: 3,
             max_tool_retries: 2,
             max_context_tokens: 128_000,
@@ -109,7 +109,7 @@ impl HarnessProfile {
             trace_informed_guidance: true,
             trace_injection_interval: 3, // More frequent feedback during coding.
             task_type: TaskType::Coding,
-            max_iterations: 50, // Coding tasks often need more steps.
+            max_iterations: 120, // Coding tasks often need more steps.
             max_consecutive_errors: 2, // Reflect sooner on code errors.
             max_tool_retries: 3,
             max_context_tokens: 128_000,
@@ -131,7 +131,7 @@ impl HarnessProfile {
             trace_informed_guidance: true,
             trace_injection_interval: 5,
             task_type: TaskType::Research,
-            max_iterations: 40,
+            max_iterations: 100,
             max_consecutive_errors: 3,
             max_tool_retries: 2,
             max_context_tokens: 128_000,
@@ -152,7 +152,7 @@ impl HarnessProfile {
             trace_informed_guidance: false,
             trace_injection_interval: 0,
             task_type: TaskType::Creative,
-            max_iterations: 20,
+            max_iterations: 50,
             max_consecutive_errors: 3,
             max_tool_retries: 1,
             max_context_tokens: 128_000,

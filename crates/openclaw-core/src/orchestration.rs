@@ -65,7 +65,7 @@ impl SubTask {
             description: description.into(),
             tool_hint: None,
             requires_reasoning: true,
-            context_budget: 8192,
+            context_budget: 16384,
             depends_on: Vec::new(),
         }
     }
@@ -123,6 +123,8 @@ pub struct OrchestrationConfig {
     pub consistency_temperature_spread: f32,
     /// Maximum refinement iterations.
     pub max_refinement_iterations: usize,
+    /// Maximum retries per failed tool call within sub-tasks.
+    pub max_tool_retries: u32,
     /// Whether to summarize sub-task results before synthesis.
     pub summarize_sub_results: bool,
     /// Which model to use for simple/trivial tasks (fallback model name).
@@ -134,12 +136,13 @@ pub struct OrchestrationConfig {
 impl Default for OrchestrationConfig {
     fn default() -> Self {
         Self {
-            sub_task_context_budget: 8192,
+            sub_task_context_budget: 16384,
             max_sub_tasks: 8,
             max_recursion_depth: 3,
             consistency_samples: 3,
             consistency_temperature_spread: 0.1,
             max_refinement_iterations: 3,
+            max_tool_retries: 2,
             summarize_sub_results: true,
             fallback_model: None,
             primary_model: None,
