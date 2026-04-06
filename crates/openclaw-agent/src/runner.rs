@@ -3,7 +3,7 @@ use std::time::Instant;
 
 use chrono::Utc;
 use openclaw_core::capability::Capability;
-use openclaw_core::model::{ModelProvider, ModelResponse, StopReason};
+use openclaw_core::model::{ModelProvider, ModelResponse, StopReason, StreamEvent};
 use openclaw_core::session::Session;
 use openclaw_core::types::{
     Conversation, Message, MessageContent, Role, ToolCall, ToolResult, ToolSchema,
@@ -13,6 +13,34 @@ use uuid::Uuid;
 
 use crate::sandbox::{Sandbox, SandboxPolicy};
 use crate::trace::{ExecutionTracer, ToolTrace};
+
+/// Events emitted by the agent loop during streaming execution.
+///
+/// These give callers (e.g. WebSocket handlers) real-time visibility
+/// into the agent's progress: text tokens as they arrive, tool execution
+/// lifecycle, and internal state changes like reflections and compression.
+#[derive(Debug, Clone)]
+pub enum AgentEvent {
+    /// A partial text token from the model's response.
+    TextDelta(String),
+    /// The agent is about to execute a tool.
+    ToolCallStart {
+        tool_name: String,
+        call_id: String,
+    },
+    /// A tool call has completed.
+    ToolCallEnd {
+        tool_name: String,
+        call_id: String,
+        success: bool,
+    },
+    /// The agent is reflecting after repeated errors.
+    Reflecting,
+    /// The agent is compressing conversation memory.
+    Compressing,
+    /// The agent loop has completed.
+    Done,
+}
 
 /// Configuration for the agent runner.
 #[derive(Debug, Clone)]
@@ -221,6 +249,178 @@ impl AgentRunner {
             }
 
             // Text response — done.
+            return Ok(());
+        }
+
+        Err(Error::Internal(format!(
+            "agent exceeded max iterations ({})",
+            self.config.max_iterations
+        )))
+    }
+
+    /// Run the agent loop with streaming: text deltas are forwarded through
+    /// the callback as they arrive, and tool lifecycle events are emitted
+    /// so callers can show real-time progress.
+    ///
+    /// Each call creates a fresh ExecutionTracer to prevent cross-session
+    /// information leakage (H8).
+    ///
+    /// The callback must be `Send + Sync` because it may be invoked from
+    /// the provider's streaming internals on a different task.
+    pub async fn run_streaming(
+        &self,
+        conv: &mut Conversation,
+        session: &Session,
+        on_event: &(dyn Fn(AgentEvent) + Send + Sync),
+    ) -> Result<()> {
+        if session.is_expired() {
+            return Err(Error::Auth("session has expired".into()));
+        }
+
+        // Create a per-run tracer to prevent cross-session data leaks (H8)
+        let tracer = ExecutionTracer::new();
+
+        let schemas: Vec<ToolSchema> = self
+            .tools
+            .iter()
+            .filter(|t| session.capabilities.can_use_tool(t.name()))
+            .map(|t| t.schema())
+            .collect();
+
+        let mut consecutive_errors = 0;
+
+        for iteration in 0..self.config.max_iterations {
+            tracer.record_iteration();
+
+            // Check session expiry on each iteration (not just at start)
+            if session.is_expired() {
+                return Err(Error::Auth("session expired during execution".into()));
+            }
+
+            if self.should_compress(conv) {
+                on_event(AgentEvent::Compressing);
+                self.compress_memory(conv).await?;
+                tracer.record_compression();
+            }
+
+            // Use chat_stream so text deltas are forwarded in real time.
+            let stream_callback = |event: StreamEvent| {
+                if let StreamEvent::TextDelta(delta) = event {
+                    on_event(AgentEvent::TextDelta(delta));
+                }
+            };
+
+            let ModelResponse {
+                message,
+                usage: _,
+                stop_reason,
+            } = self
+                .provider
+                .chat_stream(&conv.messages, &schemas, &stream_callback)
+                .await?;
+
+            conv.messages.push(message.clone());
+            conv.updated_at = Utc::now();
+
+            // Handle tool calls.
+            if message.content.has_tool_calls() {
+                let calls = message.content.tool_calls();
+                tracing::info!(
+                    iteration,
+                    tool_count = calls.len(),
+                    "executing tool calls"
+                );
+
+                // Emit start events.
+                for call in &calls {
+                    on_event(AgentEvent::ToolCallStart {
+                        tool_name: call.name.clone(),
+                        call_id: call.id.clone(),
+                    });
+                }
+
+                let results = self
+                    .execute_tools_parallel_traced(calls, session, &tracer)
+                    .await;
+
+                let had_errors = results.iter().any(|r| {
+                    if let Ok(tr) = r {
+                        tr.output.get("error").is_some()
+                    } else {
+                        true
+                    }
+                });
+
+                for result in results {
+                    let (tool_msg, tool_name, call_id, success) = match result {
+                        Ok(tr) => {
+                            let msg = Message {
+                                id: Uuid::new_v4(),
+                                role: Role::Tool,
+                                content: MessageContent::ToolResult(tr.clone()),
+                                created_at: Utc::now(),
+                            };
+                            (msg, String::new(), tr.call_id, true)
+                        }
+                        Err(e) => {
+                            let msg = Message {
+                                id: Uuid::new_v4(),
+                                role: Role::Tool,
+                                content: MessageContent::ToolResult(ToolResult {
+                                    call_id: "error".to_string(),
+                                    output: serde_json::json!({ "error": e.to_string() }),
+                                }),
+                                created_at: Utc::now(),
+                            };
+                            (msg, String::new(), "error".to_string(), false)
+                        }
+                    };
+                    on_event(AgentEvent::ToolCallEnd {
+                        tool_name,
+                        call_id,
+                        success,
+                    });
+                    conv.messages.push(tool_msg);
+                }
+                conv.updated_at = Utc::now();
+
+                if let Some(trace_guidance) = tracer.summary_for_prompt() {
+                    if iteration > 0 && iteration % 5 == 0 {
+                        self.inject_trace_context(conv, &trace_guidance);
+                    }
+                }
+
+                if had_errors {
+                    consecutive_errors += 1;
+                    if consecutive_errors >= self.config.max_consecutive_errors {
+                        tracing::warn!(
+                            consecutive_errors,
+                            "injecting reflection prompt after repeated errors"
+                        );
+                        on_event(AgentEvent::Reflecting);
+                        self.inject_reflection(conv);
+                        consecutive_errors = 0;
+                    }
+                } else {
+                    consecutive_errors = 0;
+                }
+
+                continue;
+            }
+
+            if stop_reason == StopReason::MaxTokens {
+                tracing::warn!("model hit max tokens, prompting to continue");
+                conv.messages.push(Message {
+                    id: Uuid::new_v4(),
+                    role: Role::User,
+                    content: MessageContent::Text("Continue.".to_string()),
+                    created_at: Utc::now(),
+                });
+                continue;
+            }
+
+            // Text response — done.
+            on_event(AgentEvent::Done);
             return Ok(());
         }
 

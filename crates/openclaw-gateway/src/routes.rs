@@ -88,6 +88,9 @@ async fn send_message(
         .get(id)
         .map_err(|_| StatusCode::NOT_FOUND)?;
 
+    // Clone content before moving into the message (needed for profile classification).
+    let user_content = body.content.clone();
+
     // Add the user message.
     let user_msg = Message {
         id: Uuid::new_v4(),
@@ -98,26 +101,17 @@ async fn send_message(
     conv.messages.push(user_msg);
     conv.updated_at = Utc::now();
 
-    // Call the model provider.
-    let response = state
-        .provider
-        .chat(&conv.messages, &[])
-        .await
-        .map_err(|e| {
-            tracing::error!("model error: {e}");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    // Run the full agent pipeline.
+    let assistant_msg =
+        crate::orchestrate::run_agent(&state, &mut conv, &user_content).await?;
 
-    // Add assistant response to conversation.
-    conv.messages.push(response.message.clone());
+    // Persist the full conversation (including intermediate tool call messages).
     conv.updated_at = Utc::now();
-
-    // Persist.
     state
         .store
         .conversations()
         .save(&conv)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    Ok(Json(response.message))
+    Ok(Json(assistant_msg))
 }

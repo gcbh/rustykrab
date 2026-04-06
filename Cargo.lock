@@ -1214,6 +1214,7 @@ dependencies = [
  "openclaw-agent",
  "openclaw-channels",
  "openclaw-core",
+ "openclaw-skills",
  "openclaw-store",
  "rand 0.8.5",
  "rust-embed",

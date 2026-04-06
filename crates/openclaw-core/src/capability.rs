@@ -72,6 +72,20 @@ impl CapabilitySet {
         self.capabilities.contains(&Capability::Tool(tool_name.to_string()))
     }
 
+    /// Create a capability set that grants access to a specific set of tools
+    /// plus standard resource capabilities (file, shell, http).
+    pub fn for_tools(tool_names: &[&str]) -> Self {
+        let mut caps = HashSet::new();
+        caps.insert(Capability::FileRead);
+        caps.insert(Capability::FileWrite);
+        caps.insert(Capability::ShellExec);
+        caps.insert(Capability::HttpRequest);
+        for name in tool_names {
+            caps.insert(Capability::Tool(name.to_string()));
+        }
+        Self { capabilities: caps }
+    }
+
     /// Return all granted capabilities.
     pub fn list(&self) -> impl Iterator<Item = &Capability> {
         self.capabilities.iter()
