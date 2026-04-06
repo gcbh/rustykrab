@@ -1052,11 +1052,8 @@
         const lines = buffer.split('\n');
         buffer = lines.pop(); // keep incomplete line in buffer
 
-        let currentEvent = null;
         for (const line of lines) {
-          if (line.startsWith('event:')) {
-            currentEvent = line.slice(6).trim();
-          } else if (line.startsWith('data:')) {
+          if (line.startsWith('data:')) {
             const raw = line.slice(5).trim();
             if (raw) {
               try {
@@ -1064,7 +1061,6 @@
                 handleStreamEvent(data);
               } catch { /* ignore malformed JSON */ }
             }
-            currentEvent = null;
           }
         }
       }

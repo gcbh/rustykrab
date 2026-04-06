@@ -224,9 +224,9 @@ async fn send_message_stream(
                     serde_json::json!({"type": "thinking", "delta": "compressing memory"})
                         .to_string(),
                 ),
-                AgentEvent::Done => Event::default().event("done").data(
-                    serde_json::json!({"type": "done"}).to_string(),
-                ),
+                AgentEvent::Done => Event::default()
+                    .event("done")
+                    .data(serde_json::json!({"type": "done"}).to_string()),
             },
             SsePayload::Done(Ok(message)) => Event::default().event("done").data(
                 serde_json::json!({"type": "done", "message": message}).to_string(),
