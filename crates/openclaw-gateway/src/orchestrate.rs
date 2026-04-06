@@ -1,0 +1,132 @@
+use axum::http::StatusCode;
+use chrono::Utc;
+use uuid::Uuid;
+
+use openclaw_agent::{AgentEvent, AgentRunner};
+use openclaw_core::capability::CapabilitySet;
+use openclaw_core::session::Session;
+use openclaw_core::types::{Conversation, Message, MessageContent, Role};
+use openclaw_skills::SystemPromptBuilder;
+
+use crate::AppState;
+
+/// Shared setup: resolve profile, build system prompt, inject it,
+/// create session and runner. Returns `(AgentRunner, Session)`.
+async fn prepare_agent(
+    state: &AppState,
+    conv: &mut Conversation,
+    user_content: &str,
+) -> Result<(AgentRunner, Session), StatusCode> {
+    // 1. Resolve the harness profile for this message.
+    let profile = state.profile_for(user_content).await;
+    tracing::info!(profile = %profile.name, "harness profile selected");
+
+    // 2. Collect tool schemas for the prompt builder.
+    let schemas: Vec<_> = state.tools.iter().map(|t| t.schema()).collect();
+
+    // 3. Build the system prompt.
+    let mut builder = SystemPromptBuilder::new()
+        .with_identity(&profile.agent_name, &profile.agent_description)
+        .with_tool_guidance(&schemas);
+
+    if profile.chain_of_thought {
+        builder = builder.with_chain_of_thought();
+    }
+    if let Some(task_guidance) = profile.task_type_guidance() {
+        builder = builder.with_task_guidance(task_guidance);
+    }
+    if let Some(ref summary) = conv.summary {
+        builder = builder.with_memory(summary);
+    }
+
+    let system_prompt = builder.build();
+
+    // 4. Inject system prompt as first message.
+    if conv
+        .messages
+        .first()
+        .map(|m| m.role == Role::System)
+        .unwrap_or(false)
+    {
+        conv.messages[0].content = MessageContent::Text(system_prompt);
+    } else {
+        conv.messages.insert(
+            0,
+            Message {
+                id: Uuid::new_v4(),
+                role: Role::System,
+                content: MessageContent::Text(system_prompt),
+                created_at: Utc::now(),
+            },
+        );
+    }
+
+    // 5. Create an ephemeral session with capabilities for all registered tools.
+    let tool_names: Vec<&str> = state.tools.iter().map(|t| t.name()).collect();
+    let caps = CapabilitySet::for_tools(&tool_names);
+    let session = Session::with_capabilities(conv.id, caps);
+
+    // 6. Create the agent runner with profile-derived config.
+    let runner = AgentRunner::new(
+        state.provider.clone(),
+        state.tools.clone(),
+        state.sandbox.clone(),
+    )
+    .with_config(profile.to_agent_config());
+
+    Ok((runner, session))
+}
+
+/// Extract the last assistant text message from a conversation.
+fn extract_assistant_message(conv: &Conversation) -> Result<Message, StatusCode> {
+    conv.messages
+        .iter()
+        .rev()
+        .find(|m| m.role == Role::Assistant && m.content.as_text().is_some())
+        .cloned()
+        .ok_or_else(|| {
+            tracing::error!("agent loop completed but no assistant text message found");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
+}
+
+/// Run the full agent pipeline on a conversation (non-streaming).
+///
+/// Used by the HTTP handler where the full response is returned at once.
+pub async fn run_agent(
+    state: &AppState,
+    conv: &mut Conversation,
+    user_content: &str,
+) -> Result<Message, StatusCode> {
+    let (runner, session) = prepare_agent(state, conv, user_content).await?;
+
+    runner.run(conv, &session).await.map_err(|e| {
+        tracing::error!("agent error: {e}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    extract_assistant_message(conv)
+}
+
+/// Run the full agent pipeline with streaming events.
+///
+/// Used by the WebSocket handler to forward text deltas and tool
+/// lifecycle events to the client in real time.
+pub async fn run_agent_streaming(
+    state: &AppState,
+    conv: &mut Conversation,
+    user_content: &str,
+    on_event: &(dyn Fn(AgentEvent) + Send + Sync),
+) -> Result<Message, StatusCode> {
+    let (runner, session) = prepare_agent(state, conv, user_content).await?;
+
+    runner
+        .run_streaming(conv, &session, on_event)
+        .await
+        .map_err(|e| {
+            tracing::error!("agent error: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    extract_assistant_message(conv)
+}

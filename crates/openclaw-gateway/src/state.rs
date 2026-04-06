@@ -1,4 +1,4 @@
-use openclaw_agent::{HarnessProfile, HarnessRouter};
+use openclaw_agent::{HarnessProfile, HarnessRouter, ProcessSandbox, Sandbox};
 use openclaw_channels::{SignalChannel, TelegramChannel};
 use openclaw_core::model::ModelProvider;
 use openclaw_store::Store;
@@ -18,6 +18,8 @@ pub struct AppState {
     pub origin_policy: OriginPolicy,
     pub telegram: Option<Arc<TelegramChannel>>,
     pub signal: Option<Arc<SignalChannel>>,
+    /// Sandbox for tool execution isolation.
+    pub sandbox: Arc<dyn Sandbox>,
     /// Base harness profile (used as fallback and template).
     pub harness_profile: HarnessProfile,
     /// Auto-router that classifies messages and selects profiles on-the-fly.
@@ -41,6 +43,7 @@ impl AppState {
             origin_policy: OriginPolicy::default(),
             telegram: None,
             signal: None,
+            sandbox: Arc::new(ProcessSandbox::new()),
             harness_profile: HarnessProfile::default(),
             harness_router: None,
         }
@@ -67,6 +70,12 @@ impl AppState {
     /// Attach a Signal channel.
     pub fn with_signal(mut self, signal: Arc<SignalChannel>) -> Self {
         self.signal = Some(signal);
+        self
+    }
+
+    /// Override the sandbox implementation.
+    pub fn with_sandbox(mut self, sandbox: Arc<dyn Sandbox>) -> Self {
+        self.sandbox = sandbox;
         self
     }
 
