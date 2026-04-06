@@ -184,7 +184,8 @@ async fn execute_sub_task(
 
             let calls = response.message.content.tool_calls();
             for call in calls {
-                let result = execute_tool_for_subtask(call, tools, sandbox).await;
+                let result =
+                    execute_tool_for_subtask(call, tools, sandbox, config.max_tool_retries).await;
                 messages.push(Message {
                     id: Uuid::new_v4(),
                     role: Role::Tool,
@@ -228,34 +229,57 @@ async fn execute_sub_task(
     }
 }
 
-/// Execute a tool call within a sub-task (simplified, no session caps).
+/// Execute a tool call within a sub-task, retrying transient failures.
 async fn execute_tool_for_subtask(
     call: &ToolCall,
     tools: &[Arc<dyn Tool>],
     sandbox: &Arc<dyn Sandbox>,
+    max_retries: u32,
 ) -> ToolResult {
-    let tool = tools.iter().find(|t| t.name() == call.name);
-    match tool {
-        Some(t) => {
-            let policy = SandboxPolicy::trusted();
-            if let Err(e) = sandbox.execute(&call.name, call.arguments.clone(), &policy).await {
-                tracing::warn!(tool = call.name, "sandbox check failed: {e}");
-            }
-            match t.execute(call.arguments.clone()).await {
-                Ok(output) => ToolResult {
+    let tool = match tools.iter().find(|t| t.name() == call.name) {
+        Some(t) => t,
+        None => {
+            return ToolResult {
+                call_id: call.id.clone(),
+                output: serde_json::json!({ "error": format!("unknown tool: {}", call.name) }),
+            };
+        }
+    };
+
+    let policy = SandboxPolicy::trusted();
+    if let Err(e) = sandbox.execute(&call.name, call.arguments.clone(), &policy).await {
+        tracing::warn!(tool = call.name, "sandbox check failed: {e}");
+    }
+
+    let mut last_err = None;
+    for attempt in 0..=max_retries {
+        match tool.execute(call.arguments.clone()).await {
+            Ok(output) => {
+                return ToolResult {
                     call_id: call.id.clone(),
                     output,
-                },
-                Err(e) => ToolResult {
-                    call_id: call.id.clone(),
-                    output: serde_json::json!({ "error": e.to_string() }),
-                },
+                };
+            }
+            Err(e) => {
+                tracing::warn!(
+                    tool = call.name,
+                    attempt = attempt + 1,
+                    max_retries,
+                    error = %e,
+                    "sub-task tool call failed, retrying"
+                );
+                last_err = Some(e);
+                if attempt < max_retries {
+                    let delay = std::time::Duration::from_millis(500 * 2u64.pow(attempt));
+                    tokio::time::sleep(delay).await;
+                }
             }
         }
-        None => ToolResult {
-            call_id: call.id.clone(),
-            output: serde_json::json!({ "error": format!("unknown tool: {}", call.name) }),
-        },
+    }
+
+    ToolResult {
+        call_id: call.id.clone(),
+        output: serde_json::json!({ "error": last_err.unwrap().to_string() }),
     }
 }
 

@@ -66,7 +66,7 @@ pub struct AgentConfig {
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
-            max_iterations: 30,
+            max_iterations: 80,
             max_consecutive_errors: 3,
             max_tool_retries: 2,
             max_context_tokens: 128_000,
@@ -432,16 +432,29 @@ impl AgentRunner {
     }
 
     /// Execute multiple tool calls in parallel, recording execution traces.
+    ///
+    /// Each tool call is retried up to `max_tool_retries` times on failure
+    /// before the error is surfaced to the model.
     async fn execute_tools_parallel_traced(
         &self,
         calls: Vec<&ToolCall>,
         session: &Session,
         tracer: &ExecutionTracer,
     ) -> Vec<Result<ToolResult>> {
+        let max_retries = self.config.max_tool_retries;
+
         if calls.len() == 1 {
             let call = calls[0];
             let start = Instant::now();
-            let result = self.execute_tool_checked(call, session).await;
+            let result = execute_with_retries(
+                call,
+                &self.tools,
+                &self.sandbox,
+                &session.capabilities,
+                session.id,
+                max_retries,
+            )
+            .await;
             tracer.record(ToolTrace {
                 tool_name: call.name.clone(),
                 success: result.is_ok(),
@@ -464,8 +477,15 @@ impl AgentRunner {
 
             handles.push(tokio::spawn(async move {
                 let start = Instant::now();
-                let result =
-                    execute_single_tool(&call, &tools, &sandbox, &session_caps, session_id).await;
+                let result = execute_with_retries(
+                    &call,
+                    &tools,
+                    &sandbox,
+                    &session_caps,
+                    session_id,
+                    max_retries,
+                )
+                .await;
                 (result, call.name.clone(), start.elapsed())
             }));
         }
@@ -495,21 +515,6 @@ impl AgentRunner {
         }
 
         results
-    }
-
-    async fn execute_tool_checked(
-        &self,
-        call: &ToolCall,
-        session: &Session,
-    ) -> Result<ToolResult> {
-        execute_single_tool(
-            call,
-            &self.tools,
-            &self.sandbox,
-            &session.capabilities,
-            session.id,
-        )
-        .await
     }
 
     /// Inject trace-informed context so the model can adapt its strategy.
@@ -672,6 +677,47 @@ impl AgentRunner {
 /// This prevents internal path and stack trace leakage to the model/client.
 fn sanitize_error(e: &str) -> String {
     e.chars().take(200).collect()
+}
+
+/// Retry a tool call up to `max_retries` times with exponential backoff.
+///
+/// Auth errors (permission denied, unknown tool) are not retried since
+/// they will fail deterministically. Only transient errors (timeouts,
+/// execution failures) are retried.
+async fn execute_with_retries(
+    call: &ToolCall,
+    tools: &[Arc<dyn Tool>],
+    sandbox: &Arc<dyn Sandbox>,
+    capabilities: &openclaw_core::capability::CapabilitySet,
+    session_id: uuid::Uuid,
+    max_retries: u32,
+) -> Result<ToolResult> {
+    let mut last_err = None;
+    for attempt in 0..=max_retries {
+        match execute_single_tool(call, tools, sandbox, capabilities, session_id).await {
+            Ok(result) => return Ok(result),
+            Err(e) => {
+                // Don't retry auth errors — they'll fail the same way every time.
+                if matches!(e, Error::Auth(_)) {
+                    return Err(e);
+                }
+                tracing::warn!(
+                    tool = call.name,
+                    attempt = attempt + 1,
+                    max_retries,
+                    error = %e,
+                    "tool call failed, retrying"
+                );
+                last_err = Some(e);
+                if attempt < max_retries {
+                    // Exponential backoff: 500ms, 1s, 2s, ...
+                    let delay = std::time::Duration::from_millis(500 * 2u64.pow(attempt));
+                    tokio::time::sleep(delay).await;
+                }
+            }
+        }
+    }
+    Err(last_err.unwrap())
 }
 
 /// Standalone function so it can be moved into a tokio::spawn.
