@@ -87,10 +87,7 @@ impl RateLimiter {
     }
 }
 
-/// Axum middleware that enforces rate limiting on API and WebSocket endpoints.
-///
-/// Security: Rate limits apply to both /api/ and /ws/ endpoints to prevent
-/// brute-force attacks via WebSocket connections.
+/// Axum middleware that enforces rate limiting on API endpoints.
 pub async fn rate_limit_middleware(
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     state: axum::extract::State<crate::AppState>,
@@ -99,8 +96,8 @@ pub async fn rate_limit_middleware(
 ) -> Result<Response, StatusCode> {
     let path = request.uri().path();
 
-    // Rate-limit API and WebSocket endpoints.
-    if !path.starts_with("/api/") && !path.starts_with("/ws/") {
+    // Only rate-limit API endpoints.
+    if !path.starts_with("/api/") {
         return Ok(next.run(request).await);
     }
 

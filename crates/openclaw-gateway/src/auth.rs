@@ -11,7 +11,7 @@ use crate::AppState;
 /// server's configured token using constant-time comparison.
 ///
 /// Security: All endpoints except /api/health and static assets require
-/// authentication. WebSocket and webhook endpoints are also authenticated.
+/// authentication. Webhook endpoints use their own auth mechanism.
 pub async fn require_auth(
     state: axum::extract::State<AppState>,
     request: Request,
@@ -25,7 +25,6 @@ pub async fn require_auth(
     // Static assets are public (the WebChat UI).
     if !request.uri().path().starts_with("/api/")
         && !request.uri().path().starts_with("/webhook/")
-        && !request.uri().path().starts_with("/ws/")
     {
         return Ok(next.run(request).await);
     }
@@ -35,32 +34,16 @@ pub async fn require_auth(
         return Ok(next.run(request).await);
     }
 
-    // All /api/ and /ws/ endpoints require Bearer token.
+    // All /api/ endpoints require Bearer token.
     let token = request
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "));
 
-    // For WebSocket upgrades, also check query parameter as fallback
-    // (browsers can't set headers on WebSocket connections from JS).
-    let token = token.or_else(|| {
-        if request.uri().path().starts_with("/ws/") {
-            request
-                .uri()
-                .query()
-                .and_then(|q| {
-                    q.split('&')
-                        .find(|p| p.starts_with("token="))
-                        .map(|p| &p[6..])
-                })
-        } else {
-            None
-        }
-    });
-
+    let current_token = state.auth_token.read().unwrap().clone();
     match token {
-        Some(t) if constant_time_eq(t, &state.auth_token) => Ok(next.run(request).await),
+        Some(t) if constant_time_eq(t, &current_token) => Ok(next.run(request).await),
         _ => {
             // Track auth failures for rate limiting
             tracing::warn!(

@@ -1,11 +1,17 @@
+use std::convert::Infallible;
+
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
+use axum::response::sse::{Event, Sse};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::Utc;
 use serde::Deserialize;
+use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::StreamExt;
 use uuid::Uuid;
 
+use openclaw_agent::AgentEvent;
 use openclaw_core::types::{Conversation, Message, MessageContent, Role};
 
 use crate::AppState;
@@ -17,7 +23,12 @@ pub fn api_routes() -> Router<AppState> {
         .route("/api/conversations/{id}", get(get_conversation))
         .route("/api/conversations/{id}", axum::routing::delete(delete_conversation))
         .route("/api/conversations/{id}/messages", post(send_message))
+        .route(
+            "/api/conversations/{id}/messages/stream",
+            post(send_message_stream),
+        )
         .route("/api/health", get(health))
+        .route("/api/logout", post(logout))
 }
 
 #[derive(Deserialize)]
@@ -27,6 +38,16 @@ struct SendMessageRequest {
 
 async fn health() -> &'static str {
     "ok"
+}
+
+/// Rotate the auth token, invalidating the current session.
+/// The new token is printed to the server's stdout so the operator can
+/// retrieve it. The old token is immediately invalid.
+async fn logout(State(state): State<AppState>) -> StatusCode {
+    let new_token = state.rotate_token();
+    tracing::info!("auth token rotated via /api/logout");
+    println!("\n  New OPENCLAW_AUTH_TOKEN={new_token}\n");
+    StatusCode::NO_CONTENT
 }
 
 async fn create_conversation(
@@ -114,4 +135,109 @@ async fn send_message(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(Json(assistant_msg))
+}
+
+/// Payload sent through the MPSC channel from the agent task to the SSE stream.
+enum SsePayload {
+    Event(AgentEvent),
+    Done(Result<Message, StatusCode>),
+}
+
+/// Send a user message and stream the assistant response as SSE events.
+async fn send_message_stream(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<SendMessageRequest>,
+) -> Result<Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>>, StatusCode> {
+    // Load the conversation.
+    let mut conv = state
+        .store
+        .conversations()
+        .get(id)
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+
+    let user_content = body.content.clone();
+
+    // Add the user message.
+    let user_msg = Message {
+        id: Uuid::new_v4(),
+        role: Role::User,
+        content: MessageContent::Text(body.content),
+        created_at: Utc::now(),
+    };
+    conv.messages.push(user_msg);
+    conv.updated_at = Utc::now();
+
+    // Channel for streaming events from the agent task to the SSE response.
+    let (tx, rx) = tokio::sync::mpsc::channel::<SsePayload>(128);
+
+    // Spawn the agent loop in a background task.
+    let agent_state = state.clone();
+    tokio::spawn(async move {
+        let event_tx = tx.clone();
+        let on_event = move |event: AgentEvent| {
+            let _ = event_tx.try_send(SsePayload::Event(event));
+        };
+
+        let result = crate::orchestrate::run_agent_streaming(
+            &agent_state,
+            &mut conv,
+            &user_content,
+            &on_event,
+        )
+        .await;
+
+        // Persist conversation on success.
+        if result.is_ok() {
+            conv.updated_at = Utc::now();
+            let _ = agent_state.store.conversations().save(&conv);
+        }
+
+        let _ = tx.send(SsePayload::Done(result)).await;
+    });
+
+    // Map channel messages to SSE events.
+    let stream = ReceiverStream::new(rx).map(|payload| {
+        let event = match payload {
+            SsePayload::Event(agent_event) => match agent_event {
+                AgentEvent::TextDelta(delta) => Event::default()
+                    .event("delta")
+                    .data(serde_json::json!({"type": "delta", "delta": delta}).to_string()),
+                AgentEvent::ToolCallStart { tool_name, .. } => Event::default()
+                    .event("tool_start")
+                    .data(
+                        serde_json::json!({"type": "tool_start", "delta": tool_name}).to_string(),
+                    ),
+                AgentEvent::ToolCallEnd {
+                    tool_name, success, ..
+                } => {
+                    let t = if success { "tool_end" } else { "tool_error" };
+                    Event::default()
+                        .event(t)
+                        .data(serde_json::json!({"type": t, "delta": tool_name}).to_string())
+                }
+                AgentEvent::Reflecting => Event::default().event("thinking").data(
+                    serde_json::json!({"type": "thinking", "delta": "reflecting on errors"})
+                        .to_string(),
+                ),
+                AgentEvent::Compressing => Event::default().event("thinking").data(
+                    serde_json::json!({"type": "thinking", "delta": "compressing memory"})
+                        .to_string(),
+                ),
+                AgentEvent::Done => Event::default().event("done").data(
+                    serde_json::json!({"type": "done"}).to_string(),
+                ),
+            },
+            SsePayload::Done(Ok(message)) => Event::default().event("done").data(
+                serde_json::json!({"type": "done", "message": message}).to_string(),
+            ),
+            SsePayload::Done(Err(_)) => Event::default().event("error").data(
+                serde_json::json!({"type": "error", "delta": "an internal error occurred"})
+                    .to_string(),
+            ),
+        };
+        Ok(event)
+    });
+
+    Ok(Sse::new(stream))
 }

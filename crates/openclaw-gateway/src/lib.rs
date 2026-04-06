@@ -7,7 +7,6 @@ mod signal_webhook;
 mod state;
 mod telegram_webhook;
 mod webchat;
-mod ws;
 
 pub use auth::generate_token;
 pub use origin::OriginPolicy;
@@ -21,7 +20,6 @@ use axum::Router;
 pub fn router(state: AppState) -> Router {
     Router::new()
         .merge(routes::api_routes())
-        .merge(ws::ws_routes())
         .merge(telegram_webhook::telegram_routes())
         .merge(signal_webhook::signal_routes())
         .merge(webchat::static_routes())

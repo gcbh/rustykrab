@@ -41,11 +41,10 @@ async fn main() -> anyhow::Result<()> {
     });
 
     // --- Model provider ---
-    let provider: Arc<dyn ModelProvider> = match std::env::var("OPENCLAW_PROVIDER")
-        .unwrap_or_else(|_| "anthropic".to_string())
-        .to_lowercase()
-        .as_str()
-    {
+    let provider_name = std::env::var("OPENCLAW_PROVIDER")
+        .unwrap_or_else(|_| "anthropic".to_string());
+    let provider_name = provider_name.trim().to_lowercase();
+    let provider: Arc<dyn ModelProvider> = match provider_name.as_str() {
         "ollama" => {
             let model = std::env::var("OLLAMA_MODEL").unwrap_or_else(|_| "qwen3:32b".to_string());
             let base_url = std::env::var("OLLAMA_BASE_URL")
