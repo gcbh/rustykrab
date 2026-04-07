@@ -22,6 +22,11 @@ pub struct HarnessRouter {
     classifier: Arc<dyn ModelProvider>,
     /// Base profile to use as a template. Task-specific fields get overlaid.
     base: HarnessProfile,
+    /// When true, use the LLM classifier for task routing.
+    /// When false (default), use instant keyword-based classification.
+    /// Keyword mode is ideal for local models (Ollama) where an extra LLM
+    /// call would add 30-40 seconds of latency per request.
+    use_llm_classifier: bool,
 }
 
 /// Classification prompt — kept minimal to minimize latency and cost.
@@ -64,6 +69,7 @@ impl HarnessRouter {
         Self {
             classifier,
             base: HarnessProfile::default(),
+            use_llm_classifier: false,
         }
     }
 
@@ -73,11 +79,39 @@ impl HarnessRouter {
         self
     }
 
+    /// Enable or disable LLM-based classification.
+    ///
+    /// When `true`, the router makes an LLM call to classify each message
+    /// (better accuracy, but adds latency — significant on local models).
+    /// When `false` (the default), uses instant keyword-based matching.
+    ///
+    /// Recommended: `false` for Ollama/local, `true` for Anthropic/cloud.
+    pub fn with_llm_classifier(mut self, enabled: bool) -> Self {
+        self.use_llm_classifier = enabled;
+        self
+    }
+
     /// Classify the complexity of a user message for pipeline routing.
     ///
     /// Returns a TaskComplexity that determines which orchestration
-    /// pipeline stages to run.
+    /// pipeline stages to run. When `use_llm_classifier` is false, uses
+    /// a fast heuristic instead of an LLM call.
     pub async fn classify_complexity(&self, user_message: &str) -> TaskComplexity {
+        if self.use_llm_classifier {
+            match self.classify_complexity_llm(user_message).await {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::debug!("LLM complexity classification failed, falling back to keywords: {e}");
+                    classify_complexity_keywords(user_message)
+                }
+            }
+        } else {
+            classify_complexity_keywords(user_message)
+        }
+    }
+
+    /// Classify complexity via LLM call.
+    async fn classify_complexity_llm(&self, user_message: &str) -> openclaw_core::Result<TaskComplexity> {
         let truncated = truncate_for_classification(user_message);
         let prompt = format!("{COMPLEXITY_PROMPT}{truncated}");
 
@@ -88,42 +122,39 @@ impl HarnessRouter {
             created_at: chrono::Utc::now(),
         }];
 
-        match self.classifier.chat(&messages, &[]).await {
-            Ok(response) => {
-                let text = response
-                    .message
-                    .content
-                    .as_text()
-                    .unwrap_or("simple")
-                    .trim()
-                    .to_lowercase();
-                parse_complexity(&text)
-            }
-            Err(e) => {
-                tracing::debug!("complexity classification failed: {e}");
-                TaskComplexity::Simple
-            }
-        }
+        let response = self.classifier.chat(&messages, &[]).await?;
+        let text = response
+            .message
+            .content
+            .as_text()
+            .unwrap_or("simple")
+            .trim()
+            .to_lowercase();
+        Ok(parse_complexity(&text))
     }
 
     /// Classify a user message and return the appropriate harness profile.
     ///
-    /// On classification failure (model error, unparseable response), falls
-    /// back to the base profile rather than blocking the request.
+    /// When `use_llm_classifier` is true, makes an LLM call (falling back
+    /// to keywords on failure). When false, uses instant keyword matching.
     pub async fn route(&self, user_message: &str) -> HarnessProfile {
-        match self.classify(user_message).await {
-            Ok(task_type) => {
-                let mut profile = self.profile_for(task_type);
-                // Preserve any user customizations from the base profile.
-                profile.agent_name = self.base.agent_name.clone();
-                profile.max_context_tokens = self.base.max_context_tokens;
-                profile
+        let task_type = if self.use_llm_classifier {
+            match self.classify(user_message).await {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::debug!("LLM classification failed, falling back to keywords: {e}");
+                    classify_with_keywords(user_message)
+                }
             }
-            Err(e) => {
-                tracing::debug!("harness classification failed, using default: {e}");
-                self.base.clone()
-            }
-        }
+        } else {
+            classify_with_keywords(user_message)
+        };
+
+        let mut profile = self.profile_for(task_type);
+        // Preserve any user customizations from the base profile.
+        profile.agent_name = self.base.agent_name.clone();
+        profile.max_context_tokens = self.base.max_context_tokens;
+        profile
     }
 
     /// Classify the user's message into a TaskType.
@@ -169,6 +200,121 @@ impl HarnessRouter {
             TaskType::General => self.base.clone(),
         }
     }
+}
+
+/// Classify a message using keyword matching. No LLM call -- instant result.
+///
+/// Checks the first ~300 characters of the message (lowercased) against
+/// keyword lists for each category. The category with the most keyword
+/// hits wins. Defaults to `General` if no keywords match.
+///
+/// This is the default routing strategy for local model deployments
+/// (e.g., Ollama on Apple Silicon) where an LLM classification call
+/// would add 30-40 seconds of latency.
+fn classify_with_keywords(text: &str) -> TaskType {
+    let lower = text.to_lowercase();
+    let sample = if lower.len() > 300 {
+        &lower[..lower.floor_char_boundary(300)]
+    } else {
+        &lower
+    };
+
+    // Keyword lists per category. Multi-word phrases are checked first
+    // so they aren't double-counted by their individual words.
+    const CODING_KEYWORDS: &[&str] = &[
+        "typescript", "javascript", "python", "rust", "sql", "html", "css",
+        "docker", "kubernetes", "npm", "cargo", "pip", "function", "bug",
+        "compile", "error", "implement", "code", "debug", "fix", "refactor",
+        "test", "class", "method", "variable", "parse", "syntax", "api",
+        "endpoint", "database", "query", "migration", "deploy", "git",
+        "commit", "merge", "branch",
+    ];
+
+    const RESEARCH_KEYWORDS: &[&str] = &[
+        "difference between", "pros and cons", "tell me about", "how does",
+        "what is", "look up", "search", "find", "compare", "explain",
+        "research", "summarize", "analyze", "investigate", "review",
+    ];
+
+    const CREATIVE_KEYWORDS: &[&str] = &[
+        "write a story", "write a poem", "blog post", "draft", "creative",
+        "brainstorm", "imagine", "fiction", "narrative", "article",
+        "marketing", "slogan", "tagline",
+    ];
+
+    const PLANNING_KEYWORDS: &[&str] = &[
+        "plan", "roadmap", "architecture", "design", "strategy", "breakdown",
+        "steps", "milestone", "timeline", "dependency", "prioritize",
+        "schedule",
+    ];
+
+    let count = |keywords: &[&str]| -> usize {
+        keywords.iter().filter(|kw| sample.contains(*kw)).count()
+    };
+
+    let coding = count(CODING_KEYWORDS);
+    let research = count(RESEARCH_KEYWORDS);
+    let creative = count(CREATIVE_KEYWORDS);
+    let planning = count(PLANNING_KEYWORDS);
+
+    let max = coding.max(research).max(creative).max(planning);
+    if max == 0 {
+        return TaskType::General;
+    }
+
+    // On ties, prefer in order: coding > research > planning > creative.
+    if coding == max {
+        TaskType::Coding
+    } else if research == max {
+        TaskType::Research
+    } else if planning == max {
+        TaskType::Planning
+    } else {
+        TaskType::Creative
+    }
+}
+
+/// Classify message complexity using simple heuristics. No LLM call.
+///
+/// Heuristic:
+/// - Under 50 chars with no sequencing language -> Trivial
+/// - Contains sequencing markers ("and then", "after that", numbered steps) -> Complex
+/// - Multiple sentences or mentions of multiple concepts -> Moderate
+/// - Everything else -> Simple
+fn classify_complexity_keywords(text: &str) -> TaskComplexity {
+    let lower = text.to_lowercase();
+    let char_count = lower.len();
+
+    // Check for complex sequencing markers.
+    let complex_markers = [
+        "and then", "after that", "next step", "step 1", "step 2",
+        "first,", "second,", "third,", "finally,", "1.", "2.", "3.",
+        "1)", "2)", "3)", "multiple steps", "multi-step",
+    ];
+    let complex_hits: usize = complex_markers.iter().filter(|m| lower.contains(*m)).count();
+    if complex_hits >= 2 {
+        return TaskComplexity::Complex;
+    }
+
+    // Check for critical indicators.
+    let critical_markers = ["critical", "urgent", "production", "security vulnerability", "data loss"];
+    let critical_hits: usize = critical_markers.iter().filter(|m| lower.contains(*m)).count();
+    if critical_hits >= 2 {
+        return TaskComplexity::Critical;
+    }
+
+    // Trivial: short messages with no complexity signals.
+    if char_count < 50 && complex_hits == 0 {
+        return TaskComplexity::Trivial;
+    }
+
+    // Moderate: longer messages or those with some structure.
+    let sentence_count = text.matches(". ").count() + text.matches("? ").count() + 1;
+    if sentence_count >= 3 || char_count > 200 || complex_hits == 1 {
+        return TaskComplexity::Moderate;
+    }
+
+    TaskComplexity::Simple
 }
 
 /// Truncate a message for classification (first ~200 chars).
@@ -245,5 +391,148 @@ mod tests {
         assert_eq!(parse_task_type("planning"), TaskType::Planning);
         assert_eq!(parse_task_type("general"), TaskType::General);
         assert_eq!(parse_task_type("something unknown"), TaskType::General);
+    }
+
+    #[test]
+    fn test_classify_keywords_coding() {
+        assert_eq!(
+            classify_with_keywords("fix the bug in the login function"),
+            TaskType::Coding
+        );
+        assert_eq!(
+            classify_with_keywords("implement a REST api endpoint for user query"),
+            TaskType::Coding
+        );
+        assert_eq!(
+            classify_with_keywords("refactor the database migration code"),
+            TaskType::Coding
+        );
+        assert_eq!(
+            classify_with_keywords("debug the typescript compile error"),
+            TaskType::Coding
+        );
+    }
+
+    #[test]
+    fn test_classify_keywords_research() {
+        assert_eq!(
+            classify_with_keywords("what is the difference between REST and GraphQL"),
+            TaskType::Research
+        );
+        assert_eq!(
+            classify_with_keywords("compare the pros and cons of React vs Vue"),
+            TaskType::Research
+        );
+        assert_eq!(
+            classify_with_keywords("explain how DNS resolution works"),
+            TaskType::Research
+        );
+    }
+
+    #[test]
+    fn test_classify_keywords_creative() {
+        assert_eq!(
+            classify_with_keywords("write a story about a robot in space"),
+            TaskType::Creative
+        );
+        assert_eq!(
+            classify_with_keywords("draft a blog post about machine learning"),
+            TaskType::Creative
+        );
+        assert_eq!(
+            classify_with_keywords("brainstorm marketing slogan ideas"),
+            TaskType::Creative
+        );
+    }
+
+    #[test]
+    fn test_classify_keywords_planning() {
+        assert_eq!(
+            classify_with_keywords("create a roadmap with milestones for the project"),
+            TaskType::Planning
+        );
+        assert_eq!(
+            classify_with_keywords("plan the architecture and design for the new system"),
+            TaskType::Planning
+        );
+        assert_eq!(
+            classify_with_keywords("breakdown the timeline and prioritize tasks"),
+            TaskType::Planning
+        );
+    }
+
+    #[test]
+    fn test_classify_keywords_general() {
+        assert_eq!(
+            classify_with_keywords("hello how are you"),
+            TaskType::General
+        );
+        assert_eq!(
+            classify_with_keywords("thanks for your help"),
+            TaskType::General
+        );
+        assert_eq!(classify_with_keywords(""), TaskType::General);
+    }
+
+    #[test]
+    fn test_classify_keywords_tiebreak() {
+        // Coding wins ties over other categories.
+        assert_eq!(
+            classify_with_keywords("fix the code and explain how it works"),
+            TaskType::Coding
+        );
+    }
+
+    #[test]
+    fn test_classify_keywords_long_message_truncated() {
+        // Only the first ~300 chars should be checked.
+        let padding = "a ".repeat(200);
+        let msg = format!("{padding}function bug compile");
+        // The keywords appear after 400 chars, so they should be ignored.
+        assert_eq!(classify_with_keywords(&msg), TaskType::General);
+    }
+
+    #[test]
+    fn test_classify_complexity_keywords_trivial() {
+        assert_eq!(
+            classify_complexity_keywords("hello"),
+            TaskComplexity::Trivial
+        );
+        assert_eq!(
+            classify_complexity_keywords("yes"),
+            TaskComplexity::Trivial
+        );
+    }
+
+    #[test]
+    fn test_classify_complexity_keywords_simple() {
+        assert_eq!(
+            classify_complexity_keywords(
+                "Can you help me understand how the routing system works in this project?"
+            ),
+            TaskComplexity::Simple
+        );
+    }
+
+    #[test]
+    fn test_classify_complexity_keywords_moderate() {
+        assert_eq!(
+            classify_complexity_keywords(
+                "I need help with my project. It involves setting up a database. \
+                 Then I need to connect it to the frontend. Can you help?"
+            ),
+            TaskComplexity::Moderate
+        );
+    }
+
+    #[test]
+    fn test_classify_complexity_keywords_complex() {
+        assert_eq!(
+            classify_complexity_keywords(
+                "First, set up the database. Second, create the API. And then \
+                 deploy to production after that."
+            ),
+            TaskComplexity::Complex
+        );
     }
 }

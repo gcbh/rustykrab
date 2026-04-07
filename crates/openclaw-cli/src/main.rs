@@ -105,10 +105,31 @@ async fn main() -> anyhow::Result<()> {
 
     // --- Harness router (auto-selects profile per message) ---
     // Reuses the main provider for classification to avoid model swapping.
-    // The classification prompt is ~50 tokens — negligible overhead on any model.
     let classifier: Arc<dyn ModelProvider> = provider.clone();
 
-    let router = Arc::new(HarnessRouter::new(classifier).with_base(profile));
+    // Decide routing mode: keyword matching (instant) vs LLM classification.
+    // OPENCLAW_LLM_ROUTING overrides auto-detection if set.
+    let use_llm = std::env::var("OPENCLAW_LLM_ROUTING")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or_else(|_| {
+            // Auto-detect: local models use keywords, cloud models use LLM.
+            match provider_name.as_str() {
+                "ollama" => false,
+                _ => true,
+            }
+        });
+
+    let router = Arc::new(
+        HarnessRouter::new(classifier)
+            .with_base(profile)
+            .with_llm_classifier(use_llm),
+    );
+
+    tracing::info!(
+        llm_routing = use_llm,
+        "harness router configured ({})",
+        if use_llm { "LLM classification" } else { "keyword matching" }
+    );
 
     // --- Orchestration pipeline (optional, enabled via OPENCLAW_ORCHESTRATION=true) ---
     let orchestration_config = load_orchestration_config(&data_dir)?;
