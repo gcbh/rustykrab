@@ -18,9 +18,18 @@ async fn prepare_agent(
     conv: &mut Conversation,
     user_content: &str,
 ) -> Result<(AgentRunner, Session), StatusCode> {
-    // 1. Resolve the harness profile for this message.
-    let profile = state.profile_for(user_content).await;
-    tracing::info!(profile = %profile.name, "harness profile selected");
+    // 1. Resolve the harness profile.
+    // If the model self-classified on a previous turn, use that.
+    // Otherwise, fall back to the router (keyword or LLM based).
+    let profile = if let Some(ref detected) = conv.detected_profile {
+        let profile = state.profile_for_name(detected);
+        tracing::info!(profile = %profile.name, source = "self-classified", "harness profile selected");
+        profile
+    } else {
+        let profile = state.profile_for(user_content).await;
+        tracing::info!(profile = %profile.name, source = "router", "harness profile selected");
+        profile
+    };
 
     // 2. Collect tool schemas for the prompt builder.
     let schemas: Vec<_> = state.tools.iter().map(|t| t.schema()).collect();
@@ -30,6 +39,11 @@ async fn prepare_agent(
         .with_identity(&profile.agent_name, &profile.agent_description)
         .with_tool_guidance(&schemas)
         .with_security_policy();
+
+    // Only ask for self-classification if we don't have one yet.
+    if conv.detected_profile.is_none() {
+        builder = builder.with_self_classification();
+    }
 
     if profile.chain_of_thought {
         builder = builder.with_chain_of_thought();
