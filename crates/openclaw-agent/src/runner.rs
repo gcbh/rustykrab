@@ -170,11 +170,21 @@ impl AgentRunner {
                 tracer.record_compression();
             }
 
+            let llm_start = std::time::Instant::now();
             let ModelResponse {
                 message,
-                usage: _,
+                usage,
                 stop_reason,
             } = self.provider.chat(&conv.messages, &schemas).await?;
+            let llm_elapsed = llm_start.elapsed();
+            tracing::info!(
+                iteration,
+                duration_ms = llm_elapsed.as_millis() as u64,
+                prompt_tokens = usage.prompt_tokens,
+                completion_tokens = usage.completion_tokens,
+                ?stop_reason,
+                "LLM call completed"
+            );
 
             conv.messages.push(message.clone());
             conv.updated_at = Utc::now();
@@ -337,14 +347,24 @@ impl AgentRunner {
                 }
             };
 
+            let llm_start = std::time::Instant::now();
             let ModelResponse {
                 message,
-                usage: _,
+                usage,
                 stop_reason,
             } = self
                 .provider
                 .chat_stream(&conv.messages, &schemas, &stream_callback)
                 .await?;
+            let llm_elapsed = llm_start.elapsed();
+            tracing::info!(
+                iteration,
+                duration_ms = llm_elapsed.as_millis() as u64,
+                prompt_tokens = usage.prompt_tokens,
+                completion_tokens = usage.completion_tokens,
+                ?stop_reason,
+                "LLM call completed"
+            );
 
             conv.messages.push(message.clone());
             conv.updated_at = Utc::now();

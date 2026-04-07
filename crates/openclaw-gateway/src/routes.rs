@@ -182,7 +182,7 @@ async fn send_message_stream(
     // Channel for streaming events from the agent task to the SSE response.
     let (tx, rx) = tokio::sync::mpsc::channel::<SsePayload>(128);
 
-    // Spawn the agent loop in a background task with a 5-minute timeout
+    // Spawn the agent loop in a background task with a 10-minute timeout
     // to prevent unbounded connection exhaustion.
     let agent_state = state.clone();
     tokio::spawn(async move {
@@ -192,7 +192,7 @@ async fn send_message_stream(
         };
 
         let result = tokio::time::timeout(
-            tokio::time::Duration::from_secs(300),
+            tokio::time::Duration::from_secs(600),
             crate::orchestrate::run_agent_streaming(
                 &agent_state,
                 &mut conv,
@@ -205,7 +205,7 @@ async fn send_message_stream(
         let result = match result {
             Ok(r) => r,
             Err(_) => {
-                tracing::warn!("streaming agent timed out after 300s");
+                tracing::warn!("streaming agent timed out after 600s");
                 Err(StatusCode::REQUEST_TIMEOUT)
             }
         };
@@ -258,13 +258,20 @@ async fn send_message_stream(
             SsePayload::Done(Ok(message)) => Event::default().event("done").data(
                 serde_json::json!({"type": "done", "message": message}).to_string(),
             ),
-            SsePayload::Done(Err(_)) => Event::default().event("error").data(
-                serde_json::json!({"type": "error", "delta": "an internal error occurred"})
-                    .to_string(),
-            ),
+            SsePayload::Done(Err(e)) => {
+                tracing::error!(error = %e, "agent stream ended with error");
+                Event::default().event("error").data(
+                    serde_json::json!({"type": "error", "delta": format!("{e}")})
+                        .to_string(),
+                )
+            }
         };
         Ok(event)
     });
 
-    Ok(Sse::new(stream))
+    Ok(Sse::new(stream).keep_alive(
+        axum::response::sse::KeepAlive::new()
+            .interval(std::time::Duration::from_secs(15))
+            .text("ping"),
+    ))
 }
