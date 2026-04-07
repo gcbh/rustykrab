@@ -22,6 +22,7 @@ impl ConversationStore {
             created_at: Utc::now(),
             updated_at: Utc::now(),
             summary: None,
+            detected_profile: None,
         };
         self.save(&conv)?;
         Ok(conv)

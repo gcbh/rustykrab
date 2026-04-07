@@ -186,6 +186,24 @@ impl AgentRunner {
                 "LLM call completed"
             );
 
+            // Extract self-classification tag from text responses and strip it.
+            let message = if let Some(text) = message.content.as_text() {
+                let (profile, cleaned) = extract_self_classification(text);
+                if let Some(ref p) = profile {
+                    conv.detected_profile = Some(p.clone());
+                }
+                if profile.is_some() && cleaned != text {
+                    Message {
+                        content: MessageContent::Text(cleaned),
+                        ..message
+                    }
+                } else {
+                    message
+                }
+            } else {
+                message
+            };
+
             conv.messages.push(message.clone());
             conv.updated_at = Utc::now();
 
@@ -365,6 +383,24 @@ impl AgentRunner {
                 ?stop_reason,
                 "LLM call completed"
             );
+
+            // Extract self-classification tag from text responses and strip it.
+            let message = if let Some(text) = message.content.as_text() {
+                let (profile, cleaned) = extract_self_classification(text);
+                if let Some(ref p) = profile {
+                    conv.detected_profile = Some(p.clone());
+                }
+                if profile.is_some() && cleaned != text {
+                    Message {
+                        content: MessageContent::Text(cleaned),
+                        ..message
+                    }
+                } else {
+                    message
+                }
+            } else {
+                message
+            };
 
             conv.messages.push(message.clone());
             conv.updated_at = Utc::now();
@@ -744,6 +780,26 @@ impl AgentRunner {
 /// Sanitize and truncate error messages before they flow into the conversation.
 /// This prevents internal path and stack trace leakage to the model/client.
 /// Takes only the first line (no stack traces) and truncates to 200 chars.
+/// Extract a `[PROFILE: xxx]` tag from the first line of model output.
+/// Returns the profile name and the text with the tag stripped.
+fn extract_self_classification(text: &str) -> (Option<String>, String) {
+    let trimmed = text.trim_start();
+    if let Some(rest) = trimmed.strip_prefix("[PROFILE:") {
+        if let Some(end) = rest.find(']') {
+            let profile = rest[..end].trim().to_lowercase();
+            let remaining = rest[end + 1..].trim_start_matches('\n').to_string();
+            if matches!(
+                profile.as_str(),
+                "coding" | "research" | "creative" | "planning" | "general"
+            ) {
+                tracing::info!(profile = %profile, "model self-classified task type");
+                return (Some(profile), remaining);
+            }
+        }
+    }
+    (None, text.to_string())
+}
+
 fn sanitize_error(e: &str) -> String {
     let first_line = e.lines().next().unwrap_or(e);
     first_line.chars().take(200).collect()

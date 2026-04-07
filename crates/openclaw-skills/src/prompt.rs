@@ -132,6 +132,27 @@ impl SystemPromptBuilder {
         self
     }
 
+    /// Add self-classification instruction.
+    ///
+    /// Asks the model to output a profile tag as the first line of its
+    /// response. This piggybacks classification on the normal generation
+    /// at a cost of ~5 tokens, avoiding a separate LLM call.
+    pub fn with_self_classification(mut self) -> Self {
+        self.sections.push(
+            "SELF-CLASSIFICATION:\n\
+             As the VERY FIRST LINE of your response, output exactly one of these tags \
+             (this will be stripped before showing to the user):\n\
+             [PROFILE: coding] — for code generation, debugging, reviewing, or explaining code\n\
+             [PROFILE: research] — for finding information, comparing options, fact-checking\n\
+             [PROFILE: creative] — for writing stories, poems, marketing copy, brainstorming\n\
+             [PROFILE: planning] — for project plans, task breakdowns, architecture decisions\n\
+             [PROFILE: general] — for casual conversation, simple questions, everything else\n\
+             Then continue with your actual response on the next line."
+                .to_string(),
+        );
+        self
+    }
+
     /// Add chain-of-thought guidance for complex tasks.
     pub fn with_chain_of_thought(mut self) -> Self {
         self.sections.push(

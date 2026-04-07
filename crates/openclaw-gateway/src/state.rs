@@ -141,4 +141,23 @@ impl AppState {
             self.harness_profile.clone()
         }
     }
+
+    /// Get a harness profile by name (from model self-classification).
+    pub fn profile_for_name(&self, name: &str) -> HarnessProfile {
+        match name {
+            "coding" => HarnessProfile::coding(),
+            "research" => HarnessProfile::research(),
+            "creative" => HarnessProfile::creative(),
+            "planning" => {
+                let mut p = HarnessProfile::research();
+                p.name = "planning".to_string();
+                p.task_type = openclaw_agent::TaskType::Planning;
+                p.agent_description = "a methodical planning assistant. You break complex \
+                    problems into actionable steps and identify dependencies."
+                    .to_string();
+                p
+            }
+            _ => self.harness_profile.clone(),
+        }
+    }
 }
