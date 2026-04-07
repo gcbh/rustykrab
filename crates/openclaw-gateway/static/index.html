@@ -1324,7 +1324,22 @@
   // ── Utilities ─────────────────────────────────────────────
   function extractText(content) {
     if (typeof content === 'string') return content;
+    // Tagged enum format: {"type": "text", "data": "..."}
+    if (content && content.type === 'text') return content.data || '';
+    // Legacy untagged format
     if (content && content.Text) return content.Text;
+    if (content && content.type === 'tool_call') {
+      const tc = content.data;
+      return tc ? `Tool: ${tc.name}` : 'Tool call';
+    }
+    if (content && content.type === 'multi_tool_call') {
+      const calls = content.data || [];
+      return calls.map(tc => `Tool: ${tc.name}`).join(', ');
+    }
+    if (content && content.type === 'tool_result') {
+      const tr = content.data;
+      return tr ? `Result for ${tr.call_id}` : 'Tool result';
+    }
     if (Array.isArray(content)) return 'Multiple tool calls';
     if (content && content.name) return `Tool: ${content.name}`;
     if (content && content.call_id) return `Result for ${content.call_id}`;
