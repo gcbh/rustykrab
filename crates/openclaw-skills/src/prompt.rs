@@ -145,13 +145,13 @@ impl SystemPromptBuilder {
     pub fn with_self_classification(mut self) -> Self {
         self.sections.push(
             "SELF-CLASSIFICATION:\n\
-             As the VERY FIRST LINE of your response, output exactly one of these tags \
-             (this will be stripped before showing to the user):\n\
-             [PROFILE: coding] — for code generation, debugging, reviewing, or explaining code\n\
-             [PROFILE: research] — for finding information, comparing options, fact-checking\n\
-             [PROFILE: creative] — for writing stories, poems, marketing copy, brainstorming\n\
-             [PROFILE: planning] — for project plans, task breakdowns, architecture decisions\n\
-             [PROFILE: general] — for casual conversation, simple questions, everything else\n\
+             As the VERY FIRST LINE of every response, output exactly one tag \
+             (it will be stripped before showing to the user):\n\
+             [PROFILE: coding] — code generation, debugging, reviewing, or explaining code\n\
+             [PROFILE: research] — finding information, comparing options, fact-checking\n\
+             [PROFILE: creative] — writing stories, poems, marketing copy, brainstorming\n\
+             [PROFILE: planning] — project plans, task breakdowns, architecture decisions\n\
+             [PROFILE: general] — casual conversation, simple questions, everything else\n\
              Then continue with your actual response on the next line."
                 .to_string(),
         );

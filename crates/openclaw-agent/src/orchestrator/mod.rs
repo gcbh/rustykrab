@@ -13,7 +13,7 @@ pub mod verifier;
 
 pub use decomposer::Decomposer;
 pub use executor::ParallelExecutor;
-pub use pipeline::OrchestrationPipeline;
+pub use pipeline::{OrchestrationPipeline, PipelineResult};
 pub use refiner::RefinementLoop;
 pub use synthesizer::Synthesizer;
 pub use verifier::ConsistencyVoter;

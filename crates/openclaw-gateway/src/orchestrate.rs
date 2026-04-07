@@ -4,6 +4,7 @@ use uuid::Uuid;
 
 use openclaw_agent::{AgentEvent, AgentRunner};
 use openclaw_core::capability::CapabilitySet;
+use openclaw_core::orchestration::TaskComplexity;
 use openclaw_core::session::Session;
 use openclaw_core::types::{Conversation, Message, MessageContent, Role};
 use openclaw_skills::SystemPromptBuilder;
@@ -40,10 +41,9 @@ async fn prepare_agent(
         .with_tool_guidance(&schemas)
         .with_security_policy();
 
-    // Only ask for self-classification if we don't have one yet.
-    if conv.detected_profile.is_none() {
-        builder = builder.with_self_classification();
-    }
+    // Always ask for self-classification — the model tags every response
+    // so the profile stays current as the conversation evolves.
+    builder = builder.with_self_classification();
 
     if profile.chain_of_thought {
         builder = builder.with_chain_of_thought();
@@ -141,12 +141,55 @@ fn extract_assistant_message(conv: &Conversation) -> Result<Message, StatusCode>
 
 /// Run the full agent pipeline on a conversation (non-streaming).
 ///
-/// Used by the HTTP handler where the full response is returned at once.
+/// If the orchestration pipeline is enabled, routes through
+/// decompose → execute → synthesize → refine. Otherwise falls
+/// back to the simple agent loop.
 pub async fn run_agent(
     state: &AppState,
     conv: &mut Conversation,
     user_content: &str,
 ) -> Result<Message, StatusCode> {
+    // Try the orchestration pipeline first if enabled.
+    if let Some(ref pipeline) = state.orchestration_pipeline {
+        tracing::info!("routing through orchestration pipeline");
+
+        // Build context from the system prompt (first message if System role).
+        let context = conv
+            .messages
+            .first()
+            .filter(|m| m.role == Role::System)
+            .and_then(|m| m.content.as_text())
+            .map(|s| s.to_string());
+
+        let result = pipeline
+            .run(user_content, TaskComplexity::Complex, context.as_deref())
+            .await
+            .map_err(|e| {
+                tracing::error!("orchestration pipeline error: {e}");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
+        tracing::info!(
+            stages = ?result.stages_executed,
+            sub_tasks = result.sub_task_count,
+            refinement_iterations = result.refinement_iterations,
+            "orchestration pipeline completed"
+        );
+
+        // Add the pipeline result as an assistant message.
+        let msg = Message {
+            id: Uuid::new_v4(),
+            role: Role::Assistant,
+            content: MessageContent::Text(result.response),
+            created_at: Utc::now(),
+        };
+        conv.messages.push(msg.clone());
+        conv.updated_at = Utc::now();
+
+        return Ok(msg);
+    }
+
+    // Fallback: simple agent loop.
     let (runner, session) = prepare_agent(state, conv, user_content).await?;
 
     runner.run(conv, &session).await.map_err(|e| {
@@ -159,14 +202,77 @@ pub async fn run_agent(
 
 /// Run the full agent pipeline with streaming events.
 ///
-/// Used by the WebSocket handler to forward text deltas and tool
-/// lifecycle events to the client in real time.
+/// If the orchestration pipeline is enabled, routes through
+/// decompose → execute → synthesize → refine (non-streaming,
+/// since the pipeline doesn't support event callbacks yet).
+/// Otherwise uses the streaming agent loop.
 pub async fn run_agent_streaming(
     state: &AppState,
     conv: &mut Conversation,
     user_content: &str,
     on_event: &(dyn Fn(AgentEvent) + Send + Sync),
 ) -> Result<Message, StatusCode> {
+    // Try the orchestration pipeline first if enabled.
+    if let Some(ref pipeline) = state.orchestration_pipeline {
+        tracing::info!("routing through orchestration pipeline (streaming path)");
+
+        on_event(AgentEvent::ToolCallStart {
+            tool_name: "orchestration_pipeline".to_string(),
+            call_id: "pipeline".to_string(),
+        });
+
+        let context = conv
+            .messages
+            .first()
+            .filter(|m| m.role == Role::System)
+            .and_then(|m| m.content.as_text())
+            .map(|s| s.to_string());
+
+        let result = pipeline
+            .run(user_content, TaskComplexity::Complex, context.as_deref())
+            .await
+            .map_err(|e| {
+                tracing::error!("orchestration pipeline error: {e}");
+                on_event(AgentEvent::ToolCallEnd {
+                    tool_name: "orchestration_pipeline".to_string(),
+                    call_id: "pipeline".to_string(),
+                    success: false,
+                    error_message: Some(e.to_string()),
+                });
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
+        on_event(AgentEvent::ToolCallEnd {
+            tool_name: "orchestration_pipeline".to_string(),
+            call_id: "pipeline".to_string(),
+            success: true,
+            error_message: None,
+        });
+
+        tracing::info!(
+            stages = ?result.stages_executed,
+            sub_tasks = result.sub_task_count,
+            refinement_iterations = result.refinement_iterations,
+            "orchestration pipeline completed"
+        );
+
+        // Emit the result as text deltas so the client sees it stream.
+        on_event(AgentEvent::TextDelta(result.response.clone()));
+        on_event(AgentEvent::Done);
+
+        let msg = Message {
+            id: Uuid::new_v4(),
+            role: Role::Assistant,
+            content: MessageContent::Text(result.response),
+            created_at: Utc::now(),
+        };
+        conv.messages.push(msg.clone());
+        conv.updated_at = Utc::now();
+
+        return Ok(msg);
+    }
+
+    // Fallback: streaming agent loop.
     let (runner, session) = prepare_agent(state, conv, user_content).await?;
 
     runner

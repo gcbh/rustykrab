@@ -8,8 +8,8 @@ pub mod trace;
 
 pub use harness::{HarnessProfile, TaskType};
 pub use orchestrator::{
-    ConsistencyVoter, Decomposer, OrchestrationPipeline, ParallelExecutor, RefinementLoop,
-    Synthesizer,
+    ConsistencyVoter, Decomposer, OrchestrationPipeline, ParallelExecutor, PipelineResult,
+    RefinementLoop, Synthesizer,
 };
 pub use rlm::{ContextManager, RecursiveExecutor};
 pub use router::HarnessRouter;

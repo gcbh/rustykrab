@@ -89,8 +89,8 @@ pub struct Conversation {
     /// Optional summary of earlier messages for context compression.
     #[serde(default)]
     pub summary: Option<String>,
-    /// Self-classified profile from the model's previous response.
-    /// Used to select the harness profile for the next turn.
+    /// Self-classified profile from the model's latest response.
+    /// Updated every turn — the model always tags its response.
     #[serde(default)]
     pub detected_profile: Option<String>,
 }

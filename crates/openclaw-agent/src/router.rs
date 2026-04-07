@@ -78,32 +78,7 @@ impl HarnessRouter {
     /// Returns a TaskComplexity that determines which orchestration
     /// pipeline stages to run.
     pub async fn classify_complexity(&self, user_message: &str) -> TaskComplexity {
-        let truncated = truncate_for_classification(user_message);
-        let prompt = format!("{COMPLEXITY_PROMPT}{truncated}");
-
-        let messages = vec![Message {
-            id: Uuid::new_v4(),
-            role: Role::User,
-            content: MessageContent::Text(prompt),
-            created_at: chrono::Utc::now(),
-        }];
-
-        match self.classifier.chat(&messages, &[]).await {
-            Ok(response) => {
-                let text = response
-                    .message
-                    .content
-                    .as_text()
-                    .unwrap_or("simple")
-                    .trim()
-                    .to_lowercase();
-                parse_complexity(&text)
-            }
-            Err(e) => {
-                tracing::debug!("complexity classification failed: {e}");
-                TaskComplexity::Simple
-            }
-        }
+        classify_complexity_keywords(user_message)
     }
 
     /// Classify a user message and return the appropriate harness profile.
@@ -198,6 +173,57 @@ fn parse_complexity(text: &str) -> TaskComplexity {
         TaskComplexity::Complex
     } else if lower.contains("critical") {
         TaskComplexity::Critical
+    } else {
+        TaskComplexity::Simple
+    }
+}
+
+/// Classify complexity using keyword heuristics. No LLM call — instant.
+///
+/// Heuristics:
+/// - Multiple sub-questions or "and then" / "after that" → Complex
+/// - "compare", "analyze", "research", "step by step" → Moderate
+/// - Short, single-action requests → Simple
+/// - Very short greetings/questions → Trivial
+pub fn classify_complexity_keywords(text: &str) -> TaskComplexity {
+    let lower = text.to_lowercase();
+    let word_count = lower.split_whitespace().count();
+
+    // Trivial: very short, no action
+    if word_count <= 5 {
+        return TaskComplexity::Trivial;
+    }
+
+    // Count complexity signals
+    let complex_signals = [
+        "and then", "after that", "once you", "next step",
+        "first do", "then do", "finally", "multiple",
+        "step by step", "break down", "break it down",
+        "all of the", "each of the", "every",
+    ];
+    let moderate_signals = [
+        "compare", "analyze", "analyse", "research", "investigate",
+        "summarize", "review", "evaluate", "assess",
+        "pros and cons", "difference between", "trade-off",
+        "explain how", "explain why", "deep dive",
+    ];
+
+    let complex_count = complex_signals.iter().filter(|s| lower.contains(**s)).count();
+    let moderate_count = moderate_signals.iter().filter(|s| lower.contains(**s)).count();
+
+    // Count question marks and list items (numbered or bulleted)
+    let question_marks = lower.matches('?').count();
+    let list_items = lower.lines().filter(|l| {
+        let t = l.trim();
+        t.starts_with("- ") || t.starts_with("* ") || t.chars().next().map_or(false, |c| c.is_ascii_digit())
+    }).count();
+
+    if complex_count >= 2 || (complex_count >= 1 && moderate_count >= 1) || list_items >= 4 {
+        TaskComplexity::Complex
+    } else if moderate_count >= 1 || complex_count >= 1 || question_marks >= 2 || list_items >= 2 || word_count > 100 {
+        TaskComplexity::Moderate
+    } else if word_count <= 15 {
+        TaskComplexity::Simple
     } else {
         TaskComplexity::Simple
     }
