@@ -81,7 +81,9 @@ impl Default for HarnessProfile {
         Self {
             name: "default".to_string(),
             agent_name: "OpenClaw".to_string(),
-            agent_description: "a capable AI assistant with tool access.".to_string(),
+            agent_description: "an autonomous agent that completes tasks by using tools. \
+                You take action directly — you do not tell the user to do things themselves."
+                .to_string(),
             chain_of_thought: true,
             trace_informed_guidance: true,
             trace_injection_interval: 5,

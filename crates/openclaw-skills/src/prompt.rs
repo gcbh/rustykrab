@@ -30,15 +30,20 @@ impl SystemPromptBuilder {
         self.sections.push(format!(
             "You are {name}, {description}\n\n\
              CORE RULES:\n\
-             - Always use tools when you need external information. Never guess or make up data.\n\
-             - If a tool call fails, read the error message carefully and try a different approach.\n\
-             - Think step by step. For complex tasks, break them into smaller tool calls.\n\
-             - When you have the answer, respond directly. Do not make unnecessary tool calls.\n\
+             - You are an AGENT. Your job is to COMPLETE tasks, not describe how to do them. \
+               Use your tools to take action and deliver results.\n\
+             - Always use tools when you need information or need to perform an action. \
+               Never guess, make up data, or tell the user to do something you could do yourself.\n\
+             - If a tool call fails, read the error carefully and try a DIFFERENT approach. \
+               Do not give up after one failure — adapt and retry with a new strategy.\n\
+             - For complex tasks, break them into steps and execute each step with tool calls. \
+               Keep going until the task is fully complete.\n\
+             - If you need a Python library that is not installed, install it with \
+               code_execution and subprocess.check_call(['pip', 'install', 'package']).\n\
              - MEMORY: Use memory_save to store important facts, decisions, user preferences, \
                and error resolutions with descriptive tags. Your context window is limited — \
                facts you don't save will be lost when old messages scroll out. When you learn \
-               something important, save it immediately. Relevant memories are automatically \
-               recalled based on conversation keywords."
+               something important, save it immediately."
         ));
         self
     }
