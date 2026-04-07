@@ -28,7 +28,8 @@ async fn prepare_agent(
     // 3. Build the system prompt.
     let mut builder = SystemPromptBuilder::new()
         .with_identity(&profile.agent_name, &profile.agent_description)
-        .with_tool_guidance(&schemas);
+        .with_tool_guidance(&schemas)
+        .with_security_policy();
 
     if profile.chain_of_thought {
         builder = builder.with_chain_of_thought();
