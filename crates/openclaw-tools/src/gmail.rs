@@ -543,7 +543,7 @@ impl Tool for GmailTool {
                     },
                     "mailbox": {
                         "type": "string",
-                        "description": "Mailbox/label to operate on (default 'INBOX')"
+                        "description": "IMAP mailbox name (default 'INBOX'). Gmail folders: '[Gmail]/Sent Mail', '[Gmail]/All Mail', '[Gmail]/Drafts', '[Gmail]/Spam', '[Gmail]/Trash', '[Gmail]/Starred'. Custom labels use their name directly."
                     },
                     "uid": {
                         "type": "integer",
