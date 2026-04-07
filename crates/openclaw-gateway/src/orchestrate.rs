@@ -41,10 +41,9 @@ async fn prepare_agent(
         .with_tool_guidance(&schemas)
         .with_security_policy();
 
-    // Only ask for self-classification if we don't have one yet.
-    if conv.detected_profile.is_none() {
-        builder = builder.with_self_classification();
-    }
+    // Always ask for self-classification — the model tags every response
+    // so the profile stays current as the conversation evolves.
+    builder = builder.with_self_classification();
 
     if profile.chain_of_thought {
         builder = builder.with_chain_of_thought();

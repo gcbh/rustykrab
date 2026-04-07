@@ -780,23 +780,25 @@ impl AgentRunner {
 /// Sanitize and truncate error messages before they flow into the conversation.
 /// This prevents internal path and stack trace leakage to the model/client.
 /// Takes only the first line (no stack traces) and truncates to 200 chars.
-/// Extract a `[PROFILE: xxx]` tag from the first line of model output.
-/// Returns the profile name and the text with the tag stripped.
+/// Extract `[PROFILE: xxx]` tag from the first line of model output.
+/// Returns the profile and the text with the tag line stripped.
 fn extract_self_classification(text: &str) -> (Option<String>, String) {
     let trimmed = text.trim_start();
-    if let Some(rest) = trimmed.strip_prefix("[PROFILE:") {
-        if let Some(end) = rest.find(']') {
-            let profile = rest[..end].trim().to_lowercase();
-            let remaining = rest[end + 1..].trim_start_matches('\n').to_string();
-            if matches!(
-                profile.as_str(),
-                "coding" | "research" | "creative" | "planning" | "general"
-            ) {
-                tracing::info!(profile = %profile, "model self-classified task type");
-                return (Some(profile), remaining);
+    let first_line = trimmed.lines().next().unwrap_or("");
+
+    // Extract [PROFILE: xxx]
+    if let Some(start) = first_line.find("[PROFILE:") {
+        if let Some(end) = first_line[start + 9..].find(']') {
+            let val = first_line[start + 9..start + 9 + end].trim().to_lowercase();
+            if matches!(val.as_str(), "coding" | "research" | "creative" | "planning" | "general") {
+                let remaining = trimmed.lines().skip(1).collect::<Vec<_>>().join("\n");
+                let remaining = remaining.trim_start().to_string();
+                tracing::info!(profile = %val, "model self-classified");
+                return (Some(val), remaining);
             }
         }
     }
+
     (None, text.to_string())
 }
 

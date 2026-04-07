@@ -145,21 +145,13 @@ impl SystemPromptBuilder {
     pub fn with_self_classification(mut self) -> Self {
         self.sections.push(
             "SELF-CLASSIFICATION:\n\
-             As the VERY FIRST LINE of your response, output exactly this format \
+             As the VERY FIRST LINE of every response, output exactly one tag \
              (it will be stripped before showing to the user):\n\
-             [PROFILE: <type>] [COMPLEXITY: <level>]\n\n\
-             Profile types:\n\
-             - coding — code generation, debugging, reviewing, or explaining code\n\
-             - research — finding information, comparing options, fact-checking\n\
-             - creative — writing stories, poems, marketing copy, brainstorming\n\
-             - planning — project plans, task breakdowns, architecture decisions\n\
-             - general — casual conversation, simple questions, everything else\n\n\
-             Complexity levels:\n\
-             - simple — single-step, straightforward request\n\
-             - moderate — needs analysis, comparison, or multi-source gathering\n\
-             - complex — multi-step with dependencies, needs decomposition\n\
-             - critical — high stakes, needs verification and cross-checking\n\n\
-             Example: [PROFILE: coding] [COMPLEXITY: moderate]\n\
+             [PROFILE: coding] — code generation, debugging, reviewing, or explaining code\n\
+             [PROFILE: research] — finding information, comparing options, fact-checking\n\
+             [PROFILE: creative] — writing stories, poems, marketing copy, brainstorming\n\
+             [PROFILE: planning] — project plans, task breakdowns, architecture decisions\n\
+             [PROFILE: general] — casual conversation, simple questions, everything else\n\
              Then continue with your actual response on the next line."
                 .to_string(),
         );
