@@ -5,6 +5,28 @@ use serde_json::{json, Value};
 use std::time::Duration;
 use tokio::time::timeout;
 
+/// Resolve the full path to python3, checking common locations
+/// so that pyenv/Homebrew/conda installs are found even after env_clear().
+fn which_python() -> Option<std::path::PathBuf> {
+    // Check the current PATH first (before we clear it)
+    if let Ok(output) = std::process::Command::new("which")
+        .arg("python3")
+        .output()
+    {
+        if output.status.success() {
+            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !path.is_empty() {
+                // Resolve shims (pyenv) to the actual binary
+                if let Ok(canonical) = std::fs::canonicalize(&path) {
+                    return Some(canonical);
+                }
+                return Some(path.into());
+            }
+        }
+    }
+    None
+}
+
 /// A built-in tool that executes Python code in a sandboxed environment.
 ///
 /// Security improvements:
@@ -32,7 +54,11 @@ impl Tool for CodeExecutionTool {
     }
 
     fn description(&self) -> &str {
-        "Execute Python code in a sandboxed environment and return the result."
+        "Execute Python code and return stdout/stderr. Has access to the user's \
+         Python environment including installed packages. If a package is missing, \
+         install it with subprocess.check_call(['pip', 'install', 'package_name']). \
+         Use this for data processing, file format conversion, calculations, \
+         and any task that benefits from Python libraries."
     }
 
     fn schema(&self) -> ToolSchema {
@@ -79,13 +105,29 @@ impl Tool for CodeExecutionTool {
             .await
             .map_err(|e| openclaw_core::Error::ToolExecution(e.to_string().into()))?;
 
-        let future = tokio::process::Command::new("python3")
+        // Resolve the full path to python3 before clearing the environment.
+        // This ensures we find the user's Python (e.g., pyenv, Homebrew)
+        // rather than falling back to a system Python that may lack packages.
+        let python_path = which_python().unwrap_or_else(|| "python3".into());
+
+        // Include the Python's bin directory in PATH so pip is also available.
+        // This allows the model to install packages if needed.
+        let python_bin_dir = python_path
+            .parent()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let sandbox_path = if python_bin_dir.is_empty() {
+            "/usr/local/bin:/usr/bin:/bin".to_string()
+        } else {
+            format!("{python_bin_dir}:/usr/local/bin:/usr/bin:/bin")
+        };
+
+        let future = tokio::process::Command::new(&python_path)
             .arg(&tmp_file)
             .env_clear()
-            .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+            .env("PATH", &sandbox_path)
             .env("HOME", std::env::temp_dir())
             .env("LANG", "C.UTF-8")
-            // Prevent Python from importing from arbitrary locations
             .env("PYTHONDONTWRITEBYTECODE", "1")
             .current_dir(&tmp_dir)
             .output();
