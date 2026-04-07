@@ -53,7 +53,7 @@ impl Tool for MemoryGetTool {
             .backend
             .get(memory_id)
             .await
-            .map_err(|e| openclaw_core::Error::ToolExecution(e.to_string()))?;
+            .map_err(|e| openclaw_core::Error::ToolExecution(e.to_string().into()))?;
 
         Ok(entry)
     }

@@ -112,7 +112,7 @@ impl Tool for SkillCreateTool {
             return Err(Error::ToolExecution(format!(
                 "skill '{name}' already exists at {}",
                 skill_dir.display()
-            )));
+            ).into()));
         }
 
         // Optional fields
@@ -156,11 +156,11 @@ impl Tool for SkillCreateTool {
 
         // Write to disk
         std::fs::create_dir_all(&skill_dir)
-            .map_err(|e| Error::ToolExecution(format!("failed to create skill directory: {e}")))?;
+            .map_err(|e| Error::ToolExecution(format!("failed to create skill directory: {e}").into()))?;
 
         let path = skill_dir.join("SKILL.md");
         std::fs::write(&path, &content)
-            .map_err(|e| Error::ToolExecution(format!("failed to write SKILL.md: {e}")))?;
+            .map_err(|e| Error::ToolExecution(format!("failed to write SKILL.md: {e}").into()))?;
 
         Ok(json!({
             "created": true,

@@ -65,7 +65,7 @@ impl Tool for SubagentsTool {
         if current_depth >= MAX_RECURSION_DEPTH {
             return Err(openclaw_core::Error::ToolExecution(format!(
                 "maximum agent recursion depth ({MAX_RECURSION_DEPTH}) exceeded"
-            )));
+            ).into()));
         }
 
         self.manager.run_subagent(agent_id, task).await

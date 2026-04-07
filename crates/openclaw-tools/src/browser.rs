@@ -10,6 +10,8 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio_stream::StreamExt;
 
+use crate::security;
+
 const DEFAULT_CDP_URL: &str = "ws://127.0.0.1:9222";
 const MAX_CONTENT_BYTES: usize = 50 * 1024; // 50KB cap for page content
 
@@ -57,7 +59,7 @@ impl BrowserTool {
                         "Chrome not reachable at {}: {}. \
                          Launch Chrome with: open -a 'Google Chrome' --args --remote-debugging-port=9222",
                         self.cdp_url, e
-                    ))
+                    ).into())
                 })?;
 
             // Spawn the CDP handler so messages are processed in the background.
@@ -86,14 +88,14 @@ impl Default for BrowserTool {
 async fn get_active_page(browser: &Browser) -> Result<chromiumoxide::Page> {
     // Try to get existing pages first
     let pages = browser.pages().await.map_err(|e| {
-        Error::ToolExecution(format!("failed to list browser pages: {e}"))
+        Error::ToolExecution(format!("failed to list browser pages: {e}").into())
     })?;
     if let Some(page) = pages.into_iter().next() {
         return Ok(page);
     }
     // No pages — create one
     browser.new_page("about:blank").await.map_err(|e| {
-        Error::ToolExecution(format!("failed to create new page: {e}"))
+        Error::ToolExecution(format!("failed to create new page: {e}").into())
     })
 }
 
@@ -180,9 +182,13 @@ impl Tool for BrowserTool {
                     .as_str()
                     .ok_or_else(|| Error::ToolExecution("navigate action requires 'url' parameter".into()))?;
 
+                // SSRF protection: validate URL before navigating
+                security::validate_url(url)
+                    .map_err(|e| Error::ToolExecution(e.into()))?;
+
                 let page = get_active_page(browser).await?;
                 page.goto(url).await.map_err(|e| {
-                    Error::ToolExecution(format!("navigation failed: {e}"))
+                    Error::ToolExecution(format!("navigation failed: {e}").into())
                 })?;
 
                 // Wait briefly for the page to settle
@@ -191,13 +197,13 @@ impl Tool for BrowserTool {
                 let title = page
                     .get_title()
                     .await
-                    .map_err(|e| Error::ToolExecution(format!("failed to get title: {e}")))?
+                    .map_err(|e| Error::ToolExecution(format!("failed to get title: {e}").into()))?
                     .unwrap_or_default();
 
                 let current_url = page
                     .url()
                     .await
-                    .map_err(|e| Error::ToolExecution(format!("failed to get URL: {e}")))?
+                    .map_err(|e| Error::ToolExecution(format!("failed to get URL: {e}").into()))?
                     .unwrap_or_default();
 
                 Ok(json!({
@@ -214,10 +220,10 @@ impl Tool for BrowserTool {
 
                 let page = get_active_page(browser).await?;
                 let elem = page.find_element(selector).await.map_err(|e| {
-                    Error::ToolExecution(format!("element not found for selector '{selector}': {e}"))
+                    Error::ToolExecution(format!("element not found for selector '{selector}': {e}").into())
                 })?;
                 elem.click().await.map_err(|e| {
-                    Error::ToolExecution(format!("click failed on '{selector}': {e}"))
+                    Error::ToolExecution(format!("click failed on '{selector}': {e}").into())
                 })?;
 
                 Ok(json!({
@@ -237,12 +243,12 @@ impl Tool for BrowserTool {
 
                 let page = get_active_page(browser).await?;
                 let elem = page.find_element(selector).await.map_err(|e| {
-                    Error::ToolExecution(format!("element not found for selector '{selector}': {e}"))
+                    Error::ToolExecution(format!("element not found for selector '{selector}': {e}").into())
                 })?;
 
                 // Click to focus the field
                 elem.click().await.map_err(|e| {
-                    Error::ToolExecution(format!("failed to focus '{selector}': {e}"))
+                    Error::ToolExecution(format!("failed to focus '{selector}': {e}").into())
                 })?;
 
                 if clear {
@@ -264,7 +270,7 @@ impl Tool for BrowserTool {
                 }
 
                 elem.type_str(text).await.map_err(|e| {
-                    Error::ToolExecution(format!("typing failed on '{selector}': {e}"))
+                    Error::ToolExecution(format!("typing failed on '{selector}': {e}").into())
                 })?;
 
                 Ok(json!({
@@ -285,14 +291,14 @@ impl Tool for BrowserTool {
                     let elem = page.find_element(sel).await.map_err(|e| {
                         Error::ToolExecution(format!(
                             "element not found for selector '{sel}': {e}"
-                        ))
+                        ).into())
                     })?;
                     elem.screenshot(
                         chromiumoxide::cdp::browser_protocol::page::CaptureScreenshotFormat::Png,
                     )
                     .await
                     .map_err(|e| {
-                        Error::ToolExecution(format!("element screenshot failed: {e}"))
+                        Error::ToolExecution(format!("element screenshot failed: {e}").into())
                     })?
                 } else {
                     // Page screenshot
@@ -300,7 +306,7 @@ impl Tool for BrowserTool {
                         .full_page(full_page)
                         .build();
                     page.screenshot(params).await.map_err(|e| {
-                        Error::ToolExecution(format!("screenshot failed: {e}"))
+                        Error::ToolExecution(format!("screenshot failed: {e}").into())
                     })?
                 };
 
@@ -322,7 +328,7 @@ impl Tool for BrowserTool {
                 let content = match format {
                     "html" => {
                         page.content().await.map_err(|e| {
-                            Error::ToolExecution(format!("failed to get page HTML: {e}"))
+                            Error::ToolExecution(format!("failed to get page HTML: {e}").into())
                         })?
                     }
                     _ => {
@@ -331,7 +337,7 @@ impl Tool for BrowserTool {
                             .evaluate("document.body.innerText")
                             .await
                             .map_err(|e| {
-                                Error::ToolExecution(format!("failed to get page text: {e}"))
+                                Error::ToolExecution(format!("failed to get page text: {e}").into())
                             })?;
                         result.into_value::<String>().unwrap_or_default()
                     }
@@ -343,13 +349,13 @@ impl Tool for BrowserTool {
                 let title = page
                     .get_title()
                     .await
-                    .map_err(|e| Error::ToolExecution(format!("failed to get title: {e}")))?
+                    .map_err(|e| Error::ToolExecution(format!("failed to get title: {e}").into()))?
                     .unwrap_or_default();
 
                 let current_url = page
                     .url()
                     .await
-                    .map_err(|e| Error::ToolExecution(format!("failed to get URL: {e}")))?
+                    .map_err(|e| Error::ToolExecution(format!("failed to get URL: {e}").into()))?
                     .unwrap_or_default();
 
                 Ok(json!({
@@ -368,7 +374,7 @@ impl Tool for BrowserTool {
 
                 let page = get_active_page(browser).await?;
                 let result = page.evaluate(expression).await.map_err(|e| {
-                    Error::ToolExecution(format!("JS evaluation failed: {e}"))
+                    Error::ToolExecution(format!("JS evaluation failed: {e}").into())
                 })?;
 
                 // Try to deserialize as a JSON value; fall back to string representation
@@ -458,7 +464,7 @@ impl Tool for BrowserTool {
                 );
 
                 let result = page.evaluate(js).await.map_err(|e| {
-                    Error::ToolExecution(format!("select failed: {e}"))
+                    Error::ToolExecution(format!("select failed: {e}").into())
                 })?;
 
                 let status: String = result.into_value().unwrap_or_else(|_| "unknown".into());
@@ -466,7 +472,7 @@ impl Tool for BrowserTool {
                 if status == "element_not_found" {
                     return Err(Error::ToolExecution(format!(
                         "element not found for selector '{selector}'"
-                    )));
+                    ).into()));
                 }
 
                 Ok(json!({
@@ -481,7 +487,7 @@ impl Tool for BrowserTool {
                 let page = get_active_page(browser).await?;
 
                 let cookies: Vec<Cookie> = page.get_cookies().await.map_err(|e| {
-                    Error::ToolExecution(format!("failed to get cookies: {e}"))
+                    Error::ToolExecution(format!("failed to get cookies: {e}").into())
                 })?;
 
                 let filtered: Vec<Value> = cookies
@@ -523,12 +529,12 @@ impl Tool for BrowserTool {
                     _ => {
                         return Err(Error::ToolExecution(format!(
                             "unknown scroll direction: '{direction}'. Use: down, up, bottom, top"
-                        )));
+                        ).into()));
                     }
                 };
 
                 let result = page.evaluate(js).await.map_err(|e| {
-                    Error::ToolExecution(format!("scroll failed: {e}"))
+                    Error::ToolExecution(format!("scroll failed: {e}").into())
                 })?;
 
                 let scroll_y: f64 = result.into_value().unwrap_or(0.0);
@@ -543,7 +549,7 @@ impl Tool for BrowserTool {
             _ => Err(Error::ToolExecution(format!(
                 "unknown browser action: '{action}'. Available actions: \
                  navigate, click, type, screenshot, content, evaluate, wait, select, cookies, scroll"
-            ))),
+            ).into())),
         }
     }
 }

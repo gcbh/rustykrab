@@ -56,12 +56,12 @@ impl GmailTool {
         let (email, password) = self.get_credentials()?;
         let tls = native_tls::TlsConnector::builder()
             .build()
-            .map_err(|e| Error::ToolExecution(format!("TLS setup failed: {e}")))?;
+            .map_err(|e| Error::ToolExecution(format!("TLS setup failed: {e}").into()))?;
         let client = imap::connect((IMAP_HOST, IMAP_PORT), IMAP_HOST, &tls)
-            .map_err(|e| Error::ToolExecution(format!("IMAP connect failed: {e}")))?;
+            .map_err(|e| Error::ToolExecution(format!("IMAP connect failed: {e}").into()))?;
         let session = client
             .login(&email, &password)
-            .map_err(|e| Error::ToolExecution(format!("IMAP login failed: {}", e.0)))?;
+            .map_err(|e| Error::ToolExecution(format!("IMAP login failed: {}", e.0).into()))?;
         Ok(session)
     }
 
@@ -79,10 +79,10 @@ impl GmailTool {
 
         self.secrets
             .set(KEY_EMAIL, email)
-            .map_err(|e| Error::ToolExecution(format!("failed to store email: {e}")))?;
+            .map_err(|e| Error::ToolExecution(format!("failed to store email: {e}").into()))?;
         self.secrets
             .set(KEY_APP_PASSWORD, app_password)
-            .map_err(|e| Error::ToolExecution(format!("failed to store app password: {e}")))?;
+            .map_err(|e| Error::ToolExecution(format!("failed to store app password: {e}").into()))?;
 
         // Verify credentials by connecting to IMAP.
         let mut session = self.connect_imap()?;
@@ -118,14 +118,14 @@ impl GmailTool {
 
             session
                 .select(&mailbox)
-                .map_err(|e| Error::ToolExecution(format!("select {mailbox} failed: {e}")))?;
+                .map_err(|e| Error::ToolExecution(format!("select {mailbox} failed: {e}").into()))?;
 
             // Use Gmail's X-GM-RAW extension for full search syntax,
             // falling back to standard IMAP SEARCH.
             let uids = session
                 .uid_search(&format!("X-GM-RAW \"{query}\""))
                 .or_else(|_| session.uid_search(&query))
-                .map_err(|e| Error::ToolExecution(format!("search failed: {e}")))?;
+                .map_err(|e| Error::ToolExecution(format!("search failed: {e}").into()))?;
 
             // Take the most recent UIDs (highest numbers = newest).
             let mut uid_list: Vec<u32> = uids.into_iter().collect();
@@ -145,7 +145,7 @@ impl GmailTool {
 
             let fetches = session
                 .uid_fetch(&uid_set, "(UID ENVELOPE FLAGS)")
-                .map_err(|e| Error::ToolExecution(format!("fetch failed: {e}")))?;
+                .map_err(|e| Error::ToolExecution(format!("fetch failed: {e}").into()))?;
 
             let mut messages = Vec::new();
             for fetch in fetches.iter() {
@@ -194,7 +194,7 @@ impl GmailTool {
             }))
         })
         .await
-        .map_err(|e| Error::ToolExecution(format!("task join failed: {e}")))?
+        .map_err(|e| Error::ToolExecution(format!("task join failed: {e}").into()))?
     }
 
     // -----------------------------------------------------------------------
@@ -217,16 +217,16 @@ impl GmailTool {
 
             session
                 .select(&mailbox)
-                .map_err(|e| Error::ToolExecution(format!("select {mailbox} failed: {e}")))?;
+                .map_err(|e| Error::ToolExecution(format!("select {mailbox} failed: {e}").into()))?;
 
             let fetches = session
                 .uid_fetch(uid.to_string(), "(UID RFC822 FLAGS ENVELOPE)")
-                .map_err(|e| Error::ToolExecution(format!("fetch uid {uid} failed: {e}")))?;
+                .map_err(|e| Error::ToolExecution(format!("fetch uid {uid} failed: {e}").into()))?;
 
             let fetch = fetches
                 .iter()
                 .next()
-                .ok_or_else(|| Error::ToolExecution(format!("message uid {uid} not found")))?;
+                .ok_or_else(|| Error::ToolExecution(format!("message uid {uid} not found").into()))?;
 
             let raw_body = fetch.body().unwrap_or_default();
             let parsed = mail_parser::MessageParser::default()
@@ -282,7 +282,7 @@ impl GmailTool {
             }))
         })
         .await
-        .map_err(|e| Error::ToolExecution(format!("task join failed: {e}")))?
+        .map_err(|e| Error::ToolExecution(format!("task join failed: {e}").into()))?
     }
 
     // -----------------------------------------------------------------------
@@ -303,13 +303,13 @@ impl GmailTool {
         let (email, password) = self.get_credentials()?;
 
         let mut message_builder = lettre::message::Message::builder()
-            .from(email.parse().map_err(|e| Error::ToolExecution(format!("invalid from address: {e}")))?)
-            .to(to.parse().map_err(|e| Error::ToolExecution(format!("invalid to address: {e}")))?)
+            .from(email.parse().map_err(|e| Error::ToolExecution(format!("invalid from address: {e}").into()))?)
+            .to(to.parse().map_err(|e| Error::ToolExecution(format!("invalid to address: {e}").into()))?)
             .subject(subject);
 
         if let Some(cc_addr) = cc {
             message_builder = message_builder.cc(
-                cc_addr.parse().map_err(|e| Error::ToolExecution(format!("invalid cc address: {e}")))?
+                cc_addr.parse().map_err(|e| Error::ToolExecution(format!("invalid cc address: {e}").into()))?
             );
         }
         if let Some(reply_id) = in_reply_to {
@@ -318,7 +318,7 @@ impl GmailTool {
 
         let email_msg = message_builder
             .body(body.to_string())
-            .map_err(|e| Error::ToolExecution(format!("failed to build email: {e}")))?;
+            .map_err(|e| Error::ToolExecution(format!("failed to build email: {e}").into()))?;
 
         let creds = lettre::transport::smtp::authentication::Credentials::new(
             email.clone(),
@@ -329,14 +329,14 @@ impl GmailTool {
         use lettre::{AsyncSmtpTransport, AsyncTransport, Tokio1Executor};
 
         let mailer = AsyncSmtpTransport::<Tokio1Executor>::relay(SMTP_HOST)
-            .map_err(|e| Error::ToolExecution(format!("SMTP relay setup failed: {e}")))?
+            .map_err(|e| Error::ToolExecution(format!("SMTP relay setup failed: {e}").into()))?
             .credentials(creds)
             .build();
 
         mailer
             .send(email_msg)
             .await
-            .map_err(|e| Error::ToolExecution(format!("send failed: {e}")))?;
+            .map_err(|e| Error::ToolExecution(format!("send failed: {e}").into()))?;
 
         Ok(json!({
             "status": "sent",
@@ -358,7 +358,7 @@ impl GmailTool {
 
             let mailboxes = session
                 .list(Some(""), Some("*"))
-                .map_err(|e| Error::ToolExecution(format!("list mailboxes failed: {e}")))?;
+                .map_err(|e| Error::ToolExecution(format!("list mailboxes failed: {e}").into()))?;
 
             let labels: Vec<Value> = mailboxes
                 .iter()
@@ -375,7 +375,7 @@ impl GmailTool {
             Ok(json!({ "labels": labels }))
         })
         .await
-        .map_err(|e| Error::ToolExecution(format!("task join failed: {e}")))?
+        .map_err(|e| Error::ToolExecution(format!("task join failed: {e}").into()))?
     }
 
     // -----------------------------------------------------------------------
@@ -402,11 +402,11 @@ impl GmailTool {
 
             session
                 .select(&from_mailbox)
-                .map_err(|e| Error::ToolExecution(format!("select {from_mailbox} failed: {e}")))?;
+                .map_err(|e| Error::ToolExecution(format!("select {from_mailbox} failed: {e}").into()))?;
 
             session
                 .uid_mv(uid.to_string(), &to_mailbox)
-                .map_err(|e| Error::ToolExecution(format!("move failed: {e}")))?;
+                .map_err(|e| Error::ToolExecution(format!("move failed: {e}").into()))?;
 
             let _ = session.logout();
 
@@ -418,7 +418,7 @@ impl GmailTool {
             }))
         })
         .await
-        .map_err(|e| Error::ToolExecution(format!("task join failed: {e}")))?
+        .map_err(|e| Error::ToolExecution(format!("task join failed: {e}").into()))?
     }
 
     // -----------------------------------------------------------------------
@@ -441,18 +441,18 @@ impl GmailTool {
 
             session
                 .select(&mailbox)
-                .map_err(|e| Error::ToolExecution(format!("select {mailbox} failed: {e}")))?;
+                .map_err(|e| Error::ToolExecution(format!("select {mailbox} failed: {e}").into()))?;
 
             session
                 .uid_mv(uid.to_string(), "[Gmail]/Trash")
-                .map_err(|e| Error::ToolExecution(format!("trash failed: {e}")))?;
+                .map_err(|e| Error::ToolExecution(format!("trash failed: {e}").into()))?;
 
             let _ = session.logout();
 
             Ok(json!({ "status": "trashed", "uid": uid }))
         })
         .await
-        .map_err(|e| Error::ToolExecution(format!("task join failed: {e}")))?
+        .map_err(|e| Error::ToolExecution(format!("task join failed: {e}").into()))?
     }
 
     // -----------------------------------------------------------------------
@@ -475,16 +475,16 @@ impl GmailTool {
 
             session
                 .select(&mailbox)
-                .map_err(|e| Error::ToolExecution(format!("select {mailbox} failed: {e}")))?;
+                .map_err(|e| Error::ToolExecution(format!("select {mailbox} failed: {e}").into()))?;
 
             if read {
                 session
                     .uid_store(uid.to_string(), "+FLAGS (\\Seen)")
-                    .map_err(|e| Error::ToolExecution(format!("mark read failed: {e}")))?;
+                    .map_err(|e| Error::ToolExecution(format!("mark read failed: {e}").into()))?;
             } else {
                 session
                     .uid_store(uid.to_string(), "-FLAGS (\\Seen)")
-                    .map_err(|e| Error::ToolExecution(format!("mark unread failed: {e}")))?;
+                    .map_err(|e| Error::ToolExecution(format!("mark unread failed: {e}").into()))?;
             }
 
             let _ = session.logout();
@@ -493,7 +493,7 @@ impl GmailTool {
             Ok(json!({ "status": status, "uid": uid }))
         })
         .await
-        .map_err(|e| Error::ToolExecution(format!("task join failed: {e}")))?
+        .map_err(|e| Error::ToolExecution(format!("task join failed: {e}").into()))?
     }
 }
 
@@ -596,7 +596,7 @@ impl Tool for GmailTool {
             "mark_unread" => self.action_mark(&args, false).await,
             other => Err(Error::ToolExecution(format!(
                 "unknown action '{other}', expected one of: setup, search, read, send, labels, move, trash, mark_read, mark_unread"
-            ))),
+            ).into())),
         }
     }
 }
@@ -625,12 +625,12 @@ fn connect_imap_blocking(
 ) -> Result<imap::Session<native_tls::TlsStream<std::net::TcpStream>>> {
     let tls = native_tls::TlsConnector::builder()
         .build()
-        .map_err(|e| Error::ToolExecution(format!("TLS setup failed: {e}")))?;
+        .map_err(|e| Error::ToolExecution(format!("TLS setup failed: {e}").into()))?;
     let client = imap::connect((IMAP_HOST, IMAP_PORT), IMAP_HOST, &tls)
-        .map_err(|e| Error::ToolExecution(format!("IMAP connect failed: {e}")))?;
+        .map_err(|e| Error::ToolExecution(format!("IMAP connect failed: {e}").into()))?;
     let session = client
         .login(email, password)
-        .map_err(|e| Error::ToolExecution(format!("IMAP login failed: {}", e.0)))?;
+        .map_err(|e| Error::ToolExecution(format!("IMAP login failed: {}", e.0).into()))?;
     Ok(session)
 }
 

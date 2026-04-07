@@ -71,7 +71,7 @@ impl Tool for CredentialWriteTool {
 
                 self.secrets
                     .set(name, value)
-                    .map_err(|e| Error::ToolExecution(format!("failed to store secret: {e}")))?;
+                    .map_err(|e| Error::ToolExecution(format!("failed to store secret: {e}").into()))?;
 
                 Ok(json!({
                     "status": "stored",
@@ -81,7 +81,7 @@ impl Tool for CredentialWriteTool {
             "delete" => {
                 self.secrets
                     .delete(name)
-                    .map_err(|e| Error::ToolExecution(format!("failed to delete secret: {e}")))?;
+                    .map_err(|e| Error::ToolExecution(format!("failed to delete secret: {e}").into()))?;
 
                 Ok(json!({
                     "status": "deleted",
@@ -90,7 +90,7 @@ impl Tool for CredentialWriteTool {
             }
             other => Err(Error::ToolExecution(format!(
                 "unknown action '{other}', expected 'set' or 'delete'"
-            ))),
+            ).into())),
         }
     }
 }

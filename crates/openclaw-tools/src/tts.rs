@@ -78,7 +78,7 @@ impl Tool for TtsTool {
 
         // Path traversal protection: validate output path before writing
         let safe_output_path = crate::security::validate_path(output_path)
-            .map_err(|e| openclaw_core::Error::ToolExecution(format!("output path validation failed: {e}")))?;
+            .map_err(|e| openclaw_core::Error::ToolExecution(format!("output path validation failed: {e}").into()))?;
 
         let text_length = text.len();
 
@@ -94,16 +94,16 @@ impl Tool for TtsTool {
         let resp = req
             .send()
             .await
-            .map_err(|e| openclaw_core::Error::ToolExecution(format!("TTS request failed: {e}")))?;
+            .map_err(|e| openclaw_core::Error::ToolExecution(format!("TTS request failed: {e}").into()))?;
 
         let audio_bytes = resp
             .bytes()
             .await
-            .map_err(|e| openclaw_core::Error::ToolExecution(format!("failed to read TTS response: {e}")))?;
+            .map_err(|e| openclaw_core::Error::ToolExecution(format!("failed to read TTS response: {e}").into()))?;
 
         tokio::fs::write(&safe_output_path, &audio_bytes)
             .await
-            .map_err(|e| openclaw_core::Error::ToolExecution(format!("failed to save audio file: {e}")))?;
+            .map_err(|e| openclaw_core::Error::ToolExecution(format!("failed to save audio file: {e}").into()))?;
 
         Ok(json!({
             "generated": true,

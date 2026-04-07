@@ -106,7 +106,7 @@ impl Tool for ProcessTool {
 
                 // Validate command against allowlist
                 validate_process_command(command).map_err(|e| {
-                    openclaw_core::Error::ToolExecution(format!("command rejected: {e}"))
+                    openclaw_core::Error::ToolExecution(format!("command rejected: {e}").into())
                 })?;
 
                 // Parse the command into parts and execute directly (no shell)
@@ -125,7 +125,7 @@ impl Tool for ProcessTool {
                     .env("HOME", std::env::var("HOME").unwrap_or_default())
                     .env("LANG", "C.UTF-8")
                     .spawn()
-                    .map_err(|e| openclaw_core::Error::ToolExecution(e.to_string()))?;
+                    .map_err(|e| openclaw_core::Error::ToolExecution(e.to_string().into()))?;
 
                 let pid = child.id().ok_or_else(|| {
                     openclaw_core::Error::ToolExecution(
@@ -156,7 +156,7 @@ impl Tool for ProcessTool {
                     .arg(pid.to_string())
                     .output()
                     .await
-                    .map_err(|e| openclaw_core::Error::ToolExecution(e.to_string()))?;
+                    .map_err(|e| openclaw_core::Error::ToolExecution(e.to_string().into()))?;
 
                 if output.status.success() {
                     Ok(json!({
@@ -168,7 +168,7 @@ impl Tool for ProcessTool {
                     let stderr = String::from_utf8_lossy(&output.stderr);
                     Err(openclaw_core::Error::ToolExecution(format!(
                         "failed to stop process {pid}: {stderr}"
-                    )))
+                    ).into()))
                 }
             }
             "list" => {
@@ -176,7 +176,7 @@ impl Tool for ProcessTool {
                     .args(["aux", "--no-headers"])
                     .output()
                     .await
-                    .map_err(|e| openclaw_core::Error::ToolExecution(e.to_string()))?;
+                    .map_err(|e| openclaw_core::Error::ToolExecution(e.to_string().into()))?;
 
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 let processes: Vec<Value> = stdout
@@ -205,7 +205,7 @@ impl Tool for ProcessTool {
             }
             other => Err(openclaw_core::Error::ToolExecution(format!(
                 "unknown action: {other}"
-            ))),
+            ).into())),
         }
     }
 }

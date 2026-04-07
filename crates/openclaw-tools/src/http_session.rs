@@ -130,7 +130,7 @@ impl Tool for HttpSessionTool {
 
         // SSRF protection: validate URL before making request
         security::validate_url(url)
-            .map_err(|e| Error::ToolExecution(e))?;
+            .map_err(|e| Error::ToolExecution(e.into()))?;
 
         let method = args["method"]
             .as_str()
@@ -174,7 +174,7 @@ impl Tool for HttpSessionTool {
         let resp = req
             .send()
             .await
-            .map_err(|e| Error::ToolExecution(format!("request failed: {e}")))?;
+            .map_err(|e| Error::ToolExecution(format!("request failed: {e}").into()))?;
 
         let status = resp.status().as_u16();
         let status_text = resp.status().canonical_reason().unwrap_or("").to_string();
@@ -193,7 +193,7 @@ impl Tool for HttpSessionTool {
         let body = resp
             .text()
             .await
-            .map_err(|e| Error::ToolExecution(format!("failed to read response: {e}")))?;
+            .map_err(|e| Error::ToolExecution(format!("failed to read response: {e}").into()))?;
 
         // Truncate very large responses
         let max_len = 100_000;

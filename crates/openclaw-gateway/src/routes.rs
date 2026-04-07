@@ -232,12 +232,16 @@ async fn send_message_stream(
                         serde_json::json!({"type": "tool_start", "delta": tool_name}).to_string(),
                     ),
                 AgentEvent::ToolCallEnd {
-                    tool_name, success, ..
+                    tool_name, success, error_message, ..
                 } => {
                     let t = if success { "tool_end" } else { "tool_error" };
+                    let mut payload = serde_json::json!({"type": t, "delta": tool_name});
+                    if let Some(ref err) = error_message {
+                        payload["error"] = serde_json::json!(err);
+                    }
                     Event::default()
                         .event(t)
-                        .data(serde_json::json!({"type": t, "delta": tool_name}).to_string())
+                        .data(payload.to_string())
                 }
                 AgentEvent::Reflecting => Event::default().event("thinking").data(
                     serde_json::json!({"type": "thinking", "delta": "reflecting on errors"})

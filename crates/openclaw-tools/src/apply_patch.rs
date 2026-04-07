@@ -232,7 +232,7 @@ impl Tool for ApplyPatchTool {
             .ok_or_else(|| openclaw_core::Error::ToolExecution("missing patch".into()))?;
 
         let file_diffs = parse_unified_diff(patch)
-            .map_err(|e| openclaw_core::Error::ToolExecution(format!("failed to parse patch: {e}")))?;
+            .map_err(|e| openclaw_core::Error::ToolExecution(format!("failed to parse patch: {e}").into()))?;
 
         let mut files_modified = 0;
 
@@ -242,24 +242,24 @@ impl Tool for ApplyPatchTool {
             // Validate each file path from the patch for traversal attacks
             let safe_path = security::validate_path(path)
                 .map_err(|e| openclaw_core::Error::ToolExecution(
-                    format!("patch path rejected for '{path}': {e}"),
+                    format!("patch path rejected for '{path}': {e}").into(),
                 ))?;
 
             let original = tokio::fs::read_to_string(&safe_path)
                 .await
                 .map_err(|e| openclaw_core::Error::ToolExecution(
-                    format!("failed to read {path}: {e}"),
+                    format!("failed to read {path}: {e}").into(),
                 ))?;
 
             let patched = apply_hunks(&original, &file_diff.hunks)
                 .map_err(|e| openclaw_core::Error::ToolExecution(
-                    format!("failed to apply hunks to {path}: {e}"),
+                    format!("failed to apply hunks to {path}: {e}").into(),
                 ))?;
 
             tokio::fs::write(&safe_path, &patched)
                 .await
                 .map_err(|e| openclaw_core::Error::ToolExecution(
-                    format!("failed to write {path}: {e}"),
+                    format!("failed to write {path}: {e}").into(),
                 ))?;
 
             files_modified += 1;

@@ -71,13 +71,13 @@ impl Tool for CodeExecutionTool {
         // Create sandbox temp directory with restricted scope
         tokio::fs::create_dir_all(&tmp_dir)
             .await
-            .map_err(|e| openclaw_core::Error::ToolExecution(e.to_string()))?;
+            .map_err(|e| openclaw_core::Error::ToolExecution(e.to_string().into()))?;
 
         let tmp_file = tmp_dir.join(format!("exec_{}.py", unique_id));
 
         tokio::fs::write(&tmp_file, code)
             .await
-            .map_err(|e| openclaw_core::Error::ToolExecution(e.to_string()))?;
+            .map_err(|e| openclaw_core::Error::ToolExecution(e.to_string().into()))?;
 
         let future = tokio::process::Command::new("python3")
             .arg(&tmp_file)
@@ -99,9 +99,9 @@ impl Tool for CodeExecutionTool {
             .map_err(|_| {
                 openclaw_core::Error::ToolExecution(format!(
                     "code execution timed out after {timeout_secs}s"
-                ))
+                ).into())
             })?
-            .map_err(|e| openclaw_core::Error::ToolExecution(e.to_string()))?;
+            .map_err(|e| openclaw_core::Error::ToolExecution(e.to_string().into()))?;
 
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();

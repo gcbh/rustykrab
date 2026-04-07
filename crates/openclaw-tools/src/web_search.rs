@@ -93,19 +93,19 @@ async fn search_duckduckgo(
         .header("Accept", "text/html")
         .send()
         .await
-        .map_err(|e| Error::ToolExecution(format!("search request failed: {e}")))?;
+        .map_err(|e| Error::ToolExecution(format!("search request failed: {e}").into()))?;
 
     if !resp.status().is_success() {
         return Err(Error::ToolExecution(format!(
             "search returned status {}",
             resp.status()
-        )));
+        ).into()));
     }
 
     let body = resp
         .text()
         .await
-        .map_err(|e| Error::ToolExecution(format!("failed to read search response: {e}")))?;
+        .map_err(|e| Error::ToolExecution(format!("failed to read search response: {e}").into()))?;
 
     let results = parse_duckduckgo_results(&body, max_results);
     Ok(results)

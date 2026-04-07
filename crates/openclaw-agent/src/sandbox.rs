@@ -120,7 +120,7 @@ impl Sandbox for ProcessSandbox {
             Err(_) => Err(Error::ToolExecution(format!(
                 "tool '{tool_name}' exceeded sandbox timeout of {}s",
                 policy.timeout_secs
-            ))),
+            ).into())),
         }
     }
 }

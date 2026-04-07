@@ -66,7 +66,7 @@ impl Tool for MessageTool {
         self.backend
             .send_message(channel, text, chat_id)
             .await
-            .map_err(|e| openclaw_core::Error::ToolExecution(e.to_string()))?;
+            .map_err(|e| openclaw_core::Error::ToolExecution(e.to_string().into()))?;
 
         Ok(json!({
             "sent": true,

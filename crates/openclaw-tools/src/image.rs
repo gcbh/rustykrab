@@ -62,25 +62,25 @@ impl Tool for ImageTool {
         let image_bytes = if source.starts_with("http://") || source.starts_with("https://") {
             // SSRF protection: validate URL before making request
             crate::security::validate_url(source)
-                .map_err(|e| openclaw_core::Error::ToolExecution(format!("URL validation failed: {e}")))?;
+                .map_err(|e| openclaw_core::Error::ToolExecution(format!("URL validation failed: {e}").into()))?;
 
             self.client
                 .get(source)
                 .send()
                 .await
-                .map_err(|e| openclaw_core::Error::ToolExecution(format!("failed to download image: {e}")))?
+                .map_err(|e| openclaw_core::Error::ToolExecution(format!("failed to download image: {e}").into()))?
                 .bytes()
                 .await
-                .map_err(|e| openclaw_core::Error::ToolExecution(format!("failed to read image bytes: {e}")))?
+                .map_err(|e| openclaw_core::Error::ToolExecution(format!("failed to read image bytes: {e}").into()))?
                 .to_vec()
         } else {
             // Path traversal protection: validate path before reading
             let safe_path = crate::security::validate_path(source)
-                .map_err(|e| openclaw_core::Error::ToolExecution(format!("path validation failed: {e}")))?;
+                .map_err(|e| openclaw_core::Error::ToolExecution(format!("path validation failed: {e}").into()))?;
 
             tokio::fs::read(&safe_path)
                 .await
-                .map_err(|e| openclaw_core::Error::ToolExecution(format!("failed to read image file: {e}")))?
+                .map_err(|e| openclaw_core::Error::ToolExecution(format!("failed to read image file: {e}").into()))?
         };
 
         let b64 = base64::engine::general_purpose::STANDARD.encode(&image_bytes);

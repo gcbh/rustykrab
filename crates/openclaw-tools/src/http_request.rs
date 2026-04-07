@@ -78,7 +78,7 @@ impl Tool for HttpRequestTool {
 
         // SSRF protection: validate URL before making request
         security::validate_url(url)
-            .map_err(|e| openclaw_core::Error::ToolExecution(e))?;
+            .map_err(|e| openclaw_core::Error::ToolExecution(e.into()))?;
 
         let mut req = match method.as_str() {
             "POST" => self.client.post(url),
@@ -95,13 +95,13 @@ impl Tool for HttpRequestTool {
         let resp = req
             .send()
             .await
-            .map_err(|e| openclaw_core::Error::ToolExecution(e.to_string()))?;
+            .map_err(|e| openclaw_core::Error::ToolExecution(e.to_string().into()))?;
 
         let status = resp.status().as_u16();
         let body = resp
             .text()
             .await
-            .map_err(|e| openclaw_core::Error::ToolExecution(e.to_string()))?;
+            .map_err(|e| openclaw_core::Error::ToolExecution(e.to_string().into()))?;
 
         if body.len() > 5_000_000 {
             return Err(openclaw_core::Error::ToolExecution(

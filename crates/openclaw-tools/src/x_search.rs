@@ -71,12 +71,12 @@ impl Tool for XSearchTool {
                     .header("Authorization", format!("Bearer {}", token))
                     .send()
                     .await
-                    .map_err(|e| openclaw_core::Error::ToolExecution(e.to_string()))?;
+                    .map_err(|e| openclaw_core::Error::ToolExecution(e.to_string().into()))?;
 
                 let body: Value = resp
                     .json()
                     .await
-                    .map_err(|e| openclaw_core::Error::ToolExecution(e.to_string()))?;
+                    .map_err(|e| openclaw_core::Error::ToolExecution(e.to_string().into()))?;
 
                 // Extract results from the API response
                 let results = body["data"]

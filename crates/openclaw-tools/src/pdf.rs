@@ -79,14 +79,14 @@ impl Tool for PdfTool {
 
         // Validate path for traversal attacks
         let safe_path = security::validate_path(path)
-            .map_err(|e| openclaw_core::Error::ToolExecution(format!("path rejected: {e}")))?;
+            .map_err(|e| openclaw_core::Error::ToolExecution(format!("path rejected: {e}").into()))?;
 
         let pages = args["pages"].as_str();
 
         // Validate page range if provided
         if let Some(p) = pages {
             validate_page_range(p)
-                .map_err(|e| openclaw_core::Error::ToolExecution(format!("invalid page range: {e}")))?;
+                .map_err(|e| openclaw_core::Error::ToolExecution(format!("invalid page range: {e}").into()))?;
         }
 
         let safe_path_str = safe_path.to_string_lossy();
@@ -101,7 +101,7 @@ impl Tool for PdfTool {
                 try_python_pdf(&safe_path_str, pages)
                     .await
                     .map_err(|e| openclaw_core::Error::ToolExecution(
-                        format!("failed to extract PDF text (tried pdftotext and python3): {e}")
+                        format!("failed to extract PDF text (tried pdftotext and python3): {e}").into()
                     ))?
             }
         };

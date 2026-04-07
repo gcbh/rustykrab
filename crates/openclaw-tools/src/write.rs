@@ -64,7 +64,7 @@ impl Tool for WriteTool {
 
         // Validate path for traversal and blocked directories
         let safe_path = security::validate_path(path)
-            .map_err(|e| openclaw_core::Error::ToolExecution(format!("path rejected: {e}")))?;
+            .map_err(|e| openclaw_core::Error::ToolExecution(format!("path rejected: {e}").into()))?;
 
         let file_path = std::path::Path::new(&safe_path);
         if let Some(parent) = file_path.parent() {
@@ -73,7 +73,7 @@ impl Tool for WriteTool {
                 tokio::fs::create_dir_all(parent)
                     .await
                     .map_err(|e| openclaw_core::Error::ToolExecution(
-                        format!("failed to create directories for {path}: {e}"),
+                        format!("failed to create directories for {path}: {e}").into(),
                     ))?;
             }
         }
@@ -82,7 +82,7 @@ impl Tool for WriteTool {
         tokio::fs::write(&safe_path, content)
             .await
             .map_err(|e| openclaw_core::Error::ToolExecution(
-                format!("failed to write {path}: {e}"),
+                format!("failed to write {path}: {e}").into(),
             ))?;
 
         Ok(json!({

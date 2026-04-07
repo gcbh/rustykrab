@@ -59,7 +59,7 @@ impl Tool for SessionsSpawnTool {
         if current_depth >= MAX_SPAWN_DEPTH {
             return Err(openclaw_core::Error::ToolExecution(format!(
                 "maximum session spawn depth ({MAX_SPAWN_DEPTH}) exceeded"
-            )));
+            ).into()));
         }
 
         let system_prompt = args["system_prompt"].as_str();

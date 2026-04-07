@@ -78,12 +78,12 @@ impl Tool for CanvasTool {
                         .json(&json!({"action": "present", "content": content}))
                         .send()
                         .await
-                        .map_err(|e| openclaw_core::Error::ToolExecution(format!("canvas present failed: {e}")))?;
+                        .map_err(|e| openclaw_core::Error::ToolExecution(format!("canvas present failed: {e}").into()))?;
 
                     let body = resp
                         .text()
                         .await
-                        .map_err(|e| openclaw_core::Error::ToolExecution(format!("failed to read response: {e}")))?;
+                        .map_err(|e| openclaw_core::Error::ToolExecution(format!("failed to read response: {e}").into()))?;
 
                     Ok(json!({
                         "action": "present",
@@ -118,12 +118,12 @@ impl Tool for CanvasTool {
                     .json(&json!({"action": "evaluate", "expression": expression}))
                     .send()
                     .await
-                    .map_err(|e| openclaw_core::Error::ToolExecution(format!("canvas evaluate failed: {e}")))?;
+                    .map_err(|e| openclaw_core::Error::ToolExecution(format!("canvas evaluate failed: {e}").into()))?;
 
                 let body = resp
                     .text()
                     .await
-                    .map_err(|e| openclaw_core::Error::ToolExecution(format!("failed to read response: {e}")))?;
+                    .map_err(|e| openclaw_core::Error::ToolExecution(format!("failed to read response: {e}").into()))?;
 
                 Ok(json!({
                     "action": "evaluate",
@@ -144,12 +144,12 @@ impl Tool for CanvasTool {
                     .json(&json!({"action": "snapshot"}))
                     .send()
                     .await
-                    .map_err(|e| openclaw_core::Error::ToolExecution(format!("canvas snapshot failed: {e}")))?;
+                    .map_err(|e| openclaw_core::Error::ToolExecution(format!("canvas snapshot failed: {e}").into()))?;
 
                 let body = resp
                     .text()
                     .await
-                    .map_err(|e| openclaw_core::Error::ToolExecution(format!("failed to read response: {e}")))?;
+                    .map_err(|e| openclaw_core::Error::ToolExecution(format!("failed to read response: {e}").into()))?;
 
                 Ok(json!({
                     "action": "snapshot",
@@ -159,7 +159,7 @@ impl Tool for CanvasTool {
             }
             _ => Err(openclaw_core::Error::ToolExecution(format!(
                 "unknown canvas action: {action}"
-            ))),
+            ).into())),
         }
     }
 }

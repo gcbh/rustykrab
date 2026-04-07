@@ -76,13 +76,13 @@ impl Tool for NodesTool {
                         .map_err(|e| {
                             openclaw_core::Error::ToolExecution(format!(
                                 "node discovery failed: {e}"
-                            ))
+                            ).into())
                         })?;
 
                     let body: Value = resp.json().await.map_err(|e| {
                         openclaw_core::Error::ToolExecution(format!(
                             "failed to parse discovery response: {e}"
-                        ))
+                        ).into())
                     })?;
 
                     Ok(json!({
@@ -107,13 +107,13 @@ impl Tool for NodesTool {
                         .map_err(|e| {
                             openclaw_core::Error::ToolExecution(format!(
                                 "node list failed: {e}"
-                            ))
+                            ).into())
                         })?;
 
                     let body: Value = resp.json().await.map_err(|e| {
                         openclaw_core::Error::ToolExecution(format!(
                             "failed to parse nodes response: {e}"
-                        ))
+                        ).into())
                     })?;
 
                     Ok(json!({
@@ -159,14 +159,14 @@ impl Tool for NodesTool {
                     .map_err(|e| {
                         openclaw_core::Error::ToolExecution(format!(
                             "failed to send to node: {e}"
-                        ))
+                        ).into())
                     })?;
 
                 let status = resp.status().as_u16();
                 let body = resp.text().await.map_err(|e| {
                     openclaw_core::Error::ToolExecution(format!(
                         "failed to read response: {e}"
-                    ))
+                    ).into())
                 })?;
 
                 Ok(json!({
@@ -179,7 +179,7 @@ impl Tool for NodesTool {
             }
             _ => Err(openclaw_core::Error::ToolExecution(format!(
                 "unknown nodes action: {action}"
-            ))),
+            ).into())),
         }
     }
 }

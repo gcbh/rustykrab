@@ -76,19 +76,19 @@ impl Tool for EditTool {
 
         // Validate path for traversal and blocked directories
         let safe_path = security::validate_path(path)
-            .map_err(|e| openclaw_core::Error::ToolExecution(format!("path rejected: {e}")))?;
+            .map_err(|e| openclaw_core::Error::ToolExecution(format!("path rejected: {e}").into()))?;
 
         let content = tokio::fs::read_to_string(&safe_path)
             .await
             .map_err(|e| openclaw_core::Error::ToolExecution(
-                format!("failed to read {path}: {e}"),
+                format!("failed to read {path}: {e}").into(),
             ))?;
 
         let match_count = content.matches(old_string).count();
 
         if match_count == 0 {
             return Err(openclaw_core::Error::ToolExecution(
-                format!("old_string not found in {path}"),
+                format!("old_string not found in {path}").into(),
             ));
         }
 
@@ -97,7 +97,7 @@ impl Tool for EditTool {
                 format!(
                     "old_string is not unique in {path} ({match_count} occurrences found). \
                      Use replace_all: true to replace all, or provide a more specific string."
-                ),
+                ).into(),
             ));
         }
 
@@ -112,7 +112,7 @@ impl Tool for EditTool {
         tokio::fs::write(&safe_path, &new_content)
             .await
             .map_err(|e| openclaw_core::Error::ToolExecution(
-                format!("failed to write {path}: {e}"),
+                format!("failed to write {path}: {e}").into(),
             ))?;
 
         Ok(json!({

@@ -84,7 +84,7 @@ impl Tool for CronTool {
                     .backend
                     .create_job(schedule, task)
                     .await
-                    .map_err(|e| openclaw_core::Error::ToolExecution(e.to_string()))?;
+                    .map_err(|e| openclaw_core::Error::ToolExecution(e.to_string().into()))?;
 
                 Ok(json!({
                     "action": "create",
@@ -96,7 +96,7 @@ impl Tool for CronTool {
                     .backend
                     .list_jobs()
                     .await
-                    .map_err(|e| openclaw_core::Error::ToolExecution(e.to_string()))?;
+                    .map_err(|e| openclaw_core::Error::ToolExecution(e.to_string().into()))?;
 
                 Ok(json!({
                     "action": "list",
@@ -116,7 +116,7 @@ impl Tool for CronTool {
                     .backend
                     .delete_job(job_id)
                     .await
-                    .map_err(|e| openclaw_core::Error::ToolExecution(e.to_string()))?;
+                    .map_err(|e| openclaw_core::Error::ToolExecution(e.to_string().into()))?;
 
                 Ok(json!({
                     "action": "delete",
@@ -124,7 +124,7 @@ impl Tool for CronTool {
                 }))
             }
             _ => Err(openclaw_core::Error::ToolExecution(
-                format!("unknown action: {action}"),
+                format!("unknown action: {action}").into(),
             )),
         }
     }

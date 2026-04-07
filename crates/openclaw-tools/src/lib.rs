@@ -1,4 +1,5 @@
 // Security utilities
+pub mod sanitize;
 pub mod security;
 
 // Filesystem tools

@@ -64,7 +64,7 @@ impl Tool for GatewayTool {
                     .backend
                     .status()
                     .await
-                    .map_err(|e| openclaw_core::Error::ToolExecution(e.to_string()))?;
+                    .map_err(|e| openclaw_core::Error::ToolExecution(e.to_string().into()))?;
 
                 Ok(json!({
                     "action": "status",
@@ -76,7 +76,7 @@ impl Tool for GatewayTool {
                     .backend
                     .health()
                     .await
-                    .map_err(|e| openclaw_core::Error::ToolExecution(e.to_string()))?;
+                    .map_err(|e| openclaw_core::Error::ToolExecution(e.to_string().into()))?;
 
                 Ok(json!({
                     "action": "health",
@@ -92,7 +92,7 @@ impl Tool for GatewayTool {
                         .backend
                         .set_config(k, v)
                         .await
-                        .map_err(|e| openclaw_core::Error::ToolExecution(e.to_string()))?;
+                        .map_err(|e| openclaw_core::Error::ToolExecution(e.to_string().into()))?;
 
                     Ok(json!({
                         "action": "config",
@@ -104,7 +104,7 @@ impl Tool for GatewayTool {
                         .backend
                         .get_config(key)
                         .await
-                        .map_err(|e| openclaw_core::Error::ToolExecution(e.to_string()))?;
+                        .map_err(|e| openclaw_core::Error::ToolExecution(e.to_string().into()))?;
 
                     Ok(json!({
                         "action": "config",
@@ -114,7 +114,7 @@ impl Tool for GatewayTool {
                 }
             }
             _ => Err(openclaw_core::Error::ToolExecution(
-                format!("unknown action: {action}"),
+                format!("unknown action: {action}").into(),
             )),
         }
     }

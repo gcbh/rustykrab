@@ -82,14 +82,14 @@ impl Tool for CredentialReadTool {
                         "error": format!("no secret found with name '{name}'"),
                         "hint": "Use action 'list' to see available secret names",
                     })),
-                    Err(e) => Err(Error::ToolExecution(format!("failed to read secret: {e}"))),
+                    Err(e) => Err(Error::ToolExecution(format!("failed to read secret: {e}").into())),
                 }
             }
             "list" => {
                 let names = self
                     .secrets
                     .list_names()
-                    .map_err(|e| Error::ToolExecution(format!("failed to list secrets: {e}")))?;
+                    .map_err(|e| Error::ToolExecution(format!("failed to list secrets: {e}").into()))?;
 
                 Ok(json!({
                     "secrets": names,
@@ -98,7 +98,7 @@ impl Tool for CredentialReadTool {
             }
             other => Err(Error::ToolExecution(format!(
                 "unknown action '{other}', expected 'get' or 'list'"
-            ))),
+            ).into())),
         }
     }
 }

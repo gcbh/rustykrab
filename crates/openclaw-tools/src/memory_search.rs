@@ -73,7 +73,7 @@ impl Tool for MemorySearchTool {
             .backend
             .search(query, &tags, limit)
             .await
-            .map_err(|e| openclaw_core::Error::ToolExecution(e.to_string()))?;
+            .map_err(|e| openclaw_core::Error::ToolExecution(e.to_string().into()))?;
 
         let count = results
             .as_array()

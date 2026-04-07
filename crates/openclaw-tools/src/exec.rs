@@ -146,7 +146,7 @@ impl Tool for ExecTool {
 
         // Validate command against allowlist
         validate_command(command).map_err(|e| {
-            openclaw_core::Error::ToolExecution(format!("command rejected: {e}"))
+            openclaw_core::Error::ToolExecution(format!("command rejected: {e}").into())
         })?;
 
         let timeout_secs = args["timeout_secs"].as_u64().unwrap_or(30).min(120);
@@ -165,9 +165,9 @@ impl Tool for ExecTool {
             .map_err(|_| {
                 openclaw_core::Error::ToolExecution(format!(
                     "command timed out after {timeout_secs}s"
-                ))
+                ).into())
             })?
-            .map_err(|e| openclaw_core::Error::ToolExecution(e.to_string()))?;
+            .map_err(|e| openclaw_core::Error::ToolExecution(e.to_string().into()))?;
 
         let stdout = truncate_output(String::from_utf8_lossy(&output.stdout).into_owned());
         let stderr = truncate_output(String::from_utf8_lossy(&output.stderr).into_owned());

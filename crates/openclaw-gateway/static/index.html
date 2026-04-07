@@ -852,7 +852,9 @@
     } else if (data.type === 'tool_end') {
       showAgentStatus('tool-end', `${data.delta} done`, false);
     } else if (data.type === 'tool_error') {
-      showAgentStatus('tool-error', `${data.delta} failed`, false);
+      const toolName = data.delta || 'Tool';
+      const errorMsg = data.error ? `: ${data.error}` : ' failed';
+      showAgentStatus('tool-error', `${toolName}${errorMsg}`, false);
     } else if (data.type === 'thinking') {
       showAgentStatus('thinking', data.delta, true);
     } else if (data.type === 'done') {
