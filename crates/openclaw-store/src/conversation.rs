@@ -33,6 +33,9 @@ impl ConversationStore {
         self.tree
             .insert(conv.id.as_bytes(), bytes)
             .map_err(|e| Error::Storage(e.to_string()))?;
+        self.tree
+            .flush()
+            .map_err(|e| Error::Storage(e.to_string()))?;
         Ok(())
     }
 

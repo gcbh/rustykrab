@@ -149,6 +149,8 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // --- Build gateway state ---
+    // Clone store handle so we can flush it after the server shuts down.
+    let store_handle = store.clone();
     let mut state = openclaw_gateway::AppState::new(store, tools, provider, auth_token)
         .with_harness_router(router)
         .with_orchestration_config(orchestration_config)
@@ -266,13 +268,29 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(%addr, "OpenClaw gateway listening");
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(
+    let server = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .await?;
+    .with_graceful_shutdown(shutdown_signal());
+
+    server.await?;
+
+    // Flush database before exit
+    tracing::info!("flushing database...");
+    store_handle
+        .flush()
+        .map_err(|e| anyhow::anyhow!("flush failed: {e}"))?;
+    tracing::info!("shutdown complete");
 
     Ok(())
+}
+
+async fn shutdown_signal() {
+    tokio::signal::ctrl_c()
+        .await
+        .expect("failed to listen for ctrl+c");
+    tracing::info!("shutdown signal received");
 }
 
 /// Load orchestration config from file or defaults.
