@@ -12,6 +12,7 @@ mod webchat;
 pub use auth::generate_token;
 pub use origin::OriginPolicy;
 pub use rate_limit::RateLimitConfig;
+pub use orchestrate::{run_agent, run_agent_streaming};
 pub use state::AppState;
 
 use axum::http::header;

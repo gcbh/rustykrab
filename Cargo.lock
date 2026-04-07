@@ -1513,6 +1513,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "chrono",
  "dirs",
  "openclaw-agent",
  "openclaw-channels",
@@ -1529,6 +1530,7 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

@@ -10,6 +10,12 @@ use uuid::Uuid;
 
 type HmacSha256 = Hmac<Sha256>;
 
+/// An inbound message with channel-specific routing metadata.
+pub struct ChannelMessage {
+    pub chat_id: i64,
+    pub message: Message,
+}
+
 /// Telegram Bot API channel.
 ///
 /// Supports two modes:
@@ -29,9 +35,9 @@ pub struct TelegramChannel {
     /// Secret token for webhook validation.
     webhook_secret: Option<String>,
     /// Sender for inbound messages (user -> agent).
-    inbound_tx: mpsc::Sender<Message>,
+    inbound_tx: mpsc::Sender<ChannelMessage>,
     /// Receiver for inbound messages (consumed by the agent loop).
-    inbound_rx: Option<mpsc::Receiver<Message>>,
+    inbound_rx: Option<mpsc::Receiver<ChannelMessage>>,
 }
 
 impl TelegramChannel {
@@ -60,7 +66,7 @@ impl TelegramChannel {
 
     /// Take the inbound receiver (can only be called once).
     /// The agent loop reads from this to get user messages.
-    pub fn take_inbound_rx(&mut self) -> Option<mpsc::Receiver<Message>> {
+    pub fn take_inbound_rx(&mut self) -> Option<mpsc::Receiver<ChannelMessage>> {
         self.inbound_rx.take()
     }
 
@@ -236,7 +242,7 @@ impl TelegramChannel {
         };
 
         self.inbound_tx
-            .send(message)
+            .send(ChannelMessage { chat_id, message })
             .await
             .map_err(|e| Error::Channel(format!("inbound queue full: {e}")))?;
 

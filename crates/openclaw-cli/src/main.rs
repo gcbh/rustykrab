@@ -1,15 +1,22 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use openclaw_agent::{HarnessProfile, HarnessRouter, OrchestrationPipeline};
+use chrono::Utc;
+use openclaw_agent::{AgentEvent, HarnessProfile, HarnessRouter, OrchestrationPipeline};
+use openclaw_channels::{ChannelMessage, TelegramChannel};
 use openclaw_core::model::ModelProvider;
 use openclaw_core::orchestration::OrchestrationConfig;
+use openclaw_core::types::MessageContent;
+use openclaw_gateway::AppState;
 use openclaw_skills::SkillRegistry;
+use tokio::sync::mpsc;
 use tracing_subscriber::fmt;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
+use uuid::Uuid;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -161,6 +168,10 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // --- Telegram channel (optional) ---
+    // We need to take the inbound_rx before wrapping in Arc, so build in stages.
+    let mut telegram_rx: Option<mpsc::Receiver<ChannelMessage>> = None;
+    let mut telegram_arc: Option<Arc<TelegramChannel>> = None;
+
     if let Ok(bot_token) = std::env::var("TELEGRAM_BOT_TOKEN") {
         let allowed_chats: HashSet<i64> = std::env::var("TELEGRAM_ALLOWED_CHATS")
             .unwrap_or_default()
@@ -170,12 +181,16 @@ async fn main() -> anyhow::Result<()> {
 
         let webhook_secret = std::env::var("TELEGRAM_WEBHOOK_SECRET").ok();
 
-        let mut tg = openclaw_channels::TelegramChannel::new(bot_token, allowed_chats.clone());
+        let mut tg = TelegramChannel::new(bot_token, allowed_chats.clone());
         if let Some(secret) = webhook_secret {
             tg = tg.with_webhook_secret(secret);
         }
 
+        // Take rx before wrapping in Arc (requires &mut self).
+        telegram_rx = tg.take_inbound_rx();
+
         let tg = Arc::new(tg);
+        telegram_arc = Some(tg.clone());
         state = state.with_telegram(tg.clone());
 
         if let Ok(webhook_url) = std::env::var("TELEGRAM_WEBHOOK_URL") {
@@ -260,6 +275,12 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // --- Spawn Telegram agent loop (after state is fully built) ---
+    if let (Some(rx), Some(tg)) = (telegram_rx, telegram_arc) {
+        tokio::spawn(telegram_agent_loop(rx, tg, state.clone()));
+        tracing::info!("Telegram agent loop started");
+    }
+
     // --- Gateway with security middleware ---
     let app = openclaw_gateway::router(state);
 
@@ -284,6 +305,135 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("shutdown complete");
 
     Ok(())
+}
+
+/// How long the agent can go without emitting any event (text delta,
+/// tool start/end, etc.) before we consider it stalled.
+const HEARTBEAT_TIMEOUT_SECS: u64 = 300; // 5 minutes
+
+fn epoch_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+/// Background task: consume inbound Telegram messages and run the agent.
+///
+/// Each Telegram chat_id gets its own persistent conversation. Messages are
+/// processed sequentially — one agent run at a time. The agent is allowed to
+/// run indefinitely as long as it keeps making progress (emitting events).
+/// Only times out if the heartbeat goes stale.
+async fn telegram_agent_loop(
+    mut rx: mpsc::Receiver<ChannelMessage>,
+    tg: Arc<TelegramChannel>,
+    state: AppState,
+) {
+    let mut chat_conversations: HashMap<i64, Uuid> = HashMap::new();
+
+    while let Some(channel_msg) = rx.recv().await {
+        let chat_id = channel_msg.chat_id;
+
+        // Get or create conversation for this chat.
+        let conv_id = match chat_conversations.get(&chat_id) {
+            Some(id) => *id,
+            None => {
+                match state.store.conversations().create() {
+                    Ok(conv) => {
+                        let id = conv.id;
+                        chat_conversations.insert(chat_id, id);
+                        tracing::info!(chat_id, conv_id = %id, "created new conversation for Telegram chat");
+                        id
+                    }
+                    Err(e) => {
+                        tracing::error!(chat_id, "failed to create conversation: {e}");
+                        let _ = tg.send_text(chat_id, "Internal error — please try again.").await;
+                        continue;
+                    }
+                }
+            }
+        };
+
+        // Load the conversation.
+        let mut conv = match state.store.conversations().get(conv_id) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!(chat_id, %conv_id, "failed to load conversation: {e}");
+                // Conversation may have been deleted — start fresh.
+                chat_conversations.remove(&chat_id);
+                let _ = tg.send_text(chat_id, "Internal error — please try again.").await;
+                continue;
+            }
+        };
+
+        // Append user message.
+        let user_text = match &channel_msg.message.content {
+            MessageContent::Text(t) => t.clone(),
+            _ => continue,
+        };
+        conv.messages.push(channel_msg.message);
+        conv.updated_at = Utc::now();
+
+        // Run agent with heartbeat-based timeout.
+        // Every AgentEvent (text delta, tool start/end, etc.) resets the
+        // heartbeat. The agent can run for hours as long as it keeps working.
+        let last_heartbeat = Arc::new(AtomicU64::new(epoch_millis()));
+        let hb = last_heartbeat.clone();
+
+        let on_event = move |_event: AgentEvent| {
+            hb.store(epoch_millis(), Ordering::Relaxed);
+        };
+
+        let agent_fut =
+            openclaw_gateway::run_agent_streaming(&state, &mut conv, &user_text, &on_event);
+
+        let timeout_millis = HEARTBEAT_TIMEOUT_SECS * 1000;
+        let heartbeat_monitor = async {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                let last = last_heartbeat.load(Ordering::Relaxed);
+                if epoch_millis() - last > timeout_millis {
+                    break;
+                }
+            }
+        };
+
+        let reply = tokio::select! {
+            result = agent_fut => {
+                match result {
+                    Ok(assistant_msg) => {
+                        match &assistant_msg.content {
+                            MessageContent::Text(t) => t.clone(),
+                            _ => "I processed your message but have no text response.".to_string(),
+                        }
+                    }
+                    Err(_status) => {
+                        tracing::error!(chat_id, %conv_id, "agent returned error");
+                        "Sorry, I encountered an error processing your message.".to_string()
+                    }
+                }
+            }
+            _ = heartbeat_monitor => {
+                tracing::error!(
+                    chat_id, %conv_id,
+                    "agent stalled — no activity for {HEARTBEAT_TIMEOUT_SECS}s"
+                );
+                "Sorry, the agent appears to have stalled. Please try again.".to_string()
+            }
+        };
+
+        // Persist conversation.
+        if let Err(e) = state.store.conversations().save(&conv) {
+            tracing::error!(chat_id, %conv_id, "failed to persist conversation: {e}");
+        }
+
+        // Send response back to Telegram.
+        if let Err(e) = tg.send_text(chat_id, &reply).await {
+            tracing::error!(chat_id, "failed to send Telegram reply: {e}");
+        }
+    }
+
+    tracing::warn!("Telegram agent loop exited — inbound channel closed");
 }
 
 async fn shutdown_signal() {
