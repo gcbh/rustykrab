@@ -1,4 +1,5 @@
 pub mod auth;
+mod logging;
 mod orchestrate;
 pub mod origin;
 pub mod rate_limit;
@@ -55,6 +56,7 @@ pub fn router(state: AppState) -> Router {
             state.clone(),
             rate_limit::rate_limit_middleware,
         ))
+        .layer(middleware::from_fn(logging::request_logging_middleware))
         .with_state(state)
         .layer(middleware::map_response(add_security_headers))
 }

@@ -76,11 +76,12 @@ mod tests {
     #[test]
     fn test_child_budget_decreases() {
         let config = OrchestrationConfig::default();
+        let parent_budget = config.sub_task_context_budget;
         let cm = ContextManager::new(config);
 
-        let b0 = cm.child_budget(8192, 0);
-        let b1 = cm.child_budget(8192, 1);
-        let b2 = cm.child_budget(8192, 2);
+        let b0 = cm.child_budget(parent_budget, 0);
+        let b1 = cm.child_budget(parent_budget, 1);
+        let b2 = cm.child_budget(parent_budget, 2);
 
         assert!(b0 > b1, "depth 0 budget should be > depth 1");
         assert!(b1 > b2, "depth 1 budget should be > depth 2");
@@ -92,10 +93,11 @@ mod tests {
             max_recursion_depth: 3,
             ..Default::default()
         };
+        let parent_budget = config.sub_task_context_budget;
         let cm = ContextManager::new(config);
 
-        assert_eq!(cm.child_budget(8192, 3), 0);
-        assert_eq!(cm.child_budget(8192, 10), 0);
+        assert_eq!(cm.child_budget(parent_budget, 3), 0);
+        assert_eq!(cm.child_budget(parent_budget, 10), 0);
     }
 
     #[test]
