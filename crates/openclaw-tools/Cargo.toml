@@ -24,6 +24,7 @@ imap-proto = "0.10"
 native-tls.workspace = true
 lettre.workspace = true
 mail-parser.workspace = true
+calamine.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

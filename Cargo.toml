@@ -70,6 +70,9 @@ zeroize = { version = "1", features = ["zeroize_derive"] }
 # Browser automation (Chrome DevTools Protocol)
 chromiumoxide = { version = "0.9", default-features = false }
 
+# Spreadsheet reading
+calamine = "0.26"
+
 # Email (IMAP + SMTP)
 imap = "2"
 native-tls = "0.2"

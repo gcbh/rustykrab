@@ -50,6 +50,7 @@ mod gateway;
 mod image;
 mod image_generate;
 mod pdf;
+mod spreadsheet;
 mod tts;
 
 // UI tools
@@ -123,6 +124,7 @@ pub use gateway_backend::GatewayBackend;
 pub use self::image::ImageTool;
 pub use image_generate::ImageGenerateTool;
 pub use pdf::PdfTool;
+pub use spreadsheet::SpreadsheetTool;
 pub use tts::TtsTool;
 
 // UI
@@ -175,6 +177,7 @@ pub fn builtin_tools(
         std::sync::Arc::new(ImageGenerateTool::new()),
         std::sync::Arc::new(TtsTool::new()),
         std::sync::Arc::new(PdfTool::new()),
+        std::sync::Arc::new(SpreadsheetTool::new()),
         // UI
         std::sync::Arc::new(BrowserTool::new()),
         std::sync::Arc::new(CanvasTool::new()),
