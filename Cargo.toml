@@ -67,6 +67,9 @@ argon2 = "0.5"
 security-framework = "3"
 zeroize = { version = "1", features = ["zeroize_derive"] }
 
+# Browser automation (Chrome DevTools Protocol)
+chromiumoxide = { version = "0.9", default-features = false }
+
 # Email (IMAP + SMTP)
 imap = "2"
 native-tls = "0.2"
