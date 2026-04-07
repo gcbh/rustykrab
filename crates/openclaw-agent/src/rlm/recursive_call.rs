@@ -34,14 +34,35 @@ impl RecursiveExecutor {
 
     /// Execute a recursive query, allowing the model to delegate sub-queries.
     pub async fn execute(&self, prompt: &str, context: Option<&str>) -> Result<String> {
+        tracing::info!(
+            budget = self.config.sub_task_context_budget,
+            max_depth = self.config.max_recursion_depth,
+            prompt_len = prompt.len(),
+            "RLM: starting recursive execution"
+        );
+        let start = std::time::Instant::now();
         let root = RecursiveCall::root(prompt, self.config.sub_task_context_budget);
-        execute_call(
+        let result = execute_call(
             self.provider.clone(),
             self.config.clone(),
             root,
             context.map(|s| s.to_string()),
         )
-        .await
+        .await;
+        let elapsed = start.elapsed();
+        match &result {
+            Ok(text) => tracing::info!(
+                duration_ms = elapsed.as_millis() as u64,
+                response_len = text.len(),
+                "RLM: recursive execution completed"
+            ),
+            Err(e) => tracing::error!(
+                duration_ms = elapsed.as_millis() as u64,
+                error = %e,
+                "RLM: recursive execution failed"
+            ),
+        }
+        result
     }
 }
 
@@ -67,16 +88,24 @@ async fn execute_call_impl(
 ) -> Result<String> {
     let context_mgr = ContextManager::new(config.clone());
 
+    tracing::info!(
+        depth = call.depth,
+        budget = call.context_budget,
+        prompt_preview = &call.prompt[..call.prompt.len().min(100)],
+        "RLM: executing call"
+    );
+
     if call.depth >= context_mgr.max_depth() {
         tracing::warn!(
             depth = call.depth,
-            "max recursion depth reached, answering directly"
+            "RLM: max recursion depth reached, answering directly"
         );
         return direct_call(&provider, &call.prompt, context.as_deref()).await;
     }
 
     let budget = context_mgr.child_budget(call.context_budget, call.depth);
     if budget == 0 {
+        tracing::warn!(depth = call.depth, "RLM: budget exhausted, answering directly");
         return direct_call(&provider, &call.prompt, context.as_deref()).await;
     }
 
@@ -128,13 +157,19 @@ async fn execute_call_impl(
     // Check for sub-call requests.
     let sub_calls = extract_sub_calls(text);
     if sub_calls.is_empty() {
+        tracing::debug!(depth = call.depth, "RLM: no sub-calls requested");
         return Ok(text.to_string());
     }
 
+    let sub_call_previews: Vec<&str> = sub_calls
+        .iter()
+        .map(|s| &s[..s.len().min(80)])
+        .collect();
     tracing::info!(
         depth = call.depth,
         sub_calls = sub_calls.len(),
-        "resolving sub-calls"
+        prompts = ?sub_call_previews,
+        "RLM: model requested sub-calls"
     );
 
     // Execute sub-calls concurrently.
@@ -158,12 +193,42 @@ async fn execute_call_impl(
     let mut sub_results: HashMap<String, String> = HashMap::new();
     for (i, handle) in handles.into_iter().enumerate() {
         let result = match handle.await {
-            Ok(Ok(text)) => text,
-            Ok(Err(e)) => format!("[Error resolving sub-call: {e}]"),
-            Err(e) => format!("[Sub-call panicked: {e}]"),
+            Ok(Ok(text)) => {
+                tracing::info!(
+                    depth = call.depth,
+                    sub_call_index = i,
+                    result_len = text.len(),
+                    "RLM: sub-call completed"
+                );
+                text
+            }
+            Ok(Err(e)) => {
+                tracing::error!(
+                    depth = call.depth,
+                    sub_call_index = i,
+                    error = %e,
+                    "RLM: sub-call failed"
+                );
+                format!("[Error resolving sub-call: {e}]")
+            }
+            Err(e) => {
+                tracing::error!(
+                    depth = call.depth,
+                    sub_call_index = i,
+                    error = %e,
+                    "RLM: sub-call panicked"
+                );
+                format!("[Sub-call panicked: {e}]")
+            }
         };
         sub_results.insert(sub_calls[i].clone(), result);
     }
+
+    tracing::info!(
+        depth = call.depth,
+        resolved_count = sub_results.len(),
+        "RLM: all sub-calls resolved, substituting results"
+    );
 
     // Substitute results back into the original response.
     let mut resolved = text.to_string();
