@@ -182,8 +182,9 @@ async fn send_message_stream(
     // Channel for streaming events from the agent task to the SSE response.
     let (tx, rx) = tokio::sync::mpsc::channel::<SsePayload>(128);
 
-    // Spawn the agent loop in a background task with a 10-minute timeout
-    // to prevent unbounded connection exhaustion.
+    // Spawn the agent loop in a background task with a 30-minute timeout.
+    // Local models (Ollama) can take 1-5 minutes per LLM call, and multi-step
+    // tool-use conversations may need 5+ iterations.
     let agent_state = state.clone();
     tokio::spawn(async move {
         let event_tx = tx.clone();
@@ -192,7 +193,7 @@ async fn send_message_stream(
         };
 
         let result = tokio::time::timeout(
-            tokio::time::Duration::from_secs(600),
+            tokio::time::Duration::from_secs(1800),
             crate::orchestrate::run_agent_streaming(
                 &agent_state,
                 &mut conv,
@@ -205,7 +206,7 @@ async fn send_message_stream(
         let result = match result {
             Ok(r) => r,
             Err(_) => {
-                tracing::warn!("streaming agent timed out after 600s");
+                tracing::warn!("streaming agent timed out after 1800s");
                 Err(StatusCode::REQUEST_TIMEOUT)
             }
         };

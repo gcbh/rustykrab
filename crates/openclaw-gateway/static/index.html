@@ -382,18 +382,26 @@
     font-weight: 500;
     color: var(--text-tertiary);
   }
-  .agent-activity-header .spinner {
+  .agent-activity-items {
+    padding: 2px 0 6px;
+    max-height: 200px;
+    overflow-y: auto;
+  }
+  .activity-footer {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 16px 4px;
+    font-size: 13px;
+    color: var(--text-tertiary);
+  }
+  .activity-footer .spinner {
     width: 14px;
     height: 14px;
     border: 2px solid var(--text-quaternary);
     border-top-color: var(--accent);
     border-radius: 50%;
     animation: spin 0.8s linear infinite;
-  }
-  .agent-activity-items {
-    padding: 2px 0 6px;
-    max-height: 200px;
-    overflow-y: auto;
   }
   .activity-item {
     display: flex;
@@ -925,11 +933,13 @@
       container = document.createElement('div');
       container.className = 'agent-activity';
       container.innerHTML = `
-        <div class="agent-activity-header">
-          <div class="spinner"></div>
-          Working
-        </div>
-        <div class="agent-activity-items"></div>`;
+        <div class="agent-activity-header">Activity</div>
+        <div class="agent-activity-items">
+          <div class="activity-footer">
+            <div class="spinner"></div>
+            Working
+          </div>
+        </div>`;
       msgContainer.appendChild(container);
     }
     return container.querySelector('.agent-activity-items');
@@ -946,11 +956,17 @@
         startItem.className = `activity-item ${type}`;
         startItem.querySelector('.status-icon').outerHTML = STATUS_ICONS[type];
         startItem.querySelector('.label').textContent = text;
+        // Freeze the timer at its final value
         const elapsed = startItem.dataset.startedAt
           ? ((Date.now() - parseInt(startItem.dataset.startedAt)) / 1000).toFixed(1) + 's'
           : '';
         const elapsedEl = startItem.querySelector('.elapsed');
         if (elapsedEl) elapsedEl.textContent = elapsed;
+        // Stop the live-updating timer
+        if (activeToolTimers[toolName]) {
+          clearInterval(activeToolTimers[toolName]);
+          delete activeToolTimers[toolName];
+        }
         scrollToBottom();
         return;
       }
@@ -962,7 +978,13 @@
     item.dataset.tool = toolName;
     item.dataset.startedAt = Date.now().toString();
     item.innerHTML = `${STATUS_ICONS[type] || ''}<span class="label">${escapeHtml(text)}</span><span class="elapsed"></span>`;
-    items.appendChild(item);
+    // Insert before the spinner footer so completed items stay above it
+    const footer = items.querySelector('.activity-footer');
+    if (footer) {
+      items.insertBefore(item, footer);
+    } else {
+      items.appendChild(item);
+    }
 
     // Update elapsed time for active items
     if (isActive && type === 'tool-start') {
@@ -996,7 +1018,7 @@
           const conv = await api(`/api/conversations/${id}`);
           const lastMsg = conv.messages[conv.messages.length - 1];
           const preview = lastMsg?.content
-            ? (typeof lastMsg.content === 'string' ? lastMsg.content : 'Tool interaction')
+            ? extractText(lastMsg.content)
             : 'New conversation';
           conversations.push({
             id: conv.id,
@@ -1110,6 +1132,9 @@
     msgContainer.innerHTML = '';
     for (const msg of activeMessages) {
       if (msg.role === 'system' || msg.role === 'tool') continue;
+      // Skip assistant messages that are tool calls (not text responses)
+      const contentType = msg.content && typeof msg.content === 'object' ? msg.content.type : null;
+      if (msg.role === 'assistant' && (contentType === 'tool_call' || contentType === 'multi_tool_call')) continue;
       appendMessageBubble(msg.role, extractText(msg.content), msg.created_at);
     }
     scrollToBottom();
@@ -1323,7 +1348,18 @@
 
   // ── Utilities ─────────────────────────────────────────────
   function extractText(content) {
-    if (typeof content === 'string') return content;
+    if (typeof content === 'string') {
+      // Guard against double-serialized JSON strings like '{"type":"text","data":"..."}'
+      if (content.startsWith('{') || content.startsWith('[')) {
+        try {
+          const parsed = JSON.parse(content);
+          if (typeof parsed === 'object' && parsed !== null) {
+            return extractText(parsed);
+          }
+        } catch { /* not JSON, treat as plain text */ }
+      }
+      return content;
+    }
     // Tagged enum format: {"type": "text", "data": "..."}
     if (content && content.type === 'text') return content.data || '';
     // Legacy untagged format
@@ -1343,7 +1379,12 @@
     if (Array.isArray(content)) return 'Multiple tool calls';
     if (content && content.name) return `Tool: ${content.name}`;
     if (content && content.call_id) return `Result for ${content.call_id}`;
-    return JSON.stringify(content);
+    // Last resort: try to extract anything useful rather than showing raw JSON
+    if (content && typeof content === 'object') {
+      if (content.data && typeof content.data === 'string') return content.data;
+      if (content.data && typeof content.data === 'object' && content.data.name) return `Tool: ${content.data.name}`;
+    }
+    return typeof content === 'string' ? content : '';
   }
 
   function formatMessageText(text) {
