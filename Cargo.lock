@@ -1476,175 +1476,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 
 [[package]]
-name = "openclaw-agent"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "chrono",
- "openclaw-core",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "openclaw-channels"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "chrono",
- "hex",
- "hmac",
- "openclaw-core",
- "reqwest 0.12.28",
- "serde",
- "serde_json",
- "sha2",
- "tokio",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "openclaw-cli"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "chrono",
- "dirs",
- "openclaw-agent",
- "openclaw-channels",
- "openclaw-core",
- "openclaw-gateway",
- "openclaw-providers",
- "openclaw-skills",
- "openclaw-store",
- "openclaw-tools",
- "serde",
- "serde_json",
- "tokio",
- "toml",
- "tracing",
- "tracing-appender",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
-name = "openclaw-core"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "chrono",
- "serde",
- "serde_json",
- "thiserror",
- "uuid",
-]
-
-[[package]]
-name = "openclaw-gateway"
-version = "0.1.0"
-dependencies = [
- "axum",
- "chrono",
- "hex",
- "mime_guess",
- "openclaw-agent",
- "openclaw-channels",
- "openclaw-core",
- "openclaw-skills",
- "openclaw-store",
- "rand 0.8.5",
- "rust-embed",
- "serde",
- "serde_json",
- "tokio",
- "tokio-stream",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "openclaw-providers"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "chrono",
- "openclaw-core",
- "reqwest 0.12.28",
- "serde",
- "serde_json",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "openclaw-skills"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "ed25519-dalek",
- "hex",
- "openclaw-core",
- "rand 0.8.5",
- "serde",
- "serde_json",
- "serde_yaml",
- "tracing",
-]
-
-[[package]]
-name = "openclaw-store"
-version = "0.1.0"
-dependencies = [
- "aes-gcm",
- "argon2",
- "chrono",
- "hex",
- "hmac",
- "openclaw-core",
- "rand 0.8.5",
- "security-framework",
- "serde",
- "serde_json",
- "sha2",
- "sled",
- "tracing",
- "uuid",
- "zeroize",
-]
-
-[[package]]
-name = "openclaw-tools"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "base64 0.22.1",
- "chromiumoxide",
- "imap",
- "imap-proto",
- "lettre",
- "mail-parser",
- "native-tls",
- "openclaw-core",
- "openclaw-store",
- "reqwest 0.12.28",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tokio-stream",
- "tracing",
- "url",
- "uuid",
-]
-
-[[package]]
 name = "openssl"
 version = "0.10.76"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2236,6 +2067,175 @@ name = "rustversion"
 version = "1.0.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
+
+[[package]]
+name = "rustykrab-agent"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "rustykrab-core",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "rustykrab-channels"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "hex",
+ "hmac",
+ "reqwest 0.12.28",
+ "rustykrab-core",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "rustykrab-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "chrono",
+ "dirs",
+ "rustykrab-agent",
+ "rustykrab-channels",
+ "rustykrab-core",
+ "rustykrab-gateway",
+ "rustykrab-providers",
+ "rustykrab-skills",
+ "rustykrab-store",
+ "rustykrab-tools",
+ "serde",
+ "serde_json",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "rustykrab-core"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "uuid",
+]
+
+[[package]]
+name = "rustykrab-gateway"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "chrono",
+ "hex",
+ "mime_guess",
+ "rand 0.8.5",
+ "rust-embed",
+ "rustykrab-agent",
+ "rustykrab-channels",
+ "rustykrab-core",
+ "rustykrab-skills",
+ "rustykrab-store",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "rustykrab-providers"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "reqwest 0.12.28",
+ "rustykrab-core",
+ "serde",
+ "serde_json",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "rustykrab-skills"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "ed25519-dalek",
+ "hex",
+ "rand 0.8.5",
+ "rustykrab-core",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tracing",
+]
+
+[[package]]
+name = "rustykrab-store"
+version = "0.1.0"
+dependencies = [
+ "aes-gcm",
+ "argon2",
+ "chrono",
+ "hex",
+ "hmac",
+ "rand 0.8.5",
+ "rustykrab-core",
+ "security-framework",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sled",
+ "tracing",
+ "uuid",
+ "zeroize",
+]
+
+[[package]]
+name = "rustykrab-tools"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "chromiumoxide",
+ "imap",
+ "imap-proto",
+ "lettre",
+ "mail-parser",
+ "native-tls",
+ "reqwest 0.12.28",
+ "rustykrab-core",
+ "rustykrab-store",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
+ "tracing",
+ "url",
+ "uuid",
+]
 
 [[package]]
 name = "ryu"

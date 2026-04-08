@@ -1,15 +1,15 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/openclaw-core",
-    "crates/openclaw-store",
-    "crates/openclaw-gateway",
-    "crates/openclaw-agent",
-    "crates/openclaw-providers",
-    "crates/openclaw-tools",
-    "crates/openclaw-channels",
-    "crates/openclaw-skills",
-    "crates/openclaw-cli",
+    "crates/rustykrab-core",
+    "crates/rustykrab-store",
+    "crates/rustykrab-gateway",
+    "crates/rustykrab-agent",
+    "crates/rustykrab-providers",
+    "crates/rustykrab-tools",
+    "crates/rustykrab-channels",
+    "crates/rustykrab-skills",
+    "crates/rustykrab-cli",
 ]
 
 [workspace.package]
@@ -77,12 +77,12 @@ lettre = { version = "0.11", default-features = false, features = ["smtp-transpo
 mail-parser = "0.9"
 
 # Internal crates
-openclaw-core = { path = "crates/openclaw-core" }
-openclaw-store = { path = "crates/openclaw-store" }
-openclaw-gateway = { path = "crates/openclaw-gateway" }
-openclaw-agent = { path = "crates/openclaw-agent" }
-openclaw-providers = { path = "crates/openclaw-providers" }
-openclaw-tools = { path = "crates/openclaw-tools" }
-openclaw-channels = { path = "crates/openclaw-channels" }
-openclaw-skills = { path = "crates/openclaw-skills" }
-openclaw-cli = { path = "crates/openclaw-cli" }
+rustykrab-core = { path = "crates/rustykrab-core" }
+rustykrab-store = { path = "crates/rustykrab-store" }
+rustykrab-gateway = { path = "crates/rustykrab-gateway" }
+rustykrab-agent = { path = "crates/rustykrab-agent" }
+rustykrab-providers = { path = "crates/rustykrab-providers" }
+rustykrab-tools = { path = "crates/rustykrab-tools" }
+rustykrab-channels = { path = "crates/rustykrab-channels" }
+rustykrab-skills = { path = "crates/rustykrab-skills" }
+rustykrab-cli = { path = "crates/rustykrab-cli" }

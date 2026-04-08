@@ -1,0 +1,14 @@
+[package]
+name = "rustykrab-core"
+description = "Shared types, error types, and trait definitions for RustyKrab"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+uuid.workspace = true

@@ -1,4 +1,4 @@
-# OpenClaw Security Analysis Report
+# RustyKrab Security Analysis Report
 
 **Date:** 2026-04-05
 **Scope:** Full codebase audit — authentication, authorization, injection, sandboxing, network, cryptography, dependencies, supply chain
@@ -8,69 +8,69 @@
 
 ## Executive Summary
 
-The OpenClaw codebase demonstrates solid Rust engineering with zero `unsafe` blocks, modern crypto libraries (`rustls`, `ed25519-dalek`), and thoughtful middleware design. However, **12 CRITICAL**, **10 HIGH**, and **12 MEDIUM** severity findings were identified across five analysis dimensions. The most urgent issues are: unenforced sandbox/capability model, arbitrary command execution, path traversal in file tools, SSRF in HTTP tools, and weak secret encryption.
+The RustyKrab codebase demonstrates solid Rust engineering with zero `unsafe` blocks, modern crypto libraries (`rustls`, `ed25519-dalek`), and thoughtful middleware design. However, **12 CRITICAL**, **10 HIGH**, and **12 MEDIUM** severity findings were identified across five analysis dimensions. The most urgent issues are: unenforced sandbox/capability model, arbitrary command execution, path traversal in file tools, SSRF in HTTP tools, and weak secret encryption.
 
 ---
 
 ## CRITICAL Findings (12)
 
 ### C1. WebSocket Authentication Bypass
-**Files:** `crates/openclaw-gateway/src/auth.rs:23-29`, `ws.rs:15-24`
+**Files:** `crates/rustykrab-gateway/src/auth.rs:23-29`, `ws.rs:15-24`
 **Issue:** The `require_auth` middleware exempts all non-`/api/` and non-`/webhook/` paths. The WebSocket endpoint at `/ws/chat` is completely unauthenticated — any attacker can connect, send messages, and read conversations without a Bearer token.
 **Impact:** Full conversation access without credentials.
 
 ### C2. No Conversation Ownership / Authorization
-**File:** `crates/openclaw-gateway/src/routes.rs:32-76`
+**File:** `crates/rustykrab-gateway/src/routes.rs:32-76`
 **Issue:** REST and WebSocket handlers perform no ownership checks. Any authenticated user (or unauthenticated WS client) can read, delete, or inject messages into any conversation by UUID. The `GET /api/conversations` endpoint enumerates all IDs.
 **Impact:** Complete lateral movement between conversations; data exfiltration and poisoning.
 
 ### C3. Session/Capability Model Defined But Never Enforced
-**Files:** `crates/openclaw-core/src/session.rs`, `capability.rs`, `crates/openclaw-gateway/src/routes.rs`
+**Files:** `crates/rustykrab-core/src/session.rs`, `capability.rs`, `crates/rustykrab-gateway/src/routes.rs`
 **Issue:** A sophisticated `Session` + `CapabilitySet` system exists but the gateway never creates sessions or passes them to the agent runner. All tools are available to all conversations.
 **Impact:** Designed least-privilege model is completely bypassed.
 
 ### C4. Sandbox Is a Non-Functional Placeholder
-**File:** `crates/openclaw-agent/src/sandbox.rs:90-131`
+**File:** `crates/rustykrab-agent/src/sandbox.rs:90-131`
 **Issue:** `ProcessSandbox` logs policy constraints but returns args unchanged — no seccomp-bpf, no namespace isolation, no enforcement. The runner calls the sandbox *and then* calls the tool directly, meaning the sandbox result is ignored entirely (`runner.rs:570-574`).
 **Impact:** All tool-level security policies are unenforced.
 
 ### C5. Command Injection — `exec` Tool
-**File:** `crates/openclaw-tools/src/exec.rs:73-76`
+**File:** `crates/rustykrab-tools/src/exec.rs:73-76`
 **Issue:** `Command::new("sh").arg("-c").arg(command)` — user/agent input passed directly to shell without sanitization.
 **Impact:** Arbitrary OS command execution.
 
 ### C6. Command Injection — `process` Tool
-**File:** `crates/openclaw-tools/src/process.rs:70-76`
+**File:** `crates/rustykrab-tools/src/process.rs:70-76`
 **Issue:** Same pattern as exec — `sh -c` with unsanitized input, plus process spawning for persistent background execution.
 **Impact:** Arbitrary command execution with persistence.
 
 ### C7. Arbitrary Python Code Execution
-**File:** `crates/openclaw-tools/src/code_execution.rs:55-76`
-**Issue:** User-supplied Python code written to a predictable temp file (`openclaw_exec_{pid}.py`) and executed via `python3`. No sandboxing, no validation. Temp file name collision across concurrent sessions.
+**File:** `crates/rustykrab-tools/src/code_execution.rs:55-76`
+**Issue:** User-supplied Python code written to a predictable temp file (`rustykrab_exec_{pid}.py`) and executed via `python3`. No sandboxing, no validation. Temp file name collision across concurrent sessions.
 **Impact:** Full code execution; cross-session code injection via race condition.
 
 ### C8. Path Traversal — `read` Tool
-**File:** `crates/openclaw-tools/src/read.rs:57-63`
+**File:** `crates/rustykrab-tools/src/read.rs:57-63`
 **Issue:** `tokio::fs::read_to_string(path)` with no bounds checking. Can read `/etc/shadow`, SSH keys, application secrets.
 **Impact:** Unrestricted file disclosure.
 
 ### C9. Path Traversal — `write` Tool
-**File:** `crates/openclaw-tools/src/write.rs:60-74`
+**File:** `crates/rustykrab-tools/src/write.rs:60-74`
 **Issue:** Creates arbitrary directories and writes to any path. Can overwrite system files, plant backdoors, modify cron jobs.
 **Impact:** Arbitrary file write; system compromise.
 
 ### C10. Path Traversal — `edit` and `apply_patch` Tools
-**Files:** `crates/openclaw-tools/src/edit.rs:72-107`, `apply_patch.rs:238-256`
+**Files:** `crates/rustykrab-tools/src/edit.rs:72-107`, `apply_patch.rs:238-256`
 **Issue:** Same unrestricted file access. Patch tool additionally parses paths from untrusted patch content.
 **Impact:** Arbitrary file modification.
 
 ### C11. SSRF — HTTP Request Tools (3 tools)
-**Files:** `crates/openclaw-tools/src/http_request.rs:66-76`, `http_session.rs:125-142`, `web_fetch.rs:69-80`
+**Files:** `crates/rustykrab-tools/src/http_request.rs:66-76`, `http_session.rs:125-142`, `web_fetch.rs:69-80`
 **Issue:** No URL scheme validation, no private IP blocking. Can access `http://169.254.169.254/` (cloud metadata), internal services, file:// URIs.
 **Impact:** Internal network access, credential theft, service enumeration.
 
 ### C12. Command Injection — `pdf` Tool
-**File:** `crates/openclaw-tools/src/pdf.rs:82-96, 118-145`
+**File:** `crates/rustykrab-tools/src/pdf.rs:82-96, 118-145`
 **Issue:** Path passed to `pdftotext` without validation. Python fallback uses `format!()` string interpolation with unescaped user input in Python code.
 **Impact:** Arbitrary code execution via Python string injection.
 
@@ -79,51 +79,51 @@ The OpenClaw codebase demonstrates solid Rust engineering with zero `unsafe` blo
 ## HIGH Findings (10)
 
 ### H1. XOR Encryption Without Authentication
-**File:** `crates/openclaw-store/src/secret.rs:69-97`
+**File:** `crates/rustykrab-store/src/secret.rs:69-97`
 **Issue:** Secrets encrypted with XOR against HMAC-SHA256 keystream. No authentication tag (AEAD). Ciphertext is malleable — attacker can flip bits without detection. Deterministic: same name always produces same keystream.
 **Recommendation:** Upgrade to AES-256-GCM or ChaCha20-Poly1305.
 
 ### H2. Weak Key Derivation
-**File:** `crates/openclaw-store/src/secret.rs:81-97`
+**File:** `crates/rustykrab-store/src/secret.rs:81-97`
 **Issue:** Master key used directly with HMAC-SHA256 for keystream derivation. No salt, no proper KDF (Argon2/PBKDF2).
 **Recommendation:** Use Argon2 for key derivation.
 
 ### H3. Master Key Stored in Environment Variable
-**File:** `crates/openclaw-cli/src/main.rs:27-35`
-**Issue:** `OPENCLAW_MASTER_KEY` visible via `/proc/[pid]/environ`, inherited by child processes. Ephemeral key generated if not set — secrets lost on restart.
+**File:** `crates/rustykrab-cli/src/main.rs:27-35`
+**Issue:** `RUSTYKRAB_MASTER_KEY` visible via `/proc/[pid]/environ`, inherited by child processes. Ephemeral key generated if not set — secrets lost on restart.
 **Recommendation:** Use OS keychain or file with 0600 permissions.
 
 ### H4. Rate Limiting Bypassed for WebSocket
-**File:** `crates/openclaw-gateway/src/rate_limit.rs:97-100`
+**File:** `crates/rustykrab-gateway/src/rate_limit.rs:97-100`
 **Issue:** Rate limiting only applies to `/api/` paths. WebSocket connections at `/ws/chat` are unlimited.
 **Recommendation:** Apply per-IP rate limiting to WS connections.
 
 ### H5. No Auth-Specific Rate Limiting
-**File:** `crates/openclaw-gateway/src/auth.rs:12-48`
+**File:** `crates/rustykrab-gateway/src/auth.rs:12-48`
 **Issue:** No exponential backoff or lockout on repeated authentication failures. Enables brute-force attacks on Bearer tokens.
 
 ### H6. Weak Webhook Secret Validation (Telegram & Signal)
-**Files:** `crates/openclaw-channels/src/telegram.rs:150-156`, `signal.rs:205-211`
+**Files:** `crates/rustykrab-channels/src/telegram.rs:150-156`, `signal.rs:205-211`
 **Issue:** Plain string comparison (timing-vulnerable). `verify_hmac()` function exists but is never called. No payload body validation.
 **Recommendation:** Use constant-time comparison + HMAC-SHA256 payload validation.
 
 ### H7. Unbounded Agent Recursion
-**Files:** `crates/openclaw-tools/src/subagents.rs:52-61`, `sessions_spawn.rs:53-64`
+**Files:** `crates/rustykrab-tools/src/subagents.rs:52-61`, `sessions_spawn.rs:53-64`
 **Issue:** No recursion depth limits, no parent tracking, no max-nested-agents enforcement. Agents can spawn agents infinitely.
 **Impact:** Resource exhaustion DoS.
 
 ### H8. Shared Tracer Leaks Cross-Session Data
-**File:** `crates/openclaw-agent/src/runner.rs:64, 175-179`
+**File:** `crates/rustykrab-agent/src/runner.rs:64, 175-179`
 **Issue:** `ExecutionTracer` shared per runner instance. Session B can receive Session A's execution history (tool names, errors, timing) via trace context injected into conversation.
 **Impact:** Information disclosure across sessions.
 
 ### H9. Mutex Unwrap Cascade in Tracer
-**File:** `crates/openclaw-agent/src/trace.rs:72, 86, 91, 96, 101, 107-118, 132`
+**File:** `crates/rustykrab-agent/src/trace.rs:72, 86, 91, 96, 101, 107-118, 132`
 **Issue:** Multiple `.lock().unwrap()` calls. If any thread panics holding the lock, all subsequent lock attempts panic — cascading crash.
 **Impact:** Denial of service.
 
 ### H10. Information Disclosure via WebSocket Errors
-**File:** `crates/openclaw-gateway/src/ws.rs:56, 135, 144`
+**File:** `crates/rustykrab-gateway/src/ws.rs:56, 135, 144`
 **Issue:** Internal error details (JSON parse errors, model provider errors, API details) sent directly to clients via WebSocket `error` frames.
 **Recommendation:** Return generic error messages; log details server-side.
 

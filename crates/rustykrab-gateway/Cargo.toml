@@ -1,0 +1,25 @@
+[package]
+name = "rustykrab-gateway"
+description = "Axum-based HTTP gateway for RustyKrab"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rustykrab-core.workspace = true
+rustykrab-store.workspace = true
+rustykrab-agent.workspace = true
+rustykrab-channels.workspace = true
+rustykrab-skills.workspace = true
+axum.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+rust-embed.workspace = true
+mime_guess = "2"
+rand.workspace = true
+hex.workspace = true

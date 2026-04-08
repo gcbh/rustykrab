@@ -1,0 +1,16 @@
+[package]
+name = "rustykrab-agent"
+description = "Agent loop: orchestrates model calls and tool execution"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rustykrab-core.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+serde.workspace = true
+uuid.workspace = true
+chrono.workspace = true

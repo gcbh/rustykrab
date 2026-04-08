@@ -1,0 +1,28 @@
+[package]
+name = "rustykrab-cli"
+description = "CLI entrypoint and daemon management for RustyKrab"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rustykrab-core.workspace = true
+rustykrab-store.workspace = true
+rustykrab-gateway.workspace = true
+rustykrab-agent.workspace = true
+rustykrab-tools.workspace = true
+rustykrab-channels.workspace = true
+rustykrab-skills.workspace = true
+rustykrab-providers.workspace = true
+axum.workspace = true
+chrono.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-appender.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+dirs = "6"
+toml.workspace = true

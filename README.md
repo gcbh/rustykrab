@@ -1,6 +1,6 @@
-# OpenClaw (Rust)
+# RustyKrab (Rust)
 
-A security-first reimplementation of the OpenClaw AI agent gateway in Rust. Built from scratch to address the architectural security flaws in the original Node.js version — no shared-memory single process, no plaintext credentials, no unsandboxed tool execution.
+A security-first reimplementation of the RustyKrab AI agent gateway in Rust. Built from scratch to address the architectural security flaws in the original Node.js version — no shared-memory single process, no plaintext credentials, no unsandboxed tool execution.
 
 ## Prerequisites
 
@@ -14,10 +14,15 @@ A security-first reimplementation of the OpenClaw AI agent gateway in Rust. Buil
 ```bash
 git clone https://github.com/gcbh/rustycrab.git
 cd rustycrab
-cargo build --release
+make              # release build (+ codesign on macOS)
+make debug        # debug build (+ codesign on macOS)
 ```
 
-The binary will be at `target/release/openclaw-cli`.
+The binary will be at `target/release/rustykrab-cli`.
+
+On macOS, `make` automatically ad-hoc codesigns the binary with the
+`keychain-access-groups` entitlement required by the Data Protection Keychain.
+You can also run `make codesign` or `make codesign-debug` separately.
 
 ## Quick Start
 
@@ -25,13 +30,13 @@ The binary will be at `target/release/openclaw-cli`.
 
 ```bash
 export ANTHROPIC_API_KEY=sk-ant-your-key-here
-cargo run --release -p openclaw-cli
+cargo run --release -p rustykrab-cli
 ```
 
 On first launch, the CLI generates and prints an auth token. Save it:
 
 ```
-  OPENCLAW_AUTH_TOKEN=64-char-hex-token
+  RUSTYKRAB_AUTH_TOKEN=64-char-hex-token
 ```
 
 ### Option B: Run with a local model via Ollama
@@ -40,9 +45,9 @@ On first launch, the CLI generates and prints an auth token. Save it:
 # Pull a model (Gemma 4 26B recommended for tool-use)
 ollama pull gemma4:26b
 
-# Start OpenClaw with Ollama
-export OPENCLAW_PROVIDER=ollama
-cargo run --release -p openclaw-cli
+# Start RustyKrab with Ollama
+export RUSTYKRAB_PROVIDER=ollama
+cargo run --release -p rustykrab-cli
 ```
 
 ## Configuration
@@ -51,14 +56,14 @@ All configuration is via environment variables. No plaintext config files.
 
 | Variable | Default | Description |
 |---|---|---|
-| `OPENCLAW_PROVIDER` | `anthropic` | Model backend: `anthropic` or `ollama` |
+| `RUSTYKRAB_PROVIDER` | `anthropic` | Model backend: `anthropic` or `ollama` |
 | `ANTHROPIC_API_KEY` | — | Anthropic API key (required for Claude) |
 | `ANTHROPIC_MODEL` | `claude-sonnet-4-20250514` | Claude model to use |
 | `OLLAMA_MODEL` | `gemma4:26b` | Ollama model name |
 | `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama server address |
 | `CHROME_CDP_URL` | `ws://127.0.0.1:9222` | Chrome DevTools Protocol endpoint |
-| `OPENCLAW_AUTH_TOKEN` | auto-generated | Bearer token for API auth |
-| `OPENCLAW_MASTER_KEY` | auto-generated | Encryption key for secrets at rest |
+| `RUSTYKRAB_AUTH_TOKEN` | auto-generated | Bearer token for API auth |
+| `RUSTYKRAB_MASTER_KEY` | auto-generated | Encryption key for secrets at rest |
 | `TELEGRAM_BOT_TOKEN` | — | Telegram bot token from @BotFather |
 | `TELEGRAM_ALLOWED_CHATS` | — | Comma-separated chat IDs allowed to use the bot |
 | `TELEGRAM_WEBHOOK_URL` | — | Public webhook URL (omit for long-polling mode) |
@@ -68,7 +73,7 @@ All configuration is via environment variables. No plaintext config files.
 | `SIGNAL_ALLOWED_NUMBERS` | — | Comma-separated E.164 numbers allowed to message |
 | `SIGNAL_WEBHOOK_URL` | — | Webhook URL (omit for polling mode) |
 | `SIGNAL_WEBHOOK_SECRET` | — | Shared secret for webhook validation |
-| `RUST_LOG` | — | Log level (`info`, `debug`, `openclaw_gateway=debug`) |
+| `RUST_LOG` | — | Log level (`info`, `debug`, `rustykrab_gateway=debug`) |
 
 ### Persisting credentials
 
@@ -76,10 +81,10 @@ To avoid setting env vars every launch:
 
 ```bash
 # Generate a stable master key (save this somewhere safe)
-export OPENCLAW_MASTER_KEY=$(openssl rand -hex 32)
+export RUSTYKRAB_MASTER_KEY=$(openssl rand -hex 32)
 
 # Generate a stable auth token
-export OPENCLAW_AUTH_TOKEN=$(openssl rand -hex 32)
+export RUSTYKRAB_AUTH_TOKEN=$(openssl rand -hex 32)
 ```
 
 Add these to your shell profile or a secrets manager. The master key encrypts all secrets stored in the database — if you lose it, stored secrets become unreadable.
@@ -96,19 +101,19 @@ curl http://127.0.0.1:3000/api/health
 
 # Create a conversation
 curl -X POST http://127.0.0.1:3000/api/conversations \
-  -H "Authorization: Bearer $OPENCLAW_AUTH_TOKEN"
+  -H "Authorization: Bearer $RUSTYKRAB_AUTH_TOKEN"
 
 # List conversations
 curl http://127.0.0.1:3000/api/conversations \
-  -H "Authorization: Bearer $OPENCLAW_AUTH_TOKEN"
+  -H "Authorization: Bearer $RUSTYKRAB_AUTH_TOKEN"
 
 # Get a conversation
 curl http://127.0.0.1:3000/api/conversations/{id} \
-  -H "Authorization: Bearer $OPENCLAW_AUTH_TOKEN"
+  -H "Authorization: Bearer $RUSTYKRAB_AUTH_TOKEN"
 
 # Delete a conversation
 curl -X DELETE http://127.0.0.1:3000/api/conversations/{id} \
-  -H "Authorization: Bearer $OPENCLAW_AUTH_TOKEN"
+  -H "Authorization: Bearer $RUSTYKRAB_AUTH_TOKEN"
 ```
 
 ### Telegram
@@ -124,7 +129,7 @@ Talk to your agent through Telegram.
 ```bash
 export TELEGRAM_BOT_TOKEN=123456:ABC-DEF...
 export TELEGRAM_ALLOWED_CHATS=your_chat_id
-cargo run --release -p openclaw-cli
+cargo run --release -p rustykrab-cli
 ```
 
 That's it — message your bot on Telegram and the agent responds.
@@ -136,7 +141,7 @@ export TELEGRAM_BOT_TOKEN=123456:ABC-DEF...
 export TELEGRAM_ALLOWED_CHATS=your_chat_id
 export TELEGRAM_WEBHOOK_SECRET=$(openssl rand -hex 16)
 export TELEGRAM_WEBHOOK_URL=https://your-domain.com/webhook/telegram
-cargo run --release -p openclaw-cli
+cargo run --release -p rustykrab-cli
 ```
 
 If running locally, use ngrok or Cloudflare Tunnel to expose port 3000:
@@ -175,12 +180,12 @@ curl -X POST 'http://localhost:8080/v1/register/+1234567890'
 curl -X POST 'http://localhost:8080/v1/register/+1234567890/verify/123456'
 ```
 
-**3. Start OpenClaw with Signal:**
+**3. Start RustyKrab with Signal:**
 
 ```bash
 export SIGNAL_ACCOUNT=+1234567890
 export SIGNAL_ALLOWED_NUMBERS=+1987654321,+1555555555
-cargo run --release -p openclaw-cli
+cargo run --release -p rustykrab-cli
 ```
 
 Now message the registered number from an allowed phone — the agent responds via Signal.
@@ -190,11 +195,11 @@ Now message the registered number from an allowed phone — the agent responds v
 ```bash
 export SIGNAL_WEBHOOK_URL=http://localhost:3000/webhook/signal
 export SIGNAL_WEBHOOK_SECRET=$(openssl rand -hex 16)
-cargo run --release -p openclaw-cli
+cargo run --release -p rustykrab-cli
 ```
 
 **Security notes:**
-- All messages are E2E encrypted by the Signal protocol — neither the server nor OpenClaw sees plaintext on the wire
+- All messages are E2E encrypted by the Signal protocol — neither the server nor RustyKrab sees plaintext on the wire
 - `SIGNAL_ALLOWED_NUMBERS` is **required** — without it, the bot denies all messages
 - signal-cli-rest-api runs on localhost only — no external exposure
 - Use a dedicated phone number for the bot, not your personal number
@@ -206,35 +211,35 @@ Open `http://127.0.0.1:3000` in a browser for the embedded WebChat interface.
 ## Architecture
 
 ```
-openclaw-cli          Binary entrypoint, wires everything together
+rustykrab-cli          Binary entrypoint, wires everything together
   |
-  +-- openclaw-gateway    Axum HTTP server, REST API, WebChat static files
+  +-- rustykrab-gateway    Axum HTTP server, REST API, WebChat static files
   |     +-- auth            Bearer token middleware (constant-time comparison)
   |     +-- rate_limit      Per-IP sliding window + lockout (anti-brute-force)
   |     +-- origin          Origin header validation (blocks cross-origin hijacking)
   |
-  +-- openclaw-agent      Agent loop: model call -> tool exec -> repeat
+  +-- rustykrab-agent      Agent loop: model call -> tool exec -> repeat
   |     +-- sandbox         Sandbox trait + process-based isolation with policy
   |
-  +-- openclaw-providers  Model provider implementations
+  +-- rustykrab-providers  Model provider implementations
   |     +-- anthropic       Claude Messages API with full tool-use support
   |     +-- ollama          Local models via Ollama (Qwen, Llama, Mistral, etc.)
   |
-  +-- openclaw-store      Sled-based persistent storage
+  +-- rustykrab-store      Sled-based persistent storage
   |     +-- conversations   CRUD for conversation history
   |     +-- secrets         Encrypted credential storage (HMAC-SHA256 key derivation)
   |
-  +-- openclaw-tools      Built-in tool implementations
+  +-- rustykrab-tools      Built-in tool implementations
   |     +-- http_request    HTTP client tool (GET/POST/PUT/DELETE/PATCH)
   |
-  +-- openclaw-channels   Communication channel abstractions
+  +-- rustykrab-channels   Communication channel abstractions
   |     +-- signal          Signal via signal-cli-rest-api (E2E encrypted)
   |     +-- telegram        Telegram bot (long-polling + webhook + chat allowlist)
   |     +-- webchat         In-process mpsc-backed channel for the WebChat UI
   |
-  +-- openclaw-skills     Skill system with ed25519 signature verification
+  +-- rustykrab-skills     Skill system with ed25519 signature verification
   |
-  +-- openclaw-core       Shared types, traits, error types
+  +-- rustykrab-core       Shared types, traits, error types
         +-- Tool trait, ModelProvider trait
         +-- Capability / CapabilitySet (least-privilege session scoping)
         +-- Session (per-conversation isolation with expiry)
@@ -242,7 +247,7 @@ openclaw-cli          Binary entrypoint, wires everything together
 
 ## Security Model
 
-This rewrite directly addresses the vulnerability classes found in the original Node.js OpenClaw:
+This rewrite directly addresses the vulnerability classes found in the original Node.js RustyKrab:
 
 | Original CVE Class | Mitigation |
 |---|---|
@@ -272,10 +277,10 @@ This rewrite directly addresses the vulnerability classes found in the original 
 cargo check
 
 # Run with debug logging
-RUST_LOG=debug cargo run -p openclaw-cli
+RUST_LOG=debug cargo run -p rustykrab-cli
 
 # Run a specific crate's tests
-cargo test -p openclaw-core
+cargo test -p rustykrab-core
 ```
 
 ## License

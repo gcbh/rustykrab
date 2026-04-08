@@ -1,0 +1,29 @@
+[package]
+name = "rustykrab-tools"
+description = "Built-in tool implementations for RustyKrab agents"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rustykrab-core.workspace = true
+rustykrab-store.workspace = true
+async-trait.workspace = true
+reqwest = { workspace = true, features = ["cookies"] }
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+base64.workspace = true
+uuid.workspace = true
+chromiumoxide.workspace = true
+tokio-stream.workspace = true
+url = "2"
+imap.workspace = true
+imap-proto = "0.10"
+native-tls.workspace = true
+lettre.workspace = true
+mail-parser.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
