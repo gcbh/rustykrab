@@ -28,10 +28,10 @@ impl Default for OllamaConfig {
     fn default() -> Self {
         Self {
             temperature: 0.1,
-            num_ctx: 65536,
+            num_ctx: 131_072,
             num_parallel: 6,
             top_p: 0.9,
-            num_predict: -1,
+            num_predict: 8192,
         }
     }
 }
@@ -41,7 +41,7 @@ impl OllamaConfig {
     pub fn tool_calling() -> Self {
         Self {
             temperature: 0.0,
-            num_ctx: 65536,
+            num_ctx: 131_072,
             num_parallel: 6,
             top_p: 0.9,
             num_predict: 4096,
@@ -52,15 +52,15 @@ impl OllamaConfig {
     pub fn creative() -> Self {
         Self {
             temperature: 0.7,
-            num_ctx: 65536,
+            num_ctx: 131_072,
             num_parallel: 6,
             top_p: 0.95,
-            num_predict: -1,
+            num_predict: 16384,
         }
     }
 }
 
-/// Ollama provider for local models (Qwen, Llama, Mistral, etc.).
+/// Ollama provider for local models (Gemma, Qwen, Llama, Mistral, etc.).
 pub struct OllamaProvider {
     client: reqwest::Client,
     base_url: String,
@@ -166,6 +166,20 @@ impl OllamaProvider {
             .collect()
     }
 
+    /// Normalize tool-call arguments: some models (notably Gemma) return
+    /// arguments as a JSON-encoded string rather than an object. Detect
+    /// that case and parse it into a proper `Value::Object`.
+    fn normalize_arguments(args: serde_json::Value) -> serde_json::Value {
+        if let serde_json::Value::String(ref s) = args {
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(s) {
+                if parsed.is_object() {
+                    return parsed;
+                }
+            }
+        }
+        args
+    }
+
     fn parse_response(resp: OllamaResponse) -> Result<ModelResponse> {
         let msg = resp.message;
 
@@ -177,7 +191,7 @@ impl OllamaProvider {
                     .map(|tc| ToolCall {
                         id: Uuid::new_v4().to_string(),
                         name: tc.function.name,
-                        arguments: tc.function.arguments,
+                        arguments: Self::normalize_arguments(tc.function.arguments),
                     })
                     .collect();
 

@@ -74,7 +74,7 @@ async fn main() -> anyhow::Result<()> {
     let provider_name = provider_name.trim().to_lowercase();
     let provider: Arc<dyn ModelProvider> = match provider_name.as_str() {
         "ollama" => {
-            let model = std::env::var("OLLAMA_MODEL").unwrap_or_else(|_| "qwen3:32b".to_string());
+            let model = std::env::var("OLLAMA_MODEL").unwrap_or_else(|_| "gemma4:26b".to_string());
             let base_url = std::env::var("OLLAMA_BASE_URL")
                 .unwrap_or_else(|_| "http://localhost:11434".to_string());
             tracing::info!(%model, %base_url, "using Ollama provider");

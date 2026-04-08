@@ -37,8 +37,8 @@ On first launch, the CLI generates and prints an auth token. Save it:
 ### Option B: Run with a local model via Ollama
 
 ```bash
-# Pull a model (Qwen 3 32B recommended for tool-use)
-ollama pull qwen3:32b
+# Pull a model (Gemma 4 26B recommended for tool-use)
+ollama pull gemma4:26b
 
 # Start OpenClaw with Ollama
 export OPENCLAW_PROVIDER=ollama
@@ -54,7 +54,7 @@ All configuration is via environment variables. No plaintext config files.
 | `OPENCLAW_PROVIDER` | `anthropic` | Model backend: `anthropic` or `ollama` |
 | `ANTHROPIC_API_KEY` | — | Anthropic API key (required for Claude) |
 | `ANTHROPIC_MODEL` | `claude-sonnet-4-20250514` | Claude model to use |
-| `OLLAMA_MODEL` | `qwen3:32b` | Ollama model name |
+| `OLLAMA_MODEL` | `gemma4:26b` | Ollama model name |
 | `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama server address |
 | `OPENCLAW_AUTH_TOKEN` | auto-generated | Bearer token for API auth |
 | `OPENCLAW_MASTER_KEY` | auto-generated | Encryption key for secrets at rest |
