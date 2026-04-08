@@ -19,6 +19,20 @@ cargo build --release
 
 The binary will be at `target/release/openclaw-cli`.
 
+### macOS: Codesign for Keychain access
+
+On macOS, the Data Protection Keychain requires the `keychain-access-groups`
+entitlement. Cargo-built binaries aren't signed, so you need to ad-hoc codesign
+after building:
+
+```bash
+./scripts/codesign.sh --release    # sign release build
+./scripts/codesign.sh              # sign debug build
+```
+
+Without this step, keychain operations will fail with an entitlements error.
+You only need to re-run this after each `cargo build`.
+
 ## Quick Start
 
 ### Option A: Run with Claude (recommended)
