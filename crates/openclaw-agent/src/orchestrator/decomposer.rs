@@ -54,11 +54,27 @@ impl Decomposer {
     /// Returns a list of `SubTask`s with dependency information.
     /// If decomposition fails or the request is simple enough,
     /// returns a single sub-task wrapping the original request.
-    pub async fn decompose(&self, user_request: &str, context: Option<&str>) -> Result<Vec<SubTask>> {
+    pub async fn decompose(
+        &self,
+        user_request: &str,
+        context: Option<&str>,
+        available_tools: &[&str],
+    ) -> Result<Vec<SubTask>> {
         let decompose_instructions = DECOMPOSE_PROMPT.replace(
             "{max_tasks}",
             &self.config.max_sub_tasks.to_string(),
         );
+
+        // Append the concrete list of tool names so the model generates
+        // accurate tool_hint values instead of guessing.
+        let decompose_instructions = if available_tools.is_empty() {
+            decompose_instructions
+        } else {
+            let tool_list = available_tools.join(", ");
+            format!(
+                "{decompose_instructions}\n\nAvailable tools (use these exact names for tool_hint): [{tool_list}]"
+            )
+        };
 
         // Combine agent system context with decomposition instructions so the
         // model understands the agent's identity, available tools, and

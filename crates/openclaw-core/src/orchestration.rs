@@ -125,6 +125,8 @@ pub struct OrchestrationConfig {
     pub max_refinement_iterations: usize,
     /// Maximum retries per failed tool call within sub-tasks.
     pub max_tool_retries: u32,
+    /// Maximum tool-call rounds per sub-task before giving up.
+    pub max_tool_rounds: usize,
     /// Whether to summarize sub-task results before synthesis.
     pub summarize_sub_results: bool,
     /// Which model to use for simple/trivial tasks (fallback model name).
@@ -143,6 +145,7 @@ impl Default for OrchestrationConfig {
             consistency_temperature_spread: 0.1,
             max_refinement_iterations: 3,
             max_tool_retries: 2,
+            max_tool_rounds: 10,
             summarize_sub_results: true,
             fallback_model: None,
             primary_model: None,

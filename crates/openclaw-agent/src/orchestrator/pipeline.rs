@@ -142,8 +142,10 @@ impl OrchestrationPipeline {
         );
         let synthesizer = Synthesizer::new(self.provider.clone());
 
-        // Decompose (with system context so the model understands the agent's role).
-        let sub_tasks = decomposer.decompose(request, context).await?;
+        // Decompose (with system context and tool names so the model
+        // understands the agent's role and can produce accurate tool hints).
+        let tool_names: Vec<&str> = self.tools.iter().map(|t| t.name()).collect();
+        let sub_tasks = decomposer.decompose(request, context, &tool_names).await?;
         let sub_task_count = sub_tasks.len();
 
         // Execute in parallel (with system context for each sub-task).

@@ -171,8 +171,8 @@ async fn execute_sub_task(
         tools.iter().map(|t| t.schema()).collect()
     };
 
-    // Run the model, handling up to 3 tool-call rounds per sub-task.
-    let max_rounds = 3;
+    // Run the model, handling multiple tool-call rounds per sub-task.
+    let max_rounds = config.max_tool_rounds;
     for _round in 0..max_rounds {
         let response = match provider.chat(&messages, &schemas).await {
             Ok(r) => r,

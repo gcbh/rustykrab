@@ -12,16 +12,17 @@ use openclaw_store::memory::extract_keywords;
 
 use crate::AppState;
 
-/// Shared setup: resolve profile, build system prompt, inject it,
-/// create session and runner. Returns `(AgentRunner, Session)`.
-async fn prepare_agent(
+/// Build the system prompt and inject it as the first message in the conversation.
+///
+/// This is shared between the orchestration pipeline path and the
+/// direct agent loop so both get the same identity, tool guidance,
+/// security policy, memory recall, and skills catalog.
+async fn build_and_inject_system_prompt(
     state: &AppState,
     conv: &mut Conversation,
     user_content: &str,
-) -> Result<(AgentRunner, Session), StatusCode> {
+) {
     // 1. Resolve the harness profile.
-    // If the model self-classified on a previous turn, use that.
-    // Otherwise, fall back to the router (keyword or LLM based).
     let profile = if let Some(ref detected) = conv.detected_profile {
         let profile = state.profile_for_name(detected);
         tracing::info!(profile = %profile.name, source = "self-classified", "harness profile selected");
@@ -109,13 +110,29 @@ async fn prepare_agent(
             },
         );
     }
+}
 
-    // 5. Create an ephemeral session with capabilities for all registered tools.
+/// Shared setup: build system prompt, inject it, create session and runner.
+/// Returns `(AgentRunner, Session)`.
+async fn prepare_agent(
+    state: &AppState,
+    conv: &mut Conversation,
+    user_content: &str,
+) -> Result<(AgentRunner, Session), StatusCode> {
+    build_and_inject_system_prompt(state, conv, user_content).await;
+
+    // Create an ephemeral session with capabilities for all registered tools.
     let tool_names: Vec<&str> = state.tools.iter().map(|t| t.name()).collect();
     let caps = CapabilitySet::for_tools_permissive(&tool_names);
     let session = Session::with_capabilities(conv.id, caps);
 
-    // 6. Create the agent runner with profile-derived config.
+    // Resolve profile again for agent config (cheap — no LLM call on cache hit).
+    let profile = if let Some(ref detected) = conv.detected_profile {
+        state.profile_for_name(detected)
+    } else {
+        state.profile_for(user_content).await
+    };
+
     let runner = AgentRunner::new(
         state.provider.clone(),
         state.tools.clone(),
@@ -153,7 +170,10 @@ pub async fn run_agent(
     if let Some(ref pipeline) = state.orchestration_pipeline {
         tracing::info!("routing through orchestration pipeline");
 
-        // Build context from the system prompt (first message if System role).
+        // Build and inject the system prompt so the pipeline has full
+        // agent identity, tool guidance, security policy, and memory.
+        build_and_inject_system_prompt(state, conv, user_content).await;
+
         let context = conv
             .messages
             .first()
@@ -215,6 +235,10 @@ pub async fn run_agent_streaming(
     // Try the orchestration pipeline first if enabled.
     if let Some(ref pipeline) = state.orchestration_pipeline {
         tracing::info!("routing through orchestration pipeline (streaming path)");
+
+        // Build and inject the system prompt so the pipeline has full
+        // agent identity, tool guidance, security policy, and memory.
+        build_and_inject_system_prompt(state, conv, user_content).await;
 
         on_event(AgentEvent::ToolCallStart {
             tool_name: "orchestration_pipeline".to_string(),
