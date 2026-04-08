@@ -311,6 +311,10 @@ async fn main() -> anyhow::Result<()> {
 /// tool start/end, etc.) before we consider it stalled.
 const HEARTBEAT_TIMEOUT_SECS: u64 = 300; // 5 minutes
 
+/// How often to resend the "typing" indicator while the agent is working.
+/// Telegram's typing indicator expires after ~5 seconds.
+const TYPING_INTERVAL_SECS: u64 = 4;
+
 fn epoch_millis() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -318,122 +322,214 @@ fn epoch_millis() -> u64 {
         .as_millis() as u64
 }
 
+/// Per-chat state for tracking conversations and preventing concurrent runs.
+struct ChatState {
+    conv_id: Uuid,
+    /// True while an agent run is in progress for this chat.
+    busy: bool,
+}
+
 /// Background task: consume inbound Telegram messages and run the agent.
 ///
-/// Each Telegram chat_id gets its own persistent conversation. Messages are
-/// processed sequentially — one agent run at a time. The agent is allowed to
-/// run indefinitely as long as it keeps making progress (emitting events).
-/// Only times out if the heartbeat goes stale.
+/// Each Telegram chat_id gets its own persistent conversation. Messages
+/// for different chats are processed concurrently so one slow agent run
+/// doesn't block other users. Within a single chat, messages are serialized.
 async fn telegram_agent_loop(
     mut rx: mpsc::Receiver<ChannelMessage>,
     tg: Arc<TelegramChannel>,
     state: AppState,
 ) {
-    let mut chat_conversations: HashMap<i64, Uuid> = HashMap::new();
+    let chat_states: Arc<tokio::sync::Mutex<HashMap<i64, ChatState>>> =
+        Arc::new(tokio::sync::Mutex::new(HashMap::new()));
 
     while let Some(channel_msg) = rx.recv().await {
         let chat_id = channel_msg.chat_id;
+        let tg = tg.clone();
+        let state = state.clone();
+        let chat_states = chat_states.clone();
 
-        // Get or create conversation for this chat.
-        let conv_id = match chat_conversations.get(&chat_id) {
-            Some(id) => *id,
-            None => {
-                match state.store.conversations().create() {
-                    Ok(conv) => {
-                        let id = conv.id;
-                        chat_conversations.insert(chat_id, id);
-                        tracing::info!(chat_id, conv_id = %id, "created new conversation for Telegram chat");
-                        id
-                    }
-                    Err(e) => {
-                        tracing::error!(chat_id, "failed to create conversation: {e}");
-                        let _ = tg.send_text(chat_id, "Internal error — please try again.").await;
-                        continue;
+        tokio::spawn(async move {
+            // Check if this chat already has an agent run in progress.
+            {
+                let states = chat_states.lock().await;
+                if let Some(cs) = states.get(&chat_id) {
+                    if cs.busy {
+                        let _ = tg
+                            .send_text(
+                                chat_id,
+                                "I'm still working on your previous message. Please wait.",
+                            )
+                            .await;
+                        return;
                     }
                 }
             }
-        };
 
-        // Load the conversation.
-        let mut conv = match state.store.conversations().get(conv_id) {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::error!(chat_id, %conv_id, "failed to load conversation: {e}");
-                // Conversation may have been deleted — start fresh.
-                chat_conversations.remove(&chat_id);
-                let _ = tg.send_text(chat_id, "Internal error — please try again.").await;
-                continue;
-            }
-        };
+            let user_text = match &channel_msg.message.content {
+                MessageContent::Text(t) => t.clone(),
+                _ => return,
+            };
 
-        // Append user message.
-        let user_text = match &channel_msg.message.content {
-            MessageContent::Text(t) => t.clone(),
-            _ => continue,
-        };
-        conv.messages.push(channel_msg.message);
-        conv.updated_at = Utc::now();
-
-        // Run agent with heartbeat-based timeout.
-        // Every AgentEvent (text delta, tool start/end, etc.) resets the
-        // heartbeat. The agent can run for hours as long as it keeps working.
-        let last_heartbeat = Arc::new(AtomicU64::new(epoch_millis()));
-        let hb = last_heartbeat.clone();
-
-        let on_event = move |_event: AgentEvent| {
-            hb.store(epoch_millis(), Ordering::Relaxed);
-        };
-
-        let agent_fut =
-            openclaw_gateway::run_agent_streaming(&state, &mut conv, &user_text, &on_event);
-
-        let timeout_millis = HEARTBEAT_TIMEOUT_SECS * 1000;
-        let heartbeat_monitor = async {
-            loop {
-                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-                let last = last_heartbeat.load(Ordering::Relaxed);
-                if epoch_millis() - last > timeout_millis {
-                    break;
+            // Handle /reset command — clear conversation for this chat.
+            if user_text.trim() == "/reset" {
+                {
+                    let mut states = chat_states.lock().await;
+                    states.remove(&chat_id);
                 }
+                let _ = tg
+                    .send_text(chat_id, "Conversation reset. Send a new message to start fresh.")
+                    .await;
+                return;
             }
-        };
 
-        let reply = tokio::select! {
-            result = agent_fut => {
-                match result {
-                    Ok(assistant_msg) => {
-                        match &assistant_msg.content {
-                            MessageContent::Text(t) => t.clone(),
-                            _ => "I processed your message but have no text response.".to_string(),
+            // Get or create conversation.
+            let conv_id = {
+                let mut states = chat_states.lock().await;
+                match states.get(&chat_id) {
+                    Some(cs) => cs.conv_id,
+                    None => match state.store.conversations().create() {
+                        Ok(conv) => {
+                            let id = conv.id;
+                            states.insert(chat_id, ChatState { conv_id: id, busy: false });
+                            tracing::info!(chat_id, conv_id = %id, "created new conversation for Telegram chat");
+                            id
                         }
-                    }
-                    Err(_status) => {
-                        tracing::error!(chat_id, %conv_id, "agent returned error");
-                        "Sorry, I encountered an error processing your message.".to_string()
-                    }
+                        Err(e) => {
+                            tracing::error!(chat_id, "failed to create conversation: {e}");
+                            let _ = tg.send_text(chat_id, "Internal error — please try again.").await;
+                            return;
+                        }
+                    },
+                }
+            };
+
+            // Mark chat as busy.
+            {
+                let mut states = chat_states.lock().await;
+                if let Some(cs) = states.get_mut(&chat_id) {
+                    cs.busy = true;
                 }
             }
-            _ = heartbeat_monitor => {
-                tracing::error!(
-                    chat_id, %conv_id,
-                    "agent stalled — no activity for {HEARTBEAT_TIMEOUT_SECS}s"
-                );
-                "Sorry, the agent appears to have stalled. Please try again.".to_string()
+
+            let reply = process_telegram_message(
+                &state, &tg, chat_id, conv_id, channel_msg.message, &user_text,
+            )
+            .await;
+
+            // Mark chat as no longer busy.
+            {
+                let mut states = chat_states.lock().await;
+                if let Some(cs) = states.get_mut(&chat_id) {
+                    cs.busy = false;
+                }
             }
-        };
 
-        // Persist conversation.
-        if let Err(e) = state.store.conversations().save(&conv) {
-            tracing::error!(chat_id, %conv_id, "failed to persist conversation: {e}");
-        }
-
-        // Send response back to Telegram.
-        if let Err(e) = tg.send_text(chat_id, &reply).await {
-            tracing::error!(chat_id, "failed to send Telegram reply: {e}");
-        }
+            // Send response back to Telegram.
+            if let Err(e) = tg.send_text(chat_id, &reply).await {
+                tracing::error!(chat_id, "failed to send Telegram reply: {e}");
+            }
+        });
     }
 
     tracing::warn!("Telegram agent loop exited — inbound channel closed");
+}
+
+/// Process a single Telegram message: load conversation, run agent, persist.
+async fn process_telegram_message(
+    state: &AppState,
+    tg: &Arc<TelegramChannel>,
+    chat_id: i64,
+    conv_id: Uuid,
+    message: openclaw_core::types::Message,
+    user_text: &str,
+) -> String {
+    // Load the conversation.
+    let mut conv = match state.store.conversations().get(conv_id) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(chat_id, %conv_id, "failed to load conversation: {e}");
+            return "Internal error — please try again.".to_string();
+        }
+    };
+
+    // Append user message.
+    conv.messages.push(message);
+    conv.updated_at = Utc::now();
+
+    // Send initial typing indicator.
+    let _ = tg.send_typing(chat_id).await;
+
+    // Spawn a background task to keep re-sending typing indicators
+    // while the agent is working.
+    let typing_active = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let typing_flag = typing_active.clone();
+    let tg_typing = tg.clone();
+    let typing_task = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(TYPING_INTERVAL_SECS)).await;
+            if !typing_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                break;
+            }
+            let _ = tg_typing.send_typing(chat_id).await;
+        }
+    });
+
+    // Run agent with heartbeat-based timeout.
+    let last_heartbeat = Arc::new(AtomicU64::new(epoch_millis()));
+    let hb = last_heartbeat.clone();
+
+    let on_event = move |_event: AgentEvent| {
+        hb.store(epoch_millis(), Ordering::Relaxed);
+    };
+
+    let agent_fut =
+        openclaw_gateway::run_agent_streaming(state, &mut conv, user_text, &on_event);
+
+    let timeout_millis = HEARTBEAT_TIMEOUT_SECS * 1000;
+    let heartbeat_monitor = async {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            let last = last_heartbeat.load(Ordering::Relaxed);
+            if epoch_millis() - last > timeout_millis {
+                break;
+            }
+        }
+    };
+
+    let reply = tokio::select! {
+        result = agent_fut => {
+            match result {
+                Ok(assistant_msg) => {
+                    match &assistant_msg.content {
+                        MessageContent::Text(t) => t.clone(),
+                        _ => "I processed your message but have no text response.".to_string(),
+                    }
+                }
+                Err(_status) => {
+                    tracing::error!(chat_id, %conv_id, "agent returned error");
+                    "Sorry, I encountered an error processing your message.".to_string()
+                }
+            }
+        }
+        _ = heartbeat_monitor => {
+            tracing::error!(
+                chat_id, %conv_id,
+                "agent stalled — no activity for {HEARTBEAT_TIMEOUT_SECS}s"
+            );
+            "Sorry, the agent appears to have stalled. Please try again.".to_string()
+        }
+    };
+
+    // Stop typing indicator.
+    typing_active.store(false, std::sync::atomic::Ordering::Relaxed);
+    typing_task.abort();
+
+    // Persist conversation.
+    if let Err(e) = state.store.conversations().save(&conv) {
+        tracing::error!(chat_id, %conv_id, "failed to persist conversation: {e}");
+    }
+
+    reply
 }
 
 async fn shutdown_signal() {
