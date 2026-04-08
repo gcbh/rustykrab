@@ -1,17 +1,18 @@
-//! macOS Keychain integration for master key storage.
+//! macOS Keychain integration for credential storage.
 //!
-//! On macOS, the master encryption key is stored in the system Keychain
-//! rather than in an environment variable. The Keychain is protected by:
+//! Uses the **Data Protection Keychain** (`kSecUseDataProtectionKeychain`)
+//! available on macOS 10.15+. Unlike the legacy keychain, the Data Protection
+//! Keychain does **not** use per-application ACLs, so credentials are
+//! accessible to any process running as the current user without password
+//! prompts or code-signing requirements. Items are protected by the user's
+//! login session — they are available after first unlock (i.e. once the user
+//! logs in after boot) and do not require further interaction.
 //!
-//! - The user's login password (required to unlock)
-//! - The Secure Enclave on Apple Silicon Macs (hardware-backed protection)
-//! - Touch ID (if enabled, macOS prompts biometric auth for keychain access)
-//! - Per-app ACLs (only OpenClaw can read its own keychain item)
-//!
-//! On first launch, if no master key exists in the Keychain or env var,
-//! a random 32-byte key is generated and stored in the Keychain. On
-//! subsequent launches, the key is retrieved from the Keychain — macOS
-//! may prompt for Touch ID or password depending on system settings.
+//! This means:
+//! - No password prompts when the binary is rebuilt during development
+//! - No Touch ID / biometric gates on credential reads
+//! - Credentials survive restarts without environment variables
+//! - Items are still encrypted at rest by macOS and tied to the user account
 
 use openclaw_core::Error;
 
@@ -20,67 +21,110 @@ const SERVICE_NAME: &str = "com.openclaw.master-key";
 #[cfg(target_os = "macos")]
 const ACCOUNT_NAME: &str = "openclaw-encryption-key";
 
-/// Retrieve the master key from the macOS Keychain.
-///
-/// Returns `None` if no key is stored yet.
-#[cfg(target_os = "macos")]
-pub fn get_master_key() -> Result<Option<Vec<u8>>, Error> {
-    use security_framework::passwords::get_generic_password;
+// ---------------------------------------------------------------------------
+// Internal helpers — Data Protection Keychain read/write
+// ---------------------------------------------------------------------------
 
-    match get_generic_password(SERVICE_NAME, ACCOUNT_NAME) {
-        Ok(bytes) => {
-            // The key is stored as hex — decode it.
-            let hex_str = String::from_utf8(bytes.to_vec())
-                .map_err(|e| Error::Storage(format!("keychain: invalid utf-8: {e}")))?;
-            let key = hex::decode(hex_str.trim())
-                .map_err(|e| Error::Storage(format!("keychain: invalid hex: {e}")))?;
-            Ok(Some(key))
-        }
+/// Read a generic password from the Data Protection Keychain.
+///
+/// Returns `Ok(None)` when the item does not exist (errSecItemNotFound).
+#[cfg(target_os = "macos")]
+fn dp_get(service: &str, account: &str) -> Result<Option<Vec<u8>>, Error> {
+    use security_framework::passwords::{generic_password, PasswordOptions};
+
+    let mut opts = PasswordOptions::new_generic_password(service, account);
+    opts.use_protected_keychain();
+
+    match generic_password(opts) {
+        Ok(bytes) => Ok(Some(bytes)),
         Err(e) => {
             let msg = e.to_string();
-            // "The specified item could not be found in the keychain" means
-            // no key has been stored yet — not an error.
             if msg.contains("could not be found") || msg.contains("errSecItemNotFound") {
                 Ok(None)
             } else {
-                Err(Error::Storage(format!("keychain read failed: {e}")))
+                Err(Error::Storage(format!(
+                    "keychain read failed for {service}/{account}: {e}"
+                )))
             }
         }
     }
 }
 
-/// Store the master key in the macOS Keychain.
+/// Write a generic password to the Data Protection Keychain.
 ///
-/// If a key already exists, it is updated. The key is stored as hex.
+/// Deletes any existing item first to avoid duplicate-item errors, then
+/// creates a new item in the Data Protection Keychain with
+/// `kSecUseDataProtectionKeychain = true` so no per-app ACLs are applied.
+#[cfg(target_os = "macos")]
+fn dp_set(service: &str, account: &str, password: &[u8]) -> Result<(), Error> {
+    use security_framework::passwords::{
+        delete_generic_password_options, set_generic_password_options, PasswordOptions,
+    };
+
+    // Delete from Data Protection Keychain (ignore "not found").
+    let mut del_opts = PasswordOptions::new_generic_password(service, account);
+    del_opts.use_protected_keychain();
+    let _ = delete_generic_password_options(del_opts);
+
+    // Also try deleting from legacy keychain to avoid stale entries that
+    // would shadow the new Data Protection item during migration.
+    let legacy_del = PasswordOptions::new_generic_password(service, account);
+    let _ = delete_generic_password_options(legacy_del);
+
+    let mut opts = PasswordOptions::new_generic_password(service, account);
+    opts.use_protected_keychain();
+    set_generic_password_options(password, opts)
+        .map_err(|e| Error::Storage(format!("keychain write failed for {service}/{account}: {e}")))
+}
+
+/// Delete a generic password from the Data Protection Keychain.
+#[cfg(target_os = "macos")]
+fn dp_delete(service: &str, account: &str) -> Result<(), Error> {
+    use security_framework::passwords::{delete_generic_password_options, PasswordOptions};
+
+    let mut opts = PasswordOptions::new_generic_password(service, account);
+    opts.use_protected_keychain();
+    delete_generic_password_options(opts)
+        .map_err(|e| Error::Storage(format!("keychain delete failed for {service}/{account}: {e}")))
+}
+
+// ---------------------------------------------------------------------------
+// Master key — the encryption key for the local SecretStore
+// ---------------------------------------------------------------------------
+
+/// Retrieve the master key from the macOS Keychain.
+///
+/// Returns `None` if no key is stored yet.
+#[cfg(target_os = "macos")]
+pub fn get_master_key() -> Result<Option<Vec<u8>>, Error> {
+    match dp_get(SERVICE_NAME, ACCOUNT_NAME)? {
+        Some(bytes) => {
+            let hex_str = String::from_utf8(bytes)
+                .map_err(|e| Error::Storage(format!("keychain: invalid utf-8: {e}")))?;
+            let key = hex::decode(hex_str.trim())
+                .map_err(|e| Error::Storage(format!("keychain: invalid hex: {e}")))?;
+            Ok(Some(key))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Store the master key in the macOS Keychain (as hex).
 #[cfg(target_os = "macos")]
 pub fn set_master_key(key: &[u8]) -> Result<(), Error> {
-    use security_framework::passwords::{delete_generic_password, set_generic_password};
-
-    let hex_key = hex::encode(key);
-
-    // Try to delete any existing item first (set_generic_password errors on duplicates).
-    let _ = delete_generic_password(SERVICE_NAME, ACCOUNT_NAME);
-
-    set_generic_password(SERVICE_NAME, ACCOUNT_NAME, hex_key.as_bytes())
-        .map_err(|e| Error::Storage(format!("keychain write failed: {e}")))?;
-
-    Ok(())
+    dp_set(SERVICE_NAME, ACCOUNT_NAME, hex::encode(key).as_bytes())
 }
 
 /// Delete the master key from the Keychain.
 #[cfg(target_os = "macos")]
 pub fn delete_master_key() -> Result<(), Error> {
-    use security_framework::passwords::delete_generic_password;
-
-    delete_generic_password(SERVICE_NAME, ACCOUNT_NAME)
-        .map_err(|e| Error::Storage(format!("keychain delete failed: {e}")))?;
-    Ok(())
+    dp_delete(SERVICE_NAME, ACCOUNT_NAME)
 }
 
 /// Retrieve or generate the master key using the macOS Keychain.
 ///
 /// 1. Try env var `OPENCLAW_MASTER_KEY`
-/// 2. Try macOS Keychain
+/// 2. Try macOS Keychain (Data Protection Keychain — no password prompt)
 /// 3. Generate a new random key and store it in the Keychain
 ///
 /// This is the primary entry point for CLI startup.
@@ -89,15 +133,16 @@ pub fn resolve_master_key() -> Result<Vec<u8>, Error> {
     // Priority 1: environment variable (for CI, Docker, non-macOS deployments).
     if let Ok(env_key) = std::env::var("OPENCLAW_MASTER_KEY") {
         tracing::info!("using master key from OPENCLAW_MASTER_KEY env var");
-        return hex::decode(env_key.trim())
-            .map_err(|e| Error::Storage(format!(
+        return hex::decode(env_key.trim()).map_err(|e| {
+            Error::Storage(format!(
                 "OPENCLAW_MASTER_KEY must be a hex-encoded string: {e}"
-            )));
+            ))
+        });
     }
 
-    // Priority 2: macOS Keychain.
+    // Priority 2: macOS Data Protection Keychain (no password prompt).
     if let Some(key) = get_master_key()? {
-        tracing::info!("master key loaded from macOS Keychain (Secure Enclave backed)");
+        tracing::info!("master key loaded from macOS Keychain (Data Protection)");
         return Ok(key);
     }
 
@@ -107,8 +152,8 @@ pub fn resolve_master_key() -> Result<Vec<u8>, Error> {
     rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut key);
     set_master_key(&key)?;
     tracing::info!(
-        "master key stored in macOS Keychain under '{SERVICE_NAME}'. \
-         It is protected by your login password and Touch ID."
+        "master key stored in macOS Keychain under '{SERVICE_NAME}' \
+         (Data Protection Keychain — no password prompt on access)."
     );
     Ok(key.to_vec())
 }
@@ -118,10 +163,11 @@ pub fn resolve_master_key() -> Result<Vec<u8>, Error> {
 pub fn resolve_master_key() -> Result<Vec<u8>, Error> {
     if let Ok(env_key) = std::env::var("OPENCLAW_MASTER_KEY") {
         tracing::info!("using master key from OPENCLAW_MASTER_KEY env var");
-        return hex::decode(env_key.trim())
-            .map_err(|e| Error::Storage(format!(
+        return hex::decode(env_key.trim()).map_err(|e| {
+            Error::Storage(format!(
                 "OPENCLAW_MASTER_KEY must be a hex-encoded string: {e}"
-            )));
+            ))
+        });
     }
 
     tracing::warn!(
@@ -131,4 +177,84 @@ pub fn resolve_master_key() -> Result<Vec<u8>, Error> {
     let mut key = [0u8; 32];
     rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut key);
     Ok(key.to_vec())
+}
+
+// ---------------------------------------------------------------------------
+// Generic credential access — read arbitrary credentials from macOS Keychain
+// for use during remote deployment.
+// ---------------------------------------------------------------------------
+
+/// A credential retrieved from the macOS Keychain.
+#[derive(Debug, Clone)]
+pub struct KeychainCredential {
+    pub service: String,
+    pub account: String,
+    /// The raw password / secret value.
+    pub value: String,
+}
+
+/// Returns `true` when the current platform supports Keychain credential
+/// lookups (i.e. the binary was compiled for macOS).
+pub fn keychain_available() -> bool {
+    cfg!(target_os = "macos")
+}
+
+/// Retrieve a credential from the macOS Keychain by service and account.
+///
+/// Uses the Data Protection Keychain — no password prompt or per-app ACL.
+/// `service` corresponds to the "Where" field visible in Keychain Access,
+/// and `account` to the "Account" field.
+///
+/// Returns `Ok(None)` when the item does not exist.
+#[cfg(target_os = "macos")]
+pub fn get_credential(service: &str, account: &str) -> Result<Option<KeychainCredential>, Error> {
+    match dp_get(service, account)? {
+        Some(bytes) => {
+            let value = String::from_utf8(bytes)
+                .map_err(|e| Error::Storage(format!("keychain: credential is not valid utf-8: {e}")))?;
+            Ok(Some(KeychainCredential {
+                service: service.to_string(),
+                account: account.to_string(),
+                value,
+            }))
+        }
+        None => Ok(None),
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn get_credential(_service: &str, _account: &str) -> Result<Option<KeychainCredential>, Error> {
+    Err(Error::Storage(
+        "macOS Keychain is not available on this platform".into(),
+    ))
+}
+
+/// Store a credential in the macOS Keychain under the given service/account.
+///
+/// Uses the Data Protection Keychain — no password prompt or per-app ACL.
+/// If a credential already exists for this service/account pair, it is
+/// replaced.
+#[cfg(target_os = "macos")]
+pub fn set_credential(service: &str, account: &str, value: &str) -> Result<(), Error> {
+    dp_set(service, account, value.as_bytes())
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn set_credential(_service: &str, _account: &str, _value: &str) -> Result<(), Error> {
+    Err(Error::Storage(
+        "macOS Keychain is not available on this platform".into(),
+    ))
+}
+
+/// Delete a credential from the macOS Keychain.
+#[cfg(target_os = "macos")]
+pub fn delete_credential(service: &str, account: &str) -> Result<(), Error> {
+    dp_delete(service, account)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn delete_credential(_service: &str, _account: &str) -> Result<(), Error> {
+    Err(Error::Storage(
+        "macOS Keychain is not available on this platform".into(),
+    ))
 }

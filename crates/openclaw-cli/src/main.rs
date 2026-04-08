@@ -46,6 +46,9 @@ async fn main() -> anyhow::Result<()> {
     if args.len() >= 2 && args[1] == "skill" {
         return handle_skill_subcommand(&data_dir, &args[2..]);
     }
+    if args.len() >= 2 && args[1] == "keychain" {
+        return handle_keychain_subcommand(&data_dir, &args[2..]);
+    }
 
     // --- Harness profile ---
     // Load from file or use a preset. Supported: default, coding, research, creative
@@ -61,12 +64,12 @@ async fn main() -> anyhow::Result<()> {
     let store = openclaw_store::Store::open(data_dir.join("db"), master_key)?;
 
     // --- Auth token ---
-    let auth_token = std::env::var("OPENCLAW_AUTH_TOKEN").unwrap_or_else(|_| {
-        let token = openclaw_gateway::generate_token();
-        tracing::info!("Generated auth token (set OPENCLAW_AUTH_TOKEN to persist):");
-        println!("\n  OPENCLAW_AUTH_TOKEN={token}\n");
-        token
-    });
+    // Resolution order:
+    // 1. OPENCLAW_AUTH_TOKEN env var (CI, Docker, explicit override)
+    // 2. macOS Keychain (persists across restarts without env var)
+    // 3. Encrypted local SecretStore
+    // 4. Generate a new token and persist it in Keychain + SecretStore
+    let auth_token = resolve_auth_token(&store);
 
     // --- Model provider ---
     let provider_name = std::env::var("OPENCLAW_PROVIDER")
@@ -82,15 +85,7 @@ async fn main() -> anyhow::Result<()> {
             Arc::new(p)
         }
         _ => {
-            let api_key = std::env::var("ANTHROPIC_API_KEY").unwrap_or_else(|_| {
-                if let Ok(key) = store.secrets().get("anthropic_api_key") {
-                    return key;
-                }
-                tracing::error!(
-                    "ANTHROPIC_API_KEY not set. Set it or store via the secrets API."
-                );
-                String::new()
-            });
+            let api_key = resolve_api_key(&store);
             let model = std::env::var("ANTHROPIC_MODEL")
                 .unwrap_or_else(|_| "claude-sonnet-4-20250514".to_string());
             tracing::info!(%model, "using Anthropic provider");
@@ -573,6 +568,284 @@ fn handle_skill_subcommand(data_dir: &std::path::Path, args: &[String]) -> anyho
             std::process::exit(1);
         }
     }
+    Ok(())
+}
+
+// --- Credential resolution helpers ---
+// These functions implement a multi-source lookup chain:
+//   env var → macOS Keychain → SecretStore → generate/error
+// When a credential is found or generated, it is persisted to the sources
+// below so it survives future restarts without the env var.
+
+/// Keychain service names for OpenClaw credentials.
+const KEYCHAIN_SERVICE: &str = "com.openclaw.credentials";
+const KEYCHAIN_ACCOUNT_AUTH_TOKEN: &str = "auth-token";
+const KEYCHAIN_ACCOUNT_API_KEY: &str = "anthropic-api-key";
+
+/// Resolve the bearer auth token for the gateway.
+///
+/// Lookup chain: env var → Keychain → SecretStore → generate new.
+/// A newly generated token is persisted to Keychain and SecretStore so
+/// subsequent restarts pick it up automatically.
+fn resolve_auth_token(store: &openclaw_store::Store) -> String {
+    // 1. Environment variable (highest priority — explicit override).
+    if let Ok(token) = std::env::var("OPENCLAW_AUTH_TOKEN") {
+        tracing::info!("auth token loaded from OPENCLAW_AUTH_TOKEN env var");
+        // Persist downward so removing the env var still works next time.
+        persist_credential(store, KEYCHAIN_ACCOUNT_AUTH_TOKEN, "openclaw_auth_token", &token);
+        return token;
+    }
+
+    // 2. macOS Keychain.
+    if openclaw_store::keychain::keychain_available() {
+        if let Ok(Some(cred)) =
+            openclaw_store::keychain::get_credential(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT_AUTH_TOKEN)
+        {
+            tracing::info!("auth token loaded from macOS Keychain");
+            // Also ensure it's in the SecretStore.
+            let _ = store.secrets().set("openclaw_auth_token", &cred.value);
+            return cred.value;
+        }
+    }
+
+    // 3. Encrypted SecretStore.
+    if let Ok(token) = store.secrets().get("openclaw_auth_token") {
+        tracing::info!("auth token loaded from encrypted store");
+        // Back-fill into Keychain if available.
+        if openclaw_store::keychain::keychain_available() {
+            let _ = openclaw_store::keychain::set_credential(
+                KEYCHAIN_SERVICE,
+                KEYCHAIN_ACCOUNT_AUTH_TOKEN,
+                &token,
+            );
+        }
+        return token;
+    }
+
+    // 4. Generate a new token and persist everywhere.
+    let token = openclaw_gateway::generate_token();
+    tracing::info!("generated new auth token — persisting for future restarts");
+    println!("\n  Auth token (also saved to Keychain/store): {token}\n");
+    persist_credential(store, KEYCHAIN_ACCOUNT_AUTH_TOKEN, "openclaw_auth_token", &token);
+    token
+}
+
+/// Resolve the Anthropic API key.
+///
+/// Lookup chain: env var → Keychain → SecretStore → empty (with error log).
+fn resolve_api_key(store: &openclaw_store::Store) -> String {
+    // 1. Environment variable.
+    if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
+        tracing::info!("API key loaded from ANTHROPIC_API_KEY env var");
+        persist_credential(store, KEYCHAIN_ACCOUNT_API_KEY, "anthropic_api_key", &key);
+        return key;
+    }
+
+    // 2. macOS Keychain.
+    if openclaw_store::keychain::keychain_available() {
+        if let Ok(Some(cred)) =
+            openclaw_store::keychain::get_credential(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT_API_KEY)
+        {
+            tracing::info!("API key loaded from macOS Keychain");
+            let _ = store.secrets().set("anthropic_api_key", &cred.value);
+            return cred.value;
+        }
+    }
+
+    // 3. SecretStore.
+    if let Ok(key) = store.secrets().get("anthropic_api_key") {
+        tracing::info!("API key loaded from encrypted store");
+        if openclaw_store::keychain::keychain_available() {
+            let _ = openclaw_store::keychain::set_credential(
+                KEYCHAIN_SERVICE,
+                KEYCHAIN_ACCOUNT_API_KEY,
+                &key,
+            );
+        }
+        return key;
+    }
+
+    tracing::error!(
+        "ANTHROPIC_API_KEY not set. Set the env var, store it via the secrets API, \
+         or add it to macOS Keychain (service: {KEYCHAIN_SERVICE}, account: {KEYCHAIN_ACCOUNT_API_KEY})."
+    );
+    String::new()
+}
+
+/// Persist a credential to both the macOS Keychain and the encrypted
+/// SecretStore. Errors are logged but not fatal — best-effort persistence.
+fn persist_credential(
+    store: &openclaw_store::Store,
+    keychain_account: &str,
+    store_name: &str,
+    value: &str,
+) {
+    if openclaw_store::keychain::keychain_available() {
+        if let Err(e) =
+            openclaw_store::keychain::set_credential(KEYCHAIN_SERVICE, keychain_account, value)
+        {
+            tracing::warn!("failed to persist credential to Keychain: {e}");
+        }
+    }
+    if let Err(e) = store.secrets().set(store_name, value) {
+        tracing::warn!("failed to persist credential to store: {e}");
+    }
+}
+
+/// Handle `keychain status`, `keychain migrate`, and `keychain set` subcommands.
+///
+/// These let the user verify Keychain connectivity, migrate legacy keychain
+/// items to the Data Protection Keychain, and manually seed credentials.
+fn handle_keychain_subcommand(data_dir: &std::path::Path, args: &[String]) -> anyhow::Result<()> {
+    let sub = args.first().map(|s| s.as_str()).unwrap_or("status");
+
+    match sub {
+        "status" => {
+            println!("macOS Keychain support: {}", if openclaw_store::keychain::keychain_available() {
+                "available (Data Protection Keychain)"
+            } else {
+                "not available (this platform does not support macOS Keychain)"
+            });
+
+            if !openclaw_store::keychain::keychain_available() {
+                println!("\nOn non-macOS platforms, use environment variables or the encrypted store.");
+                return Ok(());
+            }
+
+            // Check each known credential.
+            let checks = [
+                ("Master key", "com.openclaw.master-key", "openclaw-encryption-key"),
+                ("Auth token", KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT_AUTH_TOKEN),
+                ("Anthropic API key", KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT_API_KEY),
+            ];
+
+            println!("\n{:<25} {:<40} {}", "CREDENTIAL", "SERVICE/ACCOUNT", "STATUS");
+            println!("{}", "-".repeat(80));
+            for (label, service, account) in &checks {
+                let status = match openclaw_store::keychain::get_credential(service, account) {
+                    Ok(Some(_)) => "present",
+                    Ok(None) => "not set",
+                    Err(_) => "error",
+                };
+                println!("{:<25} {}/{:<14} {}", label, service, account, status);
+            }
+            println!();
+            println!("All items use the Data Protection Keychain (no password prompts).");
+        }
+
+        "set" => {
+            let name = args.get(1).ok_or_else(|| anyhow::anyhow!(
+                "usage: openclaw-cli keychain set <name> <value>\n  \
+                 names: auth-token, api-key"
+            ))?;
+            let value = args.get(2).ok_or_else(|| anyhow::anyhow!(
+                "usage: openclaw-cli keychain set <name> <value>"
+            ))?;
+
+            if !openclaw_store::keychain::keychain_available() {
+                anyhow::bail!("macOS Keychain is not available on this platform");
+            }
+
+            let (service, account) = match name.as_str() {
+                "auth-token" => (KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT_AUTH_TOKEN),
+                "api-key" => (KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT_API_KEY),
+                other => {
+                    // Allow arbitrary service/account if specified as service:account
+                    if let Some((s, a)) = other.split_once(':') {
+                        (s, a)
+                    } else {
+                        anyhow::bail!(
+                            "unknown credential name '{other}'. \
+                             Use: auth-token, api-key, or service:account"
+                        );
+                    }
+                }
+            };
+
+            openclaw_store::keychain::set_credential(service, account, value)
+                .map_err(|e| anyhow::anyhow!("failed to store: {e}"))?;
+            println!("Stored in Keychain: {service}/{account}");
+
+            // Also persist to the encrypted store if the DB exists.
+            let db_path = data_dir.join("db");
+            if db_path.exists() {
+                if let Ok(master_key) = openclaw_store::keychain::resolve_master_key() {
+                    if let Ok(store) = openclaw_store::Store::open(&db_path, master_key) {
+                        let store_name = match name.as_str() {
+                            "auth-token" => "openclaw_auth_token",
+                            "api-key" => "anthropic_api_key",
+                            _ => name.as_str(),
+                        };
+                        let _ = store.secrets().set(store_name, value);
+                        println!("Also stored in encrypted store as '{store_name}'");
+                    }
+                }
+            }
+        }
+
+        "migrate" => {
+            if !openclaw_store::keychain::keychain_available() {
+                anyhow::bail!("macOS Keychain is not available on this platform");
+            }
+
+            println!("Migrating credentials to Data Protection Keychain...");
+            println!("(This re-creates items without per-app ACLs so no password prompts occur.)\n");
+
+            // Re-resolve master key — this migrates it to the DP keychain.
+            match openclaw_store::keychain::resolve_master_key() {
+                Ok(_) => println!("  master key: OK"),
+                Err(e) => println!("  master key: FAILED ({e})"),
+            }
+
+            // Migrate auth token and API key from env vars or existing store.
+            let db_path = data_dir.join("db");
+            if db_path.exists() {
+                if let Ok(master_key) = openclaw_store::keychain::resolve_master_key() {
+                    if let Ok(store) = openclaw_store::Store::open(&db_path, master_key) {
+                        // Auth token
+                        if let Ok(token) = store.secrets().get("openclaw_auth_token") {
+                            match openclaw_store::keychain::set_credential(
+                                KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT_AUTH_TOKEN, &token,
+                            ) {
+                                Ok(()) => println!("  auth token: migrated to DP Keychain"),
+                                Err(e) => println!("  auth token: FAILED ({e})"),
+                            }
+                        } else {
+                            println!("  auth token: not in store (will be generated on next start)");
+                        }
+
+                        // API key
+                        if let Ok(key) = store.secrets().get("anthropic_api_key") {
+                            match openclaw_store::keychain::set_credential(
+                                KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT_API_KEY, &key,
+                            ) {
+                                Ok(()) => println!("  API key: migrated to DP Keychain"),
+                                Err(e) => println!("  API key: FAILED ({e})"),
+                            }
+                        } else {
+                            println!("  API key: not in store (set via env var or 'keychain set api-key')");
+                        }
+                    }
+                }
+            } else {
+                println!("  No database found at {} — skipping store migration", db_path.display());
+            }
+
+            println!("\nMigration complete. Restart openclaw-cli to verify.");
+        }
+
+        _ => {
+            eprintln!("Unknown keychain subcommand: {sub}");
+            eprintln!("Usage:");
+            eprintln!("  openclaw-cli keychain status              Show Keychain credential status");
+            eprintln!("  openclaw-cli keychain set <name> <value>  Store a credential");
+            eprintln!("  openclaw-cli keychain migrate             Migrate to Data Protection Keychain");
+            eprintln!();
+            eprintln!("Credential names: auth-token, api-key, or <service>:<account>");
+            std::process::exit(1);
+        }
+    }
+
     Ok(())
 }
 
