@@ -252,10 +252,30 @@ pub async fn run_agent_streaming(
             .and_then(|m| m.content.as_text())
             .map(|s| s.to_string());
 
+        // The pipeline runs synchronously and can take many minutes.
+        // Emit periodic heartbeat events so the SSE timeout doesn't
+        // kill the connection while the pipeline is working.
+        let heartbeat_event = on_event as &(dyn Fn(AgentEvent) + Send + Sync);
+        let keepalive = tokio::spawn({
+            // Safety: on_event lives for the duration of run_agent_streaming
+            // which is awaited below, so it outlives this spawned task.
+            let event_fn: &'static (dyn Fn(AgentEvent) + Send + Sync) =
+                unsafe { std::mem::transmute(heartbeat_event) };
+            async move {
+                loop {
+                    tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+                    event_fn(AgentEvent::Compressing); // reuse existing event as heartbeat
+                }
+            }
+        });
+
         let result = pipeline
             .run(user_content, TaskComplexity::Complex, context.as_deref())
-            .await
-            .map_err(|e| {
+            .await;
+
+        keepalive.abort(); // stop the heartbeat once pipeline finishes
+
+        let result = result.map_err(|e| {
                 tracing::error!("orchestration pipeline error: {e}");
                 on_event(AgentEvent::ToolCallEnd {
                     tool_name: "orchestration_pipeline".to_string(),

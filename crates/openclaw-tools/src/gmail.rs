@@ -122,8 +122,11 @@ impl GmailTool {
 
             // Use Gmail's X-GM-RAW extension for full search syntax,
             // falling back to standard IMAP SEARCH.
+            // Escape inner double quotes so the IMAP command parses correctly
+            // (e.g. query `from:"foo@bar.com"` becomes `X-GM-RAW "from:\"foo@bar.com\""`).
+            let escaped_query = query.replace('\\', "\\\\").replace('"', "\\\"");
             let uids = session
-                .uid_search(&format!("X-GM-RAW \"{query}\""))
+                .uid_search(&format!("X-GM-RAW \"{escaped_query}\""))
                 .or_else(|_| session.uid_search(&query))
                 .map_err(|e| Error::ToolExecution(format!("search failed: {e}").into()))?;
 
@@ -626,13 +629,15 @@ impl GmailTool {
 
             let mut all_uids = std::collections::HashSet::new();
             for mid in &msg_ids {
+                // Escape message IDs for IMAP query safety.
+                let escaped = mid.replace('\\', "\\\\").replace('"', "\\\"");
                 // Search for messages that reference this ID or have this ID.
-                let query = format!("X-GM-RAW \"rfc822msgid:{mid} OR references:{mid}\"");
+                let query = format!("X-GM-RAW \"rfc822msgid:{escaped} OR references:{escaped}\"");
                 if let Ok(uids) = session.uid_search(&query) {
                     all_uids.extend(uids);
                 }
                 // Also try standard HEADER search as fallback.
-                let query2 = format!("OR HEADER Message-ID \"<{mid}>\" HEADER References \"<{mid}>\"");
+                let query2 = format!("OR HEADER Message-ID \"<{escaped}>\" HEADER References \"<{escaped}>\"");
                 if let Ok(uids) = session.uid_search(&query2) {
                     all_uids.extend(uids);
                 }
