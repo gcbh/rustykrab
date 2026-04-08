@@ -150,10 +150,18 @@ async fn execute_sub_task(
         });
     }
 
+    // Frame the sub-task as a direct action instruction, not a topic to
+    // discuss. Without this framing the model tends to describe how to do
+    // the task or investigate tool availability rather than executing it.
+    let instruction = format!(
+        "Execute the following task now using your tools. Do NOT explain how to do it — \
+         call the appropriate tool(s) and return the results.\n\nTask: {}",
+        task.description
+    );
     messages.push(Message {
         id: Uuid::new_v4(),
         role: Role::User,
-        content: MessageContent::Text(task.description.clone()),
+        content: MessageContent::Text(instruction),
         created_at: Utc::now(),
     });
 
