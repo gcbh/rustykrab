@@ -56,6 +56,7 @@ All configuration is via environment variables. No plaintext config files.
 | `ANTHROPIC_MODEL` | `claude-sonnet-4-20250514` | Claude model to use |
 | `OLLAMA_MODEL` | `gemma4:26b` | Ollama model name |
 | `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama server address |
+| `CHROME_CDP_URL` | `ws://127.0.0.1:9222` | Chrome DevTools Protocol endpoint |
 | `OPENCLAW_AUTH_TOKEN` | auto-generated | Bearer token for API auth |
 | `OPENCLAW_MASTER_KEY` | auto-generated | Encryption key for secrets at rest |
 | `TELEGRAM_BOT_TOKEN` | — | Telegram bot token from @BotFather |

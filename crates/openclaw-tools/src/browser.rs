@@ -19,16 +19,19 @@ const MAX_CONTENT_BYTES: usize = 50 * 1024; // 50KB cap for page content
 ///
 /// Connects to a running Chrome instance via CDP for full browser automation
 /// including navigation, form filling, screenshots, and cookie persistence.
-/// The user's existing Chrome profile is used, so all logged-in sessions are available.
 ///
-/// Launch Chrome with remote debugging:
-/// ```sh
-/// open -a 'Google Chrome' --args --remote-debugging-port=9222
-/// ```
+/// If Chrome is not already running with remote debugging, the tool will
+/// auto-launch it. Modern Chrome requires a non-default `--user-data-dir`
+/// for remote debugging, so the tool creates a wrapper directory at
+/// `~/.openclaw/chrome-profile` that symlinks back to the user's real
+/// Chrome profile — all existing sessions, cookies, and logins are
+/// available without re-authenticating. The user's active profile is
+/// detected from Chrome's `Local State` file.
 ///
 /// Configure the CDP URL via `CHROME_CDP_URL` env var (default: ws://127.0.0.1:9222).
 pub struct BrowserTool {
     cdp_url: String,
+    user_data_dir: std::path::PathBuf,
     /// Lazy connection: created on first use and held for the tool's lifetime.
     /// Stores (Browser, JoinHandle) — the JoinHandle keeps the CDP handler task alive.
     state: Arc<Mutex<Option<BrowserState>>>,
@@ -43,26 +46,52 @@ impl BrowserTool {
     pub fn new() -> Self {
         let cdp_url = std::env::var("CHROME_CDP_URL")
             .unwrap_or_else(|_| DEFAULT_CDP_URL.to_string());
+        let home = std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .unwrap_or_else(|_| ".".to_string());
+        let user_data_dir = std::path::PathBuf::from(home)
+            .join(".openclaw")
+            .join("chrome-profile");
         Self {
             cdp_url,
+            user_data_dir,
             state: Arc::new(Mutex::new(None)),
         }
     }
 
     /// Get or create the browser connection.
+    ///
+    /// Tries to connect to an existing Chrome instance. If that fails,
+    /// attempts to auto-launch Chrome with remote debugging enabled,
+    /// then retries the connection.
     async fn get_browser(&self) -> Result<Arc<Mutex<Option<BrowserState>>>> {
         let mut guard = self.state.lock().await;
         if guard.is_none() {
-            let (browser, mut handler) =
-                Browser::connect(&self.cdp_url).await.map_err(|e| {
-                    Error::ToolExecution(format!(
-                        "Chrome not reachable at {}: {}. \
-                         Launch Chrome with: open -a 'Google Chrome' --args --remote-debugging-port=9222",
-                        self.cdp_url, e
-                    ).into())
-                })?;
+            let connect_result = Browser::connect(&self.cdp_url).await;
+
+            let (browser, handler) = match connect_result {
+                Ok(pair) => pair,
+                Err(_) => {
+                    // Chrome isn't running with debugging — try to launch it.
+                    tracing::info!("Chrome not reachable, attempting auto-launch with remote debugging");
+                    self.launch_chrome()?;
+
+                    // Give Chrome time to start and open the debugging port.
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+                    Browser::connect(&self.cdp_url).await.map_err(|e| {
+                        Error::ToolExecution(format!(
+                            "Chrome not reachable at {} after auto-launch attempt: {}. \
+                             If Chrome is already running without remote debugging, \
+                             quit it first so a new instance can start with the debugging port.",
+                            self.cdp_url, e
+                        ).into())
+                    })?
+                }
+            };
 
             // Spawn the CDP handler so messages are processed in the background.
+            let mut handler = handler;
             let handler_task = tokio::spawn(async move {
                 while let Some(_event) = handler.next().await {}
             });
@@ -74,6 +103,156 @@ impl BrowserTool {
         }
         drop(guard);
         Ok(Arc::clone(&self.state))
+    }
+
+    /// Detect the platform-specific Chrome data directory.
+    fn chrome_data_dir() -> Option<std::path::PathBuf> {
+        let home = std::env::var("HOME").ok()?;
+        #[cfg(target_os = "macos")]
+        {
+            Some(std::path::PathBuf::from(home).join("Library/Application Support/Google/Chrome"))
+        }
+        #[cfg(target_os = "linux")]
+        {
+            Some(std::path::PathBuf::from(home).join(".config/google-chrome"))
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            None
+        }
+    }
+
+    /// Read Chrome's `Local State` to find the last-used profile directory
+    /// name (e.g. "Default", "Profile 4"). Falls back to "Default".
+    fn detect_profile_name(chrome_dir: &std::path::Path) -> String {
+        let local_state_path = chrome_dir.join("Local State");
+        if let Ok(data) = std::fs::read_to_string(&local_state_path) {
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&data) {
+                if let Some(name) = parsed["profile"]["last_used"].as_str() {
+                    if chrome_dir.join(name).exists() {
+                        return name.to_string();
+                    }
+                }
+            }
+        }
+        "Default".to_string()
+    }
+
+    /// Set up the wrapper data directory so Chrome uses the user's real
+    /// profile without showing a profile picker.
+    ///
+    /// 1. Reads `Local State` from the real Chrome dir to find the active
+    ///    profile name (e.g. "Profile 4").
+    /// 2. Symlinks that profile folder into our wrapper directory.
+    /// 3. Writes a minimal `Local State` with `picker_shown: false`.
+    ///
+    /// Returns the profile directory name to pass as `--profile-directory`.
+    /// Best-effort: if anything fails, returns "Default" and Chrome starts
+    /// with a fresh profile.
+    fn setup_profile_link(&self) -> String {
+        let Some(chrome_dir) = Self::chrome_data_dir() else {
+            return "Default".to_string();
+        };
+
+        let profile_name = Self::detect_profile_name(&chrome_dir);
+        let real_profile = chrome_dir.join(&profile_name);
+        let link_path = self.user_data_dir.join(&profile_name);
+
+        // Symlink the profile directory (only if it doesn't already exist).
+        if real_profile.exists() && !link_path.exists() {
+            #[cfg(unix)]
+            {
+                if let Err(e) = std::os::unix::fs::symlink(&real_profile, &link_path) {
+                    tracing::warn!("could not symlink Chrome profile: {e}");
+                }
+            }
+        }
+
+        // Write a minimal Local State that points to our profile and
+        // disables the profile picker.
+        let local_state_dest = self.user_data_dir.join("Local State");
+        let local_state = serde_json::json!({
+            "profile": {
+                "last_used": &profile_name,
+                "last_active_profiles": [&profile_name],
+                "picker_shown": false
+            }
+        });
+        if let Err(e) = std::fs::write(&local_state_dest, local_state.to_string()) {
+            tracing::warn!("could not write Chrome Local State: {e}");
+        }
+
+        profile_name
+    }
+
+    /// Launch Chrome with remote debugging and the user's real profile.
+    ///
+    /// Modern Chrome requires a non-default `--user-data-dir` for remote
+    /// debugging. We create a wrapper dir, symlink the user's actual
+    /// profile into it, write a `Local State` that disables the profile
+    /// picker, and pass `about:blank` so Chrome opens directly.
+    fn launch_chrome(&self) -> Result<()> {
+        let port = self.cdp_url
+            .rsplit(':')
+            .next()
+            .and_then(|p| p.trim_end_matches('/').parse::<u16>().ok())
+            .unwrap_or(9222);
+
+        std::fs::create_dir_all(&self.user_data_dir).map_err(|e| {
+            Error::ToolExecution(format!("failed to create Chrome profile dir: {e}").into())
+        })?;
+
+        let profile_name = self.setup_profile_link();
+
+        let args = [
+            format!("--remote-debugging-port={port}"),
+            format!("--user-data-dir={}", self.user_data_dir.display()),
+            format!("--profile-directory={profile_name}"),
+            "--no-first-run".to_string(),
+            "about:blank".to_string(),
+        ];
+
+        #[cfg(target_os = "macos")]
+        {
+            let chrome_path = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
+            std::process::Command::new(chrome_path)
+                .args(&args)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .map_err(|e| {
+                    Error::ToolExecution(format!("failed to launch Chrome: {e}").into())
+                })?;
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            let browsers = ["google-chrome", "google-chrome-stable", "chromium-browser", "chromium"];
+            let launched = browsers.iter().any(|name| {
+                std::process::Command::new(name)
+                    .args(&args)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .is_ok()
+            });
+            if !launched {
+                return Err(Error::ToolExecution(
+                    "could not find Chrome or Chromium. Install Google Chrome or set CHROME_CDP_URL.".into(),
+                ));
+            }
+        }
+
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            return Err(Error::ToolExecution(format!(
+                "auto-launch not supported on this platform. \
+                 Launch Chrome manually with: --remote-debugging-port={port}"
+            ).into()));
+        }
+
+        tracing::info!(port, %profile_name, "launched Chrome with remote debugging");
+        Ok(())
     }
 }
 
