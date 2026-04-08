@@ -791,14 +791,14 @@ fn persist_credential(
 /// Handle `keychain status`, `keychain migrate`, and `keychain set` subcommands.
 ///
 /// These let the user verify Keychain connectivity, migrate legacy keychain
-/// items to the Data Protection Keychain, and manually seed credentials.
+/// items to the login keychain, and manually seed credentials.
 fn handle_keychain_subcommand(data_dir: &std::path::Path, args: &[String]) -> anyhow::Result<()> {
     let sub = args.first().map(|s| s.as_str()).unwrap_or("status");
 
     match sub {
         "status" => {
             println!("macOS Keychain support: {}", if openclaw_store::keychain::keychain_available() {
-                "available (Data Protection Keychain)"
+                "available (login keychain)"
             } else {
                 "not available (this platform does not support macOS Keychain)"
             });
@@ -826,7 +826,7 @@ fn handle_keychain_subcommand(data_dir: &std::path::Path, args: &[String]) -> an
                 println!("{:<25} {}/{:<14} {}", label, service, account, status);
             }
             println!();
-            println!("All items use the Data Protection Keychain (no password prompts).");
+            println!("All items use the login keychain (no entitlements or password prompts required).");
         }
 
         "set" => {
@@ -884,8 +884,8 @@ fn handle_keychain_subcommand(data_dir: &std::path::Path, args: &[String]) -> an
                 anyhow::bail!("macOS Keychain is not available on this platform");
             }
 
-            println!("Migrating credentials to Data Protection Keychain...");
-            println!("(This re-creates items without per-app ACLs so no password prompts occur.)\n");
+            println!("Migrating credentials to login keychain...");
+            println!("(This re-creates items in the login keychain — no entitlements required.)\n");
 
             // Re-resolve master key — this migrates it to the DP keychain.
             match openclaw_store::keychain::resolve_master_key() {
@@ -903,7 +903,7 @@ fn handle_keychain_subcommand(data_dir: &std::path::Path, args: &[String]) -> an
                             match openclaw_store::keychain::set_credential(
                                 KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT_AUTH_TOKEN, &token,
                             ) {
-                                Ok(()) => println!("  auth token: migrated to DP Keychain"),
+                                Ok(()) => println!("  auth token: migrated to login keychain"),
                                 Err(e) => println!("  auth token: FAILED ({e})"),
                             }
                         } else {
@@ -915,7 +915,7 @@ fn handle_keychain_subcommand(data_dir: &std::path::Path, args: &[String]) -> an
                             match openclaw_store::keychain::set_credential(
                                 KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT_API_KEY, &key,
                             ) {
-                                Ok(()) => println!("  API key: migrated to DP Keychain"),
+                                Ok(()) => println!("  API key: migrated to login keychain"),
                                 Err(e) => println!("  API key: FAILED ({e})"),
                             }
                         } else {
@@ -935,7 +935,7 @@ fn handle_keychain_subcommand(data_dir: &std::path::Path, args: &[String]) -> an
             eprintln!("Usage:");
             eprintln!("  openclaw-cli keychain status              Show Keychain credential status");
             eprintln!("  openclaw-cli keychain set <name> <value>  Store a credential");
-            eprintln!("  openclaw-cli keychain migrate             Migrate to Data Protection Keychain");
+            eprintln!("  openclaw-cli keychain migrate             Migrate credentials to login keychain");
             eprintln!();
             eprintln!("Credential names: auth-token, api-key, or <service>:<account>");
             std::process::exit(1);

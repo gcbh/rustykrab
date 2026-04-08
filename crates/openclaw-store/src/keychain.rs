@@ -1,14 +1,14 @@
 //! macOS Keychain integration for credential storage.
 //!
-//! Uses the **Data Protection Keychain** (`kSecUseDataProtectionKeychain`)
-//! available on macOS 10.15+. Unlike the legacy keychain, the Data Protection
-//! Keychain does **not** use per-application ACLs, so credentials are
-//! accessible to any process running as the current user without password
-//! prompts or code-signing requirements. Items are protected by the user's
-//! login session — they are available after first unlock (i.e. once the user
-//! logs in after boot) and do not require further interaction.
+//! Uses the **login keychain** — the default keychain that macOS unlocks
+//! automatically when the user logs in. This avoids the
+//! `keychain-access-groups` entitlement requirement imposed by the Data
+//! Protection Keychain (`kSecUseDataProtectionKeychain`), which only works
+//! for properly signed and entitled binaries — not cargo-built debug/release
+//! builds.
 //!
 //! This means:
+//! - No entitlements or codesigning required for development builds
 //! - No password prompts when the binary is rebuilt during development
 //! - No Touch ID / biometric gates on credential reads
 //! - Credentials survive restarts without environment variables
@@ -22,18 +22,17 @@ const SERVICE_NAME: &str = "com.openclaw.master-key";
 const ACCOUNT_NAME: &str = "openclaw-encryption-key";
 
 // ---------------------------------------------------------------------------
-// Internal helpers — Data Protection Keychain read/write
+// Internal helpers — login keychain read/write
 // ---------------------------------------------------------------------------
 
-/// Read a generic password from the Data Protection Keychain.
+/// Read a generic password from the login keychain.
 ///
 /// Returns `Ok(None)` when the item does not exist (errSecItemNotFound).
 #[cfg(target_os = "macos")]
-fn dp_get(service: &str, account: &str) -> Result<Option<Vec<u8>>, Error> {
+fn kc_get(service: &str, account: &str) -> Result<Option<Vec<u8>>, Error> {
     use security_framework::passwords::{generic_password, PasswordOptions};
 
-    let mut opts = PasswordOptions::new_generic_password(service, account);
-    opts.use_protected_keychain();
+    let opts = PasswordOptions::new_generic_password(service, account);
 
     match generic_password(opts) {
         Ok(bytes) => Ok(Some(bytes)),
@@ -50,40 +49,30 @@ fn dp_get(service: &str, account: &str) -> Result<Option<Vec<u8>>, Error> {
     }
 }
 
-/// Write a generic password to the Data Protection Keychain.
+/// Write a generic password to the login keychain.
 ///
-/// Deletes any existing item first to avoid duplicate-item errors, then
-/// creates a new item in the Data Protection Keychain with
-/// `kSecUseDataProtectionKeychain = true` so no per-app ACLs are applied.
+/// Deletes any existing item first to avoid duplicate-item errors.
 #[cfg(target_os = "macos")]
-fn dp_set(service: &str, account: &str, password: &[u8]) -> Result<(), Error> {
+fn kc_set(service: &str, account: &str, password: &[u8]) -> Result<(), Error> {
     use security_framework::passwords::{
         delete_generic_password_options, set_generic_password_options, PasswordOptions,
     };
 
-    // Delete from Data Protection Keychain (ignore "not found").
-    let mut del_opts = PasswordOptions::new_generic_password(service, account);
-    del_opts.use_protected_keychain();
+    // Delete any existing item (ignore "not found").
+    let del_opts = PasswordOptions::new_generic_password(service, account);
     let _ = delete_generic_password_options(del_opts);
 
-    // Also try deleting from legacy keychain to avoid stale entries that
-    // would shadow the new Data Protection item during migration.
-    let legacy_del = PasswordOptions::new_generic_password(service, account);
-    let _ = delete_generic_password_options(legacy_del);
-
-    let mut opts = PasswordOptions::new_generic_password(service, account);
-    opts.use_protected_keychain();
+    let opts = PasswordOptions::new_generic_password(service, account);
     set_generic_password_options(password, opts)
         .map_err(|e| Error::Storage(format!("keychain write failed for {service}/{account}: {e}")))
 }
 
-/// Delete a generic password from the Data Protection Keychain.
+/// Delete a generic password from the login keychain.
 #[cfg(target_os = "macos")]
-fn dp_delete(service: &str, account: &str) -> Result<(), Error> {
+fn kc_delete(service: &str, account: &str) -> Result<(), Error> {
     use security_framework::passwords::{delete_generic_password_options, PasswordOptions};
 
-    let mut opts = PasswordOptions::new_generic_password(service, account);
-    opts.use_protected_keychain();
+    let opts = PasswordOptions::new_generic_password(service, account);
     delete_generic_password_options(opts)
         .map_err(|e| Error::Storage(format!("keychain delete failed for {service}/{account}: {e}")))
 }
@@ -97,7 +86,7 @@ fn dp_delete(service: &str, account: &str) -> Result<(), Error> {
 /// Returns `None` if no key is stored yet.
 #[cfg(target_os = "macos")]
 pub fn get_master_key() -> Result<Option<Vec<u8>>, Error> {
-    match dp_get(SERVICE_NAME, ACCOUNT_NAME)? {
+    match kc_get(SERVICE_NAME, ACCOUNT_NAME)? {
         Some(bytes) => {
             let hex_str = String::from_utf8(bytes)
                 .map_err(|e| Error::Storage(format!("keychain: invalid utf-8: {e}")))?;
@@ -112,19 +101,19 @@ pub fn get_master_key() -> Result<Option<Vec<u8>>, Error> {
 /// Store the master key in the macOS Keychain (as hex).
 #[cfg(target_os = "macos")]
 pub fn set_master_key(key: &[u8]) -> Result<(), Error> {
-    dp_set(SERVICE_NAME, ACCOUNT_NAME, hex::encode(key).as_bytes())
+    kc_set(SERVICE_NAME, ACCOUNT_NAME, hex::encode(key).as_bytes())
 }
 
 /// Delete the master key from the Keychain.
 #[cfg(target_os = "macos")]
 pub fn delete_master_key() -> Result<(), Error> {
-    dp_delete(SERVICE_NAME, ACCOUNT_NAME)
+    kc_delete(SERVICE_NAME, ACCOUNT_NAME)
 }
 
 /// Retrieve or generate the master key using the macOS Keychain.
 ///
 /// 1. Try env var `OPENCLAW_MASTER_KEY`
-/// 2. Try macOS Keychain (Data Protection Keychain — no password prompt)
+/// 2. Try macOS login keychain (no password prompt)
 /// 3. Generate a new random key and store it in the Keychain
 ///
 /// This is the primary entry point for CLI startup.
@@ -140,9 +129,9 @@ pub fn resolve_master_key() -> Result<Vec<u8>, Error> {
         });
     }
 
-    // Priority 2: macOS Data Protection Keychain (no password prompt).
+    // Priority 2: macOS login keychain (no password prompt).
     if let Some(key) = get_master_key()? {
-        tracing::info!("master key loaded from macOS Keychain (Data Protection)");
+        tracing::info!("master key loaded from macOS Keychain");
         return Ok(key);
     }
 
@@ -152,8 +141,7 @@ pub fn resolve_master_key() -> Result<Vec<u8>, Error> {
     rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut key);
     set_master_key(&key)?;
     tracing::info!(
-        "master key stored in macOS Keychain under '{SERVICE_NAME}' \
-         (Data Protection Keychain — no password prompt on access)."
+        "master key stored in macOS Keychain under '{SERVICE_NAME}'"
     );
     Ok(key.to_vec())
 }
@@ -201,14 +189,14 @@ pub fn keychain_available() -> bool {
 
 /// Retrieve a credential from the macOS Keychain by service and account.
 ///
-/// Uses the Data Protection Keychain — no password prompt or per-app ACL.
+/// Uses the login keychain — no entitlements or codesigning required.
 /// `service` corresponds to the "Where" field visible in Keychain Access,
 /// and `account` to the "Account" field.
 ///
 /// Returns `Ok(None)` when the item does not exist.
 #[cfg(target_os = "macos")]
 pub fn get_credential(service: &str, account: &str) -> Result<Option<KeychainCredential>, Error> {
-    match dp_get(service, account)? {
+    match kc_get(service, account)? {
         Some(bytes) => {
             let value = String::from_utf8(bytes)
                 .map_err(|e| Error::Storage(format!("keychain: credential is not valid utf-8: {e}")))?;
@@ -231,12 +219,12 @@ pub fn get_credential(_service: &str, _account: &str) -> Result<Option<KeychainC
 
 /// Store a credential in the macOS Keychain under the given service/account.
 ///
-/// Uses the Data Protection Keychain — no password prompt or per-app ACL.
+/// Uses the login keychain — no entitlements or codesigning required.
 /// If a credential already exists for this service/account pair, it is
 /// replaced.
 #[cfg(target_os = "macos")]
 pub fn set_credential(service: &str, account: &str, value: &str) -> Result<(), Error> {
-    dp_set(service, account, value.as_bytes())
+    kc_set(service, account, value.as_bytes())
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -249,7 +237,7 @@ pub fn set_credential(_service: &str, _account: &str, _value: &str) -> Result<()
 /// Delete a credential from the macOS Keychain.
 #[cfg(target_os = "macos")]
 pub fn delete_credential(service: &str, account: &str) -> Result<(), Error> {
-    dp_delete(service, account)
+    kc_delete(service, account)
 }
 
 #[cfg(not(target_os = "macos"))]

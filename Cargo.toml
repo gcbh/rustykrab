@@ -64,7 +64,7 @@ hex = "0.4"
 base64 = "0.22"
 aes-gcm = "0.10"
 argon2 = "0.5"
-security-framework = { version = "3", features = ["OSX_10_15"] }
+security-framework = "3"
 zeroize = { version = "1", features = ["zeroize_derive"] }
 
 # Browser automation (Chrome DevTools Protocol)
