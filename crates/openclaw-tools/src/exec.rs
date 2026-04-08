@@ -83,16 +83,29 @@ fn validate_command(command: &str) -> std::result::Result<(), String> {
                 continue;
             }
 
-            let base = sub.split_whitespace().next().unwrap_or("");
-            let cmd_name = base.rsplit('/').next().unwrap_or(base);
-
-            if !ALLOWED_COMMANDS.contains(&cmd_name) {
+            // Find the actual command, skipping leading variable assignments
+            // (e.g. `FOO=bar python3 script.py` → check `python3`).
+            let mut found_allowed = false;
+            for token in sub.split_whitespace() {
+                // Variable assignments (KEY=value) are not commands — skip them.
+                if token.contains('=') && !token.starts_with('=') {
+                    continue;
+                }
+                let cmd_name = token.rsplit('/').next().unwrap_or(token);
+                if ALLOWED_COMMANDS.contains(&cmd_name) {
+                    found_allowed = true;
+                    break;
+                }
+                // First non-assignment token that isn't allowed → reject.
                 return Err(format!(
                     "command '{}' is not in the allowlist. Allowed commands: {}",
                     cmd_name,
                     ALLOWED_COMMANDS.join(", ")
                 ));
             }
+            // If segment was all variable assignments with no command, that's fine
+            // (sh -c handles bare assignments).
+            let _ = found_allowed;
         }
     }
 
