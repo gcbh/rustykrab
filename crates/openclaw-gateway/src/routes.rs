@@ -182,34 +182,73 @@ async fn send_message_stream(
     // Channel for streaming events from the agent task to the SSE response.
     let (tx, rx) = tokio::sync::mpsc::channel::<SsePayload>(128);
 
-    // Spawn the agent loop in a background task with a 30-minute timeout.
-    // Local models (Ollama) can take 1-5 minutes per LLM call, and multi-step
-    // tool-use conversations may need 5+ iterations.
+    // Spawn the agent loop in a background task with a heartbeat-based timeout.
+    // The agent can run indefinitely as long as it emits events (tool calls,
+    // text deltas, etc.) within each 5-minute window. This prevents the 408
+    // timeout that killed long-running orchestration tasks while still
+    // catching genuinely stuck agents.
     let agent_state = state.clone();
     tokio::spawn(async move {
+        let heartbeat = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+        ));
+
+        let hb = heartbeat.clone();
         let event_tx = tx.clone();
         let on_event = move |event: AgentEvent| {
+            // Reset heartbeat on every event.
+            hb.store(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
             let _ = event_tx.try_send(SsePayload::Event(event));
         };
 
-        let result = tokio::time::timeout(
-            tokio::time::Duration::from_secs(1800),
-            crate::orchestrate::run_agent_streaming(
-                &agent_state,
-                &mut conv,
-                &user_content,
-                &on_event,
-            ),
-        )
-        .await;
+        // Heartbeat monitor: checks every 30s if we've gone 5 minutes without an event.
+        let hb_monitor = heartbeat.clone();
+        let timeout_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let tf = timeout_flag.clone();
+        let monitor = tokio::spawn(async move {
+            const HEARTBEAT_TIMEOUT_MS: u64 = 300_000; // 5 minutes
+            loop {
+                tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
+                let last = hb_monitor.load(std::sync::atomic::Ordering::Relaxed);
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                if now.saturating_sub(last) > HEARTBEAT_TIMEOUT_MS {
+                    tf.store(true, std::sync::atomic::Ordering::Relaxed);
+                    break;
+                }
+            }
+        });
 
-        let result = match result {
-            Ok(r) => r,
-            Err(_) => {
-                tracing::warn!("streaming agent timed out after 1800s");
+        let agent_future = crate::orchestrate::run_agent_streaming(
+            &agent_state,
+            &mut conv,
+            &user_content,
+            &on_event,
+        );
+
+        let result = tokio::select! {
+            r = agent_future => r,
+            _ = monitor => {
+                tracing::warn!("streaming agent timed out (no activity for 5 minutes)");
                 Err(StatusCode::REQUEST_TIMEOUT)
             }
         };
+
+        // If the agent finished before the monitor, cancel the monitor.
+        if !timeout_flag.load(std::sync::atomic::Ordering::Relaxed) {
+            // Agent completed normally; monitor task will be dropped.
+        }
 
         // Persist conversation on success.
         if result.is_ok() {

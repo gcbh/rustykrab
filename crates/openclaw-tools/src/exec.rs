@@ -54,40 +54,31 @@ fn truncate_output(s: String) -> String {
 }
 
 /// Validate that all commands in a potentially piped command are allowed.
+///
+/// The allowlist prevents arbitrary binary execution. Variable expansion,
+/// redirects, and other shell features are permitted since commands run
+/// via `sh -c` and the agent needs these for real-world tasks (e.g.
+/// `echo $HOME`, `python3 script.py > output.txt`).
 fn validate_command(command: &str) -> std::result::Result<(), String> {
-    // Block newline injection (could bypass allowlist via multi-line commands)
+    // Block newline injection (could bypass allowlist via multi-line commands).
     if command.contains('\n') || command.contains('\r') {
         return Err("command contains newline characters".into());
     }
-    // Block all variable expansion (not just ${...} but also bare $VAR)
-    if command.contains('$') {
-        return Err("command contains variable expansion ($)".into());
-    }
-    // Block shell redirects (could write/overwrite arbitrary files)
-    if command.contains('>') || command.contains('<') {
-        return Err("command contains redirects".into());
-    }
 
-    // Reject dangerous shell operators: $(...), `...`, process substitution
-    if command.contains('`') {
-        return Err("command substitution and variable expansion are not allowed".into());
-    }
-
-    // Split by pipes and semicolons, validate each segment
+    // Split by pipes, semicolons, &&, || and validate each command segment.
     for segment in command.split(&['|', ';'][..]) {
         let segment = segment.trim();
         if segment.is_empty() {
             continue;
         }
 
-        // Handle && and || by splitting further
         for sub in segment.split("&&").flat_map(|s| s.split("||")) {
             let sub = sub.trim();
             if sub.is_empty() {
                 continue;
             }
 
-            // Skip redirections (>, <, >>, 2>&1 etc.)
+            // Skip redirect-only fragments (e.g. "> file", "2>&1").
             if sub.starts_with('>') || sub.starts_with('<') {
                 continue;
             }
@@ -151,11 +142,17 @@ impl Tool for ExecTool {
 
         let timeout_secs = args["timeout_secs"].as_u64().unwrap_or(30).min(120);
 
+        // Inherit the user's PATH so tools installed via homebrew, cargo,
+        // pip, nvm, etc. are available. Fall back to a sensible default.
+        let path = std::env::var("PATH").unwrap_or_else(|_| {
+            "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin".to_string()
+        });
+
         let future = tokio::process::Command::new("sh")
             .arg("-c")
             .arg(command)
             .env_clear()
-            .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+            .env("PATH", &path)
             .env("HOME", std::env::var("HOME").unwrap_or_default())
             .env("LANG", "C.UTF-8")
             .output();

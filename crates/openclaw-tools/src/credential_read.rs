@@ -39,8 +39,8 @@ impl Tool for CredentialReadTool {
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["get", "list"],
-                        "description": "Action to perform: 'get' retrieves a specific secret, 'list' shows all secret names"
+                        "enum": ["get", "read", "list"],
+                        "description": "Action to perform: 'get'/'read' retrieves a specific secret, 'list' shows all secret names"
                     },
                     "name": {
                         "type": "string",
@@ -58,7 +58,7 @@ impl Tool for CredentialReadTool {
             .ok_or_else(|| Error::ToolExecution("missing action".into()))?;
 
         match action {
-            "get" => {
+            "get" | "read" => {
                 let name = args["name"]
                     .as_str()
                     .ok_or_else(|| Error::ToolExecution("missing name for 'get' action".into()))?;
