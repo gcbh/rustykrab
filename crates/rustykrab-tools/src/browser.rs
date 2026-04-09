@@ -12,7 +12,9 @@ use tokio_stream::StreamExt;
 
 use crate::security;
 
-const DEFAULT_CDP_URL: &str = "ws://127.0.0.1:9222";
+// Use http:// so chromiumoxide auto-discovers the websocket URL via /json/version.
+// A ws:// URL skips discovery and 404s because there's no handler at the root path.
+const DEFAULT_CDP_URL: &str = "http://127.0.0.1:9222";
 const MAX_CONTENT_BYTES: usize = 50 * 1024; // 50KB cap for page content
 
 /// Browser automation tool using Chrome DevTools Protocol.
@@ -28,7 +30,7 @@ const MAX_CONTENT_BYTES: usize = 50 * 1024; // 50KB cap for page content
 /// available without re-authenticating. The user's active profile is
 /// detected from Chrome's `Local State` file.
 ///
-/// Configure the CDP URL via `CHROME_CDP_URL` env var (default: ws://127.0.0.1:9222).
+/// Configure the CDP URL via `CHROME_CDP_URL` env var (default: http://127.0.0.1:9222).
 pub struct BrowserTool {
     cdp_url: String,
     user_data_dir: std::path::PathBuf,
