@@ -21,13 +21,12 @@
 //! ```rust,ignore
 //! use rustykrab_memory::{MemorySystem, MemoryConfig};
 //! use rustykrab_memory::embedding::HashEmbedder;
-//! use rustykrab_memory::storage::SledMemoryStorage;
+//! use rustykrab_memory::storage::SqliteMemoryStorage;
 //! use std::sync::Arc;
 //! use uuid::Uuid;
 //!
 //! # async fn example() -> rustykrab_core::Result<()> {
-//! let db = sled::open("/tmp/memory_test")?;
-//! let storage = Arc::new(SledMemoryStorage::open(&db)?);
+//! let storage = Arc::new(SqliteMemoryStorage::open("memory.db")?);
 //! let embedder = Arc::new(HashEmbedder::new(768));
 //! let config = MemoryConfig::default();
 //!
@@ -95,7 +94,7 @@ impl MemorySystem {
     /// Create a new memory system.
     ///
     /// - `config`: tuning parameters for chunking, retrieval, and lifecycle.
-    /// - `storage`: the backing store (sled, SQLite, PostgreSQL, etc.).
+    /// - `storage`: the backing store (SQLite, PostgreSQL, etc.).
     /// - `embedder`: the text embedding model (fastembed, API-based, etc.).
     pub fn new(
         config: MemoryConfig,
