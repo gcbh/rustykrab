@@ -96,6 +96,14 @@ impl Tool for TtsTool {
             rustykrab_core::Error::ToolExecution(format!("TTS request failed: {e}").into())
         })?;
 
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let err = resp.text().await.unwrap_or_default();
+            return Err(rustykrab_core::Error::ToolExecution(
+                format!("TTS API returned {status}: {err}").into(),
+            ));
+        }
+
         let audio_bytes = resp.bytes().await.map_err(|e| {
             rustykrab_core::Error::ToolExecution(format!("failed to read TTS response: {e}").into())
         })?;

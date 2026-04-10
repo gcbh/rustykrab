@@ -86,6 +86,14 @@ impl Tool for CanvasTool {
                             )
                         })?;
 
+                    if !resp.status().is_success() {
+                        let status = resp.status();
+                        let err = resp.text().await.unwrap_or_default();
+                        return Err(rustykrab_core::Error::ToolExecution(
+                            format!("canvas present API returned {status}: {err}").into(),
+                        ));
+                    }
+
                     let body = resp.text().await.map_err(|e| {
                         rustykrab_core::Error::ToolExecution(
                             format!("failed to read response: {e}").into(),
@@ -133,6 +141,14 @@ impl Tool for CanvasTool {
                         )
                     })?;
 
+                if !resp.status().is_success() {
+                    let status = resp.status();
+                    let err = resp.text().await.unwrap_or_default();
+                    return Err(rustykrab_core::Error::ToolExecution(
+                        format!("canvas evaluate API returned {status}: {err}").into(),
+                    ));
+                }
+
                 let body = resp.text().await.map_err(|e| {
                     rustykrab_core::Error::ToolExecution(
                         format!("failed to read response: {e}").into(),
@@ -163,6 +179,14 @@ impl Tool for CanvasTool {
                             format!("canvas snapshot failed: {e}").into(),
                         )
                     })?;
+
+                if !resp.status().is_success() {
+                    let status = resp.status();
+                    let err = resp.text().await.unwrap_or_default();
+                    return Err(rustykrab_core::Error::ToolExecution(
+                        format!("canvas snapshot API returned {status}: {err}").into(),
+                    ));
+                }
 
                 let body = resp.text().await.map_err(|e| {
                     rustykrab_core::Error::ToolExecution(

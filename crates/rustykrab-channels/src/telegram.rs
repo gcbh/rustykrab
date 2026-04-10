@@ -5,6 +5,9 @@ use rustykrab_core::{Error, Result};
 use serde::Deserialize;
 use sha2::Sha256;
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
@@ -44,6 +47,8 @@ pub struct TelegramChannel {
     inbound_tx: mpsc::Sender<ChannelMessage>,
     /// Receiver for inbound messages (consumed by the agent loop).
     inbound_rx: Option<mpsc::Receiver<ChannelMessage>>,
+    /// Graceful shutdown flag.
+    shutdown_flag: Arc<AtomicBool>,
 }
 
 impl TelegramChannel {
@@ -53,14 +58,20 @@ impl TelegramChannel {
     /// `allowed_chats` restricts which Telegram chats can use the bot.
     pub fn new(bot_token: String, allowed_chats: HashSet<i64>) -> Self {
         let (tx, rx) = mpsc::channel(256);
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(60))
+            .connect_timeout(Duration::from_secs(10))
+            .build()
+            .expect("failed to build HTTP client");
         Self {
-            client: reqwest::Client::new(),
+            client,
             api_base: format!("https://api.telegram.org/bot{bot_token}"),
             bot_token,
             allowed_chats,
             webhook_secret: None,
             inbound_tx: tx,
             inbound_rx: Some(rx),
+            shutdown_flag: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -74,6 +85,11 @@ impl TelegramChannel {
     /// The agent loop reads from this to get user messages.
     pub fn take_inbound_rx(&mut self) -> Option<mpsc::Receiver<ChannelMessage>> {
         self.inbound_rx.take()
+    }
+
+    /// Request graceful shutdown of the polling loop.
+    pub fn shutdown(&self) {
+        self.shutdown_flag.store(true, Ordering::Relaxed);
     }
 
     /// Send a "typing" chat action so the user sees the bot is working.
@@ -215,6 +231,11 @@ impl TelegramChannel {
         tracing::info!("Telegram long-polling started");
 
         loop {
+            if self.shutdown_flag.load(Ordering::Relaxed) {
+                tracing::info!("Telegram polling shutdown requested");
+                return Ok(());
+            }
+
             let url = format!("{}/getUpdates", self.api_base);
             let mut params = vec![("timeout", "30".to_string())];
             if let Some(off) = offset {
@@ -436,8 +457,8 @@ impl TelegramChannel {
             Error::Config("no webhook secret configured for HMAC verification".into())
         })?;
 
-        let mut mac =
-            HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key size");
+        let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
+            .map_err(|e| Error::Config(format!("invalid HMAC key: {e}")))?;
         mac.update(payload);
 
         let expected = hex::decode(signature_hex)
@@ -476,8 +497,18 @@ fn split_message(text: &str, max_len: usize) -> Vec<String> {
             break;
         }
 
+        // Find the nearest char boundary at or before max_len to avoid
+        // panicking on multi-byte UTF-8 characters.
+        let safe_end = remaining.floor_char_boundary(max_len);
+        if safe_end == 0 {
+            // Single character larger than max_len (shouldn't happen with
+            // reasonable limits, but handle gracefully).
+            chunks.push(remaining.to_string());
+            break;
+        }
+
         // Find the best split point within the limit.
-        let window = &remaining[..max_len];
+        let window = &remaining[..safe_end];
         let split_at = find_split_point(window);
 
         chunks.push(remaining[..split_at].trim_end().to_string());

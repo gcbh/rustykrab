@@ -85,14 +85,17 @@ impl RateLimiter {
         record.attempts.push(now);
 
         // Prune stale entries to prevent unbounded memory growth.
-        // Only evict a limited batch per call to avoid iterating the
-        // entire HashMap under the lock (fixes ASYNC-M2).
-        if records.len() > 10_000 {
-            let stale_cutoff = now - (self.config.lockout * 2);
+        // Use a lower threshold (1000) to keep memory usage reasonable,
+        // and only evict a limited batch per call to avoid iterating the
+        // entire HashMap under the lock.
+        if records.len() > 1_000 {
+            let stale_cutoff = now - self.config.window * 2;
             let stale_keys: Vec<IpAddr> = records
                 .iter()
                 .filter(|(_, rec)| {
+                    // Stale if lockout expired (or never locked).
                     let locked_expired = rec.locked_until.map(|l| l <= now).unwrap_or(true);
+                    // Stale if no recent activity.
                     let no_recent = rec
                         .attempts
                         .last()

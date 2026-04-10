@@ -133,15 +133,11 @@ impl HarnessRouter {
     }
 }
 
-/// Truncate a message for classification (first ~200 chars).
+/// Truncate a message for classification (first ~200 bytes, respecting
+/// UTF-8 char boundaries via `floor_char_boundary`).
 fn truncate_for_classification(text: &str) -> &str {
     if text.len() > 200 {
-        &text[..text
-            .char_indices()
-            .take_while(|(i, _)| *i < 200)
-            .last()
-            .map(|(i, c)| i + c.len_utf8())
-            .unwrap_or(200)]
+        &text[..text.floor_char_boundary(200)]
     } else {
         text
     }

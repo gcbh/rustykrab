@@ -114,8 +114,12 @@ impl Decomposer {
                 );
                 Ok(tasks)
             }
-            Ok(_) | Err(_) => {
-                tracing::debug!("decomposition failed or empty, wrapping as single task");
+            Ok(_) => {
+                tracing::warn!("decomposition returned empty task list, wrapping as single task");
+                Ok(vec![SubTask::new(user_request)])
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "decomposition failed, wrapping as single task");
                 Ok(vec![SubTask::new(user_request)])
             }
         }

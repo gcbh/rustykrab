@@ -3,6 +3,9 @@ use rustykrab_core::types::{Message, MessageContent, Role};
 use rustykrab_core::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
@@ -34,6 +37,8 @@ pub struct SignalChannel {
     inbound_tx: mpsc::Sender<Message>,
     /// Receiver for inbound messages (consumed by the agent loop).
     inbound_rx: Option<mpsc::Receiver<Message>>,
+    /// Graceful shutdown flag.
+    shutdown_flag: Arc<AtomicBool>,
 }
 
 impl SignalChannel {
@@ -44,14 +49,20 @@ impl SignalChannel {
     /// - `allowed_numbers`: set of phone numbers allowed to message the bot
     pub fn new(base_url: String, account_number: String, allowed_numbers: HashSet<String>) -> Self {
         let (tx, rx) = mpsc::channel(256);
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .connect_timeout(Duration::from_secs(10))
+            .build()
+            .expect("failed to build HTTP client");
         Self {
-            client: reqwest::Client::new(),
+            client,
             base_url,
             account_number,
             allowed_numbers,
             webhook_secret: None,
             inbound_tx: tx,
             inbound_rx: Some(rx),
+            shutdown_flag: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -64,6 +75,11 @@ impl SignalChannel {
     /// Take the inbound receiver (can only be called once).
     pub fn take_inbound_rx(&mut self) -> Option<mpsc::Receiver<Message>> {
         self.inbound_rx.take()
+    }
+
+    /// Request graceful shutdown of the polling loop.
+    pub fn shutdown(&self) {
+        self.shutdown_flag.store(true, Ordering::Relaxed);
     }
 
     /// Send a text message to a Signal recipient.
@@ -122,7 +138,7 @@ impl SignalChannel {
         Ok(())
     }
 
-    /// Start polling for incoming messages. Runs forever — spawn as a task.
+    /// Start polling for incoming messages. Runs until `shutdown()` is called.
     ///
     /// Uses the signal-cli-rest-api `/v1/receive` endpoint which returns
     /// pending messages and marks them as read.
@@ -134,6 +150,11 @@ impl SignalChannel {
         );
 
         loop {
+            if self.shutdown_flag.load(Ordering::Relaxed) {
+                tracing::info!("Signal polling shutdown requested");
+                return Ok(());
+            }
+
             match self.poll_once().await {
                 Ok(count) => {
                     if count > 0 {
@@ -142,12 +163,12 @@ impl SignalChannel {
                 }
                 Err(e) => {
                     tracing::error!("Signal polling error: {e}");
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    tokio::time::sleep(Duration::from_secs(5)).await;
                 }
             }
 
             // signal-cli-rest-api doesn't support long-polling, so we poll on an interval.
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
         }
     }
 

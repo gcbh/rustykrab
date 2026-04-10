@@ -107,7 +107,15 @@ impl OrchestrationPipeline {
 
         let schemas: Vec<_> = self.tools.iter().map(|t| t.schema()).collect();
         let response = self.provider.chat(&messages, &schemas).await?;
-        let text = response.message.content.as_text().unwrap_or("").to_string();
+        let text = match response.message.content.as_text() {
+            Some(t) => t.to_string(),
+            None => {
+                tracing::warn!(
+                    "model returned non-text response in direct pipeline, using empty string"
+                );
+                String::new()
+            }
+        };
 
         Ok(PipelineResult {
             response: text,
@@ -211,8 +219,10 @@ impl OrchestrationPipeline {
         for (i, r) in results.iter().enumerate() {
             if r.success {
                 // Truncate long outputs to keep the completion check cheap.
+                // Use floor_char_boundary to avoid splitting multi-byte UTF-8.
                 let output = if r.output.len() > 500 {
-                    format!("{}...", &r.output[..500])
+                    let end = r.output.floor_char_boundary(500);
+                    format!("{}...", &r.output[..end])
                 } else {
                     r.output.clone()
                 };
@@ -248,12 +258,15 @@ impl OrchestrationPipeline {
         });
 
         let response = self.provider.chat(&messages, &[]).await?;
-        let text = response
-            .message
-            .content
-            .as_text()
-            .unwrap_or("")
-            .to_uppercase();
+        let text = match response.message.content.as_text() {
+            Some(t) => t.to_uppercase(),
+            None => {
+                tracing::warn!(
+                    "model returned non-text response in completion check, assuming incomplete"
+                );
+                return Ok(false);
+            }
+        };
 
         Ok(text.contains("COMPLETE") && !text.contains("INCOMPLETE"))
     }

@@ -191,6 +191,7 @@ async fn send_message_stream(
     // streaming agent are surfaced instead of silently swallowed when
     // the JoinHandle is dropped (fixes ASYNC-H4).
     let agent_state = state.clone();
+    let panic_tx = tx.clone();
     let agent_handle = tokio::spawn(async move {
         let heartbeat = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
             std::time::SystemTime::now()
@@ -210,7 +211,9 @@ async fn send_message_stream(
                     .as_millis() as u64,
                 std::sync::atomic::Ordering::Relaxed,
             );
-            let _ = event_tx.try_send(SsePayload::Event(event));
+            if let Err(e) = event_tx.try_send(SsePayload::Event(event)) {
+                tracing::warn!("SSE event dropped (channel full): {e}");
+            }
         };
 
         // Heartbeat monitor: checks every 30s if we've gone 5 minutes without an event.
@@ -253,18 +256,22 @@ async fn send_message_stream(
             // Agent completed normally; monitor task will be dropped.
         }
 
-        // Persist conversation on success.
-        if result.is_ok() {
-            conv.updated_at = Utc::now();
-            let _ = agent_state.store.conversations().save(&conv);
+        // Persist conversation regardless of outcome to preserve the user message.
+        conv.updated_at = Utc::now();
+        if let Err(e) = agent_state.store.conversations().save(&conv) {
+            tracing::error!("failed to save conversation: {e}");
         }
 
         let _ = tx.send(SsePayload::Done(result)).await;
     });
-    // Spawn a lightweight watcher that logs if the agent task panics.
+    // Spawn a lightweight watcher that logs if the agent task panics
+    // and sends an error event to the client so the result is not silently lost.
     tokio::spawn(async move {
         if let Err(e) = agent_handle.await {
             tracing::error!("streaming agent task panicked: {e}");
+            let _ = panic_tx
+                .send(SsePayload::Done(Err(StatusCode::INTERNAL_SERVER_ERROR)))
+                .await;
         }
     });
 
