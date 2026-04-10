@@ -950,16 +950,30 @@ fn get_creds(secrets: &SecretStore) -> Result<(String, String)> {
     Ok((email, password))
 }
 
-/// Connect to Gmail IMAP (blocking, for use in spawn_blocking).
+/// Connect to Gmail IMAP over rustls (blocking, for use in spawn_blocking).
 fn connect_imap_blocking(
     email: &str,
     password: &str,
-) -> Result<imap::Session<native_tls::TlsStream<std::net::TcpStream>>> {
-    let tls = native_tls::TlsConnector::builder()
-        .build()
+) -> Result<imap::Session<rustls::StreamOwned<rustls::ClientConnection, std::net::TcpStream>>> {
+    let native_certs = rustls_native_certs::load_native_certs();
+    let mut root_store = rustls::RootCertStore::empty();
+    root_store.add_parsable_certificates(native_certs.certs);
+
+    let config = std::sync::Arc::new(
+        rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth(),
+    );
+    let server_name: rustls::pki_types::ServerName<'static> = IMAP_HOST
+        .to_string()
+        .try_into()
+        .map_err(|e| Error::ToolExecution(format!("invalid server name: {e}").into()))?;
+    let tls_conn = rustls::ClientConnection::new(config, server_name)
         .map_err(|e| Error::ToolExecution(format!("TLS setup failed: {e}").into()))?;
-    let client = imap::connect((IMAP_HOST, IMAP_PORT), IMAP_HOST, &tls)
+    let tcp = std::net::TcpStream::connect((IMAP_HOST, IMAP_PORT))
         .map_err(|e| Error::ToolExecution(format!("IMAP connect failed: {e}").into()))?;
+    let tls_stream = rustls::StreamOwned::new(tls_conn, tcp);
+    let client = imap::Client::new(tls_stream);
     let session = client
         .login(email, password)
         .map_err(|e| Error::ToolExecution(format!("IMAP login failed: {}", e.0).into()))?;

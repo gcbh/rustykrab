@@ -10,13 +10,53 @@ use rustykrab_core::model::ModelProvider;
 use rustykrab_core::orchestration::OrchestrationConfig;
 use rustykrab_core::types::MessageContent;
 use rustykrab_gateway::AppState;
+use rustykrab_memory::backend::HybridMemoryBackend;
+use rustykrab_memory::embedding::HashEmbedder;
+use rustykrab_memory::storage::SqliteMemoryStorage;
+use rustykrab_memory::{MemoryConfig, MemorySystem};
 use rustykrab_skills::SkillRegistry;
+use rustykrab_tools::MemoryBackend;
 use tokio::sync::mpsc;
 use tracing_subscriber::fmt;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
+
+/// Adapter bridging [HybridMemoryBackend] (rustykrab-memory) to the
+/// [MemoryBackend] trait (rustykrab-tools) so the memory tools can use
+/// the hybrid retrieval engine.
+struct MemoryAdapter {
+    inner: HybridMemoryBackend,
+}
+
+#[async_trait::async_trait]
+impl MemoryBackend for MemoryAdapter {
+    async fn search(
+        &self,
+        query: &str,
+        tags: &[String],
+        limit: usize,
+    ) -> rustykrab_core::Result<serde_json::Value> {
+        self.inner.search(query, tags, limit).await
+    }
+    async fn get(&self, memory_id: &str) -> rustykrab_core::Result<serde_json::Value> {
+        self.inner.get(memory_id).await
+    }
+    async fn save(
+        &self,
+        fact: &str,
+        tags: &[String],
+    ) -> rustykrab_core::Result<serde_json::Value> {
+        self.inner.save(fact, tags).await
+    }
+    async fn delete(&self, memory_id: &str) -> rustykrab_core::Result<serde_json::Value> {
+        self.inner.delete(memory_id).await
+    }
+    async fn list(&self) -> rustykrab_core::Result<serde_json::Value> {
+        self.inner.list().await
+    }
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -98,8 +138,32 @@ async fn main() -> anyhow::Result<()> {
     let skills_dir = data_dir.join("skills");
     std::fs::create_dir_all(&skills_dir)?;
 
+    // --- Memory system (hybrid retrieval: vector + BM25 + temporal + graph) ---
+    let memory_db_path = data_dir.join("memory.db");
+    let memory_storage = Arc::new(
+        SqliteMemoryStorage::open(&memory_db_path)
+            .expect("failed to open memory database"),
+    );
+    let embedder = Arc::new(HashEmbedder::new(768));
+    let memory_system = Arc::new(MemorySystem::new(
+        MemoryConfig::default(),
+        memory_storage,
+        embedder,
+    ));
+    let agent_id = Uuid::new_v4();
+    let session_id = Uuid::new_v4();
+    let memory_backend: Arc<dyn MemoryBackend> = Arc::new(MemoryAdapter {
+        inner: HybridMemoryBackend::new(
+            Arc::clone(&memory_system),
+            agent_id,
+            session_id,
+        ),
+    });
+    tracing::info!("memory system initialized");
+
     // --- Tools ---
     let mut tools = rustykrab_tools::builtin_tools(store.secrets());
+    tools.extend(rustykrab_tools::memory_tools(memory_backend));
     tools.extend(rustykrab_tools::skill_tools(skills_dir.clone()));
 
     // --- Log provider status ---
