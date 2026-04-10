@@ -14,6 +14,7 @@ use rustykrab_core::types::{
     Message, MessageContent, Role, ToolCall, ToolResult, ToolSchema,
 };
 use rustykrab_core::{Result, Tool};
+use tokio::sync::Semaphore;
 use uuid::Uuid;
 
 use crate::sandbox::{Sandbox, SandboxPolicy};
@@ -73,7 +74,10 @@ impl ParallelExecutor {
 
             tracing::info!(wave_size = ready.len(), "executing sub-task wave");
 
-            // Execute all ready tasks concurrently.
+            // Execute all ready tasks concurrently, bounded by a semaphore
+            // to prevent pathological workloads from spawning unbounded
+            // concurrent LLM calls (fixes ASYNC-M1).
+            let semaphore = Arc::new(Semaphore::new(self.config.max_concurrent_tasks));
             let mut handles = Vec::new();
             for task in &ready {
                 // Gather dependency results as context.
@@ -91,8 +95,10 @@ impl ParallelExecutor {
                 let sandbox = self.sandbox.clone();
                 let config = self.config.clone();
                 let sys_ctx = system_context.map(|s| s.to_string());
+                let sem = semaphore.clone();
 
                 handles.push(tokio::spawn(async move {
+                    let _permit = sem.acquire().await.expect("semaphore closed");
                     execute_sub_task(&task, &dep_context, sys_ctx.as_deref(), &provider, &tools, &sandbox, &config)
                         .await
                 }));

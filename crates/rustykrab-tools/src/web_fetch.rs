@@ -73,7 +73,7 @@ impl Tool for WebFetchTool {
             .ok_or_else(|| Error::ToolExecution("missing url".into()))?;
 
         // SSRF protection: validate URL before making request
-        security::validate_url(url)
+        security::validate_url(url).await
             .map_err(|e| Error::ToolExecution(e.into()))?;
 
         let include_links = args["include_links"].as_bool().unwrap_or(false);

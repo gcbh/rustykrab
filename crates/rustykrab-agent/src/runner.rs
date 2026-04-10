@@ -21,6 +21,10 @@ use crate::trace::{ExecutionTracer, ToolTrace};
 /// Note: `gmail` is intentionally excluded — the user's own email is a
 /// trusted data source and fencing it causes the model to ignore actionable
 /// content like document lists and account details.
+/// Maximum number of concurrent tool calls spawned in parallel.
+/// Prevents pathological workloads from overwhelming the system (fixes ASYNC-M1).
+const MAX_CONCURRENT_TOOL_CALLS: usize = 10;
+
 const EXTERNAL_CONTENT_TOOLS: &[&str] = &[
     "browser",
     "http_request",
@@ -560,7 +564,12 @@ impl AgentRunner {
             return vec![(call.name.clone(), call.id.clone(), result)];
         }
 
-        // Spawn all tool executions concurrently.
+        // Spawn all tool executions concurrently, bounded by a semaphore
+        // to prevent pathological workloads from spawning unbounded
+        // concurrent tasks (fixes ASYNC-M1).
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(
+            MAX_CONCURRENT_TOOL_CALLS,
+        ));
         let mut handles = Vec::with_capacity(calls.len());
         let call_meta: Vec<(String, String)> = calls
             .iter()
@@ -573,8 +582,10 @@ impl AgentRunner {
             let sandbox = self.sandbox.clone();
             let session_caps = session.capabilities.clone();
             let session_id = session.id;
+            let sem = semaphore.clone();
 
             handles.push(tokio::spawn(async move {
+                let _permit = sem.acquire().await.expect("semaphore closed");
                 let start = Instant::now();
                 let result = execute_with_retries(
                     &call,

@@ -226,6 +226,10 @@ async fn main() -> anyhow::Result<()> {
         state = state.with_orchestration_pipeline(pipeline);
     }
 
+    // Track infrastructure task JoinHandles so panics are surfaced
+    // instead of silently swallowed (fixes ASYNC-H4).
+    let mut infra_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+
     // --- Telegram channel (optional) ---
     // We need to take the inbound_rx before wrapping in Arc, so build in stages.
     let mut telegram_rx: Option<mpsc::Receiver<ChannelMessage>> = None;
@@ -257,11 +261,12 @@ async fn main() -> anyhow::Result<()> {
             tracing::info!("Telegram: webhook mode");
         } else {
             let tg_poll = tg.clone();
-            tokio::spawn(async move {
+            // Store handle so panics are not silently swallowed (fixes ASYNC-H4).
+            infra_handles.push(tokio::spawn(async move {
                 if let Err(e) = tg_poll.start_polling().await {
                     tracing::error!("Telegram polling error: {e}");
                 }
-            });
+            }));
             tracing::info!("Telegram: long-polling mode");
         }
 
@@ -313,11 +318,12 @@ async fn main() -> anyhow::Result<()> {
             }
         } else {
             let sig_poll = sig.clone();
-            tokio::spawn(async move {
+            // Store handle so panics are not silently swallowed (fixes ASYNC-H4).
+            infra_handles.push(tokio::spawn(async move {
                 if let Err(e) = sig_poll.start_polling().await {
                     tracing::error!("Signal polling error: {e}");
                 }
-            });
+            }));
             tracing::info!("Signal: polling mode");
         }
 
@@ -336,7 +342,8 @@ async fn main() -> anyhow::Result<()> {
 
     // --- Spawn Telegram agent loop (after state is fully built) ---
     if let (Some(rx), Some(tg)) = (telegram_rx, telegram_arc) {
-        tokio::spawn(telegram_agent_loop(rx, tg, state.clone()));
+        // Store handle so panics are not silently swallowed (fixes ASYNC-H4).
+        infra_handles.push(tokio::spawn(telegram_agent_loop(rx, tg, state.clone())));
         tracing::info!("Telegram agent loop started");
     }
 
@@ -355,6 +362,18 @@ async fn main() -> anyhow::Result<()> {
     .with_graceful_shutdown(shutdown_signal());
 
     server.await?;
+
+    // Abort infrastructure tasks and log any panics.
+    for handle in &infra_handles {
+        handle.abort();
+    }
+    for handle in infra_handles {
+        if let Err(e) = handle.await {
+            if e.is_panic() {
+                tracing::error!("infrastructure task panicked during shutdown: {e}");
+            }
+        }
+    }
 
     // Flush database before exit
     tracing::info!("flushing database...");

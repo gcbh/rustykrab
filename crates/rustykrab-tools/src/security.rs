@@ -96,7 +96,10 @@ pub fn validate_path(path: &str) -> Result<PathBuf, String> {
 /// - Cloud metadata endpoints (169.254.169.254)
 /// - Non-HTTP(S) schemes
 /// - URLs without a host
-pub fn validate_url(url: &str) -> Result<(), String> {
+///
+/// DNS resolution uses `tokio::net::lookup_host` to avoid blocking the
+/// async runtime (fixes ASYNC-H1).
+pub async fn validate_url(url: &str) -> Result<(), String> {
     let parsed = url::Url::parse(url)
         .map_err(|e| format!("invalid URL: {e}"))?;
 
@@ -136,9 +139,11 @@ pub fn validate_url(url: &str) -> Result<(), String> {
         return Err("requests to cloud metadata endpoint are blocked (SSRF protection)".into());
     }
 
-    // Resolve hostname and check all IPs against private ranges to prevent DNS rebinding
+    // Resolve hostname and check all IPs against private ranges to prevent DNS rebinding.
+    // Uses tokio::net::lookup_host for non-blocking async DNS resolution.
     let port = parsed.port().unwrap_or(if parsed.scheme() == "https" { 443 } else { 80 });
-    if let Ok(addrs) = std::net::ToSocketAddrs::to_socket_addrs(&(host, port)) {
+    let host_port = format!("{host}:{port}");
+    if let Ok(addrs) = tokio::net::lookup_host(&host_port).await {
         for addr in addrs {
             let ip = addr.ip();
             if is_private_ip(&ip) {

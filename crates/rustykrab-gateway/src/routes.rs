@@ -187,8 +187,11 @@ async fn send_message_stream(
     // text deltas, etc.) within each 5-minute window. This prevents the 408
     // timeout that killed long-running orchestration tasks while still
     // catching genuinely stuck agents.
+    // Wrap agent task in a panic-logging outer task so panics in the
+    // streaming agent are surfaced instead of silently swallowed when
+    // the JoinHandle is dropped (fixes ASYNC-H4).
     let agent_state = state.clone();
-    tokio::spawn(async move {
+    let agent_handle = tokio::spawn(async move {
         let heartbeat = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -257,6 +260,12 @@ async fn send_message_stream(
         }
 
         let _ = tx.send(SsePayload::Done(result)).await;
+    });
+    // Spawn a lightweight watcher that logs if the agent task panics.
+    tokio::spawn(async move {
+        if let Err(e) = agent_handle.await {
+            tracing::error!("streaming agent task panicked: {e}");
+        }
     });
 
     // Map channel messages to SSE events.

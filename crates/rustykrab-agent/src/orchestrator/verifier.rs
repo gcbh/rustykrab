@@ -11,6 +11,7 @@ use rustykrab_core::model::ModelProvider;
 use rustykrab_core::orchestration::{OrchestrationConfig, VoteResult, VotingStrategy};
 use rustykrab_core::types::{Message, MessageContent, Role};
 use rustykrab_core::Result;
+use tokio::sync::Semaphore;
 use uuid::Uuid;
 
 /// Self-consistency voter that runs multiple samples and compares.
@@ -58,14 +59,19 @@ impl ConsistencyVoter {
         let num_samples = self.config.consistency_samples;
         tracing::info!(num_samples, "running self-consistency voting");
 
-        // Run all samples concurrently.
+        // Run all samples concurrently, bounded by a semaphore to prevent
+        // pathological workloads from spawning unbounded concurrent LLM
+        // calls (fixes ASYNC-M1).
+        let semaphore = Arc::new(Semaphore::new(self.config.max_concurrent_tasks));
         let mut handles = Vec::with_capacity(num_samples);
         for i in 0..num_samples {
             let provider = self.provider.clone();
             let query = query.to_string();
             let context = context.map(|s| s.to_string());
+            let sem = semaphore.clone();
 
             handles.push(tokio::spawn(async move {
+                let _permit = sem.acquire().await.expect("semaphore closed");
                 let mut messages = Vec::new();
                 if let Some(ctx) = context {
                     messages.push(Message {

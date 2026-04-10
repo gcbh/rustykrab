@@ -377,8 +377,15 @@ impl BrowserManager {
             }
         }
 
-        // Launch a new browser instance
-        self.launch_browser(profile_name)?;
+        // Launch a new browser instance via spawn_blocking to avoid
+        // blocking the async runtime with std::fs and std::process
+        // operations (fixes ASYNC-H3).
+        let config = self.config.clone();
+        let profile = profile_name.to_string();
+        tokio::task::spawn_blocking(move || launch_browser_blocking(&config, &profile))
+            .await
+            .map_err(|e| Error::ToolExecution(format!("launch task failed: {e}").into()))?
+            ?;
 
         // Wait for it to start
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
@@ -408,80 +415,83 @@ impl BrowserManager {
         })
     }
 
-    /// Launch a Chrome/Chromium instance for the given profile.
-    fn launch_browser(&self, profile_name: &str) -> Result<()> {
-        let cdp_url = self.config.resolve_cdp_url(profile_name);
-        let port = cdp_url
-            .rsplit(':')
-            .next()
-            .and_then(|p| p.trim_end_matches('/').parse::<u16>().ok())
-            .unwrap_or(18800);
+}
 
-        let user_data_dir = self.config.resolve_user_data_dir(profile_name);
-        std::fs::create_dir_all(&user_data_dir).map_err(|e| {
-            Error::ToolExecution(format!("failed to create user-data dir: {e}").into())
-        })?;
+/// Launch a Chrome/Chromium instance for the given profile.
+///
+/// This is a free function (not a method) so it can be called from
+/// `spawn_blocking` without lifetime issues (fixes ASYNC-H3).
+fn launch_browser_blocking(config: &BrowserConfig, profile_name: &str) -> Result<()> {
+    let cdp_url = config.resolve_cdp_url(profile_name);
+    let port = cdp_url
+        .rsplit(':')
+        .next()
+        .and_then(|p| p.trim_end_matches('/').parse::<u16>().ok())
+        .unwrap_or(18800);
 
-        // Set up profile symlink for cookie persistence (managed profiles only)
-        let profile = self.config.profiles.get(profile_name);
-        let driver = profile.map(|p| &p.driver).unwrap_or(&DriverType::Rustykrab);
-        let profile_dir_name = if *driver == DriverType::Rustykrab {
-            setup_profile_link(&user_data_dir)
-        } else {
-            "Default".to_string()
-        };
+    let user_data_dir = config.resolve_user_data_dir(profile_name);
+    std::fs::create_dir_all(&user_data_dir).map_err(|e| {
+        Error::ToolExecution(format!("failed to create user-data dir: {e}").into())
+    })?;
 
-        let mut args: Vec<String> = vec![
-            format!("--remote-debugging-port={port}"),
-            format!("--user-data-dir={}", user_data_dir.display()),
-            format!("--profile-directory={profile_dir_name}"),
-            "--no-first-run".to_string(),
-        ];
+    // Set up profile symlink for cookie persistence (managed profiles only)
+    let profile = config.profiles.get(profile_name);
+    let driver = profile.map(|p| &p.driver).unwrap_or(&DriverType::Rustykrab);
+    let profile_dir_name = if *driver == DriverType::Rustykrab {
+        setup_profile_link(&user_data_dir)
+    } else {
+        "Default".to_string()
+    };
 
-        if self.config.is_headless(profile_name) {
-            args.push("--headless=new".to_string());
-        }
-        if self.config.is_no_sandbox(profile_name) {
-            args.push("--no-sandbox".to_string());
-            args.push("--disable-setuid-sandbox".to_string());
-        }
+    let mut args: Vec<String> = vec![
+        format!("--remote-debugging-port={port}"),
+        format!("--user-data-dir={}", user_data_dir.display()),
+        format!("--profile-directory={profile_dir_name}"),
+        "--no-first-run".to_string(),
+    ];
 
-        // Extra args from config
-        args.extend(self.config.extra_args.iter().cloned());
-
-        args.push("about:blank".to_string());
-
-        // Resolve executable
-        let executable = self
-            .config
-            .resolve_executable(profile_name)
-            .or_else(detect_chrome_executable);
-
-        let exe = executable.ok_or_else(|| {
-            Error::ToolExecution(
-                "no supported browser found (Chrome/Brave/Edge/Chromium). \
-                 Install Google Chrome or set CHROME_EXECUTABLE / executablePath."
-                    .into(),
-            )
-        })?;
-
-        std::process::Command::new(&exe)
-            .args(&args)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .map_err(|e| {
-                Error::ToolExecution(format!("failed to launch browser ({exe}): {e}").into())
-            })?;
-
-        tracing::info!(
-            port,
-            profile = profile_name,
-            %profile_dir_name,
-            "launched browser with remote debugging"
-        );
-        Ok(())
+    if config.is_headless(profile_name) {
+        args.push("--headless=new".to_string());
     }
+    if config.is_no_sandbox(profile_name) {
+        args.push("--no-sandbox".to_string());
+        args.push("--disable-setuid-sandbox".to_string());
+    }
+
+    // Extra args from config
+    args.extend(config.extra_args.iter().cloned());
+
+    args.push("about:blank".to_string());
+
+    // Resolve executable
+    let executable = config
+        .resolve_executable(profile_name)
+        .or_else(detect_chrome_executable);
+
+    let exe = executable.ok_or_else(|| {
+        Error::ToolExecution(
+            "no supported browser found (Chrome/Brave/Edge/Chromium). \
+             Install Google Chrome or set CHROME_EXECUTABLE / executablePath."
+                .into(),
+        )
+    })?;
+
+    std::process::Command::new(&exe)
+        .args(&args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| {
+            Error::ToolExecution(format!("failed to launch browser ({exe}): {e}").into())
+        })?;
+
+    tracing::info!(
+        port,
+        profile = profile_name,
+        %profile_dir_name,
+        "launched browser with remote debugging"
+    );
+    Ok(())
 }
 
 /// Detect the platform-specific Chrome data directory.

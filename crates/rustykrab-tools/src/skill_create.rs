@@ -154,12 +154,15 @@ impl Tool for SkillCreateTool {
 
         let content = format!("---\n{yaml}\n---\n{instructions}");
 
-        // Write to disk
-        std::fs::create_dir_all(&skill_dir)
+        // Write to disk using tokio::fs to avoid blocking the async
+        // runtime (fixes ASYNC-M3).
+        tokio::fs::create_dir_all(&skill_dir)
+            .await
             .map_err(|e| Error::ToolExecution(format!("failed to create skill directory: {e}").into()))?;
 
         let path = skill_dir.join("SKILL.md");
-        std::fs::write(&path, &content)
+        tokio::fs::write(&path, &content)
+            .await
             .map_err(|e| Error::ToolExecution(format!("failed to write SKILL.md: {e}").into()))?;
 
         Ok(json!({

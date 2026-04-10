@@ -61,7 +61,7 @@ impl Tool for ImageTool {
 
         let image_bytes = if source.starts_with("http://") || source.starts_with("https://") {
             // SSRF protection: validate URL before making request
-            crate::security::validate_url(source)
+            crate::security::validate_url(source).await
                 .map_err(|e| rustykrab_core::Error::ToolExecution(format!("URL validation failed: {e}").into()))?;
 
             self.client

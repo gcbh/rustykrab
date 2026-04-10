@@ -12,6 +12,7 @@ use rustykrab_core::model::ModelProvider;
 use rustykrab_core::orchestration::{OrchestrationConfig, RecursiveCall};
 use rustykrab_core::types::{Message, MessageContent, Role};
 use rustykrab_core::{Error, Result};
+use tokio::sync::Semaphore;
 use uuid::Uuid;
 
 use super::context_manager::ContextManager;
@@ -172,7 +173,10 @@ async fn execute_call_impl(
         "RLM: model requested sub-calls"
     );
 
-    // Execute sub-calls concurrently.
+    // Execute sub-calls concurrently, bounded by a semaphore to prevent
+    // pathological workloads from spawning unbounded concurrent LLM calls
+    // (fixes ASYNC-M1).
+    let semaphore = Arc::new(Semaphore::new(config.max_concurrent_tasks));
     let mut handles = Vec::new();
     for sub_prompt in &sub_calls {
         let child = RecursiveCall::child(
@@ -183,10 +187,12 @@ async fn execute_call_impl(
         );
         let provider = provider.clone();
         let config = config.clone();
+        let sem = semaphore.clone();
 
-        handles.push(tokio::spawn(
-            execute_call(provider, config, child, None),
-        ));
+        handles.push(tokio::spawn(async move {
+            let _permit = sem.acquire().await.expect("semaphore closed");
+            execute_call(provider, config, child, None).await
+        }));
     }
 
     // Collect results.

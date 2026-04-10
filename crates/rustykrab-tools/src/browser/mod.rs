@@ -275,7 +275,7 @@ impl Tool for BrowserTool {
                 let url = args["url"]
                     .as_str()
                     .ok_or_else(|| Error::ToolExecution("'open' requires 'url' parameter".into()))?;
-                security::validate_url(url).map_err(|e| Error::ToolExecution(e.into()))?;
+                security::validate_url(url).await.map_err(|e| Error::ToolExecution(e.into()))?;
                 let _ = self.manager.get_browser(&profile).await?;
                 self.manager.open_tab(&profile, url).await
             }
@@ -299,7 +299,7 @@ impl Tool for BrowserTool {
                 let url = args["url"]
                     .as_str()
                     .ok_or_else(|| Error::ToolExecution("'navigate' requires 'url' parameter".into()))?;
-                security::validate_url(url).map_err(|e| Error::ToolExecution(e.into()))?;
+                security::validate_url(url).await.map_err(|e| Error::ToolExecution(e.into()))?;
 
                 let _ = self.manager.get_browser(&profile).await?;
                 let page = self.manager.get_page(&profile, target_id).await?;

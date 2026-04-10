@@ -77,7 +77,7 @@ impl Tool for HttpRequestTool {
             .ok_or_else(|| rustykrab_core::Error::ToolExecution("missing url".into()))?;
 
         // SSRF protection: validate URL before making request
-        security::validate_url(url)
+        security::validate_url(url).await
             .map_err(|e| rustykrab_core::Error::ToolExecution(e.into()))?;
 
         let mut req = match method.as_str() {

@@ -133,6 +133,10 @@ pub struct OrchestrationConfig {
     pub fallback_model: Option<String>,
     /// Which model to use for complex tasks (primary model name).
     pub primary_model: Option<String>,
+    /// Maximum number of concurrent LLM/tool tasks spawned in parallel.
+    /// Prevents pathological workloads from overwhelming the system
+    /// (fixes ASYNC-M1).
+    pub max_concurrent_tasks: usize,
 }
 
 impl Default for OrchestrationConfig {
@@ -149,6 +153,7 @@ impl Default for OrchestrationConfig {
             summarize_sub_results: true,
             fallback_model: None,
             primary_model: None,
+            max_concurrent_tasks: 10,
         }
     }
 }
