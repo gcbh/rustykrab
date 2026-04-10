@@ -119,7 +119,10 @@ impl Default for ExecTool {
 
 fn truncate_output(s: String) -> String {
     if s.len() > MAX_OUTPUT_BYTES {
-        let mut truncated = s[..MAX_OUTPUT_BYTES].to_string();
+        // Use floor_char_boundary to avoid panicking when the truncation
+        // point falls within a multi-byte UTF-8 character.
+        let end = s.floor_char_boundary(MAX_OUTPUT_BYTES);
+        let mut truncated = s[..end].to_string();
         truncated.push_str("\n... [truncated]");
         truncated
     } else {
@@ -249,7 +252,7 @@ impl Tool for ExecTool {
             .arg(command)
             .env_clear()
             .env("PATH", &path)
-            .env("HOME", std::env::var("HOME").unwrap_or_default())
+            .env("HOME", "/tmp/rustykrab-home")
             .env("LANG", "C.UTF-8")
             .output();
 

@@ -229,35 +229,24 @@ impl Tool for ProcessTool {
                     ));
                 }
 
-                // Try to kill via the stored child handle first (cleans up zombie).
+                // Only allow killing processes that were spawned by this tool.
+                // This prevents arbitrary PID termination of system or
+                // third-party processes.
                 let pid_u32 = pid as u32;
                 if let Some(mut child) = self.children.lock().await.remove(&pid_u32) {
                     let _ = child.kill().await;
                     let _ = child.wait().await;
-                    return Ok(json!({
-                        "action": "stop",
-                        "pid": pid,
-                        "status": "terminated",
-                    }));
-                }
-
-                // Fallback to kill(1) for processes not tracked by us.
-                let output = tokio::process::Command::new("kill")
-                    .arg(pid.to_string())
-                    .output()
-                    .await
-                    .map_err(|e| rustykrab_core::Error::ToolExecution(e.to_string().into()))?;
-
-                if output.status.success() {
                     Ok(json!({
                         "action": "stop",
                         "pid": pid,
                         "status": "terminated",
                     }))
                 } else {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
                     Err(rustykrab_core::Error::ToolExecution(
-                        format!("failed to stop process {pid}: {stderr}").into(),
+                        format!(
+                            "process {pid} was not spawned by this tool and cannot be stopped"
+                        )
+                        .into(),
                     ))
                 }
             }

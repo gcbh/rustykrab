@@ -77,8 +77,10 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
 
 /// Generate a cryptographically random 32-byte hex token.
 pub fn generate_token() -> String {
-    use rand::RngCore;
+    use rand::TryRngCore;
     let mut bytes = [0u8; 32];
-    rand::rng().fill_bytes(&mut bytes);
+    rand::rngs::OsRng
+        .try_fill_bytes(&mut bytes)
+        .expect("OS RNG failed");
     hex::encode(bytes)
 }
