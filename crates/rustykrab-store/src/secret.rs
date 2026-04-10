@@ -125,7 +125,7 @@ impl SecretStore {
 
         // Derive a per-secret encryption key via Argon2id.
         let derived_key = self.derive_key(&salt)?;
-        let cipher = Aes256Gcm::new_from_slice(&derived_key)
+        let cipher = Aes256Gcm::new_from_slice(&*derived_key)
             .map_err(|e| Error::Storage(format!("cipher init: {e}")))?;
 
         let nonce = Nonce::from_slice(&nonce_bytes);
@@ -160,7 +160,7 @@ impl SecretStore {
         let ciphertext = &data[SALT_LEN + NONCE_LEN..];
 
         let derived_key = self.derive_key(salt)?;
-        let cipher = Aes256Gcm::new_from_slice(&derived_key)
+        let cipher = Aes256Gcm::new_from_slice(&*derived_key)
             .map_err(|e| Error::Storage(format!("cipher init: {e}")))?;
 
         let nonce = Nonce::from_slice(nonce_bytes);
@@ -185,10 +185,14 @@ impl SecretStore {
     /// Argon2id is resistant to both side-channel and GPU/ASIC brute-force
     /// attacks. Even if the database is stolen, the attacker must spend
     /// significant time/memory per guess of the master key.
-    fn derive_key(&self, salt: &[u8]) -> Result<[u8; 32], Error> {
-        let mut key = [0u8; 32];
+    ///
+    /// The returned key is wrapped in `Zeroizing` so it is securely erased
+    /// from memory when dropped, preventing key material from lingering
+    /// on the stack.
+    fn derive_key(&self, salt: &[u8]) -> Result<Zeroizing<[u8; 32]>, Error> {
+        let mut key = Zeroizing::new([0u8; 32]);
         Argon2::default()
-            .hash_password_into(&self.master_key, salt, &mut key)
+            .hash_password_into(&self.master_key, salt, &mut *key)
             .map_err(|e| Error::Storage(format!("key derivation failed: {e}")))?;
         Ok(key)
     }

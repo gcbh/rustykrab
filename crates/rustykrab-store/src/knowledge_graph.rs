@@ -10,6 +10,7 @@
 use rustykrab_core::orchestration::{EntityType, KnowledgeEntity, KnowledgeRelation, RelationType};
 use rustykrab_core::Error;
 use serde::{Deserialize, Serialize};
+use sled::Transactional;
 use uuid::Uuid;
 
 /// Persistent knowledge graph backed by sled trees.
@@ -43,6 +44,24 @@ impl KnowledgeGraph {
     /// Add or update an entity in the graph.
     pub fn upsert_entity(&self, entity: &KnowledgeEntity) -> Result<(), Error> {
         let key = entity.id.as_bytes().to_vec();
+
+        // If the entity already exists with a different name, remove the stale
+        // name index entry so it doesn't accumulate over renames.
+        if let Some(old_bytes) = self
+            .entities
+            .get(&key)
+            .map_err(|e| Error::Storage(e.to_string()))?
+        {
+            let old_entity: KnowledgeEntity = serde_json::from_slice(&old_bytes)?;
+            let old_name_key = old_entity.name.to_lowercase();
+            let new_name_key = entity.name.to_lowercase();
+            if old_name_key != new_name_key {
+                self.entity_names
+                    .remove(old_name_key.as_bytes())
+                    .map_err(|e| Error::Storage(e.to_string()))?;
+            }
+        }
+
         let bytes = serde_json::to_vec(entity)?;
         self.entities
             .insert(key, bytes)
@@ -122,24 +141,22 @@ impl KnowledgeGraph {
         Ok(results)
     }
 
-    /// Delete an entity and all its relations.
+    /// Delete an entity and all its relations atomically.
+    ///
+    /// Uses a sled transaction across all three trees so a crash cannot
+    /// leave orphaned relations or a dangling name index entry.
     pub fn delete_entity(&self, id: Uuid) -> Result<(), Error> {
-        // Remove the entity.
-        if let Some(bytes) = self
+        // Fetch the entity name for the name-index cleanup.
+        let name_key = self
             .entities
-            .remove(id.as_bytes())
+            .get(id.as_bytes())
             .map_err(|e| Error::Storage(e.to_string()))?
-        {
-            // Remove name index.
-            let entity: KnowledgeEntity = serde_json::from_slice(&bytes)?;
-            let name_key = entity.name.to_lowercase();
-            self.entity_names
-                .remove(name_key.as_bytes())
-                .map_err(|e| Error::Storage(e.to_string()))?;
-        }
+            .and_then(|bytes| serde_json::from_slice::<KnowledgeEntity>(&bytes).ok())
+            .map(|e| e.name.to_lowercase());
 
-        // Remove all relations involving this entity.
-        let to_remove: Vec<Vec<u8>> = self
+        // Collect relation keys to remove (iteration not available inside
+        // sled transactions, so we scan first).
+        let relation_keys: Vec<Vec<u8>> = self
             .relations
             .iter()
             .filter_map(|entry| {
@@ -153,11 +170,21 @@ impl KnowledgeGraph {
             })
             .collect();
 
-        for key in to_remove {
-            self.relations
-                .remove(key)
-                .map_err(|e| Error::Storage(e.to_string()))?;
-        }
+        // Atomically remove entity, name index, and all relations.
+        (&self.entities, &self.relations, &self.entity_names)
+            .transaction(|(entities_tx, relations_tx, names_tx)| {
+                entities_tx.remove(id.as_bytes())?;
+                if let Some(ref nk) = name_key {
+                    names_tx.remove(nk.as_bytes())?;
+                }
+                for key in &relation_keys {
+                    relations_tx.remove(key.as_slice())?;
+                }
+                Ok(())
+            })
+            .map_err(|e: sled::transaction::TransactionError| {
+                Error::Storage(format!("transaction failed: {e}"))
+            })?;
 
         Ok(())
     }
@@ -182,6 +209,11 @@ impl KnowledgeGraph {
         for entry in self.relations.scan_prefix(&prefix) {
             let (_, value) = entry.map_err(|e| Error::Storage(e.to_string()))?;
             let rel: KnowledgeRelation = serde_json::from_slice(&value)?;
+            debug_assert_eq!(
+                rel.from_id, entity_id,
+                "prefix scan returned relation with from_id {} but expected {}",
+                rel.from_id, entity_id
+            );
             results.push(rel);
         }
         Ok(results)

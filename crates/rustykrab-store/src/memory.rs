@@ -44,9 +44,20 @@ impl MemoryStore {
         Self { tree }
     }
 
+    /// Build a composite key: `conversation_id (16 bytes) || entry_id (16 bytes)`.
+    ///
+    /// This layout lets us `scan_prefix(conversation_id)` to retrieve only
+    /// the entries belonging to a single conversation, avoiding full-table scans.
+    fn composite_key(conversation_id: &Uuid, entry_id: &Uuid) -> Vec<u8> {
+        let mut key = Vec::with_capacity(32);
+        key.extend_from_slice(conversation_id.as_bytes());
+        key.extend_from_slice(entry_id.as_bytes());
+        key
+    }
+
     /// Store a memory entry.
     pub fn save(&self, entry: &MemoryEntry) -> Result<(), Error> {
-        let key = entry.id.as_bytes().to_vec();
+        let key = Self::composite_key(&entry.conversation_id, &entry.id);
         let bytes = serde_json::to_vec(entry)?;
         self.tree
             .insert(key, bytes)
@@ -54,11 +65,12 @@ impl MemoryStore {
         Ok(())
     }
 
-    /// Retrieve a memory by its unique ID.
-    pub fn get(&self, id: Uuid) -> Result<MemoryEntry, Error> {
+    /// Retrieve a memory by its unique ID and conversation ID.
+    pub fn get(&self, id: Uuid, conversation_id: Uuid) -> Result<MemoryEntry, Error> {
+        let key = Self::composite_key(&conversation_id, &id);
         let bytes = self
             .tree
-            .get(id.as_bytes())
+            .get(key)
             .map_err(|e| Error::Storage(e.to_string()))?
             .ok_or_else(|| Error::NotFound(format!("memory {id}")))?;
         let entry: MemoryEntry = serde_json::from_slice(&bytes)?;
@@ -69,6 +81,9 @@ impl MemoryStore {
     /// given keywords. This is the associative retrieval mechanism:
     /// keywords from the user's message are matched against stored
     /// tags to surface relevant memories automatically.
+    ///
+    /// Uses a prefix scan on `conversation_id` so only entries for the
+    /// target conversation are visited.
     ///
     /// Updates `last_accessed` and `access_count` on matched entries
     /// (reconsolidation — retrieval strengthens the memory).
@@ -83,13 +98,9 @@ impl MemoryStore {
         let keywords_lower: Vec<String> = keywords.iter().map(|k| k.to_lowercase()).collect();
         let mut results = Vec::new();
 
-        for item in self.tree.iter() {
+        for item in self.tree.scan_prefix(conversation_id.as_bytes()) {
             let (key, value) = item.map_err(|e| Error::Storage(e.to_string()))?;
             let mut entry: MemoryEntry = serde_json::from_slice(&value)?;
-
-            if entry.conversation_id != conversation_id {
-                continue;
-            }
 
             let matches = entry.tags.iter().any(|tag| {
                 let tag_lower = tag.to_lowercase();
@@ -118,32 +129,35 @@ impl MemoryStore {
     /// List all memories for a conversation.
     pub fn list_for_conversation(&self, conversation_id: Uuid) -> Result<Vec<MemoryEntry>, Error> {
         let mut entries = Vec::new();
-        for item in self.tree.iter() {
+        for item in self.tree.scan_prefix(conversation_id.as_bytes()) {
             let (_, value) = item.map_err(|e| Error::Storage(e.to_string()))?;
             let entry: MemoryEntry = serde_json::from_slice(&value)?;
-            if entry.conversation_id == conversation_id {
-                entries.push(entry);
-            }
+            entries.push(entry);
         }
         entries.sort_by(|a, b| b.created_at.cmp(&a.created_at));
         Ok(entries)
     }
 
     /// Delete a specific memory entry.
-    pub fn delete(&self, id: Uuid) -> Result<(), Error> {
+    pub fn delete(&self, id: Uuid, conversation_id: Uuid) -> Result<(), Error> {
+        let key = Self::composite_key(&conversation_id, &id);
         self.tree
-            .remove(id.as_bytes())
+            .remove(key)
             .map_err(|e| Error::Storage(e.to_string()))?;
         Ok(())
     }
 
     /// Delete all memories for a conversation.
     pub fn delete_for_conversation(&self, conversation_id: Uuid) -> Result<u32, Error> {
-        let entries = self.list_for_conversation(conversation_id)?;
-        let count = entries.len() as u32;
-        for entry in entries {
+        let keys: Vec<Vec<u8>> = self
+            .tree
+            .scan_prefix(conversation_id.as_bytes())
+            .filter_map(|item| item.ok().map(|(key, _)| key.to_vec()))
+            .collect();
+        let count = keys.len() as u32;
+        for key in keys {
             self.tree
-                .remove(entry.id.as_bytes())
+                .remove(key)
                 .map_err(|e| Error::Storage(e.to_string()))?;
         }
         Ok(count)

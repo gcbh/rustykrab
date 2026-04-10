@@ -29,13 +29,13 @@ impl ConversationStore {
     }
 
     /// Persist a conversation (insert or update).
+    ///
+    /// Does not force an fsync — sled flushes according to its own policy.
+    /// Call `Store::flush()` when an explicit durability barrier is needed.
     pub fn save(&self, conv: &Conversation) -> Result<(), Error> {
         let bytes = serde_json::to_vec(conv)?;
         self.tree
             .insert(conv.id.as_bytes(), bytes)
-            .map_err(|e| Error::Storage(e.to_string()))?;
-        self.tree
-            .flush()
             .map_err(|e| Error::Storage(e.to_string()))?;
         Ok(())
     }
