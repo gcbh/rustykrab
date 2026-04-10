@@ -11,7 +11,7 @@ use rustykrab_core::orchestration::OrchestrationConfig;
 use rustykrab_core::types::MessageContent;
 use rustykrab_gateway::AppState;
 use rustykrab_memory::backend::HybridMemoryBackend;
-use rustykrab_memory::embedding::HashEmbedder;
+use rustykrab_memory::embedding::FastEmbedder;
 use rustykrab_memory::storage::SqliteMemoryStorage;
 use rustykrab_memory::{MemoryConfig, MemorySystem};
 use rustykrab_skills::SkillRegistry;
@@ -139,18 +139,48 @@ async fn main() -> anyhow::Result<()> {
     let memory_storage = Arc::new(
         SqliteMemoryStorage::open(&memory_db_path).expect("failed to open memory database"),
     );
-    let embedder = Arc::new(HashEmbedder::new(768));
+    let model_cache_dir = data_dir.join("models");
+    std::fs::create_dir_all(&model_cache_dir)?;
+    let embedder = Arc::new(
+        FastEmbedder::new(model_cache_dir).expect("failed to initialize embedding model"),
+    );
     let memory_system = Arc::new(MemorySystem::new(
         MemoryConfig::default(),
         memory_storage,
         embedder,
     ));
-    let agent_id = Uuid::new_v4();
+
+    // Persist agent_id so memories survive restarts. Stored as a simple
+    // file in the data directory; created once on first run.
+    let agent_id_path = data_dir.join("agent_id");
+    let agent_id = if agent_id_path.exists() {
+        let raw = std::fs::read_to_string(&agent_id_path)?;
+        Uuid::parse_str(raw.trim())
+            .unwrap_or_else(|_| {
+                tracing::warn!("corrupt agent_id file, generating new ID");
+                let id = Uuid::new_v4();
+                let _ = std::fs::write(&agent_id_path, id.to_string());
+                id
+            })
+    } else {
+        let id = Uuid::new_v4();
+        std::fs::write(&agent_id_path, id.to_string())?;
+        tracing::info!(%id, "generated new persistent agent_id");
+        id
+    };
+
     let session_id = Uuid::new_v4();
+
+    // Rebuild in-memory BM25 index from persisted memories.
+    let indexed = memory_system.rebuild_indexes(agent_id).await?;
+    if indexed > 0 {
+        tracing::info!(indexed, "BM25 index rebuilt from stored memories");
+    }
+
     let memory_backend: Arc<dyn MemoryBackend> = Arc::new(MemoryAdapter {
         inner: HybridMemoryBackend::new(Arc::clone(&memory_system), agent_id, session_id),
     });
-    tracing::info!("memory system initialized");
+    tracing::info!(%agent_id, "memory system initialized");
 
     // --- Video channel (optional, enabled via RUSTYKRAB_VIDEO=true) ---
     let video_enabled = std::env::var("RUSTYKRAB_VIDEO")

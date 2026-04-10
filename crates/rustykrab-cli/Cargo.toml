@@ -14,7 +14,7 @@ rustykrab-tools.workspace = true
 rustykrab-channels.workspace = true
 rustykrab-skills.workspace = true
 rustykrab-providers.workspace = true
-rustykrab-memory.workspace = true
+rustykrab-memory = { workspace = true, features = ["fastembed"] }
 axum.workspace = true
 async-trait.workspace = true
 chrono.workspace = true

@@ -159,6 +159,88 @@ impl Embedder for HashEmbedder {
     }
 }
 
+// ── fastembed integration (behind feature flag) ─────────────────
+
+#[cfg(feature = "fastembed")]
+mod fastembed_impl {
+    use super::*;
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
+
+    use fastembed::{EmbeddingModel, InitOptionsWithLength, TextEmbedding};
+
+    /// Production embedder backed by fastembed (ONNX Runtime).
+    ///
+    /// Uses Nomic-embed-text-v1.5 by default (768d, 8K context, Apache 2.0).
+    /// `TextEmbedding::embed` takes `&mut self`, so we wrap it in an
+    /// `Arc<Mutex>` and call it via `spawn_blocking` to avoid blocking
+    /// the async runtime.
+    pub struct FastEmbedder {
+        model: Arc<Mutex<TextEmbedding>>,
+        dims: usize,
+        model_version: String,
+    }
+
+    impl FastEmbedder {
+        /// Create a new FastEmbedder with the default model (Nomic-embed-text-v1.5).
+        ///
+        /// `cache_dir` is where ONNX model files are downloaded and cached.
+        /// The first call downloads ~275MB; subsequent calls use the cache.
+        pub fn new(cache_dir: PathBuf) -> std::result::Result<Self, rustykrab_core::Error> {
+            Self::with_model(EmbeddingModel::NomicEmbedTextV15, 768, cache_dir)
+        }
+
+        /// Create a FastEmbedder with a specific model and dimensionality.
+        pub fn with_model(
+            model_name: EmbeddingModel,
+            dims: usize,
+            cache_dir: PathBuf,
+        ) -> std::result::Result<Self, rustykrab_core::Error> {
+            let model_version = format!("{:?}", model_name);
+            let opts = InitOptionsWithLength::new(model_name)
+                .with_cache_dir(cache_dir)
+                .with_show_download_progress(true);
+
+            let model = TextEmbedding::try_new(opts)
+                .map_err(|e| rustykrab_core::Error::Internal(format!("fastembed init: {e}")))?;
+
+            Ok(Self {
+                model: Arc::new(Mutex::new(model)),
+                dims,
+                model_version,
+            })
+        }
+    }
+
+    #[async_trait]
+    impl Embedder for FastEmbedder {
+        async fn embed(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
+            let model = Arc::clone(&self.model);
+            tokio::task::spawn_blocking(move || {
+                let mut guard = model
+                    .lock()
+                    .map_err(|e| rustykrab_core::Error::Internal(format!("embedder lock: {e}")))?;
+                guard
+                    .embed(&texts, None)
+                    .map_err(|e| rustykrab_core::Error::Internal(format!("fastembed: {e}")))
+            })
+            .await
+            .map_err(|e| rustykrab_core::Error::Internal(format!("spawn_blocking: {e}")))?
+        }
+
+        fn dimensions(&self) -> usize {
+            self.dims
+        }
+
+        fn model_version(&self) -> &str {
+            &self.model_version
+        }
+    }
+}
+
+#[cfg(feature = "fastembed")]
+pub use fastembed_impl::FastEmbedder;
+
 #[cfg(test)]
 mod tests {
     use super::*;
