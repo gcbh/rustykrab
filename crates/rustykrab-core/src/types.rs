@@ -77,6 +77,10 @@ pub struct ToolCall {
 pub struct ToolResult {
     pub call_id: String,
     pub output: serde_json::Value,
+    /// Whether the tool execution failed. Sent as `is_error` to providers
+    /// so the model knows to interpret the output as an error message.
+    #[serde(default)]
+    pub is_error: bool,
 }
 
 /// A conversation is an ordered sequence of messages.
