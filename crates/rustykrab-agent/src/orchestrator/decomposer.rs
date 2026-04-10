@@ -99,7 +99,17 @@ impl Decomposer {
             },
         ];
 
-        let response = self.provider.chat(&messages, &[]).await?;
+        let timeout_secs = self.config.model_call_timeout_secs;
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(timeout_secs),
+            self.provider.chat(&messages, &[]),
+        )
+        .await
+        .map_err(|_| {
+            Error::Internal(format!(
+                "decomposition model call timed out after {timeout_secs}s"
+            ))
+        })??;
         let text = response
             .message
             .content

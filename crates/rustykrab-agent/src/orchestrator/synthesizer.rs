@@ -49,9 +49,12 @@ impl Synthesizer {
         results: &[SubTaskResult],
         context: Option<&str>,
     ) -> Result<String> {
-        // If there's only one successful result, just return it directly.
+        // If there's only one result and it succeeded, just return it directly.
+        // Don't take this fast path when other sub-tasks failed, since the
+        // synthesizer should acknowledge incomplete/missing information.
+        let has_failures = results.iter().any(|r| !r.success);
         let successful: Vec<&SubTaskResult> = results.iter().filter(|r| r.success).collect();
-        if successful.len() == 1 {
+        if successful.len() == 1 && !has_failures {
             return Ok(successful[0].output.clone());
         }
 
@@ -96,7 +99,14 @@ impl Synthesizer {
             created_at: Utc::now(),
         });
 
-        let response = self.provider.chat(&messages, &[]).await?;
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            self.provider.chat(&messages, &[]),
+        )
+        .await
+        .map_err(|_| {
+            rustykrab_core::Error::Internal("synthesis model call timed out after 120s".into())
+        })??;
         Ok(response.message.content.as_text().unwrap_or("").to_string())
     }
 }

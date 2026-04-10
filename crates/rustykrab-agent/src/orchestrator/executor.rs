@@ -22,6 +22,7 @@ pub struct ParallelExecutor {
     provider: Arc<dyn ModelProvider>,
     tools: Vec<Arc<dyn Tool>>,
     sandbox: Arc<dyn Sandbox>,
+    policy: SandboxPolicy,
     config: OrchestrationConfig,
 }
 
@@ -30,12 +31,14 @@ impl ParallelExecutor {
         provider: Arc<dyn ModelProvider>,
         tools: Vec<Arc<dyn Tool>>,
         sandbox: Arc<dyn Sandbox>,
+        policy: SandboxPolicy,
         config: OrchestrationConfig,
     ) -> Self {
         Self {
             provider,
             tools,
             sandbox,
+            policy,
             config,
         }
     }
@@ -97,6 +100,7 @@ impl ParallelExecutor {
                 let tools = self.tools.clone();
                 let sandbox = self.sandbox.clone();
                 let config = self.config.clone();
+                let policy = self.policy.clone();
                 let sys_ctx = system_context.map(|s| s.to_string());
                 let sem = semaphore.clone();
 
@@ -111,6 +115,7 @@ impl ParallelExecutor {
                             &provider,
                             &tools,
                             &sandbox,
+                            &policy,
                             &config,
                         )
                         .await
@@ -142,6 +147,25 @@ impl ParallelExecutor {
                     }
                 }
             }
+
+            // Safety: ensure all dispatched tasks are tracked as completed
+            // to prevent infinite re-dispatch if a task_id mismatch occurs.
+            for task in &ready {
+                if !completed.contains(&task.id) {
+                    tracing::warn!(task_id = %task.id, "task not tracked after wave, marking failed");
+                    completed.insert(task.id);
+                    results.insert(
+                        task.id,
+                        SubTaskResult {
+                            task_id: task.id,
+                            output: String::new(),
+                            success: false,
+                            error: Some("task not completed (internal tracking error)".into()),
+                            tokens_used: 0,
+                        },
+                    );
+                }
+            }
         }
 
         // Return results in original task order.
@@ -157,6 +181,7 @@ async fn execute_sub_task(
     provider: &Arc<dyn ModelProvider>,
     tools: &[Arc<dyn Tool>],
     sandbox: &Arc<dyn Sandbox>,
+    policy: &SandboxPolicy,
     config: &OrchestrationConfig,
 ) -> SubTaskResult {
     // Build focused context for this sub-task.
@@ -211,21 +236,38 @@ async fn execute_sub_task(
 
     // Run the model, handling multiple tool-call rounds per sub-task.
     let max_rounds = config.max_tool_rounds;
+    let mut total_tokens: u64 = 0;
+    let timeout_secs = config.model_call_timeout_secs;
     for _round in 0..max_rounds {
-        let response = match provider.chat(&messages, &schemas).await {
-            Ok(r) => r,
-            Err(e) => {
+        let response = match tokio::time::timeout(
+            std::time::Duration::from_secs(timeout_secs),
+            provider.chat(&messages, &schemas),
+        )
+        .await
+        {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
                 return SubTaskResult {
                     task_id: task.id,
                     output: String::new(),
                     success: false,
                     error: Some(e.to_string()),
-                    tokens_used: 0,
+                    tokens_used: total_tokens as usize,
+                };
+            }
+            Err(_) => {
+                return SubTaskResult {
+                    task_id: task.id,
+                    output: String::new(),
+                    success: false,
+                    error: Some(format!("model call timed out after {timeout_secs}s")),
+                    tokens_used: total_tokens as usize,
                 };
             }
         };
 
-        let tokens = response.usage.prompt_tokens + response.usage.completion_tokens;
+        total_tokens +=
+            (response.usage.prompt_tokens + response.usage.completion_tokens) as u64;
 
         // If the model wants to use tools, execute them and continue.
         if response.message.content.has_tool_calls() {
@@ -234,7 +276,8 @@ async fn execute_sub_task(
             let calls = response.message.content.tool_calls();
             for call in calls {
                 let result =
-                    execute_tool_for_subtask(call, tools, sandbox, config.max_tool_retries).await;
+                    execute_tool_for_subtask(call, tools, sandbox, policy, config.max_tool_retries)
+                        .await;
                 messages.push(Message {
                     id: Uuid::new_v4(),
                     role: Role::Tool,
@@ -260,7 +303,7 @@ async fn execute_sub_task(
             output,
             success: true,
             error: None,
-            tokens_used: tokens as usize,
+            tokens_used: total_tokens as usize,
         };
     }
 
@@ -269,7 +312,7 @@ async fn execute_sub_task(
         output: String::new(),
         success: false,
         error: Some("exceeded max tool-call rounds for sub-task".into()),
-        tokens_used: 0,
+        tokens_used: total_tokens as usize,
     }
 }
 
@@ -278,6 +321,7 @@ async fn execute_tool_for_subtask(
     call: &ToolCall,
     tools: &[Arc<dyn Tool>],
     sandbox: &Arc<dyn Sandbox>,
+    policy: &SandboxPolicy,
     max_retries: u32,
 ) -> ToolResult {
     let tool = match tools.iter().find(|t| t.name() == call.name) {
@@ -291,20 +335,10 @@ async fn execute_tool_for_subtask(
         }
     };
 
-    // Sub-tasks need the same capabilities as the main agent loop —
-    // writing files (e.g. saving downloaded documents) and spawning
-    // processes (e.g. pip install) are required for real task completion.
-    let policy = SandboxPolicy {
-        allow_net: true,
-        allow_fs_read: true,
-        allow_fs_write: true,
-        allow_spawn: true,
-        ..SandboxPolicy::default()
-    };
-
-    // Enforce sandbox check — fail the tool call if denied.
+    // Enforce sandbox check using the session's policy — fail the tool
+    // call if the policy denies the required capabilities.
     if let Err(e) = sandbox
-        .execute(&call.name, call.arguments.clone(), &policy)
+        .execute(&call.name, call.arguments.clone(), policy)
         .await
     {
         return ToolResult {

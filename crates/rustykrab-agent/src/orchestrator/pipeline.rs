@@ -12,7 +12,7 @@ use rustykrab_core::orchestration::{
 };
 use rustykrab_core::{Result, Tool};
 
-use crate::sandbox::Sandbox;
+use crate::sandbox::{Sandbox, SandboxPolicy};
 
 use super::decomposer::Decomposer;
 use super::executor::ParallelExecutor;
@@ -46,6 +46,7 @@ pub struct OrchestrationPipeline {
     provider: Arc<dyn ModelProvider>,
     tools: Vec<Arc<dyn Tool>>,
     sandbox: Arc<dyn Sandbox>,
+    policy: SandboxPolicy,
     config: OrchestrationConfig,
 }
 
@@ -60,11 +61,20 @@ impl OrchestrationPipeline {
             provider,
             tools,
             sandbox,
+            policy: SandboxPolicy::trusted(),
             config,
         }
     }
 
+    /// Override the sandbox policy used for sub-task tool execution.
+    pub fn with_policy(mut self, policy: SandboxPolicy) -> Self {
+        self.policy = policy;
+        self
+    }
+
     /// Run the pipeline for a given request at the specified complexity level.
+    ///
+    /// The entire pipeline is wrapped in a timeout to prevent unbounded execution.
     pub async fn run(
         &self,
         request: &str,
@@ -73,6 +83,30 @@ impl OrchestrationPipeline {
     ) -> Result<PipelineResult> {
         tracing::info!(?complexity, "running orchestration pipeline");
 
+        let timeout_secs = self.config.pipeline_timeout_secs;
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(timeout_secs),
+            self.run_inner(request, complexity, context),
+        )
+        .await;
+
+        match result {
+            Ok(inner) => inner,
+            Err(_) => {
+                tracing::error!(timeout_secs, "orchestration pipeline timed out");
+                Err(rustykrab_core::Error::Internal(format!(
+                    "orchestration pipeline timed out after {timeout_secs}s"
+                )))
+            }
+        }
+    }
+
+    async fn run_inner(
+        &self,
+        request: &str,
+        complexity: TaskComplexity,
+        context: Option<&str>,
+    ) -> Result<PipelineResult> {
         match complexity {
             TaskComplexity::Trivial | TaskComplexity::Simple => {
                 self.run_direct(request, context).await
@@ -106,7 +140,17 @@ impl OrchestrationPipeline {
         });
 
         let schemas: Vec<_> = self.tools.iter().map(|t| t.schema()).collect();
-        let response = self.provider.chat(&messages, &schemas).await?;
+        let timeout_secs = self.config.model_call_timeout_secs;
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(timeout_secs),
+            self.provider.chat(&messages, &schemas),
+        )
+        .await
+        .map_err(|_| {
+            rustykrab_core::Error::Internal(format!(
+                "model call timed out after {timeout_secs}s"
+            ))
+        })??;
         let text = match response.message.content.as_text() {
             Some(t) => t.to_string(),
             None => {
@@ -135,6 +179,7 @@ impl OrchestrationPipeline {
             self.provider.clone(),
             self.tools.clone(),
             self.sandbox.clone(),
+            self.policy.clone(),
             self.config.clone(),
         );
         let synthesizer = Synthesizer::new(self.provider.clone());
@@ -257,7 +302,17 @@ impl OrchestrationPipeline {
             created_at: Utc::now(),
         });
 
-        let response = self.provider.chat(&messages, &[]).await?;
+        let timeout_secs = self.config.model_call_timeout_secs;
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(timeout_secs),
+            self.provider.chat(&messages, &[]),
+        )
+        .await
+        .map_err(|_| {
+            rustykrab_core::Error::Internal(format!(
+                "completion check timed out after {timeout_secs}s"
+            ))
+        })??;
         let text = match response.message.content.as_text() {
             Some(t) => t.to_uppercase(),
             None => {
@@ -268,7 +323,10 @@ impl OrchestrationPipeline {
             }
         };
 
-        Ok(text.contains("COMPLETE") && !text.contains("INCOMPLETE"))
+        Ok(text.contains("COMPLETE")
+            && !text.contains("INCOMPLETE")
+            && !text.contains("NOT COMPLETE")
+            && !text.contains("NOT YET COMPLETE"))
     }
 
     /// Complex pipeline: decompose + execute + synthesize + refine.

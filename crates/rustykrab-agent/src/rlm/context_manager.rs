@@ -27,7 +27,7 @@ impl ContextManager {
 
         // Each level gets 75% of the parent's budget.
         let factor = 0.75_f64.powi(depth as i32);
-        let budget = (self.config.sub_task_context_budget as f64 * factor) as usize;
+        let budget = (parent_budget as f64 * factor) as usize;
 
         // Floor at 2K tokens — below that, model output quality degrades.
         budget.max(2048).min(parent_budget)

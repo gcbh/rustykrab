@@ -137,6 +137,10 @@ pub struct OrchestrationConfig {
     /// Prevents pathological workloads from overwhelming the system
     /// (fixes ASYNC-M1).
     pub max_concurrent_tasks: usize,
+    /// Timeout in seconds for individual model/LLM calls within the pipeline.
+    pub model_call_timeout_secs: u64,
+    /// Timeout in seconds for the entire orchestration pipeline.
+    pub pipeline_timeout_secs: u64,
 }
 
 impl Default for OrchestrationConfig {
@@ -154,6 +158,8 @@ impl Default for OrchestrationConfig {
             fallback_model: None,
             primary_model: None,
             max_concurrent_tasks: 10,
+            model_call_timeout_secs: 120,
+            pipeline_timeout_secs: 300,
         }
     }
 }
