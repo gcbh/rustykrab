@@ -88,7 +88,18 @@ impl ConsistencyVoter {
                     created_at: Utc::now(),
                 });
 
-                let result = provider.chat(&messages, &[]).await;
+                let timeout_secs = 120u64;
+                let result = match tokio::time::timeout(
+                    std::time::Duration::from_secs(timeout_secs),
+                    provider.chat(&messages, &[]),
+                )
+                .await
+                {
+                    Ok(inner) => inner,
+                    Err(_) => Err(rustykrab_core::Error::Internal(format!(
+                        "voting sample timed out after {timeout_secs}s"
+                    ))),
+                };
                 tracing::debug!(sample = i, "consistency sample completed");
                 result
             }));
@@ -169,24 +180,57 @@ impl ConsistencyVoter {
             created_at: Utc::now(),
         }];
 
-        let result = self.provider.chat(&messages, &[]).await?;
+        let timeout_secs = 120u64;
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(timeout_secs),
+            self.provider.chat(&messages, &[]),
+        )
+        .await
+        .map_err(|_| {
+            rustykrab_core::Error::Internal(format!(
+                "consensus model call timed out after {timeout_secs}s"
+            ))
+        })??;
         let answer = result.message.content.as_text().unwrap_or("").to_string();
 
-        // Estimate agreement by simple similarity check.
+        // Estimate agreement by similarity check, filtering out common stop
+        // words that inflate overlap scores (fixes ORCH-M3).
+        const STOP_WORDS: &[&str] = &[
+            "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
+            "have", "has", "had", "do", "does", "did", "will", "would", "shall",
+            "should", "may", "might", "can", "could", "must", "to", "of", "in",
+            "for", "on", "with", "at", "by", "from", "as", "into", "through",
+            "during", "before", "after", "then", "once", "here", "there", "when",
+            "where", "why", "how", "all", "both", "each", "few", "more", "most",
+            "other", "some", "such", "no", "nor", "not", "only", "own", "same",
+            "so", "than", "too", "very", "and", "but", "or", "if", "it", "its",
+            "this", "that", "these", "those", "i", "me", "my", "we", "our", "you",
+            "your", "he", "him", "his", "she", "her", "they", "them", "their",
+            "what", "which", "who", "whom",
+        ];
+        let a_lower = answer.to_lowercase();
+        let answer_words: std::collections::HashSet<&str> = a_lower
+            .split_whitespace()
+            .filter(|w| !STOP_WORDS.contains(w))
+            .collect();
         let agreement_count = responses
             .iter()
             .filter(|r| {
-                // Rough similarity: check if key phrases overlap.
+                if answer_words.is_empty() {
+                    return true; // No content words — assume agreement
+                }
                 let r_lower = r.to_lowercase();
-                let a_lower = answer.to_lowercase();
-                // Consider "agreeing" if they share significant word overlap.
-                let answer_words: std::collections::HashSet<&str> =
-                    a_lower.split_whitespace().collect();
-                let response_words: std::collections::HashSet<&str> =
-                    r_lower.split_whitespace().collect();
-                let overlap = answer_words.intersection(&response_words).count();
-                let total = answer_words.len().max(1);
-                (overlap as f64 / total as f64) > 0.3
+                let response_words: std::collections::HashSet<String> = r_lower
+                    .split_whitespace()
+                    .filter(|w| !STOP_WORDS.contains(w))
+                    .map(|w| w.to_string())
+                    .collect();
+                let overlap = answer_words
+                    .iter()
+                    .filter(|w| response_words.contains(**w))
+                    .count();
+                let total = answer_words.len();
+                (overlap as f64 / total as f64) > 0.5
             })
             .count();
 

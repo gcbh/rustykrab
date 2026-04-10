@@ -124,12 +124,22 @@ impl RefinementLoop {
             created_at: Utc::now(),
         });
 
-        let result = self.provider.chat(&messages, &[]).await?;
+        let timeout_secs = self.config.model_call_timeout_secs;
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(timeout_secs),
+            self.provider.chat(&messages, &[]),
+        )
+        .await
+        .map_err(|_| {
+            rustykrab_core::Error::Internal(format!(
+                "critique model call timed out after {timeout_secs}s"
+            ))
+        })??;
         Ok(result
             .message
             .content
             .as_text()
-            .unwrap_or("APPROVED")
+            .unwrap_or("Non-text response — requires manual review")
             .to_string())
     }
 
@@ -171,7 +181,17 @@ impl RefinementLoop {
             created_at: Utc::now(),
         });
 
-        let result = self.provider.chat(&messages, &[]).await?;
+        let timeout_secs = self.config.model_call_timeout_secs;
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(timeout_secs),
+            self.provider.chat(&messages, &[]),
+        )
+        .await
+        .map_err(|_| {
+            rustykrab_core::Error::Internal(format!(
+                "refinement model call timed out after {timeout_secs}s"
+            ))
+        })??;
         Ok(result
             .message
             .content
