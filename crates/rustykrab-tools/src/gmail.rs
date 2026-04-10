@@ -811,12 +811,29 @@ impl GmailTool {
                 )
             })?;
 
-            let filename = part
+            let raw_filename = part
                 .content_disposition()
                 .and_then(|cd| cd.attribute("filename"))
                 .or_else(|| part.content_type().and_then(|ct| ct.attribute("name")))
                 .unwrap_or("attachment.bin")
                 .to_string();
+
+            // Sanitize filename to prevent path traversal attacks.
+            // Strip path separators and parent-directory components,
+            // keeping only the final filename component.
+            let filename = {
+                let name = std::path::Path::new(&raw_filename)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("attachment.bin");
+                // Reject empty or dot-only filenames
+                if name.is_empty() || name == "." || name == ".." {
+                    "attachment.bin".to_string()
+                } else {
+                    // Prefix with a UUID to avoid collisions and ensure uniqueness
+                    format!("{}_{}", uuid::Uuid::new_v4(), name)
+                }
+            };
 
             let contents = part.contents();
 
@@ -826,6 +843,26 @@ impl GmailTool {
                 .map_err(|e| Error::ToolExecution(format!("create dir failed: {e}").into()))?;
 
             let dest = download_dir.join(&filename);
+
+            // Final safety check: ensure the destination is within download_dir
+            if let Ok(canonical_dest) = dest.canonicalize().or_else(|_| {
+                // For new files, check parent
+                dest.parent()
+                    .and_then(|p| p.canonicalize().ok())
+                    .map(|p| p.join(dest.file_name().unwrap_or_default()))
+                    .ok_or(std::io::Error::other(
+                        "cannot resolve",
+                    ))
+            }) {
+                let canonical_dir = download_dir
+                    .canonicalize()
+                    .map_err(|e| Error::ToolExecution(format!("resolve dir failed: {e}").into()))?;
+                if !canonical_dest.starts_with(&canonical_dir) {
+                    return Err(Error::ToolExecution(
+                        "attachment filename escapes download directory".into(),
+                    ));
+                }
+            }
             std::fs::write(&dest, contents)
                 .map_err(|e| Error::ToolExecution(format!("write failed: {e}").into()))?;
 

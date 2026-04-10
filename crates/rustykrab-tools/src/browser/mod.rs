@@ -461,6 +461,42 @@ impl Tool for BrowserTool {
                     Error::ToolExecution("'evaluate' requires 'expression' parameter".into())
                 })?;
 
+                // Limit expression length to prevent abuse
+                const MAX_EXPRESSION_LEN: usize = 10_000;
+                if expression.len() > MAX_EXPRESSION_LEN {
+                    return Err(Error::ToolExecution(
+                        format!(
+                            "expression too long ({} bytes, max {MAX_EXPRESSION_LEN})",
+                            expression.len()
+                        )
+                        .into(),
+                    ));
+                }
+
+                // Block access to sensitive browser APIs that could exfiltrate
+                // credentials or session data
+                let expr_lower = expression.to_lowercase();
+                let blocked_patterns = [
+                    "document.cookie",
+                    "localstorage",
+                    "sessionstorage",
+                    "indexeddb",
+                    "navigator.credentials",
+                    "serviceworker",
+                    "importscripts",
+                ];
+                for pattern in &blocked_patterns {
+                    if expr_lower.contains(pattern) {
+                        return Err(Error::ToolExecution(
+                            format!(
+                                "access to '{pattern}' is blocked in evaluate for security. \
+                                 Use dedicated browser actions instead."
+                            )
+                            .into(),
+                        ));
+                    }
+                }
+
                 let _ = self.manager.get_browser(&profile).await?;
                 let page = self.manager.get_page(&profile, target_id).await?;
                 let result = page.evaluate(expression).await.map_err(|e| {

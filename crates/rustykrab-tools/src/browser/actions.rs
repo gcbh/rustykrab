@@ -10,6 +10,13 @@ use serde_json::{json, Value};
 
 use super::snapshot::SnapshotStore;
 
+/// Encode a string as a safe JavaScript string literal (including quotes).
+/// Uses serde_json serialization which properly escapes backslashes, quotes,
+/// newlines, line/paragraph separators, and all other special characters.
+fn js_string_literal(s: &str) -> String {
+    serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string())
+}
+
 /// Execute a ref-based action on the page.
 ///
 /// The `ref_id` comes from a previous snapshot. The action is performed on
@@ -103,9 +110,9 @@ async fn act_type(page: &Page, selector: &str, text: &str, clear: bool) -> Resul
 
     if clear {
         // Clear existing value via JS
+        let sel_lit = js_string_literal(selector);
         let clear_js = format!(
-            "var el = document.querySelector('{}'); if(el) {{ el.value = ''; el.dispatchEvent(new Event('input', {{bubbles: true}})); }}",
-            selector.replace('\'', "\\'").replace('"', "\\\""),
+            "var el = document.querySelector({sel_lit}); if(el) {{ el.value = ''; el.dispatchEvent(new Event('input', {{bubbles: true}})); }}"
         );
         let _ = page.evaluate(clear_js).await;
     }
@@ -124,32 +131,29 @@ async fn act_type(page: &Page, selector: &str, text: &str, clear: bool) -> Resul
 
 /// Press a key on an element (e.g., "Enter", "Tab", "Escape").
 async fn act_press(page: &Page, selector: &str, key: &str) -> Result<Value> {
+    let sel_lit = js_string_literal(selector);
+    let key_lit = js_string_literal(key);
     let js = format!(
         r#"(function() {{
-            var el = document.querySelector('{}');
+            var el = document.querySelector({sel_lit});
             if (!el) return 'element_not_found';
             el.focus();
             var event = new KeyboardEvent('keydown', {{
-                key: '{}',
-                code: '{}',
+                key: {key_lit},
+                code: {key_lit},
                 bubbles: true,
                 cancelable: true
             }});
             el.dispatchEvent(event);
             var up = new KeyboardEvent('keyup', {{
-                key: '{}',
-                code: '{}',
+                key: {key_lit},
+                code: {key_lit},
                 bubbles: true,
                 cancelable: true
             }});
             el.dispatchEvent(up);
             return 'pressed';
-        }})()"#,
-        selector.replace('\'', "\\'").replace('"', "\\\""),
-        key,
-        key,
-        key,
-        key,
+        }})()"#
     );
 
     let result = page
@@ -169,9 +173,10 @@ async fn act_press(page: &Page, selector: &str, key: &str) -> Result<Value> {
 
 /// Hover over an element.
 async fn act_hover(page: &Page, selector: &str) -> Result<Value> {
+    let sel_lit = js_string_literal(selector);
     let js = format!(
         r#"(function() {{
-            var el = document.querySelector('{}');
+            var el = document.querySelector({sel_lit});
             if (!el) return 'element_not_found';
             var rect = el.getBoundingClientRect();
             var event = new MouseEvent('mouseover', {{
@@ -187,8 +192,7 @@ async fn act_hover(page: &Page, selector: &str) -> Result<Value> {
             }});
             el.dispatchEvent(enter);
             return 'hovered';
-        }})()"#,
-        selector.replace('\'', "\\'").replace('"', "\\\""),
+        }})()"#
     );
 
     let result = page
@@ -208,17 +212,17 @@ async fn act_hover(page: &Page, selector: &str) -> Result<Value> {
 
 /// Select an option in a dropdown.
 async fn act_select(page: &Page, selector: &str, value: &str) -> Result<Value> {
+    let sel_lit = js_string_literal(selector);
+    let val_lit = js_string_literal(value);
     let js = format!(
         r#"(function() {{
-            var el = document.querySelector('{}');
+            var el = document.querySelector({sel_lit});
             if (!el) return 'element_not_found';
-            el.value = '{}';
+            el.value = {val_lit};
             el.dispatchEvent(new Event('change', {{ bubbles: true }}));
             el.dispatchEvent(new Event('input', {{ bubbles: true }}));
             return 'selected';
-        }})()"#,
-        selector.replace('\'', "\\'").replace('"', "\\\""),
-        value.replace('\'', "\\'").replace('"', "\\\""),
+        }})()"#
     );
 
     let result = page
@@ -238,10 +242,12 @@ async fn act_select(page: &Page, selector: &str, value: &str) -> Result<Value> {
 
 /// Drag one element to another.
 async fn act_drag(page: &Page, source_selector: &str, target_selector: &str) -> Result<Value> {
+    let src_lit = js_string_literal(source_selector);
+    let tgt_lit = js_string_literal(target_selector);
     let js = format!(
         r#"(function() {{
-            var src = document.querySelector('{}');
-            var tgt = document.querySelector('{}');
+            var src = document.querySelector({src_lit});
+            var tgt = document.querySelector({tgt_lit});
             if (!src) return 'source_not_found';
             if (!tgt) return 'target_not_found';
             var srcRect = src.getBoundingClientRect();
@@ -261,9 +267,7 @@ async fn act_drag(page: &Page, source_selector: &str, target_selector: &str) -> 
                 src.dispatchEvent(new DragEvent('dragend', {{ bubbles: true }}));
             }} catch(e) {{}}
             return 'dragged';
-        }})()"#,
-        source_selector.replace('\'', "\\'").replace('"', "\\\""),
-        target_selector.replace('\'', "\\'").replace('"', "\\\""),
+        }})()"#
     );
 
     let result = page

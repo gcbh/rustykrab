@@ -266,7 +266,7 @@ pub async fn take_snapshot(
     let selector_arg = options
         .selector
         .as_deref()
-        .map(|s| format!("'{}'", s.replace('\'', "\\'")))
+        .map(|s| serde_json::to_string(s).unwrap_or_else(|_| "null".to_string()))
         .unwrap_or_else(|| "null".to_string());
 
     // Execute the snapshot JS with arguments
