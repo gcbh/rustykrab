@@ -107,8 +107,8 @@ impl SecretStore {
         // Generate random salt and nonce.
         let mut salt = [0u8; SALT_LEN];
         let mut nonce_bytes = [0u8; NONCE_LEN];
-        rand::thread_rng().fill_bytes(&mut salt);
-        rand::thread_rng().fill_bytes(&mut nonce_bytes);
+        rand::rng().fill_bytes(&mut salt);
+        rand::rng().fill_bytes(&mut nonce_bytes);
 
         // Derive a per-secret encryption key via Argon2id.
         let derived_key = self.derive_key(&salt)?;

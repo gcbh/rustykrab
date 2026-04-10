@@ -71,7 +71,7 @@ impl SkillVerifier {
 
 /// Utility: generate a new ed25519 signing keypair (for skill publishers).
 pub fn generate_signing_keypair() -> (ed25519_dalek::SigningKey, VerifyingKey) {
-    let mut csprng = rand::thread_rng();
+    let mut csprng = rand_core::OsRng;
     let signing_key = ed25519_dalek::SigningKey::generate(&mut csprng);
     let verifying_key = signing_key.verifying_key();
     (signing_key, verifying_key)

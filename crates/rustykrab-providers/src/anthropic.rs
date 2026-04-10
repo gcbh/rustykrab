@@ -8,7 +8,13 @@ use rustykrab_core::types::{
 use rustykrab_core::Error;
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 use uuid::Uuid;
+
+/// Maximum number of retries for transient errors (429, 5xx).
+const MAX_RETRIES: u32 = 3;
+/// Base delay for exponential backoff (doubles each retry, with jitter).
+const RETRY_BASE_DELAY: Duration = Duration::from_secs(1);
 
 /// Anthropic Claude API provider.
 ///
@@ -24,8 +30,13 @@ pub struct AnthropicProvider {
 
 impl AnthropicProvider {
     pub fn new(api_key: String) -> Self {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(300))
+            .connect_timeout(Duration::from_secs(10))
+            .build()
+            .expect("failed to build HTTP client");
         Self {
-            client: reqwest::Client::new(),
+            client,
             api_key: SecretString::from(api_key),
             model: "claude-sonnet-4-20250514".to_string(),
             max_tokens: 4096,
@@ -227,31 +238,52 @@ impl ModelProvider for AnthropicProvider {
 
         tracing::debug!(model = %self.model, "calling Anthropic Messages API");
 
-        let resp = self
-            .client
-            .post("https://api.anthropic.com/v1/messages")
-            .header("x-api-key", self.api_key.expose_secret())
-            .header("anthropic-version", "2023-06-01")
-            .header("content-type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| Error::ModelProvider(e.to_string()))?;
+        let mut last_err = None;
+        for attempt in 0..=MAX_RETRIES {
+            if attempt > 0 {
+                let delay = RETRY_BASE_DELAY * 2u32.pow(attempt - 1);
+                tracing::warn!(attempt, "retrying Anthropic API after {delay:?}");
+                tokio::time::sleep(delay).await;
+            }
 
-        let status = resp.status();
-        if !status.is_success() {
+            let resp = match self
+                .client
+                .post("https://api.anthropic.com/v1/messages")
+                .header("x-api-key", self.api_key.expose_secret())
+                .header("anthropic-version", "2023-06-01")
+                .header("content-type", "application/json")
+                .json(&body)
+                .send()
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    last_err = Some(Error::ModelProvider(e.to_string()));
+                    continue;
+                }
+            };
+
+            let status = resp.status();
+            if status.is_success() {
+                let api_resp: ApiResponse = resp
+                    .json()
+                    .await
+                    .map_err(|e| Error::ModelProvider(format!("failed to parse response: {e}")))?;
+                return Self::parse_response(api_resp);
+            }
+
             let error_body = resp.text().await.unwrap_or_default();
-            return Err(Error::ModelProvider(format!(
+            let is_retryable = matches!(status.as_u16(), 429 | 500 | 502 | 503 | 529);
+            last_err = Some(Error::ModelProvider(format!(
                 "Anthropic API returned {status}: {error_body}"
             )));
+
+            if !is_retryable {
+                break;
+            }
         }
 
-        let api_resp: ApiResponse = resp
-            .json()
-            .await
-            .map_err(|e| Error::ModelProvider(format!("failed to parse response: {e}")))?;
-
-        Self::parse_response(api_resp)
+        Err(last_err.unwrap_or_else(|| Error::ModelProvider("request failed".into())))
     }
 }
 

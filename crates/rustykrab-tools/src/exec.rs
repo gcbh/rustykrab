@@ -65,6 +65,14 @@ fn validate_command(command: &str) -> std::result::Result<(), String> {
         return Err("command contains newline characters".into());
     }
 
+    // Block shell substitution patterns that bypass the allowlist.
+    // Since the command runs via `sh -c`, constructs like `$(cmd)`, `\`cmd\``,
+    // and `${var}` can execute arbitrary commands even if the outer command
+    // is in the allowlist (e.g. `echo $(rm -rf /)`).
+    if command.contains("$(") || command.contains('`') {
+        return Err("command contains shell substitution ($() or backticks) which is not allowed".into());
+    }
+
     // Split by pipes, semicolons, &&, || and validate each command segment.
     for segment in command.split(&['|', ';'][..]) {
         let segment = segment.trim();
