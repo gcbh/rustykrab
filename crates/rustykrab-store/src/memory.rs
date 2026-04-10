@@ -44,9 +44,20 @@ impl MemoryStore {
         Self { tree }
     }
 
+    /// Build a composite key: `conversation_id (16 bytes) || memory_id (16 bytes)`.
+    ///
+    /// This enables efficient prefix scans by conversation, avoiding
+    /// full-table scans (fixes #171).
+    fn composite_key(conversation_id: Uuid, memory_id: Uuid) -> Vec<u8> {
+        let mut key = Vec::with_capacity(32);
+        key.extend_from_slice(conversation_id.as_bytes());
+        key.extend_from_slice(memory_id.as_bytes());
+        key
+    }
+
     /// Store a memory entry.
     pub fn save(&self, entry: &MemoryEntry) -> Result<(), Error> {
-        let key = entry.id.as_bytes().to_vec();
+        let key = Self::composite_key(entry.conversation_id, entry.id);
         let bytes = serde_json::to_vec(entry)?;
         self.tree
             .insert(key, bytes)
@@ -54,11 +65,12 @@ impl MemoryStore {
         Ok(())
     }
 
-    /// Retrieve a memory by its unique ID.
-    pub fn get(&self, id: Uuid) -> Result<MemoryEntry, Error> {
+    /// Retrieve a memory by conversation and memory ID.
+    pub fn get(&self, conversation_id: Uuid, id: Uuid) -> Result<MemoryEntry, Error> {
+        let key = Self::composite_key(conversation_id, id);
         let bytes = self
             .tree
-            .get(id.as_bytes())
+            .get(key)
             .map_err(|e| Error::Storage(e.to_string()))?
             .ok_or_else(|| Error::NotFound(format!("memory {id}")))?;
         let entry: MemoryEntry = serde_json::from_slice(&bytes)?;
@@ -83,13 +95,11 @@ impl MemoryStore {
         let keywords_lower: Vec<String> = keywords.iter().map(|k| k.to_lowercase()).collect();
         let mut results = Vec::new();
 
-        for item in self.tree.iter() {
+        // Prefix scan scoped to this conversation (fixes #171).
+        let prefix = conversation_id.as_bytes().to_vec();
+        for item in self.tree.scan_prefix(&prefix) {
             let (key, value) = item.map_err(|e| Error::Storage(e.to_string()))?;
             let mut entry: MemoryEntry = serde_json::from_slice(&value)?;
-
-            if entry.conversation_id != conversation_id {
-                continue;
-            }
 
             let matches = entry.tags.iter().any(|tag| {
                 let tag_lower = tag.to_lowercase();
@@ -117,35 +127,39 @@ impl MemoryStore {
 
     /// List all memories for a conversation.
     pub fn list_for_conversation(&self, conversation_id: Uuid) -> Result<Vec<MemoryEntry>, Error> {
+        let prefix = conversation_id.as_bytes().to_vec();
         let mut entries = Vec::new();
-        for item in self.tree.iter() {
+        for item in self.tree.scan_prefix(&prefix) {
             let (_, value) = item.map_err(|e| Error::Storage(e.to_string()))?;
             let entry: MemoryEntry = serde_json::from_slice(&value)?;
-            if entry.conversation_id == conversation_id {
-                entries.push(entry);
-            }
+            entries.push(entry);
         }
         entries.sort_by(|a, b| b.created_at.cmp(&a.created_at));
         Ok(entries)
     }
 
     /// Delete a specific memory entry.
-    pub fn delete(&self, id: Uuid) -> Result<(), Error> {
+    pub fn delete(&self, conversation_id: Uuid, id: Uuid) -> Result<(), Error> {
+        let key = Self::composite_key(conversation_id, id);
         self.tree
-            .remove(id.as_bytes())
+            .remove(key)
             .map_err(|e| Error::Storage(e.to_string()))?;
         Ok(())
     }
 
     /// Delete all memories for a conversation.
     pub fn delete_for_conversation(&self, conversation_id: Uuid) -> Result<u32, Error> {
-        let entries = self.list_for_conversation(conversation_id)?;
-        let count = entries.len() as u32;
-        for entry in entries {
-            self.tree
-                .remove(entry.id.as_bytes())
-                .map_err(|e| Error::Storage(e.to_string()))?;
+        let prefix = conversation_id.as_bytes().to_vec();
+        let mut batch = sled::Batch::default();
+        let mut count = 0u32;
+        for item in self.tree.scan_prefix(&prefix) {
+            let (key, _) = item.map_err(|e| Error::Storage(e.to_string()))?;
+            batch.remove(key);
+            count += 1;
         }
+        self.tree
+            .apply_batch(batch)
+            .map_err(|e| Error::Storage(e.to_string()))?;
         Ok(count)
     }
 }

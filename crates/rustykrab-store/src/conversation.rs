@@ -29,13 +29,15 @@ impl ConversationStore {
     }
 
     /// Persist a conversation (insert or update).
+    ///
+    /// Sled handles durability through its own write-ahead log; an
+    /// explicit `flush()` on every save is unnecessary and forces a
+    /// synchronous fsync that hurts throughput (fixes #184).  Callers
+    /// that need an immediate fsync can call `Store::flush()`.
     pub fn save(&self, conv: &Conversation) -> Result<(), Error> {
         let bytes = serde_json::to_vec(conv)?;
         self.tree
             .insert(conv.id.as_bytes(), bytes)
-            .map_err(|e| Error::Storage(e.to_string()))?;
-        self.tree
-            .flush()
             .map_err(|e| Error::Storage(e.to_string()))?;
         Ok(())
     }

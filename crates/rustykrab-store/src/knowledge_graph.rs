@@ -43,6 +43,24 @@ impl KnowledgeGraph {
     /// Add or update an entity in the graph.
     pub fn upsert_entity(&self, entity: &KnowledgeEntity) -> Result<(), Error> {
         let key = entity.id.as_bytes().to_vec();
+
+        // If the entity already exists, check whether the name changed
+        // and remove the stale name-index entry (fixes #162).
+        if let Some(old_bytes) = self
+            .entities
+            .get(&key)
+            .map_err(|e| Error::Storage(e.to_string()))?
+        {
+            let old_entity: KnowledgeEntity = serde_json::from_slice(&old_bytes)?;
+            let old_name_key = old_entity.name.to_lowercase();
+            let new_name_key = entity.name.to_lowercase();
+            if old_name_key != new_name_key {
+                self.entity_names
+                    .remove(old_name_key.as_bytes())
+                    .map_err(|e| Error::Storage(e.to_string()))?;
+            }
+        }
+
         let bytes = serde_json::to_vec(entity)?;
         self.entities
             .insert(key, bytes)
@@ -123,39 +141,36 @@ impl KnowledgeGraph {
     }
 
     /// Delete an entity and all its relations.
+    ///
+    /// Relation removals are applied as an atomic `Batch` so a crash
+    /// mid-delete cannot leave orphaned relations (fixes #168).
     pub fn delete_entity(&self, id: Uuid) -> Result<(), Error> {
-        // Remove the entity.
+        // Collect relation keys to remove first, then apply as an
+        // atomic batch before removing the entity itself. This ordering
+        // ensures a crash never leaves orphaned relations.
+        let mut batch = sled::Batch::default();
+        for entry in self.relations.iter() {
+            let (key, value) = entry.map_err(|e| Error::Storage(e.to_string()))?;
+            if let Ok(rel) = serde_json::from_slice::<KnowledgeRelation>(&value) {
+                if rel.from_id == id || rel.to_id == id {
+                    batch.remove(key);
+                }
+            }
+        }
+        self.relations
+            .apply_batch(batch)
+            .map_err(|e| Error::Storage(e.to_string()))?;
+
+        // Remove the entity and its name index.
         if let Some(bytes) = self
             .entities
             .remove(id.as_bytes())
             .map_err(|e| Error::Storage(e.to_string()))?
         {
-            // Remove name index.
             let entity: KnowledgeEntity = serde_json::from_slice(&bytes)?;
             let name_key = entity.name.to_lowercase();
             self.entity_names
                 .remove(name_key.as_bytes())
-                .map_err(|e| Error::Storage(e.to_string()))?;
-        }
-
-        // Remove all relations involving this entity.
-        let to_remove: Vec<Vec<u8>> = self
-            .relations
-            .iter()
-            .filter_map(|entry| {
-                let (key, value) = entry.ok()?;
-                let rel: KnowledgeRelation = serde_json::from_slice(&value).ok()?;
-                if rel.from_id == id || rel.to_id == id {
-                    Some(key.to_vec())
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        for key in to_remove {
-            self.relations
-                .remove(key)
                 .map_err(|e| Error::Storage(e.to_string()))?;
         }
 
@@ -182,6 +197,13 @@ impl KnowledgeGraph {
         for entry in self.relations.scan_prefix(&prefix) {
             let (_, value) = entry.map_err(|e| Error::Storage(e.to_string()))?;
             let rel: KnowledgeRelation = serde_json::from_slice(&value)?;
+            // Verify the prefix scan returned a relation that actually
+            // belongs to this entity (guards against key-collision after
+            // deserialization, fixes #189).
+            debug_assert_eq!(
+                rel.from_id, entity_id,
+                "prefix scan returned relation with unexpected from_id"
+            );
             results.push(rel);
         }
         Ok(results)
