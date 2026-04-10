@@ -17,7 +17,9 @@ pub struct BrowserConfig {
     pub enabled: bool,
 
     /// Whether `evaluate` (arbitrary JS) is allowed.
-    #[serde(default = "default_true")]
+    /// Defaults to false for security — arbitrary JS can access cookies,
+    /// session tokens, and other sensitive data in the browser context.
+    #[serde(default)]
     pub evaluate_enabled: bool,
 
     /// Default profile name used when `profile` is omitted from a tool call.
@@ -148,7 +150,7 @@ impl Default for BrowserConfig {
         );
         Self {
             enabled: true,
-            evaluate_enabled: true,
+            evaluate_enabled: false,
             default_profile: "rustykrab".to_string(),
             headless: false,
             no_sandbox: false,
