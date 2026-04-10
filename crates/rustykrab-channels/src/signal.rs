@@ -201,13 +201,14 @@ impl SignalChannel {
         payload: &[u8],
         secret_header: Option<&str>,
     ) -> Result<()> {
-        // Validate webhook secret if configured (using constant-time comparison).
-        if let Some(ref secret) = self.webhook_secret {
-            let header = secret_header
-                .ok_or_else(|| Error::Auth("missing X-Signal-Webhook-Secret header".into()))?;
-            if !constant_time_eq(header, secret) {
-                return Err(Error::Auth("invalid Signal webhook secret".into()));
-            }
+        // Validate webhook secret (required — reject if none configured).
+        let secret = self.webhook_secret.as_ref().ok_or_else(|| {
+            Error::Auth("no webhook secret configured — refusing unauthenticated payload".into())
+        })?;
+        let header = secret_header
+            .ok_or_else(|| Error::Auth("missing X-Signal-Webhook-Secret header".into()))?;
+        if !constant_time_eq(header, secret) {
+            return Err(Error::Auth("invalid Signal webhook secret".into()));
         }
 
         let envelope: Envelope = serde_json::from_slice(payload)?;

@@ -7,7 +7,13 @@ use rustykrab_core::types::{
 };
 use rustykrab_core::Error;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 use uuid::Uuid;
+
+/// Maximum number of retries for transient errors (429, 5xx).
+const MAX_RETRIES: u32 = 3;
+/// Base delay for exponential backoff (doubles each retry).
+const RETRY_BASE_DELAY: Duration = Duration::from_secs(1);
 
 /// Configuration for Ollama model inference.
 #[derive(Debug, Clone)]
@@ -70,8 +76,13 @@ pub struct OllamaProvider {
 
 impl OllamaProvider {
     pub fn new(model: impl Into<String>) -> Self {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(300))
+            .connect_timeout(Duration::from_secs(10))
+            .build()
+            .expect("failed to build HTTP client");
         Self {
-            client: reqwest::Client::new(),
+            client,
             base_url: "http://localhost:11434".to_string(),
             model: model.into(),
             config: OllamaConfig::default(),
@@ -267,33 +278,53 @@ impl ModelProvider for OllamaProvider {
         tracing::debug!(model = %self.model, base_url = %self.base_url, "calling Ollama chat API");
 
         let url = format!("{}/api/chat", self.base_url);
-        let resp = self
-            .client
-            .post(&url)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| {
-                Error::ModelProvider(format!(
-                    "failed to connect to Ollama at {}: {e}. Is Ollama running?",
-                    self.base_url
-                ))
-            })?;
 
-        let status = resp.status();
-        if !status.is_success() {
+        let mut last_err = None;
+        for attempt in 0..=MAX_RETRIES {
+            if attempt > 0 {
+                let delay = RETRY_BASE_DELAY * 2u32.pow(attempt - 1);
+                tracing::warn!(attempt, "retrying Ollama API after {delay:?}");
+                tokio::time::sleep(delay).await;
+            }
+
+            let resp = match self
+                .client
+                .post(&url)
+                .json(&body)
+                .send()
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    last_err = Some(Error::ModelProvider(format!(
+                        "failed to connect to Ollama at {}: {e}. Is Ollama running?",
+                        self.base_url
+                    )));
+                    continue;
+                }
+            };
+
+            let status = resp.status();
+            if status.is_success() {
+                let ollama_resp: OllamaResponse = resp
+                    .json()
+                    .await
+                    .map_err(|e| Error::ModelProvider(format!("failed to parse Ollama response: {e}")))?;
+                return Self::parse_response(ollama_resp);
+            }
+
             let error_body = resp.text().await.unwrap_or_default();
-            return Err(Error::ModelProvider(format!(
+            let is_retryable = matches!(status.as_u16(), 429 | 500 | 502 | 503 | 529);
+            last_err = Some(Error::ModelProvider(format!(
                 "Ollama API returned {status}: {error_body}"
             )));
+
+            if !is_retryable {
+                break;
+            }
         }
 
-        let ollama_resp: OllamaResponse = resp
-            .json()
-            .await
-            .map_err(|e| Error::ModelProvider(format!("failed to parse Ollama response: {e}")))?;
-
-        Self::parse_response(ollama_resp)
+        Err(last_err.unwrap_or_else(|| Error::ModelProvider("request failed".into())))
     }
 }
 

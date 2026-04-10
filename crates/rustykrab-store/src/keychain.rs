@@ -198,7 +198,7 @@ pub fn resolve_master_key() -> Result<Vec<u8>, Error> {
     // Priority 3: generate and store a new key.
     tracing::info!("no master key found — generating and storing in macOS Keychain");
     let mut key = [0u8; 32];
-    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut key);
+    rand::RngCore::fill_bytes(&mut rand::rng(), &mut key);
     set_master_key(&key)?;
     tracing::info!(
         "master key stored in macOS Keychain under '{SERVICE_NAME}' \
@@ -224,7 +224,7 @@ pub fn resolve_master_key() -> Result<Vec<u8>, Error> {
          generating ephemeral key. Secrets will not survive restart."
     );
     let mut key = [0u8; 32];
-    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut key);
+    rand::RngCore::fill_bytes(&mut rand::rng(), &mut key);
     Ok(key.to_vec())
 }
 
