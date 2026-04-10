@@ -22,7 +22,7 @@ pub struct SkillMdFrontmatter {
     pub emoji: Option<String>,
     /// Forward-compatible catch-all for unknown fields.
     #[serde(flatten)]
-    pub extra: HashMap<String, serde_yaml::Value>,
+    pub extra: HashMap<String, serde_yml::Value>,
 }
 
 /// Environment and binary requirements for a skill.
@@ -93,7 +93,7 @@ pub fn parse_skill_md(content: &str) -> Result<(SkillMdFrontmatter, String), Str
     };
 
     let frontmatter: SkillMdFrontmatter =
-        serde_yaml::from_str(yaml_str).map_err(|e| format!("invalid SKILL.md frontmatter: {e}"))?;
+        serde_yml::from_str(yaml_str).map_err(|e| format!("invalid SKILL.md frontmatter: {e}"))?;
 
     Ok((frontmatter, body.to_string()))
 }

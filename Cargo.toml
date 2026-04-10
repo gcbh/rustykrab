@@ -16,6 +16,7 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.85"
 license = "MIT"
 repository = "https://github.com/gcbh/rustycrab"
 
@@ -29,7 +30,7 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls", "j
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-serde_yaml = "0.9"
+serde_yml = "0.0.12"
 toml = "0.8"
 
 # Error handling
@@ -74,9 +75,12 @@ chromiumoxide = "0.9"
 
 # Email (IMAP + SMTP)
 imap = "2"
-native-tls = "0.2"
-lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "tokio1-native-tls", "builder"] }
+lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "tokio1-rustls", "rustls-native-certs", "aws-lc-rs", "builder"] }
 mail-parser = "0.9"
+
+# TLS (unified on rustls — no OpenSSL dependency)
+rustls = "0.23"
+rustls-native-certs = "0.8"
 
 # Internal crates
 rustykrab-core = { path = "crates/rustykrab-core" }
@@ -89,3 +93,9 @@ rustykrab-channels = { path = "crates/rustykrab-channels" }
 rustykrab-skills = { path = "crates/rustykrab-skills" }
 rustykrab-cli = { path = "crates/rustykrab-cli" }
 rustykrab-memory = { path = "crates/rustykrab-memory" }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

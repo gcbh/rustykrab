@@ -21,7 +21,8 @@ tokio-stream.workspace = true
 url = "2"
 imap.workspace = true
 imap-proto = "0.10"
-native-tls.workspace = true
+rustls.workspace = true
+rustls-native-certs.workspace = true
 lettre.workspace = true
 mail-parser.workspace = true
 
