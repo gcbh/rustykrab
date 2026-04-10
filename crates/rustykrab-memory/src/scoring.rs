@@ -65,6 +65,7 @@ fn count_named_entities(content: &str) -> usize {
 
 /// Simple sentiment intensity based on the presence of strong words.
 /// Returns a value in [0.0, 1.0].
+/// Uses word-boundary matching to avoid false positives (#136).
 fn sentiment_intensity(content: &str) -> f64 {
     const STRONG_WORDS: &[&str] = &[
         "love", "hate", "amazing", "terrible", "critical", "urgent",
@@ -74,18 +75,39 @@ fn sentiment_intensity(content: &str) -> f64 {
     ];
 
     let lower = content.to_lowercase();
+    let words: Vec<&str> = lower
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect();
     let matches = STRONG_WORDS
         .iter()
-        .filter(|w| lower.contains(**w))
+        .filter(|w| words.contains(w))
         .count();
 
     (matches as f64 / 3.0).min(1.0) // 3+ strong words → max intensity
 }
 
 /// Check for temporal markers (dates, days, relative time references).
+/// Multi-word markers use substring matching; single-word markers use
+/// word-boundary matching to avoid false positives like "may" in "maybe" (#138).
 fn has_temporal_markers(content: &str) -> bool {
     let lower = content.to_lowercase();
-    let markers = [
+
+    // Multi-word markers can safely use substring matching.
+    const MULTI_WORD_MARKERS: &[&str] = &[
+        "next week",
+        "last week",
+        "next month",
+        "this morning",
+        "by end of",
+        "due date",
+    ];
+    if MULTI_WORD_MARKERS.iter().any(|m| lower.contains(m)) {
+        return true;
+    }
+
+    // Single-word markers use word-boundary matching.
+    const SINGLE_WORD_MARKERS: &[&str] = &[
         "today",
         "tomorrow",
         "yesterday",
@@ -96,14 +118,8 @@ fn has_temporal_markers(content: &str) -> bool {
         "friday",
         "saturday",
         "sunday",
-        "next week",
-        "last week",
-        "next month",
-        "this morning",
         "tonight",
         "deadline",
-        "by end of",
-        "due date",
         "scheduled",
         "january",
         "february",
@@ -119,7 +135,11 @@ fn has_temporal_markers(content: &str) -> bool {
         "december",
     ];
 
-    markers.iter().any(|m| lower.contains(m))
+    let words: Vec<&str> = lower
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect();
+    SINGLE_WORD_MARKERS.iter().any(|m| words.contains(m))
 }
 
 /// Reciprocal Rank Fusion: merge multiple ranked lists into a single

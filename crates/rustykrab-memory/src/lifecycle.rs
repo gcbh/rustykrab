@@ -74,9 +74,10 @@ impl LifecycleManager {
             }
 
             // Demotion criteria: low effective score AND idle > 30 days.
+            // Use max(0) instead of unsigned_abs() to surface clock skew (#119).
             let idle_hours = (now - mem.last_accessed_at.unwrap_or(mem.created_at))
                 .num_hours()
-                .unsigned_abs() as f64;
+                .max(0) as f64;
             let effective_decay = mem.decay_rate * (1.0 - mem.importance * 0.8);
             let score = mem.importance * (-effective_decay * idle_hours / 168.0).exp();
 
@@ -152,15 +153,27 @@ impl LifecycleManager {
             return Ok(0);
         }
 
+        // Cap the number of memories to prevent O(n^2) blowup (#114).
+        const MAX_DEDUP_MEMORIES: usize = 500;
+
         // Get embeddings for all memories (use first chunk of each).
         let mut mem_embeddings: Vec<(Uuid, Vec<f32>)> = Vec::new();
-        for mem in &memories {
+        for mem in memories.iter().take(MAX_DEDUP_MEMORIES) {
             let chunks = self.storage.get_chunks_for_memory(mem.id).await?;
             if let Some(first) = chunks.first() {
                 if !first.embedding.is_empty() {
                     mem_embeddings.push((mem.id, first.embedding.clone()));
                 }
             }
+        }
+
+        if mem_embeddings.len() > MAX_DEDUP_MEMORIES {
+            tracing::warn!(
+                agent_id = %agent_id,
+                total = memories.len(),
+                capped_to = MAX_DEDUP_MEMORIES,
+                "near-duplicate detection capped to prevent O(n^2) blowup"
+            );
         }
 
         let mut link_count = 0u32;
@@ -199,7 +212,7 @@ impl LifecycleManager {
                     link_count += 2;
                     links_for_i += 1;
                 } else if sim >= self.config.dedup_distinct_threshold as f32 {
-                    // Semantically similar but distinct.
+                    // Semantically similar but distinct — create bidirectional links (#125).
                     let link = MemoryLink {
                         source_id: mem_embeddings[i].0,
                         target_id: mem_embeddings[j].0,
@@ -208,7 +221,16 @@ impl LifecycleManager {
                         created_at: now,
                     };
                     self.storage.upsert_link(&link).await?;
-                    link_count += 1;
+
+                    let reverse = MemoryLink {
+                        source_id: mem_embeddings[j].0,
+                        target_id: mem_embeddings[i].0,
+                        link_type: LinkType::SemanticSimilar,
+                        weight: sim as f64,
+                        created_at: now,
+                    };
+                    self.storage.upsert_link(&reverse).await?;
+                    link_count += 2;
                     links_for_i += 1;
                 }
             }

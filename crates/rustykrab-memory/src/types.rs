@@ -92,9 +92,10 @@ impl Memory {
     /// where `effective_decay = decay_rate × (1 − importance × 0.8)` so that
     /// high-importance memories decay up to 5× slower.
     pub fn effective_score(&self, query_similarity: f64, now: DateTime<Utc>) -> f64 {
+        // Use max(0, hours) instead of unsigned_abs() to surface clock skew (#119).
         let idle_hours = (now - self.last_accessed_at.unwrap_or(self.created_at))
             .num_hours()
-            .unsigned_abs() as f64;
+            .max(0) as f64;
 
         // High-importance memories decay up to 5× slower.
         let effective_decay = self.decay_rate * (1.0 - self.importance * 0.8);
@@ -179,6 +180,20 @@ pub enum LinkType {
     Consolidation,
     /// Contradiction between memories.
     Contradicts,
+}
+
+/// Stable string representation for link keys (#147).
+/// Use this instead of Debug formatting which is not stable across refactors.
+impl std::fmt::Display for LinkType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SemanticSimilar => write!(f, "semantic_similar"),
+            Self::EntityCooccurrence => write!(f, "entity_cooccurrence"),
+            Self::CausalChain => write!(f, "causal_chain"),
+            Self::Consolidation => write!(f, "consolidation"),
+            Self::Contradicts => write!(f, "contradicts"),
+        }
+    }
 }
 
 /// Which retrieval strategy produced a result.

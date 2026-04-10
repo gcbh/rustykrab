@@ -64,11 +64,14 @@ impl MemoryRetriever {
             vecs.into_iter().next().unwrap_or_default()
         };
 
-        // ── Stage 2: Parallel dispatch ──────────────────────────
+        // ── Stage 2: Fetch embeddings once, then dispatch ──────
+        // Shared embedding fetch avoids duplicate full-table scans (#106).
+        let chunk_embeddings = self.storage.get_all_chunk_embeddings(agent_id).await?;
+
         let (semantic_results, keyword_results, graph_results, temporal_results) = tokio::join!(
-            self.retrieve_semantic(agent_id, &query_embedding, candidates),
-            self.retrieve_bm25(query, candidates),
-            self.retrieve_graph(agent_id, &query_embedding, candidates),
+            self.retrieve_semantic(&query_embedding, &chunk_embeddings, candidates),
+            self.retrieve_bm25(query, agent_id, candidates),
+            self.retrieve_graph(&query_embedding, &chunk_embeddings, candidates),
             self.retrieve_temporal(agent_id, candidates),
         );
 
@@ -108,9 +111,18 @@ impl MemoryRetriever {
                     continue;
                 }
 
-                // Use RRF score as a proxy for query similarity in effective_score.
-                // Normalize to [0, 1] range approximately.
-                let normalized_rrf = (*rrf_score * self.config.rrf_k).min(1.0);
+                // Normalize RRF score to [0, 1] using the theoretical max (#117).
+                // max_rrf = sum_of_all_weights / rrf_k (when doc is rank 0 in all arms).
+                let max_rrf = (self.config.rrf_weight_semantic
+                    + self.config.rrf_weight_keyword
+                    + self.config.rrf_weight_graph
+                    + self.config.rrf_weight_temporal)
+                    / self.config.rrf_k;
+                let normalized_rrf = if max_rrf > 0.0 {
+                    (*rrf_score / max_rrf).min(1.0)
+                } else {
+                    0.0
+                };
                 let eff_score = mem.effective_score(normalized_rrf, now);
 
                 results.push(RetrievalResult {
@@ -133,13 +145,15 @@ impl MemoryRetriever {
         results.truncate(limit);
 
         // ── Stage 5: Record access on returned results ──────────
+        // Batch access updates instead of spawning unbounded tasks (#110).
         for result in &results {
-            // Fire-and-forget access recording.
-            let storage = Arc::clone(&self.storage);
-            let id = result.memory_id;
-            tokio::spawn(async move {
-                let _ = storage.record_access(id).await;
-            });
+            if let Err(e) = self.storage.record_access(result.memory_id).await {
+                tracing::warn!(
+                    memory_id = %result.memory_id,
+                    error = %e,
+                    "failed to record access"
+                );
+            }
         }
 
         debug!(
@@ -151,20 +165,19 @@ impl MemoryRetriever {
         Ok(results)
     }
 
-    /// Semantic retrieval: embed query and find nearest neighbors via
-    /// brute-force cosine similarity over all chunk embeddings.
+    /// Semantic retrieval: find nearest neighbors via brute-force cosine
+    /// similarity over pre-fetched chunk embeddings.
     async fn retrieve_semantic(
         &self,
-        agent_id: Uuid,
         query_vec: &[f32],
+        chunk_embeddings: &[(Uuid, Vec<f32>)],
         limit: usize,
     ) -> rustykrab_core::Result<Vec<(Uuid, usize)>> {
         if query_vec.is_empty() || query_vec.iter().all(|v| *v == 0.0) {
             return Ok(Vec::new());
         }
 
-        let chunk_embeddings = self.storage.get_all_chunk_embeddings(agent_id).await?;
-        let top = embedding::top_k_similar(query_vec, &chunk_embeddings, limit * 2);
+        let top = embedding::top_k_similar(query_vec, chunk_embeddings, limit * 2);
 
         // Deduplicate to memory level (multiple chunks may belong to same memory).
         let mut seen = HashSet::new();
@@ -181,14 +194,16 @@ impl MemoryRetriever {
         Ok(results)
     }
 
-    /// Keyword retrieval: BM25 search over in-memory inverted index.
+    /// Keyword retrieval: BM25 search over in-memory inverted index,
+    /// scoped to the querying agent.
     async fn retrieve_bm25(
         &self,
         query: &str,
+        agent_id: Uuid,
         limit: usize,
     ) -> rustykrab_core::Result<Vec<(Uuid, usize)>> {
         let index = self.bm25_index.lock().await;
-        let results = index.search(query, limit);
+        let results = index.search(query, agent_id, limit);
         Ok(results
             .into_iter()
             .enumerate()
@@ -197,11 +212,11 @@ impl MemoryRetriever {
     }
 
     /// Graph retrieval: find semantically similar memories, then expand
-    /// via precomputed links (1-hop).
+    /// via precomputed links (1-hop). Uses pre-fetched embeddings.
     async fn retrieve_graph(
         &self,
-        agent_id: Uuid,
         query_vec: &[f32],
+        chunk_embeddings: &[(Uuid, Vec<f32>)],
         limit: usize,
     ) -> rustykrab_core::Result<Vec<(Uuid, usize)>> {
         if query_vec.is_empty() || query_vec.iter().all(|v| *v == 0.0) {
@@ -209,8 +224,7 @@ impl MemoryRetriever {
         }
 
         // Seed: top-5 from semantic search.
-        let chunk_embeddings = self.storage.get_all_chunk_embeddings(agent_id).await?;
-        let seeds = embedding::top_k_similar(query_vec, &chunk_embeddings, 5);
+        let seeds = embedding::top_k_similar(query_vec, chunk_embeddings, 5);
 
         let mut seen = HashSet::new();
         let mut linked = Vec::new();

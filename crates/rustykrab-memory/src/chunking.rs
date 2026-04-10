@@ -1,6 +1,7 @@
 /// Estimate token count for a text string (~3.5 chars per token).
+/// Uses char count instead of byte length for correct CJK handling (#122).
 pub fn estimate_tokens(text: &str) -> usize {
-    (text.len() as f64 / 3.5).ceil() as usize
+    (text.chars().count() as f64 / 3.5).ceil() as usize
 }
 
 /// Estimate character count for a given token budget.

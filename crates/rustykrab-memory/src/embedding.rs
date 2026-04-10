@@ -18,9 +18,17 @@ pub trait Embedder: Send + Sync {
     fn model_version(&self) -> &str;
 }
 
-/// Cosine similarity between two vectors. Returns 0.0 for zero-norm vectors.
+/// Cosine similarity between two vectors. Returns 0.0 for zero-norm vectors
+/// or mismatched dimensions (#144).
 pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-    debug_assert_eq!(a.len(), b.len(), "vector dimension mismatch");
+    if a.len() != b.len() {
+        tracing::warn!(
+            a_len = a.len(),
+            b_len = b.len(),
+            "cosine_similarity: dimension mismatch, returning 0.0"
+        );
+        return 0.0;
+    }
 
     let mut dot = 0.0f32;
     let mut norm_a = 0.0f32;
@@ -121,9 +129,12 @@ impl Embedder for HashEmbedder {
                     }
                     let bytes: [u8; 4] =
                         hash[offset..offset + 4].try_into().unwrap_or([0; 4]);
-                    // Map to [-1, 1] range.
-                    let val = (f32::from_bits(u32::from_le_bytes(bytes)) % 2.0) - 1.0;
-                    vec.push(if val.is_finite() { val } else { 0.0 });
+                    // Map hash bytes to [-1, 1] deterministically without
+                    // producing NaN/Inf (#131). Use integer interpretation
+                    // instead of f32::from_bits which can produce NaN/Inf.
+                    let int_val = i32::from_le_bytes(bytes);
+                    let val = int_val as f64 / i32::MAX as f64;
+                    vec.push(val as f32);
                     offset += 4;
                 }
 

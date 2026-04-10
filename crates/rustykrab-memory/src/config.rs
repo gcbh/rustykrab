@@ -1,5 +1,12 @@
 use serde::{Deserialize, Serialize};
 
+/// Validation error for memory configuration.
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigValidationError {
+    #[error("{field} must be greater than zero, got {value}")]
+    MustBePositive { field: &'static str, value: String },
+}
+
 /// Configuration for the memory system.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryConfig {
@@ -52,6 +59,26 @@ pub struct MemoryConfig {
     pub embedding_dimensions: usize,
     /// Model version string for provenance tracking.
     pub embedding_model_version: String,
+}
+
+impl MemoryConfig {
+    /// Validate the configuration, returning an error if any value would
+    /// cause a division by zero or other runtime panic (#141).
+    pub fn validate(&self) -> Result<(), ConfigValidationError> {
+        if self.chunk_max_tokens == 0 {
+            return Err(ConfigValidationError::MustBePositive {
+                field: "chunk_max_tokens",
+                value: "0".to_string(),
+            });
+        }
+        if self.rrf_k == 0.0 {
+            return Err(ConfigValidationError::MustBePositive {
+                field: "rrf_k",
+                value: "0.0".to_string(),
+            });
+        }
+        Ok(())
+    }
 }
 
 impl Default for MemoryConfig {

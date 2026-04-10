@@ -148,7 +148,7 @@ impl MemoryWriter {
         // ── BM25 index ─────────────────────────────────────────
         {
             let mut index = self.bm25_index.lock().await;
-            index.index_document(memory_id, &turn.content);
+            index.index_document(memory_id, agent_id, &turn.content);
         }
 
         // ── Track 2: Async background extraction ────────────────
@@ -205,9 +205,11 @@ impl MemoryWriter {
     ) -> rustykrab_core::Result<usize> {
         let memories = self.storage.list_retrievable(agent_id).await?;
         let mut index = self.bm25_index.lock().await;
+        // Clear existing entries before rebuilding to prevent double-indexing (#128).
+        index.clear();
         let count = memories.len();
         for mem in memories {
-            index.index_document(mem.id, &mem.content);
+            index.index_document(mem.id, agent_id, &mem.content);
         }
         debug!(agent_id = %agent_id, indexed = count, "BM25 index rebuilt");
         Ok(count)
