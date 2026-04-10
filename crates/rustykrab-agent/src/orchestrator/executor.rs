@@ -78,9 +78,9 @@ impl ParallelExecutor {
 
             // Execute all ready tasks concurrently, bounded by a semaphore
             // to prevent pathological workloads from spawning unbounded
-            // concurrent LLM calls (fixes ASYNC-M1).
+            // concurrent LLM calls.
             let semaphore = Arc::new(Semaphore::new(self.config.max_concurrent_tasks));
-            let mut handles = Vec::new();
+            let mut handles: Vec<(Uuid, _)> = Vec::new();
             for task in &ready {
                 // Gather dependency results as context.
                 let dep_context: Vec<String> = task
@@ -91,6 +91,7 @@ impl ParallelExecutor {
                     .map(|r| r.output.clone())
                     .collect();
 
+                let task_id = task.id;
                 let task = (*task).clone();
                 let provider = self.provider.clone();
                 let tools = self.tools.clone();
@@ -99,29 +100,45 @@ impl ParallelExecutor {
                 let sys_ctx = system_context.map(|s| s.to_string());
                 let sem = semaphore.clone();
 
-                handles.push(tokio::spawn(async move {
-                    let _permit = sem.acquire().await.expect("semaphore closed");
-                    execute_sub_task(
-                        &task,
-                        &dep_context,
-                        sys_ctx.as_deref(),
-                        &provider,
-                        &tools,
-                        &sandbox,
-                        &config,
-                    )
-                    .await
-                }));
+                handles.push((
+                    task_id,
+                    tokio::spawn(async move {
+                        let _permit = sem.acquire().await.expect("semaphore closed");
+                        execute_sub_task(
+                            &task,
+                            &dep_context,
+                            sys_ctx.as_deref(),
+                            &provider,
+                            &tools,
+                            &sandbox,
+                            &config,
+                        )
+                        .await
+                    }),
+                ));
             }
 
-            for handle in handles {
+            for (task_id, handle) in handles {
                 match handle.await {
                     Ok(result) => {
                         completed.insert(result.task_id);
                         results.insert(result.task_id, result);
                     }
                     Err(e) => {
-                        tracing::error!("sub-task panicked: {e}");
+                        tracing::error!(task_id = %task_id, "sub-task panicked: {e}");
+                        // Insert a failure result so downstream consumers know the
+                        // task failed rather than silently receiving incomplete results.
+                        completed.insert(task_id);
+                        results.insert(
+                            task_id,
+                            SubTaskResult {
+                                task_id,
+                                output: String::new(),
+                                success: false,
+                                error: Some(format!("task panicked: {e}")),
+                                tokens_used: 0,
+                            },
+                        );
                     }
                 }
             }
