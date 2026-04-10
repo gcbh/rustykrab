@@ -66,6 +66,9 @@ mod http_session;
 // Email tools
 mod gmail;
 
+// Notion integration
+mod notion;
+
 // Credentials (from main)
 mod credential_read;
 mod credential_write;
@@ -139,6 +142,9 @@ pub use http_session::HttpSessionTool;
 // Email
 pub use gmail::GmailTool;
 
+// Notion
+pub use notion::NotionTool;
+
 // Credentials
 pub use credential_read::CredentialReadTool;
 pub use credential_write::CredentialWriteTool;
@@ -182,6 +188,8 @@ pub fn builtin_tools(
         std::sync::Arc::new(NodesTool::new()),
         // Email
         std::sync::Arc::new(GmailTool::new(secrets.clone())),
+        // Notion
+        std::sync::Arc::new(NotionTool::new(secrets.clone())),
         // Credentials
         std::sync::Arc::new(CredentialReadTool::new(secrets.clone())),
         std::sync::Arc::new(CredentialWriteTool::new(secrets)),
