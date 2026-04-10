@@ -183,6 +183,7 @@ impl AgentRunner {
                 message,
                 usage,
                 stop_reason,
+                ..
             } = self.provider.chat(&conv.messages, &schemas).await?;
             let llm_elapsed = llm_start.elapsed();
             tracing::info!(
@@ -265,6 +266,7 @@ impl AgentRunner {
                                 content: MessageContent::ToolResult(ToolResult {
                                     call_id,
                                     output: serde_json::json!({ "error": err_str }),
+                                    is_error: true,
                                 }),
                                 created_at: Utc::now(),
                             }
@@ -378,6 +380,7 @@ impl AgentRunner {
                 message,
                 usage,
                 stop_reason,
+                ..
             } = self
                 .provider
                 .chat_stream(&conv.messages, &schemas, &stream_callback)
@@ -466,6 +469,7 @@ impl AgentRunner {
                                 content: MessageContent::ToolResult(ToolResult {
                                     call_id: call_id.clone(),
                                     output: serde_json::json!({ "error": err_str }),
+                                    is_error: true,
                                 }),
                                 created_at: Utc::now(),
                             };
@@ -982,6 +986,7 @@ async fn execute_single_tool(
     Ok(ToolResult {
         call_id: call.id.clone(),
         output,
+        is_error: false,
     })
 }
 

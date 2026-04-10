@@ -106,6 +106,18 @@ pub enum Error {
     #[error("model provider error: {0}")]
     ModelProvider(String),
 
+    #[error("model provider rate limited: {0}")]
+    ModelRateLimit(String),
+
+    #[error("model provider authentication failed: {0}")]
+    ModelAuthError(String),
+
+    #[error("model provider bad request: {0}")]
+    ModelBadRequest(String),
+
+    #[error("model provider overloaded: {0}")]
+    ModelOverloaded(String),
+
     #[error("tool execution error: {0}")]
     ToolExecution(ToolError),
 

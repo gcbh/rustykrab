@@ -10,6 +10,10 @@ pub struct ModelResponse {
     pub usage: Usage,
     /// The stop reason from the model — tells us if there are more tool calls.
     pub stop_reason: StopReason,
+    /// Text content returned alongside tool calls in a mixed response.
+    /// When the model returns both reasoning text and tool_use blocks,
+    /// the tool calls go into `message.content` and the text is preserved here.
+    pub text: Option<String>,
 }
 
 /// Why the model stopped generating.
@@ -28,6 +32,10 @@ pub enum StopReason {
 pub struct Usage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
+    /// Tokens read from the prompt cache (Anthropic).
+    pub cache_read_tokens: u32,
+    /// Tokens written into the prompt cache (Anthropic).
+    pub cache_creation_tokens: u32,
 }
 
 /// A chunk of a streaming response.
