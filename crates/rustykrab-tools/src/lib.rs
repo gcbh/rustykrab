@@ -51,6 +51,7 @@ mod image;
 mod image_generate;
 mod pdf;
 mod tts;
+mod video;
 
 // UI tools
 mod browser;
@@ -124,6 +125,7 @@ pub use self::image::ImageTool;
 pub use image_generate::ImageGenerateTool;
 pub use pdf::PdfTool;
 pub use tts::TtsTool;
+pub use video::{VideoBackend, VideoChannelAdapter, VideoTool};
 
 // UI
 pub use browser::BrowserTool;
@@ -239,4 +241,11 @@ pub fn automation_tools(
         std::sync::Arc::new(CronTool::new(cron_backend)),
         std::sync::Arc::new(GatewayTool::new(gateway_backend)),
     ]
+}
+
+/// Collect video tools that require a VideoBackend into a Vec.
+pub fn video_tools(
+    backend: std::sync::Arc<dyn VideoBackend>,
+) -> Vec<std::sync::Arc<dyn rustykrab_core::Tool>> {
+    vec![std::sync::Arc::new(VideoTool::new(backend))]
 }

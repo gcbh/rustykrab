@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use rustykrab_agent::{AgentEvent, HarnessProfile, HarnessRouter, OrchestrationPipeline};
-use rustykrab_channels::{ChannelMessage, TelegramChannel};
+use rustykrab_channels::{ChannelMessage, TelegramChannel, VideoChannel, VideoConfig};
 use rustykrab_core::model::ModelProvider;
 use rustykrab_core::orchestration::OrchestrationConfig;
 use rustykrab_core::types::MessageContent;
@@ -152,10 +152,45 @@ async fn main() -> anyhow::Result<()> {
     });
     tracing::info!("memory system initialized");
 
+    // --- Video channel (optional, enabled via RUSTYKRAB_VIDEO=true) ---
+    let video_enabled = std::env::var("RUSTYKRAB_VIDEO")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false);
+
+    let video_channel: Option<Arc<VideoChannel>> = if video_enabled {
+        let video_dir = data_dir.join("video");
+        std::fs::create_dir_all(&video_dir)?;
+
+        let mut video_config = VideoConfig::default();
+        video_config.projects_dir = video_dir;
+
+        // Allow custom npx path via env.
+        if let Ok(npx) = std::env::var("RUSTYKRAB_NPX_PATH") {
+            video_config.npx_path = npx;
+        }
+
+        let channel = Arc::new(VideoChannel::new(video_config));
+        tracing::info!("video communication channel enabled");
+        Some(channel)
+    } else {
+        tracing::info!(
+            "video channel disabled (set RUSTYKRAB_VIDEO=true to enable)"
+        );
+        None
+    };
+
     // --- Tools ---
     let mut tools = rustykrab_tools::builtin_tools(store.secrets());
     tools.extend(rustykrab_tools::memory_tools(memory_backend));
     tools.extend(rustykrab_tools::skill_tools(skills_dir.clone()));
+
+    // --- Video tool (if video channel enabled) ---
+    if let Some(ref vc) = video_channel {
+        let video_backend: Arc<dyn rustykrab_tools::VideoBackend> =
+            Arc::new(rustykrab_tools::VideoChannelAdapter::new(vc.clone()));
+        tools.extend(rustykrab_tools::video_tools(video_backend));
+        tracing::info!("video tool registered");
+    }
 
     // --- Log provider status ---
     tracing::info!(provider = provider.name(), "model provider configured");
@@ -217,6 +252,11 @@ async fn main() -> anyhow::Result<()> {
 
     if let Some(pipeline) = orchestration_pipeline {
         state = state.with_orchestration_pipeline(pipeline);
+    }
+
+    // --- Attach video channel to state ---
+    if let Some(vc) = video_channel {
+        state = state.with_video(vc);
     }
 
     // Track infrastructure task JoinHandles so panics are surfaced
@@ -343,6 +383,9 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("Telegram agent loop started");
     }
 
+    // Save a reference to the video channel for shutdown.
+    let video_shutdown_handle = state.video.clone();
+
     // --- Gateway with security middleware ---
     let app = rustykrab_gateway::router(state);
 
@@ -369,6 +412,12 @@ async fn main() -> anyhow::Result<()> {
                 tracing::error!("infrastructure task panicked during shutdown: {e}");
             }
         }
+    }
+
+    // Shut down video channel (MCP server).
+    if let Some(ref vc) = video_shutdown_handle {
+        tracing::info!("shutting down video channel...");
+        vc.shutdown().await;
     }
 
     // Flush database before exit

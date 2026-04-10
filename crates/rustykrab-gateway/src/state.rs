@@ -1,7 +1,7 @@
 use rustykrab_agent::{
     HarnessProfile, HarnessRouter, OrchestrationPipeline, ProcessSandbox, Sandbox,
 };
-use rustykrab_channels::{SignalChannel, TelegramChannel};
+use rustykrab_channels::{SignalChannel, TelegramChannel, VideoChannel};
 use rustykrab_core::model::ModelProvider;
 use rustykrab_core::orchestration::OrchestrationConfig;
 use rustykrab_skills::SkillRegistry;
@@ -22,6 +22,8 @@ pub struct AppState {
     pub origin_policy: OriginPolicy,
     pub telegram: Option<Arc<TelegramChannel>>,
     pub signal: Option<Arc<SignalChannel>>,
+    /// Video communication channel (hyperframes MCP).
+    pub video: Option<Arc<VideoChannel>>,
     /// Sandbox for tool execution isolation.
     pub sandbox: Arc<dyn Sandbox>,
     /// Base harness profile (used as fallback and template).
@@ -54,6 +56,7 @@ impl AppState {
             origin_policy: OriginPolicy::default(),
             telegram: None,
             signal: None,
+            video: None,
             sandbox: Arc::new(ProcessSandbox::new()),
             harness_profile: HarnessProfile::default(),
             harness_router: None,
@@ -84,6 +87,12 @@ impl AppState {
     /// Attach a Signal channel.
     pub fn with_signal(mut self, signal: Arc<SignalChannel>) -> Self {
         self.signal = Some(signal);
+        self
+    }
+
+    /// Attach a Video communication channel.
+    pub fn with_video(mut self, video: Arc<VideoChannel>) -> Self {
+        self.video = Some(video);
         self
     }
 
