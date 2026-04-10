@@ -5,7 +5,6 @@
 	<key>keychain-access-groups</key>
 	<array>
 		<string>com.rustykrab.master-key</string>
-		<string>com.rustykrab.credentials</string>
 	</array>
 </dict>
 </plist>
