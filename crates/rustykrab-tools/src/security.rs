@@ -178,6 +178,10 @@ fn is_private_ip(ip: &IpAddr) -> bool {
         IpAddr::V6(v6) => {
             v6.is_loopback()       // ::1
                 || v6.is_unspecified() // ::
+                // Unique local addresses (fc00::/7)
+                || (v6.segments()[0] & 0xfe00) == 0xfc00
+                // Link-local addresses (fe80::/10)
+                || (v6.segments()[0] & 0xffc0) == 0xfe80
                 // IPv4-mapped addresses
                 || v6.to_ipv4_mapped().map(|v4| {
                     v4.is_loopback() || v4.is_private() || v4.is_link_local()

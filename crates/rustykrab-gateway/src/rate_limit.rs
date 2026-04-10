@@ -115,6 +115,28 @@ impl RateLimiter {
     }
 }
 
+/// Extract the client IP address, preferring the X-Forwarded-For header
+/// when the request arrives through a reverse proxy.
+fn extract_client_ip(request: &Request, socket_addr: IpAddr) -> IpAddr {
+    // Only trust X-Forwarded-For when the direct connection is from
+    // loopback (i.e. a local reverse proxy). This prevents spoofing
+    // by external clients injecting the header directly.
+    if socket_addr.is_loopback() {
+        if let Some(forwarded) = request.headers().get("x-forwarded-for") {
+            if let Ok(value) = forwarded.to_str() {
+                // X-Forwarded-For: client, proxy1, proxy2
+                // The leftmost entry is the original client IP.
+                if let Some(client_ip) = value.split(',').next() {
+                    if let Ok(ip) = client_ip.trim().parse::<IpAddr>() {
+                        return ip;
+                    }
+                }
+            }
+        }
+    }
+    socket_addr
+}
+
 /// Axum middleware that enforces rate limiting on API endpoints.
 pub async fn rate_limit_middleware(
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
@@ -129,8 +151,10 @@ pub async fn rate_limit_middleware(
         return Ok(next.run(request).await);
     }
 
-    if !state.rate_limiter.check(addr.ip()) {
-        tracing::warn!(ip = %addr.ip(), path = %path, "rate limited");
+    let client_ip = extract_client_ip(&request, addr.ip());
+
+    if !state.rate_limiter.check(client_ip) {
+        tracing::warn!(ip = %client_ip, path = %path, "rate limited");
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
 

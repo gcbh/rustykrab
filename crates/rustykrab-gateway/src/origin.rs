@@ -43,23 +43,36 @@ impl Default for OriginPolicy {
 
 /// Axum middleware that validates the Origin header.
 ///
-/// Non-browser clients (curl, SDKs) typically don't send an Origin header,
-/// so a missing header is allowed. But if an Origin header IS present,
-/// it must match the policy — this is what blocks browser-based attacks.
+/// For sensitive endpoints (/api/ and /webhook/), the Origin header is
+/// mandatory. This prevents non-browser tools from bypassing origin
+/// protection by simply omitting the header.
 pub async fn origin_check_middleware(
     state: axum::extract::State<crate::AppState>,
     request: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
-    if let Some(origin) = request.headers().get(header::ORIGIN) {
-        let origin_str = origin.to_str().unwrap_or("");
-        if !state.origin_policy.is_allowed(origin_str) {
+    let path = request.uri().path().to_string();
+    let is_sensitive = path.starts_with("/api/") || path.starts_with("/webhook/");
+
+    match request.headers().get(header::ORIGIN) {
+        Some(origin) => {
+            let origin_str = origin.to_str().unwrap_or("");
+            if !state.origin_policy.is_allowed(origin_str) {
+                tracing::warn!(
+                    origin = origin_str,
+                    "rejected request from disallowed origin"
+                );
+                return Err(StatusCode::FORBIDDEN);
+            }
+        }
+        None if is_sensitive => {
             tracing::warn!(
-                origin = origin_str,
-                "rejected request from disallowed origin"
+                path = %path,
+                "rejected request without Origin header on sensitive endpoint"
             );
             return Err(StatusCode::FORBIDDEN);
         }
+        None => {} // non-sensitive endpoints don't require Origin
     }
 
     Ok(next.run(request).await)

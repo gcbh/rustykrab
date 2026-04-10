@@ -31,7 +31,7 @@ async fn add_security_headers(mut response: Response) -> Response {
     );
     headers.insert(
         header::CONTENT_SECURITY_POLICY,
-        "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' data:"
+        "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:"
             .parse()
             .unwrap(),
     );

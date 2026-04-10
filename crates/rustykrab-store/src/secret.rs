@@ -1,7 +1,7 @@
 use aes_gcm::aead::Aead;
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use argon2::Argon2;
-use rand::RngCore;
+use rand::TryRngCore;
 use rustykrab_core::Error;
 use std::sync::Arc;
 use zeroize::Zeroizing;
@@ -112,11 +112,16 @@ impl SecretStore {
     /// ciphertext to its key name — moving a ciphertext to a different
     /// key name will fail authentication.
     fn encrypt(&self, key_name: &str, data: &[u8]) -> Result<Vec<u8>, Error> {
-        // Generate random salt and nonce.
+        // Generate random salt and nonce using OsRng for explicit
+        // cryptographic intent.
         let mut salt = [0u8; SALT_LEN];
         let mut nonce_bytes = [0u8; NONCE_LEN];
-        rand::rng().fill_bytes(&mut salt);
-        rand::rng().fill_bytes(&mut nonce_bytes);
+        rand::rngs::OsRng
+            .try_fill_bytes(&mut salt)
+            .expect("OS RNG failed");
+        rand::rngs::OsRng
+            .try_fill_bytes(&mut nonce_bytes)
+            .expect("OS RNG failed");
 
         // Derive a per-secret encryption key via Argon2id.
         let derived_key = self.derive_key(&salt)?;

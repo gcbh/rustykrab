@@ -119,9 +119,11 @@ impl GmailTool {
 
             // Use Gmail's X-GM-RAW extension for full search syntax,
             // falling back to standard IMAP SEARCH.
-            // Escape inner double quotes so the IMAP command parses correctly
+            // Strip CRLF sequences to prevent IMAP command injection, then
+            // escape inner double quotes so the IMAP command parses correctly
             // (e.g. query `from:"foo@bar.com"` becomes `X-GM-RAW "from:\"foo@bar.com\""`).
-            let escaped_query = query.replace('\\', "\\\\").replace('"', "\\\"");
+            let sanitized_query = query.replace('\r', "").replace('\n', "").replace('\0', "");
+            let escaped_query = sanitized_query.replace('\\', "\\\\").replace('"', "\\\"");
             let uids = session
                 .uid_search(format!("X-GM-RAW \"{escaped_query}\""))
                 .or_else(|_| session.uid_search(&query))

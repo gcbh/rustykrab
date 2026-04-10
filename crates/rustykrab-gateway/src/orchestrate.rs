@@ -256,25 +256,26 @@ pub async fn run_agent_streaming(
         // The pipeline runs synchronously and can take many minutes.
         // Emit periodic heartbeat events so the SSE timeout doesn't
         // kill the connection while the pipeline is working.
-        let heartbeat_event = on_event as &(dyn Fn(AgentEvent) + Send + Sync);
-        let keepalive = tokio::spawn({
-            // Safety: on_event lives for the duration of run_agent_streaming
-            // which is awaited below, so it outlives this spawned task.
-            let event_fn: &'static (dyn Fn(AgentEvent) + Send + Sync) =
-                unsafe { std::mem::transmute(heartbeat_event) };
-            async move {
-                loop {
-                    tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
-                    event_fn(AgentEvent::Compressing); // reuse existing event as heartbeat
+        // Uses tokio::select! with an interval instead of unsafe transmute,
+        // avoiding a potential use-after-free if the pipeline future is
+        // cancelled before the heartbeat task is aborted.
+        let result = {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
+            interval.tick().await; // first tick is immediate, consume it
+
+            let pipeline_future =
+                pipeline.run(user_content, TaskComplexity::Complex, context.as_deref());
+            tokio::pin!(pipeline_future);
+
+            loop {
+                tokio::select! {
+                    result = &mut pipeline_future => break result,
+                    _ = interval.tick() => {
+                        on_event(AgentEvent::Compressing); // heartbeat
+                    }
                 }
             }
-        });
-
-        let result = pipeline
-            .run(user_content, TaskComplexity::Complex, context.as_deref())
-            .await;
-
-        keepalive.abort(); // stop the heartbeat once pipeline finishes
+        };
 
         let result = result.map_err(|e| {
             tracing::error!("orchestration pipeline error: {e}");

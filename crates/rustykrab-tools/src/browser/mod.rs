@@ -90,13 +90,13 @@ fn truncate_utf8(s: &str, max_bytes: usize) -> (&str, bool) {
     (&s[..end], true)
 }
 
-/// Mask a cookie value for security: show first 8 chars + "..."
+/// Mask a cookie value for security: hide the entire value to prevent
+/// exposure of predictable session token prefixes.
 fn mask_cookie_value(value: &str) -> String {
-    if value.len() <= 8 {
-        value.to_string()
-    } else {
-        format!("{}...", &value[..8])
+    if value.is_empty() {
+        return String::new();
     }
+    format!("***({} chars)", value.len())
 }
 
 #[async_trait]
