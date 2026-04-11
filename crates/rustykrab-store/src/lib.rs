@@ -1,4 +1,5 @@
 mod conversation;
+mod jobs;
 pub mod keychain;
 mod secret;
 
@@ -10,6 +11,7 @@ use std::sync::Mutex;
 use zeroize::Zeroizing;
 
 pub use conversation::ConversationStore;
+pub use jobs::{JobStore, ScheduledJob};
 pub use secret::SecretStore;
 
 /// Top-level database handle wrapping a SQLite connection.
@@ -61,6 +63,23 @@ impl Store {
                 name TEXT PRIMARY KEY,
                 data BLOB NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS scheduled_jobs (
+                id          TEXT PRIMARY KEY,
+                schedule    TEXT NOT NULL,
+                task        TEXT NOT NULL,
+                channel     TEXT,
+                chat_id     TEXT,
+                one_shot    INTEGER NOT NULL DEFAULT 0,
+                enabled     INTEGER NOT NULL DEFAULT 1,
+                next_run_at TEXT NOT NULL,
+                last_run_at TEXT,
+                created_at  TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_scheduled_jobs_due
+                ON scheduled_jobs (next_run_at)
+                WHERE enabled = 1;
             ",
         )
         .map_err(|e| Error::Storage(e.to_string()))?;
@@ -75,6 +94,11 @@ impl Store {
     /// Return a handle for encrypted secret operations.
     pub fn secrets(&self) -> SecretStore {
         SecretStore::new(Arc::clone(&self.conn), self.master_key.clone())
+    }
+
+    /// Return a handle for scheduled-job operations.
+    pub fn jobs(&self) -> JobStore {
+        JobStore::new(Arc::clone(&self.conn))
     }
 
     /// Flush all pending writes to disk.
