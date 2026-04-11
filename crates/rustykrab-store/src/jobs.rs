@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use croner::Cron;
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex;
+use std::sync::Mutex;
 use uuid::Uuid;
 
 use rustykrab_core::Error;
@@ -64,7 +64,7 @@ impl JobStore {
             created_at: now,
         };
 
-        let conn = self.conn.blocking_lock();
+        let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO scheduled_jobs (id, schedule, task, channel, chat_id, one_shot, enabled, next_run_at, last_run_at, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
@@ -88,7 +88,7 @@ impl JobStore {
 
     /// List all scheduled jobs.
     pub fn list_jobs(&self) -> Result<Vec<ScheduledJob>, Error> {
-        let conn = self.conn.blocking_lock();
+        let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare(
                 "SELECT id, schedule, task, channel, chat_id, one_shot, enabled, next_run_at, last_run_at, created_at
@@ -120,7 +120,7 @@ impl JobStore {
 
     /// Delete a scheduled job by ID.
     pub fn delete_job(&self, job_id: &str) -> Result<bool, Error> {
-        let conn = self.conn.blocking_lock();
+        let conn = self.conn.lock().unwrap();
         let rows = conn
             .execute("DELETE FROM scheduled_jobs WHERE id = ?1", params![job_id])
             .map_err(|e| Error::Storage(e.to_string()))?;
@@ -129,7 +129,7 @@ impl JobStore {
 
     /// Return all enabled jobs whose `next_run_at` is at or before `now`.
     pub fn get_due_jobs(&self, now: DateTime<Utc>) -> Result<Vec<ScheduledJob>, Error> {
-        let conn = self.conn.blocking_lock();
+        let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare(
                 "SELECT id, schedule, task, channel, chat_id, one_shot, enabled, next_run_at, last_run_at, created_at
@@ -163,7 +163,7 @@ impl JobStore {
     /// Mark a job as executed: update `last_run_at`, advance `next_run_at`
     /// for recurring jobs, or disable one-shot jobs.
     pub fn mark_executed(&self, job_id: &str) -> Result<(), Error> {
-        let conn = self.conn.blocking_lock();
+        let conn = self.conn.lock().unwrap();
         let now = Utc::now();
 
         // Read the job to determine schedule type.
