@@ -34,7 +34,7 @@ async fn security_headers_middleware(request: Request, next: Next) -> Response {
     );
     headers.insert(
         header::CONTENT_SECURITY_POLICY,
-        "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:"
+        "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:"
             .parse()
             .unwrap(),
     );
