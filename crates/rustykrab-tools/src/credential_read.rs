@@ -41,10 +41,13 @@ impl Tool for CredentialReadTool {
         "Read a stored credential/secret by name, or list all stored credential names. \
          Use this to retrieve API keys, passwords, or tokens needed to authenticate \
          with external services. Credentials are stored encrypted at rest.\n\n\
-         Set source to 'keychain' to read credentials directly from the macOS Keychain \
-         (requires service and account parameters). This is useful during remote \
-         deployment to pull SSH keys, deploy tokens, or API keys stored in the \
-         system Keychain."
+         Set source to 'keychain' to read credentials directly from the macOS Keychain. \
+         When using keychain source, you MUST provide both 'service' and 'account' \
+         parameters.\n\n\
+         Examples:\n\
+         - List secrets from local store: {\"action\": \"list\", \"source\": \"store\"}\n\
+         - Read from local store: {\"action\": \"get\", \"source\": \"store\", \"name\": \"my_api_key\"}\n\
+         - Read from keychain: {\"action\": \"get\", \"source\": \"keychain\", \"service\": \"myapp\", \"account\": \"deploy_token\"}"
     }
 
     fn schema(&self) -> ToolSchema {
@@ -67,25 +70,18 @@ impl Tool for CredentialReadTool {
                         "type": "string",
                         "enum": ["store", "keychain"],
                         "default": "store",
-                        "description": "Where to read from: 'store' (default, encrypted local store) or 'keychain' (macOS Keychain). When set to 'keychain', the 'service' and 'account' parameters MUST be provided."
+                        "description": "Where to read from: 'store' (default, encrypted local store) or 'keychain' (macOS Keychain)"
                     },
                     "service": {
                         "type": "string",
-                        "description": "macOS Keychain service name (the 'Where' field in Keychain Access). REQUIRED when source is 'keychain'."
+                        "description": "macOS Keychain service name (the 'Where' field in Keychain Access). REQUIRED — provide the service name associated with the keychain entry."
                     },
                     "account": {
                         "type": "string",
-                        "description": "macOS Keychain account name. REQUIRED when source is 'keychain'."
+                        "description": "macOS Keychain account name. REQUIRED — provide the account name associated with the keychain entry (e.g. 'deploy_token', 'api_key', 'rustykrab')."
                     }
                 },
-                "required": ["action"],
-                "if": {
-                    "properties": { "source": { "const": "keychain" } },
-                    "required": ["source"]
-                },
-                "then": {
-                    "required": ["action", "account", "service"]
-                }
+                "required": ["action", "source", "service", "account"]
             }),
         }
     }
@@ -159,12 +155,20 @@ impl CredentialReadTool {
             "get" | "read" => {
                 let service = args["service"].as_str().ok_or_else(|| {
                     Error::ToolExecution(
-                        "missing 'service' parameter (required when source is 'keychain')".into(),
+                        "missing 'service' parameter. Provide the macOS Keychain service \
+                         name (the 'Where' field in Keychain Access). Example: \
+                         {\"action\": \"get\", \"source\": \"keychain\", \"service\": \"myapp\", \
+                         \"account\": \"deploy_token\"}"
+                            .into(),
                     )
                 })?;
                 let account = args["account"].as_str().ok_or_else(|| {
                     Error::ToolExecution(
-                        "missing 'account' parameter (required when source is 'keychain')".into(),
+                        "missing 'account' parameter. Provide the macOS Keychain account \
+                         name associated with the entry (e.g. 'deploy_token', 'api_key'). \
+                         Example: {\"action\": \"get\", \"source\": \"keychain\", \
+                         \"service\": \"myapp\", \"account\": \"deploy_token\"}"
+                            .into(),
                     )
                 })?;
 

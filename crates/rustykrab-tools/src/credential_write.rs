@@ -30,11 +30,16 @@ impl Tool for CredentialWriteTool {
         "Store, update, or delete a credential/secret. Use this to save API keys, \
          passwords, or tokens so they can be retrieved later with credential_read. \
          All credentials are encrypted at rest.\n\n\
-         Set source to 'keychain' to write to the macOS Keychain instead of the \
-         local store (requires service and account parameters).\n\n\
-         Use the 'import_from_keychain' action to copy a credential from the macOS \
-         Keychain into the encrypted local store — useful for preparing deployment \
-         bundles that work on non-macOS targets."
+         Set source to 'keychain' to write to the macOS Keychain. When using keychain \
+         source, you MUST provide both 'service' and 'account' parameters. The \
+         'import_from_keychain' action also requires 'service' and 'account'.\n\n\
+         Examples:\n\
+         - Store in local store: {\"action\": \"set\", \"name\": \"my_api_key\", \"value\": \"sk-123\", \
+         \"source\": \"store\", \"service\": \"\", \"account\": \"\"}\n\
+         - Store in keychain: {\"action\": \"set\", \"name\": \"deploy_key\", \"value\": \"sk-123\", \
+         \"source\": \"keychain\", \"service\": \"myapp\", \"account\": \"deploy_token\"}\n\
+         - Import from keychain: {\"action\": \"import_from_keychain\", \"name\": \"local_copy\", \
+         \"source\": \"keychain\", \"service\": \"myapp\", \"account\": \"deploy_token\"}"
     }
 
     fn schema(&self) -> ToolSchema {
@@ -65,14 +70,14 @@ impl Tool for CredentialWriteTool {
                     },
                     "service": {
                         "type": "string",
-                        "description": "macOS Keychain service name. Required when source is 'keychain' or action is 'import_from_keychain'."
+                        "description": "macOS Keychain service name. REQUIRED — provide the service name for the keychain entry."
                     },
                     "account": {
                         "type": "string",
-                        "description": "macOS Keychain account name. Required when source is 'keychain' or action is 'import_from_keychain'."
+                        "description": "macOS Keychain account name. REQUIRED — provide the account name for the keychain entry (e.g. 'deploy_token', 'api_key')."
                     }
                 },
-                "required": ["action", "name"]
+                "required": ["action", "name", "source", "service", "account"]
             }),
         }
     }
@@ -148,12 +153,19 @@ impl CredentialWriteTool {
 
         let service = args["service"].as_str().ok_or_else(|| {
             Error::ToolExecution(
-                "missing 'service' parameter (required when source is 'keychain')".into(),
+                "missing 'service' parameter. Provide the macOS Keychain service \
+                 name. Example: {\"action\": \"set\", \"name\": \"key\", \"value\": \"val\", \
+                 \"source\": \"keychain\", \"service\": \"myapp\", \"account\": \"deploy_token\"}"
+                    .into(),
             )
         })?;
         let account = args["account"].as_str().ok_or_else(|| {
             Error::ToolExecution(
-                "missing 'account' parameter (required when source is 'keychain')".into(),
+                "missing 'account' parameter. Provide the macOS Keychain account \
+                 name (e.g. 'deploy_token', 'api_key'). Example: {\"action\": \"set\", \
+                 \"name\": \"key\", \"value\": \"val\", \"source\": \"keychain\", \
+                 \"service\": \"myapp\", \"account\": \"deploy_token\"}"
+                    .into(),
             )
         })?;
 
@@ -212,10 +224,22 @@ impl CredentialWriteTool {
         }
 
         let service = args["service"].as_str().ok_or_else(|| {
-            Error::ToolExecution("missing 'service' parameter for import_from_keychain".into())
+            Error::ToolExecution(
+                "missing 'service' parameter. Provide the macOS Keychain service name \
+                 to import from. Example: {\"action\": \"import_from_keychain\", \
+                 \"name\": \"local_copy\", \"source\": \"keychain\", \"service\": \"myapp\", \
+                 \"account\": \"deploy_token\"}"
+                    .into(),
+            )
         })?;
         let account = args["account"].as_str().ok_or_else(|| {
-            Error::ToolExecution("missing 'account' parameter for import_from_keychain".into())
+            Error::ToolExecution(
+                "missing 'account' parameter. Provide the macOS Keychain account name \
+                 to import from (e.g. 'deploy_token', 'api_key'). Example: \
+                 {\"action\": \"import_from_keychain\", \"name\": \"local_copy\", \
+                 \"source\": \"keychain\", \"service\": \"myapp\", \"account\": \"deploy_token\"}"
+                    .into(),
+            )
         })?;
 
         // Read from Keychain.
