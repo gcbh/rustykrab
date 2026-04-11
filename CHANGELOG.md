@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.7] - 2026-04-11
+
+- Fix credential_read tool to return actual credential values (#340)
+
 ## [1.4.6] - 2026-04-11
 
 - feat: increase Telegram heartbeat timeout from 5 to 30 minutes (#329)
