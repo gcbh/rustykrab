@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use rustykrab_core::types::ToolSchema;
-use rustykrab_core::{Result, Tool};
+use rustykrab_core::{Result, Tool, ToolError};
 use serde_json::{json, Value};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
@@ -91,23 +91,27 @@ async fn tcp_probe(addr: SocketAddr, timeout_ms: u64) -> bool {
 
 /// Expand a CIDR-style subnet (e.g. `192.168.1.0/24`) into individual IPv4
 /// host addresses, excluding the network and broadcast addresses.
-fn expand_subnet(cidr: &str) -> std::result::Result<Vec<Ipv4Addr>, String> {
+fn expand_subnet(cidr: &str) -> std::result::Result<Vec<Ipv4Addr>, ToolError> {
     let parts: Vec<&str> = cidr.split('/').collect();
     if parts.len() != 2 {
-        return Err("expected CIDR notation, e.g. 192.168.1.0/24".into());
+        return Err(ToolError::invalid_input(
+            "expected CIDR notation, e.g. 192.168.1.0/24",
+        ));
     }
-    let base: Ipv4Addr = parts[0].parse().map_err(|e| format!("invalid IP: {e}"))?;
+    let base: Ipv4Addr = parts[0]
+        .parse()
+        .map_err(|e| ToolError::invalid_input(format!("invalid IP: {e}")))?;
     let prefix_len: u32 = parts[1]
         .parse()
-        .map_err(|e| format!("invalid prefix length: {e}"))?;
+        .map_err(|e| ToolError::invalid_input(format!("invalid prefix length: {e}")))?;
     if prefix_len > 32 {
-        return Err("prefix length must be <= 32".into());
+        return Err(ToolError::invalid_input("prefix length must be <= 32"));
     }
     // Limit to /20 (4094 hosts) to avoid accidental DoS.
     if prefix_len < 20 {
-        return Err(
-            "prefix length must be >= 20 (max 4094 hosts) to prevent accidental DoS".into(),
-        );
+        return Err(ToolError::invalid_input(
+            "prefix length must be >= 20 (max 4094 hosts) to prevent accidental DoS",
+        ));
     }
 
     let base_u32 = u32::from(base);
@@ -128,16 +132,16 @@ fn expand_subnet(cidr: &str) -> std::result::Result<Vec<Ipv4Addr>, String> {
 }
 
 /// Perform a ping sweep by attempting a TCP connect on probe ports.
-async fn ping_sweep(cidr: &str, timeout_ms: u64) -> std::result::Result<Vec<Value>, String> {
+async fn ping_sweep(cidr: &str, timeout_ms: u64) -> std::result::Result<Vec<Value>, ToolError> {
     let hosts = expand_subnet(cidr)?;
     let probe_ports: &[u16] = &[80, 443, 22, 445];
 
     // Verify all hosts are in local network ranges.
     for h in &hosts {
         if !is_local_network(&IpAddr::V4(*h)) {
-            return Err(format!(
+            return Err(ToolError::invalid_input(format!(
                 "host {h} is not in a private/local range — only local-network scanning is allowed"
-            ));
+            )));
         }
     }
 
@@ -256,12 +260,14 @@ impl Tool for NetScanTool {
         match action {
             "ping_sweep" => {
                 let subnet = args["subnet"].as_str().ok_or_else(|| {
-                    rustykrab_core::Error::ToolExecution("subnet is required for ping_sweep".into())
+                    rustykrab_core::Error::ToolExecution(ToolError::invalid_input(
+                        "subnet is required for ping_sweep",
+                    ))
                 })?;
 
                 let live = ping_sweep(subnet, timeout_ms)
                     .await
-                    .map_err(|e| rustykrab_core::Error::ToolExecution(e.into()))?;
+                    .map_err(rustykrab_core::Error::ToolExecution)?;
 
                 Ok(json!({
                     "action": "ping_sweep",
@@ -272,14 +278,20 @@ impl Tool for NetScanTool {
             }
             "port_scan" => {
                 let host_str = args["host"].as_str().ok_or_else(|| {
-                    rustykrab_core::Error::ToolExecution("host is required for port_scan".into())
+                    rustykrab_core::Error::ToolExecution(ToolError::invalid_input(
+                        "host is required for port_scan",
+                    ))
                 })?;
                 let ip: IpAddr = host_str.parse().map_err(|e| {
-                    rustykrab_core::Error::ToolExecution(format!("invalid IP address: {e}").into())
+                    rustykrab_core::Error::ToolExecution(ToolError::invalid_input(format!(
+                        "invalid IP address: {e}"
+                    )))
                 })?;
                 if !is_local_network(&ip) {
                     return Err(rustykrab_core::Error::ToolExecution(
-                        format!("{ip} is not in a private/local range — only local-network scanning is allowed").into(),
+                        ToolError::invalid_input(format!(
+                            "{ip} is not in a private/local range — only local-network scanning is allowed"
+                        )),
                     ));
                 }
 
@@ -293,14 +305,14 @@ impl Tool for NetScanTool {
             }
             "scan_subnet" => {
                 let subnet = args["subnet"].as_str().ok_or_else(|| {
-                    rustykrab_core::Error::ToolExecution(
-                        "subnet is required for scan_subnet".into(),
-                    )
+                    rustykrab_core::Error::ToolExecution(ToolError::invalid_input(
+                        "subnet is required for scan_subnet",
+                    ))
                 })?;
 
                 let live = ping_sweep(subnet, timeout_ms)
                     .await
-                    .map_err(|e| rustykrab_core::Error::ToolExecution(e.into()))?;
+                    .map_err(rustykrab_core::Error::ToolExecution)?;
 
                 let mut results = Vec::new();
                 for host_val in &live {
@@ -322,7 +334,7 @@ impl Tool for NetScanTool {
                 }))
             }
             _ => Err(rustykrab_core::Error::ToolExecution(
-                format!("unknown net_scan action: {action}").into(),
+                ToolError::invalid_input(format!("unknown net_scan action: {action}")),
             )),
         }
     }

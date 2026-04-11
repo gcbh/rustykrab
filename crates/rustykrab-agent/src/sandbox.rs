@@ -85,6 +85,9 @@ fn validate_tool_policy(tool_name: &str, policy: &SandboxPolicy) -> Result<()> {
             | "gmail"
             | "image_generate"
             | "tts"
+            | "net_scan"
+            | "net_admin"
+            | "net_audit"
     );
 
     if needs_fs_read && !policy.allow_fs_read {

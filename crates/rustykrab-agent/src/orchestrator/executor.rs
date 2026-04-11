@@ -6,16 +6,33 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Instant;
 
 use chrono::Utc;
 use rustykrab_core::model::ModelProvider;
 use rustykrab_core::orchestration::{OrchestrationConfig, SubTask, SubTaskResult};
 use rustykrab_core::types::{Message, MessageContent, Role, ToolCall, ToolResult, ToolSchema};
-use rustykrab_core::{Result, Tool};
+use rustykrab_core::{Error, Result, Tool, ToolErrorKind};
 use tokio::sync::Semaphore;
 use uuid::Uuid;
 
 use crate::sandbox::{Sandbox, SandboxPolicy};
+
+/// Check whether an error is worth retrying.
+///
+/// Validation errors (`InvalidInput`), missing resources (`NotFound`), and
+/// permission failures (`PermissionDenied`) will never succeed on retry, so
+/// we fail fast instead of burning the pipeline time budget.
+fn is_retryable(err: &Error) -> bool {
+    match err {
+        Error::ToolExecution(te) => !matches!(
+            te.kind,
+            ToolErrorKind::InvalidInput | ToolErrorKind::NotFound | ToolErrorKind::PermissionDenied
+        ),
+        Error::ModelRateLimit(_) | Error::ModelOverloaded(_) => true,
+        _ => false,
+    }
+}
 
 /// Executes sub-tasks in parallel, respecting dependency ordering.
 pub struct ParallelExecutor {
@@ -24,6 +41,9 @@ pub struct ParallelExecutor {
     sandbox: Arc<dyn Sandbox>,
     policy: SandboxPolicy,
     config: OrchestrationConfig,
+    /// Pipeline deadline — retries and model calls check this to avoid
+    /// wasting time when the pipeline is about to time out.
+    deadline: Option<Instant>,
 }
 
 impl ParallelExecutor {
@@ -40,7 +60,15 @@ impl ParallelExecutor {
             sandbox,
             policy,
             config,
+            deadline: None,
         }
+    }
+
+    /// Set the pipeline deadline so retries can bail out early when time is
+    /// nearly up rather than burning the remaining budget on doomed attempts.
+    pub fn with_deadline(mut self, deadline: Instant) -> Self {
+        self.deadline = Some(deadline);
+        self
     }
 
     /// Execute all sub-tasks, respecting dependencies.
@@ -103,6 +131,7 @@ impl ParallelExecutor {
                 let policy = self.policy.clone();
                 let sys_ctx = system_context.map(|s| s.to_string());
                 let sem = semaphore.clone();
+                let deadline = self.deadline;
 
                 handles.push((
                     task_id,
@@ -117,6 +146,7 @@ impl ParallelExecutor {
                             &sandbox,
                             &policy,
                             &config,
+                            deadline,
                         )
                         .await
                     }),
@@ -184,6 +214,7 @@ async fn execute_sub_task(
     sandbox: &Arc<dyn Sandbox>,
     policy: &SandboxPolicy,
     config: &OrchestrationConfig,
+    deadline: Option<Instant>,
 ) -> SubTaskResult {
     // Build focused context for this sub-task.
     let mut messages = Vec::new();
@@ -275,9 +306,15 @@ async fn execute_sub_task(
 
             let calls = response.message.content.tool_calls();
             for call in calls {
-                let result =
-                    execute_tool_for_subtask(call, tools, sandbox, policy, config.max_tool_retries)
-                        .await;
+                let result = execute_tool_for_subtask(
+                    call,
+                    tools,
+                    sandbox,
+                    policy,
+                    config.max_tool_retries,
+                    deadline,
+                )
+                .await;
                 messages.push(Message {
                     id: Uuid::new_v4(),
                     role: Role::Tool,
@@ -316,13 +353,19 @@ async fn execute_sub_task(
     }
 }
 
-/// Execute a tool call within a sub-task, retrying transient failures.
+/// Execute a tool call within a sub-task, retrying only transient failures.
+///
+/// Non-retryable errors (invalid input, not-found, permission denied) fail
+/// immediately — retrying them just wastes the pipeline time budget.  The
+/// optional `deadline` prevents retries when the pipeline is about to time
+/// out, leaving remaining time for useful work instead of doomed attempts.
 async fn execute_tool_for_subtask(
     call: &ToolCall,
     tools: &[Arc<dyn Tool>],
     sandbox: &Arc<dyn Sandbox>,
     policy: &SandboxPolicy,
     max_retries: u32,
+    deadline: Option<Instant>,
 ) -> ToolResult {
     let tool = match tools.iter().find(|t| t.name() == call.name) {
         Some(t) => t,
@@ -359,16 +402,41 @@ async fn execute_tool_for_subtask(
                 };
             }
             Err(e) => {
+                let retryable = is_retryable(&e);
                 tracing::warn!(
                     tool = call.name,
                     attempt = attempt + 1,
                     max_retries,
+                    retryable,
                     error = %e,
-                    "sub-task tool call failed, retrying"
+                    "sub-task tool call failed",
                 );
                 last_err = Some(e);
+
+                // Non-retryable errors (validation, not-found, permission) will
+                // never succeed — bail out immediately.
+                if !retryable {
+                    break;
+                }
+
                 if attempt < max_retries {
                     let delay = std::time::Duration::from_millis(500 * 2u64.pow(attempt));
+
+                    // If the pipeline deadline would expire before the backoff
+                    // completes, skip the retry to preserve time for other work.
+                    if let Some(dl) = deadline {
+                        let remaining = dl.saturating_duration_since(Instant::now());
+                        if remaining < delay {
+                            tracing::warn!(
+                                tool = call.name,
+                                ?remaining,
+                                ?delay,
+                                "skipping retry — insufficient time before pipeline deadline",
+                            );
+                            break;
+                        }
+                    }
+
                     tokio::time::sleep(delay).await;
                 }
             }

@@ -5,6 +5,7 @@
 //! entirely; complex tasks get the full treatment.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use rustykrab_core::model::ModelProvider;
 use rustykrab_core::orchestration::{
@@ -75,6 +76,8 @@ impl OrchestrationPipeline {
     /// Run the pipeline for a given request at the specified complexity level.
     ///
     /// The entire pipeline is wrapped in a timeout to prevent unbounded execution.
+    /// A deadline is computed and threaded through to the executor so that tool
+    /// retries can bail out early when the pipeline is about to time out.
     pub async fn run(
         &self,
         request: &str,
@@ -84,9 +87,10 @@ impl OrchestrationPipeline {
         tracing::info!(?complexity, "running orchestration pipeline");
 
         let timeout_secs = self.config.pipeline_timeout_secs;
+        let deadline = Instant::now() + std::time::Duration::from_secs(timeout_secs);
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(timeout_secs),
-            self.run_inner(request, complexity, context),
+            self.run_inner(request, complexity, context, deadline),
         )
         .await;
 
@@ -106,14 +110,15 @@ impl OrchestrationPipeline {
         request: &str,
         complexity: TaskComplexity,
         context: Option<&str>,
+        deadline: Instant,
     ) -> Result<PipelineResult> {
         match complexity {
             TaskComplexity::Trivial | TaskComplexity::Simple => {
                 self.run_direct(request, context).await
             }
-            TaskComplexity::Moderate => self.run_moderate(request, context).await,
-            TaskComplexity::Complex => self.run_complex(request, context).await,
-            TaskComplexity::Critical => self.run_critical(request, context).await,
+            TaskComplexity::Moderate => self.run_moderate(request, context, deadline).await,
+            TaskComplexity::Complex => self.run_complex(request, context, deadline).await,
+            TaskComplexity::Critical => self.run_critical(request, context, deadline).await,
         }
     }
 
@@ -171,7 +176,12 @@ impl OrchestrationPipeline {
     /// Moderate pipeline: decompose + parallel execute + synthesize,
     /// with a continuation loop that re-decomposes remaining work
     /// until the task is complete or max_recursion_depth is reached.
-    async fn run_moderate(&self, request: &str, context: Option<&str>) -> Result<PipelineResult> {
+    async fn run_moderate(
+        &self,
+        request: &str,
+        context: Option<&str>,
+        deadline: Instant,
+    ) -> Result<PipelineResult> {
         let decomposer = Decomposer::new(self.provider.clone(), self.config.clone());
         let executor = ParallelExecutor::new(
             self.provider.clone(),
@@ -179,7 +189,8 @@ impl OrchestrationPipeline {
             self.sandbox.clone(),
             self.policy.clone(),
             self.config.clone(),
-        );
+        )
+        .with_deadline(deadline);
         let synthesizer = Synthesizer::new(self.provider.clone());
         let tool_names: Vec<&str> = self.tools.iter().map(|t| t.name()).collect();
 
@@ -328,9 +339,14 @@ impl OrchestrationPipeline {
     }
 
     /// Complex pipeline: decompose + execute + synthesize + refine.
-    async fn run_complex(&self, request: &str, context: Option<&str>) -> Result<PipelineResult> {
+    async fn run_complex(
+        &self,
+        request: &str,
+        context: Option<&str>,
+        deadline: Instant,
+    ) -> Result<PipelineResult> {
         // Run moderate pipeline first.
-        let mut result = self.run_moderate(request, context).await?;
+        let mut result = self.run_moderate(request, context, deadline).await?;
 
         // Self-refinement (with system context so the critic knows the agent has tool access).
         let refiner = RefinementLoop::new(self.provider.clone(), self.config.clone());
@@ -344,7 +360,12 @@ impl OrchestrationPipeline {
     }
 
     /// Critical pipeline: decompose + execute + synthesize + vote + refine.
-    async fn run_critical(&self, request: &str, context: Option<&str>) -> Result<PipelineResult> {
+    async fn run_critical(
+        &self,
+        request: &str,
+        context: Option<&str>,
+        deadline: Instant,
+    ) -> Result<PipelineResult> {
         // Self-consistency voting first.
         let voter = ConsistencyVoter::new(
             self.provider.clone(),
@@ -368,7 +389,7 @@ impl OrchestrationPipeline {
         }
 
         // Low confidence — fall back to full decomposition pipeline.
-        let mut result = self.run_complex(request, context).await?;
+        let mut result = self.run_complex(request, context, deadline).await?;
         result.vote = Some(vote);
         result.stages_executed.insert(0, PipelineStage::Verify);
 
