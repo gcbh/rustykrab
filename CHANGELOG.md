@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.4] - 2026-04-11
+
+- fix: make account/service required in credential tool schemas (#263) (#265)
+
 ## [1.4.3] - 2026-04-11
 
 - fix: harden release script against special characters in PR titles (#261)
