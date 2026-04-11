@@ -25,7 +25,7 @@ use rustykrab_memory::embedding::FastEmbedder;
 use rustykrab_memory::storage::SqliteMemoryStorage;
 use rustykrab_memory::{MemoryConfig, MemorySystem};
 use rustykrab_skills::SkillRegistry;
-use rustykrab_tools::MemoryBackend;
+use rustykrab_tools::{CronBackend, MemoryBackend};
 use tokio::sync::mpsc;
 use tracing_subscriber::fmt;
 use tracing_subscriber::layer::SubscriberExt;
@@ -61,6 +61,39 @@ impl MemoryBackend for MemoryAdapter {
     }
     async fn list(&self) -> rustykrab_core::Result<serde_json::Value> {
         self.inner.list().await
+    }
+}
+
+/// Adapter bridging [rustykrab_store::JobStore] to the [CronBackend] trait
+/// (rustykrab-tools) so the cron tool can manage scheduled jobs.
+struct CronAdapter {
+    store: rustykrab_store::Store,
+}
+
+#[async_trait::async_trait]
+impl CronBackend for CronAdapter {
+    async fn create_job(
+        &self,
+        schedule: &str,
+        task: &str,
+        channel: Option<&str>,
+        chat_id: Option<&str>,
+    ) -> rustykrab_core::Result<serde_json::Value> {
+        let job = self
+            .store
+            .jobs()
+            .create_job(schedule, task, channel, chat_id)?;
+        Ok(serde_json::to_value(&job).expect("ScheduledJob is always serializable"))
+    }
+
+    async fn list_jobs(&self) -> rustykrab_core::Result<serde_json::Value> {
+        let jobs = self.store.jobs().list_jobs()?;
+        Ok(serde_json::to_value(&jobs).expect("Vec<ScheduledJob> is always serializable"))
+    }
+
+    async fn delete_job(&self, job_id: &str) -> rustykrab_core::Result<serde_json::Value> {
+        let deleted = self.store.jobs().delete_job(job_id)?;
+        Ok(serde_json::json!({ "deleted": deleted, "job_id": job_id }))
     }
 }
 
@@ -252,6 +285,13 @@ async fn main() -> anyhow::Result<()> {
     let mut tools = rustykrab_tools::builtin_tools(store.secrets());
     tools.extend(rustykrab_tools::memory_tools(memory_backend));
     tools.extend(rustykrab_tools::skill_tools(skills_dir.clone()));
+
+    // --- Cron tool (task scheduling) ---
+    let cron_backend: Arc<dyn CronBackend> = Arc::new(CronAdapter {
+        store: store.clone(),
+    });
+    tools.push(Arc::new(rustykrab_tools::CronTool::new(cron_backend)));
+    tracing::info!("cron tool registered");
 
     // --- Video tool (if video channel enabled) ---
     if let Some(ref vc) = video_channel {
@@ -450,6 +490,16 @@ async fn main() -> anyhow::Result<()> {
         // Store handle so panics are not silently swallowed (fixes ASYNC-H4).
         infra_handles.push(tokio::spawn(telegram_agent_loop(rx, tg, state.clone())));
         tracing::info!("Telegram agent loop started");
+    }
+
+    // --- Job executor (scheduled task runner) ---
+    {
+        let executor_store = store_handle.clone();
+        let executor_state = state.clone();
+        infra_handles.push(tokio::spawn(async move {
+            job_executor_loop(executor_store, executor_state).await;
+        }));
+        tracing::info!("job executor started (30s poll interval)");
     }
 
     // Save a reference to the video channel for shutdown.
@@ -748,6 +798,121 @@ async fn shutdown_signal() {
         .await
         .expect("failed to listen for ctrl+c");
     tracing::info!("shutdown signal received");
+}
+
+/// Background task: poll for due scheduled jobs and execute them.
+///
+/// Every 30 seconds, queries the job store for enabled jobs whose
+/// `next_run_at` has passed. Each due job is spawned as an independent
+/// task that runs the job's prompt through the agent pipeline and
+/// delivers the response to the originating channel.
+async fn job_executor_loop(store: rustykrab_store::Store, state: AppState) {
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+
+    loop {
+        interval.tick().await;
+
+        let now = Utc::now();
+        let due_jobs = match store.jobs().get_due_jobs(now) {
+            Ok(jobs) => jobs,
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to query due jobs");
+                continue;
+            }
+        };
+
+        for job in due_jobs {
+            let store = store.clone();
+            let state = state.clone();
+
+            tokio::spawn(async move {
+                let job_id = job.id.clone();
+                let task = job.task.clone();
+                let channel = job.channel.clone();
+                let chat_id = job.chat_id.clone();
+
+                tracing::info!(
+                    job_id = %job_id,
+                    task = %task,
+                    "executing scheduled job"
+                );
+
+                // Create a fresh conversation for this job execution.
+                let mut conv = match state.store.conversations().create() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::error!(job_id = %job_id, "failed to create conversation for scheduled job: {e}");
+                        return;
+                    }
+                };
+
+                // Prefix the task so the agent knows this is a scheduled execution.
+                let prompt = format!(
+                    "[Scheduled task] The following task was scheduled by the user and is now due. \
+                     Execute it and provide the result concisely.\n\nTask: {task}"
+                );
+
+                // Run the agent.
+                let no_op_event = |_event: AgentEvent| {};
+                let result = rustykrab_gateway::run_agent_streaming(
+                    &state,
+                    &mut conv,
+                    &prompt,
+                    &no_op_event,
+                )
+                .await;
+
+                let response_text = match result {
+                    Ok(msg) => match &msg.content {
+                        MessageContent::Text(t) => t.clone(),
+                        _ => "Scheduled task completed (no text response).".to_string(),
+                    },
+                    Err(_) => {
+                        tracing::error!(job_id = %job_id, "agent error executing scheduled job");
+                        "Sorry, the scheduled task encountered an error.".to_string()
+                    }
+                };
+
+                // Route the response to the originating channel.
+                match channel.as_deref() {
+                    Some("telegram") => {
+                        if let (Some(tg), Some(cid)) = (&state.telegram, &chat_id) {
+                            if let Ok(chat_id_num) = cid.parse::<i64>() {
+                                if let Err(e) = tg.send_text(chat_id_num, &response_text).await {
+                                    tracing::error!(job_id = %job_id, "failed to send scheduled job result to Telegram: {e}");
+                                }
+                            } else {
+                                tracing::error!(job_id = %job_id, chat_id = %cid, "invalid Telegram chat_id");
+                            }
+                        }
+                    }
+                    Some("signal") => {
+                        if let (Some(sig), Some(number)) = (&state.signal, &chat_id) {
+                            if let Err(e) = sig.send_text(number, &response_text).await {
+                                tracing::error!(job_id = %job_id, "failed to send scheduled job result to Signal: {e}");
+                            }
+                        }
+                    }
+                    _ => {
+                        tracing::info!(
+                            job_id = %job_id,
+                            "scheduled job completed (no channel routing): {response_text}"
+                        );
+                    }
+                }
+
+                // Mark the job as executed (advances next_run_at or disables one-shot).
+                if let Err(e) = store.jobs().mark_executed(&job_id) {
+                    tracing::error!(job_id = %job_id, "failed to mark scheduled job as executed: {e}");
+                }
+
+                // Clean up the ephemeral conversation.
+                if let Err(e) = state.store.conversations().delete(conv.id) {
+                    tracing::warn!(job_id = %job_id, "failed to clean up job conversation: {e}");
+                }
+            });
+        }
+    }
 }
 
 /// Load orchestration config from file or defaults.
