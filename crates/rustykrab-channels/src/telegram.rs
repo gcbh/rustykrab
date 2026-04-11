@@ -1,5 +1,6 @@
 use chrono::Utc;
 use hmac::{Hmac, Mac};
+use rustykrab_core::crypto::constant_time_eq;
 use rustykrab_core::types::{Message, MessageContent, Role};
 use rustykrab_core::{Error, Result};
 use serde::Deserialize;
@@ -23,6 +24,8 @@ const SEND_MAX_RETRIES: u32 = 3;
 pub struct ChannelMessage {
     pub chat_id: i64,
     pub message: Message,
+    /// If true, the conversation for this chat should be reset.
+    pub reset: bool,
 }
 
 /// Telegram Bot API channel.
@@ -409,7 +412,11 @@ impl TelegramChannel {
         };
 
         self.inbound_tx
-            .send(ChannelMessage { chat_id, message })
+            .send(ChannelMessage {
+                chat_id,
+                message,
+                reset: false,
+            })
             .await
             .map_err(|e| Error::Channel(format!("inbound queue full: {e}")))?;
 
@@ -436,11 +443,9 @@ impl TelegramChannel {
                     .to_string(),
             ),
             "/ping" => Some("Pong! Bot is running.".to_string()),
-            "/reset" => {
-                // The actual conversation reset is handled in the agent loop
-                // by looking for this sentinel in the message content.
-                None
-            }
+            "/reset" => Some(
+                "Conversation reset. Send a new message to start fresh.".to_string(),
+            ),
             _ if cmd.starts_with('/') => {
                 // Unknown command — let it pass through to the agent.
                 None
@@ -554,22 +559,6 @@ fn find_split_point(window: &str) -> usize {
     window.len()
 }
 
-/// Constant-time string comparison to prevent timing attacks on webhook secrets.
-/// Compares all bytes up to the length of the longer string
-/// so that the length of neither input is leaked through timing.
-fn constant_time_eq(a: &str, b: &str) -> bool {
-    let a_bytes = a.as_bytes();
-    let b_bytes = b.as_bytes();
-    let len = a_bytes.len().max(b_bytes.len());
-    let mut result = (a_bytes.len() != b_bytes.len()) as u8;
-    for i in 0..len {
-        let x = a_bytes.get(i).copied().unwrap_or(0);
-        let y = b_bytes.get(i).copied().unwrap_or(0);
-        result |= x ^ y;
-    }
-    result == 0
-}
-
 // --- Telegram Bot API wire types ---
 
 #[derive(Deserialize)]
@@ -651,12 +640,4 @@ mod tests {
         assert_eq!(chunks[0].len(), 4096);
     }
 
-    #[test]
-    fn test_constant_time_eq() {
-        assert!(constant_time_eq("abc", "abc"));
-        assert!(!constant_time_eq("abc", "abd"));
-        assert!(!constant_time_eq("abc", "ab"));
-        assert!(!constant_time_eq("", "a"));
-        assert!(constant_time_eq("", ""));
-    }
 }

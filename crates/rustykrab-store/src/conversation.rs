@@ -62,11 +62,16 @@ impl ConversationStore {
         Ok(ids)
     }
 
-    /// Delete a conversation by ID.
+    /// Delete a conversation by ID. Returns `NotFound` if the conversation
+    /// does not exist, so callers can distinguish 404 from 500.
     pub fn delete(&self, id: Uuid) -> Result<(), Error> {
-        self.tree
+        let removed = self
+            .tree
             .remove(id.as_bytes())
             .map_err(|e| Error::Storage(e.to_string()))?;
+        if removed.is_none() {
+            return Err(Error::NotFound(format!("conversation {id}")));
+        }
         Ok(())
     }
 }

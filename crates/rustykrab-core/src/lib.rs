@@ -1,4 +1,5 @@
 pub mod capability;
+pub mod crypto;
 pub mod error;
 pub mod model;
 pub mod orchestration;

@@ -2,6 +2,7 @@ use axum::extract::Request;
 use axum::http::{header, StatusCode};
 use axum::middleware::Next;
 use axum::response::Response;
+use rustykrab_core::crypto::constant_time_eq;
 
 use crate::AppState;
 
@@ -57,22 +58,6 @@ pub async fn require_auth(
         );
         Err(StatusCode::UNAUTHORIZED)
     }
-}
-
-/// Constant-time string comparison to prevent timing attacks.
-/// Compares all bytes up to the length of the longer string
-/// so that the length of neither input is leaked through timing.
-fn constant_time_eq(a: &str, b: &str) -> bool {
-    let a_bytes = a.as_bytes();
-    let b_bytes = b.as_bytes();
-    let len = a_bytes.len().max(b_bytes.len());
-    let mut result = (a_bytes.len() != b_bytes.len()) as u8;
-    for i in 0..len {
-        let x = a_bytes.get(i).copied().unwrap_or(0);
-        let y = b_bytes.get(i).copied().unwrap_or(0);
-        result |= x ^ y;
-    }
-    result == 0
 }
 
 /// Generate a cryptographically random 32-byte hex token.

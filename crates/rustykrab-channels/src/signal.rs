@@ -1,4 +1,5 @@
 use chrono::Utc;
+use rustykrab_core::crypto::constant_time_eq;
 use rustykrab_core::types::{Message, MessageContent, Role};
 use rustykrab_core::{Error, Result};
 use serde::{Deserialize, Serialize};
@@ -8,6 +9,19 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use uuid::Uuid;
+
+/// An inbound Signal message with sender metadata for reply routing.
+pub struct SignalInboundMessage {
+    /// The sender's phone number (E.164 format).
+    pub source_number: String,
+    /// The core message payload.
+    pub message: Message,
+}
+
+/// Maximum age (in seconds) for a webhook payload before it is rejected
+/// as a potential replay. Protects against replay attacks where old
+/// messages are re-sent to the webhook endpoint.
+const MAX_WEBHOOK_AGE_SECS: i64 = 300; // 5 minutes
 
 /// Signal channel via signal-cli-rest-api.
 ///
@@ -23,6 +37,7 @@ use uuid::Uuid;
 /// - All traffic between RustyKrab and signal-cli stays on localhost
 /// - Signal protocol provides E2E encryption on the wire
 /// - Webhook payloads validated via shared secret header
+/// - Replay protection via timestamp validation
 pub struct SignalChannel {
     client: reqwest::Client,
     /// Base URL of the signal-cli-rest-api instance.
@@ -34,9 +49,9 @@ pub struct SignalChannel {
     /// Shared secret for webhook validation.
     webhook_secret: Option<String>,
     /// Sender for inbound messages (user -> agent).
-    inbound_tx: mpsc::Sender<Message>,
+    inbound_tx: mpsc::Sender<SignalInboundMessage>,
     /// Receiver for inbound messages (consumed by the agent loop).
-    inbound_rx: Option<mpsc::Receiver<Message>>,
+    inbound_rx: Option<mpsc::Receiver<SignalInboundMessage>>,
     /// Graceful shutdown flag.
     shutdown_flag: Arc<AtomicBool>,
 }
@@ -73,7 +88,7 @@ impl SignalChannel {
     }
 
     /// Take the inbound receiver (can only be called once).
-    pub fn take_inbound_rx(&mut self) -> Option<mpsc::Receiver<Message>> {
+    pub fn take_inbound_rx(&mut self) -> Option<mpsc::Receiver<SignalInboundMessage>> {
         self.inbound_rx.take()
     }
 
@@ -229,6 +244,21 @@ impl SignalChannel {
         }
 
         let envelope: Envelope = serde_json::from_slice(payload)?;
+
+        // Replay protection: reject payloads with stale timestamps.
+        if let Some(ref dm) = envelope.data_message {
+            if let Some(ts) = dm.timestamp {
+                let now_ms = Utc::now().timestamp_millis();
+                let age_secs = (now_ms - ts) / 1000;
+                if age_secs > MAX_WEBHOOK_AGE_SECS {
+                    tracing::warn!(age_secs, "rejecting stale Signal webhook payload");
+                    return Err(Error::Auth(format!(
+                        "webhook payload too old ({age_secs}s > {MAX_WEBHOOK_AGE_SECS}s limit)"
+                    )));
+                }
+            }
+        }
+
         self.handle_envelope(envelope).await
     }
 
@@ -271,7 +301,10 @@ impl SignalChannel {
         };
 
         self.inbound_tx
-            .send(message)
+            .send(SignalInboundMessage {
+                source_number: source,
+                message,
+            })
             .await
             .map_err(|e| Error::Channel(format!("inbound queue full: {e}")))?;
 
@@ -337,22 +370,6 @@ impl SignalChannel {
     pub fn account_number(&self) -> &str {
         &self.account_number
     }
-}
-
-/// Constant-time string comparison to prevent timing attacks on webhook secrets.
-/// Compares all bytes up to the length of the longer string
-/// so that the length of neither input is leaked through timing.
-fn constant_time_eq(a: &str, b: &str) -> bool {
-    let a_bytes = a.as_bytes();
-    let b_bytes = b.as_bytes();
-    let len = a_bytes.len().max(b_bytes.len());
-    let mut result = (a_bytes.len() != b_bytes.len()) as u8;
-    for i in 0..len {
-        let x = a_bytes.get(i).copied().unwrap_or(0);
-        let y = b_bytes.get(i).copied().unwrap_or(0);
-        result |= x ^ y;
-    }
-    result == 0
 }
 
 /// Percent-encode a phone number for URL path segments.

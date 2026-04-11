@@ -5,7 +5,8 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use rustykrab_agent::{AgentEvent, HarnessProfile, HarnessRouter, OrchestrationPipeline};
-use rustykrab_channels::{ChannelMessage, TelegramChannel, VideoChannel, VideoConfig};
+use rustykrab_channels::telegram::ChannelMessage;
+use rustykrab_channels::{TelegramChannel, VideoChannel, VideoConfig};
 use rustykrab_core::model::ModelProvider;
 use rustykrab_core::orchestration::OrchestrationConfig;
 use rustykrab_core::types::MessageContent;
@@ -518,25 +519,19 @@ async fn telegram_agent_loop(
                 }
             }
 
-            let user_text = match &channel_msg.message.content {
-                MessageContent::Text(t) => t.clone(),
-                _ => return,
-            };
-
-            // Handle /reset command — clear conversation for this chat.
-            if user_text.trim() == "/reset" {
+            // Handle conversation reset via structured flag (not sentinel string).
+            if channel_msg.reset {
                 {
                     let mut states = chat_states.lock().await;
                     states.remove(&chat_id);
                 }
-                let _ = tg
-                    .send_text(
-                        chat_id,
-                        "Conversation reset. Send a new message to start fresh.",
-                    )
-                    .await;
                 return;
             }
+
+            let user_text = match &channel_msg.message.content {
+                MessageContent::Text(t) => t.clone(),
+                _ => return,
+            };
 
             // Get or create conversation.
             let conv_id = {

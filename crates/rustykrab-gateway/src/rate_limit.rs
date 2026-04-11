@@ -85,13 +85,13 @@ impl RateLimiter {
         record.attempts.push(now);
 
         // Prune stale entries to prevent unbounded memory growth.
-        // Use a lower threshold (1000) to keep memory usage reasonable,
-        // and only evict a limited batch per call to avoid iterating the
-        // entire HashMap under the lock.
+        // Only scan a bounded number of entries per call to avoid
+        // iterating the entire HashMap under the lock during DDoS.
         if records.len() > 1_000 {
             let stale_cutoff = now - self.config.window * 2;
             let stale_keys: Vec<IpAddr> = records
                 .iter()
+                .take(512) // Bound scan to 512 entries per request.
                 .filter(|(_, rec)| {
                     // Stale if lockout expired (or never locked).
                     let locked_expired = rec.locked_until.map(|l| l <= now).unwrap_or(true);
@@ -106,8 +106,8 @@ impl RateLimiter {
                 .map(|(ip, _)| *ip)
                 .take(256)
                 .collect();
-            for key in stale_keys {
-                records.remove(&key);
+            for key in &stale_keys {
+                records.remove(key);
             }
         }
 

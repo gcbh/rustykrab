@@ -52,7 +52,8 @@ async fn health() -> &'static str {
 async fn logout(State(state): State<AppState>) -> StatusCode {
     let new_token = state.rotate_token();
     tracing::info!("auth token rotated via /api/logout");
-    println!("\n  New RUSTYKRAB_AUTH_TOKEN={new_token}\n");
+    // Print to stderr to avoid capture by structured logging infrastructure.
+    eprintln!("\n  New RUSTYKRAB_AUTH_TOKEN={new_token}\n");
     StatusCode::NO_CONTENT
 }
 
@@ -97,7 +98,10 @@ async fn delete_conversation(
         .conversations()
         .delete(id)
         .map(|_| StatusCode::NO_CONTENT)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+        .map_err(|e| match e {
+            rustykrab_core::Error::NotFound(_) => StatusCode::NOT_FOUND,
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        })
 }
 
 /// Send a user message to a conversation and get an assistant response.
@@ -220,7 +224,7 @@ async fn send_message_stream(
         let hb_monitor = heartbeat.clone();
         let timeout_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let tf = timeout_flag.clone();
-        let monitor = tokio::spawn(async move {
+        let mut monitor = tokio::spawn(async move {
             const HEARTBEAT_TIMEOUT_MS: u64 = 300_000; // 5 minutes
             loop {
                 tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
@@ -245,16 +249,15 @@ async fn send_message_stream(
 
         let result = tokio::select! {
             r = agent_future => r,
-            _ = monitor => {
+            _ = &mut monitor => {
                 tracing::warn!("streaming agent timed out (no activity for 5 minutes)");
                 Err(StatusCode::REQUEST_TIMEOUT)
             }
         };
 
-        // If the agent finished before the monitor, cancel the monitor.
-        if !timeout_flag.load(std::sync::atomic::Ordering::Relaxed) {
-            // Agent completed normally; monitor task will be dropped.
-        }
+        // Abort the monitor task to prevent it from leaking for up to
+        // 5 minutes after the agent completes normally.
+        monitor.abort();
 
         // Persist conversation regardless of outcome to preserve the user message.
         conv.updated_at = Utc::now();
