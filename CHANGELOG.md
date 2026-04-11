@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.2] - 2026-04-11
+
+- Fix macOS release builds: pin runners to correct architectures, add manual dispatch (#254)
+
 ## [1.3.1] - 2026-04-11
 
 - Show Telegram conversations in web UI, persist chat mapping (#253)
