@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-04-11
+
+- Add central secret registry and cross-platform OS keychain support (#255)
+
 ## [1.3.3] - 2026-04-11
 
 - Drop Intel macOS build, fix release workflow (#257)
