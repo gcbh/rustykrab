@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-04-11
+
+- Add semantic versioning, changelog, and automated releases (#244)
+
 ### Added
 - Semantic versioning with git metadata embedded at build time
 - `--version` / `-V` CLI flag prints version, git hash, and build date
