@@ -41,7 +41,25 @@ impl Tool for CronTool {
                     },
                     "schedule": {
                         "type": "string",
-                        "description": "Cron expression for recurring schedules (e.g. '0 9 * * *' for daily at 9am, '*/30 * * * *' for every 30 minutes) or an ISO 8601 timestamp for one-shot tasks (e.g. '2025-04-12T14:30:00Z'). Required for create."
+                        "description": concat!(
+                            "Required for create. Must be ONE of:\n",
+                            "\n",
+                            "1) Standard 5-field cron expression: minute hour day-of-month month day-of-week\n",
+                            "   Fields: minute(0-59) hour(0-23) day(1-31) month(1-12) weekday(0-6, 0=Sun)\n",
+                            "   Allowed operators: * (any), */N (every N), N-M (range), N,M (list)\n",
+                            "   Examples:\n",
+                            "   - '0 9 * * *'     → daily at 9:00 AM\n",
+                            "   - '*/30 * * * *'  → every 30 minutes\n",
+                            "   - '0 9 * * 1-5'   → weekdays at 9:00 AM\n",
+                            "   - '0 0 1 * *'     → first day of every month at midnight\n",
+                            "   - '0 8,12,18 * * *' → daily at 8 AM, noon, and 6 PM\n",
+                            "\n",
+                            "2) ISO 8601 timestamp for one-shot tasks (must be in the future):\n",
+                            "   - '2025-04-12T14:30:00Z'\n",
+                            "\n",
+                            "IMPORTANT: Use only the standard 5-field format. Do NOT use non-standard extensions, ",
+                            "named months/days (like 'MON'), or 6-field expressions.",
+                        )
                     },
                     "task": {
                         "type": "string",

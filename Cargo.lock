@@ -691,11 +691,13 @@ dependencies = [
 
 [[package]]
 name = "croner"
-version = "2.2.0"
+version = "3.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c344b0690c1ad1c7176fe18eb173e0c927008fdaaa256e40dfd43ddd149c0843"
+checksum = "4aa42bcd3d846ebf66e15bd528d1087f75d1c6c1c66ebff626178a106353c576"
 dependencies = [
  "chrono",
+ "derive_builder",
+ "strum",
 ]
 
 [[package]]
@@ -3250,7 +3252,7 @@ checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
 
 [[package]]
 name = "rustykrab-agent"
-version = "1.4.2"
+version = "1.4.3"
 dependencies = [
  "async-trait",
  "chrono",
@@ -3264,7 +3266,7 @@ dependencies = [
 
 [[package]]
 name = "rustykrab-channels"
-version = "1.4.2"
+version = "1.4.3"
 dependencies = [
  "async-trait",
  "chrono",
@@ -3283,7 +3285,7 @@ dependencies = [
 
 [[package]]
 name = "rustykrab-cli"
-version = "1.4.2"
+version = "1.4.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3311,7 +3313,7 @@ dependencies = [
 
 [[package]]
 name = "rustykrab-core"
-version = "1.4.2"
+version = "1.4.3"
 dependencies = [
  "async-trait",
  "chrono",
@@ -3323,7 +3325,7 @@ dependencies = [
 
 [[package]]
 name = "rustykrab-gateway"
-version = "1.4.2"
+version = "1.4.3"
 dependencies = [
  "axum",
  "chrono",
@@ -3346,7 +3348,7 @@ dependencies = [
 
 [[package]]
 name = "rustykrab-memory"
-version = "1.4.2"
+version = "1.4.3"
 dependencies = [
  "async-trait",
  "chrono",
@@ -3367,7 +3369,7 @@ dependencies = [
 
 [[package]]
 name = "rustykrab-providers"
-version = "1.4.2"
+version = "1.4.3"
 dependencies = [
  "async-trait",
  "chrono",
@@ -3383,7 +3385,7 @@ dependencies = [
 
 [[package]]
 name = "rustykrab-skills"
-version = "1.4.2"
+version = "1.4.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3399,7 +3401,7 @@ dependencies = [
 
 [[package]]
 name = "rustykrab-store"
-version = "1.4.2"
+version = "1.4.3"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -3422,7 +3424,7 @@ dependencies = [
 
 [[package]]
 name = "rustykrab-tools"
-version = "1.4.2"
+version = "1.4.3"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -3745,6 +3747,27 @@ name = "strsim"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
+
+[[package]]
+name = "strum"
+version = "0.27.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "af23d6f6c1a224baef9d3f61e287d2761385a5b88fdab4eb4c6f11aeb54c4bcf"
+dependencies = [
+ "strum_macros",
+]
+
+[[package]]
+name = "strum_macros"
+version = "0.27.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7695ce3845ea4b33927c055a39dc438a45b059f7c1b3d91d38d10355fb8cbca7"
+dependencies = [
+ "heck",
+ "proc-macro2",
+ "quote",
+ "syn",
+]
 
 [[package]]
 name = "subtle"
