@@ -494,7 +494,7 @@ async fn main() -> anyhow::Result<()> {
 
     // --- Job executor (scheduled task runner) ---
     {
-        let executor_store = store.clone();
+        let executor_store = store_handle.clone();
         let executor_state = state.clone();
         infra_handles.push(tokio::spawn(async move {
             job_executor_loop(executor_store, executor_state).await;
