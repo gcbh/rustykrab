@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.3] - 2026-04-11
+
+- fix: harden release script against special characters in PR titles (#261)
+
 ## [1.4.2] - 2026-04-11
 
 - fix: enforce account and service as required params for keychain source in credential_read schema (#259)
