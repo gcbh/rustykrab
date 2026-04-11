@@ -1,20 +1,67 @@
 name: Release
 
 on:
-  push:
-    tags:
-      - "v*"
+  pull_request:
+    types: [closed]
+    branches: [main]
 
 permissions:
   contents: write
 
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: -Dwarnings
 
 jobs:
+  # ── Version bump, commit, tag ──────────────────────────────────────
+  bump:
+    name: Bump Version & Tag
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.bump.outputs.version }}
+      tag: ${{ steps.bump.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Determine bump type from PR labels
+        id: bump-type
+        run: |
+          LABELS='${{ toJson(github.event.pull_request.labels.*.name) }}'
+          if echo "$LABELS" | grep -q '"semver:major"'; then
+            echo "bump=major" >> "$GITHUB_OUTPUT"
+          elif echo "$LABELS" | grep -q '"semver:minor"'; then
+            echo "bump=minor" >> "$GITHUB_OUTPUT"
+          else
+            echo "bump=patch" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Bump version
+        id: bump
+        run: |
+          ./scripts/release.sh "${{ steps.bump-type.outputs.bump }}" \
+            --ci \
+            --pr-title "${{ github.event.pull_request.title }}" \
+            --pr-number "${{ github.event.pull_request.number }}"
+          VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Push version commit and tag
+        run: |
+          git push origin main --tags
+
+  # ── Build release binaries ─────────────────────────────────────────
   build:
     name: Build (${{ matrix.target }})
+    needs: bump
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
@@ -31,6 +78,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.bump.outputs.tag }}
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -55,12 +104,15 @@ jobs:
           name: rustykrab-${{ matrix.target }}
           path: dist/rustykrab-${{ matrix.target }}.tar.gz
 
+  # ── Create GitHub Release ──────────────────────────────────────────
   release:
     name: Create GitHub Release
-    needs: build
+    needs: [bump, build]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.bump.outputs.tag }}
 
       - uses: actions/download-artifact@v4
         with:
@@ -68,18 +120,15 @@ jobs:
           merge-multiple: true
 
       - name: Extract changelog for this version
-        id: changelog
         run: |
-          TAG="${GITHUB_REF_NAME}"
-          VERSION="${TAG#v}"
-          # Extract the section for this version from CHANGELOG.md
-          NOTES=$(awk "/^## \[${VERSION}\]/{found=1; next} /^## \[/{if(found) exit} found" CHANGELOG.md)
-          # Write to file for the release body
-          echo "$NOTES" > release_notes.md
+          VERSION="${{ needs.bump.outputs.version }}"
+          awk "/^## \[${VERSION}\]/{found=1; next} /^## \[/{if(found) exit} found" \
+            CHANGELOG.md > release_notes.md
 
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ needs.bump.outputs.tag }}
           body_path: release_notes.md
           files: artifacts/*
           generate_release_notes: false
