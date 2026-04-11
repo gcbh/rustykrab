@@ -4,6 +4,17 @@ on:
   pull_request:
     types: [closed]
     branches: [main]
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "Version bump type"
+        required: true
+        default: patch
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
 
 permissions:
   contents: write
@@ -15,7 +26,9 @@ jobs:
   # ── Version bump, commit, tag ──────────────────────────────────────
   bump:
     name: Bump Version & Tag
-    if: github.event.pull_request.merged == true
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.pull_request.merged == true
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.bump.outputs.version }}
@@ -38,25 +51,31 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-      - name: Determine bump type from PR labels
+      - name: Determine bump type
         id: bump-type
         run: |
-          LABELS='${{ toJson(github.event.pull_request.labels.*.name) }}'
-          if echo "$LABELS" | grep -q '"semver:major"'; then
-            echo "bump=major" >> "$GITHUB_OUTPUT"
-          elif echo "$LABELS" | grep -q '"semver:minor"'; then
-            echo "bump=minor" >> "$GITHUB_OUTPUT"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "bump=${{ inputs.bump }}" >> "$GITHUB_OUTPUT"
           else
-            echo "bump=patch" >> "$GITHUB_OUTPUT"
+            LABELS='${{ toJson(github.event.pull_request.labels.*.name) }}'
+            if echo "$LABELS" | grep -q '"semver:major"'; then
+              echo "bump=major" >> "$GITHUB_OUTPUT"
+            elif echo "$LABELS" | grep -q '"semver:minor"'; then
+              echo "bump=minor" >> "$GITHUB_OUTPUT"
+            else
+              echo "bump=patch" >> "$GITHUB_OUTPUT"
+            fi
           fi
 
       - name: Bump version
         id: bump
         run: |
+          PR_TITLE="${{ github.event.pull_request.title || 'Manual release' }}"
+          PR_NUMBER="${{ github.event.pull_request.number || '0' }}"
           ./scripts/release.sh "${{ steps.bump-type.outputs.bump }}" \
             --ci \
-            --pr-title "${{ github.event.pull_request.title }}" \
-            --pr-number "${{ github.event.pull_request.number }}"
+            --pr-title "$PR_TITLE" \
+            --pr-number "$PR_NUMBER"
           VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
@@ -80,10 +99,10 @@ jobs:
             os: ubuntu-latest
             artifact: rustykrab-cli
           - target: aarch64-apple-darwin
-            os: macos-latest
+            os: macos-14
             artifact: rustykrab-cli
           - target: x86_64-apple-darwin
-            os: macos-latest
+            os: macos-13
             artifact: rustykrab-cli
 
     steps:
