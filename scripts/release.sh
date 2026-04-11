@@ -89,8 +89,20 @@ if [ "$CI_MODE" = true ] && [ -n "$PR_TITLE" ]; then
         PR_REF=" (#$PR_NUMBER)"
     fi
 
-    # Insert the new version heading after [Unreleased], and append the PR entry
-    sed -i "s/^## \[Unreleased\]/## [Unreleased]\n\n## [$NEXT] - $DATE\n\n- ${PR_TITLE}${PR_REF}/" "$CHANGELOG"
+    # Insert the new version heading after [Unreleased], and append the PR entry.
+    # Use awk + ENVIRON instead of sed so special characters in PR titles
+    # (quotes, parentheses, slashes, ampersands) don't cause syntax errors.
+    export _PR_TITLE="$PR_TITLE"
+    export _PR_REF="$PR_REF"
+    awk -v ver="$NEXT" -v date="$DATE" '
+        /^## \[Unreleased\]/ {
+            print
+            print ""
+            printf "## [%s] - %s\n\n- %s%s\n", ver, date, ENVIRON["_PR_TITLE"], ENVIRON["_PR_REF"]
+            next
+        }
+        { print }
+    ' "$CHANGELOG" > "${CHANGELOG}.tmp" && mv "${CHANGELOG}.tmp" "$CHANGELOG"
 else
     # Local: just promote the [Unreleased] section to the new version heading
     sed -i "s/^## \[Unreleased\]/## [Unreleased]\n\n## [$NEXT] - $DATE/" "$CHANGELOG"

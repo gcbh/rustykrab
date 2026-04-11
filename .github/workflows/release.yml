@@ -69,10 +69,12 @@ jobs:
 
       - name: Bump version
         id: bump
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title || 'Manual release' }}
+          PR_NUMBER: ${{ github.event.pull_request.number || '0' }}
+          BUMP_TYPE: ${{ steps.bump-type.outputs.bump }}
         run: |
-          PR_TITLE="${{ github.event.pull_request.title || 'Manual release' }}"
-          PR_NUMBER="${{ github.event.pull_request.number || '0' }}"
-          ./scripts/release.sh "${{ steps.bump-type.outputs.bump }}" \
+          ./scripts/release.sh "$BUMP_TYPE" \
             --ci \
             --pr-title "$PR_TITLE" \
             --pr-number "$PR_NUMBER"
