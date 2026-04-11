@@ -148,10 +148,50 @@ async fn main() -> anyhow::Result<()> {
 
     let store = rustykrab_store::Store::open(data_dir.join("db"), master_key)?;
 
+    // --- Validate required secrets (central registry) ---
+    // Every credential the app needs is declared in `registry::REGISTRY`.
+    // Required secrets that cannot be resolved from any source (env var,
+    // OS keychain, or encrypted store) cause a hard startup failure.
+    {
+        let missing = rustykrab_store::registry::validate(&store.secrets());
+        let required_missing: Vec<_> = missing.iter().filter(|m| m.spec.required).collect();
+
+        if !required_missing.is_empty() {
+            eprintln!();
+            eprintln!("ERROR: required secrets are missing — the application cannot start.");
+            eprintln!();
+            for m in &required_missing {
+                eprintln!("  {} ({})", m.spec.description, m.spec.store_name);
+                eprintln!("    Set via one of:");
+                eprintln!("      env var:    export {}=<value>", m.spec.env_var);
+                eprintln!(
+                    "      keychain:   rustykrab-cli keychain set {} <value>",
+                    m.spec.keychain_account
+                );
+                eprintln!(
+                    "      store:      credential_write(action='set', name='{}', value='...')",
+                    m.spec.store_name
+                );
+                eprintln!();
+            }
+            eprintln!("Tip: run `scripts/setup-secrets.sh` to store all required secrets at once.");
+            std::process::exit(1);
+        }
+
+        // Warn about optional secrets that are absent.
+        for m in missing.iter().filter(|m| !m.spec.required) {
+            tracing::warn!(
+                secret = m.spec.store_name,
+                "optional secret '{}' not found — some features may be unavailable",
+                m.spec.description,
+            );
+        }
+    }
+
     // --- Auth token ---
-    // Resolution order:
-    // 1. RUSTYKRAB_AUTH_TOKEN env var (CI, Docker, explicit override)
-    // 2. macOS Keychain (persists across restarts without env var)
+    // Resolution order (via registry):
+    // 1. Environment variable (CI, Docker, explicit override)
+    // 2. OS credential store (persists across restarts without env var)
     // 3. Encrypted local SecretStore
     // 4. Generate a new token and persist it in Keychain + SecretStore
     let auth_token = resolve_auth_token(&store);
@@ -1111,134 +1151,53 @@ fn handle_skill_subcommand(data_dir: &std::path::Path, args: &[String]) -> anyho
 }
 
 // --- Credential resolution helpers ---
-// These functions implement a multi-source lookup chain:
-//   env var → macOS Keychain → SecretStore → generate/error
-// When a credential is found or generated, it is persisted to the sources
-// below so it survives future restarts without the env var.
-
-/// Keychain service names for RustyKrab credentials.
-const KEYCHAIN_SERVICE: &str = "com.rustykrab.credentials";
-const KEYCHAIN_ACCOUNT_AUTH_TOKEN: &str = "auth-token";
-const KEYCHAIN_ACCOUNT_API_KEY: &str = "anthropic-api-key";
+// These use the central registry (rustykrab_store::registry) for the
+// env-var → OS-keychain → SecretStore lookup chain.
 
 /// Resolve the bearer auth token for the gateway.
 ///
-/// Lookup chain: env var → Keychain → SecretStore → generate new.
-/// A newly generated token is persisted to Keychain and SecretStore so
-/// subsequent restarts pick it up automatically.
+/// Uses the registry to check env / keychain / store, then generates
+/// a new token if none exists.
 fn resolve_auth_token(store: &rustykrab_store::Store) -> String {
-    // 1. Environment variable (highest priority — explicit override).
-    if let Ok(token) = std::env::var("RUSTYKRAB_AUTH_TOKEN") {
-        tracing::info!("auth token loaded from RUSTYKRAB_AUTH_TOKEN env var");
-        // Persist downward so removing the env var still works next time.
-        persist_credential(
-            store,
-            KEYCHAIN_ACCOUNT_AUTH_TOKEN,
-            "rustykrab_auth_token",
-            &token,
-        );
+    let spec = rustykrab_store::registry::lookup("rustykrab_auth_token")
+        .expect("rustykrab_auth_token must be in the registry");
+
+    if let Some(token) = rustykrab_store::registry::resolve(spec, &store.secrets()) {
+        tracing::info!("auth token resolved via registry");
         return token;
     }
 
-    // 2. macOS Keychain.
-    if rustykrab_store::keychain::keychain_available() {
-        if let Ok(Some(cred)) =
-            rustykrab_store::keychain::get_credential(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT_AUTH_TOKEN)
-        {
-            tracing::info!("auth token loaded from macOS Keychain");
-            // Also ensure it's in the SecretStore.
-            let _ = store.secrets().set("rustykrab_auth_token", &cred.value);
-            return cred.value;
-        }
-    }
-
-    // 3. Encrypted SecretStore.
-    if let Ok(token) = store.secrets().get("rustykrab_auth_token") {
-        tracing::info!("auth token loaded from encrypted store");
-        // Back-fill into Keychain if available.
-        if rustykrab_store::keychain::keychain_available() {
-            let _ = rustykrab_store::keychain::set_credential(
-                KEYCHAIN_SERVICE,
-                KEYCHAIN_ACCOUNT_AUTH_TOKEN,
-                &token,
-            );
-        }
-        return token;
-    }
-
-    // 4. Generate a new token and persist everywhere.
+    // Not found anywhere — generate a new token and persist it.
     let token = rustykrab_gateway::generate_token();
     tracing::info!("generated new auth token — persisting for future restarts");
-    println!("\n  Auth token (also saved to Keychain/store): {token}\n");
-    persist_credential(
-        store,
-        KEYCHAIN_ACCOUNT_AUTH_TOKEN,
-        "rustykrab_auth_token",
-        &token,
-    );
+    println!("\n  Auth token (also saved to credential store): {token}\n");
+
+    let svc = rustykrab_store::registry::keychain_service();
+    if rustykrab_store::keychain::keychain_available() {
+        let _ = rustykrab_store::keychain::set_credential(svc, spec.keychain_account, &token);
+    }
+    let _ = store.secrets().set(spec.store_name, &token);
     token
 }
 
 /// Resolve the Anthropic API key.
 ///
-/// Lookup chain: env var → Keychain → SecretStore → empty (with error log).
+/// Uses the registry to check env / keychain / store.
 fn resolve_api_key(store: &rustykrab_store::Store) -> String {
-    // 1. Environment variable.
-    if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
-        tracing::info!("API key loaded from ANTHROPIC_API_KEY env var");
-        persist_credential(store, KEYCHAIN_ACCOUNT_API_KEY, "anthropic_api_key", &key);
-        return key;
-    }
+    let spec = rustykrab_store::registry::lookup("anthropic_api_key")
+        .expect("anthropic_api_key must be in the registry");
 
-    // 2. macOS Keychain.
-    if rustykrab_store::keychain::keychain_available() {
-        if let Ok(Some(cred)) =
-            rustykrab_store::keychain::get_credential(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT_API_KEY)
-        {
-            tracing::info!("API key loaded from macOS Keychain");
-            let _ = store.secrets().set("anthropic_api_key", &cred.value);
-            return cred.value;
-        }
-    }
-
-    // 3. SecretStore.
-    if let Ok(key) = store.secrets().get("anthropic_api_key") {
-        tracing::info!("API key loaded from encrypted store");
-        if rustykrab_store::keychain::keychain_available() {
-            let _ = rustykrab_store::keychain::set_credential(
-                KEYCHAIN_SERVICE,
-                KEYCHAIN_ACCOUNT_API_KEY,
-                &key,
-            );
-        }
+    if let Some(key) = rustykrab_store::registry::resolve(spec, &store.secrets()) {
+        tracing::info!("API key resolved via registry");
         return key;
     }
 
     tracing::error!(
         "ANTHROPIC_API_KEY not set. Set the env var, store it via the secrets API, \
-         or add it to macOS Keychain (service: {KEYCHAIN_SERVICE}, account: {KEYCHAIN_ACCOUNT_API_KEY})."
+         or add it to the OS credential store (rustykrab-cli keychain set {}).",
+        spec.keychain_account,
     );
     String::new()
-}
-
-/// Persist a credential to both the macOS Keychain and the encrypted
-/// SecretStore. Errors are logged but not fatal — best-effort persistence.
-fn persist_credential(
-    store: &rustykrab_store::Store,
-    keychain_account: &str,
-    store_name: &str,
-    value: &str,
-) {
-    if rustykrab_store::keychain::keychain_available() {
-        if let Err(e) =
-            rustykrab_store::keychain::set_credential(KEYCHAIN_SERVICE, keychain_account, value)
-        {
-            tracing::warn!("failed to persist credential to Keychain: {e}");
-        }
-    }
-    if let Err(e) = store.secrets().set(store_name, value) {
-        tracing::warn!("failed to persist credential to store: {e}");
-    }
 }
 
 /// Handle `keychain status`, `keychain migrate`, and `keychain set` subcommands.
@@ -1250,56 +1209,78 @@ fn handle_keychain_subcommand(data_dir: &std::path::Path, args: &[String]) -> an
 
     match sub {
         "status" => {
+            let available = rustykrab_store::keychain::keychain_available();
             println!(
-                "macOS Keychain support: {}",
-                if rustykrab_store::keychain::keychain_available() {
-                    "available (Data Protection Keychain)"
+                "OS credential store: {}",
+                if available {
+                    if cfg!(target_os = "macos") {
+                        "available (macOS Data Protection Keychain)"
+                    } else {
+                        "available (Secret Service)"
+                    }
                 } else {
-                    "not available (this platform does not support macOS Keychain)"
+                    "not available"
                 }
             );
 
-            if !rustykrab_store::keychain::keychain_available() {
+            if !available {
                 println!(
-                    "\nOn non-macOS platforms, use environment variables or the encrypted store."
+                    "\nNo OS credential store detected. Use environment variables \
+                     or the encrypted store instead."
                 );
                 return Ok(());
             }
 
-            // Check each known credential.
-            let checks = [
-                (
-                    "Master key",
-                    "com.rustykrab.master-key",
-                    "rustykrab-encryption-key",
-                ),
-                ("Auth token", KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT_AUTH_TOKEN),
-                (
-                    "Anthropic API key",
-                    KEYCHAIN_SERVICE,
-                    KEYCHAIN_ACCOUNT_API_KEY,
-                ),
-            ];
+            // Master key (separate service).
+            let master_status = match rustykrab_store::keychain::get_credential(
+                "com.rustykrab.master-key",
+                "rustykrab-encryption-key",
+            ) {
+                Ok(Some(_)) => "present",
+                Ok(None) => "not set",
+                Err(_) => "error",
+            };
 
-            println!("\n{:<25} {:<40} STATUS", "CREDENTIAL", "SERVICE/ACCOUNT");
-            println!("{}", "-".repeat(80));
-            for (label, service, account) in &checks {
-                let status = match rustykrab_store::keychain::get_credential(service, account) {
-                    Ok(Some(_)) => "present",
-                    Ok(None) => "not set",
-                    Err(_) => "error",
-                };
-                println!("{:<25} {}/{:<14} {}", label, service, account, status);
+            let svc = rustykrab_store::registry::keychain_service();
+            println!(
+                "\n{:<25} {:<25} {:<10} STATUS",
+                "CREDENTIAL", "ACCOUNT", "REQUIRED"
+            );
+            println!("{}", "-".repeat(75));
+            println!(
+                "{:<25} {:<25} {:<10} {}",
+                "Master key", "rustykrab-encryption-key", "-", master_status
+            );
+
+            // All registry entries.
+            for spec in rustykrab_store::registry::REGISTRY {
+                let status =
+                    match rustykrab_store::keychain::get_credential(svc, spec.keychain_account) {
+                        Ok(Some(_)) => "present",
+                        Ok(None) => "not set",
+                        Err(_) => "error",
+                    };
+                let req = if spec.required { "yes" } else { "no" };
+                println!(
+                    "{:<25} {:<25} {:<10} {}",
+                    spec.description, spec.keychain_account, req, status
+                );
             }
             println!();
-            println!("All items use the Data Protection Keychain (no password prompts).");
         }
 
         "set" => {
+            // Build the list of accepted names from the registry.
+            let known_names: Vec<&str> = rustykrab_store::registry::REGISTRY
+                .iter()
+                .map(|s| s.keychain_account)
+                .collect();
+            let names_list = known_names.join(", ");
+
             let name = args.get(1).ok_or_else(|| {
                 anyhow::anyhow!(
                     "usage: rustykrab-cli keychain set <name> <value>\n  \
-                 names: auth-token, api-key"
+                     names: {names_list}, or <service>:<account>"
                 )
             })?;
             let value = args.get(2).ok_or_else(|| {
@@ -1307,41 +1288,38 @@ fn handle_keychain_subcommand(data_dir: &std::path::Path, args: &[String]) -> an
             })?;
 
             if !rustykrab_store::keychain::keychain_available() {
-                anyhow::bail!("macOS Keychain is not available on this platform");
+                anyhow::bail!("OS credential store is not available on this platform");
             }
 
-            let (service, account) = match name.as_str() {
-                "auth-token" => (KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT_AUTH_TOKEN),
-                "api-key" => (KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT_API_KEY),
-                other => {
-                    // Allow arbitrary service/account if specified as service:account
-                    if let Some((s, a)) = other.split_once(':') {
-                        (s, a)
-                    } else {
-                        anyhow::bail!(
-                            "unknown credential name '{other}'. \
-                             Use: auth-token, api-key, or service:account"
-                        );
-                    }
-                }
-            };
+            let svc = rustykrab_store::registry::keychain_service();
+
+            // Look up the name in the registry first, then fall back to
+            // arbitrary service:account pairs.
+            let (service, account, store_name) =
+                if let Some(spec) = rustykrab_store::registry::lookup_by_account(name) {
+                    (svc, spec.keychain_account, Some(spec.store_name))
+                } else if let Some((s, a)) = name.split_once(':') {
+                    (s, a, None)
+                } else {
+                    anyhow::bail!(
+                        "unknown credential name '{name}'. \
+                         Use: {names_list}, or <service>:<account>"
+                    );
+                };
 
             rustykrab_store::keychain::set_credential(service, account, value)
                 .map_err(|e| anyhow::anyhow!("failed to store: {e}"))?;
-            println!("Stored in Keychain: {service}/{account}");
+            println!("Stored in credential store: {service}/{account}");
 
             // Also persist to the encrypted store if the DB exists.
-            let db_path = data_dir.join("db");
-            if db_path.exists() {
-                if let Ok(master_key) = rustykrab_store::keychain::resolve_master_key() {
-                    if let Ok(store) = rustykrab_store::Store::open(&db_path, master_key) {
-                        let store_name = match name.as_str() {
-                            "auth-token" => "rustykrab_auth_token",
-                            "api-key" => "anthropic_api_key",
-                            _ => name.as_str(),
-                        };
-                        let _ = store.secrets().set(store_name, value);
-                        println!("Also stored in encrypted store as '{store_name}'");
+            if let Some(sn) = store_name {
+                let db_path = data_dir.join("db");
+                if db_path.exists() {
+                    if let Ok(master_key) = rustykrab_store::keychain::resolve_master_key() {
+                        if let Ok(store) = rustykrab_store::Store::open(&db_path, master_key) {
+                            let _ = store.secrets().set(sn, value);
+                            println!("Also stored in encrypted store as '{sn}'");
+                        }
                     }
                 }
             }
@@ -1349,53 +1327,39 @@ fn handle_keychain_subcommand(data_dir: &std::path::Path, args: &[String]) -> an
 
         "migrate" => {
             if !rustykrab_store::keychain::keychain_available() {
-                anyhow::bail!("macOS Keychain is not available on this platform");
+                anyhow::bail!("OS credential store is not available on this platform");
             }
 
-            println!("Migrating credentials to Data Protection Keychain...");
-            println!(
-                "(This re-creates items without per-app ACLs so no password prompts occur.)\n"
-            );
+            println!("Migrating credentials to OS credential store...\n");
 
-            // Re-resolve master key — this migrates it to the DP keychain.
+            // Re-resolve master key — this ensures it is stored in the credential store.
             match rustykrab_store::keychain::resolve_master_key() {
                 Ok(_) => println!("  master key: OK"),
                 Err(e) => println!("  master key: FAILED ({e})"),
             }
 
-            // Migrate auth token and API key from env vars or existing store.
+            // Migrate all registry secrets from the encrypted store.
             let db_path = data_dir.join("db");
             if db_path.exists() {
                 if let Ok(master_key) = rustykrab_store::keychain::resolve_master_key() {
                     if let Ok(store) = rustykrab_store::Store::open(&db_path, master_key) {
-                        // Auth token
-                        if let Ok(token) = store.secrets().get("rustykrab_auth_token") {
-                            match rustykrab_store::keychain::set_credential(
-                                KEYCHAIN_SERVICE,
-                                KEYCHAIN_ACCOUNT_AUTH_TOKEN,
-                                &token,
-                            ) {
-                                Ok(()) => println!("  auth token: migrated to DP Keychain"),
-                                Err(e) => println!("  auth token: FAILED ({e})"),
+                        let svc = rustykrab_store::registry::keychain_service();
+                        for spec in rustykrab_store::registry::REGISTRY {
+                            if let Ok(val) = store.secrets().get(spec.store_name) {
+                                match rustykrab_store::keychain::set_credential(
+                                    svc,
+                                    spec.keychain_account,
+                                    &val,
+                                ) {
+                                    Ok(()) => println!("  {}: migrated", spec.description),
+                                    Err(e) => println!("  {}: FAILED ({e})", spec.description),
+                                }
+                            } else {
+                                println!(
+                                    "  {}: not in store (set via 'keychain set {}')",
+                                    spec.description, spec.keychain_account
+                                );
                             }
-                        } else {
-                            println!(
-                                "  auth token: not in store (will be generated on next start)"
-                            );
-                        }
-
-                        // API key
-                        if let Ok(key) = store.secrets().get("anthropic_api_key") {
-                            match rustykrab_store::keychain::set_credential(
-                                KEYCHAIN_SERVICE,
-                                KEYCHAIN_ACCOUNT_API_KEY,
-                                &key,
-                            ) {
-                                Ok(()) => println!("  API key: migrated to DP Keychain"),
-                                Err(e) => println!("  API key: FAILED ({e})"),
-                            }
-                        } else {
-                            println!("  API key: not in store (set via env var or 'keychain set api-key')");
                         }
                     }
                 }
@@ -1412,15 +1376,18 @@ fn handle_keychain_subcommand(data_dir: &std::path::Path, args: &[String]) -> an
         _ => {
             eprintln!("Unknown keychain subcommand: {sub}");
             eprintln!("Usage:");
-            eprintln!(
-                "  rustykrab-cli keychain status              Show Keychain credential status"
-            );
+            eprintln!("  rustykrab-cli keychain status              Show credential store status");
             eprintln!("  rustykrab-cli keychain set <name> <value>  Store a credential");
             eprintln!(
-                "  rustykrab-cli keychain migrate             Migrate to Data Protection Keychain"
+                "  rustykrab-cli keychain migrate             Migrate store to OS credential store"
             );
             eprintln!();
-            eprintln!("Credential names: auth-token, api-key, or <service>:<account>");
+            eprint!("Credential names: ");
+            let names: Vec<&str> = rustykrab_store::registry::REGISTRY
+                .iter()
+                .map(|s| s.keychain_account)
+                .collect();
+            eprintln!("{}, or <service>:<account>", names.join(", "));
             std::process::exit(1);
         }
     }

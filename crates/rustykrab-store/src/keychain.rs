@@ -16,9 +16,7 @@
 
 use rustykrab_core::Error;
 
-#[cfg(target_os = "macos")]
 const SERVICE_NAME: &str = "com.rustykrab.master-key";
-#[cfg(target_os = "macos")]
 const ACCOUNT_NAME: &str = "rustykrab-encryption-key";
 
 // ---------------------------------------------------------------------------
@@ -213,9 +211,11 @@ pub fn resolve_master_key() -> Result<Vec<u8>, Error> {
     Ok(key.to_vec())
 }
 
-/// Non-macOS fallback: use env var or generate an ephemeral key.
+/// Non-macOS: use env var, then OS credential store (Secret Service on Linux),
+/// then generate an ephemeral key as a last resort.
 #[cfg(not(target_os = "macos"))]
 pub fn resolve_master_key() -> Result<Vec<u8>, Error> {
+    // Priority 1: environment variable (for CI, Docker, explicit override).
     if let Ok(env_key) = std::env::var("RUSTYKRAB_MASTER_KEY") {
         tracing::info!("using master key from RUSTYKRAB_MASTER_KEY env var");
         return hex::decode(env_key.trim()).map_err(|e| {
@@ -225,13 +225,71 @@ pub fn resolve_master_key() -> Result<Vec<u8>, Error> {
         });
     }
 
+    // Priority 2: OS credential store (Secret Service on Linux).
+    if keychain_available() {
+        if let Some(key) = get_master_key()? {
+            tracing::info!("master key loaded from OS credential store");
+            return Ok(key);
+        }
+
+        // Generate a new key and persist it in the credential store.
+        tracing::info!("no master key found — generating and storing in OS credential store");
+        let mut key = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::rng(), &mut key);
+        set_master_key(&key)?;
+        tracing::info!("master key stored in OS credential store");
+        return Ok(key.to_vec());
+    }
+
+    // Priority 3: ephemeral key (no credential store available).
     tracing::warn!(
-        "RUSTYKRAB_MASTER_KEY not set and macOS Keychain not available — \
+        "RUSTYKRAB_MASTER_KEY not set and OS credential store not available — \
          generating ephemeral key. Secrets will not survive restart."
     );
     let mut key = [0u8; 32];
     rand::RngCore::fill_bytes(&mut rand::rng(), &mut key);
     Ok(key.to_vec())
+}
+
+/// Retrieve the master key from the OS credential store.
+#[cfg(not(target_os = "macos"))]
+pub fn get_master_key() -> Result<Option<Vec<u8>>, Error> {
+    let entry = keyring::Entry::new(SERVICE_NAME, ACCOUNT_NAME)
+        .map_err(|e| Error::Storage(format!("keyring init failed: {e}")))?;
+    match entry.get_password() {
+        Ok(hex_str) => {
+            let key = hex::decode(hex_str.trim())
+                .map_err(|e| Error::Storage(format!("keyring: invalid hex: {e}")))?;
+            Ok(Some(key))
+        }
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(e) => {
+            tracing::debug!("keyring read failed (Secret Service may not be available): {e}");
+            Ok(None)
+        }
+    }
+}
+
+/// Store the master key in the OS credential store (as hex).
+#[cfg(not(target_os = "macos"))]
+pub fn set_master_key(key: &[u8]) -> Result<(), Error> {
+    let entry = keyring::Entry::new(SERVICE_NAME, ACCOUNT_NAME)
+        .map_err(|e| Error::Storage(format!("keyring init failed: {e}")))?;
+    entry
+        .set_password(&hex::encode(key))
+        .map_err(|e| Error::Storage(format!("keyring write failed: {e}")))
+}
+
+/// Delete the master key from the OS credential store.
+#[cfg(not(target_os = "macos"))]
+pub fn delete_master_key() -> Result<(), Error> {
+    let entry = keyring::Entry::new(SERVICE_NAME, ACCOUNT_NAME)
+        .map_err(|e| Error::Storage(format!("keyring init failed: {e}")))?;
+    match entry.delete_credential() {
+        Ok(()) => Ok(()),
+        Err(keyring::Error::NoEntry) => Ok(()),
+        Err(e) => Err(Error::Storage(format!("keyring delete failed: {e}"))),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -248,10 +306,26 @@ pub struct KeychainCredential {
     pub value: String,
 }
 
-/// Returns `true` when the current platform supports Keychain credential
-/// lookups (i.e. the binary was compiled for macOS).
+/// Returns `true` when the current platform has a working OS credential
+/// store (macOS Keychain, Linux Secret Service, etc.).
+#[cfg(target_os = "macos")]
 pub fn keychain_available() -> bool {
-    cfg!(target_os = "macos")
+    true
+}
+
+/// Probe the OS credential store (Secret Service on Linux).
+///
+/// Returns `true` if the backend responds, `false` otherwise (e.g. no
+/// D-Bus session, no Secret Service daemon running).
+#[cfg(not(target_os = "macos"))]
+pub fn keychain_available() -> bool {
+    keyring::Entry::new("com.rustykrab.probe", "availability-check")
+        .and_then(|entry| match entry.get_password() {
+            Ok(_) => Ok(()),
+            Err(keyring::Error::NoEntry) => Ok(()),
+            Err(e) => Err(e),
+        })
+        .is_ok()
 }
 
 /// Retrieve a credential from the macOS Keychain by service and account.
@@ -279,10 +353,20 @@ pub fn get_credential(service: &str, account: &str) -> Result<Option<KeychainCre
 }
 
 #[cfg(not(target_os = "macos"))]
-pub fn get_credential(_service: &str, _account: &str) -> Result<Option<KeychainCredential>, Error> {
-    Err(Error::Storage(
-        "macOS Keychain is not available on this platform".into(),
-    ))
+pub fn get_credential(service: &str, account: &str) -> Result<Option<KeychainCredential>, Error> {
+    let entry = keyring::Entry::new(service, account)
+        .map_err(|e| Error::Storage(format!("keyring init failed: {e}")))?;
+    match entry.get_password() {
+        Ok(value) => Ok(Some(KeychainCredential {
+            service: service.to_string(),
+            account: account.to_string(),
+            value,
+        })),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(e) => Err(Error::Storage(format!(
+            "keyring read failed for {service}/{account}: {e}"
+        ))),
+    }
 }
 
 /// Store a credential in the macOS Keychain under the given service/account.
@@ -296,10 +380,12 @@ pub fn set_credential(service: &str, account: &str, value: &str) -> Result<(), E
 }
 
 #[cfg(not(target_os = "macos"))]
-pub fn set_credential(_service: &str, _account: &str, _value: &str) -> Result<(), Error> {
-    Err(Error::Storage(
-        "macOS Keychain is not available on this platform".into(),
-    ))
+pub fn set_credential(service: &str, account: &str, value: &str) -> Result<(), Error> {
+    let entry = keyring::Entry::new(service, account)
+        .map_err(|e| Error::Storage(format!("keyring init failed: {e}")))?;
+    entry
+        .set_password(value)
+        .map_err(|e| Error::Storage(format!("keyring write failed for {service}/{account}: {e}")))
 }
 
 /// Delete a credential from the macOS Keychain.
@@ -309,8 +395,14 @@ pub fn delete_credential(service: &str, account: &str) -> Result<(), Error> {
 }
 
 #[cfg(not(target_os = "macos"))]
-pub fn delete_credential(_service: &str, _account: &str) -> Result<(), Error> {
-    Err(Error::Storage(
-        "macOS Keychain is not available on this platform".into(),
-    ))
+pub fn delete_credential(service: &str, account: &str) -> Result<(), Error> {
+    let entry = keyring::Entry::new(service, account)
+        .map_err(|e| Error::Storage(format!("keyring init failed: {e}")))?;
+    match entry.delete_credential() {
+        Ok(()) => Ok(()),
+        Err(keyring::Error::NoEntry) => Ok(()),
+        Err(e) => Err(Error::Storage(format!(
+            "keyring delete failed for {service}/{account}: {e}"
+        ))),
+    }
 }
