@@ -1,6 +1,6 @@
-mod skill;
 pub mod loader;
 pub mod prompt;
+mod skill;
 pub mod skill_md;
 pub mod verify;
 

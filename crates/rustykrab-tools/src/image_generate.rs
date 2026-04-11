@@ -88,23 +88,30 @@ impl Tool for ImageGenerateTool {
             req = req.header("Authorization", format!("Bearer {api_key}"));
         }
 
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| rustykrab_core::Error::ToolExecution(format!("image generation request failed: {e}").into()))?;
+        let resp = req.send().await.map_err(|e| {
+            rustykrab_core::Error::ToolExecution(
+                format!("image generation request failed: {e}").into(),
+            )
+        })?;
 
-        let resp_bytes = resp
-            .bytes()
-            .await
-            .map_err(|e| rustykrab_core::Error::ToolExecution(format!("failed to read response: {e}").into()))?;
+        let resp_bytes = resp.bytes().await.map_err(|e| {
+            rustykrab_core::Error::ToolExecution(format!("failed to read response: {e}").into())
+        })?;
 
         let saved_path = if let Some(path) = output_path {
             // Path traversal protection: validate output path before writing
-            let safe_path = crate::security::validate_path(path)
-                .map_err(|e| rustykrab_core::Error::ToolExecution(format!("output path validation failed: {e}").into()))?;
+            let safe_path = crate::security::validate_path(path).map_err(|e| {
+                rustykrab_core::Error::ToolExecution(
+                    format!("output path validation failed: {e}").into(),
+                )
+            })?;
             tokio::fs::write(&safe_path, &resp_bytes)
                 .await
-                .map_err(|e| rustykrab_core::Error::ToolExecution(format!("failed to save image: {e}").into()))?;
+                .map_err(|e| {
+                    rustykrab_core::Error::ToolExecution(
+                        format!("failed to save image: {e}").into(),
+                    )
+                })?;
             safe_path.to_string_lossy().to_string()
         } else {
             String::new()

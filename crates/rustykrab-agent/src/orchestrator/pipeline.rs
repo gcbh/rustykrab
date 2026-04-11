@@ -12,7 +12,7 @@ use rustykrab_core::orchestration::{
 };
 use rustykrab_core::{Result, Tool};
 
-use crate::sandbox::Sandbox;
+use crate::sandbox::{Sandbox, SandboxPolicy};
 
 use super::decomposer::Decomposer;
 use super::executor::ParallelExecutor;
@@ -46,6 +46,7 @@ pub struct OrchestrationPipeline {
     provider: Arc<dyn ModelProvider>,
     tools: Vec<Arc<dyn Tool>>,
     sandbox: Arc<dyn Sandbox>,
+    policy: SandboxPolicy,
     config: OrchestrationConfig,
 }
 
@@ -60,11 +61,20 @@ impl OrchestrationPipeline {
             provider,
             tools,
             sandbox,
+            policy: SandboxPolicy::trusted(),
             config,
         }
     }
 
+    /// Override the sandbox policy used for sub-task tool execution.
+    pub fn with_policy(mut self, policy: SandboxPolicy) -> Self {
+        self.policy = policy;
+        self
+    }
+
     /// Run the pipeline for a given request at the specified complexity level.
+    ///
+    /// The entire pipeline is wrapped in a timeout to prevent unbounded execution.
     pub async fn run(
         &self,
         request: &str,
@@ -73,6 +83,30 @@ impl OrchestrationPipeline {
     ) -> Result<PipelineResult> {
         tracing::info!(?complexity, "running orchestration pipeline");
 
+        let timeout_secs = self.config.pipeline_timeout_secs;
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(timeout_secs),
+            self.run_inner(request, complexity, context),
+        )
+        .await;
+
+        match result {
+            Ok(inner) => inner,
+            Err(_) => {
+                tracing::error!(timeout_secs, "orchestration pipeline timed out");
+                Err(rustykrab_core::Error::Internal(format!(
+                    "orchestration pipeline timed out after {timeout_secs}s"
+                )))
+            }
+        }
+    }
+
+    async fn run_inner(
+        &self,
+        request: &str,
+        complexity: TaskComplexity,
+        context: Option<&str>,
+    ) -> Result<PipelineResult> {
         match complexity {
             TaskComplexity::Trivial | TaskComplexity::Simple => {
                 self.run_direct(request, context).await
@@ -84,11 +118,7 @@ impl OrchestrationPipeline {
     }
 
     /// Direct response — no pipeline, single model call.
-    async fn run_direct(
-        &self,
-        request: &str,
-        context: Option<&str>,
-    ) -> Result<PipelineResult> {
+    async fn run_direct(&self, request: &str, context: Option<&str>) -> Result<PipelineResult> {
         use chrono::Utc;
         use rustykrab_core::types::{Message, MessageContent, Role};
         use uuid::Uuid;
@@ -110,13 +140,24 @@ impl OrchestrationPipeline {
         });
 
         let schemas: Vec<_> = self.tools.iter().map(|t| t.schema()).collect();
-        let response = self.provider.chat(&messages, &schemas).await?;
-        let text = response
-            .message
-            .content
-            .as_text()
-            .unwrap_or("")
-            .to_string();
+        let timeout_secs = self.config.model_call_timeout_secs;
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(timeout_secs),
+            self.provider.chat(&messages, &schemas),
+        )
+        .await
+        .map_err(|_| {
+            rustykrab_core::Error::Internal(format!("model call timed out after {timeout_secs}s"))
+        })??;
+        let text = match response.message.content.as_text() {
+            Some(t) => t.to_string(),
+            None => {
+                tracing::warn!(
+                    "model returned non-text response in direct pipeline, using empty string"
+                );
+                String::new()
+            }
+        };
 
         Ok(PipelineResult {
             response: text,
@@ -130,16 +171,13 @@ impl OrchestrationPipeline {
     /// Moderate pipeline: decompose + parallel execute + synthesize,
     /// with a continuation loop that re-decomposes remaining work
     /// until the task is complete or max_recursion_depth is reached.
-    async fn run_moderate(
-        &self,
-        request: &str,
-        context: Option<&str>,
-    ) -> Result<PipelineResult> {
+    async fn run_moderate(&self, request: &str, context: Option<&str>) -> Result<PipelineResult> {
         let decomposer = Decomposer::new(self.provider.clone(), self.config.clone());
         let executor = ParallelExecutor::new(
             self.provider.clone(),
             self.tools.clone(),
             self.sandbox.clone(),
+            self.policy.clone(),
             self.config.clone(),
         );
         let synthesizer = Synthesizer::new(self.provider.clone());
@@ -224,8 +262,10 @@ impl OrchestrationPipeline {
         for (i, r) in results.iter().enumerate() {
             if r.success {
                 // Truncate long outputs to keep the completion check cheap.
+                // Use floor_char_boundary to avoid splitting multi-byte UTF-8.
                 let output = if r.output.len() > 500 {
-                    format!("{}...", &r.output[..500])
+                    let end = r.output.floor_char_boundary(500);
+                    format!("{}...", &r.output[..end])
                 } else {
                     r.output.clone()
                 };
@@ -260,23 +300,35 @@ impl OrchestrationPipeline {
             created_at: Utc::now(),
         });
 
-        let response = self.provider.chat(&messages, &[]).await?;
-        let text = response
-            .message
-            .content
-            .as_text()
-            .unwrap_or("")
-            .to_uppercase();
+        let timeout_secs = self.config.model_call_timeout_secs;
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(timeout_secs),
+            self.provider.chat(&messages, &[]),
+        )
+        .await
+        .map_err(|_| {
+            rustykrab_core::Error::Internal(format!(
+                "completion check timed out after {timeout_secs}s"
+            ))
+        })??;
+        let text = match response.message.content.as_text() {
+            Some(t) => t.to_uppercase(),
+            None => {
+                tracing::warn!(
+                    "model returned non-text response in completion check, assuming incomplete"
+                );
+                return Ok(false);
+            }
+        };
 
-        Ok(text.contains("COMPLETE") && !text.contains("INCOMPLETE"))
+        Ok(text.contains("COMPLETE")
+            && !text.contains("INCOMPLETE")
+            && !text.contains("NOT COMPLETE")
+            && !text.contains("NOT YET COMPLETE"))
     }
 
     /// Complex pipeline: decompose + execute + synthesize + refine.
-    async fn run_complex(
-        &self,
-        request: &str,
-        context: Option<&str>,
-    ) -> Result<PipelineResult> {
+    async fn run_complex(&self, request: &str, context: Option<&str>) -> Result<PipelineResult> {
         // Run moderate pipeline first.
         let mut result = self.run_moderate(request, context).await?;
 
@@ -292,11 +344,7 @@ impl OrchestrationPipeline {
     }
 
     /// Critical pipeline: decompose + execute + synthesize + vote + refine.
-    async fn run_critical(
-        &self,
-        request: &str,
-        context: Option<&str>,
-    ) -> Result<PipelineResult> {
+    async fn run_critical(&self, request: &str, context: Option<&str>) -> Result<PipelineResult> {
         // Self-consistency voting first.
         let voter = ConsistencyVoter::new(
             self.provider.clone(),
@@ -312,10 +360,7 @@ impl OrchestrationPipeline {
 
             return Ok(PipelineResult {
                 response: refined,
-                stages_executed: vec![
-                    PipelineStage::Verify,
-                    PipelineStage::Refine,
-                ],
+                stages_executed: vec![PipelineStage::Verify, PipelineStage::Refine],
                 sub_task_count: 0,
                 vote: Some(vote),
                 refinement_iterations: iterations,

@@ -92,7 +92,7 @@ impl Tool for CredentialReadTool {
 
         match source {
             "keychain" => self.execute_keychain(action, &args).await,
-            "store" | _ => self.execute_store(action, &args).await,
+            _ => self.execute_store(action, &args).await,
         }
     }
 }
@@ -107,13 +107,11 @@ impl CredentialReadTool {
                     .ok_or_else(|| Error::ToolExecution("missing name for 'get' action".into()))?;
 
                 match self.secrets.get(name) {
-                    Ok(value) => {
-                        Ok(json!({
-                            "source": "store",
-                            "name": name,
-                            "value": mask_secret(&value),
-                        }))
-                    }
+                    Ok(value) => Ok(json!({
+                        "source": "store",
+                        "name": name,
+                        "value": mask_secret(&value),
+                    })),
                     Err(rustykrab_core::Error::NotFound(_)) => Ok(json!({
                         "error": format!("no secret found with name '{name}'"),
                         "hint": "Use action 'list' to see available secret names, or try source 'keychain' to check the macOS Keychain",

@@ -111,7 +111,7 @@ impl HarnessProfile {
             trace_informed_guidance: true,
             trace_injection_interval: 3, // More frequent feedback during coding.
             task_type: TaskType::Coding,
-            max_iterations: 120, // Coding tasks often need more steps.
+            max_iterations: 120,       // Coding tasks often need more steps.
             max_consecutive_errors: 2, // Reflect sooner on code errors.
             max_tool_retries: 3,
             max_context_tokens: 128_000,

@@ -84,17 +84,57 @@ impl RateLimiter {
 
         record.attempts.push(now);
 
-        // Prune stale entries to prevent unbounded memory growth
-        if records.len() > 10_000 {
-            let stale_cutoff = now - (self.config.lockout * 2);
-            records.retain(|_, rec| {
-                rec.locked_until.map(|l| l > now).unwrap_or(true)
-                    || rec.attempts.last().map(|&t| t > stale_cutoff).unwrap_or(false)
-            });
+        // Prune stale entries to prevent unbounded memory growth.
+        // Only scan a bounded number of entries per call to avoid
+        // iterating the entire HashMap under the lock during DDoS.
+        if records.len() > 1_000 {
+            let stale_cutoff = now - self.config.window * 2;
+            let stale_keys: Vec<IpAddr> = records
+                .iter()
+                .take(512) // Bound scan to 512 entries per request.
+                .filter(|(_, rec)| {
+                    // Stale if lockout expired (or never locked).
+                    let locked_expired = rec.locked_until.map(|l| l <= now).unwrap_or(true);
+                    // Stale if no recent activity.
+                    let no_recent = rec
+                        .attempts
+                        .last()
+                        .map(|&t| t <= stale_cutoff)
+                        .unwrap_or(true);
+                    locked_expired && no_recent
+                })
+                .map(|(ip, _)| *ip)
+                .take(256)
+                .collect();
+            for key in &stale_keys {
+                records.remove(key);
+            }
         }
 
         true
     }
+}
+
+/// Extract the client IP address, preferring the X-Forwarded-For header
+/// when the request arrives through a reverse proxy.
+fn extract_client_ip(request: &Request, socket_addr: IpAddr) -> IpAddr {
+    // Only trust X-Forwarded-For when the direct connection is from
+    // loopback (i.e. a local reverse proxy). This prevents spoofing
+    // by external clients injecting the header directly.
+    if socket_addr.is_loopback() {
+        if let Some(forwarded) = request.headers().get("x-forwarded-for") {
+            if let Ok(value) = forwarded.to_str() {
+                // X-Forwarded-For: client, proxy1, proxy2
+                // The leftmost entry is the original client IP.
+                if let Some(client_ip) = value.split(',').next() {
+                    if let Ok(ip) = client_ip.trim().parse::<IpAddr>() {
+                        return ip;
+                    }
+                }
+            }
+        }
+    }
+    socket_addr
 }
 
 /// Axum middleware that enforces rate limiting on API endpoints.
@@ -111,8 +151,10 @@ pub async fn rate_limit_middleware(
         return Ok(next.run(request).await);
     }
 
-    if !state.rate_limiter.check(addr.ip()) {
-        tracing::warn!(ip = %addr.ip(), path = %path, "rate limited");
+    let client_ip = extract_client_ip(&request, addr.ip());
+
+    if !state.rate_limiter.check(client_ip) {
+        tracing::warn!(ip = %client_ip, path = %path, "rate limited");
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
 

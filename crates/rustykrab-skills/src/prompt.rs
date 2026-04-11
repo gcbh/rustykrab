@@ -225,10 +225,10 @@ impl Default for SystemPromptBuilder {
 /// Escape XML special characters to prevent injection in skill names/descriptions.
 fn escape_xml(s: &str) -> String {
     s.replace('&', "&amp;")
-     .replace('<', "&lt;")
-     .replace('>', "&gt;")
-     .replace('"', "&quot;")
-     .replace('\'', "&apos;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
 }
 
 /// Produce a human-readable summary of a JSON Schema parameters object.
@@ -247,10 +247,7 @@ fn summarize_params(schema: &serde_json::Value) -> String {
     let mut parts = Vec::new();
     if let Some(obj) = props.as_object() {
         for (key, val) in obj {
-            let typ = val
-                .get("type")
-                .and_then(|t| t.as_str())
-                .unwrap_or("any");
+            let typ = val.get("type").and_then(|t| t.as_str()).unwrap_or("any");
             let req = if required.contains(&key.as_str()) {
                 " (required)"
             } else {

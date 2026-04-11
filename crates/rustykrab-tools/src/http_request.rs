@@ -68,16 +68,14 @@ impl Tool for HttpRequestTool {
     }
 
     async fn execute(&self, args: Value) -> Result<Value> {
-        let method = args["method"]
-            .as_str()
-            .unwrap_or("GET")
-            .to_uppercase();
+        let method = args["method"].as_str().unwrap_or("GET").to_uppercase();
         let url = args["url"]
             .as_str()
             .ok_or_else(|| rustykrab_core::Error::ToolExecution("missing url".into()))?;
 
         // SSRF protection: validate URL before making request
         security::validate_url(url)
+            .await
             .map_err(|e| rustykrab_core::Error::ToolExecution(e.into()))?;
 
         let mut req = match method.as_str() {
@@ -92,22 +90,39 @@ impl Tool for HttpRequestTool {
             req = req.body(body.to_string());
         }
 
-        let resp = req
+        let mut resp = req
             .send()
             .await
             .map_err(|e| rustykrab_core::Error::ToolExecution(e.to_string().into()))?;
 
         let status = resp.status().as_u16();
-        let body = resp
-            .text()
-            .await
-            .map_err(|e| rustykrab_core::Error::ToolExecution(e.to_string().into()))?;
 
-        if body.len() > 5_000_000 {
-            return Err(rustykrab_core::Error::ToolExecution(
-                "response exceeds 5MB size limit".into(),
-            ));
+        // Check Content-Length header before reading body to prevent OOM
+        // on multi-gigabyte responses.
+        const MAX_BODY_SIZE: usize = 5_000_000;
+        if let Some(len) = resp.content_length() {
+            if len > MAX_BODY_SIZE as u64 {
+                return Err(rustykrab_core::Error::ToolExecution(
+                    format!("response Content-Length ({len} bytes) exceeds 5MB limit").into(),
+                ));
+            }
         }
+
+        // Stream body with a size cap for chunked/missing Content-Length responses.
+        let mut body_bytes = Vec::new();
+        while let Some(chunk) = resp
+            .chunk()
+            .await
+            .map_err(|e| rustykrab_core::Error::ToolExecution(e.to_string().into()))?
+        {
+            body_bytes.extend_from_slice(&chunk);
+            if body_bytes.len() > MAX_BODY_SIZE {
+                return Err(rustykrab_core::Error::ToolExecution(
+                    "response exceeds 5MB size limit".into(),
+                ));
+            }
+        }
+        let body = String::from_utf8_lossy(&body_bytes).to_string();
 
         Ok(json!({
             "status": status,

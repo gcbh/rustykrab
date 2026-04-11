@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 use crate::Skill;
 
-/// YAML frontmatter from a SKILL.md file.
+/// TOML frontmatter from a SKILL.md file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SkillMdFrontmatter {
     pub name: String,
@@ -22,7 +22,7 @@ pub struct SkillMdFrontmatter {
     pub emoji: Option<String>,
     /// Forward-compatible catch-all for unknown fields.
     #[serde(flatten)]
-    pub extra: HashMap<String, serde_yaml::Value>,
+    pub extra: HashMap<String, toml::Value>,
 }
 
 /// Environment and binary requirements for a skill.
@@ -63,8 +63,8 @@ pub struct SkillMd {
 /// Expected format:
 /// ```text
 /// ---
-/// name: my-skill
-/// description: Does something useful
+/// name = "my-skill"
+/// description = "Does something useful"
 /// ---
 /// Markdown instructions here...
 /// ```
@@ -82,7 +82,7 @@ pub fn parse_skill_md(content: &str) -> Result<(SkillMdFrontmatter, String), Str
         .find("\n---")
         .ok_or("missing closing `---` frontmatter delimiter")?;
 
-    let yaml_str = &after_open[..close_pos];
+    let toml_str = &after_open[..close_pos];
     let body_start = close_pos + 4; // skip "\n---"
     let body = if body_start < after_open.len() {
         after_open[body_start..]
@@ -93,7 +93,7 @@ pub fn parse_skill_md(content: &str) -> Result<(SkillMdFrontmatter, String), Str
     };
 
     let frontmatter: SkillMdFrontmatter =
-        serde_yaml::from_str(yaml_str).map_err(|e| format!("invalid SKILL.md frontmatter: {e}"))?;
+        toml::from_str(toml_str).map_err(|e| format!("invalid SKILL.md frontmatter: {e}"))?;
 
     Ok((frontmatter, body.to_string()))
 }
@@ -124,16 +124,15 @@ mod tests {
     #[test]
     fn parse_valid_skill_md() {
         let content = r#"---
-name: test-skill
-description: A test skill
-version: "1.0"
-user_invocable: true
-emoji: "\U0001F680"
-requires:
-  env:
-    - MY_API_KEY
-  bins:
-    - jq
+name = "test-skill"
+description = "A test skill"
+version = "1.0"
+user_invocable = true
+emoji = "\U0001F680"
+
+[requires]
+env = ["MY_API_KEY"]
+bins = ["jq"]
 ---
 You are a helpful test skill.
 
@@ -151,7 +150,7 @@ Use these instructions carefully.
 
     #[test]
     fn parse_minimal_skill_md() {
-        let content = "---\nname: minimal\n---\nBody text\n";
+        let content = "---\nname = \"minimal\"\n---\nBody text\n";
         let (fm, body) = parse_skill_md(content).unwrap();
         assert_eq!(fm.name, "minimal");
         assert_eq!(fm.description, "");
@@ -161,7 +160,7 @@ Use these instructions carefully.
 
     #[test]
     fn parse_missing_delimiter() {
-        let content = "name: no-delimiters\nBody text\n";
+        let content = "name = \"no-delimiters\"\nBody text\n";
         assert!(parse_skill_md(content).is_err());
     }
 }

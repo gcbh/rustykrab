@@ -93,7 +93,7 @@ impl Tool for CredentialWriteTool {
 
         match source {
             "keychain" => self.execute_keychain(action, name, &args).await,
-            "store" | _ => self.execute_store(action, name, &args).await,
+            _ => self.execute_store(action, name, &args).await,
         }
     }
 }
@@ -129,7 +129,10 @@ impl CredentialWriteTool {
                 }))
             }
             other => Err(Error::ToolExecution(
-                format!("unknown action '{other}', expected 'set', 'delete', or 'import_from_keychain'").into(),
+                format!(
+                    "unknown action '{other}', expected 'set', 'delete', or 'import_from_keychain'"
+                )
+                .into(),
             )),
         }
     }
@@ -160,9 +163,9 @@ impl CredentialWriteTool {
                     .as_str()
                     .ok_or_else(|| Error::ToolExecution("missing value for 'set' action".into()))?;
 
-                rustykrab_store::keychain::set_credential(service, account, value).map_err(|e| {
-                    Error::ToolExecution(format!("failed to store in keychain: {e}").into())
-                })?;
+                rustykrab_store::keychain::set_credential(service, account, value).map_err(
+                    |e| Error::ToolExecution(format!("failed to store in keychain: {e}").into()),
+                )?;
 
                 tracing::info!(
                     service = service,
@@ -209,14 +212,10 @@ impl CredentialWriteTool {
         }
 
         let service = args["service"].as_str().ok_or_else(|| {
-            Error::ToolExecution(
-                "missing 'service' parameter for import_from_keychain".into(),
-            )
+            Error::ToolExecution("missing 'service' parameter for import_from_keychain".into())
         })?;
         let account = args["account"].as_str().ok_or_else(|| {
-            Error::ToolExecution(
-                "missing 'account' parameter for import_from_keychain".into(),
-            )
+            Error::ToolExecution("missing 'account' parameter for import_from_keychain".into())
         })?;
 
         // Read from Keychain.

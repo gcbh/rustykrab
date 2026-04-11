@@ -1,10 +1,14 @@
 use chrono::Utc;
 use hmac::{Hmac, Mac};
+use rustykrab_core::crypto::constant_time_eq;
 use rustykrab_core::types::{Message, MessageContent, Role};
 use rustykrab_core::{Error, Result};
 use serde::Deserialize;
 use sha2::Sha256;
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
@@ -19,7 +23,12 @@ const SEND_MAX_RETRIES: u32 = 3;
 /// An inbound message with channel-specific routing metadata.
 pub struct ChannelMessage {
     pub chat_id: i64,
+    /// Telegram forum topic thread ID. `0` means no thread (non-forum chat
+    /// or the implicit "General" topic).
+    pub thread_id: i64,
     pub message: Message,
+    /// If true, the conversation for this chat should be reset.
+    pub reset: bool,
 }
 
 /// Telegram Bot API channel.
@@ -44,6 +53,8 @@ pub struct TelegramChannel {
     inbound_tx: mpsc::Sender<ChannelMessage>,
     /// Receiver for inbound messages (consumed by the agent loop).
     inbound_rx: Option<mpsc::Receiver<ChannelMessage>>,
+    /// Graceful shutdown flag.
+    shutdown_flag: Arc<AtomicBool>,
 }
 
 impl TelegramChannel {
@@ -53,14 +64,20 @@ impl TelegramChannel {
     /// `allowed_chats` restricts which Telegram chats can use the bot.
     pub fn new(bot_token: String, allowed_chats: HashSet<i64>) -> Self {
         let (tx, rx) = mpsc::channel(256);
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(60))
+            .connect_timeout(Duration::from_secs(10))
+            .build()
+            .expect("failed to build HTTP client");
         Self {
-            client: reqwest::Client::new(),
+            client,
             api_base: format!("https://api.telegram.org/bot{bot_token}"),
             bot_token,
             allowed_chats,
             webhook_secret: None,
             inbound_tx: tx,
             inbound_rx: Some(rx),
+            shutdown_flag: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -76,13 +93,24 @@ impl TelegramChannel {
         self.inbound_rx.take()
     }
 
+    /// Request graceful shutdown of the polling loop.
+    pub fn shutdown(&self) {
+        self.shutdown_flag.store(true, Ordering::Relaxed);
+    }
+
     /// Send a "typing" chat action so the user sees the bot is working.
-    pub async fn send_typing(&self, chat_id: i64) -> Result<()> {
+    ///
+    /// When `thread_id > 0`, the typing indicator is scoped to that forum
+    /// topic so it appears in the correct thread.
+    pub async fn send_typing(&self, chat_id: i64, thread_id: i64) -> Result<()> {
         let url = format!("{}/sendChatAction", self.api_base);
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "chat_id": chat_id,
             "action": "typing",
         });
+        if thread_id > 0 {
+            body["message_thread_id"] = serde_json::json!(thread_id);
+        }
 
         let resp = self
             .client
@@ -103,32 +131,36 @@ impl TelegramChannel {
     /// Send a text message to a Telegram chat, automatically splitting
     /// messages that exceed Telegram's 4096 character limit.
     ///
+    /// When `thread_id > 0`, the message is posted inside that forum topic.
     /// Uses Markdown parse mode with automatic plain-text fallback if
     /// Telegram rejects the formatting.
-    pub async fn send_text(&self, chat_id: i64, text: &str) -> Result<()> {
+    pub async fn send_text(&self, chat_id: i64, text: &str, thread_id: i64) -> Result<()> {
         let chunks = split_message(text, TELEGRAM_MAX_LENGTH);
         for chunk in &chunks {
-            self.send_single_message(chat_id, chunk).await?;
+            self.send_single_message(chat_id, chunk, thread_id).await?;
         }
         Ok(())
     }
 
     /// Send a single message chunk with retry and Markdown fallback.
-    async fn send_single_message(&self, chat_id: i64, text: &str) -> Result<()> {
+    async fn send_single_message(&self, chat_id: i64, text: &str, thread_id: i64) -> Result<()> {
         // First attempt: with Markdown.
         match self
-            .try_send(chat_id, text, Some("Markdown"), SEND_MAX_RETRIES)
+            .try_send(chat_id, text, Some("Markdown"), SEND_MAX_RETRIES, thread_id)
             .await
         {
-            Ok(()) => return Ok(()),
+            Ok(()) => Ok(()),
             Err(e) => {
                 // If Markdown parsing failed (400 Bad Request), retry as plain text.
                 let err_str = format!("{e}");
-                if err_str.contains("400") || err_str.contains("parse") || err_str.contains("can't") {
+                if err_str.contains("400") || err_str.contains("parse") || err_str.contains("can't")
+                {
                     tracing::debug!("Markdown rejected by Telegram, retrying as plain text");
-                    return self.try_send(chat_id, text, None, SEND_MAX_RETRIES).await;
+                    self.try_send(chat_id, text, None, SEND_MAX_RETRIES, thread_id)
+                        .await
+                } else {
+                    Err(e)
                 }
-                return Err(e);
             }
         }
     }
@@ -140,6 +172,7 @@ impl TelegramChannel {
         text: &str,
         parse_mode: Option<&str>,
         max_retries: u32,
+        thread_id: i64,
     ) -> Result<()> {
         let url = format!("{}/sendMessage", self.api_base);
         let mut body = serde_json::json!({
@@ -148,6 +181,9 @@ impl TelegramChannel {
         });
         if let Some(mode) = parse_mode {
             body["parse_mode"] = serde_json::json!(mode);
+        }
+        if thread_id > 0 {
+            body["message_thread_id"] = serde_json::json!(thread_id);
         }
 
         let mut last_err = None;
@@ -213,6 +249,11 @@ impl TelegramChannel {
         tracing::info!("Telegram long-polling started");
 
         loop {
+            if self.shutdown_flag.load(Ordering::Relaxed) {
+                tracing::info!("Telegram polling shutdown requested");
+                return Ok(());
+            }
+
             let url = format!("{}/getUpdates", self.api_base);
             let mut params = vec![("timeout", "30".to_string())];
             if let Some(off) = offset {
@@ -286,13 +327,14 @@ impl TelegramChannel {
         payload: &[u8],
         secret_header: Option<&str>,
     ) -> Result<()> {
-        // Validate webhook secret if configured (using constant-time comparison).
-        if let Some(ref secret) = self.webhook_secret {
-            let header = secret_header
-                .ok_or_else(|| Error::Auth("missing X-Telegram-Bot-Api-Secret-Token header".into()))?;
-            if !constant_time_eq(header, secret) {
-                return Err(Error::Auth("invalid Telegram webhook secret".into()));
-            }
+        // Validate webhook secret (required — reject if none configured).
+        let secret = self.webhook_secret.as_ref().ok_or_else(|| {
+            Error::Auth("no webhook secret configured — refusing unauthenticated payload".into())
+        })?;
+        let header = secret_header
+            .ok_or_else(|| Error::Auth("missing X-Telegram-Bot-Api-Secret-Token header".into()))?;
+        if !constant_time_eq(header, secret) {
+            return Err(Error::Auth("invalid Telegram webhook secret".into()));
         }
 
         let update: Update = serde_json::from_slice(payload)?;
@@ -344,12 +386,16 @@ impl TelegramChannel {
         };
 
         let chat_id = msg.chat.id;
+        let thread_id = msg.message_thread_id.unwrap_or(0);
 
         // Chat allowlist check.
         if !self.allowed_chats.is_empty() && !self.allowed_chats.contains(&chat_id) {
             tracing::warn!(
                 chat_id,
-                username = msg.from.as_ref().map(|u| u.username.as_deref().unwrap_or("unknown")),
+                username = msg
+                    .from
+                    .as_ref()
+                    .map(|u| u.username.as_deref().unwrap_or("unknown")),
                 "message from disallowed chat, ignoring"
             );
             return Ok(());
@@ -362,7 +408,7 @@ impl TelegramChannel {
 
         // Handle bot commands before forwarding to the agent.
         if let Some(reply) = self.handle_command(&text, chat_id).await {
-            let _ = self.send_text(chat_id, &reply).await;
+            let _ = self.send_text(chat_id, &reply, thread_id).await;
             return Ok(());
         }
 
@@ -372,7 +418,7 @@ impl TelegramChannel {
             .and_then(|u| u.username.as_deref())
             .unwrap_or("unknown");
 
-        tracing::info!(chat_id, %from, "received Telegram message");
+        tracing::info!(chat_id, thread_id, %from, "received Telegram message");
 
         let message = Message {
             id: Uuid::new_v4(),
@@ -382,7 +428,12 @@ impl TelegramChannel {
         };
 
         self.inbound_tx
-            .send(ChannelMessage { chat_id, message })
+            .send(ChannelMessage {
+                chat_id,
+                thread_id,
+                message,
+                reset: false,
+            })
             .await
             .map_err(|e| Error::Channel(format!("inbound queue full: {e}")))?;
 
@@ -409,11 +460,9 @@ impl TelegramChannel {
                     .to_string(),
             ),
             "/ping" => Some("Pong! Bot is running.".to_string()),
-            "/reset" => {
-                // The actual conversation reset is handled in the agent loop
-                // by looking for this sentinel in the message content.
-                None
-            }
+            "/reset" => Some(
+                "Conversation reset. Send a new message to start fresh.".to_string(),
+            ),
             _ if cmd.starts_with('/') => {
                 // Unknown command — let it pass through to the agent.
                 None
@@ -426,13 +475,12 @@ impl TelegramChannel {
     /// This provides an additional layer of verification beyond the
     /// secret_token header that Telegram sends.
     pub fn verify_hmac(&self, payload: &[u8], signature_hex: &str) -> Result<()> {
-        let secret = self
-            .webhook_secret
-            .as_ref()
-            .ok_or_else(|| Error::Config("no webhook secret configured for HMAC verification".into()))?;
+        let secret = self.webhook_secret.as_ref().ok_or_else(|| {
+            Error::Config("no webhook secret configured for HMAC verification".into())
+        })?;
 
         let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
-            .expect("HMAC accepts any key size");
+            .map_err(|e| Error::Config(format!("invalid HMAC key: {e}")))?;
         mac.update(payload);
 
         let expected = hex::decode(signature_hex)
@@ -471,8 +519,18 @@ fn split_message(text: &str, max_len: usize) -> Vec<String> {
             break;
         }
 
+        // Find the nearest char boundary at or before max_len to avoid
+        // panicking on multi-byte UTF-8 characters.
+        let safe_end = remaining.floor_char_boundary(max_len);
+        if safe_end == 0 {
+            // Single character larger than max_len (shouldn't happen with
+            // reasonable limits, but handle gracefully).
+            chunks.push(remaining.to_string());
+            break;
+        }
+
         // Find the best split point within the limit.
-        let window = &remaining[..max_len];
+        let window = &remaining[..safe_end];
         let split_at = find_split_point(window);
 
         chunks.push(remaining[..split_at].trim_end().to_string());
@@ -518,22 +576,6 @@ fn find_split_point(window: &str) -> usize {
     window.len()
 }
 
-/// Constant-time string comparison to prevent timing attacks on webhook secrets.
-/// Compares all bytes up to the length of the longer string
-/// so that the length of neither input is leaked through timing.
-fn constant_time_eq(a: &str, b: &str) -> bool {
-    let a_bytes = a.as_bytes();
-    let b_bytes = b.as_bytes();
-    let len = a_bytes.len().max(b_bytes.len());
-    let mut result = (a_bytes.len() != b_bytes.len()) as u8;
-    for i in 0..len {
-        let x = a_bytes.get(i).copied().unwrap_or(0);
-        let y = b_bytes.get(i).copied().unwrap_or(0);
-        result |= x ^ y;
-    }
-    result == 0
-}
-
 // --- Telegram Bot API wire types ---
 
 #[derive(Deserialize)]
@@ -554,6 +596,12 @@ pub struct TelegramMessage {
     pub from: Option<User>,
     pub text: Option<String>,
     pub date: i64,
+    /// Forum topic thread ID. Present when the message belongs to a forum topic.
+    #[serde(default)]
+    pub message_thread_id: Option<i64>,
+    /// Whether this message was sent inside a forum topic.
+    #[serde(default)]
+    pub is_topic_message: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -613,14 +661,5 @@ mod tests {
         let chunks = split_message(&text, 4096);
         assert_eq!(chunks.len(), 2);
         assert_eq!(chunks[0].len(), 4096);
-    }
-
-    #[test]
-    fn test_constant_time_eq() {
-        assert!(constant_time_eq("abc", "abc"));
-        assert!(!constant_time_eq("abc", "abd"));
-        assert!(!constant_time_eq("abc", "ab"));
-        assert!(!constant_time_eq("", "a"));
-        assert!(constant_time_eq("", ""));
     }
 }

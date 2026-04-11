@@ -1,17 +1,19 @@
 [package]
 name = "rustykrab-store"
-description = "Sled-based persistent storage for RustyKrab"
+description = "SQLite-based persistent storage for RustyKrab"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
 rustykrab-core.workspace = true
-sled.workspace = true
+rusqlite = { version = "0.34", features = ["bundled"] }
+tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
 chrono.workspace = true
+croner.workspace = true
 tracing.workspace = true
 hmac.workspace = true
 sha2.workspace = true

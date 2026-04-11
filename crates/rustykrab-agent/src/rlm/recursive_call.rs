@@ -12,6 +12,7 @@ use rustykrab_core::model::ModelProvider;
 use rustykrab_core::orchestration::{OrchestrationConfig, RecursiveCall};
 use rustykrab_core::types::{Message, MessageContent, Role};
 use rustykrab_core::{Error, Result};
+use tokio::sync::Semaphore;
 use uuid::Uuid;
 
 use super::context_manager::ContextManager;
@@ -105,7 +106,10 @@ async fn execute_call_impl(
 
     let budget = context_mgr.child_budget(call.context_budget, call.depth);
     if budget == 0 {
-        tracing::warn!(depth = call.depth, "RLM: budget exhausted, answering directly");
+        tracing::warn!(
+            depth = call.depth,
+            "RLM: budget exhausted, answering directly"
+        );
         return direct_call(&provider, &call.prompt, context.as_deref()).await;
     }
 
@@ -163,7 +167,7 @@ async fn execute_call_impl(
 
     let sub_call_previews: Vec<&str> = sub_calls
         .iter()
-        .map(|s| &s[..s.len().min(80)])
+        .map(|(_, p)| &p[..p.len().min(80)])
         .collect();
     tracing::info!(
         depth = call.depth,
@@ -172,9 +176,12 @@ async fn execute_call_impl(
         "RLM: model requested sub-calls"
     );
 
-    // Execute sub-calls concurrently.
+    // Execute sub-calls concurrently, bounded by a semaphore to prevent
+    // pathological workloads from spawning unbounded concurrent LLM calls
+    // (fixes ASYNC-M1).
+    let semaphore = Arc::new(Semaphore::new(config.max_concurrent_tasks));
     let mut handles = Vec::new();
-    for sub_prompt in &sub_calls {
+    for (_, sub_prompt) in &sub_calls {
         let child = RecursiveCall::child(
             call.id,
             sub_prompt.clone(),
@@ -183,13 +190,16 @@ async fn execute_call_impl(
         );
         let provider = provider.clone();
         let config = config.clone();
+        let child_context = context.clone();
+        let sem = semaphore.clone();
 
-        handles.push(tokio::spawn(
-            execute_call(provider, config, child, None),
-        ));
+        handles.push(tokio::spawn(async move {
+            let _permit = sem.acquire().await.expect("semaphore closed");
+            execute_call(provider, config, child, child_context).await
+        }));
     }
 
-    // Collect results.
+    // Collect results keyed by original marker text for exact substitution.
     let mut sub_results: HashMap<String, String> = HashMap::new();
     for (i, handle) in handles.into_iter().enumerate() {
         let result = match handle.await {
@@ -221,7 +231,7 @@ async fn execute_call_impl(
                 format!("[Sub-call panicked: {e}]")
             }
         };
-        sub_results.insert(sub_calls[i].clone(), result);
+        sub_results.insert(sub_calls[i].0.clone(), result);
     }
 
     tracing::info!(
@@ -230,12 +240,12 @@ async fn execute_call_impl(
         "RLM: all sub-calls resolved, substituting results"
     );
 
-    // Substitute results back into the original response.
+    // Substitute results back using the original marker text to avoid
+    // mismatches from whitespace trimming.
     let mut resolved = text.to_string();
-    for (prompt, result) in &sub_results {
-        let marker = format!("{SUB_CALL_PREFIX} {prompt}{SUB_CALL_SUFFIX}");
+    for (marker, result) in &sub_results {
         let summary = ContextManager::truncate_to_budget(result, budget / 4);
-        resolved = resolved.replace(&marker, &summary);
+        resolved = resolved.replace(marker, &summary);
     }
 
     // Clean up any remaining unresolved markers.
@@ -269,16 +279,15 @@ async fn direct_call(
     });
 
     let response = provider.chat(&messages, &[]).await?;
-    Ok(response
-        .message
-        .content
-        .as_text()
-        .unwrap_or("")
-        .to_string())
+    Ok(response.message.content.as_text().unwrap_or("").to_string())
 }
 
 /// Extract sub-call prompts from model output.
-fn extract_sub_calls(text: &str) -> Vec<String> {
+///
+/// Returns `(original_marker, trimmed_prompt)` pairs so that the caller
+/// can substitute results using the exact original marker text, avoiding
+/// mismatches caused by whitespace trimming.
+fn extract_sub_calls(text: &str) -> Vec<(String, String)> {
     let mut calls = Vec::new();
     let mut remaining = text;
 
@@ -287,7 +296,9 @@ fn extract_sub_calls(text: &str) -> Vec<String> {
         if let Some(end) = after_prefix.find(SUB_CALL_SUFFIX) {
             let prompt = after_prefix[..end].trim().to_string();
             if !prompt.is_empty() {
-                calls.push(prompt);
+                let marker_len = SUB_CALL_PREFIX.len() + end + SUB_CALL_SUFFIX.len();
+                let original_marker = remaining[start..start + marker_len].to_string();
+                calls.push((original_marker, prompt));
             }
             remaining = &after_prefix[end + SUB_CALL_SUFFIX.len()..];
         } else {
@@ -329,8 +340,21 @@ mod tests {
                     and also [SUB_CALL: What time is it in London?]";
         let calls = extract_sub_calls(text);
         assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0], "What is the weather in Tokyo?");
-        assert_eq!(calls[1], "What time is it in London?");
+        assert_eq!(calls[0].1, "What is the weather in Tokyo?");
+        assert_eq!(calls[1].1, "What time is it in London?");
+        // Verify original markers are captured for exact replacement
+        assert_eq!(calls[0].0, "[SUB_CALL: What is the weather in Tokyo?]");
+        assert_eq!(calls[1].0, "[SUB_CALL: What time is it in London?]");
+    }
+
+    #[test]
+    fn test_extract_sub_calls_preserves_original_marker() {
+        // Extra whitespace in the original should be preserved in the marker
+        let text = "[SUB_CALL:  extra spaces here  ]";
+        let calls = extract_sub_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "[SUB_CALL:  extra spaces here  ]");
+        assert_eq!(calls[0].1, "extra spaces here");
     }
 
     #[test]

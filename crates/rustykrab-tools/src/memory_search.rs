@@ -75,10 +75,7 @@ impl Tool for MemorySearchTool {
             .await
             .map_err(|e| rustykrab_core::Error::ToolExecution(e.to_string().into()))?;
 
-        let count = results
-            .as_array()
-            .map(|a| a.len())
-            .unwrap_or(0);
+        let count = results.as_array().map(|a| a.len()).unwrap_or(0);
 
         Ok(json!({
             "results": results,

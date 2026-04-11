@@ -10,10 +10,9 @@ use std::sync::Arc;
 use chrono::Utc;
 use rustykrab_core::model::ModelProvider;
 use rustykrab_core::orchestration::{OrchestrationConfig, SubTask, SubTaskResult};
-use rustykrab_core::types::{
-    Message, MessageContent, Role, ToolCall, ToolResult, ToolSchema,
-};
+use rustykrab_core::types::{Message, MessageContent, Role, ToolCall, ToolResult, ToolSchema};
 use rustykrab_core::{Result, Tool};
+use tokio::sync::Semaphore;
 use uuid::Uuid;
 
 use crate::sandbox::{Sandbox, SandboxPolicy};
@@ -23,6 +22,7 @@ pub struct ParallelExecutor {
     provider: Arc<dyn ModelProvider>,
     tools: Vec<Arc<dyn Tool>>,
     sandbox: Arc<dyn Sandbox>,
+    policy: SandboxPolicy,
     config: OrchestrationConfig,
 }
 
@@ -31,12 +31,14 @@ impl ParallelExecutor {
         provider: Arc<dyn ModelProvider>,
         tools: Vec<Arc<dyn Tool>>,
         sandbox: Arc<dyn Sandbox>,
+        policy: SandboxPolicy,
         config: OrchestrationConfig,
     ) -> Self {
         Self {
             provider,
             tools,
             sandbox,
+            policy,
             config,
         }
     }
@@ -50,7 +52,11 @@ impl ParallelExecutor {
     /// The optional `system_context` carries the agent's identity, tool
     /// permissions, and security policies so that sub-task model calls
     /// understand they are operating within an authorized agent.
-    pub async fn execute(&self, tasks: &[SubTask], system_context: Option<&str>) -> Vec<SubTaskResult> {
+    pub async fn execute(
+        &self,
+        tasks: &[SubTask],
+        system_context: Option<&str>,
+    ) -> Vec<SubTaskResult> {
         let mut results: HashMap<Uuid, SubTaskResult> = HashMap::new();
         let mut completed: HashSet<Uuid> = HashSet::new();
         let all_ids: HashSet<Uuid> = tasks.iter().map(|t| t.id).collect();
@@ -73,8 +79,11 @@ impl ParallelExecutor {
 
             tracing::info!(wave_size = ready.len(), "executing sub-task wave");
 
-            // Execute all ready tasks concurrently.
-            let mut handles = Vec::new();
+            // Execute all ready tasks concurrently, bounded by a semaphore
+            // to prevent pathological workloads from spawning unbounded
+            // concurrent LLM calls.
+            let semaphore = Arc::new(Semaphore::new(self.config.max_concurrent_tasks));
+            let mut handles: Vec<(Uuid, _)> = Vec::new();
             for task in &ready {
                 // Gather dependency results as context.
                 let dep_context: Vec<String> = task
@@ -85,41 +94,87 @@ impl ParallelExecutor {
                     .map(|r| r.output.clone())
                     .collect();
 
+                let task_id = task.id;
                 let task = (*task).clone();
                 let provider = self.provider.clone();
                 let tools = self.tools.clone();
                 let sandbox = self.sandbox.clone();
                 let config = self.config.clone();
+                let policy = self.policy.clone();
                 let sys_ctx = system_context.map(|s| s.to_string());
+                let sem = semaphore.clone();
 
-                handles.push(tokio::spawn(async move {
-                    execute_sub_task(&task, &dep_context, sys_ctx.as_deref(), &provider, &tools, &sandbox, &config)
+                handles.push((
+                    task_id,
+                    tokio::spawn(async move {
+                        let _permit = sem.acquire().await.expect("semaphore closed");
+                        execute_sub_task(
+                            &task,
+                            &dep_context,
+                            sys_ctx.as_deref(),
+                            &provider,
+                            &tools,
+                            &sandbox,
+                            &policy,
+                            &config,
+                        )
                         .await
-                }));
+                    }),
+                ));
             }
 
-            for handle in handles {
+            for (task_id, handle) in handles {
                 match handle.await {
                     Ok(result) => {
                         completed.insert(result.task_id);
                         results.insert(result.task_id, result);
                     }
                     Err(e) => {
-                        tracing::error!("sub-task panicked: {e}");
+                        tracing::error!(task_id = %task_id, "sub-task panicked: {e}");
+                        // Insert a failure result so downstream consumers know the
+                        // task failed rather than silently receiving incomplete results.
+                        completed.insert(task_id);
+                        results.insert(
+                            task_id,
+                            SubTaskResult {
+                                task_id,
+                                output: String::new(),
+                                success: false,
+                                error: Some(format!("task panicked: {e}")),
+                                tokens_used: 0,
+                            },
+                        );
                     }
+                }
+            }
+
+            // Safety: ensure all dispatched tasks are tracked as completed
+            // to prevent infinite re-dispatch if a task_id mismatch occurs.
+            for task in &ready {
+                if !completed.contains(&task.id) {
+                    tracing::warn!(task_id = %task.id, "task not tracked after wave, marking failed");
+                    completed.insert(task.id);
+                    results.insert(
+                        task.id,
+                        SubTaskResult {
+                            task_id: task.id,
+                            output: String::new(),
+                            success: false,
+                            error: Some("task not completed (internal tracking error)".into()),
+                            tokens_used: 0,
+                        },
+                    );
                 }
             }
         }
 
         // Return results in original task order.
-        tasks
-            .iter()
-            .filter_map(|t| results.remove(&t.id))
-            .collect()
+        tasks.iter().filter_map(|t| results.remove(&t.id)).collect()
     }
 }
 
 /// Execute a single sub-task with its own focused context.
+#[allow(clippy::too_many_arguments)]
 async fn execute_sub_task(
     task: &SubTask,
     dep_context: &[String],
@@ -127,6 +182,7 @@ async fn execute_sub_task(
     provider: &Arc<dyn ModelProvider>,
     tools: &[Arc<dyn Tool>],
     sandbox: &Arc<dyn Sandbox>,
+    policy: &SandboxPolicy,
     config: &OrchestrationConfig,
 ) -> SubTaskResult {
     // Build focused context for this sub-task.
@@ -181,21 +237,37 @@ async fn execute_sub_task(
 
     // Run the model, handling multiple tool-call rounds per sub-task.
     let max_rounds = config.max_tool_rounds;
+    let mut total_tokens: u64 = 0;
+    let timeout_secs = config.model_call_timeout_secs;
     for _round in 0..max_rounds {
-        let response = match provider.chat(&messages, &schemas).await {
-            Ok(r) => r,
-            Err(e) => {
+        let response = match tokio::time::timeout(
+            std::time::Duration::from_secs(timeout_secs),
+            provider.chat(&messages, &schemas),
+        )
+        .await
+        {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
                 return SubTaskResult {
                     task_id: task.id,
                     output: String::new(),
                     success: false,
                     error: Some(e.to_string()),
-                    tokens_used: 0,
+                    tokens_used: total_tokens as usize,
+                };
+            }
+            Err(_) => {
+                return SubTaskResult {
+                    task_id: task.id,
+                    output: String::new(),
+                    success: false,
+                    error: Some(format!("model call timed out after {timeout_secs}s")),
+                    tokens_used: total_tokens as usize,
                 };
             }
         };
 
-        let tokens = response.usage.prompt_tokens + response.usage.completion_tokens;
+        total_tokens += (response.usage.prompt_tokens + response.usage.completion_tokens) as u64;
 
         // If the model wants to use tools, execute them and continue.
         if response.message.content.has_tool_calls() {
@@ -204,7 +276,8 @@ async fn execute_sub_task(
             let calls = response.message.content.tool_calls();
             for call in calls {
                 let result =
-                    execute_tool_for_subtask(call, tools, sandbox, config.max_tool_retries).await;
+                    execute_tool_for_subtask(call, tools, sandbox, policy, config.max_tool_retries)
+                        .await;
                 messages.push(Message {
                     id: Uuid::new_v4(),
                     role: Role::Tool,
@@ -216,12 +289,7 @@ async fn execute_sub_task(
         }
 
         // Text response — sub-task complete.
-        let output = response
-            .message
-            .content
-            .as_text()
-            .unwrap_or("")
-            .to_string();
+        let output = response.message.content.as_text().unwrap_or("").to_string();
 
         // Summarize if output is too long.
         let output = if config.summarize_sub_results && output.len() > 2000 {
@@ -235,7 +303,7 @@ async fn execute_sub_task(
             output,
             success: true,
             error: None,
-            tokens_used: tokens as usize,
+            tokens_used: total_tokens as usize,
         };
     }
 
@@ -244,7 +312,7 @@ async fn execute_sub_task(
         output: String::new(),
         success: false,
         error: Some("exceeded max tool-call rounds for sub-task".into()),
-        tokens_used: 0,
+        tokens_used: total_tokens as usize,
     }
 }
 
@@ -253,6 +321,7 @@ async fn execute_tool_for_subtask(
     call: &ToolCall,
     tools: &[Arc<dyn Tool>],
     sandbox: &Arc<dyn Sandbox>,
+    policy: &SandboxPolicy,
     max_retries: u32,
 ) -> ToolResult {
     let tool = match tools.iter().find(|t| t.name() == call.name) {
@@ -261,26 +330,21 @@ async fn execute_tool_for_subtask(
             return ToolResult {
                 call_id: call.id.clone(),
                 output: serde_json::json!({ "error": format!("unknown tool: {}", call.name) }),
+                is_error: true,
             };
         }
     };
 
-    // Sub-tasks need the same capabilities as the main agent loop —
-    // writing files (e.g. saving downloaded documents) and spawning
-    // processes (e.g. pip install) are required for real task completion.
-    let policy = SandboxPolicy {
-        allow_net: true,
-        allow_fs_read: true,
-        allow_fs_write: true,
-        allow_spawn: true,
-        ..SandboxPolicy::default()
-    };
-
-    // Enforce sandbox check — fail the tool call if denied.
-    if let Err(e) = sandbox.execute(&call.name, call.arguments.clone(), &policy).await {
+    // Enforce sandbox check using the session's policy — fail the tool
+    // call if the policy denies the required capabilities.
+    if let Err(e) = sandbox
+        .execute(&call.name, call.arguments.clone(), policy)
+        .await
+    {
         return ToolResult {
             call_id: call.id.clone(),
             output: serde_json::json!({ "error": format!("sandbox denied tool '{}': {e}", call.name) }),
+            is_error: true,
         };
     }
 
@@ -291,6 +355,7 @@ async fn execute_tool_for_subtask(
                 return ToolResult {
                     call_id: call.id.clone(),
                     output,
+                    is_error: false,
                 };
             }
             Err(e) => {
@@ -312,15 +377,13 @@ async fn execute_tool_for_subtask(
 
     ToolResult {
         call_id: call.id.clone(),
-        output: serde_json::json!({ "error": last_err.unwrap().to_string() }),
+        output: serde_json::json!({ "error": last_err.unwrap_or_else(|| rustykrab_core::Error::ToolExecution("all retries exhausted".into())).to_string() }),
+        is_error: true,
     }
 }
 
 /// Summarize a long output to stay within context budgets.
-async fn summarize_output(
-    provider: &Arc<dyn ModelProvider>,
-    output: &str,
-) -> Result<String> {
+async fn summarize_output(provider: &Arc<dyn ModelProvider>, output: &str) -> Result<String> {
     let messages = vec![Message {
         id: Uuid::new_v4(),
         role: Role::User,

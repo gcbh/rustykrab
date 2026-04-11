@@ -11,7 +11,9 @@ use crate::AppState;
 struct StaticAssets;
 
 pub fn static_routes() -> Router<AppState> {
-    Router::new().route("/", get(index)).route("/{*path}", get(serve_static))
+    Router::new()
+        .route("/", get(index))
+        .route("/{*path}", get(serve_static))
 }
 
 async fn index() -> impl IntoResponse {

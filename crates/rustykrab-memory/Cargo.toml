@@ -1,0 +1,29 @@
+[package]
+name = "rustykrab-memory"
+description = "Production agent memory: verbatim storage, hybrid retrieval, value-driven lifecycle"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+fastembed = ["dep:fastembed"]
+
+[dependencies]
+rustykrab-core.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+sha2.workspace = true
+hex.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+regex = "1"
+rusqlite = { version = "0.34", features = ["bundled"] }
+fastembed = { version = "5", optional = true }
+
+[dev-dependencies]
+tempfile = "3"

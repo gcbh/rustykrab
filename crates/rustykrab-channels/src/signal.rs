@@ -1,10 +1,27 @@
 use chrono::Utc;
+use rustykrab_core::crypto::constant_time_eq;
 use rustykrab_core::types::{Message, MessageContent, Role};
 use rustykrab_core::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc;
 use uuid::Uuid;
+
+/// An inbound Signal message with sender metadata for reply routing.
+pub struct SignalInboundMessage {
+    /// The sender's phone number (E.164 format).
+    pub source_number: String,
+    /// The core message payload.
+    pub message: Message,
+}
+
+/// Maximum age (in seconds) for a webhook payload before it is rejected
+/// as a potential replay. Protects against replay attacks where old
+/// messages are re-sent to the webhook endpoint.
+const MAX_WEBHOOK_AGE_SECS: i64 = 300; // 5 minutes
 
 /// Signal channel via signal-cli-rest-api.
 ///
@@ -20,6 +37,7 @@ use uuid::Uuid;
 /// - All traffic between RustyKrab and signal-cli stays on localhost
 /// - Signal protocol provides E2E encryption on the wire
 /// - Webhook payloads validated via shared secret header
+/// - Replay protection via timestamp validation
 pub struct SignalChannel {
     client: reqwest::Client,
     /// Base URL of the signal-cli-rest-api instance.
@@ -31,9 +49,11 @@ pub struct SignalChannel {
     /// Shared secret for webhook validation.
     webhook_secret: Option<String>,
     /// Sender for inbound messages (user -> agent).
-    inbound_tx: mpsc::Sender<Message>,
+    inbound_tx: mpsc::Sender<SignalInboundMessage>,
     /// Receiver for inbound messages (consumed by the agent loop).
-    inbound_rx: Option<mpsc::Receiver<Message>>,
+    inbound_rx: Option<mpsc::Receiver<SignalInboundMessage>>,
+    /// Graceful shutdown flag.
+    shutdown_flag: Arc<AtomicBool>,
 }
 
 impl SignalChannel {
@@ -42,20 +62,22 @@ impl SignalChannel {
     /// - `base_url`: URL of signal-cli-rest-api (e.g. `http://localhost:8080`)
     /// - `account_number`: your registered Signal number in E.164 format
     /// - `allowed_numbers`: set of phone numbers allowed to message the bot
-    pub fn new(
-        base_url: String,
-        account_number: String,
-        allowed_numbers: HashSet<String>,
-    ) -> Self {
+    pub fn new(base_url: String, account_number: String, allowed_numbers: HashSet<String>) -> Self {
         let (tx, rx) = mpsc::channel(256);
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .connect_timeout(Duration::from_secs(10))
+            .build()
+            .expect("failed to build HTTP client");
         Self {
-            client: reqwest::Client::new(),
+            client,
             base_url,
             account_number,
             allowed_numbers,
             webhook_secret: None,
             inbound_tx: tx,
             inbound_rx: Some(rx),
+            shutdown_flag: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -66,8 +88,13 @@ impl SignalChannel {
     }
 
     /// Take the inbound receiver (can only be called once).
-    pub fn take_inbound_rx(&mut self) -> Option<mpsc::Receiver<Message>> {
+    pub fn take_inbound_rx(&mut self) -> Option<mpsc::Receiver<SignalInboundMessage>> {
         self.inbound_rx.take()
+    }
+
+    /// Request graceful shutdown of the polling loop.
+    pub fn shutdown(&self) {
+        self.shutdown_flag.store(true, Ordering::Relaxed);
     }
 
     /// Send a text message to a Signal recipient.
@@ -126,7 +153,7 @@ impl SignalChannel {
         Ok(())
     }
 
-    /// Start polling for incoming messages. Runs forever — spawn as a task.
+    /// Start polling for incoming messages. Runs until `shutdown()` is called.
     ///
     /// Uses the signal-cli-rest-api `/v1/receive` endpoint which returns
     /// pending messages and marks them as read.
@@ -138,6 +165,11 @@ impl SignalChannel {
         );
 
         loop {
+            if self.shutdown_flag.load(Ordering::Relaxed) {
+                tracing::info!("Signal polling shutdown requested");
+                return Ok(());
+            }
+
             match self.poll_once().await {
                 Ok(count) => {
                     if count > 0 {
@@ -146,12 +178,12 @@ impl SignalChannel {
                 }
                 Err(e) => {
                     tracing::error!("Signal polling error: {e}");
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    tokio::time::sleep(Duration::from_secs(5)).await;
                 }
             }
 
             // signal-cli-rest-api doesn't support long-polling, so we poll on an interval.
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
         }
     }
 
@@ -201,16 +233,32 @@ impl SignalChannel {
         payload: &[u8],
         secret_header: Option<&str>,
     ) -> Result<()> {
-        // Validate webhook secret if configured (using constant-time comparison).
-        if let Some(ref secret) = self.webhook_secret {
-            let header = secret_header
-                .ok_or_else(|| Error::Auth("missing X-Signal-Webhook-Secret header".into()))?;
-            if !constant_time_eq(header, secret) {
-                return Err(Error::Auth("invalid Signal webhook secret".into()));
-            }
+        // Validate webhook secret (required — reject if none configured).
+        let secret = self.webhook_secret.as_ref().ok_or_else(|| {
+            Error::Auth("no webhook secret configured — refusing unauthenticated payload".into())
+        })?;
+        let header = secret_header
+            .ok_or_else(|| Error::Auth("missing X-Signal-Webhook-Secret header".into()))?;
+        if !constant_time_eq(header, secret) {
+            return Err(Error::Auth("invalid Signal webhook secret".into()));
         }
 
         let envelope: Envelope = serde_json::from_slice(payload)?;
+
+        // Replay protection: reject payloads with stale timestamps.
+        if let Some(ref dm) = envelope.data_message {
+            if let Some(ts) = dm.timestamp {
+                let now_ms = Utc::now().timestamp_millis();
+                let age_secs = (now_ms - ts) / 1000;
+                if age_secs > MAX_WEBHOOK_AGE_SECS {
+                    tracing::warn!(age_secs, "rejecting stale Signal webhook payload");
+                    return Err(Error::Auth(format!(
+                        "webhook payload too old ({age_secs}s > {MAX_WEBHOOK_AGE_SECS}s limit)"
+                    )));
+                }
+            }
+        }
+
         self.handle_envelope(envelope).await
     }
 
@@ -253,7 +301,10 @@ impl SignalChannel {
         };
 
         self.inbound_tx
-            .send(message)
+            .send(SignalInboundMessage {
+                source_number: source,
+                message,
+            })
             .await
             .map_err(|e| Error::Channel(format!("inbound queue full: {e}")))?;
 
@@ -263,17 +314,12 @@ impl SignalChannel {
     /// Check that signal-cli-rest-api is reachable and the account is registered.
     pub async fn health_check(&self) -> Result<()> {
         let url = format!("{}/v1/about", self.base_url);
-        let resp = self
-            .client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| {
-                Error::Channel(format!(
-                    "cannot reach signal-cli-rest-api at {}: {e}",
-                    self.base_url
-                ))
-            })?;
+        let resp = self.client.get(&url).send().await.map_err(|e| {
+            Error::Channel(format!(
+                "cannot reach signal-cli-rest-api at {}: {e}",
+                self.base_url
+            ))
+        })?;
 
         if !resp.status().is_success() {
             return Err(Error::Channel(
@@ -324,22 +370,6 @@ impl SignalChannel {
     pub fn account_number(&self) -> &str {
         &self.account_number
     }
-}
-
-/// Constant-time string comparison to prevent timing attacks on webhook secrets.
-/// Compares all bytes up to the length of the longer string
-/// so that the length of neither input is leaked through timing.
-fn constant_time_eq(a: &str, b: &str) -> bool {
-    let a_bytes = a.as_bytes();
-    let b_bytes = b.as_bytes();
-    let len = a_bytes.len().max(b_bytes.len());
-    let mut result = (a_bytes.len() != b_bytes.len()) as u8;
-    for i in 0..len {
-        let x = a_bytes.get(i).copied().unwrap_or(0);
-        let y = b_bytes.get(i).copied().unwrap_or(0);
-        result |= x ^ y;
-    }
-    result == 0
 }
 
 /// Percent-encode a phone number for URL path segments.

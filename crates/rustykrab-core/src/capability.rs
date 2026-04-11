@@ -69,7 +69,8 @@ impl CapabilitySet {
 
     /// Check whether the set has permission to use a specific tool.
     pub fn can_use_tool(&self, tool_name: &str) -> bool {
-        self.capabilities.contains(&Capability::Tool(tool_name.to_string()))
+        self.capabilities
+            .contains(&Capability::Tool(tool_name.to_string()))
     }
 
     /// Create a capability set that grants access to a specific set of tools

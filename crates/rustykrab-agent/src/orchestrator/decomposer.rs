@@ -60,10 +60,8 @@ impl Decomposer {
         context: Option<&str>,
         available_tools: &[&str],
     ) -> Result<Vec<SubTask>> {
-        let decompose_instructions = DECOMPOSE_PROMPT.replace(
-            "{max_tasks}",
-            &self.config.max_sub_tasks.to_string(),
-        );
+        let decompose_instructions =
+            DECOMPOSE_PROMPT.replace("{max_tasks}", &self.config.max_sub_tasks.to_string());
 
         // Append the concrete list of tool names so the model generates
         // accurate tool_hint values instead of guessing.
@@ -101,7 +99,17 @@ impl Decomposer {
             },
         ];
 
-        let response = self.provider.chat(&messages, &[]).await?;
+        let timeout_secs = self.config.model_call_timeout_secs;
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(timeout_secs),
+            self.provider.chat(&messages, &[]),
+        )
+        .await
+        .map_err(|_| {
+            Error::Internal(format!(
+                "decomposition model call timed out after {timeout_secs}s"
+            ))
+        })??;
         let text = response
             .message
             .content
@@ -110,11 +118,18 @@ impl Decomposer {
 
         match self.parse_decomposition(text) {
             Ok(tasks) if !tasks.is_empty() => {
-                tracing::info!(task_count = tasks.len(), "decomposed request into sub-tasks");
+                tracing::info!(
+                    task_count = tasks.len(),
+                    "decomposed request into sub-tasks"
+                );
                 Ok(tasks)
             }
-            Ok(_) | Err(_) => {
-                tracing::debug!("decomposition failed or empty, wrapping as single task");
+            Ok(_) => {
+                tracing::warn!("decomposition returned empty task list, wrapping as single task");
+                Ok(vec![SubTask::new(user_request)])
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "decomposition failed, wrapping as single task");
                 Ok(vec![SubTask::new(user_request)])
             }
         }

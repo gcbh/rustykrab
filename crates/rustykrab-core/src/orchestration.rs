@@ -133,6 +133,14 @@ pub struct OrchestrationConfig {
     pub fallback_model: Option<String>,
     /// Which model to use for complex tasks (primary model name).
     pub primary_model: Option<String>,
+    /// Maximum number of concurrent LLM/tool tasks spawned in parallel.
+    /// Prevents pathological workloads from overwhelming the system
+    /// (fixes ASYNC-M1).
+    pub max_concurrent_tasks: usize,
+    /// Timeout in seconds for individual model/LLM calls within the pipeline.
+    pub model_call_timeout_secs: u64,
+    /// Timeout in seconds for the entire orchestration pipeline.
+    pub pipeline_timeout_secs: u64,
 }
 
 impl Default for OrchestrationConfig {
@@ -149,6 +157,9 @@ impl Default for OrchestrationConfig {
             summarize_sub_results: true,
             fallback_model: None,
             primary_model: None,
+            max_concurrent_tasks: 10,
+            model_call_timeout_secs: 120,
+            pipeline_timeout_secs: 300,
         }
     }
 }
@@ -201,66 +212,6 @@ impl RecursiveCall {
             result: None,
         }
     }
-}
-
-/// An entity in the knowledge graph.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct KnowledgeEntity {
-    /// Unique entity ID.
-    pub id: Uuid,
-    /// Entity type (person, project, event, preference, etc.).
-    pub entity_type: EntityType,
-    /// Display name.
-    pub name: String,
-    /// Key-value attributes.
-    pub attributes: serde_json::Value,
-    /// When this entity was created.
-    pub created_at: chrono::DateTime<chrono::Utc>,
-    /// When this entity was last updated.
-    pub updated_at: chrono::DateTime<chrono::Utc>,
-}
-
-/// Types of entities in the knowledge graph.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum EntityType {
-    Person,
-    Project,
-    Event,
-    Preference,
-    Task,
-    Location,
-    Organization,
-    Topic,
-    Custom(String),
-}
-
-/// A relationship between two entities.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct KnowledgeRelation {
-    /// Source entity ID.
-    pub from_id: Uuid,
-    /// Target entity ID.
-    pub to_id: Uuid,
-    /// Relationship type.
-    pub relation_type: RelationType,
-    /// Optional metadata about this relationship.
-    pub metadata: Option<serde_json::Value>,
-}
-
-/// Types of relationships between entities.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RelationType {
-    WorksWith,
-    DependsOn,
-    Prefers,
-    ScheduledFor,
-    BelongsTo,
-    RelatedTo,
-    CreatedBy,
-    AssignedTo,
-    Custom(String),
 }
 
 /// Result of a self-consistency vote.

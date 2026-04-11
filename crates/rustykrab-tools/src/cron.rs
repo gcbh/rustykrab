@@ -41,11 +41,19 @@ impl Tool for CronTool {
                     },
                     "schedule": {
                         "type": "string",
-                        "description": "Cron expression for the schedule (required for create)"
+                        "description": "Cron expression for recurring schedules (e.g. '0 9 * * *' for daily at 9am, '*/30 * * * *' for every 30 minutes) or an ISO 8601 timestamp for one-shot tasks (e.g. '2025-04-12T14:30:00Z'). Required for create."
                     },
                     "task": {
                         "type": "string",
-                        "description": "Command or prompt to execute (required for create)"
+                        "description": "The task description or prompt to execute when the schedule fires (required for create)"
+                    },
+                    "channel": {
+                        "type": "string",
+                        "description": "Channel to deliver the result to (e.g. 'telegram', 'signal'). Include this so scheduled task results are sent to the right place."
+                    },
+                    "chat_id": {
+                        "type": "string",
+                        "description": "Chat identifier for the target channel (e.g. Telegram chat ID, Signal phone number)"
                     },
                     "job_id": {
                         "type": "string",
@@ -64,25 +72,22 @@ impl Tool for CronTool {
 
         match action {
             "create" => {
-                let schedule = args["schedule"]
-                    .as_str()
-                    .ok_or_else(|| {
-                        rustykrab_core::Error::ToolExecution(
-                            "missing schedule for create action".into(),
-                        )
-                    })?;
+                let schedule = args["schedule"].as_str().ok_or_else(|| {
+                    rustykrab_core::Error::ToolExecution(
+                        "missing schedule for create action".into(),
+                    )
+                })?;
 
-                let task = args["task"]
-                    .as_str()
-                    .ok_or_else(|| {
-                        rustykrab_core::Error::ToolExecution(
-                            "missing task for create action".into(),
-                        )
-                    })?;
+                let task = args["task"].as_str().ok_or_else(|| {
+                    rustykrab_core::Error::ToolExecution("missing task for create action".into())
+                })?;
+
+                let channel = args["channel"].as_str();
+                let chat_id = args["chat_id"].as_str();
 
                 let result = self
                     .backend
-                    .create_job(schedule, task)
+                    .create_job(schedule, task, channel, chat_id)
                     .await
                     .map_err(|e| rustykrab_core::Error::ToolExecution(e.to_string().into()))?;
 
@@ -104,13 +109,9 @@ impl Tool for CronTool {
                 }))
             }
             "delete" => {
-                let job_id = args["job_id"]
-                    .as_str()
-                    .ok_or_else(|| {
-                        rustykrab_core::Error::ToolExecution(
-                            "missing job_id for delete action".into(),
-                        )
-                    })?;
+                let job_id = args["job_id"].as_str().ok_or_else(|| {
+                    rustykrab_core::Error::ToolExecution("missing job_id for delete action".into())
+                })?;
 
                 let result = self
                     .backend

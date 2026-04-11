@@ -1,17 +1,21 @@
+use std::sync::Arc;
+
 use chrono::Utc;
+use rusqlite::params;
 use rustykrab_core::types::Conversation;
 use rustykrab_core::Error;
+use std::sync::Mutex;
 use uuid::Uuid;
 
-/// CRUD operations on conversations backed by a sled tree.
+/// CRUD operations on conversations backed by SQLite.
 #[derive(Clone)]
 pub struct ConversationStore {
-    tree: sled::Tree,
+    conn: Arc<Mutex<rusqlite::Connection>>,
 }
 
 impl ConversationStore {
-    pub(crate) fn new(tree: sled::Tree) -> Self {
-        Self { tree }
+    pub(crate) fn new(conn: Arc<Mutex<rusqlite::Connection>>) -> Self {
+        Self { conn }
     }
 
     /// Create a new empty conversation and return it.
@@ -32,61 +36,69 @@ impl ConversationStore {
 
     /// Persist a conversation (insert or update).
     pub fn save(&self, conv: &Conversation) -> Result<(), Error> {
-        let bytes = serde_json::to_vec(conv)?;
-        self.tree
-            .insert(conv.id.as_bytes(), bytes)
-            .map_err(|e| Error::Storage(e.to_string()))?;
-        self.tree
-            .flush()
-            .map_err(|e| Error::Storage(e.to_string()))?;
+        let data = serde_json::to_string(conv)?;
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO conversations (id, data) VALUES (?1, ?2)
+             ON CONFLICT(id) DO UPDATE SET data = excluded.data",
+            params![conv.id.to_string(), data],
+        )
+        .map_err(|e| Error::Storage(e.to_string()))?;
         Ok(())
     }
 
     /// Retrieve a conversation by ID.
     pub fn get(&self, id: Uuid) -> Result<Conversation, Error> {
-        let bytes = self
-            .tree
-            .get(id.as_bytes())
-            .map_err(|e| Error::Storage(e.to_string()))?
-            .ok_or_else(|| Error::NotFound(format!("conversation {id}")))?;
-        let conv: Conversation = serde_json::from_slice(&bytes)?;
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT data FROM conversations WHERE id = ?1")
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        let data: String = stmt
+            .query_row(params![id.to_string()], |row| row.get(0))
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => {
+                    Error::NotFound(format!("conversation {id}"))
+                }
+                other => Error::Storage(other.to_string()),
+            })?;
+        let conv: Conversation = serde_json::from_str(&data)?;
         Ok(conv)
     }
 
     /// List all conversation IDs (lightweight, doesn't deserialize messages).
     pub fn list_ids(&self) -> Result<Vec<Uuid>, Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT id FROM conversations")
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        let rows = stmt
+            .query_map([], |row| {
+                let id_str: String = row.get(0)?;
+                Ok(id_str)
+            })
+            .map_err(|e| Error::Storage(e.to_string()))?;
         let mut ids = Vec::new();
-        for entry in self.tree.iter() {
-            let (key, _) = entry.map_err(|e| Error::Storage(e.to_string()))?;
-            let id =
-                Uuid::from_slice(&key).map_err(|e| Error::Storage(e.to_string()))?;
+        for row in rows {
+            let id_str = row.map_err(|e| Error::Storage(e.to_string()))?;
+            let id = Uuid::parse_str(&id_str).map_err(|e| Error::Storage(e.to_string()))?;
             ids.push(id);
         }
         Ok(ids)
     }
 
-    /// Find a conversation by channel source and channel ID.
-    ///
-    /// Used to persistently map e.g. a Telegram chat_id to a conversation
-    /// so the mapping survives server restarts.
-    pub fn find_by_channel(&self, source: &str, channel_id: &str) -> Result<Option<Conversation>, Error> {
-        for entry in self.tree.iter() {
-            let (_key, value) = entry.map_err(|e| Error::Storage(e.to_string()))?;
-            let conv: Conversation = serde_json::from_slice(&value)?;
-            if conv.channel_source.as_deref() == Some(source)
-                && conv.channel_id.as_deref() == Some(channel_id)
-            {
-                return Ok(Some(conv));
-            }
-        }
-        Ok(None)
-    }
-
-    /// Delete a conversation by ID.
+    /// Delete a conversation by ID. Returns `NotFound` if the conversation
+    /// does not exist, so callers can distinguish 404 from 500.
     pub fn delete(&self, id: Uuid) -> Result<(), Error> {
-        self.tree
-            .remove(id.as_bytes())
+        let conn = self.conn.lock().unwrap();
+        let affected = conn
+            .execute(
+                "DELETE FROM conversations WHERE id = ?1",
+                params![id.to_string()],
+            )
             .map_err(|e| Error::Storage(e.to_string()))?;
+        if affected == 0 {
+            return Err(Error::NotFound(format!("conversation {id}")));
+        }
         Ok(())
     }
 }

@@ -19,8 +19,8 @@ impl SkillVerifier {
 
     /// Parse a hex-encoded ed25519 public key and add it to the trust set.
     pub fn add_trusted_key_hex(&mut self, hex_key: &str) -> Result<(), Error> {
-        let bytes = hex::decode(hex_key)
-            .map_err(|e| Error::Config(format!("invalid hex key: {e}")))?;
+        let bytes =
+            hex::decode(hex_key).map_err(|e| Error::Config(format!("invalid hex key: {e}")))?;
         let key_bytes: [u8; 32] = bytes
             .try_into()
             .map_err(|_| Error::Config("ed25519 public key must be 32 bytes".into()))?;
@@ -71,7 +71,7 @@ impl SkillVerifier {
 
 /// Utility: generate a new ed25519 signing keypair (for skill publishers).
 pub fn generate_signing_keypair() -> (ed25519_dalek::SigningKey, VerifyingKey) {
-    let mut csprng = rand::thread_rng();
+    let mut csprng = rand_core::OsRng;
     let signing_key = ed25519_dalek::SigningKey::generate(&mut csprng);
     let verifying_key = signing_key.verifying_key();
     (signing_key, verifying_key)

@@ -1,8 +1,10 @@
 use async_trait::async_trait;
-use base64::Engine;
 use rustykrab_core::types::ToolSchema;
 use rustykrab_core::{Result, Tool};
 use serde_json::{json, Value};
+
+/// Maximum image download size (50 MB).
+const MAX_IMAGE_DOWNLOAD_SIZE: usize = 50 * 1024 * 1024;
 
 /// A built-in tool that analyzes images from URLs or file paths.
 pub struct ImageTool {
@@ -12,7 +14,10 @@ pub struct ImageTool {
 impl ImageTool {
     pub fn new() -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .expect("failed to build HTTP client"),
         }
     }
 }
@@ -61,34 +66,68 @@ impl Tool for ImageTool {
 
         let image_bytes = if source.starts_with("http://") || source.starts_with("https://") {
             // SSRF protection: validate URL before making request
-            crate::security::validate_url(source)
-                .map_err(|e| rustykrab_core::Error::ToolExecution(format!("URL validation failed: {e}").into()))?;
+            crate::security::validate_url(source).await.map_err(|e| {
+                rustykrab_core::Error::ToolExecution(format!("URL validation failed: {e}").into())
+            })?;
 
-            self.client
-                .get(source)
-                .send()
-                .await
-                .map_err(|e| rustykrab_core::Error::ToolExecution(format!("failed to download image: {e}").into()))?
-                .bytes()
-                .await
-                .map_err(|e| rustykrab_core::Error::ToolExecution(format!("failed to read image bytes: {e}").into()))?
-                .to_vec()
+            let resp = self.client.get(source).send().await.map_err(|e| {
+                rustykrab_core::Error::ToolExecution(
+                    format!("failed to download image: {e}").into(),
+                )
+            })?;
+
+            // Check content-length header for early rejection
+            if let Some(len) = resp.content_length() {
+                if len > MAX_IMAGE_DOWNLOAD_SIZE as u64 {
+                    return Err(rustykrab_core::Error::ToolExecution(
+                        format!("image too large: {len} bytes (max {MAX_IMAGE_DOWNLOAD_SIZE})")
+                            .into(),
+                    ));
+                }
+            }
+
+            // Read body with size limit via chunked reading
+            let mut bytes = Vec::new();
+            let mut resp = resp;
+            while let Some(chunk) = resp.chunk().await.map_err(|e| {
+                rustykrab_core::Error::ToolExecution(
+                    format!("failed to read image bytes: {e}").into(),
+                )
+            })? {
+                bytes.extend_from_slice(&chunk);
+                if bytes.len() > MAX_IMAGE_DOWNLOAD_SIZE {
+                    return Err(rustykrab_core::Error::ToolExecution(
+                        format!(
+                            "image download exceeded size limit ({MAX_IMAGE_DOWNLOAD_SIZE} bytes)"
+                        )
+                        .into(),
+                    ));
+                }
+            }
+            bytes
         } else {
             // Path traversal protection: validate path before reading
-            let safe_path = crate::security::validate_path(source)
-                .map_err(|e| rustykrab_core::Error::ToolExecution(format!("path validation failed: {e}").into()))?;
+            let safe_path = crate::security::validate_path(source).map_err(|e| {
+                rustykrab_core::Error::ToolExecution(format!("path validation failed: {e}").into())
+            })?;
 
-            tokio::fs::read(&safe_path)
-                .await
-                .map_err(|e| rustykrab_core::Error::ToolExecution(format!("failed to read image file: {e}").into()))?
+            tokio::fs::read(&safe_path).await.map_err(|e| {
+                rustykrab_core::Error::ToolExecution(
+                    format!("failed to read image file: {e}").into(),
+                )
+            })?
         };
 
-        let b64 = base64::engine::general_purpose::STANDARD.encode(&image_bytes);
-        let b64_len = b64.len();
+        // Compute base64 length without allocating the encoded string.
+        let b64_len = image_bytes.len().div_ceil(3) * 4;
+
+        let prompt = args["prompt"].as_str().unwrap_or("");
 
         Ok(json!({
             "source": source,
+            "size_bytes": image_bytes.len(),
             "base64_length": b64_len,
+            "prompt": prompt,
             "analysis": "Image loaded successfully. Pass to model for analysis."
         }))
     }

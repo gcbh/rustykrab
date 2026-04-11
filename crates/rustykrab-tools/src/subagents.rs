@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -11,13 +12,20 @@ use super::session_manager::SessionManager;
 const MAX_RECURSION_DEPTH: u64 = 5;
 
 /// A tool that runs a task using a specific sub-agent.
+///
+/// Depth is tracked server-side via an atomic counter so clients cannot
+/// bypass the fork-bomb guard by omitting or resetting the `_depth` arg.
 pub struct SubagentsTool {
     manager: Arc<dyn SessionManager>,
+    depth: Arc<AtomicU64>,
 }
 
 impl SubagentsTool {
     pub fn new(manager: Arc<dyn SessionManager>) -> Self {
-        Self { manager }
+        Self {
+            manager,
+            depth: Arc::new(AtomicU64::new(0)),
+        }
     }
 }
 
@@ -60,14 +68,18 @@ impl Tool for SubagentsTool {
             .as_str()
             .ok_or_else(|| rustykrab_core::Error::ToolExecution("missing task".into()))?;
 
-        // H7: Check current recursion depth before spawning
-        let current_depth = args["_depth"].as_u64().unwrap_or(0);
+        // H7: Server-side depth tracking — ignore client-provided _depth.
+        let current_depth = self.depth.load(Ordering::Acquire);
         if current_depth >= MAX_RECURSION_DEPTH {
-            return Err(rustykrab_core::Error::ToolExecution(format!(
-                "maximum agent recursion depth ({MAX_RECURSION_DEPTH}) exceeded"
-            ).into()));
+            return Err(rustykrab_core::Error::ToolExecution(
+                format!("maximum agent recursion depth ({MAX_RECURSION_DEPTH}) exceeded").into(),
+            ));
         }
 
-        self.manager.run_subagent(agent_id, task).await
+        self.depth.fetch_add(1, Ordering::AcqRel);
+        let result = self.manager.run_subagent(agent_id, task).await;
+        self.depth.fetch_sub(1, Ordering::AcqRel);
+
+        result
     }
 }

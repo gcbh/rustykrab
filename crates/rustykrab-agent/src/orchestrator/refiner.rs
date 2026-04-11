@@ -92,10 +92,21 @@ impl RefinementLoop {
     }
 
     /// Run the critique pass.
-    async fn critique(&self, request: &str, response: &str, context: Option<&str>) -> Result<String> {
+    async fn critique(
+        &self,
+        request: &str,
+        response: &str,
+        context: Option<&str>,
+    ) -> Result<String> {
         let prompt = CRITIQUE_PROMPT
-            .replace("{request}", &format!("<user_input>\n{request}\n</user_input>"))
-            .replace("{response}", &format!("<agent_response>\n{response}\n</agent_response>"));
+            .replace(
+                "{request}",
+                &format!("<user_input>\n{request}\n</user_input>"),
+            )
+            .replace(
+                "{response}",
+                &format!("<agent_response>\n{response}\n</agent_response>"),
+            );
 
         let mut messages = Vec::new();
         if let Some(ctx) = context {
@@ -113,12 +124,22 @@ impl RefinementLoop {
             created_at: Utc::now(),
         });
 
-        let result = self.provider.chat(&messages, &[]).await?;
+        let timeout_secs = self.config.model_call_timeout_secs;
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(timeout_secs),
+            self.provider.chat(&messages, &[]),
+        )
+        .await
+        .map_err(|_| {
+            rustykrab_core::Error::Internal(format!(
+                "critique model call timed out after {timeout_secs}s"
+            ))
+        })??;
         Ok(result
             .message
             .content
             .as_text()
-            .unwrap_or("APPROVED")
+            .unwrap_or("Non-text response — requires manual review")
             .to_string())
     }
 
@@ -131,9 +152,18 @@ impl RefinementLoop {
         context: Option<&str>,
     ) -> Result<String> {
         let prompt = REFINE_PROMPT
-            .replace("{request}", &format!("<user_input>\n{request}\n</user_input>"))
-            .replace("{response}", &format!("<agent_response>\n{response}\n</agent_response>"))
-            .replace("{critique}", &format!("<agent_response>\n{critique}\n</agent_response>"));
+            .replace(
+                "{request}",
+                &format!("<user_input>\n{request}\n</user_input>"),
+            )
+            .replace(
+                "{response}",
+                &format!("<agent_response>\n{response}\n</agent_response>"),
+            )
+            .replace(
+                "{critique}",
+                &format!("<agent_response>\n{critique}\n</agent_response>"),
+            );
 
         let mut messages = Vec::new();
         if let Some(ctx) = context {
@@ -151,7 +181,17 @@ impl RefinementLoop {
             created_at: Utc::now(),
         });
 
-        let result = self.provider.chat(&messages, &[]).await?;
+        let timeout_secs = self.config.model_call_timeout_secs;
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(timeout_secs),
+            self.provider.chat(&messages, &[]),
+        )
+        .await
+        .map_err(|_| {
+            rustykrab_core::Error::Internal(format!(
+                "refinement model call timed out after {timeout_secs}s"
+            ))
+        })??;
         Ok(result
             .message
             .content

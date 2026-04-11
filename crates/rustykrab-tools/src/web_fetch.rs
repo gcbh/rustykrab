@@ -74,6 +74,7 @@ impl Tool for WebFetchTool {
 
         // SSRF protection: validate URL before making request
         security::validate_url(url)
+            .await
             .map_err(|e| Error::ToolExecution(e.into()))?;
 
         let include_links = args["include_links"].as_bool().unwrap_or(false);
@@ -115,7 +116,11 @@ impl Tool for WebFetchTool {
                 .last()
                 .map(|(i, c)| i + c.len_utf8())
                 .unwrap_or(MAX_CONTENT_LENGTH);
-            format!("{}...\n\n[Content truncated at {} characters]", &text[..end], MAX_CONTENT_LENGTH)
+            format!(
+                "{}...\n\n[Content truncated at {} characters]",
+                &text[..end],
+                MAX_CONTENT_LENGTH
+            )
         } else {
             text
         };
@@ -127,4 +132,3 @@ impl Tool for WebFetchTool {
         }))
     }
 }
-

@@ -1,13 +1,18 @@
 use async_trait::async_trait;
 use chrono::Utc;
 use rustykrab_core::error::Result;
-use rustykrab_core::model::{ModelProvider, ModelResponse, StopReason, Usage};
-use rustykrab_core::types::{
-    Message, MessageContent, Role, ToolCall, ToolSchema,
-};
+use rustykrab_core::model::{ModelProvider, ModelResponse, StopReason, StreamEvent, Usage};
+use rustykrab_core::types::{Message, MessageContent, Role, ToolCall, ToolSchema};
 use rustykrab_core::Error;
+use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 use uuid::Uuid;
+
+/// Maximum number of retries for transient errors (429, 5xx).
+const MAX_RETRIES: u32 = 3;
+/// Base delay for exponential backoff (doubles each retry, with jitter).
+const RETRY_BASE_DELAY: Duration = Duration::from_secs(1);
 
 /// Anthropic Claude API provider.
 ///
@@ -16,16 +21,21 @@ use uuid::Uuid;
 /// agentic workloads due to superior prompt injection resistance.
 pub struct AnthropicProvider {
     client: reqwest::Client,
-    api_key: String,
+    api_key: SecretString,
     model: String,
     max_tokens: u32,
 }
 
 impl AnthropicProvider {
     pub fn new(api_key: String) -> Self {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(300))
+            .connect_timeout(Duration::from_secs(10))
+            .build()
+            .expect("failed to build HTTP client");
         Self {
-            client: reqwest::Client::new(),
-            api_key,
+            client,
+            api_key: SecretString::from(api_key),
             model: "claude-sonnet-4-20250514".to_string(),
             max_tokens: 4096,
         }
@@ -42,7 +52,9 @@ impl AnthropicProvider {
     }
 
     /// Convert our internal messages to Anthropic API format.
-    fn build_messages(messages: &[Message]) -> (Option<String>, Vec<ApiMessage>) {
+    ///
+    /// Returns an error if tool result serialization fails (#195).
+    fn build_messages(messages: &[Message]) -> Result<(Option<String>, Vec<ApiMessage>)> {
         let mut system_prompt = None;
         let mut api_messages = Vec::new();
 
@@ -57,7 +69,9 @@ impl AnthropicProvider {
                     if let MessageContent::Text(ref text) = msg.content {
                         api_messages.push(ApiMessage {
                             role: "user".to_string(),
-                            content: ApiContent::Text(text.clone()),
+                            content: ApiContent::Blocks(vec![ContentBlock::Text {
+                                text: text.clone(),
+                            }]),
                         });
                     }
                 }
@@ -65,7 +79,9 @@ impl AnthropicProvider {
                     MessageContent::Text(ref text) => {
                         api_messages.push(ApiMessage {
                             role: "assistant".to_string(),
-                            content: ApiContent::Text(text.clone()),
+                            content: ApiContent::Blocks(vec![ContentBlock::Text {
+                                text: text.clone(),
+                            }]),
                         });
                     }
                     MessageContent::ToolCall(ref call) => {
@@ -96,12 +112,19 @@ impl AnthropicProvider {
                 },
                 Role::Tool => {
                     if let MessageContent::ToolResult(ref result) = msg.content {
+                        // Fix #182: avoid double-serialization of string values.
+                        // Fix #195: propagate serialization errors instead of swallowing them.
+                        let content = match &result.output {
+                            serde_json::Value::String(s) => s.clone(),
+                            other => serde_json::to_string(other).map_err(Error::Serialization)?,
+                        };
                         api_messages.push(ApiMessage {
                             role: "user".to_string(),
                             content: ApiContent::Blocks(vec![ContentBlock::ToolResult {
                                 tool_use_id: result.call_id.clone(),
-                                content: serde_json::to_string(&result.output)
-                                    .unwrap_or_default(),
+                                content,
+                                // Fix #207: pass is_error flag to model.
+                                is_error: result.is_error,
                             }]),
                         });
                     }
@@ -109,7 +132,7 @@ impl AnthropicProvider {
             }
         }
 
-        (system_prompt, api_messages)
+        Ok((system_prompt, api_messages))
     }
 
     /// Convert tool schemas to Anthropic's tool format.
@@ -126,10 +149,14 @@ impl AnthropicProvider {
 
     /// Parse the API response into our internal types.
     /// Supports multiple tool calls in a single response (parallel tool use).
+    /// Fix #190: preserves text content alongside tool calls.
     fn parse_response(resp: ApiResponse) -> Result<ModelResponse> {
         let usage = Usage {
             prompt_tokens: resp.usage.input_tokens,
             completion_tokens: resp.usage.output_tokens,
+            // Fix #203: capture cache token fields from Anthropic response.
+            cache_read_tokens: resp.usage.cache_read_input_tokens.unwrap_or(0),
+            cache_creation_tokens: resp.usage.cache_creation_input_tokens.unwrap_or(0),
         };
 
         let stop_reason = match resp.stop_reason.as_deref() {
@@ -152,7 +179,19 @@ impl AnthropicProvider {
             })
             .collect();
 
-        // If there are tool calls, return them (single or multi).
+        // Fix #190: always extract text blocks, even when tool calls are present.
+        let text: String = resp
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ResponseBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("");
+
+        // If there are tool calls, return them (single or multi),
+        // preserving any accompanying text in `response.text`.
         if !tool_calls.is_empty() {
             let content = if tool_calls.len() == 1 {
                 MessageContent::ToolCall(tool_calls.into_iter().next().unwrap())
@@ -169,19 +208,9 @@ impl AnthropicProvider {
                 },
                 usage,
                 stop_reason,
+                text: if text.is_empty() { None } else { Some(text) },
             });
         }
-
-        // Otherwise, extract text.
-        let text = resp
-            .content
-            .iter()
-            .filter_map(|b| match b {
-                ResponseBlock::Text { text } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("");
 
         Ok(ModelResponse {
             message: Message {
@@ -192,7 +221,19 @@ impl AnthropicProvider {
             },
             usage,
             stop_reason,
+            text: None,
         })
+    }
+
+    /// Map an HTTP status code to a specific error variant (#186).
+    fn map_status_error(status: reqwest::StatusCode, body: &str) -> Error {
+        match status.as_u16() {
+            400 => Error::ModelBadRequest(format!("Anthropic API: {body}")),
+            401 | 403 => Error::ModelAuthError(format!("Anthropic API: {body}")),
+            429 => Error::ModelRateLimit(format!("Anthropic API: {body}")),
+            529 => Error::ModelOverloaded(format!("Anthropic API: {body}")),
+            _ => Error::ModelProvider(format!("Anthropic API returned {status}: {body}")),
+        }
     }
 }
 
@@ -202,12 +243,16 @@ impl ModelProvider for AnthropicProvider {
         "anthropic"
     }
 
-    async fn chat(
-        &self,
-        messages: &[Message],
-        tools: &[ToolSchema],
-    ) -> Result<ModelResponse> {
-        let (system, api_messages) = Self::build_messages(messages);
+    async fn chat(&self, messages: &[Message], tools: &[ToolSchema]) -> Result<ModelResponse> {
+        let (system, api_messages) = Self::build_messages(messages)?;
+
+        // Fix #200: validate that the message list is not empty before calling the API.
+        if api_messages.is_empty() {
+            return Err(Error::ModelBadRequest(
+                "cannot call Anthropic API with an empty message list".into(),
+            ));
+        }
+
         let api_tools = Self::build_tools(tools);
 
         let mut body = serde_json::json!({
@@ -216,20 +261,100 @@ impl ModelProvider for AnthropicProvider {
             "messages": api_messages,
         });
 
+        // Fix #178: use array format for system parameter to enable prompt caching.
         if let Some(sys) = system {
-            body["system"] = serde_json::json!(sys);
+            body["system"] = serde_json::json!([{"type": "text", "text": sys}]);
         }
         if !api_tools.is_empty() {
-            body["tools"] = serde_json::to_value(&api_tools)
-                .map_err(|e| Error::Serialization(e))?;
+            body["tools"] = serde_json::to_value(&api_tools).map_err(Error::Serialization)?;
         }
 
         tracing::debug!(model = %self.model, "calling Anthropic Messages API");
 
+        let mut last_err = None;
+        for attempt in 0..=MAX_RETRIES {
+            if attempt > 0 {
+                let delay = RETRY_BASE_DELAY * 2u32.pow(attempt - 1);
+                tracing::warn!(attempt, "retrying Anthropic API after {delay:?}");
+                tokio::time::sleep(delay).await;
+            }
+
+            let resp = match self
+                .client
+                .post("https://api.anthropic.com/v1/messages")
+                .header("x-api-key", self.api_key.expose_secret())
+                .header("anthropic-version", "2023-06-01")
+                .header("content-type", "application/json")
+                .json(&body)
+                .send()
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    last_err = Some(Error::ModelProvider(e.to_string()));
+                    continue;
+                }
+            };
+
+            let status = resp.status();
+            if status.is_success() {
+                let api_resp: ApiResponse = resp
+                    .json()
+                    .await
+                    .map_err(|e| Error::ModelProvider(format!("failed to parse response: {e}")))?;
+                return Self::parse_response(api_resp);
+            }
+
+            let error_body = resp.text().await.unwrap_or_default();
+            let is_retryable = matches!(status.as_u16(), 429 | 500 | 502 | 503 | 529);
+            // Fix #186: map status codes to specific error variants.
+            last_err = Some(Self::map_status_error(status, &error_body));
+
+            if !is_retryable {
+                break;
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| Error::ModelProvider("request failed".into())))
+    }
+
+    /// Fix #175: streaming implementation using Anthropic SSE.
+    async fn chat_stream(
+        &self,
+        messages: &[Message],
+        tools: &[ToolSchema],
+        on_event: &(dyn Fn(StreamEvent) + Send + Sync),
+    ) -> Result<ModelResponse> {
+        let (system, api_messages) = Self::build_messages(messages)?;
+
+        if api_messages.is_empty() {
+            return Err(Error::ModelBadRequest(
+                "cannot call Anthropic API with an empty message list".into(),
+            ));
+        }
+
+        let api_tools = Self::build_tools(tools);
+
+        let mut body = serde_json::json!({
+            "model": self.model,
+            "max_tokens": self.max_tokens,
+            "messages": api_messages,
+            "stream": true,
+        });
+
+        if let Some(sys) = system {
+            body["system"] = serde_json::json!([{"type": "text", "text": sys}]);
+        }
+        if !api_tools.is_empty() {
+            body["tools"] = serde_json::to_value(&api_tools).map_err(Error::Serialization)?;
+        }
+
+        tracing::debug!(model = %self.model, "calling Anthropic Messages API (streaming)");
+
         let resp = self
             .client
             .post("https://api.anthropic.com/v1/messages")
-            .header("x-api-key", &self.api_key)
+            .header("x-api-key", self.api_key.expose_secret())
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json")
             .json(&body)
@@ -240,17 +365,148 @@ impl ModelProvider for AnthropicProvider {
         let status = resp.status();
         if !status.is_success() {
             let error_body = resp.text().await.unwrap_or_default();
-            return Err(Error::ModelProvider(format!(
-                "Anthropic API returned {status}: {error_body}"
-            )));
+            return Err(Self::map_status_error(status, &error_body));
         }
 
-        let api_resp: ApiResponse = resp
-            .json()
-            .await
-            .map_err(|e| Error::ModelProvider(format!("failed to parse response: {e}")))?;
+        // Parse SSE events from the response body.
+        let mut buffer = String::new();
+        let mut current_event_type = String::new();
+        let mut full_text = String::new();
+        let mut tool_calls: Vec<ToolCall> = Vec::new();
+        // Per-block accumulators for tool input JSON (keyed by block index).
+        let mut tool_input_bufs: std::collections::HashMap<usize, String> =
+            std::collections::HashMap::new();
+        let mut tool_meta: std::collections::HashMap<usize, (String, String)> =
+            std::collections::HashMap::new();
+        let mut input_tokens: u32 = 0;
+        let mut output_tokens: u32 = 0;
+        let mut cache_read_tokens: u32 = 0;
+        let mut cache_creation_tokens: u32 = 0;
+        let mut stop_reason = StopReason::EndTurn;
 
-        Self::parse_response(api_resp)
+        let mut response = resp;
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|e| Error::ModelProvider(format!("stream read error: {e}")))?
+        {
+            buffer.push_str(&String::from_utf8_lossy(&chunk));
+
+            while let Some(newline_pos) = buffer.find('\n') {
+                let line = buffer[..newline_pos].trim_end().to_string();
+                buffer = buffer[newline_pos + 1..].to_string();
+
+                if let Some(event_type) = line.strip_prefix("event: ") {
+                    current_event_type = event_type.to_string();
+                } else if let Some(data) = line.strip_prefix("data: ") {
+                    match current_event_type.as_str() {
+                        "message_start" => {
+                            if let Ok(evt) = serde_json::from_str::<SseMessageStart>(data) {
+                                input_tokens = evt.message.usage.input_tokens;
+                                cache_read_tokens =
+                                    evt.message.usage.cache_read_input_tokens.unwrap_or(0);
+                                cache_creation_tokens =
+                                    evt.message.usage.cache_creation_input_tokens.unwrap_or(0);
+                            }
+                        }
+                        "content_block_start" => {
+                            if let Ok(evt) = serde_json::from_str::<SseContentBlockStart>(data) {
+                                if let SseContentBlock::ToolUse { id, name } = evt.content_block {
+                                    tool_meta.insert(evt.index, (id, name));
+                                    tool_input_bufs.insert(evt.index, String::new());
+                                }
+                            }
+                        }
+                        "content_block_delta" => {
+                            if let Ok(evt) = serde_json::from_str::<SseContentBlockDelta>(data) {
+                                match evt.delta {
+                                    SseDelta::TextDelta { text } => {
+                                        full_text.push_str(&text);
+                                        on_event(StreamEvent::TextDelta(text));
+                                    }
+                                    SseDelta::InputJsonDelta { partial_json } => {
+                                        if let Some(buf) = tool_input_bufs.get_mut(&evt.index) {
+                                            buf.push_str(&partial_json);
+                                        }
+                                    }
+                                    SseDelta::Unknown => {}
+                                }
+                            }
+                        }
+                        "content_block_stop" => {
+                            // Finalize any tool call whose input is now complete.
+                            if let Ok(evt) = serde_json::from_str::<SseContentBlockStop>(data) {
+                                if let Some(json_buf) = tool_input_bufs.remove(&evt.index) {
+                                    if let Some((id, name)) = tool_meta.remove(&evt.index) {
+                                        let input: serde_json::Value = serde_json::from_str(
+                                            &json_buf,
+                                        )
+                                        .unwrap_or(serde_json::Value::Object(Default::default()));
+                                        tool_calls.push(ToolCall {
+                                            id,
+                                            name,
+                                            arguments: input,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                        "message_delta" => {
+                            if let Ok(evt) = serde_json::from_str::<SseMessageDelta>(data) {
+                                output_tokens = evt.usage.output_tokens;
+                                stop_reason = match evt.delta.stop_reason.as_deref() {
+                                    Some("tool_use") => StopReason::ToolUse,
+                                    Some("max_tokens") => StopReason::MaxTokens,
+                                    _ => StopReason::EndTurn,
+                                };
+                            }
+                        }
+                        _ => {} // message_stop, ping, etc.
+                    }
+                }
+                // Blank lines and other lines are ignored.
+            }
+        }
+
+        let usage = Usage {
+            prompt_tokens: input_tokens,
+            completion_tokens: output_tokens,
+            cache_read_tokens,
+            cache_creation_tokens,
+        };
+
+        let (content, text_field) = if !tool_calls.is_empty() {
+            let tc = if tool_calls.len() == 1 {
+                MessageContent::ToolCall(tool_calls.into_iter().next().unwrap())
+            } else {
+                MessageContent::MultiToolCall(tool_calls)
+            };
+            (
+                tc,
+                if full_text.is_empty() {
+                    None
+                } else {
+                    Some(full_text)
+                },
+            )
+        } else {
+            (MessageContent::Text(full_text), None)
+        };
+
+        let response = ModelResponse {
+            message: Message {
+                id: Uuid::new_v4(),
+                role: Role::Assistant,
+                content,
+                created_at: Utc::now(),
+            },
+            usage,
+            stop_reason,
+            text: text_field,
+        };
+
+        on_event(StreamEvent::Done(response.clone()));
+        Ok(response)
     }
 }
 
@@ -265,13 +521,14 @@ struct ApiMessage {
 #[derive(Serialize)]
 #[serde(untagged)]
 enum ApiContent {
-    Text(String),
     Blocks(Vec<ContentBlock>),
 }
 
 #[derive(Serialize)]
 #[serde(tag = "type")]
 enum ContentBlock {
+    #[serde(rename = "text")]
+    Text { text: String },
     #[serde(rename = "tool_use")]
     ToolUse {
         id: String,
@@ -282,7 +539,14 @@ enum ContentBlock {
     ToolResult {
         tool_use_id: String,
         content: String,
+        /// Fix #207: signal tool execution errors to the model.
+        #[serde(skip_serializing_if = "is_false")]
+        is_error: bool,
     },
+}
+
+fn is_false(v: &bool) -> bool {
+    !v
 }
 
 #[derive(Serialize)]
@@ -300,6 +564,7 @@ struct ApiResponse {
     stop_reason: Option<String>,
 }
 
+/// Fix #206: added Unknown catch-all so new block types don't crash deserialization.
 #[derive(Deserialize)]
 #[serde(tag = "type")]
 enum ResponseBlock {
@@ -311,10 +576,86 @@ enum ResponseBlock {
         name: String,
         input: serde_json::Value,
     },
+    /// Catch-all for any block type not yet handled (e.g. future API additions).
+    #[serde(other)]
+    Unknown,
 }
 
+/// Fix #203: added cache token fields.
 #[derive(Deserialize)]
 struct ApiUsage {
     input_tokens: u32,
+    output_tokens: u32,
+    #[serde(default)]
+    cache_read_input_tokens: Option<u32>,
+    #[serde(default)]
+    cache_creation_input_tokens: Option<u32>,
+}
+
+// --- Streaming SSE types ---
+
+#[derive(Deserialize)]
+struct SseMessageStart {
+    message: SseMessageMeta,
+}
+
+#[derive(Deserialize)]
+struct SseMessageMeta {
+    usage: ApiUsage,
+}
+
+#[derive(Deserialize)]
+struct SseContentBlockStart {
+    index: usize,
+    content_block: SseContentBlock,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type")]
+#[allow(dead_code)]
+enum SseContentBlock {
+    #[serde(rename = "text")]
+    Text { text: String },
+    #[serde(rename = "tool_use")]
+    ToolUse { id: String, name: String },
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Deserialize)]
+struct SseContentBlockDelta {
+    index: usize,
+    delta: SseDelta,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type")]
+enum SseDelta {
+    #[serde(rename = "text_delta")]
+    TextDelta { text: String },
+    #[serde(rename = "input_json_delta")]
+    InputJsonDelta { partial_json: String },
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Deserialize)]
+struct SseContentBlockStop {
+    index: usize,
+}
+
+#[derive(Deserialize)]
+struct SseMessageDelta {
+    delta: SseMessageDeltaInfo,
+    usage: SseDeltaUsage,
+}
+
+#[derive(Deserialize)]
+struct SseMessageDeltaInfo {
+    stop_reason: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct SseDeltaUsage {
     output_tokens: u32,
 }

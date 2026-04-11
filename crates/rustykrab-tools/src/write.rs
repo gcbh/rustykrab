@@ -63,27 +63,26 @@ impl Tool for WriteTool {
             .ok_or_else(|| rustykrab_core::Error::ToolExecution("missing content".into()))?;
 
         // Validate path for traversal and blocked directories
-        let safe_path = security::validate_path(path)
-            .map_err(|e| rustykrab_core::Error::ToolExecution(format!("path rejected: {e}").into()))?;
+        let safe_path = security::validate_path(path).map_err(|e| {
+            rustykrab_core::Error::ToolExecution(format!("path rejected: {e}").into())
+        })?;
 
         let file_path = std::path::Path::new(&safe_path);
         if let Some(parent) = file_path.parent() {
             // Re-validate the parent directory
             if !parent.as_os_str().is_empty() {
-                tokio::fs::create_dir_all(parent)
-                    .await
-                    .map_err(|e| rustykrab_core::Error::ToolExecution(
+                tokio::fs::create_dir_all(parent).await.map_err(|e| {
+                    rustykrab_core::Error::ToolExecution(
                         format!("failed to create directories for {path}: {e}").into(),
-                    ))?;
+                    )
+                })?;
             }
         }
 
         let bytes = content.len();
-        tokio::fs::write(&safe_path, content)
-            .await
-            .map_err(|e| rustykrab_core::Error::ToolExecution(
-                format!("failed to write {path}: {e}").into(),
-            ))?;
+        tokio::fs::write(&safe_path, content).await.map_err(|e| {
+            rustykrab_core::Error::ToolExecution(format!("failed to write {path}: {e}").into())
+        })?;
 
         Ok(json!({
             "written": true,

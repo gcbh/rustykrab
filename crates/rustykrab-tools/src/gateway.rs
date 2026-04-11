@@ -87,30 +87,32 @@ impl Tool for GatewayTool {
                 let key = args["key"].as_str();
                 let value = args["value"].as_str();
 
-                if let (Some(k), Some(v)) = (key, value) {
-                    let result = self
-                        .backend
-                        .set_config(k, v)
-                        .await
-                        .map_err(|e| rustykrab_core::Error::ToolExecution(e.to_string().into()))?;
+                match (key, value) {
+                    (Some(k), Some(v)) => {
+                        let result = self.backend.set_config(k, v).await.map_err(|e| {
+                            rustykrab_core::Error::ToolExecution(e.to_string().into())
+                        })?;
 
-                    Ok(json!({
-                        "action": "config",
-                        "operation": "set",
-                        "result": result,
-                    }))
-                } else {
-                    let config = self
-                        .backend
-                        .get_config(key)
-                        .await
-                        .map_err(|e| rustykrab_core::Error::ToolExecution(e.to_string().into()))?;
+                        Ok(json!({
+                            "action": "config",
+                            "operation": "set",
+                            "result": result,
+                        }))
+                    }
+                    (None, Some(_)) => Err(rustykrab_core::Error::ToolExecution(
+                        "config value provided without a key".into(),
+                    )),
+                    (key, None) => {
+                        let config = self.backend.get_config(key).await.map_err(|e| {
+                            rustykrab_core::Error::ToolExecution(e.to_string().into())
+                        })?;
 
-                    Ok(json!({
-                        "action": "config",
-                        "operation": "get",
-                        "config": config,
-                    }))
+                        Ok(json!({
+                            "action": "config",
+                            "operation": "get",
+                            "config": config,
+                        }))
+                    }
                 }
             }
             _ => Err(rustykrab_core::Error::ToolExecution(

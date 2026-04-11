@@ -84,16 +84,18 @@ impl Tool for PdfTool {
             .ok_or_else(|| rustykrab_core::Error::ToolExecution("missing path".into()))?;
 
         // Validate path for traversal attacks
-        let safe_path = security::validate_path(path)
-            .map_err(|e| rustykrab_core::Error::ToolExecution(format!("path rejected: {e}").into()))?;
+        let safe_path = security::validate_path(path).map_err(|e| {
+            rustykrab_core::Error::ToolExecution(format!("path rejected: {e}").into())
+        })?;
 
         let pages = args["pages"].as_str();
         let password = args["password"].as_str();
 
         // Validate page range if provided
         if let Some(p) = pages {
-            validate_page_range(p)
-                .map_err(|e| rustykrab_core::Error::ToolExecution(format!("invalid page range: {e}").into()))?;
+            validate_page_range(p).map_err(|e| {
+                rustykrab_core::Error::ToolExecution(format!("invalid page range: {e}").into())
+            })?;
         }
 
         let safe_path_str = safe_path.to_string_lossy();
@@ -219,10 +221,7 @@ except Exception as e:
 
 /// Resolve the user's python3 path (same logic as code_execution tool).
 fn resolve_python() -> std::path::PathBuf {
-    if let Ok(output) = std::process::Command::new("which")
-        .arg("python3")
-        .output()
-    {
+    if let Ok(output) = std::process::Command::new("which").arg("python3").output() {
         if output.status.success() {
             let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
             if !path.is_empty() {
@@ -236,7 +235,10 @@ fn resolve_python() -> std::path::PathBuf {
     "python3".into()
 }
 
-async fn try_pdftotext(path: &str, pages: Option<&str>) -> std::result::Result<(String, u64), String> {
+async fn try_pdftotext(
+    path: &str,
+    pages: Option<&str>,
+) -> std::result::Result<(String, u64), String> {
     let mut cmd = tokio::process::Command::new("pdftotext");
 
     if let Some(page_range) = pages {
@@ -274,7 +276,10 @@ async fn try_pdftotext(path: &str, pages: Option<&str>) -> std::result::Result<(
     Ok((content, pages_extracted))
 }
 
-async fn try_python_pdf(path: &str, pages: Option<&str>) -> std::result::Result<(String, u64), String> {
+async fn try_python_pdf(
+    path: &str,
+    pages: Option<&str>,
+) -> std::result::Result<(String, u64), String> {
     // Sanitize path for Python string: escape backslashes and quotes
     let escaped_path = path.replace('\\', "\\\\").replace('"', "\\\"");
 

@@ -1,10 +1,11 @@
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use rustykrab_core::types::ToolSchema;
 use rustykrab_core::{Error, Result, Tool};
 use serde_json::{json, Value};
+use tokio::sync::Mutex;
 
 use crate::security;
 
@@ -16,6 +17,9 @@ use crate::security;
 ///
 /// Each named session has its own cookie jar, so multiple services
 /// can be accessed simultaneously without cookie conflicts.
+///
+/// Uses `tokio::sync::Mutex` to avoid blocking the async runtime
+/// (fixes ASYNC-H2).
 pub struct HttpSessionTool {
     sessions: Arc<Mutex<HashMap<String, reqwest::Client>>>,
 }
@@ -27,8 +31,8 @@ impl HttpSessionTool {
         }
     }
 
-    fn get_or_create_client(&self, session_name: &str) -> reqwest::Client {
-        let mut sessions = self.sessions.lock().unwrap();
+    async fn get_or_create_client(&self, session_name: &str) -> reqwest::Client {
+        let mut sessions = self.sessions.lock().await;
         sessions
             .entry(session_name.to_string())
             .or_insert_with(|| {
@@ -116,7 +120,7 @@ impl Tool for HttpSessionTool {
         let action = args["action"].as_str().unwrap_or("request");
 
         if action == "clear" {
-            let mut sessions = self.sessions.lock().unwrap();
+            let mut sessions = self.sessions.lock().await;
             sessions.remove(session_name);
             return Ok(json!({
                 "status": "session_cleared",
@@ -130,14 +134,12 @@ impl Tool for HttpSessionTool {
 
         // SSRF protection: validate URL before making request
         security::validate_url(url)
+            .await
             .map_err(|e| Error::ToolExecution(e.into()))?;
 
-        let method = args["method"]
-            .as_str()
-            .unwrap_or("GET")
-            .to_uppercase();
+        let method = args["method"].as_str().unwrap_or("GET").to_uppercase();
 
-        let client = self.get_or_create_client(session_name);
+        let client = self.get_or_create_client(session_name).await;
 
         let mut req = match method.as_str() {
             "POST" => client.post(url),
@@ -183,11 +185,7 @@ impl Tool for HttpSessionTool {
         let response_headers: HashMap<String, String> = resp
             .headers()
             .iter()
-            .filter_map(|(k, v)| {
-                v.to_str()
-                    .ok()
-                    .map(|val| (k.to_string(), val.to_string()))
-            })
+            .filter_map(|(k, v)| v.to_str().ok().map(|val| (k.to_string(), val.to_string())))
             .collect();
 
         let body = resp

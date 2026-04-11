@@ -44,8 +44,9 @@ impl Channel for WebChatChannel {
     async fn receive(&self) -> Result<Message> {
         // We need &mut self for recv, but the trait takes &self.
         // In practice this will be wrapped in a Mutex or redesigned with streams.
-        // For now, provide the shape of the API.
-        unimplemented!("use WebChatHandle with a stream adapter in production")
+        Err(rustykrab_core::Error::Channel(
+            "WebChatChannel::receive() requires &mut self; use WebChatHandle with a stream adapter instead".into(),
+        ))
     }
 
     async fn send(&self, message: &Message) -> Result<()> {

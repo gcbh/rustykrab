@@ -4,19 +4,98 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use chrono::Utc;
+
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+const GIT_HASH: &str = env!("RUSTYKRAB_GIT_HASH");
+const GIT_DIRTY: &str = env!("RUSTYKRAB_GIT_DIRTY");
+const BUILD_DATE: &str = env!("RUSTYKRAB_BUILD_DATE");
+
+fn version_string() -> String {
+    format!("{VERSION} ({GIT_HASH}{GIT_DIRTY}, {BUILD_DATE})")
+}
 use rustykrab_agent::{AgentEvent, HarnessProfile, HarnessRouter, OrchestrationPipeline};
-use rustykrab_channels::{ChannelMessage, TelegramChannel};
+use rustykrab_channels::telegram::ChannelMessage;
+use rustykrab_channels::{TelegramChannel, VideoChannel, VideoConfig};
 use rustykrab_core::model::ModelProvider;
 use rustykrab_core::orchestration::OrchestrationConfig;
 use rustykrab_core::types::MessageContent;
 use rustykrab_gateway::AppState;
+use rustykrab_memory::backend::HybridMemoryBackend;
+use rustykrab_memory::embedding::FastEmbedder;
+use rustykrab_memory::storage::SqliteMemoryStorage;
+use rustykrab_memory::{MemoryConfig, MemorySystem};
 use rustykrab_skills::SkillRegistry;
+use rustykrab_tools::{CronBackend, MemoryBackend};
 use tokio::sync::mpsc;
 use tracing_subscriber::fmt;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
+
+/// Adapter bridging [HybridMemoryBackend] (rustykrab-memory) to the
+/// [MemoryBackend] trait (rustykrab-tools) so the memory tools can use
+/// the hybrid retrieval engine.
+struct MemoryAdapter {
+    inner: HybridMemoryBackend,
+}
+
+#[async_trait::async_trait]
+impl MemoryBackend for MemoryAdapter {
+    async fn search(
+        &self,
+        query: &str,
+        tags: &[String],
+        limit: usize,
+    ) -> rustykrab_core::Result<serde_json::Value> {
+        self.inner.search(query, tags, limit).await
+    }
+    async fn get(&self, memory_id: &str) -> rustykrab_core::Result<serde_json::Value> {
+        self.inner.get(memory_id).await
+    }
+    async fn save(&self, fact: &str, tags: &[String]) -> rustykrab_core::Result<serde_json::Value> {
+        self.inner.save(fact, tags).await
+    }
+    async fn delete(&self, memory_id: &str) -> rustykrab_core::Result<serde_json::Value> {
+        self.inner.delete(memory_id).await
+    }
+    async fn list(&self) -> rustykrab_core::Result<serde_json::Value> {
+        self.inner.list().await
+    }
+}
+
+/// Adapter bridging [rustykrab_store::JobStore] to the [CronBackend] trait
+/// (rustykrab-tools) so the cron tool can manage scheduled jobs.
+struct CronAdapter {
+    store: rustykrab_store::Store,
+}
+
+#[async_trait::async_trait]
+impl CronBackend for CronAdapter {
+    async fn create_job(
+        &self,
+        schedule: &str,
+        task: &str,
+        channel: Option<&str>,
+        chat_id: Option<&str>,
+    ) -> rustykrab_core::Result<serde_json::Value> {
+        let job = self
+            .store
+            .jobs()
+            .create_job(schedule, task, channel, chat_id)?;
+        Ok(serde_json::to_value(&job).expect("ScheduledJob is always serializable"))
+    }
+
+    async fn list_jobs(&self) -> rustykrab_core::Result<serde_json::Value> {
+        let jobs = self.store.jobs().list_jobs()?;
+        Ok(serde_json::to_value(&jobs).expect("Vec<ScheduledJob> is always serializable"))
+    }
+
+    async fn delete_job(&self, job_id: &str) -> rustykrab_core::Result<serde_json::Value> {
+        let deleted = self.store.jobs().delete_job(job_id)?;
+        Ok(serde_json::json!({ "deleted": deleted, "job_id": job_id }))
+    }
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -41,8 +120,14 @@ async fn main() -> anyhow::Result<()> {
         .with(fmt::layer().with_writer(non_blocking).with_ansi(false))
         .init();
 
+    tracing::info!("rustykrab {}", version_string());
+
     // --- CLI subcommands ---
     let args: Vec<String> = std::env::args().collect();
+    if args.len() >= 2 && (args[1] == "--version" || args[1] == "-V") {
+        println!("rustykrab {}", version_string());
+        return Ok(());
+    }
     if args.len() >= 2 && args[1] == "skill" {
         return handle_skill_subcommand(&data_dir, &args[2..]);
     }
@@ -72,8 +157,8 @@ async fn main() -> anyhow::Result<()> {
     let auth_token = resolve_auth_token(&store);
 
     // --- Model provider ---
-    let provider_name = std::env::var("RUSTYKRAB_PROVIDER")
-        .unwrap_or_else(|_| "anthropic".to_string());
+    let provider_name =
+        std::env::var("RUSTYKRAB_PROVIDER").unwrap_or_else(|_| "anthropic".to_string());
     let provider_name = provider_name.trim().to_lowercase();
     let provider: Arc<dyn ModelProvider> = match provider_name.as_str() {
         "ollama" => {
@@ -98,9 +183,123 @@ async fn main() -> anyhow::Result<()> {
     let skills_dir = data_dir.join("skills");
     std::fs::create_dir_all(&skills_dir)?;
 
+    // --- Memory system (hybrid retrieval: vector + BM25 + temporal + graph) ---
+    let memory_db_path = data_dir.join("memory.db");
+    let memory_storage = Arc::new(
+        SqliteMemoryStorage::open(&memory_db_path).expect("failed to open memory database"),
+    );
+    let model_cache_dir = data_dir.join("models");
+    std::fs::create_dir_all(&model_cache_dir)?;
+    let embedder =
+        Arc::new(FastEmbedder::new(model_cache_dir).expect("failed to initialize embedding model"));
+    let memory_system = Arc::new(MemorySystem::new(
+        MemoryConfig::default(),
+        memory_storage,
+        embedder,
+    ));
+
+    // Persist agent_id so memories survive restarts. Stored as a simple
+    // file in the data directory; created once on first run.
+    let agent_id_path = data_dir.join("agent_id");
+    let agent_id = if agent_id_path.exists() {
+        let raw = std::fs::read_to_string(&agent_id_path)?;
+        Uuid::parse_str(raw.trim()).unwrap_or_else(|_| {
+            tracing::warn!("corrupt agent_id file, generating new ID");
+            let id = Uuid::new_v4();
+            let _ = std::fs::write(&agent_id_path, id.to_string());
+            id
+        })
+    } else {
+        let id = Uuid::new_v4();
+        std::fs::write(&agent_id_path, id.to_string())?;
+        tracing::info!(%id, "generated new persistent agent_id");
+        id
+    };
+
+    let session_id = Uuid::new_v4();
+
+    // Rebuild FTS5 index from persisted memories (idempotent).
+    let indexed = memory_system.rebuild_indexes(agent_id).await?;
+    if indexed > 0 {
+        tracing::info!(indexed, "FTS5 index rebuilt from stored memories");
+    }
+
+    let memory_backend: Arc<dyn MemoryBackend> = Arc::new(MemoryAdapter {
+        inner: HybridMemoryBackend::new(Arc::clone(&memory_system), agent_id, session_id),
+    });
+    tracing::info!(%agent_id, "memory system initialized");
+
+    // --- Idle lifecycle sweep ---
+    // Runs a lifecycle sweep when there is no activity for N minutes.
+    // Resets the idle timer on each inbound request (signaled via Notify).
+    let activity_signal = Arc::new(tokio::sync::Notify::new());
+    let idle_sweep_handle = {
+        let system = Arc::clone(&memory_system);
+        let activity = Arc::clone(&activity_signal);
+        let idle_secs = memory_system.config().sweep_idle_trigger_minutes as u64 * 60;
+        tokio::spawn(async move {
+            loop {
+                let idle = tokio::time::sleep(std::time::Duration::from_secs(idle_secs));
+                tokio::select! {
+                    _ = idle => {
+                        if let Err(e) = system.lifecycle_sweep(agent_id).await {
+                            tracing::warn!(error = %e, "idle lifecycle sweep failed");
+                        }
+                    }
+                    _ = activity.notified() => {
+                        continue;
+                    }
+                }
+            }
+        })
+    };
+
+    // --- Video channel (optional, enabled via RUSTYKRAB_VIDEO=true) ---
+    let video_enabled = std::env::var("RUSTYKRAB_VIDEO")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false);
+
+    let video_channel: Option<Arc<VideoChannel>> = if video_enabled {
+        let video_dir = data_dir.join("video");
+        std::fs::create_dir_all(&video_dir)?;
+
+        let mut video_config = VideoConfig {
+            projects_dir: video_dir,
+            ..Default::default()
+        };
+
+        // Allow custom npx path via env.
+        if let Ok(npx) = std::env::var("RUSTYKRAB_NPX_PATH") {
+            video_config.npx_path = npx;
+        }
+
+        let channel = Arc::new(VideoChannel::new(video_config));
+        tracing::info!("video communication channel enabled");
+        Some(channel)
+    } else {
+        tracing::info!("video channel disabled (set RUSTYKRAB_VIDEO=true to enable)");
+        None
+    };
+
     // --- Tools ---
     let mut tools = rustykrab_tools::builtin_tools(store.secrets());
+    tools.extend(rustykrab_tools::memory_tools(memory_backend));
     tools.extend(rustykrab_tools::skill_tools(skills_dir.clone()));
+
+    // --- Cron tool (task scheduling) ---
+    let cron_backend: Arc<dyn CronBackend> = Arc::new(CronAdapter {
+        store: store.clone(),
+    });
+    tools.push(Arc::new(rustykrab_tools::CronTool::new(cron_backend)));
+    tracing::info!("cron tool registered");
+
+    // --- Video tool (if video channel enabled) ---
+    if let Some(ref vc) = video_channel {
+        let video_backend: Arc<dyn rustykrab_tools::VideoBackend> =
+            Arc::new(rustykrab_tools::VideoChannelAdapter::new(vc.clone()));
+        tools.extend(rustykrab_tools::video_tools(video_backend));
+        tracing::info!("video tool registered");
+    }
 
     // --- Log provider status ---
     tracing::info!(provider = provider.name(), "model provider configured");
@@ -129,7 +328,9 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("orchestration pipeline enabled");
         Some(Arc::new(pipeline))
     } else {
-        tracing::info!("orchestration pipeline disabled (set RUSTYKRAB_ORCHESTRATION=true to enable)");
+        tracing::info!(
+            "orchestration pipeline disabled (set RUSTYKRAB_ORCHESTRATION=true to enable)"
+        );
         None
     };
 
@@ -162,6 +363,15 @@ async fn main() -> anyhow::Result<()> {
         state = state.with_orchestration_pipeline(pipeline);
     }
 
+    // --- Attach video channel to state ---
+    if let Some(vc) = video_channel {
+        state = state.with_video(vc);
+    }
+
+    // Track infrastructure task JoinHandles so panics are surfaced
+    // instead of silently swallowed (fixes ASYNC-H4).
+    let mut infra_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+
     // --- Telegram channel (optional) ---
     // We need to take the inbound_rx before wrapping in Arc, so build in stages.
     let mut telegram_rx: Option<mpsc::Receiver<ChannelMessage>> = None;
@@ -193,11 +403,12 @@ async fn main() -> anyhow::Result<()> {
             tracing::info!("Telegram: webhook mode");
         } else {
             let tg_poll = tg.clone();
-            tokio::spawn(async move {
+            // Store handle so panics are not silently swallowed (fixes ASYNC-H4).
+            infra_handles.push(tokio::spawn(async move {
                 if let Err(e) = tg_poll.start_polling().await {
                     tracing::error!("Telegram polling error: {e}");
                 }
-            });
+            }));
             tracing::info!("Telegram: long-polling mode");
         }
 
@@ -213,8 +424,8 @@ async fn main() -> anyhow::Result<()> {
 
     // --- Signal channel (optional) ---
     if let Ok(account_number) = std::env::var("SIGNAL_ACCOUNT") {
-        let base_url = std::env::var("SIGNAL_CLI_URL")
-            .unwrap_or_else(|_| "http://localhost:8080".to_string());
+        let base_url =
+            std::env::var("SIGNAL_CLI_URL").unwrap_or_else(|_| "http://localhost:8080".to_string());
 
         let allowed_numbers: HashSet<String> = std::env::var("SIGNAL_ALLOWED_NUMBERS")
             .unwrap_or_default()
@@ -225,8 +436,11 @@ async fn main() -> anyhow::Result<()> {
 
         let webhook_secret = std::env::var("SIGNAL_WEBHOOK_SECRET").ok();
 
-        let mut sig =
-            rustykrab_channels::SignalChannel::new(base_url.clone(), account_number.clone(), allowed_numbers.clone());
+        let mut sig = rustykrab_channels::SignalChannel::new(
+            base_url.clone(),
+            account_number.clone(),
+            allowed_numbers.clone(),
+        );
         if let Some(secret) = webhook_secret {
             sig = sig.with_webhook_secret(secret);
         }
@@ -249,11 +463,12 @@ async fn main() -> anyhow::Result<()> {
             }
         } else {
             let sig_poll = sig.clone();
-            tokio::spawn(async move {
+            // Store handle so panics are not silently swallowed (fixes ASYNC-H4).
+            infra_handles.push(tokio::spawn(async move {
                 if let Err(e) = sig_poll.start_polling().await {
                     tracing::error!("Signal polling error: {e}");
                 }
-            });
+            }));
             tracing::info!("Signal: polling mode");
         }
 
@@ -272,9 +487,23 @@ async fn main() -> anyhow::Result<()> {
 
     // --- Spawn Telegram agent loop (after state is fully built) ---
     if let (Some(rx), Some(tg)) = (telegram_rx, telegram_arc) {
-        tokio::spawn(telegram_agent_loop(rx, tg, state.clone()));
+        // Store handle so panics are not silently swallowed (fixes ASYNC-H4).
+        infra_handles.push(tokio::spawn(telegram_agent_loop(rx, tg, state.clone())));
         tracing::info!("Telegram agent loop started");
     }
+
+    // --- Job executor (scheduled task runner) ---
+    {
+        let executor_store = store_handle.clone();
+        let executor_state = state.clone();
+        infra_handles.push(tokio::spawn(async move {
+            job_executor_loop(executor_store, executor_state).await;
+        }));
+        tracing::info!("job executor started (30s poll interval)");
+    }
+
+    // Save a reference to the video channel for shutdown.
+    let video_shutdown_handle = state.video.clone();
 
     // --- Gateway with security middleware ---
     let app = rustykrab_gateway::router(state);
@@ -291,6 +520,34 @@ async fn main() -> anyhow::Result<()> {
     .with_graceful_shutdown(shutdown_signal());
 
     server.await?;
+
+    // Abort infrastructure tasks and log any panics.
+    for handle in &infra_handles {
+        handle.abort();
+    }
+    for handle in infra_handles {
+        if let Err(e) = handle.await {
+            if e.is_panic() {
+                tracing::error!("infrastructure task panicked during shutdown: {e}");
+            }
+        }
+    }
+
+    // Finalize memory session: Working → Episodic + lifecycle sweep.
+    idle_sweep_handle.abort();
+    tracing::info!("finalizing memory session...");
+    if let Err(e) = memory_system.finalize_session(agent_id, session_id).await {
+        tracing::warn!(error = %e, "failed to finalize memory session");
+    }
+    if let Err(e) = memory_system.lifecycle_sweep(agent_id).await {
+        tracing::warn!(error = %e, "shutdown lifecycle sweep failed");
+    }
+
+    // Shut down video channel (MCP server).
+    if let Some(ref vc) = video_shutdown_handle {
+        tracing::info!("shutting down video channel...");
+        vc.shutdown().await;
+    }
 
     // Flush database before exit
     tracing::info!("flushing database...");
@@ -317,42 +574,48 @@ fn epoch_millis() -> u64 {
         .as_millis() as u64
 }
 
-/// Per-chat state for tracking conversations and preventing concurrent runs.
+/// Per-chat (or per-thread in forum groups) state for tracking conversations
+/// and preventing concurrent runs. Keyed by `(chat_id, thread_id)` where
+/// `thread_id == 0` means a non-forum chat or the implicit "General" topic.
 struct ChatState {
     conv_id: Uuid,
-    /// True while an agent run is in progress for this chat.
+    /// True while an agent run is in progress for this chat/thread.
     busy: bool,
 }
 
 /// Background task: consume inbound Telegram messages and run the agent.
 ///
-/// Each Telegram chat_id gets its own persistent conversation. Messages
-/// for different chats are processed concurrently so one slow agent run
-/// doesn't block other users. Within a single chat, messages are serialized.
+/// Each `(chat_id, thread_id)` pair gets its own persistent conversation.
+/// Messages for different chats/threads are processed concurrently so one
+/// slow agent run doesn't block other users or topics. Within a single
+/// chat+thread, messages are serialized.
 async fn telegram_agent_loop(
     mut rx: mpsc::Receiver<ChannelMessage>,
     tg: Arc<TelegramChannel>,
     state: AppState,
 ) {
-    let chat_states: Arc<tokio::sync::Mutex<HashMap<i64, ChatState>>> =
+    let chat_states: Arc<tokio::sync::Mutex<HashMap<(i64, i64), ChatState>>> =
         Arc::new(tokio::sync::Mutex::new(HashMap::new()));
 
     while let Some(channel_msg) = rx.recv().await {
         let chat_id = channel_msg.chat_id;
+        let thread_id = channel_msg.thread_id;
+        let key = (chat_id, thread_id);
         let tg = tg.clone();
         let state = state.clone();
         let chat_states = chat_states.clone();
 
         tokio::spawn(async move {
-            // Check if this chat already has an agent run in progress.
+            // Check if this chat/thread already has an agent run in progress.
             {
                 let states = chat_states.lock().await;
-                if let Some(cs) = states.get(&chat_id) {
+                if let Some(cs) = states.get(&key) {
                     if cs.busy {
                         let _ = tg
                             .send_text(
                                 chat_id,
                                 "I'm still working on your previous message. Please wait.",
+                                thread_id,
                             )
                             .await;
                         return;
@@ -360,61 +623,93 @@ async fn telegram_agent_loop(
                 }
             }
 
+            // Handle conversation reset via structured flag (not sentinel string).
+            if channel_msg.reset {
+                {
+                    let mut states = chat_states.lock().await;
+                    states.remove(&key);
+                }
+                // Also clear the persisted mapping.
+                if let Err(e) = state.store.chat_map().remove(chat_id, thread_id) {
+                    tracing::warn!(chat_id, thread_id, "failed to remove chat map entry: {e}");
+                }
+                return;
+            }
+
             let user_text = match &channel_msg.message.content {
                 MessageContent::Text(t) => t.clone(),
                 _ => return,
             };
 
-            // Handle /reset command — clear conversation for this chat.
-            if user_text.trim() == "/reset" {
-                {
-                    let mut states = chat_states.lock().await;
-                    states.remove(&chat_id);
-                }
-                let _ = tg
-                    .send_text(chat_id, "Conversation reset. Send a new message to start fresh.")
-                    .await;
-                return;
-            }
-
-            // Get or create conversation.
-            // First check in-memory cache, then persistent store, then create new.
+            // Get or create conversation. Check in-memory first, then DB,
+            // then create a brand new one.
             let conv_id = {
                 let mut states = chat_states.lock().await;
-                match states.get(&chat_id) {
+                match states.get(&key) {
                     Some(cs) => cs.conv_id,
                     None => {
-                        let chat_id_str = chat_id.to_string();
-                        // Check persistent store for an existing Telegram conversation.
-                        let existing = state
+                        // Try the database (survives restarts).
+                        let db_id = state
                             .store
-                            .conversations()
-                            .find_by_channel("telegram", &chat_id_str)
+                            .chat_map()
+                            .lookup(chat_id, thread_id)
                             .ok()
                             .flatten();
 
-                        match existing {
-                            Some(conv) => {
-                                let id = conv.id;
-                                states.insert(chat_id, ChatState { conv_id: id, busy: false });
-                                tracing::info!(chat_id, conv_id = %id, "resumed Telegram conversation from database");
+                        match db_id {
+                            Some(id) => {
+                                states.insert(
+                                    key,
+                                    ChatState {
+                                        conv_id: id,
+                                        busy: false,
+                                    },
+                                );
+                                tracing::info!(
+                                    chat_id, thread_id, conv_id = %id,
+                                    "restored conversation from database"
+                                );
                                 id
                             }
                             None => match state.store.conversations().create() {
-                                Ok(mut conv) => {
-                                    conv.channel_source = Some("telegram".to_string());
-                                    conv.channel_id = Some(chat_id_str);
-                                    if let Err(e) = state.store.conversations().save(&conv) {
-                                        tracing::error!(chat_id, "failed to save conversation metadata: {e}");
-                                    }
+                                Ok(conv) => {
                                     let id = conv.id;
-                                    states.insert(chat_id, ChatState { conv_id: id, busy: false });
-                                    tracing::info!(chat_id, conv_id = %id, "created new Telegram conversation");
+                                    states.insert(
+                                        key,
+                                        ChatState {
+                                            conv_id: id,
+                                            busy: false,
+                                        },
+                                    );
+                                    // Persist the mapping so it survives restarts.
+                                    if let Err(e) =
+                                        state.store.chat_map().upsert(chat_id, thread_id, id)
+                                    {
+                                        tracing::warn!(
+                                            chat_id,
+                                            thread_id,
+                                            "failed to persist chat map: {e}"
+                                        );
+                                    }
+                                    tracing::info!(
+                                        chat_id, thread_id, conv_id = %id,
+                                        "created new conversation for Telegram chat/thread"
+                                    );
                                     id
                                 }
                                 Err(e) => {
-                                    tracing::error!(chat_id, "failed to create conversation: {e}");
-                                    let _ = tg.send_text(chat_id, "Internal error — please try again.").await;
+                                    tracing::error!(
+                                        chat_id,
+                                        thread_id,
+                                        "failed to create conversation: {e}"
+                                    );
+                                    let _ = tg
+                                        .send_text(
+                                            chat_id,
+                                            "Internal error — please try again.",
+                                            thread_id,
+                                        )
+                                        .await;
                                     return;
                                 }
                             },
@@ -423,30 +718,36 @@ async fn telegram_agent_loop(
                 }
             };
 
-            // Mark chat as busy.
+            // Mark chat/thread as busy.
             {
                 let mut states = chat_states.lock().await;
-                if let Some(cs) = states.get_mut(&chat_id) {
+                if let Some(cs) = states.get_mut(&key) {
                     cs.busy = true;
                 }
             }
 
             let reply = process_telegram_message(
-                &state, &tg, chat_id, conv_id, channel_msg.message, &user_text,
+                &state,
+                &tg,
+                chat_id,
+                thread_id,
+                conv_id,
+                channel_msg.message,
+                &user_text,
             )
             .await;
 
-            // Mark chat as no longer busy.
+            // Mark chat/thread as no longer busy.
             {
                 let mut states = chat_states.lock().await;
-                if let Some(cs) = states.get_mut(&chat_id) {
+                if let Some(cs) = states.get_mut(&key) {
                     cs.busy = false;
                 }
             }
 
-            // Send response back to Telegram.
-            if let Err(e) = tg.send_text(chat_id, &reply).await {
-                tracing::error!(chat_id, "failed to send Telegram reply: {e}");
+            // Send response back to Telegram (in the correct thread).
+            if let Err(e) = tg.send_text(chat_id, &reply, thread_id).await {
+                tracing::error!(chat_id, thread_id, "failed to send Telegram reply: {e}");
             }
         });
     }
@@ -459,6 +760,7 @@ async fn process_telegram_message(
     state: &AppState,
     tg: &Arc<TelegramChannel>,
     chat_id: i64,
+    thread_id: i64,
     conv_id: Uuid,
     message: rustykrab_core::types::Message,
     user_text: &str,
@@ -467,7 +769,7 @@ async fn process_telegram_message(
     let mut conv = match state.store.conversations().get(conv_id) {
         Ok(c) => c,
         Err(e) => {
-            tracing::error!(chat_id, %conv_id, "failed to load conversation: {e}");
+            tracing::error!(chat_id, thread_id, %conv_id, "failed to load conversation: {e}");
             return "Internal error — please try again.".to_string();
         }
     };
@@ -476,8 +778,8 @@ async fn process_telegram_message(
     conv.messages.push(message);
     conv.updated_at = Utc::now();
 
-    // Send initial typing indicator.
-    let _ = tg.send_typing(chat_id).await;
+    // Send initial typing indicator (scoped to forum thread if applicable).
+    let _ = tg.send_typing(chat_id, thread_id).await;
 
     // Spawn a background task to keep re-sending typing indicators
     // while the agent is working.
@@ -490,7 +792,7 @@ async fn process_telegram_message(
             if !typing_flag.load(std::sync::atomic::Ordering::Relaxed) {
                 break;
             }
-            let _ = tg_typing.send_typing(chat_id).await;
+            let _ = tg_typing.send_typing(chat_id, thread_id).await;
         }
     });
 
@@ -502,8 +804,7 @@ async fn process_telegram_message(
         hb.store(epoch_millis(), Ordering::Relaxed);
     };
 
-    let agent_fut =
-        rustykrab_gateway::run_agent_streaming(state, &mut conv, user_text, &on_event);
+    let agent_fut = rustykrab_gateway::run_agent_streaming(state, &mut conv, user_text, &on_event);
 
     let timeout_millis = HEARTBEAT_TIMEOUT_SECS * 1000;
     let heartbeat_monitor = async {
@@ -557,6 +858,123 @@ async fn shutdown_signal() {
         .await
         .expect("failed to listen for ctrl+c");
     tracing::info!("shutdown signal received");
+}
+
+/// Background task: poll for due scheduled jobs and execute them.
+///
+/// Every 30 seconds, queries the job store for enabled jobs whose
+/// `next_run_at` has passed. Each due job is spawned as an independent
+/// task that runs the job's prompt through the agent pipeline and
+/// delivers the response to the originating channel.
+async fn job_executor_loop(store: rustykrab_store::Store, state: AppState) {
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+
+    loop {
+        interval.tick().await;
+
+        let now = Utc::now();
+        let due_jobs = match store.jobs().get_due_jobs(now) {
+            Ok(jobs) => jobs,
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to query due jobs");
+                continue;
+            }
+        };
+
+        for job in due_jobs {
+            let store = store.clone();
+            let state = state.clone();
+
+            tokio::spawn(async move {
+                let job_id = job.id.clone();
+                let task = job.task.clone();
+                let channel = job.channel.clone();
+                let chat_id = job.chat_id.clone();
+
+                tracing::info!(
+                    job_id = %job_id,
+                    task = %task,
+                    "executing scheduled job"
+                );
+
+                // Create a fresh conversation for this job execution.
+                let mut conv = match state.store.conversations().create() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::error!(job_id = %job_id, "failed to create conversation for scheduled job: {e}");
+                        return;
+                    }
+                };
+
+                // Prefix the task so the agent knows this is a scheduled execution.
+                let prompt = format!(
+                    "[Scheduled task] The following task was scheduled by the user and is now due. \
+                     Execute it and provide the result concisely.\n\nTask: {task}"
+                );
+
+                // Run the agent.
+                let no_op_event = |_event: AgentEvent| {};
+                let result = rustykrab_gateway::run_agent_streaming(
+                    &state,
+                    &mut conv,
+                    &prompt,
+                    &no_op_event,
+                )
+                .await;
+
+                let response_text = match result {
+                    Ok(msg) => match &msg.content {
+                        MessageContent::Text(t) => t.clone(),
+                        _ => "Scheduled task completed (no text response).".to_string(),
+                    },
+                    Err(_) => {
+                        tracing::error!(job_id = %job_id, "agent error executing scheduled job");
+                        "Sorry, the scheduled task encountered an error.".to_string()
+                    }
+                };
+
+                // Route the response to the originating channel.
+                match channel.as_deref() {
+                    Some("telegram") => {
+                        if let (Some(tg), Some(cid)) = (&state.telegram, &chat_id) {
+                            if let Ok(chat_id_num) = cid.parse::<i64>() {
+                                // Scheduled jobs don't have thread context;
+                                // messages go to the "General" topic in forum groups.
+                                if let Err(e) = tg.send_text(chat_id_num, &response_text, 0).await {
+                                    tracing::error!(job_id = %job_id, "failed to send scheduled job result to Telegram: {e}");
+                                }
+                            } else {
+                                tracing::error!(job_id = %job_id, chat_id = %cid, "invalid Telegram chat_id");
+                            }
+                        }
+                    }
+                    Some("signal") => {
+                        if let (Some(sig), Some(number)) = (&state.signal, &chat_id) {
+                            if let Err(e) = sig.send_text(number, &response_text).await {
+                                tracing::error!(job_id = %job_id, "failed to send scheduled job result to Signal: {e}");
+                            }
+                        }
+                    }
+                    _ => {
+                        tracing::info!(
+                            job_id = %job_id,
+                            "scheduled job completed (no channel routing): {response_text}"
+                        );
+                    }
+                }
+
+                // Mark the job as executed (advances next_run_at or disables one-shot).
+                if let Err(e) = store.jobs().mark_executed(&job_id) {
+                    tracing::error!(job_id = %job_id, "failed to mark scheduled job as executed: {e}");
+                }
+
+                // Clean up the ephemeral conversation.
+                if let Err(e) = state.store.conversations().delete(conv.id) {
+                    tracing::warn!(job_id = %job_id, "failed to clean up job conversation: {e}");
+                }
+            });
+        }
+    }
 }
 
 /// Load orchestration config from file or defaults.
@@ -642,7 +1060,7 @@ fn handle_skill_subcommand(data_dir: &std::path::Path, args: &[String]) -> anyho
                 println!("  Place skill directories containing SKILL.md here.");
                 return Ok(());
             }
-            println!("{:<24} {:<10} {}", "NAME", "STATUS", "DESCRIPTION");
+            println!("{:<24} {:<10} DESCRIPTION", "NAME", "STATUS");
             println!("{}", "-".repeat(60));
             for s in &skills {
                 let status = if s.validation.is_satisfied() {
@@ -713,7 +1131,12 @@ fn resolve_auth_token(store: &rustykrab_store::Store) -> String {
     if let Ok(token) = std::env::var("RUSTYKRAB_AUTH_TOKEN") {
         tracing::info!("auth token loaded from RUSTYKRAB_AUTH_TOKEN env var");
         // Persist downward so removing the env var still works next time.
-        persist_credential(store, KEYCHAIN_ACCOUNT_AUTH_TOKEN, "rustykrab_auth_token", &token);
+        persist_credential(
+            store,
+            KEYCHAIN_ACCOUNT_AUTH_TOKEN,
+            "rustykrab_auth_token",
+            &token,
+        );
         return token;
     }
 
@@ -747,7 +1170,12 @@ fn resolve_auth_token(store: &rustykrab_store::Store) -> String {
     let token = rustykrab_gateway::generate_token();
     tracing::info!("generated new auth token — persisting for future restarts");
     println!("\n  Auth token (also saved to Keychain/store): {token}\n");
-    persist_credential(store, KEYCHAIN_ACCOUNT_AUTH_TOKEN, "rustykrab_auth_token", &token);
+    persist_credential(
+        store,
+        KEYCHAIN_ACCOUNT_AUTH_TOKEN,
+        "rustykrab_auth_token",
+        &token,
+    );
     token
 }
 
@@ -822,25 +1250,38 @@ fn handle_keychain_subcommand(data_dir: &std::path::Path, args: &[String]) -> an
 
     match sub {
         "status" => {
-            println!("macOS Keychain support: {}", if rustykrab_store::keychain::keychain_available() {
-                "available (Data Protection Keychain)"
-            } else {
-                "not available (this platform does not support macOS Keychain)"
-            });
+            println!(
+                "macOS Keychain support: {}",
+                if rustykrab_store::keychain::keychain_available() {
+                    "available (Data Protection Keychain)"
+                } else {
+                    "not available (this platform does not support macOS Keychain)"
+                }
+            );
 
             if !rustykrab_store::keychain::keychain_available() {
-                println!("\nOn non-macOS platforms, use environment variables or the encrypted store.");
+                println!(
+                    "\nOn non-macOS platforms, use environment variables or the encrypted store."
+                );
                 return Ok(());
             }
 
             // Check each known credential.
             let checks = [
-                ("Master key", "com.rustykrab.master-key", "rustykrab-encryption-key"),
+                (
+                    "Master key",
+                    "com.rustykrab.master-key",
+                    "rustykrab-encryption-key",
+                ),
                 ("Auth token", KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT_AUTH_TOKEN),
-                ("Anthropic API key", KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT_API_KEY),
+                (
+                    "Anthropic API key",
+                    KEYCHAIN_SERVICE,
+                    KEYCHAIN_ACCOUNT_API_KEY,
+                ),
             ];
 
-            println!("\n{:<25} {:<40} {}", "CREDENTIAL", "SERVICE/ACCOUNT", "STATUS");
+            println!("\n{:<25} {:<40} STATUS", "CREDENTIAL", "SERVICE/ACCOUNT");
             println!("{}", "-".repeat(80));
             for (label, service, account) in &checks {
                 let status = match rustykrab_store::keychain::get_credential(service, account) {
@@ -855,13 +1296,15 @@ fn handle_keychain_subcommand(data_dir: &std::path::Path, args: &[String]) -> an
         }
 
         "set" => {
-            let name = args.get(1).ok_or_else(|| anyhow::anyhow!(
-                "usage: rustykrab-cli keychain set <name> <value>\n  \
+            let name = args.get(1).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "usage: rustykrab-cli keychain set <name> <value>\n  \
                  names: auth-token, api-key"
-            ))?;
-            let value = args.get(2).ok_or_else(|| anyhow::anyhow!(
-                "usage: rustykrab-cli keychain set <name> <value>"
-            ))?;
+                )
+            })?;
+            let value = args.get(2).ok_or_else(|| {
+                anyhow::anyhow!("usage: rustykrab-cli keychain set <name> <value>")
+            })?;
 
             if !rustykrab_store::keychain::keychain_available() {
                 anyhow::bail!("macOS Keychain is not available on this platform");
@@ -910,7 +1353,9 @@ fn handle_keychain_subcommand(data_dir: &std::path::Path, args: &[String]) -> an
             }
 
             println!("Migrating credentials to Data Protection Keychain...");
-            println!("(This re-creates items without per-app ACLs so no password prompts occur.)\n");
+            println!(
+                "(This re-creates items without per-app ACLs so no password prompts occur.)\n"
+            );
 
             // Re-resolve master key — this migrates it to the DP keychain.
             match rustykrab_store::keychain::resolve_master_key() {
@@ -926,19 +1371,25 @@ fn handle_keychain_subcommand(data_dir: &std::path::Path, args: &[String]) -> an
                         // Auth token
                         if let Ok(token) = store.secrets().get("rustykrab_auth_token") {
                             match rustykrab_store::keychain::set_credential(
-                                KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT_AUTH_TOKEN, &token,
+                                KEYCHAIN_SERVICE,
+                                KEYCHAIN_ACCOUNT_AUTH_TOKEN,
+                                &token,
                             ) {
                                 Ok(()) => println!("  auth token: migrated to DP Keychain"),
                                 Err(e) => println!("  auth token: FAILED ({e})"),
                             }
                         } else {
-                            println!("  auth token: not in store (will be generated on next start)");
+                            println!(
+                                "  auth token: not in store (will be generated on next start)"
+                            );
                         }
 
                         // API key
                         if let Ok(key) = store.secrets().get("anthropic_api_key") {
                             match rustykrab_store::keychain::set_credential(
-                                KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT_API_KEY, &key,
+                                KEYCHAIN_SERVICE,
+                                KEYCHAIN_ACCOUNT_API_KEY,
+                                &key,
                             ) {
                                 Ok(()) => println!("  API key: migrated to DP Keychain"),
                                 Err(e) => println!("  API key: FAILED ({e})"),
@@ -949,7 +1400,10 @@ fn handle_keychain_subcommand(data_dir: &std::path::Path, args: &[String]) -> an
                     }
                 }
             } else {
-                println!("  No database found at {} — skipping store migration", db_path.display());
+                println!(
+                    "  No database found at {} — skipping store migration",
+                    db_path.display()
+                );
             }
 
             println!("\nMigration complete. Restart rustykrab-cli to verify.");
@@ -958,9 +1412,13 @@ fn handle_keychain_subcommand(data_dir: &std::path::Path, args: &[String]) -> an
         _ => {
             eprintln!("Unknown keychain subcommand: {sub}");
             eprintln!("Usage:");
-            eprintln!("  rustykrab-cli keychain status              Show Keychain credential status");
+            eprintln!(
+                "  rustykrab-cli keychain status              Show Keychain credential status"
+            );
             eprintln!("  rustykrab-cli keychain set <name> <value>  Store a credential");
-            eprintln!("  rustykrab-cli keychain migrate             Migrate to Data Protection Keychain");
+            eprintln!(
+                "  rustykrab-cli keychain migrate             Migrate to Data Protection Keychain"
+            );
             eprintln!();
             eprintln!("Credential names: auth-token, api-key, or <service>:<account>");
             std::process::exit(1);

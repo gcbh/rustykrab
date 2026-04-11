@@ -1,34 +1,29 @@
+mod chat_map;
 mod conversation;
+mod jobs;
 pub mod keychain;
-mod knowledge_graph;
-pub mod memory;
 mod secret;
 
 use std::path::Path;
+use std::sync::Arc;
 
 use rustykrab_core::Error;
+use std::sync::Mutex;
 use zeroize::Zeroizing;
 
+pub use chat_map::ChatMapStore;
 pub use conversation::ConversationStore;
-pub use knowledge_graph::{KnowledgeGraph, SubGraph};
-pub use memory::{MemoryEntry, MemoryStore};
+pub use jobs::{JobStore, ScheduledJob};
 pub use secret::SecretStore;
 
-/// Top-level database handle wrapping a sled instance.
+/// Top-level database handle wrapping a SQLite connection.
 ///
 /// The master key is wrapped in `Zeroizing` so it is securely erased
 /// from memory when the Store is dropped.
 #[derive(Clone)]
 pub struct Store {
-    db: sled::Db,
+    conn: Arc<Mutex<rusqlite::Connection>>,
     master_key: Zeroizing<Vec<u8>>,
-    // Pre-opened trees to avoid panics on every accessor call
-    conversations_tree: sled::Tree,
-    secrets_tree: sled::Tree,
-    memories_tree: sled::Tree,
-    kg_entities_tree: sled::Tree,
-    kg_relations_tree: sled::Tree,
-    kg_entity_names_tree: sled::Tree,
 }
 
 impl Store {
@@ -38,59 +33,94 @@ impl Store {
     /// sourced from the OS keychain or an environment variable — never
     /// stored alongside the database.
     pub fn open(path: impl AsRef<Path>, master_key: Vec<u8>) -> Result<Self, Error> {
-        let db = sled::open(path).map_err(|e| Error::Storage(e.to_string()))?;
-        let conversations_tree = db.open_tree("conversations")
-            .map_err(|e| Error::Storage(e.to_string()))?;
-        let secrets_tree = db.open_tree("secrets")
-            .map_err(|e| Error::Storage(e.to_string()))?;
-        let memories_tree = db.open_tree("memories")
-            .map_err(|e| Error::Storage(e.to_string()))?;
-        let kg_entities_tree = db.open_tree("kg_entities")
-            .map_err(|e| Error::Storage(e.to_string()))?;
-        let kg_relations_tree = db.open_tree("kg_relations")
-            .map_err(|e| Error::Storage(e.to_string()))?;
-        let kg_entity_names_tree = db.open_tree("kg_entity_names")
-            .map_err(|e| Error::Storage(e.to_string()))?;
+        let db_path = path.as_ref().join("store.db");
+        let conn =
+            rusqlite::Connection::open(&db_path).map_err(|e| Error::Storage(e.to_string()))?;
+
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             PRAGMA synchronous = NORMAL;
+             PRAGMA foreign_keys = ON;
+             PRAGMA busy_timeout = 5000;",
+        )
+        .map_err(|e| Error::Storage(e.to_string()))?;
+
+        Self::run_migrations(&conn)?;
+
         Ok(Self {
-            db,
+            conn: Arc::new(Mutex::new(conn)),
             master_key: Zeroizing::new(master_key),
-            conversations_tree,
-            secrets_tree,
-            memories_tree,
-            kg_entities_tree,
-            kg_relations_tree,
-            kg_entity_names_tree,
         })
+    }
+
+    fn run_migrations(conn: &rusqlite::Connection) -> Result<(), Error> {
+        conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS conversations (
+                id   TEXT PRIMARY KEY,
+                data TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS secrets (
+                name TEXT PRIMARY KEY,
+                data BLOB NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS scheduled_jobs (
+                id          TEXT PRIMARY KEY,
+                schedule    TEXT NOT NULL,
+                task        TEXT NOT NULL,
+                channel     TEXT,
+                chat_id     TEXT,
+                one_shot    INTEGER NOT NULL DEFAULT 0,
+                enabled     INTEGER NOT NULL DEFAULT 1,
+                next_run_at TEXT NOT NULL,
+                last_run_at TEXT,
+                created_at  TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_scheduled_jobs_due
+                ON scheduled_jobs (next_run_at)
+                WHERE enabled = 1;
+
+            CREATE TABLE IF NOT EXISTS telegram_chat_map (
+                chat_id    INTEGER NOT NULL,
+                thread_id  INTEGER NOT NULL DEFAULT 0,
+                conv_id    TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                UNIQUE(chat_id, thread_id)
+            );
+            ",
+        )
+        .map_err(|e| Error::Storage(e.to_string()))?;
+        Ok(())
     }
 
     /// Return a handle for conversation operations.
     pub fn conversations(&self) -> ConversationStore {
-        ConversationStore::new(self.conversations_tree.clone())
+        ConversationStore::new(Arc::clone(&self.conn))
     }
 
     /// Return a handle for encrypted secret operations.
     pub fn secrets(&self) -> SecretStore {
-        SecretStore::new(self.secrets_tree.clone(), (*self.master_key).clone())
+        SecretStore::new(Arc::clone(&self.conn), self.master_key.clone())
     }
 
-    /// Return a handle for conversation memory/RAG operations.
-    pub fn memories(&self) -> MemoryStore {
-        MemoryStore::new(self.memories_tree.clone())
+    /// Return a handle for scheduled-job operations.
+    pub fn jobs(&self) -> JobStore {
+        JobStore::new(Arc::clone(&self.conn))
     }
 
-    /// Return a handle for the persistent knowledge graph.
-    pub fn knowledge_graph(&self) -> KnowledgeGraph {
-        KnowledgeGraph::new(
-            self.kg_entities_tree.clone(),
-            self.kg_relations_tree.clone(),
-            self.kg_entity_names_tree.clone(),
-        )
+    /// Return a handle for Telegram chat/thread → conversation mapping.
+    pub fn chat_map(&self) -> ChatMapStore {
+        ChatMapStore::new(Arc::clone(&self.conn))
     }
 
     /// Flush all pending writes to disk.
     pub fn flush(&self) -> Result<(), Error> {
-        self.db
-            .flush()
+        // WAL mode checkpoints automatically; explicit checkpoint for shutdown.
+        let conn = self.conn.lock().unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
             .map_err(|e| Error::Storage(e.to_string()))?;
         Ok(())
     }

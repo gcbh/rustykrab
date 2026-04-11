@@ -2,6 +2,9 @@
 pub mod sanitize;
 pub mod security;
 
+// Sandboxed subprocess execution
+mod sandboxed_spawn;
+
 // Filesystem tools
 mod apply_patch;
 mod edit;
@@ -19,8 +22,8 @@ mod web_search;
 mod x_search;
 
 // Session tools
-pub mod session_manager;
 mod agents_list;
+pub mod session_manager;
 mod session_status;
 mod sessions_history;
 mod sessions_list;
@@ -37,20 +40,21 @@ mod memory_save;
 mod memory_search;
 
 // Messaging tools
-pub mod message_backend;
 mod message;
+pub mod message_backend;
 
 // Automation tools
-pub mod cron_backend;
 mod cron;
-pub mod gateway_backend;
+pub mod cron_backend;
 mod gateway;
+pub mod gateway_backend;
 
 // Media tools
 mod image;
 mod image_generate;
 mod pdf;
 mod tts;
+mod video;
 
 // UI tools
 mod browser;
@@ -65,6 +69,12 @@ mod http_session;
 
 // Email tools
 mod gmail;
+
+// Notion integration
+mod notion;
+
+// Obsidian integration
+pub(crate) mod obsidian;
 
 // Credentials (from main)
 mod credential_read;
@@ -124,6 +134,7 @@ pub use self::image::ImageTool;
 pub use image_generate::ImageGenerateTool;
 pub use pdf::PdfTool;
 pub use tts::TtsTool;
+pub use video::{VideoBackend, VideoChannelAdapter, VideoTool};
 
 // UI
 pub use browser::BrowserTool;
@@ -138,6 +149,12 @@ pub use http_session::HttpSessionTool;
 
 // Email
 pub use gmail::GmailTool;
+
+// Notion
+pub use notion::NotionTool;
+
+// Obsidian
+pub use obsidian::ObsidianTool;
 
 // Credentials
 pub use credential_read::CredentialReadTool;
@@ -182,6 +199,10 @@ pub fn builtin_tools(
         std::sync::Arc::new(NodesTool::new()),
         // Email
         std::sync::Arc::new(GmailTool::new(secrets.clone())),
+        // Notion
+        std::sync::Arc::new(NotionTool::new(secrets.clone())),
+        // Obsidian
+        std::sync::Arc::new(ObsidianTool::new(secrets.clone())),
         // Credentials
         std::sync::Arc::new(CredentialReadTool::new(secrets.clone())),
         std::sync::Arc::new(CredentialWriteTool::new(secrets)),
@@ -239,4 +260,11 @@ pub fn automation_tools(
         std::sync::Arc::new(CronTool::new(cron_backend)),
         std::sync::Arc::new(GatewayTool::new(gateway_backend)),
     ]
+}
+
+/// Collect video tools that require a VideoBackend into a Vec.
+pub fn video_tools(
+    backend: std::sync::Arc<dyn VideoBackend>,
+) -> Vec<std::sync::Arc<dyn rustykrab_core::Tool>> {
+    vec![std::sync::Arc::new(VideoTool::new(backend))]
 }

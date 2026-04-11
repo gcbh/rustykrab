@@ -25,17 +25,39 @@ const ACCOUNT_NAME: &str = "rustykrab-encryption-key";
 // Internal helpers — Data Protection Keychain read/write
 // ---------------------------------------------------------------------------
 
-/// Read a generic password from the Data Protection Keychain.
+/// Read a generic password from the keychain.
+///
+/// Tries the Data Protection Keychain first; falls back to the legacy
+/// keychain if the entitlement required for the Data Protection Keychain
+/// is absent (ad-hoc or unsigned binaries without a Developer Team ID).
 ///
 /// Returns `Ok(None)` when the item does not exist (errSecItemNotFound).
 #[cfg(target_os = "macos")]
 fn dp_get(service: &str, account: &str) -> Result<Option<Vec<u8>>, Error> {
-    use security_framework::passwords::{generic_password, PasswordOptions};
+    use security_framework::passwords::{generic_password, get_generic_password, PasswordOptions};
 
     let mut opts = PasswordOptions::new_generic_password(service, account);
     opts.use_protected_keychain();
 
     match generic_password(opts) {
+        Ok(bytes) => return Ok(Some(bytes)),
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("could not be found") || msg.contains("errSecItemNotFound") {
+                // Not in the Data Protection Keychain; try legacy below.
+            } else if msg.contains("entitlement") || msg.contains("-34018") {
+                // No Data Protection Keychain entitlement — fall through to legacy.
+                tracing::debug!("Data Protection Keychain not available, using legacy keychain");
+            } else {
+                return Err(Error::Storage(format!(
+                    "keychain read failed for {service}/{account}: {e}"
+                )));
+            }
+        }
+    }
+
+    // Legacy keychain fallback.
+    match get_generic_password(service, account) {
         Ok(bytes) => Ok(Some(bytes)),
         Err(e) => {
             let msg = e.to_string();
@@ -50,42 +72,75 @@ fn dp_get(service: &str, account: &str) -> Result<Option<Vec<u8>>, Error> {
     }
 }
 
-/// Write a generic password to the Data Protection Keychain.
+/// Write a generic password to the keychain.
 ///
-/// Deletes any existing item first to avoid duplicate-item errors, then
-/// creates a new item in the Data Protection Keychain with
-/// `kSecUseDataProtectionKeychain = true` so no per-app ACLs are applied.
+/// Tries the Data Protection Keychain first; falls back to the legacy
+/// keychain if the entitlement is absent (ad-hoc signed binaries).
 #[cfg(target_os = "macos")]
 fn dp_set(service: &str, account: &str, password: &[u8]) -> Result<(), Error> {
     use security_framework::passwords::{
-        delete_generic_password_options, set_generic_password_options, PasswordOptions,
+        delete_generic_password, delete_generic_password_options, set_generic_password,
+        set_generic_password_options, PasswordOptions,
     };
 
-    // Delete from Data Protection Keychain (ignore "not found").
+    // Try Data Protection Keychain first.
     let mut del_opts = PasswordOptions::new_generic_password(service, account);
     del_opts.use_protected_keychain();
     let _ = delete_generic_password_options(del_opts);
 
-    // Also try deleting from legacy keychain to avoid stale entries that
-    // would shadow the new Data Protection item during migration.
-    let legacy_del = PasswordOptions::new_generic_password(service, account);
-    let _ = delete_generic_password_options(legacy_del);
-
     let mut opts = PasswordOptions::new_generic_password(service, account);
     opts.use_protected_keychain();
-    set_generic_password_options(password, opts)
-        .map_err(|e| Error::Storage(format!("keychain write failed for {service}/{account}: {e}")))
+    match set_generic_password_options(password, opts) {
+        Ok(()) => return Ok(()),
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("entitlement") || msg.contains("-34018") {
+                tracing::debug!("Data Protection Keychain not available, using legacy keychain");
+            } else {
+                return Err(Error::Storage(format!(
+                    "keychain write failed for {service}/{account}: {e}"
+                )));
+            }
+        }
+    }
+
+    // Legacy keychain fallback: delete then add to avoid duplicate errors.
+    let _ = delete_generic_password(service, account);
+    set_generic_password(service, account, password).map_err(|e| {
+        Error::Storage(format!(
+            "keychain write failed for {service}/{account}: {e}"
+        ))
+    })
 }
 
-/// Delete a generic password from the Data Protection Keychain.
+/// Delete a generic password from the keychain (Data Protection, then legacy).
 #[cfg(target_os = "macos")]
 fn dp_delete(service: &str, account: &str) -> Result<(), Error> {
-    use security_framework::passwords::{delete_generic_password_options, PasswordOptions};
+    use security_framework::passwords::{
+        delete_generic_password, delete_generic_password_options, PasswordOptions,
+    };
 
     let mut opts = PasswordOptions::new_generic_password(service, account);
     opts.use_protected_keychain();
-    delete_generic_password_options(opts)
-        .map_err(|e| Error::Storage(format!("keychain delete failed for {service}/{account}: {e}")))
+    match delete_generic_password_options(opts) {
+        Ok(()) => return Ok(()),
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("entitlement") || msg.contains("-34018") {
+                tracing::debug!("Data Protection Keychain not available, using legacy keychain");
+            } else {
+                return Err(Error::Storage(format!(
+                    "keychain delete failed for {service}/{account}: {e}"
+                )));
+            }
+        }
+    }
+
+    delete_generic_password(service, account).map_err(|e| {
+        Error::Storage(format!(
+            "keychain delete failed for {service}/{account}: {e}"
+        ))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -149,7 +204,7 @@ pub fn resolve_master_key() -> Result<Vec<u8>, Error> {
     // Priority 3: generate and store a new key.
     tracing::info!("no master key found — generating and storing in macOS Keychain");
     let mut key = [0u8; 32];
-    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut key);
+    rand::RngCore::fill_bytes(&mut rand::rng(), &mut key);
     set_master_key(&key)?;
     tracing::info!(
         "master key stored in macOS Keychain under '{SERVICE_NAME}' \
@@ -175,7 +230,7 @@ pub fn resolve_master_key() -> Result<Vec<u8>, Error> {
          generating ephemeral key. Secrets will not survive restart."
     );
     let mut key = [0u8; 32];
-    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut key);
+    rand::RngCore::fill_bytes(&mut rand::rng(), &mut key);
     Ok(key.to_vec())
 }
 
@@ -210,8 +265,9 @@ pub fn keychain_available() -> bool {
 pub fn get_credential(service: &str, account: &str) -> Result<Option<KeychainCredential>, Error> {
     match dp_get(service, account)? {
         Some(bytes) => {
-            let value = String::from_utf8(bytes)
-                .map_err(|e| Error::Storage(format!("keychain: credential is not valid utf-8: {e}")))?;
+            let value = String::from_utf8(bytes).map_err(|e| {
+                Error::Storage(format!("keychain: credential is not valid utf-8: {e}"))
+            })?;
             Ok(Some(KeychainCredential {
                 service: service.to_string(),
                 account: account.to_string(),

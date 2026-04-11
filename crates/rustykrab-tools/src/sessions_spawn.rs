@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -11,13 +12,20 @@ use super::session_manager::SessionManager;
 const MAX_SPAWN_DEPTH: u64 = 5;
 
 /// A tool that spawns a new sub-session with an optional system prompt.
+///
+/// Depth is tracked server-side via an atomic counter so clients cannot
+/// bypass the fork-bomb guard by omitting or resetting the `_depth` arg.
 pub struct SessionsSpawnTool {
     manager: Arc<dyn SessionManager>,
+    depth: Arc<AtomicU64>,
 }
 
 impl SessionsSpawnTool {
     pub fn new(manager: Arc<dyn SessionManager>) -> Self {
-        Self { manager }
+        Self {
+            manager,
+            depth: Arc::new(AtomicU64::new(0)),
+        }
     }
 }
 
@@ -54,23 +62,30 @@ impl Tool for SessionsSpawnTool {
     }
 
     async fn execute(&self, args: Value) -> Result<Value> {
-        // H7: Check current recursion depth before spawning
-        let current_depth = args["_depth"].as_u64().unwrap_or(0);
+        // H7: Server-side depth tracking — ignore client-provided _depth.
+        let current_depth = self.depth.load(Ordering::Acquire);
         if current_depth >= MAX_SPAWN_DEPTH {
-            return Err(rustykrab_core::Error::ToolExecution(format!(
-                "maximum session spawn depth ({MAX_SPAWN_DEPTH}) exceeded"
-            ).into()));
+            return Err(rustykrab_core::Error::ToolExecution(
+                format!("maximum session spawn depth ({MAX_SPAWN_DEPTH}) exceeded").into(),
+            ));
         }
 
-        let system_prompt = args["system_prompt"].as_str();
-        let capabilities = args["capabilities"]
-            .as_array()
-            .map(|arr| {
+        self.depth.fetch_add(1, Ordering::AcqRel);
+        let result = async {
+            let system_prompt = args["system_prompt"].as_str();
+            let capabilities = args["capabilities"].as_array().map(|arr| {
                 arr.iter()
                     .filter_map(|v| v.as_str().map(|s| s.to_string()))
                     .collect::<Vec<String>>()
             });
 
-        self.manager.spawn_session(system_prompt, capabilities).await
+            self.manager
+                .spawn_session(system_prompt, capabilities)
+                .await
+        }
+        .await;
+        self.depth.fetch_sub(1, Ordering::AcqRel);
+
+        result
     }
 }

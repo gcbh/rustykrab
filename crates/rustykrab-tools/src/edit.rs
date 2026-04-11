@@ -75,14 +75,13 @@ impl Tool for EditTool {
         let replace_all = args["replace_all"].as_bool().unwrap_or(false);
 
         // Validate path for traversal and blocked directories
-        let safe_path = security::validate_path(path)
-            .map_err(|e| rustykrab_core::Error::ToolExecution(format!("path rejected: {e}").into()))?;
+        let safe_path = security::validate_path(path).map_err(|e| {
+            rustykrab_core::Error::ToolExecution(format!("path rejected: {e}").into())
+        })?;
 
-        let content = tokio::fs::read_to_string(&safe_path)
-            .await
-            .map_err(|e| rustykrab_core::Error::ToolExecution(
-                format!("failed to read {path}: {e}").into(),
-            ))?;
+        let content = tokio::fs::read_to_string(&safe_path).await.map_err(|e| {
+            rustykrab_core::Error::ToolExecution(format!("failed to read {path}: {e}").into())
+        })?;
 
         let match_count = content.matches(old_string).count();
 
@@ -97,7 +96,8 @@ impl Tool for EditTool {
                 format!(
                     "old_string is not unique in {path} ({match_count} occurrences found). \
                      Use replace_all: true to replace all, or provide a more specific string."
-                ).into(),
+                )
+                .into(),
             ));
         }
 
@@ -111,9 +111,9 @@ impl Tool for EditTool {
 
         tokio::fs::write(&safe_path, &new_content)
             .await
-            .map_err(|e| rustykrab_core::Error::ToolExecution(
-                format!("failed to write {path}: {e}").into(),
-            ))?;
+            .map_err(|e| {
+                rustykrab_core::Error::ToolExecution(format!("failed to write {path}: {e}").into())
+            })?;
 
         Ok(json!({
             "edited": true,

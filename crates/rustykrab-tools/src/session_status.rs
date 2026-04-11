@@ -46,9 +46,7 @@ impl Tool for SessionStatusTool {
     }
 
     async fn execute(&self, args: Value) -> Result<Value> {
-        let session_id = args["session_id"]
-            .as_str()
-            .unwrap_or("current");
+        let session_id = args["session_id"].as_str().unwrap_or("current");
 
         self.manager.get_session_status(session_id).await
     }

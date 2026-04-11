@@ -10,11 +10,13 @@ members = [
     "crates/rustykrab-channels",
     "crates/rustykrab-skills",
     "crates/rustykrab-cli",
+    "crates/rustykrab-memory",
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "1.2.0"
 edition = "2021"
+rust-version = "1.88"
 license = "MIT"
 repository = "https://github.com/gcbh/rustycrab"
 
@@ -23,12 +25,11 @@ repository = "https://github.com/gcbh/rustycrab"
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
 axum = "0.8"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "query"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-serde_yaml = "0.9"
 toml = "0.8"
 
 # Error handling
@@ -39,9 +40,6 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
-
-# Storage
-sled = "0.34"
 
 # Embedding static assets
 rust-embed = "8"
@@ -54,10 +52,11 @@ uuid = { version = "1", features = ["v4", "serde"] }
 
 # Time
 chrono = { version = "0.4", features = ["serde"] }
+croner = "2"
 
 # Cryptography
 ed25519-dalek = { version = "2", features = ["rand_core", "serde"] }
-rand = "0.8"
+rand = "0.9"
 hmac = "0.12"
 sha2 = "0.10"
 hex = "0.4"
@@ -66,15 +65,22 @@ aes-gcm = "0.10"
 argon2 = "0.5"
 security-framework = { version = "3", features = ["OSX_10_15"] }
 zeroize = { version = "1", features = ["zeroize_derive"] }
+secrecy = "0.10"
 
 # Browser automation (Chrome DevTools Protocol)
-chromiumoxide = { version = "0.9", default-features = false }
+chromiumoxide = "0.9"
 
 # Email (IMAP + SMTP)
 imap = "2"
-native-tls = "0.2"
-lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "tokio1-native-tls", "builder"] }
+lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "tokio1-rustls", "rustls-native-certs", "aws-lc-rs", "builder"] }
 mail-parser = "0.9"
+
+# System-level interfaces (resource limits, process isolation)
+libc = "0.2"
+
+# TLS (unified on rustls — no OpenSSL dependency)
+rustls = "0.23"
+rustls-native-certs = "0.8"
 
 # Internal crates
 rustykrab-core = { path = "crates/rustykrab-core" }
@@ -86,3 +92,10 @@ rustykrab-tools = { path = "crates/rustykrab-tools" }
 rustykrab-channels = { path = "crates/rustykrab-channels" }
 rustykrab-skills = { path = "crates/rustykrab-skills" }
 rustykrab-cli = { path = "crates/rustykrab-cli" }
+rustykrab-memory = { path = "crates/rustykrab-memory" }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

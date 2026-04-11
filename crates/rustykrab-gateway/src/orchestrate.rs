@@ -2,15 +2,13 @@ use axum::http::StatusCode;
 use chrono::Utc;
 use uuid::Uuid;
 
+use crate::AppState;
 use rustykrab_agent::{AgentEvent, AgentRunner};
 use rustykrab_core::capability::CapabilitySet;
 use rustykrab_core::orchestration::TaskComplexity;
 use rustykrab_core::session::Session;
 use rustykrab_core::types::{Conversation, Message, MessageContent, Role};
 use rustykrab_skills::SystemPromptBuilder;
-use rustykrab_store::memory::extract_keywords;
-
-use crate::AppState;
 
 /// Build the system prompt and inject it as the first message in the conversation.
 ///
@@ -52,30 +50,9 @@ async fn build_and_inject_system_prompt(
     if let Some(task_guidance) = profile.task_type_guidance() {
         builder = builder.with_task_guidance(task_guidance);
     }
-    // Associative memory recall: extract keywords from the user's message,
-    // match against stored memory tags, and inject relevant facts.
-    // No LLM call — just keyword extraction + tag matching.
-    let keywords = extract_keywords(user_content);
-    if !keywords.is_empty() {
-        match state.store.memories().recall(conv.id, &keywords) {
-            Ok(memories) if !memories.is_empty() => {
-                let mut recall_text = String::from("RECALLED MEMORIES (relevant to this message):\n");
-                for mem in memories.iter().take(10) {
-                    recall_text.push_str(&format!("- [{}] {}\n", mem.id, mem.fact));
-                }
-                builder = builder.with_memory(&recall_text);
-                tracing::info!(
-                    count = memories.len(),
-                    keywords = ?keywords,
-                    "associative recall matched memories"
-                );
-            }
-            Ok(_) => {} // no matches — that's fine
-            Err(e) => {
-                tracing::warn!("associative recall failed: {e}");
-            }
-        }
-    }
+    // Memory recall is now handled by the hybrid memory system
+    // (rustykrab-memory) via the memory_search tool, not injected
+    // into the system prompt from the old sled-based MemoryStore.
 
     // Inject SKILL.md catalog (only satisfied skills).
     let satisfied: Vec<_> = state
@@ -255,36 +232,37 @@ pub async fn run_agent_streaming(
         // The pipeline runs synchronously and can take many minutes.
         // Emit periodic heartbeat events so the SSE timeout doesn't
         // kill the connection while the pipeline is working.
-        let heartbeat_event = on_event as &(dyn Fn(AgentEvent) + Send + Sync);
-        let keepalive = tokio::spawn({
-            // Safety: on_event lives for the duration of run_agent_streaming
-            // which is awaited below, so it outlives this spawned task.
-            let event_fn: &'static (dyn Fn(AgentEvent) + Send + Sync) =
-                unsafe { std::mem::transmute(heartbeat_event) };
-            async move {
-                loop {
-                    tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
-                    event_fn(AgentEvent::Compressing); // reuse existing event as heartbeat
+        // Uses tokio::select! with an interval instead of unsafe transmute,
+        // avoiding a potential use-after-free if the pipeline future is
+        // cancelled before the heartbeat task is aborted.
+        let result = {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
+            interval.tick().await; // first tick is immediate, consume it
+
+            let pipeline_future =
+                pipeline.run(user_content, TaskComplexity::Complex, context.as_deref());
+            tokio::pin!(pipeline_future);
+
+            loop {
+                tokio::select! {
+                    result = &mut pipeline_future => break result,
+                    _ = interval.tick() => {
+                        on_event(AgentEvent::Compressing); // heartbeat
+                    }
                 }
             }
-        });
-
-        let result = pipeline
-            .run(user_content, TaskComplexity::Complex, context.as_deref())
-            .await;
-
-        keepalive.abort(); // stop the heartbeat once pipeline finishes
+        };
 
         let result = result.map_err(|e| {
-                tracing::error!("orchestration pipeline error: {e}");
-                on_event(AgentEvent::ToolCallEnd {
-                    tool_name: "orchestration_pipeline".to_string(),
-                    call_id: "pipeline".to_string(),
-                    success: false,
-                    error_message: Some(e.to_string()),
-                });
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
+            tracing::error!("orchestration pipeline error: {e}");
+            on_event(AgentEvent::ToolCallEnd {
+                tool_name: "orchestration_pipeline".to_string(),
+                call_id: "pipeline".to_string(),
+                success: false,
+                error_message: Some(e.to_string()),
+            });
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
         on_event(AgentEvent::ToolCallEnd {
             tool_name: "orchestration_pipeline".to_string(),

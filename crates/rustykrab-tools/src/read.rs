@@ -67,25 +67,29 @@ impl Tool for ReadTool {
             .ok_or_else(|| rustykrab_core::Error::ToolExecution("missing path".into()))?;
 
         // Validate path for traversal and blocked directories
-        let safe_path = security::validate_path(path)
-            .map_err(|e| rustykrab_core::Error::ToolExecution(format!("path rejected: {e}").into()))?;
+        let safe_path = security::validate_path(path).map_err(|e| {
+            rustykrab_core::Error::ToolExecution(format!("path rejected: {e}").into())
+        })?;
 
         // Check file size before reading
-        let metadata = tokio::fs::metadata(&safe_path)
-            .await
-            .map_err(|e| rustykrab_core::Error::ToolExecution(format!("failed to stat {path}: {e}").into()))?;
+        let metadata = tokio::fs::metadata(&safe_path).await.map_err(|e| {
+            rustykrab_core::Error::ToolExecution(format!("failed to stat {path}: {e}").into())
+        })?;
 
         if metadata.len() > MAX_FILE_SIZE {
-            return Err(rustykrab_core::Error::ToolExecution(format!(
+            return Err(rustykrab_core::Error::ToolExecution(
+                format!(
                 "file is too large ({} bytes, max {} bytes). Use offset/limit to read a portion.",
                 metadata.len(),
                 MAX_FILE_SIZE
-            ).into()));
+            )
+                .into(),
+            ));
         }
 
-        let content = tokio::fs::read_to_string(&safe_path)
-            .await
-            .map_err(|e| rustykrab_core::Error::ToolExecution(format!("failed to read {path}: {e}").into()))?;
+        let content = tokio::fs::read_to_string(&safe_path).await.map_err(|e| {
+            rustykrab_core::Error::ToolExecution(format!("failed to read {path}: {e}").into())
+        })?;
 
         let lines: Vec<&str> = content.lines().collect();
         let total_lines = lines.len();

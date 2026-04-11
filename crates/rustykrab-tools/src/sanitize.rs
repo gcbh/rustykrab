@@ -18,18 +18,20 @@ pub fn html_to_text(html: &str, include_links: bool) -> String {
     let mut in_anchor = false;
     let mut anchor_text = String::new();
 
-    let chars: Vec<char> = html.chars().collect();
-    let len = chars.len();
+    // Iterate directly over the str using byte offsets instead of collecting
+    // all chars into a Vec (which would use 4 bytes per char — ~4x memory).
+    let len = html.len();
     let mut i = 0;
 
     while i < len {
-        let ch = chars[i];
+        let ch = html[i..].chars().next().unwrap();
+        let ch_len = ch.len_utf8();
 
         if ch == '<' {
             in_tag = true;
             collecting_tag = true;
             tag_name.clear();
-            i += 1;
+            i += ch_len;
             continue;
         }
 
@@ -40,7 +42,11 @@ pub fn html_to_text(html: &str, include_links: bool) -> String {
 
                 let tag_lower = tag_name.to_lowercase();
                 let is_closing = tag_lower.starts_with('/');
-                let clean_tag = tag_lower.trim_start_matches('/').split_whitespace().next().unwrap_or("");
+                let clean_tag = tag_lower
+                    .trim_start_matches('/')
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("");
 
                 match clean_tag {
                     "script" | "style" | "noscript" | "svg" | "head" => {
@@ -64,8 +70,8 @@ pub fn html_to_text(html: &str, include_links: bool) -> String {
                             }
                         }
                     }
-                    "p" | "div" | "section" | "article" | "main" | "header" | "footer"
-                    | "nav" | "aside" | "blockquote" | "tr" | "table" => {
+                    "p" | "div" | "section" | "article" | "main" | "header" | "footer" | "nav"
+                    | "aside" | "blockquote" | "tr" | "table" => {
                         if !in_script_or_style {
                             if is_closing {
                                 if in_anchor {
@@ -84,11 +90,7 @@ pub fn html_to_text(html: &str, include_links: bool) -> String {
                     }
                     "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
                         if !in_script_or_style {
-                            if is_closing {
-                                result.push_str("\n\n");
-                            } else {
-                                result.push_str("\n\n");
-                            }
+                            result.push_str("\n\n");
                         }
                     }
                     "li" => {
@@ -128,29 +130,28 @@ pub fn html_to_text(html: &str, include_links: bool) -> String {
                     _ => {}
                 }
 
-                i += 1;
+                i += ch_len;
                 continue;
             }
 
             if collecting_tag {
                 tag_name.push(ch);
             }
-            i += 1;
+            i += ch_len;
             continue;
         }
 
         // Not in a tag — this is text content
         if in_script_or_style {
-            i += 1;
+            i += ch_len;
             continue;
         }
 
         // Handle HTML entities
         if ch == '&' {
-            let entity_end = chars[i..].iter().position(|&c| c == ';');
-            if let Some(end) = entity_end {
-                let entity: String = chars[i..i + end + 1].iter().collect();
-                let decoded = decode_entity(&entity);
+            if let Some(end) = html[i..].find(';') {
+                let entity = &html[i..i + end + 1];
+                let decoded = decode_entity(entity);
                 if in_anchor {
                     anchor_text.push_str(&decoded);
                 } else {
@@ -166,7 +167,7 @@ pub fn html_to_text(html: &str, include_links: bool) -> String {
         } else {
             result.push(ch);
         }
-        i += 1;
+        i += ch_len;
     }
 
     // Collapse excessive whitespace but preserve paragraph breaks
@@ -175,28 +176,18 @@ pub fn html_to_text(html: &str, include_links: bool) -> String {
 
 /// Extract href attribute value from a tag string like `a href="..."`
 fn extract_href(tag_content: &str) -> String {
-    let lower = tag_content.to_lowercase();
+    // Use to_ascii_lowercase() to preserve byte positions — to_lowercase()
+    // can shift byte offsets when multi-byte chars change length.
+    let lower = tag_content.to_ascii_lowercase();
     if let Some(pos) = lower.find("href=") {
         let after_href = &tag_content[pos + 5..];
         let trimmed = after_href.trim_start();
-        if trimmed.starts_with('"') {
-            trimmed[1..]
-                .split('"')
-                .next()
-                .unwrap_or("")
-                .to_string()
-        } else if trimmed.starts_with('\'') {
-            trimmed[1..]
-                .split('\'')
-                .next()
-                .unwrap_or("")
-                .to_string()
+        if let Some(rest) = trimmed.strip_prefix('"') {
+            rest.split('"').next().unwrap_or("").to_string()
+        } else if let Some(rest) = trimmed.strip_prefix('\'') {
+            rest.split('\'').next().unwrap_or("").to_string()
         } else {
-            trimmed
-                .split_whitespace()
-                .next()
-                .unwrap_or("")
-                .to_string()
+            trimmed.split_whitespace().next().unwrap_or("").to_string()
         }
     } else {
         String::new()

@@ -37,19 +37,6 @@ Categories:
 
 User message: ";
 
-/// Complexity classification prompt.
-const COMPLEXITY_PROMPT: &str = "\
-Rate the complexity of this user message. Reply with ONLY one word, nothing else.
-
-Levels:
-- trivial: simple greeting, acknowledgment, yes/no question
-- simple: single fact lookup, one-step task, calendar check
-- moderate: multi-step task, requires gathering info from multiple sources
-- complex: needs research, synthesis, drafting with quality requirements
-- critical: high-stakes decision, ambiguous situation, needs careful analysis
-
-User message: ";
-
 impl HarnessRouter {
     /// Create a router with a fast classifier model.
     ///
@@ -146,21 +133,18 @@ impl HarnessRouter {
     }
 }
 
-/// Truncate a message for classification (first ~200 chars).
+/// Truncate a message for classification (first ~200 bytes, respecting
+/// UTF-8 char boundaries via `floor_char_boundary`).
 fn truncate_for_classification(text: &str) -> &str {
     if text.len() > 200 {
-        &text[..text
-            .char_indices()
-            .take_while(|(i, _)| *i < 200)
-            .last()
-            .map(|(i, c)| i + c.len_utf8())
-            .unwrap_or(200)]
+        &text[..text.floor_char_boundary(200)]
     } else {
         text
     }
 }
 
 /// Parse a model response into a TaskComplexity.
+#[cfg(test)]
 fn parse_complexity(text: &str) -> TaskComplexity {
     let lower = text.to_lowercase();
     if lower.contains("trivial") {
@@ -196,34 +180,69 @@ pub fn classify_complexity_keywords(text: &str) -> TaskComplexity {
 
     // Count complexity signals
     let complex_signals = [
-        "and then", "after that", "once you", "next step",
-        "first do", "then do", "finally", "multiple",
-        "step by step", "break down", "break it down",
-        "all of the", "each of the", "every",
+        "and then",
+        "after that",
+        "once you",
+        "next step",
+        "first do",
+        "then do",
+        "finally",
+        "multiple",
+        "step by step",
+        "break down",
+        "break it down",
+        "all of the",
+        "each of the",
+        "every",
     ];
     let moderate_signals = [
-        "compare", "analyze", "analyse", "research", "investigate",
-        "summarize", "review", "evaluate", "assess",
-        "pros and cons", "difference between", "trade-off",
-        "explain how", "explain why", "deep dive",
+        "compare",
+        "analyze",
+        "analyse",
+        "research",
+        "investigate",
+        "summarize",
+        "review",
+        "evaluate",
+        "assess",
+        "pros and cons",
+        "difference between",
+        "trade-off",
+        "explain how",
+        "explain why",
+        "deep dive",
     ];
 
-    let complex_count = complex_signals.iter().filter(|s| lower.contains(**s)).count();
-    let moderate_count = moderate_signals.iter().filter(|s| lower.contains(**s)).count();
+    let complex_count = complex_signals
+        .iter()
+        .filter(|s| lower.contains(**s))
+        .count();
+    let moderate_count = moderate_signals
+        .iter()
+        .filter(|s| lower.contains(**s))
+        .count();
 
     // Count question marks and list items (numbered or bulleted)
     let question_marks = lower.matches('?').count();
-    let list_items = lower.lines().filter(|l| {
-        let t = l.trim();
-        t.starts_with("- ") || t.starts_with("* ") || t.chars().next().map_or(false, |c| c.is_ascii_digit())
-    }).count();
+    let list_items = lower
+        .lines()
+        .filter(|l| {
+            let t = l.trim();
+            t.starts_with("- ")
+                || t.starts_with("* ")
+                || t.chars().next().is_some_and(|c| c.is_ascii_digit())
+        })
+        .count();
 
     if complex_count >= 2 || (complex_count >= 1 && moderate_count >= 1) || list_items >= 4 {
         TaskComplexity::Complex
-    } else if moderate_count >= 1 || complex_count >= 1 || question_marks >= 2 || list_items >= 2 || word_count > 100 {
+    } else if moderate_count >= 1
+        || complex_count >= 1
+        || question_marks >= 2
+        || list_items >= 2
+        || word_count > 100
+    {
         TaskComplexity::Moderate
-    } else if word_count <= 15 {
-        TaskComplexity::Simple
     } else {
         TaskComplexity::Simple
     }

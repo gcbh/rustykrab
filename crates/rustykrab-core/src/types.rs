@@ -20,10 +20,13 @@ pub enum Role {
     Tool,
 }
 
-// TODO: This is a breaking change from the previous `#[serde(untagged)]` format.
-// Existing persisted conversations in sled will fail to deserialize.
-// A migration pass should be added to convert old data on first load.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Message content with migration support.
+///
+/// Current format uses `#[serde(tag = "type", content = "data")]`.
+/// Previous format used `#[serde(untagged)]`. The custom Deserialize
+/// implementation tries the current format first, then falls back to
+/// the old untagged format so persisted conversations still load.
+#[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", content = "data")]
 pub enum MessageContent {
     #[serde(rename = "text")]
@@ -37,6 +40,62 @@ pub enum MessageContent {
     /// several tools at once and receive all results before continuing.
     #[serde(rename = "multi_tool_call")]
     MultiToolCall(Vec<ToolCall>),
+}
+
+impl<'de> Deserialize<'de> for MessageContent {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // Buffer the raw value so we can try multiple formats.
+        let raw = serde_json::Value::deserialize(deserializer)?;
+
+        // Try current tagged format first.
+        #[derive(Deserialize)]
+        #[serde(tag = "type", content = "data")]
+        enum Tagged {
+            #[serde(rename = "text")]
+            Text(String),
+            #[serde(rename = "tool_call")]
+            ToolCall(ToolCall),
+            #[serde(rename = "tool_result")]
+            ToolResult(ToolResult),
+            #[serde(rename = "multi_tool_call")]
+            MultiToolCall(Vec<ToolCall>),
+        }
+
+        if let Ok(tagged) = serde_json::from_value::<Tagged>(raw.clone()) {
+            return Ok(match tagged {
+                Tagged::Text(s) => MessageContent::Text(s),
+                Tagged::ToolCall(tc) => MessageContent::ToolCall(tc),
+                Tagged::ToolResult(tr) => MessageContent::ToolResult(tr),
+                Tagged::MultiToolCall(tcs) => MessageContent::MultiToolCall(tcs),
+            });
+        }
+
+        // Fall back to old untagged format for migration.
+        // In the untagged format, a plain string is Text, an object with
+        // "name" + "arguments" is ToolCall, an object with "call_id" + "output"
+        // is ToolResult, and an array of tool calls is MultiToolCall.
+        if let Some(s) = raw.as_str() {
+            return Ok(MessageContent::Text(s.to_string()));
+        }
+        if let Ok(tcs) = serde_json::from_value::<Vec<ToolCall>>(raw.clone()) {
+            if !tcs.is_empty() {
+                return Ok(MessageContent::MultiToolCall(tcs));
+            }
+        }
+        if let Ok(tr) = serde_json::from_value::<ToolResult>(raw.clone()) {
+            return Ok(MessageContent::ToolResult(tr));
+        }
+        if let Ok(tc) = serde_json::from_value::<ToolCall>(raw.clone()) {
+            return Ok(MessageContent::ToolCall(tc));
+        }
+
+        Err(serde::de::Error::custom(
+            "failed to deserialize MessageContent in both tagged and untagged formats",
+        ))
+    }
 }
 
 impl MessageContent {
@@ -77,6 +136,10 @@ pub struct ToolCall {
 pub struct ToolResult {
     pub call_id: String,
     pub output: serde_json::Value,
+    /// Whether the tool execution failed. Sent as `is_error` to providers
+    /// so the model knows to interpret the output as an error message.
+    #[serde(default)]
+    pub is_error: bool,
 }
 
 /// A conversation is an ordered sequence of messages.

@@ -1,15 +1,20 @@
+use std::sync::Arc;
+
 use aes_gcm::aead::Aead;
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use argon2::Argon2;
+use rand::TryRngCore;
+use rusqlite::params;
 use rustykrab_core::Error;
-use rand::RngCore;
+use std::sync::Mutex;
+use zeroize::Zeroizing;
 
 /// The salt length used for Argon2 key derivation.
 const SALT_LEN: usize = 16;
 /// The nonce length for AES-256-GCM (96 bits).
 const NONCE_LEN: usize = 12;
 
-/// Encrypted credential store backed by a sled tree.
+/// Encrypted credential store backed by SQLite.
 ///
 /// Secrets are encrypted at rest using AES-256-GCM (authenticated encryption
 /// with associated data). Each secret gets its own random salt and nonce,
@@ -26,13 +31,19 @@ const NONCE_LEN: usize = 12;
 ///   different ciphertexts and compromising one key doesn't reveal others
 #[derive(Clone)]
 pub struct SecretStore {
-    tree: sled::Tree,
-    master_key: Vec<u8>,
+    conn: Arc<Mutex<rusqlite::Connection>>,
+    master_key: Arc<Zeroizing<Vec<u8>>>,
 }
 
 impl SecretStore {
-    pub(crate) fn new(tree: sled::Tree, master_key: Vec<u8>) -> Self {
-        Self { tree, master_key }
+    pub(crate) fn new(
+        conn: Arc<Mutex<rusqlite::Connection>>,
+        master_key: Zeroizing<Vec<u8>>,
+    ) -> Self {
+        Self {
+            conn,
+            master_key: Arc::new(master_key),
+        }
     }
 
     /// Store a secret value under the given name.
@@ -41,19 +52,28 @@ impl SecretStore {
         Self::validate_name(name)?;
 
         let encrypted = self.encrypt(name, value.as_bytes())?;
-        self.tree
-            .insert(name.as_bytes(), encrypted)
-            .map_err(|e| Error::Storage(e.to_string()))?;
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO secrets (name, data) VALUES (?1, ?2)
+             ON CONFLICT(name) DO UPDATE SET data = excluded.data",
+            params![name, encrypted],
+        )
+        .map_err(|e| Error::Storage(e.to_string()))?;
         Ok(())
     }
 
     /// Retrieve and decrypt a secret by name.
     pub fn get(&self, name: &str) -> Result<String, Error> {
-        let encrypted = self
-            .tree
-            .get(name.as_bytes())
-            .map_err(|e| Error::Storage(e.to_string()))?
-            .ok_or_else(|| Error::NotFound(format!("secret '{name}'")))?;
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT data FROM secrets WHERE name = ?1")
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        let encrypted: Vec<u8> = stmt
+            .query_row(params![name], |row| row.get(0))
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Error::NotFound(format!("secret '{name}'")),
+                other => Error::Storage(other.to_string()),
+            })?;
         let plaintext = self.decrypt(name, &encrypted)?;
         String::from_utf8(plaintext)
             .map_err(|e| Error::Storage(format!("invalid utf-8 in secret: {e}")))
@@ -61,34 +81,39 @@ impl SecretStore {
 
     /// Delete a secret.
     pub fn delete(&self, name: &str) -> Result<(), Error> {
-        self.tree
-            .remove(name.as_bytes())
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM secrets WHERE name = ?1", params![name])
             .map_err(|e| Error::Storage(e.to_string()))?;
         Ok(())
     }
 
     /// List all secret names (does not decrypt values).
     pub fn list_names(&self) -> Result<Vec<String>, Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT name FROM secrets")
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        let rows = stmt
+            .query_map([], |row| row.get(0))
+            .map_err(|e| Error::Storage(e.to_string()))?;
         let mut names = Vec::new();
-        for entry in self.tree.iter() {
-            let (key, _) = entry.map_err(|e| Error::Storage(e.to_string()))?;
-            let name = String::from_utf8(key.to_vec())
-                .map_err(|e| Error::Storage(e.to_string()))?;
-            names.push(name);
+        for row in rows {
+            names.push(row.map_err(|e| Error::Storage(e.to_string()))?);
         }
         Ok(names)
     }
 
     /// Validate that a secret name is well-formed.
-    ///
-    /// Prevents Unicode normalization attacks and ensures key names
-    /// are safe for use as HMAC/AAD inputs.
     fn validate_name(name: &str) -> Result<(), Error> {
         if name.is_empty() || name.len() > 256 {
-            return Err(Error::Storage("secret name must be 1-256 characters".into()));
+            return Err(Error::Storage(
+                "secret name must be 1-256 characters".into(),
+            ));
         }
-        // Allow alphanumeric, underscore, hyphen, and dot
-        if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.') {
+        if !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+        {
             return Err(Error::Storage(
                 "secret name must contain only alphanumeric characters, underscores, hyphens, and dots".into(),
             ));
@@ -97,33 +122,32 @@ impl SecretStore {
     }
 
     /// Encrypt data with AES-256-GCM. Returns `salt || nonce || ciphertext+tag`.
-    ///
-    /// The secret name is used as associated data (AAD), binding the
-    /// ciphertext to its key name — moving a ciphertext to a different
-    /// key name will fail authentication.
     fn encrypt(&self, key_name: &str, data: &[u8]) -> Result<Vec<u8>, Error> {
-        // Generate random salt and nonce.
         let mut salt = [0u8; SALT_LEN];
         let mut nonce_bytes = [0u8; NONCE_LEN];
-        rand::thread_rng().fill_bytes(&mut salt);
-        rand::thread_rng().fill_bytes(&mut nonce_bytes);
+        rand::rngs::OsRng
+            .try_fill_bytes(&mut salt)
+            .expect("OS RNG failed");
+        rand::rngs::OsRng
+            .try_fill_bytes(&mut nonce_bytes)
+            .expect("OS RNG failed");
 
-        // Derive a per-secret encryption key via Argon2id.
         let derived_key = self.derive_key(&salt)?;
-        let cipher = Aes256Gcm::new_from_slice(&derived_key)
+        let cipher = Aes256Gcm::new_from_slice(&*derived_key)
             .map_err(|e| Error::Storage(format!("cipher init: {e}")))?;
 
         let nonce = Nonce::from_slice(&nonce_bytes);
 
-        // Encrypt with the secret name as AAD.
         let ciphertext = cipher
-            .encrypt(nonce, aes_gcm::aead::Payload {
-                msg: data,
-                aad: key_name.as_bytes(),
-            })
+            .encrypt(
+                nonce,
+                aes_gcm::aead::Payload {
+                    msg: data,
+                    aad: key_name.as_bytes(),
+                },
+            )
             .map_err(|e| Error::Storage(format!("encryption failed: {e}")))?;
 
-        // Pack: salt || nonce || ciphertext+tag
         let mut packed = Vec::with_capacity(SALT_LEN + NONCE_LEN + ciphertext.len());
         packed.extend_from_slice(&salt);
         packed.extend_from_slice(&nonce_bytes);
@@ -142,30 +166,31 @@ impl SecretStore {
         let ciphertext = &data[SALT_LEN + NONCE_LEN..];
 
         let derived_key = self.derive_key(salt)?;
-        let cipher = Aes256Gcm::new_from_slice(&derived_key)
+        let cipher = Aes256Gcm::new_from_slice(&*derived_key)
             .map_err(|e| Error::Storage(format!("cipher init: {e}")))?;
 
         let nonce = Nonce::from_slice(nonce_bytes);
 
         cipher
-            .decrypt(nonce, aes_gcm::aead::Payload {
-                msg: ciphertext,
-                aad: key_name.as_bytes(),
+            .decrypt(
+                nonce,
+                aes_gcm::aead::Payload {
+                    msg: ciphertext,
+                    aad: key_name.as_bytes(),
+                },
+            )
+            .map_err(|e| {
+                Error::Storage(format!(
+                    "decryption failed (wrong key or tampered data): {e}"
+                ))
             })
-            .map_err(|e| Error::Storage(format!(
-                "decryption failed (wrong key or tampered data): {e}"
-            )))
     }
 
     /// Derive a 256-bit encryption key from the master key + salt using Argon2id.
-    ///
-    /// Argon2id is resistant to both side-channel and GPU/ASIC brute-force
-    /// attacks. Even if the database is stolen, the attacker must spend
-    /// significant time/memory per guess of the master key.
-    fn derive_key(&self, salt: &[u8]) -> Result<[u8; 32], Error> {
-        let mut key = [0u8; 32];
+    fn derive_key(&self, salt: &[u8]) -> Result<Zeroizing<[u8; 32]>, Error> {
+        let mut key = Zeroizing::new([0u8; 32]);
         Argon2::default()
-            .hash_password_into(&self.master_key, salt, &mut key)
+            .hash_password_into(&self.master_key, salt, &mut *key)
             .map_err(|e| Error::Storage(format!("key derivation failed: {e}")))?;
         Ok(key)
     }

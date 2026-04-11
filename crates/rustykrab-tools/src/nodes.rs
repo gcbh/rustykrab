@@ -11,7 +11,10 @@ pub struct NodesTool {
 impl NodesTool {
     pub fn new() -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .expect("failed to build HTTP client"),
         }
     }
 }
@@ -74,15 +77,15 @@ impl Tool for NodesTool {
                         .send()
                         .await
                         .map_err(|e| {
-                            rustykrab_core::Error::ToolExecution(format!(
-                                "node discovery failed: {e}"
-                            ).into())
+                            rustykrab_core::Error::ToolExecution(
+                                format!("node discovery failed: {e}").into(),
+                            )
                         })?;
 
                     let body: Value = resp.json().await.map_err(|e| {
-                        rustykrab_core::Error::ToolExecution(format!(
-                            "failed to parse discovery response: {e}"
-                        ).into())
+                        rustykrab_core::Error::ToolExecution(
+                            format!("failed to parse discovery response: {e}").into(),
+                        )
                     })?;
 
                     Ok(json!({
@@ -105,15 +108,15 @@ impl Tool for NodesTool {
                         .send()
                         .await
                         .map_err(|e| {
-                            rustykrab_core::Error::ToolExecution(format!(
-                                "node list failed: {e}"
-                            ).into())
+                            rustykrab_core::Error::ToolExecution(
+                                format!("node list failed: {e}").into(),
+                            )
                         })?;
 
                     let body: Value = resp.json().await.map_err(|e| {
-                        rustykrab_core::Error::ToolExecution(format!(
-                            "failed to parse nodes response: {e}"
-                        ).into())
+                        rustykrab_core::Error::ToolExecution(
+                            format!("failed to parse nodes response: {e}").into(),
+                        )
                     })?;
 
                     Ok(json!({
@@ -134,14 +137,10 @@ impl Tool for NodesTool {
             }
             "send" => {
                 let node_id = args["node_id"].as_str().ok_or_else(|| {
-                    rustykrab_core::Error::ToolExecution(
-                        "missing node_id for send action".into(),
-                    )
+                    rustykrab_core::Error::ToolExecution("missing node_id for send action".into())
                 })?;
                 let message = args["message"].as_str().ok_or_else(|| {
-                    rustykrab_core::Error::ToolExecution(
-                        "missing message for send action".into(),
-                    )
+                    rustykrab_core::Error::ToolExecution("missing message for send action".into())
                 })?;
 
                 let url = discovery_url.ok_or_else(|| {
@@ -157,16 +156,16 @@ impl Tool for NodesTool {
                     .send()
                     .await
                     .map_err(|e| {
-                        rustykrab_core::Error::ToolExecution(format!(
-                            "failed to send to node: {e}"
-                        ).into())
+                        rustykrab_core::Error::ToolExecution(
+                            format!("failed to send to node: {e}").into(),
+                        )
                     })?;
 
                 let status = resp.status().as_u16();
                 let body = resp.text().await.map_err(|e| {
-                    rustykrab_core::Error::ToolExecution(format!(
-                        "failed to read response: {e}"
-                    ).into())
+                    rustykrab_core::Error::ToolExecution(
+                        format!("failed to read response: {e}").into(),
+                    )
                 })?;
 
                 Ok(json!({
@@ -177,9 +176,9 @@ impl Tool for NodesTool {
                     "response": body,
                 }))
             }
-            _ => Err(rustykrab_core::Error::ToolExecution(format!(
-                "unknown nodes action: {action}"
-            ).into())),
+            _ => Err(rustykrab_core::Error::ToolExecution(
+                format!("unknown nodes action: {action}").into(),
+            )),
         }
     }
 }

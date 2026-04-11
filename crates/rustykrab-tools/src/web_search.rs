@@ -66,10 +66,7 @@ impl Tool for WebSearchTool {
         let query = args["query"]
             .as_str()
             .ok_or_else(|| Error::ToolExecution("missing query".into()))?;
-        let max_results = args["max_results"]
-            .as_u64()
-            .unwrap_or(10)
-            .min(25) as usize;
+        let max_results = args["max_results"].as_u64().unwrap_or(10).min(25) as usize;
 
         let results = search_duckduckgo(&self.client, query, max_results).await?;
 
@@ -96,10 +93,9 @@ async fn search_duckduckgo(
         .map_err(|e| Error::ToolExecution(format!("search request failed: {e}").into()))?;
 
     if !resp.status().is_success() {
-        return Err(Error::ToolExecution(format!(
-            "search returned status {}",
-            resp.status()
-        ).into()));
+        return Err(Error::ToolExecution(
+            format!("search returned status {}", resp.status()).into(),
+        ));
     }
 
     let body = resp
@@ -278,10 +274,8 @@ fn url_decode(input: &str) -> String {
 
     while i < bytes.len() {
         if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(byte) = u8::from_str_radix(
-                &String::from_utf8_lossy(&bytes[i + 1..i + 3]),
-                16,
-            ) {
+            if let Ok(byte) = u8::from_str_radix(&String::from_utf8_lossy(&bytes[i + 1..i + 3]), 16)
+            {
                 result.push(byte as char);
                 i += 3;
                 continue;

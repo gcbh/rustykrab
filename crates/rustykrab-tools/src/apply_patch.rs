@@ -147,7 +147,11 @@ fn apply_hunks(original: &str, hunks: &[Hunk]) -> std::result::Result<String, St
     let mut old_idx: usize = 0; // 0-based index into old_lines
 
     for hunk in hunks {
-        let hunk_start = if hunk.old_start == 0 { 0 } else { hunk.old_start - 1 };
+        let hunk_start = if hunk.old_start == 0 {
+            0
+        } else {
+            hunk.old_start - 1
+        };
 
         // Copy lines before this hunk
         while old_idx < hunk_start && old_idx < old_lines.len() {
@@ -231,8 +235,9 @@ impl Tool for ApplyPatchTool {
             .as_str()
             .ok_or_else(|| rustykrab_core::Error::ToolExecution("missing patch".into()))?;
 
-        let file_diffs = parse_unified_diff(patch)
-            .map_err(|e| rustykrab_core::Error::ToolExecution(format!("failed to parse patch: {e}").into()))?;
+        let file_diffs = parse_unified_diff(patch).map_err(|e| {
+            rustykrab_core::Error::ToolExecution(format!("failed to parse patch: {e}").into())
+        })?;
 
         let mut files_modified = 0;
 
@@ -240,27 +245,25 @@ impl Tool for ApplyPatchTool {
             let path = &file_diff.path;
 
             // Validate each file path from the patch for traversal attacks
-            let safe_path = security::validate_path(path)
-                .map_err(|e| rustykrab_core::Error::ToolExecution(
+            let safe_path = security::validate_path(path).map_err(|e| {
+                rustykrab_core::Error::ToolExecution(
                     format!("patch path rejected for '{path}': {e}").into(),
-                ))?;
+                )
+            })?;
 
-            let original = tokio::fs::read_to_string(&safe_path)
-                .await
-                .map_err(|e| rustykrab_core::Error::ToolExecution(
-                    format!("failed to read {path}: {e}").into(),
-                ))?;
+            let original = tokio::fs::read_to_string(&safe_path).await.map_err(|e| {
+                rustykrab_core::Error::ToolExecution(format!("failed to read {path}: {e}").into())
+            })?;
 
-            let patched = apply_hunks(&original, &file_diff.hunks)
-                .map_err(|e| rustykrab_core::Error::ToolExecution(
+            let patched = apply_hunks(&original, &file_diff.hunks).map_err(|e| {
+                rustykrab_core::Error::ToolExecution(
                     format!("failed to apply hunks to {path}: {e}").into(),
-                ))?;
+                )
+            })?;
 
-            tokio::fs::write(&safe_path, &patched)
-                .await
-                .map_err(|e| rustykrab_core::Error::ToolExecution(
-                    format!("failed to write {path}: {e}").into(),
-                ))?;
+            tokio::fs::write(&safe_path, &patched).await.map_err(|e| {
+                rustykrab_core::Error::ToolExecution(format!("failed to write {path}: {e}").into())
+            })?;
 
             files_modified += 1;
         }

@@ -1,4 +1,4 @@
-.PHONY: build release debug codesign codesign-debug clean
+.PHONY: build release debug codesign codesign-debug clean version
 
 # Default: release build + codesign
 build: release
@@ -23,3 +23,6 @@ codesign-debug:
 
 clean:
 	cargo clean
+
+version:
+	@cargo run -p rustykrab-cli --quiet -- --version
