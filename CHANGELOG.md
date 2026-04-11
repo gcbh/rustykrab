@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.1] - 2026-04-11
+
+- Show Telegram conversations in web UI, persist chat mapping (#253)
+
 ## [1.3.0] - 2026-04-11
 
 - Add network reconnaissance tools and skill (net_scan, net_admin, net_audit) (#252)
