@@ -127,31 +127,28 @@ impl Tool for SkillCreateTool {
             .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
             .unwrap_or_default();
 
-        // Build YAML frontmatter
-        let mut yaml = format!(
-            "name: {name}\ndescription: \"{}\"\nversion: \"{version}\"\nuser_invocable: {user_invocable}",
+        // Build TOML frontmatter
+        let mut fm = format!(
+            "name = \"{}\"\ndescription = \"{}\"\nversion = \"{version}\"\nuser_invocable = {user_invocable}",
+            name.replace('"', "\\\""),
             description.replace('"', "\\\""),
         );
         if let Some(e) = emoji {
-            yaml.push_str(&format!("\nemoji: \"{}\"", e.replace('"', "\\\"")));
+            fm.push_str(&format!("\nemoji = \"{}\"", e.replace('"', "\\\"")));
         }
         if !requires_env.is_empty() || !requires_bins.is_empty() {
-            yaml.push_str("\nrequires:");
+            fm.push_str("\n\n[requires]");
             if !requires_env.is_empty() {
-                yaml.push_str("\n  env:");
-                for v in &requires_env {
-                    yaml.push_str(&format!("\n    - {v}"));
-                }
+                let env_items: Vec<String> = requires_env.iter().map(|v| format!("\"{v}\"")).collect();
+                fm.push_str(&format!("\nenv = [{}]", env_items.join(", ")));
             }
             if !requires_bins.is_empty() {
-                yaml.push_str("\n  bins:");
-                for b in &requires_bins {
-                    yaml.push_str(&format!("\n    - {b}"));
-                }
+                let bin_items: Vec<String> = requires_bins.iter().map(|b| format!("\"{b}\"")).collect();
+                fm.push_str(&format!("\nbins = [{}]", bin_items.join(", ")));
             }
         }
 
-        let content = format!("---\n{yaml}\n---\n{instructions}");
+        let content = format!("---\n{fm}\n---\n{instructions}");
 
         // Write to disk using tokio::fs to avoid blocking the async
         // runtime (fixes ASYNC-M3).
@@ -204,7 +201,7 @@ mod tests {
 
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.starts_with("---\n"));
-        assert!(content.contains("name: my-skill"));
+        assert!(content.contains("name = \"my-skill\""));
         assert!(content.contains("Do the thing."));
     }
 
@@ -273,9 +270,9 @@ mod tests {
         assert_eq!(result["created"], true);
 
         let content = std::fs::read_to_string(tmp.path().join("minimal/SKILL.md")).unwrap();
-        assert!(content.contains("version: \"1.0\""));
-        assert!(content.contains("user_invocable: true"));
+        assert!(content.contains("version = \"1.0\""));
+        assert!(content.contains("user_invocable = true"));
         // Should not contain requires section
-        assert!(!content.contains("requires:"));
+        assert!(!content.contains("[requires]"));
     }
 }
