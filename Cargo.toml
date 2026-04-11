@@ -75,6 +75,9 @@ imap = "2"
 lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "tokio1-rustls", "rustls-native-certs", "aws-lc-rs", "builder"] }
 mail-parser = "0.9"
 
+# Regular expressions
+regex = "1"
+
 # System-level interfaces (resource limits, process isolation)
 libc = "0.2"
 
