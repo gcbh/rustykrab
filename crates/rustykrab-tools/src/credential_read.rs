@@ -67,18 +67,25 @@ impl Tool for CredentialReadTool {
                         "type": "string",
                         "enum": ["store", "keychain"],
                         "default": "store",
-                        "description": "Where to read from: 'store' (default, encrypted local store) or 'keychain' (macOS Keychain)"
+                        "description": "Where to read from: 'store' (default, encrypted local store) or 'keychain' (macOS Keychain). When set to 'keychain', the 'service' and 'account' parameters MUST be provided."
                     },
                     "service": {
                         "type": "string",
-                        "description": "macOS Keychain service name (the 'Where' field in Keychain Access). Required when source is 'keychain'."
+                        "description": "macOS Keychain service name (the 'Where' field in Keychain Access). REQUIRED when source is 'keychain'."
                     },
                     "account": {
                         "type": "string",
-                        "description": "macOS Keychain account name. Required when source is 'keychain'."
+                        "description": "macOS Keychain account name. REQUIRED when source is 'keychain'."
                     }
                 },
-                "required": ["action"]
+                "required": ["action"],
+                "if": {
+                    "properties": { "source": { "const": "keychain" } },
+                    "required": ["source"]
+                },
+                "then": {
+                    "required": ["action", "account", "service"]
+                }
             }),
         }
     }
