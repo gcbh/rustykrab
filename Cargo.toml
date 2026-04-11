@@ -75,6 +75,9 @@ imap = "2"
 lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "tokio1-rustls", "rustls-native-certs", "aws-lc-rs", "builder"] }
 mail-parser = "0.9"
 
+# Futures combinators
+futures = "0.3"
+
 # Regular expressions
 regex = "1"
 

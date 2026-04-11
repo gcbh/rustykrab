@@ -12,5 +12,5 @@ pub mod context_manager;
 pub mod recursive_call;
 pub mod repl_tools;
 
-pub use context_manager::ContextManager;
+pub use context_manager::estimate_tokens;
 pub use recursive_call::RecursiveExecutor;

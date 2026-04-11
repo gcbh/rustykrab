@@ -11,7 +11,7 @@ pub use orchestrator::{
     ConsistencyVoter, Decomposer, OrchestrationPipeline, ParallelExecutor, PipelineResult,
     RefinementLoop, Synthesizer,
 };
-pub use rlm::{ContextManager, RecursiveExecutor};
+pub use rlm::RecursiveExecutor;
 pub use router::HarnessRouter;
 pub use runner::{AgentConfig, AgentEvent, AgentRunner};
 pub use sandbox::{NoSandbox, ProcessSandbox, Sandbox, SandboxPolicy};

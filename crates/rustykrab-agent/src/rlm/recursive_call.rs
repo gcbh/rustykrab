@@ -23,7 +23,7 @@ use rustykrab_core::{Error, Result};
 use tokio::sync::Semaphore;
 use uuid::Uuid;
 
-use super::context_manager::ContextManager;
+use super::context_manager::estimate_tokens;
 use super::repl_tools;
 
 /// Executes recursive queries where the model explores context via tools.
@@ -39,10 +39,15 @@ impl RecursiveExecutor {
 
     /// Execute a recursive query, allowing the model to explore context
     /// via REPL tools and delegate sub-queries on specific slices.
+    ///
+    /// The entire execution tree is bounded by `pipeline_timeout_secs`
+    /// to prevent runaway recursion from consuming unbounded wall time.
     pub async fn execute(&self, prompt: &str, context: Option<&str>) -> Result<String> {
+        let pipeline_timeout = self.config.pipeline_timeout_secs;
         tracing::info!(
             max_depth = self.config.max_recursion_depth,
             max_tool_rounds = self.config.max_tool_rounds,
+            pipeline_timeout_secs = pipeline_timeout,
             prompt_len = prompt.len(),
             context_len = context.map(|c| c.len()).unwrap_or(0),
             "RLM REPL: starting recursive execution"
@@ -52,30 +57,44 @@ impl RecursiveExecutor {
         let context_arc = Arc::new(context.unwrap_or_default().to_string());
         let semaphore = Arc::new(Semaphore::new(self.config.max_concurrent_tasks));
 
-        let result = execute_repl_call(
-            self.provider.clone(),
-            self.config.clone(),
-            prompt.to_string(),
-            context_arc,
-            0,
-            semaphore,
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(pipeline_timeout),
+            execute_repl_call(
+                self.provider.clone(),
+                self.config.clone(),
+                prompt.to_string(),
+                context_arc,
+                0,
+                semaphore,
+            ),
         )
         .await;
 
         let elapsed = start.elapsed();
-        match &result {
-            Ok(text) => tracing::info!(
+        match result {
+            Ok(Ok(ref text)) => tracing::info!(
                 duration_ms = elapsed.as_millis() as u64,
                 response_len = text.len(),
                 "RLM REPL: recursive execution completed"
             ),
-            Err(e) => tracing::error!(
+            Ok(Err(ref e)) => tracing::error!(
                 duration_ms = elapsed.as_millis() as u64,
                 error = %e,
                 "RLM REPL: recursive execution failed"
             ),
+            Err(_) => tracing::error!(
+                duration_ms = elapsed.as_millis() as u64,
+                pipeline_timeout_secs = pipeline_timeout,
+                "RLM REPL: pipeline timeout exceeded"
+            ),
         }
-        result
+
+        match result {
+            Ok(inner) => inner,
+            Err(_) => Err(Error::Internal(format!(
+                "RLM pipeline timed out after {pipeline_timeout}s"
+            ))),
+        }
     }
 }
 
@@ -133,10 +152,11 @@ async fn execute_repl_call_impl(
 
     // System prompt — tells the model about the context variable and
     // available tools. Context text is NOT in the prompt.
-    let estimated_tokens = ContextManager::estimate_tokens(&context);
+    let estimated_tokens = estimate_tokens(&context);
     let system = format!(
         "You are a reasoning engine. Answer the question below.\n\n\
-         You have access to a context variable ({} chars, ~{} tokens, {} lines).\n\
+         You have access to a context variable ({} bytes, ~{} tokens, {} lines).\n\
+         All positions in tools use byte offsets (snapped to UTF-8 boundaries).\n\
          Use the provided tools to examine, search, and query the context.\n\
          Do NOT try to answer from memory — always consult the context.\n\n\
          Strategy:\n\
@@ -179,7 +199,10 @@ async fn execute_repl_call_impl(
         // before tool execution so recursive sub_query calls can
         // acquire their own permits without deadlocking.
         let response = {
-            let _permit = semaphore.acquire().await.expect("semaphore closed");
+            let _permit = semaphore
+                .acquire()
+                .await
+                .map_err(|_| Error::Internal("RLM semaphore closed".into()))?;
             match tokio::time::timeout(
                 std::time::Duration::from_secs(timeout_secs),
                 provider.chat(&messages, &schemas),
@@ -213,8 +236,18 @@ async fn execute_repl_call_impl(
                 "RLM REPL: executing tool calls"
             );
 
-            for call in calls {
-                let result = execute_repl_tool(call, &tools).await;
+            // Execute tool calls concurrently within a round so
+            // parallel sub_queries don't block each other.
+            let futs: Vec<_> = calls
+                .into_iter()
+                .map(|call| {
+                    let call = call.clone();
+                    let tools = tools.clone();
+                    async move { execute_repl_tool(&call, &tools).await }
+                })
+                .collect();
+            let results = futures::future::join_all(futs).await;
+            for result in results {
                 messages.push(Message {
                     id: Uuid::new_v4(),
                     role: Role::Tool,
@@ -245,7 +278,7 @@ async fn execute_repl_tool(
     call: &rustykrab_core::types::ToolCall,
     tools: &[Arc<dyn Tool>],
 ) -> ToolResult {
-    let tool = match tools.iter().find(|t| t.name() == call.name) {
+    let tool = match tools.iter().find(|t| t.name() == call.name.as_str()) {
         Some(t) => t,
         None => {
             return ToolResult {

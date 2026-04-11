@@ -3256,6 +3256,7 @@ version = "1.4.7"
 dependencies = [
  "async-trait",
  "chrono",
+ "futures",
  "regex",
  "rustykrab-core",
  "serde",

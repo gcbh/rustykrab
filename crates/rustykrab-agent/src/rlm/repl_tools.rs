@@ -16,7 +16,7 @@ use rustykrab_core::types::ToolSchema;
 use serde_json::{json, Value};
 use tokio::sync::Semaphore;
 
-use super::context_manager::ContextManager;
+use super::context_manager::estimate_tokens;
 
 /// Maximum characters returned by a single `context_peek` call.
 const MAX_PEEK_CHARS: usize = 50_000;
@@ -70,9 +70,9 @@ impl Tool for ContextInfoTool {
     }
 
     fn description(&self) -> &str {
-        "Get metadata about the context variable: character count, \
-         estimated token count, line count, and a short preview of the \
-         first 500 characters."
+        "Get metadata about the context variable: byte length, \
+         character count, estimated token count, line count, and a \
+         short preview of the first 500 characters."
     }
 
     fn schema(&self) -> ToolSchema {
@@ -88,8 +88,9 @@ impl Tool for ContextInfoTool {
     }
 
     async fn execute(&self, _args: Value) -> rustykrab_core::Result<Value> {
-        let length_chars = self.context.len();
-        let estimated_tokens = ContextManager::estimate_tokens(&self.context);
+        let length_bytes = self.context.len();
+        let length_chars = self.context.chars().count();
+        let estimated_tokens = estimate_tokens(&self.context);
         let line_count = self.context.lines().count();
         let preview_end = self
             .context
@@ -97,10 +98,11 @@ impl Tool for ContextInfoTool {
             .take_while(|(i, _)| *i < 500)
             .last()
             .map(|(i, c)| i + c.len_utf8())
-            .unwrap_or(length_chars.min(500));
+            .unwrap_or(length_bytes.min(500));
         let preview = &self.context[..preview_end];
 
         Ok(json!({
+            "length_bytes": length_bytes,
             "length_chars": length_chars,
             "estimated_tokens": estimated_tokens,
             "line_count": line_count,
@@ -122,9 +124,10 @@ impl Tool for ContextPeekTool {
     }
 
     fn description(&self) -> &str {
-        "View a slice of the context by character position. Returns \
-         context[start..end]. Clamped to context bounds and a safety \
-         limit of 50 000 characters per call."
+        "View a slice of the context by byte offset. Returns \
+         context[start..end]. Offsets are snapped to valid UTF-8 \
+         boundaries. Clamped to context bounds and a safety limit \
+         of 50 000 bytes per call."
     }
 
     fn schema(&self) -> ToolSchema {
@@ -136,11 +139,11 @@ impl Tool for ContextPeekTool {
                 "properties": {
                     "start": {
                         "type": "integer",
-                        "description": "Start character position (0-indexed, inclusive)"
+                        "description": "Start byte offset (0-indexed, inclusive). Snapped to nearest UTF-8 boundary."
                     },
                     "end": {
                         "type": "integer",
-                        "description": "End character position (exclusive)"
+                        "description": "End byte offset (exclusive). Snapped to nearest UTF-8 boundary."
                     }
                 },
                 "required": ["start", "end"]
@@ -190,8 +193,8 @@ impl Tool for ContextSearchTool {
 
     fn description(&self) -> &str {
         "Search the context using a regex pattern. Returns matching \
-         lines with their line numbers and character offsets. Use this \
-         to locate relevant sections before peeking at them."
+         lines with their line numbers and byte offsets. Use the \
+         byte_offset values with context_peek or sub_query."
     }
 
     fn schema(&self) -> ToolSchema {
@@ -226,29 +229,32 @@ impl Tool for ContextSearchTool {
         })?;
 
         let mut matches = Vec::new();
-        let mut char_offset = 0usize;
+        let mut byte_offset = 0usize;
+        let mut total_count = 0usize;
 
         for (line_num, line) in self.context.lines().enumerate() {
             if re.is_match(line) {
-                matches.push(json!({
-                    "line_number": line_num + 1,
-                    "char_offset": char_offset,
-                    "text": if line.len() > 200 {
-                        format!("{}...", &line[..line.floor_char_boundary(200)])
-                    } else {
-                        line.to_string()
-                    }
-                }));
-                if matches.len() >= max_results {
-                    break;
+                total_count += 1;
+                if matches.len() < max_results {
+                    matches.push(json!({
+                        "line_number": line_num + 1,
+                        "byte_offset": byte_offset,
+                        "text": if line.len() > 200 {
+                            format!("{}...", &line[..line.floor_char_boundary(200)])
+                        } else {
+                            line.to_string()
+                        }
+                    }));
                 }
             }
             // +1 for the newline character.
-            char_offset += line.len() + 1;
+            byte_offset += line.len() + 1;
         }
 
         Ok(json!({
-            "total_matches": matches.len(),
+            "total_matches": total_count,
+            "returned_matches": matches.len(),
+            "truncated": total_count > matches.len(),
             "matches": matches
         }))
     }
@@ -292,11 +298,11 @@ impl Tool for SubQueryTool {
                     },
                     "start": {
                         "type": "integer",
-                        "description": "Start character position of the context slice (inclusive)"
+                        "description": "Start byte offset of the context slice (inclusive). Snapped to nearest UTF-8 boundary."
                     },
                     "end": {
                         "type": "integer",
-                        "description": "End character position of the context slice (exclusive)"
+                        "description": "End byte offset of the context slice (exclusive). Snapped to nearest UTF-8 boundary."
                     }
                 },
                 "required": ["question", "start", "end"]
@@ -377,7 +383,8 @@ mod tests {
         let tool = ContextInfoTool { context: ctx };
         let result = tool.execute(json!({})).await.unwrap();
         assert_eq!(result["line_count"], 3);
-        assert_eq!(result["length_chars"], 28);
+        assert_eq!(result["length_bytes"], 28);
+        assert_eq!(result["length_chars"], 28); // ASCII: bytes == chars
         assert!(result["estimated_tokens"].as_u64().unwrap() > 0);
     }
 
@@ -415,8 +422,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result["total_matches"], 2);
+        assert_eq!(result["returned_matches"], 2);
+        assert_eq!(result["truncated"], false);
         let matches = result["matches"].as_array().unwrap();
         assert_eq!(matches[0]["line_number"], 1);
+        assert!(matches[0].get("byte_offset").is_some());
         assert_eq!(matches[1]["line_number"], 3);
     }
 
@@ -436,6 +446,10 @@ mod tests {
             .execute(json!({"pattern": "match", "max_results": 2}))
             .await
             .unwrap();
-        assert_eq!(result["total_matches"], 2);
+        // total_matches reports the true count, not the capped count
+        assert_eq!(result["total_matches"], 5);
+        assert_eq!(result["returned_matches"], 2);
+        assert_eq!(result["truncated"], true);
+        assert_eq!(result["matches"].as_array().unwrap().len(), 2);
     }
 }
