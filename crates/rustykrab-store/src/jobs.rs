@@ -243,29 +243,28 @@ fn try_parse_datetime(s: &str) -> Option<DateTime<Utc>> {
 
 /// Compute the next occurrence of a cron expression after `after`.
 ///
-/// Handles both standard 5-field cron (`minute hour dom month dow`) and
-/// 6-field cron with seconds (`second minute hour dom month dow`).
+/// Accepts standard 5-field cron (`minute hour dom month dow`), 6-field
+/// with seconds, or 7-field with seconds and year.
 fn compute_next_cron_run(expression: &str, after: DateTime<Utc>) -> Result<DateTime<Utc>, Error> {
-    let normalized = normalize_cron_expression(expression);
-    let cron: Cron = normalized
+    let cron: Cron = expression
         .parse()
-        .map_err(|e| Error::Config(format!("invalid cron expression '{expression}': {e}")))?;
+        .map_err(|e| {
+            Error::Config(format!(
+                "invalid cron expression '{expression}': {e}. \
+                 Use standard 5-field format: minute(0-59) hour(0-23) day(1-31) month(1-12) weekday(0-6, 0=Sun). \
+                 Example: '0 9 * * *' for daily at 9 AM"
+            ))
+        })?;
 
     cron.find_next_occurrence(&after, false)
-        .map_err(|e| Error::Config(format!("could not compute next cron occurrence: {e}")))
-}
-
-/// Normalize a cron expression for `croner` which requires 6 fields
-/// (seconds minutes hours day-of-month month day-of-week).
-///
-/// If the input has 5 fields (standard cron), prepend `0` for seconds.
-fn normalize_cron_expression(expr: &str) -> String {
-    let fields: Vec<&str> = expr.split_whitespace().collect();
-    if fields.len() == 5 {
-        format!("0 {expr}")
-    } else {
-        expr.to_string()
-    }
+        .map_err(|_| {
+            Error::Config(format!(
+                "cron expression '{expression}' cannot produce a future occurrence. \
+                 The expression may be too restrictive or invalid. \
+                 Use standard 5-field format: minute(0-59) hour(0-23) day(1-31) month(1-12) weekday(0-6, 0=Sun). \
+                 Example: '0 9 * * 1-5' for weekdays at 9 AM"
+            ))
+        })
 }
 
 /// Parse an RFC 3339 timestamp stored in SQLite.
@@ -273,4 +272,84 @@ fn parse_stored_timestamp(s: String) -> DateTime<Utc> {
     DateTime::parse_from_rfc3339(&s)
         .map(|dt| dt.with_timezone(&Utc))
         .unwrap_or_else(|_| Utc::now())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compute_next_cron_5_field_expression() {
+        let now = Utc::now();
+        let result = compute_next_cron_run("*/5 * * * *", now);
+        assert!(result.is_ok(), "expected Ok, got: {result:?}");
+        assert!(result.unwrap() > now);
+    }
+
+    #[test]
+    fn compute_next_cron_6_field_expression() {
+        let now = Utc::now();
+        let result = compute_next_cron_run("0 */5 * * * *", now);
+        assert!(result.is_ok(), "expected Ok, got: {result:?}");
+        assert!(result.unwrap() > now);
+    }
+
+    #[test]
+    fn compute_next_cron_too_few_fields_gives_actionable_error() {
+        let now = Utc::now();
+        let err = compute_next_cron_run("* *", now).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("invalid cron expression"), "got: {msg}");
+        assert!(msg.contains("Example:"), "got: {msg}");
+    }
+
+    #[test]
+    fn compute_next_cron_garbage_gives_actionable_error() {
+        let now = Utc::now();
+        let err = compute_next_cron_run("not a cron", now).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("invalid cron expression"), "got: {msg}");
+        assert!(msg.contains("Example:"), "got: {msg}");
+    }
+
+    #[test]
+    fn compute_next_cron_unreachable_gives_actionable_error() {
+        let now = Utc::now();
+        // February 31st never exists
+        let err = compute_next_cron_run("0 0 31 2 *", now).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("cannot produce a future occurrence"),
+            "got: {msg}"
+        );
+        assert!(msg.contains("Example:"), "got: {msg}");
+    }
+
+    #[test]
+    fn parse_schedule_one_shot_in_past_fails() {
+        let now = Utc::now();
+        let err = parse_schedule("2020-01-01T00:00:00Z", now).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("one-shot schedule must be in the future"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_schedule_one_shot_in_future_succeeds() {
+        let now = Utc::now();
+        let future = (now + chrono::Duration::hours(1)).to_rfc3339();
+        let (one_shot, next_run) = parse_schedule(&future, now).unwrap();
+        assert!(one_shot);
+        assert!(next_run > now);
+    }
+
+    #[test]
+    fn parse_schedule_valid_cron() {
+        let now = Utc::now();
+        let (one_shot, next_run) = parse_schedule("0 9 * * *", now).unwrap();
+        assert!(!one_shot);
+        assert!(next_run > now);
+    }
 }
