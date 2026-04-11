@@ -190,8 +190,10 @@ async fn main() -> anyhow::Result<()> {
         let video_dir = data_dir.join("video");
         std::fs::create_dir_all(&video_dir)?;
 
-        let mut video_config = VideoConfig::default();
-        video_config.projects_dir = video_dir;
+        let mut video_config = VideoConfig {
+            projects_dir: video_dir,
+            ..Default::default()
+        };
 
         // Allow custom npx path via env.
         if let Ok(npx) = std::env::var("RUSTYKRAB_NPX_PATH") {
