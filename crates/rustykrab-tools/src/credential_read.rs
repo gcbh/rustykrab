@@ -4,15 +4,6 @@ use rustykrab_core::{Error, Result, Tool};
 use rustykrab_store::SecretStore;
 use serde_json::{json, Value};
 
-/// Mask a secret value so only the first 4 and last 4 characters are visible.
-fn mask_secret(value: &str) -> String {
-    if value.len() > 8 {
-        format!("{}...{}", &value[..4], &value[value.len() - 4..])
-    } else {
-        "*".repeat(value.len())
-    }
-}
-
 /// A tool that reads credentials from the encrypted SecretStore or from the
 /// macOS Keychain.
 ///
@@ -113,7 +104,7 @@ impl CredentialReadTool {
                     Ok(value) => Ok(json!({
                         "source": "store",
                         "name": name,
-                        "value": mask_secret(&value),
+                        "value": value,
                     })),
                     Err(rustykrab_core::Error::NotFound(_)) => Ok(json!({
                         "error": format!("no secret found with name '{name}'"),
@@ -183,7 +174,7 @@ impl CredentialReadTool {
                             "source": "keychain",
                             "service": cred.service,
                             "account": cred.account,
-                            "value": mask_secret(&cred.value),
+                            "value": cred.value,
                         }))
                     }
                     Ok(None) => Ok(json!({
