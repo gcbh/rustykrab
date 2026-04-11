@@ -4,6 +4,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use chrono::Utc;
+
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+const GIT_HASH: &str = env!("RUSTYKRAB_GIT_HASH");
+const GIT_DIRTY: &str = env!("RUSTYKRAB_GIT_DIRTY");
+const BUILD_DATE: &str = env!("RUSTYKRAB_BUILD_DATE");
+
+fn version_string() -> String {
+    format!("{VERSION} ({GIT_HASH}{GIT_DIRTY}, {BUILD_DATE})")
+}
 use rustykrab_agent::{AgentEvent, HarnessProfile, HarnessRouter, OrchestrationPipeline};
 use rustykrab_channels::telegram::ChannelMessage;
 use rustykrab_channels::{TelegramChannel, VideoChannel, VideoConfig};
@@ -78,8 +87,14 @@ async fn main() -> anyhow::Result<()> {
         .with(fmt::layer().with_writer(non_blocking).with_ansi(false))
         .init();
 
+    tracing::info!("rustykrab {}", version_string());
+
     // --- CLI subcommands ---
     let args: Vec<String> = std::env::args().collect();
+    if args.len() >= 2 && (args[1] == "--version" || args[1] == "-V") {
+        println!("rustykrab {}", version_string());
+        return Ok(());
+    }
     if args.len() >= 2 && args[1] == "skill" {
         return handle_skill_subcommand(&data_dir, &args[2..]);
     }
