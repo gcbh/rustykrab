@@ -63,6 +63,11 @@ mod canvas;
 // Device tools
 mod nodes;
 
+// Network tools
+mod net_admin;
+mod net_audit;
+mod net_scan;
+
 // HTTP
 mod http_request;
 mod http_session;
@@ -143,6 +148,11 @@ pub use canvas::CanvasTool;
 // Devices
 pub use nodes::NodesTool;
 
+// Network
+pub use net_admin::NetAdminTool;
+pub use net_audit::NetAuditTool;
+pub use net_scan::NetScanTool;
+
 // HTTP
 pub use http_request::HttpRequestTool;
 pub use http_session::HttpSessionTool;
@@ -197,6 +207,10 @@ pub fn builtin_tools(
         std::sync::Arc::new(CanvasTool::new()),
         // Devices
         std::sync::Arc::new(NodesTool::new()),
+        // Network
+        std::sync::Arc::new(NetScanTool::new()),
+        std::sync::Arc::new(NetAdminTool::new()),
+        std::sync::Arc::new(NetAuditTool::new()),
         // Email
         std::sync::Arc::new(GmailTool::new(secrets.clone())),
         // Notion
