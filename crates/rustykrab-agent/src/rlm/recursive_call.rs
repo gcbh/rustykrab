@@ -127,7 +127,7 @@ async fn execute_repl_call_impl(
         provider.clone(),
         config.clone(),
         depth,
-        semaphore,
+        semaphore.clone(),
     );
     let schemas: Vec<_> = tools.iter().map(|t| t.schema()).collect();
 
@@ -175,22 +175,28 @@ async fn execute_repl_call_impl(
     let timeout_secs = config.model_call_timeout_secs;
 
     for round in 0..max_rounds {
-        let response = match tokio::time::timeout(
-            std::time::Duration::from_secs(timeout_secs),
-            provider.chat(&messages, &schemas),
-        )
-        .await
-        {
-            Ok(Ok(r)) => r,
-            Ok(Err(e)) => {
-                tracing::error!(depth, round, error = %e, "RLM REPL: model call failed");
-                return Err(e);
-            }
-            Err(_) => {
-                tracing::error!(depth, round, "RLM REPL: model call timed out");
-                return Err(Error::Internal(format!(
-                    "RLM model call timed out after {timeout_secs}s"
-                )));
+        // Acquire a semaphore permit for the LLM call only — released
+        // before tool execution so recursive sub_query calls can
+        // acquire their own permits without deadlocking.
+        let response = {
+            let _permit = semaphore.acquire().await.expect("semaphore closed");
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(timeout_secs),
+                provider.chat(&messages, &schemas),
+            )
+            .await
+            {
+                Ok(Ok(r)) => r,
+                Ok(Err(e)) => {
+                    tracing::error!(depth, round, error = %e, "RLM REPL: model call failed");
+                    return Err(e);
+                }
+                Err(_) => {
+                    tracing::error!(depth, round, "RLM REPL: model call timed out");
+                    return Err(Error::Internal(format!(
+                        "RLM model call timed out after {timeout_secs}s"
+                    )));
+                }
             }
         };
 

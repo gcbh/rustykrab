@@ -324,9 +324,11 @@ impl Tool for SubQueryTool {
             "RLM REPL: launching sub_query"
         );
 
-        // Acquire semaphore permit to bound concurrent LLM calls.
-        let _permit = self.semaphore.acquire().await.expect("semaphore closed");
-
+        // NOTE: We do NOT acquire the semaphore here. The semaphore
+        // gates individual provider.chat() calls inside
+        // execute_repl_call's tool-use loop. Holding a permit across
+        // the entire recursive subtree would deadlock at
+        // depth >= permit count.
         let answer = super::recursive_call::execute_repl_call(
             self.provider.clone(),
             self.config.clone(),
