@@ -21,10 +21,17 @@ jobs:
       version: ${{ steps.bump.outputs.version }}
       tag: ${{ steps.bump.outputs.tag }}
     steps:
+      - name: Generate app token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          token: ${{ secrets.RELEASE_TOKEN }}
+          token: ${{ steps.app-token.outputs.token }}
 
       - name: Configure git
         run: |
@@ -56,13 +63,9 @@ jobs:
 
       - name: Push version commit and tag
         env:
-          RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          APP_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
-          if [ -z "$RELEASE_TOKEN" ]; then
-            echo "::error::RELEASE_TOKEN secret is not set — cannot push to main"
-            exit 1
-          fi
-          git remote set-url origin "https://x-access-token:${RELEASE_TOKEN}@github.com/${{ github.repository }}.git"
+          git remote set-url origin "https://x-access-token:${APP_TOKEN}@github.com/${{ github.repository }}.git"
           git push origin main --tags
 
   # ── Build release binaries ─────────────────────────────────────────
