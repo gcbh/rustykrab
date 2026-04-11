@@ -4,7 +4,7 @@ use chrono::Utc;
 use rusqlite::params;
 use rustykrab_core::types::Conversation;
 use rustykrab_core::Error;
-use tokio::sync::Mutex;
+use std::sync::Mutex;
 use uuid::Uuid;
 
 /// CRUD operations on conversations backed by SQLite.
@@ -35,7 +35,7 @@ impl ConversationStore {
     /// Persist a conversation (insert or update).
     pub fn save(&self, conv: &Conversation) -> Result<(), Error> {
         let data = serde_json::to_string(conv)?;
-        let conn = self.conn.blocking_lock();
+        let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO conversations (id, data) VALUES (?1, ?2)
              ON CONFLICT(id) DO UPDATE SET data = excluded.data",
@@ -47,7 +47,7 @@ impl ConversationStore {
 
     /// Retrieve a conversation by ID.
     pub fn get(&self, id: Uuid) -> Result<Conversation, Error> {
-        let conn = self.conn.blocking_lock();
+        let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare("SELECT data FROM conversations WHERE id = ?1")
             .map_err(|e| Error::Storage(e.to_string()))?;
@@ -65,7 +65,7 @@ impl ConversationStore {
 
     /// List all conversation IDs (lightweight, doesn't deserialize messages).
     pub fn list_ids(&self) -> Result<Vec<Uuid>, Error> {
-        let conn = self.conn.blocking_lock();
+        let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare("SELECT id FROM conversations")
             .map_err(|e| Error::Storage(e.to_string()))?;
@@ -87,7 +87,7 @@ impl ConversationStore {
     /// Delete a conversation by ID. Returns `NotFound` if the conversation
     /// does not exist, so callers can distinguish 404 from 500.
     pub fn delete(&self, id: Uuid) -> Result<(), Error> {
-        let conn = self.conn.blocking_lock();
+        let conn = self.conn.lock().unwrap();
         let affected = conn
             .execute(
                 "DELETE FROM conversations WHERE id = ?1",

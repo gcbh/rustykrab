@@ -6,7 +6,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use rustykrab_core::Error;
-use tokio::sync::Mutex;
+use std::sync::Mutex;
 use zeroize::Zeroizing;
 
 pub use conversation::ConversationStore;
@@ -80,7 +80,7 @@ impl Store {
     /// Flush all pending writes to disk.
     pub fn flush(&self) -> Result<(), Error> {
         // WAL mode checkpoints automatically; explicit checkpoint for shutdown.
-        let conn = self.conn.blocking_lock();
+        let conn = self.conn.lock().unwrap();
         conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
             .map_err(|e| Error::Storage(e.to_string()))?;
         Ok(())

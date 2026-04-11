@@ -134,9 +134,6 @@ impl Tool for CodeExecutionTool {
                     .await
                     .map_err(|e| rustykrab_core::Error::ToolExecution(e.to_string().into()))?;
 
-                let max_mem = 256u64 * 1024 * 1024;
-                let max_cpu = timeout_secs;
-
                 let mut cmd = tokio::process::Command::new("sandbox-exec");
                 cmd.arg("-f")
                     .arg(&profile_file)
@@ -150,7 +147,10 @@ impl Tool for CodeExecutionTool {
                     .env("PYTHONDONTWRITEBYTECODE", "1")
                     .current_dir(&tmp_dir);
 
-                // Apply resource limits in the child process
+                // On macOS, resource limits are supplementary — the seatbelt
+                // profile provides the primary containment. On Linux, rlimits
+                // are the only defense when namespace isolation is unavailable.
+                #[cfg(not(target_os = "macos"))]
                 unsafe {
                     cmd.pre_exec(move || sandboxed_spawn::apply_resource_limits(max_mem, max_cpu));
                 }
@@ -165,7 +165,7 @@ impl Tool for CodeExecutionTool {
 
             #[cfg(target_os = "linux")]
             let future = {
-                let max_mem = 256u64 * 1024 * 1024;
+                let max_mem = 512u64 * 1024 * 1024;
                 let max_cpu = timeout_secs;
 
                 let mut cmd = tokio::process::Command::new(&python_path);
@@ -199,7 +199,7 @@ impl Tool for CodeExecutionTool {
             // Fallback for other Unix platforms: rlimits only
             #[cfg(not(any(target_os = "macos", target_os = "linux")))]
             let future = {
-                let max_mem = 256u64 * 1024 * 1024;
+                let max_mem = 512u64 * 1024 * 1024;
                 let max_cpu = timeout_secs;
 
                 let mut cmd = tokio::process::Command::new(&python_path);

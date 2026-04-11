@@ -6,7 +6,7 @@ use argon2::Argon2;
 use rand::TryRngCore;
 use rusqlite::params;
 use rustykrab_core::Error;
-use tokio::sync::Mutex;
+use std::sync::Mutex;
 use zeroize::Zeroizing;
 
 /// The salt length used for Argon2 key derivation.
@@ -52,7 +52,7 @@ impl SecretStore {
         Self::validate_name(name)?;
 
         let encrypted = self.encrypt(name, value.as_bytes())?;
-        let conn = self.conn.blocking_lock();
+        let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO secrets (name, data) VALUES (?1, ?2)
              ON CONFLICT(name) DO UPDATE SET data = excluded.data",
@@ -64,7 +64,7 @@ impl SecretStore {
 
     /// Retrieve and decrypt a secret by name.
     pub fn get(&self, name: &str) -> Result<String, Error> {
-        let conn = self.conn.blocking_lock();
+        let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare("SELECT data FROM secrets WHERE name = ?1")
             .map_err(|e| Error::Storage(e.to_string()))?;
@@ -81,7 +81,7 @@ impl SecretStore {
 
     /// Delete a secret.
     pub fn delete(&self, name: &str) -> Result<(), Error> {
-        let conn = self.conn.blocking_lock();
+        let conn = self.conn.lock().unwrap();
         conn.execute("DELETE FROM secrets WHERE name = ?1", params![name])
             .map_err(|e| Error::Storage(e.to_string()))?;
         Ok(())
@@ -89,7 +89,7 @@ impl SecretStore {
 
     /// List all secret names (does not decrypt values).
     pub fn list_names(&self) -> Result<Vec<String>, Error> {
-        let conn = self.conn.blocking_lock();
+        let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare("SELECT name FROM secrets")
             .map_err(|e| Error::Storage(e.to_string()))?;

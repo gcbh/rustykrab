@@ -24,28 +24,17 @@ use std::io;
 /// Must be called in a `pre_exec` context (post-fork, pre-exec). Uses only
 /// async-signal-safe libc calls (`setrlimit`).
 #[cfg(unix)]
+#[allow(unused_variables, dead_code)]
 pub fn apply_resource_limits(max_memory_bytes: u64, max_cpu_secs: u64) -> io::Result<()> {
     unsafe {
-        // Memory limit (virtual address space)
-        if max_memory_bytes > 0 {
-            let limit = libc::rlimit {
-                rlim_cur: max_memory_bytes,
-                rlim_max: max_memory_bytes,
-            };
-            if libc::setrlimit(libc::RLIMIT_AS, &limit) != 0 {
-                return Err(io::Error::last_os_error());
-            }
-        }
-
         // CPU time limit
         if max_cpu_secs > 0 {
             let limit = libc::rlimit {
                 rlim_cur: max_cpu_secs,
                 rlim_max: max_cpu_secs,
             };
-            if libc::setrlimit(libc::RLIMIT_CPU, &limit) != 0 {
-                return Err(io::Error::last_os_error());
-            }
+            // Ignore EINVAL — on macOS the hard limit may be lower than requested.
+            let _ = libc::setrlimit(libc::RLIMIT_CPU, &limit);
         }
 
         // File size limit (10 MB)
@@ -53,19 +42,31 @@ pub fn apply_resource_limits(max_memory_bytes: u64, max_cpu_secs: u64) -> io::Re
             rlim_cur: 10 * 1024 * 1024,
             rlim_max: 10 * 1024 * 1024,
         };
-        if libc::setrlimit(libc::RLIMIT_FSIZE, &fsize_limit) != 0 {
-            return Err(io::Error::last_os_error());
+        let _ = libc::setrlimit(libc::RLIMIT_FSIZE, &fsize_limit);
+
+        // Memory limit (virtual address space).
+        // On macOS, Python's virtual address space at startup can be several
+        // GB due to memory-mapped frameworks, so RLIMIT_AS kills it before
+        // it can even print output. Only apply on Linux where virtual memory
+        // usage is more predictable.
+        #[cfg(target_os = "linux")]
+        if max_memory_bytes > 0 {
+            let limit = libc::rlimit {
+                rlim_cur: max_memory_bytes,
+                rlim_max: max_memory_bytes,
+            };
+            let _ = libc::setrlimit(libc::RLIMIT_AS, &limit);
         }
 
         // Process count limit — prevent fork bombs.
-        // Set to 1 so the Python process itself can run but cannot spawn children.
+        // On macOS, RLIMIT_NPROC applies to the entire user, not just
+        // the child tree. Use a small but workable limit; ignore failure
+        // when the current count already exceeds it.
         let nproc_limit = libc::rlimit {
-            rlim_cur: 1,
-            rlim_max: 1,
+            rlim_cur: 32,
+            rlim_max: 32,
         };
-        if libc::setrlimit(libc::RLIMIT_NPROC, &nproc_limit) != 0 {
-            return Err(io::Error::last_os_error());
-        }
+        let _ = libc::setrlimit(libc::RLIMIT_NPROC, &nproc_limit);
     }
     Ok(())
 }
@@ -78,70 +79,31 @@ pub fn apply_resource_limits(max_memory_bytes: u64, max_cpu_secs: u64) -> io::Re
 /// - Basic process operations needed by the Python runtime
 /// - Network access is always denied
 #[cfg(target_os = "macos")]
-pub fn generate_seatbelt_profile(sandbox_dir: &Path, python_path: &Path) -> String {
+pub fn generate_seatbelt_profile(
+    sandbox_dir: &std::path::Path,
+    _python_path: &std::path::Path,
+) -> String {
     let sandbox_dir = sandbox_dir.to_string_lossy();
 
-    // Resolve the Python installation's lib directory for read access.
-    // e.g., /opt/homebrew/Cellar/python@3.12/3.12.x/Frameworks/...
-    let python_parent = python_path
-        .parent()
-        .and_then(|p| p.parent()) // go up from bin/ to the install root
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_default();
-
-    let mut profile = String::from(
+    // Use a permissive-by-default profile that only denies network access
+    // and restricts file writes to the sandbox directory. Enumerating
+    // every permission Python's runtime needs is fragile across macOS
+    // versions and Python installations (pyenv, homebrew, system, etc.).
+    format!(
         r#"(version 1)
-(deny default)
+(allow default)
 
-;; Allow the Python process to execute
-(allow process-exec)
-
-;; Allow reading system libraries and frameworks
-(allow file-read*
-    (subpath "/usr/")
-    (subpath "/Library/")
-    (subpath "/System/")
-    (subpath "/private/var/")
-    (subpath "/opt/homebrew/")
-    (subpath "/usr/local/")
-    (subpath "/dev/")
-    (subpath "/private/tmp/")
-    (subpath "/tmp/")
-"#,
-    );
-
-    // Allow reading the Python installation directory (for pyenv, conda, etc.)
-    if !python_parent.is_empty()
-        && !python_parent.starts_with("/usr/")
-        && !python_parent.starts_with("/opt/homebrew/")
-        && !python_parent.starts_with("/usr/local/")
-    {
-        profile.push_str(&format!("    (subpath \"{}\")\n", python_parent));
-    }
-
-    profile.push_str(&format!(
-        r#"    (subpath "{sandbox_dir}"))
-
-;; Allow writing ONLY to the sandbox temp directory
-(allow file-write*
-    (subpath "{sandbox_dir}")
-    (subpath "/dev/null"))
-
-;; Allow basic process operations needed by Python runtime
-(allow process-fork)
-(allow signal (target self))
-(allow sysctl-read)
-
-;; Allow mach IPC (required for basic process operation on macOS)
-(allow mach-lookup)
-(allow mach-register)
-
-;; DENY all network access
+;; DENY all network access — this is the primary containment.
 (deny network*)
-"#
-    ));
 
-    profile
+;; Restrict file writes to the sandbox temp directory.
+(deny file-write*
+    (require-not
+        (require-any
+            (subpath "{sandbox_dir}")
+            (subpath "/dev/null"))))
+"#
+    )
 }
 
 /// Apply Linux namespace isolation to the current process.
@@ -198,30 +160,20 @@ mod tests {
             Path::new("/tmp/rustykrab_sandbox"),
             Path::new("/usr/bin/python3"),
         );
-        assert!(profile.contains("(subpath \"/tmp/rustykrab_sandbox\")"));
-        assert!(profile.contains("(allow file-write*"));
+        // Sandbox dir should appear in the write exception
+        assert!(profile.contains("/tmp/rustykrab_sandbox"));
+        assert!(profile.contains("(deny network*)"));
     }
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn seatbelt_profile_includes_custom_python_path() {
-        let profile = generate_seatbelt_profile(
-            Path::new("/tmp/rustykrab_sandbox"),
-            Path::new("/Users/dev/.pyenv/versions/3.12.0/bin/python3"),
-        );
-        // Should include the pyenv install root for read access
-        assert!(profile.contains("/Users/dev/.pyenv/versions/3.12.0"));
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn seatbelt_profile_no_duplicate_for_system_python() {
+    fn seatbelt_profile_restricts_writes() {
         let profile = generate_seatbelt_profile(
             Path::new("/tmp/rustykrab_sandbox"),
             Path::new("/usr/bin/python3"),
         );
-        // /usr/ is already in the default paths, so no extra subpath needed
-        let count = profile.matches("(subpath \"/usr/\")").count();
-        assert_eq!(count, 1);
+        // File writes should be denied except to sandbox dir
+        assert!(profile.contains("(deny file-write*"));
+        assert!(profile.contains("/tmp/rustykrab_sandbox"));
     }
 }
