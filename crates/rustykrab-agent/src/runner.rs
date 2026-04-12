@@ -887,6 +887,9 @@ fn enforce_sandbox_policy(tool_name: &str, policy: &SandboxPolicy) -> Result<()>
             | "gmail"
             | "image_generate"
             | "tts"
+            | "net_scan"
+            | "net_admin"
+            | "net_audit"
     );
     let is_known = needs_fs_read
         || needs_fs_write
