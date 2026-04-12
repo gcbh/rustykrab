@@ -31,8 +31,13 @@ async fn build_and_inject_system_prompt(
         profile
     };
 
-    // 2. Collect tool schemas for the prompt builder.
-    let schemas: Vec<_> = state.tools.iter().map(|t| t.schema()).collect();
+    // 2. Collect tool schemas for the prompt builder (skip unavailable tools).
+    let schemas: Vec<_> = state
+        .tools
+        .iter()
+        .filter(|t| t.available())
+        .map(|t| t.schema())
+        .collect();
 
     // 3. Build the system prompt.
     let mut builder = SystemPromptBuilder::new()
@@ -98,8 +103,13 @@ async fn prepare_agent(
 ) -> Result<(AgentRunner, Session), StatusCode> {
     build_and_inject_system_prompt(state, conv, user_content).await;
 
-    // Create an ephemeral session with capabilities for all registered tools.
-    let tool_names: Vec<&str> = state.tools.iter().map(|t| t.name()).collect();
+    // Create an ephemeral session with capabilities for available registered tools.
+    let tool_names: Vec<&str> = state
+        .tools
+        .iter()
+        .filter(|t| t.available())
+        .map(|t| t.name())
+        .collect();
     let caps = CapabilitySet::for_tools_permissive(&tool_names);
     let session = Session::with_capabilities(conv.id, caps);
 

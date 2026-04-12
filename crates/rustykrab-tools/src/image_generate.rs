@@ -32,6 +32,10 @@ impl Tool for ImageGenerateTool {
         "Generate an image from a text prompt using a configured image generation API."
     }
 
+    fn available(&self) -> bool {
+        std::env::var("IMAGE_API_URL").is_ok()
+    }
+
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: self.name().to_string(),

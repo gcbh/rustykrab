@@ -176,7 +176,7 @@ impl AgentRunner {
         let schemas: Vec<ToolSchema> = self
             .tools
             .iter()
-            .filter(|t| session.capabilities.can_use_tool(t.name()))
+            .filter(|t| t.available() && session.capabilities.can_use_tool(t.name()))
             .map(|t| t.schema())
             .collect();
 
@@ -380,7 +380,7 @@ impl AgentRunner {
         let schemas: Vec<ToolSchema> = self
             .tools
             .iter()
-            .filter(|t| session.capabilities.can_use_tool(t.name()))
+            .filter(|t| t.available() && session.capabilities.can_use_tool(t.name()))
             .map(|t| t.schema())
             .collect();
 

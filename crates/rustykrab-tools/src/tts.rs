@@ -38,6 +38,10 @@ impl Tool for TtsTool {
         "Convert text to speech audio using a configured TTS API."
     }
 
+    fn available(&self) -> bool {
+        std::env::var("TTS_API_URL").is_ok()
+    }
+
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: self.name().to_string(),
