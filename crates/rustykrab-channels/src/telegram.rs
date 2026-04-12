@@ -142,6 +142,138 @@ impl TelegramChannel {
         Ok(())
     }
 
+    /// Send a video file to a Telegram chat.
+    ///
+    /// `file_path` must be a local path to a video file (MP4, WebM, etc.).
+    /// `caption` is optional text shown alongside the video.
+    /// When `thread_id > 0`, the video is posted inside that forum topic.
+    pub async fn send_video(
+        &self,
+        chat_id: i64,
+        file_path: &std::path::Path,
+        caption: Option<&str>,
+        thread_id: i64,
+    ) -> Result<()> {
+        self.send_file(chat_id, file_path, "sendVideo", "video", caption, thread_id)
+            .await
+    }
+
+    /// Send a document (any file type) to a Telegram chat.
+    ///
+    /// `file_path` must be a local path to the file.
+    /// `caption` is optional text shown alongside the document.
+    /// When `thread_id > 0`, the document is posted inside that forum topic.
+    pub async fn send_document(
+        &self,
+        chat_id: i64,
+        file_path: &std::path::Path,
+        caption: Option<&str>,
+        thread_id: i64,
+    ) -> Result<()> {
+        self.send_file(chat_id, file_path, "sendDocument", "document", caption, thread_id)
+            .await
+    }
+
+    /// Internal: send a file via Telegram Bot API multipart upload.
+    async fn send_file(
+        &self,
+        chat_id: i64,
+        file_path: &std::path::Path,
+        api_method: &str,
+        field_name: &str,
+        caption: Option<&str>,
+        thread_id: i64,
+    ) -> Result<()> {
+        let url = format!("{}/{api_method}", self.api_base);
+
+        let file_data = tokio::fs::read(file_path).await.map_err(|e| {
+            Error::Channel(format!("failed to read file {}: {e}", file_path.display()))
+        })?;
+
+        let file_name = file_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("file")
+            .to_string();
+
+        // Determine MIME type from extension.
+        let mime = match file_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+        {
+            "mp4" => "video/mp4",
+            "webm" => "video/webm",
+            "wav" => "audio/wav",
+            "mp3" => "audio/mpeg",
+            "png" => "image/png",
+            "jpg" | "jpeg" => "image/jpeg",
+            _ => "application/octet-stream",
+        };
+
+        let mut last_err = None;
+        for attempt in 0..=SEND_MAX_RETRIES {
+            if attempt > 0 {
+                let delay = Duration::from_millis(500 * 2u64.pow(attempt - 1));
+                tokio::time::sleep(delay).await;
+            }
+
+            let file_part = reqwest::multipart::Part::bytes(file_data.clone())
+                .file_name(file_name.clone())
+                .mime_str(mime)
+                .unwrap_or_else(|_| {
+                    reqwest::multipart::Part::bytes(file_data.clone())
+                        .file_name(file_name.clone())
+                });
+
+            let mut form = reqwest::multipart::Form::new()
+                .text("chat_id", chat_id.to_string())
+                .part(field_name.to_string(), file_part);
+
+            if let Some(cap) = caption {
+                form = form.text("caption", cap.to_string());
+            }
+            if thread_id > 0 {
+                form = form.text("message_thread_id", thread_id.to_string());
+            }
+
+            match self.client.post(&url).multipart(form).send().await {
+                Ok(resp) => {
+                    if resp.status().is_success() {
+                        return Ok(());
+                    }
+                    let status = resp.status();
+                    let err_text = resp.text().await.unwrap_or_default();
+
+                    if status.is_client_error() && status.as_u16() != 429 {
+                        return Err(Error::Channel(format!(
+                            "Telegram {api_method} failed ({status}): {err_text}"
+                        )));
+                    }
+
+                    if status.as_u16() == 429 {
+                        tracing::warn!("Telegram rate limited on {api_method}, backing off");
+                    }
+
+                    last_err = Some(Error::Channel(format!(
+                        "Telegram {api_method} failed ({status}): {err_text}"
+                    )));
+                }
+                Err(e) => {
+                    last_err = Some(Error::Channel(format!("Telegram API error: {e}")));
+                }
+            }
+
+            if attempt < SEND_MAX_RETRIES {
+                tracing::debug!(attempt, "retrying Telegram {}", api_method);
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| {
+            Error::Channel(format!("{api_method} failed after retries"))
+        }))
+    }
+
     /// Send a single message chunk with retry and Markdown fallback.
     async fn send_single_message(&self, chat_id: i64, text: &str, thread_id: i64) -> Result<()> {
         // First attempt: with Markdown.

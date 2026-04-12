@@ -281,6 +281,33 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
+    // --- Video channel (optional, enabled via RUSTYKRAB_VIDEO=true) ---
+    let video_enabled = std::env::var("RUSTYKRAB_VIDEO")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false);
+
+    let video_channel: Option<Arc<VideoChannel>> = if video_enabled {
+        let video_dir = data_dir.join("video");
+        std::fs::create_dir_all(&video_dir)?;
+
+        let mut video_config = VideoConfig::default();
+        video_config.projects_dir = video_dir;
+
+        // Allow custom npx path via env.
+        if let Ok(npx) = std::env::var("RUSTYKRAB_NPX_PATH") {
+            video_config.npx_path = npx;
+        }
+
+        let channel = Arc::new(VideoChannel::new(video_config));
+        tracing::info!("video communication channel enabled");
+        Some(channel)
+    } else {
+        tracing::info!(
+            "video channel disabled (set RUSTYKRAB_VIDEO=true to enable)"
+        );
+        None
+    };
+
     // --- Tools ---
     let mut tools = rustykrab_tools::builtin_tools(store.secrets());
     tools.extend(rustykrab_tools::memory_tools(memory_backend));
@@ -750,6 +777,9 @@ async fn telegram_agent_loop(
             if let Err(e) = tg.send_text(chat_id, &reply, thread_id).await {
                 tracing::error!(chat_id, thread_id, "failed to send Telegram reply: {e}");
             }
+
+            // Check if the reply references a rendered video file and send it.
+            send_media_attachments(&tg, chat_id, thread_id, &reply).await;
         });
     }
 
@@ -852,6 +882,59 @@ async fn process_telegram_message(
     }
 
     reply
+}
+
+/// Scan the agent reply for file paths pointing to rendered media and send
+/// them as Telegram attachments. This bridges the gap between the video tool
+/// (which renders to disk) and Telegram (which needs multipart upload).
+async fn send_media_attachments(
+    tg: &Arc<TelegramChannel>,
+    chat_id: i64,
+    thread_id: i64,
+    reply: &str,
+) {
+    // Look for common video/audio file path patterns in the reply text.
+    // The agent typically includes paths like `/path/to/output.mp4` in its response.
+    let media_extensions = [".mp4", ".webm", ".wav", ".mp3", ".png", ".jpg"];
+
+    for word in reply.split_whitespace() {
+        // Clean up potential markdown or punctuation wrapping.
+        let cleaned = word.trim_matches(|c: char| c == '`' || c == '"' || c == '\'' || c == '(' || c == ')' || c == '[' || c == ']');
+
+        let is_media = media_extensions.iter().any(|ext| cleaned.ends_with(ext));
+        if !is_media {
+            continue;
+        }
+
+        let path = std::path::Path::new(cleaned);
+        if !path.is_absolute() || !path.exists() {
+            continue;
+        }
+
+        let is_video = cleaned.ends_with(".mp4") || cleaned.ends_with(".webm");
+        let result = if is_video {
+            tg.send_video(chat_id, path, None, thread_id).await
+        } else {
+            tg.send_document(chat_id, path, None, thread_id).await
+        };
+
+        match result {
+            Ok(()) => {
+                tracing::info!(
+                    chat_id,
+                    path = %path.display(),
+                    "sent media attachment to Telegram"
+                );
+            }
+            Err(e) => {
+                tracing::error!(
+                    chat_id,
+                    path = %path.display(),
+                    "failed to send media attachment: {e}"
+                );
+            }
+        }
+    }
 }
 
 async fn shutdown_signal() {

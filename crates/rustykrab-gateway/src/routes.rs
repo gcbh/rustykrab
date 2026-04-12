@@ -33,6 +33,7 @@ pub fn api_routes() -> Router<AppState> {
             "/api/conversations/{id}/messages/stream",
             post(send_message_stream),
         )
+        .route("/api/media/{project_id}/{filename}", get(serve_media))
         .route("/api/health", get(health))
         .route("/api/logout", post(logout))
 }
@@ -55,6 +56,76 @@ async fn logout(State(state): State<AppState>) -> StatusCode {
     // Print to stderr to avoid capture by structured logging infrastructure.
     eprintln!("\n  New RUSTYKRAB_AUTH_TOKEN={new_token}\n");
     StatusCode::NO_CONTENT
+}
+
+/// Serve a rendered media file (video, audio, image) from a video project.
+///
+/// Path: `/api/media/{project_id}/{filename}`
+/// The file must reside within the project's directory to prevent traversal.
+async fn serve_media(
+    State(state): State<AppState>,
+    Path((project_id, filename)): Path<(String, String)>,
+) -> Result<axum::response::Response, StatusCode> {
+    use axum::body::Body;
+    use axum::http::header;
+
+    // Only serve media when video channel is configured.
+    let video = state.video.as_ref().ok_or(StatusCode::NOT_FOUND)?;
+
+    // Reject path traversal attempts.
+    if project_id.contains("..") || filename.contains("..") || filename.contains('/') {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let projects_dir = &video.projects_dir();
+    let file_path = projects_dir.join(&project_id).join(&filename);
+
+    // Verify the file is inside the project directory (canonicalize to prevent symlink escape).
+    let canonical = file_path
+        .canonicalize()
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+    let canonical_base = projects_dir
+        .canonicalize()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if !canonical.starts_with(&canonical_base) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    if !canonical.is_file() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    // Determine MIME type from extension.
+    let content_type = match file_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+    {
+        "mp4" => "video/mp4",
+        "webm" => "video/webm",
+        "wav" => "audio/wav",
+        "mp3" => "audio/mpeg",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "html" => "text/html",
+        _ => "application/octet-stream",
+    };
+
+    let file_data = tokio::fs::read(&canonical)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let response = axum::http::Response::builder()
+        .header(header::CONTENT_TYPE, content_type)
+        .header(header::CONTENT_LENGTH, file_data.len())
+        .header(
+            header::CONTENT_DISPOSITION,
+            format!("inline; filename=\"{filename}\""),
+        )
+        .body(Body::from(file_data))
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(response)
 }
 
 async fn create_conversation(

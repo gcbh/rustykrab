@@ -1046,8 +1046,9 @@ fn enforce_sandbox_policy(tool_name: &str, policy: &SandboxPolicy) -> Result<()>
     let needs_fs_write = matches!(
         tool_name,
         "write" | "edit" | "apply_patch" | "tts" | "image_generate" | "skill_create" | "canvas"
+            | "video"
     );
-    let needs_spawn = matches!(tool_name, "exec" | "process" | "code_execution");
+    let needs_spawn = matches!(tool_name, "exec" | "process" | "code_execution" | "video");
     let needs_net = matches!(
         tool_name,
         "http_request"
@@ -1085,6 +1086,7 @@ fn enforce_sandbox_policy(tool_name: &str, policy: &SandboxPolicy) -> Result<()>
                 | "session_status"
                 | "session_manager"
                 | "agents_list"
+                | "video"
         );
 
     if !is_known {

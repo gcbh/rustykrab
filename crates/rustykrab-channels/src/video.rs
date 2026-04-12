@@ -155,6 +155,11 @@ impl VideoChannel {
         "video"
     }
 
+    /// Get the projects directory path (for media serving).
+    pub fn projects_dir(&self) -> &std::path::Path {
+        &self.config.projects_dir
+    }
+
     /// Run `hyperframes doctor` to verify the environment (Node >= 22, FFmpeg, Chrome).
     pub async fn check_environment(&self) -> Result<DoctorResult, String> {
         let output = self.run_npx(&["hyperframes", "doctor"], None).await?;

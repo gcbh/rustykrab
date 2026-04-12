@@ -8,6 +8,6 @@ mod webchat;
 pub use channel::Channel;
 pub use mcp::McpClient;
 pub use signal::{SignalChannel, SignalInboundMessage};
-pub use telegram::TelegramChannel;
+pub use telegram::{ChannelMessage, TelegramChannel};
 pub use video::{VideoChannel, VideoConfig};
 pub use webchat::{web_chat_pair, WebChatChannel, WebChatHandle};
