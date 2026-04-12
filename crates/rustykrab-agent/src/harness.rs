@@ -41,6 +41,9 @@ pub struct HarnessProfile {
     // --- Agent loop parameters ---
     /// Maximum iterations before the agent gives up.
     pub max_iterations: usize,
+    /// Iteration count at which a soft warning is injected, nudging the agent
+    /// to wrap up or save progress. Set to 0 to disable.
+    pub soft_iteration_warning: usize,
     /// Consecutive errors before injecting a reflection prompt.
     pub max_consecutive_errors: usize,
     /// Max retries per failed tool call.
@@ -53,6 +56,8 @@ pub struct HarnessProfile {
     pub summary_budget_ratio: f64,
     /// Fraction of context reserved for model response (0.0–1.0).
     pub response_reserve_ratio: f64,
+    /// Number of recent assistant messages to always preserve during truncation.
+    pub keep_last_assistants: usize,
 }
 
 /// Task-type hints that adjust prompt strategy.
@@ -88,12 +93,14 @@ impl Default for HarnessProfile {
             trace_informed_guidance: true,
             trace_injection_interval: 5,
             task_type: TaskType::General,
-            max_iterations: 80,
+            max_iterations: 200,
+            soft_iteration_warning: 150,
             max_consecutive_errors: 3,
             max_tool_retries: 2,
             max_context_tokens: 128_000,
             summary_budget_ratio: 0.20,
             response_reserve_ratio: 0.15,
+            keep_last_assistants: 3,
         }
     }
 }
@@ -111,12 +118,14 @@ impl HarnessProfile {
             trace_informed_guidance: true,
             trace_injection_interval: 3, // More frequent feedback during coding.
             task_type: TaskType::Coding,
-            max_iterations: 120,       // Coding tasks often need more steps.
+            max_iterations: 200, // Coding tasks often need many steps.
+            soft_iteration_warning: 150,
             max_consecutive_errors: 2, // Reflect sooner on code errors.
             max_tool_retries: 3,
             max_context_tokens: 128_000,
             summary_budget_ratio: 0.15, // Less summary, more live code context.
             response_reserve_ratio: 0.20, // Longer code responses.
+            keep_last_assistants: 3,
         }
     }
 
@@ -133,12 +142,14 @@ impl HarnessProfile {
             trace_informed_guidance: true,
             trace_injection_interval: 5,
             task_type: TaskType::Research,
-            max_iterations: 100,
+            max_iterations: 200,
+            soft_iteration_warning: 150,
             max_consecutive_errors: 3,
             max_tool_retries: 2,
             max_context_tokens: 128_000,
             summary_budget_ratio: 0.25, // More summary budget for accumulated research.
             response_reserve_ratio: 0.15,
+            keep_last_assistants: 3,
         }
     }
 
@@ -154,12 +165,14 @@ impl HarnessProfile {
             trace_informed_guidance: false,
             trace_injection_interval: 0,
             task_type: TaskType::Creative,
-            max_iterations: 50,
+            max_iterations: 100,
+            soft_iteration_warning: 75,
             max_consecutive_errors: 3,
             max_tool_retries: 1,
             max_context_tokens: 128_000,
             summary_budget_ratio: 0.25,
             response_reserve_ratio: 0.25, // Longer creative outputs.
+            keep_last_assistants: 3,
         }
     }
 
@@ -167,11 +180,13 @@ impl HarnessProfile {
     pub fn to_agent_config(&self) -> AgentConfig {
         AgentConfig {
             max_iterations: self.max_iterations,
+            soft_iteration_warning: self.soft_iteration_warning,
             max_consecutive_errors: self.max_consecutive_errors,
             max_tool_retries: self.max_tool_retries,
             max_context_tokens: self.max_context_tokens,
             summary_budget_ratio: self.summary_budget_ratio,
             response_reserve_ratio: self.response_reserve_ratio,
+            keep_last_assistants: self.keep_last_assistants,
         }
     }
 

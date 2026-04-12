@@ -159,7 +159,7 @@ impl Default for OrchestrationConfig {
             primary_model: None,
             max_concurrent_tasks: 10,
             model_call_timeout_secs: 120,
-            pipeline_timeout_secs: 300,
+            pipeline_timeout_secs: 1800,
         }
     }
 }

@@ -65,6 +65,9 @@ pub enum AgentEvent {
 pub struct AgentConfig {
     /// Maximum iterations before giving up.
     pub max_iterations: usize,
+    /// Iteration count at which a soft warning is injected, nudging the agent
+    /// to wrap up or save progress. Set to 0 to disable.
+    pub soft_iteration_warning: usize,
     /// Maximum consecutive errors before reflecting.
     pub max_consecutive_errors: usize,
     /// Maximum retries per failed tool call.
@@ -79,17 +82,21 @@ pub struct AgentConfig {
     /// Fraction of context reserved for the model's response.
     /// Default 0.15 (15%) — leaves room for a substantial reply.
     pub response_reserve_ratio: f64,
+    /// Number of recent assistant messages to always preserve during truncation.
+    pub keep_last_assistants: usize,
 }
 
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
-            max_iterations: 80,
+            max_iterations: 200,
+            soft_iteration_warning: 150,
             max_consecutive_errors: 3,
             max_tool_retries: 2,
             max_context_tokens: 128_000,
             summary_budget_ratio: 0.20,
             response_reserve_ratio: 0.15,
+            keep_last_assistants: 3,
         }
     }
 }
@@ -181,6 +188,8 @@ impl AgentRunner {
             .collect();
 
         let mut consecutive_errors = 0;
+        let mut context_flush_injected = false;
+        let mut soft_warning_injected = false;
 
         for iteration in 0..self.config.max_iterations {
             tracer.record_iteration();
@@ -196,11 +205,47 @@ impl AgentRunner {
                 "agent loop iteration"
             );
 
+            // Soft iteration warning: nudge the agent to save progress.
+            if self.config.soft_iteration_warning > 0
+                && iteration == self.config.soft_iteration_warning
+                && !soft_warning_injected
+            {
+                soft_warning_injected = true;
+                tracing::info!(iteration, "injecting soft iteration warning");
+                conv.messages.push(Message {
+                    id: Uuid::new_v4(),
+                    role: Role::System,
+                    content: MessageContent::Text(format!(
+                        "[Harness warning] You have used {iteration} of {} iterations. \
+                         Save any critical progress using memory_save now. \
+                         Focus on completing the most important remaining work.",
+                        self.config.max_iterations
+                    )),
+                    created_at: Utc::now(),
+                });
+            }
+
+            // Pre-truncation memory flush: warn the agent before dropping context.
+            if self.should_warn_context(conv) && !context_flush_injected {
+                context_flush_injected = true;
+                tracing::info!("injecting pre-truncation memory flush prompt");
+                conv.messages.push(Message {
+                    id: Uuid::new_v4(),
+                    role: Role::System,
+                    content: MessageContent::Text(
+                        "[Harness warning] Context approaching limit. Save any critical \
+                         information using memory_save now — older messages will be \
+                         removed after your next response."
+                            .to_string(),
+                    ),
+                    created_at: Utc::now(),
+                });
+            }
+
             // Sliding window: drop oldest messages when context exceeds budget.
-            // No LLM call — the agent is responsible for saving important
-            // facts via the memory_save tool before they scroll out.
             if self.should_truncate(conv) {
                 self.truncate_oldest(conv);
+                context_flush_injected = false; // Reset so we warn again next time.
                 tracer.record_compression();
             }
 
@@ -323,7 +368,7 @@ impl AgentRunner {
                             consecutive_errors,
                             "injecting reflection prompt after repeated errors"
                         );
-                        self.inject_reflection(conv);
+                        self.inject_reflection(conv, &tracer);
                         consecutive_errors = 0;
                     }
                 } else {
@@ -349,10 +394,30 @@ impl AgentRunner {
             return Ok(());
         }
 
-        Err(Error::Internal(format!(
-            "agent exceeded max iterations ({})",
-            self.config.max_iterations
-        )))
+        // Escalate to user instead of hard-failing: inject a summary prompt
+        // and let the model produce one final text response so the user gets
+        // a meaningful status update instead of an opaque error.
+        tracing::warn!(
+            max_iterations = self.config.max_iterations,
+            "iteration cap reached — escalating to user"
+        );
+        conv.messages.push(Message {
+            id: Uuid::new_v4(),
+            role: Role::User,
+            content: MessageContent::Text(format!(
+                "You have reached the iteration limit ({} iterations). \
+                 Please summarize what you have accomplished so far, what remains \
+                 incomplete, and what you would do next if given more iterations. \
+                 The user can then decide how to proceed.",
+                self.config.max_iterations
+            )),
+            created_at: Utc::now(),
+        });
+        // Final LLM call with no tool schemas — forces a text-only response.
+        let final_response = self.provider.chat(&conv.messages, &[]).await?;
+        conv.messages.push(final_response.message);
+        conv.updated_at = Utc::now();
+        Ok(())
     }
 
     /// Run the agent loop with streaming: text deltas are forwarded through
@@ -385,6 +450,8 @@ impl AgentRunner {
             .collect();
 
         let mut consecutive_errors = 0;
+        let mut context_flush_injected = false;
+        let mut soft_warning_injected = false;
 
         for iteration in 0..self.config.max_iterations {
             tracer.record_iteration();
@@ -394,8 +461,47 @@ impl AgentRunner {
                 return Err(Error::Auth("session expired during execution".into()));
             }
 
+            // Soft iteration warning: nudge the agent to save progress.
+            if self.config.soft_iteration_warning > 0
+                && iteration == self.config.soft_iteration_warning
+                && !soft_warning_injected
+            {
+                soft_warning_injected = true;
+                tracing::info!(iteration, "injecting soft iteration warning");
+                conv.messages.push(Message {
+                    id: Uuid::new_v4(),
+                    role: Role::System,
+                    content: MessageContent::Text(format!(
+                        "[Harness warning] You have used {iteration} of {} iterations. \
+                         Save any critical progress using memory_save now. \
+                         Focus on completing the most important remaining work.",
+                        self.config.max_iterations
+                    )),
+                    created_at: Utc::now(),
+                });
+            }
+
+            // Pre-truncation memory flush: warn the agent before dropping context.
+            if self.should_warn_context(conv) && !context_flush_injected {
+                context_flush_injected = true;
+                tracing::info!("injecting pre-truncation memory flush prompt");
+                conv.messages.push(Message {
+                    id: Uuid::new_v4(),
+                    role: Role::System,
+                    content: MessageContent::Text(
+                        "[Harness warning] Context approaching limit. Save any critical \
+                         information using memory_save now — older messages will be \
+                         removed after your next response."
+                            .to_string(),
+                    ),
+                    created_at: Utc::now(),
+                });
+            }
+
+            // Sliding window: drop oldest messages when context exceeds budget.
             if self.should_truncate(conv) {
                 self.truncate_oldest(conv);
+                context_flush_injected = false; // Reset so we warn again next time.
                 tracer.record_compression();
             }
 
@@ -536,7 +642,7 @@ impl AgentRunner {
                             "injecting reflection prompt after repeated errors"
                         );
                         on_event(AgentEvent::Reflecting);
-                        self.inject_reflection(conv);
+                        self.inject_reflection(conv, &tracer);
                         consecutive_errors = 0;
                     }
                 } else {
@@ -562,10 +668,36 @@ impl AgentRunner {
             return Ok(());
         }
 
-        Err(Error::Internal(format!(
-            "agent exceeded max iterations ({})",
-            self.config.max_iterations
-        )))
+        // Escalate to user instead of hard-failing.
+        tracing::warn!(
+            max_iterations = self.config.max_iterations,
+            "iteration cap reached — escalating to user"
+        );
+        conv.messages.push(Message {
+            id: Uuid::new_v4(),
+            role: Role::User,
+            content: MessageContent::Text(format!(
+                "You have reached the iteration limit ({} iterations). \
+                 Please summarize what you have accomplished so far, what remains \
+                 incomplete, and what you would do next if given more iterations. \
+                 The user can then decide how to proceed.",
+                self.config.max_iterations
+            )),
+            created_at: Utc::now(),
+        });
+        let stream_callback = |event: StreamEvent| {
+            if let StreamEvent::TextDelta(delta) = event {
+                on_event(AgentEvent::TextDelta(delta));
+            }
+        };
+        let final_response = self
+            .provider
+            .chat_stream(&conv.messages, &[], &stream_callback)
+            .await?;
+        conv.messages.push(final_response.message);
+        conv.updated_at = Utc::now();
+        on_event(AgentEvent::Done);
+        Ok(())
     }
 
     /// Execute multiple tool calls in parallel, recording execution traces.
@@ -681,16 +813,55 @@ impl AgentRunner {
         });
     }
 
-    /// Inject a brief nudge when the agent hits repeated errors.
-    fn inject_reflection(&self, conv: &mut Conversation) {
+    /// Inject a detailed reflection prompt when the agent hits repeated errors.
+    ///
+    /// Extracts recent error details from the conversation and tracer so the
+    /// model gets specific, actionable feedback instead of a generic nudge.
+    fn inject_reflection(&self, conv: &mut Conversation, tracer: &ExecutionTracer) {
+        // Collect recent tool errors from the conversation tail.
+        let mut recent_errors: Vec<String> = Vec::new();
+        for msg in conv.messages.iter().rev().take(10) {
+            if let MessageContent::ToolResult(tr) = &msg.content {
+                if tr.is_error {
+                    if let Some(err) = tr.output.get("error").and_then(|e| e.as_str()) {
+                        recent_errors.push(err.to_string());
+                    }
+                }
+            }
+            if recent_errors.len() >= 3 {
+                break;
+            }
+        }
+
+        let mut text =
+            String::from("[Harness observation] Multiple consecutive tool calls have failed.\n");
+
+        if !recent_errors.is_empty() {
+            text.push_str("Recent errors:\n");
+            for (i, err) in recent_errors.iter().enumerate() {
+                text.push_str(&format!("  {}. {}\n", i + 1, err));
+            }
+        }
+
+        // Include tracer summary if available.
+        if let Some(trace_summary) = tracer.summary_for_prompt() {
+            text.push_str(&format!("\n{trace_summary}\n"));
+        }
+
+        text.push_str(
+            "\nDo NOT retry the same approach. Consider:\n\
+             - Using a different tool entirely\n\
+             - Trying different arguments or file paths\n\
+             - Breaking the problem into smaller steps\n\
+             - Checking your assumptions (paths, names, formats)\n\
+             Continue working on the task using tools — do not respond with \
+             only text while the task is incomplete.",
+        );
+
         conv.messages.push(Message {
             id: Uuid::new_v4(),
             role: Role::User,
-            content: MessageContent::Text(
-                "The previous tool calls failed. Try a different approach or \
-                 different arguments and continue working on the task."
-                    .to_string(),
-            ),
+            content: MessageContent::Text(text),
             created_at: Utc::now(),
         });
     }
@@ -750,18 +921,45 @@ impl AgentRunner {
         estimated > (budget as f64 * 0.85) as usize
     }
 
+    /// Early warning: context is approaching the truncation threshold.
+    /// Fires at 75% of budget so the agent has a chance to save state
+    /// before the 85% hard truncation kicks in.
+    fn should_warn_context(&self, conv: &Conversation) -> bool {
+        let estimated = Self::estimate_conversation_tokens(conv);
+        let budget = self.live_message_budget();
+        estimated > (budget as f64 * 0.75) as usize
+    }
+
     /// Sliding window truncation: drop oldest messages to stay within
-    /// the context budget. No LLM call — the agent is responsible for
-    /// saving important facts via the memory_save tool before they
-    /// scroll out of context.
+    /// the context budget.
     ///
-    /// Keeps the system message at index 0 (if present) and retains
+    /// Keeps the system message at index 0 (if present), guarantees the
+    /// last `keep_last_assistants` assistant messages survive, and retains
     /// ~60% of the live budget worth of recent messages.
     fn truncate_oldest(&self, conv: &mut Conversation) {
         let budget = self.live_message_budget();
         let target = (budget as f64 * 0.60) as usize;
         let mut keep_tokens = 0;
         let mut keep_from = conv.messages.len();
+
+        // Find the index of the Nth-from-last assistant message so we
+        // guarantee at least `keep_last_assistants` survive truncation.
+        let min_keep_idx = if self.config.keep_last_assistants > 0 {
+            let mut assistant_count = 0;
+            let mut idx = conv.messages.len();
+            for (i, msg) in conv.messages.iter().enumerate().rev() {
+                if msg.role == Role::Assistant {
+                    assistant_count += 1;
+                    if assistant_count >= self.config.keep_last_assistants {
+                        idx = i;
+                        break;
+                    }
+                }
+            }
+            idx
+        } else {
+            conv.messages.len()
+        };
 
         for (i, msg) in conv.messages.iter().enumerate().rev() {
             let msg_tokens = match &msg.content {
@@ -786,6 +984,11 @@ impl AgentRunner {
             }
             keep_tokens += msg_tokens;
             keep_from = i;
+        }
+
+        // Ensure we keep at least `keep_last_assistants` assistant messages.
+        if keep_from > min_keep_idx {
+            keep_from = min_keep_idx;
         }
 
         // Don't truncate if there's almost nothing to drop.
@@ -886,13 +1089,12 @@ async fn execute_with_retries(
                 if matches!(e, Error::Auth(_)) {
                     return Err(e);
                 }
-                // Don't retry deterministic tool errors.
+                // Don't retry deterministic tool errors — but allow
+                // NotFound one retry since the agent may correct a typo.
                 if let Error::ToolExecution(ref te) = e {
                     if matches!(
                         te.kind,
-                        ToolErrorKind::InvalidInput
-                            | ToolErrorKind::NotFound
-                            | ToolErrorKind::PermissionDenied
+                        ToolErrorKind::InvalidInput | ToolErrorKind::PermissionDenied
                     ) {
                         return Err(e);
                     }

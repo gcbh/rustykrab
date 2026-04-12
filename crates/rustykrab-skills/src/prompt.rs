@@ -35,9 +35,17 @@ impl SystemPromptBuilder {
              - Always use tools when you need information or need to perform an action. \
                Never guess, make up data, or tell the user to do something you could do yourself.\n\
              - If a tool call fails, read the error carefully and try a DIFFERENT approach. \
-               Do not give up after one failure — adapt and retry with a new strategy.\n\
+               Do not give up after one failure — adapt and retry with a new strategy. \
+               After multiple failures, step back and try a fundamentally different strategy: \
+               different tools, different data sources, different file paths, or break the \
+               problem into smaller pieces.\n\
              - For complex tasks, break them into steps and execute each step with tool calls. \
                Keep going until the task is fully complete.\n\
+             - PERSISTENCE: Always attempt a tool call before responding with text when a task \
+               is incomplete. If you are unsure what to do next, use a tool to gather more \
+               information. Never respond with only an explanation while work remains — use \
+               your tools to make progress. Explaining what you tried is not a substitute for \
+               trying harder.\n\
              - If you need a Python library that is not installed, install it with \
                code_execution and subprocess.check_call(['pip', 'install', 'package']).\n\
              - MEMORY: Use memory_save to store important facts, decisions, user preferences, \
