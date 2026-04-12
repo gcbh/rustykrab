@@ -56,7 +56,21 @@ fn dp_get(service: &str, account: &str) -> Result<Option<Vec<u8>>, Error> {
 
     // Legacy keychain fallback.
     match get_generic_password(service, account) {
-        Ok(bytes) => Ok(Some(bytes)),
+        Ok(bytes) => {
+            // Auto-migrate: write to Data Protection Keychain so future reads
+            // skip the legacy keychain (and its per-app ACL prompts).
+            if let Err(e) = dp_set(service, account, &bytes) {
+                tracing::debug!(
+                    "auto-migrate to Data Protection Keychain failed for \
+                     {service}/{account}: {e}"
+                );
+            } else {
+                tracing::info!(
+                    "migrated {service}/{account} from legacy to Data Protection Keychain"
+                );
+            }
+            Ok(Some(bytes))
+        }
         Err(e) => {
             let msg = e.to_string();
             if msg.contains("could not be found") || msg.contains("errSecItemNotFound") {

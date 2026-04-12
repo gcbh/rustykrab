@@ -120,12 +120,86 @@ jobs:
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }} -p rustykrab-cli
 
+      - name: Import signing certificate
+        if: runner.os == 'macOS'
+        env:
+          P12_BASE64: ${{ secrets.DEVELOPER_ID_P12 }}
+          P12_PASSWORD: ${{ secrets.DEVELOPER_ID_P12_PASSWORD }}
+        run: |
+          KEYCHAIN=build.keychain-db
+          KEYCHAIN_PASSWORD=$(openssl rand -base64 24)
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 900 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          echo "$P12_BASE64" | base64 --decode > /tmp/cert.p12
+          security import /tmp/cert.p12 -k "$KEYCHAIN" -P "$P12_PASSWORD" -T /usr/bin/codesign
+          rm /tmp/cert.p12
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
+
+      - name: Codesign and bundle
+        if: runner.os == 'macOS'
+        env:
+          PROVISIONING_PROFILE_BASE64: ${{ secrets.PROVISIONING_PROFILE }}
+        run: |
+          BINARY=target/${{ matrix.target }}/release/${{ matrix.artifact }}
+          VERSION=${{ needs.bump.outputs.version }}
+          APP=target/${{ matrix.target }}/release/RustyKrab.app
+
+          # Detect signing identity
+          IDENTITY=$(security find-identity -v -p codesigning | grep "Developer ID Application" | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          TEAM_ID=$(echo "$IDENTITY" | sed -n 's/.*(\([A-Z0-9]*\)).*/\1/p')
+
+          # Create .app bundle with embedded provisioning profile
+          mkdir -p "$APP/Contents/MacOS"
+          cp "$BINARY" "$APP/Contents/MacOS/${{ matrix.artifact }}"
+
+          echo "$PROVISIONING_PROFILE_BASE64" | base64 --decode > "$APP/Contents/embedded.provisionprofile"
+
+          cat > "$APP/Contents/Info.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>CFBundleIdentifier</key>
+              <string>com.gcbh.rustykrab</string>
+              <key>CFBundleExecutable</key>
+              <string>${{ matrix.artifact }}</string>
+              <key>CFBundleName</key>
+              <string>RustyKrab</string>
+              <key>CFBundleVersion</key>
+              <string>${VERSION}</string>
+              <key>LSMinimumSystemVersion</key>
+              <string>10.15</string>
+          </dict>
+          </plist>
+          PLIST
+
+          # Sign the bundle
+          codesign \
+              --sign "$IDENTITY" \
+              --options runtime \
+              --team-id "$TEAM_ID" \
+              --identifier "com.gcbh.rustykrab" \
+              --entitlements entitlements.plist \
+              -r="designated => anchor apple generic and certificate leaf[subject.OU] = \"${TEAM_ID}\"" \
+              --force \
+              "$APP"
+
+          codesign -vvv "$APP"
+
       - name: Package artifact
         run: |
           mkdir -p dist
-          cp target/${{ matrix.target }}/release/${{ matrix.artifact }} dist/
-          cd dist
-          tar czf rustykrab-${{ matrix.target }}.tar.gz ${{ matrix.artifact }}
+          if [ -d "target/${{ matrix.target }}/release/RustyKrab.app" ]; then
+            cp -R target/${{ matrix.target }}/release/RustyKrab.app dist/
+            cd dist
+            tar czf rustykrab-${{ matrix.target }}.tar.gz RustyKrab.app
+          else
+            cp target/${{ matrix.target }}/release/${{ matrix.artifact }} dist/
+            cd dist
+            tar czf rustykrab-${{ matrix.target }}.tar.gz ${{ matrix.artifact }}
+          fi
 
       - uses: actions/upload-artifact@v4
         with:

@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 #
-# Codesign rustykrab-cli with keychain entitlements.
+# Codesign rustykrab-cli for macOS.
 #
 # Uses the Developer ID certificate if available, otherwise falls
-# back to ad-hoc signing. The Data Protection Keychain requires a
-# real signing identity with the keychain-access-groups entitlement.
+# back to ad-hoc signing. For Developer ID, enables hardened runtime
+# and sets the team identifier (required for notarization).
 #
 # Usage:
 #   ./scripts/codesign.sh                  # sign debug build
@@ -56,13 +56,30 @@ fi
 
 echo "Signing: $BINARY"
 echo "Identity: $IDENTITY"
+
+# Build codesign flags. For Developer ID, enable hardened runtime and set
+# the team ID with an explicit designated requirement (codesign generates a
+# broken one for bare Mach-O files).
+EXTRA_FLAGS=()
+if [ "$IDENTITY" != "-" ]; then
+    EXTRA_FLAGS+=(--options runtime)
+    TEAM_ID=$(echo "$IDENTITY" | sed -n 's/.*(\([A-Z0-9]*\)).*/\1/p')
+    if [ -n "$TEAM_ID" ]; then
+        EXTRA_FLAGS+=(--team-id "$TEAM_ID")
+        EXTRA_FLAGS+=(-r="designated => anchor apple generic and certificate leaf[subject.OU] = \"${TEAM_ID}\"")
+        echo "Team ID: $TEAM_ID"
+    fi
+fi
+
 echo "Entitlements: $ENTITLEMENTS"
 
 codesign \
     --sign "$IDENTITY" \
     --entitlements "$ENTITLEMENTS" \
     --force \
+    "${EXTRA_FLAGS[@]}" \
     "$BINARY"
 
 echo "Done. Verifying..."
+codesign -vvv "$BINARY" 2>&1
 codesign --display --entitlements - "$BINARY" 2>&1 | head -20
