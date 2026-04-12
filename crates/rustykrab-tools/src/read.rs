@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use rustykrab_core::error::ToolError;
 use rustykrab_core::types::ToolSchema;
 use rustykrab_core::{Result, Tool};
 use serde_json::{json, Value};
@@ -73,7 +74,13 @@ impl Tool for ReadTool {
 
         // Check file size before reading
         let metadata = tokio::fs::metadata(&safe_path).await.map_err(|e| {
-            rustykrab_core::Error::ToolExecution(format!("failed to stat {path}: {e}").into())
+            if e.kind() == std::io::ErrorKind::NotFound {
+                rustykrab_core::Error::ToolExecution(ToolError::not_found(format!(
+                    "file not found: {path}"
+                )))
+            } else {
+                rustykrab_core::Error::ToolExecution(format!("failed to stat {path}: {e}").into())
+            }
         })?;
 
         if metadata.len() > MAX_FILE_SIZE {
@@ -88,7 +95,13 @@ impl Tool for ReadTool {
         }
 
         let content = tokio::fs::read_to_string(&safe_path).await.map_err(|e| {
-            rustykrab_core::Error::ToolExecution(format!("failed to read {path}: {e}").into())
+            if e.kind() == std::io::ErrorKind::NotFound {
+                rustykrab_core::Error::ToolExecution(ToolError::not_found(format!(
+                    "file not found: {path}"
+                )))
+            } else {
+                rustykrab_core::Error::ToolExecution(format!("failed to read {path}: {e}").into())
+            }
         })?;
 
         let lines: Vec<&str> = content.lines().collect();
