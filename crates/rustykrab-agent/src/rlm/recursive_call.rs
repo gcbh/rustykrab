@@ -15,7 +15,7 @@
 use std::sync::Arc;
 
 use chrono::Utc;
-use rustykrab_core::model::ModelProvider;
+use rustykrab_core::model::{ModelProvider, StopReason};
 use rustykrab_core::orchestration::OrchestrationConfig;
 use rustykrab_core::tool::Tool;
 use rustykrab_core::types::{Message, MessageContent, Role, ToolResult};
@@ -258,15 +258,52 @@ async fn execute_repl_call_impl(
             continue;
         }
 
-        // Text response — call is complete.
-        let answer = response.message.content.as_text().unwrap_or("").to_string();
-        tracing::info!(
+        // Explicit end-of-turn or text response — call is complete.
+        if response.stop_reason == StopReason::EndTurn {
+            let answer = response.message.content.as_text().unwrap_or("").to_string();
+            tracing::info!(
+                depth,
+                rounds_used = round + 1,
+                answer_len = answer.len(),
+                "RLM REPL: call completed"
+            );
+            return Ok(answer);
+        }
+
+        // MaxTokens — prompt to continue.
+        if response.stop_reason == StopReason::MaxTokens {
+            tracing::warn!(
+                depth,
+                round,
+                "RLM REPL: model hit max tokens, prompting to continue"
+            );
+            messages.push(response.message);
+            messages.push(Message {
+                id: Uuid::new_v4(),
+                role: Role::User,
+                content: MessageContent::Text("Continue.".to_string()),
+                created_at: Utc::now(),
+            });
+            continue;
+        }
+
+        // Stop reason indicates tool use but no tool calls found — re-prompt.
+        tracing::warn!(
             depth,
-            rounds_used = round + 1,
-            answer_len = answer.len(),
-            "RLM REPL: call completed"
+            round,
+            stop_reason = ?response.stop_reason,
+            "RLM REPL: stop reason indicates tool use but no tool calls found, re-prompting"
         );
-        return Ok(answer);
+        messages.push(Message {
+            id: Uuid::new_v4(),
+            role: Role::User,
+            content: MessageContent::Text(
+                "Your previous response indicated a tool call but none was found. Please retry."
+                    .to_string(),
+            ),
+            created_at: Utc::now(),
+        });
+        continue;
     }
 
     tracing::error!(depth, max_rounds, "RLM REPL: exceeded max tool rounds");

@@ -306,8 +306,26 @@ impl AgentRunner {
                 continue;
             }
 
-            // Text response — done.
-            return Ok(());
+            // Explicit end-of-turn — done.
+            if stop_reason == StopReason::EndTurn {
+                return Ok(());
+            }
+
+            // Stop reason indicates tool use but no tool calls found in content.
+            // Re-prompt rather than silently ending the turn.
+            tracing::warn!(
+                ?stop_reason,
+                "stop reason indicates tool use but no tool calls found in response, re-prompting"
+            );
+            conv.messages.push(Message {
+                id: Uuid::new_v4(),
+                role: Role::User,
+                content: MessageContent::Text(
+                    "Your previous response indicated a tool call but none was found. Please retry.".to_string(),
+                ),
+                created_at: Utc::now(),
+            });
+            continue;
         }
 
         // Escalate to user instead of hard-failing.
@@ -517,8 +535,27 @@ impl AgentRunner {
                 continue;
             }
 
-            on_event(AgentEvent::Done);
-            return Ok(());
+            // Explicit end-of-turn — done.
+            if stop_reason == StopReason::EndTurn {
+                on_event(AgentEvent::Done);
+                return Ok(());
+            }
+
+            // Stop reason indicates tool use but no tool calls found in content.
+            // Re-prompt rather than silently ending the turn.
+            tracing::warn!(
+                ?stop_reason,
+                "stop reason indicates tool use but no tool calls found in response, re-prompting"
+            );
+            conv.messages.push(Message {
+                id: Uuid::new_v4(),
+                role: Role::User,
+                content: MessageContent::Text(
+                    "Your previous response indicated a tool call but none was found. Please retry.".to_string(),
+                ),
+                created_at: Utc::now(),
+            });
+            continue;
         }
 
         // Escalate to user.
