@@ -1393,6 +1393,86 @@ fn handle_keychain_subcommand(data_dir: &std::path::Path, args: &[String]) -> an
             println!("\nMigration complete. Restart rustykrab-cli to verify.");
         }
 
+        "allow-cli" => {
+            if !cfg!(target_os = "macos") {
+                anyhow::bail!(
+                    "allow-cli is only needed on macOS (partition lists are a Keychain concept)"
+                );
+            }
+
+            // Accept keychain password from argument or KEYCHAIN_PASSWORD env var.
+            let password = args
+                .get(1)
+                .cloned()
+                .or_else(|| std::env::var("KEYCHAIN_PASSWORD").ok())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "usage: rustykrab-cli keychain allow-cli <keychain-password>\n\
+                         \n\
+                         Your login keychain password is required (one-time operation).\n\
+                         Alternatively set KEYCHAIN_PASSWORD env var:\n\
+                         \n\
+                           KEYCHAIN_PASSWORD=... rustykrab-cli keychain allow-cli"
+                    )
+                })?;
+
+            println!(
+                "Updating partition lists so CLI tools can access keychain items\n\
+                 without per-binary prompts...\n"
+            );
+
+            let mut ok = 0u32;
+            let mut fail = 0u32;
+
+            // Master key (separate service).
+            match rustykrab_store::keychain::fix_partition_list(
+                "com.rustykrab.master-key",
+                "rustykrab-encryption-key",
+                &password,
+            ) {
+                Ok(()) => {
+                    println!("  master key: OK");
+                    ok += 1;
+                }
+                Err(e) => {
+                    println!("  master key: FAILED ({e})");
+                    fail += 1;
+                }
+            }
+
+            // All registry credentials.
+            let svc = rustykrab_store::registry::keychain_service();
+            for spec in rustykrab_store::registry::REGISTRY {
+                match rustykrab_store::keychain::fix_partition_list(
+                    svc,
+                    spec.keychain_account,
+                    &password,
+                ) {
+                    Ok(()) => {
+                        println!("  {}: OK", spec.description);
+                        ok += 1;
+                    }
+                    Err(e) => {
+                        println!("  {}: FAILED ({e})", spec.description);
+                        fail += 1;
+                    }
+                }
+            }
+
+            println!("\nDone: {ok} updated, {fail} failed.");
+            if fail > 0 {
+                println!(
+                    "\nFailed items may not exist in the keychain yet.\n\
+                     Use 'keychain set' to create them first, then re-run allow-cli."
+                );
+            } else {
+                println!(
+                    "\nKeychain items are now accessible to CLI tools without prompts.\n\
+                     Rebuilding the binary will no longer trigger Keychain access dialogs."
+                );
+            }
+        }
+
         _ => {
             eprintln!("Unknown keychain subcommand: {sub}");
             eprintln!("Usage:");
@@ -1400,6 +1480,9 @@ fn handle_keychain_subcommand(data_dir: &std::path::Path, args: &[String]) -> an
             eprintln!("  rustykrab-cli keychain set <name> <value>  Store a credential");
             eprintln!(
                 "  rustykrab-cli keychain migrate             Migrate store to OS credential store"
+            );
+            eprintln!(
+                "  rustykrab-cli keychain allow-cli <password> Allow CLI access without prompts (macOS)"
             );
             eprintln!();
             eprint!("Credential names: ");

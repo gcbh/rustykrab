@@ -23,17 +23,47 @@ const ACCOUNT_NAME: &str = "rustykrab-encryption-key";
 // Internal helpers — Data Protection Keychain read/write
 // ---------------------------------------------------------------------------
 
+/// Read a generic password via the macOS `security` CLI tool.
+///
+/// This succeeds without prompting when the item's partition list includes
+/// `apple-tool:` — configured via `rustykrab-cli keychain allow-cli`.
+/// Returns `Ok(None)` when the item does not exist or the CLI is unavailable.
+#[cfg(target_os = "macos")]
+fn security_cli_get(service: &str, account: &str) -> Option<Vec<u8>> {
+    use std::process::Command;
+
+    let output = Command::new("security")
+        .args(["find-generic-password", "-s", service, "-a", account, "-w"])
+        .output()
+        .ok()?;
+
+    if output.status.success() {
+        let mut pw = output.stdout;
+        // `security -w` appends a trailing newline.
+        if pw.last() == Some(&b'\n') {
+            pw.pop();
+        }
+        Some(pw)
+    } else {
+        None
+    }
+}
+
 /// Read a generic password from the keychain.
 ///
-/// Tries the Data Protection Keychain first; falls back to the legacy
-/// keychain if the entitlement required for the Data Protection Keychain
-/// is absent (ad-hoc or unsigned binaries without a Developer Team ID).
+/// Resolution order:
+/// 1. Data Protection Keychain (no prompt, no per-app ACL)
+/// 2. `security find-generic-password` CLI (no prompt when partition list
+///    includes `apple-tool:` — see `rustykrab-cli keychain allow-cli`)
+/// 3. Legacy Security framework (may trigger a macOS Keychain access prompt
+///    when the binary's code signature has changed since the item was created)
 ///
 /// Returns `Ok(None)` when the item does not exist (errSecItemNotFound).
 #[cfg(target_os = "macos")]
 fn dp_get(service: &str, account: &str) -> Result<Option<Vec<u8>>, Error> {
     use security_framework::passwords::{generic_password, get_generic_password, PasswordOptions};
 
+    // 1. Try Data Protection Keychain (no prompt, no per-app ACL).
     let mut opts = PasswordOptions::new_generic_password(service, account);
     opts.use_protected_keychain();
 
@@ -42,9 +72,9 @@ fn dp_get(service: &str, account: &str) -> Result<Option<Vec<u8>>, Error> {
         Err(e) => {
             let msg = e.to_string();
             if msg.contains("could not be found") || msg.contains("errSecItemNotFound") {
-                // Not in the Data Protection Keychain; try legacy below.
+                // Not in the Data Protection Keychain; try other sources below.
             } else if msg.contains("entitlement") || msg.contains("-34018") {
-                // No Data Protection Keychain entitlement — fall through to legacy.
+                // No Data Protection Keychain entitlement — fall through.
                 tracing::debug!("Data Protection Keychain not available, using legacy keychain");
             } else {
                 return Err(Error::Storage(format!(
@@ -54,7 +84,15 @@ fn dp_get(service: &str, account: &str) -> Result<Option<Vec<u8>>, Error> {
         }
     }
 
-    // Legacy keychain fallback.
+    // 2. Try `security` CLI — succeeds without prompting when the partition
+    //    list includes `apple-tool:` (configured via `keychain allow-cli`).
+    if let Some(bytes) = security_cli_get(service, account) {
+        return Ok(Some(bytes));
+    }
+
+    // 3. Legacy Security framework — may trigger a macOS Keychain prompt
+    //    when the binary signature has changed since the item was created.
+    //    Run `rustykrab-cli keychain allow-cli` to avoid these prompts.
     match get_generic_password(service, account) {
         Ok(bytes) => Ok(Some(bytes)),
         Err(e) => {
@@ -139,6 +177,60 @@ fn dp_delete(service: &str, account: &str) -> Result<(), Error> {
             "keychain delete failed for {service}/{account}: {e}"
         ))
     })
+}
+
+// ---------------------------------------------------------------------------
+// Partition list management — allow CLI tools to access legacy keychain items
+// ---------------------------------------------------------------------------
+
+/// Update the partition list on a legacy keychain item so that Apple CLI tools
+/// (including `security find-generic-password`) can read it without triggering
+/// a per-binary Keychain access prompt.
+///
+/// This calls `security set-generic-password-partition-list` under the hood.
+/// The user's login keychain password is required (one-time operation).
+#[cfg(target_os = "macos")]
+pub fn fix_partition_list(
+    service: &str,
+    account: &str,
+    keychain_password: &str,
+) -> Result<(), Error> {
+    use std::process::Command;
+
+    let output = Command::new("security")
+        .args([
+            "set-generic-password-partition-list",
+            "-s",
+            service,
+            "-a",
+            account,
+            "-S",
+            "apple-tool:,apple:",
+            "-k",
+            keychain_password,
+        ])
+        .output()
+        .map_err(|e| Error::Storage(format!("failed to run security CLI: {e}")))?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(Error::Storage(format!(
+            "set-generic-password-partition-list failed for {service}/{account}: {}",
+            stderr.trim()
+        )))
+    }
+}
+
+/// Stub for non-macOS — partition lists are a macOS Keychain concept.
+#[cfg(not(target_os = "macos"))]
+pub fn fix_partition_list(
+    _service: &str,
+    _account: &str,
+    _keychain_password: &str,
+) -> Result<(), Error> {
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
