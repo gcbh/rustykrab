@@ -1,273 +1,324 @@
-//! Recursive call tree execution.
+//! REPL-style recursive call execution.
 //!
-//! The model can request sub-LLM calls by emitting a special format
-//! in its response. Each sub-call gets its own focused context window.
-//! Results are summarized before injection back into the parent context.
+//! Following the foundational RLM paper (Zhang, Kraska, Khattab —
+//! arXiv 2512.24601), the context is stored **outside** the prompt as
+//! an external variable.  The model explores it via tools:
+//!
+//! - `context_info`  — get metadata (length, tokens, preview)
+//! - `context_peek`  — view a slice by character position
+//! - `context_search` — regex search for patterns
+//! - `sub_query`     — launch a recursive sub-call on a context slice
+//!
+//! This replaces the previous approach where context was truncated into
+//! the prompt and the model emitted `[SUB_CALL: ...]` text markers.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use chrono::Utc;
 use rustykrab_core::model::ModelProvider;
-use rustykrab_core::orchestration::{OrchestrationConfig, RecursiveCall};
-use rustykrab_core::types::{Message, MessageContent, Role};
+use rustykrab_core::orchestration::OrchestrationConfig;
+use rustykrab_core::tool::Tool;
+use rustykrab_core::types::{Message, MessageContent, Role, ToolResult};
 use rustykrab_core::{Error, Result};
 use tokio::sync::Semaphore;
 use uuid::Uuid;
 
-use super::context_manager::ContextManager;
+use super::context_manager::estimate_tokens;
+use super::repl_tools;
 
-/// Executes recursive call trees where the model can delegate sub-queries.
+/// Executes recursive queries where the model explores context via tools.
 pub struct RecursiveExecutor {
     provider: Arc<dyn ModelProvider>,
     config: OrchestrationConfig,
 }
-
-/// Marker format the model uses to request a sub-call.
-/// The model emits: [SUB_CALL: <question>]
-const SUB_CALL_PREFIX: &str = "[SUB_CALL:";
-const SUB_CALL_SUFFIX: &str = "]";
 
 impl RecursiveExecutor {
     pub fn new(provider: Arc<dyn ModelProvider>, config: OrchestrationConfig) -> Self {
         Self { provider, config }
     }
 
-    /// Execute a recursive query, allowing the model to delegate sub-queries.
+    /// Execute a recursive query, allowing the model to explore context
+    /// via REPL tools and delegate sub-queries on specific slices.
+    ///
+    /// The entire execution tree is bounded by `pipeline_timeout_secs`
+    /// to prevent runaway recursion from consuming unbounded wall time.
     pub async fn execute(&self, prompt: &str, context: Option<&str>) -> Result<String> {
+        let pipeline_timeout = self.config.pipeline_timeout_secs;
         tracing::info!(
-            budget = self.config.sub_task_context_budget,
             max_depth = self.config.max_recursion_depth,
+            max_tool_rounds = self.config.max_tool_rounds,
+            pipeline_timeout_secs = pipeline_timeout,
             prompt_len = prompt.len(),
-            "RLM: starting recursive execution"
+            context_len = context.map(|c| c.len()).unwrap_or(0),
+            "RLM REPL: starting recursive execution"
         );
+
         let start = std::time::Instant::now();
-        let root = RecursiveCall::root(prompt, self.config.sub_task_context_budget);
-        let result = execute_call(
-            self.provider.clone(),
-            self.config.clone(),
-            root,
-            context.map(|s| s.to_string()),
+        let context_arc = Arc::new(context.unwrap_or_default().to_string());
+        let semaphore = Arc::new(Semaphore::new(self.config.max_concurrent_tasks));
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(pipeline_timeout),
+            execute_repl_call(
+                self.provider.clone(),
+                self.config.clone(),
+                prompt.to_string(),
+                context_arc,
+                0,
+                semaphore,
+            ),
         )
         .await;
+
         let elapsed = start.elapsed();
-        match &result {
-            Ok(text) => tracing::info!(
+        match result {
+            Ok(Ok(ref text)) => tracing::info!(
                 duration_ms = elapsed.as_millis() as u64,
                 response_len = text.len(),
-                "RLM: recursive execution completed"
+                "RLM REPL: recursive execution completed"
             ),
-            Err(e) => tracing::error!(
+            Ok(Err(ref e)) => tracing::error!(
                 duration_ms = elapsed.as_millis() as u64,
                 error = %e,
-                "RLM: recursive execution failed"
+                "RLM REPL: recursive execution failed"
+            ),
+            Err(_) => tracing::error!(
+                duration_ms = elapsed.as_millis() as u64,
+                pipeline_timeout_secs = pipeline_timeout,
+                "RLM REPL: pipeline timeout exceeded"
             ),
         }
-        result
+
+        match result {
+            Ok(inner) => inner,
+            Err(_) => Err(Error::Internal(format!(
+                "RLM pipeline timed out after {pipeline_timeout}s"
+            ))),
+        }
     }
 }
 
-/// Execute a single call in the recursive tree.
+/// Execute a single REPL call at the given depth.
 ///
-/// This is a free function (not a method) so it can be spawned into
-/// tokio tasks without lifetime issues. Returns a boxed future to
-/// enable recursive async calls with `Send` bound.
-fn execute_call(
+/// Public within the crate so that [`repl_tools::SubQueryTool`] can
+/// call it recursively.
+pub(crate) fn execute_repl_call(
     provider: Arc<dyn ModelProvider>,
     config: OrchestrationConfig,
-    call: RecursiveCall,
-    context: Option<String>,
+    prompt: String,
+    context: Arc<String>,
+    depth: usize,
+    semaphore: Arc<Semaphore>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send>> {
-    Box::pin(execute_call_impl(provider, config, call, context))
+    Box::pin(execute_repl_call_impl(
+        provider, config, prompt, context, depth, semaphore,
+    ))
 }
 
-async fn execute_call_impl(
+async fn execute_repl_call_impl(
     provider: Arc<dyn ModelProvider>,
     config: OrchestrationConfig,
-    call: RecursiveCall,
-    context: Option<String>,
+    prompt: String,
+    context: Arc<String>,
+    depth: usize,
+    semaphore: Arc<Semaphore>,
 ) -> Result<String> {
-    let context_mgr = ContextManager::new(config.clone());
-
     tracing::info!(
-        depth = call.depth,
-        budget = call.context_budget,
-        prompt_preview = &call.prompt[..call.prompt.len().min(100)],
-        "RLM: executing call"
+        depth,
+        context_chars = context.len(),
+        prompt_preview = &prompt[..prompt.len().min(100)],
+        "RLM REPL: executing call"
     );
 
-    if call.depth >= context_mgr.max_depth() {
+    // At max depth, answer directly with the context in the prompt.
+    // The context at this level is a small, model-selected slice.
+    if depth >= config.max_recursion_depth {
         tracing::warn!(
-            depth = call.depth,
-            "RLM: max recursion depth reached, answering directly"
+            depth,
+            "RLM REPL: max recursion depth reached, answering directly"
         );
-        return direct_call(&provider, &call.prompt, context.as_deref()).await;
+        return direct_call(&provider, &prompt, &context).await;
     }
 
-    let budget = context_mgr.child_budget(call.context_budget, call.depth);
-    if budget == 0 {
-        tracing::warn!(
-            depth = call.depth,
-            "RLM: budget exhausted, answering directly"
-        );
-        return direct_call(&provider, &call.prompt, context.as_deref()).await;
-    }
+    // Build REPL tools for this depth level.
+    let tools = repl_tools::repl_tools(
+        context.clone(),
+        provider.clone(),
+        config.clone(),
+        depth,
+        semaphore.clone(),
+    );
+    let schemas: Vec<_> = tools.iter().map(|t| t.schema()).collect();
 
-    // Build the prompt instructing the model it can delegate.
+    // System prompt — tells the model about the context variable and
+    // available tools. Context text is NOT in the prompt.
+    let estimated_tokens = estimate_tokens(&context);
     let system = format!(
-        "You are a reasoning engine. Answer the question below.\n\
-         If you need to break a sub-question out for separate analysis, \
-         wrap it in [SUB_CALL: your sub-question here].\n\
-         Sub-calls will be resolved and their results substituted back.\n\
-         You can use up to 3 sub-calls per response.\n\
-         Current depth: {}/{}\n\
-         Context budget: {} tokens",
-        call.depth,
-        context_mgr.max_depth(),
-        budget,
+        "You are a reasoning engine. Answer the question below.\n\n\
+         You have access to a context variable ({} bytes, ~{} tokens, {} lines).\n\
+         All positions in tools use byte offsets (snapped to UTF-8 boundaries).\n\
+         Use the provided tools to examine, search, and query the context.\n\
+         Do NOT try to answer from memory — always consult the context.\n\n\
+         Strategy:\n\
+         1. Start with context_info to understand the context structure.\n\
+         2. Use context_search to find relevant sections.\n\
+         3. Use context_peek to read specific sections in detail.\n\
+         4. Use sub_query to delegate focused questions on specific \
+            sections if the context is too large to process at once.\n\n\
+         Be efficient with tool calls. Batch information into larger \
+         peeks rather than many small ones.\n\
+         Current depth: {}/{}",
+        context.len(),
+        estimated_tokens,
+        context.lines().count(),
+        depth,
+        config.max_recursion_depth,
     );
 
-    let mut messages = vec![Message {
-        id: Uuid::new_v4(),
-        role: Role::System,
-        content: MessageContent::Text(system),
-        created_at: Utc::now(),
-    }];
-
-    if let Some(ref ctx) = context {
-        let ctx = ContextManager::truncate_to_budget(ctx, budget / 3);
-        messages.push(Message {
+    let mut messages = vec![
+        Message {
             id: Uuid::new_v4(),
             role: Role::System,
-            content: MessageContent::Text(format!("Context:\n{ctx}")),
+            content: MessageContent::Text(system),
             created_at: Utc::now(),
-        });
-    }
+        },
+        Message {
+            id: Uuid::new_v4(),
+            role: Role::User,
+            content: MessageContent::Text(prompt),
+            created_at: Utc::now(),
+        },
+    ];
 
-    messages.push(Message {
-        id: Uuid::new_v4(),
-        role: Role::User,
-        content: MessageContent::Text(call.prompt.clone()),
-        created_at: Utc::now(),
-    });
+    // Tool-use loop — mirrors the pattern in orchestrator/executor.rs.
+    let max_rounds = config.max_tool_rounds;
+    let timeout_secs = config.model_call_timeout_secs;
 
-    let response = provider.chat(&messages, &[]).await?;
-    let text = response
-        .message
-        .content
-        .as_text()
-        .ok_or_else(|| Error::Internal("recursive call returned non-text".into()))?;
-
-    // Check for sub-call requests.
-    let sub_calls = extract_sub_calls(text);
-    if sub_calls.is_empty() {
-        tracing::debug!(depth = call.depth, "RLM: no sub-calls requested");
-        return Ok(text.to_string());
-    }
-
-    let sub_call_previews: Vec<&str> = sub_calls
-        .iter()
-        .map(|(_, p)| &p[..p.len().min(80)])
-        .collect();
-    tracing::info!(
-        depth = call.depth,
-        sub_calls = sub_calls.len(),
-        prompts = ?sub_call_previews,
-        "RLM: model requested sub-calls"
-    );
-
-    // Execute sub-calls concurrently, bounded by a semaphore to prevent
-    // pathological workloads from spawning unbounded concurrent LLM calls
-    // (fixes ASYNC-M1).
-    let semaphore = Arc::new(Semaphore::new(config.max_concurrent_tasks));
-    let mut handles = Vec::new();
-    for (_, sub_prompt) in &sub_calls {
-        let child = RecursiveCall::child(
-            call.id,
-            sub_prompt.clone(),
-            context_mgr.child_budget(budget, call.depth + 1),
-            call.depth + 1,
-        );
-        let provider = provider.clone();
-        let config = config.clone();
-        let child_context = context.clone();
-        let sem = semaphore.clone();
-
-        handles.push(tokio::spawn(async move {
-            let _permit = sem.acquire().await.expect("semaphore closed");
-            execute_call(provider, config, child, child_context).await
-        }));
-    }
-
-    // Collect results keyed by original marker text for exact substitution.
-    let mut sub_results: HashMap<String, String> = HashMap::new();
-    for (i, handle) in handles.into_iter().enumerate() {
-        let result = match handle.await {
-            Ok(Ok(text)) => {
-                tracing::info!(
-                    depth = call.depth,
-                    sub_call_index = i,
-                    result_len = text.len(),
-                    "RLM: sub-call completed"
-                );
-                text
-            }
-            Ok(Err(e)) => {
-                tracing::error!(
-                    depth = call.depth,
-                    sub_call_index = i,
-                    error = %e,
-                    "RLM: sub-call failed"
-                );
-                format!("[Error resolving sub-call: {e}]")
-            }
-            Err(e) => {
-                tracing::error!(
-                    depth = call.depth,
-                    sub_call_index = i,
-                    error = %e,
-                    "RLM: sub-call panicked"
-                );
-                format!("[Sub-call panicked: {e}]")
+    for round in 0..max_rounds {
+        // Acquire a semaphore permit for the LLM call only — released
+        // before tool execution so recursive sub_query calls can
+        // acquire their own permits without deadlocking.
+        let response = {
+            let _permit = semaphore
+                .acquire()
+                .await
+                .map_err(|_| Error::Internal("RLM semaphore closed".into()))?;
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(timeout_secs),
+                provider.chat(&messages, &schemas),
+            )
+            .await
+            {
+                Ok(Ok(r)) => r,
+                Ok(Err(e)) => {
+                    tracing::error!(depth, round, error = %e, "RLM REPL: model call failed");
+                    return Err(e);
+                }
+                Err(_) => {
+                    tracing::error!(depth, round, "RLM REPL: model call timed out");
+                    return Err(Error::Internal(format!(
+                        "RLM model call timed out after {timeout_secs}s"
+                    )));
+                }
             }
         };
-        sub_results.insert(sub_calls[i].0.clone(), result);
+
+        // If the model wants to use tools, execute them and continue.
+        if response.message.content.has_tool_calls() {
+            messages.push(response.message.clone());
+
+            let calls = response.message.content.tool_calls();
+            tracing::debug!(
+                depth,
+                round,
+                tool_calls = calls.len(),
+                tools = ?calls.iter().map(|c| &c.name).collect::<Vec<_>>(),
+                "RLM REPL: executing tool calls"
+            );
+
+            // Execute tool calls concurrently within a round so
+            // parallel sub_queries don't block each other.
+            let futs: Vec<_> = calls
+                .into_iter()
+                .map(|call| {
+                    let call = call.clone();
+                    let tools = tools.clone();
+                    async move { execute_repl_tool(&call, &tools).await }
+                })
+                .collect();
+            let results = futures::future::join_all(futs).await;
+            for result in results {
+                messages.push(Message {
+                    id: Uuid::new_v4(),
+                    role: Role::Tool,
+                    content: MessageContent::ToolResult(result),
+                    created_at: Utc::now(),
+                });
+            }
+            continue;
+        }
+
+        // Text response — call is complete.
+        let answer = response.message.content.as_text().unwrap_or("").to_string();
+        tracing::info!(
+            depth,
+            rounds_used = round + 1,
+            answer_len = answer.len(),
+            "RLM REPL: call completed"
+        );
+        return Ok(answer);
     }
 
-    tracing::info!(
-        depth = call.depth,
-        resolved_count = sub_results.len(),
-        "RLM: all sub-calls resolved, substituting results"
-    );
-
-    // Substitute results back using the original marker text to avoid
-    // mismatches from whitespace trimming.
-    let mut resolved = text.to_string();
-    for (marker, result) in &sub_results {
-        let summary = ContextManager::truncate_to_budget(result, budget / 4);
-        resolved = resolved.replace(marker, &summary);
-    }
-
-    // Clean up any remaining unresolved markers.
-    if resolved.contains(SUB_CALL_PREFIX) {
-        resolved = remove_unresolved_markers(&resolved);
-    }
-
-    Ok(resolved)
+    tracing::error!(depth, max_rounds, "RLM REPL: exceeded max tool rounds");
+    Err(Error::Internal("RLM exceeded max tool-call rounds".into()))
 }
 
-/// Direct model call without sub-call support.
+/// Execute a single REPL tool call by name.
+async fn execute_repl_tool(
+    call: &rustykrab_core::types::ToolCall,
+    tools: &[Arc<dyn Tool>],
+) -> ToolResult {
+    let tool = match tools.iter().find(|t| t.name() == call.name.as_str()) {
+        Some(t) => t,
+        None => {
+            return ToolResult {
+                call_id: call.id.clone(),
+                output: serde_json::json!({
+                    "error": format!("unknown tool: {}", call.name)
+                }),
+                is_error: true,
+            };
+        }
+    };
+
+    match tool.execute(call.arguments.clone()).await {
+        Ok(output) => ToolResult {
+            call_id: call.id.clone(),
+            output,
+            is_error: false,
+        },
+        Err(e) => ToolResult {
+            call_id: call.id.clone(),
+            output: serde_json::json!({ "error": e.to_string() }),
+            is_error: true,
+        },
+    }
+}
+
+/// Direct model call at max depth — context goes into the prompt since
+/// the model has no tools to explore it. At this level the context is a
+/// small, model-selected slice (not the original full blob).
 async fn direct_call(
     provider: &Arc<dyn ModelProvider>,
     prompt: &str,
-    context: Option<&str>,
+    context: &str,
 ) -> Result<String> {
     let mut messages = Vec::new();
-    if let Some(ctx) = context {
+    if !context.is_empty() {
         messages.push(Message {
             id: Uuid::new_v4(),
             role: Role::System,
-            content: MessageContent::Text(ctx.to_string()),
+            content: MessageContent::Text(format!("Context:\n{context}")),
             created_at: Utc::now(),
         });
     }
@@ -282,99 +333,164 @@ async fn direct_call(
     Ok(response.message.content.as_text().unwrap_or("").to_string())
 }
 
-/// Extract sub-call prompts from model output.
-///
-/// Returns `(original_marker, trimmed_prompt)` pairs so that the caller
-/// can substitute results using the exact original marker text, avoiding
-/// mismatches caused by whitespace trimming.
-fn extract_sub_calls(text: &str) -> Vec<(String, String)> {
-    let mut calls = Vec::new();
-    let mut remaining = text;
-
-    while let Some(start) = remaining.find(SUB_CALL_PREFIX) {
-        let after_prefix = &remaining[start + SUB_CALL_PREFIX.len()..];
-        if let Some(end) = after_prefix.find(SUB_CALL_SUFFIX) {
-            let prompt = after_prefix[..end].trim().to_string();
-            if !prompt.is_empty() {
-                let marker_len = SUB_CALL_PREFIX.len() + end + SUB_CALL_SUFFIX.len();
-                let original_marker = remaining[start..start + marker_len].to_string();
-                calls.push((original_marker, prompt));
-            }
-            remaining = &after_prefix[end + SUB_CALL_SUFFIX.len()..];
-        } else {
-            break;
-        }
-    }
-
-    // Limit to 3 sub-calls per response.
-    calls.truncate(3);
-    calls
-}
-
-/// Remove unresolved [SUB_CALL: ...] markers from text.
-fn remove_unresolved_markers(text: &str) -> String {
-    let mut result = String::with_capacity(text.len());
-    let mut remaining = text;
-
-    while let Some(start) = remaining.find(SUB_CALL_PREFIX) {
-        result.push_str(&remaining[..start]);
-        let after_prefix = &remaining[start + SUB_CALL_PREFIX.len()..];
-        if let Some(end) = after_prefix.find(SUB_CALL_SUFFIX) {
-            remaining = &after_prefix[end + SUB_CALL_SUFFIX.len()..];
-        } else {
-            remaining = after_prefix;
-        }
-    }
-    result.push_str(remaining);
-    result
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_extract_sub_calls() {
-        let text = "I need to check two things: \
-                    [SUB_CALL: What is the weather in Tokyo?] \
-                    and also [SUB_CALL: What time is it in London?]";
-        let calls = extract_sub_calls(text);
-        assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0].1, "What is the weather in Tokyo?");
-        assert_eq!(calls[1].1, "What time is it in London?");
-        // Verify original markers are captured for exact replacement
-        assert_eq!(calls[0].0, "[SUB_CALL: What is the weather in Tokyo?]");
-        assert_eq!(calls[1].0, "[SUB_CALL: What time is it in London?]");
+    use async_trait::async_trait;
+    use rustykrab_core::model::{ModelResponse, StopReason, StreamEvent, Usage};
+    use rustykrab_core::types::ToolSchema;
+    use serde_json::Value;
+    use std::sync::Mutex;
+
+    /// A mock provider that returns canned responses.
+    struct MockProvider {
+        responses: Mutex<Vec<ModelResponse>>,
     }
 
-    #[test]
-    fn test_extract_sub_calls_preserves_original_marker() {
-        // Extra whitespace in the original should be preserved in the marker
-        let text = "[SUB_CALL:  extra spaces here  ]";
-        let calls = extract_sub_calls(text);
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, "[SUB_CALL:  extra spaces here  ]");
-        assert_eq!(calls[0].1, "extra spaces here");
+    impl MockProvider {
+        fn new(responses: Vec<ModelResponse>) -> Self {
+            Self {
+                responses: Mutex::new(responses),
+            }
+        }
+
+        fn text_response(text: &str) -> ModelResponse {
+            ModelResponse {
+                message: Message {
+                    id: Uuid::new_v4(),
+                    role: Role::Assistant,
+                    content: MessageContent::Text(text.to_string()),
+                    created_at: Utc::now(),
+                },
+                usage: Usage {
+                    prompt_tokens: 10,
+                    completion_tokens: 10,
+                    ..Default::default()
+                },
+                stop_reason: StopReason::EndTurn,
+                text: Some(text.to_string()),
+            }
+        }
+
+        fn tool_call_response(tool_name: &str, args: Value) -> ModelResponse {
+            use rustykrab_core::types::ToolCall;
+            ModelResponse {
+                message: Message {
+                    id: Uuid::new_v4(),
+                    role: Role::Assistant,
+                    content: MessageContent::ToolCall(ToolCall {
+                        id: "call_1".to_string(),
+                        name: tool_name.to_string(),
+                        arguments: args,
+                    }),
+                    created_at: Utc::now(),
+                },
+                usage: Usage {
+                    prompt_tokens: 10,
+                    completion_tokens: 10,
+                    ..Default::default()
+                },
+                stop_reason: StopReason::ToolUse,
+                text: None,
+            }
+        }
     }
 
-    #[test]
-    fn test_extract_sub_calls_empty() {
-        let text = "No sub-calls here, just a regular response.";
-        let calls = extract_sub_calls(text);
-        assert!(calls.is_empty());
+    #[async_trait]
+    impl ModelProvider for MockProvider {
+        fn name(&self) -> &str {
+            "mock"
+        }
+
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSchema],
+        ) -> Result<ModelResponse> {
+            let mut responses = self.responses.lock().unwrap();
+            if responses.is_empty() {
+                Ok(Self::text_response("(no more responses)"))
+            } else {
+                Ok(responses.remove(0))
+            }
+        }
+
+        async fn chat_stream(
+            &self,
+            messages: &[Message],
+            tools: &[ToolSchema],
+            _on_event: &(dyn Fn(StreamEvent) + Send + Sync),
+        ) -> Result<ModelResponse> {
+            self.chat(messages, tools).await
+        }
     }
 
-    #[test]
-    fn test_extract_sub_calls_max_three() {
-        let text = "[SUB_CALL: a] [SUB_CALL: b] [SUB_CALL: c] [SUB_CALL: d]";
-        let calls = extract_sub_calls(text);
-        assert_eq!(calls.len(), 3);
+    #[tokio::test]
+    async fn test_direct_answer_no_tools() {
+        // Model immediately returns a text answer.
+        let provider = Arc::new(MockProvider::new(vec![MockProvider::text_response(
+            "The answer is 42",
+        )]));
+        let config = OrchestrationConfig::default();
+        let executor = RecursiveExecutor::new(provider, config);
+
+        let result = executor
+            .execute("What is the answer?", Some("some context"))
+            .await
+            .unwrap();
+        assert_eq!(result, "The answer is 42");
     }
 
-    #[test]
-    fn test_remove_unresolved_markers() {
-        let text = "Here [SUB_CALL: something] and there";
-        let cleaned = remove_unresolved_markers(text);
-        assert_eq!(cleaned, "Here  and there");
+    #[tokio::test]
+    async fn test_tool_use_then_answer() {
+        // Model first calls context_info, then answers.
+        let provider = Arc::new(MockProvider::new(vec![
+            MockProvider::tool_call_response("context_info", serde_json::json!({})),
+            MockProvider::text_response("The context has 11 characters"),
+        ]));
+        let config = OrchestrationConfig::default();
+        let executor = RecursiveExecutor::new(provider, config);
+
+        let result = executor
+            .execute("How long is the context?", Some("hello world"))
+            .await
+            .unwrap();
+        assert_eq!(result, "The context has 11 characters");
+    }
+
+    #[tokio::test]
+    async fn test_peek_then_answer() {
+        let provider = Arc::new(MockProvider::new(vec![
+            MockProvider::tool_call_response(
+                "context_peek",
+                serde_json::json!({"start": 0, "end": 5}),
+            ),
+            MockProvider::text_response("The first word is Hello"),
+        ]));
+        let config = OrchestrationConfig::default();
+        let executor = RecursiveExecutor::new(provider, config);
+
+        let result = executor
+            .execute("What is the first word?", Some("Hello, world!"))
+            .await
+            .unwrap();
+        assert_eq!(result, "The first word is Hello");
+    }
+
+    #[tokio::test]
+    async fn test_max_depth_direct_call() {
+        // At max depth, context goes directly into the prompt.
+        let provider = Arc::new(MockProvider::new(vec![MockProvider::text_response(
+            "Direct answer",
+        )]));
+        let config = OrchestrationConfig {
+            max_recursion_depth: 0,
+            ..Default::default()
+        };
+        let executor = RecursiveExecutor::new(provider, config);
+
+        let result = executor.execute("question", Some("ctx")).await.unwrap();
+        assert_eq!(result, "Direct answer");
     }
 }
