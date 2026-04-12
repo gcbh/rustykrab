@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use rustykrab_core::types::ToolSchema;
-use rustykrab_core::{Result, Tool};
+use rustykrab_core::{Result, SandboxRequirements, Tool};
 use serde_json::{json, Value};
 
 /// A built-in tool that discovers and interacts with paired RustyKrab nodes.
@@ -33,6 +33,13 @@ impl Tool for NodesTool {
 
     fn description(&self) -> &str {
         "Discover and interact with paired RustyKrab nodes on the network."
+    }
+
+    fn sandbox_requirements(&self) -> SandboxRequirements {
+        SandboxRequirements {
+            needs_net: true,
+            ..SandboxRequirements::default()
+        }
     }
 
     fn schema(&self) -> ToolSchema {

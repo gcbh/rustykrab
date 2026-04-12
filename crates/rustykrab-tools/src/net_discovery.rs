@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use rustykrab_core::types::ToolSchema;
-use rustykrab_core::{Result, Tool, ToolError};
+use rustykrab_core::{Result, SandboxRequirements, Tool, ToolError};
 use serde_json::{json, Value};
 use std::net::IpAddr;
 use std::time::Duration;
@@ -462,6 +462,14 @@ impl Tool for NetDiscoveryTool {
     fn description(&self) -> &str {
         "Discover hosts, services, and network topology. DNS lookups, mDNS/DNS-SD service \
          discovery, ARP table, traceroute, and interface listing."
+    }
+
+    fn sandbox_requirements(&self) -> SandboxRequirements {
+        SandboxRequirements {
+            needs_fs_read: true,
+            needs_spawn: true,
+            ..SandboxRequirements::default()
+        }
     }
 
     fn schema(&self) -> ToolSchema {
