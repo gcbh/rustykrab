@@ -2,9 +2,13 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+	<!-- Resolved at signing time by codesign.sh (replaces TEAMID with actual value).
+	     For ad-hoc signing these entitlements are ignored. -->
+	<key>com.apple.application-identifier</key>
+	<string>TEAMID.com.rustykrab.cli</string>
 	<key>keychain-access-groups</key>
 	<array>
-		<string>$(AppIdentifierPrefix)com.rustykrab</string>
+		<string>TEAMID.com.rustykrab</string>
 	</array>
 </dict>
 </plist>

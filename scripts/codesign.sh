@@ -54,13 +54,31 @@ else
     fi
 fi
 
-echo "Signing: $BINARY"
-echo "Identity: $IDENTITY"
-echo "Entitlements: $ENTITLEMENTS"
+# Extract team ID from the signing identity (e.g. "Developer ID Application: Name (ABCDEF1234)")
+# and resolve the TEAMID placeholder in entitlements.plist so the Data Protection Keychain works.
+TEAM_ID=""
+if [ "$IDENTITY" != "-" ]; then
+    TEAM_ID=$(echo "$IDENTITY" | sed -n 's/.*(\([A-Z0-9]*\))$/\1/p')
+fi
+
+if [ -n "$TEAM_ID" ]; then
+    RESOLVED_ENTITLEMENTS=$(mktemp "${TMPDIR:-/tmp}/rustykrab-entitlements.XXXXXX.plist")
+    sed "s/TEAMID/${TEAM_ID}/g" "$ENTITLEMENTS" > "$RESOLVED_ENTITLEMENTS"
+    trap 'rm -f "$RESOLVED_ENTITLEMENTS"' EXIT
+    echo "Signing: $BINARY"
+    echo "Identity: $IDENTITY"
+    echo "Team ID: $TEAM_ID"
+    echo "Entitlements: $ENTITLEMENTS (resolved → $RESOLVED_ENTITLEMENTS)"
+else
+    RESOLVED_ENTITLEMENTS="$ENTITLEMENTS"
+    echo "Signing: $BINARY"
+    echo "Identity: $IDENTITY"
+    echo "Entitlements: $ENTITLEMENTS (no team ID — Data Protection Keychain unavailable)"
+fi
 
 codesign \
     --sign "$IDENTITY" \
-    --entitlements "$ENTITLEMENTS" \
+    --entitlements "$RESOLVED_ENTITLEMENTS" \
     --force \
     "$BINARY"
 
