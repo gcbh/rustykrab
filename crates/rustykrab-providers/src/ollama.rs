@@ -107,6 +107,30 @@ impl OllamaProvider {
         &self.model
     }
 
+    /// Strip `<think>…</think>` blocks from assistant content so that
+    /// model thinking is not re-submitted in conversation history.
+    /// Gemma 4 and other thinking models embed reasoning inside these tags;
+    /// re-sending them degrades output quality (see model card best practices).
+    fn strip_thinking(text: &str) -> String {
+        let mut result = String::with_capacity(text.len());
+        let mut rest = text;
+        while let Some(start) = rest.find("<think>") {
+            result.push_str(&rest[..start]);
+            match rest[start..].find("</think>") {
+                Some(end) => {
+                    rest = &rest[start + end + "</think>".len()..];
+                }
+                None => {
+                    // Unclosed <think> tag — drop everything from here.
+                    rest = "";
+                    break;
+                }
+            }
+        }
+        result.push_str(rest);
+        result
+    }
+
     /// Fix #195: returns Result to propagate serialization errors.
     fn build_messages(messages: &[Message]) -> Result<Vec<OllamaMessage>> {
         messages
@@ -120,11 +144,26 @@ impl OllamaProvider {
                 };
 
                 Ok(match &msg.content {
-                    MessageContent::Text(text) => OllamaMessage {
-                        role: role.to_string(),
-                        content: Some(text.clone()),
-                        tool_calls: None,
-                    },
+                    MessageContent::Text(text) => {
+                        // Strip <think> blocks from assistant messages so
+                        // model thinking is not re-submitted in history.
+                        let content = if msg.role == Role::Assistant && text.contains("<think>") {
+                            let stripped = Self::strip_thinking(text);
+                            tracing::debug!(
+                                original_len = text.len(),
+                                stripped_len = stripped.len(),
+                                "stripped thinking blocks from assistant message"
+                            );
+                            stripped
+                        } else {
+                            text.clone()
+                        };
+                        OllamaMessage {
+                            role: role.to_string(),
+                            content: Some(content),
+                            tool_calls: None,
+                        }
+                    }
                     MessageContent::ToolCall(call) => OllamaMessage {
                         role: role.to_string(),
                         content: None,
@@ -328,10 +367,33 @@ impl ModelProvider for OllamaProvider {
 
             let status = resp.status();
             if status.is_success() {
-                let ollama_resp: OllamaResponse = resp.json().await.map_err(|e| {
+                let raw_body = resp.text().await.map_err(|e| {
+                    Error::ModelProvider(format!("failed to read Ollama response body: {e}"))
+                })?;
+                let ollama_resp: OllamaResponse = serde_json::from_str(&raw_body).map_err(|e| {
                     Error::ModelProvider(format!("failed to parse Ollama response: {e}"))
                 })?;
-                return Self::parse_response(ollama_resp);
+                let response = Self::parse_response(ollama_resp)?;
+
+                // Debug: dump raw response when message text is empty
+                // despite having completion tokens.
+                if response.usage.completion_tokens > 0
+                    && !response.message.content.has_tool_calls()
+                    && response
+                        .message
+                        .content
+                        .as_text()
+                        .is_none_or(|t| t.is_empty())
+                {
+                    tracing::warn!(
+                        completion_tokens = response.usage.completion_tokens,
+                        ?response.stop_reason,
+                        "empty message text with completion tokens — dumping raw response"
+                    );
+                    tracing::warn!(raw_body = %raw_body, "raw Ollama API response");
+                }
+
+                return Ok(response);
             }
 
             let error_body = resp.text().await.unwrap_or_default();
@@ -491,6 +553,23 @@ impl ModelProvider for OllamaProvider {
             stop_reason,
             text: None,
         };
+
+        // Debug: dump response info when message text is empty
+        // despite having completion tokens.
+        if response.usage.completion_tokens > 0
+            && !response.message.content.has_tool_calls()
+            && response
+                .message
+                .content
+                .as_text()
+                .is_none_or(|t| t.is_empty())
+        {
+            tracing::warn!(
+                completion_tokens = response.usage.completion_tokens,
+                ?response.stop_reason,
+                "streaming: empty message text with completion tokens"
+            );
+        }
 
         on_event(StreamEvent::Done(response.clone()));
         Ok(response)

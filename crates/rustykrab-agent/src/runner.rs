@@ -308,6 +308,21 @@ impl AgentRunner {
 
             // Explicit end-of-turn — done.
             if stop_reason == StopReason::EndTurn {
+                // Debug: warn when the model ends its turn with empty text.
+                // This helps diagnose cases where completion_tokens > 0 but no
+                // usable text was extracted (e.g. unhandled content block types).
+                if !message.content.has_tool_calls() {
+                    let text = message.content.as_text().unwrap_or("");
+                    if text.is_empty() {
+                        tracing::warn!(
+                            iteration,
+                            completion_tokens = usage.completion_tokens,
+                            content_variant = ?std::mem::discriminant(&message.content),
+                            "EndTurn with empty assistant text — \
+                             response may contain unhandled content blocks"
+                        );
+                    }
+                }
                 return Ok(());
             }
 
@@ -537,6 +552,18 @@ impl AgentRunner {
 
             // Explicit end-of-turn — done.
             if stop_reason == StopReason::EndTurn {
+                if !message.content.has_tool_calls() {
+                    let text = message.content.as_text().unwrap_or("");
+                    if text.is_empty() {
+                        tracing::warn!(
+                            iteration,
+                            completion_tokens = usage.completion_tokens,
+                            content_variant = ?std::mem::discriminant(&message.content),
+                            "EndTurn with empty assistant text — \
+                             response may contain unhandled content blocks"
+                        );
+                    }
+                }
                 on_event(AgentEvent::Done);
                 return Ok(());
             }

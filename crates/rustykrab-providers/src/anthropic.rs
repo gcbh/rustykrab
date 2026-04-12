@@ -150,7 +150,7 @@ impl AnthropicProvider {
     /// Parse the API response into our internal types.
     /// Supports multiple tool calls in a single response (parallel tool use).
     /// Fix #190: preserves text content alongside tool calls.
-    fn parse_response(resp: ApiResponse) -> Result<ModelResponse> {
+    fn parse_response(resp: &ApiResponse) -> Result<ModelResponse> {
         let usage = Usage {
             prompt_tokens: resp.usage.input_tokens,
             completion_tokens: resp.usage.output_tokens,
@@ -298,11 +298,38 @@ impl ModelProvider for AnthropicProvider {
 
             let status = resp.status();
             if status.is_success() {
-                let api_resp: ApiResponse = resp
-                    .json()
-                    .await
+                let raw_body = resp.text().await.map_err(|e| {
+                    Error::ModelProvider(format!("failed to read response body: {e}"))
+                })?;
+                let api_resp: ApiResponse = serde_json::from_str(&raw_body)
                     .map_err(|e| Error::ModelProvider(format!("failed to parse response: {e}")))?;
-                return Self::parse_response(api_resp);
+                let response = Self::parse_response(&api_resp)?;
+
+                // Debug: dump raw response when message text is empty
+                // despite having completion tokens (likely unknown content block types).
+                if response.usage.completion_tokens > 0
+                    && !response.message.content.has_tool_calls()
+                    && response
+                        .message
+                        .content
+                        .as_text()
+                        .is_none_or(|t| t.is_empty())
+                {
+                    tracing::warn!(
+                        completion_tokens = response.usage.completion_tokens,
+                        ?response.stop_reason,
+                        content_blocks = api_resp.content.len(),
+                        block_types = ?api_resp.content.iter().map(|b| match b {
+                            ResponseBlock::Text { .. } => "text",
+                            ResponseBlock::ToolUse { .. } => "tool_use",
+                            ResponseBlock::Unknown => "unknown",
+                        }).collect::<Vec<_>>(),
+                        "empty message text with completion tokens — dumping raw response"
+                    );
+                    tracing::warn!(raw_body = %raw_body, "raw Anthropic API response");
+                }
+
+                return Ok(response);
             }
 
             let error_body = resp.text().await.unwrap_or_default();
@@ -411,9 +438,19 @@ impl ModelProvider for AnthropicProvider {
                         }
                         "content_block_start" => {
                             if let Ok(evt) = serde_json::from_str::<SseContentBlockStart>(data) {
-                                if let SseContentBlock::ToolUse { id, name } = evt.content_block {
-                                    tool_meta.insert(evt.index, (id, name));
-                                    tool_input_bufs.insert(evt.index, String::new());
+                                match evt.content_block {
+                                    SseContentBlock::ToolUse { id, name } => {
+                                        tool_meta.insert(evt.index, (id, name));
+                                        tool_input_bufs.insert(evt.index, String::new());
+                                    }
+                                    SseContentBlock::Text { .. } => {}
+                                    SseContentBlock::Unknown => {
+                                        tracing::warn!(
+                                            index = evt.index,
+                                            raw_data = %data,
+                                            "streaming: unhandled content block type"
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -429,7 +466,13 @@ impl ModelProvider for AnthropicProvider {
                                             buf.push_str(&partial_json);
                                         }
                                     }
-                                    SseDelta::Unknown => {}
+                                    SseDelta::Unknown => {
+                                        tracing::debug!(
+                                            index = evt.index,
+                                            raw_data = %data,
+                                            "streaming: unhandled delta type"
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -505,6 +548,24 @@ impl ModelProvider for AnthropicProvider {
             text: text_field,
         };
 
+        // Debug: dump response info when message text is empty
+        // despite having completion tokens (likely unknown content block types).
+        if response.usage.completion_tokens > 0
+            && !response.message.content.has_tool_calls()
+            && response
+                .message
+                .content
+                .as_text()
+                .is_none_or(|t| t.is_empty())
+        {
+            tracing::warn!(
+                completion_tokens = response.usage.completion_tokens,
+                ?response.stop_reason,
+                "streaming: empty message text with completion tokens — \
+                 response may contain unhandled content block types"
+            );
+        }
+
         on_event(StreamEvent::Done(response.clone()));
         Ok(response)
     }
@@ -565,7 +626,7 @@ struct ApiResponse {
 }
 
 /// Fix #206: added Unknown catch-all so new block types don't crash deserialization.
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(tag = "type")]
 enum ResponseBlock {
     #[serde(rename = "text")]
