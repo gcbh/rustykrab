@@ -34,18 +34,27 @@ impl GmailTool {
 
     /// Get email and app password from the credential store.
     fn get_credentials(&self) -> Result<(String, String)> {
-        let email = self.secrets.get(KEY_EMAIL).map_err(|_| {
+        let email = self.secrets.get(KEY_EMAIL).map_err(|e| {
             Error::ToolExecution(
-                "gmail_email not found. Store it with: \
-                 credential_write(action='set', name='gmail_email', value='you@gmail.com')"
-                    .into(),
+                format!(
+                    "gmail_email not available: {e}. Store it with: \
+                     credential_write(action='set', name='gmail_email', value='you@gmail.com'). \
+                     If you already stored it, the master encryption key may have changed \
+                     (set RUSTYKRAB_MASTER_KEY for persistence across restarts)."
+                )
+                .into(),
             )
         })?;
-        let password = self.secrets.get(KEY_APP_PASSWORD).map_err(|_| {
+        let password = self.secrets.get(KEY_APP_PASSWORD).map_err(|e| {
             Error::ToolExecution(
-                "gmail_app_password not found. Store it with: \
-                 credential_write(action='set', name='gmail_app_password', value='YOUR_APP_PASSWORD')"
-                    .into(),
+                format!(
+                    "gmail_app_password not available: {e}. Store it with: \
+                     credential_write(action='set', name='gmail_app_password', \
+                     value='YOUR_APP_PASSWORD'). If you already stored it, the master \
+                     encryption key may have changed (set RUSTYKRAB_MASTER_KEY for \
+                     persistence across restarts)."
+                )
+                .into(),
             )
         })?;
         Ok((email, password))
@@ -996,12 +1005,24 @@ impl Tool for GmailTool {
 
 /// Get credentials from SecretStore (for use in spawn_blocking closures).
 fn get_creds(secrets: &SecretStore) -> Result<(String, String)> {
-    let email = secrets.get(KEY_EMAIL).map_err(|_| {
-        Error::ToolExecution("gmail_email not configured. Run gmail(action='setup') first.".into())
-    })?;
-    let password = secrets.get(KEY_APP_PASSWORD).map_err(|_| {
+    let email = secrets.get(KEY_EMAIL).map_err(|e| {
         Error::ToolExecution(
-            "gmail_app_password not configured. Run gmail(action='setup') first.".into(),
+            format!(
+                "gmail_email not available: {e}. Run gmail(action='setup') first. \
+                 If you already stored it, the master encryption key may have changed \
+                 (set RUSTYKRAB_MASTER_KEY for persistence across restarts)."
+            )
+            .into(),
+        )
+    })?;
+    let password = secrets.get(KEY_APP_PASSWORD).map_err(|e| {
+        Error::ToolExecution(
+            format!(
+                "gmail_app_password not available: {e}. Run gmail(action='setup') first. \
+                 If you already stored it, the master encryption key may have changed \
+                 (set RUSTYKRAB_MASTER_KEY for persistence across restarts)."
+            )
+            .into(),
         )
     })?;
     Ok((email, password))
