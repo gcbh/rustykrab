@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use rustykrab_core::{Error, Result, SandboxRequirements};
+use rustykrab_core::{Error, Result, SandboxRequirements, ToolError};
 use serde_json::Value;
 
 /// Policy that controls what a sandboxed tool execution can do.
@@ -151,13 +151,10 @@ impl Sandbox for ProcessSandbox {
 
         match result {
             Ok(inner) => inner,
-            Err(_) => Err(Error::ToolExecution(
-                format!(
-                    "tool '{tool_name}' exceeded sandbox timeout of {}s",
-                    policy.timeout_secs
-                )
-                .into(),
-            )),
+            Err(_) => Err(Error::ToolExecution(ToolError::timeout(format!(
+                "tool '{tool_name}' exceeded sandbox timeout of {}s",
+                policy.timeout_secs
+            )))),
         }
     }
 }

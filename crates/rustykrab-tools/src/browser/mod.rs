@@ -314,11 +314,20 @@ impl Tool for BrowserTool {
 
                 let _ = self.manager.get_browser(&profile).await?;
                 let page = self.manager.get_page(&profile, target_id).await?;
-                page.goto(url)
+
+                let timeout_ms = args["timeout_ms"].as_u64().unwrap_or(30_000);
+                let nav_timeout = std::time::Duration::from_millis(timeout_ms);
+
+                tokio::time::timeout(nav_timeout, page.goto(url))
                     .await
+                    .map_err(|_| {
+                        Error::ToolExecution(rustykrab_core::ToolError::timeout(format!(
+                            "page.goto({url}) timed out after {timeout_ms}ms — \
+                                 the page may be unresponsive or unreachable"
+                        )))
+                    })?
                     .map_err(|e| Error::ToolExecution(format!("navigation failed: {e}").into()))?;
 
-                let timeout_ms = args["timeout_ms"].as_u64().unwrap_or(10_000);
                 let _ = tokio::time::timeout(
                     std::time::Duration::from_millis(timeout_ms),
                     page.wait_for_navigation(),

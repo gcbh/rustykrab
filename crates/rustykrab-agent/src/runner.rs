@@ -8,7 +8,7 @@ use rustykrab_core::session::Session;
 use rustykrab_core::types::{
     Conversation, Message, MessageContent, Role, ToolCall, ToolResult, ToolSchema,
 };
-use rustykrab_core::{Error, Result, SandboxRequirements, Tool, ToolErrorKind};
+use rustykrab_core::{Error, Result, SandboxRequirements, Tool, ToolError, ToolErrorKind};
 use uuid::Uuid;
 
 use crate::sandbox::{Sandbox, SandboxPolicy};
@@ -781,10 +781,15 @@ async fn execute_with_retries(
                 }
                 // Don't retry deterministic tool errors — but allow
                 // NotFound one retry since the agent may correct a typo.
+                // Don't retry timeouts — if a tool (e.g. browser) timed
+                // out, the underlying resource is likely stuck and retrying
+                // will just waste another full timeout cycle.
                 if let Error::ToolExecution(ref te) = e {
                     if matches!(
                         te.kind,
-                        ToolErrorKind::InvalidInput | ToolErrorKind::PermissionDenied
+                        ToolErrorKind::InvalidInput
+                            | ToolErrorKind::PermissionDenied
+                            | ToolErrorKind::Timeout
                     ) {
                         return Err(e);
                     }
@@ -917,13 +922,10 @@ async fn execute_single_tool(
     })
     .await
     .map_err(|_| {
-        Error::ToolExecution(
-            format!(
-                "tool '{}' exceeded sandbox timeout of {}s",
-                call.name, policy.timeout_secs
-            )
-            .into(),
-        )
+        Error::ToolExecution(ToolError::timeout(format!(
+            "tool '{}' exceeded sandbox timeout of {}s",
+            call.name, policy.timeout_secs
+        )))
     })??;
 
     let output = if EXTERNAL_CONTENT_TOOLS.contains(&call.name.as_str()) {

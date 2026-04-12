@@ -199,13 +199,21 @@ impl BrowserManager {
             Error::ToolExecution(format!("browser not running for profile '{profile_name}'").into())
         })?;
 
-        let page = inst
-            .browser
-            .new_page(url)
+        let nav_timeout = std::time::Duration::from_secs(30);
+
+        let page = tokio::time::timeout(nav_timeout, inst.browser.new_page(url))
             .await
+            .map_err(|_| {
+                Error::ToolExecution(rustykrab_core::ToolError::timeout(format!(
+                    "new_page({url}) timed out after 30s — Chrome may be unresponsive"
+                )))
+            })?
             .map_err(|e| Error::ToolExecution(format!("failed to open tab: {e}").into()))?;
 
-        let _ = page.wait_for_navigation().await;
+        // Wait for navigation with a timeout — don't block indefinitely if
+        // the page never finishes loading.
+        let _ = tokio::time::timeout(nav_timeout, page.wait_for_navigation()).await;
+
         let actual_url = page.url().await.ok().flatten().unwrap_or_default();
         let title = page.get_title().await.ok().flatten().unwrap_or_default();
         let pages = inst.browser.pages().await.map(|p| p.len()).unwrap_or(0);
@@ -344,10 +352,12 @@ impl BrowserManager {
     async fn connect_or_launch(&self, profile_name: &str) -> Result<ProfileInstance> {
         let cdp_url = self.config.resolve_cdp_url(profile_name);
         let attach_only = self.config.is_attach_only(profile_name);
+        let connect_timeout = std::time::Duration::from_millis(self.config.remote_cdp_timeout_ms);
 
-        // Try connecting to an existing instance first
-        match Browser::connect(&cdp_url).await {
-            Ok((browser, handler)) => {
+        // Try connecting to an existing instance first, with a timeout to
+        // avoid hanging if Chrome accepts TCP but doesn't serve CDP.
+        match tokio::time::timeout(connect_timeout, Browser::connect(&cdp_url)).await {
+            Ok(Ok((browser, handler))) => {
                 let mut handler = handler;
                 let handler_task =
                     tokio::spawn(async move { while let Some(_event) = handler.next().await {} });
@@ -359,7 +369,7 @@ impl BrowserManager {
                     launched_by_us: false,
                 });
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 if attach_only {
                     return Err(Error::ToolExecution(
                         format!("cannot connect to browser at {cdp_url} (attach-only mode): {e}")
@@ -369,6 +379,22 @@ impl BrowserManager {
                 tracing::info!(
                     profile = profile_name,
                     "browser not reachable at {cdp_url}, launching..."
+                );
+            }
+            Err(_) => {
+                if attach_only {
+                    return Err(Error::ToolExecution(rustykrab_core::ToolError::timeout(
+                        format!(
+                            "connection to browser at {cdp_url} timed out after {}ms \
+                             (attach-only mode)",
+                            self.config.remote_cdp_timeout_ms
+                        ),
+                    )));
+                }
+                tracing::warn!(
+                    profile = profile_name,
+                    "CDP connection to {cdp_url} timed out after {}ms, launching new instance...",
+                    self.config.remote_cdp_timeout_ms
                 );
             }
         }
@@ -385,16 +411,25 @@ impl BrowserManager {
         // Wait for it to start
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
-        let (browser, handler) = Browser::connect(&cdp_url).await.map_err(|e| {
-            Error::ToolExecution(
-                format!(
-                    "browser not reachable at {cdp_url} after launch attempt: {e}. \
+        let (browser, handler) = tokio::time::timeout(connect_timeout, Browser::connect(&cdp_url))
+            .await
+            .map_err(|_| {
+                Error::ToolExecution(rustykrab_core::ToolError::timeout(format!(
+                    "CDP connection to {cdp_url} timed out after {}ms post-launch. \
+                     Chrome may have started but is not responding to CDP.",
+                    self.config.remote_cdp_timeout_ms
+                )))
+            })?
+            .map_err(|e| {
+                Error::ToolExecution(
+                    format!(
+                        "browser not reachable at {cdp_url} after launch attempt: {e}. \
                      If a browser is already running without remote debugging, \
                      quit it first so a new instance can start."
+                    )
+                    .into(),
                 )
-                .into(),
-            )
-        })?;
+            })?;
 
         let mut handler = handler;
         let handler_task =
