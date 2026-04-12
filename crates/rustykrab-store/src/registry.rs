@@ -58,6 +58,20 @@ pub static REGISTRY: &[SecretSpec] = &[
         required: true,
     },
     SecretSpec {
+        store_name: "gmail_email",
+        env_var: "GMAIL_EMAIL",
+        keychain_account: "gmail-email",
+        description: "Gmail email address (for IMAP/SMTP)",
+        required: false,
+    },
+    SecretSpec {
+        store_name: "gmail_app_password",
+        env_var: "GMAIL_APP_PASSWORD",
+        keychain_account: "gmail-app-password",
+        description: "Gmail app password (for IMAP/SMTP)",
+        required: false,
+    },
+    SecretSpec {
         store_name: "rustykrab_auth_token",
         env_var: "RUSTYKRAB_AUTH_TOKEN",
         keychain_account: "auth-token",
