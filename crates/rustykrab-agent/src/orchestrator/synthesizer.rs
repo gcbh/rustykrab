@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use rustykrab_core::model::ModelProvider;
-use rustykrab_core::orchestration::SubTaskResult;
+use rustykrab_core::orchestration::{OrchestrationConfig, SubTaskResult};
 use rustykrab_core::types::{Message, MessageContent, Role};
 use rustykrab_core::Result;
 use uuid::Uuid;
@@ -16,6 +16,7 @@ use uuid::Uuid;
 /// Synthesizes sub-task results into a final coherent response.
 pub struct Synthesizer {
     provider: Arc<dyn ModelProvider>,
+    config: OrchestrationConfig,
 }
 
 const SYNTHESIZE_PROMPT: &str = r#"You are synthesizing results from multiple sub-tasks into a single coherent response for the user.
@@ -33,8 +34,8 @@ Instructions:
 - Be concise and direct"#;
 
 impl Synthesizer {
-    pub fn new(provider: Arc<dyn ModelProvider>) -> Self {
-        Self { provider }
+    pub fn new(provider: Arc<dyn ModelProvider>, config: OrchestrationConfig) -> Self {
+        Self { provider, config }
     }
 
     /// Synthesize sub-task results into a final response.
@@ -99,13 +100,16 @@ impl Synthesizer {
             created_at: Utc::now(),
         });
 
+        let timeout_secs = self.config.model_call_timeout_secs;
         let response = tokio::time::timeout(
-            std::time::Duration::from_secs(120),
+            std::time::Duration::from_secs(timeout_secs),
             self.provider.chat(&messages, &[]),
         )
         .await
         .map_err(|_| {
-            rustykrab_core::Error::Internal("synthesis model call timed out after 120s".into())
+            rustykrab_core::Error::Internal(format!(
+                "synthesis model call timed out after {timeout_secs}s"
+            ))
         })??;
         Ok(response.message.content.as_text().unwrap_or("").to_string())
     }

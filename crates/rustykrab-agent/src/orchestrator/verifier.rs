@@ -70,6 +70,7 @@ impl ConsistencyVoter {
             let context = context.map(|s| s.to_string());
             let sem = semaphore.clone();
 
+            let model_timeout = self.config.model_call_timeout_secs;
             handles.push(tokio::spawn(async move {
                 let _permit = sem.acquire().await.expect("semaphore closed");
                 let mut messages = Vec::new();
@@ -88,16 +89,15 @@ impl ConsistencyVoter {
                     created_at: Utc::now(),
                 });
 
-                let timeout_secs = 120u64;
                 let result = match tokio::time::timeout(
-                    std::time::Duration::from_secs(timeout_secs),
+                    std::time::Duration::from_secs(model_timeout),
                     provider.chat(&messages, &[]),
                 )
                 .await
                 {
                     Ok(inner) => inner,
                     Err(_) => Err(rustykrab_core::Error::Internal(format!(
-                        "voting sample timed out after {timeout_secs}s"
+                        "voting sample timed out after {model_timeout}s"
                     ))),
                 };
                 tracing::debug!(sample = i, "consistency sample completed");
@@ -180,7 +180,7 @@ impl ConsistencyVoter {
             created_at: Utc::now(),
         }];
 
-        let timeout_secs = 120u64;
+        let timeout_secs = self.config.model_call_timeout_secs;
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(timeout_secs),
             self.provider.chat(&messages, &[]),

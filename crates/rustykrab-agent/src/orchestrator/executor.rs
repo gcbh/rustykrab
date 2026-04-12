@@ -330,7 +330,9 @@ async fn execute_sub_task(
 
         // Summarize if output is too long.
         let output = if config.summarize_sub_results && output.len() > 2000 {
-            summarize_output(provider, &output).await.unwrap_or(output)
+            summarize_output(provider, &output, config.model_call_timeout_secs)
+                .await
+                .unwrap_or(output)
         } else {
             output
         };
@@ -451,7 +453,11 @@ async fn execute_tool_for_subtask(
 }
 
 /// Summarize a long output to stay within context budgets.
-async fn summarize_output(provider: &Arc<dyn ModelProvider>, output: &str) -> Result<String> {
+async fn summarize_output(
+    provider: &Arc<dyn ModelProvider>,
+    output: &str,
+    timeout_secs: u64,
+) -> Result<String> {
     let messages = vec![Message {
         id: Uuid::new_v4(),
         role: Role::User,
@@ -461,7 +467,16 @@ async fn summarize_output(provider: &Arc<dyn ModelProvider>, output: &str) -> Re
         created_at: Utc::now(),
     }];
 
-    let response = provider.chat(&messages, &[]).await?;
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(timeout_secs),
+        provider.chat(&messages, &[]),
+    )
+    .await
+    .map_err(|_| {
+        Error::Internal(format!(
+            "summarize model call timed out after {timeout_secs}s"
+        ))
+    })??;
     Ok(response
         .message
         .content
