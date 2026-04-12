@@ -376,13 +376,59 @@ async fn main() -> anyhow::Result<()> {
         Err(e) => tracing::warn!(error = %e, "failed to scan skills directory"),
     }
 
+    // --- Truncation callback: persist dropped messages to long-term memory ---
+    let truncate_memory_system = Arc::clone(&memory_system);
+    let truncate_agent_id = agent_id;
+    let truncate_session_id = session_id;
+    let truncate_turn_counter = Arc::new(AtomicU64::new(0));
+    let on_truncate: rustykrab_agent::OnTruncateCallback = Arc::new(move |messages| {
+        let system = Arc::clone(&truncate_memory_system);
+        let aid = truncate_agent_id;
+        let sid = truncate_session_id;
+        let counter = Arc::clone(&truncate_turn_counter);
+        tokio::spawn(async move {
+            for msg in &messages {
+                let text = match &msg.content {
+                    MessageContent::Text(t) => t.clone(),
+                    _ => continue,
+                };
+                if text.is_empty() {
+                    continue;
+                }
+                let turn_num = counter.fetch_add(1, Ordering::Relaxed) as u32;
+                let speaker = format!("{:?}", msg.role).to_lowercase();
+                let turn = rustykrab_memory::types::ConversationTurn {
+                    id: Uuid::new_v4(),
+                    session_id: sid,
+                    turn_number: turn_num,
+                    speaker,
+                    content: text,
+                    token_count: None,
+                    metadata: rustykrab_memory::types::TurnMetadata {
+                        involves_tool_use: false,
+                        user_flagged: false,
+                        tags: vec!["truncation_archive".to_string()],
+                    },
+                };
+                if let Err(e) = system.writer().retain(turn, aid).await {
+                    tracing::warn!(error = %e, "failed to archive truncated message to memory");
+                }
+            }
+            tracing::debug!(
+                count = messages.len(),
+                "archived truncated messages to memory"
+            );
+        });
+    });
+
     // --- Build gateway state ---
     // Clone store handle so we can flush it after the server shuts down.
     let store_handle = store.clone();
     let mut state = rustykrab_gateway::AppState::new(store, tools, provider, auth_token)
         .with_harness_router(router)
         .with_orchestration_config(orchestration_config)
-        .with_skill_registry(Arc::new(skill_registry));
+        .with_skill_registry(Arc::new(skill_registry))
+        .with_on_truncate(on_truncate);
 
     // --- Attach video channel to state ---
     if let Some(vc) = video_channel {

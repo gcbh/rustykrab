@@ -25,6 +25,10 @@ use crate::trace::{ExecutionTracer, ToolTrace};
 /// Prevents pathological workloads from overwhelming the system (fixes ASYNC-M1).
 const MAX_CONCURRENT_TOOL_CALLS: usize = 10;
 
+/// Marker prefix for the injected context summary message.
+/// Used to identify and replace the summary on subsequent truncations.
+const SUMMARY_MARKER: &str = "[Context from earlier in this conversation]";
+
 const EXTERNAL_CONTENT_TOOLS: &[&str] = &[
     "browser",
     "http_request",
@@ -75,6 +79,12 @@ pub struct AgentConfig {
     /// Estimated max context tokens for the model.
     /// Defaults to 128k which works for Claude and large Qwen models.
     pub max_context_tokens: usize,
+    /// Fraction of context reserved for the conversation summary (0.0–1.0).
+    /// Default 0.20 (20%) — enough for a rich summary without crowding live context.
+    pub summary_budget_ratio: f64,
+    /// Fraction of context reserved for the model's response (0.0–1.0).
+    /// Default 0.15 (15%) — leaves room for a substantial reply.
+    pub response_reserve_ratio: f64,
 }
 
 impl Default for AgentConfig {
@@ -85,6 +95,8 @@ impl Default for AgentConfig {
             max_consecutive_errors: 3,
             max_tool_retries: 2,
             max_context_tokens: 128_000,
+            summary_budget_ratio: 0.20,
+            response_reserve_ratio: 0.15,
         }
     }
 }
@@ -92,6 +104,10 @@ impl Default for AgentConfig {
 /// Callback invoked with each message added to the conversation.
 /// Used for auto-persisting turns to memory.
 pub type OnMessageCallback = Arc<dyn Fn(&Message) + Send + Sync>;
+
+/// Callback invoked with messages about to be dropped from context.
+/// Used for archival preservation before truncation.
+pub type OnTruncateCallback = Arc<dyn Fn(Vec<Message>) + Send + Sync>;
 
 /// Runs the agent loop: send conversation to model, execute tool calls, repeat.
 ///
@@ -108,6 +124,7 @@ pub struct AgentRunner {
     config: AgentConfig,
     tracer: ExecutionTracer,
     on_message: Option<OnMessageCallback>,
+    on_truncate: Option<OnTruncateCallback>,
 }
 
 impl AgentRunner {
@@ -123,6 +140,7 @@ impl AgentRunner {
             config: AgentConfig::default(),
             tracer: ExecutionTracer::new(),
             on_message: None,
+            on_truncate: None,
         }
     }
 
@@ -135,6 +153,13 @@ impl AgentRunner {
     /// Used to auto-persist conversation turns to the memory system.
     pub fn with_on_message(mut self, callback: OnMessageCallback) -> Self {
         self.on_message = Some(callback);
+        self
+    }
+
+    /// Set a callback invoked with messages about to be truncated from context.
+    /// Used for archival preservation before dropping messages.
+    pub fn with_on_truncate(mut self, callback: OnTruncateCallback) -> Self {
+        self.on_truncate = Some(callback);
         self
     }
 
@@ -177,6 +202,11 @@ impl AgentRunner {
                 total_messages = conv.messages.len(),
                 "agent loop iteration"
             );
+
+            // Sliding window: drop oldest messages when context exceeds budget.
+            if self.should_truncate(conv) {
+                self.truncate_oldest(conv);
+            }
 
             // Soft iteration warning.
             if self.config.soft_iteration_warning > 0
@@ -367,6 +397,12 @@ impl AgentRunner {
 
             if session.is_expired() {
                 return Err(Error::Auth("session expired during execution".into()));
+            }
+
+            // Sliding window: drop oldest messages when context exceeds budget.
+            if self.should_truncate(conv) {
+                on_event(AgentEvent::Compressing);
+                self.truncate_oldest(conv);
             }
 
             // Soft iteration warning.
@@ -654,6 +690,231 @@ impl AgentRunner {
         results
     }
 
+    // ── Context management ───────────────────────────────────────────
+
+    /// Estimate token count for a string using a conservative heuristic.
+    fn estimate_tokens(text: &str) -> usize {
+        (text.len() as f64 / 3.5).ceil() as usize
+    }
+
+    /// Estimate total token usage of all messages in a conversation.
+    fn estimate_conversation_tokens(conv: &Conversation) -> usize {
+        let mut total = 0;
+        for msg in &conv.messages {
+            total += match &msg.content {
+                MessageContent::Text(t) => Self::estimate_tokens(t),
+                MessageContent::ToolCall(tc) => {
+                    Self::estimate_tokens(&tc.name)
+                        + Self::estimate_tokens(&tc.arguments.to_string())
+                }
+                MessageContent::ToolResult(tr) => Self::estimate_tokens(&tr.output.to_string()),
+                MessageContent::MultiToolCall(calls) => calls
+                    .iter()
+                    .map(|tc| {
+                        Self::estimate_tokens(&tc.name)
+                            + Self::estimate_tokens(&tc.arguments.to_string())
+                    })
+                    .sum(),
+            };
+            total += 4; // per-message overhead
+        }
+        total
+    }
+
+    /// The token budget available for live messages (everything except
+    /// the summary and the response reserve).
+    fn live_message_budget(&self) -> usize {
+        let total = self.config.max_context_tokens;
+        let summary_budget = (total as f64 * self.config.summary_budget_ratio) as usize;
+        let response_budget = (total as f64 * self.config.response_reserve_ratio) as usize;
+        total
+            .saturating_sub(summary_budget)
+            .saturating_sub(response_budget)
+    }
+
+    /// Determine whether the conversation needs truncation.
+    fn should_truncate(&self, conv: &Conversation) -> bool {
+        let estimated = Self::estimate_conversation_tokens(conv);
+        let budget = self.live_message_budget();
+        estimated > (budget as f64 * 0.85) as usize
+    }
+
+    /// Sliding window truncation: drop oldest messages to stay within
+    /// the context budget, building a condensed summary of dropped
+    /// messages and injecting it so the model retains earlier context.
+    fn truncate_oldest(&self, conv: &mut Conversation) {
+        let budget = self.live_message_budget();
+        let summary_budget =
+            (self.config.max_context_tokens as f64 * self.config.summary_budget_ratio) as usize;
+        let target = (budget as f64 * 0.75) as usize;
+        let mut keep_tokens = 0;
+        let mut keep_from = conv.messages.len();
+
+        for (i, msg) in conv.messages.iter().enumerate().rev() {
+            let msg_tokens = match &msg.content {
+                MessageContent::Text(t) => Self::estimate_tokens(t),
+                MessageContent::ToolCall(tc) => {
+                    Self::estimate_tokens(&tc.name)
+                        + Self::estimate_tokens(&tc.arguments.to_string())
+                }
+                MessageContent::ToolResult(tr) => Self::estimate_tokens(&tr.output.to_string()),
+                MessageContent::MultiToolCall(calls) => calls
+                    .iter()
+                    .map(|tc| {
+                        Self::estimate_tokens(&tc.name)
+                            + Self::estimate_tokens(&tc.arguments.to_string())
+                    })
+                    .sum(),
+            } + 4;
+
+            if keep_tokens + msg_tokens > target {
+                keep_from = i + 1;
+                break;
+            }
+            keep_tokens += msg_tokens;
+            keep_from = i;
+        }
+
+        // Don't truncate if there's almost nothing to drop.
+        if keep_from <= 2 {
+            return;
+        }
+
+        // Preserve the system message at index 0 if present.
+        let has_system = conv
+            .messages
+            .first()
+            .map(|m| m.role == Role::System)
+            .unwrap_or(false);
+        let system_msg = if has_system {
+            Some(conv.messages[0].clone())
+        } else {
+            None
+        };
+
+        // Determine where droppable content starts (after system + summary).
+        let start = if has_system { 1 } else { 0 };
+        let content_start = if conv.messages.len() > start {
+            if let MessageContent::Text(t) = &conv.messages[start].content {
+                if t.starts_with(SUMMARY_MARKER) {
+                    start + 1
+                } else {
+                    start
+                }
+            } else {
+                start
+            }
+        } else {
+            start
+        };
+
+        // Build a condensed summary from the messages about to be dropped.
+        let to_drop: Vec<&Message> = conv.messages[content_start..keep_from].iter().collect();
+        let new_summary_text = Self::build_summary_from_messages(&to_drop, summary_budget);
+
+        // Merge with any pre-existing summary.
+        let merged_summary = if let Some(ref existing) = conv.summary {
+            let combined = format!("{existing}\n{new_summary_text}");
+            let max_chars = (summary_budget as f64 * 3.5) as usize;
+            if combined.len() > max_chars {
+                combined[combined.len() - max_chars..].to_string()
+            } else {
+                combined
+            }
+        } else {
+            new_summary_text
+        };
+
+        conv.summary = Some(merged_summary.clone());
+
+        // Notify callback with messages about to be dropped.
+        if let Some(ref cb) = self.on_truncate {
+            let to_archive: Vec<Message> = conv.messages[content_start..keep_from].to_vec();
+            if !to_archive.is_empty() {
+                cb(to_archive);
+            }
+        }
+
+        let dropped = keep_from;
+        conv.messages = conv.messages.split_off(keep_from);
+
+        // Re-insert system message.
+        if let Some(sys) = system_msg {
+            conv.messages.insert(0, sys);
+        }
+
+        // Inject summary message right after the system prompt.
+        if !merged_summary.is_empty() {
+            let summary_msg = Message {
+                id: Uuid::new_v4(),
+                role: Role::System,
+                content: MessageContent::Text(format!("{SUMMARY_MARKER}\n{merged_summary}")),
+                created_at: Utc::now(),
+            };
+            let insert_at = if conv
+                .messages
+                .first()
+                .map(|m| m.role == Role::System)
+                .unwrap_or(false)
+            {
+                1
+            } else {
+                0
+            };
+            conv.messages.insert(insert_at, summary_msg);
+        }
+
+        tracing::info!(
+            dropped,
+            kept = conv.messages.len(),
+            summary_chars = merged_summary.len(),
+            "sliding window truncated oldest messages, summary injected"
+        );
+    }
+
+    /// Build a condensed text summary from a set of messages.
+    fn build_summary_from_messages(messages: &[&Message], token_budget: usize) -> String {
+        let max_chars = (token_budget as f64 * 3.5) as usize;
+        let mut parts: Vec<String> = Vec::new();
+        let mut total_chars = 0;
+
+        for msg in messages {
+            let entry = match msg.role {
+                Role::User => {
+                    if let MessageContent::Text(t) = &msg.content {
+                        let excerpt = truncate_str(t, 300);
+                        format!("- User: {excerpt}")
+                    } else {
+                        continue;
+                    }
+                }
+                Role::Assistant => match &msg.content {
+                    MessageContent::Text(t) => {
+                        let excerpt = truncate_str(t, 300);
+                        format!("- Assistant: {excerpt}")
+                    }
+                    MessageContent::ToolCall(tc) => {
+                        format!("- Assistant called tool `{}`", tc.name)
+                    }
+                    MessageContent::MultiToolCall(calls) => {
+                        let names: Vec<&str> = calls.iter().map(|c| c.name.as_str()).collect();
+                        format!("- Assistant called tools: {}", names.join(", "))
+                    }
+                    _ => continue,
+                },
+                Role::Tool | Role::System => continue,
+            };
+
+            if total_chars + entry.len() > max_chars {
+                break;
+            }
+            total_chars += entry.len();
+            parts.push(entry);
+        }
+
+        parts.join("\n")
+    }
+
     /// Inject a reflection prompt when the agent hits repeated errors.
     fn inject_reflection(&self, conv: &mut Conversation) {
         let mut recent_errors: Vec<String> = Vec::new();
@@ -691,6 +952,19 @@ impl AgentRunner {
 fn sanitize_error(e: &str) -> String {
     let first_line = e.lines().next().unwrap_or(e);
     first_line.chars().take(200).collect()
+}
+
+/// Truncate a string to `max_chars`, appending "..." if trimmed.
+fn truncate_str(s: &str, max_chars: usize) -> String {
+    if s.len() <= max_chars {
+        return s.to_string();
+    }
+    let end = s
+        .char_indices()
+        .nth(max_chars)
+        .map(|(i, _)| i)
+        .unwrap_or(s.len());
+    format!("{}...", &s[..end])
 }
 
 /// Retry a tool call up to `max_retries` times with exponential backoff.

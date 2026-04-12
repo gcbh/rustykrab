@@ -1,4 +1,4 @@
-use rustykrab_agent::{HarnessProfile, HarnessRouter, ProcessSandbox, Sandbox};
+use rustykrab_agent::{HarnessProfile, HarnessRouter, OnTruncateCallback, ProcessSandbox, Sandbox};
 use rustykrab_channels::{SignalChannel, TelegramChannel, VideoChannel};
 use rustykrab_core::model::ModelProvider;
 use rustykrab_core::orchestration::OrchestrationConfig;
@@ -33,6 +33,9 @@ pub struct AppState {
     pub orchestration_config: OrchestrationConfig,
     /// Skill registry for SKILL.md-based skills.
     pub skill_registry: Arc<SkillRegistry>,
+    /// Optional callback invoked with messages about to be truncated from
+    /// the conversation context. Persists them to the memory system.
+    pub on_truncate: Option<OnTruncateCallback>,
 }
 
 impl AppState {
@@ -57,6 +60,7 @@ impl AppState {
             harness_router: None,
             orchestration_config: OrchestrationConfig::default(),
             skill_registry: Arc::new(SkillRegistry::new()),
+            on_truncate: None,
         }
     }
 
@@ -118,6 +122,12 @@ impl AppState {
     /// Set the orchestration configuration (used by RLM module).
     pub fn with_orchestration_config(mut self, config: OrchestrationConfig) -> Self {
         self.orchestration_config = config;
+        self
+    }
+
+    /// Set the truncation callback for persisting dropped messages to memory.
+    pub fn with_on_truncate(mut self, callback: OnTruncateCallback) -> Self {
+        self.on_truncate = Some(callback);
         self
     }
 
