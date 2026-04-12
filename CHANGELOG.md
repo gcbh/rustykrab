@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.12] - 2026-04-12
+
+- [feat] register Gmail credentials in secret registry (#346)
+
 ## [1.4.11] - 2026-04-12
 
 - [fix] read tool returns NotFound for missing files (#344)
