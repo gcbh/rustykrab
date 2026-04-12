@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.0.3] - 2026-04-12
+
+- fix: Data Protection Keychain via provisioning profile (#353)
+
 ## [2.0.2] - 2026-04-12
 
 - refactor: simplify system prompt, remove orchestration pipeline, clean up agent loop (#351)
