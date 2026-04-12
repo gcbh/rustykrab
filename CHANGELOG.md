@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.0.1] - 2026-04-12
+
+- Improve agent persistence: raise iteration limits, add context flush, strengthen prompts (#350)
+
 ## [2.0.0] - 2026-04-12
 
 - refactor: replace RLM text markers with REPL-style tool-based context exploration (#256)
