@@ -66,6 +66,7 @@ mod nodes;
 // Network tools
 mod net_admin;
 mod net_audit;
+mod net_discovery;
 mod net_scan;
 
 // HTTP
@@ -151,6 +152,7 @@ pub use nodes::NodesTool;
 // Network
 pub use net_admin::NetAdminTool;
 pub use net_audit::NetAuditTool;
+pub use net_discovery::NetDiscoveryTool;
 pub use net_scan::NetScanTool;
 
 // HTTP
@@ -211,6 +213,7 @@ pub fn builtin_tools(
         std::sync::Arc::new(NetScanTool::new()),
         std::sync::Arc::new(NetAdminTool::new()),
         std::sync::Arc::new(NetAuditTool::new()),
+        std::sync::Arc::new(NetDiscoveryTool::new()),
         // Email
         std::sync::Arc::new(GmailTool::new(secrets.clone())),
         // Notion
