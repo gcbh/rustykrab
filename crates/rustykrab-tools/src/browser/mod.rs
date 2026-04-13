@@ -261,21 +261,48 @@ impl Tool for BrowserTool {
         let profile = self.resolve_profile(&args).to_string();
         let target_id = args["targetId"].as_str();
 
+        let result = self
+            .execute_action(action, &profile, target_id, &args)
+            .await;
+
+        // If any browser operation timed out, the Chrome instance is likely
+        // stuck. Tear it down so the next call gets a fresh launch instead
+        // of reusing a hung process.
+        if let Err(Error::ToolExecution(ref te)) = result {
+            if te.kind == rustykrab_core::ToolErrorKind::Timeout {
+                self.manager.invalidate_profile(&profile).await;
+            }
+        }
+
+        result
+    }
+}
+
+impl BrowserTool {
+    /// Dispatch the browser action. Separated from `execute()` so we can
+    /// inspect the result and invalidate stuck profiles on timeout.
+    async fn execute_action(
+        &self,
+        action: &str,
+        profile: &str,
+        target_id: Option<&str>,
+        args: &Value,
+    ) -> Result<Value> {
         match action {
             // ── Lifecycle ──────────────────────────────────────────
-            "status" => Ok(self.manager.status(&profile).await),
+            "status" => Ok(self.manager.status(profile).await),
 
-            "start" => self.manager.start(&profile).await,
+            "start" => self.manager.start(profile).await,
 
-            "stop" => self.manager.stop(&profile).await,
+            "stop" => self.manager.stop(profile).await,
 
             "profiles" => Ok(self.manager.profiles().await),
 
             // ── Tab management ─────────────────────────────────────
             "tabs" => {
                 // Auto-start if needed
-                let _ = self.manager.get_browser(&profile).await?;
-                self.manager.tabs(&profile).await
+                let _ = self.manager.get_browser(profile).await?;
+                self.manager.tabs(profile).await
             }
 
             "open" => {
@@ -285,22 +312,22 @@ impl Tool for BrowserTool {
                 security::validate_url(url)
                     .await
                     .map_err(|e| Error::ToolExecution(e.into()))?;
-                let _ = self.manager.get_browser(&profile).await?;
-                self.manager.open_tab(&profile, url).await
+                let _ = self.manager.get_browser(profile).await?;
+                self.manager.open_tab(profile, url).await
             }
 
             "close" => {
                 let tid = target_id.ok_or_else(|| {
                     Error::ToolExecution("'close' requires 'targetId' parameter".into())
                 })?;
-                self.manager.close_tab(&profile, tid).await
+                self.manager.close_tab(profile, tid).await
             }
 
             "focus" => {
                 let tid = target_id.ok_or_else(|| {
                     Error::ToolExecution("'focus' requires 'targetId' parameter".into())
                 })?;
-                self.manager.focus_tab(&profile, tid).await
+                self.manager.focus_tab(profile, tid).await
             }
 
             // ── Navigation ─────────────────────────────────────────
@@ -312,8 +339,8 @@ impl Tool for BrowserTool {
                     .await
                     .map_err(|e| Error::ToolExecution(e.into()))?;
 
-                let _ = self.manager.get_browser(&profile).await?;
-                let page = self.manager.get_page(&profile, target_id).await?;
+                let _ = self.manager.get_browser(profile).await?;
+                let page = self.manager.get_page(profile, target_id).await?;
 
                 let timeout_ms = args["timeout_ms"].as_u64().unwrap_or(30_000);
                 let nav_timeout = std::time::Duration::from_millis(timeout_ms);
@@ -347,8 +374,8 @@ impl Tool for BrowserTool {
 
             // ── Snapshot ───────────────────────────────────────────
             "snapshot" => {
-                let _ = self.manager.get_browser(&profile).await?;
-                let page = self.manager.get_page(&profile, target_id).await?;
+                let _ = self.manager.get_browser(profile).await?;
+                let page = self.manager.get_page(profile, target_id).await?;
 
                 let mode = match args["format"].as_str() {
                     Some("aria") => SnapshotMode::Aria,
@@ -363,7 +390,7 @@ impl Tool for BrowserTool {
                     selector: args["selector"].as_str().map(|s| s.to_string()),
                 };
 
-                let key = Self::store_key(&profile, target_id);
+                let key = Self::store_key(profile, target_id);
                 snapshot::take_snapshot(&page, &options, &self.snapshot_store, &key).await
             }
 
@@ -380,18 +407,18 @@ impl Tool for BrowserTool {
                         "'act' requires 'actAction' parameter (click, type, press, hover, select, drag, wait)".into(),
                     ))?;
 
-                let _ = self.manager.get_browser(&profile).await?;
-                let page = self.manager.get_page(&profile, target_id).await?;
-                let key = Self::store_key(&profile, target_id);
+                let _ = self.manager.get_browser(profile).await?;
+                let page = self.manager.get_page(profile, target_id).await?;
+                let key = Self::store_key(profile, target_id);
 
-                actions::execute_act(&page, &self.snapshot_store, &key, act_action, ref_id, &args)
+                actions::execute_act(&page, &self.snapshot_store, &key, act_action, ref_id, args)
                     .await
             }
 
             // ── Screenshot ─────────────────────────────────────────
             "screenshot" => {
-                let _ = self.manager.get_browser(&profile).await?;
-                let page = self.manager.get_page(&profile, target_id).await?;
+                let _ = self.manager.get_browser(profile).await?;
+                let page = self.manager.get_page(profile, target_id).await?;
                 let full_page = args["full_page"].as_bool().unwrap_or(false);
                 let selector = args["selector"].as_str();
 
@@ -429,8 +456,8 @@ impl Tool for BrowserTool {
 
             // ── Content ────────────────────────────────────────────
             "content" => {
-                let _ = self.manager.get_browser(&profile).await?;
-                let page = self.manager.get_page(&profile, target_id).await?;
+                let _ = self.manager.get_browser(profile).await?;
+                let page = self.manager.get_page(profile, target_id).await?;
                 let format = args["format"].as_str().unwrap_or("text");
 
                 let content = match format {
@@ -513,8 +540,8 @@ impl Tool for BrowserTool {
                     }
                 }
 
-                let _ = self.manager.get_browser(&profile).await?;
-                let page = self.manager.get_page(&profile, target_id).await?;
+                let _ = self.manager.get_browser(profile).await?;
+                let page = self.manager.get_page(profile, target_id).await?;
                 let result = page.evaluate(expression).await.map_err(|e| {
                     Error::ToolExecution(format!("JS evaluation failed: {e}").into())
                 })?;
@@ -532,8 +559,8 @@ impl Tool for BrowserTool {
                 let direction = args["direction"].as_str().unwrap_or("down");
                 let amount = args["amount"].as_i64().unwrap_or(500);
 
-                let _ = self.manager.get_browser(&profile).await?;
-                let page = self.manager.get_page(&profile, target_id).await?;
+                let _ = self.manager.get_browser(profile).await?;
+                let page = self.manager.get_page(profile, target_id).await?;
 
                 let js = match direction {
                     "down" => format!("window.scrollBy(0, {amount}); window.scrollY"),
@@ -569,8 +596,8 @@ impl Tool for BrowserTool {
 
             // ── Console ────────────────────────────────────────────
             "console" => {
-                let _ = self.manager.get_browser(&profile).await?;
-                let page = self.manager.get_page(&profile, target_id).await?;
+                let _ = self.manager.get_browser(profile).await?;
+                let page = self.manager.get_page(profile, target_id).await?;
 
                 // Retrieve console messages via JS — collects last N entries
                 let js = r#"
@@ -622,8 +649,8 @@ impl Tool for BrowserTool {
 
             // ── Cookies ────────────────────────────────────────────
             "cookies" => {
-                let _ = self.manager.get_browser(&profile).await?;
-                let page = self.manager.get_page(&profile, target_id).await?;
+                let _ = self.manager.get_browser(profile).await?;
+                let page = self.manager.get_page(profile, target_id).await?;
                 let domain_filter = args["domain"].as_str();
 
                 let cookies: Vec<Cookie> = page.get_cookies().await.map_err(|e| {
@@ -658,8 +685,8 @@ impl Tool for BrowserTool {
 
             // ── PDF ────────────────────────────────────────────────
             "pdf" => {
-                let _ = self.manager.get_browser(&profile).await?;
-                let page = self.manager.get_page(&profile, target_id).await?;
+                let _ = self.manager.get_browser(profile).await?;
+                let page = self.manager.get_page(profile, target_id).await?;
 
                 let pdf_bytes = page.pdf(Default::default()).await.map_err(|e| {
                     Error::ToolExecution(

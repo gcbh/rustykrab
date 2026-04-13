@@ -24,6 +24,8 @@ pub struct ProfileInstance {
     pub profile_name: String,
     pub cdp_url: String,
     pub launched_by_us: bool,
+    /// PID of the Chrome process we launched (None if we attached to an existing one).
+    pub chrome_pid: Option<u32>,
 }
 
 /// Manages multiple browser profiles, each an isolated Chrome instance.
@@ -117,10 +119,7 @@ impl BrowserManager {
     pub async fn stop(&self, profile_name: &str) -> Result<serde_json::Value> {
         let mut instances = self.instances.lock().await;
         if let Some(inst) = instances.remove(profile_name) {
-            // Abort the handler task to clean up the CDP connection
-            inst._handler_task.abort();
-            // Drop the browser — this closes the CDP connection
-            drop(inst.browser);
+            kill_profile_instance(inst);
             Ok(serde_json::json!({
                 "status": "stopped",
                 "profile": profile_name
@@ -130,6 +129,22 @@ impl BrowserManager {
                 "status": "not_running",
                 "profile": profile_name
             }))
+        }
+    }
+
+    /// Tear down a stuck browser profile, killing the Chrome process if we
+    /// launched it. Called when a browser operation times out — the instance
+    /// is removed so the next call gets a fresh launch instead of reusing
+    /// the stuck one.
+    pub async fn invalidate_profile(&self, profile_name: &str) {
+        let mut instances = self.instances.lock().await;
+        if let Some(inst) = instances.remove(profile_name) {
+            tracing::warn!(
+                profile = profile_name,
+                pid = ?inst.chrome_pid,
+                "invalidating stuck browser profile"
+            );
+            kill_profile_instance(inst);
         }
     }
 
@@ -367,6 +382,7 @@ impl BrowserManager {
                     profile_name: profile_name.to_string(),
                     cdp_url,
                     launched_by_us: false,
+                    chrome_pid: None,
                 });
             }
             Ok(Err(e)) => {
@@ -404,12 +420,45 @@ impl BrowserManager {
         // operations (fixes ASYNC-H3).
         let config = self.config.clone();
         let profile = profile_name.to_string();
-        tokio::task::spawn_blocking(move || launch_browser_blocking(&config, &profile))
-            .await
-            .map_err(|e| Error::ToolExecution(format!("launch task failed: {e}").into()))??;
+        let chrome_pid =
+            tokio::task::spawn_blocking(move || launch_browser_blocking(&config, &profile))
+                .await
+                .map_err(|e| Error::ToolExecution(format!("launch task failed: {e}").into()))??;
 
-        // Wait for it to start
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        // Poll for CDP readiness instead of a fixed sleep. Chrome can take
+        // a variable amount of time to bind the debug port — sometimes it
+        // gets stuck entirely (e.g. profile lock, GPU init, sandbox setup).
+        // We probe /json/version on a 500ms interval for up to 15s, then
+        // give up and kill the process.
+        let startup_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        let mut cdp_ready = false;
+        while tokio::time::Instant::now() < startup_deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            if probe_cdp(&cdp_url).await {
+                cdp_ready = true;
+                break;
+            }
+        }
+
+        if !cdp_ready {
+            // Chrome never became responsive — kill it and report.
+            tracing::error!(
+                pid = chrome_pid,
+                profile = profile_name,
+                "Chrome never bound CDP port at {cdp_url} within 15s, killing"
+            );
+            unsafe {
+                libc::kill(chrome_pid as i32, libc::SIGKILL);
+            }
+            return Err(Error::ToolExecution(rustykrab_core::ToolError::timeout(
+                format!(
+                    "Chrome launched (PID {chrome_pid}) but never made CDP available at \
+                     {cdp_url} within 15s. The process was killed. This can happen when \
+                     another Chrome instance holds a lock on the profile directory, or \
+                     Chrome hangs during GPU/sandbox initialization."
+                ),
+            )));
+        }
 
         let (browser, handler) = tokio::time::timeout(connect_timeout, Browser::connect(&cdp_url))
             .await
@@ -441,15 +490,32 @@ impl BrowserManager {
             profile_name: profile_name.to_string(),
             cdp_url,
             launched_by_us: true,
+            chrome_pid: Some(chrome_pid),
         })
     }
 }
 
+/// Tear down a profile instance: abort the CDP handler, drop the browser
+/// connection, and kill the Chrome process if we launched it.
+fn kill_profile_instance(inst: ProfileInstance) {
+    inst._handler_task.abort();
+    drop(inst.browser);
+    if inst.launched_by_us {
+        if let Some(pid) = inst.chrome_pid {
+            tracing::info!(pid, "sending SIGKILL to stuck Chrome process");
+            unsafe {
+                libc::kill(pid as i32, libc::SIGKILL);
+            }
+        }
+    }
+}
+
 /// Launch a Chrome/Chromium instance for the given profile.
+/// Returns the PID of the spawned Chrome process.
 ///
 /// This is a free function (not a method) so it can be called from
 /// `spawn_blocking` without lifetime issues (fixes ASYNC-H3).
-fn launch_browser_blocking(config: &BrowserConfig, profile_name: &str) -> Result<()> {
+fn launch_browser_blocking(config: &BrowserConfig, profile_name: &str) -> Result<u32> {
     let cdp_url = config.resolve_cdp_url(profile_name);
     let port = cdp_url
         .rsplit(':')
@@ -503,7 +569,7 @@ fn launch_browser_blocking(config: &BrowserConfig, profile_name: &str) -> Result
         )
     })?;
 
-    std::process::Command::new(&exe)
+    let child = std::process::Command::new(&exe)
         .args(&args)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -512,13 +578,15 @@ fn launch_browser_blocking(config: &BrowserConfig, profile_name: &str) -> Result
             Error::ToolExecution(format!("failed to launch browser ({exe}): {e}").into())
         })?;
 
+    let pid = child.id();
     tracing::info!(
         port,
+        pid,
         profile = profile_name,
         %profile_dir_name,
         "launched browser with remote debugging"
     );
-    Ok(())
+    Ok(pid)
 }
 
 /// Detect the platform-specific Chrome data directory.
