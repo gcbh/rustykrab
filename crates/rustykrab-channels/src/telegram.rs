@@ -288,7 +288,24 @@ impl TelegramChannel {
                 continue;
             }
 
-            let body: GetUpdatesResponse = match resp.json().await {
+            let raw_text = match resp.text().await {
+                Ok(t) => t,
+                Err(e) => {
+                    consecutive_errors += 1;
+                    let delay = backoff_delay(consecutive_errors);
+                    tracing::error!(
+                        consecutive_errors,
+                        delay_secs = delay.as_secs(),
+                        "failed to read Telegram response body: {e}"
+                    );
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+            };
+
+            tracing::debug!(raw_json = %raw_text, "raw getUpdates response");
+
+            let body: GetUpdatesResponse = match serde_json::from_str(&raw_text) {
                 Ok(b) => b,
                 Err(e) => {
                     consecutive_errors += 1;
@@ -336,6 +353,11 @@ impl TelegramChannel {
         if !constant_time_eq(header, secret) {
             return Err(Error::Auth("invalid Telegram webhook secret".into()));
         }
+
+        tracing::debug!(
+            raw_json = %String::from_utf8_lossy(payload),
+            "raw Telegram webhook payload"
+        );
 
         let update: Update = serde_json::from_slice(payload)?;
         self.handle_update(update).await
@@ -387,6 +409,16 @@ impl TelegramChannel {
 
         let chat_id = msg.chat.id;
         let thread_id = msg.message_thread_id.unwrap_or(0);
+
+        tracing::debug!(
+            update_id = update.update_id,
+            chat_id,
+            chat_type = %msg.chat.chat_type,
+            chat_title = ?msg.chat.title,
+            thread_id,
+            user_id = msg.from.as_ref().map(|u| u.id),
+            "parsed Telegram update IDs"
+        );
 
         // Chat allowlist check.
         if !self.allowed_chats.is_empty() && !self.allowed_chats.contains(&chat_id) {
