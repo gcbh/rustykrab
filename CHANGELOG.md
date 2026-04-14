@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.2.5] - 2026-04-14
+
+- Debug Telegram chat IDs and fix silent bare @mention drops (#362)
+
 ## [2.2.4] - 2026-04-14
 
 - debug: add raw JSON logging for Telegram updates to diagnose chat ID issues (#361)
