@@ -433,9 +433,42 @@ impl TelegramChannel {
             return Ok(());
         }
 
-        let text = match msg.text {
+        // Extract text from the message. Telegram sends bare @mentions with
+        // text: null and the mention in the entities array. Fall back to
+        // caption for media messages.
+        let has_mention = msg
+            .entities
+            .iter()
+            .any(|e| e.entity_type == "mention" || e.entity_type == "text_mention");
+        let text = match msg.text.or(msg.caption) {
             Some(t) => t,
-            None => return Ok(()), // Ignore non-text messages for now.
+            None if has_mention => {
+                // Bare @mention with no other text — acknowledge and return.
+                tracing::info!(
+                    chat_id,
+                    thread_id,
+                    entities_count = msg.entities.len(),
+                    "received bare @mention with no text body"
+                );
+                let _ = self
+                    .send_text(
+                        chat_id,
+                        "Hi! You mentioned me — send a message and I'll help.",
+                        thread_id,
+                    )
+                    .await;
+                return Ok(());
+            }
+            None => {
+                tracing::debug!(
+                    chat_id,
+                    thread_id,
+                    entities_count = msg.entities.len(),
+                    caption_entities_count = msg.caption_entities.len(),
+                    "ignoring non-text message (no text or caption)"
+                );
+                return Ok(());
+            }
         };
 
         // Handle bot commands before forwarding to the agent.
@@ -627,6 +660,15 @@ pub struct TelegramMessage {
     pub chat: Chat,
     pub from: Option<User>,
     pub text: Option<String>,
+    /// Caption for media messages (photos, documents, etc.).
+    #[serde(default)]
+    pub caption: Option<String>,
+    /// Entities in the text (mentions, commands, URLs, etc.).
+    #[serde(default)]
+    pub entities: Vec<MessageEntity>,
+    /// Entities in the caption.
+    #[serde(default)]
+    pub caption_entities: Vec<MessageEntity>,
     pub date: i64,
     /// Forum topic thread ID. Present when the message belongs to a forum topic.
     #[serde(default)]
@@ -634,6 +676,14 @@ pub struct TelegramMessage {
     /// Whether this message was sent inside a forum topic.
     #[serde(default)]
     pub is_topic_message: Option<bool>,
+}
+
+#[derive(Deserialize)]
+pub struct MessageEntity {
+    #[serde(rename = "type")]
+    pub entity_type: String,
+    pub offset: i64,
+    pub length: i64,
 }
 
 #[derive(Deserialize)]
