@@ -39,7 +39,7 @@ fn num_ctx_from_env(default: u32) -> u32 {
 
 /// Default context-window size.  The previous 128 K was too aggressive and
 /// caused Ollama to OOM (returning 500).  Can be overridden via `OLLAMA_NUM_CTX`.
-const DEFAULT_NUM_CTX: u32 = 85_000;
+const DEFAULT_NUM_CTX: u32 = 100_000;
 
 impl Default for OllamaConfig {
     fn default() -> Self {
