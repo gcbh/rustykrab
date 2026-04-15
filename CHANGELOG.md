@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.3.1] - 2026-04-15
+
+- fix: handle stream read errors gracefully instead of crashing (#366)
+
 ## [2.3.0] - 2026-04-15
 
 - feat: add network device discovery mechanisms (Part 1) (#365)
