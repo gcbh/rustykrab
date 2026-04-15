@@ -697,6 +697,9 @@ async fn telegram_agent_loop(
                                 Ok(mut conv) => {
                                     conv.channel_source = Some("telegram".to_string());
                                     conv.channel_id = Some(chat_id.to_string());
+                                    if thread_id != 0 {
+                                        conv.channel_thread_id = Some(thread_id.to_string());
+                                    }
                                     if let Err(e) = state.store.conversations().save(&conv) {
                                         tracing::warn!(
                                             chat_id,
@@ -803,6 +806,19 @@ async fn process_telegram_message(
             return "Internal error — please try again.".to_string();
         }
     };
+
+    // Ensure channel metadata is present (backfills conversations created
+    // before this field was populated).
+    if conv.channel_source.is_none() {
+        conv.channel_source = Some("telegram".to_string());
+        conv.channel_id = Some(chat_id.to_string());
+        if thread_id != 0 {
+            conv.channel_thread_id = Some(thread_id.to_string());
+        }
+    }
+    if conv.channel_thread_id.is_none() && thread_id != 0 {
+        conv.channel_thread_id = Some(thread_id.to_string());
+    }
 
     // Append user message.
     conv.messages.push(message);
