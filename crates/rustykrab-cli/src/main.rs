@@ -694,7 +694,15 @@ async fn telegram_agent_loop(
                                 id
                             }
                             None => match state.store.conversations().create() {
-                                Ok(conv) => {
+                                Ok(mut conv) => {
+                                    conv.channel_source = Some("telegram".to_string());
+                                    conv.channel_id = Some(chat_id.to_string());
+                                    if let Err(e) = state.store.conversations().save(&conv) {
+                                        tracing::warn!(
+                                            chat_id,
+                                            "failed to persist channel metadata: {e}"
+                                        );
+                                    }
                                     let id = conv.id;
                                     states.insert(
                                         key,
