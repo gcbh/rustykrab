@@ -3,7 +3,8 @@ use rustykrab_core::types::ToolSchema;
 use rustykrab_core::{Result, SandboxRequirements, Tool, ToolError};
 use serde_json::{json, Value};
 use std::net::IpAddr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use tokio::net::UdpSocket;
 use tokio::time::timeout;
 
 /// Network discovery tool for identifying hosts, services, and topology on the
@@ -16,17 +17,27 @@ use tokio::time::timeout;
 ///   types (A, AAAA, MX, TXT, SRV, NS, CNAME, PTR).
 /// - **mdns_discover**: Zero-configuration service discovery via mDNS/DNS-SD.
 ///   Finds printers, IoT devices, media servers, and other services that
-///   advertise themselves on the local network segment.
+///   advertise themselves on the local network segment.  Supports IoT service
+///   type presets for common smart-home protocols.
 /// - **arp_table**: Reads the system ARP cache to list MAC/IP mappings of
 ///   recently-seen devices — fast, passive, and doesn't generate traffic.
+/// - **arp_scan**: Actively scans a subnet to discover all IP-connected devices
+///   (including those with static IPs) via ARP requests.
+/// - **dhcp_leases**: Queries a router's DHCP lease table over SSH to discover
+///   all DHCP-assigned devices with hostnames, IPs, and MAC addresses.
+/// - **ssdp_discover**: Discovers UPnP devices on the local network via SSDP
+///   M-SEARCH multicast (Hue bridges, smart TVs, NAS, media servers).
+/// - **oui_lookup**: Looks up the manufacturer/vendor for a MAC address using
+///   the IEEE OUI database.
 /// - **traceroute**: Maps the network path (hops) to a target host.  Restricted
 ///   to private/link-local targets.
 /// - **interfaces**: Lists the host's own network interfaces with IP addresses,
 ///   subnet masks, MAC addresses, and link state.
 ///
-/// All probing actions that reach out to a target (traceroute) are restricted to
-/// RFC-1918 / link-local addresses.  Passive reads (arp_table, interfaces) and
-/// DNS lookups (which query name servers, not targets) have no such restriction.
+/// All probing actions that reach out to a target (traceroute, arp_scan) are
+/// restricted to RFC-1918 / link-local addresses.  Passive reads (arp_table,
+/// interfaces) and DNS lookups (which query name servers, not targets) have no
+/// such restriction.
 pub struct NetDiscoveryTool;
 
 impl NetDiscoveryTool {
@@ -133,6 +144,35 @@ async fn dns_lookup(name: &str, record_type: &str, timeout_ms: u64) -> Value {
             "success": false,
             "error": "DNS lookup timed out",
         }),
+    }
+}
+
+/// Resolve an mDNS preset name to a list of well-known service types.
+fn mdns_preset_service_types(preset: &str) -> std::result::Result<Vec<&'static str>, String> {
+    match preset {
+        "homekit" => Ok(vec!["_hap._tcp"]),
+        "chromecast" => Ok(vec!["_googlecast._tcp"]),
+        "sonos" => Ok(vec!["_sonos._tcp"]),
+        "airplay" => Ok(vec!["_airplay._tcp", "_raop._tcp"]),
+        "printers" => Ok(vec!["_ipp._tcp", "_printer._tcp", "_pdl-datastream._tcp"]),
+        "iot" => Ok(vec![
+            "_hap._tcp",          // HomeKit
+            "_googlecast._tcp",   // Chromecast / Google Home / Nest Hub
+            "_sonos._tcp",        // Sonos
+            "_airplay._tcp",      // AirPlay 2
+            "_raop._tcp",         // AirPlay (Remote Audio Output)
+            "_http._tcp",         // Generic HTTP (many IoT web UIs)
+            "_mqtt._tcp",         // MQTT brokers
+            "_esphomelib._tcp",   // ESPHome devices
+            "_miio._udp",         // Xiaomi IoT
+            "_printer._tcp",      // Network printers
+            "_ipp._tcp",          // IPP printers
+            "_smb._tcp",          // SMB file shares
+            "_ssh._tcp",          // SSH servers
+        ]),
+        other => Err(format!(
+            "unknown mDNS preset '{other}'. Available: homekit, chromecast, sonos, airplay, printers, iot"
+        )),
     }
 }
 
@@ -450,6 +490,591 @@ async fn interfaces(timeout_ms: u64) -> Value {
 }
 
 // ---------------------------------------------------------------------------
+// Active ARP scan
+// ---------------------------------------------------------------------------
+
+/// Actively scan a subnet for all devices using ARP requests.
+///
+/// Tries `arp-scan` first (most reliable, returns vendor info).  Falls back to
+/// `nmap -sn` (ping scan + ARP on local segment).
+async fn arp_scan(subnet: &str, timeout_ms: u64) -> Value {
+    let path = system_path();
+
+    // Try arp-scan first: `arp-scan --localnet` or `arp-scan <cidr>`
+    let arp_scan_result = timeout(
+        Duration::from_millis(timeout_ms),
+        tokio::process::Command::new("arp-scan")
+            .args(["--interface=eth0", "--retry=1", "--timeout=500", subnet])
+            .env("PATH", &path)
+            .output(),
+    )
+    .await;
+
+    if let Ok(Ok(output)) = arp_scan_result {
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            let mut entries = Vec::new();
+
+            for line in stdout.lines() {
+                let parts: Vec<&str> = line.split('\t').collect();
+                if parts.len() >= 3 {
+                    // arp-scan output: IP\tMAC\tVendor
+                    let ip_str = parts[0].trim();
+                    // Only include lines that start with a valid IP.
+                    if ip_str.parse::<IpAddr>().is_ok() {
+                        entries.push(json!({
+                            "ip": ip_str,
+                            "mac": parts[1].trim(),
+                            "vendor": parts[2].trim(),
+                        }));
+                    }
+                }
+            }
+
+            return json!({
+                "success": true,
+                "subnet": subnet,
+                "source": "arp-scan",
+                "entries": entries,
+                "count": entries.len(),
+            });
+        }
+    }
+
+    // Fallback: nmap -sn (ping/ARP scan)
+    let nmap_result = timeout(
+        Duration::from_millis(timeout_ms),
+        tokio::process::Command::new("nmap")
+            .args(["-sn", "-n", subnet])
+            .env("PATH", &path)
+            .output(),
+    )
+    .await;
+
+    match nmap_result {
+        Ok(Ok(output)) => {
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            let mut entries = Vec::new();
+            let mut current_ip = String::new();
+            let mut current_mac = String::new();
+            let mut current_vendor = String::new();
+
+            // nmap output blocks look like:
+            //   Nmap scan report for 192.168.1.1
+            //   Host is up (0.0012s latency).
+            //   MAC Address: AA:BB:CC:DD:EE:FF (Vendor Name)
+            for line in stdout.lines() {
+                let line = line.trim();
+                if line.starts_with("Nmap scan report for ") {
+                    // Flush previous entry.
+                    if !current_ip.is_empty() {
+                        entries.push(json!({
+                            "ip": current_ip,
+                            "mac": current_mac,
+                            "vendor": current_vendor,
+                        }));
+                    }
+                    current_ip = line.trim_start_matches("Nmap scan report for ").to_string();
+                    current_mac = String::new();
+                    current_vendor = String::new();
+                } else if line.starts_with("MAC Address: ") {
+                    let rest = line.trim_start_matches("MAC Address: ");
+                    if let Some((mac, vendor)) = rest.split_once(' ') {
+                        current_mac = mac.to_string();
+                        current_vendor = vendor
+                            .trim_start_matches('(')
+                            .trim_end_matches(')')
+                            .to_string();
+                    } else {
+                        current_mac = rest.to_string();
+                    }
+                }
+            }
+            // Flush last entry.
+            if !current_ip.is_empty() {
+                entries.push(json!({
+                    "ip": current_ip,
+                    "mac": current_mac,
+                    "vendor": current_vendor,
+                }));
+            }
+
+            json!({
+                "success": true,
+                "subnet": subnet,
+                "source": "nmap",
+                "entries": entries,
+                "count": entries.len(),
+            })
+        }
+        Ok(Err(e)) => json!({
+            "success": false,
+            "error": format!(
+                "Neither arp-scan nor nmap available: {e}. \
+                 Install arp-scan or nmap for active ARP scanning."
+            ),
+        }),
+        Err(_) => json!({
+            "success": false,
+            "error": "ARP scan timed out",
+        }),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// OUI vendor lookup
+// ---------------------------------------------------------------------------
+
+/// Normalize a MAC address to an uppercase OUI prefix (first 3 octets).
+///
+/// Accepts "AA:BB:CC:DD:EE:FF", "AA-BB-CC-DD-EE-FF", or "AABBCCDDEEFF".
+fn normalize_oui_prefix(mac: &str) -> Option<String> {
+    let cleaned: String = mac
+        .chars()
+        .filter(|c| c.is_ascii_hexdigit())
+        .collect::<String>()
+        .to_uppercase();
+    if cleaned.len() < 6 {
+        return None;
+    }
+    // Return "AA:BB:CC" format.
+    Some(format!(
+        "{}:{}:{}",
+        &cleaned[0..2],
+        &cleaned[2..4],
+        &cleaned[4..6]
+    ))
+}
+
+/// Built-in lookup table for common IoT / smart-home OUI prefixes.
+///
+/// This covers the most frequently seen vendors in home-network device
+/// discovery.  For comprehensive lookups the tool also checks system-installed
+/// IEEE databases.
+fn builtin_oui_lookup(prefix: &str) -> Option<&'static str> {
+    // prefix is "AA:BB:CC" uppercase
+    match prefix {
+        // Amazon
+        "F0:F0:A4" | "A4:08:EA" | "74:C2:46" | "FC:65:DE" | "4C:EF:C0" | "0C:47:C9" => {
+            Some("Amazon Technologies (Echo, Ring, Fire TV)")
+        }
+        // Google / Nest
+        "F4:F5:D8" | "54:60:09" | "A4:77:33" | "30:FD:38" | "48:D6:D5" | "6C:AD:F8" => {
+            Some("Google LLC (Nest, Chromecast, Google Home)")
+        }
+        // Apple
+        "3C:22:FB" | "A8:5C:2C" | "F0:B3:EC" | "AC:BC:32" | "D0:03:4B" | "70:56:81" => {
+            Some("Apple Inc. (HomePod, Apple TV, HomeKit)")
+        }
+        // Philips Hue / Signify
+        "00:17:88" | "EC:B5:FA" => Some("Signify / Philips Lighting (Hue bridge, bulbs)"),
+        // Espressif (ESP32/ESP8266)
+        "24:0A:C4" | "30:AE:A4" | "A4:CF:12" | "AC:67:B2" | "CC:50:E3" | "24:6F:28"
+        | "84:CC:A8" | "3C:61:05" | "EC:FA:BC" | "10:52:1C" => {
+            Some("Espressif Systems (ESP32/ESP8266 — Tasmota, ESPHome, DIY IoT)")
+        }
+        // TP-Link / Kasa
+        "50:C7:BF" | "60:A4:B7" | "1C:61:B4" | "98:DA:C4" | "B0:95:75" | "E8:48:B8" => {
+            Some("TP-Link Technologies (Kasa smart plugs, routers)")
+        }
+        // Belkin / WeMo
+        "94:10:3E" | "C4:41:1E" | "EC:1A:59" | "08:86:3B" => {
+            Some("Belkin International (WeMo smart plugs)")
+        }
+        // Sonos
+        "00:0E:58" | "34:7E:5C" | "48:A6:B8" | "5C:AA:FD" | "78:28:CA" | "B8:E9:37" => {
+            Some("Sonos Inc. (speakers, amps)")
+        }
+        // Samsung / SmartThings
+        "8C:79:F5" | "D0:66:7B" | "FC:A6:67" | "C4:73:1E" => {
+            Some("Samsung Electronics (SmartThings, TVs)")
+        }
+        // Tuya
+        "D8:1F:12" | "10:D5:61" | "A0:92:08" => Some("Tuya Smart (generic smart-home devices)"),
+        // Shelly (Allterco Robotics)
+        "E8:DB:84" | "EC:62:60" | "30:C6:F7" | "C8:F0:9E" => {
+            Some("Allterco Robotics (Shelly relays, plugs)")
+        }
+        // IKEA
+        "00:0B:57" | "D0:73:D5" | "CC:86:EC" | "94:3A:F0" => {
+            Some("IKEA (TRADFRI / Dirigera smart home)")
+        }
+        // Roku
+        "D8:31:34" | "C8:3A:6B" | "B0:A7:37" | "AC:3A:7A" => {
+            Some("Roku Inc. (streaming players, TVs)")
+        }
+        // Raspberry Pi
+        "B8:27:EB" | "DC:A6:32" | "E4:5F:01" | "D8:3A:DD" | "28:CD:C1" => {
+            Some("Raspberry Pi Foundation")
+        }
+        // Synology
+        "00:11:32" => Some("Synology Inc. (NAS)"),
+        // QNAP
+        "00:08:9B" | "24:5E:BE" => Some("QNAP Systems (NAS)"),
+        // Ring (Amazon)
+        "B0:09:DA" | "18:B4:30" => Some("Ring LLC (doorbells, cameras)"),
+        // Wyze
+        "2C:AA:8E" => Some("Wyze Labs (cameras, sensors)"),
+        // Ecobee
+        "44:61:32" => Some("ecobee Inc. (thermostats)"),
+        _ => None,
+    }
+}
+
+/// Look up the vendor/manufacturer for a MAC address.
+///
+/// Checks system-installed IEEE OUI databases at standard paths, then falls
+/// back to a built-in table of common IoT/smart-home vendors.
+async fn oui_lookup(mac: &str) -> Value {
+    let prefix = match normalize_oui_prefix(mac) {
+        Some(p) => p,
+        None => {
+            return json!({
+                "success": false,
+                "error": "invalid MAC address — expected at least 6 hex digits (e.g. 'AA:BB:CC:DD:EE:FF')",
+            });
+        }
+    };
+
+    // Prefix without colons for matching some file formats.
+    let prefix_nocolon = prefix.replace(':', "");
+
+    // Try system OUI databases.
+    let oui_paths = [
+        "/usr/share/ieee-data/oui.csv",
+        "/usr/share/misc/oui.txt",
+        "/usr/share/nmap/nmap-mac-prefixes",
+        "/var/lib/ieee-data/oui.csv",
+    ];
+
+    for path in &oui_paths {
+        if let Ok(contents) = tokio::fs::read_to_string(path).await {
+            // Search for the OUI prefix in the file.
+            for line in contents.lines() {
+                let upper = line.to_uppercase();
+                if upper.contains(&prefix) || upper.contains(&prefix_nocolon) {
+                    // Extract vendor name — varies by format.
+                    let vendor = if path.ends_with(".csv") {
+                        // CSV format: MA-L,AABBCC,Vendor Name,...
+                        line.split(',')
+                            .nth(2)
+                            .unwrap_or("")
+                            .trim()
+                            .trim_matches('"')
+                    } else if path.ends_with("nmap-mac-prefixes") {
+                        // nmap format: AABBCC Vendor Name
+                        line.split_once(' ')
+                            .or_else(|| line.split_once('\t'))
+                            .map(|(_, v)| v.trim())
+                            .unwrap_or("")
+                    } else {
+                        // oui.txt format: AA-BB-CC (hex)\tVendor Name
+                        line.split_once('\t')
+                            .or_else(|| line.split_once("  "))
+                            .map(|(_, v)| v.trim())
+                            .unwrap_or("")
+                    };
+
+                    if !vendor.is_empty() {
+                        return json!({
+                            "success": true,
+                            "mac": mac,
+                            "oui_prefix": prefix,
+                            "vendor": vendor,
+                            "source": path,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // Fall back to built-in table.
+    if let Some(vendor) = builtin_oui_lookup(&prefix) {
+        return json!({
+            "success": true,
+            "mac": mac,
+            "oui_prefix": prefix,
+            "vendor": vendor,
+            "source": "builtin",
+        });
+    }
+
+    json!({
+        "success": false,
+        "mac": mac,
+        "oui_prefix": prefix,
+        "error": "OUI prefix not found in available databases",
+    })
+}
+
+// ---------------------------------------------------------------------------
+// SSDP / UPnP discovery
+// ---------------------------------------------------------------------------
+
+const SSDP_MULTICAST_ADDR: &str = "239.255.255.250:1900";
+const SSDP_M_SEARCH: &str = "M-SEARCH * HTTP/1.1\r\n\
+                               HOST: 239.255.255.250:1900\r\n\
+                               MAN: \"ssdp:discover\"\r\n\
+                               MX: 3\r\n\
+                               ST: ssdp:all\r\n\r\n";
+
+/// Parse an SSDP response into key-value headers.
+fn parse_ssdp_headers(response: &str) -> Value {
+    let mut headers = serde_json::Map::new();
+    for line in response.lines() {
+        if let Some((key, value)) = line.split_once(':') {
+            let key = key.trim().to_uppercase();
+            let value = value.trim().to_string();
+            if !key.is_empty() && !value.is_empty() {
+                headers.insert(key, Value::String(value));
+            }
+        }
+    }
+    Value::Object(headers)
+}
+
+/// Extract a friendly name from UPnP device description XML.
+fn extract_xml_field(xml: &str, tag: &str) -> Option<String> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    if let Some(start) = xml.find(&open) {
+        let start = start + open.len();
+        if let Some(end) = xml[start..].find(&close) {
+            let value = xml[start..start + end].trim().to_string();
+            if !value.is_empty() {
+                return Some(value);
+            }
+        }
+    }
+    None
+}
+
+/// Discover UPnP devices on the local network via SSDP M-SEARCH.
+///
+/// Sends a multicast M-SEARCH request and collects responses.  When
+/// `fetch_descriptions` is true, fetches the device description XML from each
+/// device's LOCATION URL to extract friendly names, device types, and
+/// manufacturer info.
+async fn ssdp_discover(timeout_ms: u64, fetch_descriptions: bool) -> Value {
+    let sock = match UdpSocket::bind("0.0.0.0:0").await {
+        Ok(s) => s,
+        Err(e) => {
+            return json!({
+                "success": false,
+                "error": format!("failed to bind UDP socket: {e}"),
+            });
+        }
+    };
+
+    // Enable broadcast / multicast.
+    if let Err(e) = sock.set_broadcast(true) {
+        return json!({
+            "success": false,
+            "error": format!("failed to set broadcast: {e}"),
+        });
+    }
+
+    // Send M-SEARCH.
+    let dest: std::net::SocketAddr = match SSDP_MULTICAST_ADDR.parse() {
+        Ok(a) => a,
+        Err(e) => {
+            return json!({
+                "success": false,
+                "error": format!("invalid multicast address: {e}"),
+            });
+        }
+    };
+
+    if let Err(e) = sock.send_to(SSDP_M_SEARCH.as_bytes(), dest).await {
+        return json!({
+            "success": false,
+            "error": format!("failed to send M-SEARCH: {e}"),
+        });
+    }
+
+    // Collect responses until timeout.
+    let mut devices = Vec::new();
+    let mut seen_usns = std::collections::HashSet::new();
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms.min(15_000));
+    let mut buf = [0u8; 4096];
+
+    while Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+
+        match timeout(remaining, sock.recv_from(&mut buf)).await {
+            Ok(Ok((n, addr))) => {
+                let resp = String::from_utf8_lossy(&buf[..n]).to_string();
+                let headers = parse_ssdp_headers(&resp);
+
+                // De-duplicate by USN (Unique Service Name).
+                let usn = headers["USN"].as_str().unwrap_or("").to_string();
+                if !usn.is_empty() && !seen_usns.insert(usn.clone()) {
+                    continue;
+                }
+
+                let location = headers["LOCATION"].as_str().unwrap_or("").to_string();
+                let st = headers["ST"].as_str().unwrap_or("").to_string();
+                let server = headers["SERVER"].as_str().unwrap_or("").to_string();
+
+                devices.push(json!({
+                    "ip": addr.ip().to_string(),
+                    "port": addr.port(),
+                    "usn": usn,
+                    "st": st,
+                    "location_url": location,
+                    "server": server,
+                }));
+            }
+            Ok(Err(_)) | Err(_) => break,
+        }
+    }
+
+    // Optionally fetch device description XML from LOCATION URLs.
+    if fetch_descriptions {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+
+        for device in &mut devices {
+            let location = device["location_url"].as_str().unwrap_or("").to_string();
+            if location.is_empty() || !location.starts_with("http") {
+                continue;
+            }
+            if let Ok(resp) = client.get(&location).send().await {
+                if let Ok(body) = resp.text().await {
+                    // Extract key fields from XML.
+                    let friendly_name = extract_xml_field(&body, "friendlyName");
+                    let device_type = extract_xml_field(&body, "deviceType");
+                    let manufacturer = extract_xml_field(&body, "manufacturer");
+                    let model_name = extract_xml_field(&body, "modelName");
+                    let model_number = extract_xml_field(&body, "modelNumber");
+
+                    if let Some(obj) = device.as_object_mut() {
+                        if let Some(v) = friendly_name {
+                            obj.insert("friendly_name".to_string(), Value::String(v));
+                        }
+                        if let Some(v) = device_type {
+                            obj.insert("device_type".to_string(), Value::String(v));
+                        }
+                        if let Some(v) = manufacturer {
+                            obj.insert("manufacturer".to_string(), Value::String(v));
+                        }
+                        if let Some(v) = model_name {
+                            obj.insert("model_name".to_string(), Value::String(v));
+                        }
+                        if let Some(v) = model_number {
+                            obj.insert("model_number".to_string(), Value::String(v));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    json!({
+        "success": true,
+        "devices": devices,
+        "count": devices.len(),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// DHCP lease table
+// ---------------------------------------------------------------------------
+
+/// Query a router's DHCP lease table over SSH.
+///
+/// Connects to the router at `host` as `user` (default "root") and reads the
+/// dnsmasq lease file.  The standard location is `/tmp/dnsmasq.leases` on
+/// OpenWrt/DD-WRT routers, but `lease_file` can be overridden.
+///
+/// Lease line format: `epoch mac ip hostname client-id`
+async fn dhcp_leases(host: &str, user: &str, lease_file: &str, timeout_ms: u64) -> Value {
+    let path = system_path();
+
+    let remote_cmd = format!("cat {lease_file}");
+    let result = timeout(
+        Duration::from_millis(timeout_ms),
+        tokio::process::Command::new("ssh")
+            .args([
+                "-o",
+                "StrictHostKeyChecking=accept-new",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=5",
+                "-l",
+                user,
+                host,
+                &remote_cmd,
+            ])
+            .env("PATH", &path)
+            .output(),
+    )
+    .await;
+
+    match result {
+        Ok(Ok(output)) => {
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+
+            if !output.status.success() {
+                return json!({
+                    "success": false,
+                    "error": if stderr.is_empty() {
+                        format!("SSH command failed with exit code {}", output.status.code().unwrap_or(-1))
+                    } else {
+                        stderr
+                    },
+                });
+            }
+
+            let mut leases = Vec::new();
+            for line in stdout.lines() {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() < 4 {
+                    continue;
+                }
+                // dnsmasq format: epoch mac ip hostname [client-id]
+                let expires = parts[0].parse::<u64>().unwrap_or(0);
+                let mac = parts[1];
+                let ip = parts[2];
+                let hostname = parts[3];
+                let client_id = parts.get(4).copied().unwrap_or("");
+
+                leases.push(json!({
+                    "ip": ip,
+                    "mac": mac,
+                    "hostname": if hostname == "*" { "" } else { hostname },
+                    "lease_expires": expires,
+                    "client_id": client_id,
+                }));
+            }
+
+            json!({
+                "success": true,
+                "router": host,
+                "leases": leases,
+                "count": leases.len(),
+            })
+        }
+        Ok(Err(e)) => json!({
+            "success": false,
+            "error": format!("SSH not available: {e}"),
+        }),
+        Err(_) => json!({
+            "success": false,
+            "error": "DHCP lease query timed out",
+        }),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tool trait implementation
 // ---------------------------------------------------------------------------
 
@@ -461,12 +1086,14 @@ impl Tool for NetDiscoveryTool {
 
     fn description(&self) -> &str {
         "Discover hosts, services, and network topology. DNS lookups, mDNS/DNS-SD service \
-         discovery, ARP table, traceroute, and interface listing."
+         discovery, DHCP lease table, active ARP scan, SSDP/UPnP, OUI vendor lookup, \
+         ARP cache, traceroute, and interface listing."
     }
 
     fn sandbox_requirements(&self) -> SandboxRequirements {
         SandboxRequirements {
             needs_fs_read: true,
+            needs_net: true,
             needs_spawn: true,
             ..SandboxRequirements::default()
         }
@@ -481,8 +1108,12 @@ impl Tool for NetDiscoveryTool {
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["dns_lookup", "mdns_discover", "arp_table", "traceroute", "interfaces"],
-                        "description": "dns_lookup: forward/reverse DNS resolution. mdns_discover: find services via mDNS/DNS-SD. arp_table: read cached MAC/IP mappings. traceroute: map network hops to a local target. interfaces: list local network interfaces."
+                        "enum": [
+                            "dns_lookup", "mdns_discover", "arp_table", "arp_scan",
+                            "dhcp_leases", "ssdp_discover", "oui_lookup",
+                            "traceroute", "interfaces"
+                        ],
+                        "description": "dns_lookup: forward/reverse DNS resolution. mdns_discover: find services via mDNS/DNS-SD (supports IoT presets). arp_table: read cached MAC/IP mappings. arp_scan: actively scan a subnet for all devices via ARP. dhcp_leases: query router DHCP lease table over SSH. ssdp_discover: find UPnP devices via SSDP multicast. oui_lookup: look up MAC address vendor/manufacturer. traceroute: map network hops to a local target. interfaces: list local network interfaces."
                     },
                     "name": {
                         "type": "string",
@@ -495,11 +1126,36 @@ impl Tool for NetDiscoveryTool {
                     },
                     "service_type": {
                         "type": "string",
-                        "description": "mDNS service type for mdns_discover (e.g. '_http._tcp', '_ssh._tcp', '_ipp._tcp', '_smb._tcp'). Default: '_services._dns-sd._udp' to list all."
+                        "description": "mDNS service type for mdns_discover (e.g. '_http._tcp', '_ssh._tcp', '_hap._tcp'). Default: '_services._dns-sd._udp' to list all."
+                    },
+                    "preset": {
+                        "type": "string",
+                        "enum": ["homekit", "chromecast", "sonos", "airplay", "iot", "printers"],
+                        "description": "mDNS preset for mdns_discover — browses well-known IoT service types. 'iot' scans all smart-home types. Overrides service_type."
                     },
                     "host": {
                         "type": "string",
-                        "description": "Target IP address for traceroute (must be private/link-local)"
+                        "description": "Target IP for traceroute (must be private/link-local). Router IP for dhcp_leases."
+                    },
+                    "user": {
+                        "type": "string",
+                        "description": "SSH user for dhcp_leases (default: 'root')"
+                    },
+                    "lease_file": {
+                        "type": "string",
+                        "description": "Path to lease file on router for dhcp_leases (default: '/tmp/dnsmasq.leases')"
+                    },
+                    "subnet": {
+                        "type": "string",
+                        "description": "CIDR subnet for arp_scan (e.g. '192.168.1.0/24')"
+                    },
+                    "mac": {
+                        "type": "string",
+                        "description": "MAC address for oui_lookup (e.g. 'AA:BB:CC:DD:EE:FF')"
+                    },
+                    "fetch_descriptions": {
+                        "type": "boolean",
+                        "description": "For ssdp_discover: fetch UPnP device description XML from LOCATION URLs (default: false, adds latency)"
                     },
                     "timeout_ms": {
                         "type": "integer",
@@ -547,6 +1203,34 @@ impl Tool for NetDiscoveryTool {
             }
 
             "mdns_discover" => {
+                // If a preset is given, browse multiple service types at once.
+                if let Some(preset) = args["preset"].as_str() {
+                    let types = mdns_preset_service_types(preset).map_err(|e| {
+                        rustykrab_core::Error::ToolExecution(ToolError::invalid_input(e))
+                    })?;
+
+                    let mut all_services = Vec::new();
+                    // Split timeout evenly across types, minimum 3s each.
+                    let per_type_ms = (timeout_ms / types.len() as u64).max(3_000);
+                    for svc_type in &types {
+                        let result = mdns_discover(svc_type, per_type_ms).await;
+                        if let Some(services) = result["services"].as_array() {
+                            all_services.extend(services.clone());
+                        }
+                    }
+
+                    return Ok(json!({
+                        "action": "mdns_discover",
+                        "preset": preset,
+                        "service_types_queried": types,
+                        "result": {
+                            "success": true,
+                            "services": all_services,
+                            "count": all_services.len(),
+                        },
+                    }));
+                }
+
                 let service_type = args["service_type"]
                     .as_str()
                     .unwrap_or("_services._dns-sd._udp");
@@ -566,6 +1250,55 @@ impl Tool for NetDiscoveryTool {
                 }))
             }
 
+            "arp_scan" => {
+                let subnet = args["subnet"].as_str().ok_or_else(|| {
+                    rustykrab_core::Error::ToolExecution(ToolError::invalid_input(
+                        "subnet (CIDR) is required for arp_scan, e.g. '192.168.1.0/24'",
+                    ))
+                })?;
+
+                // Validate the base IP is in a local range.
+                let base_ip_str = subnet.split('/').next().unwrap_or("");
+                if let Ok(ip) = base_ip_str.parse::<IpAddr>() {
+                    if !is_local_network(&ip) {
+                        return Err(rustykrab_core::Error::ToolExecution(
+                            ToolError::invalid_input(format!(
+                                "{ip} is not in a private/local range — only local-network scanning is allowed"
+                            )),
+                        ));
+                    }
+                }
+
+                let result = arp_scan(subnet, timeout_ms).await;
+                Ok(json!({
+                    "action": "arp_scan",
+                    "result": result,
+                }))
+            }
+
+            "oui_lookup" => {
+                let mac_str = args["mac"].as_str().ok_or_else(|| {
+                    rustykrab_core::Error::ToolExecution(ToolError::invalid_input(
+                        "mac is required for oui_lookup (e.g. 'AA:BB:CC:DD:EE:FF')",
+                    ))
+                })?;
+
+                let result = oui_lookup(mac_str).await;
+                Ok(json!({
+                    "action": "oui_lookup",
+                    "result": result,
+                }))
+            }
+
+            "ssdp_discover" => {
+                let fetch_desc = args["fetch_descriptions"].as_bool().unwrap_or(false);
+                let result = ssdp_discover(timeout_ms, fetch_desc).await;
+                Ok(json!({
+                    "action": "ssdp_discover",
+                    "result": result,
+                }))
+            }
+
             "traceroute" => {
                 let host_str = args["host"].as_str().ok_or_else(|| {
                     rustykrab_core::Error::ToolExecution(ToolError::invalid_input(
@@ -578,6 +1311,25 @@ impl Tool for NetDiscoveryTool {
                 let result = traceroute(ip, timeout_ms).await;
                 Ok(json!({
                     "action": "traceroute",
+                    "result": result,
+                }))
+            }
+
+            "dhcp_leases" => {
+                let host_str = args["host"].as_str().ok_or_else(|| {
+                    rustykrab_core::Error::ToolExecution(ToolError::invalid_input(
+                        "host (router IP) is required for dhcp_leases",
+                    ))
+                })?;
+                // Validate router IP is on local network.
+                require_local(host_str).map_err(rustykrab_core::Error::ToolExecution)?;
+
+                let user = args["user"].as_str().unwrap_or("root");
+                let lease_file = args["lease_file"].as_str().unwrap_or("/tmp/dnsmasq.leases");
+
+                let result = dhcp_leases(host_str, user, lease_file, timeout_ms).await;
+                Ok(json!({
+                    "action": "dhcp_leases",
                     "result": result,
                 }))
             }
