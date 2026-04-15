@@ -37,10 +37,9 @@ fn num_ctx_from_env(default: u32) -> u32 {
         .unwrap_or(default)
 }
 
-/// Default context-window size.  128 K was too aggressive for most local
-/// GPU setups and caused Ollama to OOM (returning 500).  8 192 is safe for
-/// virtually every model / card and can be raised via `OLLAMA_NUM_CTX`.
-const DEFAULT_NUM_CTX: u32 = 8_192;
+/// Default context-window size.  The previous 128 K was too aggressive and
+/// caused Ollama to OOM (returning 500).  Can be overridden via `OLLAMA_NUM_CTX`.
+const DEFAULT_NUM_CTX: u32 = 85_000;
 
 impl Default for OllamaConfig {
     fn default() -> Self {
