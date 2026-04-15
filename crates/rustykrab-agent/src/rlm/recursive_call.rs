@@ -193,6 +193,8 @@ async fn execute_repl_call_impl(
     // Tool-use loop — mirrors the pattern in orchestrator/executor.rs.
     let max_rounds = config.max_tool_rounds;
     let timeout_secs = config.model_call_timeout_secs;
+    let mut empty_tool_use_retries: usize = 0;
+    let max_empty_tool_use_retries: usize = 3;
 
     for round in 0..max_rounds {
         // Acquire a semaphore permit for the LLM call only — released
@@ -225,6 +227,7 @@ async fn execute_repl_call_impl(
 
         // If the model wants to use tools, execute them and continue.
         if response.message.content.has_tool_calls() {
+            empty_tool_use_retries = 0;
             messages.push(response.message.clone());
 
             let calls = response.message.content.tool_calls();
@@ -258,52 +261,73 @@ async fn execute_repl_call_impl(
             continue;
         }
 
-        // Explicit end-of-turn or text response — call is complete.
-        if response.stop_reason == StopReason::EndTurn {
-            let answer = response.message.content.as_text().unwrap_or("").to_string();
-            tracing::info!(
-                depth,
-                rounds_used = round + 1,
-                answer_len = answer.len(),
-                "RLM REPL: call completed"
-            );
-            return Ok(answer);
+        match response.stop_reason {
+            StopReason::EndTurn => {
+                let answer = response.message.content.as_text().unwrap_or("").to_string();
+                tracing::info!(
+                    depth,
+                    rounds_used = round + 1,
+                    answer_len = answer.len(),
+                    "RLM REPL: call completed"
+                );
+                return Ok(answer);
+            }
+            StopReason::MaxTokens => {
+                tracing::warn!(
+                    depth,
+                    round,
+                    "RLM REPL: model hit max tokens, prompting to continue"
+                );
+                messages.push(response.message);
+                messages.push(Message {
+                    id: Uuid::new_v4(),
+                    role: Role::User,
+                    content: MessageContent::Text("Continue.".to_string()),
+                    created_at: Utc::now(),
+                });
+                continue;
+            }
+            StopReason::ContentPolicy => {
+                tracing::error!(
+                    depth,
+                    round,
+                    "RLM REPL: model refused due to content policy"
+                );
+                return Err(Error::Internal(
+                    "model refused to respond due to content policy".into(),
+                ));
+            }
+            StopReason::ToolUse => {
+                empty_tool_use_retries += 1;
+                if empty_tool_use_retries > max_empty_tool_use_retries {
+                    tracing::error!(
+                        depth,
+                        round,
+                        retries = empty_tool_use_retries,
+                        "RLM REPL: repeated ToolUse with no tool calls — aborting"
+                    );
+                    return Err(Error::Internal(
+                        "model repeatedly indicated tool use but provided no tool calls".into(),
+                    ));
+                }
+                tracing::warn!(
+                    depth,
+                    round,
+                    retries = empty_tool_use_retries,
+                    "RLM REPL: stop reason is ToolUse but no tool calls found, re-prompting"
+                );
+                messages.push(Message {
+                    id: Uuid::new_v4(),
+                    role: Role::User,
+                    content: MessageContent::Text(
+                        "Your previous response indicated a tool call but none was found. Please retry."
+                            .to_string(),
+                    ),
+                    created_at: Utc::now(),
+                });
+                continue;
+            }
         }
-
-        // MaxTokens — prompt to continue.
-        if response.stop_reason == StopReason::MaxTokens {
-            tracing::warn!(
-                depth,
-                round,
-                "RLM REPL: model hit max tokens, prompting to continue"
-            );
-            messages.push(response.message);
-            messages.push(Message {
-                id: Uuid::new_v4(),
-                role: Role::User,
-                content: MessageContent::Text("Continue.".to_string()),
-                created_at: Utc::now(),
-            });
-            continue;
-        }
-
-        // Stop reason indicates tool use but no tool calls found — re-prompt.
-        tracing::warn!(
-            depth,
-            round,
-            stop_reason = ?response.stop_reason,
-            "RLM REPL: stop reason indicates tool use but no tool calls found, re-prompting"
-        );
-        messages.push(Message {
-            id: Uuid::new_v4(),
-            role: Role::User,
-            content: MessageContent::Text(
-                "Your previous response indicated a tool call but none was found. Please retry."
-                    .to_string(),
-            ),
-            created_at: Utc::now(),
-        });
-        continue;
     }
 
     tracing::error!(depth, max_rounds, "RLM REPL: exceeded max tool rounds");

@@ -21,6 +21,14 @@ pub struct SandboxRequirements {
     pub needs_spawn: bool,
 }
 
+impl SandboxRequirements {
+    /// Returns true if this tool can cause external side effects
+    /// (writes, network calls, or process spawning).
+    pub fn has_side_effects(&self) -> bool {
+        self.needs_fs_write || self.needs_net || self.needs_spawn
+    }
+}
+
 /// Trait implemented by every tool available to the agent.
 #[async_trait]
 pub trait Tool: Send + Sync {

@@ -34,6 +34,68 @@ const EXTERNAL_CONTENT_TOOLS: &[&str] = &[
     "x_search",
 ];
 
+/// Maximum retries for an empty response (model returned no text).
+const EMPTY_RESPONSE_RETRY_LIMIT: usize = 1;
+/// Maximum retries for a planning-only response (model described intent
+/// without using tools).
+const PLANNING_ONLY_RETRY_LIMIT: usize = 2;
+
+/// Classification of a model response that didn't include tool calls.
+enum ResponseClass {
+    /// Substantive text — the model produced a real answer.
+    Complete,
+    /// Empty or whitespace-only text (possibly with completion tokens from
+    /// unhandled content blocks like thinking).
+    Empty,
+    /// The model described what it *plans* to do without actually doing it
+    /// (e.g. "I'll read the file…", "Let me search for…").
+    PlanningOnly,
+}
+
+/// Classify a text-only assistant response.
+fn classify_response(text: &str, _completion_tokens: u32) -> ResponseClass {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return ResponseClass::Empty;
+    }
+    if is_planning_only(trimmed) {
+        return ResponseClass::PlanningOnly;
+    }
+    ResponseClass::Complete
+}
+
+/// Heuristic: does the text look like the model is just *describing* what
+/// it intends to do rather than actually doing it?
+///
+/// We check for common planning prefixes combined with the absence of
+/// concrete output markers (code blocks, results, long text).
+fn is_planning_only(text: &str) -> bool {
+    // Long responses are unlikely to be pure planning.
+    if text.len() > 500 {
+        return false;
+    }
+    // If the text contains a code block, it's producing output.
+    if text.contains("```") {
+        return false;
+    }
+    let lower = text.to_lowercase();
+    let planning_prefixes = [
+        "i'll ",
+        "i will ",
+        "let me ",
+        "i'm going to ",
+        "i am going to ",
+        "first, i'll ",
+        "first, let me ",
+        "i need to ",
+        "i should ",
+        "let's ",
+        "i can ",
+        "i would ",
+    ];
+    planning_prefixes.iter().any(|p| lower.starts_with(p))
+}
+
 /// Events emitted by the agent loop during streaming execution.
 ///
 /// These give callers (e.g. WebSocket handlers) real-time visibility
@@ -164,6 +226,13 @@ impl AgentRunner {
 
         let mut consecutive_errors = 0;
         let mut soft_warning_injected = false;
+        // Per-category retry counters (à la OpenClaw incomplete-turn).
+        let mut empty_response_retries: usize = 0;
+        let mut planning_only_retries: usize = 0;
+        let mut empty_tool_use_retries: usize = 0;
+        // Track whether any side-effect tool has been executed this run,
+        // so we can suppress retries that might duplicate externally-visible actions.
+        let mut had_side_effects = false;
 
         for iteration in 0..self.config.max_iterations {
             tracer.record_iteration();
@@ -221,6 +290,9 @@ impl AgentRunner {
 
             // Handle tool calls.
             if message.content.has_tool_calls() {
+                empty_tool_use_retries = 0;
+                empty_response_retries = 0;
+                planning_only_retries = 0;
                 let calls = message.content.tool_calls();
                 let tool_names: Vec<&str> = calls.iter().map(|c| c.name.as_str()).collect();
                 tracing::info!(
@@ -237,6 +309,22 @@ impl AgentRunner {
                 let results = self
                     .execute_tools_parallel_traced(calls, session, &tracer)
                     .await;
+
+                // Track side effects: check if any successfully executed tool
+                // can cause external mutations (writes, network, spawning).
+                if !had_side_effects {
+                    for (tool_name, _, result) in &results {
+                        if result.is_ok() {
+                            if let Some(t) = self.tools.iter().find(|t| t.name() == tool_name) {
+                                if t.sandbox_requirements().has_side_effects() {
+                                    had_side_effects = true;
+                                    tracing::debug!(tool = %tool_name, "side-effect tool executed — retry guard active");
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
 
                 let had_errors = results.iter().any(|(_, _, r)| {
                     if let Ok(tr) = r {
@@ -294,53 +382,119 @@ impl AgentRunner {
                 continue;
             }
 
-            // If model hit max_tokens, it may be truncated — let it continue.
-            if stop_reason == StopReason::MaxTokens {
-                tracing::warn!("model hit max tokens, prompting to continue");
-                conv.messages.push(Message {
-                    id: Uuid::new_v4(),
-                    role: Role::User,
-                    content: MessageContent::Text("Continue.".to_string()),
-                    created_at: Utc::now(),
-                });
-                continue;
-            }
-
-            // Explicit end-of-turn — done.
-            if stop_reason == StopReason::EndTurn {
-                // Debug: warn when the model ends its turn with empty text.
-                // This helps diagnose cases where completion_tokens > 0 but no
-                // usable text was extracted (e.g. unhandled content block types).
-                if !message.content.has_tool_calls() {
+            match stop_reason {
+                StopReason::MaxTokens => {
+                    tracing::warn!("model hit max tokens, prompting to continue");
+                    conv.messages.push(Message {
+                        id: Uuid::new_v4(),
+                        role: Role::User,
+                        content: MessageContent::Text("Continue.".to_string()),
+                        created_at: Utc::now(),
+                    });
+                    continue;
+                }
+                StopReason::EndTurn => {
                     let text = message.content.as_text().unwrap_or("");
-                    if text.is_empty() {
-                        tracing::warn!(
-                            iteration,
-                            completion_tokens = usage.completion_tokens,
-                            content_variant = ?std::mem::discriminant(&message.content),
-                            "EndTurn with empty assistant text — \
-                             response may contain unhandled content blocks"
-                        );
+                    let classification = classify_response(text, usage.completion_tokens);
+
+                    match classification {
+                        ResponseClass::Complete => return Ok(()),
+                        ResponseClass::Empty => {
+                            tracing::warn!(
+                                iteration,
+                                completion_tokens = usage.completion_tokens,
+                                "EndTurn with empty assistant text"
+                            );
+                            if had_side_effects {
+                                tracing::info!(
+                                    "side effects occurred — not retrying empty response"
+                                );
+                                return Ok(());
+                            }
+                            empty_response_retries += 1;
+                            if empty_response_retries > EMPTY_RESPONSE_RETRY_LIMIT {
+                                tracing::warn!("empty response retries exhausted");
+                                return Ok(());
+                            }
+                            conv.messages.push(Message {
+                                id: Uuid::new_v4(),
+                                role: Role::User,
+                                content: MessageContent::Text(
+                                    "Your response was empty. Please provide a substantive answer or take an action.".to_string(),
+                                ),
+                                created_at: Utc::now(),
+                            });
+                            continue;
+                        }
+                        ResponseClass::PlanningOnly => {
+                            if had_side_effects {
+                                tracing::info!(
+                                    "side effects occurred — accepting planning-only response"
+                                );
+                                return Ok(());
+                            }
+                            planning_only_retries += 1;
+                            if planning_only_retries > PLANNING_ONLY_RETRY_LIMIT {
+                                tracing::warn!(
+                                    "planning-only retries exhausted — accepting response"
+                                );
+                                return Ok(());
+                            }
+                            tracing::warn!(
+                                retries = planning_only_retries,
+                                "model produced planning-only text without action, re-prompting"
+                            );
+                            conv.messages.push(Message {
+                                id: Uuid::new_v4(),
+                                role: Role::User,
+                                content: MessageContent::Text(
+                                    "Don't just describe what you plan to do — actually do it using the tools available to you.".to_string(),
+                                ),
+                                created_at: Utc::now(),
+                            });
+                            continue;
+                        }
                     }
                 }
-                return Ok(());
+                StopReason::ContentPolicy => {
+                    tracing::error!(iteration, "model refused to respond due to content policy");
+                    return Err(Error::ContentPolicy);
+                }
+                StopReason::ToolUse => {
+                    // stop_reason says ToolUse but no tool calls were found.
+                    // If side-effect tools already ran, don't retry — risk of
+                    // duplicate external actions.
+                    if had_side_effects {
+                        tracing::warn!(
+                            "ToolUse without tool calls after side effects — stopping to avoid duplicates"
+                        );
+                        return Ok(());
+                    }
+                    empty_tool_use_retries += 1;
+                    if empty_tool_use_retries > self.config.max_consecutive_errors {
+                        tracing::error!(
+                            retries = empty_tool_use_retries,
+                            "repeated ToolUse stop reason with no tool calls — aborting"
+                        );
+                        return Err(Error::Internal(
+                            "model repeatedly indicated tool use but provided no tool calls".into(),
+                        ));
+                    }
+                    tracing::warn!(
+                        retries = empty_tool_use_retries,
+                        "stop reason is ToolUse but no tool calls found in response, re-prompting"
+                    );
+                    conv.messages.push(Message {
+                        id: Uuid::new_v4(),
+                        role: Role::User,
+                        content: MessageContent::Text(
+                            "Your previous response indicated a tool call but none was found. Please retry.".to_string(),
+                        ),
+                        created_at: Utc::now(),
+                    });
+                    continue;
+                }
             }
-
-            // Stop reason indicates tool use but no tool calls found in content.
-            // Re-prompt rather than silently ending the turn.
-            tracing::warn!(
-                ?stop_reason,
-                "stop reason indicates tool use but no tool calls found in response, re-prompting"
-            );
-            conv.messages.push(Message {
-                id: Uuid::new_v4(),
-                role: Role::User,
-                content: MessageContent::Text(
-                    "Your previous response indicated a tool call but none was found. Please retry.".to_string(),
-                ),
-                created_at: Utc::now(),
-            });
-            continue;
         }
 
         // Escalate to user instead of hard-failing.
@@ -394,6 +548,10 @@ impl AgentRunner {
 
         let mut consecutive_errors = 0;
         let mut soft_warning_injected = false;
+        let mut empty_response_retries: usize = 0;
+        let mut planning_only_retries: usize = 0;
+        let mut empty_tool_use_retries: usize = 0;
+        let mut had_side_effects = false;
 
         for iteration in 0..self.config.max_iterations {
             tracer.record_iteration();
@@ -454,6 +612,9 @@ impl AgentRunner {
 
             // Handle tool calls.
             if message.content.has_tool_calls() {
+                empty_tool_use_retries = 0;
+                empty_response_retries = 0;
+                planning_only_retries = 0;
                 let calls = message.content.tool_calls();
                 let tool_names: Vec<&str> = calls.iter().map(|c| c.name.as_str()).collect();
                 tracing::info!(
@@ -474,6 +635,21 @@ impl AgentRunner {
                 let results = self
                     .execute_tools_parallel_traced(calls, session, &tracer)
                     .await;
+
+                // Track side effects in streaming path.
+                if !had_side_effects {
+                    for (tool_name, _, result) in &results {
+                        if result.is_ok() {
+                            if let Some(t) = self.tools.iter().find(|t| t.name() == tool_name) {
+                                if t.sandbox_requirements().has_side_effects() {
+                                    had_side_effects = true;
+                                    tracing::debug!(tool = %tool_name, "side-effect tool executed — retry guard active");
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
 
                 let had_errors = results.iter().any(|(_, _, r)| {
                     if let Ok(tr) = r {
@@ -539,50 +715,124 @@ impl AgentRunner {
                 continue;
             }
 
-            if stop_reason == StopReason::MaxTokens {
-                tracing::warn!("model hit max tokens, prompting to continue");
-                conv.messages.push(Message {
-                    id: Uuid::new_v4(),
-                    role: Role::User,
-                    content: MessageContent::Text("Continue.".to_string()),
-                    created_at: Utc::now(),
-                });
-                continue;
-            }
-
-            // Explicit end-of-turn — done.
-            if stop_reason == StopReason::EndTurn {
-                if !message.content.has_tool_calls() {
+            match stop_reason {
+                StopReason::MaxTokens => {
+                    tracing::warn!("model hit max tokens, prompting to continue");
+                    conv.messages.push(Message {
+                        id: Uuid::new_v4(),
+                        role: Role::User,
+                        content: MessageContent::Text("Continue.".to_string()),
+                        created_at: Utc::now(),
+                    });
+                    continue;
+                }
+                StopReason::EndTurn => {
                     let text = message.content.as_text().unwrap_or("");
-                    if text.is_empty() {
-                        tracing::warn!(
-                            iteration,
-                            completion_tokens = usage.completion_tokens,
-                            content_variant = ?std::mem::discriminant(&message.content),
-                            "EndTurn with empty assistant text — \
-                             response may contain unhandled content blocks"
-                        );
+                    let classification = classify_response(text, usage.completion_tokens);
+
+                    match classification {
+                        ResponseClass::Complete => {
+                            on_event(AgentEvent::Done);
+                            return Ok(());
+                        }
+                        ResponseClass::Empty => {
+                            tracing::warn!(
+                                iteration,
+                                completion_tokens = usage.completion_tokens,
+                                "EndTurn with empty assistant text"
+                            );
+                            if had_side_effects {
+                                tracing::info!(
+                                    "side effects occurred — not retrying empty response"
+                                );
+                                on_event(AgentEvent::Done);
+                                return Ok(());
+                            }
+                            empty_response_retries += 1;
+                            if empty_response_retries > EMPTY_RESPONSE_RETRY_LIMIT {
+                                tracing::warn!("empty response retries exhausted");
+                                on_event(AgentEvent::Done);
+                                return Ok(());
+                            }
+                            conv.messages.push(Message {
+                                id: Uuid::new_v4(),
+                                role: Role::User,
+                                content: MessageContent::Text(
+                                    "Your response was empty. Please provide a substantive answer or take an action.".to_string(),
+                                ),
+                                created_at: Utc::now(),
+                            });
+                            continue;
+                        }
+                        ResponseClass::PlanningOnly => {
+                            if had_side_effects {
+                                tracing::info!(
+                                    "side effects occurred — accepting planning-only response"
+                                );
+                                on_event(AgentEvent::Done);
+                                return Ok(());
+                            }
+                            planning_only_retries += 1;
+                            if planning_only_retries > PLANNING_ONLY_RETRY_LIMIT {
+                                tracing::warn!(
+                                    "planning-only retries exhausted — accepting response"
+                                );
+                                on_event(AgentEvent::Done);
+                                return Ok(());
+                            }
+                            tracing::warn!(
+                                retries = planning_only_retries,
+                                "model produced planning-only text without action, re-prompting"
+                            );
+                            conv.messages.push(Message {
+                                id: Uuid::new_v4(),
+                                role: Role::User,
+                                content: MessageContent::Text(
+                                    "Don't just describe what you plan to do — actually do it using the tools available to you.".to_string(),
+                                ),
+                                created_at: Utc::now(),
+                            });
+                            continue;
+                        }
                     }
                 }
-                on_event(AgentEvent::Done);
-                return Ok(());
+                StopReason::ContentPolicy => {
+                    tracing::error!(iteration, "model refused to respond due to content policy");
+                    return Err(Error::ContentPolicy);
+                }
+                StopReason::ToolUse => {
+                    if had_side_effects {
+                        tracing::warn!(
+                            "ToolUse without tool calls after side effects — stopping to avoid duplicates"
+                        );
+                        on_event(AgentEvent::Done);
+                        return Ok(());
+                    }
+                    empty_tool_use_retries += 1;
+                    if empty_tool_use_retries > self.config.max_consecutive_errors {
+                        tracing::error!(
+                            retries = empty_tool_use_retries,
+                            "repeated ToolUse stop reason with no tool calls — aborting"
+                        );
+                        return Err(Error::Internal(
+                            "model repeatedly indicated tool use but provided no tool calls".into(),
+                        ));
+                    }
+                    tracing::warn!(
+                        retries = empty_tool_use_retries,
+                        "stop reason is ToolUse but no tool calls found in response, re-prompting"
+                    );
+                    conv.messages.push(Message {
+                        id: Uuid::new_v4(),
+                        role: Role::User,
+                        content: MessageContent::Text(
+                            "Your previous response indicated a tool call but none was found. Please retry.".to_string(),
+                        ),
+                        created_at: Utc::now(),
+                    });
+                    continue;
+                }
             }
-
-            // Stop reason indicates tool use but no tool calls found in content.
-            // Re-prompt rather than silently ending the turn.
-            tracing::warn!(
-                ?stop_reason,
-                "stop reason indicates tool use but no tool calls found in response, re-prompting"
-            );
-            conv.messages.push(Message {
-                id: Uuid::new_v4(),
-                role: Role::User,
-                content: MessageContent::Text(
-                    "Your previous response indicated a tool call but none was found. Please retry.".to_string(),
-                ),
-                created_at: Utc::now(),
-            });
-            continue;
         }
 
         // Escalate to user.
