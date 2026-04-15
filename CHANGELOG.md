@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.3.0] - 2026-04-15
+
+- feat: add network device discovery mechanisms (Part 1) (#365)
+
 ## [2.2.6] - 2026-04-15
 
 - Fix agent visibility of Telegram chat IDs (#363)
