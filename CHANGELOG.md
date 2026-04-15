@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.2.6] - 2026-04-15
+
+- Fix agent visibility of Telegram chat IDs (#363)
+
 ## [2.2.5] - 2026-04-14
 
 - Debug Telegram chat IDs and fix silent bare @mention drops (#362)
