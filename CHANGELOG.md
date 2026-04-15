@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.3.2] - 2026-04-15
+
+- Expose Telegram chat ID and thread ID to the agent (#364)
+
 ## [2.3.1] - 2026-04-15
 
 - fix: handle stream read errors gracefully instead of crashing (#366)
