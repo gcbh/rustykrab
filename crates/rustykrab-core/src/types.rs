@@ -162,6 +162,9 @@ pub struct Conversation {
     /// Channel-specific identifier (e.g. Telegram chat_id as string).
     #[serde(default)]
     pub channel_id: Option<String>,
+    /// Channel-specific thread/topic identifier (e.g. Telegram forum thread_id).
+    #[serde(default)]
+    pub channel_thread_id: Option<String>,
 }
 
 /// JSON-Schema-style description of a tool parameter.

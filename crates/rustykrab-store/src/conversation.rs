@@ -29,6 +29,7 @@ impl ConversationStore {
             detected_profile: None,
             channel_source: None,
             channel_id: None,
+            channel_thread_id: None,
         };
         self.save(&conv)?;
         Ok(conv)
