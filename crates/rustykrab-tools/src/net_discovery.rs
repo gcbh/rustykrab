@@ -493,18 +493,78 @@ async fn interfaces(timeout_ms: u64) -> Value {
 // Active ARP scan
 // ---------------------------------------------------------------------------
 
+/// Detect the default network interface by parsing `ip route show default`.
+///
+/// Returns the device name from the first default route (e.g. "enp0s3",
+/// "wlan0", "eth0").  Returns `None` if no default route exists or the
+/// `ip` command is unavailable.
+async fn detect_default_interface() -> Option<String> {
+    let path = system_path();
+    let output = tokio::process::Command::new("ip")
+        .args(["route", "show", "default"])
+        .env("PATH", &path)
+        .output()
+        .await
+        .ok()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Typical line: "default via 192.168.1.1 dev enp0s3 proto dhcp metric 100"
+    for line in stdout.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if let Some(idx) = parts.iter().position(|&p| p == "dev") {
+            if let Some(iface) = parts.get(idx + 1) {
+                return Some((*iface).to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Validate that an interface name is safe to pass as a CLI argument.
+///
+/// Only allows alphanumeric characters, hyphens, underscores, and dots —
+/// typical Linux interface naming (e.g. "eth0", "enp0s3", "wlan0", "br-lan").
+fn validate_interface_name(name: &str) -> std::result::Result<(), ToolError> {
+    if name.is_empty() {
+        return Err(ToolError::invalid_input("interface name must not be empty"));
+    }
+    if name.starts_with('-') {
+        return Err(ToolError::invalid_input(
+            "interface name must not start with '-'",
+        ));
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    {
+        return Err(ToolError::invalid_input(
+            "interface name contains disallowed characters",
+        ));
+    }
+    Ok(())
+}
+
 /// Actively scan a subnet for all devices using ARP requests.
 ///
-/// Tries `arp-scan` first (most reliable, returns vendor info).  Falls back to
-/// `nmap -sn` (ping scan + ARP on local segment).
-async fn arp_scan(subnet: &str, timeout_ms: u64) -> Value {
+/// When `interface` is `None`, auto-detects the default interface via
+/// `ip route`.  Tries `arp-scan` first (most reliable, returns vendor
+/// info).  Falls back to `nmap -sn` (ping scan + ARP on local segment).
+async fn arp_scan(subnet: &str, interface: Option<&str>, timeout_ms: u64) -> Value {
     let path = system_path();
 
-    // Try arp-scan first: `arp-scan --localnet` or `arp-scan <cidr>`
+    // Resolve the interface to use.
+    let iface = match interface {
+        Some(i) => i.to_string(),
+        None => detect_default_interface()
+            .await
+            .unwrap_or_else(|| "eth0".to_string()),
+    };
+    let iface_arg = format!("--interface={iface}");
+
+    // Try arp-scan first.
     let arp_scan_result = timeout(
         Duration::from_millis(timeout_ms),
         tokio::process::Command::new("arp-scan")
-            .args(["--interface=eth0", "--retry=1", "--timeout=500", subnet])
+            .args([&iface_arg, "--retry=1", "--timeout=500", subnet])
             .env("PATH", &path)
             .output(),
     )
@@ -534,6 +594,7 @@ async fn arp_scan(subnet: &str, timeout_ms: u64) -> Value {
             return json!({
                 "success": true,
                 "subnet": subnet,
+                "interface": iface,
                 "source": "arp-scan",
                 "entries": entries,
                 "count": entries.len(),
@@ -541,11 +602,11 @@ async fn arp_scan(subnet: &str, timeout_ms: u64) -> Value {
         }
     }
 
-    // Fallback: nmap -sn (ping/ARP scan)
+    // Fallback: nmap -sn (ping/ARP scan), with -e <interface>.
     let nmap_result = timeout(
         Duration::from_millis(timeout_ms),
         tokio::process::Command::new("nmap")
-            .args(["-sn", "-n", subnet])
+            .args(["-sn", "-n", "-e", &iface, subnet])
             .env("PATH", &path)
             .output(),
     )
@@ -602,6 +663,7 @@ async fn arp_scan(subnet: &str, timeout_ms: u64) -> Value {
             json!({
                 "success": true,
                 "subnet": subnet,
+                "interface": iface,
                 "source": "nmap",
                 "entries": entries,
                 "count": entries.len(),
@@ -1253,6 +1315,10 @@ impl Tool for NetDiscoveryTool {
                         "type": "string",
                         "description": "CIDR subnet for arp_scan (e.g. '192.168.1.0/24')"
                     },
+                    "interface": {
+                        "type": "string",
+                        "description": "Network interface for arp_scan (e.g. 'eth0', 'enp0s3', 'wlan0'). Auto-detected from the default route if omitted."
+                    },
                     "mac": {
                         "type": "string",
                         "description": "MAC address for oui_lookup (e.g. 'AA:BB:CC:DD:EE:FF')"
@@ -1364,7 +1430,12 @@ impl Tool for NetDiscoveryTool {
                 // Full CIDR validation: well-formed, local network, sane prefix.
                 validate_scan_cidr(subnet).map_err(rustykrab_core::Error::ToolExecution)?;
 
-                let result = arp_scan(subnet, timeout_ms).await;
+                let interface = args["interface"].as_str();
+                if let Some(iface) = interface {
+                    validate_interface_name(iface).map_err(rustykrab_core::Error::ToolExecution)?;
+                }
+
+                let result = arp_scan(subnet, interface, timeout_ms).await;
                 Ok(json!({
                     "action": "arp_scan",
                     "result": result,
