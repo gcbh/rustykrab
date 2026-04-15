@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.3.3] - 2026-04-15
+
+- Fix stop reason fallthrough causing misleading re-prompts and infinite loops (#367)
+
 ## [2.3.2] - 2026-04-15
 
 - Expose Telegram chat ID and thread ID to the agent (#364)
