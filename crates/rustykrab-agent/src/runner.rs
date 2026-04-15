@@ -163,6 +163,7 @@ impl AgentRunner {
             .collect();
 
         let mut consecutive_errors = 0;
+        let mut empty_tool_use_retries: usize = 0;
         let mut soft_warning_injected = false;
 
         for iteration in 0..self.config.max_iterations {
@@ -221,6 +222,7 @@ impl AgentRunner {
 
             // Handle tool calls.
             if message.content.has_tool_calls() {
+                empty_tool_use_retries = 0;
                 let calls = message.content.tool_calls();
                 let tool_names: Vec<&str> = calls.iter().map(|c| c.name.as_str()).collect();
                 tracing::info!(
@@ -294,53 +296,66 @@ impl AgentRunner {
                 continue;
             }
 
-            // If model hit max_tokens, it may be truncated — let it continue.
-            if stop_reason == StopReason::MaxTokens {
-                tracing::warn!("model hit max tokens, prompting to continue");
-                conv.messages.push(Message {
-                    id: Uuid::new_v4(),
-                    role: Role::User,
-                    content: MessageContent::Text("Continue.".to_string()),
-                    created_at: Utc::now(),
-                });
-                continue;
-            }
-
-            // Explicit end-of-turn — done.
-            if stop_reason == StopReason::EndTurn {
-                // Debug: warn when the model ends its turn with empty text.
-                // This helps diagnose cases where completion_tokens > 0 but no
-                // usable text was extracted (e.g. unhandled content block types).
-                if !message.content.has_tool_calls() {
-                    let text = message.content.as_text().unwrap_or("");
-                    if text.is_empty() {
-                        tracing::warn!(
-                            iteration,
-                            completion_tokens = usage.completion_tokens,
-                            content_variant = ?std::mem::discriminant(&message.content),
-                            "EndTurn with empty assistant text — \
-                             response may contain unhandled content blocks"
-                        );
-                    }
+            match stop_reason {
+                StopReason::MaxTokens => {
+                    tracing::warn!("model hit max tokens, prompting to continue");
+                    conv.messages.push(Message {
+                        id: Uuid::new_v4(),
+                        role: Role::User,
+                        content: MessageContent::Text("Continue.".to_string()),
+                        created_at: Utc::now(),
+                    });
+                    continue;
                 }
-                return Ok(());
+                StopReason::EndTurn => {
+                    // Debug: warn when the model ends its turn with empty text.
+                    if !message.content.has_tool_calls() {
+                        let text = message.content.as_text().unwrap_or("");
+                        if text.is_empty() {
+                            tracing::warn!(
+                                iteration,
+                                completion_tokens = usage.completion_tokens,
+                                content_variant = ?std::mem::discriminant(&message.content),
+                                "EndTurn with empty assistant text — \
+                                 response may contain unhandled content blocks"
+                            );
+                        }
+                    }
+                    return Ok(());
+                }
+                StopReason::ContentPolicy => {
+                    tracing::error!(iteration, "model refused to respond due to content policy");
+                    return Err(Error::ContentPolicy);
+                }
+                StopReason::ToolUse => {
+                    // stop_reason says ToolUse but no tool calls were found
+                    // in the content (the has_tool_calls() branch above
+                    // already handles the normal case). Re-prompt with a limit.
+                    empty_tool_use_retries += 1;
+                    if empty_tool_use_retries > self.config.max_consecutive_errors {
+                        tracing::error!(
+                            retries = empty_tool_use_retries,
+                            "repeated ToolUse stop reason with no tool calls — aborting"
+                        );
+                        return Err(Error::Internal(
+                            "model repeatedly indicated tool use but provided no tool calls".into(),
+                        ));
+                    }
+                    tracing::warn!(
+                        retries = empty_tool_use_retries,
+                        "stop reason is ToolUse but no tool calls found in response, re-prompting"
+                    );
+                    conv.messages.push(Message {
+                        id: Uuid::new_v4(),
+                        role: Role::User,
+                        content: MessageContent::Text(
+                            "Your previous response indicated a tool call but none was found. Please retry.".to_string(),
+                        ),
+                        created_at: Utc::now(),
+                    });
+                    continue;
+                }
             }
-
-            // Stop reason indicates tool use but no tool calls found in content.
-            // Re-prompt rather than silently ending the turn.
-            tracing::warn!(
-                ?stop_reason,
-                "stop reason indicates tool use but no tool calls found in response, re-prompting"
-            );
-            conv.messages.push(Message {
-                id: Uuid::new_v4(),
-                role: Role::User,
-                content: MessageContent::Text(
-                    "Your previous response indicated a tool call but none was found. Please retry.".to_string(),
-                ),
-                created_at: Utc::now(),
-            });
-            continue;
         }
 
         // Escalate to user instead of hard-failing.
@@ -394,6 +409,7 @@ impl AgentRunner {
 
         let mut consecutive_errors = 0;
         let mut soft_warning_injected = false;
+        let mut empty_tool_use_retries: usize = 0;
 
         for iteration in 0..self.config.max_iterations {
             tracer.record_iteration();
@@ -454,6 +470,7 @@ impl AgentRunner {
 
             // Handle tool calls.
             if message.content.has_tool_calls() {
+                empty_tool_use_retries = 0;
                 let calls = message.content.tool_calls();
                 let tool_names: Vec<&str> = calls.iter().map(|c| c.name.as_str()).collect();
                 tracing::info!(
@@ -539,50 +556,63 @@ impl AgentRunner {
                 continue;
             }
 
-            if stop_reason == StopReason::MaxTokens {
-                tracing::warn!("model hit max tokens, prompting to continue");
-                conv.messages.push(Message {
-                    id: Uuid::new_v4(),
-                    role: Role::User,
-                    content: MessageContent::Text("Continue.".to_string()),
-                    created_at: Utc::now(),
-                });
-                continue;
-            }
-
-            // Explicit end-of-turn — done.
-            if stop_reason == StopReason::EndTurn {
-                if !message.content.has_tool_calls() {
-                    let text = message.content.as_text().unwrap_or("");
-                    if text.is_empty() {
-                        tracing::warn!(
-                            iteration,
-                            completion_tokens = usage.completion_tokens,
-                            content_variant = ?std::mem::discriminant(&message.content),
-                            "EndTurn with empty assistant text — \
-                             response may contain unhandled content blocks"
-                        );
-                    }
+            match stop_reason {
+                StopReason::MaxTokens => {
+                    tracing::warn!("model hit max tokens, prompting to continue");
+                    conv.messages.push(Message {
+                        id: Uuid::new_v4(),
+                        role: Role::User,
+                        content: MessageContent::Text("Continue.".to_string()),
+                        created_at: Utc::now(),
+                    });
+                    continue;
                 }
-                on_event(AgentEvent::Done);
-                return Ok(());
+                StopReason::EndTurn => {
+                    if !message.content.has_tool_calls() {
+                        let text = message.content.as_text().unwrap_or("");
+                        if text.is_empty() {
+                            tracing::warn!(
+                                iteration,
+                                completion_tokens = usage.completion_tokens,
+                                content_variant = ?std::mem::discriminant(&message.content),
+                                "EndTurn with empty assistant text — \
+                                 response may contain unhandled content blocks"
+                            );
+                        }
+                    }
+                    on_event(AgentEvent::Done);
+                    return Ok(());
+                }
+                StopReason::ContentPolicy => {
+                    tracing::error!(iteration, "model refused to respond due to content policy");
+                    return Err(Error::ContentPolicy);
+                }
+                StopReason::ToolUse => {
+                    empty_tool_use_retries += 1;
+                    if empty_tool_use_retries > self.config.max_consecutive_errors {
+                        tracing::error!(
+                            retries = empty_tool_use_retries,
+                            "repeated ToolUse stop reason with no tool calls — aborting"
+                        );
+                        return Err(Error::Internal(
+                            "model repeatedly indicated tool use but provided no tool calls".into(),
+                        ));
+                    }
+                    tracing::warn!(
+                        retries = empty_tool_use_retries,
+                        "stop reason is ToolUse but no tool calls found in response, re-prompting"
+                    );
+                    conv.messages.push(Message {
+                        id: Uuid::new_v4(),
+                        role: Role::User,
+                        content: MessageContent::Text(
+                            "Your previous response indicated a tool call but none was found. Please retry.".to_string(),
+                        ),
+                        created_at: Utc::now(),
+                    });
+                    continue;
+                }
             }
-
-            // Stop reason indicates tool use but no tool calls found in content.
-            // Re-prompt rather than silently ending the turn.
-            tracing::warn!(
-                ?stop_reason,
-                "stop reason indicates tool use but no tool calls found in response, re-prompting"
-            );
-            conv.messages.push(Message {
-                id: Uuid::new_v4(),
-                role: Role::User,
-                content: MessageContent::Text(
-                    "Your previous response indicated a tool call but none was found. Please retry.".to_string(),
-                ),
-                created_at: Utc::now(),
-            });
-            continue;
         }
 
         // Escalate to user.

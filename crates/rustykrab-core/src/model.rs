@@ -25,6 +25,8 @@ pub enum StopReason {
     ToolUse,
     /// Model hit the max token limit (response may be truncated).
     MaxTokens,
+    /// Model refused to generate due to content policy violation.
+    ContentPolicy,
 }
 
 /// Token usage for a single request.

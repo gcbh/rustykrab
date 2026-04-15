@@ -162,6 +162,7 @@ impl AnthropicProvider {
         let stop_reason = match resp.stop_reason.as_deref() {
             Some("tool_use") => StopReason::ToolUse,
             Some("max_tokens") => StopReason::MaxTokens,
+            Some("content_filter") => StopReason::ContentPolicy,
             _ => StopReason::EndTurn,
         };
 
@@ -500,6 +501,7 @@ impl ModelProvider for AnthropicProvider {
                                 stop_reason = match evt.delta.stop_reason.as_deref() {
                                     Some("tool_use") => StopReason::ToolUse,
                                     Some("max_tokens") => StopReason::MaxTokens,
+                                    Some("content_filter") => StopReason::ContentPolicy,
                                     _ => StopReason::EndTurn,
                                 };
                             }
