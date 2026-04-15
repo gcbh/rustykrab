@@ -28,11 +28,25 @@ pub struct OllamaConfig {
     pub num_predict: i32,
 }
 
+/// Read `num_ctx` from the `OLLAMA_NUM_CTX` env var, falling back to the
+/// given default.  Invalid values are silently ignored.
+fn num_ctx_from_env(default: u32) -> u32 {
+    std::env::var("OLLAMA_NUM_CTX")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(default)
+}
+
+/// Default context-window size.  128 K was too aggressive for most local
+/// GPU setups and caused Ollama to OOM (returning 500).  8 192 is safe for
+/// virtually every model / card and can be raised via `OLLAMA_NUM_CTX`.
+const DEFAULT_NUM_CTX: u32 = 8_192;
+
 impl Default for OllamaConfig {
     fn default() -> Self {
         Self {
             temperature: 0.1,
-            num_ctx: 131_072,
+            num_ctx: num_ctx_from_env(DEFAULT_NUM_CTX),
             num_parallel: 6,
             top_p: 0.9,
             num_predict: 8192,
@@ -45,7 +59,7 @@ impl OllamaConfig {
     pub fn tool_calling() -> Self {
         Self {
             temperature: 0.0,
-            num_ctx: 131_072,
+            num_ctx: num_ctx_from_env(DEFAULT_NUM_CTX),
             num_parallel: 6,
             top_p: 0.9,
             num_predict: 4096,
@@ -56,7 +70,7 @@ impl OllamaConfig {
     pub fn creative() -> Self {
         Self {
             temperature: 0.7,
-            num_ctx: 131_072,
+            num_ctx: num_ctx_from_env(DEFAULT_NUM_CTX),
             num_parallel: 6,
             top_p: 0.95,
             num_predict: 16384,
@@ -297,6 +311,88 @@ impl OllamaProvider {
         })
     }
 
+    /// Conservative token estimate for a single message (~3.5 chars/token,
+    /// plus a small overhead for role and JSON framing).
+    fn estimate_message_tokens(msg: &OllamaMessage) -> usize {
+        let content_tokens = msg
+            .content
+            .as_deref()
+            .map_or(0, |c| (c.len() as f64 / 3.5).ceil() as usize);
+        let tool_call_tokens = msg.tool_calls.as_ref().map_or(0, |tcs| {
+            tcs.iter()
+                .map(|tc| {
+                    let name_len = tc.function.name.len();
+                    let args_len = tc.function.arguments.to_string().len();
+                    ((name_len + args_len) as f64 / 3.5).ceil() as usize
+                })
+                .sum()
+        });
+        content_tokens + tool_call_tokens + 4 // 4 tokens overhead per message
+    }
+
+    /// Truncate the message list so its estimated token count fits inside the
+    /// configured context window (minus a reserve for the completion).
+    ///
+    /// Strategy: always keep system messages (they are usually small and
+    /// critical), then keep as many of the most-recent non-system messages as
+    /// the budget allows.  Older messages are dropped from the front.
+    fn truncate_messages(
+        messages: Vec<OllamaMessage>,
+        max_ctx: u32,
+        num_predict: i32,
+    ) -> Vec<OllamaMessage> {
+        let reserve = if num_predict > 0 {
+            num_predict as usize
+        } else {
+            // -1 means unlimited; reserve a generous default so we don't
+            // consume the entire window with the prompt.
+            2048
+        };
+        let budget = (max_ctx as usize).saturating_sub(reserve);
+
+        // Partition into system and non-system, preserving order.
+        let mut system_msgs: Vec<OllamaMessage> = Vec::new();
+        let mut other_msgs: Vec<OllamaMessage> = Vec::new();
+        for msg in messages {
+            if msg.role == "system" {
+                system_msgs.push(msg);
+            } else {
+                other_msgs.push(msg);
+            }
+        }
+
+        let system_tokens: usize = system_msgs.iter().map(Self::estimate_message_tokens).sum();
+        let remaining_budget = budget.saturating_sub(system_tokens);
+
+        // Walk backwards through non-system messages, accumulating tokens.
+        let mut kept_tokens: usize = 0;
+        let mut keep_from = 0; // index into other_msgs from which we keep
+        for (i, msg) in other_msgs.iter().enumerate().rev() {
+            let t = Self::estimate_message_tokens(msg);
+            if kept_tokens + t > remaining_budget {
+                keep_from = i + 1;
+                break;
+            }
+            kept_tokens += t;
+        }
+
+        let dropped = keep_from;
+        if dropped > 0 {
+            tracing::warn!(
+                total_messages = system_msgs.len() + other_msgs.len(),
+                dropped,
+                kept = system_msgs.len() + (other_msgs.len() - dropped),
+                estimated_prompt_tokens = system_tokens + kept_tokens,
+                budget,
+                "truncated conversation history to fit context window"
+            );
+        }
+
+        let mut result = system_msgs;
+        result.extend(other_msgs.into_iter().skip(keep_from));
+        result
+    }
+
     /// Map an HTTP status code to a specific error variant (#186).
     fn map_status_error(status: reqwest::StatusCode, body: &str) -> Error {
         match status.as_u16() {
@@ -324,6 +420,13 @@ impl ModelProvider for OllamaProvider {
             ));
         }
 
+        // Truncate to fit within the context window so we don't OOM Ollama.
+        let ollama_messages = Self::truncate_messages(
+            ollama_messages,
+            self.config.num_ctx,
+            self.config.num_predict,
+        );
+
         let ollama_tools = Self::build_tools(tools);
 
         let mut body = serde_json::json!({
@@ -342,7 +445,18 @@ impl ModelProvider for OllamaProvider {
             body["tools"] = serde_json::to_value(&ollama_tools).map_err(Error::Serialization)?;
         }
 
-        tracing::debug!(model = %self.model, base_url = %self.base_url, "calling Ollama chat API");
+        let estimated_prompt_tokens: usize = ollama_messages
+            .iter()
+            .map(Self::estimate_message_tokens)
+            .sum();
+        tracing::debug!(
+            model = %self.model,
+            base_url = %self.base_url,
+            num_messages = ollama_messages.len(),
+            estimated_prompt_tokens,
+            num_ctx = self.config.num_ctx,
+            "calling Ollama chat API"
+        );
 
         let url = format!("{}/api/chat", self.base_url);
 
@@ -397,6 +511,14 @@ impl ModelProvider for OllamaProvider {
             }
 
             let error_body = resp.text().await.unwrap_or_default();
+            tracing::warn!(
+                status = %status,
+                estimated_prompt_tokens,
+                num_ctx = self.config.num_ctx,
+                num_messages = ollama_messages.len(),
+                error_body = %error_body,
+                "Ollama API error — possible context overload"
+            );
             let is_retryable = matches!(status.as_u16(), 429 | 500 | 502 | 503 | 529);
             // Fix #186: map status codes to specific error variants.
             last_err = Some(Self::map_status_error(status, &error_body));
@@ -424,6 +546,13 @@ impl ModelProvider for OllamaProvider {
             ));
         }
 
+        // Truncate to fit within the context window so we don't OOM Ollama.
+        let ollama_messages = Self::truncate_messages(
+            ollama_messages,
+            self.config.num_ctx,
+            self.config.num_predict,
+        );
+
         let ollama_tools = Self::build_tools(tools);
 
         let mut body = serde_json::json!({
@@ -442,7 +571,18 @@ impl ModelProvider for OllamaProvider {
             body["tools"] = serde_json::to_value(&ollama_tools).map_err(Error::Serialization)?;
         }
 
-        tracing::debug!(model = %self.model, base_url = %self.base_url, "calling Ollama chat API (streaming)");
+        let estimated_prompt_tokens: usize = ollama_messages
+            .iter()
+            .map(Self::estimate_message_tokens)
+            .sum();
+        tracing::debug!(
+            model = %self.model,
+            base_url = %self.base_url,
+            num_messages = ollama_messages.len(),
+            estimated_prompt_tokens,
+            num_ctx = self.config.num_ctx,
+            "calling Ollama chat API (streaming)"
+        );
 
         let url = format!("{}/api/chat", self.base_url);
 
@@ -470,6 +610,13 @@ impl ModelProvider for OllamaProvider {
             let status = r.status();
             if !status.is_success() {
                 let error_body = r.text().await.unwrap_or_default();
+                tracing::warn!(
+                    status = %status,
+                    num_ctx = self.config.num_ctx,
+                    num_messages = ollama_messages.len(),
+                    error_body = %error_body,
+                    "Ollama streaming API error"
+                );
                 let is_retryable = matches!(status.as_u16(), 429 | 500 | 502 | 503 | 529);
                 last_err = Some(Self::map_status_error(status, &error_body));
                 if !is_retryable {
@@ -628,7 +775,7 @@ impl ModelProvider for OllamaProvider {
 
 // --- Ollama API wire types (private) ---
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct OllamaMessage {
     role: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -637,12 +784,12 @@ struct OllamaMessage {
     tool_calls: Option<Vec<OllamaToolCall>>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct OllamaToolCall {
     function: OllamaFunction,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct OllamaFunction {
     name: String,
     arguments: serde_json::Value,
