@@ -36,7 +36,16 @@ async fn build_and_inject_system_prompt(
         builder = builder.with_available_skills(&refs);
     }
 
-    let system_prompt = builder.build();
+    let mut system_prompt = builder.build();
+
+    // Append channel context so the agent knows where this conversation lives.
+    if let Some(ref source) = conv.channel_source {
+        system_prompt.push_str("\n\n## Channel context\n");
+        system_prompt.push_str(&format!("- Source: {source}\n"));
+        if let Some(ref cid) = conv.channel_id {
+            system_prompt.push_str(&format!("- Chat ID: {cid}\n"));
+        }
+    }
 
     // 3. Inject system prompt as first message.
     if conv
