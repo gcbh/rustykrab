@@ -26,6 +26,10 @@ pub struct OllamaConfig {
     pub top_p: f32,
     /// Number of tokens to predict (-1 = unlimited, 0 = fill context).
     pub num_predict: i32,
+    /// Enable thinking mode for models that support it (e.g. Gemma 4).
+    /// When enabled, the model produces `<think>…</think>` reasoning
+    /// blocks before its answer, improving tool-calling accuracy.
+    pub think: bool,
 }
 
 /// Read `num_ctx` from the `OLLAMA_NUM_CTX` env var, falling back to the
@@ -49,6 +53,7 @@ impl Default for OllamaConfig {
             num_parallel: 6,
             top_p: 0.9,
             num_predict: 8192,
+            think: true,
         }
     }
 }
@@ -62,6 +67,7 @@ impl OllamaConfig {
             num_parallel: 6,
             top_p: 0.9,
             num_predict: 4096,
+            think: true,
         }
     }
 
@@ -73,6 +79,7 @@ impl OllamaConfig {
             num_parallel: 6,
             top_p: 0.95,
             num_predict: 16384,
+            think: true,
         }
     }
 }
@@ -343,6 +350,7 @@ impl ModelProvider for OllamaProvider {
             "model": self.model,
             "messages": ollama_messages,
             "stream": false,
+            "think": self.config.think,
             "options": {
                 "temperature": self.config.temperature,
                 "num_ctx": self.config.num_ctx,
@@ -456,6 +464,7 @@ impl ModelProvider for OllamaProvider {
             "model": self.model,
             "messages": ollama_messages,
             "stream": true,
+            "think": self.config.think,
             "options": {
                 "temperature": self.config.temperature,
                 "num_ctx": self.config.num_ctx,
