@@ -13,4 +13,5 @@ pub trait CronBackend: Send + Sync {
     ) -> Result<Value>;
     async fn list_jobs(&self) -> Result<Value>;
     async fn delete_job(&self, job_id: &str) -> Result<Value>;
+    async fn list_runs(&self, job_id: &str, limit: u32) -> Result<Value>;
 }

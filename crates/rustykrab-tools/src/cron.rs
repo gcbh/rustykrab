@@ -24,7 +24,7 @@ impl Tool for CronTool {
     }
 
     fn description(&self) -> &str {
-        "Manage scheduled tasks: create, list, or delete cron jobs."
+        "Manage scheduled tasks: create, list, delete cron jobs, or view run history."
     }
 
     fn schema(&self) -> ToolSchema {
@@ -36,7 +36,7 @@ impl Tool for CronTool {
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["create", "list", "delete"],
+                        "enum": ["create", "list", "delete", "list_runs"],
                         "description": "The action to perform"
                     },
                     "schedule": {
@@ -75,7 +75,11 @@ impl Tool for CronTool {
                     },
                     "job_id": {
                         "type": "string",
-                        "description": "Job identifier (required for delete)"
+                        "description": "Job identifier (required for delete and list_runs)"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum number of run records to return (default 20, used with list_runs)"
                     }
                 },
                 "required": ["action"]
@@ -140,6 +144,27 @@ impl Tool for CronTool {
                 Ok(json!({
                     "action": "delete",
                     "result": result,
+                }))
+            }
+            "list_runs" => {
+                let job_id = args["job_id"].as_str().ok_or_else(|| {
+                    rustykrab_core::Error::ToolExecution(
+                        "missing job_id for list_runs action".into(),
+                    )
+                })?;
+
+                let limit = args["limit"].as_u64().unwrap_or(20) as u32;
+
+                let runs = self
+                    .backend
+                    .list_runs(job_id, limit)
+                    .await
+                    .map_err(|e| rustykrab_core::Error::ToolExecution(e.to_string().into()))?;
+
+                Ok(json!({
+                    "action": "list_runs",
+                    "job_id": job_id,
+                    "runs": runs,
                 }))
             }
             _ => Err(rustykrab_core::Error::ToolExecution(

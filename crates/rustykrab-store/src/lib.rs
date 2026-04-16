@@ -14,7 +14,7 @@ use zeroize::Zeroizing;
 
 pub use chat_map::ChatMapStore;
 pub use conversation::ConversationStore;
-pub use jobs::{JobStore, ScheduledJob};
+pub use jobs::{JobRun, JobStore, ScheduledJob};
 pub use secret::SecretStore;
 
 /// Top-level database handle wrapping a SQLite connection.
@@ -83,6 +83,18 @@ impl Store {
             CREATE INDEX IF NOT EXISTS idx_scheduled_jobs_due
                 ON scheduled_jobs (next_run_at)
                 WHERE enabled = 1;
+
+            CREATE TABLE IF NOT EXISTS job_runs (
+                id         TEXT PRIMARY KEY,
+                job_id     TEXT NOT NULL,
+                status     TEXT NOT NULL,
+                output     TEXT,
+                started_at TEXT NOT NULL,
+                finished_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_job_runs_job_id
+                ON job_runs (job_id, finished_at DESC);
 
             CREATE TABLE IF NOT EXISTS telegram_chat_map (
                 chat_id    INTEGER NOT NULL,

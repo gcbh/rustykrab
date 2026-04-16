@@ -24,6 +24,19 @@ pub struct ScheduledJob {
     pub created_at: DateTime<Utc>,
 }
 
+/// A recorded execution of a scheduled job.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobRun {
+    pub id: String,
+    pub job_id: String,
+    /// `"ok"` or `"error"`.
+    pub status: String,
+    /// Agent response text (or error message).
+    pub output: Option<String>,
+    pub started_at: DateTime<Utc>,
+    pub finished_at: DateTime<Utc>,
+}
+
 /// Handle for scheduled-job CRUD operations, backed by SQLite.
 #[derive(Clone)]
 pub struct JobStore {
@@ -194,6 +207,73 @@ impl JobStore {
         }
 
         Ok(())
+    }
+    /// Record a completed run for a job.
+    pub fn record_run(
+        &self,
+        job_id: &str,
+        status: &str,
+        output: Option<&str>,
+        started_at: DateTime<Utc>,
+        finished_at: DateTime<Utc>,
+    ) -> Result<JobRun, Error> {
+        let id = Uuid::new_v4().to_string();
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO job_runs (id, job_id, status, output, started_at, finished_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                id,
+                job_id,
+                status,
+                output,
+                started_at.to_rfc3339(),
+                finished_at.to_rfc3339(),
+            ],
+        )
+        .map_err(|e| Error::Storage(e.to_string()))?;
+
+        Ok(JobRun {
+            id,
+            job_id: job_id.to_string(),
+            status: status.to_string(),
+            output: output.map(|s| s.to_string()),
+            started_at,
+            finished_at,
+        })
+    }
+
+    /// List recent runs for a job, newest first.
+    ///
+    /// Returns at most `limit` entries.
+    pub fn list_runs(&self, job_id: &str, limit: u32) -> Result<Vec<JobRun>, Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, job_id, status, output, started_at, finished_at
+                 FROM job_runs
+                 WHERE job_id = ?1
+                 ORDER BY finished_at DESC
+                 LIMIT ?2",
+            )
+            .map_err(|e| Error::Storage(e.to_string()))?;
+
+        let runs = stmt
+            .query_map(params![job_id, limit], |row| {
+                Ok(JobRun {
+                    id: row.get(0)?,
+                    job_id: row.get(1)?,
+                    status: row.get(2)?,
+                    output: row.get(3)?,
+                    started_at: parse_stored_timestamp(row.get::<_, String>(4)?),
+                    finished_at: parse_stored_timestamp(row.get::<_, String>(5)?),
+                })
+            })
+            .map_err(|e| Error::Storage(e.to_string()))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| Error::Storage(e.to_string()))?;
+
+        Ok(runs)
     }
 }
 

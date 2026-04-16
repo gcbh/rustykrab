@@ -1,3 +1,5 @@
+mod task_queue;
+
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -94,6 +96,15 @@ impl CronBackend for CronAdapter {
     async fn delete_job(&self, job_id: &str) -> rustykrab_core::Result<serde_json::Value> {
         let deleted = self.store.jobs().delete_job(job_id)?;
         Ok(serde_json::json!({ "deleted": deleted, "job_id": job_id }))
+    }
+
+    async fn list_runs(
+        &self,
+        job_id: &str,
+        limit: u32,
+    ) -> rustykrab_core::Result<serde_json::Value> {
+        let runs = self.store.jobs().list_runs(job_id, limit)?;
+        Ok(serde_json::to_value(&runs).expect("Vec<JobRun> is always serializable"))
     }
 }
 
@@ -516,12 +527,26 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("Telegram agent loop started");
     }
 
+    // --- Task queue (bounded concurrency for background work) ---
+    let max_concurrent: usize = std::env::var("RUSTYKRAB_MAX_CONCURRENT_TASKS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4);
+    let (task_queue, queue_handle) = task_queue::TaskQueue::spawn(
+        64, // buffer capacity
+        max_concurrent,
+        state.clone(),
+        store_handle.clone(),
+    );
+    infra_handles.push(queue_handle);
+    tracing::info!(max_concurrent, "task queue started");
+
     // --- Job executor (scheduled task runner) ---
     {
         let executor_store = store_handle.clone();
-        let executor_state = state.clone();
+        let executor_queue = task_queue.clone();
         infra_handles.push(tokio::spawn(async move {
-            job_executor_loop(executor_store, executor_state).await;
+            job_executor_loop(executor_store, executor_queue).await;
         }));
         tracing::info!("job executor started (30s poll interval)");
     }
@@ -909,13 +934,14 @@ async fn shutdown_signal() {
     tracing::info!("shutdown signal received");
 }
 
-/// Background task: poll for due scheduled jobs and execute them.
+/// Background task: poll for due scheduled jobs and submit them to
+/// the task queue.
 ///
 /// Every 30 seconds, queries the job store for enabled jobs whose
-/// `next_run_at` has passed. Each due job is spawned as an independent
-/// task that runs the job's prompt through the agent pipeline and
-/// delivers the response to the originating channel.
-async fn job_executor_loop(store: rustykrab_store::Store, state: AppState) {
+/// `next_run_at` has passed. Each due job is submitted to the shared
+/// task queue with a dedup key so a long-running job cannot be picked
+/// up again on the next poll cycle.
+async fn job_executor_loop(store: rustykrab_store::Store, queue: task_queue::TaskQueue) {
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
 
     loop {
@@ -931,97 +957,19 @@ async fn job_executor_loop(store: rustykrab_store::Store, state: AppState) {
         };
 
         for job in due_jobs {
-            let store = store.clone();
-            let state = state.clone();
+            let request = task_queue::TaskRequest {
+                prompt: job.task.clone(),
+                source: task_queue::TaskSource::Cron {
+                    job_id: job.id.clone(),
+                    channel: job.channel.clone(),
+                    chat_id: job.chat_id.clone(),
+                },
+                dedupe_key: Some(format!("cron:{}", job.id)),
+            };
 
-            tokio::spawn(async move {
-                let job_id = job.id.clone();
-                let task = job.task.clone();
-                let channel = job.channel.clone();
-                let chat_id = job.chat_id.clone();
-
-                tracing::info!(
-                    job_id = %job_id,
-                    task = %task,
-                    "executing scheduled job"
-                );
-
-                // Create a fresh conversation for this job execution.
-                let mut conv = match state.store.conversations().create() {
-                    Ok(c) => c,
-                    Err(e) => {
-                        tracing::error!(job_id = %job_id, "failed to create conversation for scheduled job: {e}");
-                        return;
-                    }
-                };
-
-                // Prefix the task so the agent knows this is a scheduled execution.
-                let prompt = format!(
-                    "[Scheduled task] The following task was scheduled by the user and is now due. \
-                     Execute it and provide the result concisely.\n\nTask: {task}"
-                );
-
-                // Run the agent.
-                let no_op_event = |_event: AgentEvent| {};
-                let result = rustykrab_gateway::run_agent_streaming(
-                    &state,
-                    &mut conv,
-                    &prompt,
-                    &no_op_event,
-                )
-                .await;
-
-                let response_text = match result {
-                    Ok(msg) => match &msg.content {
-                        MessageContent::Text(t) => t.clone(),
-                        _ => "Scheduled task completed (no text response).".to_string(),
-                    },
-                    Err(_) => {
-                        tracing::error!(job_id = %job_id, "agent error executing scheduled job");
-                        "Sorry, the scheduled task encountered an error.".to_string()
-                    }
-                };
-
-                // Route the response to the originating channel.
-                match channel.as_deref() {
-                    Some("telegram") => {
-                        if let (Some(tg), Some(cid)) = (&state.telegram, &chat_id) {
-                            if let Ok(chat_id_num) = cid.parse::<i64>() {
-                                // Scheduled jobs don't have thread context;
-                                // messages go to the "General" topic in forum groups.
-                                if let Err(e) = tg.send_text(chat_id_num, &response_text, 0).await {
-                                    tracing::error!(job_id = %job_id, "failed to send scheduled job result to Telegram: {e}");
-                                }
-                            } else {
-                                tracing::error!(job_id = %job_id, chat_id = %cid, "invalid Telegram chat_id");
-                            }
-                        }
-                    }
-                    Some("signal") => {
-                        if let (Some(sig), Some(number)) = (&state.signal, &chat_id) {
-                            if let Err(e) = sig.send_text(number, &response_text).await {
-                                tracing::error!(job_id = %job_id, "failed to send scheduled job result to Signal: {e}");
-                            }
-                        }
-                    }
-                    _ => {
-                        tracing::info!(
-                            job_id = %job_id,
-                            "scheduled job completed (no channel routing): {response_text}"
-                        );
-                    }
-                }
-
-                // Mark the job as executed (advances next_run_at or disables one-shot).
-                if let Err(e) = store.jobs().mark_executed(&job_id) {
-                    tracing::error!(job_id = %job_id, "failed to mark scheduled job as executed: {e}");
-                }
-
-                // Clean up the ephemeral conversation.
-                if let Err(e) = state.store.conversations().delete(conv.id) {
-                    tracing::warn!(job_id = %job_id, "failed to clean up job conversation: {e}");
-                }
-            });
+            if let Err(e) = queue.submit(request).await {
+                tracing::error!(job_id = %job.id, "failed to submit job to task queue: {e}");
+            }
         }
     }
 }
