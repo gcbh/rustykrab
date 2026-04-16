@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use tokio::sync::{mpsc, Mutex, Semaphore};
 
+use chrono::Utc;
 use rustykrab_agent::AgentEvent;
 use rustykrab_core::types::MessageContent;
 use rustykrab_gateway::AppState;
@@ -142,6 +143,7 @@ async fn execute_cron_task(
     state: &AppState,
     store: &rustykrab_store::Store,
 ) {
+    let started_at = Utc::now();
     tracing::info!(job_id = %job_id, task = %task_prompt, "executing scheduled job");
 
     // Create a fresh conversation for this job execution.
@@ -149,6 +151,14 @@ async fn execute_cron_task(
         Ok(c) => c,
         Err(e) => {
             tracing::error!(job_id = %job_id, "failed to create conversation for scheduled job: {e}");
+            let finished_at = Utc::now();
+            let _ = store.jobs().record_run(
+                job_id,
+                "error",
+                Some(&format!("failed to create conversation: {e}")),
+                started_at,
+                finished_at,
+            );
             return;
         }
     };
@@ -164,14 +174,20 @@ async fn execute_cron_task(
     let result =
         rustykrab_gateway::run_agent_streaming(state, &mut conv, &prompt, &no_op_event).await;
 
-    let response_text = match result {
+    let (status, response_text) = match result {
         Ok(msg) => match &msg.content {
-            MessageContent::Text(t) => t.clone(),
-            _ => "Scheduled task completed (no text response).".to_string(),
+            MessageContent::Text(t) => ("ok", t.clone()),
+            _ => (
+                "ok",
+                "Scheduled task completed (no text response).".to_string(),
+            ),
         },
         Err(_) => {
             tracing::error!(job_id = %job_id, "agent error executing scheduled job");
-            "Sorry, the scheduled task encountered an error.".to_string()
+            (
+                "error",
+                "Sorry, the scheduled task encountered an error.".to_string(),
+            )
         }
     };
 
@@ -201,6 +217,19 @@ async fn execute_cron_task(
                 "scheduled job completed (no channel routing): {response_text}"
             );
         }
+    }
+
+    // Record the run before marking executed so the result is persisted
+    // even if mark_executed fails.
+    let finished_at = Utc::now();
+    if let Err(e) = store.jobs().record_run(
+        job_id,
+        status,
+        Some(&response_text),
+        started_at,
+        finished_at,
+    ) {
+        tracing::warn!(job_id = %job_id, "failed to record job run: {e}");
     }
 
     // Mark the job as executed (advances next_run_at or disables one-shot).

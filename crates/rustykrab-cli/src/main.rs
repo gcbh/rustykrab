@@ -97,6 +97,15 @@ impl CronBackend for CronAdapter {
         let deleted = self.store.jobs().delete_job(job_id)?;
         Ok(serde_json::json!({ "deleted": deleted, "job_id": job_id }))
     }
+
+    async fn list_runs(
+        &self,
+        job_id: &str,
+        limit: u32,
+    ) -> rustykrab_core::Result<serde_json::Value> {
+        let runs = self.store.jobs().list_runs(job_id, limit)?;
+        Ok(serde_json::to_value(&runs).expect("Vec<JobRun> is always serializable"))
+    }
 }
 
 #[tokio::main]
