@@ -14,54 +14,28 @@ use uuid::Uuid;
 
 type HmacSha256 = Hmac<Sha256>;
 
-/// Maximum text length Telegram allows in a single message.
 const TELEGRAM_MAX_LENGTH: usize = 4096;
-
-/// Maximum retries for sending a message before giving up.
 const SEND_MAX_RETRIES: u32 = 3;
 
-/// An inbound message with channel-specific routing metadata.
 pub struct ChannelMessage {
     pub chat_id: i64,
-    /// Telegram forum topic thread ID. `0` means no thread (non-forum chat
-    /// or the implicit "General" topic).
     pub thread_id: i64,
     pub message: Message,
-    /// If true, the conversation for this chat should be reset.
     pub reset: bool,
 }
 
-/// Telegram Bot API channel.
-///
-/// Supports two modes:
-/// - **Long-polling** (`start_polling`) — no public IP required, ideal for local dev
-/// - **Webhook** (`parse_webhook_update`) — for production behind a reverse proxy
-///
-/// Security features (addressing original RustyKrab Telegram CVEs):
-/// - Webhook secret token validation (HMAC-SHA256)
-/// - Chat ID allowlist — only specified chats can interact
-/// - No auto-join; every chat must be explicitly allowed
 pub struct TelegramChannel {
     client: reqwest::Client,
     bot_token: String,
     api_base: String,
-    /// Only these chat IDs may interact. Empty = deny all.
     allowed_chats: HashSet<i64>,
-    /// Secret token for webhook validation.
     webhook_secret: Option<String>,
-    /// Sender for inbound messages (user -> agent).
     inbound_tx: mpsc::Sender<ChannelMessage>,
-    /// Receiver for inbound messages (consumed by the agent loop).
     inbound_rx: Option<mpsc::Receiver<ChannelMessage>>,
-    /// Graceful shutdown flag.
     shutdown_flag: Arc<AtomicBool>,
 }
 
 impl TelegramChannel {
-    /// Create a new Telegram channel.
-    ///
-    /// `bot_token` is the token from @BotFather.
-    /// `allowed_chats` restricts which Telegram chats can use the bot.
     pub fn new(bot_token: String, allowed_chats: HashSet<i64>) -> Self {
         let (tx, rx) = mpsc::channel(256);
         let client = reqwest::Client::builder()
@@ -81,27 +55,19 @@ impl TelegramChannel {
         }
     }
 
-    /// Set a webhook secret for HMAC validation of incoming updates.
     pub fn with_webhook_secret(mut self, secret: String) -> Self {
         self.webhook_secret = Some(secret);
         self
     }
 
-    /// Take the inbound receiver (can only be called once).
-    /// The agent loop reads from this to get user messages.
     pub fn take_inbound_rx(&mut self) -> Option<mpsc::Receiver<ChannelMessage>> {
         self.inbound_rx.take()
     }
 
-    /// Request graceful shutdown of the polling loop.
     pub fn shutdown(&self) {
         self.shutdown_flag.store(true, Ordering::Relaxed);
     }
 
-    /// Send a "typing" chat action so the user sees the bot is working.
-    ///
-    /// When `thread_id > 0`, the typing indicator is scoped to that forum
-    /// topic so it appears in the correct thread.
     pub async fn send_typing(&self, chat_id: i64, thread_id: i64) -> Result<()> {
         let url = format!("{}/sendChatAction", self.api_base);
         let mut body = serde_json::json!({
@@ -128,12 +94,6 @@ impl TelegramChannel {
         Ok(())
     }
 
-    /// Send a text message to a Telegram chat, automatically splitting
-    /// messages that exceed Telegram's 4096 character limit.
-    ///
-    /// When `thread_id > 0`, the message is posted inside that forum topic.
-    /// Uses Markdown parse mode with automatic plain-text fallback if
-    /// Telegram rejects the formatting.
     pub async fn send_text(&self, chat_id: i64, text: &str, thread_id: i64) -> Result<()> {
         let chunks = split_message(text, TELEGRAM_MAX_LENGTH);
         for chunk in &chunks {
@@ -142,11 +102,6 @@ impl TelegramChannel {
         Ok(())
     }
 
-    /// Send a video file to a Telegram chat.
-    ///
-    /// `file_path` must be a local path to a video file (MP4, WebM, etc.).
-    /// `caption` is optional text shown alongside the video.
-    /// When `thread_id > 0`, the video is posted inside that forum topic.
     pub async fn send_video(
         &self,
         chat_id: i64,
@@ -158,11 +113,6 @@ impl TelegramChannel {
             .await
     }
 
-    /// Send a document (any file type) to a Telegram chat.
-    ///
-    /// `file_path` must be a local path to the file.
-    /// `caption` is optional text shown alongside the document.
-    /// When `thread_id > 0`, the document is posted inside that forum topic.
     pub async fn send_document(
         &self,
         chat_id: i64,
@@ -174,7 +124,6 @@ impl TelegramChannel {
             .await
     }
 
-    /// Internal: send a file via Telegram Bot API multipart upload.
     async fn send_file(
         &self,
         chat_id: i64,
@@ -196,7 +145,6 @@ impl TelegramChannel {
             .unwrap_or("file")
             .to_string();
 
-        // Determine MIME type from extension.
         let mime = match file_path
             .extension()
             .and_then(|e| e.to_str())
@@ -274,16 +222,13 @@ impl TelegramChannel {
         }))
     }
 
-    /// Send a single message chunk with retry and Markdown fallback.
     async fn send_single_message(&self, chat_id: i64, text: &str, thread_id: i64) -> Result<()> {
-        // First attempt: with Markdown.
         match self
             .try_send(chat_id, text, Some("Markdown"), SEND_MAX_RETRIES, thread_id)
             .await
         {
             Ok(()) => Ok(()),
             Err(e) => {
-                // If Markdown parsing failed (400 Bad Request), retry as plain text.
                 let err_str = format!("{e}");
                 if err_str.contains("400") || err_str.contains("parse") || err_str.contains("can't")
                 {
@@ -297,7 +242,6 @@ impl TelegramChannel {
         }
     }
 
-    /// Low-level send with retry on transient failures.
     async fn try_send(
         &self,
         chat_id: i64,
@@ -333,14 +277,12 @@ impl TelegramChannel {
                     let status = resp.status();
                     let err_text = resp.text().await.unwrap_or_default();
 
-                    // Don't retry client errors (except 429 rate limit).
                     if status.is_client_error() && status.as_u16() != 429 {
                         return Err(Error::Channel(format!(
                             "Telegram sendMessage failed ({status}): {err_text}"
                         )));
                     }
 
-                    // Rate limited — respect Retry-After if present.
                     if status.as_u16() == 429 {
                         tracing::warn!("Telegram rate limited, backing off");
                     }
@@ -362,15 +304,7 @@ impl TelegramChannel {
         Err(last_err.unwrap_or_else(|| Error::Channel("send failed after retries".into())))
     }
 
-    /// Start long-polling for updates. Runs forever — spawn this as a task.
-    ///
-    /// This is the simplest way to receive messages without exposing a
-    /// public endpoint. Suitable for local development.
-    ///
-    /// Resilient to transient errors: logs and retries with exponential
-    /// backoff rather than crashing on network blips.
     pub async fn start_polling(&self) -> Result<()> {
-        // Clear any stale webhook so Telegram doesn't send duplicates.
         if let Err(e) = self.delete_webhook().await {
             tracing::warn!("failed to clear stale webhook (may not be set): {e}");
         }
@@ -420,7 +354,24 @@ impl TelegramChannel {
                 continue;
             }
 
-            let body: GetUpdatesResponse = match resp.json().await {
+            let raw_text = match resp.text().await {
+                Ok(t) => t,
+                Err(e) => {
+                    consecutive_errors += 1;
+                    let delay = backoff_delay(consecutive_errors);
+                    tracing::error!(
+                        consecutive_errors,
+                        delay_secs = delay.as_secs(),
+                        "failed to read Telegram response body: {e}"
+                    );
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+            };
+
+            tracing::debug!(raw_json = %raw_text, "raw getUpdates response");
+
+            let body: GetUpdatesResponse = match serde_json::from_str(&raw_text) {
                 Ok(b) => b,
                 Err(e) => {
                     consecutive_errors += 1;
@@ -435,7 +386,6 @@ impl TelegramChannel {
                 }
             };
 
-            // Successful poll — reset error counter.
             consecutive_errors = 0;
 
             for update in body.result {
@@ -450,16 +400,11 @@ impl TelegramChannel {
         }
     }
 
-    /// Parse and handle a webhook update payload.
-    ///
-    /// Call this from your axum webhook handler. Returns an error if
-    /// the update is from a disallowed chat or fails validation.
     pub async fn parse_webhook_update(
         &self,
         payload: &[u8],
         secret_header: Option<&str>,
     ) -> Result<()> {
-        // Validate webhook secret (required — reject if none configured).
         let secret = self.webhook_secret.as_ref().ok_or_else(|| {
             Error::Auth("no webhook secret configured — refusing unauthenticated payload".into())
         })?;
@@ -469,11 +414,15 @@ impl TelegramChannel {
             return Err(Error::Auth("invalid Telegram webhook secret".into()));
         }
 
+        tracing::debug!(
+            raw_json = %String::from_utf8_lossy(payload),
+            "raw Telegram webhook payload"
+        );
+
         let update: Update = serde_json::from_slice(payload)?;
         self.handle_update(update).await
     }
 
-    /// Register a webhook URL with Telegram.
     pub async fn set_webhook(&self, url: &str) -> Result<()> {
         let api_url = format!("{}/setWebhook", self.api_base);
 
@@ -499,7 +448,6 @@ impl TelegramChannel {
         Ok(())
     }
 
-    /// Delete the webhook (switch back to long-polling).
     pub async fn delete_webhook(&self) -> Result<()> {
         let url = format!("{}/deleteWebhook", self.api_base);
         self.client
@@ -510,17 +458,25 @@ impl TelegramChannel {
         Ok(())
     }
 
-    /// Process a single Telegram update.
     async fn handle_update(&self, update: Update) -> Result<()> {
         let msg = match update.message {
             Some(m) => m,
-            None => return Ok(()), // Ignore non-message updates (edits, callbacks, etc.)
+            None => return Ok(()),
         };
 
         let chat_id = msg.chat.id;
         let thread_id = msg.message_thread_id.unwrap_or(0);
 
-        // Chat allowlist check.
+        tracing::debug!(
+            update_id = update.update_id,
+            chat_id,
+            chat_type = %msg.chat.chat_type,
+            chat_title = ?msg.chat.title,
+            thread_id,
+            user_id = msg.from.as_ref().map(|u| u.id),
+            "parsed Telegram update IDs"
+        );
+
         if !self.allowed_chats.is_empty() && !self.allowed_chats.contains(&chat_id) {
             tracing::warn!(
                 chat_id,
@@ -533,12 +489,40 @@ impl TelegramChannel {
             return Ok(());
         }
 
-        let text = match msg.text {
+        let has_mention = msg
+            .entities
+            .iter()
+            .any(|e| e.entity_type == "mention" || e.entity_type == "text_mention");
+        let text = match msg.text.or(msg.caption) {
             Some(t) => t,
-            None => return Ok(()), // Ignore non-text messages for now.
+            None if has_mention => {
+                tracing::info!(
+                    chat_id,
+                    thread_id,
+                    entities_count = msg.entities.len(),
+                    "received bare @mention with no text body"
+                );
+                let _ = self
+                    .send_text(
+                        chat_id,
+                        "Hi! You mentioned me — send a message and I'll help.",
+                        thread_id,
+                    )
+                    .await;
+                return Ok(());
+            }
+            None => {
+                tracing::debug!(
+                    chat_id,
+                    thread_id,
+                    entities_count = msg.entities.len(),
+                    caption_entities_count = msg.caption_entities.len(),
+                    "ignoring non-text message (no text or caption)"
+                );
+                return Ok(());
+            }
         };
 
-        // Handle bot commands before forwarding to the agent.
         if let Some(reply) = self.handle_command(&text, chat_id).await {
             let _ = self.send_text(chat_id, &reply, thread_id).await;
             return Ok(());
@@ -572,8 +556,6 @@ impl TelegramChannel {
         Ok(())
     }
 
-    /// Handle built-in bot commands. Returns Some(reply) if the command
-    /// was handled, None if the message should be forwarded to the agent.
     async fn handle_command(&self, text: &str, _chat_id: i64) -> Option<String> {
         let cmd = text.split_whitespace().next()?;
         match cmd {
@@ -595,17 +577,11 @@ impl TelegramChannel {
             "/reset" => Some(
                 "Conversation reset. Send a new message to start fresh.".to_string(),
             ),
-            _ if cmd.starts_with('/') => {
-                // Unknown command — let it pass through to the agent.
-                None
-            }
+            _ if cmd.starts_with('/') => None,
             _ => None,
         }
     }
 
-    /// Validate an HMAC-SHA256 signature for webhook payloads.
-    /// This provides an additional layer of verification beyond the
-    /// secret_token header that Telegram sends.
     pub fn verify_hmac(&self, payload: &[u8], signature_hex: &str) -> Result<()> {
         let secret = self.webhook_secret.as_ref().ok_or_else(|| {
             Error::Config("no webhook secret configured for HMAC verification".into())
@@ -622,21 +598,16 @@ impl TelegramChannel {
             .map_err(|_| Error::Auth("HMAC verification failed".into()))
     }
 
-    /// Get the bot token (for constructing webhook URLs).
     pub fn bot_token(&self) -> &str {
         &self.bot_token
     }
 }
 
-/// Exponential backoff delay, capped at 60 seconds.
 fn backoff_delay(consecutive_errors: u32) -> std::time::Duration {
     let secs = (2u64.pow(consecutive_errors.min(6))).min(60);
     std::time::Duration::from_secs(secs)
 }
 
-/// Split a message into chunks that fit within Telegram's character limit.
-/// Tries to split on paragraph boundaries, then sentence boundaries,
-/// then word boundaries, to avoid cutting mid-sentence.
 fn split_message(text: &str, max_len: usize) -> Vec<String> {
     if text.len() <= max_len {
         return vec![text.to_string()];
@@ -651,17 +622,12 @@ fn split_message(text: &str, max_len: usize) -> Vec<String> {
             break;
         }
 
-        // Find the nearest char boundary at or before max_len to avoid
-        // panicking on multi-byte UTF-8 characters.
         let safe_end = remaining.floor_char_boundary(max_len);
         if safe_end == 0 {
-            // Single character larger than max_len (shouldn't happen with
-            // reasonable limits, but handle gracefully).
             chunks.push(remaining.to_string());
             break;
         }
 
-        // Find the best split point within the limit.
         let window = &remaining[..safe_end];
         let split_at = find_split_point(window);
 
@@ -672,23 +638,19 @@ fn split_message(text: &str, max_len: usize) -> Vec<String> {
     chunks
 }
 
-/// Find the best place to split text, preferring paragraph > sentence > word boundaries.
 fn find_split_point(window: &str) -> usize {
-    // Try to split on a double newline (paragraph break).
     if let Some(pos) = window.rfind("\n\n") {
         if pos > 0 {
-            return pos + 2; // Include the double newline.
+            return pos + 2;
         }
     }
 
-    // Try to split on a single newline.
     if let Some(pos) = window.rfind('\n') {
         if pos > 0 {
             return pos + 1;
         }
     }
 
-    // Try to split on sentence-ending punctuation followed by a space.
     for &sep in &[". ", "! ", "? "] {
         if let Some(pos) = window.rfind(sep) {
             if pos > 0 {
@@ -697,14 +659,12 @@ fn find_split_point(window: &str) -> usize {
         }
     }
 
-    // Fall back to a word boundary (space).
     if let Some(pos) = window.rfind(' ') {
         if pos > 0 {
             return pos + 1;
         }
     }
 
-    // Absolute fallback: hard split at the limit.
     window.len()
 }
 
@@ -727,13 +687,25 @@ pub struct TelegramMessage {
     pub chat: Chat,
     pub from: Option<User>,
     pub text: Option<String>,
+    #[serde(default)]
+    pub caption: Option<String>,
+    #[serde(default)]
+    pub entities: Vec<MessageEntity>,
+    #[serde(default)]
+    pub caption_entities: Vec<MessageEntity>,
     pub date: i64,
-    /// Forum topic thread ID. Present when the message belongs to a forum topic.
     #[serde(default)]
     pub message_thread_id: Option<i64>,
-    /// Whether this message was sent inside a forum topic.
     #[serde(default)]
     pub is_topic_message: Option<bool>,
+}
+
+#[derive(Deserialize)]
+pub struct MessageEntity {
+    #[serde(rename = "type")]
+    pub entity_type: String,
+    pub offset: i64,
+    pub length: i64,
 }
 
 #[derive(Deserialize)]
