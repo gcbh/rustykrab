@@ -95,6 +95,11 @@ async fn prepare_agent(
         .filter(|t| t.available())
         .map(|t| t.name())
         .collect();
+    tracing::debug!(
+        tool_count = tool_names.len(),
+        tools = ?tool_names,
+        "granting session capabilities for available tools"
+    );
     let caps = CapabilitySet::for_tools_permissive(&tool_names);
     let session = Session::with_capabilities(conv.id, caps);
 

@@ -1244,9 +1244,17 @@ async fn execute_single_tool(
     session_id: uuid::Uuid,
 ) -> Result<ToolResult> {
     if !capabilities.can_use_tool(&call.name) {
+        let granted: Vec<String> = capabilities
+            .list()
+            .filter_map(|c| match c {
+                rustykrab_core::capability::Capability::Tool(name) => Some(name.clone()),
+                _ => None,
+            })
+            .collect();
         tracing::warn!(
             tool = call.name,
             session = %session_id,
+            granted_tool_count = granted.len(),
             "tool call denied: insufficient capabilities"
         );
         return Err(Error::Auth(format!(
@@ -1255,9 +1263,16 @@ async fn execute_single_tool(
         )));
     }
 
+    // Look up the tool by exact name first, then by trimmed/base name so
+    // that the lookup stays consistent with can_use_tool's normalisation.
+    let call_name_trimmed = call.name.trim();
+    let call_base_name = call_name_trimmed
+        .split(':')
+        .next()
+        .unwrap_or(call_name_trimmed);
     let tool = tools
         .iter()
-        .find(|t| t.name() == call.name)
+        .find(|t| t.name() == call_name_trimmed || t.name() == call_base_name)
         .ok_or_else(|| Error::ToolExecution(format!("unknown tool: {}", call.name).into()))?;
 
     // Basic schema validation: check required parameters are present.
