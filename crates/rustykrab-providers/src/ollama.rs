@@ -94,8 +94,16 @@ pub struct OllamaProvider {
 
 impl OllamaProvider {
     pub fn new(model: impl Into<String>) -> Self {
+        // Large prompts (near the 100K `num_ctx`) can easily take more than
+        // five minutes for prompt evaluation on a local GPU, so allow up to
+        // 15 minutes per request before we give up.  Can be overridden via
+        // `OLLAMA_TIMEOUT_SECS`.
+        let timeout_secs = std::env::var("OLLAMA_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(900);
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(300))
+            .timeout(Duration::from_secs(timeout_secs))
             .connect_timeout(Duration::from_secs(10))
             .build()
             .expect("failed to build HTTP client");
@@ -384,6 +392,22 @@ impl ModelProvider for OllamaProvider {
             let resp = match self.client.post(&url).json(&body).send().await {
                 Ok(r) => r,
                 Err(e) => {
+                    // Don't retry timeouts: retrying the same 99K-token prompt
+                    // would just burn another 15-minute budget for the same
+                    // failure.  The caller (agent loop) needs to reduce context
+                    // or abort before re-trying.
+                    if e.is_timeout() {
+                        tracing::warn!(
+                            model = %self.model,
+                            num_messages = ollama_messages.len(),
+                            num_ctx = self.config.num_ctx,
+                            "Ollama request timed out — not retrying (reduce context or raise OLLAMA_TIMEOUT_SECS)"
+                        );
+                        return Err(Error::ModelProvider(format!(
+                            "Ollama request timed out after the configured HTTP timeout. \
+                             Reduce prompt size or raise OLLAMA_TIMEOUT_SECS: {e}"
+                        )));
+                    }
                     last_err = Some(Error::ModelProvider(format!(
                         "failed to connect to Ollama at {}: {e}. Is Ollama running?",
                         self.base_url
@@ -500,6 +524,19 @@ impl ModelProvider for OllamaProvider {
             let r = match self.client.post(&url).json(&body).send().await {
                 Ok(r) => r,
                 Err(e) => {
+                    // Don't retry timeouts — see `chat` for rationale.
+                    if e.is_timeout() {
+                        tracing::warn!(
+                            model = %self.model,
+                            num_messages = ollama_messages.len(),
+                            num_ctx = self.config.num_ctx,
+                            "Ollama streaming request timed out — not retrying"
+                        );
+                        return Err(Error::ModelProvider(format!(
+                            "Ollama streaming request timed out after the configured HTTP timeout. \
+                             Reduce prompt size or raise OLLAMA_TIMEOUT_SECS: {e}"
+                        )));
+                    }
                     last_err = Some(Error::ModelProvider(format!(
                         "failed to connect to Ollama at {}: {e}. Is Ollama running?",
                         self.base_url
