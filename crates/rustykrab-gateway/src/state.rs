@@ -1,6 +1,4 @@
-use rustykrab_agent::{
-    HarnessProfile, HarnessRouter, OrchestrationPipeline, ProcessSandbox, Sandbox,
-};
+use rustykrab_agent::{HarnessProfile, HarnessRouter, ProcessSandbox, Sandbox};
 use rustykrab_channels::{SignalChannel, TelegramChannel, VideoChannel};
 use rustykrab_core::model::ModelProvider;
 use rustykrab_core::orchestration::OrchestrationConfig;
@@ -31,10 +29,7 @@ pub struct AppState {
     /// Auto-router that classifies messages and selects profiles on-the-fly.
     /// None = static profile mode (uses harness_profile directly).
     pub harness_router: Option<Arc<HarnessRouter>>,
-    /// Orchestration pipeline for recursive agentic patterns.
-    /// None = disabled (direct agent loop only).
-    pub orchestration_pipeline: Option<Arc<OrchestrationPipeline>>,
-    /// Orchestration configuration.
+    /// Orchestration configuration (used by RLM module).
     pub orchestration_config: OrchestrationConfig,
     /// Skill registry for SKILL.md-based skills.
     pub skill_registry: Arc<SkillRegistry>,
@@ -60,7 +55,6 @@ impl AppState {
             sandbox: Arc::new(ProcessSandbox::new()),
             harness_profile: HarnessProfile::default(),
             harness_router: None,
-            orchestration_pipeline: None,
             orchestration_config: OrchestrationConfig::default(),
             skill_registry: Arc::new(SkillRegistry::new()),
         }
@@ -115,19 +109,13 @@ impl AppState {
         self
     }
 
-    /// Enable the orchestration pipeline for recursive agentic patterns.
-    pub fn with_orchestration_pipeline(mut self, pipeline: Arc<OrchestrationPipeline>) -> Self {
-        self.orchestration_pipeline = Some(pipeline);
-        self
-    }
-
     /// Set the skill registry.
     pub fn with_skill_registry(mut self, registry: Arc<SkillRegistry>) -> Self {
         self.skill_registry = registry;
         self
     }
 
-    /// Set the orchestration configuration.
+    /// Set the orchestration configuration (used by RLM module).
     pub fn with_orchestration_config(mut self, config: OrchestrationConfig) -> Self {
         self.orchestration_config = config;
         self
@@ -153,21 +141,12 @@ impl AppState {
         }
     }
 
-    /// Get a harness profile by name (from model self-classification).
+    /// Get a harness profile by name.
     pub fn profile_for_name(&self, name: &str) -> HarnessProfile {
         match name {
             "coding" => HarnessProfile::coding(),
             "research" => HarnessProfile::research(),
             "creative" => HarnessProfile::creative(),
-            "planning" => {
-                let mut p = HarnessProfile::research();
-                p.name = "planning".to_string();
-                p.task_type = rustykrab_agent::TaskType::Planning;
-                p.agent_description = "a methodical planning assistant. You break complex \
-                    problems into actionable steps and identify dependencies."
-                    .to_string();
-                p
-            }
             _ => self.harness_profile.clone(),
         }
     }
