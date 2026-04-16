@@ -210,8 +210,11 @@ async fn main() -> anyhow::Result<()> {
             let model = std::env::var("OLLAMA_MODEL").unwrap_or_else(|_| "gemma4:26b".to_string());
             let base_url = std::env::var("OLLAMA_BASE_URL")
                 .unwrap_or_else(|_| "http://localhost:11434".to_string());
-            tracing::info!(%model, %base_url, "using Ollama provider");
-            let p = rustykrab_providers::OllamaProvider::new(model).with_base_url(base_url);
+            let config = rustykrab_providers::OllamaConfig::default();
+            tracing::info!(%model, %base_url, num_ctx = config.num_ctx, "using Ollama provider");
+            let p = rustykrab_providers::OllamaProvider::new(model)
+                .with_base_url(base_url)
+                .with_config(config);
             Arc::new(p)
         }
         _ => {
@@ -697,6 +700,9 @@ async fn telegram_agent_loop(
                                 Ok(mut conv) => {
                                     conv.channel_source = Some("telegram".to_string());
                                     conv.channel_id = Some(chat_id.to_string());
+                                    if thread_id != 0 {
+                                        conv.channel_thread_id = Some(thread_id.to_string());
+                                    }
                                     if let Err(e) = state.store.conversations().save(&conv) {
                                         tracing::warn!(
                                             chat_id,
@@ -803,6 +809,19 @@ async fn process_telegram_message(
             return "Internal error — please try again.".to_string();
         }
     };
+
+    // Ensure channel metadata is present (backfills conversations created
+    // before this field was populated).
+    if conv.channel_source.is_none() {
+        conv.channel_source = Some("telegram".to_string());
+        conv.channel_id = Some(chat_id.to_string());
+        if thread_id != 0 {
+            conv.channel_thread_id = Some(thread_id.to_string());
+        }
+    }
+    if conv.channel_thread_id.is_none() && thread_id != 0 {
+        conv.channel_thread_id = Some(thread_id.to_string());
+    }
 
     // Append user message.
     conv.messages.push(message);

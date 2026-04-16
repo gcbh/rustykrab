@@ -493,18 +493,78 @@ async fn interfaces(timeout_ms: u64) -> Value {
 // Active ARP scan
 // ---------------------------------------------------------------------------
 
+/// Detect the default network interface by parsing `ip route show default`.
+///
+/// Returns the device name from the first default route (e.g. "enp0s3",
+/// "wlan0", "eth0").  Returns `None` if no default route exists or the
+/// `ip` command is unavailable.
+async fn detect_default_interface() -> Option<String> {
+    let path = system_path();
+    let output = tokio::process::Command::new("ip")
+        .args(["route", "show", "default"])
+        .env("PATH", &path)
+        .output()
+        .await
+        .ok()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Typical line: "default via 192.168.1.1 dev enp0s3 proto dhcp metric 100"
+    for line in stdout.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if let Some(idx) = parts.iter().position(|&p| p == "dev") {
+            if let Some(iface) = parts.get(idx + 1) {
+                return Some((*iface).to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Validate that an interface name is safe to pass as a CLI argument.
+///
+/// Only allows alphanumeric characters, hyphens, underscores, and dots —
+/// typical Linux interface naming (e.g. "eth0", "enp0s3", "wlan0", "br-lan").
+fn validate_interface_name(name: &str) -> std::result::Result<(), ToolError> {
+    if name.is_empty() {
+        return Err(ToolError::invalid_input("interface name must not be empty"));
+    }
+    if name.starts_with('-') {
+        return Err(ToolError::invalid_input(
+            "interface name must not start with '-'",
+        ));
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    {
+        return Err(ToolError::invalid_input(
+            "interface name contains disallowed characters",
+        ));
+    }
+    Ok(())
+}
+
 /// Actively scan a subnet for all devices using ARP requests.
 ///
-/// Tries `arp-scan` first (most reliable, returns vendor info).  Falls back to
-/// `nmap -sn` (ping scan + ARP on local segment).
-async fn arp_scan(subnet: &str, timeout_ms: u64) -> Value {
+/// When `interface` is `None`, auto-detects the default interface via
+/// `ip route`.  Tries `arp-scan` first (most reliable, returns vendor
+/// info).  Falls back to `nmap -sn` (ping scan + ARP on local segment).
+async fn arp_scan(subnet: &str, interface: Option<&str>, timeout_ms: u64) -> Value {
     let path = system_path();
 
-    // Try arp-scan first: `arp-scan --localnet` or `arp-scan <cidr>`
+    // Resolve the interface to use.
+    let iface = match interface {
+        Some(i) => i.to_string(),
+        None => detect_default_interface()
+            .await
+            .unwrap_or_else(|| "eth0".to_string()),
+    };
+    let iface_arg = format!("--interface={iface}");
+
+    // Try arp-scan first.
     let arp_scan_result = timeout(
         Duration::from_millis(timeout_ms),
         tokio::process::Command::new("arp-scan")
-            .args(["--interface=eth0", "--retry=1", "--timeout=500", subnet])
+            .args([&iface_arg, "--retry=1", "--timeout=500", subnet])
             .env("PATH", &path)
             .output(),
     )
@@ -534,6 +594,7 @@ async fn arp_scan(subnet: &str, timeout_ms: u64) -> Value {
             return json!({
                 "success": true,
                 "subnet": subnet,
+                "interface": iface,
                 "source": "arp-scan",
                 "entries": entries,
                 "count": entries.len(),
@@ -541,11 +602,11 @@ async fn arp_scan(subnet: &str, timeout_ms: u64) -> Value {
         }
     }
 
-    // Fallback: nmap -sn (ping/ARP scan)
+    // Fallback: nmap -sn (ping/ARP scan), with -e <interface>.
     let nmap_result = timeout(
         Duration::from_millis(timeout_ms),
         tokio::process::Command::new("nmap")
-            .args(["-sn", "-n", subnet])
+            .args(["-sn", "-n", "-e", &iface, subnet])
             .env("PATH", &path)
             .output(),
     )
@@ -602,6 +663,7 @@ async fn arp_scan(subnet: &str, timeout_ms: u64) -> Value {
             json!({
                 "success": true,
                 "subnet": subnet,
+                "interface": iface,
                 "source": "nmap",
                 "entries": entries,
                 "count": entries.len(),
@@ -987,6 +1049,105 @@ async fn ssdp_discover(timeout_ms: u64, fetch_descriptions: bool) -> Value {
 // DHCP lease table
 // ---------------------------------------------------------------------------
 
+/// Validate that an SSH username is safe.
+///
+/// Rejects values that start with `-` (which could be interpreted as SSH
+/// options, enabling option injection) and values containing shell
+/// metacharacters.  Only allows alphanumeric characters, hyphens (not as
+/// the first character), underscores, and dots.
+fn validate_ssh_user(user: &str) -> std::result::Result<(), ToolError> {
+    if user.is_empty() {
+        return Err(ToolError::invalid_input("SSH user must not be empty"));
+    }
+    if user.starts_with('-') {
+        return Err(ToolError::invalid_input(
+            "SSH user must not start with '-' (option injection)",
+        ));
+    }
+    if !user
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    {
+        return Err(ToolError::invalid_input(
+            "SSH user contains disallowed characters — \
+             only alphanumeric, '-', '_', '.' are permitted",
+        ));
+    }
+    Ok(())
+}
+
+/// Validate a CIDR subnet string for use with scanning tools.
+///
+/// Ensures the string is well-formed (`<ipv4>/<prefix>`), the base IP is
+/// in a local network range, and the prefix length is between 20 and 32
+/// to prevent accidental DoS via overly broad scans.
+fn validate_scan_cidr(cidr: &str) -> std::result::Result<(), ToolError> {
+    let parts: Vec<&str> = cidr.split('/').collect();
+    if parts.len() != 2 {
+        return Err(ToolError::invalid_input(
+            "expected CIDR notation, e.g. '192.168.1.0/24'",
+        ));
+    }
+
+    let ip: IpAddr = parts[0]
+        .parse()
+        .map_err(|e| ToolError::invalid_input(format!("invalid IP in CIDR: {e}")))?;
+
+    if !is_local_network(&ip) {
+        return Err(ToolError::invalid_input(format!(
+            "{ip} is not in a private/local range — only local-network scanning is allowed"
+        )));
+    }
+
+    let prefix_len: u32 = parts[1]
+        .parse()
+        .map_err(|e| ToolError::invalid_input(format!("invalid prefix length: {e}")))?;
+
+    if prefix_len > 32 {
+        return Err(ToolError::invalid_input("prefix length must be <= 32"));
+    }
+    if prefix_len < 20 {
+        return Err(ToolError::invalid_input(
+            "prefix length must be >= 20 (max 4094 hosts) to prevent accidental DoS",
+        ));
+    }
+
+    Ok(())
+}
+
+/// Validate that a lease file path is safe to pass to a remote shell.
+///
+/// Rejects paths containing shell metacharacters, backticks, command
+/// substitution, pipes, redirects, semicolons, etc.  Only allows
+/// absolute paths with alphanumeric segments, hyphens, underscores,
+/// dots, and forward slashes.
+fn validate_lease_path(path: &str) -> std::result::Result<(), ToolError> {
+    if path.is_empty() {
+        return Err(ToolError::invalid_input("lease_file must not be empty"));
+    }
+    if !path.starts_with('/') {
+        return Err(ToolError::invalid_input(
+            "lease_file must be an absolute path (start with '/')",
+        ));
+    }
+    if path.contains("..") {
+        return Err(ToolError::invalid_input(
+            "lease_file must not contain '..' path traversal",
+        ));
+    }
+    // Allow only safe characters: alphanumeric, '/', '-', '_', '.'
+    if !path
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '-' | '_' | '.'))
+    {
+        return Err(ToolError::invalid_input(
+            "lease_file contains disallowed characters — \
+             only alphanumeric, '/', '-', '_', '.' are permitted",
+        ));
+    }
+    Ok(())
+}
+
 /// Query a router's DHCP lease table over SSH.
 ///
 /// Connects to the router at `host` as `user` (default "root") and reads the
@@ -997,7 +1158,10 @@ async fn ssdp_discover(timeout_ms: u64, fetch_descriptions: bool) -> Value {
 async fn dhcp_leases(host: &str, user: &str, lease_file: &str, timeout_ms: u64) -> Value {
     let path = system_path();
 
-    let remote_cmd = format!("cat {lease_file}");
+    // Pass the file path as a separate argument to `cat` instead of
+    // interpolating it into a shell string, preventing command injection.
+    // SSH with "--" separates ssh options from the remote command; each
+    // subsequent argument becomes a separate word in the remote argv.
     let result = timeout(
         Duration::from_millis(timeout_ms),
         tokio::process::Command::new("ssh")
@@ -1011,7 +1175,9 @@ async fn dhcp_leases(host: &str, user: &str, lease_file: &str, timeout_ms: u64) 
                 "-l",
                 user,
                 host,
-                &remote_cmd,
+                "--",
+                "cat",
+                lease_file,
             ])
             .env("PATH", &path)
             .output(),
@@ -1149,6 +1315,10 @@ impl Tool for NetDiscoveryTool {
                         "type": "string",
                         "description": "CIDR subnet for arp_scan (e.g. '192.168.1.0/24')"
                     },
+                    "interface": {
+                        "type": "string",
+                        "description": "Network interface for arp_scan (e.g. 'eth0', 'enp0s3', 'wlan0'). Auto-detected from the default route if omitted."
+                    },
                     "mac": {
                         "type": "string",
                         "description": "MAC address for oui_lookup (e.g. 'AA:BB:CC:DD:EE:FF')"
@@ -1257,19 +1427,15 @@ impl Tool for NetDiscoveryTool {
                     ))
                 })?;
 
-                // Validate the base IP is in a local range.
-                let base_ip_str = subnet.split('/').next().unwrap_or("");
-                if let Ok(ip) = base_ip_str.parse::<IpAddr>() {
-                    if !is_local_network(&ip) {
-                        return Err(rustykrab_core::Error::ToolExecution(
-                            ToolError::invalid_input(format!(
-                                "{ip} is not in a private/local range — only local-network scanning is allowed"
-                            )),
-                        ));
-                    }
+                // Full CIDR validation: well-formed, local network, sane prefix.
+                validate_scan_cidr(subnet).map_err(rustykrab_core::Error::ToolExecution)?;
+
+                let interface = args["interface"].as_str();
+                if let Some(iface) = interface {
+                    validate_interface_name(iface).map_err(rustykrab_core::Error::ToolExecution)?;
                 }
 
-                let result = arp_scan(subnet, timeout_ms).await;
+                let result = arp_scan(subnet, interface, timeout_ms).await;
                 Ok(json!({
                     "action": "arp_scan",
                     "result": result,
@@ -1325,7 +1491,10 @@ impl Tool for NetDiscoveryTool {
                 require_local(host_str).map_err(rustykrab_core::Error::ToolExecution)?;
 
                 let user = args["user"].as_str().unwrap_or("root");
+                validate_ssh_user(user).map_err(rustykrab_core::Error::ToolExecution)?;
+
                 let lease_file = args["lease_file"].as_str().unwrap_or("/tmp/dnsmasq.leases");
+                validate_lease_path(lease_file).map_err(rustykrab_core::Error::ToolExecution)?;
 
                 let result = dhcp_leases(host_str, user, lease_file, timeout_ms).await;
                 Ok(json!({

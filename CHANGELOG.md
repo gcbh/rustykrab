@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.3.5] - 2026-04-16
+
+- fix: prevent Ollama 500s from context window overload (#368)
+
+## [2.3.4] - 2026-04-16
+
+- Fix rustls-webpki vulnerabilities RUSTSEC-2026-0098 and RUSTSEC-2026-0099 (#369)
+
+## [2.3.3] - 2026-04-15
+
+- Fix stop reason fallthrough causing misleading re-prompts and infinite loops (#367)
+
+## [2.3.2] - 2026-04-15
+
+- Expose Telegram chat ID and thread ID to the agent (#364)
+
+## [2.3.1] - 2026-04-15
+
+- fix: handle stream read errors gracefully instead of crashing (#366)
+
+## [2.3.0] - 2026-04-15
+
+- feat: add network device discovery mechanisms (Part 1) (#365)
+
 ## [2.2.6] - 2026-04-15
 
 - Fix agent visibility of Telegram chat IDs (#363)

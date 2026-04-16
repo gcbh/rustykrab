@@ -45,6 +45,17 @@ async fn build_and_inject_system_prompt(
         if let Some(ref cid) = conv.channel_id {
             system_prompt.push_str(&format!("- Chat ID: {cid}\n"));
         }
+        if let Some(ref tid) = conv.channel_thread_id {
+            system_prompt.push_str(&format!("- Thread ID: {tid}\n"));
+        }
+        tracing::debug!(
+            channel_source = source.as_str(),
+            channel_id = ?conv.channel_id,
+            channel_thread_id = ?conv.channel_thread_id,
+            "injected channel context into system prompt"
+        );
+    } else {
+        tracing::debug!("no channel_source on conversation — skipping channel context");
     }
 
     // 3. Inject system prompt as first message.

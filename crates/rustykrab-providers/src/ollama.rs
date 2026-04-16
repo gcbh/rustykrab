@@ -28,11 +28,24 @@ pub struct OllamaConfig {
     pub num_predict: i32,
 }
 
+/// Read `num_ctx` from the `OLLAMA_NUM_CTX` env var, falling back to the
+/// given default.  Invalid values are silently ignored.
+fn num_ctx_from_env(default: u32) -> u32 {
+    std::env::var("OLLAMA_NUM_CTX")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(default)
+}
+
+/// Default context-window size.  The previous 128 K was too aggressive and
+/// caused Ollama to OOM (returning 500).  Can be overridden via `OLLAMA_NUM_CTX`.
+const DEFAULT_NUM_CTX: u32 = 100_000;
+
 impl Default for OllamaConfig {
     fn default() -> Self {
         Self {
             temperature: 0.1,
-            num_ctx: 131_072,
+            num_ctx: num_ctx_from_env(DEFAULT_NUM_CTX),
             num_parallel: 6,
             top_p: 0.9,
             num_predict: 8192,
@@ -45,7 +58,7 @@ impl OllamaConfig {
     pub fn tool_calling() -> Self {
         Self {
             temperature: 0.0,
-            num_ctx: 131_072,
+            num_ctx: num_ctx_from_env(DEFAULT_NUM_CTX),
             num_parallel: 6,
             top_p: 0.9,
             num_predict: 4096,
@@ -56,7 +69,7 @@ impl OllamaConfig {
     pub fn creative() -> Self {
         Self {
             temperature: 0.7,
-            num_ctx: 131_072,
+            num_ctx: num_ctx_from_env(DEFAULT_NUM_CTX),
             num_parallel: 6,
             top_p: 0.95,
             num_predict: 16384,
@@ -342,7 +355,13 @@ impl ModelProvider for OllamaProvider {
             body["tools"] = serde_json::to_value(&ollama_tools).map_err(Error::Serialization)?;
         }
 
-        tracing::debug!(model = %self.model, base_url = %self.base_url, "calling Ollama chat API");
+        tracing::debug!(
+            model = %self.model,
+            base_url = %self.base_url,
+            num_messages = ollama_messages.len(),
+            num_ctx = self.config.num_ctx,
+            "calling Ollama chat API"
+        );
 
         let url = format!("{}/api/chat", self.base_url);
 
@@ -397,6 +416,13 @@ impl ModelProvider for OllamaProvider {
             }
 
             let error_body = resp.text().await.unwrap_or_default();
+            tracing::warn!(
+                status = %status,
+                num_ctx = self.config.num_ctx,
+                num_messages = ollama_messages.len(),
+                error_body = %error_body,
+                "Ollama API error"
+            );
             let is_retryable = matches!(status.as_u16(), 429 | 500 | 502 | 503 | 529);
             // Fix #186: map status codes to specific error variants.
             last_err = Some(Self::map_status_error(status, &error_body));
@@ -442,28 +468,61 @@ impl ModelProvider for OllamaProvider {
             body["tools"] = serde_json::to_value(&ollama_tools).map_err(Error::Serialization)?;
         }
 
-        tracing::debug!(model = %self.model, base_url = %self.base_url, "calling Ollama chat API (streaming)");
+        tracing::debug!(
+            model = %self.model,
+            base_url = %self.base_url,
+            num_messages = ollama_messages.len(),
+            num_ctx = self.config.num_ctx,
+            "calling Ollama chat API (streaming)"
+        );
 
         let url = format!("{}/api/chat", self.base_url);
 
-        let resp = self
-            .client
-            .post(&url)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| {
-                Error::ModelProvider(format!(
-                    "failed to connect to Ollama at {}: {e}. Is Ollama running?",
-                    self.base_url
-                ))
-            })?;
+        // Retry the initial connection with the same backoff as the non-streaming path.
+        let mut last_err = None;
+        let mut resp = None;
+        for attempt in 0..=MAX_RETRIES {
+            if attempt > 0 {
+                let delay = RETRY_BASE_DELAY * 2u32.pow(attempt - 1);
+                tracing::warn!(attempt, "retrying Ollama streaming API after {delay:?}");
+                tokio::time::sleep(delay).await;
+            }
 
-        let status = resp.status();
-        if !status.is_success() {
-            let error_body = resp.text().await.unwrap_or_default();
-            return Err(Self::map_status_error(status, &error_body));
+            let r = match self.client.post(&url).json(&body).send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    last_err = Some(Error::ModelProvider(format!(
+                        "failed to connect to Ollama at {}: {e}. Is Ollama running?",
+                        self.base_url
+                    )));
+                    continue;
+                }
+            };
+
+            let status = r.status();
+            if !status.is_success() {
+                let error_body = r.text().await.unwrap_or_default();
+                tracing::warn!(
+                    status = %status,
+                    num_ctx = self.config.num_ctx,
+                    num_messages = ollama_messages.len(),
+                    error_body = %error_body,
+                    "Ollama streaming API error"
+                );
+                let is_retryable = matches!(status.as_u16(), 429 | 500 | 502 | 503 | 529);
+                last_err = Some(Self::map_status_error(status, &error_body));
+                if !is_retryable {
+                    break;
+                }
+                continue;
+            }
+
+            resp = Some(r);
+            break;
         }
+        let resp = resp.ok_or_else(|| {
+            last_err.unwrap_or_else(|| Error::ModelProvider("request failed".into()))
+        })?;
 
         // Parse newline-delimited JSON chunks.
         let mut buffer = String::new();
@@ -474,11 +533,32 @@ impl ModelProvider for OllamaProvider {
         let mut done_reason: Option<String> = None;
 
         let mut response = resp;
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .map_err(|e| Error::ModelProvider(format!("stream read error: {e}")))?
-        {
+        let mut chunks_received: u64 = 0;
+        let mut bytes_received: u64 = 0;
+        let stream_start = std::time::Instant::now();
+        loop {
+            let chunk = match response.chunk().await {
+                Ok(Some(chunk)) => chunk,
+                Ok(None) => break, // stream finished normally
+                Err(e) => {
+                    let elapsed = stream_start.elapsed();
+                    tracing::warn!(
+                        error = %e,
+                        error_debug = ?e,
+                        model = %self.model,
+                        base_url = %self.base_url,
+                        chunks_received,
+                        bytes_received,
+                        elapsed_ms = elapsed.as_millis() as u64,
+                        accumulated_text_len = full_text.len(),
+                        buffer_len = buffer.len(),
+                        "stream read error mid-stream, returning partial response"
+                    );
+                    break;
+                }
+            };
+            chunks_received += 1;
+            bytes_received += chunk.len() as u64;
             buffer.push_str(&String::from_utf8_lossy(&chunk));
 
             while let Some(newline_pos) = buffer.find('\n') {
@@ -518,6 +598,15 @@ impl ModelProvider for OllamaProvider {
                 }
             }
         }
+
+        let stream_elapsed = stream_start.elapsed();
+        tracing::debug!(
+            chunks_received,
+            bytes_received,
+            elapsed_ms = stream_elapsed.as_millis() as u64,
+            text_len = full_text.len(),
+            "Ollama stream completed"
+        );
 
         let stop_reason = if !tool_calls.is_empty() {
             StopReason::ToolUse

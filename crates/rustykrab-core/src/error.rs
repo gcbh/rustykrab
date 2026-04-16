@@ -118,6 +118,9 @@ pub enum Error {
     #[error("model provider overloaded: {0}")]
     ModelOverloaded(String),
 
+    #[error("model refused to respond due to content policy")]
+    ContentPolicy,
+
     #[error("tool execution error: {0}")]
     ToolExecution(ToolError),
 

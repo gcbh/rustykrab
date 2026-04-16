@@ -34,6 +34,68 @@ const EXTERNAL_CONTENT_TOOLS: &[&str] = &[
     "x_search",
 ];
 
+/// Maximum retries for an empty response (model returned no text).
+const EMPTY_RESPONSE_RETRY_LIMIT: usize = 1;
+/// Maximum retries for a planning-only response (model described intent
+/// without using tools).
+const PLANNING_ONLY_RETRY_LIMIT: usize = 2;
+
+/// Classification of a model response that didn't include tool calls.
+enum ResponseClass {
+    /// Substantive text — the model produced a real answer.
+    Complete,
+    /// Empty or whitespace-only text (possibly with completion tokens from
+    /// unhandled content blocks like thinking).
+    Empty,
+    /// The model described what it *plans* to do without actually doing it
+    /// (e.g. "I'll read the file…", "Let me search for…").
+    PlanningOnly,
+}
+
+/// Classify a text-only assistant response.
+fn classify_response(text: &str, _completion_tokens: u32) -> ResponseClass {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return ResponseClass::Empty;
+    }
+    if is_planning_only(trimmed) {
+        return ResponseClass::PlanningOnly;
+    }
+    ResponseClass::Complete
+}
+
+/// Heuristic: does the text look like the model is just *describing* what
+/// it intends to do rather than actually doing it?
+///
+/// We check for common planning prefixes combined with the absence of
+/// concrete output markers (code blocks, results, long text).
+fn is_planning_only(text: &str) -> bool {
+    // Long responses are unlikely to be pure planning.
+    if text.len() > 500 {
+        return false;
+    }
+    // If the text contains a code block, it's producing output.
+    if text.contains("```") {
+        return false;
+    }
+    let lower = text.to_lowercase();
+    let planning_prefixes = [
+        "i'll ",
+        "i will ",
+        "let me ",
+        "i'm going to ",
+        "i am going to ",
+        "first, i'll ",
+        "first, let me ",
+        "i need to ",
+        "i should ",
+        "let's ",
+        "i can ",
+        "i would ",
+    ];
+    planning_prefixes.iter().any(|p| lower.starts_with(p))
+}
+
 /// Events emitted by the agent loop during streaming execution.
 ///
 /// These give callers (e.g. WebSocket handlers) real-time visibility
@@ -75,6 +137,10 @@ pub struct AgentConfig {
     /// Estimated max context tokens for the model.
     /// Defaults to 128k which works for Claude and large Qwen models.
     pub max_context_tokens: usize,
+    /// Fraction of `max_context_tokens` at which compaction fires (0.0–1.0).
+    /// Following the RLM paper (Zhang, Kraska, Khattab — arXiv 2512.24601),
+    /// default is 0.85 (85%).  Set to 0.0 to disable compaction.
+    pub compaction_threshold_pct: f64,
 }
 
 impl Default for AgentConfig {
@@ -85,6 +151,7 @@ impl Default for AgentConfig {
             max_consecutive_errors: 3,
             max_tool_retries: 2,
             max_context_tokens: 128_000,
+            compaction_threshold_pct: 0.85,
         }
     }
 }
@@ -164,6 +231,13 @@ impl AgentRunner {
 
         let mut consecutive_errors = 0;
         let mut soft_warning_injected = false;
+        // Per-category retry counters (à la OpenClaw incomplete-turn).
+        let mut empty_response_retries: usize = 0;
+        let mut planning_only_retries: usize = 0;
+        let mut empty_tool_use_retries: usize = 0;
+        // Track whether any side-effect tool has been executed this run,
+        // so we can suppress retries that might duplicate externally-visible actions.
+        let mut had_side_effects = false;
 
         for iteration in 0..self.config.max_iterations {
             tracer.record_iteration();
@@ -177,6 +251,13 @@ impl AgentRunner {
                 total_messages = conv.messages.len(),
                 "agent loop iteration"
             );
+
+            // Compaction: if conversation exceeds threshold, ask the LLM to
+            // summarize before the next call (RLM paper §3.2).
+            if self.needs_compaction(&conv.messages) {
+                tracing::info!(iteration, "conversation crossed compaction threshold");
+                self.compact_history(conv).await?;
+            }
 
             // Soft iteration warning.
             if self.config.soft_iteration_warning > 0
@@ -221,6 +302,9 @@ impl AgentRunner {
 
             // Handle tool calls.
             if message.content.has_tool_calls() {
+                empty_tool_use_retries = 0;
+                empty_response_retries = 0;
+                planning_only_retries = 0;
                 let calls = message.content.tool_calls();
                 let tool_names: Vec<&str> = calls.iter().map(|c| c.name.as_str()).collect();
                 tracing::info!(
@@ -237,6 +321,22 @@ impl AgentRunner {
                 let results = self
                     .execute_tools_parallel_traced(calls, session, &tracer)
                     .await;
+
+                // Track side effects: check if any successfully executed tool
+                // can cause external mutations (writes, network, spawning).
+                if !had_side_effects {
+                    for (tool_name, _, result) in &results {
+                        if result.is_ok() {
+                            if let Some(t) = self.tools.iter().find(|t| t.name() == tool_name) {
+                                if t.sandbox_requirements().has_side_effects() {
+                                    had_side_effects = true;
+                                    tracing::debug!(tool = %tool_name, "side-effect tool executed — retry guard active");
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
 
                 let had_errors = results.iter().any(|(_, _, r)| {
                     if let Ok(tr) = r {
@@ -294,53 +394,119 @@ impl AgentRunner {
                 continue;
             }
 
-            // If model hit max_tokens, it may be truncated — let it continue.
-            if stop_reason == StopReason::MaxTokens {
-                tracing::warn!("model hit max tokens, prompting to continue");
-                conv.messages.push(Message {
-                    id: Uuid::new_v4(),
-                    role: Role::User,
-                    content: MessageContent::Text("Continue.".to_string()),
-                    created_at: Utc::now(),
-                });
-                continue;
-            }
-
-            // Explicit end-of-turn — done.
-            if stop_reason == StopReason::EndTurn {
-                // Debug: warn when the model ends its turn with empty text.
-                // This helps diagnose cases where completion_tokens > 0 but no
-                // usable text was extracted (e.g. unhandled content block types).
-                if !message.content.has_tool_calls() {
+            match stop_reason {
+                StopReason::MaxTokens => {
+                    tracing::warn!("model hit max tokens, prompting to continue");
+                    conv.messages.push(Message {
+                        id: Uuid::new_v4(),
+                        role: Role::User,
+                        content: MessageContent::Text("Continue.".to_string()),
+                        created_at: Utc::now(),
+                    });
+                    continue;
+                }
+                StopReason::EndTurn => {
                     let text = message.content.as_text().unwrap_or("");
-                    if text.is_empty() {
-                        tracing::warn!(
-                            iteration,
-                            completion_tokens = usage.completion_tokens,
-                            content_variant = ?std::mem::discriminant(&message.content),
-                            "EndTurn with empty assistant text — \
-                             response may contain unhandled content blocks"
-                        );
+                    let classification = classify_response(text, usage.completion_tokens);
+
+                    match classification {
+                        ResponseClass::Complete => return Ok(()),
+                        ResponseClass::Empty => {
+                            tracing::warn!(
+                                iteration,
+                                completion_tokens = usage.completion_tokens,
+                                "EndTurn with empty assistant text"
+                            );
+                            if had_side_effects {
+                                tracing::info!(
+                                    "side effects occurred — not retrying empty response"
+                                );
+                                return Ok(());
+                            }
+                            empty_response_retries += 1;
+                            if empty_response_retries > EMPTY_RESPONSE_RETRY_LIMIT {
+                                tracing::warn!("empty response retries exhausted");
+                                return Ok(());
+                            }
+                            conv.messages.push(Message {
+                                id: Uuid::new_v4(),
+                                role: Role::User,
+                                content: MessageContent::Text(
+                                    "Your response was empty. Please provide a substantive answer or take an action.".to_string(),
+                                ),
+                                created_at: Utc::now(),
+                            });
+                            continue;
+                        }
+                        ResponseClass::PlanningOnly => {
+                            if had_side_effects {
+                                tracing::info!(
+                                    "side effects occurred — accepting planning-only response"
+                                );
+                                return Ok(());
+                            }
+                            planning_only_retries += 1;
+                            if planning_only_retries > PLANNING_ONLY_RETRY_LIMIT {
+                                tracing::warn!(
+                                    "planning-only retries exhausted — accepting response"
+                                );
+                                return Ok(());
+                            }
+                            tracing::warn!(
+                                retries = planning_only_retries,
+                                "model produced planning-only text without action, re-prompting"
+                            );
+                            conv.messages.push(Message {
+                                id: Uuid::new_v4(),
+                                role: Role::User,
+                                content: MessageContent::Text(
+                                    "Don't just describe what you plan to do — actually do it using the tools available to you.".to_string(),
+                                ),
+                                created_at: Utc::now(),
+                            });
+                            continue;
+                        }
                     }
                 }
-                return Ok(());
+                StopReason::ContentPolicy => {
+                    tracing::error!(iteration, "model refused to respond due to content policy");
+                    return Err(Error::ContentPolicy);
+                }
+                StopReason::ToolUse => {
+                    // stop_reason says ToolUse but no tool calls were found.
+                    // If side-effect tools already ran, don't retry — risk of
+                    // duplicate external actions.
+                    if had_side_effects {
+                        tracing::warn!(
+                            "ToolUse without tool calls after side effects — stopping to avoid duplicates"
+                        );
+                        return Ok(());
+                    }
+                    empty_tool_use_retries += 1;
+                    if empty_tool_use_retries > self.config.max_consecutive_errors {
+                        tracing::error!(
+                            retries = empty_tool_use_retries,
+                            "repeated ToolUse stop reason with no tool calls — aborting"
+                        );
+                        return Err(Error::Internal(
+                            "model repeatedly indicated tool use but provided no tool calls".into(),
+                        ));
+                    }
+                    tracing::warn!(
+                        retries = empty_tool_use_retries,
+                        "stop reason is ToolUse but no tool calls found in response, re-prompting"
+                    );
+                    conv.messages.push(Message {
+                        id: Uuid::new_v4(),
+                        role: Role::User,
+                        content: MessageContent::Text(
+                            "Your previous response indicated a tool call but none was found. Please retry.".to_string(),
+                        ),
+                        created_at: Utc::now(),
+                    });
+                    continue;
+                }
             }
-
-            // Stop reason indicates tool use but no tool calls found in content.
-            // Re-prompt rather than silently ending the turn.
-            tracing::warn!(
-                ?stop_reason,
-                "stop reason indicates tool use but no tool calls found in response, re-prompting"
-            );
-            conv.messages.push(Message {
-                id: Uuid::new_v4(),
-                role: Role::User,
-                content: MessageContent::Text(
-                    "Your previous response indicated a tool call but none was found. Please retry.".to_string(),
-                ),
-                created_at: Utc::now(),
-            });
-            continue;
         }
 
         // Escalate to user instead of hard-failing.
@@ -394,12 +560,24 @@ impl AgentRunner {
 
         let mut consecutive_errors = 0;
         let mut soft_warning_injected = false;
+        let mut empty_response_retries: usize = 0;
+        let mut planning_only_retries: usize = 0;
+        let mut empty_tool_use_retries: usize = 0;
+        let mut had_side_effects = false;
 
         for iteration in 0..self.config.max_iterations {
             tracer.record_iteration();
 
             if session.is_expired() {
                 return Err(Error::Auth("session expired during execution".into()));
+            }
+
+            // Compaction: if conversation exceeds threshold, ask the LLM to
+            // summarize before the next call (RLM paper §3.2).
+            if self.needs_compaction(&conv.messages) {
+                tracing::info!(iteration, "conversation crossed compaction threshold");
+                on_event(AgentEvent::Compressing);
+                self.compact_history(conv).await?;
             }
 
             // Soft iteration warning.
@@ -454,6 +632,9 @@ impl AgentRunner {
 
             // Handle tool calls.
             if message.content.has_tool_calls() {
+                empty_tool_use_retries = 0;
+                empty_response_retries = 0;
+                planning_only_retries = 0;
                 let calls = message.content.tool_calls();
                 let tool_names: Vec<&str> = calls.iter().map(|c| c.name.as_str()).collect();
                 tracing::info!(
@@ -474,6 +655,21 @@ impl AgentRunner {
                 let results = self
                     .execute_tools_parallel_traced(calls, session, &tracer)
                     .await;
+
+                // Track side effects in streaming path.
+                if !had_side_effects {
+                    for (tool_name, _, result) in &results {
+                        if result.is_ok() {
+                            if let Some(t) = self.tools.iter().find(|t| t.name() == tool_name) {
+                                if t.sandbox_requirements().has_side_effects() {
+                                    had_side_effects = true;
+                                    tracing::debug!(tool = %tool_name, "side-effect tool executed — retry guard active");
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
 
                 let had_errors = results.iter().any(|(_, _, r)| {
                     if let Ok(tr) = r {
@@ -539,50 +735,124 @@ impl AgentRunner {
                 continue;
             }
 
-            if stop_reason == StopReason::MaxTokens {
-                tracing::warn!("model hit max tokens, prompting to continue");
-                conv.messages.push(Message {
-                    id: Uuid::new_v4(),
-                    role: Role::User,
-                    content: MessageContent::Text("Continue.".to_string()),
-                    created_at: Utc::now(),
-                });
-                continue;
-            }
-
-            // Explicit end-of-turn — done.
-            if stop_reason == StopReason::EndTurn {
-                if !message.content.has_tool_calls() {
+            match stop_reason {
+                StopReason::MaxTokens => {
+                    tracing::warn!("model hit max tokens, prompting to continue");
+                    conv.messages.push(Message {
+                        id: Uuid::new_v4(),
+                        role: Role::User,
+                        content: MessageContent::Text("Continue.".to_string()),
+                        created_at: Utc::now(),
+                    });
+                    continue;
+                }
+                StopReason::EndTurn => {
                     let text = message.content.as_text().unwrap_or("");
-                    if text.is_empty() {
-                        tracing::warn!(
-                            iteration,
-                            completion_tokens = usage.completion_tokens,
-                            content_variant = ?std::mem::discriminant(&message.content),
-                            "EndTurn with empty assistant text — \
-                             response may contain unhandled content blocks"
-                        );
+                    let classification = classify_response(text, usage.completion_tokens);
+
+                    match classification {
+                        ResponseClass::Complete => {
+                            on_event(AgentEvent::Done);
+                            return Ok(());
+                        }
+                        ResponseClass::Empty => {
+                            tracing::warn!(
+                                iteration,
+                                completion_tokens = usage.completion_tokens,
+                                "EndTurn with empty assistant text"
+                            );
+                            if had_side_effects {
+                                tracing::info!(
+                                    "side effects occurred — not retrying empty response"
+                                );
+                                on_event(AgentEvent::Done);
+                                return Ok(());
+                            }
+                            empty_response_retries += 1;
+                            if empty_response_retries > EMPTY_RESPONSE_RETRY_LIMIT {
+                                tracing::warn!("empty response retries exhausted");
+                                on_event(AgentEvent::Done);
+                                return Ok(());
+                            }
+                            conv.messages.push(Message {
+                                id: Uuid::new_v4(),
+                                role: Role::User,
+                                content: MessageContent::Text(
+                                    "Your response was empty. Please provide a substantive answer or take an action.".to_string(),
+                                ),
+                                created_at: Utc::now(),
+                            });
+                            continue;
+                        }
+                        ResponseClass::PlanningOnly => {
+                            if had_side_effects {
+                                tracing::info!(
+                                    "side effects occurred — accepting planning-only response"
+                                );
+                                on_event(AgentEvent::Done);
+                                return Ok(());
+                            }
+                            planning_only_retries += 1;
+                            if planning_only_retries > PLANNING_ONLY_RETRY_LIMIT {
+                                tracing::warn!(
+                                    "planning-only retries exhausted — accepting response"
+                                );
+                                on_event(AgentEvent::Done);
+                                return Ok(());
+                            }
+                            tracing::warn!(
+                                retries = planning_only_retries,
+                                "model produced planning-only text without action, re-prompting"
+                            );
+                            conv.messages.push(Message {
+                                id: Uuid::new_v4(),
+                                role: Role::User,
+                                content: MessageContent::Text(
+                                    "Don't just describe what you plan to do — actually do it using the tools available to you.".to_string(),
+                                ),
+                                created_at: Utc::now(),
+                            });
+                            continue;
+                        }
                     }
                 }
-                on_event(AgentEvent::Done);
-                return Ok(());
+                StopReason::ContentPolicy => {
+                    tracing::error!(iteration, "model refused to respond due to content policy");
+                    return Err(Error::ContentPolicy);
+                }
+                StopReason::ToolUse => {
+                    if had_side_effects {
+                        tracing::warn!(
+                            "ToolUse without tool calls after side effects — stopping to avoid duplicates"
+                        );
+                        on_event(AgentEvent::Done);
+                        return Ok(());
+                    }
+                    empty_tool_use_retries += 1;
+                    if empty_tool_use_retries > self.config.max_consecutive_errors {
+                        tracing::error!(
+                            retries = empty_tool_use_retries,
+                            "repeated ToolUse stop reason with no tool calls — aborting"
+                        );
+                        return Err(Error::Internal(
+                            "model repeatedly indicated tool use but provided no tool calls".into(),
+                        ));
+                    }
+                    tracing::warn!(
+                        retries = empty_tool_use_retries,
+                        "stop reason is ToolUse but no tool calls found in response, re-prompting"
+                    );
+                    conv.messages.push(Message {
+                        id: Uuid::new_v4(),
+                        role: Role::User,
+                        content: MessageContent::Text(
+                            "Your previous response indicated a tool call but none was found. Please retry.".to_string(),
+                        ),
+                        created_at: Utc::now(),
+                    });
+                    continue;
+                }
             }
-
-            // Stop reason indicates tool use but no tool calls found in content.
-            // Re-prompt rather than silently ending the turn.
-            tracing::warn!(
-                ?stop_reason,
-                "stop reason indicates tool use but no tool calls found in response, re-prompting"
-            );
-            conv.messages.push(Message {
-                id: Uuid::new_v4(),
-                role: Role::User,
-                content: MessageContent::Text(
-                    "Your previous response indicated a tool call but none was found. Please retry.".to_string(),
-                ),
-                created_at: Utc::now(),
-            });
-            continue;
         }
 
         // Escalate to user.
@@ -716,6 +986,138 @@ impl AgentRunner {
         }
 
         results
+    }
+
+    // --- Compaction (RLM paper §3.2) -------------------------------------------
+
+    /// Conservative token estimate for a message (~3.5 chars per token).
+    fn estimate_message_tokens(msg: &Message) -> usize {
+        let content_chars = match &msg.content {
+            MessageContent::Text(t) => t.len(),
+            MessageContent::ToolCall(tc) => tc.name.len() + tc.arguments.to_string().len(),
+            MessageContent::MultiToolCall(tcs) => tcs
+                .iter()
+                .map(|tc| tc.name.len() + tc.arguments.to_string().len())
+                .sum(),
+            MessageContent::ToolResult(tr) => tr.output.to_string().len(),
+        };
+        // +4 per message for role/framing overhead.
+        (content_chars as f64 / 3.5).ceil() as usize + 4
+    }
+
+    /// Estimate total token count for the conversation.
+    fn estimate_conversation_tokens(messages: &[Message]) -> usize {
+        messages.iter().map(Self::estimate_message_tokens).sum()
+    }
+
+    /// Returns true if the conversation has crossed the compaction threshold.
+    fn needs_compaction(&self, messages: &[Message]) -> bool {
+        if self.config.compaction_threshold_pct <= 0.0 {
+            return false;
+        }
+        let threshold =
+            (self.config.max_context_tokens as f64 * self.config.compaction_threshold_pct) as usize;
+        let estimated = Self::estimate_conversation_tokens(messages);
+        estimated >= threshold
+    }
+
+    /// Ask the LLM to summarize the conversation so far, then replace the
+    /// history with [system messages, summary, continuation prompt].
+    ///
+    /// Follows the RLM paper's compaction strategy: the summary preserves
+    /// concrete intermediate results and the model's current plan so it can
+    /// pick up where it left off without repeating completed work.
+    async fn compact_history(&self, conv: &mut Conversation) -> Result<()> {
+        let before_len = conv.messages.len();
+        let before_tokens = Self::estimate_conversation_tokens(&conv.messages);
+
+        tracing::info!(
+            before_messages = before_len,
+            before_tokens,
+            "compacting conversation history"
+        );
+
+        // Build a compaction prompt and ask the model to summarize.
+        let compaction_prompt = Message {
+            id: Uuid::new_v4(),
+            role: Role::User,
+            content: MessageContent::Text(
+                "Your conversation history is getting long and needs to be compressed. \
+                 Summarize your progress so far in a concise message. Include:\n\
+                 1. What you have already completed (concrete results, values, file paths, etc.)\n\
+                 2. What remains to be done\n\
+                 3. Your current plan / next step\n\n\
+                 Be specific — include variable names, numbers, tool outputs, and any \
+                 intermediate results needed to continue without repeating work."
+                    .to_string(),
+            ),
+            created_at: Utc::now(),
+        };
+
+        // Send the full history + compaction prompt so the model can see
+        // everything it needs to summarize.
+        let mut compaction_messages = conv.messages.clone();
+        compaction_messages.push(compaction_prompt);
+
+        let response = self.provider.chat(&compaction_messages, &[]).await?;
+        let summary = response.message.content.as_text().unwrap_or("").to_string();
+
+        if summary.is_empty() {
+            tracing::warn!("compaction produced empty summary, skipping");
+            return Ok(());
+        }
+
+        // Preserve system messages (they contain the agent's identity and
+        // instructions) and the first user message (the original task).
+        let mut new_messages: Vec<Message> = Vec::new();
+
+        // Keep all leading system messages.
+        for msg in &conv.messages {
+            if msg.role == Role::System {
+                new_messages.push(msg.clone());
+            } else {
+                break;
+            }
+        }
+
+        // Keep the first user message (the original request).
+        if let Some(first_user) = conv.messages.iter().find(|m| m.role == Role::User) {
+            new_messages.push(first_user.clone());
+        }
+
+        // Insert the summary as an assistant message.
+        new_messages.push(Message {
+            id: Uuid::new_v4(),
+            role: Role::Assistant,
+            content: MessageContent::Text(summary.clone()),
+            created_at: Utc::now(),
+        });
+
+        // Continuation prompt so the model picks up where it left off.
+        new_messages.push(Message {
+            id: Uuid::new_v4(),
+            role: Role::User,
+            content: MessageContent::Text(
+                "Continue from the summary above. Do not repeat already-completed work."
+                    .to_string(),
+            ),
+            created_at: Utc::now(),
+        });
+
+        conv.messages = new_messages;
+        conv.summary = Some(summary);
+        conv.updated_at = Utc::now();
+
+        let after_tokens = Self::estimate_conversation_tokens(&conv.messages);
+        tracing::info!(
+            before_messages = before_len,
+            after_messages = conv.messages.len(),
+            before_tokens,
+            after_tokens,
+            "compaction complete"
+        );
+
+        Ok(())
     }
 
     /// Inject a reflection prompt when the agent hits repeated errors.
