@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.3.6] - 2026-04-16
+
+- fix: grant net_discovery capability to Telegram chat sessions (#371)
+
 ## [2.3.5] - 2026-04-16
 
 - fix: prevent Ollama 500s from context window overload (#368)
