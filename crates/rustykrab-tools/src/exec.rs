@@ -96,6 +96,8 @@ const ALLOWED_COMMANDS: &[&str] = &[
     "true",
     "false",
     "sleep",
+    "crontab",
+    "at",
 ];
 
 /// A built-in tool that executes shell commands and returns their output.
