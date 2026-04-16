@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.3.4] - 2026-04-16
+
+- Fix rustls-webpki vulnerabilities RUSTSEC-2026-0098 and RUSTSEC-2026-0099 (#369)
+
 ## [2.3.3] - 2026-04-15
 
 - Fix stop reason fallthrough causing misleading re-prompts and infinite loops (#367)
