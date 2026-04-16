@@ -52,6 +52,7 @@ impl HarnessRouter {
         // Preserve user customizations from the base profile.
         profile.agent_name = self.base.agent_name.clone();
         profile.max_context_tokens = self.base.max_context_tokens;
+        profile.compaction_threshold_pct = self.base.compaction_threshold_pct;
         profile
     }
 }

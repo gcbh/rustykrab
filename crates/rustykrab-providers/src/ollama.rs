@@ -28,11 +28,24 @@ pub struct OllamaConfig {
     pub num_predict: i32,
 }
 
+/// Read `num_ctx` from the `OLLAMA_NUM_CTX` env var, falling back to the
+/// given default.  Invalid values are silently ignored.
+fn num_ctx_from_env(default: u32) -> u32 {
+    std::env::var("OLLAMA_NUM_CTX")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(default)
+}
+
+/// Default context-window size.  The previous 128 K was too aggressive and
+/// caused Ollama to OOM (returning 500).  Can be overridden via `OLLAMA_NUM_CTX`.
+const DEFAULT_NUM_CTX: u32 = 100_000;
+
 impl Default for OllamaConfig {
     fn default() -> Self {
         Self {
             temperature: 0.1,
-            num_ctx: 131_072,
+            num_ctx: num_ctx_from_env(DEFAULT_NUM_CTX),
             num_parallel: 6,
             top_p: 0.9,
             num_predict: 8192,
@@ -45,7 +58,7 @@ impl OllamaConfig {
     pub fn tool_calling() -> Self {
         Self {
             temperature: 0.0,
-            num_ctx: 131_072,
+            num_ctx: num_ctx_from_env(DEFAULT_NUM_CTX),
             num_parallel: 6,
             top_p: 0.9,
             num_predict: 4096,
@@ -56,7 +69,7 @@ impl OllamaConfig {
     pub fn creative() -> Self {
         Self {
             temperature: 0.7,
-            num_ctx: 131_072,
+            num_ctx: num_ctx_from_env(DEFAULT_NUM_CTX),
             num_parallel: 6,
             top_p: 0.95,
             num_predict: 16384,
@@ -342,7 +355,13 @@ impl ModelProvider for OllamaProvider {
             body["tools"] = serde_json::to_value(&ollama_tools).map_err(Error::Serialization)?;
         }
 
-        tracing::debug!(model = %self.model, base_url = %self.base_url, "calling Ollama chat API");
+        tracing::debug!(
+            model = %self.model,
+            base_url = %self.base_url,
+            num_messages = ollama_messages.len(),
+            num_ctx = self.config.num_ctx,
+            "calling Ollama chat API"
+        );
 
         let url = format!("{}/api/chat", self.base_url);
 
@@ -397,6 +416,13 @@ impl ModelProvider for OllamaProvider {
             }
 
             let error_body = resp.text().await.unwrap_or_default();
+            tracing::warn!(
+                status = %status,
+                num_ctx = self.config.num_ctx,
+                num_messages = ollama_messages.len(),
+                error_body = %error_body,
+                "Ollama API error"
+            );
             let is_retryable = matches!(status.as_u16(), 429 | 500 | 502 | 503 | 529);
             // Fix #186: map status codes to specific error variants.
             last_err = Some(Self::map_status_error(status, &error_body));
@@ -442,7 +468,13 @@ impl ModelProvider for OllamaProvider {
             body["tools"] = serde_json::to_value(&ollama_tools).map_err(Error::Serialization)?;
         }
 
-        tracing::debug!(model = %self.model, base_url = %self.base_url, "calling Ollama chat API (streaming)");
+        tracing::debug!(
+            model = %self.model,
+            base_url = %self.base_url,
+            num_messages = ollama_messages.len(),
+            num_ctx = self.config.num_ctx,
+            "calling Ollama chat API (streaming)"
+        );
 
         let url = format!("{}/api/chat", self.base_url);
 
@@ -470,6 +502,13 @@ impl ModelProvider for OllamaProvider {
             let status = r.status();
             if !status.is_success() {
                 let error_body = r.text().await.unwrap_or_default();
+                tracing::warn!(
+                    status = %status,
+                    num_ctx = self.config.num_ctx,
+                    num_messages = ollama_messages.len(),
+                    error_body = %error_body,
+                    "Ollama streaming API error"
+                );
                 let is_retryable = matches!(status.as_u16(), 429 | 500 | 502 | 503 | 529);
                 last_err = Some(Self::map_status_error(status, &error_body));
                 if !is_retryable {

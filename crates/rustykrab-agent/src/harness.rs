@@ -31,6 +31,9 @@ pub struct HarnessProfile {
     // --- Context budget ---
     /// Model's context window size in tokens.
     pub max_context_tokens: usize,
+    /// Fraction of `max_context_tokens` at which compaction fires (0.0–1.0).
+    /// Default is 0.85 per the RLM paper.
+    pub compaction_threshold_pct: f64,
 }
 
 impl Default for HarnessProfile {
@@ -43,6 +46,7 @@ impl Default for HarnessProfile {
             max_consecutive_errors: 3,
             max_tool_retries: 2,
             max_context_tokens: 128_000,
+            compaction_threshold_pct: 0.85,
         }
     }
 }
@@ -85,6 +89,7 @@ impl HarnessProfile {
             max_consecutive_errors: self.max_consecutive_errors,
             max_tool_retries: self.max_tool_retries,
             max_context_tokens: self.max_context_tokens,
+            compaction_threshold_pct: self.compaction_threshold_pct,
         }
     }
 }

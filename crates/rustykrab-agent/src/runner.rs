@@ -137,6 +137,10 @@ pub struct AgentConfig {
     /// Estimated max context tokens for the model.
     /// Defaults to 128k which works for Claude and large Qwen models.
     pub max_context_tokens: usize,
+    /// Fraction of `max_context_tokens` at which compaction fires (0.0–1.0).
+    /// Following the RLM paper (Zhang, Kraska, Khattab — arXiv 2512.24601),
+    /// default is 0.85 (85%).  Set to 0.0 to disable compaction.
+    pub compaction_threshold_pct: f64,
 }
 
 impl Default for AgentConfig {
@@ -147,6 +151,7 @@ impl Default for AgentConfig {
             max_consecutive_errors: 3,
             max_tool_retries: 2,
             max_context_tokens: 128_000,
+            compaction_threshold_pct: 0.85,
         }
     }
 }
@@ -246,6 +251,13 @@ impl AgentRunner {
                 total_messages = conv.messages.len(),
                 "agent loop iteration"
             );
+
+            // Compaction: if conversation exceeds threshold, ask the LLM to
+            // summarize before the next call (RLM paper §3.2).
+            if self.needs_compaction(&conv.messages) {
+                tracing::info!(iteration, "conversation crossed compaction threshold");
+                self.compact_history(conv).await?;
+            }
 
             // Soft iteration warning.
             if self.config.soft_iteration_warning > 0
@@ -558,6 +570,14 @@ impl AgentRunner {
 
             if session.is_expired() {
                 return Err(Error::Auth("session expired during execution".into()));
+            }
+
+            // Compaction: if conversation exceeds threshold, ask the LLM to
+            // summarize before the next call (RLM paper §3.2).
+            if self.needs_compaction(&conv.messages) {
+                tracing::info!(iteration, "conversation crossed compaction threshold");
+                on_event(AgentEvent::Compressing);
+                self.compact_history(conv).await?;
             }
 
             // Soft iteration warning.
@@ -966,6 +986,138 @@ impl AgentRunner {
         }
 
         results
+    }
+
+    // --- Compaction (RLM paper §3.2) -------------------------------------------
+
+    /// Conservative token estimate for a message (~3.5 chars per token).
+    fn estimate_message_tokens(msg: &Message) -> usize {
+        let content_chars = match &msg.content {
+            MessageContent::Text(t) => t.len(),
+            MessageContent::ToolCall(tc) => tc.name.len() + tc.arguments.to_string().len(),
+            MessageContent::MultiToolCall(tcs) => tcs
+                .iter()
+                .map(|tc| tc.name.len() + tc.arguments.to_string().len())
+                .sum(),
+            MessageContent::ToolResult(tr) => tr.output.to_string().len(),
+        };
+        // +4 per message for role/framing overhead.
+        (content_chars as f64 / 3.5).ceil() as usize + 4
+    }
+
+    /// Estimate total token count for the conversation.
+    fn estimate_conversation_tokens(messages: &[Message]) -> usize {
+        messages.iter().map(Self::estimate_message_tokens).sum()
+    }
+
+    /// Returns true if the conversation has crossed the compaction threshold.
+    fn needs_compaction(&self, messages: &[Message]) -> bool {
+        if self.config.compaction_threshold_pct <= 0.0 {
+            return false;
+        }
+        let threshold =
+            (self.config.max_context_tokens as f64 * self.config.compaction_threshold_pct) as usize;
+        let estimated = Self::estimate_conversation_tokens(messages);
+        estimated >= threshold
+    }
+
+    /// Ask the LLM to summarize the conversation so far, then replace the
+    /// history with [system messages, summary, continuation prompt].
+    ///
+    /// Follows the RLM paper's compaction strategy: the summary preserves
+    /// concrete intermediate results and the model's current plan so it can
+    /// pick up where it left off without repeating completed work.
+    async fn compact_history(&self, conv: &mut Conversation) -> Result<()> {
+        let before_len = conv.messages.len();
+        let before_tokens = Self::estimate_conversation_tokens(&conv.messages);
+
+        tracing::info!(
+            before_messages = before_len,
+            before_tokens,
+            "compacting conversation history"
+        );
+
+        // Build a compaction prompt and ask the model to summarize.
+        let compaction_prompt = Message {
+            id: Uuid::new_v4(),
+            role: Role::User,
+            content: MessageContent::Text(
+                "Your conversation history is getting long and needs to be compressed. \
+                 Summarize your progress so far in a concise message. Include:\n\
+                 1. What you have already completed (concrete results, values, file paths, etc.)\n\
+                 2. What remains to be done\n\
+                 3. Your current plan / next step\n\n\
+                 Be specific — include variable names, numbers, tool outputs, and any \
+                 intermediate results needed to continue without repeating work."
+                    .to_string(),
+            ),
+            created_at: Utc::now(),
+        };
+
+        // Send the full history + compaction prompt so the model can see
+        // everything it needs to summarize.
+        let mut compaction_messages = conv.messages.clone();
+        compaction_messages.push(compaction_prompt);
+
+        let response = self.provider.chat(&compaction_messages, &[]).await?;
+        let summary = response.message.content.as_text().unwrap_or("").to_string();
+
+        if summary.is_empty() {
+            tracing::warn!("compaction produced empty summary, skipping");
+            return Ok(());
+        }
+
+        // Preserve system messages (they contain the agent's identity and
+        // instructions) and the first user message (the original task).
+        let mut new_messages: Vec<Message> = Vec::new();
+
+        // Keep all leading system messages.
+        for msg in &conv.messages {
+            if msg.role == Role::System {
+                new_messages.push(msg.clone());
+            } else {
+                break;
+            }
+        }
+
+        // Keep the first user message (the original request).
+        if let Some(first_user) = conv.messages.iter().find(|m| m.role == Role::User) {
+            new_messages.push(first_user.clone());
+        }
+
+        // Insert the summary as an assistant message.
+        new_messages.push(Message {
+            id: Uuid::new_v4(),
+            role: Role::Assistant,
+            content: MessageContent::Text(summary.clone()),
+            created_at: Utc::now(),
+        });
+
+        // Continuation prompt so the model picks up where it left off.
+        new_messages.push(Message {
+            id: Uuid::new_v4(),
+            role: Role::User,
+            content: MessageContent::Text(
+                "Continue from the summary above. Do not repeat already-completed work."
+                    .to_string(),
+            ),
+            created_at: Utc::now(),
+        });
+
+        conv.messages = new_messages;
+        conv.summary = Some(summary);
+        conv.updated_at = Utc::now();
+
+        let after_tokens = Self::estimate_conversation_tokens(&conv.messages);
+        tracing::info!(
+            before_messages = before_len,
+            after_messages = conv.messages.len(),
+            before_tokens,
+            after_tokens,
+            "compaction complete"
+        );
+
+        Ok(())
     }
 
     /// Inject a reflection prompt when the agent hits repeated errors.

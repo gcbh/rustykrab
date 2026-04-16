@@ -210,8 +210,11 @@ async fn main() -> anyhow::Result<()> {
             let model = std::env::var("OLLAMA_MODEL").unwrap_or_else(|_| "gemma4:26b".to_string());
             let base_url = std::env::var("OLLAMA_BASE_URL")
                 .unwrap_or_else(|_| "http://localhost:11434".to_string());
-            tracing::info!(%model, %base_url, "using Ollama provider");
-            let p = rustykrab_providers::OllamaProvider::new(model).with_base_url(base_url);
+            let config = rustykrab_providers::OllamaConfig::default();
+            tracing::info!(%model, %base_url, num_ctx = config.num_ctx, "using Ollama provider");
+            let p = rustykrab_providers::OllamaProvider::new(model)
+                .with_base_url(base_url)
+                .with_config(config);
             Arc::new(p)
         }
         _ => {
