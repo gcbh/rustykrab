@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.6.0] - 2026-04-17
+
+- feat: hot-reload skills and add skill_delete tool (#378)
+
 ## [2.5.0] - 2026-04-17
 
 - refactor(tools): replace net_* tools with network-recon skill over `exec` (#377)
