@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.4.3] - 2026-04-17
+
+- feat(providers): make Ollama provider context-window aware (#374)
+
 ## [2.4.2] - 2026-04-16
 
 - fix(providers): raise Ollama HTTP timeout to 15 min and skip retry on timeout (#373)
