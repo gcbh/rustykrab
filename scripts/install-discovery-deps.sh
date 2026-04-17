@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # -----------------------------------------------------------------------
-# install-discovery-deps.sh — Install system dependencies for the
-# network device discovery tools (net_discovery + net_scan).
+# install-discovery-deps.sh — Install system dependencies used by the
+# `network-recon` skill (driven through the `exec` tool).
 #
-# The discovery actions in rustykrab-tools rely on several system
-# binaries for network scanning, mDNS browsing, and SSH access.
-# This script detects the package manager and installs them.
+# The skill shells out to standard network CLIs for discovery, admin,
+# and audit tasks. This script detects the package manager and installs
+# the expected binaries.
 #
 # Usage:
 #   sudo ./scripts/install-discovery-deps.sh          # install all
@@ -13,9 +13,9 @@
 #
 # Dependencies installed:
 #   Required:
-#     nmap           — active ARP scan fallback, subnet scanning
+#     nmap           — live-host and port scanning
 #     avahi-utils    — mDNS/DNS-SD service discovery (avahi-browse)
-#     openssh-client — SSH for DHCP lease queries and net_admin
+#     openssh-client — SSH for remote admin and DHCP lease queries
 #     dnsutils       — DNS lookups (dig)
 #     traceroute     — network path tracing
 #     iproute2       — interface listing, ARP cache (ip command)
@@ -23,7 +23,7 @@
 #   Recommended:
 #     arp-scan       — fast, reliable ARP scanning with OUI vendor data
 #     ieee-data      — IEEE OUI database for MAC vendor lookups
-#     openssl        — TLS/SSL certificate checking (net_audit)
+#     openssl        — TLS/SSL certificate checking
 # -----------------------------------------------------------------------
 
 set -euo pipefail

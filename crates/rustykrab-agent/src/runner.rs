@@ -1303,9 +1303,9 @@ async fn execute_single_tool(
         allow_fs_write: capabilities.has(&Capability::FileWrite),
         allow_net: capabilities.has(&Capability::HttpRequest),
         allow_spawn: capabilities.has(&Capability::ShellExec),
-        // Network tools (net_scan, net_admin, net_audit) can take several
-        // minutes to sweep a subnet. Use a 5-minute timeout when the tool
-        // actually needs network access; keep the default 30s for everything else.
+        // Network-using tools (e.g. `exec` running `nmap`, `curl`, `ssh`) can
+        // take several minutes to sweep a subnet. Use a 5-minute timeout when
+        // the tool actually needs network access; keep the default 30s otherwise.
         timeout_secs: if requirements.needs_net {
             300
         } else {

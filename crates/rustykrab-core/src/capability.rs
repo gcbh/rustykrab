@@ -70,7 +70,7 @@ impl CapabilitySet {
     /// Check whether the set has permission to use a specific tool.
     ///
     /// Normalises the tool name before lookup: trims whitespace and, if
-    /// the name contains a colon separator (e.g. `"net_discovery:arp_scan"`
+    /// the name contains a colon separator (e.g. `"some_tool:subaction"`
     /// emitted by some models), checks the base name as well.
     pub fn can_use_tool(&self, tool_name: &str) -> bool {
         let trimmed = tool_name.trim();
@@ -134,12 +134,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn for_tools_permissive_includes_net_discovery() {
-        let tools = &["http_request", "read", "exec", "net_scan", "net_discovery"];
+    fn for_tools_permissive_grants_resource_capabilities() {
+        let tools = &["http_request", "read", "exec", "example_tool"];
         let caps = CapabilitySet::for_tools_permissive(tools);
 
-        assert!(caps.can_use_tool("net_discovery"));
-        assert!(caps.can_use_tool("net_scan"));
+        assert!(caps.can_use_tool("example_tool"));
         assert!(caps.can_use_tool("http_request"));
         assert!(caps.has(&Capability::FileRead));
         assert!(caps.has(&Capability::ShellExec));
@@ -148,32 +147,31 @@ mod tests {
 
     #[test]
     fn can_use_tool_trims_whitespace() {
-        let caps = CapabilitySet::for_tools(&["net_discovery"]);
-        assert!(caps.can_use_tool("net_discovery"));
-        assert!(caps.can_use_tool("net_discovery "));
-        assert!(caps.can_use_tool(" net_discovery"));
-        assert!(caps.can_use_tool(" net_discovery "));
+        let caps = CapabilitySet::for_tools(&["example_tool"]);
+        assert!(caps.can_use_tool("example_tool"));
+        assert!(caps.can_use_tool("example_tool "));
+        assert!(caps.can_use_tool(" example_tool"));
+        assert!(caps.can_use_tool(" example_tool "));
     }
 
     #[test]
     fn can_use_tool_handles_colon_separator() {
-        let caps = CapabilitySet::for_tools(&["net_discovery"]);
-        assert!(caps.can_use_tool("net_discovery:arp_scan"));
-        assert!(caps.can_use_tool("net_discovery:interfaces"));
-        assert!(caps.can_use_tool("net_discovery:dns_lookup"));
+        let caps = CapabilitySet::for_tools(&["example_tool"]);
+        assert!(caps.can_use_tool("example_tool:subaction"));
+        assert!(caps.can_use_tool("example_tool:another"));
     }
 
     #[test]
     fn can_use_tool_rejects_unknown() {
-        let caps = CapabilitySet::for_tools(&["net_discovery"]);
-        assert!(!caps.can_use_tool("net_scan"));
+        let caps = CapabilitySet::for_tools(&["example_tool"]);
+        assert!(!caps.can_use_tool("other_tool"));
         assert!(!caps.can_use_tool("unknown_tool"));
     }
 
     #[test]
     fn default_safe_denies_tools() {
         let caps = CapabilitySet::default_safe();
-        assert!(!caps.can_use_tool("net_discovery"));
+        assert!(!caps.can_use_tool("example_tool"));
         assert!(caps.has(&Capability::HttpRequest));
     }
 }
