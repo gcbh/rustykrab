@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.4.4] - 2026-04-17
+
+- feat(cron): persistent conversations across scheduled runs (#375)
+
 ## [2.4.3] - 2026-04-17
 
 - feat(providers): make Ollama provider context-window aware (#374)
