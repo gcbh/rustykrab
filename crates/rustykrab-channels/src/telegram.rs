@@ -100,20 +100,19 @@ impl TelegramChannel {
 
     pub async fn start_polling(&self) -> Result<()> {
         let _ = self.delete_webhook().await;
-        let mut offset: Option<i64> = None;
-        let mut errs: u32 = 0;
+        let mut offset: Option<i64> = None; let mut errs: u32 = 0;
         tracing::info!("Telegram long-polling started");
         loop {
             if self.shutdown_flag.load(Ordering::Relaxed) { return Ok(()); }
             let url = format!("{}/getUpdates", self.api_base);
-            let mut params = vec![("timeout","30".to_string())];
+            let mut params = vec![("timeout","30".into())];
             if let Some(o) = offset { params.push(("offset", o.to_string())); }
             let resp = match self.client.get(&url).query(&params).send().await { Ok(r)=>r, Err(e)=>{ errs+=1; tokio::time::sleep(backoff_delay(errs)).await; tracing::error!(errs,"getUpdates: {e}"); continue; } };
-            if !resp.status().is_success() { errs+=1; let e=resp.text().await.unwrap_or_default(); tokio::time::sleep(backoff_delay(errs)).await; tracing::error!(errs,"getUpdates HTTP: {e}"); continue; }
-            let raw = match resp.text().await { Ok(t)=>t, Err(e)=>{ errs+=1; tokio::time::sleep(backoff_delay(errs)).await; continue; } };
+            if !resp.status().is_success() { errs+=1; tokio::time::sleep(backoff_delay(errs)).await; continue; }
+            let raw = match resp.text().await { Ok(t)=>t, Err(_)=>{ errs+=1; tokio::time::sleep(backoff_delay(errs)).await; continue; } };
             let body: GetUpdatesResponse = match serde_json::from_str(&raw) { Ok(b)=>b, Err(e)=>{ errs+=1; tokio::time::sleep(backoff_delay(errs)).await; tracing::error!(errs,"parse: {e}"); continue; } };
             errs = 0;
-            for update in body.result { if let Some(n) = Some(update.update_id+1) { offset = Some(n); } let _ = self.handle_update(update).await; }
+            for u in body.result { if let Some(n) = Some(u.update_id+1) { offset = Some(n); } let _ = self.handle_update(u).await; }
         }
     }
 
@@ -129,7 +128,7 @@ impl TelegramChannel {
         let api_url = format!("{}/setWebhook", self.api_base);
         let mut body = serde_json::json!({"url": url});
         if let Some(ref s) = self.webhook_secret { body["secret_token"] = serde_json::json!(s); }
-        let resp = self.client.post(&api_url).json(&body).send().await.map_err(|e| Error::Channel(format!("set webhook: {e}")))?;
+        let resp = self.client.post(&api_url).json(&body).send().await.map_err(|e| Error::Channel(format!("webhook: {e}")))?;
         if !resp.status().is_success() { return Err(Error::Channel(format!("setWebhook: {}", resp.text().await.unwrap_or_default()))); }
         tracing::info!(%url, "webhook registered"); Ok(())
     }
@@ -139,4 +138,3 @@ impl TelegramChannel {
     }
 
     include!("telegram_ext.rs");
-}
