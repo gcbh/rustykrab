@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.5.0] - 2026-04-17
+
+- refactor(tools): replace net_* tools with network-recon skill over `exec` (#377)
+
 ## [2.4.4] - 2026-04-17
 
 - feat(cron): persistent conversations across scheduled runs (#375)
