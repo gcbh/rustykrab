@@ -51,9 +51,6 @@ pub mod gateway_backend;
 
 // Media tools
 mod image;
-mod image_generate;
-mod pdf;
-mod tts;
 mod video;
 
 // UI tools
@@ -131,9 +128,6 @@ pub use gateway_backend::GatewayBackend;
 
 // Media
 pub use self::image::ImageTool;
-pub use image_generate::ImageGenerateTool;
-pub use pdf::PdfTool;
-pub use tts::TtsTool;
 pub use video::{VideoBackend, VideoChannelAdapter, VideoTool};
 
 // UI
@@ -189,9 +183,6 @@ pub fn builtin_tools(
         std::sync::Arc::new(XSearchTool::new()),
         // Media
         std::sync::Arc::new(ImageTool::new()),
-        std::sync::Arc::new(ImageGenerateTool::new()),
-        std::sync::Arc::new(TtsTool::new()),
-        std::sync::Arc::new(PdfTool::new()),
         // UI
         std::sync::Arc::new(BrowserTool::new()),
         std::sync::Arc::new(CanvasTool::new()),
