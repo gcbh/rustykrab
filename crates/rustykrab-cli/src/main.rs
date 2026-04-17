@@ -250,13 +250,22 @@ async fn main() -> anyhow::Result<()> {
             let base_url = std::env::var("OLLAMA_BASE_URL")
                 .unwrap_or_else(|_| "http://localhost:11434".to_string());
             let config = rustykrab_providers::OllamaConfig::default();
-            tracing::info!(%model, %base_url, num_ctx = config.num_ctx, "using Ollama provider");
+            tracing::info!(
+                %model,
+                %base_url,
+                num_ctx = ?config.num_ctx,
+                "using Ollama provider (num_ctx=None defers to server's OLLAMA_CONTEXT_LENGTH)"
+            );
             let p = rustykrab_providers::OllamaProvider::new(model)
                 .with_base_url(base_url)
                 .with_config(config)
                 .with_detected_context_window()
                 .await;
-            tracing::info!(num_ctx = p.num_ctx(), "Ollama effective context window");
+            tracing::info!(
+                num_ctx = ?p.num_ctx(),
+                effective_ctx = ?p.effective_ctx(),
+                "Ollama client-side context settings"
+            );
             Arc::new(p)
         }
         _ => {
