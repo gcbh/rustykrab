@@ -250,13 +250,22 @@ async fn main() -> anyhow::Result<()> {
             let base_url = std::env::var("OLLAMA_BASE_URL")
                 .unwrap_or_else(|_| "http://localhost:11434".to_string());
             let config = rustykrab_providers::OllamaConfig::default();
-            tracing::info!(%model, %base_url, num_ctx = config.num_ctx, "using Ollama provider");
+            tracing::info!(
+                %model,
+                %base_url,
+                num_ctx = ?config.num_ctx,
+                "using Ollama provider (num_ctx=None defers to server's OLLAMA_CONTEXT_LENGTH)"
+            );
             let p = rustykrab_providers::OllamaProvider::new(model)
                 .with_base_url(base_url)
                 .with_config(config)
                 .with_detected_context_window()
                 .await;
-            tracing::info!(num_ctx = p.num_ctx(), "Ollama effective context window");
+            tracing::info!(
+                num_ctx = ?p.num_ctx(),
+                effective_ctx = ?p.effective_ctx(),
+                "Ollama client-side context settings"
+            );
             Arc::new(p)
         }
         _ => {
@@ -371,10 +380,28 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
+    // --- Skill registry (shared by hot-reload tools and the gateway state) ---
+    let skill_registry = Arc::new(SkillRegistry::new());
+    match rustykrab_skills::load_skills_from_dir(&skills_dir) {
+        Ok(loaded) => {
+            let count = loaded.len();
+            for s in loaded {
+                skill_registry.register_md(Arc::new(s));
+            }
+            if count > 0 {
+                tracing::info!(count, "SKILL.md skills loaded");
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "failed to scan skills directory"),
+    }
+
     // --- Tools ---
     let mut tools = rustykrab_tools::builtin_tools(store.secrets());
     tools.extend(rustykrab_tools::memory_tools(memory_backend));
-    tools.extend(rustykrab_tools::skill_tools(skills_dir.clone()));
+    tools.extend(rustykrab_tools::skill_tools(
+        skills_dir.clone(),
+        Some(skill_registry.clone()),
+    ));
 
     // --- Cron tool (task scheduling) ---
     let cron_backend: Arc<dyn CronBackend> = Arc::new(CronAdapter {
@@ -404,30 +431,13 @@ async fn main() -> anyhow::Result<()> {
     // --- Orchestration config (used by RLM module) ---
     let orchestration_config = load_orchestration_config(&data_dir)?;
 
-    // --- Load SKILL.md skills ---
-    let skills_dir = data_dir.join("skills");
-    std::fs::create_dir_all(&skills_dir)?;
-    let mut skill_registry = SkillRegistry::new();
-    match rustykrab_skills::load_skills_from_dir(&skills_dir) {
-        Ok(loaded) => {
-            let count = loaded.len();
-            for s in loaded {
-                skill_registry.register_md(Arc::new(s));
-            }
-            if count > 0 {
-                tracing::info!(count, "SKILL.md skills loaded");
-            }
-        }
-        Err(e) => tracing::warn!(error = %e, "failed to scan skills directory"),
-    }
-
     // --- Build gateway state ---
     // Clone store handle so we can flush it after the server shuts down.
     let store_handle = store.clone();
     let mut state = rustykrab_gateway::AppState::new(store, tools, provider, auth_token)
         .with_harness_router(router)
         .with_orchestration_config(orchestration_config)
-        .with_skill_registry(Arc::new(skill_registry));
+        .with_skill_registry(skill_registry);
 
     // --- Attach video channel to state ---
     if let Some(vc) = video_channel {

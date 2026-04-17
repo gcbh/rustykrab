@@ -61,6 +61,8 @@ All configuration is via environment variables. No plaintext config files.
 | `ANTHROPIC_MODEL` | `claude-sonnet-4-20250514` | Claude model to use |
 | `OLLAMA_MODEL` | `gemma4:26b` | Ollama model name |
 | `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama server address |
+| `OLLAMA_NUM_CTX` | — | Explicit client-side `num_ctx` override. Omitted by default so the server's own `OLLAMA_CONTEXT_LENGTH` (or per-model default) wins |
+| `OLLAMA_TIMEOUT_SECS` | `900` | HTTP request timeout for Ollama in seconds |
 | `CHROME_CDP_URL` | `ws://127.0.0.1:9222` | Chrome DevTools Protocol endpoint |
 | `RUSTYKRAB_AUTH_TOKEN` | auto-generated | Bearer token for API auth |
 | `RUSTYKRAB_MASTER_KEY` | auto-generated | Encryption key for secrets at rest |

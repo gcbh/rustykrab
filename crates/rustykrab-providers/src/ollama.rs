@@ -18,8 +18,12 @@ const RETRY_BASE_DELAY: Duration = Duration::from_secs(1);
 pub struct OllamaConfig {
     /// Temperature for sampling (0.0 = deterministic, 0.7 = creative).
     pub temperature: f32,
-    /// Context window size in tokens.
-    pub num_ctx: u32,
+    /// Explicit context-window size to send to the Ollama server as
+    /// `options.num_ctx`. When `None` (the default), the value is omitted
+    /// from the request so the server's own configuration is used — e.g.
+    /// its `OLLAMA_CONTEXT_LENGTH` env var or the per-model default.
+    /// Set `OLLAMA_NUM_CTX` on the client to force a specific override.
+    pub num_ctx: Option<u32>,
     /// Number of parallel inference slots.
     pub num_parallel: u32,
     /// Top-p nucleus sampling threshold.
@@ -32,18 +36,14 @@ pub struct OllamaConfig {
     pub think: bool,
 }
 
-/// Read `num_ctx` from the `OLLAMA_NUM_CTX` env var, falling back to the
-/// given default.  Invalid values are silently ignored.
-fn num_ctx_from_env(default: u32) -> u32 {
+/// Read `num_ctx` from the `OLLAMA_NUM_CTX` env var.  Returns `None` when
+/// the var is unset or unparseable so the request omits `num_ctx` and the
+/// Ollama server's own configuration (e.g. `OLLAMA_CONTEXT_LENGTH`) wins.
+fn num_ctx_from_env() -> Option<u32> {
     std::env::var("OLLAMA_NUM_CTX")
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
-        .unwrap_or(default)
 }
-
-/// Default context-window size.  The previous 128 K was too aggressive and
-/// caused Ollama to OOM (returning 500).  Can be overridden via `OLLAMA_NUM_CTX`.
-const DEFAULT_NUM_CTX: u32 = 100_000;
 
 /// Rough characters-per-token ratio used for client-side context budgeting.
 /// Real tokenization varies by model (English prose ≈ 4, code ≈ 3, CJK ≈ 1-2);
@@ -61,7 +61,7 @@ impl Default for OllamaConfig {
     fn default() -> Self {
         Self {
             temperature: 0.1,
-            num_ctx: num_ctx_from_env(DEFAULT_NUM_CTX),
+            num_ctx: num_ctx_from_env(),
             num_parallel: 6,
             top_p: 0.9,
             num_predict: 8192,
@@ -75,7 +75,7 @@ impl OllamaConfig {
     pub fn tool_calling() -> Self {
         Self {
             temperature: 0.0,
-            num_ctx: num_ctx_from_env(DEFAULT_NUM_CTX),
+            num_ctx: num_ctx_from_env(),
             num_parallel: 6,
             top_p: 0.9,
             num_predict: 4096,
@@ -87,7 +87,7 @@ impl OllamaConfig {
     pub fn creative() -> Self {
         Self {
             temperature: 0.7,
-            num_ctx: num_ctx_from_env(DEFAULT_NUM_CTX),
+            num_ctx: num_ctx_from_env(),
             num_parallel: 6,
             top_p: 0.95,
             num_predict: 16384,
@@ -102,14 +102,17 @@ pub struct OllamaProvider {
     base_url: String,
     model: String,
     config: OllamaConfig,
+    /// Model's native context length discovered from `/api/show`.  Used
+    /// only as a client-side prompt-trimming budget when the user hasn't
+    /// set an explicit `num_ctx`; never sent to the server.
+    detected_ctx: Option<u32>,
 }
 
 impl OllamaProvider {
     pub fn new(model: impl Into<String>) -> Self {
-        // Large prompts (near the 100K `num_ctx`) can easily take more than
-        // five minutes for prompt evaluation on a local GPU, so allow up to
-        // 15 minutes per request before we give up.  Can be overridden via
-        // `OLLAMA_TIMEOUT_SECS`.
+        // Large prompts can easily take more than five minutes for prompt
+        // evaluation on a local GPU, so allow up to 15 minutes per request
+        // before we give up.  Can be overridden via `OLLAMA_TIMEOUT_SECS`.
         let timeout_secs = std::env::var("OLLAMA_TIMEOUT_SECS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
@@ -124,6 +127,7 @@ impl OllamaProvider {
             base_url: "http://localhost:11434".to_string(),
             model: model.into(),
             config: OllamaConfig::default(),
+            detected_ctx: None,
         }
     }
 
@@ -147,9 +151,17 @@ impl OllamaProvider {
         &self.model
     }
 
-    /// Get the configured (post-detection) `num_ctx`.
-    pub fn num_ctx(&self) -> u32 {
+    /// Get the explicit `num_ctx` that will be sent to the server, if any.
+    /// `None` means the server's own configuration is used.
+    pub fn num_ctx(&self) -> Option<u32> {
         self.config.num_ctx
+    }
+
+    /// Effective context window used for client-side prompt trimming.
+    /// Prefers the user's explicit `num_ctx`, then the value detected from
+    /// the model via `/api/show`, else `None` (no trimming).
+    pub fn effective_ctx(&self) -> Option<u32> {
+        self.config.num_ctx.or(self.detected_ctx)
     }
 
     /// Query Ollama's `/api/show` endpoint for the loaded model's native
@@ -178,43 +190,54 @@ impl OllamaProvider {
         Ok(parse_context_length_from_show(&raw))
     }
 
-    /// Detect the model's native context length and clamp `config.num_ctx`
-    /// to it.  On any failure the configured value is left untouched and a
-    /// warning is logged — startup must not fail just because Ollama is
-    /// momentarily unreachable.
+    /// Detect the model's native context length and cache it for client-side
+    /// prompt-trimming purposes.  If the user has set an explicit `num_ctx`
+    /// that exceeds the detected value, clamp it down so we don't OOM the
+    /// server.  On any failure the cached value stays `None` and a warning
+    /// is logged — startup must not fail just because Ollama is momentarily
+    /// unreachable.
     pub async fn with_detected_context_window(mut self) -> Self {
         match self.detect_context_window().await {
             Ok(Some(detected)) => {
-                if self.config.num_ctx > detected {
-                    tracing::info!(
-                        model = %self.model,
-                        requested_num_ctx = self.config.num_ctx,
-                        detected_num_ctx = detected,
-                        "clamping num_ctx to model's native context length"
-                    );
-                    self.config.num_ctx = detected;
+                self.detected_ctx = Some(detected);
+                if let Some(requested) = self.config.num_ctx {
+                    if requested > detected {
+                        tracing::info!(
+                            model = %self.model,
+                            requested_num_ctx = requested,
+                            detected_num_ctx = detected,
+                            "clamping explicit num_ctx to model's native context length"
+                        );
+                        self.config.num_ctx = Some(detected);
+                    } else {
+                        tracing::debug!(
+                            model = %self.model,
+                            num_ctx = requested,
+                            detected_num_ctx = detected,
+                            "explicit num_ctx fits within model's native context length"
+                        );
+                    }
                 } else {
                     tracing::debug!(
                         model = %self.model,
-                        num_ctx = self.config.num_ctx,
                         detected_num_ctx = detected,
-                        "configured num_ctx fits within model's native context length"
+                        "no explicit num_ctx set; deferring to server while using detected value for client-side trimming"
                     );
                 }
             }
             Ok(None) => {
                 tracing::warn!(
                     model = %self.model,
-                    num_ctx = self.config.num_ctx,
-                    "could not detect model context length from /api/show; using configured num_ctx"
+                    num_ctx = ?self.config.num_ctx,
+                    "could not detect model context length from /api/show"
                 );
             }
             Err(e) => {
                 tracing::warn!(
                     model = %self.model,
-                    num_ctx = self.config.num_ctx,
+                    num_ctx = ?self.config.num_ctx,
                     error = %e,
-                    "failed to query /api/show; using configured num_ctx"
+                    "failed to query /api/show"
                 );
             }
         }
@@ -412,13 +435,20 @@ impl OllamaProvider {
     }
 
     /// Trim oldest non-system messages until the estimated prompt fits the
-    /// budget derived from `num_ctx` minus `num_predict` and a safety margin
+    /// budget derived from `total_ctx` minus `num_predict` and a safety margin
     /// for tool schemas / chat-template framing.  Tool-result messages are
     /// dropped along with any preceding orphaned tool-call assistant turn so
-    /// the request stays well-formed.
-    fn trim_to_budget(messages: Vec<OllamaMessage>, config: &OllamaConfig) -> Vec<OllamaMessage> {
-        let reserved_output = config.num_predict.max(0) as u32;
-        let total_ctx = config.num_ctx;
+    /// the request stays well-formed.  When `total_ctx` is `None` we have no
+    /// budget to enforce so messages pass through unchanged.
+    fn trim_to_budget(
+        messages: Vec<OllamaMessage>,
+        total_ctx: Option<u32>,
+        num_predict: i32,
+    ) -> Vec<OllamaMessage> {
+        let Some(total_ctx) = total_ctx else {
+            return messages;
+        };
+        let reserved_output = num_predict.max(0) as u32;
         let budget = total_ctx
             .saturating_sub(reserved_output)
             .saturating_sub(SAFETY_OVERHEAD_TOKENS);
@@ -486,21 +516,32 @@ impl ModelProvider for OllamaProvider {
             ));
         }
 
-        let ollama_messages = Self::trim_to_budget(ollama_messages, &self.config);
+        let ollama_messages = Self::trim_to_budget(
+            ollama_messages,
+            self.effective_ctx(),
+            self.config.num_predict,
+        );
 
         let ollama_tools = Self::build_tools(tools);
+
+        let mut options = serde_json::json!({
+            "temperature": self.config.temperature,
+            "top_p": self.config.top_p,
+            "num_predict": self.config.num_predict,
+        });
+        // Only override the server's context length when the user has asked
+        // for it explicitly — otherwise leave `num_ctx` out so `OLLAMA_CONTEXT_LENGTH`
+        // (or the model default) wins.
+        if let Some(num_ctx) = self.config.num_ctx {
+            options["num_ctx"] = serde_json::json!(num_ctx);
+        }
 
         let mut body = serde_json::json!({
             "model": self.model,
             "messages": ollama_messages,
             "stream": false,
             "think": self.config.think,
-            "options": {
-                "temperature": self.config.temperature,
-                "num_ctx": self.config.num_ctx,
-                "top_p": self.config.top_p,
-                "num_predict": self.config.num_predict,
-            },
+            "options": options,
         });
 
         if !ollama_tools.is_empty() {
@@ -511,7 +552,7 @@ impl ModelProvider for OllamaProvider {
             model = %self.model,
             base_url = %self.base_url,
             num_messages = ollama_messages.len(),
-            num_ctx = self.config.num_ctx,
+            num_ctx = ?self.config.num_ctx,
             "calling Ollama chat API"
         );
 
@@ -536,7 +577,7 @@ impl ModelProvider for OllamaProvider {
                         tracing::warn!(
                             model = %self.model,
                             num_messages = ollama_messages.len(),
-                            num_ctx = self.config.num_ctx,
+                            num_ctx = ?self.config.num_ctx,
                             "Ollama request timed out — not retrying (reduce context or raise OLLAMA_TIMEOUT_SECS)"
                         );
                         return Err(Error::ModelProvider(format!(
@@ -586,7 +627,7 @@ impl ModelProvider for OllamaProvider {
             let error_body = resp.text().await.unwrap_or_default();
             tracing::warn!(
                 status = %status,
-                num_ctx = self.config.num_ctx,
+                num_ctx = ?self.config.num_ctx,
                 num_messages = ollama_messages.len(),
                 error_body = %error_body,
                 "Ollama API error"
@@ -618,21 +659,29 @@ impl ModelProvider for OllamaProvider {
             ));
         }
 
-        let ollama_messages = Self::trim_to_budget(ollama_messages, &self.config);
+        let ollama_messages = Self::trim_to_budget(
+            ollama_messages,
+            self.effective_ctx(),
+            self.config.num_predict,
+        );
 
         let ollama_tools = Self::build_tools(tools);
+
+        let mut options = serde_json::json!({
+            "temperature": self.config.temperature,
+            "top_p": self.config.top_p,
+            "num_predict": self.config.num_predict,
+        });
+        if let Some(num_ctx) = self.config.num_ctx {
+            options["num_ctx"] = serde_json::json!(num_ctx);
+        }
 
         let mut body = serde_json::json!({
             "model": self.model,
             "messages": ollama_messages,
             "stream": true,
             "think": self.config.think,
-            "options": {
-                "temperature": self.config.temperature,
-                "num_ctx": self.config.num_ctx,
-                "top_p": self.config.top_p,
-                "num_predict": self.config.num_predict,
-            },
+            "options": options,
         });
 
         if !ollama_tools.is_empty() {
@@ -643,7 +692,7 @@ impl ModelProvider for OllamaProvider {
             model = %self.model,
             base_url = %self.base_url,
             num_messages = ollama_messages.len(),
-            num_ctx = self.config.num_ctx,
+            num_ctx = ?self.config.num_ctx,
             "calling Ollama chat API (streaming)"
         );
 
@@ -667,7 +716,7 @@ impl ModelProvider for OllamaProvider {
                         tracing::warn!(
                             model = %self.model,
                             num_messages = ollama_messages.len(),
-                            num_ctx = self.config.num_ctx,
+                            num_ctx = ?self.config.num_ctx,
                             "Ollama streaming request timed out — not retrying"
                         );
                         return Err(Error::ModelProvider(format!(
@@ -688,7 +737,7 @@ impl ModelProvider for OllamaProvider {
                 let error_body = r.text().await.unwrap_or_default();
                 tracing::warn!(
                     status = %status,
-                    num_ctx = self.config.num_ctx,
+                    num_ctx = ?self.config.num_ctx,
                     num_messages = ollama_messages.len(),
                     error_body = %error_body,
                     "Ollama streaming API error"
@@ -1043,12 +1092,18 @@ mod tests {
     fn trim_returns_unchanged_when_under_budget() {
         let msgs = vec![system_msg("sys"), user_msg("hi")];
         let original_len = msgs.len();
-        let config = OllamaConfig {
-            num_ctx: 8192,
-            num_predict: 1024,
-            ..OllamaConfig::default()
-        };
-        let trimmed = OllamaProvider::trim_to_budget(msgs, &config);
+        let trimmed = OllamaProvider::trim_to_budget(msgs, Some(8192), 1024);
+        assert_eq!(trimmed.len(), original_len);
+    }
+
+    #[test]
+    fn trim_is_noop_when_num_ctx_is_none() {
+        // No budget means defer entirely to the server; the client leaves
+        // the history untouched.
+        let big = "x".repeat(40_000);
+        let msgs = vec![system_msg("sys"), user_msg(&big), user_msg("latest")];
+        let original_len = msgs.len();
+        let trimmed = OllamaProvider::trim_to_budget(msgs, None, 256);
         assert_eq!(trimmed.len(), original_len);
     }
 
@@ -1064,13 +1119,8 @@ mod tests {
             user_msg(&big),
             user_msg("latest"),
         ];
-        let config = OllamaConfig {
-            // budget = 4096 - 256 - SAFETY_OVERHEAD_TOKENS(2048) = 1792 tokens
-            num_ctx: 4096,
-            num_predict: 256,
-            ..OllamaConfig::default()
-        };
-        let trimmed = OllamaProvider::trim_to_budget(msgs, &config);
+        // budget = 4096 - 256 - SAFETY_OVERHEAD_TOKENS(2048) = 1792 tokens
+        let trimmed = OllamaProvider::trim_to_budget(msgs, Some(4096), 256);
         // System message must survive.
         assert_eq!(trimmed[0].role, "system");
         // Latest message must survive.
@@ -1088,17 +1138,37 @@ mod tests {
             tool_msg("orphaned tool result"),
             user_msg("latest"),
         ];
-        let config = OllamaConfig {
-            num_ctx: 4096,
-            num_predict: 256,
-            ..OllamaConfig::default()
-        };
-        let trimmed = OllamaProvider::trim_to_budget(msgs, &config);
+        let trimmed = OllamaProvider::trim_to_budget(msgs, Some(4096), 256);
         // Orphan tool result must not become the first non-system message.
         assert_ne!(trimmed.get(1).map(|m| m.role.as_str()), Some("tool"));
         // System and latest user message survive.
         assert_eq!(trimmed[0].role, "system");
         assert_eq!(trimmed.last().unwrap().content.as_deref(), Some("latest"));
+    }
+
+    #[test]
+    fn default_config_omits_num_ctx_when_env_unset() {
+        // Guard: when OLLAMA_NUM_CTX is not set, constructors leave num_ctx
+        // as None so the server's own OLLAMA_CONTEXT_LENGTH wins.
+        //
+        // std::env is process-global; restore it after the test so we don't
+        // contaminate sibling tests that may set it themselves.
+        let saved = std::env::var("OLLAMA_NUM_CTX").ok();
+        // SAFETY: single-threaded section of this test. `cargo test` runs
+        // tests on separate threads by default but we're only reading/writing
+        // our own var and restoring it.
+        unsafe {
+            std::env::remove_var("OLLAMA_NUM_CTX");
+        }
+        assert_eq!(OllamaConfig::default().num_ctx, None);
+        assert_eq!(OllamaConfig::tool_calling().num_ctx, None);
+        assert_eq!(OllamaConfig::creative().num_ctx, None);
+        unsafe {
+            match saved {
+                Some(v) => std::env::set_var("OLLAMA_NUM_CTX", v),
+                None => std::env::remove_var("OLLAMA_NUM_CTX"),
+            }
+        }
     }
 
     #[test]

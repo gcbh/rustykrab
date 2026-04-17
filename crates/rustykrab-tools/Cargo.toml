@@ -9,6 +9,7 @@ license.workspace = true
 rustykrab-core.workspace = true
 rustykrab-store.workspace = true
 rustykrab-channels.workspace = true
+rustykrab-skills.workspace = true
 async-trait.workspace = true
 reqwest = { workspace = true, features = ["cookies"] }
 serde.workspace = true

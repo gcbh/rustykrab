@@ -78,7 +78,7 @@ mod credential_read;
 mod credential_write;
 
 // Skill tools
-mod skill_create;
+mod skills;
 
 // --- Public re-exports ---
 
@@ -155,7 +155,7 @@ pub use credential_read::CredentialReadTool;
 pub use credential_write::CredentialWriteTool;
 
 // Skills
-pub use skill_create::SkillCreateTool;
+pub use self::skills::SkillsTool;
 
 /// Collect all built-in tools that require no external backend into a Vec.
 ///
@@ -240,10 +240,19 @@ pub fn message_tools(
 }
 
 /// Collect skill tools that require a skills directory into a Vec.
+///
+/// When a live `SkillRegistry` is supplied, newly created and deleted skills
+/// take effect immediately (no restart). If `registry` is `None`, the tool
+/// still works but changes only apply on the next startup.
 pub fn skill_tools(
     skills_dir: std::path::PathBuf,
+    registry: Option<std::sync::Arc<rustykrab_skills::SkillRegistry>>,
 ) -> Vec<std::sync::Arc<dyn rustykrab_core::Tool>> {
-    vec![std::sync::Arc::new(SkillCreateTool::new(skills_dir))]
+    let tool: std::sync::Arc<dyn rustykrab_core::Tool> = match registry {
+        Some(reg) => std::sync::Arc::new(SkillsTool::with_registry(skills_dir, reg)),
+        None => std::sync::Arc::new(SkillsTool::new(skills_dir)),
+    };
+    vec![tool]
 }
 
 /// Collect automation tools that require backends into a Vec.
