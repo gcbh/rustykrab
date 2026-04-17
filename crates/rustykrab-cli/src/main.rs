@@ -253,7 +253,10 @@ async fn main() -> anyhow::Result<()> {
             tracing::info!(%model, %base_url, num_ctx = config.num_ctx, "using Ollama provider");
             let p = rustykrab_providers::OllamaProvider::new(model)
                 .with_base_url(base_url)
-                .with_config(config);
+                .with_config(config)
+                .with_detected_context_window()
+                .await;
+            tracing::info!(num_ctx = p.num_ctx(), "Ollama effective context window");
             Arc::new(p)
         }
         _ => {

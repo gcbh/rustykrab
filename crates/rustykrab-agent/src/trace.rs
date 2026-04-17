@@ -149,7 +149,7 @@ impl ExecutionTracer {
             .iter()
             .map(|(n, s)| (n.clone(), s.clone()))
             .collect();
-        sorted.sort_by(|a, b| b.1.calls.cmp(&a.1.calls));
+        sorted.sort_by_key(|b| std::cmp::Reverse(b.1.calls));
         sorted.truncate(limit);
         sorted
     }
@@ -167,7 +167,7 @@ impl ExecutionTracer {
 
         // Sort by call count descending.
         let mut sorted: Vec<_> = inner.stats.iter().collect();
-        sorted.sort_by(|a, b| b.1.calls.cmp(&a.1.calls));
+        sorted.sort_by_key(|b| std::cmp::Reverse(b.1.calls));
 
         for (name, stats) in &sorted {
             let rate = (stats.success_rate() * 100.0) as u32;

@@ -61,71 +61,59 @@ pub fn html_to_text(html: &str, include_links: bool) -> String {
                             in_script_or_style = true;
                         }
                     }
-                    "br" | "hr" => {
-                        if !in_script_or_style {
-                            if in_anchor {
-                                anchor_text.push('\n');
-                            } else {
-                                result.push('\n');
-                            }
+                    "br" | "hr" if !in_script_or_style => {
+                        if in_anchor {
+                            anchor_text.push('\n');
+                        } else {
+                            result.push('\n');
                         }
                     }
                     "p" | "div" | "section" | "article" | "main" | "header" | "footer" | "nav"
-                    | "aside" | "blockquote" | "tr" | "table" => {
-                        if !in_script_or_style {
-                            if is_closing {
-                                if in_anchor {
-                                    anchor_text.push_str("\n\n");
-                                } else {
-                                    result.push_str("\n\n");
-                                }
+                    | "aside" | "blockquote" | "tr" | "table"
+                        if !in_script_or_style =>
+                    {
+                        if is_closing {
+                            if in_anchor {
+                                anchor_text.push_str("\n\n");
                             } else {
-                                if in_anchor {
-                                    anchor_text.push('\n');
-                                } else {
-                                    result.push('\n');
-                                }
+                                result.push_str("\n\n");
                             }
+                        } else if in_anchor {
+                            anchor_text.push('\n');
+                        } else {
+                            result.push('\n');
                         }
                     }
-                    "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
-                        if !in_script_or_style {
-                            result.push_str("\n\n");
-                        }
+                    "h1" | "h2" | "h3" | "h4" | "h5" | "h6" if !in_script_or_style => {
+                        result.push_str("\n\n");
                     }
-                    "li" => {
-                        if !in_script_or_style && !is_closing {
-                            result.push_str("\n- ");
-                        }
+                    "li" if !in_script_or_style && !is_closing => {
+                        result.push_str("\n- ");
                     }
-                    "a" => {
-                        if !in_script_or_style && include_links {
-                            if is_closing {
-                                // End of anchor — emit markdown link
-                                if !current_href.is_empty() && !anchor_text.trim().is_empty() {
-                                    result.push('[');
-                                    result.push_str(anchor_text.trim());
-                                    result.push_str("](");
-                                    result.push_str(&current_href);
-                                    result.push(')');
-                                } else {
-                                    result.push_str(anchor_text.trim());
-                                }
-                                in_anchor = false;
-                                anchor_text.clear();
-                                current_href.clear();
+                    "a" if !in_script_or_style && include_links => {
+                        if is_closing {
+                            // End of anchor — emit markdown link
+                            if !current_href.is_empty() && !anchor_text.trim().is_empty() {
+                                result.push('[');
+                                result.push_str(anchor_text.trim());
+                                result.push_str("](");
+                                result.push_str(&current_href);
+                                result.push(')');
                             } else {
-                                // Extract href from tag attributes
-                                current_href = extract_href(&tag_name);
-                                in_anchor = true;
-                                anchor_text.clear();
+                                result.push_str(anchor_text.trim());
                             }
+                            in_anchor = false;
+                            anchor_text.clear();
+                            current_href.clear();
+                        } else {
+                            // Extract href from tag attributes
+                            current_href = extract_href(&tag_name);
+                            in_anchor = true;
+                            anchor_text.clear();
                         }
                     }
-                    "td" | "th" => {
-                        if !in_script_or_style && is_closing {
-                            result.push('\t');
-                        }
+                    "td" | "th" if !in_script_or_style && is_closing => {
+                        result.push('\t');
                     }
                     _ => {}
                 }
