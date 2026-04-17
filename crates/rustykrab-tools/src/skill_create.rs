@@ -1,22 +1,36 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use rustykrab_core::types::ToolSchema;
 use rustykrab_core::{Error, Result, SandboxRequirements, Tool};
+use rustykrab_skills::SkillRegistry;
 use serde_json::{json, Value};
 
 /// A tool that creates new SKILL.md skills on disk.
 ///
 /// The agent can use this to author reusable skills during a conversation.
-/// Skills are written to `$DATA_DIR/skills/<name>/SKILL.md` and become
-/// available on the next server restart.
+/// Skills are written to `$DATA_DIR/skills/<name>/SKILL.md` and — when a
+/// registry handle is supplied — are also registered live, becoming
+/// available on the next agent turn with no restart.
 pub struct SkillCreateTool {
     skills_dir: PathBuf,
+    registry: Option<Arc<SkillRegistry>>,
 }
 
 impl SkillCreateTool {
     pub fn new(skills_dir: PathBuf) -> Self {
-        Self { skills_dir }
+        Self {
+            skills_dir,
+            registry: None,
+        }
+    }
+
+    pub fn with_registry(skills_dir: PathBuf, registry: Arc<SkillRegistry>) -> Self {
+        Self {
+            skills_dir,
+            registry: Some(registry),
+        }
     }
 }
 
@@ -36,7 +50,8 @@ impl Tool for SkillCreateTool {
     }
 
     fn description(&self) -> &str {
-        "Create a new SKILL.md skill on disk. The skill becomes available on next restart. \
+        "Create a new SKILL.md skill on disk. The skill is hot-loaded into the \
+         registry immediately (available on the next agent turn, no restart required). \
          Provide a name (lowercase a-z, 0-9, hyphens, underscores), a short description, \
          and the markdown instructions body."
     }
@@ -170,11 +185,44 @@ impl Tool for SkillCreateTool {
             .await
             .map_err(|e| Error::ToolExecution(format!("failed to write SKILL.md: {e}").into()))?;
 
+        // Hot-register in the live registry if one was supplied.
+        // Parse the file we just wrote so requirement validation (env/bins)
+        // is consistent with the startup loader path.
+        let mut hot_reloaded = false;
+        if let Some(ref registry) = self.registry {
+            let skill_dir_owned = skill_dir.clone();
+            let path_owned = path.clone();
+            let loaded = tokio::task::spawn_blocking(move || {
+                rustykrab_skills::load_single_skill(&skill_dir_owned, &path_owned)
+            })
+            .await
+            .map_err(|e| Error::ToolExecution(format!("load task join failed: {e}").into()))?;
+
+            match loaded {
+                Ok(skill_md) => {
+                    registry.register_md(Arc::new(skill_md));
+                    hot_reloaded = true;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        name = name,
+                        error = %e,
+                        "skill written to disk but hot-reload parse failed"
+                    );
+                }
+            }
+        }
+
         Ok(json!({
             "created": true,
             "name": name,
             "path": path.display().to_string(),
-            "note": "Skill will be available on next server restart."
+            "hot_reloaded": hot_reloaded,
+            "note": if hot_reloaded {
+                "Skill is live — available on the next agent turn."
+            } else {
+                "Skill will be available on next server restart."
+            },
         }))
     }
 }
@@ -283,5 +331,24 @@ mod tests {
         assert!(content.contains("user_invocable = true"));
         // Should not contain requires section
         assert!(!content.contains("[requires]"));
+    }
+
+    #[tokio::test]
+    async fn hot_reload_registers_skill_in_registry() {
+        let tmp = TempDir::new().unwrap();
+        let registry = Arc::new(SkillRegistry::new());
+        let tool = SkillCreateTool::with_registry(tmp.path().to_path_buf(), registry.clone());
+
+        let result = tool
+            .execute(json!({
+                "name": "live-skill",
+                "description": "Hot reloaded",
+                "instructions": "Instructions body."
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(result["hot_reloaded"], true);
+        assert!(registry.get_md("live-skill").is_some());
     }
 }

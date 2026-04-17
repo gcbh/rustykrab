@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use rustykrab_core::types::ToolSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use crate::skill_md::SkillMd;
 
@@ -31,48 +31,69 @@ pub struct SkillManifest {
     pub description: String,
 }
 
-/// Registry that holds all available skills.
-pub struct SkillRegistry {
+#[derive(Default)]
+struct Inner {
     skills: HashMap<String, Arc<dyn Skill>>,
     md_skills_map: HashMap<String, Arc<SkillMd>>,
+}
+
+/// Registry that holds all available skills.
+///
+/// Uses interior mutability so tools can hot-register and hot-remove skills
+/// against a shared `Arc<SkillRegistry>` without a restart.
+pub struct SkillRegistry {
+    inner: RwLock<Inner>,
 }
 
 impl SkillRegistry {
     pub fn new() -> Self {
         Self {
-            skills: HashMap::new(),
-            md_skills_map: HashMap::new(),
+            inner: RwLock::new(Inner::default()),
         }
     }
 
-    pub fn register(&mut self, skill: Arc<dyn Skill>) {
-        self.skills.insert(skill.id().to_string(), skill);
+    pub fn register(&self, skill: Arc<dyn Skill>) {
+        let mut g = self.inner.write().expect("SkillRegistry poisoned");
+        g.skills.insert(skill.id().to_string(), skill);
     }
 
     /// Register a SKILL.md-based skill (stored in both maps).
-    pub fn register_md(&mut self, skill: Arc<SkillMd>) {
-        self.skills
+    pub fn register_md(&self, skill: Arc<SkillMd>) {
+        let mut g = self.inner.write().expect("SkillRegistry poisoned");
+        g.skills
             .insert(skill.frontmatter.name.clone(), skill.clone());
-        self.md_skills_map
+        g.md_skills_map
             .insert(skill.frontmatter.name.clone(), skill);
     }
 
-    pub fn get(&self, id: &str) -> Option<&Arc<dyn Skill>> {
-        self.skills.get(id)
+    /// Remove a skill (by name) from both maps. Returns true if it existed.
+    pub fn unregister(&self, id: &str) -> bool {
+        let mut g = self.inner.write().expect("SkillRegistry poisoned");
+        let had_md = g.md_skills_map.remove(id).is_some();
+        let had_any = g.skills.remove(id).is_some();
+        had_md || had_any
+    }
+
+    pub fn get(&self, id: &str) -> Option<Arc<dyn Skill>> {
+        let g = self.inner.read().expect("SkillRegistry poisoned");
+        g.skills.get(id).cloned()
     }
 
     /// Access rich SKILL.md metadata by id.
-    pub fn get_md(&self, id: &str) -> Option<&Arc<SkillMd>> {
-        self.md_skills_map.get(id)
+    pub fn get_md(&self, id: &str) -> Option<Arc<SkillMd>> {
+        let g = self.inner.read().expect("SkillRegistry poisoned");
+        g.md_skills_map.get(id).cloned()
     }
 
     /// List all SKILL.md skills (for XML catalog injection).
-    pub fn md_skills(&self) -> Vec<&Arc<SkillMd>> {
-        self.md_skills_map.values().collect()
+    pub fn md_skills(&self) -> Vec<Arc<SkillMd>> {
+        let g = self.inner.read().expect("SkillRegistry poisoned");
+        g.md_skills_map.values().cloned().collect()
     }
 
     pub fn list(&self) -> Vec<SkillManifest> {
-        self.skills
+        let g = self.inner.read().expect("SkillRegistry poisoned");
+        g.skills
             .values()
             .map(|s| SkillManifest {
                 id: s.id().to_string(),
