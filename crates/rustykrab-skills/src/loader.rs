@@ -54,7 +54,7 @@ pub fn load_skills_from_dir(skills_dir: &Path) -> anyhow::Result<Vec<SkillMd>> {
     Ok(skills)
 }
 
-fn load_single_skill(skill_dir: &Path, skill_md_path: &Path) -> anyhow::Result<SkillMd> {
+pub fn load_single_skill(skill_dir: &Path, skill_md_path: &Path) -> anyhow::Result<SkillMd> {
     let content = std::fs::read_to_string(skill_md_path)?;
     let (frontmatter, raw_body) = parse_skill_md(&content).map_err(|e| anyhow::anyhow!("{e}"))?;
     let validation = validate_requirements(&frontmatter);
