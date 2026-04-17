@@ -1241,6 +1241,638 @@ async fn dhcp_leases(host: &str, user: &str, lease_file: &str, timeout_ms: u64) 
 }
 
 // ---------------------------------------------------------------------------
+// Zigbee coordinator query (zigbee2mqtt via MQTT)
+// ---------------------------------------------------------------------------
+
+/// Query zigbee2mqtt for all paired Zigbee devices.
+///
+/// Subscribes to `zigbee2mqtt/bridge/devices` using `mosquitto_sub` and reads
+/// the retained message.  The broker host and port default to `localhost:1883`
+/// but can be overridden via parameters or the `ZIGBEE2MQTT_HOST` /
+/// `ZIGBEE2MQTT_PORT` environment variables.
+async fn zigbee_devices(host: &str, port: u16, timeout_ms: u64) -> Value {
+    let path = system_path();
+    let port_str = port.to_string();
+
+    // mosquitto_sub -h <host> -p <port> -t zigbee2mqtt/bridge/devices -C 1 -W <secs>
+    //   -C 1: read one message then exit
+    //   -W <secs>: timeout
+    let wait_secs = (timeout_ms / 1000).max(1).to_string();
+    let result = timeout(
+        Duration::from_millis(timeout_ms + 2000),
+        tokio::process::Command::new("mosquitto_sub")
+            .args([
+                "-h",
+                host,
+                "-p",
+                &port_str,
+                "-t",
+                "zigbee2mqtt/bridge/devices",
+                "-C",
+                "1",
+                "-W",
+                &wait_secs,
+            ])
+            .env("PATH", &path)
+            .output(),
+    )
+    .await;
+
+    match result {
+        Ok(Ok(output)) => {
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+
+            if !output.status.success() && stdout.trim().is_empty() {
+                return json!({
+                    "success": false,
+                    "error": if stderr.is_empty() {
+                        "mosquitto_sub returned no data — is zigbee2mqtt running?".to_string()
+                    } else {
+                        stderr
+                    },
+                });
+            }
+
+            match serde_json::from_str::<Value>(stdout.trim()) {
+                Ok(Value::Array(devices)) => {
+                    let parsed: Vec<Value> = devices
+                        .iter()
+                        .map(|d| {
+                            json!({
+                                "ieee_address": d["ieee_address"].as_str().unwrap_or(""),
+                                "friendly_name": d["friendly_name"].as_str().unwrap_or(""),
+                                "type": d["type"].as_str().unwrap_or(""),
+                                "vendor": d["definition"]["vendor"].as_str()
+                                    .or_else(|| d["vendor"].as_str())
+                                    .unwrap_or(""),
+                                "model": d["definition"]["model"].as_str()
+                                    .or_else(|| d["model_id"].as_str())
+                                    .unwrap_or(""),
+                                "description": d["definition"]["description"].as_str()
+                                    .or_else(|| d["description"].as_str())
+                                    .unwrap_or(""),
+                                "supported": d["supported"],
+                                "disabled": d["disabled"],
+                                "interview_completed": d["interview_completed"],
+                            })
+                        })
+                        .collect();
+                    json!({
+                        "success": true,
+                        "broker": format!("{host}:{port}"),
+                        "devices": parsed,
+                        "count": parsed.len(),
+                    })
+                }
+                Ok(other) => json!({
+                    "success": false,
+                    "error": format!("unexpected payload type (expected array): {other}"),
+                }),
+                Err(e) => json!({
+                    "success": false,
+                    "error": format!("failed to parse zigbee2mqtt response: {e}"),
+                    "raw": stdout.chars().take(500).collect::<String>(),
+                }),
+            }
+        }
+        Ok(Err(e)) => json!({
+            "success": false,
+            "error": format!(
+                "mosquitto_sub not available: {e}. \
+                 Install mosquitto-clients for Zigbee device discovery."
+            ),
+        }),
+        Err(_) => json!({
+            "success": false,
+            "error": "Zigbee device query timed out",
+        }),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Z-Wave coordinator query (Z-Wave JS)
+// ---------------------------------------------------------------------------
+
+/// Query Z-Wave JS UI for all paired Z-Wave nodes.
+///
+/// Z-Wave JS UI exposes a REST-like endpoint at `/health` and node data
+/// via its MQTT or WebSocket interface.  For simplicity we query the
+/// Z-Wave JS UI HTTP API which is available when `zwave-js-ui` is running
+/// (default port 8091).  Falls back to `mosquitto_sub` on the
+/// `zwave/_CLIENTS/ZWAVE_GATEWAY-zwave-js-ui/api/getNodes` topic.
+async fn zwave_nodes(host: &str, port: u16, timeout_ms: u64) -> Value {
+    let base_url = format!("http://{host}:{port}");
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_millis(timeout_ms))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+
+    // Try the Z-Wave JS UI /api/_getNodes endpoint first.
+    let nodes_url = format!("{base_url}/api/getNodes");
+    if let Ok(resp) = client.get(&nodes_url).send().await {
+        if resp.status().is_success() {
+            if let Ok(body) = resp.json::<Value>().await {
+                let nodes = if body["result"].is_array() {
+                    &body["result"]
+                } else if body["data"].is_array() {
+                    &body["data"]
+                } else if body.is_array() {
+                    &body
+                } else {
+                    &Value::Null
+                };
+
+                if let Some(node_arr) = nodes.as_array() {
+                    let parsed: Vec<Value> = node_arr
+                        .iter()
+                        .map(|n| {
+                            json!({
+                                "node_id": n["id"].as_u64().or_else(|| n["nodeId"].as_u64()),
+                                "name": n["name"].as_str().unwrap_or(""),
+                                "location": n["loc"].as_str()
+                                    .or_else(|| n["location"].as_str())
+                                    .unwrap_or(""),
+                                "manufacturer": n["manufacturer"].as_str().unwrap_or(""),
+                                "product": n["productDescription"].as_str()
+                                    .or_else(|| n["product"].as_str())
+                                    .unwrap_or(""),
+                                "product_type": n["productType"].as_str().unwrap_or(""),
+                                "status": n["status"].as_str().unwrap_or(""),
+                                "ready": n["ready"],
+                                "interview_stage": n["interviewStage"].as_str().unwrap_or(""),
+                            })
+                        })
+                        .collect();
+                    return json!({
+                        "success": true,
+                        "host": format!("{host}:{port}"),
+                        "source": "zwave-js-ui",
+                        "nodes": parsed,
+                        "count": parsed.len(),
+                    });
+                }
+            }
+        }
+    }
+
+    // Fallback: try MQTT topic for Z-Wave JS nodes.
+    let path = system_path();
+    let mqtt_host = std::env::var("ZWAVE_MQTT_HOST").unwrap_or_else(|_| host.to_string());
+    let mqtt_port = std::env::var("ZWAVE_MQTT_PORT").unwrap_or_else(|_| "1883".to_string());
+    let wait_secs = (timeout_ms / 1000).max(1).to_string();
+
+    let mqtt_result = timeout(
+        Duration::from_millis(timeout_ms + 2000),
+        tokio::process::Command::new("mosquitto_sub")
+            .args([
+                "-h",
+                &mqtt_host,
+                "-p",
+                &mqtt_port,
+                "-t",
+                "zwave/_CLIENTS/ZWAVE_GATEWAY-zwave-js-ui/api/getNodes",
+                "-C",
+                "1",
+                "-W",
+                &wait_secs,
+            ])
+            .env("PATH", &path)
+            .output(),
+    )
+    .await;
+
+    match mqtt_result {
+        Ok(Ok(output)) if output.status.success() => {
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            match serde_json::from_str::<Value>(stdout.trim()) {
+                Ok(data) => {
+                    let nodes = data["result"]
+                        .as_array()
+                        .or_else(|| data.as_array())
+                        .cloned()
+                        .unwrap_or_default();
+                    json!({
+                        "success": true,
+                        "host": format!("{mqtt_host}:{mqtt_port}"),
+                        "source": "mqtt",
+                        "nodes": nodes,
+                        "count": nodes.len(),
+                    })
+                }
+                Err(e) => json!({
+                    "success": false,
+                    "error": format!("failed to parse Z-Wave MQTT response: {e}"),
+                }),
+            }
+        }
+        _ => json!({
+            "success": false,
+            "error": format!(
+                "Z-Wave JS UI not reachable at {base_url} and MQTT fallback failed. \
+                 Ensure zwave-js-ui is running or provide correct host/port."
+            ),
+        }),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Home Assistant API integration
+// ---------------------------------------------------------------------------
+
+/// Validate that a Home Assistant URL is safe (local network only).
+fn validate_ha_url(url: &str) -> std::result::Result<(), ToolError> {
+    if url.is_empty() {
+        return Err(ToolError::invalid_input(
+            "Home Assistant URL is required (e.g. 'http://192.168.1.100:8123')",
+        ));
+    }
+    // Must start with http:// or https://
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        return Err(ToolError::invalid_input(
+            "Home Assistant URL must start with http:// or https://",
+        ));
+    }
+    // Extract host portion and verify it's a local address.
+    let host_part = url
+        .trim_start_matches("http://")
+        .trim_start_matches("https://")
+        .split('/')
+        .next()
+        .unwrap_or("")
+        .split(':')
+        .next()
+        .unwrap_or("");
+    if let Ok(ip) = host_part.parse::<IpAddr>() {
+        if !is_local_network(&ip) {
+            return Err(ToolError::invalid_input(format!(
+                "{ip} is not a local network address — only local HA instances are supported"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Build a reqwest client with the HA bearer token.
+fn ha_client(token: &str, timeout_ms: u64) -> reqwest::Client {
+    use reqwest::header;
+    let mut headers = header::HeaderMap::new();
+    if let Ok(val) = header::HeaderValue::from_str(&format!("Bearer {token}")) {
+        headers.insert(header::AUTHORIZATION, val);
+    }
+    headers.insert(
+        header::CONTENT_TYPE,
+        header::HeaderValue::from_static("application/json"),
+    );
+    reqwest::Client::builder()
+        .timeout(Duration::from_millis(timeout_ms))
+        .default_headers(headers)
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
+/// List all devices registered in Home Assistant.
+async fn ha_list_devices(ha_url: &str, token: &str, timeout_ms: u64) -> Value {
+    let client = ha_client(token, timeout_ms);
+    let url = format!("{ha_url}/api/config/device_registry/list");
+
+    match client.get(&url).send().await {
+        Ok(resp) if resp.status().is_success() => match resp.json::<Value>().await {
+            Ok(Value::Array(devices)) => {
+                let parsed: Vec<Value> = devices
+                    .iter()
+                    .map(|d| {
+                        json!({
+                            "id": d["id"].as_str().unwrap_or(""),
+                            "name": d["name"].as_str()
+                                .or_else(|| d["name_by_user"].as_str())
+                                .unwrap_or(""),
+                            "manufacturer": d["manufacturer"].as_str().unwrap_or(""),
+                            "model": d["model"].as_str().unwrap_or(""),
+                            "area_id": d["area_id"].as_str().unwrap_or(""),
+                            "via_device_id": d["via_device_id"].as_str().unwrap_or(""),
+                            "disabled_by": d["disabled_by"],
+                            "entry_type": d["entry_type"],
+                            "hw_version": d["hw_version"].as_str().unwrap_or(""),
+                            "sw_version": d["sw_version"].as_str().unwrap_or(""),
+                            "connections": d["connections"],
+                            "identifiers": d["identifiers"],
+                        })
+                    })
+                    .collect();
+                json!({
+                    "success": true,
+                    "devices": parsed,
+                    "count": parsed.len(),
+                })
+            }
+            Ok(other) => json!({
+                "success": false,
+                "error": format!("unexpected response type: {}", other.to_string().chars().take(200).collect::<String>()),
+            }),
+            Err(e) => json!({
+                "success": false,
+                "error": format!("failed to parse HA response: {e}"),
+            }),
+        },
+        Ok(resp) => {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            json!({
+                "success": false,
+                "error": format!("HA API returned {status}: {}", body.chars().take(300).collect::<String>()),
+            })
+        }
+        Err(e) => json!({
+            "success": false,
+            "error": format!("failed to connect to Home Assistant: {e}"),
+        }),
+    }
+}
+
+/// Get the state of a single Home Assistant entity.
+async fn ha_entity_state(ha_url: &str, token: &str, entity_id: &str, timeout_ms: u64) -> Value {
+    let client = ha_client(token, timeout_ms);
+    let url = format!("{ha_url}/api/states/{entity_id}");
+
+    match client.get(&url).send().await {
+        Ok(resp) if resp.status().is_success() => match resp.json::<Value>().await {
+            Ok(state) => {
+                json!({
+                    "success": true,
+                    "entity_id": entity_id,
+                    "state": state["state"].as_str().unwrap_or(""),
+                    "attributes": state["attributes"],
+                    "last_changed": state["last_changed"].as_str().unwrap_or(""),
+                    "last_updated": state["last_updated"].as_str().unwrap_or(""),
+                })
+            }
+            Err(e) => json!({
+                "success": false,
+                "error": format!("failed to parse entity state: {e}"),
+            }),
+        },
+        Ok(resp) if resp.status().as_u16() == 404 => json!({
+            "success": false,
+            "error": format!("entity '{entity_id}' not found"),
+        }),
+        Ok(resp) => json!({
+            "success": false,
+            "error": format!("HA API returned {}", resp.status().as_u16()),
+        }),
+        Err(e) => json!({
+            "success": false,
+            "error": format!("failed to connect to Home Assistant: {e}"),
+        }),
+    }
+}
+
+/// Call a Home Assistant service.
+async fn ha_call_service(
+    ha_url: &str,
+    token: &str,
+    domain: &str,
+    service: &str,
+    data: &Value,
+    timeout_ms: u64,
+) -> Value {
+    let client = ha_client(token, timeout_ms);
+    let url = format!("{ha_url}/api/services/{domain}/{service}");
+
+    match client.post(&url).json(data).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            let body = resp.json::<Value>().await.unwrap_or(Value::Null);
+            json!({
+                "success": true,
+                "domain": domain,
+                "service": service,
+                "result": body,
+            })
+        }
+        Ok(resp) => {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            json!({
+                "success": false,
+                "error": format!("HA service call returned {status}: {}", body.chars().take(300).collect::<String>()),
+            })
+        }
+        Err(e) => json!({
+            "success": false,
+            "error": format!("failed to call HA service: {e}"),
+        }),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Unified discovery pipeline
+// ---------------------------------------------------------------------------
+
+/// Run the full discovery pipeline and merge results by MAC address.
+///
+/// Execution order:
+/// 1. ARP table (passive, instant)
+/// 2. mDNS sweep (IoT preset)
+/// 3. SSDP sweep
+///
+/// Results are merged on MAC address as the primary key (when available),
+/// falling back to IP address.  Each device candidate aggregates information
+/// from all sources that reported it.
+async fn discover_all(timeout_ms: u64) -> Value {
+    use std::collections::HashMap;
+
+    let per_step_ms = (timeout_ms / 3).max(3_000);
+
+    // Step 1: ARP table (passive — no scanning, just cached entries).
+    let arp = arp_table(per_step_ms).await;
+
+    // Step 2: mDNS sweep with IoT preset.
+    let mdns_types = mdns_preset_service_types("iot").unwrap_or_default();
+    let mut mdns_services = Vec::new();
+    let per_type_ms = (per_step_ms / mdns_types.len().max(1) as u64).max(2_000);
+    for svc_type in &mdns_types {
+        let result = mdns_discover(svc_type, per_type_ms).await;
+        if let Some(services) = result["services"].as_array() {
+            mdns_services.extend(services.clone());
+        }
+    }
+
+    // Step 3: SSDP sweep.
+    let ssdp = ssdp_discover(per_step_ms, false).await;
+
+    // --- Merge all results ---
+    // Use a map keyed by IP (most universally available identifier).
+    let mut candidates: HashMap<String, Value> = HashMap::new();
+
+    // Merge ARP entries.
+    if let Some(entries) = arp["entries"].as_array() {
+        for entry in entries {
+            let ip = entry["ip"].as_str().unwrap_or("").to_string();
+            if ip.is_empty() {
+                continue;
+            }
+            let mac = entry["mac"].as_str().unwrap_or("").to_string();
+            let state = entry["state"].as_str().unwrap_or("");
+            if mac.is_empty() || mac == "00:00:00:00:00:00" || state == "FAILED" {
+                continue;
+            }
+
+            let candidate = candidates.entry(ip.clone()).or_insert_with(|| {
+                json!({
+                    "ip": ip,
+                    "mac": "",
+                    "hostname": "",
+                    "manufacturer": "",
+                    "device_type": "",
+                    "friendly_name": "",
+                    "sources": [],
+                    "services": [],
+                })
+            });
+            candidate["mac"] = Value::String(mac.clone());
+            if let Some(sources) = candidate["sources"].as_array_mut() {
+                sources.push(Value::String("arp".to_string()));
+            }
+
+            // Try a quick OUI lookup from the built-in table.
+            if let Some(prefix) = normalize_oui_prefix(&mac) {
+                if let Some(vendor) = builtin_oui_lookup(&prefix) {
+                    candidate["manufacturer"] = Value::String(vendor.to_string());
+                }
+            }
+        }
+    }
+
+    // Merge mDNS services.
+    for svc in &mdns_services {
+        let ip = svc["address"].as_str().unwrap_or("").to_string();
+        if ip.is_empty() {
+            continue;
+        }
+        let candidate = candidates.entry(ip.clone()).or_insert_with(|| {
+            json!({
+                "ip": ip,
+                "mac": "",
+                "hostname": "",
+                "manufacturer": "",
+                "device_type": "",
+                "friendly_name": "",
+                "sources": [],
+                "services": [],
+            })
+        });
+
+        if let Some(name) = svc["name"].as_str() {
+            if candidate["friendly_name"].as_str().unwrap_or("").is_empty() {
+                candidate["friendly_name"] = Value::String(name.to_string());
+            }
+        }
+        if let Some(hostname) = svc["hostname"].as_str() {
+            if candidate["hostname"].as_str().unwrap_or("").is_empty() {
+                candidate["hostname"] = Value::String(hostname.to_string());
+            }
+        }
+        if let Some(svc_type) = svc["type"].as_str() {
+            // Infer device type from mDNS service type.
+            let device_type = match svc_type {
+                t if t.contains("_hap._tcp") => "homekit_accessory",
+                t if t.contains("_googlecast._tcp") => "chromecast",
+                t if t.contains("_sonos._tcp") => "sonos_speaker",
+                t if t.contains("_airplay._tcp") => "airplay_device",
+                t if t.contains("_raop._tcp") => "airplay_device",
+                t if t.contains("_printer._tcp") || t.contains("_ipp._tcp") => "printer",
+                t if t.contains("_esphomelib._tcp") => "esphome_device",
+                t if t.contains("_mqtt._tcp") => "mqtt_broker",
+                t if t.contains("_http._tcp") => "http_device",
+                _ => "",
+            };
+            if !device_type.is_empty() && candidate["device_type"].as_str().unwrap_or("").is_empty()
+            {
+                candidate["device_type"] = Value::String(device_type.to_string());
+            }
+            if let Some(services) = candidate["services"].as_array_mut() {
+                services.push(json!({
+                    "type": svc_type,
+                    "port": svc["port"],
+                }));
+            }
+        }
+        if let Some(sources) = candidate["sources"].as_array_mut() {
+            if !sources.iter().any(|s| s.as_str() == Some("mdns")) {
+                sources.push(Value::String("mdns".to_string()));
+            }
+        }
+    }
+
+    // Merge SSDP devices.
+    if let Some(devices) = ssdp["devices"].as_array() {
+        for dev in devices {
+            let ip = dev["ip"].as_str().unwrap_or("").to_string();
+            if ip.is_empty() {
+                continue;
+            }
+            let candidate = candidates.entry(ip.clone()).or_insert_with(|| {
+                json!({
+                    "ip": ip,
+                    "mac": "",
+                    "hostname": "",
+                    "manufacturer": "",
+                    "device_type": "",
+                    "friendly_name": "",
+                    "sources": [],
+                    "services": [],
+                })
+            });
+
+            if let Some(name) = dev["friendly_name"].as_str() {
+                if !name.is_empty() {
+                    candidate["friendly_name"] = Value::String(name.to_string());
+                }
+            }
+            if let Some(mfg) = dev["manufacturer"].as_str() {
+                if !mfg.is_empty() && candidate["manufacturer"].as_str().unwrap_or("").is_empty() {
+                    candidate["manufacturer"] = Value::String(mfg.to_string());
+                }
+            }
+            if let Some(dt) = dev["device_type"].as_str() {
+                if !dt.is_empty() && candidate["device_type"].as_str().unwrap_or("").is_empty() {
+                    candidate["device_type"] = Value::String(dt.to_string());
+                }
+            }
+            if let Some(server) = dev["server"].as_str() {
+                if let Some(services) = candidate["services"].as_array_mut() {
+                    services.push(json!({
+                        "type": "ssdp",
+                        "server": server,
+                        "st": dev["st"].as_str().unwrap_or(""),
+                    }));
+                }
+            }
+            if let Some(sources) = candidate["sources"].as_array_mut() {
+                if !sources.iter().any(|s| s.as_str() == Some("ssdp")) {
+                    sources.push(Value::String("ssdp".to_string()));
+                }
+            }
+        }
+    }
+
+    let mut devices: Vec<Value> = candidates.into_values().collect();
+    devices.sort_by(|a, b| {
+        let a_ip = a["ip"].as_str().unwrap_or("");
+        let b_ip = b["ip"].as_str().unwrap_or("");
+        a_ip.cmp(b_ip)
+    });
+
+    json!({
+        "success": true,
+        "devices": devices,
+        "count": devices.len(),
+        "sources_used": ["arp_table", "mdns", "ssdp"],
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Tool trait implementation
 // ---------------------------------------------------------------------------
 
@@ -1251,9 +1883,9 @@ impl Tool for NetDiscoveryTool {
     }
 
     fn description(&self) -> &str {
-        "Discover hosts, services, and network topology. DNS lookups, mDNS/DNS-SD service \
-         discovery, DHCP lease table, active ARP scan, SSDP/UPnP, OUI vendor lookup, \
-         ARP cache, traceroute, and interface listing."
+        "Discover hosts, services, and devices on the local network. DNS lookups, mDNS/DNS-SD, \
+         DHCP leases, active ARP scan, SSDP/UPnP, OUI vendor lookup, Zigbee/Z-Wave coordinator \
+         queries, Home Assistant API integration, and unified discovery pipeline."
     }
 
     fn sandbox_requirements(&self) -> SandboxRequirements {
@@ -1277,9 +1909,12 @@ impl Tool for NetDiscoveryTool {
                         "enum": [
                             "dns_lookup", "mdns_discover", "arp_table", "arp_scan",
                             "dhcp_leases", "ssdp_discover", "oui_lookup",
-                            "traceroute", "interfaces"
+                            "traceroute", "interfaces",
+                            "zigbee_devices", "zwave_nodes",
+                            "ha_devices", "ha_entity_state", "ha_call_service",
+                            "discover_all"
                         ],
-                        "description": "dns_lookup: forward/reverse DNS resolution. mdns_discover: find services via mDNS/DNS-SD (supports IoT presets). arp_table: read cached MAC/IP mappings. arp_scan: actively scan a subnet for all devices via ARP. dhcp_leases: query router DHCP lease table over SSH. ssdp_discover: find UPnP devices via SSDP multicast. oui_lookup: look up MAC address vendor/manufacturer. traceroute: map network hops to a local target. interfaces: list local network interfaces."
+                        "description": "dns_lookup: forward/reverse DNS. mdns_discover: mDNS/DNS-SD services (IoT presets). arp_table: cached MAC/IP mappings. arp_scan: active ARP scan of a subnet. dhcp_leases: query router DHCP via SSH. ssdp_discover: UPnP devices via SSDP. oui_lookup: MAC vendor lookup. traceroute: hops to local target. interfaces: list local NICs. zigbee_devices: query zigbee2mqtt for Zigbee devices. zwave_nodes: query Z-Wave JS UI for Z-Wave nodes. ha_devices: list Home Assistant devices. ha_entity_state: get HA entity state. ha_call_service: call an HA service. discover_all: unified multi-source discovery pipeline."
                     },
                     "name": {
                         "type": "string",
@@ -1326,6 +1961,46 @@ impl Tool for NetDiscoveryTool {
                     "fetch_descriptions": {
                         "type": "boolean",
                         "description": "For ssdp_discover: fetch UPnP device description XML from LOCATION URLs (default: false, adds latency)"
+                    },
+                    "mqtt_host": {
+                        "type": "string",
+                        "description": "MQTT broker host for zigbee_devices (default: env ZIGBEE2MQTT_HOST or 'localhost')"
+                    },
+                    "mqtt_port": {
+                        "type": "integer",
+                        "description": "MQTT broker port for zigbee_devices (default: env ZIGBEE2MQTT_PORT or 1883)"
+                    },
+                    "zwave_host": {
+                        "type": "string",
+                        "description": "Z-Wave JS UI host for zwave_nodes (default: env ZWAVE_JS_HOST or 'localhost')"
+                    },
+                    "zwave_port": {
+                        "type": "integer",
+                        "description": "Z-Wave JS UI port for zwave_nodes (default: env ZWAVE_JS_PORT or 8091)"
+                    },
+                    "ha_url": {
+                        "type": "string",
+                        "description": "Home Assistant URL for ha_* actions (default: env HOME_ASSISTANT_URL, e.g. 'http://192.168.1.100:8123')"
+                    },
+                    "ha_token": {
+                        "type": "string",
+                        "description": "Home Assistant Long-Lived Access Token for ha_* actions (default: env HOME_ASSISTANT_TOKEN)"
+                    },
+                    "entity_id": {
+                        "type": "string",
+                        "description": "Entity ID for ha_entity_state (e.g. 'light.living_room', 'sensor.temperature')"
+                    },
+                    "domain": {
+                        "type": "string",
+                        "description": "Service domain for ha_call_service (e.g. 'light', 'switch', 'climate')"
+                    },
+                    "service": {
+                        "type": "string",
+                        "description": "Service name for ha_call_service (e.g. 'turn_on', 'turn_off', 'set_temperature')"
+                    },
+                    "service_data": {
+                        "type": "object",
+                        "description": "Data payload for ha_call_service (e.g. {\"entity_id\": \"light.living_room\", \"brightness\": 128})"
                     },
                     "timeout_ms": {
                         "type": "integer",
@@ -1507,6 +2182,157 @@ impl Tool for NetDiscoveryTool {
                 let result = interfaces(timeout_ms).await;
                 Ok(json!({
                     "action": "interfaces",
+                    "result": result,
+                }))
+            }
+
+            "zigbee_devices" => {
+                let host = args["mqtt_host"]
+                    .as_str()
+                    .map(|s| s.to_string())
+                    .or_else(|| std::env::var("ZIGBEE2MQTT_HOST").ok())
+                    .unwrap_or_else(|| "localhost".to_string());
+                let port = args["mqtt_port"]
+                    .as_u64()
+                    .map(|p| p as u16)
+                    .or_else(|| {
+                        std::env::var("ZIGBEE2MQTT_PORT")
+                            .ok()
+                            .and_then(|p| p.parse().ok())
+                    })
+                    .unwrap_or(1883);
+
+                let result = zigbee_devices(&host, port, timeout_ms).await;
+                Ok(json!({
+                    "action": "zigbee_devices",
+                    "result": result,
+                }))
+            }
+
+            "zwave_nodes" => {
+                let host = args["zwave_host"]
+                    .as_str()
+                    .map(|s| s.to_string())
+                    .or_else(|| std::env::var("ZWAVE_JS_HOST").ok())
+                    .unwrap_or_else(|| "localhost".to_string());
+                let port = args["zwave_port"]
+                    .as_u64()
+                    .map(|p| p as u16)
+                    .or_else(|| {
+                        std::env::var("ZWAVE_JS_PORT")
+                            .ok()
+                            .and_then(|p| p.parse().ok())
+                    })
+                    .unwrap_or(8091);
+
+                let result = zwave_nodes(&host, port, timeout_ms).await;
+                Ok(json!({
+                    "action": "zwave_nodes",
+                    "result": result,
+                }))
+            }
+
+            "ha_devices" => {
+                let ha_url = args["ha_url"]
+                    .as_str()
+                    .map(|s| s.to_string())
+                    .or_else(|| std::env::var("HOME_ASSISTANT_URL").ok())
+                    .unwrap_or_default();
+                validate_ha_url(&ha_url).map_err(rustykrab_core::Error::ToolExecution)?;
+
+                let token = args["ha_token"]
+                    .as_str()
+                    .map(|s| s.to_string())
+                    .or_else(|| std::env::var("HOME_ASSISTANT_TOKEN").ok())
+                    .ok_or_else(|| {
+                        rustykrab_core::Error::ToolExecution(ToolError::invalid_input(
+                            "ha_token is required (or set HOME_ASSISTANT_TOKEN env var)",
+                        ))
+                    })?;
+
+                let result = ha_list_devices(&ha_url, &token, timeout_ms).await;
+                Ok(json!({
+                    "action": "ha_devices",
+                    "result": result,
+                }))
+            }
+
+            "ha_entity_state" => {
+                let ha_url = args["ha_url"]
+                    .as_str()
+                    .map(|s| s.to_string())
+                    .or_else(|| std::env::var("HOME_ASSISTANT_URL").ok())
+                    .unwrap_or_default();
+                validate_ha_url(&ha_url).map_err(rustykrab_core::Error::ToolExecution)?;
+
+                let token = args["ha_token"]
+                    .as_str()
+                    .map(|s| s.to_string())
+                    .or_else(|| std::env::var("HOME_ASSISTANT_TOKEN").ok())
+                    .ok_or_else(|| {
+                        rustykrab_core::Error::ToolExecution(ToolError::invalid_input(
+                            "ha_token is required (or set HOME_ASSISTANT_TOKEN env var)",
+                        ))
+                    })?;
+
+                let entity_id = args["entity_id"].as_str().ok_or_else(|| {
+                    rustykrab_core::Error::ToolExecution(ToolError::invalid_input(
+                        "entity_id is required for ha_entity_state",
+                    ))
+                })?;
+
+                let result = ha_entity_state(&ha_url, &token, entity_id, timeout_ms).await;
+                Ok(json!({
+                    "action": "ha_entity_state",
+                    "result": result,
+                }))
+            }
+
+            "ha_call_service" => {
+                let ha_url = args["ha_url"]
+                    .as_str()
+                    .map(|s| s.to_string())
+                    .or_else(|| std::env::var("HOME_ASSISTANT_URL").ok())
+                    .unwrap_or_default();
+                validate_ha_url(&ha_url).map_err(rustykrab_core::Error::ToolExecution)?;
+
+                let token = args["ha_token"]
+                    .as_str()
+                    .map(|s| s.to_string())
+                    .or_else(|| std::env::var("HOME_ASSISTANT_TOKEN").ok())
+                    .ok_or_else(|| {
+                        rustykrab_core::Error::ToolExecution(ToolError::invalid_input(
+                            "ha_token is required (or set HOME_ASSISTANT_TOKEN env var)",
+                        ))
+                    })?;
+
+                let domain = args["domain"].as_str().ok_or_else(|| {
+                    rustykrab_core::Error::ToolExecution(ToolError::invalid_input(
+                        "domain is required for ha_call_service (e.g. 'light', 'switch')",
+                    ))
+                })?;
+                let service = args["service"].as_str().ok_or_else(|| {
+                    rustykrab_core::Error::ToolExecution(ToolError::invalid_input(
+                        "service is required for ha_call_service (e.g. 'turn_on', 'turn_off')",
+                    ))
+                })?;
+                let data = args
+                    .get("service_data")
+                    .cloned()
+                    .unwrap_or_else(|| json!({}));
+
+                let result =
+                    ha_call_service(&ha_url, &token, domain, service, &data, timeout_ms).await;
+                Ok(json!({
+                    "action": "ha_call_service",
+                    "result": result,
+                }))
+            }
+
+            "discover_all" => {
+                let result = discover_all(timeout_ms).await;
+                Ok(json!({
+                    "action": "discover_all",
                     "result": result,
                 }))
             }
