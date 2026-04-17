@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.6.2] - 2026-04-17
+
+- refactor(tools): remove tts, image_generate, and pdf tools (#379)
+
 ## [2.6.1] - 2026-04-17
 
 - fix(providers): stop overriding server's num_ctx by default (#380)
