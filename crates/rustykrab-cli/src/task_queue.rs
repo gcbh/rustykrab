@@ -5,8 +5,9 @@ use tokio::sync::{mpsc, Mutex, Semaphore};
 
 use chrono::Utc;
 use rustykrab_agent::AgentEvent;
-use rustykrab_core::types::MessageContent;
+use rustykrab_core::types::{Conversation, MessageContent};
 use rustykrab_gateway::AppState;
+use uuid::Uuid;
 
 /// Where a task originated and how to deliver results.
 #[derive(Debug, Clone)]
@@ -146,16 +147,17 @@ async fn execute_cron_task(
     let started_at = Utc::now();
     tracing::info!(job_id = %job_id, task = %task_prompt, "executing scheduled job");
 
-    // Create a fresh conversation for this job execution.
-    let mut conv = match state.store.conversations().create() {
-        Ok(c) => c,
+    // Load the job so we can resume its persistent conversation and use
+    // last_run_at in the prompt.
+    let job = match store.jobs().get_job(job_id) {
+        Ok(j) => j,
         Err(e) => {
-            tracing::error!(job_id = %job_id, "failed to create conversation for scheduled job: {e}");
+            tracing::error!(job_id = %job_id, "failed to load scheduled job: {e}");
             let finished_at = Utc::now();
             let _ = store.jobs().record_run(
                 job_id,
                 "error",
-                Some(&format!("failed to create conversation: {e}")),
+                Some(&format!("failed to load job: {e}")),
                 started_at,
                 finished_at,
             );
@@ -163,11 +165,23 @@ async fn execute_cron_task(
         }
     };
 
-    // Prefix the task so the agent knows this is a scheduled execution.
-    let prompt = format!(
-        "[Scheduled task] The following task was scheduled by the user and is now due. \
-         Execute it and provide the result concisely.\n\nTask: {task_prompt}"
-    );
+    let mut conv = match resume_or_create_conversation(&job, state, store) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(job_id = %job_id, "failed to resume conversation for scheduled job: {e}");
+            let finished_at = Utc::now();
+            let _ = store.jobs().record_run(
+                job_id,
+                "error",
+                Some(&format!("failed to resume conversation: {e}")),
+                started_at,
+                finished_at,
+            );
+            return;
+        }
+    };
+
+    let prompt = build_scheduled_prompt(task_prompt, job.last_run_at);
 
     // Run the agent.
     let no_op_event = |_event: AgentEvent| {};
@@ -237,8 +251,67 @@ async fn execute_cron_task(
         tracing::error!(job_id = %job_id, "failed to mark scheduled job as executed: {e}");
     }
 
-    // Clean up the ephemeral conversation.
-    if let Err(e) = state.store.conversations().delete(conv.id) {
-        tracing::warn!(job_id = %job_id, "failed to clean up job conversation: {e}");
+    // Conversation is intentionally NOT deleted: the next run of this job
+    // resumes it so the agent sees prior context. Deletion happens when
+    // the job itself is deleted (see CronAdapter::delete_job).
+}
+
+/// Resume this job's persistent conversation, or create one on the first
+/// run. If the stored id points at a conversation that has been deleted
+/// out from under us, silently create a fresh one and re-link.
+fn resume_or_create_conversation(
+    job: &rustykrab_store::ScheduledJob,
+    state: &AppState,
+    store: &rustykrab_store::Store,
+) -> Result<Conversation, rustykrab_core::Error> {
+    if let Some(cid) = &job.conversation_id {
+        if let Ok(uuid) = Uuid::parse_str(cid) {
+            match state.store.conversations().get(uuid) {
+                Ok(c) => return Ok(c),
+                Err(rustykrab_core::Error::NotFound(_)) => {
+                    tracing::warn!(
+                        job_id = %job.id,
+                        stale_conv_id = %cid,
+                        "stored conversation missing; creating replacement"
+                    );
+                }
+                Err(e) => return Err(e),
+            }
+        } else {
+            tracing::warn!(
+                job_id = %job.id,
+                bad_conv_id = %cid,
+                "stored conversation id is malformed; creating replacement"
+            );
+        }
+    }
+
+    let conv = state.store.conversations().create()?;
+    store
+        .jobs()
+        .set_conversation_id(&job.id, &conv.id.to_string())?;
+    Ok(conv)
+}
+
+/// Build the user message prepended to the agent's turn. On the first run
+/// there's no prior context, so we say so; on subsequent runs the prompt
+/// points the agent at the conversation history it already has.
+fn build_scheduled_prompt(
+    task_prompt: &str,
+    last_run_at: Option<chrono::DateTime<chrono::Utc>>,
+) -> String {
+    match last_run_at {
+        Some(last) => format!(
+            "[Scheduled task] Your scheduled task is due again. Earlier runs are in \
+             this conversation — refer to them for any state, filenames, or \
+             decisions you made previously. Last run was at {last}.\n\n\
+             Task: {task_prompt}"
+        ),
+        None => format!(
+            "[Scheduled task] Your scheduled task is due for the first time. This \
+             conversation will persist across runs, so any state you want to reuse \
+             (filenames, conventions, summaries) can simply be written down here.\n\n\
+             Task: {task_prompt}"
+        ),
     }
 }
