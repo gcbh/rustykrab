@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.6.1] - 2026-04-17
+
+- fix(providers): stop overriding server's num_ctx by default (#380)
+
 ## [2.6.0] - 2026-04-17
 
 - feat: hot-reload skills and add skill_delete tool (#378)
