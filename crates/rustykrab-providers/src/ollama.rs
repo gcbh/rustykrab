@@ -45,6 +45,18 @@ fn num_ctx_from_env(default: u32) -> u32 {
 /// caused Ollama to OOM (returning 500).  Can be overridden via `OLLAMA_NUM_CTX`.
 const DEFAULT_NUM_CTX: u32 = 100_000;
 
+/// Rough characters-per-token ratio used for client-side context budgeting.
+/// Real tokenization varies by model (English prose ≈ 4, code ≈ 3, CJK ≈ 1-2);
+/// 4 is a conservative middle ground that errs toward keeping more history.
+const CHARS_PER_TOKEN: usize = 4;
+
+/// Per-message overhead (role tag, framing) the server adds on top of content.
+const PER_MESSAGE_OVERHEAD_TOKENS: u32 = 4;
+
+/// Tokens reserved for tool schemas in the prompt and other framing the
+/// client can't easily measure (chat template, system tool preamble, etc.).
+const SAFETY_OVERHEAD_TOKENS: u32 = 2048;
+
 impl Default for OllamaConfig {
     fn default() -> Self {
         Self {
@@ -133,6 +145,80 @@ impl OllamaProvider {
     /// Get the model name.
     pub fn model(&self) -> &str {
         &self.model
+    }
+
+    /// Get the configured (post-detection) `num_ctx`.
+    pub fn num_ctx(&self) -> u32 {
+        self.config.num_ctx
+    }
+
+    /// Query Ollama's `/api/show` endpoint for the loaded model's native
+    /// context length.  Returns `Ok(None)` if the response shape is
+    /// unfamiliar (e.g. an architecture we don't recognize).  Network and
+    /// HTTP errors are propagated so the caller can decide how to react.
+    pub async fn detect_context_window(&self) -> Result<Option<u32>> {
+        let url = format!("{}/api/show", self.base_url);
+        let resp = self
+            .client
+            .post(&url)
+            .json(&serde_json::json!({ "model": self.model }))
+            .send()
+            .await
+            .map_err(|e| Error::ModelProvider(format!("failed to query Ollama /api/show: {e}")))?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(Self::map_status_error(status, &body));
+        }
+
+        let raw: serde_json::Value = resp.json().await.map_err(|e| {
+            Error::ModelProvider(format!("failed to parse /api/show response: {e}"))
+        })?;
+        Ok(parse_context_length_from_show(&raw))
+    }
+
+    /// Detect the model's native context length and clamp `config.num_ctx`
+    /// to it.  On any failure the configured value is left untouched and a
+    /// warning is logged — startup must not fail just because Ollama is
+    /// momentarily unreachable.
+    pub async fn with_detected_context_window(mut self) -> Self {
+        match self.detect_context_window().await {
+            Ok(Some(detected)) => {
+                if self.config.num_ctx > detected {
+                    tracing::info!(
+                        model = %self.model,
+                        requested_num_ctx = self.config.num_ctx,
+                        detected_num_ctx = detected,
+                        "clamping num_ctx to model's native context length"
+                    );
+                    self.config.num_ctx = detected;
+                } else {
+                    tracing::debug!(
+                        model = %self.model,
+                        num_ctx = self.config.num_ctx,
+                        detected_num_ctx = detected,
+                        "configured num_ctx fits within model's native context length"
+                    );
+                }
+            }
+            Ok(None) => {
+                tracing::warn!(
+                    model = %self.model,
+                    num_ctx = self.config.num_ctx,
+                    "could not detect model context length from /api/show; using configured num_ctx"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    model = %self.model,
+                    num_ctx = self.config.num_ctx,
+                    error = %e,
+                    "failed to query /api/show; using configured num_ctx"
+                );
+            }
+        }
+        self
     }
 
     /// Strip `<think>…</think>` blocks from assistant content so that
@@ -325,6 +411,54 @@ impl OllamaProvider {
         })
     }
 
+    /// Trim oldest non-system messages until the estimated prompt fits the
+    /// budget derived from `num_ctx` minus `num_predict` and a safety margin
+    /// for tool schemas / chat-template framing.  Tool-result messages are
+    /// dropped along with any preceding orphaned tool-call assistant turn so
+    /// the request stays well-formed.
+    fn trim_to_budget(messages: Vec<OllamaMessage>, config: &OllamaConfig) -> Vec<OllamaMessage> {
+        let reserved_output = config.num_predict.max(0) as u32;
+        let total_ctx = config.num_ctx;
+        let budget = total_ctx
+            .saturating_sub(reserved_output)
+            .saturating_sub(SAFETY_OVERHEAD_TOKENS);
+
+        let total: u32 = messages.iter().map(estimate_message_tokens).sum();
+        if total <= budget {
+            return messages;
+        }
+
+        let system_count = messages.iter().take_while(|m| m.role == "system").count();
+        let mut trimmed = messages;
+        let mut current = total;
+        let mut dropped = 0usize;
+
+        while current > budget && trimmed.len() > system_count {
+            let removed = trimmed.remove(system_count);
+            current = current.saturating_sub(estimate_message_tokens(&removed));
+            dropped += 1;
+        }
+
+        // If trimming left a leading orphan tool-result (no preceding
+        // assistant tool_call), drop it so Ollama doesn't reject the request.
+        while trimmed.len() > system_count && trimmed[system_count].role == "tool" {
+            let removed = trimmed.remove(system_count);
+            current = current.saturating_sub(estimate_message_tokens(&removed));
+            dropped += 1;
+        }
+
+        tracing::warn!(
+            num_ctx = total_ctx,
+            budget,
+            estimated_tokens_before = total,
+            estimated_tokens_after = current,
+            messages_dropped = dropped,
+            "trimmed conversation history to fit Ollama context window"
+        );
+
+        trimmed
+    }
+
     /// Map an HTTP status code to a specific error variant (#186).
     fn map_status_error(status: reqwest::StatusCode, body: &str) -> Error {
         match status.as_u16() {
@@ -351,6 +485,8 @@ impl ModelProvider for OllamaProvider {
                 "cannot call Ollama API with an empty message list".into(),
             ));
         }
+
+        let ollama_messages = Self::trim_to_budget(ollama_messages, &self.config);
 
         let ollama_tools = Self::build_tools(tools);
 
@@ -481,6 +617,8 @@ impl ModelProvider for OllamaProvider {
                 "cannot call Ollama API with an empty message list".into(),
             ));
         }
+
+        let ollama_messages = Self::trim_to_budget(ollama_messages, &self.config);
 
         let ollama_tools = Self::build_tools(tools);
 
@@ -780,4 +918,193 @@ struct OllamaStreamMessage {
     content: Option<String>,
     #[serde(default)]
     tool_calls: Option<Vec<OllamaToolCall>>,
+}
+
+/// Approximate the number of prompt tokens an `OllamaMessage` will cost.
+/// Errs on the high side so trimming converges instead of oscillating.
+fn estimate_message_tokens(msg: &OllamaMessage) -> u32 {
+    let mut tokens = PER_MESSAGE_OVERHEAD_TOKENS;
+    if let Some(c) = &msg.content {
+        tokens = tokens.saturating_add(estimate_text_tokens(c));
+    }
+    if let Some(tcs) = &msg.tool_calls {
+        for tc in tcs {
+            tokens = tokens.saturating_add(8);
+            tokens = tokens.saturating_add(estimate_text_tokens(&tc.function.name));
+            tokens =
+                tokens.saturating_add(estimate_text_tokens(&tc.function.arguments.to_string()));
+        }
+    }
+    tokens
+}
+
+fn estimate_text_tokens(s: &str) -> u32 {
+    // chars().count() (not len()) so multibyte characters aren't over-counted.
+    let chars = s.chars().count();
+    chars.div_ceil(CHARS_PER_TOKEN) as u32
+}
+
+/// Pull a context-length value out of a `/api/show` response.  Ollama reports
+/// it under `model_info` keyed by architecture (e.g. `llama.context_length`,
+/// `qwen3.context_length`).  We accept any key suffixed `.context_length`.
+fn parse_context_length_from_show(raw: &serde_json::Value) -> Option<u32> {
+    let info = raw.get("model_info")?.as_object()?;
+
+    let arch = raw
+        .get("model_info")
+        .and_then(|m| m.get("general.architecture"))
+        .and_then(|v| v.as_str());
+
+    if let Some(arch) = arch {
+        let key = format!("{arch}.context_length");
+        if let Some(v) = info.get(&key).and_then(|v| v.as_u64()) {
+            return Some(v.min(u32::MAX as u64) as u32);
+        }
+    }
+
+    // Fallback: any `*.context_length` field.
+    for (k, v) in info {
+        if k.ends_with(".context_length") {
+            if let Some(n) = v.as_u64() {
+                return Some(n.min(u32::MAX as u64) as u32);
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn user_msg(content: &str) -> OllamaMessage {
+        OllamaMessage {
+            role: "user".to_string(),
+            content: Some(content.to_string()),
+            tool_calls: None,
+        }
+    }
+
+    fn system_msg(content: &str) -> OllamaMessage {
+        OllamaMessage {
+            role: "system".to_string(),
+            content: Some(content.to_string()),
+            tool_calls: None,
+        }
+    }
+
+    fn tool_msg(content: &str) -> OllamaMessage {
+        OllamaMessage {
+            role: "tool".to_string(),
+            content: Some(content.to_string()),
+            tool_calls: None,
+        }
+    }
+
+    #[test]
+    fn parses_context_length_from_architecture_keyed_field() {
+        let raw = serde_json::json!({
+            "model_info": {
+                "general.architecture": "llama",
+                "llama.context_length": 32768u64,
+            }
+        });
+        assert_eq!(parse_context_length_from_show(&raw), Some(32768));
+    }
+
+    #[test]
+    fn parses_context_length_from_unknown_architecture_via_suffix_match() {
+        let raw = serde_json::json!({
+            "model_info": {
+                "general.architecture": "novel-arch",
+                "novel-arch.context_length": 16384u64,
+            }
+        });
+        assert_eq!(parse_context_length_from_show(&raw), Some(16384));
+    }
+
+    #[test]
+    fn returns_none_when_no_context_length_present() {
+        let raw = serde_json::json!({
+            "model_info": {
+                "general.architecture": "llama",
+            }
+        });
+        assert_eq!(parse_context_length_from_show(&raw), None);
+    }
+
+    #[test]
+    fn returns_none_when_model_info_missing() {
+        let raw = serde_json::json!({});
+        assert_eq!(parse_context_length_from_show(&raw), None);
+    }
+
+    #[test]
+    fn trim_returns_unchanged_when_under_budget() {
+        let msgs = vec![system_msg("sys"), user_msg("hi")];
+        let original_len = msgs.len();
+        let config = OllamaConfig {
+            num_ctx: 8192,
+            num_predict: 1024,
+            ..OllamaConfig::default()
+        };
+        let trimmed = OllamaProvider::trim_to_budget(msgs, &config);
+        assert_eq!(trimmed.len(), original_len);
+    }
+
+    #[test]
+    fn trim_drops_oldest_messages_first_and_preserves_system() {
+        // Build a conversation where each user message is ~1000 chars (~250 tokens).
+        let big = "x".repeat(4000); // ~1000 tokens
+        let msgs = vec![
+            system_msg("you are an agent"),
+            user_msg(&big),
+            user_msg(&big),
+            user_msg(&big),
+            user_msg(&big),
+            user_msg("latest"),
+        ];
+        let config = OllamaConfig {
+            // budget = 4096 - 256 - SAFETY_OVERHEAD_TOKENS(2048) = 1792 tokens
+            num_ctx: 4096,
+            num_predict: 256,
+            ..OllamaConfig::default()
+        };
+        let trimmed = OllamaProvider::trim_to_budget(msgs, &config);
+        // System message must survive.
+        assert_eq!(trimmed[0].role, "system");
+        // Latest message must survive.
+        assert_eq!(trimmed.last().unwrap().content.as_deref(), Some("latest"));
+        // Some big messages were dropped.
+        assert!(trimmed.len() < 6);
+    }
+
+    #[test]
+    fn trim_drops_orphan_tool_results_after_truncation() {
+        let big = "y".repeat(20_000); // ~5000 tokens
+        let msgs = vec![
+            system_msg("sys"),
+            user_msg(&big),
+            tool_msg("orphaned tool result"),
+            user_msg("latest"),
+        ];
+        let config = OllamaConfig {
+            num_ctx: 4096,
+            num_predict: 256,
+            ..OllamaConfig::default()
+        };
+        let trimmed = OllamaProvider::trim_to_budget(msgs, &config);
+        // Orphan tool result must not become the first non-system message.
+        assert_ne!(trimmed.get(1).map(|m| m.role.as_str()), Some("tool"));
+        // System and latest user message survive.
+        assert_eq!(trimmed[0].role, "system");
+        assert_eq!(trimmed.last().unwrap().content.as_deref(), Some("latest"));
+    }
+
+    #[test]
+    fn estimate_handles_multibyte_characters() {
+        // 4 multibyte chars should count as ceil(4/4) = 1 token, not 12 (their byte length).
+        let tokens = estimate_text_tokens("日本語x");
+        assert_eq!(tokens, 1);
+    }
 }
