@@ -22,6 +22,10 @@ pub struct ScheduledJob {
     pub next_run_at: DateTime<Utc>,
     pub last_run_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
+    /// The conversation this job resumes on each run. `None` until the first
+    /// run creates and persists one; subsequent runs append to the same
+    /// conversation so the agent sees prior context.
+    pub conversation_id: Option<String>,
 }
 
 /// A recorded execution of a scheduled job.
@@ -75,12 +79,13 @@ impl JobStore {
             next_run_at,
             last_run_at: None,
             created_at: now,
+            conversation_id: None,
         };
 
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO scheduled_jobs (id, schedule, task, channel, chat_id, one_shot, enabled, next_run_at, last_run_at, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            "INSERT INTO scheduled_jobs (id, schedule, task, channel, chat_id, one_shot, enabled, next_run_at, last_run_at, created_at, conversation_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 job.id,
                 job.schedule,
@@ -92,6 +97,7 @@ impl JobStore {
                 job.next_run_at.to_rfc3339(),
                 job.last_run_at.map(|t| t.to_rfc3339()),
                 job.created_at.to_rfc3339(),
+                job.conversation_id,
             ],
         )
         .map_err(|e| Error::Storage(e.to_string()))?;
@@ -103,32 +109,32 @@ impl JobStore {
     pub fn list_jobs(&self) -> Result<Vec<ScheduledJob>, Error> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
-            .prepare(
-                "SELECT id, schedule, task, channel, chat_id, one_shot, enabled, next_run_at, last_run_at, created_at
-                 FROM scheduled_jobs ORDER BY next_run_at",
-            )
+            .prepare(&format!(
+                "SELECT {JOB_COLUMNS} FROM scheduled_jobs ORDER BY next_run_at",
+            ))
             .map_err(|e| Error::Storage(e.to_string()))?;
 
         let jobs = stmt
-            .query_map([], |row| {
-                Ok(ScheduledJob {
-                    id: row.get(0)?,
-                    schedule: row.get(1)?,
-                    task: row.get(2)?,
-                    channel: row.get(3)?,
-                    chat_id: row.get(4)?,
-                    one_shot: row.get::<_, i32>(5)? != 0,
-                    enabled: row.get::<_, i32>(6)? != 0,
-                    next_run_at: parse_stored_timestamp(row.get::<_, String>(7)?),
-                    last_run_at: row.get::<_, Option<String>>(8)?.map(parse_stored_timestamp),
-                    created_at: parse_stored_timestamp(row.get::<_, String>(9)?),
-                })
-            })
+            .query_map([], row_to_job)
             .map_err(|e| Error::Storage(e.to_string()))?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| Error::Storage(e.to_string()))?;
 
         Ok(jobs)
+    }
+
+    /// Fetch a single scheduled job by ID. Returns `NotFound` if absent.
+    pub fn get_job(&self, job_id: &str) -> Result<ScheduledJob, Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            &format!("SELECT {JOB_COLUMNS} FROM scheduled_jobs WHERE id = ?1"),
+            params![job_id],
+            row_to_job,
+        )
+        .map_err(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => Error::NotFound(format!("job {job_id}")),
+            other => Error::Storage(other.to_string()),
+        })
     }
 
     /// Delete a scheduled job by ID.
@@ -140,32 +146,29 @@ impl JobStore {
         Ok(rows > 0)
     }
 
+    /// Attach a conversation id to a job. Called on the first run once the
+    /// executor has created (or resumed) the conversation the agent uses.
+    pub fn set_conversation_id(&self, job_id: &str, conversation_id: &str) -> Result<(), Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE scheduled_jobs SET conversation_id = ?1 WHERE id = ?2",
+            params![conversation_id, job_id],
+        )
+        .map_err(|e| Error::Storage(e.to_string()))?;
+        Ok(())
+    }
+
     /// Return all enabled jobs whose `next_run_at` is at or before `now`.
     pub fn get_due_jobs(&self, now: DateTime<Utc>) -> Result<Vec<ScheduledJob>, Error> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
-            .prepare(
-                "SELECT id, schedule, task, channel, chat_id, one_shot, enabled, next_run_at, last_run_at, created_at
-                 FROM scheduled_jobs
-                 WHERE enabled = 1 AND next_run_at <= ?1",
-            )
+            .prepare(&format!(
+                "SELECT {JOB_COLUMNS} FROM scheduled_jobs WHERE enabled = 1 AND next_run_at <= ?1",
+            ))
             .map_err(|e| Error::Storage(e.to_string()))?;
 
         let jobs = stmt
-            .query_map(params![now.to_rfc3339()], |row| {
-                Ok(ScheduledJob {
-                    id: row.get(0)?,
-                    schedule: row.get(1)?,
-                    task: row.get(2)?,
-                    channel: row.get(3)?,
-                    chat_id: row.get(4)?,
-                    one_shot: row.get::<_, i32>(5)? != 0,
-                    enabled: row.get::<_, i32>(6)? != 0,
-                    next_run_at: parse_stored_timestamp(row.get::<_, String>(7)?),
-                    last_run_at: row.get::<_, Option<String>>(8)?.map(parse_stored_timestamp),
-                    created_at: parse_stored_timestamp(row.get::<_, String>(9)?),
-                })
-            })
+            .query_map(params![now.to_rfc3339()], row_to_job)
             .map_err(|e| Error::Storage(e.to_string()))?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| Error::Storage(e.to_string()))?;
@@ -275,6 +278,28 @@ impl JobStore {
 
         Ok(runs)
     }
+}
+
+/// Column list for `SELECT`s against `scheduled_jobs`. Kept in sync with
+/// [`row_to_job`].
+const JOB_COLUMNS: &str = "id, schedule, task, channel, chat_id, one_shot, enabled, \
+     next_run_at, last_run_at, created_at, conversation_id";
+
+/// Decode a row produced by a `SELECT {JOB_COLUMNS}` into a [`ScheduledJob`].
+fn row_to_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<ScheduledJob> {
+    Ok(ScheduledJob {
+        id: row.get(0)?,
+        schedule: row.get(1)?,
+        task: row.get(2)?,
+        channel: row.get(3)?,
+        chat_id: row.get(4)?,
+        one_shot: row.get::<_, i32>(5)? != 0,
+        enabled: row.get::<_, i32>(6)? != 0,
+        next_run_at: parse_stored_timestamp(row.get::<_, String>(7)?),
+        last_run_at: row.get::<_, Option<String>>(8)?.map(parse_stored_timestamp),
+        created_at: parse_stored_timestamp(row.get::<_, String>(9)?),
+        conversation_id: row.get::<_, Option<String>>(10)?,
+    })
 }
 
 /// Parse a schedule string, returning `(is_one_shot, next_run_at)`.
@@ -431,5 +456,64 @@ mod tests {
         let (one_shot, next_run) = parse_schedule("0 9 * * *", now).unwrap();
         assert!(!one_shot);
         assert!(next_run > now);
+    }
+
+    /// Build a [`JobStore`] backed by an in-memory SQLite connection with
+    /// just the schema the tests need. Avoids pulling in a tempdir crate.
+    fn in_memory_jobs() -> JobStore {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE scheduled_jobs (
+                id              TEXT PRIMARY KEY,
+                schedule        TEXT NOT NULL,
+                task            TEXT NOT NULL,
+                channel         TEXT,
+                chat_id         TEXT,
+                one_shot        INTEGER NOT NULL DEFAULT 0,
+                enabled         INTEGER NOT NULL DEFAULT 1,
+                next_run_at     TEXT NOT NULL,
+                last_run_at     TEXT,
+                created_at      TEXT NOT NULL,
+                conversation_id TEXT
+            );
+            CREATE TABLE job_runs (
+                id          TEXT PRIMARY KEY,
+                job_id      TEXT NOT NULL,
+                status      TEXT NOT NULL,
+                output      TEXT,
+                started_at  TEXT NOT NULL,
+                finished_at TEXT NOT NULL
+            );",
+        )
+        .unwrap();
+        JobStore::new(Arc::new(Mutex::new(conn)))
+    }
+
+    #[test]
+    fn conversation_id_round_trip() {
+        let jobs = in_memory_jobs();
+        let job = jobs.create_job("*/5 * * * *", "ping", None, None).unwrap();
+        assert!(
+            job.conversation_id.is_none(),
+            "newly created jobs have no conversation yet"
+        );
+
+        jobs.set_conversation_id(&job.id, "conv-123").unwrap();
+        let reloaded = jobs.get_job(&job.id).unwrap();
+        assert_eq!(reloaded.conversation_id.as_deref(), Some("conv-123"));
+
+        // list_jobs and get_due_jobs also propagate the column.
+        let listed = jobs.list_jobs().unwrap();
+        assert_eq!(listed[0].conversation_id.as_deref(), Some("conv-123"));
+    }
+
+    #[test]
+    fn get_job_missing_returns_not_found() {
+        let jobs = in_memory_jobs();
+        let err = jobs.get_job("nope").unwrap_err();
+        assert!(
+            matches!(err, Error::NotFound(_)),
+            "expected NotFound, got {err:?}"
+        );
     }
 }

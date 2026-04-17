@@ -94,7 +94,35 @@ impl CronBackend for CronAdapter {
     }
 
     async fn delete_job(&self, job_id: &str) -> rustykrab_core::Result<serde_json::Value> {
+        // Grab the conversation id (if any) before the row goes away so we
+        // can reap the associated persistent conversation below. Missing
+        // jobs are fine; delete_job returns `false` without error.
+        let conversation_id = match self.store.jobs().get_job(job_id) {
+            Ok(job) => job.conversation_id,
+            Err(rustykrab_core::Error::NotFound(_)) => None,
+            Err(e) => return Err(e),
+        };
+
         let deleted = self.store.jobs().delete_job(job_id)?;
+
+        if deleted {
+            if let Some(cid) = conversation_id {
+                if let Ok(uuid) = uuid::Uuid::parse_str(&cid) {
+                    // NotFound is fine — the conversation may already be gone.
+                    match self.store.conversations().delete(uuid) {
+                        Ok(()) | Err(rustykrab_core::Error::NotFound(_)) => {}
+                        Err(e) => {
+                            tracing::warn!(
+                                job_id = %job_id,
+                                conv_id = %cid,
+                                "failed to reap conversation for deleted job: {e}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
         Ok(serde_json::json!({ "deleted": deleted, "job_id": job_id }))
     }
 

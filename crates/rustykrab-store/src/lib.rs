@@ -68,16 +68,17 @@ impl Store {
             );
 
             CREATE TABLE IF NOT EXISTS scheduled_jobs (
-                id          TEXT PRIMARY KEY,
-                schedule    TEXT NOT NULL,
-                task        TEXT NOT NULL,
-                channel     TEXT,
-                chat_id     TEXT,
-                one_shot    INTEGER NOT NULL DEFAULT 0,
-                enabled     INTEGER NOT NULL DEFAULT 1,
-                next_run_at TEXT NOT NULL,
-                last_run_at TEXT,
-                created_at  TEXT NOT NULL
+                id              TEXT PRIMARY KEY,
+                schedule        TEXT NOT NULL,
+                task            TEXT NOT NULL,
+                channel         TEXT,
+                chat_id         TEXT,
+                one_shot        INTEGER NOT NULL DEFAULT 0,
+                enabled         INTEGER NOT NULL DEFAULT 1,
+                next_run_at     TEXT NOT NULL,
+                last_run_at     TEXT,
+                created_at      TEXT NOT NULL,
+                conversation_id TEXT
             );
 
             CREATE INDEX IF NOT EXISTS idx_scheduled_jobs_due
@@ -106,6 +107,26 @@ impl Store {
             ",
         )
         .map_err(|e| Error::Storage(e.to_string()))?;
+
+        // Additive migration for pre-existing databases. PRAGMA table_info
+        // lists current columns; only ALTER if conversation_id is missing.
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(scheduled_jobs)")
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        let existing: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|e| Error::Storage(e.to_string()))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        drop(stmt);
+        if !existing.iter().any(|c| c == "conversation_id") {
+            conn.execute(
+                "ALTER TABLE scheduled_jobs ADD COLUMN conversation_id TEXT",
+                [],
+            )
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        }
+
         Ok(())
     }
 
