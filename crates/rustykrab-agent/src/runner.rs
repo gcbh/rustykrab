@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::Instant;
 
 use chrono::Utc;
@@ -39,6 +40,25 @@ const EMPTY_RESPONSE_RETRY_LIMIT: usize = 1;
 /// Maximum retries for a planning-only response (model described intent
 /// without using tools).
 const PLANNING_ONLY_RETRY_LIMIT: usize = 2;
+
+/// Default upper bound on the effective context window used when computing
+/// the compaction threshold. Keeps compaction aggressive even when the
+/// backing model advertises a much larger window (e.g. a 128k-ctx Ollama
+/// deployment whose GPU can't actually evaluate that much in reasonable
+/// time). Override with the `RUSTYKRAB_COMPACTION_CONTEXT_CEILING` env var.
+const DEFAULT_COMPACTION_CONTEXT_CEILING: usize = 65_536;
+
+/// Return the compaction context ceiling, reading the env var once.
+fn compaction_context_ceiling() -> usize {
+    static CEILING: OnceLock<usize> = OnceLock::new();
+    *CEILING.get_or_init(|| {
+        std::env::var("RUSTYKRAB_COMPACTION_CONTEXT_CEILING")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(DEFAULT_COMPACTION_CONTEXT_CEILING)
+    })
+}
 
 /// Classification of a model response that didn't include tool calls.
 enum ResponseClass {
@@ -1014,11 +1034,14 @@ impl AgentRunner {
     /// reported limit (Ollama's detected `num_ctx`, Anthropic's env-var
     /// override or built-in default) so downstream budgets derive from a
     /// single source of truth. Falls back to `config.max_context_tokens`
-    /// when the provider doesn't know.
+    /// when the provider doesn't know. Capped by the compaction ceiling
+    /// so runaway local-model context windows still trigger compaction
+    /// at a sane size.
     fn effective_context_limit(&self) -> usize {
         self.provider
             .context_limit()
             .unwrap_or(self.config.max_context_tokens)
+            .min(compaction_context_ceiling())
     }
 
     /// Returns true if the conversation has crossed the compaction threshold.
