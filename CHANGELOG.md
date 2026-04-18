@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.6.5] - 2026-04-18
+
+- fix(memory): default retain() to Working lifecycle stage (#383)
+
 ## [2.6.4] - 2026-04-18
 
 - feat(memory): auto-persist every conversation turn to working memory (#382)
