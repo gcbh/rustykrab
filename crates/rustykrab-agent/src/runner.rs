@@ -60,6 +60,16 @@ fn compaction_context_ceiling() -> usize {
     })
 }
 
+/// Tokens reserved for the summarizer's response + prompt framing when
+/// deciding whether a single-shot summarization call will fit. Subtracted
+/// from `effective_context_limit()` to derive the input budget.
+const SUMMARIZER_RESPONSE_RESERVE_TOKENS: usize = 4_096;
+
+/// Maximum recursion depth for chunked summarization. Guards against runaway
+/// loops in the (unlikely) case a model returns summaries that aren't
+/// materially smaller than their inputs.
+const MAX_RECURSIVE_SUMMARIZATION_DEPTH: usize = 5;
+
 /// Classification of a model response that didn't include tool calls.
 enum ResponseClass {
     /// Substantive text — the model produced a real answer.
@@ -1091,12 +1101,171 @@ impl AgentRunner {
         estimated >= threshold
     }
 
+    /// Render a single message as plain text for inclusion in a summarizer
+    /// prompt. Used by the recursive/chunked compaction path.
+    fn render_message_for_summary(msg: &Message) -> String {
+        let role = match msg.role {
+            Role::System => "system",
+            Role::User => "user",
+            Role::Assistant => "assistant",
+            Role::Tool => "tool",
+        };
+        let body = match &msg.content {
+            MessageContent::Text(t) => t.clone(),
+            MessageContent::ToolCall(tc) => format!("tool_call {}: {}", tc.name, tc.arguments),
+            MessageContent::ToolResult(tr) => {
+                let marker = if tr.is_error { " (error)" } else { "" };
+                format!("tool_result{} {}: {}", marker, tr.call_id, tr.output)
+            }
+            MessageContent::MultiToolCall(tcs) => {
+                let names: Vec<&str> = tcs.iter().map(|c| c.name.as_str()).collect();
+                format!("tool_calls: {}", names.join(", "))
+            }
+        };
+        format!("[{role}] {body}")
+    }
+
+    /// Estimate tokens for a plain string using the same ~3.5 chars/token
+    /// heuristic as `estimate_message_tokens`.
+    fn estimate_text_tokens(text: &str) -> usize {
+        (text.len() as f64 / 3.5).ceil() as usize
+    }
+
+    /// Pack text fragments into chunks whose token estimates each fit the
+    /// budget. Preserves fragment order. A single fragment larger than the
+    /// budget becomes its own chunk (the summarizer will truncate or the
+    /// provider will error — unavoidable at this layer).
+    fn pack_into_chunks(inputs: &[String], budget_tokens: usize) -> Vec<String> {
+        let mut chunks = Vec::new();
+        let mut current = String::new();
+        let mut current_tokens = 0usize;
+        for text in inputs {
+            let t = Self::estimate_text_tokens(text);
+            if current_tokens != 0 && current_tokens + t > budget_tokens {
+                chunks.push(std::mem::take(&mut current));
+                current_tokens = 0;
+            }
+            if !current.is_empty() {
+                current.push_str("\n\n");
+                current_tokens += 1;
+            }
+            current.push_str(text);
+            current_tokens += t;
+        }
+        if !current.is_empty() {
+            chunks.push(current);
+        }
+        chunks
+    }
+
+    /// Single summarizer call over an arbitrary text input. Uses a
+    /// compaction-specific system prompt — it does *not* reuse the agent's
+    /// own system prompt, so the summarizer can focus on compression
+    /// without the agent's tool-using persona.
+    async fn summarize_text_once(&self, input: &str, partial: bool) -> Result<String> {
+        let scope = if partial {
+            "a portion of a longer conversation (one of several chunks)"
+        } else {
+            "a conversation between a user and an agent"
+        };
+        let system_prompt = format!(
+            "You are compressing {scope} so a downstream agent can continue the work \
+             without re-reading it. Preserve: concrete intermediate results (values, file \
+             paths, IDs, URLs), decisions, constraints and preferences, named entities, \
+             open questions, and the agent's current plan. Drop: pleasantries, superseded \
+             reasoning, and anything already resolved by later turns. Output terse bullet \
+             points only — no preamble, no meta-commentary. Keep the summary under 1000 \
+             words."
+        );
+        let messages = vec![
+            Message {
+                id: Uuid::new_v4(),
+                role: Role::System,
+                content: MessageContent::Text(system_prompt),
+                created_at: Utc::now(),
+            },
+            Message {
+                id: Uuid::new_v4(),
+                role: Role::User,
+                content: MessageContent::Text(input.to_string()),
+                created_at: Utc::now(),
+            },
+        ];
+        let response = self.provider.chat(&messages, &[]).await?;
+        Ok(response.message.content.as_text().unwrap_or("").to_string())
+    }
+
+    /// Summarize a set of text fragments, recursively reducing when the
+    /// combined input exceeds `input_budget_tokens`. Each pass packs
+    /// fragments into budget-sized chunks, summarizes each chunk, then
+    /// recurses on the intermediate summaries until a single summary
+    /// remains.
+    ///
+    /// Terminates because each recursion strictly reduces total token count
+    /// (a summary is shorter than its input) — capped at
+    /// `MAX_RECURSIVE_SUMMARIZATION_DEPTH` as a safety net.
+    async fn summarize_text_recursively(
+        &self,
+        inputs: Vec<String>,
+        input_budget_tokens: usize,
+        depth: usize,
+    ) -> Result<String> {
+        if inputs.is_empty() {
+            return Ok(String::new());
+        }
+
+        let total_tokens: usize = inputs.iter().map(|s| Self::estimate_text_tokens(s)).sum();
+
+        // Fast path: the whole batch fits in one summarizer call.
+        if total_tokens <= input_budget_tokens {
+            let joined = inputs.join("\n\n");
+            let partial = depth > 0;
+            return self.summarize_text_once(&joined, partial).await;
+        }
+
+        if depth >= MAX_RECURSIVE_SUMMARIZATION_DEPTH {
+            tracing::warn!(
+                depth,
+                total_tokens,
+                input_budget_tokens,
+                "recursive compaction hit depth limit; concatenating intermediates"
+            );
+            return Ok(inputs.join("\n\n"));
+        }
+
+        let chunks = Self::pack_into_chunks(&inputs, input_budget_tokens);
+        tracing::info!(
+            depth,
+            chunk_count = chunks.len(),
+            total_tokens,
+            input_budget_tokens,
+            "recursive compaction: reducing"
+        );
+
+        let mut intermediates = Vec::with_capacity(chunks.len());
+        for chunk in chunks {
+            intermediates.push(self.summarize_text_once(&chunk, true).await?);
+        }
+
+        if intermediates.len() == 1 {
+            return Ok(intermediates.pop().unwrap());
+        }
+
+        Box::pin(self.summarize_text_recursively(intermediates, input_budget_tokens, depth + 1))
+            .await
+    }
+
     /// Ask the LLM to summarize the conversation so far, then replace the
     /// history with [system messages, summary, continuation prompt].
     ///
     /// Follows the RLM paper's compaction strategy: the summary preserves
     /// concrete intermediate results and the model's current plan so it can
     /// pick up where it left off without repeating completed work.
+    ///
+    /// When the full history + compaction prompt already exceeds the
+    /// provider's effective input budget, falls back to chunked/recursive
+    /// summarization so compaction still succeeds on conversations that
+    /// have grown past a single summarizer call's capacity.
     async fn compact_history(&self, conv: &mut Conversation) -> Result<()> {
         let before_len = conv.messages.len();
         let before_tokens = Self::estimate_conversation_tokens(&conv.messages);
@@ -1107,30 +1276,54 @@ impl AgentRunner {
             "compacting conversation history"
         );
 
-        // Build a compaction prompt and ask the model to summarize.
-        let compaction_prompt = Message {
-            id: Uuid::new_v4(),
-            role: Role::User,
-            content: MessageContent::Text(
-                "Your conversation history is getting long and needs to be compressed. \
-                 Summarize your progress so far in a concise message. Include:\n\
-                 1. What you have already completed (concrete results, values, file paths, etc.)\n\
-                 2. What remains to be done\n\
-                 3. Your current plan / next step\n\n\
-                 Be specific — include variable names, numbers, tool outputs, and any \
-                 intermediate results needed to continue without repeating work."
-                    .to_string(),
-            ),
-            created_at: Utc::now(),
+        let input_budget = self
+            .effective_context_limit()
+            .saturating_sub(SUMMARIZER_RESPONSE_RESERVE_TOKENS);
+
+        // Fast/original path: full history + compaction prompt fits in one
+        // model call. Preserves the existing first-person summarization
+        // semantics (the model sees its own history and is asked to
+        // summarize its progress).
+        let summary = if before_tokens <= input_budget {
+            let compaction_prompt = Message {
+                id: Uuid::new_v4(),
+                role: Role::User,
+                content: MessageContent::Text(
+                    "Your conversation history is getting long and needs to be compressed. \
+                     Summarize your progress so far in a concise message. Include:\n\
+                     1. What you have already completed (concrete results, values, file paths, etc.)\n\
+                     2. What remains to be done\n\
+                     3. Your current plan / next step\n\n\
+                     Be specific — include variable names, numbers, tool outputs, and any \
+                     intermediate results needed to continue without repeating work."
+                        .to_string(),
+                ),
+                created_at: Utc::now(),
+            };
+
+            let mut compaction_messages = conv.messages.clone();
+            compaction_messages.push(compaction_prompt);
+
+            let response = self.provider.chat(&compaction_messages, &[]).await?;
+            response.message.content.as_text().unwrap_or("").to_string()
+        } else {
+            // Recursive path: the history alone is already larger than what
+            // the provider will accept in one call. Render messages as text,
+            // chunk them within the budget, summarize each chunk, and reduce
+            // bottom-up to a single summary.
+            tracing::info!(
+                before_tokens,
+                input_budget,
+                "compaction: history exceeds single-call budget; using recursive path"
+            );
+            let rendered: Vec<String> = conv
+                .messages
+                .iter()
+                .map(Self::render_message_for_summary)
+                .collect();
+            self.summarize_text_recursively(rendered, input_budget, 0)
+                .await?
         };
-
-        // Send the full history + compaction prompt so the model can see
-        // everything it needs to summarize.
-        let mut compaction_messages = conv.messages.clone();
-        compaction_messages.push(compaction_prompt);
-
-        let response = self.provider.chat(&compaction_messages, &[]).await?;
-        let summary = response.message.content.as_text().unwrap_or("").to_string();
 
         if summary.is_empty() {
             tracing::warn!("compaction produced empty summary, skipping");
@@ -1474,4 +1667,187 @@ fn enforce_sandbox_policy(
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod compaction_tests {
+    use super::*;
+
+    use async_trait::async_trait;
+    use rustykrab_core::model::{ModelResponse, StopReason, Usage};
+    use rustykrab_core::types::ToolSchema;
+    use std::sync::Mutex;
+
+    use crate::sandbox::NoSandbox;
+
+    /// Mock provider that records chat-call count + prompt sizes and returns
+    /// a canned summary for each call.
+    struct CountingProvider {
+        call_count: Mutex<usize>,
+        last_input_chars: Mutex<Vec<usize>>,
+        ctx_limit: Option<usize>,
+    }
+
+    impl CountingProvider {
+        fn new(ctx_limit: Option<usize>) -> Self {
+            Self {
+                call_count: Mutex::new(0),
+                last_input_chars: Mutex::new(Vec::new()),
+                ctx_limit,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for CountingProvider {
+        fn name(&self) -> &str {
+            "counting-mock"
+        }
+        fn context_limit(&self) -> Option<usize> {
+            self.ctx_limit
+        }
+        async fn chat(&self, messages: &[Message], _tools: &[ToolSchema]) -> Result<ModelResponse> {
+            let total_chars: usize = messages
+                .iter()
+                .map(|m| match &m.content {
+                    MessageContent::Text(t) => t.len(),
+                    _ => 0,
+                })
+                .sum();
+            *self.call_count.lock().unwrap() += 1;
+            self.last_input_chars.lock().unwrap().push(total_chars);
+            // Return a short summary regardless of input so recursive reduce
+            // monotonically shrinks token count.
+            Ok(ModelResponse {
+                message: Message {
+                    id: Uuid::new_v4(),
+                    role: Role::Assistant,
+                    content: MessageContent::Text("- summarized".to_string()),
+                    created_at: Utc::now(),
+                },
+                usage: Usage::default(),
+                stop_reason: StopReason::EndTurn,
+                text: None,
+            })
+        }
+    }
+
+    fn build_runner(provider: Arc<CountingProvider>) -> AgentRunner {
+        AgentRunner::new(provider, Vec::new(), Arc::new(NoSandbox))
+    }
+
+    #[test]
+    fn pack_into_chunks_respects_budget() {
+        // Three ~1000-char fragments (≈286 tokens each) with a 600-token
+        // budget should land two per chunk, giving two chunks total.
+        let big = "x".repeat(1000);
+        let inputs = vec![big.clone(), big.clone(), big];
+        let chunks = AgentRunner::pack_into_chunks(&inputs, 600);
+        assert!(
+            chunks.len() >= 2,
+            "expected multi-chunk packing, got {}",
+            chunks.len()
+        );
+        // No chunk should massively exceed the budget.
+        for chunk in &chunks {
+            let tokens = AgentRunner::estimate_text_tokens(chunk);
+            assert!(tokens <= 700, "chunk exceeds budget+slack: {tokens} tokens");
+        }
+    }
+
+    #[tokio::test]
+    async fn recursive_summarization_chunks_oversized_input() {
+        // Fragments that together far exceed a small input budget should
+        // force at least two summarizer calls (one per chunk).
+        let provider = Arc::new(CountingProvider::new(None));
+        let runner = build_runner(Arc::clone(&provider));
+        let big = "x".repeat(4_000);
+        let inputs = vec![big.clone(), big.clone(), big];
+        let budget_tokens = 800;
+        let summary = runner
+            .summarize_text_recursively(inputs, budget_tokens, 0)
+            .await
+            .expect("summarization should succeed");
+        assert!(!summary.is_empty());
+        let calls = *provider.call_count.lock().unwrap();
+        assert!(
+            calls >= 2,
+            "recursive path should invoke provider multiple times, got {calls}"
+        );
+    }
+
+    #[tokio::test]
+    async fn recursive_summarization_fast_path_single_call() {
+        // Inputs that fit comfortably within the budget should produce
+        // exactly one provider call.
+        let provider = Arc::new(CountingProvider::new(None));
+        let runner = build_runner(Arc::clone(&provider));
+        let small = "hello world".to_string();
+        let summary = runner
+            .summarize_text_recursively(vec![small], 10_000, 0)
+            .await
+            .expect("summarization should succeed");
+        assert!(!summary.is_empty());
+        let calls = *provider.call_count.lock().unwrap();
+        assert_eq!(calls, 1, "fast path should issue one call, got {calls}");
+    }
+
+    #[tokio::test]
+    async fn compact_history_uses_recursive_path_when_oversized() {
+        // Tight context limit forces the recursive path: the raw history
+        // alone exceeds the single-call input budget.
+        let provider = Arc::new(CountingProvider::new(Some(8_000)));
+        let runner = build_runner(Arc::clone(&provider));
+
+        // Build a conversation that comfortably exceeds the 8k context.
+        // A 3000-char text is ~857 tokens; eight of them is ~6800+ tokens,
+        // above the ~3904-token input budget (8000 - 4096 reserve).
+        let mut messages = vec![Message {
+            id: Uuid::new_v4(),
+            role: Role::System,
+            content: MessageContent::Text("agent identity".into()),
+            created_at: Utc::now(),
+        }];
+        for i in 0..8 {
+            messages.push(Message {
+                id: Uuid::new_v4(),
+                role: if i % 2 == 0 {
+                    Role::User
+                } else {
+                    Role::Assistant
+                },
+                content: MessageContent::Text("x".repeat(3_000)),
+                created_at: Utc::now(),
+            });
+        }
+        let mut conv = Conversation {
+            id: Uuid::new_v4(),
+            messages,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            summary: None,
+            detected_profile: None,
+            channel_source: None,
+            channel_id: None,
+            channel_thread_id: None,
+        };
+
+        runner
+            .compact_history(&mut conv)
+            .await
+            .expect("compaction should succeed");
+
+        // Compacted history should be: all leading system msgs + first user
+        // msg + summary + continuation prompt = 4 messages in this setup.
+        assert_eq!(
+            conv.messages.len(),
+            4,
+            "expected compacted layout, got {} messages",
+            conv.messages.len()
+        );
+        assert!(conv.summary.is_some(), "summary should be set");
+        // Recursive path should have issued more than one provider call.
+        let calls = *provider.call_count.lock().unwrap();
+        assert!(calls >= 2, "recursive path expected, got {calls} call(s)");
+    }
 }
