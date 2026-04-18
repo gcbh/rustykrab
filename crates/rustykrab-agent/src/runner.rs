@@ -48,6 +48,13 @@ const PLANNING_ONLY_RETRY_LIMIT: usize = 2;
 /// time). Override with the `RUSTYKRAB_COMPACTION_CONTEXT_CEILING` env var.
 const DEFAULT_COMPACTION_CONTEXT_CEILING: usize = 65_536;
 
+/// Fraction of the effective context window that any single compaction call
+/// may consume. Reserves the remainder for leading system messages, the
+/// original user turn, the compaction prompt, and the model's summary
+/// response. Halving keeps each call well under the provider HTTP timeout
+/// even when the conversation has already blown past the threshold.
+const COMPACTION_CHUNK_RATIO: f64 = 0.5;
+
 /// Return the compaction context ceiling, reading the env var once.
 fn compaction_context_ceiling() -> usize {
     static CEILING: OnceLock<usize> = OnceLock::new();
@@ -1091,12 +1098,68 @@ impl AgentRunner {
         estimated >= threshold
     }
 
+    /// Returns true if a chunk break placed between `messages[i-1]` and
+    /// `messages[i]` would leave either side with an orphaned tool_call or
+    /// tool_result. Providers validate tool-call/result pairing on the
+    /// wire, so compaction must respect it when splitting history.
+    fn is_safe_chunk_boundary(messages: &[Message], i: usize) -> bool {
+        if i == 0 || i >= messages.len() {
+            return false;
+        }
+        if matches!(
+            messages[i - 1].content,
+            MessageContent::ToolCall(_) | MessageContent::MultiToolCall(_)
+        ) {
+            return false;
+        }
+        if matches!(messages[i].content, MessageContent::ToolResult(_)) {
+            return false;
+        }
+        true
+    }
+
+    /// Split `messages` into contiguous (start, end_exclusive) ranges whose
+    /// estimated token count each stays at or below `budget`, except when a
+    /// single message exceeds `budget` on its own (it becomes its own chunk).
+    /// Breaks are only placed at positions where `is_safe_chunk_boundary`
+    /// returns true, so tool_call/tool_result pairs stay together.
+    fn chunk_for_compaction(messages: &[Message], budget: usize) -> Vec<(usize, usize)> {
+        let mut chunks = Vec::new();
+        if messages.is_empty() {
+            return chunks;
+        }
+        let budget = budget.max(1);
+        let mut start = 0usize;
+        let mut cur_tokens = 0usize;
+        for i in 0..messages.len() {
+            let msg_tokens = Self::estimate_message_tokens(&messages[i]);
+            if i > start
+                && cur_tokens + msg_tokens > budget
+                && Self::is_safe_chunk_boundary(messages, i)
+            {
+                chunks.push((start, i));
+                start = i;
+                cur_tokens = 0;
+            }
+            cur_tokens += msg_tokens;
+        }
+        chunks.push((start, messages.len()));
+        chunks
+    }
+
     /// Ask the LLM to summarize the conversation so far, then replace the
-    /// history with [system messages, summary, continuation prompt].
+    /// history with [system messages, first user message, summary,
+    /// continuation prompt].
     ///
     /// Follows the RLM paper's compaction strategy: the summary preserves
     /// concrete intermediate results and the model's current plan so it can
     /// pick up where it left off without repeating completed work.
+    ///
+    /// For long histories the "middle" (everything after the first user
+    /// message) is split into token-bounded chunks and summarized one call
+    /// at a time, then the partial summaries are combined. This keeps every
+    /// provider call well under the HTTP timeout even when the conversation
+    /// has grown very large before compaction fires.
     async fn compact_history(&self, conv: &mut Conversation) -> Result<()> {
         let before_len = conv.messages.len();
         let before_tokens = Self::estimate_conversation_tokens(&conv.messages);
@@ -1107,35 +1170,92 @@ impl AgentRunner {
             "compacting conversation history"
         );
 
-        // Build a compaction prompt and ask the model to summarize.
-        let compaction_prompt = Message {
-            id: Uuid::new_v4(),
-            role: Role::User,
-            content: MessageContent::Text(
-                "Your conversation history is getting long and needs to be compressed. \
-                 Summarize your progress so far in a concise message. Include:\n\
-                 1. What you have already completed (concrete results, values, file paths, etc.)\n\
-                 2. What remains to be done\n\
-                 3. Your current plan / next step\n\n\
-                 Be specific — include variable names, numbers, tool outputs, and any \
-                 intermediate results needed to continue without repeating work."
-                    .to_string(),
-            ),
-            created_at: Utc::now(),
+        // Preserve leading system messages and the first user message as
+        // framing; everything after the first user turn is the "middle"
+        // we need to summarize.
+        let leading_system: Vec<Message> = conv
+            .messages
+            .iter()
+            .take_while(|m| m.role == Role::System)
+            .cloned()
+            .collect();
+        let first_user_idx = conv.messages.iter().position(|m| m.role == Role::User);
+        let Some(first_user_idx) = first_user_idx else {
+            tracing::warn!("compaction triggered before any user turn, skipping");
+            return Ok(());
         };
+        let first_user = conv.messages[first_user_idx].clone();
+        let middle: Vec<Message> = conv.messages[first_user_idx + 1..].to_vec();
 
-        // Send the full history + compaction prompt so the model can see
-        // everything it needs to summarize.
-        let mut compaction_messages = conv.messages.clone();
-        compaction_messages.push(compaction_prompt);
-
-        let response = self.provider.chat(&compaction_messages, &[]).await?;
-        let summary = response.message.content.as_text().unwrap_or("").to_string();
-
-        if summary.is_empty() {
-            tracing::warn!("compaction produced empty summary, skipping");
+        if middle.is_empty() {
+            tracing::warn!("compaction triggered with no messages after first user turn");
             return Ok(());
         }
+
+        let chunk_budget =
+            ((self.effective_context_limit() as f64) * COMPACTION_CHUNK_RATIO) as usize;
+        let chunks = Self::chunk_for_compaction(&middle, chunk_budget);
+
+        tracing::info!(
+            chunk_count = chunks.len(),
+            chunk_budget,
+            "splitting compaction into chunks"
+        );
+
+        let compaction_prompt_text =
+            "Your conversation history is getting long and needs to be compressed. \
+             Summarize your progress so far in a concise message. Include:\n\
+             1. What you have already completed (concrete results, values, file paths, etc.)\n\
+             2. What remains to be done\n\
+             3. Your current plan / next step\n\n\
+             Be specific — include variable names, numbers, tool outputs, and any \
+             intermediate results needed to continue without repeating work.";
+
+        let mut partial_summaries: Vec<String> = Vec::with_capacity(chunks.len());
+        for (idx, (s, e)) in chunks.iter().enumerate() {
+            let mut call_messages: Vec<Message> =
+                Vec::with_capacity(leading_system.len() + (e - s) + 2);
+            call_messages.extend(leading_system.iter().cloned());
+            call_messages.push(first_user.clone());
+            call_messages.extend(middle[*s..*e].iter().cloned());
+            call_messages.push(Message {
+                id: Uuid::new_v4(),
+                role: Role::User,
+                content: MessageContent::Text(compaction_prompt_text.to_string()),
+                created_at: Utc::now(),
+            });
+
+            let response = self.provider.chat(&call_messages, &[]).await?;
+            let summary = response
+                .message
+                .content
+                .as_text()
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if summary.is_empty() {
+                tracing::warn!(chunk = idx, "compaction chunk produced empty summary");
+                continue;
+            }
+            partial_summaries.push(summary);
+        }
+
+        if partial_summaries.is_empty() {
+            tracing::warn!("compaction produced no usable summaries, skipping replacement");
+            return Ok(());
+        }
+
+        let total_parts = partial_summaries.len();
+        let combined_summary = if total_parts == 1 {
+            partial_summaries.into_iter().next().unwrap()
+        } else {
+            partial_summaries
+                .iter()
+                .enumerate()
+                .map(|(i, s)| format!("Part {}/{}:\n{}", i + 1, total_parts, s))
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        };
 
         // Synthesize the two new messages compaction produces. They need
         // to flow through on_message so memory picks them up — even though
@@ -1144,7 +1264,7 @@ impl AgentRunner {
         let summary_msg = Message {
             id: Uuid::new_v4(),
             role: Role::Assistant,
-            content: MessageContent::Text(summary.clone()),
+            content: MessageContent::Text(combined_summary.clone()),
             created_at: Utc::now(),
         };
         let continuation_msg = Message {
@@ -1157,29 +1277,14 @@ impl AgentRunner {
             created_at: Utc::now(),
         };
 
-        // Preserve system messages (they contain the agent's identity and
-        // instructions) and the first user message (the original task).
-        let mut new_messages: Vec<Message> = Vec::new();
-
-        // Keep all leading system messages.
-        for msg in &conv.messages {
-            if msg.role == Role::System {
-                new_messages.push(msg.clone());
-            } else {
-                break;
-            }
-        }
-
-        // Keep the first user message (the original request).
-        if let Some(first_user) = conv.messages.iter().find(|m| m.role == Role::User) {
-            new_messages.push(first_user.clone());
-        }
-
+        let mut new_messages: Vec<Message> = Vec::with_capacity(leading_system.len() + 3);
+        new_messages.extend(leading_system.into_iter());
+        new_messages.push(first_user);
         new_messages.push(summary_msg.clone());
         new_messages.push(continuation_msg.clone());
 
         conv.messages = new_messages;
-        conv.summary = Some(summary);
+        conv.summary = Some(combined_summary);
         conv.updated_at = Utc::now();
 
         // Fire on_message only for the newly synthesized turns. The preserved
@@ -1198,6 +1303,7 @@ impl AgentRunner {
             after_messages = conv.messages.len(),
             before_tokens,
             after_tokens,
+            chunk_count = total_parts,
             "compaction complete"
         );
 
@@ -1474,4 +1580,179 @@ fn enforce_sandbox_policy(
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod compaction_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn text_msg(role: Role, body: &str) -> Message {
+        Message {
+            id: Uuid::new_v4(),
+            role,
+            content: MessageContent::Text(body.to_string()),
+            created_at: Utc::now(),
+        }
+    }
+
+    fn tool_call_msg(name: &str, call_id: &str) -> Message {
+        Message {
+            id: Uuid::new_v4(),
+            role: Role::Assistant,
+            content: MessageContent::ToolCall(ToolCall {
+                id: call_id.to_string(),
+                name: name.to_string(),
+                arguments: json!({}),
+            }),
+            created_at: Utc::now(),
+        }
+    }
+
+    fn tool_result_msg(call_id: &str, output: &str) -> Message {
+        Message {
+            id: Uuid::new_v4(),
+            role: Role::Tool,
+            content: MessageContent::ToolResult(ToolResult {
+                call_id: call_id.to_string(),
+                output: json!({ "output": output }),
+                is_error: false,
+            }),
+            created_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn empty_history_produces_no_chunks() {
+        let chunks = AgentRunner::chunk_for_compaction(&[], 1000);
+        assert!(chunks.is_empty());
+    }
+
+    #[test]
+    fn small_history_fits_in_one_chunk() {
+        let msgs = vec![
+            text_msg(Role::Assistant, "hello"),
+            text_msg(Role::User, "world"),
+        ];
+        let chunks = AgentRunner::chunk_for_compaction(&msgs, 10_000);
+        assert_eq!(chunks, vec![(0, 2)]);
+    }
+
+    #[test]
+    fn large_history_splits_into_multiple_chunks() {
+        // Each message is ~300 chars → ~90 tokens. Budget of 200 tokens means
+        // roughly two messages per chunk.
+        let body = "x".repeat(300);
+        let msgs: Vec<Message> = (0..6)
+            .map(|i| {
+                let role = if i % 2 == 0 {
+                    Role::Assistant
+                } else {
+                    Role::User
+                };
+                text_msg(role, &body)
+            })
+            .collect();
+        let chunks = AgentRunner::chunk_for_compaction(&msgs, 200);
+        assert!(chunks.len() > 1, "expected multiple chunks, got {chunks:?}");
+        // Chunks must be contiguous and cover the full history.
+        assert_eq!(chunks.first().unwrap().0, 0);
+        assert_eq!(chunks.last().unwrap().1, msgs.len());
+        for win in chunks.windows(2) {
+            assert_eq!(win[0].1, win[1].0, "gaps between chunks: {chunks:?}");
+        }
+    }
+
+    #[test]
+    fn chunk_break_does_not_orphan_tool_result() {
+        // Tool call + tool result pair with a big payload on the result.
+        // Budget is small enough to trigger a break, but the break must not
+        // land between the call and its result.
+        let big_output = "y".repeat(400);
+        let msgs = vec![
+            text_msg(Role::User, "kickoff"),
+            text_msg(Role::Assistant, "thinking"),
+            tool_call_msg("read_file", "c1"),
+            tool_result_msg("c1", &big_output),
+            text_msg(Role::Assistant, "done"),
+        ];
+        let chunks = AgentRunner::chunk_for_compaction(&msgs, 120);
+        for &(s, e) in &chunks {
+            let last = &msgs[e - 1];
+            assert!(
+                !matches!(
+                    last.content,
+                    MessageContent::ToolCall(_) | MessageContent::MultiToolCall(_)
+                ),
+                "chunk {s}..{e} ends on a dangling tool_call"
+            );
+            if s > 0 {
+                let first = &msgs[s];
+                assert!(
+                    !matches!(first.content, MessageContent::ToolResult(_)),
+                    "chunk {s}..{e} starts with an orphan tool_result"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn multi_tool_call_stays_with_its_results() {
+        let mut msgs = vec![
+            text_msg(Role::User, "kickoff"),
+            Message {
+                id: Uuid::new_v4(),
+                role: Role::Assistant,
+                content: MessageContent::MultiToolCall(vec![
+                    ToolCall {
+                        id: "a".into(),
+                        name: "t".into(),
+                        arguments: json!({}),
+                    },
+                    ToolCall {
+                        id: "b".into(),
+                        name: "t".into(),
+                        arguments: json!({}),
+                    },
+                ]),
+                created_at: Utc::now(),
+            },
+        ];
+        msgs.push(tool_result_msg("a", &"p".repeat(400)));
+        msgs.push(tool_result_msg("b", &"q".repeat(400)));
+        msgs.push(text_msg(Role::Assistant, "ok"));
+
+        let chunks = AgentRunner::chunk_for_compaction(&msgs, 100);
+        for &(s, e) in &chunks {
+            if s > 0 {
+                assert!(
+                    !matches!(msgs[s].content, MessageContent::ToolResult(_)),
+                    "chunk {s}..{e} starts with a tool_result"
+                );
+            }
+            let last = &msgs[e - 1];
+            assert!(
+                !matches!(
+                    last.content,
+                    MessageContent::ToolCall(_) | MessageContent::MultiToolCall(_)
+                ),
+                "chunk {s}..{e} ends on a dangling tool_call"
+            );
+        }
+    }
+
+    #[test]
+    fn oversized_single_message_becomes_its_own_chunk() {
+        // Budget is much smaller than one message. The oversized message has
+        // to end up in a chunk of its own; we never silently drop messages.
+        let huge = "z".repeat(5_000);
+        let msgs = vec![
+            text_msg(Role::User, "a"),
+            text_msg(Role::Assistant, &huge),
+            text_msg(Role::User, "b"),
+        ];
+        let chunks = AgentRunner::chunk_for_compaction(&msgs, 50);
+        let total: usize = chunks.iter().map(|(s, e)| e - s).sum();
+        assert_eq!(total, msgs.len());
+    }
 }
