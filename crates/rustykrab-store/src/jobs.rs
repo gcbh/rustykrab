@@ -128,6 +128,11 @@ impl JobStore {
     }
 
     /// Return all enabled jobs whose `next_run_at` is at or before `now`.
+    ///
+    /// Atomically advances `next_run_at` for each returned job so that
+    /// subsequent polls within the same cycle won't pick up the same job
+    /// again (prevents duplicate execution when jobs take longer than the
+    /// poll interval).
     pub fn get_due_jobs(&self, now: DateTime<Utc>) -> Result<Vec<ScheduledJob>, Error> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
@@ -157,23 +162,53 @@ impl JobStore {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| Error::Storage(e.to_string()))?;
 
+        // Claim each due job by advancing next_run_at so that subsequent
+        // polls won't pick it up again while it's still executing.
+        for job in &jobs {
+            if job.one_shot {
+                // Disable one-shot jobs immediately to prevent re-pickup.
+                conn.execute(
+                    "UPDATE scheduled_jobs SET enabled = 0 WHERE id = ?1",
+                    params![job.id],
+                )
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            } else {
+                // Push next_run_at forward so the job isn't due anymore.
+                let next = compute_next_cron_run(&job.schedule, now)
+                    .unwrap_or_else(|_| now + chrono::Duration::hours(1));
+                conn.execute(
+                    "UPDATE scheduled_jobs SET next_run_at = ?1 WHERE id = ?2",
+                    params![next.to_rfc3339(), job.id],
+                )
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            }
+        }
+
         Ok(jobs)
     }
 
     /// Mark a job as executed: update `last_run_at`, advance `next_run_at`
     /// for recurring jobs, or disable one-shot jobs.
-    pub fn mark_executed(&self, job_id: &str) -> Result<(), Error> {
+    ///
+    /// Returns `Ok(false)` if the job no longer exists (e.g. deleted while
+    /// the agent was executing). This is not an error — `get_due_jobs`
+    /// already advanced `next_run_at` when claiming the job.
+    pub fn mark_executed(&self, job_id: &str) -> Result<bool, Error> {
         let conn = self.conn.lock().unwrap();
         let now = Utc::now();
 
         // Read the job to determine schedule type.
-        let (schedule, one_shot): (String, bool) = conn
-            .query_row(
-                "SELECT schedule, one_shot FROM scheduled_jobs WHERE id = ?1",
-                params![job_id],
-                |row| Ok((row.get(0)?, row.get::<_, i32>(1)? != 0)),
-            )
-            .map_err(|e| Error::Storage(e.to_string()))?;
+        let row = conn.query_row(
+            "SELECT schedule, one_shot FROM scheduled_jobs WHERE id = ?1",
+            params![job_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i32>(1)? != 0)),
+        );
+
+        let (_schedule, one_shot) = match row {
+            Ok(r) => r,
+            Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(false),
+            Err(e) => return Err(Error::Storage(e.to_string())),
+        };
 
         if one_shot {
             // Disable one-shot jobs after execution.
@@ -183,17 +218,16 @@ impl JobStore {
             )
             .map_err(|e| Error::Storage(e.to_string()))?;
         } else {
-            // Advance next_run_at for recurring jobs.
-            let next = compute_next_cron_run(&schedule, now)
-                .unwrap_or_else(|_| now + chrono::Duration::hours(1));
+            // Update last_run_at. next_run_at was already advanced by
+            // get_due_jobs when the job was claimed.
             conn.execute(
-                "UPDATE scheduled_jobs SET last_run_at = ?1, next_run_at = ?2 WHERE id = ?3",
-                params![now.to_rfc3339(), next.to_rfc3339(), job_id],
+                "UPDATE scheduled_jobs SET last_run_at = ?1 WHERE id = ?2",
+                params![now.to_rfc3339(), job_id],
             )
             .map_err(|e| Error::Storage(e.to_string()))?;
         }
 
-        Ok(())
+        Ok(true)
     }
 }
 

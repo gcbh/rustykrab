@@ -985,9 +985,16 @@ async fn job_executor_loop(store: rustykrab_store::Store, state: AppState) {
                     }
                 }
 
-                // Mark the job as executed (advances next_run_at or disables one-shot).
-                if let Err(e) = store.jobs().mark_executed(&job_id) {
-                    tracing::error!(job_id = %job_id, "failed to mark scheduled job as executed: {e}");
+                // Mark the job as executed (updates last_run_at).
+                // next_run_at was already advanced when the job was claimed.
+                match store.jobs().mark_executed(&job_id) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        tracing::warn!(job_id = %job_id, "scheduled job was deleted during execution, skipping mark_executed");
+                    }
+                    Err(e) => {
+                        tracing::error!(job_id = %job_id, "failed to mark scheduled job as executed: {e}");
+                    }
                 }
 
                 // Clean up the ephemeral conversation.
