@@ -437,7 +437,8 @@ async fn main() -> anyhow::Result<()> {
     let mut state = rustykrab_gateway::AppState::new(store, tools, provider, auth_token)
         .with_harness_router(router)
         .with_orchestration_config(orchestration_config)
-        .with_skill_registry(skill_registry);
+        .with_skill_registry(skill_registry)
+        .with_memory(Arc::clone(&memory_system), agent_id);
 
     // --- Attach video channel to state ---
     if let Some(vc) = video_channel {

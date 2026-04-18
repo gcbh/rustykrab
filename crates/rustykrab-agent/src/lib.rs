@@ -9,7 +9,7 @@ pub mod voting;
 pub use harness::HarnessProfile;
 pub use rlm::RecursiveExecutor;
 pub use router::HarnessRouter;
-pub use runner::{AgentConfig, AgentEvent, AgentRunner};
+pub use runner::{AgentConfig, AgentEvent, AgentRunner, OnMessageCallback};
 pub use sandbox::{NoSandbox, ProcessSandbox, Sandbox, SandboxPolicy};
 pub use trace::{ExecutionTracer, ToolStats, ToolTrace};
 pub use voting::ConsistencyVoter;
