@@ -61,7 +61,7 @@ impl MemoryWriter {
         turn: ConversationTurn,
         agent_id: Uuid,
     ) -> rustykrab_core::Result<Uuid> {
-        self.retain_with_stage(turn, agent_id, LifecycleStage::Episodic)
+        self.retain_with_stage(turn, agent_id, LifecycleStage::Working)
             .await
     }
 
@@ -246,7 +246,8 @@ impl MemoryWriter {
                 ..Default::default()
             },
         };
-        self.retain(turn, agent_id).await
+        self.retain_with_stage(turn, agent_id, LifecycleStage::Episodic)
+            .await
     }
 
     /// Rebuild the FTS5 index from all retrievable memories in storage.
