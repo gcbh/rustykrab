@@ -59,6 +59,8 @@ All configuration is via environment variables. No plaintext config files.
 | `RUSTYKRAB_PROVIDER` | `anthropic` | Model backend: `anthropic` or `ollama` |
 | `ANTHROPIC_API_KEY` | — | Anthropic API key (required for Claude) |
 | `ANTHROPIC_MODEL` | `claude-sonnet-4-20250514` | Claude model to use |
+| `ANTHROPIC_CONTEXT_LENGTH` | `200000` | Context window in tokens for the selected Claude model. Anthropic doesn't expose a discovery endpoint, so set this when enabling a non-default window (e.g. the 1M-token beta) so compaction thresholds stay in sync |
+| `RUSTYKRAB_COMPACTION_CONTEXT_CEILING` | `65536` | Hard upper bound on the context window used to compute the compaction threshold. Keeps compaction firing at a sane size even when the backing model advertises a much larger window |
 | `OLLAMA_MODEL` | `gemma4:26b` | Ollama model name |
 | `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama server address |
 | `OLLAMA_NUM_CTX` | — | Explicit client-side `num_ctx` override. Omitted by default so the server's own `OLLAMA_CONTEXT_LENGTH` (or per-model default) wins |

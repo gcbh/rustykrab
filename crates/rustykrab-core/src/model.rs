@@ -55,6 +55,17 @@ pub trait ModelProvider: Send + Sync {
     /// Human-readable name of the provider.
     fn name(&self) -> &str;
 
+    /// Model's context window in tokens, when known.
+    ///
+    /// Serves as the single source of truth for downstream budgets —
+    /// compaction thresholds, prompt trimming, memory retrieval sizing.
+    /// Providers should derive this from the backing model (e.g. Ollama
+    /// reads `/api/show`) or an explicit env-var override. Returning
+    /// `None` means "unknown" and callers fall back to their own default.
+    fn context_limit(&self) -> Option<usize> {
+        None
+    }
+
     /// Send a conversation to the model and get back the next message.
     async fn chat(&self, messages: &[Message], tools: &[ToolSchema]) -> Result<ModelResponse>;
 

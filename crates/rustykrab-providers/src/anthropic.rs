@@ -24,6 +24,24 @@ pub struct AnthropicProvider {
     api_key: SecretString,
     model: String,
     max_tokens: u32,
+    /// Context window in tokens. Populated from `ANTHROPIC_CONTEXT_LENGTH`
+    /// when set; otherwise falls back to Claude's standard 200k window.
+    /// Unlike Ollama, Anthropic doesn't expose a per-model context length
+    /// endpoint, so the env var is the operator's escape hatch (e.g. to
+    /// force the 1M-token beta window on Claude 4/5 models).
+    context_limit: usize,
+}
+
+/// Default context window for Claude models when no override is set.
+/// All current production Claude models (3.5, 4, 4.5, 4.6, 4.7) ship with
+/// at least a 200k-token context window.
+const DEFAULT_ANTHROPIC_CONTEXT_TOKENS: usize = 200_000;
+
+fn anthropic_context_limit_from_env() -> Option<usize> {
+    std::env::var("ANTHROPIC_CONTEXT_LENGTH")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&v| v > 0)
 }
 
 impl AnthropicProvider {
@@ -38,6 +56,8 @@ impl AnthropicProvider {
             api_key: SecretString::from(api_key),
             model: "claude-sonnet-4-20250514".to_string(),
             max_tokens: 4096,
+            context_limit: anthropic_context_limit_from_env()
+                .unwrap_or(DEFAULT_ANTHROPIC_CONTEXT_TOKENS),
         }
     }
 
@@ -48,6 +68,13 @@ impl AnthropicProvider {
 
     pub fn with_max_tokens(mut self, max_tokens: u32) -> Self {
         self.max_tokens = max_tokens;
+        self
+    }
+
+    /// Explicit context-window override. Takes precedence over
+    /// `ANTHROPIC_CONTEXT_LENGTH` and the built-in default.
+    pub fn with_context_limit(mut self, context_limit: usize) -> Self {
+        self.context_limit = context_limit;
         self
     }
 
@@ -242,6 +269,10 @@ impl AnthropicProvider {
 impl ModelProvider for AnthropicProvider {
     fn name(&self) -> &str {
         "anthropic"
+    }
+
+    fn context_limit(&self) -> Option<usize> {
+        Some(self.context_limit)
     }
 
     async fn chat(&self, messages: &[Message], tools: &[ToolSchema]) -> Result<ModelResponse> {
