@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.6.4] - 2026-04-18
+
+- feat(memory): auto-persist every conversation turn to working memory (#382)
+
 ## [2.6.3] - 2026-04-18
 
 - fix(agent): derive compaction threshold from provider's context limit (#381)
