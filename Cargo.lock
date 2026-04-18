@@ -3359,6 +3359,7 @@ dependencies = [
  "rustykrab-agent",
  "rustykrab-channels",
  "rustykrab-core",
+ "rustykrab-memory",
  "rustykrab-skills",
  "rustykrab-store",
  "serde",

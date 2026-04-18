@@ -2,9 +2,11 @@ use rustykrab_agent::{HarnessProfile, HarnessRouter, ProcessSandbox, Sandbox};
 use rustykrab_channels::{SignalChannel, TelegramChannel, VideoChannel};
 use rustykrab_core::model::ModelProvider;
 use rustykrab_core::orchestration::OrchestrationConfig;
+use rustykrab_memory::MemorySystem;
 use rustykrab_skills::SkillRegistry;
 use rustykrab_store::Store;
 use std::sync::{Arc, RwLock};
+use uuid::Uuid;
 
 use crate::origin::OriginPolicy;
 use crate::rate_limit::{RateLimitConfig, RateLimiter};
@@ -33,6 +35,12 @@ pub struct AppState {
     pub orchestration_config: OrchestrationConfig,
     /// Skill registry for SKILL.md-based skills.
     pub skill_registry: Arc<SkillRegistry>,
+    /// Hybrid memory system for auto-persisting conversation turns.
+    /// `None` when no memory backend is configured.
+    pub memory: Option<Arc<MemorySystem>>,
+    /// Persistent agent identifier, used as the owner for memory writes.
+    /// `None` when memory is not configured.
+    pub agent_id: Option<Uuid>,
 }
 
 impl AppState {
@@ -57,7 +65,18 @@ impl AppState {
             harness_router: None,
             orchestration_config: OrchestrationConfig::default(),
             skill_registry: Arc::new(SkillRegistry::new()),
+            memory: None,
+            agent_id: None,
         }
+    }
+
+    /// Attach the memory system and the agent identifier used for writes.
+    /// When set, the gateway wires an `on_message` hook into the agent
+    /// runner that persists every conversation turn into working memory.
+    pub fn with_memory(mut self, memory: Arc<MemorySystem>, agent_id: Uuid) -> Self {
+        self.memory = Some(memory);
+        self.agent_id = Some(agent_id);
+        self
     }
 
     /// Override the origin policy.

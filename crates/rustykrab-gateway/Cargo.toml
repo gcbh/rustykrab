@@ -10,6 +10,7 @@ rustykrab-core.workspace = true
 rustykrab-store.workspace = true
 rustykrab-agent.workspace = true
 rustykrab-channels.workspace = true
+rustykrab-memory.workspace = true
 rustykrab-skills.workspace = true
 axum.workspace = true
 tokio.workspace = true

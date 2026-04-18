@@ -230,6 +230,20 @@ impl AgentRunner {
         &self.tracer
     }
 
+    /// Append a message to the conversation, bump `updated_at`, and fire
+    /// `on_message`. This is the single choke point every synthesized or
+    /// model-produced message flows through, so memory auto-persist sees
+    /// every turn — user prompts, assistant responses, tool results,
+    /// reflection injections, and the compaction summary — not just LLM
+    /// responses.
+    fn push_message(&self, conv: &mut Conversation, message: Message) {
+        conv.messages.push(message.clone());
+        conv.updated_at = Utc::now();
+        if let Some(ref cb) = self.on_message {
+            cb(&message);
+        }
+    }
+
     /// Run the agent loop on a conversation within a session's capability scope.
     ///
     /// Each call creates a fresh ExecutionTracer to prevent cross-session
@@ -285,15 +299,18 @@ impl AgentRunner {
                 && !soft_warning_injected
             {
                 soft_warning_injected = true;
-                conv.messages.push(Message {
-                    id: Uuid::new_v4(),
-                    role: Role::System,
-                    content: MessageContent::Text(format!(
-                        "[Warning: {iteration}/{} iterations used.]",
-                        self.config.max_iterations
-                    )),
-                    created_at: Utc::now(),
-                });
+                self.push_message(
+                    conv,
+                    Message {
+                        id: Uuid::new_v4(),
+                        role: Role::System,
+                        content: MessageContent::Text(format!(
+                            "[Warning: {iteration}/{} iterations used.]",
+                            self.config.max_iterations
+                        )),
+                        created_at: Utc::now(),
+                    },
+                );
             }
 
             let llm_start = std::time::Instant::now();
@@ -313,12 +330,7 @@ impl AgentRunner {
                 "LLM call completed"
             );
 
-            conv.messages.push(message.clone());
-            conv.updated_at = Utc::now();
-
-            if let Some(ref cb) = self.on_message {
-                cb(&message);
-            }
+            self.push_message(conv, message.clone());
 
             // Handle tool calls.
             if message.content.has_tool_calls() {
@@ -392,9 +404,8 @@ impl AgentRunner {
                             }
                         }
                     };
-                    conv.messages.push(tool_msg);
+                    self.push_message(conv, tool_msg);
                 }
-                conv.updated_at = Utc::now();
 
                 // Reflection on repeated errors.
                 if had_errors {
@@ -417,12 +428,15 @@ impl AgentRunner {
             match stop_reason {
                 StopReason::MaxTokens => {
                     tracing::warn!("model hit max tokens, prompting to continue");
-                    conv.messages.push(Message {
-                        id: Uuid::new_v4(),
-                        role: Role::User,
-                        content: MessageContent::Text("Continue.".to_string()),
-                        created_at: Utc::now(),
-                    });
+                    self.push_message(
+                        conv,
+                        Message {
+                            id: Uuid::new_v4(),
+                            role: Role::User,
+                            content: MessageContent::Text("Continue.".to_string()),
+                            created_at: Utc::now(),
+                        },
+                    );
                     continue;
                 }
                 StopReason::EndTurn => {
@@ -448,14 +462,17 @@ impl AgentRunner {
                                 tracing::warn!("empty response retries exhausted");
                                 return Ok(());
                             }
-                            conv.messages.push(Message {
-                                id: Uuid::new_v4(),
-                                role: Role::User,
-                                content: MessageContent::Text(
-                                    "Your response was empty. Please provide a substantive answer or take an action.".to_string(),
-                                ),
-                                created_at: Utc::now(),
-                            });
+                            self.push_message(
+                                conv,
+                                Message {
+                                    id: Uuid::new_v4(),
+                                    role: Role::User,
+                                    content: MessageContent::Text(
+                                        "Your response was empty. Please provide a substantive answer or take an action.".to_string(),
+                                    ),
+                                    created_at: Utc::now(),
+                                },
+                            );
                             continue;
                         }
                         ResponseClass::PlanningOnly => {
@@ -476,14 +493,17 @@ impl AgentRunner {
                                 retries = planning_only_retries,
                                 "model produced planning-only text without action, re-prompting"
                             );
-                            conv.messages.push(Message {
-                                id: Uuid::new_v4(),
-                                role: Role::User,
-                                content: MessageContent::Text(
-                                    "Don't just describe what you plan to do — actually do it using the tools available to you.".to_string(),
-                                ),
-                                created_at: Utc::now(),
-                            });
+                            self.push_message(
+                                conv,
+                                Message {
+                                    id: Uuid::new_v4(),
+                                    role: Role::User,
+                                    content: MessageContent::Text(
+                                        "Don't just describe what you plan to do — actually do it using the tools available to you.".to_string(),
+                                    ),
+                                    created_at: Utc::now(),
+                                },
+                            );
                             continue;
                         }
                     }
@@ -516,14 +536,17 @@ impl AgentRunner {
                         retries = empty_tool_use_retries,
                         "stop reason is ToolUse but no tool calls found in response, re-prompting"
                     );
-                    conv.messages.push(Message {
-                        id: Uuid::new_v4(),
-                        role: Role::User,
-                        content: MessageContent::Text(
-                            "Your previous response indicated a tool call but none was found. Please retry.".to_string(),
-                        ),
-                        created_at: Utc::now(),
-                    });
+                    self.push_message(
+                        conv,
+                        Message {
+                            id: Uuid::new_v4(),
+                            role: Role::User,
+                            content: MessageContent::Text(
+                                "Your previous response indicated a tool call but none was found. Please retry.".to_string(),
+                            ),
+                            created_at: Utc::now(),
+                        },
+                    );
                     continue;
                 }
             }
@@ -534,19 +557,21 @@ impl AgentRunner {
             max_iterations = self.config.max_iterations,
             "iteration cap reached — escalating to user"
         );
-        conv.messages.push(Message {
-            id: Uuid::new_v4(),
-            role: Role::User,
-            content: MessageContent::Text(format!(
-                "You have reached the iteration limit ({} iterations). \
-                 Summarize what you accomplished and what remains.",
-                self.config.max_iterations
-            )),
-            created_at: Utc::now(),
-        });
+        self.push_message(
+            conv,
+            Message {
+                id: Uuid::new_v4(),
+                role: Role::User,
+                content: MessageContent::Text(format!(
+                    "You have reached the iteration limit ({} iterations). \
+                     Summarize what you accomplished and what remains.",
+                    self.config.max_iterations
+                )),
+                created_at: Utc::now(),
+            },
+        );
         let final_response = self.provider.chat(&conv.messages, &[]).await?;
-        conv.messages.push(final_response.message);
-        conv.updated_at = Utc::now();
+        self.push_message(conv, final_response.message);
         Ok(())
     }
 
@@ -606,15 +631,18 @@ impl AgentRunner {
                 && !soft_warning_injected
             {
                 soft_warning_injected = true;
-                conv.messages.push(Message {
-                    id: Uuid::new_v4(),
-                    role: Role::System,
-                    content: MessageContent::Text(format!(
-                        "[Warning: {iteration}/{} iterations used.]",
-                        self.config.max_iterations
-                    )),
-                    created_at: Utc::now(),
-                });
+                self.push_message(
+                    conv,
+                    Message {
+                        id: Uuid::new_v4(),
+                        role: Role::System,
+                        content: MessageContent::Text(format!(
+                            "[Warning: {iteration}/{} iterations used.]",
+                            self.config.max_iterations
+                        )),
+                        created_at: Utc::now(),
+                    },
+                );
             }
 
             let stream_callback = |event: StreamEvent| {
@@ -643,12 +671,7 @@ impl AgentRunner {
                 "LLM call completed"
             );
 
-            conv.messages.push(message.clone());
-            conv.updated_at = Utc::now();
-
-            if let Some(ref cb) = self.on_message {
-                cb(&message);
-            }
+            self.push_message(conv, message.clone());
 
             // Handle tool calls.
             if message.content.has_tool_calls() {
@@ -733,9 +756,8 @@ impl AgentRunner {
                         success,
                         error_message,
                     });
-                    conv.messages.push(tool_msg);
+                    self.push_message(conv, tool_msg);
                 }
-                conv.updated_at = Utc::now();
 
                 if had_errors {
                     consecutive_errors += 1;
@@ -758,12 +780,15 @@ impl AgentRunner {
             match stop_reason {
                 StopReason::MaxTokens => {
                     tracing::warn!("model hit max tokens, prompting to continue");
-                    conv.messages.push(Message {
-                        id: Uuid::new_v4(),
-                        role: Role::User,
-                        content: MessageContent::Text("Continue.".to_string()),
-                        created_at: Utc::now(),
-                    });
+                    self.push_message(
+                        conv,
+                        Message {
+                            id: Uuid::new_v4(),
+                            role: Role::User,
+                            content: MessageContent::Text("Continue.".to_string()),
+                            created_at: Utc::now(),
+                        },
+                    );
                     continue;
                 }
                 StopReason::EndTurn => {
@@ -794,14 +819,17 @@ impl AgentRunner {
                                 on_event(AgentEvent::Done);
                                 return Ok(());
                             }
-                            conv.messages.push(Message {
-                                id: Uuid::new_v4(),
-                                role: Role::User,
-                                content: MessageContent::Text(
-                                    "Your response was empty. Please provide a substantive answer or take an action.".to_string(),
-                                ),
-                                created_at: Utc::now(),
-                            });
+                            self.push_message(
+                                conv,
+                                Message {
+                                    id: Uuid::new_v4(),
+                                    role: Role::User,
+                                    content: MessageContent::Text(
+                                        "Your response was empty. Please provide a substantive answer or take an action.".to_string(),
+                                    ),
+                                    created_at: Utc::now(),
+                                },
+                            );
                             continue;
                         }
                         ResponseClass::PlanningOnly => {
@@ -824,14 +852,17 @@ impl AgentRunner {
                                 retries = planning_only_retries,
                                 "model produced planning-only text without action, re-prompting"
                             );
-                            conv.messages.push(Message {
-                                id: Uuid::new_v4(),
-                                role: Role::User,
-                                content: MessageContent::Text(
-                                    "Don't just describe what you plan to do — actually do it using the tools available to you.".to_string(),
-                                ),
-                                created_at: Utc::now(),
-                            });
+                            self.push_message(
+                                conv,
+                                Message {
+                                    id: Uuid::new_v4(),
+                                    role: Role::User,
+                                    content: MessageContent::Text(
+                                        "Don't just describe what you plan to do — actually do it using the tools available to you.".to_string(),
+                                    ),
+                                    created_at: Utc::now(),
+                                },
+                            );
                             continue;
                         }
                     }
@@ -862,14 +893,17 @@ impl AgentRunner {
                         retries = empty_tool_use_retries,
                         "stop reason is ToolUse but no tool calls found in response, re-prompting"
                     );
-                    conv.messages.push(Message {
-                        id: Uuid::new_v4(),
-                        role: Role::User,
-                        content: MessageContent::Text(
-                            "Your previous response indicated a tool call but none was found. Please retry.".to_string(),
-                        ),
-                        created_at: Utc::now(),
-                    });
+                    self.push_message(
+                        conv,
+                        Message {
+                            id: Uuid::new_v4(),
+                            role: Role::User,
+                            content: MessageContent::Text(
+                                "Your previous response indicated a tool call but none was found. Please retry.".to_string(),
+                            ),
+                            created_at: Utc::now(),
+                        },
+                    );
                     continue;
                 }
             }
@@ -880,16 +914,19 @@ impl AgentRunner {
             max_iterations = self.config.max_iterations,
             "iteration cap reached — escalating to user"
         );
-        conv.messages.push(Message {
-            id: Uuid::new_v4(),
-            role: Role::User,
-            content: MessageContent::Text(format!(
-                "You have reached the iteration limit ({} iterations). \
-                 Summarize what you accomplished and what remains.",
-                self.config.max_iterations
-            )),
-            created_at: Utc::now(),
-        });
+        self.push_message(
+            conv,
+            Message {
+                id: Uuid::new_v4(),
+                role: Role::User,
+                content: MessageContent::Text(format!(
+                    "You have reached the iteration limit ({} iterations). \
+                     Summarize what you accomplished and what remains.",
+                    self.config.max_iterations
+                )),
+                created_at: Utc::now(),
+            },
+        );
         let stream_callback = |event: StreamEvent| {
             if let StreamEvent::TextDelta(delta) = event {
                 on_event(AgentEvent::TextDelta(delta));
@@ -899,8 +936,7 @@ impl AgentRunner {
             .provider
             .chat_stream(&conv.messages, &[], &stream_callback)
             .await?;
-        conv.messages.push(final_response.message);
-        conv.updated_at = Utc::now();
+        self.push_message(conv, final_response.message);
         on_event(AgentEvent::Done);
         Ok(())
     }
@@ -1101,6 +1137,26 @@ impl AgentRunner {
             return Ok(());
         }
 
+        // Synthesize the two new messages compaction produces. They need
+        // to flow through on_message so memory picks them up — even though
+        // they're inserted into `new_messages` directly below rather than
+        // through push_message (compaction replaces conv.messages wholesale).
+        let summary_msg = Message {
+            id: Uuid::new_v4(),
+            role: Role::Assistant,
+            content: MessageContent::Text(summary.clone()),
+            created_at: Utc::now(),
+        };
+        let continuation_msg = Message {
+            id: Uuid::new_v4(),
+            role: Role::User,
+            content: MessageContent::Text(
+                "Continue from the summary above. Do not repeat already-completed work."
+                    .to_string(),
+            ),
+            created_at: Utc::now(),
+        };
+
         // Preserve system messages (they contain the agent's identity and
         // instructions) and the first user message (the original task).
         let mut new_messages: Vec<Message> = Vec::new();
@@ -1119,28 +1175,22 @@ impl AgentRunner {
             new_messages.push(first_user.clone());
         }
 
-        // Insert the summary as an assistant message.
-        new_messages.push(Message {
-            id: Uuid::new_v4(),
-            role: Role::Assistant,
-            content: MessageContent::Text(summary.clone()),
-            created_at: Utc::now(),
-        });
-
-        // Continuation prompt so the model picks up where it left off.
-        new_messages.push(Message {
-            id: Uuid::new_v4(),
-            role: Role::User,
-            content: MessageContent::Text(
-                "Continue from the summary above. Do not repeat already-completed work."
-                    .to_string(),
-            ),
-            created_at: Utc::now(),
-        });
+        new_messages.push(summary_msg.clone());
+        new_messages.push(continuation_msg.clone());
 
         conv.messages = new_messages;
         conv.summary = Some(summary);
         conv.updated_at = Utc::now();
+
+        // Fire on_message only for the newly synthesized turns. The preserved
+        // system/first-user messages already flowed through push_message when
+        // they were first appended; the dropped history was persisted the
+        // same way, so memory still holds it even though in-context it's
+        // been replaced by the summary.
+        if let Some(ref cb) = self.on_message {
+            cb(&summary_msg);
+            cb(&continuation_msg);
+        }
 
         let after_tokens = Self::estimate_conversation_tokens(&conv.messages);
         tracing::info!(
@@ -1179,12 +1229,15 @@ impl AgentRunner {
         }
         text.push_str("Try a different approach.");
 
-        conv.messages.push(Message {
-            id: Uuid::new_v4(),
-            role: Role::User,
-            content: MessageContent::Text(text),
-            created_at: Utc::now(),
-        });
+        self.push_message(
+            conv,
+            Message {
+                id: Uuid::new_v4(),
+                role: Role::User,
+                content: MessageContent::Text(text),
+                created_at: Utc::now(),
+            },
+        );
     }
 }
 
