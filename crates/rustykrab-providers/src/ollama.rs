@@ -506,6 +506,10 @@ impl ModelProvider for OllamaProvider {
         "ollama"
     }
 
+    fn context_limit(&self) -> Option<usize> {
+        self.effective_ctx().map(|v| v as usize)
+    }
+
     async fn chat(&self, messages: &[Message], tools: &[ToolSchema]) -> Result<ModelResponse> {
         let ollama_messages = Self::build_messages(messages)?;
 

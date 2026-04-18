@@ -1010,13 +1010,24 @@ impl AgentRunner {
         messages.iter().map(Self::estimate_message_tokens).sum()
     }
 
+    /// Effective context-window budget in tokens. Prefers the provider's
+    /// reported limit (Ollama's detected `num_ctx`, Anthropic's env-var
+    /// override or built-in default) so downstream budgets derive from a
+    /// single source of truth. Falls back to `config.max_context_tokens`
+    /// when the provider doesn't know.
+    fn effective_context_limit(&self) -> usize {
+        self.provider
+            .context_limit()
+            .unwrap_or(self.config.max_context_tokens)
+    }
+
     /// Returns true if the conversation has crossed the compaction threshold.
     fn needs_compaction(&self, messages: &[Message]) -> bool {
         if self.config.compaction_threshold_pct <= 0.0 {
             return false;
         }
         let threshold =
-            (self.config.max_context_tokens as f64 * self.config.compaction_threshold_pct) as usize;
+            (self.effective_context_limit() as f64 * self.config.compaction_threshold_pct) as usize;
         let estimated = Self::estimate_conversation_tokens(messages);
         estimated >= threshold
     }
