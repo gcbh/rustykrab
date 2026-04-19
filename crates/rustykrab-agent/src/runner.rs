@@ -3,6 +3,7 @@ use std::sync::OnceLock;
 use std::time::Instant;
 
 use chrono::Utc;
+use rustykrab_core::active_tools::{ActiveToolsRegistry, SessionToolContext, SESSION_TOOL_CONTEXT};
 use rustykrab_core::capability::Capability;
 use rustykrab_core::model::{ModelProvider, ModelResponse, StopReason, StreamEvent};
 use rustykrab_core::session::Session;
@@ -11,6 +12,15 @@ use rustykrab_core::types::{
 };
 use rustykrab_core::{Error, Result, SandboxRequirements, Tool, ToolErrorKind};
 use uuid::Uuid;
+
+/// Names of meta-tools that are always included in the schema sent to the
+/// model, regardless of the active tool set. These are how the model
+/// discovers and loads the rest of the catalog.
+const META_TOOL_NAMES: &[&str] = &["tools_list", "tools_load"];
+
+fn is_meta_tool(name: &str) -> bool {
+    META_TOOL_NAMES.contains(&name)
+}
 
 use crate::sandbox::{Sandbox, SandboxPolicy};
 use crate::trace::{ExecutionTracer, ToolTrace};
@@ -227,6 +237,7 @@ pub struct AgentRunner {
     config: AgentConfig,
     tracer: ExecutionTracer,
     on_message: Option<OnMessageCallback>,
+    active_tools: Arc<ActiveToolsRegistry>,
 }
 
 impl AgentRunner {
@@ -242,6 +253,40 @@ impl AgentRunner {
             config: AgentConfig::default(),
             tracer: ExecutionTracer::new(),
             on_message: None,
+            active_tools: Arc::new(ActiveToolsRegistry::new()),
+        }
+    }
+
+    /// Share a per-gateway active-tools registry with the runner so the
+    /// `tools_load` meta-tool can persist activations across conversations.
+    pub fn with_active_tools(mut self, registry: Arc<ActiveToolsRegistry>) -> Self {
+        self.active_tools = registry;
+        self
+    }
+
+    /// Build the set of schemas sent to the model on the next request,
+    /// honoring session capabilities and the per-conversation active set.
+    /// Meta-tools (`tools_list`, `tools_load`) are always included so the
+    /// agent can always discover and load more tools.
+    fn compute_schemas(&self, session: &Session, conv_id: Uuid) -> Vec<ToolSchema> {
+        let active = self.active_tools.active_for(conv_id);
+        self.tools
+            .iter()
+            .filter(|t| {
+                t.available()
+                    && session.capabilities.can_use_tool(t.name())
+                    && (is_meta_tool(t.name()) || active.contains(t.name()))
+            })
+            .map(|t| t.schema())
+            .collect()
+    }
+
+    fn build_session_context(&self, session: &Session) -> SessionToolContext {
+        SessionToolContext {
+            conversation_id: session.conversation_id,
+            capabilities: Arc::new(session.capabilities.clone()),
+            all_tools: Arc::new(self.tools.clone()),
+            active_tools: self.active_tools.clone(),
         }
     }
 
@@ -281,19 +326,19 @@ impl AgentRunner {
     /// Each call creates a fresh ExecutionTracer to prevent cross-session
     /// information leakage (H8).
     pub async fn run(&self, conv: &mut Conversation, session: &Session) -> Result<()> {
+        let ctx = self.build_session_context(session);
+        SESSION_TOOL_CONTEXT
+            .scope(ctx, self.run_inner(conv, session))
+            .await
+    }
+
+    async fn run_inner(&self, conv: &mut Conversation, session: &Session) -> Result<()> {
         if session.is_expired() {
             return Err(Error::Auth("session has expired".into()));
         }
 
         // Create a per-run tracer to prevent cross-session data leaks (H8)
         let tracer = ExecutionTracer::new();
-
-        let schemas: Vec<ToolSchema> = self
-            .tools
-            .iter()
-            .filter(|t| t.available() && session.capabilities.can_use_tool(t.name()))
-            .map(|t| t.schema())
-            .collect();
 
         let mut consecutive_errors = 0;
         let mut soft_warning_injected = false;
@@ -344,6 +389,11 @@ impl AgentRunner {
                     },
                 );
             }
+
+            // Recompute the tool schemas on every iteration so that any
+            // activations performed by `tools_load` during the previous
+            // iteration are reflected in the next API call.
+            let schemas = self.compute_schemas(session, session.conversation_id);
 
             let llm_start = std::time::Instant::now();
             let ModelResponse {
@@ -622,18 +672,23 @@ impl AgentRunner {
         session: &Session,
         on_event: &(dyn Fn(AgentEvent) + Send + Sync),
     ) -> Result<()> {
+        let ctx = self.build_session_context(session);
+        SESSION_TOOL_CONTEXT
+            .scope(ctx, self.run_streaming_inner(conv, session, on_event))
+            .await
+    }
+
+    async fn run_streaming_inner(
+        &self,
+        conv: &mut Conversation,
+        session: &Session,
+        on_event: &(dyn Fn(AgentEvent) + Send + Sync),
+    ) -> Result<()> {
         if session.is_expired() {
             return Err(Error::Auth("session has expired".into()));
         }
 
         let tracer = ExecutionTracer::new();
-
-        let schemas: Vec<ToolSchema> = self
-            .tools
-            .iter()
-            .filter(|t| t.available() && session.capabilities.can_use_tool(t.name()))
-            .map(|t| t.schema())
-            .collect();
 
         let mut consecutive_errors = 0;
         let mut soft_warning_injected = false;
@@ -682,6 +737,11 @@ impl AgentRunner {
                     on_event(AgentEvent::TextDelta(delta));
                 }
             };
+
+            // Recompute the tool schemas on every iteration so that any
+            // activations performed by `tools_load` during the previous
+            // iteration are reflected in the next API call.
+            let schemas = self.compute_schemas(session, session.conversation_id);
 
             let llm_start = std::time::Instant::now();
             let ModelResponse {

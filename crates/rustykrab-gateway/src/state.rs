@@ -1,5 +1,6 @@
 use rustykrab_agent::{HarnessProfile, HarnessRouter, ProcessSandbox, Sandbox};
 use rustykrab_channels::{SignalChannel, TelegramChannel, VideoChannel};
+use rustykrab_core::active_tools::ActiveToolsRegistry;
 use rustykrab_core::model::ModelProvider;
 use rustykrab_core::orchestration::OrchestrationConfig;
 use rustykrab_memory::MemorySystem;
@@ -41,6 +42,10 @@ pub struct AppState {
     /// Persistent agent identifier, used as the owner for memory writes.
     /// `None` when memory is not configured.
     pub agent_id: Option<Uuid>,
+    /// Shared registry backing the `tools_load` / `tools_list` meta-tools.
+    /// Tracks which tools are "active" per conversation so schemas sent to
+    /// the model stay compact until the agent explicitly loads more.
+    pub active_tools: Arc<ActiveToolsRegistry>,
 }
 
 impl AppState {
@@ -67,6 +72,7 @@ impl AppState {
             skill_registry: Arc::new(SkillRegistry::new()),
             memory: None,
             agent_id: None,
+            active_tools: Arc::new(ActiveToolsRegistry::new()),
         }
     }
 
