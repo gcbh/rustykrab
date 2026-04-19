@@ -65,6 +65,28 @@ fn compaction_context_ceiling() -> usize {
 /// from `effective_context_limit()` to derive the input budget.
 const SUMMARIZER_RESPONSE_RESERVE_TOKENS: usize = 4_096;
 
+/// Fraction of `effective_context_limit()` that any single compaction call
+/// may consume as input. Kept well below a regular request's budget
+/// because local models (Ollama on Metal with a 26B-parameter backbone)
+/// spend minutes on prompt evaluation, and compaction calls tend to
+/// exceed the provider HTTP timeout well before a regular agent turn
+/// does. Override with `RUSTYKRAB_COMPACTION_INPUT_BUDGET_RATIO`.
+const DEFAULT_COMPACTION_INPUT_BUDGET_RATIO: f64 = 0.5;
+
+/// Read the compaction input-budget ratio once. Accepts values in (0, 1].
+/// Values outside that range are clamped.
+fn compaction_input_budget_ratio() -> f64 {
+    static RATIO: OnceLock<f64> = OnceLock::new();
+    *RATIO.get_or_init(|| {
+        std::env::var("RUSTYKRAB_COMPACTION_INPUT_BUDGET_RATIO")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .map(|v| v.clamp(f64::MIN_POSITIVE, 1.0))
+            .unwrap_or(DEFAULT_COMPACTION_INPUT_BUDGET_RATIO)
+    })
+}
+
 /// Maximum recursion depth for chunked summarization. Guards against runaway
 /// loops in the (unlikely) case a model returns summaries that aren't
 /// materially smaller than their inputs.
@@ -1276,9 +1298,22 @@ impl AgentRunner {
             "compacting conversation history"
         );
 
-        let input_budget = self
-            .effective_context_limit()
-            .saturating_sub(SUMMARIZER_RESPONSE_RESERVE_TOKENS);
+        // Compaction calls use a fraction of the effective context limit
+        // rather than the full window. Local models (Ollama) spend minutes
+        // on prompt evaluation, so a single summarization call over ~60k
+        // tokens can exceed the provider HTTP timeout even though a regular
+        // request of the same size would not (regular requests intersperse
+        // tool turns, so individual prompt sizes are smaller in practice).
+        let ceiling = self.effective_context_limit();
+        let ratio = compaction_input_budget_ratio();
+        let input_budget =
+            ((ceiling as f64 * ratio) as usize).saturating_sub(SUMMARIZER_RESPONSE_RESERVE_TOKENS);
+        tracing::debug!(
+            ceiling,
+            ratio,
+            input_budget,
+            "compaction input budget computed"
+        );
 
         // Fast/original path: full history + compaction prompt fits in one
         // model call. Preserves the existing first-person summarization
