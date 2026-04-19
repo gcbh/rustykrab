@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.6.6] - 2026-04-19
+
+- fix(agent): recursive compaction for oversized histories (#385)
+
 ## [2.6.5] - 2026-04-18
 
 - fix(memory): default retain() to Working lifecycle stage (#383)
