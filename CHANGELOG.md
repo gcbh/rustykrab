@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.6.8] - 2026-04-19
+
+- feat(tools): add tools_list and tools_load meta-tools (#387)
+
 ## [2.6.7] - 2026-04-19
 
 - fix(agent): halve compaction input budget to avoid provider timeouts (#386)
