@@ -102,6 +102,50 @@ fn compaction_input_budget_ratio() -> f64 {
 /// materially smaller than their inputs.
 const MAX_RECURSIVE_SUMMARIZATION_DEPTH: usize = 5;
 
+/// Default hard upper bound on the final compaction summary, in tokens. The
+/// summarizer is instructed to stay under 1000 words (~1500 tokens), but
+/// that's a soft hint — a misbehaving model can produce a summary larger
+/// than the original conversation, and the recursion depth-limit fallback
+/// concatenates intermediates without further compression. When the final
+/// summary exceeds this cap we re-summarize and eventually truncate.
+/// Override with `RUSTYKRAB_COMPACTION_SUMMARY_MAX_TOKENS`.
+const DEFAULT_COMPACTION_SUMMARY_MAX_TOKENS: usize = 8_192;
+
+/// Number of resummarize-passes attempted before falling back to
+/// hard-truncation of an oversized compaction summary.
+const MAX_SUMMARY_CAP_RESUMMARIZE_ATTEMPTS: usize = 3;
+
+/// Truncate `s` so its estimated token count stays at or below `max_tokens`.
+/// Cuts on a UTF-8 char boundary and appends a short marker so the
+/// downstream agent can tell the summary was clipped.
+fn truncate_summary_to_tokens(s: &str, max_tokens: usize) -> String {
+    // Inverse of `AgentRunner::estimate_text_tokens`: ~3.5 chars/token.
+    let max_bytes = (max_tokens as f64 * 3.5) as usize;
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut out = s[..end].to_string();
+    out.push_str("\n\n[summary truncated — exceeded compaction size cap]");
+    out
+}
+
+/// Read the compaction summary cap once. Treats non-positive values as
+/// unset and falls back to the default.
+fn compaction_summary_max_tokens() -> usize {
+    static CAP: OnceLock<usize> = OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("RUSTYKRAB_COMPACTION_SUMMARY_MAX_TOKENS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(DEFAULT_COMPACTION_SUMMARY_MAX_TOKENS)
+    })
+}
+
 /// Classification of a model response that didn't include tool calls.
 enum ResponseClass {
     /// Substantive text — the model produced a real answer.
@@ -1337,6 +1381,58 @@ impl AgentRunner {
             .await
     }
 
+    /// Enforce the hard upper bound on a compacted-history summary. The
+    /// summarizer is instructed to stay under ~1000 words, but that prompt
+    /// is advisory: a misbehaving model — or the recursion depth-limit
+    /// fallback that concatenates intermediates — can produce summaries
+    /// large enough to defeat the whole point of compaction. This method
+    /// re-summarizes the summary itself until it fits, then truncates as
+    /// a last resort.
+    async fn enforce_summary_size_cap(
+        &self,
+        mut summary: String,
+        input_budget: usize,
+    ) -> Result<String> {
+        let cap_tokens = compaction_summary_max_tokens();
+
+        for attempt in 0..MAX_SUMMARY_CAP_RESUMMARIZE_ATTEMPTS {
+            let tokens = Self::estimate_text_tokens(&summary);
+            if tokens <= cap_tokens {
+                return Ok(summary);
+            }
+            tracing::warn!(
+                tokens,
+                cap_tokens,
+                attempt,
+                "compaction summary exceeds cap; re-summarizing"
+            );
+
+            let resummarized = self
+                .summarize_text_recursively(vec![summary.clone()], input_budget, 0)
+                .await?;
+            let new_tokens = Self::estimate_text_tokens(&resummarized);
+
+            // Abandon the re-summarize loop if the model returns nothing or
+            // stops shrinking — truncation below is the last resort.
+            if resummarized.is_empty() || new_tokens >= tokens {
+                break;
+            }
+            summary = resummarized;
+        }
+
+        let tokens = Self::estimate_text_tokens(&summary);
+        if tokens <= cap_tokens {
+            return Ok(summary);
+        }
+
+        tracing::warn!(
+            tokens,
+            cap_tokens,
+            "compaction summary still exceeds cap after re-summarization; truncating"
+        );
+        Ok(truncate_summary_to_tokens(&summary, cap_tokens))
+    }
+
     /// Ask the LLM to summarize the conversation so far, then replace the
     /// history with [system messages, summary, continuation prompt].
     ///
@@ -1419,6 +1515,13 @@ impl AgentRunner {
             self.summarize_text_recursively(rendered, input_budget, 0)
                 .await?
         };
+
+        // Hard cap on the final summary size. The "under 1000 words" prompt
+        // is advisory and the depth-limit recursion fallback concatenates
+        // intermediates without further compression — both can produce
+        // summaries that exceed the compaction threshold themselves,
+        // defeating compaction. Re-summarize or truncate until it fits.
+        let summary = self.enforce_summary_size_cap(summary, input_budget).await?;
 
         if summary.is_empty() {
             tracing::warn!("compaction produced empty summary, skipping");
@@ -1944,5 +2047,144 @@ mod compaction_tests {
         // Recursive path should have issued more than one provider call.
         let calls = *provider.call_count.lock().unwrap();
         assert!(calls >= 2, "recursive path expected, got {calls} call(s)");
+    }
+
+    /// Mock provider that always returns a large canned summary, regardless
+    /// of input. Used to exercise the summary-cap enforcement path.
+    struct OversizedProvider {
+        response_chars: usize,
+        call_count: Mutex<usize>,
+    }
+
+    impl OversizedProvider {
+        fn new(response_chars: usize) -> Self {
+            Self {
+                response_chars,
+                call_count: Mutex::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for OversizedProvider {
+        fn name(&self) -> &str {
+            "oversized-mock"
+        }
+        fn context_limit(&self) -> Option<usize> {
+            None
+        }
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSchema],
+        ) -> Result<ModelResponse> {
+            *self.call_count.lock().unwrap() += 1;
+            Ok(ModelResponse {
+                message: Message {
+                    id: Uuid::new_v4(),
+                    role: Role::Assistant,
+                    content: MessageContent::Text("x".repeat(self.response_chars)),
+                    created_at: Utc::now(),
+                },
+                usage: Usage::default(),
+                stop_reason: StopReason::EndTurn,
+                text: None,
+            })
+        }
+    }
+
+    #[test]
+    fn truncate_summary_to_tokens_respects_cap_and_utf8() {
+        // A string of 10k chars is ~2858 tokens. Truncating to 100 tokens
+        // (~350 chars) should leave a much shorter prefix plus the marker.
+        let input = "a".repeat(10_000);
+        let out = truncate_summary_to_tokens(&input, 100);
+        // The body prefix (before the marker) should be at most 350 chars.
+        let prefix: String = out.chars().take_while(|&c| c == 'a').collect();
+        assert!(
+            prefix.len() <= 350,
+            "prefix should be truncated to ~100 tokens worth of chars, got {}",
+            prefix.len()
+        );
+        assert!(
+            out.contains("[summary truncated"),
+            "truncation marker should be appended"
+        );
+
+        // Multibyte input must not panic and must remain valid UTF-8.
+        let emoji_heavy = "🦀".repeat(10_000);
+        let out = truncate_summary_to_tokens(&emoji_heavy, 50);
+        assert!(out.contains("[summary truncated"));
+        // Round-trips via String, so UTF-8 validity is guaranteed.
+        assert!(!out.is_empty());
+    }
+
+    #[test]
+    fn truncate_summary_to_tokens_noop_when_under_cap() {
+        let input = "tiny".to_string();
+        let out = truncate_summary_to_tokens(&input, 10_000);
+        assert_eq!(out, input, "short inputs should pass through unchanged");
+    }
+
+    #[tokio::test]
+    async fn enforce_summary_size_cap_truncates_when_resummarize_fails_to_shrink() {
+        // Provider always returns a huge (~5714-token) response — far above
+        // the 8192-token default cap? Actually 20_000 chars is ~5714 tokens
+        // which is *under* the default. Use a smaller forced cap via env
+        // isn't ideal in a unit test; instead, craft a summary large enough
+        // that one pass produces a non-shrinking response.
+        //
+        // Simpler: feed the helper a summary already above the cap, and
+        // use a provider that returns a same-sized response (no shrink).
+        // The loop should break and truncation kick in.
+        let provider = Arc::new(OversizedProvider::new(40_000));
+        let runner = AgentRunner::new(
+            provider.clone() as Arc<dyn ModelProvider>,
+            Vec::new(),
+            Arc::new(NoSandbox),
+        );
+
+        let big_summary = "x".repeat(80_000); // ~22_857 tokens, above 8192 cap
+        let out = runner
+            .enforce_summary_size_cap(big_summary, 32_000)
+            .await
+            .expect("cap enforcement should succeed");
+
+        let tokens = AgentRunner::estimate_text_tokens(&out);
+        let cap = compaction_summary_max_tokens();
+        // Truncation appends a marker that nudges the final length slightly
+        // past the raw cap in token terms; allow the marker's overhead.
+        assert!(
+            tokens <= cap + 50,
+            "output should be within cap (+ marker slack), got {tokens} vs cap {cap}"
+        );
+        assert!(
+            out.contains("[summary truncated") || AgentRunner::estimate_text_tokens(&out) <= cap,
+            "oversized summary should be either re-summarized under the cap or truncated"
+        );
+    }
+
+    #[tokio::test]
+    async fn enforce_summary_size_cap_noop_when_under_cap() {
+        // Provider should never be called for summaries already under the cap.
+        let provider = Arc::new(OversizedProvider::new(100_000));
+        let runner = AgentRunner::new(
+            provider.clone() as Arc<dyn ModelProvider>,
+            Vec::new(),
+            Arc::new(NoSandbox),
+        );
+
+        let small = "- already compact".to_string();
+        let out = runner
+            .enforce_summary_size_cap(small.clone(), 32_000)
+            .await
+            .expect("cap enforcement should succeed");
+
+        assert_eq!(out, small);
+        assert_eq!(
+            *provider.call_count.lock().unwrap(),
+            0,
+            "no resummarize calls expected for already-small input"
+        );
     }
 }
