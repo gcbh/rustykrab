@@ -80,6 +80,10 @@ mod credential_write;
 // Skill tools
 mod skills;
 
+// Meta tools (tool discovery &amp; activation)
+mod tools_list;
+mod tools_load;
+
 // --- Public re-exports ---
 
 // Filesystem
@@ -157,6 +161,10 @@ pub use credential_write::CredentialWriteTool;
 // Skills
 pub use self::skills::SkillsTool;
 
+// Meta tools
+pub use tools_list::ToolsListTool;
+pub use tools_load::ToolsLoadTool;
+
 /// Collect all built-in tools that require no external backend into a Vec.
 ///
 /// Tools that need access to the secret store (credential_read, credential_write)
@@ -165,6 +173,9 @@ pub fn builtin_tools(
     secrets: rustykrab_store::SecretStore,
 ) -> Vec<std::sync::Arc<dyn rustykrab_core::Tool>> {
     vec![
+        // Meta — tool discovery and lazy schema loading. Always registered.
+        std::sync::Arc::new(ToolsListTool::new()),
+        std::sync::Arc::new(ToolsLoadTool::new()),
         // HTTP
         std::sync::Arc::new(HttpRequestTool::new()),
         std::sync::Arc::new(HttpSessionTool::new()),
