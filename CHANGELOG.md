@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.6.9] - 2026-04-20
+
+- fix(agent): hard cap on compacted-history summary size (#388)
+
 - fix(agent): hard cap on compacted-history summary size so an oversized summary can't refill the context window
 
 ## [2.6.8] - 2026-04-19
