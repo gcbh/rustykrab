@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- fix(agent): thread the compacted-summary token cap through every summarizer call so the recursive reducer targets the final output size (not just the single-call input budget) — prevents post-compaction prompts from still exceeding the provider HTTP timeout when the model ignores the "1000 words" hint
+
 ## [2.6.9] - 2026-04-20
 
 - fix(agent): hard cap on compacted-history summary size (#388)

@@ -1288,20 +1288,35 @@ impl AgentRunner {
     /// compaction-specific system prompt — it does *not* reuse the agent's
     /// own system prompt, so the summarizer can focus on compression
     /// without the agent's tool-using persona.
-    async fn summarize_text_once(&self, input: &str, partial: bool) -> Result<String> {
+    ///
+    /// `max_output_tokens` is rendered into the system prompt as an
+    /// explicit word budget. This is advisory (models don't always comply)
+    /// but when combined with the post-hoc cap in
+    /// `enforce_summary_size_cap`, it gives the recursive reducer a hard
+    /// target regardless of input size.
+    async fn summarize_text_once(
+        &self,
+        input: &str,
+        partial: bool,
+        max_output_tokens: usize,
+    ) -> Result<String> {
         let scope = if partial {
             "a portion of a longer conversation (one of several chunks)"
         } else {
             "a conversation between a user and an agent"
         };
+        // Token → word conversion uses ~1.5 tokens/word as a conservative
+        // estimate so the word budget leaves headroom under the token cap.
+        let max_words = (max_output_tokens as f64 / 1.5).floor().max(128.0) as usize;
         let system_prompt = format!(
             "You are compressing {scope} so a downstream agent can continue the work \
              without re-reading it. Preserve: concrete intermediate results (values, file \
              paths, IDs, URLs), decisions, constraints and preferences, named entities, \
              open questions, and the agent's current plan. Drop: pleasantries, superseded \
              reasoning, and anything already resolved by later turns. Output terse bullet \
-             points only — no preamble, no meta-commentary. Keep the summary under 1000 \
-             words."
+             points only — no preamble, no meta-commentary. HARD LIMIT: keep the summary \
+             under {max_words} words — shorter is better. If you cannot fit everything, \
+             prioritise the most recent decisions and open work."
         );
         let messages = vec![
             Message {
@@ -1321,19 +1336,28 @@ impl AgentRunner {
         Ok(response.message.content.as_text().unwrap_or("").to_string())
     }
 
-    /// Summarize a set of text fragments, recursively reducing when the
-    /// combined input exceeds `input_budget_tokens`. Each pass packs
-    /// fragments into budget-sized chunks, summarizes each chunk, then
-    /// recurses on the intermediate summaries until a single summary
-    /// remains.
+    /// Summarize a set of text fragments, recursively reducing until a
+    /// single summary fits within `max_output_tokens`. Each pass packs
+    /// fragments into `input_budget_tokens`-sized chunks, summarizes each
+    /// chunk targeting a proportional share of the final cap, then
+    /// recurses on the intermediates.
     ///
-    /// Terminates because each recursion strictly reduces total token count
-    /// (a summary is shorter than its input) — capped at
-    /// `MAX_RECURSIVE_SUMMARIZATION_DEPTH` as a safety net.
+    /// The key invariant: the returned summary targets `max_output_tokens`
+    /// regardless of how large the inputs are. The old behaviour — "keep
+    /// reducing until it fits in one summarizer call" — left the final
+    /// summary at the size the model happened to return (potentially tens
+    /// of thousands of tokens), which defeats compaction. Now every
+    /// summarizer call is told the target budget, and if the fast-path
+    /// output still exceeds the cap we recurse on it.
+    ///
+    /// `MAX_RECURSIVE_SUMMARIZATION_DEPTH` bounds the loop in case a
+    /// misbehaving model refuses to shrink; the caller (usually
+    /// `enforce_summary_size_cap`) truncates after that.
     async fn summarize_text_recursively(
         &self,
         inputs: Vec<String>,
         input_budget_tokens: usize,
+        max_output_tokens: usize,
         depth: usize,
     ) -> Result<String> {
         if inputs.is_empty() {
@@ -1346,7 +1370,33 @@ impl AgentRunner {
         if total_tokens <= input_budget_tokens {
             let joined = inputs.join("\n\n");
             let partial = depth > 0;
-            return self.summarize_text_once(&joined, partial).await;
+            let summary = self
+                .summarize_text_once(&joined, partial, max_output_tokens)
+                .await?;
+
+            // If the model ignored the budget, recurse on its own output so
+            // the next call can take another pass at shrinking it. Depth
+            // cap prevents runaway loops against non-compliant models.
+            let summary_tokens = Self::estimate_text_tokens(&summary);
+            if summary_tokens > max_output_tokens
+                && !summary.is_empty()
+                && depth + 1 < MAX_RECURSIVE_SUMMARIZATION_DEPTH
+            {
+                tracing::info!(
+                    depth,
+                    summary_tokens,
+                    max_output_tokens,
+                    "recursive compaction: fast-path output exceeds cap; reducing further"
+                );
+                return Box::pin(self.summarize_text_recursively(
+                    vec![summary],
+                    input_budget_tokens,
+                    max_output_tokens,
+                    depth + 1,
+                ))
+                .await;
+            }
+            return Ok(summary);
         }
 
         if depth >= MAX_RECURSIVE_SUMMARIZATION_DEPTH {
@@ -1360,25 +1410,36 @@ impl AgentRunner {
         }
 
         let chunks = Self::pack_into_chunks(&inputs, input_budget_tokens);
+        // Divide the final cap across chunks so their combined intermediate
+        // summaries stay near the target, avoiding one more reduction pass
+        // in the common case. Floor at 512 tokens so each chunk still has
+        // room for concrete details.
+        let per_chunk_target = (max_output_tokens / chunks.len().max(1)).max(512);
         tracing::info!(
             depth,
             chunk_count = chunks.len(),
             total_tokens,
             input_budget_tokens,
+            per_chunk_target,
+            max_output_tokens,
             "recursive compaction: reducing"
         );
 
         let mut intermediates = Vec::with_capacity(chunks.len());
         for chunk in chunks {
-            intermediates.push(self.summarize_text_once(&chunk, true).await?);
+            intermediates.push(
+                self.summarize_text_once(&chunk, true, per_chunk_target)
+                    .await?,
+            );
         }
 
-        if intermediates.len() == 1 {
-            return Ok(intermediates.pop().unwrap());
-        }
-
-        Box::pin(self.summarize_text_recursively(intermediates, input_budget_tokens, depth + 1))
-            .await
+        Box::pin(self.summarize_text_recursively(
+            intermediates,
+            input_budget_tokens,
+            max_output_tokens,
+            depth + 1,
+        ))
+        .await
     }
 
     /// Enforce the hard upper bound on a compacted-history summary. The
@@ -1408,7 +1469,7 @@ impl AgentRunner {
             );
 
             let resummarized = self
-                .summarize_text_recursively(vec![summary.clone()], input_budget, 0)
+                .summarize_text_recursively(vec![summary.clone()], input_budget, cap_tokens, 0)
                 .await?;
             let new_tokens = Self::estimate_text_tokens(&resummarized);
 
@@ -1464,10 +1525,12 @@ impl AgentRunner {
         let ratio = compaction_input_budget_ratio();
         let input_budget =
             ((ceiling as f64 * ratio) as usize).saturating_sub(SUMMARIZER_RESPONSE_RESERVE_TOKENS);
+        let summary_cap_tokens = compaction_summary_max_tokens();
         tracing::debug!(
             ceiling,
             ratio,
             input_budget,
+            summary_cap_tokens,
             "compaction input budget computed"
         );
 
@@ -1476,19 +1539,23 @@ impl AgentRunner {
         // semantics (the model sees its own history and is asked to
         // summarize its progress).
         let summary = if before_tokens <= input_budget {
+            // Derive a word budget from the token cap so the model's own
+            // output targets the same size as the recursive path. ~1.5
+            // tokens per word leaves headroom under the token cap.
+            let max_words = (summary_cap_tokens as f64 / 1.5).floor().max(128.0) as usize;
             let compaction_prompt = Message {
                 id: Uuid::new_v4(),
                 role: Role::User,
-                content: MessageContent::Text(
+                content: MessageContent::Text(format!(
                     "Your conversation history is getting long and needs to be compressed. \
                      Summarize your progress so far in a concise message. Include:\n\
                      1. What you have already completed (concrete results, values, file paths, etc.)\n\
                      2. What remains to be done\n\
                      3. Your current plan / next step\n\n\
                      Be specific — include variable names, numbers, tool outputs, and any \
-                     intermediate results needed to continue without repeating work."
-                        .to_string(),
-                ),
+                     intermediate results needed to continue without repeating work. \
+                     HARD LIMIT: keep the summary under {max_words} words."
+                )),
                 created_at: Utc::now(),
             };
 
@@ -1501,10 +1568,11 @@ impl AgentRunner {
             // Recursive path: the history alone is already larger than what
             // the provider will accept in one call. Render messages as text,
             // chunk them within the budget, summarize each chunk, and reduce
-            // bottom-up to a single summary.
+            // bottom-up to a single summary targeting `summary_cap_tokens`.
             tracing::info!(
                 before_tokens,
                 input_budget,
+                summary_cap_tokens,
                 "compaction: history exceeds single-call budget; using recursive path"
             );
             let rendered: Vec<String> = conv
@@ -1512,7 +1580,7 @@ impl AgentRunner {
                 .iter()
                 .map(Self::render_message_for_summary)
                 .collect();
-            self.summarize_text_recursively(rendered, input_budget, 0)
+            self.summarize_text_recursively(rendered, input_budget, summary_cap_tokens, 0)
                 .await?
         };
 
@@ -1963,7 +2031,7 @@ mod compaction_tests {
         let inputs = vec![big.clone(), big.clone(), big];
         let budget_tokens = 800;
         let summary = runner
-            .summarize_text_recursively(inputs, budget_tokens, 0)
+            .summarize_text_recursively(inputs, budget_tokens, 4_096, 0)
             .await
             .expect("summarization should succeed");
         assert!(!summary.is_empty());
@@ -1977,17 +2045,43 @@ mod compaction_tests {
     #[tokio::test]
     async fn recursive_summarization_fast_path_single_call() {
         // Inputs that fit comfortably within the budget should produce
-        // exactly one provider call.
+        // exactly one provider call when the model's output is under the
+        // output cap (CountingProvider returns a tiny "- summarized"
+        // string, so no re-reduction is triggered).
         let provider = Arc::new(CountingProvider::new(None));
         let runner = build_runner(Arc::clone(&provider));
         let small = "hello world".to_string();
         let summary = runner
-            .summarize_text_recursively(vec![small], 10_000, 0)
+            .summarize_text_recursively(vec![small], 10_000, 4_096, 0)
             .await
             .expect("summarization should succeed");
         assert!(!summary.is_empty());
         let calls = *provider.call_count.lock().unwrap();
         assert_eq!(calls, 1, "fast path should issue one call, got {calls}");
+    }
+
+    #[tokio::test]
+    async fn recursive_summarization_respects_output_cap_on_fast_path() {
+        // A compliant-sized budget but a model that returns a huge response
+        // should trigger re-reduction until the depth limit, so the
+        // provider is invoked more than once even though the input fits
+        // the budget in a single call.
+        let provider = Arc::new(OversizedProvider::new(40_000));
+        let runner = AgentRunner::new(
+            provider.clone() as Arc<dyn ModelProvider>,
+            Vec::new(),
+            Arc::new(NoSandbox),
+        );
+        // Input fits in one call; cap is well below the model's output size.
+        let _ = runner
+            .summarize_text_recursively(vec!["short input".to_string()], 32_000, 4_096, 0)
+            .await
+            .expect("recursive reduction should succeed");
+        let calls = *provider.call_count.lock().unwrap();
+        assert!(
+            calls > 1,
+            "expected re-reduction when fast-path output exceeds cap, got {calls} call(s)"
+        );
     }
 
     #[tokio::test]
