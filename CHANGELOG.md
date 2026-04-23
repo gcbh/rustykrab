@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.6.10] - 2026-04-23
+
+- fix(agent): target compaction output cap at every recursion step (#390)
+
 - fix(agent): thread the compacted-summary token cap through every summarizer call so the recursive reducer targets the final output size (not just the single-call input budget) — prevents post-compaction prompts from still exceeding the provider HTTP timeout when the model ignores the "1000 words" hint
 - fix(agent): repair oversized stored summaries on agent-loop start so conversations compacted by pre-fix code can't wedge the next model call with a bloated prompt — pure truncation, no extra model calls
 
