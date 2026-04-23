@@ -381,6 +381,12 @@ impl AgentRunner {
             return Err(Error::Auth("session has expired".into()));
         }
 
+        // Repair stored state before the loop: older compactions could
+        // persist summaries that exceed the current cap. Truncate them so
+        // the first model call doesn't get a prompt large enough to trip
+        // the provider HTTP timeout.
+        self.repair_oversized_summary(conv);
+
         // Create a per-run tracer to prevent cross-session data leaks (H8)
         let tracer = ExecutionTracer::new();
 
@@ -731,6 +737,10 @@ impl AgentRunner {
         if session.is_expired() {
             return Err(Error::Auth("session has expired".into()));
         }
+
+        // Repair stored state before the loop: older compactions could
+        // persist summaries that exceed the current cap. See run_inner.
+        self.repair_oversized_summary(conv);
 
         let tracer = ExecutionTracer::new();
 
@@ -1214,6 +1224,51 @@ impl AgentRunner {
             .context_limit()
             .unwrap_or(self.config.max_context_tokens)
             .min(compaction_context_ceiling())
+    }
+
+    /// Truncate a previously-stored compaction summary that exceeds the
+    /// current cap. Handles conversations compacted by older code that
+    /// didn't bound the summary size — without this, loading such a
+    /// conversation would immediately push the next model call over the
+    /// provider's HTTP timeout budget.
+    ///
+    /// Pure truncation, no model calls: fast, deterministic, never fails.
+    /// If the resulting conversation is still over the compaction
+    /// threshold, the main loop's `needs_compaction` check will fire and
+    /// re-compact properly on the first iteration.
+    fn repair_oversized_summary(&self, conv: &mut Conversation) {
+        let Some(stored) = conv.summary.clone() else {
+            return;
+        };
+        let cap_tokens = compaction_summary_max_tokens();
+        let stored_tokens = Self::estimate_text_tokens(&stored);
+        if stored_tokens <= cap_tokens {
+            return;
+        }
+
+        let fixed = truncate_summary_to_tokens(&stored, cap_tokens);
+        let fixed_tokens = Self::estimate_text_tokens(&fixed);
+        tracing::warn!(
+            stored_tokens,
+            fixed_tokens,
+            cap_tokens,
+            "loaded conversation has an oversized compaction summary; truncating to cap"
+        );
+
+        // Replace the synthesized summary message in-place. Compaction
+        // emits exactly one assistant text message whose body equals
+        // `conv.summary`; match on that.
+        for msg in conv.messages.iter_mut() {
+            if msg.role == Role::Assistant {
+                if let MessageContent::Text(ref text) = msg.content {
+                    if text == &stored {
+                        msg.content = MessageContent::Text(fixed.clone());
+                        break;
+                    }
+                }
+            }
+        }
+        conv.summary = Some(fixed);
     }
 
     /// Returns true if the conversation has crossed the compaction threshold.
@@ -2280,5 +2335,118 @@ mod compaction_tests {
             0,
             "no resummarize calls expected for already-small input"
         );
+    }
+
+    #[test]
+    fn repair_oversized_summary_truncates_stored_summary_and_matching_message() {
+        // Simulate a conversation compacted by older code: conv.summary is
+        // way over the current cap, and an assistant message holds the
+        // same bloated text. Repair should truncate both in place.
+        let provider = Arc::new(CountingProvider::new(None));
+        let runner = build_runner(Arc::clone(&provider));
+
+        let cap = compaction_summary_max_tokens();
+        // 10x the cap in chars/tokens to guarantee it exceeds the cap.
+        let bloated = "x".repeat(cap * 10 * 4);
+        let bloated_tokens = AgentRunner::estimate_text_tokens(&bloated);
+        assert!(bloated_tokens > cap, "test setup: bloated must exceed cap");
+
+        let mut conv = Conversation {
+            id: Uuid::new_v4(),
+            messages: vec![
+                Message {
+                    id: Uuid::new_v4(),
+                    role: Role::System,
+                    content: MessageContent::Text("agent identity".into()),
+                    created_at: Utc::now(),
+                },
+                Message {
+                    id: Uuid::new_v4(),
+                    role: Role::User,
+                    content: MessageContent::Text("original task".into()),
+                    created_at: Utc::now(),
+                },
+                Message {
+                    id: Uuid::new_v4(),
+                    role: Role::Assistant,
+                    content: MessageContent::Text(bloated.clone()),
+                    created_at: Utc::now(),
+                },
+                Message {
+                    id: Uuid::new_v4(),
+                    role: Role::User,
+                    content: MessageContent::Text("Continue from the summary above.".into()),
+                    created_at: Utc::now(),
+                },
+            ],
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            summary: Some(bloated.clone()),
+            detected_profile: None,
+            channel_source: None,
+            channel_id: None,
+            channel_thread_id: None,
+        };
+
+        runner.repair_oversized_summary(&mut conv);
+
+        // conv.summary should have been shrunk to within cap (+ marker slack).
+        let new_summary = conv.summary.as_ref().expect("summary should still be set");
+        let new_tokens = AgentRunner::estimate_text_tokens(new_summary);
+        assert!(
+            new_tokens <= cap + 50,
+            "summary should be within cap, got {new_tokens} tokens"
+        );
+        assert!(
+            new_summary.contains("[summary truncated"),
+            "truncation marker should be present"
+        );
+
+        // The assistant message with the bloated body should also be
+        // shrunk — otherwise the next model call would still include
+        // tens of thousands of summary tokens in the prompt.
+        let assistant_msg = conv
+            .messages
+            .iter()
+            .find(|m| m.role == Role::Assistant)
+            .expect("assistant summary message present");
+        if let MessageContent::Text(ref text) = assistant_msg.content {
+            assert_eq!(
+                text, new_summary,
+                "assistant msg should match repaired summary"
+            );
+        } else {
+            panic!("assistant message should be text");
+        }
+
+        // Provider was never called — repair is pure truncation.
+        assert_eq!(*provider.call_count.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn repair_oversized_summary_noop_when_within_cap() {
+        let provider = Arc::new(CountingProvider::new(None));
+        let runner = build_runner(Arc::clone(&provider));
+
+        let small = "- already compact".to_string();
+        let mut conv = Conversation {
+            id: Uuid::new_v4(),
+            messages: vec![Message {
+                id: Uuid::new_v4(),
+                role: Role::Assistant,
+                content: MessageContent::Text(small.clone()),
+                created_at: Utc::now(),
+            }],
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            summary: Some(small.clone()),
+            detected_profile: None,
+            channel_source: None,
+            channel_id: None,
+            channel_thread_id: None,
+        };
+
+        runner.repair_oversized_summary(&mut conv);
+        assert_eq!(conv.summary.as_deref(), Some(small.as_str()));
     }
 }
