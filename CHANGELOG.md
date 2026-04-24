@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.6.11] - 2026-04-24
+
+- feat(agent): configurable max_context_tokens for local inference (#391)
+
 ## [2.6.10] - 2026-04-23
 
 - fix(agent): target compaction output cap at every recursion step (#390)
