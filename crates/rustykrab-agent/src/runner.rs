@@ -1328,26 +1328,87 @@ impl AgentRunner {
         (text.len() as f64 / 3.5).ceil() as usize
     }
 
+    /// Split a single text fragment into pieces whose token estimates each
+    /// fit within `budget_tokens`. Prefers splitting on paragraph (`\n\n`)
+    /// then line (`\n`) boundaries; falls back to a UTF-8-safe character
+    /// slice when no natural break exists inside the budget. Returns the
+    /// input as a single-element vector when it already fits.
+    ///
+    /// Used by [`pack_into_chunks`] to keep individual rendered messages
+    /// (e.g. a multi-megabyte tool result) from creating chunks that
+    /// exceed the provider's context window — Ollama silently truncates
+    /// oversize prompts and then still spends minutes evaluating them.
+    fn split_to_budget(text: &str, budget_tokens: usize) -> Vec<String> {
+        if budget_tokens == 0 || Self::estimate_text_tokens(text) <= budget_tokens {
+            return vec![text.to_string()];
+        }
+        // Inverse of `estimate_text_tokens` (~3.5 chars/token). Floor and
+        // shave a little to keep the post-split estimate under the budget
+        // even with the per-message overhead the packer adds.
+        let char_budget = ((budget_tokens as f64) * 3.0).floor() as usize;
+        if char_budget == 0 {
+            return vec![text.to_string()];
+        }
+
+        let mut pieces = Vec::new();
+        let mut remaining = text;
+        while !remaining.is_empty() {
+            if Self::estimate_text_tokens(remaining) <= budget_tokens {
+                pieces.push(remaining.to_string());
+                break;
+            }
+            let target = char_budget.min(remaining.len());
+            // Walk back to a UTF-8 boundary at or below `target`.
+            let mut boundary = target;
+            while boundary > 0 && !remaining.is_char_boundary(boundary) {
+                boundary -= 1;
+            }
+            // Prefer a paragraph break inside the window; fall back to a
+            // line break; finally accept the raw boundary.
+            let head = &remaining[..boundary];
+            let split_at = head
+                .rfind("\n\n")
+                .map(|p| p + 2)
+                .or_else(|| head.rfind('\n').map(|p| p + 1))
+                .filter(|&p| p > 0)
+                .unwrap_or(boundary)
+                .max(1);
+            pieces.push(remaining[..split_at].to_string());
+            remaining = &remaining[split_at..];
+        }
+        pieces
+    }
+
     /// Pack text fragments into chunks whose token estimates each fit the
-    /// budget. Preserves fragment order. A single fragment larger than the
-    /// budget becomes its own chunk (the summarizer will truncate or the
-    /// provider will error — unavoidable at this layer).
+    /// budget. Preserves fragment order. Fragments larger than the budget
+    /// are pre-split via [`split_to_budget`] so no chunk ends up over the
+    /// provider's effective context window — sending a 75k-token prompt
+    /// to an Ollama server with `num_ctx=65536` causes silent truncation
+    /// and burns prompt-evaluation time on a context that won't fit
+    /// anyway, often blowing past the HTTP timeout.
     fn pack_into_chunks(inputs: &[String], budget_tokens: usize) -> Vec<String> {
         let mut chunks = Vec::new();
         let mut current = String::new();
         let mut current_tokens = 0usize;
         for text in inputs {
-            let t = Self::estimate_text_tokens(text);
-            if current_tokens != 0 && current_tokens + t > budget_tokens {
-                chunks.push(std::mem::take(&mut current));
-                current_tokens = 0;
+            let pieces = if Self::estimate_text_tokens(text) > budget_tokens {
+                Self::split_to_budget(text, budget_tokens)
+            } else {
+                vec![text.clone()]
+            };
+            for piece in pieces {
+                let t = Self::estimate_text_tokens(&piece);
+                if current_tokens != 0 && current_tokens + t > budget_tokens {
+                    chunks.push(std::mem::take(&mut current));
+                    current_tokens = 0;
+                }
+                if !current.is_empty() {
+                    current.push_str("\n\n");
+                    current_tokens += 1;
+                }
+                current.push_str(&piece);
+                current_tokens += t;
             }
-            if !current.is_empty() {
-                current.push_str("\n\n");
-                current_tokens += 1;
-            }
-            current.push_str(text);
-            current_tokens += t;
         }
         if !current.is_empty() {
             chunks.push(current);
@@ -2071,6 +2132,59 @@ mod compaction_tests {
 
     fn build_runner(provider: Arc<CountingProvider>) -> AgentRunner {
         AgentRunner::new(provider, Vec::new(), Arc::new(NoSandbox))
+    }
+
+    #[test]
+    fn pack_into_chunks_splits_oversized_fragments_to_budget() {
+        // Single ~100k-char fragment (~28k tokens) with a 600-token budget
+        // must be split so no chunk exceeds the budget. Without splitting,
+        // a single oversized rendered message would create one chunk of
+        // ~28k tokens — bigger than the local provider's context window.
+        let huge = "x".repeat(100_000);
+        let chunks = AgentRunner::pack_into_chunks(&[huge], 600);
+        assert!(
+            chunks.len() > 1,
+            "oversized fragment should split into multiple chunks, got {}",
+            chunks.len()
+        );
+        for chunk in &chunks {
+            let tokens = AgentRunner::estimate_text_tokens(chunk);
+            assert!(
+                tokens <= 700,
+                "chunk exceeds budget+slack after split: {tokens} tokens"
+            );
+        }
+    }
+
+    #[test]
+    fn split_to_budget_prefers_paragraph_boundaries() {
+        // Three ~1000-char paragraphs joined by blank lines. Splitting at
+        // a 300-token budget should land cuts on the paragraph breaks so
+        // no piece carries a partial paragraph.
+        let para = "y".repeat(1000);
+        let text = format!("{para}\n\n{para}\n\n{para}");
+        let pieces = AgentRunner::split_to_budget(&text, 300);
+        assert!(pieces.len() > 1, "expected split, got {}", pieces.len());
+        for piece in &pieces {
+            let tokens = AgentRunner::estimate_text_tokens(piece);
+            assert!(tokens <= 350, "piece over budget: {tokens} tokens");
+        }
+        // Reassembled pieces must equal the original (no data loss).
+        assert_eq!(pieces.concat(), text);
+    }
+
+    #[test]
+    fn split_to_budget_handles_multibyte_chars() {
+        // A long multibyte string must split on UTF-8 boundaries without
+        // panicking and reassemble losslessly.
+        let text = "日本語".repeat(2_000);
+        let pieces = AgentRunner::split_to_budget(&text, 200);
+        assert!(pieces.len() > 1);
+        assert_eq!(pieces.concat(), text);
+        for piece in &pieces {
+            assert!(piece.is_char_boundary(0));
+            assert!(piece.is_char_boundary(piece.len()));
+        }
     }
 
     #[test]
