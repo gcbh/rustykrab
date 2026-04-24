@@ -133,8 +133,12 @@ fn truncate_summary_to_tokens(s: &str, max_tokens: usize) -> String {
     out
 }
 
-/// Read the compaction summary cap once. Treats non-positive values as
-/// unset and falls back to the default.
+/// Read the env-configurable compaction summary cap once. Treats
+/// non-positive values as unset and falls back to the default. This is
+/// the *upper* bound from configuration; the effective cap used at
+/// runtime is further bounded by `max_context_tokens / 4` via
+/// [`AgentRunner::effective_compaction_summary_cap`] so summaries on
+/// small-context (local) deployments can't eclipse the context window.
 fn compaction_summary_max_tokens() -> usize {
     static CAP: OnceLock<usize> = OnceLock::new();
     *CAP.get_or_init(|| {
@@ -1226,6 +1230,18 @@ impl AgentRunner {
             .min(compaction_context_ceiling())
     }
 
+    /// Effective cap on the compacted-history summary in tokens. Combines
+    /// the env-configurable upper bound (default 8k) with a hard ceiling
+    /// of `max_context_tokens / 4` so a summary can never consume more
+    /// than a quarter of the usable context window. On a 32k local-Ollama
+    /// deployment this keeps the summary under 8k; on a 128k cloud model
+    /// the env cap is the binding constraint.
+    fn effective_compaction_summary_cap(&self) -> usize {
+        let env_cap = compaction_summary_max_tokens();
+        let quarter_cap = (self.config.max_context_tokens / 4).max(1);
+        env_cap.min(quarter_cap)
+    }
+
     /// Truncate a previously-stored compaction summary that exceeds the
     /// current cap. Handles conversations compacted by older code that
     /// didn't bound the summary size — without this, loading such a
@@ -1240,7 +1256,7 @@ impl AgentRunner {
         let Some(stored) = conv.summary.clone() else {
             return;
         };
-        let cap_tokens = compaction_summary_max_tokens();
+        let cap_tokens = self.effective_compaction_summary_cap();
         let stored_tokens = Self::estimate_text_tokens(&stored);
         if stored_tokens <= cap_tokens {
             return;
@@ -1509,7 +1525,7 @@ impl AgentRunner {
         mut summary: String,
         input_budget: usize,
     ) -> Result<String> {
-        let cap_tokens = compaction_summary_max_tokens();
+        let cap_tokens = self.effective_compaction_summary_cap();
 
         for attempt in 0..MAX_SUMMARY_CAP_RESUMMARIZE_ATTEMPTS {
             let tokens = Self::estimate_text_tokens(&summary);
@@ -1580,7 +1596,7 @@ impl AgentRunner {
         let ratio = compaction_input_budget_ratio();
         let input_budget =
             ((ceiling as f64 * ratio) as usize).saturating_sub(SUMMARIZER_RESPONSE_RESERVE_TOKENS);
-        let summary_cap_tokens = compaction_summary_max_tokens();
+        let summary_cap_tokens = self.effective_compaction_summary_cap();
         tracing::debug!(
             ceiling,
             ratio,
@@ -2300,7 +2316,7 @@ mod compaction_tests {
             .expect("cap enforcement should succeed");
 
         let tokens = AgentRunner::estimate_text_tokens(&out);
-        let cap = compaction_summary_max_tokens();
+        let cap = runner.effective_compaction_summary_cap();
         // Truncation appends a marker that nudges the final length slightly
         // past the raw cap in token terms; allow the marker's overhead.
         assert!(
@@ -2345,7 +2361,7 @@ mod compaction_tests {
         let provider = Arc::new(CountingProvider::new(None));
         let runner = build_runner(Arc::clone(&provider));
 
-        let cap = compaction_summary_max_tokens();
+        let cap = runner.effective_compaction_summary_cap();
         // 10x the cap in chars/tokens to guarantee it exceeds the cap.
         let bloated = "x".repeat(cap * 10 * 4);
         let bloated_tokens = AgentRunner::estimate_text_tokens(&bloated);

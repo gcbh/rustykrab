@@ -36,13 +36,21 @@ pub struct OllamaConfig {
     pub think: bool,
 }
 
-/// Read `num_ctx` from the `OLLAMA_NUM_CTX` env var.  Returns `None` when
-/// the var is unset or unparseable so the request omits `num_ctx` and the
-/// Ollama server's own configuration (e.g. `OLLAMA_CONTEXT_LENGTH`) wins.
+/// Read `num_ctx` from the environment. Checks `RUSTYKRAB_NUM_CTX` first
+/// (the canonical RustyKrab-namespaced name), then falls back to
+/// `OLLAMA_NUM_CTX` for backward compatibility. Returns `None` when
+/// neither var is set or parseable, so the request omits `num_ctx` and
+/// the Ollama server's own configuration (e.g. `OLLAMA_CONTEXT_LENGTH`)
+/// wins.
 fn num_ctx_from_env() -> Option<u32> {
-    std::env::var("OLLAMA_NUM_CTX")
+    std::env::var("RUSTYKRAB_NUM_CTX")
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
+        .or_else(|| {
+            std::env::var("OLLAMA_NUM_CTX")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+        })
 }
 
 /// Rough characters-per-token ratio used for client-side context budgeting.
@@ -1152,25 +1160,32 @@ mod tests {
 
     #[test]
     fn default_config_omits_num_ctx_when_env_unset() {
-        // Guard: when OLLAMA_NUM_CTX is not set, constructors leave num_ctx
-        // as None so the server's own OLLAMA_CONTEXT_LENGTH wins.
+        // Guard: when neither RUSTYKRAB_NUM_CTX nor OLLAMA_NUM_CTX is set,
+        // constructors leave num_ctx as None so the server's own
+        // OLLAMA_CONTEXT_LENGTH wins.
         //
         // std::env is process-global; restore it after the test so we don't
         // contaminate sibling tests that may set it themselves.
-        let saved = std::env::var("OLLAMA_NUM_CTX").ok();
+        let saved_ollama = std::env::var("OLLAMA_NUM_CTX").ok();
+        let saved_rk = std::env::var("RUSTYKRAB_NUM_CTX").ok();
         // SAFETY: single-threaded section of this test. `cargo test` runs
         // tests on separate threads by default but we're only reading/writing
         // our own var and restoring it.
         unsafe {
             std::env::remove_var("OLLAMA_NUM_CTX");
+            std::env::remove_var("RUSTYKRAB_NUM_CTX");
         }
         assert_eq!(OllamaConfig::default().num_ctx, None);
         assert_eq!(OllamaConfig::tool_calling().num_ctx, None);
         assert_eq!(OllamaConfig::creative().num_ctx, None);
         unsafe {
-            match saved {
+            match saved_ollama {
                 Some(v) => std::env::set_var("OLLAMA_NUM_CTX", v),
                 None => std::env::remove_var("OLLAMA_NUM_CTX"),
+            }
+            match saved_rk {
+                Some(v) => std::env::set_var("RUSTYKRAB_NUM_CTX", v),
+                None => std::env::remove_var("RUSTYKRAB_NUM_CTX"),
             }
         }
     }

@@ -60,11 +60,13 @@ All configuration is via environment variables. No plaintext config files.
 | `ANTHROPIC_API_KEY` | — | Anthropic API key (required for Claude) |
 | `ANTHROPIC_MODEL` | `claude-sonnet-4-20250514` | Claude model to use |
 | `ANTHROPIC_CONTEXT_LENGTH` | `200000` | Context window in tokens for the selected Claude model. Anthropic doesn't expose a discovery endpoint, so set this when enabling a non-default window (e.g. the 1M-token beta) so compaction thresholds stay in sync |
+| `RUSTYKRAB_MAX_CONTEXT_TOKENS` | `128000` (cloud) / `32000` (ollama) | Context budget used to compute the compaction threshold. Default is provider-aware: 128k for cloud providers (Anthropic) and 32k for local Ollama, where prompt evaluation on consumer GPUs times out long before a 128k window fills. Set to override the default for either provider |
 | `RUSTYKRAB_COMPACTION_CONTEXT_CEILING` | `65536` | Hard upper bound on the context window used to compute the compaction threshold. Keeps compaction firing at a sane size even when the backing model advertises a much larger window |
-| `RUSTYKRAB_COMPACTION_SUMMARY_MAX_TOKENS` | `8192` | Hard upper bound on the final compaction summary. If the summarizer returns a summary larger than this, it is re-summarized (up to 3 passes) and eventually truncated. Prevents oversized summaries from refilling the context window |
+| `RUSTYKRAB_COMPACTION_SUMMARY_MAX_TOKENS` | `8192` | Env-configurable upper bound on the final compaction summary. The effective cap is further bounded by `RUSTYKRAB_MAX_CONTEXT_TOKENS / 4`, so on a 32k local-Ollama deployment the summary stays under 8k regardless of this value. If the summarizer returns a summary larger than the effective cap, it is re-summarized (up to 3 passes) and eventually truncated |
 | `OLLAMA_MODEL` | `gemma4:26b` | Ollama model name |
 | `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama server address |
-| `OLLAMA_NUM_CTX` | — | Explicit client-side `num_ctx` override. Omitted by default so the server's own `OLLAMA_CONTEXT_LENGTH` (or per-model default) wins |
+| `RUSTYKRAB_NUM_CTX` | — | Explicit client-side `num_ctx` override for local providers. Takes precedence over `OLLAMA_NUM_CTX`. Omitted by default so the server's own `OLLAMA_CONTEXT_LENGTH` (or per-model default) wins |
+| `OLLAMA_NUM_CTX` | — | Legacy alias for `RUSTYKRAB_NUM_CTX`. Used only when `RUSTYKRAB_NUM_CTX` is unset |
 | `OLLAMA_TIMEOUT_SECS` | `900` | HTTP request timeout for Ollama in seconds |
 | `CHROME_CDP_URL` | `ws://127.0.0.1:9222` | Chrome DevTools Protocol endpoint |
 | `RUSTYKRAB_AUTH_TOKEN` | auto-generated | Bearer token for API auth |

@@ -181,7 +181,7 @@ async fn main() -> anyhow::Result<()> {
 
     // --- Harness profile ---
     // Load from file or use a preset. Supported: default, coding, research, creative
-    let profile = load_harness_profile(&data_dir)?;
+    let mut profile = load_harness_profile(&data_dir)?;
     tracing::info!(profile = %profile.name, "harness profile loaded");
 
     // --- Master key for credential encryption ---
@@ -277,6 +277,19 @@ async fn main() -> anyhow::Result<()> {
             Arc::new(p)
         }
     };
+
+    // Override the harness profile's context budget with a
+    // provider-aware default, or the RUSTYKRAB_MAX_CONTEXT_TOKENS env
+    // var if set. Cloud models ship with large windows (Claude at 200k);
+    // local Ollama deployments on consumer hardware can't chew through
+    // anywhere near that before the HTTP timeout fires, so default to
+    // 32k for Ollama and keep the 128k default for everything else.
+    profile.max_context_tokens = resolve_max_context_tokens(&provider_name);
+    tracing::info!(
+        max_context_tokens = profile.max_context_tokens,
+        provider = %provider_name,
+        "compaction context budget configured"
+    );
 
     // --- Skills directory (needed by skill tools and skill loader) ---
     let skills_dir = data_dir.join("skills");
@@ -1056,6 +1069,26 @@ fn load_orchestration_config(data_dir: &std::path::Path) -> anyhow::Result<Orche
     }
 
     Ok(config)
+}
+
+/// Resolve the effective `max_context_tokens` value.
+///
+/// Priority:
+/// 1. `RUSTYKRAB_MAX_CONTEXT_TOKENS` env var when set to a positive integer
+/// 2. Provider-aware default: 32k for Ollama (local inference with
+///    limited GPU memory), 128k for everything else (cloud models)
+fn resolve_max_context_tokens(provider_name: &str) -> usize {
+    if let Some(v) = std::env::var("RUSTYKRAB_MAX_CONTEXT_TOKENS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&v| v > 0)
+    {
+        return v;
+    }
+    match provider_name {
+        "ollama" => 32_000,
+        _ => 128_000,
+    }
 }
 
 /// Load harness profile from file or env var preset.
