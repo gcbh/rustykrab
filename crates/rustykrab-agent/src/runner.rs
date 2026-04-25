@@ -217,22 +217,25 @@ fn is_planning_only(text: &str) -> bool {
 /// 2. Matches anywhere in the text, not just the prefix — narration
 ///    typically appears after a preamble.
 ///
-/// Two signals trigger a match:
-/// - An explicit deferral marker ("stay tuned", "I'll update you", etc.),
-///   which on its own is enough.
+/// Three signals trigger a match:
+/// - An explicit deferral marker ("stay tuned", "I'll update you",
+///   "I will keep working", etc.) — any single match is enough.
 /// - Two or more in-progress narration phrases ("I'm currently …",
 ///   "I've initiated …") in the same response.
+/// - Five or more future-intent commitments ("I will …", "I'll …",
+///   "I'm going to …") — catches planning manifestos with numbered
+///   "Phase 1 / Phase 2" structures and no actual work.
 ///
-/// A code block or fenced JSON short-circuits to false: those represent
-/// concrete output, not narration.
+/// A code block short-circuits to false: fenced output represents concrete
+/// work, not narration.
 fn is_progress_narration(text: &str) -> bool {
     if text.contains("```") {
         return false;
     }
     let lower = text.to_lowercase();
 
-    // Explicit deferral markers: the model is promising future updates
-    // instead of producing them now. Any single match is enough.
+    // Tier 1 — explicit deferral markers: the model is promising future
+    // updates instead of producing them now. Any single match is enough.
     let deferral_markers = [
         "stay tuned",
         "i'll update you",
@@ -255,14 +258,28 @@ fn is_progress_narration(text: &str) -> bool {
         "i'll circle back",
         "i'll come back to you",
         "i'll follow up",
+        // "I will keep working / going / pushing" and friends — explicit
+        // commitments to do work in some unspecified future, instead of now.
+        "i'll keep working",
+        "i will keep working",
+        "i'll keep going",
+        "i will keep going",
+        "i'll keep at it",
+        "i will keep at it",
+        "i'll keep pushing",
+        "i will keep pushing",
+        "i won't stop",
+        "i will not stop",
+        "i'll keep at this",
+        "i will keep at this",
     ];
     if deferral_markers.iter().any(|m| lower.contains(m)) {
         return true;
     }
 
-    // Multiple in-progress narration phrases — the model is describing
-    // ongoing work that isn't actually running. A single match is too
-    // permissive (legitimate text often says "I'm working on it" once),
+    // Tier 2 — multiple in-progress narration phrases — the model is
+    // describing ongoing work that isn't actually running. A single match is
+    // too permissive (legitimate text often says "I'm working on it" once),
     // so we require two or more.
     let narration_phrases = [
         "i'm currently ",
@@ -298,7 +315,30 @@ fn is_progress_narration(text: &str) -> bool {
         .iter()
         .filter(|p| lower.contains(*p))
         .count();
-    narration_count >= 2
+    if narration_count >= 2 {
+        return true;
+    }
+
+    // Tier 3 — many future-intent commitments. Catches "planning manifesto"
+    // responses ("Phase 1: I will … Phase 2: I will … starting right now")
+    // that ride past tier 1 because they don't use deferral verbs and past
+    // tier 2 because they don't narrate ongoing action. Threshold 5 keeps
+    // out analytical answers that legitimately introduce themselves with
+    // "I'll consider three options. First, I'll … Then I'll … Finally
+    // I'll …" before delivering substance (4 intent markers, no fire).
+    let intent_markers = [
+        "i will ",
+        "i'll ",
+        "i am going to ",
+        "i'm going to ",
+        "i am starting ",
+        "i'm starting ",
+    ];
+    let intent_count: usize = intent_markers
+        .iter()
+        .map(|p| lower.matches(p).count())
+        .sum();
+    intent_count >= 5
 }
 
 /// Events emitted by the agent loop during streaming execution.
@@ -2681,5 +2721,49 @@ mod response_classification_tests {
     fn case_insensitive_matching() {
         assert_planning("STAY TUNED for the results.");
         assert_planning("I'M CURRENTLY checking logs. I'VE STARTED running diagnostics.");
+    }
+
+    #[test]
+    fn keep_working_phrasings_are_planning() {
+        assert_planning("I'll keep working on this until I have answers.");
+        assert_planning("I will not stop until the data is complete.");
+        assert_planning("I won't stop until I find it.");
+        assert_planning("I'll keep going until done.");
+        assert_planning("I will keep at it until I have a complete picture.");
+    }
+
+    #[test]
+    fn planning_manifesto_with_many_intent_markers_is_planning() {
+        // The "Phase 1 / Phase 2 / Phase 3" planning manifesto failure mode
+        // — no deferral verbs, no "I'm currently …" narration, just a wall
+        // of "I will / I'll" promises.
+        let text = "I understand. I will not stop until I have a complete, detailed breakdown.\n\n\
+            My systematic plan for this mission is:\n\n\
+            1. Phase 1: Flight Deep-Dive\n   \
+                United Airlines: Extract departure/arrival times.\n   \
+                Goal: A side-by-side comparison.\n\n\
+            2. Phase 2: Accommodation Deep-Dive\n   \
+                The Ritz-Carlton Maui: Find specific room types.\n\n\
+            3. Phase 3: Final Compilation\n   \
+                I will update Maui_Trip_Plan_Final.md with all this new data.\n   \
+                I will then present the completed data to you here.\n\n\
+            I am starting Phase 1, Step 1 (United Airlines) right now. \
+            I will keep working through these steps until the data is complete.";
+        assert_planning(text);
+    }
+
+    #[test]
+    fn four_intent_markers_below_threshold_is_complete() {
+        // An analytical answer that intros with four "I'll" statements before
+        // delivering substance must NOT be flagged by tier 3. Threshold is 5.
+        // (The intro deliberately doesn't start with a planning prefix so
+        // that `is_planning_only` doesn't fire either.)
+        let text = "Three options worth considering here. \
+            First, I'll lay out the pros. \
+            Then I'll lay out the cons. \
+            Finally, I'll recommend one. \
+            Option A is the simplest because the integration surface is small \
+            and the team already understands the moving parts.";
+        assert_complete(text);
     }
 }
