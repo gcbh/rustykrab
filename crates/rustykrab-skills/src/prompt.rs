@@ -1,5 +1,56 @@
 use crate::skill_md::SkillMd;
 
+/// Environment variable pointing at a custom `soul.md` file.
+///
+/// When set and readable, its contents replace the baked-in identity
+/// section. The string `{name}` in the file is substituted with the
+/// agent name passed to [`SystemPromptBuilder::with_identity`].
+pub const SOUL_PATH_ENV: &str = "RUSTYKRAB_SOUL_PATH";
+
+/// Baked-in default soul. Used when no `RUSTYKRAB_SOUL_PATH` is set,
+/// the file is missing, or the file is empty.
+///
+/// Kept deliberately small: one mission, one persistence rule, one
+/// named exception. Anything more belongs in the soul.md file the
+/// operator ships.
+const DEFAULT_SOUL: &str = "You are {name}. Complete the user's task and any follow-on work that \
+should obviously be done. Keep going until everything reasonable is finished — don't ask \
+permission, don't enumerate options and wait for a pick, don't promise to do it later. If you \
+genuinely can't continue (missing tool, missing data, contradictory request), say so in one \
+sentence and ask one specific question.\n\n\
+Use memory_save to persist important facts; context is limited.";
+
+/// Read the soul template, preferring a file at `RUSTYKRAB_SOUL_PATH`
+/// and falling back to [`DEFAULT_SOUL`].
+///
+/// Empty / unreadable files fall back silently — operators shouldn't
+/// be able to brick their agent with a typo. Failures are logged at
+/// `warn` so they're visible in normal logs.
+fn load_soul_template() -> String {
+    let Some(path) = std::env::var_os(SOUL_PATH_ENV) else {
+        return DEFAULT_SOUL.to_string();
+    };
+    let path = std::path::PathBuf::from(path);
+    match std::fs::read_to_string(&path) {
+        Ok(s) if !s.trim().is_empty() => s,
+        Ok(_) => {
+            tracing::warn!(
+                path = %path.display(),
+                "soul file is empty — falling back to default"
+            );
+            DEFAULT_SOUL.to_string()
+        }
+        Err(e) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "failed to read soul file — falling back to default"
+            );
+            DEFAULT_SOUL.to_string()
+        }
+    }
+}
+
 /// Builds the system prompt from composable sections.
 ///
 /// Keeps the prompt minimal (~100 tokens for identity + security) so
@@ -17,15 +68,14 @@ impl SystemPromptBuilder {
         }
     }
 
-    /// Add the base agent identity — minimal, action-oriented.
+    /// Add the base agent identity (the "soul").
+    ///
+    /// The template comes from `RUSTYKRAB_SOUL_PATH` if set, otherwise
+    /// the baked-in default. The literal `{name}` is replaced with the
+    /// supplied agent name.
     pub fn with_identity(mut self, name: &str) -> Self {
-        self.sections.push(format!(
-            "You are {name}, a personal AI agent. You complete tasks by using \
-             tools — act, don't explain. If something fails, adapt and try again.\n\n\
-             Use memory_save to store important facts, decisions, and preferences. \
-             Your context window is limited — anything you don't save will eventually \
-             be lost."
-        ));
+        let template = load_soul_template();
+        self.sections.push(template.replace("{name}", name));
         self
     }
 
@@ -116,4 +166,126 @@ fn escape_xml(s: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&apos;")
+}
+
+#[cfg(test)]
+mod soul_loader_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    // Env vars are process-global. Serialize tests that mutate them so
+    // they don't race when run with `--test-threads > 1`.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// RAII guard that restores `RUSTYKRAB_SOUL_PATH` to its prior value
+    /// (or unsets it) when dropped. Keeps the process env clean across
+    /// tests in case `cargo test` reuses the process.
+    struct EnvGuard {
+        prior: Option<std::ffi::OsString>,
+    }
+
+    impl EnvGuard {
+        fn set(value: &std::path::Path) -> Self {
+            let prior = std::env::var_os(SOUL_PATH_ENV);
+            std::env::set_var(SOUL_PATH_ENV, value);
+            Self { prior }
+        }
+
+        fn unset() -> Self {
+            let prior = std::env::var_os(SOUL_PATH_ENV);
+            std::env::remove_var(SOUL_PATH_ENV);
+            Self { prior }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match self.prior.take() {
+                Some(v) => std::env::set_var(SOUL_PATH_ENV, v),
+                None => std::env::remove_var(SOUL_PATH_ENV),
+            }
+        }
+    }
+
+    #[test]
+    fn env_unset_returns_default() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard::unset();
+        assert_eq!(load_soul_template(), DEFAULT_SOUL);
+    }
+
+    #[test]
+    fn missing_file_returns_default() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard::set(std::path::Path::new("/nonexistent/path/to/soul.md"));
+        assert_eq!(load_soul_template(), DEFAULT_SOUL);
+    }
+
+    #[test]
+    fn empty_file_returns_default() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let dir = tempdir();
+        let soul_path = dir.join("soul.md");
+        std::fs::write(&soul_path, "   \n\t\n").unwrap();
+        let _guard = EnvGuard::set(&soul_path);
+        assert_eq!(load_soul_template(), DEFAULT_SOUL);
+    }
+
+    #[test]
+    fn populated_file_overrides_default() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let dir = tempdir();
+        let soul_path = dir.join("soul.md");
+        let custom = "You are {name}. Custom soul. Do the thing.";
+        std::fs::write(&soul_path, custom).unwrap();
+        let _guard = EnvGuard::set(&soul_path);
+        assert_eq!(load_soul_template(), custom);
+    }
+
+    #[test]
+    fn name_is_substituted_in_default() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard::unset();
+        let prompt = SystemPromptBuilder::new().with_identity("Krabby").build();
+        assert!(
+            prompt.contains("You are Krabby."),
+            "expected name substitution, got: {prompt}"
+        );
+        assert!(
+            !prompt.contains("{name}"),
+            "placeholder should be substituted"
+        );
+    }
+
+    #[test]
+    fn name_is_substituted_in_file() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let dir = tempdir();
+        let soul_path = dir.join("soul.md");
+        std::fs::write(&soul_path, "Hello, I am {name}. Mission: persist.").unwrap();
+        let _guard = EnvGuard::set(&soul_path);
+
+        let prompt = SystemPromptBuilder::new().with_identity("Sandy").build();
+        assert!(prompt.starts_with("Hello, I am Sandy."));
+        assert!(!prompt.contains("{name}"));
+    }
+
+    /// Minimal temp-dir helper — avoids pulling in the `tempfile` crate
+    /// just for tests. Creates a directory under the system temp dir
+    /// that the OS will eventually reclaim. We don't bother cleaning up:
+    /// each test uses a unique subdir, and the contents are tiny.
+    fn tempdir() -> std::path::PathBuf {
+        let base = std::env::temp_dir();
+        let unique = format!(
+            "rustykrab-soul-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        let dir = base.join(unique);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
 }
