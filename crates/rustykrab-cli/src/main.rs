@@ -295,6 +295,16 @@ async fn main() -> anyhow::Result<()> {
     let skills_dir = data_dir.join("skills");
     std::fs::create_dir_all(&skills_dir)?;
 
+    // --- Soul file (default location, overridable via RUSTYKRAB_SOUL_PATH) ---
+    if std::env::var_os(rustykrab_skills::prompt::SOUL_PATH_ENV).is_none() {
+        let soul_path = data_dir.join("soul.md");
+        std::env::set_var(rustykrab_skills::prompt::SOUL_PATH_ENV, &soul_path);
+        tracing::info!(
+            path = %soul_path.display(),
+            "soul path defaulted (set RUSTYKRAB_SOUL_PATH to override)"
+        );
+    }
+
     // --- Memory system (hybrid retrieval: vector + BM25 + temporal + graph) ---
     let memory_db_path = data_dir.join("memory.db");
     let memory_storage = Arc::new(

@@ -168,7 +168,7 @@ fn classify_response(text: &str, _completion_tokens: u32) -> ResponseClass {
     if trimmed.is_empty() {
         return ResponseClass::Empty;
     }
-    if is_planning_only(trimmed) {
+    if is_planning_only(trimmed) || is_progress_narration(trimmed) {
         return ResponseClass::PlanningOnly;
     }
     ResponseClass::Complete
@@ -204,6 +204,141 @@ fn is_planning_only(text: &str) -> bool {
         "i would ",
     ];
     planning_prefixes.iter().any(|p| lower.starts_with(p))
+}
+
+/// Heuristic: is the model narrating in-progress work that isn't actually
+/// happening? Catches patterns like "I'm currently searching... stay tuned!"
+/// or "I've initiated a search and I'll update you shortly" — the response
+/// reads as if background work is underway, but no tools were called this
+/// turn so no work occurred.
+///
+/// Differs from [`is_planning_only`] in two ways:
+/// 1. Fires regardless of length — narration responses are often long.
+/// 2. Matches anywhere in the text, not just the prefix — narration
+///    typically appears after a preamble.
+///
+/// Three signals trigger a match:
+/// - An explicit deferral marker ("stay tuned", "I'll update you",
+///   "I will keep working", etc.) — any single match is enough.
+/// - Two or more in-progress narration phrases ("I'm currently …",
+///   "I've initiated …") in the same response.
+/// - Five or more future-intent commitments ("I will …", "I'll …",
+///   "I'm going to …") — catches planning manifestos with numbered
+///   "Phase 1 / Phase 2" structures and no actual work.
+///
+/// A code block short-circuits to false: fenced output represents concrete
+/// work, not narration.
+fn is_progress_narration(text: &str) -> bool {
+    if text.contains("```") {
+        return false;
+    }
+    let lower = text.to_lowercase();
+
+    // Tier 1 — explicit deferral markers: the model is promising future
+    // updates instead of producing them now. Any single match is enough.
+    let deferral_markers = [
+        "stay tuned",
+        "i'll update you",
+        "i will update you",
+        "i'll let you know",
+        "i will let you know",
+        "i'll get back to you",
+        "i will get back to you",
+        "i'll report back",
+        "i will report back",
+        "i'll have something",
+        "as soon as i have",
+        "as soon as i'm done",
+        "give me a moment",
+        "give me a sec",
+        "one moment",
+        "bear with me",
+        "hang tight",
+        "hold on while i",
+        "i'll circle back",
+        "i'll come back to you",
+        "i'll follow up",
+        // "I will keep working / going / pushing" and friends — explicit
+        // commitments to do work in some unspecified future, instead of now.
+        "i'll keep working",
+        "i will keep working",
+        "i'll keep going",
+        "i will keep going",
+        "i'll keep at it",
+        "i will keep at it",
+        "i'll keep pushing",
+        "i will keep pushing",
+        "i won't stop",
+        "i will not stop",
+        "i'll keep at this",
+        "i will keep at this",
+    ];
+    if deferral_markers.iter().any(|m| lower.contains(m)) {
+        return true;
+    }
+
+    // Tier 2 — multiple in-progress narration phrases — the model is
+    // describing ongoing work that isn't actually running. A single match is
+    // too permissive (legitimate text often says "I'm working on it" once),
+    // so we require two or more.
+    let narration_phrases = [
+        "i'm currently ",
+        "i am currently ",
+        "i'm working on ",
+        "i am working on ",
+        "i'm digging ",
+        "i am digging ",
+        "i'm hunting ",
+        "i am hunting ",
+        "i'm searching ",
+        "i am searching ",
+        "i'm looking up ",
+        "i am looking up ",
+        "i'm attempting ",
+        "i am attempting ",
+        "i'm navigating ",
+        "i am navigating ",
+        "i'm pulling ",
+        "i am pulling ",
+        "i'm trying to ",
+        "i am trying to ",
+        "i've initiated ",
+        "i have initiated ",
+        "i've started ",
+        "i have started ",
+        "i've begun ",
+        "i have begun ",
+        "i've kicked off ",
+        "i have kicked off ",
+    ];
+    let narration_count = narration_phrases
+        .iter()
+        .filter(|p| lower.contains(*p))
+        .count();
+    if narration_count >= 2 {
+        return true;
+    }
+
+    // Tier 3 — many future-intent commitments. Catches "planning manifesto"
+    // responses ("Phase 1: I will … Phase 2: I will … starting right now")
+    // that ride past tier 1 because they don't use deferral verbs and past
+    // tier 2 because they don't narrate ongoing action. Threshold 5 keeps
+    // out analytical answers that legitimately introduce themselves with
+    // "I'll consider three options. First, I'll … Then I'll … Finally
+    // I'll …" before delivering substance (4 intent markers, no fire).
+    let intent_markers = [
+        "i will ",
+        "i'll ",
+        "i am going to ",
+        "i'm going to ",
+        "i am starting ",
+        "i'm starting ",
+    ];
+    let intent_count: usize = intent_markers
+        .iter()
+        .map(|p| lower.matches(p).count())
+        .sum();
+    intent_count >= 5
 }
 
 /// Events emitted by the agent loop during streaming execution.
@@ -635,7 +770,8 @@ impl AgentRunner {
                                     id: Uuid::new_v4(),
                                     role: Role::User,
                                     content: MessageContent::Text(
-                                        "Don't just describe what you plan to do — actually do it using the tools available to you.".to_string(),
+                                        "Your previous response described or narrated work without actually calling any tools, so nothing happened. Either call the tools now to do the work, or reply with a final answer (including admitting you can't) — do not promise future updates."
+                                            .to_string(),
                                     ),
                                     created_at: Utc::now(),
                                 },
@@ -1008,7 +1144,8 @@ impl AgentRunner {
                                     id: Uuid::new_v4(),
                                     role: Role::User,
                                     content: MessageContent::Text(
-                                        "Don't just describe what you plan to do — actually do it using the tools available to you.".to_string(),
+                                        "Your previous response described or narrated work without actually calling any tools, so nothing happened. Either call the tools now to do the work, or reply with a final answer (including admitting you can't) — do not promise future updates."
+                                            .to_string(),
                                     ),
                                     created_at: Utc::now(),
                                 },
@@ -2464,5 +2601,169 @@ mod compaction_tests {
 
         runner.repair_oversized_summary(&mut conv);
         assert_eq!(conv.summary.as_deref(), Some(small.as_str()));
+    }
+}
+
+#[cfg(test)]
+mod response_classification_tests {
+    use super::*;
+
+    fn classify(text: &str) -> ResponseClass {
+        classify_response(text, 0)
+    }
+
+    fn assert_planning(text: &str) {
+        assert!(
+            matches!(classify(text), ResponseClass::PlanningOnly),
+            "expected PlanningOnly for: {text:?}"
+        );
+    }
+
+    fn assert_complete(text: &str) {
+        assert!(
+            matches!(classify(text), ResponseClass::Complete),
+            "expected Complete for: {text:?}"
+        );
+    }
+
+    #[test]
+    fn empty_text_is_empty() {
+        assert!(matches!(classify(""), ResponseClass::Empty));
+        assert!(matches!(classify("   \n\t  "), ResponseClass::Empty));
+    }
+
+    #[test]
+    fn classic_planning_prefix_is_planning() {
+        assert_planning("I'll search the web for that.");
+        assert_planning("Let me check the file.");
+    }
+
+    #[test]
+    fn stay_tuned_message_is_planning() {
+        // The exact failure mode reported by the user: a long narration
+        // that ends in a deferral promise, with no tool calls.
+        let text = "I'm digging into the specifics for you. I've already started looking at flight options and hotel rates.\n\n\
+            Current Progress:\n   \
+            Flights: I've initiated a search for United, Alaska, and Hawaiian Airlines schedules and pricing for May 24–31, 2025. \
+            I'm currently attempting to extract specific flight times and costs from Google Flights.\n   \
+            Accommodations: I'm also hunting for the exact room rates for The Ritz-Carlton Maui, Kapalua for those dates.\n\n\
+            What I'm doing right now:\n\
+            I am currently navigating through flight search results to pull out the exact departure/arrival times and the lowest available fares for the airlines you're interested in.\n\n\
+            I'll update you as soon as I have concrete numbers to add to the plan. Stay tuned!";
+        assert_planning(text);
+    }
+
+    #[test]
+    fn deferral_phrasings_are_planning() {
+        assert_planning("Working on it now — I'll update you shortly.");
+        assert_planning("Give me a moment to pull this together.");
+        assert_planning("Hang tight while I run the numbers.");
+        assert_planning("I'll get back to you with the result.");
+        assert_planning("I'll circle back once I have the data.");
+        assert_planning("I'll report back as soon as I'm done.");
+    }
+
+    #[test]
+    fn multiple_narration_phrases_are_planning() {
+        // Two narration phrases, no deferral marker.
+        assert_planning(
+            "I'm currently checking the database. \
+             I'm searching the commit history in parallel.",
+        );
+        assert_planning(
+            "I've initiated a connection to the API. \
+             I've started fetching the records you requested.",
+        );
+    }
+
+    #[test]
+    fn single_narration_phrase_is_not_planning() {
+        // One "I'm working on it" buried in a substantive answer must not
+        // false-positive — many real answers contain a single such phrase.
+        let text = "Here are the three options:\n\
+            1. Use Postgres with logical replication\n\
+            2. Switch to a CDC pipeline via Debezium\n\
+            3. Roll a custom outbox table\n\n\
+            I'm working on the tradeoffs document for option 2 — the gist is \
+            that it gives you the most flexibility but adds operational \
+            complexity that a small team probably can't absorb.";
+        assert_complete(text);
+    }
+
+    #[test]
+    fn substantive_answer_is_complete() {
+        let text = "The bug is in `runner.rs:472` — `has_tool_calls()` \
+                    returns false when the assistant message has no \
+                    `MultiToolCall` content variant, so the loop falls \
+                    through to the `EndTurn` branch and exits.";
+        assert_complete(text);
+    }
+
+    #[test]
+    fn code_block_short_circuits_narration_detection() {
+        // Even with deferral language present, a code block means the model
+        // produced concrete output — don't classify as planning.
+        let text = "Here's the patch I'm applying:\n\
+            ```rust\n\
+            fn foo() { todo!() }\n\
+            ```\n\
+            I'll update you once it's tested.";
+        assert_complete(text);
+    }
+
+    #[test]
+    fn code_block_short_circuits_planning_detection() {
+        let text = "Let me show you:\n```\nresult\n```";
+        assert_complete(text);
+    }
+
+    #[test]
+    fn case_insensitive_matching() {
+        assert_planning("STAY TUNED for the results.");
+        assert_planning("I'M CURRENTLY checking logs. I'VE STARTED running diagnostics.");
+    }
+
+    #[test]
+    fn keep_working_phrasings_are_planning() {
+        assert_planning("I'll keep working on this until I have answers.");
+        assert_planning("I will not stop until the data is complete.");
+        assert_planning("I won't stop until I find it.");
+        assert_planning("I'll keep going until done.");
+        assert_planning("I will keep at it until I have a complete picture.");
+    }
+
+    #[test]
+    fn planning_manifesto_with_many_intent_markers_is_planning() {
+        // The "Phase 1 / Phase 2 / Phase 3" planning manifesto failure mode
+        // — no deferral verbs, no "I'm currently …" narration, just a wall
+        // of "I will / I'll" promises.
+        let text = "I understand. I will not stop until I have a complete, detailed breakdown.\n\n\
+            My systematic plan for this mission is:\n\n\
+            1. Phase 1: Flight Deep-Dive\n   \
+                United Airlines: Extract departure/arrival times.\n   \
+                Goal: A side-by-side comparison.\n\n\
+            2. Phase 2: Accommodation Deep-Dive\n   \
+                The Ritz-Carlton Maui: Find specific room types.\n\n\
+            3. Phase 3: Final Compilation\n   \
+                I will update Maui_Trip_Plan_Final.md with all this new data.\n   \
+                I will then present the completed data to you here.\n\n\
+            I am starting Phase 1, Step 1 (United Airlines) right now. \
+            I will keep working through these steps until the data is complete.";
+        assert_planning(text);
+    }
+
+    #[test]
+    fn four_intent_markers_below_threshold_is_complete() {
+        // An analytical answer that intros with four "I'll" statements before
+        // delivering substance must NOT be flagged by tier 3. Threshold is 5.
+        // (The intro deliberately doesn't start with a planning prefix so
+        // that `is_planning_only` doesn't fire either.)
+        let text = "Three options worth considering here. \
+            First, I'll lay out the pros. \
+            Then I'll lay out the cons. \
+            Finally, I'll recommend one. \
+            Option A is the simplest because the integration surface is small \
+            and the team already understands the moving parts.";
+        assert_complete(text);
     }
 }
