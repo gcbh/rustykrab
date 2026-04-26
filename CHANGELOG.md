@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.6.13] - 2026-04-26
+
+- fix(agent): catch progress-narration responses in loop classifier (#393)
+
 ## [2.6.12] - 2026-04-26
 
 - feat(skills): add load action so skills are actually invoked, not just narrated (#394)
