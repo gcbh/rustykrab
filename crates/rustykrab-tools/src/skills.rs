@@ -7,11 +7,15 @@ use rustykrab_core::{Error, Result, SandboxRequirements, Tool};
 use rustykrab_skills::SkillRegistry;
 use serde_json::{json, Value};
 
-/// A tool that creates and deletes SKILL.md skills.
+/// A tool that creates, deletes, and loads SKILL.md skills.
 ///
 /// Skills are written to `$DATA_DIR/skills/<name>/SKILL.md`. When a live
 /// `SkillRegistry` handle is supplied, the change is hot-loaded — available
 /// on the next agent turn with no restart required.
+///
+/// `load` is the activation path: the model calls it with a skill name from
+/// the `<available_skills>` catalog and receives the full SKILL.md body in
+/// the tool result, which it then follows for the remainder of the turn.
 pub struct SkillsTool {
     skills_dir: PathBuf,
     registry: Option<Arc<SkillRegistry>>,
@@ -143,6 +147,46 @@ impl SkillsTool {
         }))
     }
 
+    async fn action_load(&self, args: &Value) -> Result<Value> {
+        let name = args["name"]
+            .as_str()
+            .ok_or_else(|| Error::ToolExecution("missing 'name'".into()))?;
+
+        if !is_valid_name(name) {
+            return Err(Error::ToolExecution(
+                "invalid skill name: must be 1-64 chars, lowercase a-z, 0-9, hyphens, underscores only".into(),
+            ));
+        }
+
+        // Prefer the live registry — it reflects hot-loaded skills and skips
+        // a disk read. Fall back to disk so `load` works even when no registry
+        // handle was wired (e.g. tests, ad-hoc invocations).
+        if let Some(ref registry) = self.registry {
+            if let Some(skill) = registry.get_md(name) {
+                return Ok(load_response(name, &skill));
+            }
+        }
+
+        let skill_dir = self.skills_dir.join(name);
+        let skill_md_path = skill_dir.join("SKILL.md");
+        if !skill_md_path.is_file() {
+            return Err(Error::ToolExecution(
+                format!("skill '{name}' not found").into(),
+            ));
+        }
+
+        let skill_dir_owned = skill_dir.clone();
+        let skill_md_path_owned = skill_md_path.clone();
+        let loaded = tokio::task::spawn_blocking(move || {
+            rustykrab_skills::load_single_skill(&skill_dir_owned, &skill_md_path_owned)
+        })
+        .await
+        .map_err(|e| Error::ToolExecution(format!("load task join failed: {e}").into()))?
+        .map_err(|e| Error::ToolExecution(format!("failed to load skill: {e}").into()))?;
+
+        Ok(load_response(name, &loaded))
+    }
+
     async fn action_delete(&self, args: &Value) -> Result<Value> {
         let name = args["name"]
             .as_str()
@@ -187,6 +231,23 @@ impl SkillsTool {
     }
 }
 
+/// Build the JSON tool result returned by `action_load`. The body is the
+/// SKILL.md instructions the model must follow next.
+fn load_response(name: &str, skill: &rustykrab_skills::SkillMd) -> Value {
+    let satisfied = skill.validation.is_satisfied();
+    json!({
+        "action": "load",
+        "name": name,
+        "description": skill.frontmatter.description,
+        "version": skill.frontmatter.version,
+        "body": skill.raw_body,
+        "requirements_satisfied": satisfied,
+        "missing_env": skill.validation.missing_env,
+        "missing_bins": skill.validation.missing_bins,
+        "instruction": "Follow the instructions in `body` for the rest of this turn.",
+    })
+}
+
 /// Validate that a skill name contains only `[a-z0-9_-]` and is 1–64 chars.
 /// Strict allowlist blocks path traversal.
 fn is_valid_name(name: &str) -> bool {
@@ -204,9 +265,12 @@ impl Tool for SkillsTool {
     }
 
     fn description(&self) -> &str {
-        "Create or delete SKILL.md skills on disk. Skills are hot-loaded into the \
-         registry immediately (available on the next agent turn, no restart required). \
-         Actions: 'create' (name, description, instructions), 'delete' (name)."
+        "Create, delete, or load SKILL.md skills. To USE a skill listed in \
+         <available_skills>, call this tool with action='load' and the skill \
+         name — the tool result contains the skill body, which you must then \
+         follow. Other actions: 'create' (name, description, instructions), \
+         'delete' (name). Created/deleted skills are hot-loaded into the \
+         registry on the next agent turn."
     }
 
     fn sandbox_requirements(&self) -> SandboxRequirements {
@@ -225,8 +289,8 @@ impl Tool for SkillsTool {
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["create", "delete"],
-                        "description": "Action to perform"
+                        "enum": ["load", "create", "delete"],
+                        "description": "Action to perform. Use 'load' to activate a skill from <available_skills> and receive its body."
                     },
                     "name": {
                         "type": "string",
@@ -274,10 +338,11 @@ impl Tool for SkillsTool {
             .ok_or_else(|| Error::ToolExecution("missing 'action'".into()))?;
 
         match action {
+            "load" => self.action_load(&args).await,
             "create" => self.action_create(&args).await,
             "delete" => self.action_delete(&args).await,
             other => Err(Error::ToolExecution(
-                format!("unknown action '{other}', expected one of: create, delete").into(),
+                format!("unknown action '{other}', expected one of: load, create, delete").into(),
             )),
         }
     }
@@ -457,6 +522,86 @@ mod tests {
         assert_eq!(result["unregistered"], true);
         assert!(registry.get_md("to-remove").is_none());
         assert!(!tmp.path().join("to-remove").exists());
+    }
+
+    #[tokio::test]
+    async fn load_returns_body_from_disk() {
+        let (tool, tmp) = make_tool();
+        std::fs::create_dir_all(tmp.path().join("on-disk")).unwrap();
+        std::fs::write(
+            tmp.path().join("on-disk/SKILL.md"),
+            "---\nname = \"on-disk\"\ndescription = \"Disk skill\"\n---\nDo the disk thing.\n",
+        )
+        .unwrap();
+
+        let result = tool
+            .execute(json!({ "action": "load", "name": "on-disk" }))
+            .await
+            .unwrap();
+
+        assert_eq!(result["action"], "load");
+        assert_eq!(result["name"], "on-disk");
+        assert_eq!(result["description"], "Disk skill");
+        assert!(result["body"]
+            .as_str()
+            .unwrap()
+            .contains("Do the disk thing."));
+        assert_eq!(result["requirements_satisfied"], true);
+    }
+
+    #[tokio::test]
+    async fn load_prefers_registry_over_disk() {
+        let tmp = TempDir::new().unwrap();
+        let registry = Arc::new(SkillRegistry::new());
+        let tool = SkillsTool::with_registry(tmp.path().to_path_buf(), registry.clone());
+
+        // Create via the tool so the registry is populated.
+        tool.execute(json!({
+            "action": "create",
+            "name": "live-load",
+            "description": "Live skill",
+            "instructions": "Live body content."
+        }))
+        .await
+        .unwrap();
+
+        // Mutate the on-disk file so we can prove the registry is what's read.
+        std::fs::write(
+            tmp.path().join("live-load/SKILL.md"),
+            "---\nname = \"live-load\"\ndescription = \"Stale\"\n---\nStale disk body.\n",
+        )
+        .unwrap();
+
+        let result = tool
+            .execute(json!({ "action": "load", "name": "live-load" }))
+            .await
+            .unwrap();
+
+        assert_eq!(result["description"], "Live skill");
+        assert!(result["body"]
+            .as_str()
+            .unwrap()
+            .contains("Live body content."));
+    }
+
+    #[tokio::test]
+    async fn load_errors_when_skill_missing() {
+        let (tool, _tmp) = make_tool();
+        let r = tool
+            .execute(json!({ "action": "load", "name": "ghost" }))
+            .await;
+        assert!(r.is_err());
+        assert!(r.unwrap_err().to_string().contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn load_rejects_invalid_name() {
+        let (tool, _tmp) = make_tool();
+        let r = tool
+            .execute(json!({ "action": "load", "name": "../etc/passwd" }))
+            .await;
+        assert!(r.is_err());
+        assert!(r.unwrap_err().to_string().contains("invalid skill name"));
     }
 
     #[tokio::test]
