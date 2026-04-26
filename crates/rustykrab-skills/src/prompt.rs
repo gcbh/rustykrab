@@ -64,25 +64,33 @@ impl SystemPromptBuilder {
         self
     }
 
-    /// Inject a compact `<available_skills>` XML catalog of SKILL.md skills.
+    /// Inject a compact `<available_skills>` XML catalog of SKILL.md skills,
+    /// followed by an explicit instruction telling the model how to activate one.
     ///
     /// This is appended at prompt build time so the model knows which skills
-    /// exist without loading their full body.
+    /// exist without loading their full body. To USE a skill, the model must
+    /// call the `skills` tool with `action="load"` and the skill name; the
+    /// tool result returns the body, which the model then follows.
     pub fn with_available_skills(mut self, skills: &[&SkillMd]) -> Self {
         if skills.is_empty() {
             return self;
         }
-        let mut xml = String::from("<available_skills>\n");
+        let mut section = String::from("<available_skills>\n");
         for s in skills {
             let name = escape_xml(&s.frontmatter.name);
             let desc = escape_xml(&s.frontmatter.description);
-            let loc = escape_xml(&s.path.display().to_string());
-            xml.push_str(&format!(
-                "  <skill name=\"{name}\" description=\"{desc}\" location=\"{loc}\" />\n"
+            section.push_str(&format!(
+                "  <skill name=\"{name}\" description=\"{desc}\" />\n"
             ));
         }
-        xml.push_str("</available_skills>");
-        self.sections.push(xml);
+        section.push_str("</available_skills>\n");
+        section.push_str(
+            "To use a skill above, call the `skills` tool with \
+             action=\"load\" and the skill `name`. The tool result contains \
+             the skill body — follow those instructions for the rest of the \
+             turn. Do not claim to have a skill without loading it.",
+        );
+        self.sections.push(section);
         self
     }
 
@@ -116,4 +124,63 @@ fn escape_xml(s: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&apos;")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::skill_md::{RequirementValidation, SkillMdFrontmatter};
+    use std::path::PathBuf;
+
+    fn fixture(name: &str, description: &str) -> SkillMd {
+        SkillMd {
+            path: PathBuf::from(format!("/var/lib/rustykrab/skills/{name}")),
+            frontmatter: SkillMdFrontmatter {
+                name: name.to_string(),
+                description: description.to_string(),
+                version: "1.0".to_string(),
+                requires: Default::default(),
+                user_invocable: true,
+                emoji: None,
+                extra: Default::default(),
+            },
+            raw_body: String::new(),
+            validation: RequirementValidation {
+                missing_env: Vec::new(),
+                missing_bins: Vec::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn available_skills_includes_invocation_instruction() {
+        let s = fixture("flight-monitor", "Watch flight prices");
+        let prompt = SystemPromptBuilder::new()
+            .with_available_skills(&[&s])
+            .build();
+        assert!(prompt.contains("<skill name=\"flight-monitor\""));
+        assert!(prompt.contains("description=\"Watch flight prices\""));
+        assert!(prompt.contains("action=\"load\""));
+        assert!(prompt.contains("`skills` tool"));
+    }
+
+    #[test]
+    fn available_skills_does_not_leak_filesystem_paths() {
+        let s = fixture("local-skill", "Local thing");
+        let prompt = SystemPromptBuilder::new()
+            .with_available_skills(&[&s])
+            .build();
+        assert!(
+            !prompt.contains("/var/lib/rustykrab/skills/local-skill"),
+            "filesystem path leaked into prompt: {prompt}"
+        );
+    }
+
+    #[test]
+    fn available_skills_empty_omits_section() {
+        let prompt = SystemPromptBuilder::new()
+            .with_available_skills(&[])
+            .build();
+        assert!(!prompt.contains("available_skills"));
+    }
 }
