@@ -15,12 +15,13 @@ const BUILD_DATE: &str = env!("RUSTYKRAB_BUILD_DATE");
 fn version_string() -> String {
     format!("{VERSION} ({GIT_HASH}{GIT_DIRTY}, {BUILD_DATE})")
 }
-use rustykrab_agent::{AgentEvent, HarnessProfile, HarnessRouter};
+use rustykrab_agent::{AgentEvent, HarnessProfile, HarnessRouter, ProcessSandbox, SubagentRunner};
 use rustykrab_channels::telegram::ChannelMessage;
 use rustykrab_channels::{TelegramChannel, VideoChannel, VideoConfig};
 use rustykrab_core::model::ModelProvider;
 use rustykrab_core::orchestration::OrchestrationConfig;
 use rustykrab_core::types::MessageContent;
+use rustykrab_core::AgentRegistry;
 use rustykrab_gateway::AppState;
 use rustykrab_memory::backend::HybridMemoryBackend;
 use rustykrab_memory::embedding::FastEmbedder;
@@ -457,15 +458,32 @@ async fn main() -> anyhow::Result<()> {
     // --- Log provider status ---
     tracing::info!(provider = provider.name(), "model provider configured");
 
+    // --- Orchestration config (used by RLM module and subagent throttle) ---
+    let orchestration_config = load_orchestration_config(&data_dir)?;
+
+    // --- Sub-agent tools (subagents, agents_list) ---
+    // Snapshot the tool list as it stands now so the sub-agent can call
+    // every parent tool except the session/subagent meta-tools we are
+    // about to add — that prevents a sub-agent from re-spawning itself
+    // through the same registry. The per-tool depth guard inside
+    // `SubagentsTool` is the second line of defence.
+    let agent_registry = Arc::new(AgentRegistry::with_defaults());
+    let subagent_runner: Arc<dyn rustykrab_tools::SessionManager> = Arc::new(SubagentRunner::new(
+        provider.clone(),
+        tools.clone(),
+        Arc::new(ProcessSandbox::new()),
+        agent_registry,
+        orchestration_config.max_concurrent_tasks,
+    ));
+    tools.extend(rustykrab_tools::session_tools(subagent_runner));
+    tracing::info!("subagent tools registered");
+
     // --- Harness router (auto-selects profile per message) ---
     // Reuses the main provider for classification to avoid model swapping.
     // The classification prompt is ~50 tokens — negligible overhead on any model.
     let classifier: Arc<dyn ModelProvider> = provider.clone();
 
     let router = Arc::new(HarnessRouter::new(classifier).with_base(profile));
-
-    // --- Orchestration config (used by RLM module) ---
-    let orchestration_config = load_orchestration_config(&data_dir)?;
 
     // --- Build gateway state ---
     // Clone store handle so we can flush it after the server shuts down.

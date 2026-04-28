@@ -3258,6 +3258,7 @@ dependencies = [
  "futures",
  "regex",
  "rustykrab-core",
+ "rustykrab-tools",
  "serde",
  "serde_json",
  "tokio",
