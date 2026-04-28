@@ -18,7 +18,6 @@ mod process;
 
 // Web tools
 mod web_fetch;
-mod web_search;
 mod x_search;
 
 // Session tools
@@ -99,7 +98,6 @@ pub use process::ProcessTool;
 
 // Web
 pub use web_fetch::WebFetchTool;
-pub use web_search::WebSearchTool;
 pub use x_search::XSearchTool;
 
 // Session
@@ -190,7 +188,6 @@ pub fn builtin_tools(
         std::sync::Arc::new(CodeExecutionTool::new()),
         // Web
         std::sync::Arc::new(WebFetchTool::new()),
-        std::sync::Arc::new(WebSearchTool::new()),
         std::sync::Arc::new(XSearchTool::new()),
         // Media
         std::sync::Arc::new(ImageTool::new()),

@@ -11,9 +11,7 @@ pub(crate) fn categorize(name: &str) -> &'static str {
         "tools_list" | "tools_load" => "meta",
         "read" | "write" | "edit" | "apply_patch" => "filesystem",
         "exec" | "process" | "code_execution" => "runtime",
-        "web_fetch" | "web_search" | "x_search" | "http_request" | "http_session" | "browser" => {
-            "web"
-        }
+        "web_fetch" | "x_search" | "http_request" | "http_session" | "browser" => "web",
         "image" | "video" | "canvas" => "media",
         "cron" | "gateway" => "automation",
         "gmail" | "notion" | "obsidian" => "integration",
