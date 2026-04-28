@@ -41,7 +41,6 @@ const EXTERNAL_CONTENT_TOOLS: &[&str] = &[
     "http_request",
     "http_session",
     "web_fetch",
-    "web_search",
     "x_search",
 ];
 
