@@ -16,7 +16,9 @@
 
 use rustykrab_core::Error;
 
+#[cfg(target_os = "macos")]
 const SERVICE_NAME: &str = "com.rustykrab.master-key";
+#[cfg(target_os = "macos")]
 const ACCOUNT_NAME: &str = "rustykrab-encryption-key";
 
 // ---------------------------------------------------------------------------
@@ -225,85 +227,57 @@ pub fn resolve_master_key() -> Result<Vec<u8>, Error> {
     Ok(key.to_vec())
 }
 
-/// Non-macOS: use env var, then OS credential store (Secret Service on Linux),
-/// then generate an ephemeral key as a last resort.
+/// Non-macOS (Linux/Docker): the master key must come from the
+/// `RUSTYKRAB_MASTER_KEY` environment variable.
+///
+/// There is no OS credential store integration on this platform — headless
+/// Linux and Docker containers don't have a session-persistent secret backend
+/// that's safe to rely on. If the env var is unset, the daemon refuses to
+/// start rather than silently using an ephemeral key (which would render
+/// every encrypted secret in `store.db` unrecoverable on the next boot).
 #[cfg(not(target_os = "macos"))]
 pub fn resolve_master_key() -> Result<Vec<u8>, Error> {
-    // Priority 1: environment variable (for CI, Docker, explicit override).
     if let Ok(env_key) = std::env::var("RUSTYKRAB_MASTER_KEY") {
-        tracing::info!("using master key from RUSTYKRAB_MASTER_KEY env var");
-        return hex::decode(env_key.trim()).map_err(|e| {
-            Error::Storage(format!(
-                "RUSTYKRAB_MASTER_KEY must be a hex-encoded string: {e}"
-            ))
-        });
-    }
-
-    // Priority 2: OS credential store (Secret Service on Linux).
-    if keychain_available() {
-        if let Some(key) = get_master_key()? {
-            tracing::info!("master key loaded from OS credential store");
-            return Ok(key);
+        let trimmed = env_key.trim();
+        if !trimmed.is_empty() {
+            tracing::info!("using master key from RUSTYKRAB_MASTER_KEY env var");
+            return hex::decode(trimmed).map_err(|e| {
+                Error::Storage(format!(
+                    "RUSTYKRAB_MASTER_KEY must be a hex-encoded string: {e}"
+                ))
+            });
         }
-
-        // Generate a new key and persist it in the credential store.
-        tracing::info!("no master key found — generating and storing in OS credential store");
-        let mut key = [0u8; 32];
-        rand::RngCore::fill_bytes(&mut rand::rng(), &mut key);
-        set_master_key(&key)?;
-        tracing::info!("master key stored in OS credential store");
-        return Ok(key.to_vec());
     }
 
-    // Priority 3: ephemeral key (no credential store available).
-    tracing::warn!(
-        "RUSTYKRAB_MASTER_KEY not set and OS credential store not available — \
-         generating ephemeral key. Secrets will not survive restart."
-    );
-    let mut key = [0u8; 32];
-    rand::RngCore::fill_bytes(&mut rand::rng(), &mut key);
-    Ok(key.to_vec())
+    Err(Error::Storage(
+        "RUSTYKRAB_MASTER_KEY is not set. On Linux/Docker the master key must \
+         be provided via the RUSTYKRAB_MASTER_KEY environment variable \
+         (generate one with `openssl rand -hex 32`). See the README section \
+         \"Linux / Docker setup\" for systemd and Docker examples."
+            .to_string(),
+    ))
 }
 
-/// Retrieve the master key from the OS credential store.
+/// No OS credential store on this platform.
 #[cfg(not(target_os = "macos"))]
 pub fn get_master_key() -> Result<Option<Vec<u8>>, Error> {
-    let entry = keyring::Entry::new(SERVICE_NAME, ACCOUNT_NAME)
-        .map_err(|e| Error::Storage(format!("keyring init failed: {e}")))?;
-    match entry.get_password() {
-        Ok(hex_str) => {
-            let key = hex::decode(hex_str.trim())
-                .map_err(|e| Error::Storage(format!("keyring: invalid hex: {e}")))?;
-            Ok(Some(key))
-        }
-        Err(keyring::Error::NoEntry) => Ok(None),
-        Err(e) => {
-            tracing::debug!("keyring read failed (Secret Service may not be available): {e}");
-            Ok(None)
-        }
-    }
+    Ok(None)
 }
 
-/// Store the master key in the OS credential store (as hex).
+/// No OS credential store on this platform.
 #[cfg(not(target_os = "macos"))]
-pub fn set_master_key(key: &[u8]) -> Result<(), Error> {
-    let entry = keyring::Entry::new(SERVICE_NAME, ACCOUNT_NAME)
-        .map_err(|e| Error::Storage(format!("keyring init failed: {e}")))?;
-    entry
-        .set_password(&hex::encode(key))
-        .map_err(|e| Error::Storage(format!("keyring write failed: {e}")))
+pub fn set_master_key(_key: &[u8]) -> Result<(), Error> {
+    Err(Error::Storage(
+        "OS credential store is not supported on this platform — set \
+         RUSTYKRAB_MASTER_KEY in the environment instead"
+            .to_string(),
+    ))
 }
 
-/// Delete the master key from the OS credential store.
+/// No OS credential store on this platform.
 #[cfg(not(target_os = "macos"))]
 pub fn delete_master_key() -> Result<(), Error> {
-    let entry = keyring::Entry::new(SERVICE_NAME, ACCOUNT_NAME)
-        .map_err(|e| Error::Storage(format!("keyring init failed: {e}")))?;
-    match entry.delete_credential() {
-        Ok(()) => Ok(()),
-        Err(keyring::Error::NoEntry) => Ok(()),
-        Err(e) => Err(Error::Storage(format!("keyring delete failed: {e}"))),
-    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -320,25 +294,21 @@ pub struct KeychainCredential {
     pub value: String,
 }
 
-/// Returns `true` when the current platform has a working OS credential
-/// store (macOS Keychain, Linux Secret Service, etc.).
+/// Returns `true` on macOS (Data Protection Keychain), `false` elsewhere.
 #[cfg(target_os = "macos")]
 pub fn keychain_available() -> bool {
     true
 }
 
-/// Probe the OS credential store (kernel keyutils on Linux).
+/// No OS credential store on this platform.
 ///
-/// Returns `true` if the backend responds, `false` otherwise.
+/// rustykrab targets headless Linux and Docker, where there is no
+/// session-persistent secret backend that's safe to rely on. Credentials
+/// must come from `RUSTYKRAB_MASTER_KEY` + the encrypted SQLite store
+/// (or per-credential `RUSTYKRAB_*` env vars).
 #[cfg(not(target_os = "macos"))]
 pub fn keychain_available() -> bool {
-    keyring::Entry::new("com.rustykrab.probe", "availability-check")
-        .and_then(|entry| match entry.get_password() {
-            Ok(_) => Ok(()),
-            Err(keyring::Error::NoEntry) => Ok(()),
-            Err(e) => Err(e),
-        })
-        .is_ok()
+    false
 }
 
 /// Retrieve a credential from the macOS Keychain by service and account.
@@ -366,20 +336,8 @@ pub fn get_credential(service: &str, account: &str) -> Result<Option<KeychainCre
 }
 
 #[cfg(not(target_os = "macos"))]
-pub fn get_credential(service: &str, account: &str) -> Result<Option<KeychainCredential>, Error> {
-    let entry = keyring::Entry::new(service, account)
-        .map_err(|e| Error::Storage(format!("keyring init failed: {e}")))?;
-    match entry.get_password() {
-        Ok(value) => Ok(Some(KeychainCredential {
-            service: service.to_string(),
-            account: account.to_string(),
-            value,
-        })),
-        Err(keyring::Error::NoEntry) => Ok(None),
-        Err(e) => Err(Error::Storage(format!(
-            "keyring read failed for {service}/{account}: {e}"
-        ))),
-    }
+pub fn get_credential(_service: &str, _account: &str) -> Result<Option<KeychainCredential>, Error> {
+    Ok(None)
 }
 
 /// Store a credential in the macOS Keychain under the given service/account.
@@ -393,12 +351,12 @@ pub fn set_credential(service: &str, account: &str, value: &str) -> Result<(), E
 }
 
 #[cfg(not(target_os = "macos"))]
-pub fn set_credential(service: &str, account: &str, value: &str) -> Result<(), Error> {
-    let entry = keyring::Entry::new(service, account)
-        .map_err(|e| Error::Storage(format!("keyring init failed: {e}")))?;
-    entry
-        .set_password(value)
-        .map_err(|e| Error::Storage(format!("keyring write failed for {service}/{account}: {e}")))
+pub fn set_credential(_service: &str, _account: &str, _value: &str) -> Result<(), Error> {
+    Err(Error::Storage(
+        "OS credential store is not supported on this platform — use \
+         RUSTYKRAB_* environment variables or the encrypted secrets store"
+            .to_string(),
+    ))
 }
 
 /// Delete a credential from the macOS Keychain.
@@ -408,14 +366,78 @@ pub fn delete_credential(service: &str, account: &str) -> Result<(), Error> {
 }
 
 #[cfg(not(target_os = "macos"))]
-pub fn delete_credential(service: &str, account: &str) -> Result<(), Error> {
-    let entry = keyring::Entry::new(service, account)
-        .map_err(|e| Error::Storage(format!("keyring init failed: {e}")))?;
-    match entry.delete_credential() {
-        Ok(()) => Ok(()),
-        Err(keyring::Error::NoEntry) => Ok(()),
-        Err(e) => Err(Error::Storage(format!(
-            "keyring delete failed for {service}/{account}: {e}"
-        ))),
+pub fn delete_credential(_service: &str, _account: &str) -> Result<(), Error> {
+    Ok(())
+}
+
+#[cfg(all(test, not(target_os = "macos")))]
+mod non_mac_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    // Tests in this module mutate `RUSTYKRAB_MASTER_KEY`. Run them serially
+    // so they don't race each other when cargo test parallelises.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn keychain_available_is_false() {
+        assert!(!keychain_available());
+    }
+
+    #[test]
+    fn get_credential_returns_none() {
+        assert!(get_credential("anything", "anything").unwrap().is_none());
+        assert!(get_master_key().unwrap().is_none());
+    }
+
+    #[test]
+    fn set_credential_returns_error() {
+        assert!(set_credential("svc", "acct", "value").is_err());
+        assert!(set_master_key(&[0u8; 32]).is_err());
+    }
+
+    #[test]
+    fn delete_is_noop() {
+        assert!(delete_credential("svc", "acct").is_ok());
+        assert!(delete_master_key().is_ok());
+    }
+
+    #[test]
+    fn resolve_master_key_uses_env_var() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let hex = "0".repeat(64);
+        std::env::set_var("RUSTYKRAB_MASTER_KEY", &hex);
+        let key = resolve_master_key().expect("env-var path should succeed");
+        std::env::remove_var("RUSTYKRAB_MASTER_KEY");
+        assert_eq!(key, vec![0u8; 32]);
+    }
+
+    #[test]
+    fn resolve_master_key_errors_when_unset() {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("RUSTYKRAB_MASTER_KEY");
+        let err = resolve_master_key().expect_err("unset env var must error");
+        assert!(
+            err.to_string().contains("RUSTYKRAB_MASTER_KEY"),
+            "error message should name the env var: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_master_key_errors_when_empty() {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("RUSTYKRAB_MASTER_KEY", "   ");
+        let err = resolve_master_key().expect_err("blank env var must error");
+        std::env::remove_var("RUSTYKRAB_MASTER_KEY");
+        assert!(err.to_string().contains("RUSTYKRAB_MASTER_KEY"));
+    }
+
+    #[test]
+    fn resolve_master_key_rejects_invalid_hex() {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("RUSTYKRAB_MASTER_KEY", "not-hex");
+        let err = resolve_master_key().expect_err("non-hex env var must error");
+        std::env::remove_var("RUSTYKRAB_MASTER_KEY");
+        assert!(err.to_string().contains("hex"));
     }
 }
