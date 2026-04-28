@@ -16,7 +16,13 @@ use uuid::Uuid;
 /// Names of meta-tools that are always included in the schema sent to the
 /// model, regardless of the active tool set. These are how the model
 /// discovers and loads the rest of the catalog.
-const META_TOOL_NAMES: &[&str] = &["tools_list", "tools_load"];
+///
+/// `skills` is included because the system prompt's `<available_skills>`
+/// catalog instructs the model to call `skills(action="load", ...)` to
+/// activate a skill. That instruction would be a dead end if the tool
+/// weren't always visible — the model can't first call `tools_load("skills")`
+/// because nothing in the prompt tells it to.
+const META_TOOL_NAMES: &[&str] = &["tools_list", "tools_load", "skills"];
 
 fn is_meta_tool(name: &str) -> bool {
     META_TOOL_NAMES.contains(&name)
@@ -2601,6 +2607,33 @@ mod compaction_tests {
 
         runner.repair_oversized_summary(&mut conv);
         assert_eq!(conv.summary.as_deref(), Some(small.as_str()));
+    }
+}
+
+#[cfg(test)]
+mod meta_tool_tests {
+    use super::*;
+
+    #[test]
+    fn skills_is_meta_tool() {
+        // The system prompt's `<available_skills>` catalog tells the model to
+        // call `skills(action="load", ...)` directly. If `skills` weren't a
+        // meta-tool the model would never see it at the start of a fresh
+        // conversation (active set empty) and the catalog would be a dead end.
+        assert!(is_meta_tool("skills"));
+    }
+
+    #[test]
+    fn discovery_meta_tools_are_listed() {
+        assert!(is_meta_tool("tools_list"));
+        assert!(is_meta_tool("tools_load"));
+    }
+
+    #[test]
+    fn arbitrary_tool_is_not_meta() {
+        assert!(!is_meta_tool("read"));
+        assert!(!is_meta_tool("web_fetch"));
+        assert!(!is_meta_tool(""));
     }
 }
 
