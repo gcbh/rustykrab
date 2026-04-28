@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 rustykrab-core.workspace = true
+rustykrab-tools.workspace = true
 async-trait.workspace = true
 tokio.workspace = true
 serde_json.workspace = true
