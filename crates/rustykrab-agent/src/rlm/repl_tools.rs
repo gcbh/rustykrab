@@ -4,11 +4,24 @@
 //! externally and give the model tools to peek, search, and delegate
 //! sub-queries — mirroring the foundational RLM paper's Python REPL
 //! approach (Zhang, Kraska, Khattab — arXiv 2512.24601).
+//!
+//! Two binding modes are supported:
+//!
+//! - **Fixed**: a pre-built `Arc<String>`, used by [`RecursiveExecutor`]
+//!   for a single call against a known blob.
+//! - **Store**: an [`Arc<ContextStore>`] keyed by the active
+//!   conversation's id. This is what [`context_tools`] returns — the
+//!   tools resolve their context lazily from the
+//!   `SESSION_TOOL_CONTEXT::conversation_id` task-local on every call,
+//!   so the same registered tool instances work for every session.
+//!
+//! [`RecursiveExecutor`]: super::recursive_call::RecursiveExecutor
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use regex::Regex;
+use rustykrab_core::active_tools::SESSION_TOOL_CONTEXT;
 use rustykrab_core::model::ModelProvider;
 use rustykrab_core::orchestration::OrchestrationConfig;
 use rustykrab_core::tool::Tool;
@@ -17,11 +30,43 @@ use serde_json::{json, Value};
 use tokio::sync::Semaphore;
 
 use super::context_manager::estimate_tokens;
+use super::context_store::{ContextStore, MAX_CONTEXT_BYTES};
 
 /// Maximum characters returned by a single `context_peek` call.
 const MAX_PEEK_CHARS: usize = 50_000;
 
-/// Build the set of REPL tools for a given recursion level.
+/// How a [`ContextInfoTool`] / [`ContextPeekTool`] / [`ContextSearchTool`]
+/// finds the blob it should operate on.
+#[derive(Clone)]
+enum ContextSource {
+    /// Use the same fixed blob for every call (the
+    /// [`RecursiveExecutor`] path).
+    Fixed(Arc<String>),
+    /// Look the blob up in a [`ContextStore`] by the active
+    /// conversation id read from `SESSION_TOOL_CONTEXT`.
+    Store(Arc<ContextStore>),
+}
+
+impl ContextSource {
+    fn resolve(&self) -> Option<Arc<String>> {
+        match self {
+            ContextSource::Fixed(s) => Some(s.clone()),
+            ContextSource::Store(store) => SESSION_TOOL_CONTEXT
+                .try_with(|ctx| store.get(ctx.conversation_id))
+                .ok()
+                .flatten(),
+        }
+    }
+}
+
+fn no_context_error() -> rustykrab_core::Error {
+    rustykrab_core::Error::ToolExecution(
+        "no context bound for this conversation; call `context_set` first".into(),
+    )
+}
+
+/// Build the set of REPL tools for a given recursion level. Used by
+/// [`RecursiveExecutor`] with a fixed context blob.
 ///
 /// At `depth >= max_recursion_depth - 1` the `sub_query` tool is
 /// omitted so the model must answer directly from peek/search results.
@@ -32,16 +77,15 @@ pub fn repl_tools(
     depth: usize,
     semaphore: Arc<Semaphore>,
 ) -> Vec<Arc<dyn Tool>> {
+    let source = ContextSource::Fixed(context.clone());
     let mut tools: Vec<Arc<dyn Tool>> = vec![
         Arc::new(ContextInfoTool {
-            context: context.clone(),
+            source: source.clone(),
         }),
         Arc::new(ContextPeekTool {
-            context: context.clone(),
+            source: source.clone(),
         }),
-        Arc::new(ContextSearchTool {
-            context: context.clone(),
-        }),
+        Arc::new(ContextSearchTool { source }),
     ];
 
     if depth < config.max_recursion_depth.saturating_sub(1) {
@@ -57,10 +101,98 @@ pub fn repl_tools(
     tools
 }
 
+/// Build the always-on context tools backed by a per-conversation
+/// [`ContextStore`]. Returns four tools: `context_set`, `context_info`,
+/// `context_peek`, `context_search`. `sub_query` is intentionally not
+/// included in this builder — wiring recursive sub-calls into the main
+/// agent runner is a separate change.
+pub fn context_tools(store: Arc<ContextStore>) -> Vec<Arc<dyn Tool>> {
+    let source = ContextSource::Store(store.clone());
+    vec![
+        Arc::new(ContextSetTool { store }),
+        Arc::new(ContextInfoTool {
+            source: source.clone(),
+        }),
+        Arc::new(ContextPeekTool {
+            source: source.clone(),
+        }),
+        Arc::new(ContextSearchTool { source }),
+    ]
+}
+
+// ── context_set ─────────────────────────────────────────────────────
+
+struct ContextSetTool {
+    store: Arc<ContextStore>,
+}
+
+#[async_trait]
+impl Tool for ContextSetTool {
+    fn name(&self) -> &str {
+        "context_set"
+    }
+
+    fn description(&self) -> &str {
+        "Stash a large blob of text outside the prompt for the current \
+         conversation. After calling this you can use `context_info`, \
+         `context_peek`, and `context_search` to explore the blob \
+         without paying the token cost of having it in every turn. \
+         Replaces any previously stashed context for this conversation."
+    }
+
+    fn schema(&self) -> ToolSchema {
+        ToolSchema {
+            name: self.name().to_string(),
+            description: self.description().to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "text": {
+                        "type": "string",
+                        "description": "The blob to stash. Maximum 4 MiB."
+                    }
+                },
+                "required": ["text"]
+            }),
+        }
+    }
+
+    async fn execute(&self, args: Value) -> rustykrab_core::Result<Value> {
+        let text = args["text"]
+            .as_str()
+            .ok_or_else(|| rustykrab_core::Error::ToolExecution("missing text".into()))?;
+
+        if text.len() > MAX_CONTEXT_BYTES {
+            return Err(rustykrab_core::Error::ToolExecution(
+                format!(
+                    "context too large: {} bytes exceeds {} byte limit",
+                    text.len(),
+                    MAX_CONTEXT_BYTES
+                )
+                .into(),
+            ));
+        }
+
+        let conv_id = SESSION_TOOL_CONTEXT
+            .try_with(|ctx| ctx.conversation_id)
+            .map_err(|_| {
+                rustykrab_core::Error::ToolExecution(
+                    "context_set called outside a session context".into(),
+                )
+            })?;
+
+        let bytes = self.store.set(conv_id, text.to_string());
+        Ok(json!({
+            "stored_bytes": bytes,
+            "estimated_tokens": estimate_tokens(text),
+        }))
+    }
+}
+
 // ── context_info ────────────────────────────────────────────────────
 
 struct ContextInfoTool {
-    context: Arc<String>,
+    source: ContextSource,
 }
 
 #[async_trait]
@@ -88,18 +220,18 @@ impl Tool for ContextInfoTool {
     }
 
     async fn execute(&self, _args: Value) -> rustykrab_core::Result<Value> {
-        let length_bytes = self.context.len();
-        let length_chars = self.context.chars().count();
-        let estimated_tokens = estimate_tokens(&self.context);
-        let line_count = self.context.lines().count();
-        let preview_end = self
-            .context
+        let context = self.source.resolve().ok_or_else(no_context_error)?;
+        let length_bytes = context.len();
+        let length_chars = context.chars().count();
+        let estimated_tokens = estimate_tokens(&context);
+        let line_count = context.lines().count();
+        let preview_end = context
             .char_indices()
             .take_while(|(i, _)| *i < 500)
             .last()
             .map(|(i, c)| i + c.len_utf8())
             .unwrap_or(length_bytes.min(500));
-        let preview = &self.context[..preview_end];
+        let preview = &context[..preview_end];
 
         Ok(json!({
             "length_bytes": length_bytes,
@@ -114,7 +246,7 @@ impl Tool for ContextInfoTool {
 // ── context_peek ────────────────────────────────────────────────────
 
 struct ContextPeekTool {
-    context: Arc<String>,
+    source: ContextSource,
 }
 
 #[async_trait]
@@ -152,22 +284,23 @@ impl Tool for ContextPeekTool {
     }
 
     async fn execute(&self, args: Value) -> rustykrab_core::Result<Value> {
+        let context = self.source.resolve().ok_or_else(no_context_error)?;
         let start = args["start"].as_u64().unwrap_or(0) as usize;
         let end = args["end"].as_u64().unwrap_or(0) as usize;
 
-        let ctx_len = self.context.len();
+        let ctx_len = context.len();
         let start = start.min(ctx_len);
         let end = end.min(ctx_len).max(start);
 
         // Snap to char boundaries.
-        let start = snap_to_char_boundary(&self.context, start);
-        let end = snap_to_char_boundary(&self.context, end);
+        let start = snap_to_char_boundary(&context, start);
+        let end = snap_to_char_boundary(&context, end);
 
         // Enforce safety limit.
         let effective_end = end.min(start + MAX_PEEK_CHARS);
-        let effective_end = snap_to_char_boundary(&self.context, effective_end);
+        let effective_end = snap_to_char_boundary(&context, effective_end);
 
-        let slice = &self.context[start..effective_end];
+        let slice = &context[start..effective_end];
         let truncated = effective_end < end;
 
         Ok(json!({
@@ -182,7 +315,7 @@ impl Tool for ContextPeekTool {
 // ── context_search ──────────────────────────────────────────────────
 
 struct ContextSearchTool {
-    context: Arc<String>,
+    source: ContextSource,
 }
 
 #[async_trait]
@@ -219,6 +352,7 @@ impl Tool for ContextSearchTool {
     }
 
     async fn execute(&self, args: Value) -> rustykrab_core::Result<Value> {
+        let context = self.source.resolve().ok_or_else(no_context_error)?;
         let pattern = args["pattern"]
             .as_str()
             .ok_or_else(|| rustykrab_core::Error::ToolExecution("missing pattern".into()))?;
@@ -232,9 +366,9 @@ impl Tool for ContextSearchTool {
         let mut total_count = 0usize;
         // Track byte offset by pointer arithmetic against the original
         // string so we handle both \n and \r\n correctly.
-        let ctx_start = self.context.as_ptr() as usize;
+        let ctx_start = context.as_ptr() as usize;
 
-        for (line_num, line) in self.context.lines().enumerate() {
+        for (line_num, line) in context.lines().enumerate() {
             if re.is_match(line) {
                 let byte_offset = line.as_ptr() as usize - ctx_start;
                 total_count += 1;
@@ -378,10 +512,19 @@ mod tests {
         assert_eq!(snap_to_char_boundary(s, 100), 12);
     }
 
+    use rustykrab_core::active_tools::{ActiveToolsRegistry, SessionToolContext};
+    use rustykrab_core::CapabilitySet;
+    use uuid::Uuid;
+
+    fn fixed(text: &str) -> ContextSource {
+        ContextSource::Fixed(Arc::new(text.to_string()))
+    }
+
     #[tokio::test]
     async fn test_context_info() {
-        let ctx = Arc::new("Line one\nLine two\nLine three".to_string());
-        let tool = ContextInfoTool { context: ctx };
+        let tool = ContextInfoTool {
+            source: fixed("Line one\nLine two\nLine three"),
+        };
         let result = tool.execute(json!({})).await.unwrap();
         assert_eq!(result["line_count"], 3);
         assert_eq!(result["length_bytes"], 28);
@@ -391,8 +534,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_context_peek_basic() {
-        let ctx = Arc::new("Hello, world! This is a test.".to_string());
-        let tool = ContextPeekTool { context: ctx };
+        let tool = ContextPeekTool {
+            source: fixed("Hello, world! This is a test."),
+        };
         let result = tool.execute(json!({"start": 0, "end": 13})).await.unwrap();
         assert_eq!(result["text"], "Hello, world!");
         assert_eq!(result["truncated"], false);
@@ -400,8 +544,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_context_peek_clamps_bounds() {
-        let ctx = Arc::new("short".to_string());
-        let tool = ContextPeekTool { context: ctx };
+        let tool = ContextPeekTool {
+            source: fixed("short"),
+        };
         let result = tool
             .execute(json!({"start": 0, "end": 99999}))
             .await
@@ -411,13 +556,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_context_search_finds_matches() {
-        let ctx = Arc::new(
-            "The temperature in Tokyo is 25C.\n\
-             Rain expected in London.\n\
-             Tokyo will be sunny tomorrow."
-                .to_string(),
-        );
-        let tool = ContextSearchTool { context: ctx };
+        let tool = ContextSearchTool {
+            source: fixed(
+                "The temperature in Tokyo is 25C.\n\
+                 Rain expected in London.\n\
+                 Tokyo will be sunny tomorrow.",
+            ),
+        };
         let result = tool
             .execute(json!({"pattern": "tokyo", "max_results": 10}))
             .await
@@ -433,16 +578,18 @@ mod tests {
 
     #[tokio::test]
     async fn test_context_search_invalid_regex() {
-        let ctx = Arc::new("test".to_string());
-        let tool = ContextSearchTool { context: ctx };
+        let tool = ContextSearchTool {
+            source: fixed("test"),
+        };
         let result = tool.execute(json!({"pattern": "[invalid"})).await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
     async fn test_context_search_respects_max_results() {
-        let ctx = Arc::new("match\nmatch\nmatch\nmatch\nmatch".to_string());
-        let tool = ContextSearchTool { context: ctx };
+        let tool = ContextSearchTool {
+            source: fixed("match\nmatch\nmatch\nmatch\nmatch"),
+        };
         let result = tool
             .execute(json!({"pattern": "match", "max_results": 2}))
             .await
@@ -457,12 +604,96 @@ mod tests {
     #[tokio::test]
     async fn test_context_search_crlf_offsets() {
         // \r\n line endings — byte offsets must account for 2-byte separators
-        let ctx = Arc::new("first\r\nsecond\r\nthird".to_string());
-        let tool = ContextSearchTool { context: ctx };
+        let tool = ContextSearchTool {
+            source: fixed("first\r\nsecond\r\nthird"),
+        };
         let result = tool.execute(json!({"pattern": "third"})).await.unwrap();
         let matches = result["matches"].as_array().unwrap();
         assert_eq!(matches.len(), 1);
         // "first\r\n" = 7 bytes, "second\r\n" = 8 bytes → "third" starts at byte 15
         assert_eq!(matches[0]["byte_offset"], 15);
+    }
+
+    fn session_ctx(conv_id: Uuid) -> SessionToolContext {
+        SessionToolContext {
+            conversation_id: conv_id,
+            capabilities: Arc::new(CapabilitySet::default_safe()),
+            all_tools: Arc::new(Vec::new()),
+            active_tools: Arc::new(ActiveToolsRegistry::new()),
+        }
+    }
+
+    #[tokio::test]
+    async fn store_source_resolves_via_session_context() {
+        let store = Arc::new(ContextStore::new());
+        let conv_id = Uuid::new_v4();
+        store.set(conv_id, "stored text".into());
+
+        let tool = ContextInfoTool {
+            source: ContextSource::Store(store),
+        };
+        let result = SESSION_TOOL_CONTEXT
+            .scope(session_ctx(conv_id), tool.execute(json!({})))
+            .await
+            .unwrap();
+        assert_eq!(result["length_bytes"], 11);
+    }
+
+    #[tokio::test]
+    async fn store_source_errors_when_no_context_bound() {
+        let store = Arc::new(ContextStore::new());
+        let conv_id = Uuid::new_v4(); // never set
+        let tool = ContextInfoTool {
+            source: ContextSource::Store(store),
+        };
+        let result = SESSION_TOOL_CONTEXT
+            .scope(session_ctx(conv_id), tool.execute(json!({})))
+            .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("no context bound"));
+    }
+
+    #[tokio::test]
+    async fn context_set_stashes_into_store() {
+        let store = Arc::new(ContextStore::new());
+        let conv_id = Uuid::new_v4();
+        let tool = ContextSetTool {
+            store: store.clone(),
+        };
+
+        let result = SESSION_TOOL_CONTEXT
+            .scope(
+                session_ctx(conv_id),
+                tool.execute(json!({"text": "hello world"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["stored_bytes"], 11);
+        assert_eq!(
+            store.get(conv_id).as_deref().map(String::as_str),
+            Some("hello world")
+        );
+    }
+
+    #[tokio::test]
+    async fn context_set_rejects_oversize_blob() {
+        let store = Arc::new(ContextStore::new());
+        let conv_id = Uuid::new_v4();
+        let tool = ContextSetTool { store };
+
+        let big = "x".repeat(MAX_CONTEXT_BYTES + 1);
+        let err = SESSION_TOOL_CONTEXT
+            .scope(session_ctx(conv_id), tool.execute(json!({"text": big})))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("context too large"));
+    }
+
+    #[tokio::test]
+    async fn context_set_errors_outside_session_scope() {
+        let store = Arc::new(ContextStore::new());
+        let tool = ContextSetTool { store };
+        let err = tool.execute(json!({"text": "x"})).await.unwrap_err();
+        assert!(err.to_string().contains("outside a session context"));
     }
 }

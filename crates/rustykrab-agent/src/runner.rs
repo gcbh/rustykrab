@@ -16,7 +16,19 @@ use uuid::Uuid;
 /// Names of meta-tools that are always included in the schema sent to the
 /// model, regardless of the active tool set. These are how the model
 /// discovers and loads the rest of the catalog.
-const META_TOOL_NAMES: &[&str] = &["tools_list", "tools_load"];
+/// Tools that are always sent to the model regardless of the
+/// per-conversation active set. The `tools_*` meta-tools let the model
+/// discover/load other tools; the `context_*` tools let the model
+/// stash and explore large blobs outside the prompt — useful even on
+/// small models that struggle to fit context inline.
+const META_TOOL_NAMES: &[&str] = &[
+    "tools_list",
+    "tools_load",
+    "context_set",
+    "context_info",
+    "context_peek",
+    "context_search",
+];
 
 fn is_meta_tool(name: &str) -> bool {
     META_TOOL_NAMES.contains(&name)

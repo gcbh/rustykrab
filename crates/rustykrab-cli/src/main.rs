@@ -15,6 +15,7 @@ const BUILD_DATE: &str = env!("RUSTYKRAB_BUILD_DATE");
 fn version_string() -> String {
     format!("{VERSION} ({GIT_HASH}{GIT_DIRTY}, {BUILD_DATE})")
 }
+use rustykrab_agent::rlm::{context_tools, ContextStore};
 use rustykrab_agent::{AgentEvent, HarnessProfile, HarnessRouter, ProcessSandbox, SubagentRunner};
 use rustykrab_channels::telegram::ChannelMessage;
 use rustykrab_channels::{TelegramChannel, VideoChannel, VideoConfig};
@@ -441,6 +442,14 @@ async fn main() -> anyhow::Result<()> {
         tools.extend(rustykrab_tools::video_tools(video_backend));
         tracing::info!("video tool registered");
     }
+
+    // --- Context tools (RLM REPL: context_set / info / peek / search) ---
+    // Always available regardless of `tools_load` state — registered as
+    // meta-tools in the runner so small models can stash and explore
+    // large blobs without paying token cost on every turn.
+    let context_store = Arc::new(ContextStore::new());
+    tools.extend(context_tools(context_store.clone()));
+    tracing::info!("context tools registered");
 
     // --- Log provider status ---
     tracing::info!(provider = provider.name(), "model provider configured");
