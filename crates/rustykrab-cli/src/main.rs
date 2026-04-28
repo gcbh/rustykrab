@@ -185,10 +185,21 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(profile = %profile.name, "harness profile loaded");
 
     // --- Master key for credential encryption ---
-    // On macOS: stored in the system Keychain (Secure Enclave / Touch ID protected).
-    // On Linux: falls back to RUSTYKRAB_MASTER_KEY env var or ephemeral key.
-    let master_key = rustykrab_store::keychain::resolve_master_key()
-        .expect("failed to resolve master encryption key");
+    // On macOS: stored in the Data Protection Keychain (loaded after first
+    // unlock, no password prompt).
+    // On Linux/Docker: must be supplied via RUSTYKRAB_MASTER_KEY — see the
+    // "Linux / Docker setup" section of the README. The daemon refuses to
+    // start without it rather than risk an ephemeral key that would leave
+    // previously-stored secrets unrecoverable.
+    let master_key = match rustykrab_store::keychain::resolve_master_key() {
+        Ok(key) => key,
+        Err(e) => {
+            eprintln!();
+            eprintln!("ERROR: {e}");
+            eprintln!();
+            std::process::exit(1);
+        }
+    };
 
     let store = rustykrab_store::Store::open(data_dir.join("db"), master_key)?;
 
@@ -208,10 +219,12 @@ async fn main() -> anyhow::Result<()> {
                 eprintln!("  {} ({})", m.spec.description, m.spec.store_name);
                 eprintln!("    Set via one of:");
                 eprintln!("      env var:    export {}=<value>", m.spec.env_var);
-                eprintln!(
-                    "      keychain:   rustykrab-cli keychain set {} <value>",
-                    m.spec.keychain_account
-                );
+                if cfg!(target_os = "macos") {
+                    eprintln!(
+                        "      keychain:   rustykrab-cli keychain set {} <value>",
+                        m.spec.keychain_account
+                    );
+                }
                 eprintln!(
                     "      store:      credential_write(action='set', name='{}', value='...')",
                     m.spec.store_name
@@ -1233,11 +1246,18 @@ fn resolve_api_key(store: &rustykrab_store::Store) -> String {
         return key;
     }
 
-    tracing::error!(
-        "ANTHROPIC_API_KEY not set. Set the env var, store it via the secrets API, \
-         or add it to the OS credential store (rustykrab-cli keychain set {}).",
-        spec.keychain_account,
-    );
+    if cfg!(target_os = "macos") {
+        tracing::error!(
+            "ANTHROPIC_API_KEY not set. Set the env var, store it via the secrets API, \
+             or add it to the OS credential store (rustykrab-cli keychain set {}).",
+            spec.keychain_account,
+        );
+    } else {
+        tracing::error!(
+            "ANTHROPIC_API_KEY not set. Set the env var or store it via the \
+             gateway secrets API."
+        );
+    }
     String::new()
 }
 
@@ -1254,20 +1274,18 @@ fn handle_keychain_subcommand(data_dir: &std::path::Path, args: &[String]) -> an
             println!(
                 "OS credential store: {}",
                 if available {
-                    if cfg!(target_os = "macos") {
-                        "available (macOS Data Protection Keychain)"
-                    } else {
-                        "available (Secret Service)"
-                    }
+                    "available (macOS Data Protection Keychain)"
                 } else {
-                    "not available"
+                    "not supported on this platform"
                 }
             );
 
             if !available {
                 println!(
-                    "\nNo OS credential store detected. Use environment variables \
-                     or the encrypted store instead."
+                    "\nThe `keychain` subcommand is macOS-only. On Linux/Docker, \
+                     set RUSTYKRAB_MASTER_KEY and the per-credential RUSTYKRAB_* \
+                     env vars (or write secrets to the encrypted store via the \
+                     gateway secrets API). See the README for details."
                 );
                 return Ok(());
             }
@@ -1329,7 +1347,11 @@ fn handle_keychain_subcommand(data_dir: &std::path::Path, args: &[String]) -> an
             })?;
 
             if !rustykrab_store::keychain::keychain_available() {
-                anyhow::bail!("OS credential store is not available on this platform");
+                anyhow::bail!(
+                    "the `keychain` subcommand is macOS-only. On Linux/Docker, \
+                     set the credential's RUSTYKRAB_* env var or write to the \
+                     encrypted store via the gateway secrets API."
+                );
             }
 
             let svc = rustykrab_store::registry::keychain_service();
@@ -1368,7 +1390,11 @@ fn handle_keychain_subcommand(data_dir: &std::path::Path, args: &[String]) -> an
 
         "migrate" => {
             if !rustykrab_store::keychain::keychain_available() {
-                anyhow::bail!("OS credential store is not available on this platform");
+                anyhow::bail!(
+                    "the `keychain migrate` subcommand is macOS-only. On \
+                     Linux/Docker, credentials live in env vars or the \
+                     encrypted store — there is no OS keychain to migrate to."
+                );
             }
 
             println!("Migrating credentials to OS credential store...\n");

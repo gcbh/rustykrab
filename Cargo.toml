@@ -66,7 +66,6 @@ argon2 = "0.5"
 security-framework = { version = "3", features = ["OSX_10_15"] }
 zeroize = { version = "1", features = ["zeroize_derive"] }
 secrecy = "0.10"
-keyring = { version = "3", default-features = false, features = ["linux-native"] }
 
 # Browser automation (Chrome DevTools Protocol)
 chromiumoxide = "0.9"

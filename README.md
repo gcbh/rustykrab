@@ -96,6 +96,46 @@ export RUSTYKRAB_AUTH_TOKEN=$(openssl rand -hex 32)
 
 Add these to your shell profile or a secrets manager. The master key encrypts all secrets stored in the database — if you lose it, stored secrets become unreadable.
 
+### Linux / Docker setup
+
+On macOS the master key is stored in the Data Protection Keychain. On Linux and Docker there is no comparable session-persistent backend that's safe to rely on, so **`RUSTYKRAB_MASTER_KEY` is required** — the daemon refuses to start without it. (This is intentional: an auto-generated ephemeral key would render previously-encrypted secrets in `store.db` permanently unreadable on the next restart.)
+
+```bash
+# One-time: generate and persist the key somewhere durable.
+export RUSTYKRAB_MASTER_KEY=$(openssl rand -hex 32)
+```
+
+**systemd unit:** keep the key out of the unit file by sourcing it from a 0600-perm env file:
+
+```ini
+# /etc/systemd/system/rustykrab.service
+[Service]
+EnvironmentFile=/etc/rustykrab/env
+ExecStart=/usr/local/bin/rustykrab-cli
+Restart=on-failure
+```
+
+```bash
+# /etc/rustykrab/env  (chmod 0600, owned by the service user)
+RUSTYKRAB_MASTER_KEY=<hex>
+RUSTYKRAB_AUTH_TOKEN=<hex>
+ANTHROPIC_API_KEY=<sk-ant-...>
+```
+
+**Docker:** pass the key via `--env-file` or a Docker/Compose secret mounted as a file and exported in the entrypoint:
+
+```bash
+docker run --rm \
+  --env-file /path/to/rustykrab.env \
+  -v rustykrab-data:/var/lib/rustykrab \
+  -e RUSTYKRAB_DATA_DIR=/var/lib/rustykrab \
+  rustykrab:latest
+```
+
+Per-credential values (Anthropic, Notion, Telegram, etc.) come from their `RUSTYKRAB_*`/service-specific env vars — see the table above and the registry at `crates/rustykrab-store/src/registry.rs`. Anything resolved from an env var is also persisted into the encrypted SQLite store on first run, so subsequent restarts only need `RUSTYKRAB_MASTER_KEY` plus whatever you want to rotate.
+
+The `rustykrab-cli keychain` subcommand is macOS-only; on Linux/Docker use env vars or the gateway's secrets API.
+
 ## Usage
 
 The gateway listens on `127.0.0.1:3000` (loopback only, by design).

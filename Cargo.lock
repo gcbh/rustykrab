@@ -1949,17 +1949,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "keyring"
-version = "3.6.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eebcc3aff044e5944a8fbaf69eb277d11986064cba30c468730e8b9909fb551c"
-dependencies = [
- "linux-keyutils",
- "log",
- "zeroize",
-]
-
-[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2051,16 +2040,6 @@ dependencies = [
  "cc",
  "pkg-config",
  "vcpkg",
-]
-
-[[package]]
-name = "linux-keyutils"
-version = "0.2.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "83270a18e9f90d0707c41e9f35efada77b64c0e6f3f1810e71c8368a864d5590"
-dependencies = [
- "bitflags 2.11.1",
- "libc",
 ]
 
 [[package]]
@@ -3272,7 +3251,7 @@ checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
 
 [[package]]
 name = "rustykrab-agent"
-version = "2.6.12"
+version = "2.6.13"
 dependencies = [
  "async-trait",
  "chrono",
@@ -3288,7 +3267,7 @@ dependencies = [
 
 [[package]]
 name = "rustykrab-channels"
-version = "2.6.12"
+version = "2.6.13"
 dependencies = [
  "async-trait",
  "chrono",
@@ -3307,7 +3286,7 @@ dependencies = [
 
 [[package]]
 name = "rustykrab-cli"
-version = "2.6.12"
+version = "2.6.13"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3336,7 +3315,7 @@ dependencies = [
 
 [[package]]
 name = "rustykrab-core"
-version = "2.6.12"
+version = "2.6.13"
 dependencies = [
  "async-trait",
  "chrono",
@@ -3349,7 +3328,7 @@ dependencies = [
 
 [[package]]
 name = "rustykrab-gateway"
-version = "2.6.12"
+version = "2.6.13"
 dependencies = [
  "axum",
  "chrono",
@@ -3373,7 +3352,7 @@ dependencies = [
 
 [[package]]
 name = "rustykrab-memory"
-version = "2.6.12"
+version = "2.6.13"
 dependencies = [
  "async-trait",
  "chrono",
@@ -3394,7 +3373,7 @@ dependencies = [
 
 [[package]]
 name = "rustykrab-providers"
-version = "2.6.12"
+version = "2.6.13"
 dependencies = [
  "async-trait",
  "chrono",
@@ -3410,7 +3389,7 @@ dependencies = [
 
 [[package]]
 name = "rustykrab-skills"
-version = "2.6.12"
+version = "2.6.13"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3426,7 +3405,7 @@ dependencies = [
 
 [[package]]
 name = "rustykrab-store"
-version = "2.6.12"
+version = "2.6.13"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -3434,7 +3413,6 @@ dependencies = [
  "croner",
  "hex",
  "hmac",
- "keyring",
  "rand",
  "rusqlite",
  "rustykrab-core",
@@ -3450,7 +3428,7 @@ dependencies = [
 
 [[package]]
 name = "rustykrab-tools"
-version = "2.6.12"
+version = "2.6.13"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
