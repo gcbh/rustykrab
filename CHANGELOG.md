@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.6.14] - 2026-04-28
+
+- fix(store): make non-macOS credential path safe for headless Linux/Docker (#396)
+
 ## [2.6.13] - 2026-04-26
 
 - fix(agent): catch progress-narration responses in loop classifier (#393)
