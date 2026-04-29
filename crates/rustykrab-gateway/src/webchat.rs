@@ -13,7 +13,18 @@ struct StaticAssets;
 pub fn static_routes() -> Router<AppState> {
     Router::new()
         .route("/", get(index))
+        .route(
+            "/.well-known/appspecific/com.chrome.devtools.json",
+            get(chrome_devtools_probe),
+        )
         .route("/{*path}", get(serve_static))
+}
+
+// Chrome DevTools probes this path to discover a workspace project mapping
+// when DevTools is open. Returning 204 silences the "implementation does not
+// exist" / 404 noise without claiming to support a workspace.
+async fn chrome_devtools_probe() -> StatusCode {
+    StatusCode::NO_CONTENT
 }
 
 async fn index() -> impl IntoResponse {
