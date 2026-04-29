@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.7.1] - 2026-04-29
+
+- feat(agent): preserve compaction-displaced history via RLM recall tools (#398)
+
 ## [2.7.0] - 2026-04-28
 
 - feat(agent): enable subagent delegation via agents_list/subagents tools (#397)
