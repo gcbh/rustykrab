@@ -6,6 +6,7 @@ use chrono::Utc;
 use rustykrab_core::active_tools::{ActiveToolsRegistry, SessionToolContext, SESSION_TOOL_CONTEXT};
 use rustykrab_core::capability::Capability;
 use rustykrab_core::model::{ModelProvider, ModelResponse, StopReason, StreamEvent};
+use rustykrab_core::recall::RecallStore;
 use rustykrab_core::session::Session;
 use rustykrab_core::types::{
     Conversation, Message, MessageContent, Role, ToolCall, ToolResult, ToolSchema,
@@ -14,9 +15,19 @@ use rustykrab_core::{Error, Result, SandboxRequirements, Tool, ToolErrorKind};
 use uuid::Uuid;
 
 /// Names of meta-tools that are always included in the schema sent to the
-/// model, regardless of the active tool set. These are how the model
-/// discovers and loads the rest of the catalog.
-const META_TOOL_NAMES: &[&str] = &["tools_list", "tools_load"];
+/// model, regardless of the active tool set. The first two are how the
+/// model discovers and loads the rest of the catalog. The `recall_*`
+/// tools read the per-conversation compaction archive and need to be
+/// always present — the model can't `tools_load` them after compaction
+/// has already dropped the detail it needs to recover.
+const META_TOOL_NAMES: &[&str] = &[
+    "tools_list",
+    "tools_load",
+    "recall_info",
+    "recall_peek",
+    "recall_search",
+    "recall_sub_query",
+];
 
 fn is_meta_tool(name: &str) -> bool {
     META_TOOL_NAMES.contains(&name)
@@ -421,6 +432,7 @@ pub struct AgentRunner {
     tracer: ExecutionTracer,
     on_message: Option<OnMessageCallback>,
     active_tools: Arc<ActiveToolsRegistry>,
+    recall: Arc<RecallStore>,
 }
 
 impl AgentRunner {
@@ -437,6 +449,7 @@ impl AgentRunner {
             tracer: ExecutionTracer::new(),
             on_message: None,
             active_tools: Arc::new(ActiveToolsRegistry::new()),
+            recall: Arc::new(RecallStore::new()),
         }
     }
 
@@ -444,6 +457,14 @@ impl AgentRunner {
     /// `tools_load` meta-tool can persist activations across conversations.
     pub fn with_active_tools(mut self, registry: Arc<ActiveToolsRegistry>) -> Self {
         self.active_tools = registry;
+        self
+    }
+
+    /// Share a per-gateway recall store with the runner so the
+    /// `recall_*` tools see compaction-displaced history archived from
+    /// any prior request on the same conversation.
+    pub fn with_recall_store(mut self, store: Arc<RecallStore>) -> Self {
+        self.recall = store;
         self
     }
 
@@ -470,6 +491,7 @@ impl AgentRunner {
             capabilities: Arc::new(session.capabilities.clone()),
             all_tools: Arc::new(self.tools.clone()),
             active_tools: self.active_tools.clone(),
+            recall: self.recall.clone(),
         }
     }
 
@@ -1804,6 +1826,60 @@ impl AgentRunner {
             return Ok(());
         }
 
+        // Figure out which messages survive the swap (leading system
+        // messages + the first user message). Everything else is
+        // "displaced" — its detail lives only in the summary unless we
+        // archive it for recall.
+        let mut new_messages: Vec<Message> = Vec::new();
+        let mut preserved_ids: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
+        for msg in &conv.messages {
+            if msg.role == Role::System {
+                preserved_ids.insert(msg.id);
+                new_messages.push(msg.clone());
+            } else {
+                break;
+            }
+        }
+        if let Some(first_user) = conv.messages.iter().find(|m| m.role == Role::User) {
+            preserved_ids.insert(first_user.id);
+            new_messages.push(first_user.clone());
+        }
+
+        // Archive the displaced messages into the per-conversation
+        // recall store so the agent can recover specific detail via the
+        // `recall_*` tools when the summary glosses over it. This is
+        // the RLM paper's pattern: the long history lives outside the
+        // prompt, the model navigates it via tools.
+        let displaced: Vec<String> = conv
+            .messages
+            .iter()
+            .filter(|m| !preserved_ids.contains(&m.id))
+            .map(Self::render_message_for_summary)
+            .collect();
+        let archived_chars: usize = displaced.iter().map(|s| s.len()).sum();
+        if !displaced.is_empty() {
+            self.recall.append(conv.id, &displaced.join("\n\n"));
+            tracing::info!(
+                conversation_id = %conv.id,
+                displaced_messages = displaced.len(),
+                archived_chars,
+                "compaction: archived displaced history for recall"
+            );
+        }
+
+        // Append a recall hint so the model knows specific detail is
+        // recoverable when the bullet summary glosses over something.
+        // Kept short — the summary itself is still the primary signal.
+        let summary_with_hint = if displaced.is_empty() {
+            summary.clone()
+        } else {
+            format!(
+                "{summary}\n\n[Earlier conversation detail is preserved out-of-prompt. \
+                 Use recall_info / recall_search / recall_peek / recall_sub_query to \
+                 fetch specifics this summary may have dropped.]"
+            )
+        };
+
         // Synthesize the two new messages compaction produces. They need
         // to flow through on_message so memory picks them up — even though
         // they're inserted into `new_messages` directly below rather than
@@ -1811,7 +1887,7 @@ impl AgentRunner {
         let summary_msg = Message {
             id: Uuid::new_v4(),
             role: Role::Assistant,
-            content: MessageContent::Text(summary.clone()),
+            content: MessageContent::Text(summary_with_hint.clone()),
             created_at: Utc::now(),
         };
         let continuation_msg = Message {
@@ -1824,29 +1900,11 @@ impl AgentRunner {
             created_at: Utc::now(),
         };
 
-        // Preserve system messages (they contain the agent's identity and
-        // instructions) and the first user message (the original task).
-        let mut new_messages: Vec<Message> = Vec::new();
-
-        // Keep all leading system messages.
-        for msg in &conv.messages {
-            if msg.role == Role::System {
-                new_messages.push(msg.clone());
-            } else {
-                break;
-            }
-        }
-
-        // Keep the first user message (the original request).
-        if let Some(first_user) = conv.messages.iter().find(|m| m.role == Role::User) {
-            new_messages.push(first_user.clone());
-        }
-
         new_messages.push(summary_msg.clone());
         new_messages.push(continuation_msg.clone());
 
         conv.messages = new_messages;
-        conv.summary = Some(summary);
+        conv.summary = Some(summary_with_hint);
         conv.updated_at = Utc::now();
 
         // Fire on_message only for the newly synthesized turns. The preserved
@@ -2574,6 +2632,153 @@ mod compaction_tests {
 
         // Provider was never called — repair is pure truncation.
         assert_eq!(*provider.call_count.lock().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn compact_history_archives_displaced_messages_into_recall_store() {
+        // Verify that compaction stashes the rendered text of every
+        // displaced message into the runner's RecallStore so the
+        // `recall_*` tools can recover detail the summary glosses over.
+        let provider = Arc::new(CountingProvider::new(None));
+        let recall = Arc::new(RecallStore::new());
+        let runner = AgentRunner::new(
+            provider.clone() as Arc<dyn ModelProvider>,
+            Vec::new(),
+            Arc::new(NoSandbox),
+        )
+        .with_recall_store(recall.clone());
+
+        let conv_id = Uuid::new_v4();
+        let mut conv = Conversation {
+            id: conv_id,
+            messages: vec![
+                Message {
+                    id: Uuid::new_v4(),
+                    role: Role::System,
+                    content: MessageContent::Text("agent identity".into()),
+                    created_at: Utc::now(),
+                },
+                Message {
+                    id: Uuid::new_v4(),
+                    role: Role::User,
+                    content: MessageContent::Text("original task".into()),
+                    created_at: Utc::now(),
+                },
+                Message {
+                    id: Uuid::new_v4(),
+                    role: Role::Assistant,
+                    content: MessageContent::Text("UNIQUE_DETAIL_ALPHA".into()),
+                    created_at: Utc::now(),
+                },
+                Message {
+                    id: Uuid::new_v4(),
+                    role: Role::User,
+                    content: MessageContent::Text("UNIQUE_DETAIL_BRAVO".into()),
+                    created_at: Utc::now(),
+                },
+                Message {
+                    id: Uuid::new_v4(),
+                    role: Role::Assistant,
+                    content: MessageContent::Text("UNIQUE_DETAIL_CHARLIE".into()),
+                    created_at: Utc::now(),
+                },
+            ],
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            summary: None,
+            detected_profile: None,
+            channel_source: None,
+            channel_id: None,
+            channel_thread_id: None,
+        };
+
+        runner
+            .compact_history(&mut conv)
+            .await
+            .expect("compaction should succeed");
+
+        // System message + first user message + summary + continuation = 4.
+        assert_eq!(conv.messages.len(), 4);
+
+        // The compacted summary should mention the recall tools so the
+        // model knows the displaced detail is recoverable.
+        let summary = conv.summary.as_ref().expect("summary present");
+        assert!(
+            summary.contains("recall_"),
+            "summary should advertise recall_* tools, got: {summary}"
+        );
+
+        // The recall store should hold the displaced messages but NOT
+        // the preserved system / first-user messages.
+        let archived = recall
+            .get(conv_id)
+            .expect("recall archive should be populated");
+        assert!(archived.contains("UNIQUE_DETAIL_ALPHA"));
+        assert!(archived.contains("UNIQUE_DETAIL_BRAVO"));
+        assert!(archived.contains("UNIQUE_DETAIL_CHARLIE"));
+        assert!(
+            !archived.contains("agent identity"),
+            "preserved system message should not be archived"
+        );
+        assert!(
+            !archived.contains("original task"),
+            "preserved first user message should not be archived"
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_history_appends_across_multiple_compactions() {
+        // Two successive compactions on the same conversation should
+        // accumulate displaced detail in the archive — not overwrite.
+        let provider = Arc::new(CountingProvider::new(None));
+        let recall = Arc::new(RecallStore::new());
+        let runner = AgentRunner::new(
+            provider.clone() as Arc<dyn ModelProvider>,
+            Vec::new(),
+            Arc::new(NoSandbox),
+        )
+        .with_recall_store(recall.clone());
+
+        let conv_id = Uuid::new_v4();
+        let make_conv = |detail: &str| Conversation {
+            id: conv_id,
+            messages: vec![
+                Message {
+                    id: Uuid::new_v4(),
+                    role: Role::System,
+                    content: MessageContent::Text("system".into()),
+                    created_at: Utc::now(),
+                },
+                Message {
+                    id: Uuid::new_v4(),
+                    role: Role::User,
+                    content: MessageContent::Text("task".into()),
+                    created_at: Utc::now(),
+                },
+                Message {
+                    id: Uuid::new_v4(),
+                    role: Role::Assistant,
+                    content: MessageContent::Text(detail.into()),
+                    created_at: Utc::now(),
+                },
+            ],
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            summary: None,
+            detected_profile: None,
+            channel_source: None,
+            channel_id: None,
+            channel_thread_id: None,
+        };
+
+        let mut first = make_conv("FIRST_BATCH_DETAIL");
+        runner.compact_history(&mut first).await.unwrap();
+        let mut second = make_conv("SECOND_BATCH_DETAIL");
+        runner.compact_history(&mut second).await.unwrap();
+
+        let archived = recall.get(conv_id).expect("archive populated");
+        assert!(archived.contains("FIRST_BATCH_DETAIL"));
+        assert!(archived.contains("SECOND_BATCH_DETAIL"));
     }
 
     #[test]

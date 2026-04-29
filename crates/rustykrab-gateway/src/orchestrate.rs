@@ -198,7 +198,8 @@ async fn prepare_agent(
         state.sandbox.clone(),
     )
     .with_config(profile.to_agent_config())
-    .with_active_tools(state.active_tools.clone());
+    .with_active_tools(state.active_tools.clone())
+    .with_recall_store(state.recall.clone());
 
     if let Some(cb) = build_memory_callback(state, conv) {
         // The inbound user message was pushed onto conv.messages by

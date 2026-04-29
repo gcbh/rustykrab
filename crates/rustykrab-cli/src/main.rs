@@ -478,6 +478,16 @@ async fn main() -> anyhow::Result<()> {
     tools.extend(rustykrab_tools::session_tools(subagent_runner));
     tracing::info!("subagent tools registered");
 
+    // --- Recall tools (read compaction-displaced history) ---
+    // The store backing these tools lives on AppState and is threaded
+    // through the runner's SessionToolContext, so the tools resolve it
+    // at execute() time — no construction-time store argument needed.
+    tools.extend(rustykrab_agent::recall_tools(
+        provider.clone(),
+        orchestration_config.clone(),
+    ));
+    tracing::info!("recall tools registered");
+
     // --- Harness router (auto-selects profile per message) ---
     // Reuses the main provider for classification to avoid model swapping.
     // The classification prompt is ~50 tokens — negligible overhead on any model.
