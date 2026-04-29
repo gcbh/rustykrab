@@ -1,6 +1,7 @@
 mod channel;
 pub mod mcp;
 pub mod signal;
+pub mod slack;
 pub mod telegram;
 pub mod video;
 mod webchat;
@@ -8,6 +9,7 @@ mod webchat;
 pub use channel::Channel;
 pub use mcp::McpClient;
 pub use signal::{SignalChannel, SignalInboundMessage};
+pub use slack::{SlackChannel, SlackInboundMessage};
 pub use telegram::TelegramChannel;
 pub use video::{VideoChannel, VideoConfig};
 pub use webchat::{web_chat_pair, WebChatChannel, WebChatHandle};

@@ -17,6 +17,10 @@ pub struct ScheduledJob {
     pub task: String,
     pub channel: Option<String>,
     pub chat_id: Option<String>,
+    /// Channel-specific thread identifier. Telegram: forum topic thread_id
+    /// (numeric string, e.g. "42"). Slack: thread_ts (e.g.
+    /// "1700000000.000100"). `None` means post at the channel's top level.
+    pub thread_id: Option<String>,
     pub one_shot: bool,
     pub enabled: bool,
     pub next_run_at: DateTime<Utc>,
@@ -63,6 +67,7 @@ impl JobStore {
         task: &str,
         channel: Option<&str>,
         chat_id: Option<&str>,
+        thread_id: Option<&str>,
     ) -> Result<ScheduledJob, Error> {
         let now = Utc::now();
         let (one_shot, next_run_at) = parse_schedule(schedule, now)?;
@@ -74,6 +79,7 @@ impl JobStore {
             task: task.to_string(),
             channel: channel.map(|s| s.to_string()),
             chat_id: chat_id.map(|s| s.to_string()),
+            thread_id: thread_id.map(|s| s.to_string()),
             one_shot,
             enabled: true,
             next_run_at,
@@ -84,14 +90,15 @@ impl JobStore {
 
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO scheduled_jobs (id, schedule, task, channel, chat_id, one_shot, enabled, next_run_at, last_run_at, created_at, conversation_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            "INSERT INTO scheduled_jobs (id, schedule, task, channel, chat_id, thread_id, one_shot, enabled, next_run_at, last_run_at, created_at, conversation_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 job.id,
                 job.schedule,
                 job.task,
                 job.channel,
                 job.chat_id,
+                job.thread_id,
                 job.one_shot as i32,
                 job.enabled as i32,
                 job.next_run_at.to_rfc3339(),
@@ -282,7 +289,7 @@ impl JobStore {
 
 /// Column list for `SELECT`s against `scheduled_jobs`. Kept in sync with
 /// [`row_to_job`].
-const JOB_COLUMNS: &str = "id, schedule, task, channel, chat_id, one_shot, enabled, \
+const JOB_COLUMNS: &str = "id, schedule, task, channel, chat_id, thread_id, one_shot, enabled, \
      next_run_at, last_run_at, created_at, conversation_id";
 
 /// Decode a row produced by a `SELECT {JOB_COLUMNS}` into a [`ScheduledJob`].
@@ -293,12 +300,13 @@ fn row_to_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<ScheduledJob> {
         task: row.get(2)?,
         channel: row.get(3)?,
         chat_id: row.get(4)?,
-        one_shot: row.get::<_, i32>(5)? != 0,
-        enabled: row.get::<_, i32>(6)? != 0,
-        next_run_at: parse_stored_timestamp(row.get::<_, String>(7)?),
-        last_run_at: row.get::<_, Option<String>>(8)?.map(parse_stored_timestamp),
-        created_at: parse_stored_timestamp(row.get::<_, String>(9)?),
-        conversation_id: row.get::<_, Option<String>>(10)?,
+        thread_id: row.get(5)?,
+        one_shot: row.get::<_, i32>(6)? != 0,
+        enabled: row.get::<_, i32>(7)? != 0,
+        next_run_at: parse_stored_timestamp(row.get::<_, String>(8)?),
+        last_run_at: row.get::<_, Option<String>>(9)?.map(parse_stored_timestamp),
+        created_at: parse_stored_timestamp(row.get::<_, String>(10)?),
+        conversation_id: row.get::<_, Option<String>>(11)?,
     })
 }
 
@@ -469,6 +477,7 @@ mod tests {
                 task            TEXT NOT NULL,
                 channel         TEXT,
                 chat_id         TEXT,
+                thread_id       TEXT,
                 one_shot        INTEGER NOT NULL DEFAULT 0,
                 enabled         INTEGER NOT NULL DEFAULT 1,
                 next_run_at     TEXT NOT NULL,
@@ -492,7 +501,9 @@ mod tests {
     #[test]
     fn conversation_id_round_trip() {
         let jobs = in_memory_jobs();
-        let job = jobs.create_job("*/5 * * * *", "ping", None, None).unwrap();
+        let job = jobs
+            .create_job("*/5 * * * *", "ping", None, None, None)
+            .unwrap();
         assert!(
             job.conversation_id.is_none(),
             "newly created jobs have no conversation yet"
@@ -505,6 +516,29 @@ mod tests {
         // list_jobs and get_due_jobs also propagate the column.
         let listed = jobs.list_jobs().unwrap();
         assert_eq!(listed[0].conversation_id.as_deref(), Some("conv-123"));
+    }
+
+    #[test]
+    fn thread_id_round_trip() {
+        let jobs = in_memory_jobs();
+        let job = jobs
+            .create_job(
+                "*/5 * * * *",
+                "ping",
+                Some("slack"),
+                Some("C012345"),
+                Some("1700000000.000100"),
+            )
+            .unwrap();
+        assert_eq!(job.thread_id.as_deref(), Some("1700000000.000100"));
+
+        let reloaded = jobs.get_job(&job.id).unwrap();
+        assert_eq!(reloaded.thread_id.as_deref(), Some("1700000000.000100"));
+        assert_eq!(reloaded.channel.as_deref(), Some("slack"));
+        assert_eq!(reloaded.chat_id.as_deref(), Some("C012345"));
+
+        let listed = jobs.list_jobs().unwrap();
+        assert_eq!(listed[0].thread_id.as_deref(), Some("1700000000.000100"));
     }
 
     #[test]

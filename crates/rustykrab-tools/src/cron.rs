@@ -67,11 +67,15 @@ impl Tool for CronTool {
                     },
                     "channel": {
                         "type": "string",
-                        "description": "Channel to deliver the result to (e.g. 'telegram', 'signal'). Include this so scheduled task results are sent to the right place."
+                        "description": "Channel to deliver the result to (e.g. 'telegram', 'slack', 'signal'). Include this so scheduled task results are sent to the right place."
                     },
                     "chat_id": {
                         "type": "string",
-                        "description": "Chat identifier for the target channel (e.g. Telegram chat ID, Signal phone number)"
+                        "description": "Chat identifier for the target channel (Telegram chat ID, Slack channel ID, Signal phone number)"
+                    },
+                    "thread_id": {
+                        "type": "string",
+                        "description": "Optional thread identifier so the result lands in the same thread that scheduled it. Telegram: forum topic thread_id. Slack: thread_ts (e.g. '1700000000.000100'). Omit for top-level."
                     },
                     "job_id": {
                         "type": "string",
@@ -106,10 +110,11 @@ impl Tool for CronTool {
 
                 let channel = args["channel"].as_str();
                 let chat_id = args["chat_id"].as_str();
+                let thread_id = args["thread_id"].as_str();
 
                 let result = self
                     .backend
-                    .create_job(schedule, task, channel, chat_id)
+                    .create_job(schedule, task, channel, chat_id, thread_id)
                     .await
                     .map_err(|e| rustykrab_core::Error::ToolExecution(e.to_string().into()))?;
 
