@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.8.0] - 2026-04-29
+
+- feat(channels): add Slack channel via Socket Mode with thread-aware replies (#399)
+
 ## [2.7.1] - 2026-04-29
 
 - feat(agent): preserve compaction-displaced history via RLM recall tools (#398)
