@@ -1,5 +1,5 @@
 use rustykrab_agent::{HarnessProfile, HarnessRouter, ProcessSandbox, Sandbox};
-use rustykrab_channels::{SignalChannel, TelegramChannel, VideoChannel};
+use rustykrab_channels::{SignalChannel, SlackChannel, TelegramChannel, VideoChannel};
 use rustykrab_core::active_tools::ActiveToolsRegistry;
 use rustykrab_core::model::ModelProvider;
 use rustykrab_core::orchestration::OrchestrationConfig;
@@ -24,6 +24,7 @@ pub struct AppState {
     pub origin_policy: OriginPolicy,
     pub telegram: Option<Arc<TelegramChannel>>,
     pub signal: Option<Arc<SignalChannel>>,
+    pub slack: Option<Arc<SlackChannel>>,
     /// Video communication channel (hyperframes MCP).
     pub video: Option<Arc<VideoChannel>>,
     /// Sandbox for tool execution isolation.
@@ -69,6 +70,7 @@ impl AppState {
             origin_policy: OriginPolicy::default(),
             telegram: None,
             signal: None,
+            slack: None,
             video: None,
             sandbox: Arc::new(ProcessSandbox::new()),
             harness_profile: HarnessProfile::default(),
@@ -112,6 +114,12 @@ impl AppState {
     /// Attach a Signal channel.
     pub fn with_signal(mut self, signal: Arc<SignalChannel>) -> Self {
         self.signal = Some(signal);
+        self
+    }
+
+    /// Attach a Slack channel.
+    pub fn with_slack(mut self, slack: Arc<SlackChannel>) -> Self {
+        self.slack = Some(slack);
         self
     }
 

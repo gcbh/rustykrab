@@ -4,6 +4,7 @@ mod jobs;
 pub mod keychain;
 pub mod registry;
 mod secret;
+mod slack_chat_map;
 
 use std::path::Path;
 use std::sync::Arc;
@@ -16,6 +17,7 @@ pub use chat_map::ChatMapStore;
 pub use conversation::ConversationStore;
 pub use jobs::{JobRun, JobStore, ScheduledJob};
 pub use secret::SecretStore;
+pub use slack_chat_map::SlackChatMapStore;
 
 /// Top-level database handle wrapping a SQLite connection.
 ///
@@ -73,6 +75,7 @@ impl Store {
                 task            TEXT NOT NULL,
                 channel         TEXT,
                 chat_id         TEXT,
+                thread_id       TEXT,
                 one_shot        INTEGER NOT NULL DEFAULT 0,
                 enabled         INTEGER NOT NULL DEFAULT 1,
                 next_run_at     TEXT NOT NULL,
@@ -104,12 +107,21 @@ impl Store {
                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
                 UNIQUE(chat_id, thread_id)
             );
+
+            CREATE TABLE IF NOT EXISTS slack_chat_map (
+                team_id    TEXT NOT NULL,
+                channel_id TEXT NOT NULL,
+                thread_ts  TEXT NOT NULL DEFAULT '',
+                conv_id    TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                UNIQUE(team_id, channel_id, thread_ts)
+            );
             ",
         )
         .map_err(|e| Error::Storage(e.to_string()))?;
 
-        // Additive migration for pre-existing databases. PRAGMA table_info
-        // lists current columns; only ALTER if conversation_id is missing.
+        // Additive migrations for pre-existing databases. `PRAGMA table_info`
+        // lists current columns; only ALTER if a column is missing.
         let mut stmt = conn
             .prepare("PRAGMA table_info(scheduled_jobs)")
             .map_err(|e| Error::Storage(e.to_string()))?;
@@ -125,6 +137,10 @@ impl Store {
                 [],
             )
             .map_err(|e| Error::Storage(e.to_string()))?;
+        }
+        if !existing.iter().any(|c| c == "thread_id") {
+            conn.execute("ALTER TABLE scheduled_jobs ADD COLUMN thread_id TEXT", [])
+                .map_err(|e| Error::Storage(e.to_string()))?;
         }
 
         Ok(())
@@ -148,6 +164,11 @@ impl Store {
     /// Return a handle for Telegram chat/thread → conversation mapping.
     pub fn chat_map(&self) -> ChatMapStore {
         ChatMapStore::new(Arc::clone(&self.conn))
+    }
+
+    /// Return a handle for Slack (team, channel, thread) → conversation mapping.
+    pub fn slack_chat_map(&self) -> SlackChatMapStore {
+        SlackChatMapStore::new(Arc::clone(&self.conn))
     }
 
     /// Flush all pending writes to disk.

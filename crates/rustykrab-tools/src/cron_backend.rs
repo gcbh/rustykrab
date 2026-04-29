@@ -10,6 +10,7 @@ pub trait CronBackend: Send + Sync {
         task: &str,
         channel: Option<&str>,
         chat_id: Option<&str>,
+        thread_id: Option<&str>,
     ) -> Result<Value>;
     async fn list_jobs(&self) -> Result<Value>;
     async fn delete_job(&self, job_id: &str) -> Result<Value>;

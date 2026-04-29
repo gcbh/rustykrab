@@ -16,8 +16,9 @@ fn version_string() -> String {
     format!("{VERSION} ({GIT_HASH}{GIT_DIRTY}, {BUILD_DATE})")
 }
 use rustykrab_agent::{AgentEvent, HarnessProfile, HarnessRouter, ProcessSandbox, SubagentRunner};
+use rustykrab_channels::slack::SlackInboundMessage;
 use rustykrab_channels::telegram::ChannelMessage;
-use rustykrab_channels::{TelegramChannel, VideoChannel, VideoConfig};
+use rustykrab_channels::{SlackChannel, TelegramChannel, VideoChannel, VideoConfig};
 use rustykrab_core::model::ModelProvider;
 use rustykrab_core::orchestration::OrchestrationConfig;
 use rustykrab_core::types::MessageContent;
@@ -81,11 +82,12 @@ impl CronBackend for CronAdapter {
         task: &str,
         channel: Option<&str>,
         chat_id: Option<&str>,
+        thread_id: Option<&str>,
     ) -> rustykrab_core::Result<serde_json::Value> {
         let job = self
             .store
             .jobs()
-            .create_job(schedule, task, channel, chat_id)?;
+            .create_job(schedule, task, channel, chat_id, thread_id)?;
         Ok(serde_json::to_value(&job).expect("ScheduledJob is always serializable"))
     }
 
@@ -633,6 +635,64 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("Telegram agent loop started");
     }
 
+    // --- Slack channel (optional, Socket Mode) ---
+    let mut slack_rx: Option<mpsc::Receiver<SlackInboundMessage>> = None;
+    let mut slack_arc: Option<Arc<SlackChannel>> = None;
+
+    if let (Ok(bot_token), Ok(app_token)) = (
+        std::env::var("SLACK_BOT_TOKEN"),
+        std::env::var("SLACK_APP_TOKEN"),
+    ) {
+        let allowed_channels: HashSet<String> = std::env::var("SLACK_ALLOWED_CHANNELS")
+            .unwrap_or_default()
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let allowed_teams: HashSet<String> = std::env::var("SLACK_ALLOWED_TEAMS")
+            .unwrap_or_default()
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        let mut sl = SlackChannel::new(bot_token, app_token, allowed_channels.clone());
+        if !allowed_teams.is_empty() {
+            sl = sl.with_allowed_teams(allowed_teams.clone());
+        }
+
+        slack_rx = sl.take_inbound_rx();
+
+        let sl = Arc::new(sl);
+        slack_arc = Some(sl.clone());
+        state = state.with_slack(sl.clone());
+
+        let sl_socket = sl.clone();
+        infra_handles.push(tokio::spawn(async move {
+            if let Err(e) = sl_socket.start_socket_mode().await {
+                tracing::error!("Slack Socket Mode error: {e}");
+            }
+        }));
+
+        if allowed_channels.is_empty() {
+            tracing::warn!(
+                "SLACK_ALLOWED_CHANNELS not set — bot will deny all channels. \
+                 Set it to a comma-separated list of Slack channel IDs (Cxxxxx)."
+            );
+        } else {
+            tracing::info!(channels = ?allowed_channels, "Slack allowed channels configured");
+        }
+        if !allowed_teams.is_empty() {
+            tracing::info!(teams = ?allowed_teams, "Slack allowed teams configured");
+        }
+    }
+
+    // --- Spawn Slack agent loop (after state is fully built) ---
+    if let (Some(rx), Some(sl)) = (slack_rx, slack_arc) {
+        infra_handles.push(tokio::spawn(slack_agent_loop(rx, sl, state.clone())));
+        tracing::info!("Slack agent loop started");
+    }
+
     // --- Task queue (bounded concurrency for background work) ---
     let max_concurrent: usize = std::env::var("RUSTYKRAB_MAX_CONCURRENT_TASKS")
         .ok()
@@ -1033,6 +1093,306 @@ async fn process_telegram_message(
     reply
 }
 
+/// Per-(team, channel, thread) Slack state, mirroring [`ChatState`] for
+/// Telegram. Slack threads are keyed by their `thread_ts`; when the
+/// inbound mention is at the top level, the bot auto-threads off the
+/// user's message timestamp so the conversation key is the user's `ts`.
+struct SlackChatState {
+    conv_id: Uuid,
+    busy: bool,
+}
+
+/// `(team_id, channel_id, effective_thread_ts)` → per-thread state. The
+/// effective thread is `inbound.thread_ts` when the mention was already
+/// inside a thread, and `inbound.message_ts` otherwise (auto-threading).
+type SlackChatStateMap = HashMap<(String, String, String), SlackChatState>;
+
+/// Background task: consume inbound Slack messages and run the agent.
+///
+/// Each `(team_id, channel_id, effective_thread_ts)` triple gets its own
+/// persistent conversation. When a user `@`-mentions the bot at the top
+/// level of a channel, the reply auto-threads off the user's message and
+/// the conversation is keyed by that message's `ts` — every subsequent
+/// reply in that thread joins the same conversation.
+async fn slack_agent_loop(
+    mut rx: mpsc::Receiver<SlackInboundMessage>,
+    sl: Arc<SlackChannel>,
+    state: AppState,
+) {
+    let chat_states: Arc<tokio::sync::Mutex<SlackChatStateMap>> =
+        Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+
+    while let Some(inbound) = rx.recv().await {
+        // Auto-thread: top-level mentions reply in a new thread off the
+        // user's message; in-thread mentions stay in the same thread.
+        let effective_thread_ts = inbound
+            .thread_ts
+            .clone()
+            .unwrap_or_else(|| inbound.message_ts.clone());
+        let key = (
+            inbound.team_id.clone(),
+            inbound.channel_id.clone(),
+            effective_thread_ts.clone(),
+        );
+        let sl = sl.clone();
+        let state = state.clone();
+        let chat_states = chat_states.clone();
+
+        tokio::spawn(async move {
+            // Concurrency guard: serialize within a single thread.
+            {
+                let states = chat_states.lock().await;
+                if let Some(cs) = states.get(&key) {
+                    if cs.busy {
+                        let _ = sl
+                            .send_text(
+                                &inbound.channel_id,
+                                "I'm still working on your previous message. Please wait.",
+                                Some(&effective_thread_ts),
+                            )
+                            .await;
+                        return;
+                    }
+                }
+            }
+
+            if inbound.reset {
+                {
+                    let mut states = chat_states.lock().await;
+                    states.remove(&key);
+                }
+                if let Err(e) = state.store.slack_chat_map().remove(
+                    &inbound.team_id,
+                    &inbound.channel_id,
+                    &effective_thread_ts,
+                ) {
+                    tracing::warn!(
+                        team_id = %inbound.team_id,
+                        channel_id = %inbound.channel_id,
+                        thread_ts = %effective_thread_ts,
+                        "failed to remove Slack chat map entry: {e}"
+                    );
+                }
+                return;
+            }
+
+            let user_text = match &inbound.message.content {
+                MessageContent::Text(t) => t.clone(),
+                _ => return,
+            };
+
+            // Resolve / create the conversation.
+            let conv_id = {
+                let mut states = chat_states.lock().await;
+                match states.get(&key) {
+                    Some(cs) => cs.conv_id,
+                    None => {
+                        let db_id = state
+                            .store
+                            .slack_chat_map()
+                            .lookup(&inbound.team_id, &inbound.channel_id, &effective_thread_ts)
+                            .ok()
+                            .flatten();
+
+                        match db_id {
+                            Some(id) => {
+                                states.insert(
+                                    key.clone(),
+                                    SlackChatState {
+                                        conv_id: id,
+                                        busy: false,
+                                    },
+                                );
+                                tracing::info!(
+                                    team_id = %inbound.team_id,
+                                    channel_id = %inbound.channel_id,
+                                    thread_ts = %effective_thread_ts,
+                                    conv_id = %id,
+                                    "restored Slack conversation from database"
+                                );
+                                id
+                            }
+                            None => match state.store.conversations().create() {
+                                Ok(mut conv) => {
+                                    conv.channel_source = Some("slack".to_string());
+                                    conv.channel_id = Some(inbound.channel_id.clone());
+                                    conv.channel_thread_id = Some(effective_thread_ts.clone());
+                                    if let Err(e) = state.store.conversations().save(&conv) {
+                                        tracing::warn!(
+                                            channel_id = %inbound.channel_id,
+                                            "failed to persist Slack channel metadata: {e}"
+                                        );
+                                    }
+                                    let id = conv.id;
+                                    states.insert(
+                                        key.clone(),
+                                        SlackChatState {
+                                            conv_id: id,
+                                            busy: false,
+                                        },
+                                    );
+                                    if let Err(e) = state.store.slack_chat_map().upsert(
+                                        &inbound.team_id,
+                                        &inbound.channel_id,
+                                        &effective_thread_ts,
+                                        id,
+                                    ) {
+                                        tracing::warn!(
+                                            team_id = %inbound.team_id,
+                                            channel_id = %inbound.channel_id,
+                                            thread_ts = %effective_thread_ts,
+                                            "failed to persist Slack chat map: {e}"
+                                        );
+                                    }
+                                    tracing::info!(
+                                        team_id = %inbound.team_id,
+                                        channel_id = %inbound.channel_id,
+                                        thread_ts = %effective_thread_ts,
+                                        conv_id = %id,
+                                        "created new Slack conversation"
+                                    );
+                                    id
+                                }
+                                Err(e) => {
+                                    tracing::error!(
+                                        channel_id = %inbound.channel_id,
+                                        "failed to create Slack conversation: {e}"
+                                    );
+                                    let _ = sl
+                                        .send_text(
+                                            &inbound.channel_id,
+                                            "Internal error — please try again.",
+                                            Some(&effective_thread_ts),
+                                        )
+                                        .await;
+                                    return;
+                                }
+                            },
+                        }
+                    }
+                }
+            };
+
+            // Mark busy.
+            {
+                let mut states = chat_states.lock().await;
+                if let Some(cs) = states.get_mut(&key) {
+                    cs.busy = true;
+                }
+            }
+
+            let reply = process_slack_message(
+                &state,
+                conv_id,
+                &inbound.channel_id,
+                &effective_thread_ts,
+                inbound.message,
+                &user_text,
+            )
+            .await;
+
+            // Clear busy.
+            {
+                let mut states = chat_states.lock().await;
+                if let Some(cs) = states.get_mut(&key) {
+                    cs.busy = false;
+                }
+            }
+
+            if let Err(e) = sl
+                .send_text(&inbound.channel_id, &reply, Some(&effective_thread_ts))
+                .await
+            {
+                tracing::error!(
+                    channel_id = %inbound.channel_id,
+                    thread_ts = %effective_thread_ts,
+                    "failed to send Slack reply: {e}"
+                );
+            }
+        });
+    }
+
+    tracing::warn!("Slack agent loop exited — inbound channel closed");
+}
+
+/// Process a single Slack message: load conversation, run agent, persist.
+async fn process_slack_message(
+    state: &AppState,
+    conv_id: Uuid,
+    channel_id: &str,
+    thread_ts: &str,
+    message: rustykrab_core::types::Message,
+    user_text: &str,
+) -> String {
+    let mut conv = match state.store.conversations().get(conv_id) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(channel_id, thread_ts, %conv_id, "failed to load Slack conversation: {e}");
+            return "Internal error — please try again.".to_string();
+        }
+    };
+
+    if conv.channel_source.is_none() {
+        conv.channel_source = Some("slack".to_string());
+        conv.channel_id = Some(channel_id.to_string());
+        conv.channel_thread_id = Some(thread_ts.to_string());
+    }
+    if conv.channel_thread_id.is_none() {
+        conv.channel_thread_id = Some(thread_ts.to_string());
+    }
+
+    conv.messages.push(message);
+    conv.updated_at = Utc::now();
+
+    // Heartbeat-monitored agent run, mirroring the Telegram path.
+    let last_heartbeat = Arc::new(AtomicU64::new(epoch_millis()));
+    let hb = last_heartbeat.clone();
+    let on_event = move |_event: AgentEvent| {
+        hb.store(epoch_millis(), Ordering::Relaxed);
+    };
+
+    let agent_fut = rustykrab_gateway::run_agent_streaming(state, &mut conv, user_text, &on_event);
+
+    let timeout_millis = HEARTBEAT_TIMEOUT_SECS * 1000;
+    let heartbeat_monitor = async {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            let last = last_heartbeat.load(Ordering::Relaxed);
+            if epoch_millis() - last > timeout_millis {
+                break;
+            }
+        }
+    };
+
+    let reply = tokio::select! {
+        result = agent_fut => {
+            match result {
+                Ok(assistant_msg) => match &assistant_msg.content {
+                    MessageContent::Text(t) => t.clone(),
+                    _ => "I processed your message but have no text response.".to_string(),
+                },
+                Err(_status) => {
+                    tracing::error!(channel_id, %conv_id, "Slack agent returned error");
+                    "Sorry, I encountered an error processing your message.".to_string()
+                }
+            }
+        }
+        _ = heartbeat_monitor => {
+            tracing::error!(
+                channel_id, %conv_id,
+                "Slack agent stalled — no activity for {HEARTBEAT_TIMEOUT_SECS}s"
+            );
+            "Sorry, the agent appears to have stalled. Please try again.".to_string()
+        }
+    };
+
+    if let Err(e) = state.store.conversations().save(&conv) {
+        tracing::error!(channel_id, %conv_id, "failed to persist Slack conversation: {e}");
+    }
+
+    reply
+}
+
 async fn shutdown_signal() {
     tokio::signal::ctrl_c()
         .await
@@ -1069,6 +1429,7 @@ async fn job_executor_loop(store: rustykrab_store::Store, queue: task_queue::Tas
                     job_id: job.id.clone(),
                     channel: job.channel.clone(),
                     chat_id: job.chat_id.clone(),
+                    thread_id: job.thread_id.clone(),
                 },
                 dedupe_key: Some(format!("cron:{}", job.id)),
             };

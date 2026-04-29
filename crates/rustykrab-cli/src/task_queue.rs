@@ -17,6 +17,10 @@ pub enum TaskSource {
         job_id: String,
         channel: Option<String>,
         chat_id: Option<String>,
+        /// Channel-specific thread identifier so the result can land in the
+        /// thread that scheduled the job. Telegram: forum topic thread_id
+        /// (numeric string). Slack: thread_ts. `None` posts at top level.
+        thread_id: Option<String>,
     },
 }
 
@@ -122,12 +126,14 @@ async fn execute_task(task: &TaskRequest, state: &AppState, store: &rustykrab_st
             job_id,
             channel,
             chat_id,
+            thread_id,
         } => {
             execute_cron_task(
                 job_id,
                 &task.prompt,
                 channel.as_deref(),
                 chat_id.as_deref(),
+                thread_id.as_deref(),
                 state,
                 store,
             )
@@ -141,6 +147,7 @@ async fn execute_cron_task(
     task_prompt: &str,
     channel: Option<&str>,
     chat_id: Option<&str>,
+    thread_id: Option<&str>,
     state: &AppState,
     store: &rustykrab_store::Store,
 ) {
@@ -210,11 +217,19 @@ async fn execute_cron_task(
         Some("telegram") => {
             if let (Some(tg), Some(cid)) = (&state.telegram, chat_id) {
                 if let Ok(chat_id_num) = cid.parse::<i64>() {
-                    if let Err(e) = tg.send_text(chat_id_num, &response_text, 0).await {
+                    let tg_thread = thread_id.and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+                    if let Err(e) = tg.send_text(chat_id_num, &response_text, tg_thread).await {
                         tracing::error!(job_id = %job_id, "failed to send scheduled job result to Telegram: {e}");
                     }
                 } else {
                     tracing::error!(job_id = %job_id, chat_id = %cid, "invalid Telegram chat_id");
+                }
+            }
+        }
+        Some("slack") => {
+            if let (Some(sl), Some(channel_id)) = (&state.slack, chat_id) {
+                if let Err(e) = sl.send_text(channel_id, &response_text, thread_id).await {
+                    tracing::error!(job_id = %job_id, "failed to send scheduled job result to Slack: {e}");
                 }
             }
         }
