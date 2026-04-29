@@ -240,6 +240,10 @@ impl Tool for BrowserTool {
                     "depth": {
                         "type": "integer",
                         "description": "Snapshot: max tree depth (default: 10)"
+                    },
+                    "highlight": {
+                        "type": "boolean",
+                        "description": "Snapshot: paint numbered overlay boxes on each ref so a subsequent screenshot shows the labels (default: false). Overlays auto-clear on the next snapshot."
                     }
                 },
                 "required": ["action"]
@@ -352,6 +356,7 @@ impl Tool for BrowserTool {
                     compact: args["compact"].as_bool().unwrap_or(false),
                     max_depth: args["depth"].as_u64().unwrap_or(10) as usize,
                     selector: args["selector"].as_str().map(|s| s.to_string()),
+                    highlight: args["highlight"].as_bool().unwrap_or(false),
                 };
 
                 let key = Self::store_key(&profile, target_id);
