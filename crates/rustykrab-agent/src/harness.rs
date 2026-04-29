@@ -90,6 +90,7 @@ impl HarnessProfile {
             max_tool_retries: self.max_tool_retries,
             max_context_tokens: self.max_context_tokens,
             compaction_threshold_pct: self.compaction_threshold_pct,
+            ..AgentConfig::default()
         }
     }
 }

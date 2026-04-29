@@ -12,7 +12,10 @@ pub use harness::HarnessProfile;
 pub use recall_tools::recall_tools;
 pub use rlm::RecursiveExecutor;
 pub use router::HarnessRouter;
-pub use runner::{AgentConfig, AgentEvent, AgentRunner, OnMessageCallback};
+pub use runner::{
+    AgentConfig, AgentEvent, AgentHandle, AgentRunner, InboundEvent, LlmTriggerStrategy,
+    OnMessageCallback,
+};
 pub use sandbox::{NoSandbox, ProcessSandbox, Sandbox, SandboxPolicy};
 pub use subagent::SubagentRunner;
 pub use trace::{ExecutionTracer, ToolStats, ToolTrace};
