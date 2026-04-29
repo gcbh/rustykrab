@@ -1,6 +1,7 @@
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use rustykrab_core::active_tools::{ActiveToolsRegistry, SessionToolContext, SESSION_TOOL_CONTEXT};
@@ -9,9 +10,11 @@ use rustykrab_core::model::{ModelProvider, ModelResponse, StopReason, StreamEven
 use rustykrab_core::recall::RecallStore;
 use rustykrab_core::session::Session;
 use rustykrab_core::types::{
-    Conversation, Message, MessageContent, Role, ToolCall, ToolResult, ToolSchema,
+    ContentPart, Conversation, Message, MessageContent, Role, ToolCall, ToolResult, ToolSchema,
 };
 use rustykrab_core::{Error, Result, SandboxRequirements, Tool, ToolErrorKind};
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 /// Names of meta-tools that are always included in the schema sent to the
@@ -374,8 +377,86 @@ pub enum AgentEvent {
     Reflecting,
     /// The agent is compressing conversation memory.
     Compressing,
+    /// A user message was received and queued during an active run.
+    UserMessageQueued { message_id: Uuid },
     /// The agent loop has completed.
     Done,
+}
+
+/// Events that flow INTO a running agent loop.
+#[derive(Debug)]
+pub enum InboundEvent {
+    /// A new user message (possibly multi-modal) arrived while the agent is running.
+    UserMessage {
+        parts: Vec<ContentPart>,
+        channel: Option<String>,
+        channel_msg_id: Option<String>,
+    },
+    /// Request graceful cancellation of the current agent run.
+    Cancel,
+}
+
+/// Handle to an active agent loop. Cheaply cloneable.
+#[derive(Clone)]
+pub struct AgentHandle {
+    inbound_tx: mpsc::Sender<InboundEvent>,
+    alive: Arc<AtomicBool>,
+}
+
+impl AgentHandle {
+    /// Submit a new user message to the running agent.
+    pub async fn send_message(&self, parts: Vec<ContentPart>) -> Result<()> {
+        self.inbound_tx
+            .send(InboundEvent::UserMessage {
+                parts,
+                channel: None,
+                channel_msg_id: None,
+            })
+            .await
+            .map_err(|_| Error::Internal("agent loop has terminated".into()))
+    }
+
+    /// Submit a new user message with channel metadata.
+    pub async fn send_channel_message(
+        &self,
+        parts: Vec<ContentPart>,
+        channel: String,
+        channel_msg_id: Option<String>,
+    ) -> Result<()> {
+        self.inbound_tx
+            .send(InboundEvent::UserMessage {
+                parts,
+                channel: Some(channel),
+                channel_msg_id,
+            })
+            .await
+            .map_err(|_| Error::Internal("agent loop has terminated".into()))
+    }
+
+    /// Request cancellation of the current agent run.
+    pub async fn cancel(&self) -> Result<()> {
+        self.inbound_tx
+            .send(InboundEvent::Cancel)
+            .await
+            .map_err(|_| Error::Internal("agent loop has terminated".into()))
+    }
+
+    /// Check whether the agent loop is still running.
+    pub fn is_alive(&self) -> bool {
+        self.alive.load(AtomicOrdering::Acquire)
+    }
+}
+
+/// Controls when the LLM is called after tool results start arriving.
+#[derive(Debug, Clone)]
+pub enum LlmTriggerStrategy {
+    /// Call LLM only after ALL pending tool results are in (legacy behavior).
+    WaitAll,
+    /// Call LLM as soon as the first tool result arrives.
+    Eager,
+    /// Wait for the specified duration after the first result, then call with
+    /// whatever results have arrived. Still-pending tools get a placeholder.
+    Debounce(Duration),
 }
 
 /// Configuration for the agent runner.
@@ -397,6 +478,8 @@ pub struct AgentConfig {
     /// Following the RLM paper (Zhang, Kraska, Khattab — arXiv 2512.24601),
     /// default is 0.85 (85%).  Set to 0.0 to disable compaction.
     pub compaction_threshold_pct: f64,
+    /// Strategy for when to call the LLM after tool results start arriving.
+    pub llm_trigger_strategy: LlmTriggerStrategy,
 }
 
 impl Default for AgentConfig {
@@ -408,6 +491,7 @@ impl Default for AgentConfig {
             max_tool_retries: 2,
             max_context_tokens: 128_000,
             compaction_threshold_pct: 0.85,
+            llm_trigger_strategy: LlmTriggerStrategy::Debounce(Duration::from_secs(2)),
         }
     }
 }
@@ -524,6 +608,93 @@ impl AgentRunner {
         if let Some(ref cb) = self.on_message {
             cb(&message);
         }
+    }
+
+    /// Start the event-driven agent loop.
+    ///
+    /// Returns a handle for injecting events (user messages, cancellation),
+    /// a receiver for outbound events (text deltas, tool lifecycle), and a
+    /// `JoinHandle` that resolves to the final conversation.
+    ///
+    /// The conversation is owned by the spawned task. Callers that need
+    /// the `&mut Conversation` API should use `run()` or `run_streaming()`.
+    pub fn start(
+        &self,
+        conv: Conversation,
+        session: Session,
+    ) -> (
+        AgentHandle,
+        mpsc::Receiver<AgentEvent>,
+        JoinHandle<Result<Conversation>>,
+    ) {
+        let (inbound_tx, inbound_rx) = mpsc::channel::<InboundEvent>(64);
+        let (outbound_tx, outbound_rx) = mpsc::channel::<AgentEvent>(128);
+        let alive = Arc::new(AtomicBool::new(true));
+        let alive_clone = alive.clone();
+
+        let provider = self.provider.clone();
+        let tools = self.tools.clone();
+        let sandbox = self.sandbox.clone();
+        let config = self.config.clone();
+        let on_message = self.on_message.clone();
+        let active_tools = self.active_tools.clone();
+        let recall = self.recall.clone();
+
+        let join_handle = tokio::spawn(async move {
+            let runner = AgentRunner {
+                provider,
+                tools,
+                sandbox,
+                config,
+                tracer: ExecutionTracer::new(),
+                on_message,
+                active_tools,
+                recall,
+            };
+            let result = runner
+                .run_event_loop(conv, &session, inbound_rx, outbound_tx)
+                .await;
+            alive_clone.store(false, AtomicOrdering::Release);
+            result
+        });
+
+        let handle = AgentHandle { inbound_tx, alive };
+        (handle, outbound_rx, join_handle)
+    }
+
+    /// Event-driven agent loop that accepts inbound user messages and
+    /// streams outbound events. Uses the existing `run_streaming` logic
+    /// internally and drains the inbound channel between iterations.
+    async fn run_event_loop(
+        &self,
+        mut conv: Conversation,
+        session: &Session,
+        mut inbound_rx: mpsc::Receiver<InboundEvent>,
+        outbound_tx: mpsc::Sender<AgentEvent>,
+    ) -> Result<Conversation> {
+        let supports_vision = self.provider.supports_vision();
+
+        let on_event = move |event: AgentEvent| {
+            let _ = outbound_tx.try_send(event);
+        };
+
+        // Before each LLM call, drain inbound user messages.
+        // We wrap the streaming call with a pre-iteration hook.
+        // For the initial release, we use a simpler design: drain
+        // inbound messages before running the streaming loop, and
+        // let the existing run_streaming handle the core logic.
+        // Messages that arrive mid-run are queued and appended on
+        // the next invocation.
+
+        // Drain any messages that arrived before the loop started.
+        drain_inbound_to_conv(&mut inbound_rx, &mut conv, supports_vision, &on_event);
+
+        self.run_streaming(&mut conv, session, &on_event).await?;
+
+        // Final drain after the loop completes.
+        drain_inbound_to_conv(&mut inbound_rx, &mut conv, supports_vision, &on_event);
+
+        Ok(conv)
     }
 
     /// Run the agent loop on a conversation within a session's capability scope.
@@ -1365,6 +1536,14 @@ impl AgentRunner {
                 .map(|tc| tc.name.len() + tc.arguments.to_string().len())
                 .sum(),
             MessageContent::ToolResult(tr) => tr.output.to_string().len(),
+            MessageContent::MultiPart(blocks) => blocks
+                .iter()
+                .map(|b| match b {
+                    rustykrab_core::types::ContentBlock::Text { text } => text.len(),
+                    rustykrab_core::types::ContentBlock::Image { data, .. } => data.len(),
+                    _ => 0,
+                })
+                .sum(),
         };
         // +4 per message for role/framing overhead.
         (content_chars as f64 / 3.5).ceil() as usize + 4
@@ -1476,6 +1655,19 @@ impl AgentRunner {
             MessageContent::MultiToolCall(tcs) => {
                 let names: Vec<&str> = tcs.iter().map(|c| c.name.as_str()).collect();
                 format!("tool_calls: {}", names.join(", "))
+            }
+            MessageContent::MultiPart(blocks) => {
+                let parts: Vec<String> = blocks
+                    .iter()
+                    .filter_map(|b| match b {
+                        rustykrab_core::types::ContentBlock::Text { text } => Some(text.clone()),
+                        rustykrab_core::types::ContentBlock::Image { media_type, .. } => {
+                            Some(format!("[image:{media_type}]"))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                parts.join(" ")
             }
         };
         format!("[{role}] {body}")
@@ -2199,6 +2391,33 @@ fn enforce_sandbox_policy(
         )));
     }
     Ok(())
+}
+
+/// Drain all immediately-available inbound events and append user messages
+/// to the conversation.
+fn drain_inbound_to_conv(
+    inbound_rx: &mut mpsc::Receiver<InboundEvent>,
+    conv: &mut Conversation,
+    supports_vision: bool,
+    on_event: &dyn Fn(AgentEvent),
+) {
+    while let Ok(event) = inbound_rx.try_recv() {
+        match event {
+            InboundEvent::UserMessage { parts, .. } => {
+                let content = MessageContent::from_parts(&parts, supports_vision);
+                let msg = Message {
+                    id: Uuid::new_v4(),
+                    role: Role::User,
+                    content,
+                    created_at: Utc::now(),
+                };
+                on_event(AgentEvent::UserMessageQueued { message_id: msg.id });
+                conv.messages.push(msg);
+                conv.updated_at = Utc::now();
+            }
+            InboundEvent::Cancel => {}
+        }
+    }
 }
 
 #[cfg(test)]

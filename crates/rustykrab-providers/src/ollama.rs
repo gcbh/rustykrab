@@ -347,6 +347,23 @@ impl OllamaProvider {
                             tool_calls: None,
                         }
                     }
+                    MessageContent::MultiPart(blocks) => {
+                        let text = blocks
+                            .iter()
+                            .filter_map(|b| match b {
+                                rustykrab_core::types::ContentBlock::Text { text } => {
+                                    Some(text.as_str())
+                                }
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        OllamaMessage {
+                            role: role.to_string(),
+                            content: Some(text),
+                            tool_calls: None,
+                        }
+                    }
                 })
             })
             .collect()

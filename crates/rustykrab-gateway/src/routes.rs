@@ -311,6 +311,15 @@ async fn send_message_stream(
                     serde_json::json!({"type": "thinking", "delta": "compressing memory"})
                         .to_string(),
                 ),
+                AgentEvent::UserMessageQueued { message_id } => {
+                    Event::default().event("user_message_queued").data(
+                        serde_json::json!({
+                            "type": "user_message_queued",
+                            "message_id": message_id.to_string()
+                        })
+                        .to_string(),
+                    )
+                }
                 AgentEvent::Done => Event::default()
                     .event("done")
                     .data(serde_json::json!({"type": "done"}).to_string()),

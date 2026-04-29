@@ -2,7 +2,9 @@ use async_trait::async_trait;
 use chrono::Utc;
 use rustykrab_core::error::Result;
 use rustykrab_core::model::{ModelProvider, ModelResponse, StopReason, StreamEvent, Usage};
-use rustykrab_core::types::{Message, MessageContent, Role, ToolCall, ToolSchema};
+use rustykrab_core::types::{
+    ContentBlock as CoreContentBlock, Message, MessageContent, Role, ToolCall, ToolSchema,
+};
 use rustykrab_core::Error;
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
@@ -92,8 +94,8 @@ impl AnthropicProvider {
                         system_prompt = Some(text.clone());
                     }
                 }
-                Role::User => {
-                    if let MessageContent::Text(ref text) = msg.content {
+                Role::User => match &msg.content {
+                    MessageContent::Text(text) => {
                         api_messages.push(ApiMessage {
                             role: "user".to_string(),
                             content: ApiContent::Blocks(vec![ContentBlock::Text {
@@ -101,7 +103,36 @@ impl AnthropicProvider {
                             }]),
                         });
                     }
-                }
+                    MessageContent::MultiPart(blocks) => {
+                        let api_blocks = blocks
+                            .iter()
+                            .filter_map(|b| match b {
+                                CoreContentBlock::Text { text } => {
+                                    Some(ContentBlock::Text { text: text.clone() })
+                                }
+                                CoreContentBlock::Image { media_type, data } => {
+                                    use base64::engine::general_purpose::STANDARD;
+                                    use base64::Engine;
+                                    Some(ContentBlock::Image {
+                                        source: ImageSource {
+                                            source_type: "base64".to_string(),
+                                            media_type: media_type.clone(),
+                                            data: STANDARD.encode(data),
+                                        },
+                                    })
+                                }
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>();
+                        if !api_blocks.is_empty() {
+                            api_messages.push(ApiMessage {
+                                role: "user".to_string(),
+                                content: ApiContent::Blocks(api_blocks),
+                            });
+                        }
+                    }
+                    _ => {}
+                },
                 Role::Assistant => match msg.content {
                     MessageContent::Text(ref text) => {
                         api_messages.push(ApiMessage {
@@ -273,6 +304,14 @@ impl ModelProvider for AnthropicProvider {
 
     fn context_limit(&self) -> Option<usize> {
         Some(self.context_limit)
+    }
+
+    fn supports_vision(&self) -> bool {
+        true
+    }
+
+    fn requires_paired_tool_results(&self) -> bool {
+        true
     }
 
     async fn chat(&self, messages: &[Message], tools: &[ToolSchema]) -> Result<ModelResponse> {
@@ -700,6 +739,8 @@ enum ApiContent {
 enum ContentBlock {
     #[serde(rename = "text")]
     Text { text: String },
+    #[serde(rename = "image")]
+    Image { source: ImageSource },
     #[serde(rename = "tool_use")]
     ToolUse {
         id: String,
@@ -710,10 +751,17 @@ enum ContentBlock {
     ToolResult {
         tool_use_id: String,
         content: String,
-        /// Fix #207: signal tool execution errors to the model.
         #[serde(skip_serializing_if = "is_false")]
         is_error: bool,
     },
+}
+
+#[derive(Serialize)]
+struct ImageSource {
+    #[serde(rename = "type")]
+    source_type: String,
+    media_type: String,
+    data: String,
 }
 
 fn is_false(v: &bool) -> bool {

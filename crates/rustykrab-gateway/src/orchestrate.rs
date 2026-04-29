@@ -3,10 +3,12 @@ use std::sync::Arc;
 
 use axum::http::StatusCode;
 use chrono::Utc;
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use crate::AppState;
-use rustykrab_agent::{AgentEvent, AgentRunner, OnMessageCallback};
+use rustykrab_agent::{AgentEvent, AgentHandle, AgentRunner, OnMessageCallback};
 use rustykrab_core::capability::CapabilitySet;
 use rustykrab_core::session::Session;
 use rustykrab_core::types::{Conversation, Message, MessageContent, Role};
@@ -103,6 +105,17 @@ fn message_to_turn(msg: &Message, session_id: Uuid, turn_number: u32) -> Convers
             .collect::<Vec<_>>()
             .join("\n"),
         MessageContent::ToolResult(tr) => format!("tool_result:{}", tr.output),
+        MessageContent::MultiPart(blocks) => blocks
+            .iter()
+            .filter_map(|b| match b {
+                rustykrab_core::types::ContentBlock::Text { text } => Some(text.clone()),
+                rustykrab_core::types::ContentBlock::Image { media_type, .. } => {
+                    Some(format!("[image:{media_type}]"))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
     };
     let involves_tool_use = matches!(
         msg.content,
@@ -244,6 +257,47 @@ pub async fn run_agent(
     })?;
 
     extract_assistant_message(conv)
+}
+
+/// Start the event-driven agent loop, returning a handle for injecting
+/// messages mid-run.
+///
+/// Callers (e.g. Telegram) use the `AgentHandle` to submit new user
+/// messages while the agent is already processing, instead of dropping
+/// them. The `Receiver<AgentEvent>` streams real-time progress events,
+/// and the `JoinHandle` resolves to the final conversation.
+pub async fn run_agent_interactive(
+    state: &AppState,
+    mut conv: Conversation,
+    user_content: &str,
+) -> std::result::Result<
+    (
+        AgentHandle,
+        mpsc::Receiver<AgentEvent>,
+        JoinHandle<rustykrab_core::Result<Conversation>>,
+    ),
+    StatusCode,
+> {
+    build_and_inject_system_prompt(state, &mut conv, user_content).await;
+
+    let tool_names: Vec<&str> = state
+        .tools
+        .iter()
+        .filter(|t| t.available())
+        .map(|t| t.name())
+        .collect();
+    let caps = CapabilitySet::for_tools_permissive(&tool_names);
+    let session = Session::with_capabilities(conv.id, caps);
+
+    let profile = state.profile_for(user_content).await;
+    let runner = AgentRunner::new(
+        state.provider.clone(),
+        state.tools.clone(),
+        state.sandbox.clone(),
+    )
+    .with_config(profile.to_agent_config());
+
+    Ok(runner.start(conv, session))
 }
 
 /// Run the agent loop with streaming events.

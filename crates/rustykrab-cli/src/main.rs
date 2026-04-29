@@ -15,13 +15,15 @@ const BUILD_DATE: &str = env!("RUSTYKRAB_BUILD_DATE");
 fn version_string() -> String {
     format!("{VERSION} ({GIT_HASH}{GIT_DIRTY}, {BUILD_DATE})")
 }
-use rustykrab_agent::{AgentEvent, HarnessProfile, HarnessRouter, ProcessSandbox, SubagentRunner};
+use rustykrab_agent::{
+    AgentEvent, AgentHandle, HarnessProfile, HarnessRouter, ProcessSandbox, SubagentRunner,
+};
 use rustykrab_channels::slack::SlackInboundMessage;
 use rustykrab_channels::telegram::ChannelMessage;
 use rustykrab_channels::{SlackChannel, TelegramChannel, VideoChannel, VideoConfig};
 use rustykrab_core::model::ModelProvider;
 use rustykrab_core::orchestration::OrchestrationConfig;
-use rustykrab_core::types::MessageContent;
+use rustykrab_core::types::{ContentPart, MessageContent};
 use rustykrab_core::AgentRegistry;
 use rustykrab_gateway::AppState;
 use rustykrab_memory::backend::HybridMemoryBackend;
@@ -791,12 +793,14 @@ fn epoch_millis() -> u64 {
 }
 
 /// Per-chat (or per-thread in forum groups) state for tracking conversations
-/// and preventing concurrent runs. Keyed by `(chat_id, thread_id)` where
+/// and active agent loops. Keyed by `(chat_id, thread_id)` where
 /// `thread_id == 0` means a non-forum chat or the implicit "General" topic.
 struct ChatState {
     conv_id: Uuid,
-    /// True while an agent run is in progress for this chat/thread.
-    busy: bool,
+    /// Handle to the currently-running agent loop, if any.
+    /// Messages arriving while a loop is active are injected via this handle
+    /// instead of being dropped.
+    active_handle: Option<AgentHandle>,
 }
 
 /// Background task: consume inbound Telegram messages and run the agent.
@@ -804,7 +808,8 @@ struct ChatState {
 /// Each `(chat_id, thread_id)` pair gets its own persistent conversation.
 /// Messages for different chats/threads are processed concurrently so one
 /// slow agent run doesn't block other users or topics. Within a single
-/// chat+thread, messages are serialized.
+/// chat+thread, new messages are injected into the running loop rather
+/// than queued or dropped.
 async fn telegram_agent_loop(
     mut rx: mpsc::Receiver<ChannelMessage>,
     tg: Arc<TelegramChannel>,
@@ -822,30 +827,17 @@ async fn telegram_agent_loop(
         let chat_states = chat_states.clone();
 
         tokio::spawn(async move {
-            // Check if this chat/thread already has an agent run in progress.
-            {
-                let states = chat_states.lock().await;
-                if let Some(cs) = states.get(&key) {
-                    if cs.busy {
-                        let _ = tg
-                            .send_text(
-                                chat_id,
-                                "I'm still working on your previous message. Please wait.",
-                                thread_id,
-                            )
-                            .await;
-                        return;
-                    }
-                }
-            }
-
-            // Handle conversation reset via structured flag (not sentinel string).
+            // Handle conversation reset via structured flag.
             if channel_msg.reset {
                 {
                     let mut states = chat_states.lock().await;
+                    if let Some(cs) = states.get(&key) {
+                        if let Some(ref handle) = cs.active_handle {
+                            let _ = handle.cancel().await;
+                        }
+                    }
                     states.remove(&key);
                 }
-                // Also clear the persisted mapping.
                 if let Err(e) = state.store.chat_map().remove(chat_id, thread_id) {
                     tracing::warn!(chat_id, thread_id, "failed to remove chat map entry: {e}");
                 }
@@ -857,6 +849,37 @@ async fn telegram_agent_loop(
                 _ => return,
             };
 
+            // If an agent loop is already running for this chat/thread,
+            // inject the new message instead of dropping it.
+            {
+                let states = chat_states.lock().await;
+                if let Some(cs) = states.get(&key) {
+                    if let Some(ref handle) = cs.active_handle {
+                        if handle.is_alive() {
+                            let parts = vec![ContentPart::Text { text: user_text }];
+                            if let Err(e) = handle
+                                .send_channel_message(parts, "telegram".to_string(), None)
+                                .await
+                            {
+                                tracing::warn!(
+                                    chat_id,
+                                    thread_id,
+                                    "failed to inject message into running loop: {e}"
+                                );
+                            } else {
+                                tracing::info!(
+                                    chat_id,
+                                    thread_id,
+                                    "injected user message into running agent loop"
+                                );
+                                let _ = tg.send_typing(chat_id, thread_id).await;
+                            }
+                            return;
+                        }
+                    }
+                }
+            }
+
             // Get or create conversation. Check in-memory first, then DB,
             // then create a brand new one.
             let conv_id = {
@@ -864,7 +887,6 @@ async fn telegram_agent_loop(
                 match states.get(&key) {
                     Some(cs) => cs.conv_id,
                     None => {
-                        // Try the database (survives restarts).
                         let db_id = state
                             .store
                             .chat_map()
@@ -878,7 +900,7 @@ async fn telegram_agent_loop(
                                     key,
                                     ChatState {
                                         conv_id: id,
-                                        busy: false,
+                                        active_handle: None,
                                     },
                                 );
                                 tracing::info!(
@@ -905,10 +927,9 @@ async fn telegram_agent_loop(
                                         key,
                                         ChatState {
                                             conv_id: id,
-                                            busy: false,
+                                            active_handle: None,
                                         },
                                     );
-                                    // Persist the mapping so it survives restarts.
                                     if let Err(e) =
                                         state.store.chat_map().upsert(chat_id, thread_id, id)
                                     {
@@ -945,14 +966,6 @@ async fn telegram_agent_loop(
                 }
             };
 
-            // Mark chat/thread as busy.
-            {
-                let mut states = chat_states.lock().await;
-                if let Some(cs) = states.get_mut(&key) {
-                    cs.busy = true;
-                }
-            }
-
             let reply = process_telegram_message(
                 &state,
                 &tg,
@@ -961,14 +974,16 @@ async fn telegram_agent_loop(
                 conv_id,
                 channel_msg.message,
                 &user_text,
+                &chat_states,
+                key,
             )
             .await;
 
-            // Mark chat/thread as no longer busy.
+            // Clear the active handle.
             {
                 let mut states = chat_states.lock().await;
                 if let Some(cs) = states.get_mut(&key) {
-                    cs.busy = false;
+                    cs.active_handle = None;
                 }
             }
 
@@ -982,7 +997,10 @@ async fn telegram_agent_loop(
     tracing::warn!("Telegram agent loop exited — inbound channel closed");
 }
 
-/// Process a single Telegram message: load conversation, run agent, persist.
+/// Process a single Telegram message: load conversation, start the event-driven
+/// agent loop, store the handle so concurrent messages can be injected, and
+/// collect the final reply.
+#[allow(clippy::too_many_arguments)]
 async fn process_telegram_message(
     state: &AppState,
     tg: &Arc<TelegramChannel>,
@@ -991,6 +1009,8 @@ async fn process_telegram_message(
     conv_id: Uuid,
     message: rustykrab_core::types::Message,
     user_text: &str,
+    chat_states: &Arc<tokio::sync::Mutex<HashMap<(i64, i64), ChatState>>>,
+    key: (i64, i64),
 ) -> String {
     // Load the conversation.
     let mut conv = match state.store.conversations().get(conv_id) {
@@ -1018,11 +1038,10 @@ async fn process_telegram_message(
     conv.messages.push(message);
     conv.updated_at = Utc::now();
 
-    // Send initial typing indicator (scoped to forum thread if applicable).
+    // Send initial typing indicator.
     let _ = tg.send_typing(chat_id, thread_id).await;
 
-    // Spawn a background task to keep re-sending typing indicators
-    // while the agent is working.
+    // Spawn typing indicator loop.
     let typing_active = Arc::new(std::sync::atomic::AtomicBool::new(true));
     let typing_flag = typing_active.clone();
     let tg_typing = tg.clone();
@@ -1036,17 +1055,38 @@ async fn process_telegram_message(
         }
     });
 
-    // Run agent with heartbeat-based timeout.
+    // Start the event-driven agent loop.
+    let (handle, mut event_rx, join_handle) =
+        match rustykrab_gateway::run_agent_interactive(state, conv, user_text).await {
+            Ok(triple) => triple,
+            Err(_status) => {
+                typing_active.store(false, std::sync::atomic::Ordering::Relaxed);
+                typing_task.abort();
+                return "Sorry, I encountered an error processing your message.".to_string();
+            }
+        };
+
+    // Store the handle so concurrent messages for this chat/thread
+    // can be injected into the running loop.
+    {
+        let mut states = chat_states.lock().await;
+        if let Some(cs) = states.get_mut(&key) {
+            cs.active_handle = Some(handle);
+        }
+    }
+
+    // Heartbeat-based timeout: track activity from agent events.
     let last_heartbeat = Arc::new(AtomicU64::new(epoch_millis()));
     let hb = last_heartbeat.clone();
+    let timeout_millis = HEARTBEAT_TIMEOUT_SECS * 1000;
 
-    let on_event = move |_event: AgentEvent| {
-        hb.store(epoch_millis(), Ordering::Relaxed);
+    // Drain events, updating heartbeat on each one.
+    let event_drain = async {
+        while let Some(_event) = event_rx.recv().await {
+            hb.store(epoch_millis(), Ordering::Relaxed);
+        }
     };
 
-    let agent_fut = rustykrab_gateway::run_agent_streaming(state, &mut conv, user_text, &on_event);
-
-    let timeout_millis = HEARTBEAT_TIMEOUT_SECS * 1000;
     let heartbeat_monitor = async {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
@@ -1057,38 +1097,64 @@ async fn process_telegram_message(
         }
     };
 
-    let reply = tokio::select! {
-        result = agent_fut => {
-            match result {
-                Ok(assistant_msg) => {
-                    match &assistant_msg.content {
-                        MessageContent::Text(t) => t.clone(),
-                        _ => "I processed your message but have no text response.".to_string(),
-                    }
-                }
-                Err(_status) => {
-                    tracing::error!(chat_id, %conv_id, "agent returned error");
-                    "Sorry, I encountered an error processing your message.".to_string()
+    let timed_out = tokio::select! {
+        _ = event_drain => false,
+        _ = heartbeat_monitor => true,
+    };
+
+    let reply = if timed_out {
+        tracing::error!(
+            chat_id, %conv_id,
+            "agent stalled — no activity for {HEARTBEAT_TIMEOUT_SECS}s"
+        );
+        // Cancel the running loop.
+        {
+            let states = chat_states.lock().await;
+            if let Some(cs) = states.get(&key) {
+                if let Some(ref h) = cs.active_handle {
+                    let _ = h.cancel().await;
                 }
             }
         }
-        _ = heartbeat_monitor => {
-            tracing::error!(
-                chat_id, %conv_id,
-                "agent stalled — no activity for {HEARTBEAT_TIMEOUT_SECS}s"
-            );
-            "Sorry, the agent appears to have stalled. Please try again.".to_string()
+        "Sorry, the agent appears to have stalled. Please try again.".to_string()
+    } else {
+        // Await the join handle to get the final conversation.
+        match join_handle.await {
+            Ok(Ok(final_conv)) => {
+                // Persist the final conversation.
+                if let Err(e) = state.store.conversations().save(&final_conv) {
+                    tracing::error!(chat_id, %conv_id, "failed to persist conversation: {e}");
+                }
+                // Extract last assistant text.
+                final_conv
+                    .messages
+                    .iter()
+                    .rev()
+                    .find_map(|m| {
+                        if m.role == rustykrab_core::types::Role::Assistant {
+                            m.content.as_text().map(|t| t.to_string())
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or_else(|| {
+                        "I processed your message but have no text response.".to_string()
+                    })
+            }
+            Ok(Err(e)) => {
+                tracing::error!(chat_id, %conv_id, "agent error: {e}");
+                "Sorry, I encountered an error processing your message.".to_string()
+            }
+            Err(e) => {
+                tracing::error!(chat_id, %conv_id, "agent task panicked: {e}");
+                "Sorry, I encountered an internal error.".to_string()
+            }
         }
     };
 
     // Stop typing indicator.
     typing_active.store(false, std::sync::atomic::Ordering::Relaxed);
     typing_task.abort();
-
-    // Persist conversation.
-    if let Err(e) = state.store.conversations().save(&conv) {
-        tracing::error!(chat_id, %conv_id, "failed to persist conversation: {e}");
-    }
 
     reply
 }

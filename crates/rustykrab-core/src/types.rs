@@ -1,6 +1,81 @@
+use std::path::PathBuf;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+
+/// A single part of a multi-modal content payload.
+///
+/// Used at the event boundary (inbound events from channels) and in
+/// conversation messages that contain non-text content. Messages can
+/// contain multiple parts (e.g. an image with a caption).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum ContentPart {
+    #[serde(rename = "text")]
+    Text { text: String },
+    #[serde(rename = "image")]
+    Image {
+        media_type: String,
+        #[serde(with = "base64_bytes")]
+        data: Vec<u8>,
+    },
+    #[serde(rename = "audio")]
+    Audio {
+        media_type: String,
+        #[serde(with = "base64_bytes")]
+        data: Vec<u8>,
+    },
+    #[serde(rename = "file_ref")]
+    FileRef { name: String, path: PathBuf },
+}
+
+/// Content block in the Anthropic multi-modal format.
+/// Maps directly to what providers accept in their API.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum ContentBlock {
+    #[serde(rename = "text")]
+    Text { text: String },
+    #[serde(rename = "image")]
+    Image {
+        media_type: String,
+        #[serde(with = "base64_bytes")]
+        data: Vec<u8>,
+    },
+    #[serde(rename = "tool_use")]
+    ToolUse {
+        id: String,
+        name: String,
+        input: serde_json::Value,
+    },
+    #[serde(rename = "tool_result")]
+    ToolResult {
+        tool_use_id: String,
+        content: String,
+        #[serde(default, skip_serializing_if = "is_false")]
+        is_error: bool,
+    },
+}
+
+fn is_false(v: &bool) -> bool {
+    !v
+}
+
+mod base64_bytes {
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(data: &[u8], ser: S) -> Result<S::Ok, S::Error> {
+        ser.serialize_str(&STANDARD.encode(data))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<Vec<u8>, D::Error> {
+        let s = String::deserialize(de)?;
+        STANDARD.decode(&s).map_err(serde::de::Error::custom)
+    }
+}
 
 /// A single message in a conversation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -40,6 +115,11 @@ pub enum MessageContent {
     /// several tools at once and receive all results before continuing.
     #[serde(rename = "multi_tool_call")]
     MultiToolCall(Vec<ToolCall>),
+    /// Multi-modal content (text + images, etc.).
+    /// Produced when channels deliver non-text content, or when the
+    /// event loop maps `ContentPart`s to provider-facing blocks.
+    #[serde(rename = "multi_part")]
+    MultiPart(Vec<ContentBlock>),
 }
 
 impl<'de> Deserialize<'de> for MessageContent {
@@ -62,6 +142,8 @@ impl<'de> Deserialize<'de> for MessageContent {
             ToolResult(ToolResult),
             #[serde(rename = "multi_tool_call")]
             MultiToolCall(Vec<ToolCall>),
+            #[serde(rename = "multi_part")]
+            MultiPart(Vec<ContentBlock>),
         }
 
         if let Ok(tagged) = serde_json::from_value::<Tagged>(raw.clone()) {
@@ -70,6 +152,7 @@ impl<'de> Deserialize<'de> for MessageContent {
                 Tagged::ToolCall(tc) => MessageContent::ToolCall(tc),
                 Tagged::ToolResult(tr) => MessageContent::ToolResult(tr),
                 Tagged::MultiToolCall(tcs) => MessageContent::MultiToolCall(tcs),
+                Tagged::MultiPart(blocks) => MessageContent::MultiPart(blocks),
             });
         }
 
@@ -120,8 +203,60 @@ impl MessageContent {
     pub fn as_text(&self) -> Option<&str> {
         match self {
             MessageContent::Text(t) => Some(t),
+            MessageContent::MultiPart(blocks) => {
+                // Return the first text block, if any.
+                blocks.iter().find_map(|b| match b {
+                    ContentBlock::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+            }
             _ => None,
         }
+    }
+
+    /// Build `MultiPart` content from a set of `ContentPart`s, using
+    /// provider capabilities to decide what to include.
+    pub fn from_parts(parts: &[ContentPart], supports_vision: bool) -> Self {
+        let mut blocks = Vec::new();
+        for part in parts {
+            match part {
+                ContentPart::Text { text } => {
+                    blocks.push(ContentBlock::Text { text: text.clone() });
+                }
+                ContentPart::Image { media_type, data } if supports_vision => {
+                    blocks.push(ContentBlock::Image {
+                        media_type: media_type.clone(),
+                        data: data.clone(),
+                    });
+                }
+                ContentPart::Image { .. } => {
+                    blocks.push(ContentBlock::Text {
+                        text:
+                            "[User sent an image, but the current model does not support vision.]"
+                                .to_string(),
+                    });
+                }
+                ContentPart::Audio { .. } => {
+                    blocks.push(ContentBlock::Text {
+                        text: "[User sent an audio message. Audio transcription is not yet supported.]"
+                            .to_string(),
+                    });
+                }
+                ContentPart::FileRef { name, .. } => {
+                    blocks.push(ContentBlock::Text {
+                        text: format!("[User attached file: {name}]"),
+                    });
+                }
+            }
+        }
+
+        if blocks.len() == 1 {
+            if let ContentBlock::Text { text } = blocks.remove(0) {
+                return MessageContent::Text(text);
+            }
+        }
+
+        MessageContent::MultiPart(blocks)
     }
 }
 

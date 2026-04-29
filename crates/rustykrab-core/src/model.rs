@@ -66,6 +66,17 @@ pub trait ModelProvider: Send + Sync {
         None
     }
 
+    /// Whether this provider supports image content in messages.
+    fn supports_vision(&self) -> bool {
+        false
+    }
+
+    /// Whether this provider requires every tool_use block to have a
+    /// matching tool_result before the next chat call.
+    fn requires_paired_tool_results(&self) -> bool {
+        true
+    }
+
     /// Send a conversation to the model and get back the next message.
     async fn chat(&self, messages: &[Message], tools: &[ToolSchema]) -> Result<ModelResponse>;
 
