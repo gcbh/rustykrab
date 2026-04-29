@@ -21,6 +21,7 @@ use std::sync::{Arc, RwLock};
 use uuid::Uuid;
 
 use crate::capability::CapabilitySet;
+use crate::recall::RecallStore;
 use crate::tool::Tool;
 
 /// Tracks which tools are "active" for each conversation.
@@ -80,6 +81,10 @@ pub struct SessionToolContext {
     pub capabilities: Arc<CapabilitySet>,
     pub all_tools: Arc<Vec<Arc<dyn Tool>>>,
     pub active_tools: Arc<ActiveToolsRegistry>,
+    /// Per-conversation archive of compaction-displaced history.  The
+    /// `recall_*` tools read from this so the model can recover detail
+    /// the compaction summary dropped.
+    pub recall: Arc<RecallStore>,
 }
 
 tokio::task_local! {

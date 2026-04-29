@@ -1,4 +1,5 @@
 pub mod harness;
+pub mod recall_tools;
 pub mod rlm;
 pub mod router;
 mod runner;
@@ -8,6 +9,7 @@ pub mod trace;
 pub mod voting;
 
 pub use harness::HarnessProfile;
+pub use recall_tools::recall_tools;
 pub use rlm::RecursiveExecutor;
 pub use router::HarnessRouter;
 pub use runner::{AgentConfig, AgentEvent, AgentRunner, OnMessageCallback};
