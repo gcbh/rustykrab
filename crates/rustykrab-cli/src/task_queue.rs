@@ -188,7 +188,20 @@ async fn execute_cron_task(
         }
     };
 
-    let prompt = build_scheduled_prompt(task_prompt, job.last_run_at);
+    // Resolve the delivery target. Precedence: job-specified > stored on the
+    // job's persistent conversation > operator-wide env defaults. The
+    // env defaults are the safety net for jobs created by older builds (or
+    // by the model without channel/chat_id) so their output isn't silently
+    // dropped on the floor.
+    let (effective_channel, effective_chat_id, effective_thread_id) =
+        resolve_delivery_target(channel, chat_id, thread_id, &conv);
+
+    let prompt = build_scheduled_prompt(
+        task_prompt,
+        job.last_run_at,
+        effective_channel.as_deref(),
+        effective_chat_id.as_deref(),
+    );
 
     // Run the agent.
     let no_op_event = |_event: AgentEvent| {};
@@ -213,37 +226,73 @@ async fn execute_cron_task(
     };
 
     // Route the response to the originating channel.
-    match channel {
+    match effective_channel.as_deref() {
         Some("telegram") => {
-            if let (Some(tg), Some(cid)) = (&state.telegram, chat_id) {
+            if let (Some(tg), Some(cid)) = (&state.telegram, effective_chat_id.as_deref()) {
                 if let Ok(chat_id_num) = cid.parse::<i64>() {
-                    let tg_thread = thread_id.and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+                    let tg_thread = effective_thread_id
+                        .as_deref()
+                        .and_then(|s| s.parse::<i64>().ok())
+                        .unwrap_or(0);
                     if let Err(e) = tg.send_text(chat_id_num, &response_text, tg_thread).await {
                         tracing::error!(job_id = %job_id, "failed to send scheduled job result to Telegram: {e}");
                     }
                 } else {
                     tracing::error!(job_id = %job_id, chat_id = %cid, "invalid Telegram chat_id");
                 }
+            } else {
+                tracing::warn!(
+                    job_id = %job_id,
+                    has_telegram = state.telegram.is_some(),
+                    has_chat_id = effective_chat_id.is_some(),
+                    "telegram routing unavailable; result discarded: {response_text}"
+                );
             }
         }
         Some("slack") => {
-            if let (Some(sl), Some(channel_id)) = (&state.slack, chat_id) {
-                if let Err(e) = sl.send_text(channel_id, &response_text, thread_id).await {
+            if let (Some(sl), Some(channel_id)) = (&state.slack, effective_chat_id.as_deref()) {
+                if let Err(e) = sl
+                    .send_text(channel_id, &response_text, effective_thread_id.as_deref())
+                    .await
+                {
                     tracing::error!(job_id = %job_id, "failed to send scheduled job result to Slack: {e}");
                 }
+            } else {
+                tracing::warn!(
+                    job_id = %job_id,
+                    has_slack = state.slack.is_some(),
+                    has_chat_id = effective_chat_id.is_some(),
+                    "slack routing unavailable; result discarded: {response_text}"
+                );
             }
         }
         Some("signal") => {
-            if let (Some(sig), Some(number)) = (&state.signal, chat_id) {
+            if let (Some(sig), Some(number)) = (&state.signal, effective_chat_id.as_deref()) {
                 if let Err(e) = sig.send_text(number, &response_text).await {
                     tracing::error!(job_id = %job_id, "failed to send scheduled job result to Signal: {e}");
                 }
+            } else {
+                tracing::warn!(
+                    job_id = %job_id,
+                    has_signal = state.signal.is_some(),
+                    has_chat_id = effective_chat_id.is_some(),
+                    "signal routing unavailable; result discarded: {response_text}"
+                );
             }
         }
-        _ => {
-            tracing::info!(
+        Some(other) => {
+            tracing::warn!(
                 job_id = %job_id,
-                "scheduled job completed (no channel routing): {response_text}"
+                channel = %other,
+                "unknown channel for scheduled job; result discarded: {response_text}"
+            );
+        }
+        None => {
+            tracing::warn!(
+                job_id = %job_id,
+                "scheduled job has no delivery channel — set channel/chat_id on the \
+                 job, or set RUSTYKRAB_DEFAULT_CHANNEL + RUSTYKRAB_DEFAULT_CHAT_ID. \
+                 Result discarded: {response_text}"
             );
         }
     }
@@ -310,12 +359,27 @@ fn resume_or_create_conversation(
 
 /// Build the user message prepended to the agent's turn. On the first run
 /// there's no prior context, so we say so; on subsequent runs the prompt
-/// points the agent at the conversation history it already has.
+/// points the agent at the conversation history it already has. Also tells
+/// the model where its final response will be delivered, so it knows it's
+/// being asked to actually produce output (not chat about what it might do).
 fn build_scheduled_prompt(
     task_prompt: &str,
     last_run_at: Option<chrono::DateTime<chrono::Utc>>,
+    channel: Option<&str>,
+    chat_id: Option<&str>,
 ) -> String {
-    match last_run_at {
+    let delivery = match (channel, chat_id) {
+        (Some(c), Some(id)) => format!(
+            "Your final assistant message this turn will be delivered to {c} ({id}). \
+             Treat that final message as the briefing/answer the recipient will \
+             receive — do not ask for clarification, do not promise future updates."
+        ),
+        _ => "Your final assistant message this turn IS the deliverable for this \
+             scheduled task. Produce it directly — do not ask for clarification, \
+             do not promise future updates."
+            .to_string(),
+    };
+    let body = match last_run_at {
         Some(last) => format!(
             "[Scheduled task] Your scheduled task is due again. Earlier runs are in \
              this conversation — refer to them for any state, filenames, or \
@@ -328,5 +392,165 @@ fn build_scheduled_prompt(
              (filenames, conventions, summaries) can simply be written down here.\n\n\
              Task: {task_prompt}"
         ),
+    };
+    format!("{body}\n\n{delivery}")
+}
+
+/// Env vars that name a fallback delivery target for scheduled jobs that
+/// don't carry their own channel info. Set these on a single-user deploy so
+/// briefings always land somewhere instead of getting dropped to the log.
+const DEFAULT_CHANNEL_ENV: &str = "RUSTYKRAB_DEFAULT_CHANNEL";
+const DEFAULT_CHAT_ID_ENV: &str = "RUSTYKRAB_DEFAULT_CHAT_ID";
+const DEFAULT_THREAD_ID_ENV: &str = "RUSTYKRAB_DEFAULT_THREAD_ID";
+
+/// Resolve the channel/chat_id/thread_id triple to use for delivering this
+/// run's output. Precedence (first match wins):
+///   1. The job's stored fields (set when the job was created).
+///   2. The job's persistent conversation's `channel_*` fields (set when
+///      the conversation originated from a channel).
+///   3. Operator-wide env defaults.
+fn resolve_delivery_target(
+    job_channel: Option<&str>,
+    job_chat_id: Option<&str>,
+    job_thread_id: Option<&str>,
+    conv: &Conversation,
+) -> (Option<String>, Option<String>, Option<String>) {
+    let channel = job_channel
+        .map(|s| s.to_string())
+        .or_else(|| conv.channel_source.clone())
+        .or_else(|| std::env::var(DEFAULT_CHANNEL_ENV).ok())
+        .filter(|s| !s.is_empty());
+    let chat_id = job_chat_id
+        .map(|s| s.to_string())
+        .or_else(|| conv.channel_id.clone())
+        .or_else(|| std::env::var(DEFAULT_CHAT_ID_ENV).ok())
+        .filter(|s| !s.is_empty());
+    let thread_id = job_thread_id
+        .map(|s| s.to_string())
+        .or_else(|| conv.channel_thread_id.clone())
+        .or_else(|| std::env::var(DEFAULT_THREAD_ID_ENV).ok())
+        .filter(|s| !s.is_empty());
+    (channel, chat_id, thread_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+    use std::sync::Mutex;
+
+    /// Env vars are process-global. Serialize tests that mutate them so they
+    /// don't race when run with `--test-threads > 1`.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn empty_conv() -> Conversation {
+        Conversation {
+            id: Uuid::new_v4(),
+            messages: Vec::new(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            summary: None,
+            detected_profile: None,
+            channel_source: None,
+            channel_id: None,
+            channel_thread_id: None,
+        }
+    }
+
+    fn channel_conv(source: &str, id: &str, thread: Option<&str>) -> Conversation {
+        let mut c = empty_conv();
+        c.channel_source = Some(source.to_string());
+        c.channel_id = Some(id.to_string());
+        c.channel_thread_id = thread.map(|s| s.to_string());
+        c
+    }
+
+    #[test]
+    fn scheduled_prompt_first_run_includes_delivery_target() {
+        let prompt = build_scheduled_prompt(
+            "Write the daily briefing.",
+            None,
+            Some("telegram"),
+            Some("12345"),
+        );
+        assert!(prompt.contains("first time"));
+        assert!(prompt.contains("Task: Write the daily briefing."));
+        assert!(prompt.contains("delivered to telegram (12345)"));
+        assert!(prompt.contains("do not promise future updates"));
+    }
+
+    #[test]
+    fn scheduled_prompt_recurring_includes_last_run() {
+        let last = Utc.with_ymd_and_hms(2026, 4, 30, 9, 0, 0).unwrap();
+        let prompt = build_scheduled_prompt("Daily briefing.", Some(last), None, None);
+        assert!(prompt.contains("due again"));
+        assert!(prompt.contains("Last run was at 2026-04-30 09:00:00 UTC"));
+        // No channel info → still tells the model the message IS the deliverable.
+        assert!(prompt.contains("IS the deliverable"));
+    }
+
+    #[test]
+    fn delivery_target_prefers_job_fields() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let conv = channel_conv("telegram", "999", Some("7"));
+        let (ch, cid, tid) =
+            resolve_delivery_target(Some("slack"), Some("CABC"), Some("ts.1"), &conv);
+        assert_eq!(ch.as_deref(), Some("slack"));
+        assert_eq!(cid.as_deref(), Some("CABC"));
+        assert_eq!(tid.as_deref(), Some("ts.1"));
+    }
+
+    #[test]
+    fn delivery_target_falls_back_to_conversation() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        // Make sure no stray env defaults leak in from the surrounding env.
+        std::env::remove_var(DEFAULT_CHANNEL_ENV);
+        std::env::remove_var(DEFAULT_CHAT_ID_ENV);
+        std::env::remove_var(DEFAULT_THREAD_ID_ENV);
+        let conv = channel_conv("telegram", "42", Some("9"));
+        let (ch, cid, tid) = resolve_delivery_target(None, None, None, &conv);
+        assert_eq!(ch.as_deref(), Some("telegram"));
+        assert_eq!(cid.as_deref(), Some("42"));
+        assert_eq!(tid.as_deref(), Some("9"));
+    }
+
+    #[test]
+    fn delivery_target_falls_back_to_env_when_job_and_conv_empty() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        std::env::set_var(DEFAULT_CHANNEL_ENV, "telegram");
+        std::env::set_var(DEFAULT_CHAT_ID_ENV, "55");
+        std::env::remove_var(DEFAULT_THREAD_ID_ENV);
+        let conv = empty_conv();
+        let (ch, cid, tid) = resolve_delivery_target(None, None, None, &conv);
+        std::env::remove_var(DEFAULT_CHANNEL_ENV);
+        std::env::remove_var(DEFAULT_CHAT_ID_ENV);
+        assert_eq!(ch.as_deref(), Some("telegram"));
+        assert_eq!(cid.as_deref(), Some("55"));
+        assert_eq!(tid, None);
+    }
+
+    #[test]
+    fn delivery_target_returns_none_when_nothing_configured() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        std::env::remove_var(DEFAULT_CHANNEL_ENV);
+        std::env::remove_var(DEFAULT_CHAT_ID_ENV);
+        std::env::remove_var(DEFAULT_THREAD_ID_ENV);
+        let conv = empty_conv();
+        let (ch, cid, tid) = resolve_delivery_target(None, None, None, &conv);
+        assert!(ch.is_none());
+        assert!(cid.is_none());
+        assert!(tid.is_none());
+    }
+
+    #[test]
+    fn delivery_target_treats_empty_strings_as_unset() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        std::env::remove_var(DEFAULT_CHANNEL_ENV);
+        std::env::remove_var(DEFAULT_CHAT_ID_ENV);
+        std::env::remove_var(DEFAULT_THREAD_ID_ENV);
+        let conv = empty_conv();
+        let (ch, cid, _) = resolve_delivery_target(Some(""), Some(""), None, &conv);
+        assert!(ch.is_none(), "empty channel should not satisfy the filter");
+        assert!(cid.is_none(), "empty chat_id should not satisfy the filter");
     }
 }

@@ -322,6 +322,32 @@ async fn main() -> anyhow::Result<()> {
             "soul path defaulted (set RUSTYKRAB_SOUL_PATH to override)"
         );
     }
+    // Seed the soul file if the configured path doesn't exist yet. Without
+    // this, the prompt loader silently falls back to the baked-in default
+    // and the operator has no visible file to edit. We only write when the
+    // file is missing — never overwrite a populated soul.
+    if let Some(path) = std::env::var_os(rustykrab_skills::prompt::SOUL_PATH_ENV) {
+        let soul_path = std::path::PathBuf::from(path);
+        if !soul_path.exists() {
+            if let Some(parent) = soul_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            match std::fs::write(
+                &soul_path,
+                rustykrab_skills::prompt::default_soul_template(),
+            ) {
+                Ok(()) => tracing::info!(
+                    path = %soul_path.display(),
+                    "seeded soul.md with default template — edit to customize"
+                ),
+                Err(e) => tracing::warn!(
+                    path = %soul_path.display(),
+                    error = %e,
+                    "could not seed soul.md — will use baked-in default at runtime"
+                ),
+            }
+        }
+    }
 
     // --- Memory system (hybrid retrieval: vector + BM25 + temporal + graph) ---
     let memory_db_path = data_dir.join("memory.db");

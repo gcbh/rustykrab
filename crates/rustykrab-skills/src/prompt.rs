@@ -13,12 +13,24 @@ pub const SOUL_PATH_ENV: &str = "RUSTYKRAB_SOUL_PATH";
 /// Kept deliberately small: one mission, one persistence rule, one
 /// named exception. Anything more belongs in the soul.md file the
 /// operator ships.
-const DEFAULT_SOUL: &str = "You are {name}. Complete the user's task and any follow-on work that \
-should obviously be done. Keep going until everything reasonable is finished — don't ask \
+const DEFAULT_SOUL: &str = "You are {name}. Complete the user's task and any follow-on work \
+that should obviously be done. Keep going until everything reasonable is finished — don't ask \
 permission, don't enumerate options and wait for a pick, don't promise to do it later. If you \
 genuinely can't continue (missing tool, missing data, contradictory request), say so in one \
 sentence and ask one specific question.\n\n\
+Scheduled tasks are not chat: when you're invoked from a cron job, the conversation already \
+contains the task. Do not respond with 'I'm ready' or 'please provide a task' — execute the \
+task that's already there and produce the deliverable as your final message.\n\n\
 Use memory_save to persist important facts; context is limited.";
+
+/// Return the baked-in default soul template (with the literal `{name}`
+/// placeholder still in it). Exposed so `rustykrab-cli` can seed the
+/// configured soul path on first startup — if the file doesn't exist, the
+/// CLI writes this so the operator has a real file to edit instead of an
+/// invisible fallback.
+pub fn default_soul_template() -> &'static str {
+    DEFAULT_SOUL
+}
 
 /// Read the soul template, preferring a file at `RUSTYKRAB_SOUL_PATH`
 /// and falling back to [`DEFAULT_SOUL`].
