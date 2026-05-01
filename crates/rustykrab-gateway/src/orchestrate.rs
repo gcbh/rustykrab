@@ -32,12 +32,34 @@ async fn build_and_inject_system_prompt(
         .with_security_policy();
 
     // Inject SKILL.md catalog (only satisfied skills).
-    let satisfied: Vec<_> = state
-        .skill_registry
-        .md_skills()
+    let all_md = state.skill_registry.md_skills();
+    let (satisfied, unsatisfied): (Vec<_>, Vec<_>) = all_md
         .into_iter()
-        .filter(|s| s.validation.is_satisfied())
+        .partition(|s| s.validation.is_satisfied());
+    let included: Vec<&str> = satisfied
+        .iter()
+        .map(|s| s.frontmatter.name.as_str())
         .collect();
+    let excluded: Vec<String> = unsatisfied
+        .iter()
+        .map(|s| {
+            let mut reasons = Vec::new();
+            if !s.validation.missing_env.is_empty() {
+                reasons.push(format!("missing_env={:?}", s.validation.missing_env));
+            }
+            if !s.validation.missing_bins.is_empty() {
+                reasons.push(format!("missing_bins={:?}", s.validation.missing_bins));
+            }
+            format!("{} ({})", s.frontmatter.name, reasons.join(", "))
+        })
+        .collect();
+    tracing::info!(
+        included_count = included.len(),
+        excluded_count = excluded.len(),
+        included = ?included,
+        excluded = ?excluded,
+        "SKILL.md catalog for system prompt"
+    );
     if !satisfied.is_empty() {
         let refs: Vec<&rustykrab_skills::SkillMd> = satisfied.iter().map(|s| s.as_ref()).collect();
         builder = builder.with_available_skills(&refs);

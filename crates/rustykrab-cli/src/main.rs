@@ -467,6 +467,41 @@ async fn main() -> anyhow::Result<()> {
         Err(e) => tracing::warn!(error = %e, "failed to scan skills directory"),
     }
 
+    // Aggregate startup audit: per-skill satisfaction state with the exact
+    // missing requirements. A skill whose `requires.env` or `requires.bins`
+    // is unmet at startup is filtered out of every system-prompt catalog
+    // and is therefore invisible to the agent — operators need to see
+    // that fact loudly at boot rather than wondering why the model never
+    // invokes it.
+    let all_md = skill_registry.md_skills();
+    if !all_md.is_empty() {
+        for s in &all_md {
+            if s.validation.is_satisfied() {
+                tracing::info!(
+                    name = %s.frontmatter.name,
+                    "skill ready"
+                );
+            } else {
+                tracing::warn!(
+                    name = %s.frontmatter.name,
+                    missing_env = ?s.validation.missing_env,
+                    missing_bins = ?s.validation.missing_bins,
+                    "skill UNAVAILABLE — requirements unmet, will be hidden from the agent"
+                );
+            }
+        }
+        let satisfied = all_md
+            .iter()
+            .filter(|s| s.validation.is_satisfied())
+            .count();
+        tracing::info!(
+            total = all_md.len(),
+            satisfied,
+            unsatisfied = all_md.len() - satisfied,
+            "skill registry audit complete"
+        );
+    }
+
     // --- Tools ---
     let mut tools = rustykrab_tools::builtin_tools(store.secrets());
     tools.extend(rustykrab_tools::memory_tools(memory_backend));
