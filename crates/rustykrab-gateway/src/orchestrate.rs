@@ -244,19 +244,28 @@ fn extract_assistant_message(conv: &Conversation) -> Result<Message, StatusCode>
 }
 
 /// Run the agent loop on a conversation (non-streaming).
+///
+/// `trace_id` correlates every log line and prompt-log row produced by
+/// this run. Callers at HTTP boundaries thread the request's trace id in;
+/// channel/scheduler entry points should mint a fresh one with
+/// [`Uuid::new_v4`].
 pub async fn run_agent(
     state: &AppState,
     conv: &mut Conversation,
     user_content: &str,
+    trace_id: Uuid,
 ) -> Result<Message, StatusCode> {
-    let (runner, session) = prepare_agent(state, conv, user_content).await?;
+    rustykrab_core::prompt_trace::with_trace_id(trace_id, async move {
+        let (runner, session) = prepare_agent(state, conv, user_content).await?;
 
-    runner.run(conv, &session).await.map_err(|e| {
-        tracing::error!("agent error: {e}");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+        runner.run(conv, &session).await.map_err(|e| {
+            tracing::error!(%trace_id, "agent error: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
-    extract_assistant_message(conv)
+        extract_assistant_message(conv)
+    })
+    .await
 }
 
 /// Start the event-driven agent loop, returning a handle for injecting
@@ -270,6 +279,7 @@ pub async fn run_agent_interactive(
     state: &AppState,
     mut conv: Conversation,
     user_content: &str,
+    trace_id: Uuid,
 ) -> std::result::Result<
     (
         AgentHandle,
@@ -278,26 +288,35 @@ pub async fn run_agent_interactive(
     ),
     StatusCode,
 > {
-    build_and_inject_system_prompt(state, &mut conv, user_content).await;
+    rustykrab_core::prompt_trace::with_trace_id(trace_id, async move {
+        build_and_inject_system_prompt(state, &mut conv, user_content).await;
 
-    let tool_names: Vec<&str> = state
-        .tools
-        .iter()
-        .filter(|t| t.available())
-        .map(|t| t.name())
-        .collect();
-    let caps = CapabilitySet::for_tools_permissive(&tool_names);
-    let session = Session::with_capabilities(conv.id, caps);
+        let tool_names: Vec<&str> = state
+            .tools
+            .iter()
+            .filter(|t| t.available())
+            .map(|t| t.name())
+            .collect();
+        let caps = CapabilitySet::for_tools_permissive(&tool_names);
+        let session = Session::with_capabilities(conv.id, caps);
 
-    let profile = state.profile_for(user_content).await;
-    let runner = AgentRunner::new(
-        state.provider.clone(),
-        state.tools.clone(),
-        state.sandbox.clone(),
-    )
-    .with_config(profile.to_agent_config());
+        let profile = state.profile_for(user_content).await;
+        let runner = AgentRunner::new(
+            state.provider.clone(),
+            state.tools.clone(),
+            state.sandbox.clone(),
+        )
+        .with_config(profile.to_agent_config());
 
-    Ok(runner.start(conv, session))
+        // The agent loop runs in a tokio::spawn'd task inside `start`, so
+        // the task-local trace id won't follow it. Re-scope the spawned
+        // future from inside the runner is not possible without changing
+        // the runner API; for the interactive path we accept that the
+        // agent task itself logs without trace_id. The caller can still
+        // correlate by the conversation id printed at start.
+        Ok(runner.start(conv, session))
+    })
+    .await
 }
 
 /// Run the agent loop with streaming events.
@@ -306,16 +325,20 @@ pub async fn run_agent_streaming(
     conv: &mut Conversation,
     user_content: &str,
     on_event: &(dyn Fn(AgentEvent) + Send + Sync),
+    trace_id: Uuid,
 ) -> Result<Message, StatusCode> {
-    let (runner, session) = prepare_agent(state, conv, user_content).await?;
+    rustykrab_core::prompt_trace::with_trace_id(trace_id, async move {
+        let (runner, session) = prepare_agent(state, conv, user_content).await?;
 
-    runner
-        .run_streaming(conv, &session, on_event)
-        .await
-        .map_err(|e| {
-            tracing::error!("agent error: {e}");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+        runner
+            .run_streaming(conv, &session, on_event)
+            .await
+            .map_err(|e| {
+                tracing::error!(%trace_id, "agent error: {e}");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
 
-    extract_assistant_message(conv)
+        extract_assistant_message(conv)
+    })
+    .await
 }

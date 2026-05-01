@@ -699,6 +699,10 @@ impl AgentRunner {
         let active_tools = self.active_tools.clone();
         let recall = self.recall.clone();
 
+        // Carry the trace id from the calling task into the spawned agent
+        // task so prompt-log rows and agent-loop logs share the same id.
+        let trace_id = rustykrab_core::prompt_trace::current_trace_id();
+
         let join_handle = tokio::spawn(async move {
             let runner = AgentRunner {
                 provider,
@@ -710,9 +714,15 @@ impl AgentRunner {
                 active_tools,
                 recall,
             };
-            let result = runner
-                .run_event_loop(conv, &session, inbound_rx, outbound_tx)
-                .await;
+            let body = async move {
+                runner
+                    .run_event_loop(conv, &session, inbound_rx, outbound_tx)
+                    .await
+            };
+            let result = match trace_id {
+                Some(id) => rustykrab_core::prompt_trace::with_trace_id(id, body).await,
+                None => body.await,
+            };
             alive_clone.store(false, AtomicOrdering::Release);
             result
         });

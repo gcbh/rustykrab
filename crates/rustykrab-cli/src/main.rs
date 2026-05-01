@@ -1,3 +1,4 @@
+mod prompt_log;
 mod task_queue;
 
 use std::collections::{HashMap, HashSet};
@@ -168,6 +169,10 @@ async fn main() -> anyhow::Result<()> {
         .with(fmt::layer().with_writer(std::io::stdout))
         .with(fmt::layer().with_writer(non_blocking).with_ansi(false))
         .init();
+
+    // Optional prompt log (env-gated). Hold the guard for the process
+    // lifetime so the non-blocking worker keeps draining.
+    let _prompt_log_guard = prompt_log::init(&log_dir);
 
     tracing::info!("rustykrab {}", version_string());
 
@@ -1081,9 +1086,12 @@ async fn process_telegram_message(
         }
     });
 
-    // Start the event-driven agent loop.
+    // Start the event-driven agent loop. Mint a trace id per inbound
+    // Telegram message so the prompt log can be matched against this run.
+    let trace_id = Uuid::new_v4();
+    tracing::info!(%trace_id, chat_id, ?thread_id, "telegram agent run starting");
     let (handle, mut event_rx, join_handle) =
-        match rustykrab_gateway::run_agent_interactive(state, conv, user_text).await {
+        match rustykrab_gateway::run_agent_interactive(state, conv, user_text, trace_id).await {
             Ok(triple) => triple,
             Err(_status) => {
                 typing_active.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -1443,7 +1451,10 @@ async fn process_slack_message(
         hb.store(epoch_millis(), Ordering::Relaxed);
     };
 
-    let agent_fut = rustykrab_gateway::run_agent_streaming(state, &mut conv, user_text, &on_event);
+    let trace_id = Uuid::new_v4();
+    tracing::info!(%trace_id, conv_id = %conv.id, "slack agent run starting");
+    let agent_fut =
+        rustykrab_gateway::run_agent_streaming(state, &mut conv, user_text, &on_event, trace_id);
 
     let timeout_millis = HEARTBEAT_TIMEOUT_SECS * 1000;
     let heartbeat_monitor = async {

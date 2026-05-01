@@ -8,14 +8,23 @@ use axum::middleware::Next;
 use axum::response::Response;
 use uuid::Uuid;
 
+/// Newtype wrapper so handlers can extract the trace id from request
+/// extensions without colliding with bare `Uuid` extensions.
+#[derive(Debug, Clone, Copy)]
+pub struct TraceId(pub Uuid);
+
 /// HTTP request/response logging middleware.
 ///
 /// Logs method, path, status, latency, client IP, and content lengths
 /// for every request. Skips `/api/health` to reduce noise.
 /// Uses `info!` for successful responses and `warn!` for 4xx/5xx.
+///
+/// Generates a `trace_id` per request and stashes it in request extensions
+/// so downstream handlers can thread it into agent runs — prompt-log rows
+/// and agent-loop logs then share the same id as the HTTP completion log.
 pub async fn request_logging_middleware(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Response {
     let path = request.uri().path().to_owned();
@@ -27,7 +36,8 @@ pub async fn request_logging_middleware(
 
     let method = request.method().clone();
     let query = request.uri().query().map(|q| q.to_owned());
-    let request_id = Uuid::new_v4();
+    let trace_id = Uuid::new_v4();
+    request.extensions_mut().insert(TraceId(trace_id));
     let client_ip = addr.ip();
     let user_agent = request
         .headers()
@@ -54,7 +64,7 @@ pub async fn request_logging_middleware(
 
     if status >= 400 {
         tracing::warn!(
-            %request_id,
+            %trace_id,
             %method,
             %path,
             ?query,
@@ -68,7 +78,7 @@ pub async fn request_logging_middleware(
         );
     } else {
         tracing::info!(
-            %request_id,
+            %trace_id,
             %method,
             %path,
             ?query,

@@ -1,6 +1,6 @@
 use std::convert::Infallible;
 
-use axum::extract::{Path, State};
+use axum::extract::{Extension, Path, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, Sse};
 use axum::routing::{get, post};
@@ -14,6 +14,7 @@ use uuid::Uuid;
 use rustykrab_agent::AgentEvent;
 use rustykrab_core::types::{Conversation, Message, MessageContent, Role};
 
+use crate::logging::TraceId;
 use crate::AppState;
 
 /// Maximum allowed message size in bytes (100 KB).
@@ -107,6 +108,7 @@ async fn delete_conversation(
 /// Send a user message to a conversation and get an assistant response.
 async fn send_message(
     State(state): State<AppState>,
+    Extension(TraceId(trace_id)): Extension<TraceId>,
     Path(id): Path<Uuid>,
     Json(body): Json<SendMessageRequest>,
 ) -> Result<Json<Message>, StatusCode> {
@@ -135,7 +137,8 @@ async fn send_message(
     conv.updated_at = Utc::now();
 
     // Run the full agent pipeline.
-    let assistant_msg = crate::orchestrate::run_agent(&state, &mut conv, &user_content).await?;
+    let assistant_msg =
+        crate::orchestrate::run_agent(&state, &mut conv, &user_content, trace_id).await?;
 
     // Persist the full conversation (including intermediate tool call messages).
     conv.updated_at = Utc::now();
@@ -157,6 +160,7 @@ enum SsePayload {
 /// Send a user message and stream the assistant response as SSE events.
 async fn send_message_stream(
     State(state): State<AppState>,
+    Extension(TraceId(trace_id)): Extension<TraceId>,
     Path(id): Path<Uuid>,
     Json(body): Json<SendMessageRequest>,
 ) -> Result<Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>>, StatusCode> {
@@ -245,6 +249,7 @@ async fn send_message_stream(
             &mut conv,
             &user_content,
             &on_event,
+            trace_id,
         );
 
         let result = tokio::select! {

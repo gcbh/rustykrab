@@ -582,7 +582,15 @@ impl ModelProvider for OllamaProvider {
             base_url = %self.base_url,
             num_messages = ollama_messages.len(),
             num_ctx = ?self.config.num_ctx,
+            trace_id = ?rustykrab_core::prompt_trace::current_trace_id(),
             "calling Ollama chat API"
+        );
+        rustykrab_core::prompt_trace::record_prompt(
+            self.name(),
+            &self.model,
+            false,
+            messages,
+            tools,
         );
 
         let url = format!("{}/api/chat", self.base_url);
@@ -722,7 +730,15 @@ impl ModelProvider for OllamaProvider {
             base_url = %self.base_url,
             num_messages = ollama_messages.len(),
             num_ctx = ?self.config.num_ctx,
+            trace_id = ?rustykrab_core::prompt_trace::current_trace_id(),
             "calling Ollama chat API (streaming)"
+        );
+        rustykrab_core::prompt_trace::record_prompt(
+            self.name(),
+            &self.model,
+            true,
+            messages,
+            tools,
         );
 
         let url = format!("{}/api/chat", self.base_url);

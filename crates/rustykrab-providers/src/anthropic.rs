@@ -340,7 +340,18 @@ impl ModelProvider for AnthropicProvider {
             body["tools"] = serde_json::to_value(&api_tools).map_err(Error::Serialization)?;
         }
 
-        tracing::debug!(model = %self.model, "calling Anthropic Messages API");
+        tracing::debug!(
+            model = %self.model,
+            trace_id = ?rustykrab_core::prompt_trace::current_trace_id(),
+            "calling Anthropic Messages API"
+        );
+        rustykrab_core::prompt_trace::record_prompt(
+            self.name(),
+            &self.model,
+            false,
+            messages,
+            tools,
+        );
 
         let mut last_err = None;
         for attempt in 0..=MAX_RETRIES {
@@ -447,7 +458,18 @@ impl ModelProvider for AnthropicProvider {
             body["tools"] = serde_json::to_value(&api_tools).map_err(Error::Serialization)?;
         }
 
-        tracing::debug!(model = %self.model, "calling Anthropic Messages API (streaming)");
+        tracing::debug!(
+            model = %self.model,
+            trace_id = ?rustykrab_core::prompt_trace::current_trace_id(),
+            "calling Anthropic Messages API (streaming)"
+        );
+        rustykrab_core::prompt_trace::record_prompt(
+            self.name(),
+            &self.model,
+            true,
+            messages,
+            tools,
+        );
 
         // Retry the initial connection with the same backoff as the non-streaming path.
         let mut last_err = None;
