@@ -595,6 +595,7 @@ impl ModelProvider for OllamaProvider {
 
         let url = format!("{}/api/chat", self.base_url);
 
+        let request_start = std::time::Instant::now();
         let mut last_err = None;
         for attempt in 0..=MAX_RETRIES {
             if attempt > 0 {
@@ -658,6 +659,15 @@ impl ModelProvider for OllamaProvider {
                     tracing::warn!(raw_body = %raw_body, "raw Ollama API response");
                 }
 
+                rustykrab_core::prompt_trace::record_response(
+                    self.name(),
+                    &self.model,
+                    false,
+                    &response.message,
+                    &response.usage,
+                    &response.stop_reason,
+                    request_start.elapsed().as_millis() as u64,
+                );
                 return Ok(response);
             }
 
@@ -938,6 +948,15 @@ impl ModelProvider for OllamaProvider {
             );
         }
 
+        rustykrab_core::prompt_trace::record_response(
+            self.name(),
+            &self.model,
+            true,
+            &response.message,
+            &response.usage,
+            &response.stop_reason,
+            stream_start.elapsed().as_millis() as u64,
+        );
         on_event(StreamEvent::Done(response.clone()));
         Ok(response)
     }

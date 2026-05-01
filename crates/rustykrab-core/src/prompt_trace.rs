@@ -1,14 +1,16 @@
-//! Prompt tracing — correlate log lines with the prompts that produced them.
+//! Prompt and response tracing — correlate log lines with the prompts that
+//! produced them and the responses they returned.
 //!
 //! Every agent invocation is tagged with a `trace_id` (UUID) that flows
 //! through the call stack via a task-local. Logs decorated with `trace_id`
-//! line up with rows in the prompt log file written by the registered
-//! [`PromptSink`].
+//! line up with rows in the trace log file written by the registered
+//! [`TraceSink`].
 //!
 //! The sink is opt-in: until [`set_sink`] is called the [`record_prompt`]
-//! helper is a no-op. The CLI installs a file-backed sink when
-//! `RUSTYKRAB_PROMPT_LOG=1` is set, keeping prompts out of the log
-//! directory by default since they may contain user-secret material.
+//! and [`record_response`] helpers are no-ops. The CLI installs a
+//! file-backed sink when `RUSTYKRAB_PROMPT_LOG=1` is set, keeping prompts
+//! and responses out of the log directory by default since they may
+//! contain user-secret material.
 
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -17,6 +19,7 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 use uuid::Uuid;
 
+use crate::model::{StopReason, Usage};
 use crate::types::{Message, ToolSchema};
 
 tokio::task_local! {
@@ -39,29 +42,51 @@ where
     TRACE_ID.scope(trace_id, fut).await
 }
 
-/// One row in the prompt log: a single submission to a model provider.
+/// One row in the trace log. Internally tagged via the `kind` field so a
+/// reader can distinguish prompt rows from response rows.
 #[derive(Debug, Clone, Serialize)]
-pub struct PromptRecord {
-    pub trace_id: Uuid,
-    pub timestamp: DateTime<Utc>,
-    pub provider: String,
-    pub model: String,
-    /// `true` for streaming submissions, `false` otherwise.
-    pub streaming: bool,
-    pub messages: Vec<Message>,
-    pub tools: Vec<ToolSchema>,
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TraceRecord {
+    /// Outbound submission to the model.
+    Prompt {
+        trace_id: Uuid,
+        timestamp: DateTime<Utc>,
+        provider: String,
+        model: String,
+        /// `true` for streaming submissions, `false` otherwise.
+        streaming: bool,
+        messages: Vec<Message>,
+        tools: Vec<ToolSchema>,
+    },
+    /// Successful response from the model.
+    Response {
+        trace_id: Uuid,
+        timestamp: DateTime<Utc>,
+        provider: String,
+        model: String,
+        streaming: bool,
+        message: Message,
+        prompt_tokens: u32,
+        completion_tokens: u32,
+        cache_read_tokens: u32,
+        cache_creation_tokens: u32,
+        /// Stringified [`StopReason`] so consumers don't need the core
+        /// enum to parse the log.
+        stop_reason: String,
+        duration_ms: u64,
+    },
 }
 
-/// Sink that receives [`PromptRecord`] rows.
-pub trait PromptSink: Send + Sync {
-    fn record(&self, record: PromptRecord);
+/// Sink that receives [`TraceRecord`] rows.
+pub trait TraceSink: Send + Sync {
+    fn record(&self, record: TraceRecord);
 }
 
-static SINK: OnceLock<Arc<dyn PromptSink>> = OnceLock::new();
+static SINK: OnceLock<Arc<dyn TraceSink>> = OnceLock::new();
 
-/// Install the global prompt sink. Only the first call wins — subsequent
+/// Install the global trace sink. Only the first call wins — subsequent
 /// calls are silently ignored so re-init in tests doesn't panic.
-pub fn set_sink(sink: Arc<dyn PromptSink>) {
+pub fn set_sink(sink: Arc<dyn TraceSink>) {
     let _ = SINK.set(sink);
 }
 
@@ -79,7 +104,7 @@ pub fn record_prompt(
     let Some(trace_id) = current_trace_id() else {
         return;
     };
-    sink.record(PromptRecord {
+    sink.record(TraceRecord::Prompt {
         trace_id,
         timestamp: Utc::now(),
         provider: provider.to_string(),
@@ -90,17 +115,48 @@ pub fn record_prompt(
     });
 }
 
+/// Write a response record to the global sink, tagged with the current
+/// trace id. Same no-op semantics as [`record_prompt`].
+pub fn record_response(
+    provider: &str,
+    model: &str,
+    streaming: bool,
+    message: &Message,
+    usage: &Usage,
+    stop_reason: &StopReason,
+    duration_ms: u64,
+) {
+    let Some(sink) = SINK.get() else { return };
+    let Some(trace_id) = current_trace_id() else {
+        return;
+    };
+    sink.record(TraceRecord::Response {
+        trace_id,
+        timestamp: Utc::now(),
+        provider: provider.to_string(),
+        model: model.to_string(),
+        streaming,
+        message: message.clone(),
+        prompt_tokens: usage.prompt_tokens,
+        completion_tokens: usage.completion_tokens,
+        cache_read_tokens: usage.cache_read_tokens,
+        cache_creation_tokens: usage.cache_creation_tokens,
+        stop_reason: format!("{stop_reason:?}"),
+        duration_ms,
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Mutex;
 
     struct CapturingSink {
-        records: Mutex<Vec<PromptRecord>>,
+        records: Mutex<Vec<TraceRecord>>,
     }
 
-    impl PromptSink for CapturingSink {
-        fn record(&self, record: PromptRecord) {
+    impl TraceSink for CapturingSink {
+        fn record(&self, record: TraceRecord) {
             self.records.lock().unwrap().push(record);
         }
     }
@@ -132,7 +188,7 @@ mod tests {
         let sink = Arc::new(CapturingSink {
             records: Mutex::new(Vec::new()),
         });
-        let record = PromptRecord {
+        let record = TraceRecord::Prompt {
             trace_id: Uuid::new_v4(),
             timestamp: Utc::now(),
             provider: "test".into(),
@@ -144,6 +200,24 @@ mod tests {
         sink.record(record.clone());
         let stored = sink.records.lock().unwrap();
         assert_eq!(stored.len(), 1);
-        assert_eq!(stored[0].trace_id, record.trace_id);
+        match &stored[0] {
+            TraceRecord::Prompt { provider, .. } => assert_eq!(provider, "test"),
+            _ => panic!("expected Prompt variant"),
+        }
+    }
+
+    #[test]
+    fn trace_record_serializes_with_kind_tag() {
+        let prompt = TraceRecord::Prompt {
+            trace_id: Uuid::nil(),
+            timestamp: chrono::DateTime::from_timestamp(0, 0).unwrap(),
+            provider: "p".into(),
+            model: "m".into(),
+            streaming: false,
+            messages: Vec::new(),
+            tools: Vec::new(),
+        };
+        let json = serde_json::to_string(&prompt).unwrap();
+        assert!(json.contains("\"kind\":\"prompt\""));
     }
 }
