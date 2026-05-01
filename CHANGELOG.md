@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.9.1] - 2026-05-01
+
+- fix(agent): execute scheduled briefings instead of asking for tasks (#403)
+
 ## [2.9.0] - 2026-04-29
 
 - feat: event-driven agent loop with multi-modal content support (#400)
