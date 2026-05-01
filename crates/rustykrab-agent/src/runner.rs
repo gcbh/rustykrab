@@ -182,7 +182,10 @@ fn classify_response(text: &str, _completion_tokens: u32) -> ResponseClass {
     if trimmed.is_empty() {
         return ResponseClass::Empty;
     }
-    if is_planning_only(trimmed) || is_progress_narration(trimmed) {
+    if is_planning_only(trimmed)
+        || is_progress_narration(trimmed)
+        || is_idle_acknowledgment(trimmed)
+    {
         return ResponseClass::PlanningOnly;
     }
     ResponseClass::Complete
@@ -353,6 +356,62 @@ fn is_progress_narration(text: &str) -> bool {
         .map(|p| lower.matches(p).count())
         .sum();
     intent_count >= 5
+}
+
+/// Heuristic: did the model respond with a generic idle acknowledgment
+/// instead of doing the requested work? Catches "I am ready. Please provide
+/// your first task.", "Standing by — let me know what you need.", "How can I
+/// help you today?". These responses look polite in a chat REPL but are
+/// failure modes inside a scheduled job: the conversation already contains
+/// the task, so asking for one is the model ignoring its instructions.
+///
+/// Distinct from the prior tiers:
+/// - `is_planning_only` catches "I'll do X next" (planning).
+/// - `is_progress_narration` catches "I'm currently doing X" (fake progress).
+/// - This catches "I'm waiting for you to tell me X" (idle).
+///
+/// Restricted to short responses (≤400 chars) without code blocks so a
+/// substantive answer that happens to end with "let me know if you need
+/// anything else" doesn't false-positive.
+fn is_idle_acknowledgment(text: &str) -> bool {
+    if text.contains("```") {
+        return false;
+    }
+    if text.len() > 400 {
+        return false;
+    }
+    let lower = text.to_lowercase();
+    let idle_markers = [
+        "i'm ready",
+        "i am ready",
+        "ready for your",
+        "ready when you",
+        "ready to assist",
+        "ready to help",
+        "ready to begin",
+        "ready to start",
+        "standing by",
+        "awaiting your",
+        "awaiting instructions",
+        "please provide",
+        "please give me",
+        "please tell me",
+        "please share",
+        "please specify",
+        "please let me know",
+        "what would you like",
+        "what can i help",
+        "how can i help",
+        "how may i help",
+        "how can i assist",
+        "how may i assist",
+        "your first task",
+        "your next task",
+        "what should i do",
+        "what do you want me to",
+        "what do you need me to",
+    ];
+    idle_markers.iter().any(|m| lower.contains(m))
 }
 
 /// Events emitted by the agent loop during streaming execution.
@@ -3174,6 +3233,37 @@ mod response_classification_tests {
             I am starting Phase 1, Step 1 (United Airlines) right now. \
             I will keep working through these steps until the data is complete.";
         assert_planning(text);
+    }
+
+    #[test]
+    fn idle_readiness_acknowledgment_is_planning() {
+        // The exact failure mode for scheduled briefings: the model treats
+        // the cron-triggered turn as a fresh REPL prompt and asks for work
+        // instead of executing the task already in the conversation.
+        assert_planning("I am ready. Please provide your first task.");
+        assert_planning("I'm ready. What would you like me to do?");
+        assert_planning("Standing by — let me know what you need.");
+        assert_planning("Ready to assist. How can I help you today?");
+        assert_planning("How may I assist you?");
+        assert_planning("Awaiting your instructions.");
+        assert_planning("Please tell me what you'd like to work on.");
+    }
+
+    #[test]
+    fn substantive_answer_with_trailing_offer_is_complete() {
+        // A real answer that ends with a polite "let me know" must NOT be
+        // flagged as idle — the body length keeps it above the 400-char
+        // threshold, and the response delivered actual content first.
+        let text = "The migration is safe under concurrent writes because the \
+            backfill runs inside an explicit transaction with statement-level \
+            locking on the affected rows. Postgres' MVCC keeps readers from \
+            blocking writers during the column add, and the NOT NULL \
+            constraint is added in a second pass after every row has a \
+            value. The only risk is long-running transactions that started \
+            before the migration: those will see a snapshot without the \
+            new column and may write rows that need a follow-up backfill. \
+            Let me know if you'd like the rollback plan as well.";
+        assert_complete(text);
     }
 
     #[test]
