@@ -1,3 +1,4 @@
+mod prompt_log;
 mod task_queue;
 
 use std::collections::{HashMap, HashSet};
@@ -168,6 +169,10 @@ async fn main() -> anyhow::Result<()> {
         .with(fmt::layer().with_writer(std::io::stdout))
         .with(fmt::layer().with_writer(non_blocking).with_ansi(false))
         .init();
+
+    // Optional prompt log (env-gated). Hold the guard for the process
+    // lifetime so the non-blocking worker keeps draining.
+    let _prompt_log_guard = prompt_log::init(&log_dir);
 
     tracing::info!("rustykrab {}", version_string());
 
@@ -460,6 +465,41 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Err(e) => tracing::warn!(error = %e, "failed to scan skills directory"),
+    }
+
+    // Aggregate startup audit: per-skill satisfaction state with the exact
+    // missing requirements. A skill whose `requires.env` or `requires.bins`
+    // is unmet at startup is filtered out of every system-prompt catalog
+    // and is therefore invisible to the agent — operators need to see
+    // that fact loudly at boot rather than wondering why the model never
+    // invokes it.
+    let all_md = skill_registry.md_skills();
+    if !all_md.is_empty() {
+        for s in &all_md {
+            if s.validation.is_satisfied() {
+                tracing::info!(
+                    name = %s.frontmatter.name,
+                    "skill ready"
+                );
+            } else {
+                tracing::warn!(
+                    name = %s.frontmatter.name,
+                    missing_env = ?s.validation.missing_env,
+                    missing_bins = ?s.validation.missing_bins,
+                    "skill UNAVAILABLE — requirements unmet, will be hidden from the agent"
+                );
+            }
+        }
+        let satisfied = all_md
+            .iter()
+            .filter(|s| s.validation.is_satisfied())
+            .count();
+        tracing::info!(
+            total = all_md.len(),
+            satisfied,
+            unsatisfied = all_md.len() - satisfied,
+            "skill registry audit complete"
+        );
     }
 
     // --- Tools ---
@@ -1081,9 +1121,12 @@ async fn process_telegram_message(
         }
     });
 
-    // Start the event-driven agent loop.
+    // Start the event-driven agent loop. Mint a trace id per inbound
+    // Telegram message so the prompt log can be matched against this run.
+    let trace_id = Uuid::new_v4();
+    tracing::info!(%trace_id, chat_id, ?thread_id, "telegram agent run starting");
     let (handle, mut event_rx, join_handle) =
-        match rustykrab_gateway::run_agent_interactive(state, conv, user_text).await {
+        match rustykrab_gateway::run_agent_interactive(state, conv, user_text, trace_id).await {
             Ok(triple) => triple,
             Err(_status) => {
                 typing_active.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -1443,7 +1486,10 @@ async fn process_slack_message(
         hb.store(epoch_millis(), Ordering::Relaxed);
     };
 
-    let agent_fut = rustykrab_gateway::run_agent_streaming(state, &mut conv, user_text, &on_event);
+    let trace_id = Uuid::new_v4();
+    tracing::info!(%trace_id, conv_id = %conv.id, "slack agent run starting");
+    let agent_fut =
+        rustykrab_gateway::run_agent_streaming(state, &mut conv, user_text, &on_event, trace_id);
 
     let timeout_millis = HEARTBEAT_TIMEOUT_SECS * 1000;
     let heartbeat_monitor = async {

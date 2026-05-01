@@ -32,12 +32,34 @@ async fn build_and_inject_system_prompt(
         .with_security_policy();
 
     // Inject SKILL.md catalog (only satisfied skills).
-    let satisfied: Vec<_> = state
-        .skill_registry
-        .md_skills()
+    let all_md = state.skill_registry.md_skills();
+    let (satisfied, unsatisfied): (Vec<_>, Vec<_>) = all_md
         .into_iter()
-        .filter(|s| s.validation.is_satisfied())
+        .partition(|s| s.validation.is_satisfied());
+    let included: Vec<&str> = satisfied
+        .iter()
+        .map(|s| s.frontmatter.name.as_str())
         .collect();
+    let excluded: Vec<String> = unsatisfied
+        .iter()
+        .map(|s| {
+            let mut reasons = Vec::new();
+            if !s.validation.missing_env.is_empty() {
+                reasons.push(format!("missing_env={:?}", s.validation.missing_env));
+            }
+            if !s.validation.missing_bins.is_empty() {
+                reasons.push(format!("missing_bins={:?}", s.validation.missing_bins));
+            }
+            format!("{} ({})", s.frontmatter.name, reasons.join(", "))
+        })
+        .collect();
+    tracing::info!(
+        included_count = included.len(),
+        excluded_count = excluded.len(),
+        included = ?included,
+        excluded = ?excluded,
+        "SKILL.md catalog for system prompt"
+    );
     if !satisfied.is_empty() {
         let refs: Vec<&rustykrab_skills::SkillMd> = satisfied.iter().map(|s| s.as_ref()).collect();
         builder = builder.with_available_skills(&refs);
@@ -244,19 +266,28 @@ fn extract_assistant_message(conv: &Conversation) -> Result<Message, StatusCode>
 }
 
 /// Run the agent loop on a conversation (non-streaming).
+///
+/// `trace_id` correlates every log line and prompt-log row produced by
+/// this run. Callers at HTTP boundaries thread the request's trace id in;
+/// channel/scheduler entry points should mint a fresh one with
+/// [`Uuid::new_v4`].
 pub async fn run_agent(
     state: &AppState,
     conv: &mut Conversation,
     user_content: &str,
+    trace_id: Uuid,
 ) -> Result<Message, StatusCode> {
-    let (runner, session) = prepare_agent(state, conv, user_content).await?;
+    rustykrab_core::prompt_trace::with_trace_id(trace_id, async move {
+        let (runner, session) = prepare_agent(state, conv, user_content).await?;
 
-    runner.run(conv, &session).await.map_err(|e| {
-        tracing::error!("agent error: {e}");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+        runner.run(conv, &session).await.map_err(|e| {
+            tracing::error!(%trace_id, "agent error: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
-    extract_assistant_message(conv)
+        extract_assistant_message(conv)
+    })
+    .await
 }
 
 /// Start the event-driven agent loop, returning a handle for injecting
@@ -270,6 +301,7 @@ pub async fn run_agent_interactive(
     state: &AppState,
     mut conv: Conversation,
     user_content: &str,
+    trace_id: Uuid,
 ) -> std::result::Result<
     (
         AgentHandle,
@@ -278,26 +310,35 @@ pub async fn run_agent_interactive(
     ),
     StatusCode,
 > {
-    build_and_inject_system_prompt(state, &mut conv, user_content).await;
+    rustykrab_core::prompt_trace::with_trace_id(trace_id, async move {
+        build_and_inject_system_prompt(state, &mut conv, user_content).await;
 
-    let tool_names: Vec<&str> = state
-        .tools
-        .iter()
-        .filter(|t| t.available())
-        .map(|t| t.name())
-        .collect();
-    let caps = CapabilitySet::for_tools_permissive(&tool_names);
-    let session = Session::with_capabilities(conv.id, caps);
+        let tool_names: Vec<&str> = state
+            .tools
+            .iter()
+            .filter(|t| t.available())
+            .map(|t| t.name())
+            .collect();
+        let caps = CapabilitySet::for_tools_permissive(&tool_names);
+        let session = Session::with_capabilities(conv.id, caps);
 
-    let profile = state.profile_for(user_content).await;
-    let runner = AgentRunner::new(
-        state.provider.clone(),
-        state.tools.clone(),
-        state.sandbox.clone(),
-    )
-    .with_config(profile.to_agent_config());
+        let profile = state.profile_for(user_content).await;
+        let runner = AgentRunner::new(
+            state.provider.clone(),
+            state.tools.clone(),
+            state.sandbox.clone(),
+        )
+        .with_config(profile.to_agent_config());
 
-    Ok(runner.start(conv, session))
+        // The agent loop runs in a tokio::spawn'd task inside `start`, so
+        // the task-local trace id won't follow it. Re-scope the spawned
+        // future from inside the runner is not possible without changing
+        // the runner API; for the interactive path we accept that the
+        // agent task itself logs without trace_id. The caller can still
+        // correlate by the conversation id printed at start.
+        Ok(runner.start(conv, session))
+    })
+    .await
 }
 
 /// Run the agent loop with streaming events.
@@ -306,16 +347,20 @@ pub async fn run_agent_streaming(
     conv: &mut Conversation,
     user_content: &str,
     on_event: &(dyn Fn(AgentEvent) + Send + Sync),
+    trace_id: Uuid,
 ) -> Result<Message, StatusCode> {
-    let (runner, session) = prepare_agent(state, conv, user_content).await?;
+    rustykrab_core::prompt_trace::with_trace_id(trace_id, async move {
+        let (runner, session) = prepare_agent(state, conv, user_content).await?;
 
-    runner
-        .run_streaming(conv, &session, on_event)
-        .await
-        .map_err(|e| {
-            tracing::error!("agent error: {e}");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+        runner
+            .run_streaming(conv, &session, on_event)
+            .await
+            .map_err(|e| {
+                tracing::error!(%trace_id, "agent error: {e}");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
 
-    extract_assistant_message(conv)
+        extract_assistant_message(conv)
+    })
+    .await
 }

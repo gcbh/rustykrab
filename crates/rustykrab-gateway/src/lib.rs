@@ -1,5 +1,5 @@
 pub mod auth;
-mod logging;
+pub mod logging;
 mod orchestrate;
 pub mod origin;
 pub mod rate_limit;

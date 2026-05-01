@@ -582,11 +582,20 @@ impl ModelProvider for OllamaProvider {
             base_url = %self.base_url,
             num_messages = ollama_messages.len(),
             num_ctx = ?self.config.num_ctx,
+            trace_id = ?rustykrab_core::prompt_trace::current_trace_id(),
             "calling Ollama chat API"
+        );
+        rustykrab_core::prompt_trace::record_prompt(
+            self.name(),
+            &self.model,
+            false,
+            messages,
+            tools,
         );
 
         let url = format!("{}/api/chat", self.base_url);
 
+        let request_start = std::time::Instant::now();
         let mut last_err = None;
         for attempt in 0..=MAX_RETRIES {
             if attempt > 0 {
@@ -650,6 +659,15 @@ impl ModelProvider for OllamaProvider {
                     tracing::warn!(raw_body = %raw_body, "raw Ollama API response");
                 }
 
+                rustykrab_core::prompt_trace::record_response(
+                    self.name(),
+                    &self.model,
+                    false,
+                    &response.message,
+                    &response.usage,
+                    &response.stop_reason,
+                    request_start.elapsed().as_millis() as u64,
+                );
                 return Ok(response);
             }
 
@@ -722,7 +740,15 @@ impl ModelProvider for OllamaProvider {
             base_url = %self.base_url,
             num_messages = ollama_messages.len(),
             num_ctx = ?self.config.num_ctx,
+            trace_id = ?rustykrab_core::prompt_trace::current_trace_id(),
             "calling Ollama chat API (streaming)"
+        );
+        rustykrab_core::prompt_trace::record_prompt(
+            self.name(),
+            &self.model,
+            true,
+            messages,
+            tools,
         );
 
         let url = format!("{}/api/chat", self.base_url);
@@ -922,6 +948,15 @@ impl ModelProvider for OllamaProvider {
             );
         }
 
+        rustykrab_core::prompt_trace::record_response(
+            self.name(),
+            &self.model,
+            true,
+            &response.message,
+            &response.usage,
+            &response.stop_reason,
+            stream_start.elapsed().as_millis() as u64,
+        );
         on_event(StreamEvent::Done(response.clone()));
         Ok(response)
     }

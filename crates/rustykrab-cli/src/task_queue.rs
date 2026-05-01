@@ -203,10 +203,14 @@ async fn execute_cron_task(
         effective_chat_id.as_deref(),
     );
 
-    // Run the agent.
+    // Run the agent. Mint a fresh trace id per scheduled run so prompt-log
+    // rows and agent logs for this job line up.
+    let trace_id = Uuid::new_v4();
+    tracing::info!(%trace_id, job_id = %job.id, "scheduled task starting");
     let no_op_event = |_event: AgentEvent| {};
     let result =
-        rustykrab_gateway::run_agent_streaming(state, &mut conv, &prompt, &no_op_event).await;
+        rustykrab_gateway::run_agent_streaming(state, &mut conv, &prompt, &no_op_event, trace_id)
+            .await;
 
     let (status, response_text) = match result {
         Ok(msg) => match &msg.content {

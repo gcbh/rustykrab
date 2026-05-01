@@ -5,6 +5,7 @@ pub mod crypto;
 pub mod error;
 pub mod model;
 pub mod orchestration;
+pub mod prompt_trace;
 pub mod recall;
 pub mod session;
 pub mod tool;
