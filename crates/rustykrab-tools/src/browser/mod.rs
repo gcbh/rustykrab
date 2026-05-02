@@ -10,9 +10,13 @@
 //! - SSRF protection and cookie security
 
 pub mod actions;
+pub mod adaptive;
 pub mod config;
+pub mod fetcher;
 pub mod manager;
+pub mod selectors;
 pub mod snapshot;
+pub mod stealth;
 
 use async_trait::async_trait;
 use base64::Engine;
@@ -23,6 +27,7 @@ use rustykrab_core::{Error, Result, SandboxRequirements, Tool};
 use serde_json::{json, Value};
 
 use crate::security;
+use adaptive::AdaptiveStore;
 use manager::BrowserManager;
 use snapshot::{SnapshotMode, SnapshotOptions, SnapshotStore};
 
@@ -46,6 +51,7 @@ const MAX_CONTENT_BYTES: usize = 50 * 1024; // 50KB cap for page content
 pub struct BrowserTool {
     manager: BrowserManager,
     snapshot_store: SnapshotStore,
+    adaptive_store: AdaptiveStore,
 }
 
 impl BrowserTool {
@@ -53,6 +59,7 @@ impl BrowserTool {
         Self {
             manager: BrowserManager::from_config(),
             snapshot_store: SnapshotStore::new(),
+            adaptive_store: AdaptiveStore::new(),
         }
     }
 
@@ -106,27 +113,23 @@ impl Tool for BrowserTool {
     }
 
     fn description(&self) -> &str {
-        "Control Chrome browsers via DevTools Protocol. Supports multiple isolated browser \
-         profiles, each with its own CDP port and user-data directory. Actions: \
-         status — check browser state; \
-         start — launch a browser profile; \
-         stop — terminate a browser profile; \
-         profiles — list all configured profiles; \
-         tabs — list open tabs (with targetId for addressing); \
-         open — open a URL in a new tab; \
-         close — close a tab by targetId; \
-         focus — bring a tab to front by targetId; \
-         navigate — go to URL in active tab; \
-         snapshot — take accessibility-tree snapshot with element refs; \
-         act — interact with elements by ref from snapshot (click/type/press/hover/select/drag); \
-         screenshot — capture page or element as PNG; \
-         content — extract page text or HTML; \
-         evaluate — run JavaScript; \
-         scroll — scroll the page; \
-         console — get browser console logs; \
-         cookies — list cookies; \
-         pdf — export page as PDF. \
-         Cookies persist across calls. Use snapshot + act for reliable element interaction."
+        "Browse and scrape the web. Three fetch modes plus interactive control of \
+         Chrome via DevTools Protocol. \
+         Fetch modes: \
+         fetch — pure HTTP request with browser-like header packs (impersonate=chrome|firefox|safari|edge), stealthy_headers, custom user-agent, proxy, retries, redirects; \
+         stealth_fetch — full browser navigation with anti-bot patches (block_webrtc, hide_canvas, disable_resources), wait_selector, network_idle, solve_cloudflare, and returns rendered body; \
+         select — CSS or XPath selector engine over either provided html or the active tab DOM, with Scrapling pseudo-selectors ::text and ::attr(name), find_by_text (regex or substring), and adaptive auto_save/auto_match across DOM changes. \
+         Browser control: \
+         status/start/stop — lifecycle; \
+         profiles — list profiles; \
+         tabs/open/close/focus — tab management; \
+         navigate — go to URL (supports wait_selector, wait_selector_state, network_idle, solve_cloudflare); \
+         wait_for — wait for selector / network idle / fixed delay; \
+         snapshot — accessibility-tree with element refs; \
+         act — interact by ref (click/type/press/hover/select/drag); \
+         screenshot/content/evaluate/scroll/console/cookies/pdf. \
+         Cookies persist across calls. Use snapshot + act for reliable element interaction. \
+         Use fetch when JS isn't required, stealth_fetch when it is."
     }
 
     fn sandbox_requirements(&self) -> SandboxRequirements {
@@ -150,7 +153,8 @@ impl Tool for BrowserTool {
                             "tabs", "open", "close", "focus",
                             "navigate", "snapshot", "act", "screenshot",
                             "content", "evaluate", "scroll",
-                            "console", "cookies", "pdf"
+                            "console", "cookies", "pdf",
+                            "fetch", "stealth_fetch", "select", "wait_for"
                         ],
                         "description": "Action to perform"
                     },
@@ -244,6 +248,154 @@ impl Tool for BrowserTool {
                     "highlight": {
                         "type": "boolean",
                         "description": "Snapshot: paint numbered overlay boxes on each ref so a subsequent screenshot shows the labels (default: false). Overlays auto-clear on the next snapshot."
+                    },
+
+                    "method": {
+                        "type": "string",
+                        "enum": ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"],
+                        "description": "HTTP method for 'fetch' (default: GET)"
+                    },
+                    "body": {
+                        "type": "string",
+                        "description": "Raw request body for 'fetch'"
+                    },
+                    "json": {
+                        "description": "JSON body for 'fetch' (object/array/value sent as application/json)"
+                    },
+                    "form": {
+                        "type": "object",
+                        "description": "Form-encoded body for 'fetch'",
+                        "additionalProperties": {"type": "string"}
+                    },
+                    "extra_headers": {
+                        "type": "object",
+                        "description": "Extra headers for 'fetch'/'stealth_fetch'/'navigate'",
+                        "additionalProperties": {"type": "string"}
+                    },
+                    "cookies": {
+                        "type": "object",
+                        "description": "Cookies map for 'fetch' (sent as Cookie header)",
+                        "additionalProperties": {"type": "string"}
+                    },
+                    "user_agent": {
+                        "type": "string",
+                        "description": "Custom User-Agent for 'fetch' or 'stealth_fetch'"
+                    },
+                    "impersonate": {
+                        "type": "string",
+                        "description": "Browser pack to impersonate: chrome, firefox, safari, edge (also accepts versioned variants like 'chrome131')"
+                    },
+                    "stealthy_headers": {
+                        "type": "boolean",
+                        "description": "fetch: send a coordinated browser-like header pack (Sec-Ch-Ua, Sec-Fetch-*, Accept-Language, etc.)"
+                    },
+                    "follow_redirects": {
+                        "type": "boolean",
+                        "description": "fetch: follow redirects (default: true)"
+                    },
+                    "max_redirects": {
+                        "type": "integer",
+                        "description": "fetch: redirect limit (default: 10)"
+                    },
+                    "retries": {
+                        "type": "integer",
+                        "description": "fetch: retry count on transport failure (default: 0)"
+                    },
+                    "proxy": {
+                        "type": "string",
+                        "description": "fetch/stealth_fetch: proxy URL (e.g. http://user:pass@host:8080)"
+                    },
+                    "verify_tls": {
+                        "type": "boolean",
+                        "description": "fetch: verify TLS certificates (default: true)"
+                    },
+
+                    "wait_selector": {
+                        "type": "string",
+                        "description": "navigate/stealth_fetch/wait_for: CSS selector to wait for"
+                    },
+                    "wait_selector_state": {
+                        "type": "string",
+                        "enum": ["attached", "detached", "visible", "hidden"],
+                        "description": "wait_selector state (default: visible)"
+                    },
+                    "network_idle": {
+                        "type": "boolean",
+                        "description": "navigate/stealth_fetch/wait_for: wait for the network to be idle (no new requests for ~500ms)"
+                    },
+                    "solve_cloudflare": {
+                        "type": "boolean",
+                        "description": "navigate/stealth_fetch: best-effort wait for Cloudflare challenge to clear"
+                    },
+                    "block_webrtc": {
+                        "type": "boolean",
+                        "description": "stealth_fetch/navigate: block WebRTC to prevent IP leaks"
+                    },
+                    "hide_canvas": {
+                        "type": "boolean",
+                        "description": "stealth_fetch/navigate: add noise to canvas/WebGL fingerprints"
+                    },
+                    "disable_resources": {
+                        "type": "boolean",
+                        "description": "stealth_fetch/navigate: don't load images/fonts/media (faster)"
+                    },
+                    "block_images": {
+                        "type": "boolean",
+                        "description": "stealth_fetch/navigate: block image loads only"
+                    },
+                    "hide_webdriver": {
+                        "type": "boolean",
+                        "description": "stealth_fetch/navigate: hide navigator.webdriver and other automation tells (default: true)"
+                    },
+
+                    "html": {
+                        "type": "string",
+                        "description": "select: parse this static HTML body instead of querying the live tab"
+                    },
+                    "css": {
+                        "type": "string",
+                        "description": "select: CSS selector. Supports Scrapling pseudo-selectors ::text and ::attr(name)"
+                    },
+                    "xpath": {
+                        "type": "string",
+                        "description": "select: XPath query (live mode only — requires an active tab)"
+                    },
+                    "find_by_text": {
+                        "type": "string",
+                        "description": "select: filter matches by text (substring or regex when 'regex' is true)"
+                    },
+                    "regex": {
+                        "type": "boolean",
+                        "description": "select: treat find_by_text as a regex (default: false)"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "select: max number of matches to return (default 500, hard cap 500)"
+                    },
+                    "include_html": {
+                        "type": "boolean",
+                        "description": "select: include each match's outerHTML"
+                    },
+                    "auto_save": {
+                        "type": "boolean",
+                        "description": "select: store fingerprints of the matches under 'auto_save_id' for adaptive matching later"
+                    },
+                    "auto_match": {
+                        "type": "boolean",
+                        "description": "select: if the selector returns nothing, locate closest matches by similarity to fingerprints saved under 'auto_save_id'"
+                    },
+                    "auto_save_id": {
+                        "type": "string",
+                        "description": "select: identifier for the saved fingerprint set"
+                    },
+                    "auto_match_threshold": {
+                        "type": "number",
+                        "description": "select: minimum similarity (0-1) to accept an adaptive match (default 0.6)"
+                    },
+
+                    "delay_ms": {
+                        "type": "integer",
+                        "description": "wait_for/stealth_fetch: extra delay in ms after other waits resolve"
                     }
                 },
                 "required": ["action"]
@@ -318,6 +470,13 @@ impl Tool for BrowserTool {
 
                 let _ = self.manager.get_browser(&profile).await?;
                 let page = self.manager.get_page(&profile, target_id).await?;
+
+                // Apply stealth before navigating so patches affect the new
+                // document. Network-level overrides (UA, extra headers) are
+                // a no-op when their args are absent.
+                let stealth_opts = stealth::StealthOptions::from_args(&args);
+                let _ = stealth::apply_network_overrides(&page, &stealth_opts).await;
+
                 page.goto(url)
                     .await
                     .map_err(|e| Error::ToolExecution(format!("navigation failed: {e}").into()))?;
@@ -329,6 +488,29 @@ impl Tool for BrowserTool {
                 )
                 .await;
 
+                // Apply DOM-level stealth patches (post-navigation).
+                let _ = stealth::apply_stealth(&page, &stealth_opts).await;
+
+                let mut wait_results = serde_json::Map::new();
+                if let Some(sel) = args["wait_selector"].as_str() {
+                    let state = stealth::WaitState::parse(
+                        args["wait_selector_state"].as_str().unwrap_or("visible"),
+                    );
+                    let ok = stealth::wait_for_selector(&page, sel, state, timeout_ms).await?;
+                    wait_results.insert("wait_selector".into(), Value::Bool(ok));
+                }
+                if args["network_idle"].as_bool().unwrap_or(false) {
+                    let ok = stealth::wait_for_network_idle(&page, 500, timeout_ms).await?;
+                    wait_results.insert("network_idle".into(), Value::Bool(ok));
+                }
+                if args["solve_cloudflare"].as_bool().unwrap_or(false) {
+                    let ok = stealth::solve_cloudflare(&page, timeout_ms).await?;
+                    wait_results.insert("cloudflare_clear".into(), Value::Bool(ok));
+                }
+                if let Some(delay) = args["delay_ms"].as_u64() {
+                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                }
+
                 let title = page.get_title().await.ok().flatten().unwrap_or_default();
                 let current_url = page.url().await.ok().flatten().unwrap_or_default();
 
@@ -336,6 +518,7 @@ impl Tool for BrowserTool {
                     "title": title,
                     "url": current_url,
                     "status": "loaded",
+                    "waits": Value::Object(wait_results),
                     "profile": profile
                 }))
             }
@@ -680,12 +863,197 @@ impl Tool for BrowserTool {
                 }))
             }
 
+            // ── Scrapling.Fetcher ──────────────────────────────────
+            "fetch" => {
+                let params = fetcher::FetchParams::from_args(&args)?;
+                fetcher::execute_fetch(params).await
+            }
+
+            // ── Scrapling.StealthyFetcher (single-call) ────────────
+            "stealth_fetch" => {
+                let url = args["url"].as_str().ok_or_else(|| {
+                    Error::ToolExecution("'stealth_fetch' requires 'url' parameter".into())
+                })?;
+                security::validate_url(url)
+                    .await
+                    .map_err(|e| Error::ToolExecution(e.into()))?;
+
+                let _ = self.manager.get_browser(&profile).await?;
+                let page = self.manager.get_page(&profile, target_id).await?;
+
+                let stealth_opts = stealth::StealthOptions::from_args(&args);
+                let _ = stealth::apply_network_overrides(&page, &stealth_opts).await;
+
+                page.goto(url)
+                    .await
+                    .map_err(|e| Error::ToolExecution(format!("navigation failed: {e}").into()))?;
+
+                let timeout_ms = args["timeout_ms"].as_u64().unwrap_or(30_000);
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_millis(timeout_ms),
+                    page.wait_for_navigation(),
+                )
+                .await;
+
+                let _ = stealth::apply_stealth(&page, &stealth_opts).await;
+
+                let mut wait_results = serde_json::Map::new();
+                if let Some(sel) = args["wait_selector"].as_str() {
+                    let state = stealth::WaitState::parse(
+                        args["wait_selector_state"].as_str().unwrap_or("visible"),
+                    );
+                    let ok = stealth::wait_for_selector(&page, sel, state, timeout_ms).await?;
+                    wait_results.insert("wait_selector".into(), Value::Bool(ok));
+                }
+                if args["network_idle"].as_bool().unwrap_or(true) {
+                    let ok = stealth::wait_for_network_idle(&page, 500, timeout_ms).await?;
+                    wait_results.insert("network_idle".into(), Value::Bool(ok));
+                }
+                if args["solve_cloudflare"].as_bool().unwrap_or(false) {
+                    let ok = stealth::solve_cloudflare(&page, timeout_ms).await?;
+                    wait_results.insert("cloudflare_clear".into(), Value::Bool(ok));
+                }
+                if let Some(delay) = args["delay_ms"].as_u64() {
+                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                }
+
+                let final_url = page.url().await.ok().flatten().unwrap_or_default();
+                let title = page.get_title().await.ok().flatten().unwrap_or_default();
+                let html = page.content().await.unwrap_or_default();
+                let text = page
+                    .evaluate("document.body ? document.body.innerText : ''")
+                    .await
+                    .ok()
+                    .and_then(|r| r.into_value::<String>().ok())
+                    .unwrap_or_default();
+
+                let cookies: Vec<Cookie> = page.get_cookies().await.unwrap_or_default();
+                let cookie_map: std::collections::HashMap<String, String> = cookies
+                    .iter()
+                    .map(|c| (c.name.clone(), mask_cookie_value(&c.value)))
+                    .collect();
+
+                let (truncated_text, text_truncated) = truncate_utf8(&text, MAX_CONTENT_BYTES);
+                let (truncated_html, html_truncated) = truncate_utf8(&html, MAX_CONTENT_BYTES * 4);
+
+                Ok(json!({
+                    "url": final_url,
+                    "title": title,
+                    "status": 200,
+                    "ok": true,
+                    "text": truncated_text,
+                    "text_truncated": text_truncated,
+                    "body": truncated_html,
+                    "body_truncated": html_truncated,
+                    "cookies": cookie_map,
+                    "waits": Value::Object(wait_results),
+                    "profile": profile,
+                }))
+            }
+
+            // ── Scrapling.Selector ─────────────────────────────────
+            "select" => {
+                let params = selectors::SelectParams::from_args(&args);
+
+                let mut matches = if let Some(html) = &params.html {
+                    selectors::select_static(html, &params)?
+                } else {
+                    let _ = self.manager.get_browser(&profile).await?;
+                    let page = self.manager.get_page(&profile, target_id).await?;
+                    selectors::select_live(&page, &params).await?
+                };
+
+                let mut adaptive_used = false;
+                if matches.is_empty() && params.auto_match {
+                    let id = params.auto_save_id.as_deref().unwrap_or_default();
+                    if !id.is_empty() {
+                        // Pull all elements once to build a candidate pool.
+                        let pool_params = selectors::SelectParams {
+                            css: Some("*".to_string()),
+                            ..Default::default()
+                        };
+                        let candidates = if let Some(html) = &params.html {
+                            selectors::select_static(html, &pool_params).unwrap_or_default()
+                        } else {
+                            let page = self.manager.get_page(&profile, target_id).await?;
+                            selectors::select_live(&page, &pool_params)
+                                .await
+                                .unwrap_or_default()
+                        };
+                        let threshold = args["auto_match_threshold"].as_f64().unwrap_or(0.6);
+                        let scored = self
+                            .adaptive_store
+                            .match_against(id, &candidates, threshold)
+                            .await;
+                        matches = scored.into_iter().map(|(m, _)| m).collect();
+                        adaptive_used = !matches.is_empty();
+                    }
+                }
+
+                if params.auto_save {
+                    if let Some(id) = params.auto_save_id.as_deref() {
+                        if !id.is_empty() {
+                            self.adaptive_store.save(id, &matches).await;
+                        }
+                    }
+                }
+
+                let mut value = selectors::matches_to_json(&matches);
+                if let Value::Object(ref mut o) = value {
+                    o.insert("adaptive_used".into(), Value::Bool(adaptive_used));
+                }
+                Ok(value)
+            }
+
+            // ── Wait helper ────────────────────────────────────────
+            "wait_for" => {
+                let _ = self.manager.get_browser(&profile).await?;
+                let page = self.manager.get_page(&profile, target_id).await?;
+                let timeout_ms = args["timeout_ms"].as_u64().unwrap_or(10_000);
+
+                let mut results = serde_json::Map::new();
+                let mut did_any = false;
+
+                if let Some(sel) = args["wait_selector"].as_str() {
+                    let state = stealth::WaitState::parse(
+                        args["wait_selector_state"].as_str().unwrap_or("visible"),
+                    );
+                    let ok = stealth::wait_for_selector(&page, sel, state, timeout_ms).await?;
+                    results.insert("wait_selector".into(), Value::Bool(ok));
+                    did_any = true;
+                }
+                if args["network_idle"].as_bool().unwrap_or(false) {
+                    let ok = stealth::wait_for_network_idle(&page, 500, timeout_ms).await?;
+                    results.insert("network_idle".into(), Value::Bool(ok));
+                    did_any = true;
+                }
+                if args["solve_cloudflare"].as_bool().unwrap_or(false) {
+                    let ok = stealth::solve_cloudflare(&page, timeout_ms).await?;
+                    results.insert("cloudflare_clear".into(), Value::Bool(ok));
+                    did_any = true;
+                }
+                if let Some(delay) = args["delay_ms"].as_u64() {
+                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                    results.insert("delay_ms".into(), Value::Number(delay.into()));
+                    did_any = true;
+                }
+
+                if !did_any {
+                    return Err(Error::ToolExecution(
+                        "'wait_for' requires at least one of: wait_selector, network_idle, solve_cloudflare, delay_ms"
+                            .into(),
+                    ));
+                }
+
+                Ok(Value::Object(results))
+            }
+
             _ => Err(Error::ToolExecution(
                 format!(
                     "unknown browser action: '{action}'. Available: \
                      status, start, stop, profiles, tabs, open, close, focus, \
                      navigate, snapshot, act, screenshot, content, evaluate, \
-                     scroll, console, cookies, pdf"
+                     scroll, console, cookies, pdf, fetch, stealth_fetch, select, wait_for"
                 )
                 .into(),
             )),
