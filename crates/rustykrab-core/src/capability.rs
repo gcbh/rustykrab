@@ -18,6 +18,11 @@ pub enum Capability {
     ShellExec,
     /// Can make outbound HTTP requests.
     HttpRequest,
+    /// Can perform raw-packet network discovery on the local LAN
+    /// (e.g. ARP sweeps, mDNS browsing, broadcast probes). Distinct
+    /// from `HttpRequest` so a session can be allowed to fetch URLs
+    /// without also getting raw-socket discovery, and vice versa.
+    NetDiscovery,
     /// Can access a specific messaging channel by name.
     Channel(String),
     /// Can use a specific tool by name.

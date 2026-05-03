@@ -20,8 +20,10 @@ command allowlist. Pick the right CLI for the job from the recipes below.
    `192.168.0.0/16`, `169.254.0.0/16`, `127.0.0.0/8`, `::1`, `fe80::/10`,
    `fc00::/7`. Refuse or push back if the user asks you to scan, probe, or SSH
    into a public IP or hostname that resolves to one.
-2. **Cap subnet scans at /20** (≤4094 hosts). Larger ranges waste time and may
-   trigger IDS alerts on managed networks.
+2. **Default cap on subnet scans is /20** (≤4094 hosts). Larger ranges waste
+   time and may trigger IDS alerts on managed networks. The user can ask to
+   loosen this — e.g. for a flat /16 office network — and you should comply
+   after warning about scan time and IDS noise.
 3. **SSH uses `BatchMode=yes -o StrictHostKeyChecking=accept-new`** so commands
    fail instead of hanging on prompts.
 4. **Confirm before destructive actions** over SSH (package install, service
@@ -36,6 +38,12 @@ nmap -sn 192.168.1.0/24                 # ICMP + ARP sweep
 arp-scan --interface=eth0 --localnet    # faster, needs root/cap_net_raw
 ip neigh show                           # cached MAC/IP (passive)
 ```
+
+`arp-scan` opens raw sockets, so it must run as root or with the binary
+setuid / `cap_net_raw+ep` set. If the agent is not running as root, expect
+`arp-scan` to fail with a permission error — fall back to `nmap -sn` (which
+uses the same ARP sweep on a local segment but degrades to ICMP without
+root) or `ip neigh show` for the cached entries.
 
 ### Open ports on a host
 ```

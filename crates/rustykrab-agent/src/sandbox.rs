@@ -13,6 +13,11 @@ pub struct SandboxPolicy {
     pub allow_net: bool,
     /// Allow spawning child processes.
     pub allow_spawn: bool,
+    /// Allow raw-packet local-network discovery (ARP sweeps, mDNS,
+    /// broadcast probes). Off by default because the underlying tools
+    /// (e.g. `arp-scan`) typically need raw-socket privileges and the
+    /// blast radius is the operator's whole LAN.
+    pub allow_net_discovery: bool,
     /// Maximum execution time in seconds.
     pub timeout_secs: u64,
     /// Maximum memory in bytes (0 = unlimited).
@@ -26,6 +31,7 @@ impl Default for SandboxPolicy {
             allow_fs_write: false,
             allow_net: false,
             allow_spawn: false,
+            allow_net_discovery: false,
             timeout_secs: 30,
             max_memory_bytes: 256 * 1024 * 1024, // 256 MB
         }
@@ -40,6 +46,7 @@ impl SandboxPolicy {
             allow_fs_write: true,
             allow_net: true,
             allow_spawn: false,
+            allow_net_discovery: false,
             timeout_secs: 60,
             max_memory_bytes: 0,
         }
@@ -97,6 +104,11 @@ fn validate_tool_policy(
     if requirements.needs_net && !policy.allow_net {
         return Err(Error::Auth(format!(
             "sandbox denied tool '{tool_name}': network access not permitted"
+        )));
+    }
+    if requirements.needs_net_discovery && !policy.allow_net_discovery {
+        return Err(Error::Auth(format!(
+            "sandbox denied tool '{tool_name}': raw-packet network discovery not permitted"
         )));
     }
     Ok(())
@@ -204,6 +216,12 @@ mod tests {
     fn req_net() -> SandboxRequirements {
         SandboxRequirements {
             needs_net: true,
+            ..Default::default()
+        }
+    }
+    fn req_net_discovery() -> SandboxRequirements {
+        SandboxRequirements {
+            needs_net_discovery: true,
             ..Default::default()
         }
     }
@@ -381,6 +399,47 @@ mod tests {
             .execute("notion", json!({}), &req_net(), &policy)
             .await
             .is_ok());
+    }
+
+    #[tokio::test]
+    async fn sandbox_denies_net_discovery_without_capability() {
+        let sandbox = ProcessSandbox::new();
+        // allow_net is on, but allow_net_discovery is not — the two
+        // are independent gates.
+        let policy = SandboxPolicy {
+            allow_net: true,
+            allow_spawn: true,
+            ..SandboxPolicy::default()
+        };
+        let result = sandbox
+            .execute(
+                "arp_scan",
+                json!({"interface": "eth0"}),
+                &req_net_discovery(),
+                &policy,
+            )
+            .await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("raw-packet network discovery not permitted"),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sandbox_allows_net_discovery_with_capability() {
+        let sandbox = ProcessSandbox::new();
+        let policy = SandboxPolicy {
+            allow_net_discovery: true,
+            ..SandboxPolicy::default()
+        };
+        let args = json!({"interface": "eth0"});
+        let result = sandbox
+            .execute("arp_scan", args.clone(), &req_net_discovery(), &policy)
+            .await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), args);
     }
 
     #[tokio::test]
