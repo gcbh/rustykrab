@@ -359,16 +359,20 @@ fn is_progress_narration(text: &str) -> bool {
 }
 
 /// Heuristic: did the model respond with a generic idle acknowledgment
-/// instead of doing the requested work? Catches "I am ready. Please provide
-/// your first task.", "Standing by — let me know what you need.", "How can I
-/// help you today?". These responses look polite in a chat REPL but are
-/// failure modes inside a scheduled job: the conversation already contains
-/// the task, so asking for one is the model ignoring its instructions.
+/// instead of doing the requested work? Catches both polite offers
+/// ("I am ready. Please provide your first task.", "How can I help you
+/// today?") and refusal-style stalls ("I cannot perform any work because
+/// no task or instruction has been provided"). These responses look
+/// reasonable in a chat REPL but are failure modes inside a scheduled
+/// job: the conversation already contains the task, so asking for one
+/// or refusing on grounds of "no task" is the model ignoring its
+/// instructions.
 ///
 /// Distinct from the prior tiers:
 /// - `is_planning_only` catches "I'll do X next" (planning).
 /// - `is_progress_narration` catches "I'm currently doing X" (fake progress).
-/// - This catches "I'm waiting for you to tell me X" (idle).
+/// - This catches both "I'm waiting for you to tell me X" (idle) and
+///   "I refuse to do X because nothing was specified" (false-refusal).
 ///
 /// Restricted to short responses (≤400 chars) without code blocks so a
 /// substantive answer that happens to end with "let me know if you need
@@ -382,6 +386,7 @@ fn is_idle_acknowledgment(text: &str) -> bool {
     }
     let lower = text.to_lowercase();
     let idle_markers = [
+        // Polite-offer family — model is volunteering instead of doing.
         "i'm ready",
         "i am ready",
         "ready for your",
@@ -410,6 +415,33 @@ fn is_idle_acknowledgment(text: &str) -> bool {
         "what should i do",
         "what do you want me to",
         "what do you need me to",
+        // Refusal-of-emptiness family — model claims it has no task even
+        // though the user message contained one. The exact phrasing seen
+        // in the field was "I cannot perform any work because no task or
+        // instruction has been provided" — match its pieces, plus the
+        // common variants ("haven't been given a task", "without a task
+        // to perform", "no specific task has been provided").
+        "no task or instruction",
+        "no task has been provided",
+        "no task has been given",
+        "no task was provided",
+        "no instruction has been provided",
+        "no instructions have been provided",
+        "no specific task",
+        "no specific instruction",
+        "haven't been given a task",
+        "have not been given a task",
+        "haven't been provided",
+        "have not been provided with",
+        "haven't received a task",
+        "have not received a task",
+        "i don't have a task",
+        "i do not have a task",
+        "without a task",
+        "without instructions",
+        "without a specific",
+        "task or instruction has been",
+        "task or instructions have been",
     ];
     idle_markers.iter().any(|m| lower.contains(m))
 }
@@ -3263,6 +3295,23 @@ mod response_classification_tests {
         assert_planning("How may I assist you?");
         assert_planning("Awaiting your instructions.");
         assert_planning("Please tell me what you'd like to work on.");
+    }
+
+    #[test]
+    fn refusal_style_idle_response_is_planning() {
+        // Sibling failure mode of the polite-offer family: the model
+        // treats the cron turn as if no task existed and refuses on those
+        // grounds. Every phrasing here was observed in the wild against
+        // a scheduled briefing whose task field was non-empty.
+        assert_planning(
+            "I cannot perform any work because no task or instruction has been provided.",
+        );
+        assert_planning("I'm unable to proceed — no task has been provided in this conversation.");
+        assert_planning("I haven't been given a task to perform.");
+        assert_planning("I have not received a task, so I cannot continue.");
+        assert_planning("Without a task or specific instruction, I have nothing to execute.");
+        assert_planning("I don't have a task to act on at the moment.");
+        assert_planning("No specific task has been provided for this turn.");
     }
 
     #[test]

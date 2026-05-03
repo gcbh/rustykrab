@@ -153,6 +153,20 @@ impl JobStore {
         Ok(rows > 0)
     }
 
+    /// Toggle a job's `enabled` flag. The cron poller skips disabled jobs.
+    /// Used by the executor to retire jobs that turn out to be unrunnable
+    /// (e.g. an empty task body persisted by an older build) so they stop
+    /// firing every cycle.
+    pub fn set_enabled(&self, job_id: &str, enabled: bool) -> Result<(), Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE scheduled_jobs SET enabled = ?1 WHERE id = ?2",
+            params![enabled as i32, job_id],
+        )
+        .map_err(|e| Error::Storage(e.to_string()))?;
+        Ok(())
+    }
+
     /// Attach a conversation id to a job. Called on the first run once the
     /// executor has created (or resumed) the conversation the agent uses.
     pub fn set_conversation_id(&self, job_id: &str, conversation_id: &str) -> Result<(), Error> {
