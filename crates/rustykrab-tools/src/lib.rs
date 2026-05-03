@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 // Security utilities
 pub mod sanitize;
 pub mod security;
