@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.10.3] - 2026-05-03
+
+- fix(cli): wire message tool to Telegram/Slack/Signal channels (#407)
+
 ## [2.10.2] - 2026-05-03
 
 - feat(sandbox): add NetDiscovery capability for raw-packet LAN scans (#408)
