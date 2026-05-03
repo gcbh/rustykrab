@@ -2376,10 +2376,11 @@ async fn execute_single_tool(
         allow_fs_write: capabilities.has(&Capability::FileWrite),
         allow_net: capabilities.has(&Capability::HttpRequest),
         allow_spawn: capabilities.has(&Capability::ShellExec),
+        allow_net_discovery: capabilities.has(&Capability::NetDiscovery),
         // Network-using tools (e.g. `exec` running `nmap`, `curl`, `ssh`) can
         // take several minutes to sweep a subnet. Use a 5-minute timeout when
         // the tool actually needs network access; keep the default 30s otherwise.
-        timeout_secs: if requirements.needs_net {
+        timeout_secs: if requirements.needs_net || requirements.needs_net_discovery {
             300
         } else {
             SandboxPolicy::default().timeout_secs
@@ -2457,6 +2458,11 @@ fn enforce_sandbox_policy(
     if requirements.needs_net && !policy.allow_net {
         return Err(Error::Auth(format!(
             "tool '{tool_name}' requires network access, which is denied by policy"
+        )));
+    }
+    if requirements.needs_net_discovery && !policy.allow_net_discovery {
+        return Err(Error::Auth(format!(
+            "tool '{tool_name}' requires raw-packet network discovery, which is denied by policy"
         )));
     }
     Ok(())

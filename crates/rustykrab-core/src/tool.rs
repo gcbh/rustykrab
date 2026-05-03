@@ -19,13 +19,18 @@ pub struct SandboxRequirements {
     pub needs_net: bool,
     /// Tool spawns child processes.
     pub needs_spawn: bool,
+    /// Tool performs raw-packet network discovery on the local LAN
+    /// (ARP sweeps, mDNS, broadcast probes). Independent of `needs_net`
+    /// because outbound HTTP and raw-socket discovery are different
+    /// risk surfaces.
+    pub needs_net_discovery: bool,
 }
 
 impl SandboxRequirements {
     /// Returns true if this tool can cause external side effects
     /// (writes, network calls, or process spawning).
     pub fn has_side_effects(&self) -> bool {
-        self.needs_fs_write || self.needs_net || self.needs_spawn
+        self.needs_fs_write || self.needs_net || self.needs_spawn || self.needs_net_discovery
     }
 }
 
