@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.10.2] - 2026-05-03
+
+- feat(sandbox): add NetDiscovery capability for raw-packet LAN scans (#408)
+
 ## [2.10.1] - 2026-05-03
 
 - fix(tools): make credential_read/write keychain params conditional (#405)
