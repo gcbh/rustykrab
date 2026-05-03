@@ -30,16 +30,18 @@ impl Tool for CredentialWriteTool {
         "Store, update, or delete a credential/secret. Use this to save API keys, \
          passwords, or tokens so they can be retrieved later with credential_read. \
          All credentials are encrypted at rest.\n\n\
-         Set source to 'keychain' to write to the macOS Keychain. When using keychain \
-         source, you MUST provide both 'service' and 'account' parameters. The \
-         'import_from_keychain' action also requires 'service' and 'account'.\n\n\
+         Required: 'action' and 'name'. 'value' is required for 'set'. 'source' \
+         defaults to 'store' (the encrypted local store) — omit it for normal usage. \
+         'service' and 'account' are required ONLY when source is 'keychain' or when \
+         using 'import_from_keychain'; do not pass them (or pass empty strings) for \
+         the local store.\n\n\
          Examples:\n\
-         - Store in local store: {\"action\": \"set\", \"name\": \"my_api_key\", \"value\": \"sk-123\", \
-         \"source\": \"store\", \"service\": \"\", \"account\": \"\"}\n\
+         - Store locally: {\"action\": \"set\", \"name\": \"my_api_key\", \"value\": \"sk-123\"}\n\
+         - Delete locally: {\"action\": \"delete\", \"name\": \"my_api_key\"}\n\
          - Store in keychain: {\"action\": \"set\", \"name\": \"deploy_key\", \"value\": \"sk-123\", \
          \"source\": \"keychain\", \"service\": \"myapp\", \"account\": \"deploy_token\"}\n\
          - Import from keychain: {\"action\": \"import_from_keychain\", \"name\": \"local_copy\", \
-         \"source\": \"keychain\", \"service\": \"myapp\", \"account\": \"deploy_token\"}"
+         \"service\": \"myapp\", \"account\": \"deploy_token\"}"
     }
 
     fn schema(&self) -> ToolSchema {
@@ -66,18 +68,32 @@ impl Tool for CredentialWriteTool {
                         "type": "string",
                         "enum": ["store", "keychain"],
                         "default": "store",
-                        "description": "Where to write: 'store' (default, encrypted local store) or 'keychain' (macOS Keychain)"
+                        "description": "Where to write: 'store' (default, encrypted local store) or 'keychain' (macOS Keychain). Omit to use 'store'."
                     },
                     "service": {
                         "type": "string",
-                        "description": "macOS Keychain service name. REQUIRED — provide the service name for the keychain entry."
+                        "description": "macOS Keychain service name. Required ONLY when source is 'keychain' or action is 'import_from_keychain'; omit for source 'store'."
                     },
                     "account": {
                         "type": "string",
-                        "description": "macOS Keychain account name. REQUIRED — provide the account name for the keychain entry (e.g. 'deploy_token', 'api_key')."
+                        "description": "macOS Keychain account name (e.g. 'deploy_token', 'api_key'). Required ONLY when source is 'keychain' or action is 'import_from_keychain'; omit for source 'store'."
                     }
                 },
-                "required": ["action", "name", "source", "service", "account"]
+                "required": ["action", "name"],
+                "allOf": [
+                    {
+                        "if": { "properties": { "source": { "const": "keychain" } }, "required": ["source"] },
+                        "then": { "required": ["service", "account"] }
+                    },
+                    {
+                        "if": { "properties": { "action": { "const": "import_from_keychain" } }, "required": ["action"] },
+                        "then": { "required": ["service", "account"] }
+                    },
+                    {
+                        "if": { "properties": { "action": { "const": "set" } }, "required": ["action"] },
+                        "then": { "required": ["value"] }
+                    }
+                ]
             }),
         }
     }
