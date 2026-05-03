@@ -172,6 +172,29 @@ async fn execute_cron_task(
         }
     };
 
+    // Refuse to invoke the agent with an empty prompt body. Older builds
+    // accepted empty `task` strings during creation; those rows still live
+    // in the DB and would otherwise produce "no task or instruction has
+    // been provided" responses on every fire.
+    if task_prompt.trim().is_empty() {
+        let finished_at = Utc::now();
+        tracing::error!(
+            job_id = %job_id,
+            "scheduled job has an empty task body — disabling so it stops firing"
+        );
+        let _ = store.jobs().record_run(
+            job_id,
+            "error",
+            Some("scheduled job has an empty task body; disabled. Recreate with a non-empty task."),
+            started_at,
+            finished_at,
+        );
+        if let Err(e) = store.jobs().set_enabled(job_id, false) {
+            tracing::warn!(job_id = %job_id, "failed to disable empty-task job: {e}");
+        }
+        return;
+    }
+
     let mut conv = match resume_or_create_conversation(&job, state, store) {
         Ok(c) => c,
         Err(e) => {

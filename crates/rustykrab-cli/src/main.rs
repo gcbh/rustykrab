@@ -77,6 +77,30 @@ struct CronAdapter {
     store: rustykrab_store::Store,
 }
 
+/// Merge explicit cron-tool args with the channel context of the calling
+/// conversation. The model often forgets to pass `channel`/`chat_id` when
+/// creating a job from inside a Telegram/Slack/Signal chat, which leaves
+/// the job with no delivery target — every fire is then dropped at
+/// runtime ("scheduled job has no delivery channel"). Caller-supplied
+/// values still win; this only fills in fields the caller left blank.
+fn inherit_channel_for_create(
+    channel: Option<&str>,
+    chat_id: Option<&str>,
+    thread_id: Option<&str>,
+    inherited: Option<&rustykrab_core::types::Conversation>,
+) -> (Option<String>, Option<String>, Option<String>) {
+    let channel_owned = channel
+        .map(str::to_string)
+        .or_else(|| inherited.and_then(|c| c.channel_source.clone()));
+    let chat_id_owned = chat_id
+        .map(str::to_string)
+        .or_else(|| inherited.and_then(|c| c.channel_id.clone()));
+    let thread_id_owned = thread_id
+        .map(str::to_string)
+        .or_else(|| inherited.and_then(|c| c.channel_thread_id.clone()));
+    (channel_owned, chat_id_owned, thread_id_owned)
+}
+
 #[async_trait::async_trait]
 impl CronBackend for CronAdapter {
     async fn create_job(
@@ -87,10 +111,19 @@ impl CronBackend for CronAdapter {
         chat_id: Option<&str>,
         thread_id: Option<&str>,
     ) -> rustykrab_core::Result<serde_json::Value> {
-        let job = self
-            .store
-            .jobs()
-            .create_job(schedule, task, channel, chat_id, thread_id)?;
+        let inherited = rustykrab_core::active_tools::with_session_context(|ctx| {
+            self.store.conversations().get(ctx.conversation_id).ok()
+        })
+        .flatten();
+        let (ch, cid, tid) =
+            inherit_channel_for_create(channel, chat_id, thread_id, inherited.as_ref());
+        let job = self.store.jobs().create_job(
+            schedule,
+            task,
+            ch.as_deref(),
+            cid.as_deref(),
+            tid.as_deref(),
+        )?;
         Ok(serde_json::to_value(&job).expect("ScheduledJob is always serializable"))
     }
 
@@ -2142,4 +2175,87 @@ fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> anyhow::R
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod cron_inheritance_tests {
+    use super::inherit_channel_for_create;
+    use rustykrab_core::types::Conversation;
+    use uuid::Uuid;
+
+    fn empty_conv() -> Conversation {
+        Conversation {
+            id: Uuid::new_v4(),
+            messages: Vec::new(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            summary: None,
+            detected_profile: None,
+            channel_source: None,
+            channel_id: None,
+            channel_thread_id: None,
+        }
+    }
+
+    fn channel_conv(source: &str, id: &str, thread: Option<&str>) -> Conversation {
+        let mut c = empty_conv();
+        c.channel_source = Some(source.to_string());
+        c.channel_id = Some(id.to_string());
+        c.channel_thread_id = thread.map(|s| s.to_string());
+        c
+    }
+
+    #[test]
+    fn caller_args_win_over_inherited() {
+        let conv = channel_conv("telegram", "999", Some("7"));
+        let (ch, cid, tid) =
+            inherit_channel_for_create(Some("slack"), Some("CABC"), Some("ts.1"), Some(&conv));
+        assert_eq!(ch.as_deref(), Some("slack"));
+        assert_eq!(cid.as_deref(), Some("CABC"));
+        assert_eq!(tid.as_deref(), Some("ts.1"));
+    }
+
+    #[test]
+    fn missing_args_fall_back_to_conversation() {
+        // The exact bug: model creates a cron from a Telegram chat without
+        // passing channel/chat_id; the conversation's channel_source must
+        // bridge that gap so the job persists with a delivery target.
+        let conv = channel_conv("telegram", "42", Some("9"));
+        let (ch, cid, tid) = inherit_channel_for_create(None, None, None, Some(&conv));
+        assert_eq!(ch.as_deref(), Some("telegram"));
+        assert_eq!(cid.as_deref(), Some("42"));
+        assert_eq!(tid.as_deref(), Some("9"));
+    }
+
+    #[test]
+    fn partial_args_fill_remaining_from_conversation() {
+        // Caller passed channel only (e.g. "make this a Slack job") but
+        // forgot chat_id — inherit chat_id from the active conversation
+        // rather than persisting a half-configured job.
+        let conv = channel_conv("telegram", "42", Some("9"));
+        let (ch, cid, tid) = inherit_channel_for_create(Some("slack"), None, None, Some(&conv));
+        assert_eq!(ch.as_deref(), Some("slack"));
+        // chat_id falls back to conv even though the channel switched —
+        // not perfect (Slack chat_ids look different), but better than
+        // dropping every fire on the floor. The model can override.
+        assert_eq!(cid.as_deref(), Some("42"));
+        assert_eq!(tid.as_deref(), Some("9"));
+    }
+
+    #[test]
+    fn no_session_and_no_args_yields_all_none() {
+        let (ch, cid, tid) = inherit_channel_for_create(None, None, None, None);
+        assert!(ch.is_none());
+        assert!(cid.is_none());
+        assert!(tid.is_none());
+    }
+
+    #[test]
+    fn empty_conversation_doesnt_inherit_anything() {
+        let conv = empty_conv();
+        let (ch, cid, tid) = inherit_channel_for_create(None, None, None, Some(&conv));
+        assert!(ch.is_none());
+        assert!(cid.is_none());
+        assert!(tid.is_none());
+    }
 }

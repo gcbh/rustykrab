@@ -107,6 +107,16 @@ impl Tool for CronTool {
                 let task = args["task"].as_str().ok_or_else(|| {
                     rustykrab_core::Error::ToolExecution("missing task for create action".into())
                 })?;
+                if task.trim().is_empty() {
+                    // An empty task makes the scheduled prompt collapse to
+                    // "Task: " on every fire, which the model reasonably
+                    // refuses ("no task or instruction has been provided").
+                    // Reject at creation time so the operator sees the
+                    // error instead of a string of mysterious cron failures.
+                    return Err(rustykrab_core::Error::ToolExecution(
+                        "task must be a non-empty description of the work to perform".into(),
+                    ));
+                }
 
                 let channel = args["channel"].as_str();
                 let chat_id = args["chat_id"].as_str();
@@ -176,5 +186,100 @@ impl Tool for CronTool {
                 format!("unknown action: {action}").into(),
             )),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Stub backend that records whether `create_job` was reached.
+    struct SpyBackend {
+        called: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait]
+    impl CronBackend for SpyBackend {
+        async fn create_job(
+            &self,
+            _schedule: &str,
+            _task: &str,
+            _channel: Option<&str>,
+            _chat_id: Option<&str>,
+            _thread_id: Option<&str>,
+        ) -> Result<Value> {
+            self.called.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(json!({"ok": true}))
+        }
+        async fn list_jobs(&self) -> Result<Value> {
+            Ok(json!([]))
+        }
+        async fn delete_job(&self, _job_id: &str) -> Result<Value> {
+            Ok(json!({"deleted": false}))
+        }
+        async fn list_runs(&self, _job_id: &str, _limit: u32) -> Result<Value> {
+            Ok(json!([]))
+        }
+    }
+
+    fn spy() -> (Arc<SpyBackend>, CronTool) {
+        let backend = Arc::new(SpyBackend {
+            called: std::sync::atomic::AtomicBool::new(false),
+        });
+        let tool = CronTool::new(backend.clone());
+        (backend, tool)
+    }
+
+    #[tokio::test]
+    async fn create_rejects_empty_task() {
+        // Empty/whitespace tasks would propagate to the executor as
+        // "Task: " with no body, prompting the model to refuse with
+        // "no task or instruction has been provided" on every fire.
+        // Catch it at creation time.
+        let (backend, tool) = spy();
+        let err = tool
+            .execute(json!({
+                "action": "create",
+                "schedule": "0 9 * * *",
+                "task": "",
+            }))
+            .await
+            .expect_err("empty task must be rejected");
+        assert!(
+            err.to_string().to_lowercase().contains("non-empty"),
+            "error should explain why: got {err}"
+        );
+        assert!(
+            !backend.called.load(std::sync::atomic::Ordering::SeqCst),
+            "backend.create_job should not have been reached"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_rejects_whitespace_only_task() {
+        let (backend, tool) = spy();
+        tool.execute(json!({
+            "action": "create",
+            "schedule": "0 9 * * *",
+            "task": "   \t\n  ",
+        }))
+        .await
+        .expect_err("whitespace-only task must be rejected");
+        assert!(!backend.called.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn create_accepts_real_task() {
+        let (backend, tool) = spy();
+        let result = tool
+            .execute(json!({
+                "action": "create",
+                "schedule": "0 9 * * *",
+                "task": "Write the daily briefing.",
+            }))
+            .await
+            .expect("real task should succeed");
+        assert_eq!(result["action"], "create");
+        assert!(backend.called.load(std::sync::atomic::Ordering::SeqCst));
     }
 }
