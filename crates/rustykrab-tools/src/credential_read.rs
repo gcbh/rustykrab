@@ -32,12 +32,13 @@ impl Tool for CredentialReadTool {
         "Read a stored credential/secret by name, or list all stored credential names. \
          Use this to retrieve API keys, passwords, or tokens needed to authenticate \
          with external services. Credentials are stored encrypted at rest.\n\n\
-         Set source to 'keychain' to read credentials directly from the macOS Keychain. \
-         When using keychain source, you MUST provide both 'service' and 'account' \
-         parameters.\n\n\
+         Only 'action' is always required. 'source' defaults to 'store' (the encrypted \
+         local store). 'name' is required for 'get'/'read' against the store. 'service' \
+         and 'account' are required ONLY when source is 'keychain' — do not pass them \
+         (or pass empty strings) for the local store.\n\n\
          Examples:\n\
-         - List secrets from local store: {\"action\": \"list\", \"source\": \"store\"}\n\
-         - Read from local store: {\"action\": \"get\", \"source\": \"store\", \"name\": \"my_api_key\"}\n\
+         - List local secrets: {\"action\": \"list\"}\n\
+         - Read from local store: {\"action\": \"get\", \"name\": \"my_api_key\"}\n\
          - Read from keychain: {\"action\": \"get\", \"source\": \"keychain\", \"service\": \"myapp\", \"account\": \"deploy_token\"}"
     }
 
@@ -55,24 +56,30 @@ impl Tool for CredentialReadTool {
                     },
                     "name": {
                         "type": "string",
-                        "description": "The name/key of the secret to retrieve (required for 'get' action when source is 'store')"
+                        "description": "The name/key of the secret to retrieve. Required for 'get'/'read' when source is 'store' (the default)."
                     },
                     "source": {
                         "type": "string",
                         "enum": ["store", "keychain"],
                         "default": "store",
-                        "description": "Where to read from: 'store' (default, encrypted local store) or 'keychain' (macOS Keychain)"
+                        "description": "Where to read from: 'store' (default, encrypted local store) or 'keychain' (macOS Keychain). Omit to use 'store'."
                     },
                     "service": {
                         "type": "string",
-                        "description": "macOS Keychain service name (the 'Where' field in Keychain Access). REQUIRED — provide the service name associated with the keychain entry."
+                        "description": "macOS Keychain service name (the 'Where' field in Keychain Access). Required ONLY when source is 'keychain'; omit for source 'store'."
                     },
                     "account": {
                         "type": "string",
-                        "description": "macOS Keychain account name. REQUIRED — provide the account name associated with the keychain entry (e.g. 'deploy_token', 'api_key', 'rustykrab')."
+                        "description": "macOS Keychain account name (e.g. 'deploy_token', 'api_key'). Required ONLY when source is 'keychain'; omit for source 'store'."
                     }
                 },
-                "required": ["action", "source", "service", "account"]
+                "required": ["action"],
+                "allOf": [
+                    {
+                        "if": { "properties": { "source": { "const": "keychain" } }, "required": ["source"] },
+                        "then": { "required": ["service", "account"] }
+                    }
+                ]
             }),
         }
     }
