@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.10.4] - 2026-05-03
+
+- fix(cron): catch refusal idle responses and inherit channel on create (#409)
+
 ## [2.10.3] - 2026-05-03
 
 - fix(cli): wire message tool to Telegram/Slack/Signal channels (#407)
