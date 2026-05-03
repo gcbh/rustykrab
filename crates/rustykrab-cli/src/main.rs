@@ -21,7 +21,7 @@ use rustykrab_agent::{
 };
 use rustykrab_channels::slack::SlackInboundMessage;
 use rustykrab_channels::telegram::ChannelMessage;
-use rustykrab_channels::{SlackChannel, TelegramChannel, VideoChannel, VideoConfig};
+use rustykrab_channels::{SignalChannel, SlackChannel, TelegramChannel, VideoChannel, VideoConfig};
 use rustykrab_core::model::ModelProvider;
 use rustykrab_core::orchestration::OrchestrationConfig;
 use rustykrab_core::types::{ContentPart, MessageContent};
@@ -32,7 +32,7 @@ use rustykrab_memory::embedding::FastEmbedder;
 use rustykrab_memory::storage::SqliteMemoryStorage;
 use rustykrab_memory::{MemoryConfig, MemorySystem};
 use rustykrab_skills::SkillRegistry;
-use rustykrab_tools::{CronBackend, MemoryBackend};
+use rustykrab_tools::{CronBackend, MemoryBackend, MessageBackend};
 use tokio::sync::mpsc;
 use tracing_subscriber::fmt;
 use tracing_subscriber::layer::SubscriberExt;
@@ -139,6 +139,127 @@ impl CronBackend for CronAdapter {
     ) -> rustykrab_core::Result<serde_json::Value> {
         let runs = self.store.jobs().list_runs(job_id, limit)?;
         Ok(serde_json::to_value(&runs).expect("Vec<JobRun> is always serializable"))
+    }
+}
+
+/// Late-binding holder for channel handles.
+///
+/// The `message` tool is registered alongside the other built-in tools, before
+/// any channel is constructed (channels are attached to `AppState` later, and
+/// `state.tools` is captured by-value when state is cloned for spawned agent
+/// loops). The adapter therefore reads its channels through this shared hub,
+/// which is populated in stages as each channel comes up during startup.
+#[derive(Default)]
+struct ChannelHub {
+    telegram: std::sync::RwLock<Option<Arc<TelegramChannel>>>,
+    slack: std::sync::RwLock<Option<Arc<SlackChannel>>>,
+    signal: std::sync::RwLock<Option<Arc<SignalChannel>>>,
+}
+
+impl ChannelHub {
+    fn set_telegram(&self, ch: Arc<TelegramChannel>) {
+        *self.telegram.write().expect("telegram hub poisoned") = Some(ch);
+    }
+    fn set_slack(&self, ch: Arc<SlackChannel>) {
+        *self.slack.write().expect("slack hub poisoned") = Some(ch);
+    }
+    fn set_signal(&self, ch: Arc<SignalChannel>) {
+        *self.signal.write().expect("signal hub poisoned") = Some(ch);
+    }
+    fn telegram(&self) -> Option<Arc<TelegramChannel>> {
+        self.telegram.read().expect("telegram hub poisoned").clone()
+    }
+    fn slack(&self) -> Option<Arc<SlackChannel>> {
+        self.slack.read().expect("slack hub poisoned").clone()
+    }
+    fn signal(&self) -> Option<Arc<SignalChannel>> {
+        self.signal.read().expect("signal hub poisoned").clone()
+    }
+}
+
+/// Adapter bridging the persistent channel handles to the [`MessageBackend`]
+/// trait so the `message` tool can deliver to Telegram, Slack, or Signal
+/// without resorting to shell `curl` (which is sandbox-restricted and would
+/// also bypass the channel allowlist / retry / chunking logic).
+struct MessageAdapter {
+    hub: Arc<ChannelHub>,
+}
+
+#[async_trait::async_trait]
+impl MessageBackend for MessageAdapter {
+    async fn send_message(
+        &self,
+        channel: &str,
+        text: &str,
+        chat_id: Option<&str>,
+        thread_id: Option<&str>,
+    ) -> rustykrab_core::Result<serde_json::Value> {
+        match channel {
+            "telegram" => {
+                let tg = self.hub.telegram().ok_or_else(|| {
+                    rustykrab_core::Error::ToolExecution(
+                        "telegram channel is not configured (set TELEGRAM_BOT_TOKEN)".into(),
+                    )
+                })?;
+                let cid = chat_id.ok_or_else(|| {
+                    rustykrab_core::Error::ToolExecution(
+                        "telegram requires chat_id (numeric)".into(),
+                    )
+                })?;
+                let chat_id_num = cid.parse::<i64>().map_err(|_| {
+                    rustykrab_core::Error::ToolExecution(
+                        format!("invalid telegram chat_id '{cid}': must be numeric").into(),
+                    )
+                })?;
+                let thread = thread_id.and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+                tg.send_text(chat_id_num, text, thread)
+                    .await
+                    .map_err(|e| rustykrab_core::Error::ToolExecution(e.to_string().into()))?;
+                Ok(serde_json::json!({ "delivered": "telegram", "chat_id": cid }))
+            }
+            "slack" => {
+                let sl = self.hub.slack().ok_or_else(|| {
+                    rustykrab_core::Error::ToolExecution(
+                        "slack channel is not configured (set SLACK_BOT_TOKEN/SLACK_APP_TOKEN)"
+                            .into(),
+                    )
+                })?;
+                let cid = chat_id.ok_or_else(|| {
+                    rustykrab_core::Error::ToolExecution(
+                        "slack requires chat_id (channel id, e.g. 'Cxxxxx')".into(),
+                    )
+                })?;
+                let ts = sl
+                    .send_text(cid, text, thread_id)
+                    .await
+                    .map_err(|e| rustykrab_core::Error::ToolExecution(e.to_string().into()))?;
+                Ok(serde_json::json!({ "delivered": "slack", "channel": cid, "ts": ts }))
+            }
+            "signal" => {
+                let sig = self.hub.signal().ok_or_else(|| {
+                    rustykrab_core::Error::ToolExecution(
+                        "signal channel is not configured (set SIGNAL_ACCOUNT)".into(),
+                    )
+                })?;
+                let recipient = chat_id.ok_or_else(|| {
+                    rustykrab_core::Error::ToolExecution(
+                        "signal requires chat_id (E.164 phone number)".into(),
+                    )
+                })?;
+                sig.send_text(recipient, text)
+                    .await
+                    .map_err(|e| rustykrab_core::Error::ToolExecution(e.to_string().into()))?;
+                Ok(serde_json::json!({ "delivered": "signal", "recipient": recipient }))
+            }
+            "webchat" => Err(rustykrab_core::Error::ToolExecution(
+                "webchat send is per-session and not routable through the message tool; \
+                 produce a normal assistant message instead"
+                    .into(),
+            )),
+            other => Err(rustykrab_core::Error::ToolExecution(
+                format!("unknown channel '{other}' (supported: telegram, slack, signal)").into(),
+            )),
+        }
     }
 }
 
@@ -510,6 +631,17 @@ async fn main() -> anyhow::Result<()> {
         Some(skill_registry.clone()),
     ));
 
+    // --- Message tool (delivers via Telegram/Slack/Signal) ---
+    // Registered up-front with an empty hub; channel handles are stashed into
+    // the hub as they're constructed below. This avoids the agent reaching
+    // for `exec curl` to talk to the channel APIs.
+    let channel_hub = Arc::new(ChannelHub::default());
+    let message_backend: Arc<dyn MessageBackend> = Arc::new(MessageAdapter {
+        hub: channel_hub.clone(),
+    });
+    tools.extend(rustykrab_tools::message_tools(message_backend));
+    tracing::info!("message tool registered");
+
     // --- Cron tool (task scheduling) ---
     let cron_backend: Arc<dyn CronBackend> = Arc::new(CronAdapter {
         store: store.clone(),
@@ -607,6 +739,7 @@ async fn main() -> anyhow::Result<()> {
 
         let tg = Arc::new(tg);
         telegram_arc = Some(tg.clone());
+        channel_hub.set_telegram(tg.clone());
         state = state.with_telegram(tg.clone());
 
         if let Ok(webhook_url) = std::env::var("TELEGRAM_WEBHOOK_URL") {
@@ -657,6 +790,7 @@ async fn main() -> anyhow::Result<()> {
         }
 
         let sig = Arc::new(sig);
+        channel_hub.set_signal(sig.clone());
         state = state.with_signal(sig.clone());
 
         // Health check — verify signal-cli-rest-api is running.
@@ -733,6 +867,7 @@ async fn main() -> anyhow::Result<()> {
 
         let sl = Arc::new(sl);
         slack_arc = Some(sl.clone());
+        channel_hub.set_slack(sl.clone());
         state = state.with_slack(sl.clone());
 
         let sl_socket = sl.clone();
