@@ -473,20 +473,106 @@ fn build_scheduled_prompt(
     format!("{body}{skill_block}\n\n{delivery}")
 }
 
-/// If `task_prompt` is the bare name of a registered SKILL.md skill, return
+/// If `task_prompt` references a registered SKILL.md skill, return
 /// `(name, body)` so the runner can inline the recipe into the prompt.
 ///
-/// Matches conservatively: the trimmed task must equal the skill name
-/// exactly. Anything else (free-form natural-language tasks, tasks that
-/// reference a skill by sentence) is left untouched — those still rely on
-/// the model calling the `skills` tool.
+/// Matching tiers, tried in order:
+///   1. Exact (case-insensitive) match on the trimmed task body — `"daily_briefing"`,
+///      `"  Daily_Briefing\n"`.
+///   2. Whole-word substring match on any registered skill name —
+///      `"Run the daily_briefing skill"`, `"do daily_briefing now"`. "Whole word"
+///      means the skill name appears in the task with non-identifier chars on
+///      both sides, so `"daily_briefing-extended"` does NOT match the
+///      `daily_briefing` skill.
+///
+/// If multiple skills match by substring, the longest name wins (so a
+/// `"daily_briefing_v2"` skill beats a `"briefing"` skill when both appear),
+/// with alphabetical order as a deterministic tiebreaker.
+///
+/// Why loose matching: small local models reliably execute a recipe when its
+/// body is in the prompt, but improvise unreliably from a one-line description.
+/// Operators commonly schedule jobs with natural-language task strings rather
+/// than bare skill names; without substring matching, those tasks never get the
+/// body inlined and the model loops on tool-discovery before giving up.
 fn resolve_skill_for_task(registry: &SkillRegistry, task_prompt: &str) -> Option<(String, String)> {
     let trimmed = task_prompt.trim();
     if trimmed.is_empty() {
         return None;
     }
-    let md = registry.get_md(trimmed)?;
+
+    let skills = registry.md_skills();
+    if skills.is_empty() {
+        return None;
+    }
+
+    let trimmed_lower = trimmed.to_ascii_lowercase();
+
+    // Tier 1: exact case-insensitive match on the whole task body.
+    if let Some(md) = skills
+        .iter()
+        .find(|s| s.frontmatter.name.eq_ignore_ascii_case(trimmed))
+    {
+        return Some((md.frontmatter.name.clone(), md.raw_body.clone()));
+    }
+
+    // Tier 2: whole-word substring match. Collect all candidates so we can
+    // pick the longest (most specific) one deterministically.
+    let mut candidates: Vec<&Arc<rustykrab_skills::skill_md::SkillMd>> = skills
+        .iter()
+        .filter(|s| {
+            let name = s.frontmatter.name.to_ascii_lowercase();
+            !name.is_empty() && contains_whole_word(&trimmed_lower, &name)
+        })
+        .collect();
+
+    if candidates.is_empty() {
+        return None;
+    }
+
+    // Longest name first; alphabetical as the tiebreak so the result is stable
+    // across runs even if the registry's HashMap iteration order changes.
+    candidates.sort_by(|a, b| {
+        b.frontmatter
+            .name
+            .len()
+            .cmp(&a.frontmatter.name.len())
+            .then_with(|| a.frontmatter.name.cmp(&b.frontmatter.name))
+    });
+    let md = candidates[0];
     Some((md.frontmatter.name.clone(), md.raw_body.clone()))
+}
+
+/// True if `needle` appears in `haystack` with non-identifier characters
+/// (or string boundaries) on both sides. Both inputs are expected to be
+/// already lowercased by the caller.
+///
+/// "Identifier character" here is `[A-Za-z0-9_-]`, matching the character
+/// set skill names are allowed to use. Hyphens count as part of a word so
+/// that `daily_briefing` doesn't spuriously match inside
+/// `daily_briefing-extended`.
+fn contains_whole_word(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return false;
+    }
+    for (i, _) in haystack.match_indices(needle) {
+        let before_ok = haystack[..i]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !is_skill_name_char(c));
+        let end = i + needle.len();
+        let after_ok = haystack[end..]
+            .chars()
+            .next()
+            .is_none_or(|c| !is_skill_name_char(c));
+        if before_ok && after_ok {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_skill_name_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_' || c == '-'
 }
 
 /// Stamp the resolved channel triple onto a conversation that doesn't carry
@@ -691,34 +777,36 @@ mod tests {
         assert!(conv.channel_thread_id.is_none());
     }
 
-    #[test]
-    fn resolve_skill_for_task_matches_bare_skill_name() {
+    fn make_skill(name: &str, body: &str) -> Arc<rustykrab_skills::skill_md::SkillMd> {
         use rustykrab_skills::skill_md::{
             RequirementValidation, SkillMd, SkillMdFrontmatter, SkillRequirements,
         };
         use std::collections::HashMap;
         use std::path::PathBuf;
-        use std::sync::Arc;
 
-        let registry = SkillRegistry::new();
-        let skill = Arc::new(SkillMd {
-            path: PathBuf::from("/skills/morning-briefing"),
+        Arc::new(SkillMd {
+            path: PathBuf::from(format!("/skills/{name}")),
             frontmatter: SkillMdFrontmatter {
-                name: "morning-briefing".to_string(),
-                description: "Daily briefing".to_string(),
+                name: name.to_string(),
+                description: format!("{name} description"),
                 version: "1.0".to_string(),
                 requires: SkillRequirements::default(),
                 user_invocable: true,
                 emoji: None,
                 extra: HashMap::new(),
             },
-            raw_body: "Step 1: do the thing.".to_string(),
+            raw_body: body.to_string(),
             validation: RequirementValidation {
                 missing_env: Vec::new(),
                 missing_bins: Vec::new(),
             },
-        });
-        registry.register_md(skill);
+        })
+    }
+
+    #[test]
+    fn resolve_skill_for_task_matches_bare_skill_name() {
+        let registry = SkillRegistry::new();
+        registry.register_md(make_skill("morning-briefing", "Step 1: do the thing."));
 
         // Trimmed bare match → resolves.
         let resolved = resolve_skill_for_task(&registry, "  morning-briefing\n");
@@ -731,12 +819,83 @@ mod tests {
             Some("Step 1: do the thing.")
         );
 
-        // Unrelated task → no resolution; the model still has to call
-        // `skills.load` if it wants the body.
-        assert!(resolve_skill_for_task(&registry, "do morning-briefing now").is_none());
+        // Case-insensitive bare match → still resolves.
+        let resolved = resolve_skill_for_task(&registry, "Morning-Briefing");
+        assert_eq!(
+            resolved.as_ref().map(|(n, _)| n.as_str()),
+            Some("morning-briefing")
+        );
 
         // Empty input → no resolution.
         assert!(resolve_skill_for_task(&registry, "   ").is_none());
+    }
+
+    #[test]
+    fn resolve_skill_for_task_matches_natural_language_reference() {
+        let registry = SkillRegistry::new();
+        registry.register_md(make_skill(
+            "daily_briefing",
+            "Step 1: gmail.\nStep 2: weather.\nStep 7: post to telegram.",
+        ));
+
+        // The bug this fix targets: operators commonly schedule jobs with
+        // sentence-shaped task strings, not bare skill names. These all need
+        // to resolve so the body gets inlined.
+        for task in [
+            "Run the daily_briefing skill",
+            "do daily_briefing now",
+            "DAILY_BRIEFING please",
+            "skill: daily_briefing",
+        ] {
+            let resolved = resolve_skill_for_task(&registry, task);
+            assert_eq!(
+                resolved.as_ref().map(|(n, _)| n.as_str()),
+                Some("daily_briefing"),
+                "expected daily_briefing to resolve for task {task:?}"
+            );
+            assert!(
+                resolved.unwrap().1.contains("Step 7"),
+                "body should be the full skill body, not just the name"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_skill_for_task_requires_whole_word_boundary() {
+        let registry = SkillRegistry::new();
+        registry.register_md(make_skill("briefing", "body"));
+
+        // Substring matches that aren't whole words must NOT resolve —
+        // otherwise a "briefing" skill would steal tasks meant for an
+        // unrelated "debriefing" or "briefings_v2" name.
+        assert!(resolve_skill_for_task(&registry, "do the debriefing").is_none());
+        assert!(resolve_skill_for_task(&registry, "open briefings_v2").is_none());
+        assert!(resolve_skill_for_task(&registry, "briefing-extended report").is_none());
+
+        // But a true word-boundary occurrence resolves.
+        assert!(resolve_skill_for_task(&registry, "send the briefing.").is_some());
+        assert!(resolve_skill_for_task(&registry, "(briefing) now").is_some());
+    }
+
+    #[test]
+    fn resolve_skill_for_task_picks_longest_match_when_multiple_skills_match() {
+        let registry = SkillRegistry::new();
+        registry.register_md(make_skill("briefing", "short body"));
+        registry.register_md(make_skill("daily_briefing", "long body"));
+
+        // Both names appear (briefing is a whole-word match next to the
+        // colon and the period). The more specific name wins so we don't
+        // run the wrong recipe.
+        let resolved =
+            resolve_skill_for_task(&registry, "Run daily_briefing: morning briefing.").unwrap();
+        assert_eq!(resolved.0, "daily_briefing");
+        assert_eq!(resolved.1, "long body");
+    }
+
+    #[test]
+    fn resolve_skill_for_task_no_skills_registered() {
+        let registry = SkillRegistry::new();
+        assert!(resolve_skill_for_task(&registry, "anything at all").is_none());
     }
 
     #[test]
