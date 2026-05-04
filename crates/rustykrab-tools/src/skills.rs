@@ -248,6 +248,84 @@ fn load_response(name: &str, skill: &rustykrab_skills::SkillMd) -> Value {
     })
 }
 
+/// Adapter that exposes a single SKILL.md skill as a first-class `Tool`.
+///
+/// The point of this adapter is discoverability. A meta-tool like `SkillsTool`
+/// requires the model to (1) read the `<available_skills>` catalog in the
+/// system prompt, (2) realize a skill matches the task, (3) call `skills`
+/// with `action="load"` and the right `name`. Small local models are bad at
+/// step 3 — they're trained much harder on "call a tool" than on "consult a
+/// catalog and call a meta-tool with the right enum + arg." Promoting each
+/// skill to its own native tool replaces three inferences with one and rides
+/// the strong tool-use prior the model already has.
+///
+/// Execution semantics: calling the tool returns the SKILL.md body verbatim
+/// as the tool result (a JSON string). The model reads it as instructions and
+/// executes the recipe over subsequent tool calls in the same turn — same as
+/// today's `SkillsTool::action_load`, just delivered through a tool the model
+/// is far more likely to invoke unprompted.
+pub struct SkillTool {
+    skill: Arc<rustykrab_skills::SkillMd>,
+}
+
+impl SkillTool {
+    pub fn new(skill: Arc<rustykrab_skills::SkillMd>) -> Self {
+        Self { skill }
+    }
+
+    /// The skill name, used as the tool name. Constrained to `[a-z0-9_-]` by
+    /// the SKILL.md loader, so it's already a safe tool identifier.
+    fn skill_name(&self) -> &str {
+        &self.skill.frontmatter.name
+    }
+}
+
+#[async_trait]
+impl Tool for SkillTool {
+    fn name(&self) -> &str {
+        self.skill_name()
+    }
+
+    fn description(&self) -> &str {
+        // Use the SKILL.md description verbatim. We deliberately don't prepend
+        // a "[Skill]" tag or boilerplate about "calling this returns a recipe":
+        // the tool-result-is-instructions pattern is something models already
+        // handle natively (web_search, web_fetch, etc. all return text the
+        // model then acts on), and extra framing would just dilute the
+        // signal that picks this tool over neighbours in the schema.
+        &self.skill.frontmatter.description
+    }
+
+    fn schema(&self) -> ToolSchema {
+        // No parameters: the tool name *is* the routing. Activating the skill
+        // takes no args; the body is the same regardless of caller intent.
+        ToolSchema {
+            name: self.name().to_string(),
+            description: self.description().to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    fn available(&self) -> bool {
+        // Hide skills whose declared requirements (env vars, binaries) aren't
+        // satisfied — calling one would just produce a recipe the agent
+        // can't execute anyway.
+        self.skill.validation.is_satisfied()
+    }
+
+    async fn execute(&self, _args: Value) -> Result<Value> {
+        // Return the body as a bare JSON string, not a structured object.
+        // Models read tool results as the next round of "input" and act on
+        // text directly; wrapping it in `{ "body": ... }` would force the
+        // model to do an extra parse step that small models routinely skip.
+        Ok(Value::String(self.skill.raw_body.clone()))
+    }
+}
+
 /// Validate that a skill name contains only `[a-z0-9_-]` and is 1–64 chars.
 /// Strict allowlist blocks path traversal.
 fn is_valid_name(name: &str) -> bool {
@@ -612,5 +690,129 @@ mod tests {
             .await;
         assert!(r.is_err());
         assert!(r.unwrap_err().to_string().contains("unknown action"));
+    }
+
+    fn make_skill_md(name: &str, description: &str, body: &str) -> Arc<rustykrab_skills::SkillMd> {
+        use rustykrab_skills::skill_md::{
+            RequirementValidation, SkillMd, SkillMdFrontmatter, SkillRequirements,
+        };
+        use std::collections::HashMap;
+        use std::path::PathBuf;
+
+        Arc::new(SkillMd {
+            path: PathBuf::from(format!("/skills/{name}")),
+            frontmatter: SkillMdFrontmatter {
+                name: name.to_string(),
+                description: description.to_string(),
+                version: "1.0".to_string(),
+                requires: SkillRequirements::default(),
+                user_invocable: true,
+                emoji: None,
+                extra: HashMap::new(),
+            },
+            raw_body: body.to_string(),
+            validation: RequirementValidation {
+                missing_env: Vec::new(),
+                missing_bins: Vec::new(),
+            },
+        })
+    }
+
+    #[tokio::test]
+    async fn skill_tool_uses_skill_name_and_description() {
+        let tool = SkillTool::new(make_skill_md(
+            "daily_briefing",
+            "Generate the daily briefing.",
+            "Step 1: do the thing.",
+        ));
+
+        // The tool's identity is the skill's identity — that's the whole
+        // point. If these ever drift, the model's schema view of the skill
+        // and the registry's view diverge.
+        assert_eq!(tool.name(), "daily_briefing");
+        assert_eq!(tool.description(), "Generate the daily briefing.");
+    }
+
+    #[tokio::test]
+    async fn skill_tool_execute_returns_body_as_bare_string() {
+        let body = "# Daily briefing\n\nStep 1: gmail.\nStep 2: weather.";
+        let tool = SkillTool::new(make_skill_md("daily_briefing", "desc", body));
+
+        let result = tool.execute(json!({})).await.unwrap();
+
+        // Bare string, not a JSON object: models receive tool results as
+        // text and act on them directly. Wrapping in { "body": ... } would
+        // force an extra parse step.
+        match result {
+            Value::String(s) => assert_eq!(s, body),
+            other => panic!("expected JSON string, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn skill_tool_execute_ignores_args() {
+        // The tool name is the routing — args don't change behavior.
+        // Defending against the model passing junk args.
+        let tool = SkillTool::new(make_skill_md("s", "d", "BODY"));
+        let r1 = tool.execute(json!({})).await.unwrap();
+        let r2 = tool.execute(json!({ "junk": "ignored" })).await.unwrap();
+        let r3 = tool.execute(Value::Null).await.unwrap();
+
+        assert_eq!(r1, r2);
+        assert_eq!(r2, r3);
+        assert_eq!(r1, Value::String("BODY".to_string()));
+    }
+
+    #[tokio::test]
+    async fn skill_tool_schema_has_empty_params() {
+        // Empty object schema is what we want: the model sees a tool that
+        // takes no args, and the schema rejects accidental extras.
+        let tool = SkillTool::new(make_skill_md("s", "d", "b"));
+        let schema = tool.schema();
+
+        assert_eq!(schema.name, "s");
+        assert_eq!(schema.description, "d");
+        assert_eq!(schema.parameters["type"], "object");
+        assert_eq!(schema.parameters["additionalProperties"], false);
+        assert!(
+            schema.parameters["properties"]
+                .as_object()
+                .unwrap()
+                .is_empty(),
+            "skill-tool schema must take no parameters"
+        );
+    }
+
+    #[tokio::test]
+    async fn skill_tool_unavailable_when_requirements_unsatisfied() {
+        use rustykrab_skills::skill_md::{
+            RequirementValidation, SkillMd, SkillMdFrontmatter, SkillRequirements,
+        };
+        use std::collections::HashMap;
+        use std::path::PathBuf;
+
+        // A skill whose required env var is missing should hide from the
+        // tool list — exposing it would just produce a recipe the agent
+        // can't actually execute.
+        let unsatisfied = Arc::new(SkillMd {
+            path: PathBuf::from("/skills/needs_env"),
+            frontmatter: SkillMdFrontmatter {
+                name: "needs_env".to_string(),
+                description: "Needs SOMETHING".to_string(),
+                version: "1.0".to_string(),
+                requires: SkillRequirements::default(),
+                user_invocable: true,
+                emoji: None,
+                extra: HashMap::new(),
+            },
+            raw_body: "body".to_string(),
+            validation: RequirementValidation {
+                missing_env: vec!["SOMETHING".to_string()],
+                missing_bins: Vec::new(),
+            },
+        });
+
+        let tool = SkillTool::new(unsatisfied);
+        assert!(!tool.available());
     }
 }

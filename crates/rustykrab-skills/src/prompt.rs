@@ -23,8 +23,8 @@ contains the task — usually inside a message labeled '[Scheduled task]' follow
 Read that message and execute it. Never reply with 'I'm ready', 'please provide a task', \
 'I cannot perform any work because no task has been provided', or any other variant that \
 claims you have nothing to do — the task is in the conversation. If the task names a skill, \
-load that skill via the `skills` tool with action='load' and follow its instructions; do not \
-narrate that you would load it.\n\n\
+call the tool with that skill's name and follow the instructions it returns; do not narrate \
+that you would call it.\n\n\
 Use memory_save to persist important facts; context is limited.";
 
 /// Return the baked-in default soul template (with the literal `{name}`
@@ -134,9 +134,9 @@ impl SystemPromptBuilder {
     /// followed by an explicit instruction telling the model how to activate one.
     ///
     /// This is appended at prompt build time so the model knows which skills
-    /// exist without loading their full body. To USE a skill, the model must
-    /// call the `skills` tool with `action="load"` and the skill name; the
-    /// tool result returns the body, which the model then follows.
+    /// exist without loading their full body. Each skill listed here is also
+    /// exposed as a first-class tool with the same name — the model can call
+    /// the tool directly and receive the skill body as the tool result.
     pub fn with_available_skills(mut self, skills: &[&SkillMd]) -> Self {
         if skills.is_empty() {
             return self;
@@ -151,10 +151,10 @@ impl SystemPromptBuilder {
         }
         section.push_str("</available_skills>\n");
         section.push_str(
-            "To use a skill above, call the `skills` tool with \
-             action=\"load\" and the skill `name`. The tool result contains \
-             the skill body — follow those instructions for the rest of the \
-             turn. Do not claim to have a skill without loading it.",
+            "Each skill above is also a callable tool with the same name. \
+             To use a skill, call its tool — the tool result is the skill's \
+             instructions, which you then follow for the rest of the turn. \
+             Do not claim to have a skill without invoking it.",
         );
         self.sections.push(section);
         self
@@ -226,8 +226,11 @@ mod tests {
             .build();
         assert!(prompt.contains("<skill name=\"flight-monitor\""));
         assert!(prompt.contains("description=\"Watch flight prices\""));
-        assert!(prompt.contains("action=\"load\""));
-        assert!(prompt.contains("`skills` tool"));
+        // The instruction now points the model at calling the skill's tool
+        // directly (skills are exposed as first-class tools), rather than
+        // routing through the meta-`skills` tool with an action arg.
+        assert!(prompt.contains("callable tool with the same name"));
+        assert!(prompt.contains("follow"));
     }
 
     #[test]

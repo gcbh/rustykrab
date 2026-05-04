@@ -723,6 +723,32 @@ async fn main() -> anyhow::Result<()> {
     ));
     tracing::info!("recall tools registered");
 
+    // --- SKILL.md skills as first-class tools ---
+    // Each registered SKILL.md is also exposed as a tool whose name is the
+    // skill name and whose `execute()` returns the skill body verbatim.
+    // Why: small local models reach for native tools far more reliably than
+    // they consult the `<available_skills>` system-prompt catalog and call
+    // the meta `skills` tool with `action="load"`. Riding the trained
+    // tool-use prior turns a 30-50% discovery success rate into something
+    // closer to the natural function-calling rate.
+    //
+    // Registered last so collision detection sees the full real-tool set.
+    // Placed alongside recall_tools (after the subagent_runner snapshot)
+    // so sub-agents don't inherit skill-tools — sub-agents work on
+    // bounded sub-tasks and don't need the skill catalog.
+    let existing_tool_names: std::collections::HashSet<String> =
+        tools.iter().map(|t| t.name().to_string()).collect();
+    let skill_tool_count_before = tools.len();
+    tools.extend(rustykrab_tools::skill_md_as_tools(
+        &skill_registry,
+        &existing_tool_names,
+    ));
+    tracing::info!(
+        added = tools.len() - skill_tool_count_before,
+        registered_skills = skill_registry.md_skills().len(),
+        "skill-tools registered"
+    );
+
     // --- Harness router (auto-selects profile per message) ---
     // Reuses the main provider for classification to avoid model swapping.
     // The classification prompt is ~50 tokens — negligible overhead on any model.

@@ -161,7 +161,7 @@ pub use credential_read::CredentialReadTool;
 pub use credential_write::CredentialWriteTool;
 
 // Skills
-pub use self::skills::SkillsTool;
+pub use self::skills::{SkillTool, SkillsTool};
 
 // Meta tools
 pub use tools_list::ToolsListTool;
@@ -266,6 +266,46 @@ pub fn skill_tools(
         None => std::sync::Arc::new(SkillsTool::new(skills_dir)),
     };
     vec![tool]
+}
+
+/// Wrap each currently-registered SKILL.md as its own first-class `Tool`.
+///
+/// Promotes skills from "catalog entries the model has to discover via
+/// `<available_skills>` and a meta-tool" to "tools that appear in the
+/// native function-calling schema." Models reach for native tools far
+/// more reliably than they consult a free-text catalog, especially small
+/// local ones, which is the whole point.
+///
+/// `existing_tool_names` is the set of names already taken in the tool
+/// schema (built-ins, backends, etc.). Skills whose name collides with a
+/// real tool are skipped with a warning rather than overwriting either
+/// side — collisions are rare in practice (skills get task-domain names
+/// like `daily_briefing`, tools get verb names like `web_search`) and a
+/// silent override would be the worst possible failure mode.
+///
+/// Snapshot semantics: this reads the registry once. Skills created at
+/// runtime via `SkillsTool::create` won't appear as tools until the next
+/// process restart. Hot-loading skill-tools live would require the
+/// agent's tool dispatcher to re-render the schema mid-conversation,
+/// which is out of scope here.
+pub fn skill_md_as_tools(
+    registry: &rustykrab_skills::SkillRegistry,
+    existing_tool_names: &std::collections::HashSet<String>,
+) -> Vec<std::sync::Arc<dyn rustykrab_core::Tool>> {
+    let mut out: Vec<std::sync::Arc<dyn rustykrab_core::Tool>> = Vec::new();
+    for skill in registry.md_skills() {
+        let name = skill.frontmatter.name.clone();
+        if existing_tool_names.contains(&name) {
+            tracing::warn!(
+                skill = %name,
+                "skill name collides with an existing tool name; \
+                 skipping skill-tool registration. Rename the skill to expose it as a tool."
+            );
+            continue;
+        }
+        out.push(std::sync::Arc::new(SkillTool::new(skill)));
+    }
+    out
 }
 
 /// Collect automation tools that require backends into a Vec.
