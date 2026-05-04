@@ -7,6 +7,7 @@ use chrono::Utc;
 use rustykrab_agent::AgentEvent;
 use rustykrab_core::types::{Conversation, MessageContent};
 use rustykrab_gateway::AppState;
+use rustykrab_skills::SkillRegistry;
 use uuid::Uuid;
 
 /// Where a task originated and how to deliver results.
@@ -219,11 +220,50 @@ async fn execute_cron_task(
     let (effective_channel, effective_chat_id, effective_thread_id) =
         resolve_delivery_target(channel, chat_id, thread_id, &conv);
 
+    // Stamp the resolved delivery target onto the conversation if it doesn't
+    // already carry channel info. The system-prompt builder reads these
+    // fields to tell the agent where this conversation lives — without them,
+    // freshly-created job conversations have no idea their output is bound
+    // for Telegram/Slack/Signal, which manifests as the agent producing
+    // generic "I'm ready" replies that get discarded by the delivery layer.
+    if persist_channel_context_onto_conversation(
+        &mut conv,
+        effective_channel.as_deref(),
+        effective_chat_id.as_deref(),
+        effective_thread_id.as_deref(),
+    ) {
+        if let Err(e) = state.store.conversations().save(&conv) {
+            tracing::warn!(
+                job_id = %job_id,
+                "failed to persist channel context onto job conversation: {e}"
+            );
+        }
+    }
+
+    // If the task body is the bare name of a registered SKILL.md skill,
+    // inline its body into the prompt so the model executes the recipe
+    // directly instead of spinning through tool-discovery iterations to
+    // figure out it should call `skills.load`. Operators commonly schedule
+    // jobs with `task = "morning-briefing"`; that string alone gives the
+    // model nothing to do without a tool round-trip. With the body inlined,
+    // the first turn produces output.
+    let resolved_skill = resolve_skill_for_task(&state.skill_registry, task_prompt);
+    if let Some((ref name, _)) = resolved_skill {
+        tracing::info!(
+            job_id = %job_id,
+            skill = %name,
+            "inlining SKILL.md body into scheduled-task prompt"
+        );
+    }
+
     let prompt = build_scheduled_prompt(
         task_prompt,
         job.last_run_at,
         effective_channel.as_deref(),
         effective_chat_id.as_deref(),
+        resolved_skill
+            .as_ref()
+            .map(|(n, b)| (n.as_str(), b.as_str())),
     );
 
     // Run the agent. Mint a fresh trace id per scheduled run so prompt-log
@@ -394,6 +434,7 @@ fn build_scheduled_prompt(
     last_run_at: Option<chrono::DateTime<chrono::Utc>>,
     channel: Option<&str>,
     chat_id: Option<&str>,
+    skill: Option<(&str, &str)>,
 ) -> String {
     let delivery = match (channel, chat_id) {
         (Some(c), Some(id)) => format!(
@@ -420,7 +461,67 @@ fn build_scheduled_prompt(
              Task: {task_prompt}"
         ),
     };
-    format!("{body}\n\n{delivery}")
+    let skill_block = match skill {
+        Some((name, skill_body)) => format!(
+            "\n\nThe task names the skill `{name}`. Execute the recipe below for \
+             this turn — you do NOT need to call the `skills` tool to load it; the \
+             body is included here.\n\n\
+             <skill_instructions name=\"{name}\">\n{skill_body}\n</skill_instructions>"
+        ),
+        None => String::new(),
+    };
+    format!("{body}{skill_block}\n\n{delivery}")
+}
+
+/// If `task_prompt` is the bare name of a registered SKILL.md skill, return
+/// `(name, body)` so the runner can inline the recipe into the prompt.
+///
+/// Matches conservatively: the trimmed task must equal the skill name
+/// exactly. Anything else (free-form natural-language tasks, tasks that
+/// reference a skill by sentence) is left untouched — those still rely on
+/// the model calling the `skills` tool.
+fn resolve_skill_for_task(registry: &SkillRegistry, task_prompt: &str) -> Option<(String, String)> {
+    let trimmed = task_prompt.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let md = registry.get_md(trimmed)?;
+    Some((md.frontmatter.name.clone(), md.raw_body.clone()))
+}
+
+/// Stamp the resolved channel triple onto a conversation that doesn't carry
+/// its own channel info yet. Returns `true` if any field was updated (so the
+/// caller knows to persist the conversation).
+///
+/// Existing values are preserved — we only fill in unset fields. This is
+/// idempotent: repeat calls with the same target are a no-op once the
+/// conversation has been stamped.
+fn persist_channel_context_onto_conversation(
+    conv: &mut Conversation,
+    channel: Option<&str>,
+    chat_id: Option<&str>,
+    thread_id: Option<&str>,
+) -> bool {
+    let mut changed = false;
+    if conv.channel_source.is_none() {
+        if let Some(c) = channel {
+            conv.channel_source = Some(c.to_string());
+            changed = true;
+        }
+    }
+    if conv.channel_id.is_none() {
+        if let Some(id) = chat_id {
+            conv.channel_id = Some(id.to_string());
+            changed = true;
+        }
+    }
+    if conv.channel_thread_id.is_none() {
+        if let Some(t) = thread_id {
+            conv.channel_thread_id = Some(t.to_string());
+            changed = true;
+        }
+    }
+    changed
 }
 
 /// Env vars that name a fallback delivery target for scheduled jobs that
@@ -499,6 +600,7 @@ mod tests {
             None,
             Some("telegram"),
             Some("12345"),
+            None,
         );
         assert!(prompt.contains("first time"));
         assert!(prompt.contains("Task: Write the daily briefing."));
@@ -509,11 +611,132 @@ mod tests {
     #[test]
     fn scheduled_prompt_recurring_includes_last_run() {
         let last = Utc.with_ymd_and_hms(2026, 4, 30, 9, 0, 0).unwrap();
-        let prompt = build_scheduled_prompt("Daily briefing.", Some(last), None, None);
+        let prompt = build_scheduled_prompt("Daily briefing.", Some(last), None, None, None);
         assert!(prompt.contains("due again"));
         assert!(prompt.contains("Last run was at 2026-04-30 09:00:00 UTC"));
         // No channel info → still tells the model the message IS the deliverable.
         assert!(prompt.contains("IS the deliverable"));
+    }
+
+    #[test]
+    fn scheduled_prompt_inlines_skill_body_when_provided() {
+        let body = "Step 1: gmail.search.\nStep 2: web_search.\nStep 3: assemble briefing.";
+        let prompt = build_scheduled_prompt(
+            "morning-briefing",
+            None,
+            Some("telegram"),
+            Some("99"),
+            Some(("morning-briefing", body)),
+        );
+        // The skill body must appear verbatim so the model can execute it
+        // without an extra `skills` tool round-trip.
+        assert!(
+            prompt.contains("<skill_instructions name=\"morning-briefing\">"),
+            "expected skill_instructions block in prompt: {prompt}"
+        );
+        assert!(prompt.contains("Step 1: gmail.search."));
+        assert!(prompt.contains("Step 3: assemble briefing."));
+        // And the prompt should explicitly tell the model NOT to call the
+        // skills tool — the body is already there.
+        assert!(prompt.contains("do NOT need to call the `skills` tool"));
+    }
+
+    #[test]
+    fn scheduled_prompt_omits_skill_block_when_none() {
+        let prompt = build_scheduled_prompt("Just do the thing", None, None, None, None);
+        assert!(
+            !prompt.contains("<skill_instructions"),
+            "should not emit skill block when no skill resolved: {prompt}"
+        );
+    }
+
+    #[test]
+    fn persist_channel_context_fills_unset_fields() {
+        let mut conv = empty_conv();
+        let changed = persist_channel_context_onto_conversation(
+            &mut conv,
+            Some("telegram"),
+            Some("-1003776932999"),
+            Some("198"),
+        );
+        assert!(changed);
+        assert_eq!(conv.channel_source.as_deref(), Some("telegram"));
+        assert_eq!(conv.channel_id.as_deref(), Some("-1003776932999"));
+        assert_eq!(conv.channel_thread_id.as_deref(), Some("198"));
+    }
+
+    #[test]
+    fn persist_channel_context_preserves_existing_fields() {
+        let mut conv = channel_conv("slack", "C111", Some("ts.1"));
+        let changed = persist_channel_context_onto_conversation(
+            &mut conv,
+            Some("telegram"),
+            Some("999"),
+            Some("7"),
+        );
+        // No fields were unset → nothing to write back.
+        assert!(!changed);
+        assert_eq!(conv.channel_source.as_deref(), Some("slack"));
+        assert_eq!(conv.channel_id.as_deref(), Some("C111"));
+        assert_eq!(conv.channel_thread_id.as_deref(), Some("ts.1"));
+    }
+
+    #[test]
+    fn persist_channel_context_noop_when_target_is_unset() {
+        let mut conv = empty_conv();
+        let changed = persist_channel_context_onto_conversation(&mut conv, None, None, None);
+        assert!(!changed);
+        assert!(conv.channel_source.is_none());
+        assert!(conv.channel_id.is_none());
+        assert!(conv.channel_thread_id.is_none());
+    }
+
+    #[test]
+    fn resolve_skill_for_task_matches_bare_skill_name() {
+        use rustykrab_skills::skill_md::{
+            RequirementValidation, SkillMd, SkillMdFrontmatter, SkillRequirements,
+        };
+        use std::collections::HashMap;
+        use std::path::PathBuf;
+        use std::sync::Arc;
+
+        let registry = SkillRegistry::new();
+        let skill = Arc::new(SkillMd {
+            path: PathBuf::from("/skills/morning-briefing"),
+            frontmatter: SkillMdFrontmatter {
+                name: "morning-briefing".to_string(),
+                description: "Daily briefing".to_string(),
+                version: "1.0".to_string(),
+                requires: SkillRequirements::default(),
+                user_invocable: true,
+                emoji: None,
+                extra: HashMap::new(),
+            },
+            raw_body: "Step 1: do the thing.".to_string(),
+            validation: RequirementValidation {
+                missing_env: Vec::new(),
+                missing_bins: Vec::new(),
+            },
+        });
+        registry.register_md(skill);
+
+        // Trimmed bare match → resolves.
+        let resolved = resolve_skill_for_task(&registry, "  morning-briefing\n");
+        assert_eq!(
+            resolved.as_ref().map(|(n, _)| n.as_str()),
+            Some("morning-briefing")
+        );
+        assert_eq!(
+            resolved.as_ref().map(|(_, b)| b.as_str()),
+            Some("Step 1: do the thing.")
+        );
+
+        // Unrelated task → no resolution; the model still has to call
+        // `skills.load` if it wants the body.
+        assert!(resolve_skill_for_task(&registry, "do morning-briefing now").is_none());
+
+        // Empty input → no resolution.
+        assert!(resolve_skill_for_task(&registry, "   ").is_none());
     }
 
     #[test]
