@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.10.6] - 2026-05-04
+
+- fix(cron): match skills referenced by natural-language task strings (#411)
+
 ## [2.10.5] - 2026-05-04
 
 - fix(cron): inline skill body and stamp channel context onto job conversation (#410)
