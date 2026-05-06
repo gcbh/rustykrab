@@ -2553,15 +2553,14 @@ checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 
 [[package]]
 name = "openssl"
-version = "0.10.78"
+version = "0.10.79"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f38c4372413cdaaf3cc79dd92d29d7d9f5ab09b51b10dded508fb90bb70b9222"
+checksum = "bf0b434746ee2832f4f0baf10137e1cabb18cbe6912c69e2e33263c45250f542"
 dependencies = [
  "bitflags 2.11.1",
  "cfg-if",
  "foreign-types",
  "libc",
- "once_cell",
  "openssl-macros",
  "openssl-sys",
 ]
@@ -2585,9 +2584,9 @@ checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
 name = "openssl-sys"
-version = "0.9.114"
+version = "0.9.115"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "13ce1245cd07fcc4cfdb438f7507b0c7e4f3849a69fd84d52374c66d83741bb6"
+checksum = "158fe5b292746440aa6e7a7e690e55aeb72d41505e2804c23c6973ad0e9c9781"
 dependencies = [
  "cc",
  "libc",
@@ -3485,7 +3484,7 @@ checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
 
 [[package]]
 name = "rustykrab-agent"
-version = "2.10.5"
+version = "2.10.6"
 dependencies = [
  "async-trait",
  "chrono",
@@ -3502,7 +3501,7 @@ dependencies = [
 
 [[package]]
 name = "rustykrab-channels"
-version = "2.10.5"
+version = "2.10.6"
 dependencies = [
  "async-trait",
  "chrono",
@@ -3523,7 +3522,7 @@ dependencies = [
 
 [[package]]
 name = "rustykrab-cli"
-version = "2.10.5"
+version = "2.10.6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3552,7 +3551,7 @@ dependencies = [
 
 [[package]]
 name = "rustykrab-core"
-version = "2.10.5"
+version = "2.10.6"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -3566,7 +3565,7 @@ dependencies = [
 
 [[package]]
 name = "rustykrab-gateway"
-version = "2.10.5"
+version = "2.10.6"
 dependencies = [
  "axum",
  "chrono",
@@ -3590,7 +3589,7 @@ dependencies = [
 
 [[package]]
 name = "rustykrab-memory"
-version = "2.10.5"
+version = "2.10.6"
 dependencies = [
  "async-trait",
  "chrono",
@@ -3611,7 +3610,7 @@ dependencies = [
 
 [[package]]
 name = "rustykrab-providers"
-version = "2.10.5"
+version = "2.10.6"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -3628,7 +3627,7 @@ dependencies = [
 
 [[package]]
 name = "rustykrab-skills"
-version = "2.10.5"
+version = "2.10.6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3644,7 +3643,7 @@ dependencies = [
 
 [[package]]
 name = "rustykrab-store"
-version = "2.10.5"
+version = "2.10.6"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -3667,7 +3666,7 @@ dependencies = [
 
 [[package]]
 name = "rustykrab-tools"
-version = "2.10.5"
+version = "2.10.6"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
