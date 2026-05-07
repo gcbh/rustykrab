@@ -1,0 +1,15 @@
+# cargo-audit / rustsec/audit-check configuration.
+#
+# Each ignored advisory must be re-evaluated whenever dependencies are
+# upgraded. Remove entries from this file as soon as an upstream fix lands.
+
+[advisories]
+ignore = [
+    # paste 1.0.15 is unmaintained (the original maintainer stepped away),
+    # but no security vulnerability has been reported against it. It is pulled
+    # in transitively only via `tokenizers` (HuggingFace) and
+    # `macro_rules_attribute`, both of which still depend on it. There is no
+    # actionable upstream fix available; revisit when tokenizers releases a
+    # version that drops the dependency.
+    "RUSTSEC-2024-0436",
+]
