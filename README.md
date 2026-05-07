@@ -1,6 +1,8 @@
 # RustyKrab (Rust)
 
-A security-first reimplementation of the RustyKrab AI agent gateway in Rust. Built from scratch to address the architectural security flaws in the original Node.js version — no shared-memory single process, no plaintext credentials, no unsandboxed tool execution.
+A security-first, modular AI agent gateway written in Rust. RustyKrab runs a long-lived agent loop backed by Claude (Anthropic) or local Ollama models, exposes it over a loopback HTTP+SSE gateway, and bridges it to Telegram, Signal, Slack, WebChat, and MCP clients. The agent has access to 40+ built-in tools spanning filesystem, web, browser automation, code execution, scheduling, media, and a hybrid retrieval memory (vector + BM25 + temporal + graph).
+
+Built from scratch to address the architectural security flaws in the original Node.js version — no shared-memory single process, no plaintext credentials, no unsandboxed tool execution, ed25519-signed skill packages, and per-conversation least-privilege capability scoping.
 
 ## Prerequisites
 
@@ -58,7 +60,7 @@ All configuration is via environment variables. No plaintext config files.
 |---|---|---|
 | `RUSTYKRAB_PROVIDER` | `anthropic` | Model backend: `anthropic` or `ollama` |
 | `ANTHROPIC_API_KEY` | — | Anthropic API key (required for Claude) |
-| `ANTHROPIC_MODEL` | `claude-sonnet-4-20250514` | Claude model to use |
+| `ANTHROPIC_MODEL` | `claude-sonnet-4-20250514` | Claude model to use. The Claude 4.X family (Opus 4.7 `claude-opus-4-7`, Sonnet 4.6 `claude-sonnet-4-6`, Haiku 4.5 `claude-haiku-4-5-20251001`) is recommended for new deployments |
 | `ANTHROPIC_CONTEXT_LENGTH` | `200000` | Context window in tokens for the selected Claude model. Anthropic doesn't expose a discovery endpoint, so set this when enabling a non-default window (e.g. the 1M-token beta) so compaction thresholds stay in sync |
 | `RUSTYKRAB_MAX_CONTEXT_TOKENS` | `128000` (cloud) / `32000` (ollama) | Context budget used to compute the compaction threshold. Default is provider-aware: 128k for cloud providers (Anthropic) and 32k for local Ollama, where prompt evaluation on consumer GPUs times out long before a 128k window fills. Set to override the default for either provider |
 | `RUSTYKRAB_COMPACTION_CONTEXT_CEILING` | `65536` | Hard upper bound on the context window used to compute the compaction threshold. Keeps compaction firing at a sane size even when the backing model advertises a much larger window |
@@ -257,34 +259,53 @@ Open `http://127.0.0.1:3000` in a browser for the embedded WebChat interface.
 
 ## Architecture
 
+A Cargo workspace of 10 crates under `crates/`:
+
 ```
-rustykrab-cli          Binary entrypoint, wires everything together
+rustykrab-cli          Binary entrypoint, daemon management, channel loops
+  |                    Wires concrete backends to tool adapter traits.
   |
-  +-- rustykrab-gateway    Axum HTTP server, REST API, WebChat static files
+  +-- rustykrab-gateway    Axum HTTP server, REST API, SSE streaming, WebChat static files
   |     +-- auth            Bearer token middleware (constant-time comparison)
   |     +-- rate_limit      Per-IP sliding window + lockout (anti-brute-force)
   |     +-- origin          Origin header validation (blocks cross-origin hijacking)
   |
   +-- rustykrab-agent      Agent loop: model call -> tool exec -> repeat
+  |     +-- harness         Profile-driven orchestration (system prompts, tool sets, limits)
+  |     +-- compaction      Provider-aware context compaction with re-summarization passes
   |     +-- sandbox         Sandbox trait + process-based isolation with policy
   |
   +-- rustykrab-providers  Model provider implementations
-  |     +-- anthropic       Claude Messages API with full tool-use support
-  |     +-- ollama          Local models via Ollama (Qwen, Llama, Mistral, etc.)
+  |     +-- anthropic       Claude Messages API with full tool-use, streaming, and 1M-token beta
+  |     +-- ollama          Local models via Ollama (Gemma, Qwen, Llama, Mistral, etc.)
   |
-  +-- rustykrab-store      Sled-based persistent storage
+  +-- rustykrab-store      SQLite (rusqlite, WAL mode) persistent storage
   |     +-- conversations   CRUD for conversation history
   |     +-- secrets         Encrypted credential storage (HMAC-SHA256 key derivation)
+  |     +-- jobs            Scheduled job store backing the cron tools
   |
-  +-- rustykrab-tools      Built-in tool implementations
-  |     +-- http_request    HTTP client tool (GET/POST/PUT/DELETE/PATCH)
+  +-- rustykrab-tools      40+ built-in tool implementations
+  |     +-- filesystem      read, write, edit, apply_patch
+  |     +-- exec            sandboxed_spawn, process, code_execution
+  |     +-- web             web_fetch, web_search, x_search, http_request, browser/*
+  |     +-- memory          memory_save / search / get / delete (hybrid retrieval)
+  |     +-- sessions        spawn / send / yield / list / history (sub-agent orchestration)
+  |     +-- integrations    notion, gmail, obsidian, mcp_connector
+  |     +-- media           image, canvas, video
+  |     +-- scheduling      cron (with persistent JobStore backend)
+  |     +-- credentials     credential_read / write (gated by capabilities)
   |
   +-- rustykrab-channels   Communication channel abstractions
-  |     +-- signal          Signal via signal-cli-rest-api (E2E encrypted)
   |     +-- telegram        Telegram bot (long-polling + webhook + chat allowlist)
+  |     +-- signal          Signal via signal-cli-rest-api (E2E encrypted)
+  |     +-- slack           Slack Events API adapter
   |     +-- webchat         In-process mpsc-backed channel for the WebChat UI
+  |     +-- video           Live video/audio session channel
+  |     +-- mcp / mcp_http  Model Context Protocol server (stdio + HTTP)
   |
-  +-- rustykrab-skills     Skill system with ed25519 signature verification
+  +-- rustykrab-memory     Hybrid retrieval: vector + BM25 + temporal + graph
+  |
+  +-- rustykrab-skills     SKILL.md loader with ed25519 signature verification
   |
   +-- rustykrab-core       Shared types, traits, error types
         +-- Tool trait, ModelProvider trait
