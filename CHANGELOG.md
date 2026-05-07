@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.10.7] - 2026-05-07
+
+- Refresh README description and architecture for current agent (#415)
+
 ## [2.10.6] - 2026-05-04
 
 - fix(cron): match skills referenced by natural-language task strings (#411)
