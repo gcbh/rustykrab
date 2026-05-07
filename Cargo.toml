@@ -72,7 +72,7 @@ secrecy = "0.10"
 chromiumoxide = "0.9"
 
 # Email (IMAP + SMTP)
-imap = "2"
+async-imap = { version = "0.11", default-features = false, features = ["runtime-tokio"] }
 lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "tokio1-rustls", "rustls-native-certs", "aws-lc-rs", "builder"] }
 mail-parser = "0.9"
 

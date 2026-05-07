@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use futures::TryStreamExt;
 use rustykrab_core::types::ToolSchema;
 use rustykrab_core::{Error, Result, SandboxRequirements, Tool};
 use rustykrab_store::SecretStore;
@@ -18,6 +19,8 @@ const KEY_APP_PASSWORD: &str = "gmail_app_password";
 
 /// Maximum messages to return from a search.
 const MAX_SEARCH_RESULTS: usize = 50;
+
+type ImapSession = async_imap::Session<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>;
 
 // ---------------------------------------------------------------------------
 // Tool struct
@@ -82,17 +85,8 @@ impl GmailTool {
             })?;
 
         // Verify credentials by connecting to IMAP.
-        // IMAP is blocking — run in spawn_blocking to avoid blocking the tokio worker.
-        let email_owned = email.to_string();
-        let password_owned = app_password.to_string();
-        tokio::task::spawn_blocking(move || {
-            let mut session = connect_imap_blocking(&email_owned, &password_owned)?;
-            let _ = session.logout();
-            Ok::<(), Error>(())
-        })
-        .await
-        .map_err(|e| Error::ToolExecution(format!("spawn_blocking failed: {e}").into()))?
-        .map_err(|e: Error| e)?;
+        let mut session = connect_imap(email, app_password).await?;
+        let _ = session.logout().await;
 
         Ok(json!({
             "status": "authenticated",
@@ -113,95 +107,97 @@ impl GmailTool {
             .min(MAX_SEARCH_RESULTS as u64) as usize;
         let mailbox = args["mailbox"].as_str().unwrap_or("INBOX");
 
-        // IMAP is blocking, run in spawn_blocking.
-        let secrets = self.secrets.clone();
-        let query = query.to_string();
-        let mailbox = mailbox.to_string();
+        let (email, password) = self.get_credentials()?;
+        let mut session = connect_imap(&email, &password).await?;
 
-        tokio::task::spawn_blocking(move || {
-            let (email, password) = get_creds(&secrets)?;
-            let mut session = connect_imap_blocking(&email, &password)?;
+        session
+            .select(mailbox)
+            .await
+            .map_err(|e| Error::ToolExecution(format!("select {mailbox} failed: {e}").into()))?;
 
-            session.select(&mailbox).map_err(|e| {
-                Error::ToolExecution(format!("select {mailbox} failed: {e}").into())
-            })?;
+        // Use Gmail's X-GM-RAW extension for full search syntax,
+        // falling back to standard IMAP SEARCH.
+        // Strip CRLF sequences to prevent IMAP command injection, then
+        // escape inner double quotes so the IMAP command parses correctly
+        // (e.g. query `from:"foo@bar.com"` becomes `X-GM-RAW "from:\"foo@bar.com\""`).
+        let sanitized_query = query.replace(['\r', '\n', '\0'], "");
+        let escaped_query = sanitized_query.replace('\\', "\\\\").replace('"', "\\\"");
+        let uids = match session
+            .uid_search(format!("X-GM-RAW \"{escaped_query}\""))
+            .await
+        {
+            Ok(set) => set,
+            Err(_) => session
+                .uid_search(query)
+                .await
+                .map_err(|e| Error::ToolExecution(format!("search failed: {e}").into()))?,
+        };
 
-            // Use Gmail's X-GM-RAW extension for full search syntax,
-            // falling back to standard IMAP SEARCH.
-            // Strip CRLF sequences to prevent IMAP command injection, then
-            // escape inner double quotes so the IMAP command parses correctly
-            // (e.g. query `from:"foo@bar.com"` becomes `X-GM-RAW "from:\"foo@bar.com\""`).
-            let sanitized_query = query.replace(['\r', '\n', '\0'], "");
-            let escaped_query = sanitized_query.replace('\\', "\\\\").replace('"', "\\\"");
-            let uids = session
-                .uid_search(format!("X-GM-RAW \"{escaped_query}\""))
-                .or_else(|_| session.uid_search(&query))
-                .map_err(|e| Error::ToolExecution(format!("search failed: {e}").into()))?;
+        // Take the most recent UIDs (highest numbers = newest).
+        let mut uid_list: Vec<u32> = uids.into_iter().collect();
+        uid_list.sort_unstable_by(|a, b| b.cmp(a));
+        uid_list.truncate(max_results);
 
-            // Take the most recent UIDs (highest numbers = newest).
-            let mut uid_list: Vec<u32> = uids.into_iter().collect();
-            uid_list.sort_unstable_by(|a, b| b.cmp(a));
-            uid_list.truncate(max_results);
+        if uid_list.is_empty() {
+            let _ = session.logout().await;
+            return Ok(json!({ "messages": [], "count": 0 }));
+        }
 
-            if uid_list.is_empty() {
-                let _ = session.logout();
-                return Ok(json!({ "messages": [], "count": 0 }));
-            }
+        let uid_set = uid_list
+            .iter()
+            .map(|u| u.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
 
-            let uid_set = uid_list
-                .iter()
-                .map(|u| u.to_string())
-                .collect::<Vec<_>>()
-                .join(",");
+        let fetches: Vec<async_imap::types::Fetch> = session
+            .uid_fetch(&uid_set, "(UID ENVELOPE FLAGS)")
+            .await
+            .map_err(|e| Error::ToolExecution(format!("fetch failed: {e}").into()))?
+            .try_collect()
+            .await
+            .map_err(|e| Error::ToolExecution(format!("fetch stream failed: {e}").into()))?;
 
-            let fetches = session
-                .uid_fetch(&uid_set, "(UID ENVELOPE FLAGS)")
-                .map_err(|e| Error::ToolExecution(format!("fetch failed: {e}").into()))?;
+        let mut messages = Vec::new();
+        for fetch in &fetches {
+            let envelope = match fetch.envelope() {
+                Some(e) => e,
+                None => continue,
+            };
 
-            let mut messages = Vec::new();
-            for fetch in fetches.iter() {
-                let envelope = match fetch.envelope() {
-                    Some(e) => e,
-                    None => continue,
-                };
+            let subject = envelope
+                .subject
+                .as_ref()
+                .map(|s| decode_imap_string(s))
+                .unwrap_or_default();
+            let from = envelope
+                .from
+                .as_ref()
+                .and_then(|addrs| addrs.first())
+                .map(format_address)
+                .unwrap_or_default();
+            let date = envelope
+                .date
+                .as_ref()
+                .map(|d| decode_imap_string(d))
+                .unwrap_or_default();
 
-                let subject = envelope
-                    .subject
-                    .as_ref()
-                    .map(|s| decode_imap_string(s))
-                    .unwrap_or_default();
-                let from = envelope
-                    .from
-                    .as_ref()
-                    .and_then(|addrs| addrs.first())
-                    .map(|a| format_address(a))
-                    .unwrap_or_default();
-                let date = envelope
-                    .date
-                    .as_ref()
-                    .map(|d| decode_imap_string(d))
-                    .unwrap_or_default();
+            let flags: Vec<String> = fetch.flags().map(|f| format!("{f:?}")).collect();
 
-                let flags: Vec<String> = fetch.flags().iter().map(|f| format!("{f:?}")).collect();
+            messages.push(json!({
+                "uid": fetch.uid.unwrap_or(0),
+                "subject": subject,
+                "from": from,
+                "date": date,
+                "flags": flags,
+            }));
+        }
 
-                messages.push(json!({
-                    "uid": fetch.uid.unwrap_or(0),
-                    "subject": subject,
-                    "from": from,
-                    "date": date,
-                    "flags": flags,
-                }));
-            }
+        let _ = session.logout().await;
 
-            let _ = session.logout();
-
-            Ok(json!({
-                "messages": messages,
-                "count": messages.len(),
-            }))
-        })
-        .await
-        .map_err(|e| Error::ToolExecution(format!("task join failed: {e}").into()))?
+        Ok(json!({
+            "messages": messages,
+            "count": messages.len(),
+        }))
     }
 
     // -----------------------------------------------------------------------
@@ -215,152 +211,151 @@ impl GmailTool {
             as u32;
         let mailbox = args["mailbox"].as_str().unwrap_or("INBOX");
 
-        let secrets = self.secrets.clone();
-        let mailbox = mailbox.to_string();
+        let (email, password) = self.get_credentials()?;
+        let mut session = connect_imap(&email, &password).await?;
 
-        tokio::task::spawn_blocking(move || {
-            let (email, password) = get_creds(&secrets)?;
-            let mut session = connect_imap_blocking(&email, &password)?;
+        session
+            .select(mailbox)
+            .await
+            .map_err(|e| Error::ToolExecution(format!("select {mailbox} failed: {e}").into()))?;
 
-            session.select(&mailbox).map_err(|e| {
-                Error::ToolExecution(format!("select {mailbox} failed: {e}").into())
-            })?;
+        let fetches: Vec<async_imap::types::Fetch> = session
+            .uid_fetch(uid.to_string(), "(UID RFC822 FLAGS ENVELOPE)")
+            .await
+            .map_err(|e| Error::ToolExecution(format!("fetch uid {uid} failed: {e}").into()))?
+            .try_collect()
+            .await
+            .map_err(|e| Error::ToolExecution(format!("fetch stream failed: {e}").into()))?;
 
-            let fetches = session
-                .uid_fetch(uid.to_string(), "(UID RFC822 FLAGS ENVELOPE)")
-                .map_err(|e| Error::ToolExecution(format!("fetch uid {uid} failed: {e}").into()))?;
+        let fetch = fetches
+            .first()
+            .ok_or_else(|| Error::ToolExecution(format!("message uid {uid} not found").into()))?;
 
-            let fetch = fetches.iter().next().ok_or_else(|| {
-                Error::ToolExecution(format!("message uid {uid} not found").into())
-            })?;
+        let raw_body = fetch.body().unwrap_or_default();
+        let parsed = mail_parser::MessageParser::default()
+            .parse(raw_body)
+            .ok_or_else(|| Error::ToolExecution("failed to parse email".into()))?;
 
-            let raw_body = fetch.body().unwrap_or_default();
-            let parsed = mail_parser::MessageParser::default()
-                .parse(raw_body)
-                .ok_or_else(|| Error::ToolExecution("failed to parse email".into()))?;
-
-            let subject = parsed.subject().unwrap_or("").to_string();
-            let from = parsed
-                .from()
-                .and_then(|a| a.first())
-                .map(|a| {
-                    a.name()
-                        .map(|n| format!("{n} <{}>", a.address().unwrap_or("")))
-                        .unwrap_or_else(|| a.address().unwrap_or("").to_string())
-                })
-                .unwrap_or_default();
-            let to: Vec<String> = parsed
-                .to()
-                .map(|addrs| {
-                    addrs
-                        .iter()
-                        .map(|a| {
-                            a.name()
-                                .map(|n| format!("{n} <{}>", a.address().unwrap_or("")))
-                                .unwrap_or_else(|| a.address().unwrap_or("").to_string())
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            let cc: Vec<String> = parsed
-                .cc()
-                .map(|addrs| {
-                    addrs
-                        .iter()
-                        .map(|a| {
-                            a.name()
-                                .map(|n| format!("{n} <{}>", a.address().unwrap_or("")))
-                                .unwrap_or_else(|| a.address().unwrap_or("").to_string())
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            let date = parsed.date().map(|d| d.to_string()).unwrap_or_default();
-            let message_id = parsed.message_id().unwrap_or("").to_string();
-            let reply_to = parsed
-                .reply_to()
-                .and_then(|a| a.first())
-                .and_then(|a| a.address())
-                .unwrap_or("")
-                .to_string();
-            let body_text = parsed
-                .body_text(0)
-                .unwrap_or_else(|| {
-                    parsed
-                        .body_html(0)
-                        .map(|h| strip_html_tags(&h).into())
-                        .unwrap_or_default()
-                })
-                .to_string();
-
-            // Truncate very long bodies to avoid blowing up context.
-            let body_text = if body_text.len() > 8000 {
-                format!(
-                    "{}…\n[truncated, {} chars total]",
-                    &body_text[..body_text.floor_char_boundary(8000)],
-                    body_text.len()
-                )
-            } else {
-                body_text
-            };
-
-            // Attachment metadata
-            use mail_parser::MimeHeaders;
-            let attachments: Vec<Value> = parsed
-                .attachments()
-                .enumerate()
-                .map(|(i, part)| {
-                    let filename = part
-                        .content_disposition()
-                        .and_then(|cd| cd.attribute("filename"))
-                        .or_else(|| part.content_type().and_then(|ct| ct.attribute("name")))
-                        .unwrap_or("unnamed")
-                        .to_string();
-                    let content_type = part
-                        .content_type()
-                        .map(|ct| {
-                            let sub = ct.subtype().unwrap_or("octet-stream");
-                            format!("{}/{sub}", ct.ctype())
-                        })
-                        .unwrap_or_else(|| "application/octet-stream".to_string());
-                    let size = part.contents().len();
-                    json!({
-                        "index": i,
-                        "filename": filename,
-                        "content_type": content_type,
-                        "size_bytes": size,
+        let subject = parsed.subject().unwrap_or("").to_string();
+        let from = parsed
+            .from()
+            .and_then(|a| a.first())
+            .map(|a| {
+                a.name()
+                    .map(|n| format!("{n} <{}>", a.address().unwrap_or("")))
+                    .unwrap_or_else(|| a.address().unwrap_or("").to_string())
+            })
+            .unwrap_or_default();
+        let to: Vec<String> = parsed
+            .to()
+            .map(|addrs| {
+                addrs
+                    .iter()
+                    .map(|a| {
+                        a.name()
+                            .map(|n| format!("{n} <{}>", a.address().unwrap_or("")))
+                            .unwrap_or_else(|| a.address().unwrap_or("").to_string())
                     })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let cc: Vec<String> = parsed
+            .cc()
+            .map(|addrs| {
+                addrs
+                    .iter()
+                    .map(|a| {
+                        a.name()
+                            .map(|n| format!("{n} <{}>", a.address().unwrap_or("")))
+                            .unwrap_or_else(|| a.address().unwrap_or("").to_string())
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let date = parsed.date().map(|d| d.to_string()).unwrap_or_default();
+        let message_id = parsed.message_id().unwrap_or("").to_string();
+        let reply_to = parsed
+            .reply_to()
+            .and_then(|a| a.first())
+            .and_then(|a| a.address())
+            .unwrap_or("")
+            .to_string();
+        let body_text = parsed
+            .body_text(0)
+            .unwrap_or_else(|| {
+                parsed
+                    .body_html(0)
+                    .map(|h| strip_html_tags(&h).into())
+                    .unwrap_or_default()
+            })
+            .to_string();
+
+        // Truncate very long bodies to avoid blowing up context.
+        let body_text = if body_text.len() > 8000 {
+            format!(
+                "{}…\n[truncated, {} chars total]",
+                &body_text[..body_text.floor_char_boundary(8000)],
+                body_text.len()
+            )
+        } else {
+            body_text
+        };
+
+        // Attachment metadata
+        use mail_parser::MimeHeaders;
+        let attachments: Vec<Value> = parsed
+            .attachments()
+            .enumerate()
+            .map(|(i, part)| {
+                let filename = part
+                    .content_disposition()
+                    .and_then(|cd| cd.attribute("filename"))
+                    .or_else(|| part.content_type().and_then(|ct| ct.attribute("name")))
+                    .unwrap_or("unnamed")
+                    .to_string();
+                let content_type = part
+                    .content_type()
+                    .map(|ct| {
+                        let sub = ct.subtype().unwrap_or("octet-stream");
+                        format!("{}/{sub}", ct.ctype())
+                    })
+                    .unwrap_or_else(|| "application/octet-stream".to_string());
+                let size = part.contents().len();
+                json!({
+                    "index": i,
+                    "filename": filename,
+                    "content_type": content_type,
+                    "size_bytes": size,
                 })
-                .collect();
+            })
+            .collect();
 
-            let flags: Vec<String> = fetch.flags().iter().map(|f| format!("{f:?}")).collect();
+        let flags: Vec<String> = fetch.flags().map(|f| format!("{f:?}")).collect();
 
-            let _ = session.logout();
+        let _ = session.logout().await;
 
-            let mut result = json!({
-                "uid": uid,
-                "subject": subject,
-                "from": from,
-                "to": to,
-                "date": date,
-                "body": body_text,
-                "flags": flags,
-                "message_id": message_id,
-            });
-            if !cc.is_empty() {
-                result["cc"] = json!(cc);
-            }
-            if !reply_to.is_empty() {
-                result["reply_to"] = json!(reply_to);
-            }
-            if !attachments.is_empty() {
-                result["attachments"] = json!(attachments);
-                result["attachment_count"] = json!(attachments.len());
-            }
-            Ok(result)
-        })
-        .await
-        .map_err(|e| Error::ToolExecution(format!("task join failed: {e}").into()))?
+        let mut result = json!({
+            "uid": uid,
+            "subject": subject,
+            "from": from,
+            "to": to,
+            "date": date,
+            "body": body_text,
+            "flags": flags,
+            "message_id": message_id,
+        });
+        if !cc.is_empty() {
+            result["cc"] = json!(cc);
+        }
+        if !reply_to.is_empty() {
+            result["reply_to"] = json!(reply_to);
+        }
+        if !attachments.is_empty() {
+            let count = attachments.len();
+            result["attachments"] = json!(attachments);
+            result["attachment_count"] = json!(count);
+        }
+        Ok(result)
     }
 
     // -----------------------------------------------------------------------
@@ -431,32 +426,30 @@ impl GmailTool {
     // -----------------------------------------------------------------------
 
     async fn action_labels(&self) -> Result<Value> {
-        let secrets = self.secrets.clone();
+        let (email, password) = self.get_credentials()?;
+        let mut session = connect_imap(&email, &password).await?;
 
-        tokio::task::spawn_blocking(move || {
-            let (email, password) = get_creds(&secrets)?;
-            let mut session = connect_imap_blocking(&email, &password)?;
+        let names: Vec<async_imap::types::Name> = session
+            .list(Some(""), Some("*"))
+            .await
+            .map_err(|e| Error::ToolExecution(format!("list mailboxes failed: {e}").into()))?
+            .try_collect()
+            .await
+            .map_err(|e| Error::ToolExecution(format!("list stream failed: {e}").into()))?;
 
-            let mailboxes = session
-                .list(Some(""), Some("*"))
-                .map_err(|e| Error::ToolExecution(format!("list mailboxes failed: {e}").into()))?;
-
-            let labels: Vec<Value> = mailboxes
-                .iter()
-                .map(|mb| {
-                    json!({
-                        "name": mb.name(),
-                        "delimiter": mb.delimiter().map(|c| c.to_string()),
-                    })
+        let labels: Vec<Value> = names
+            .iter()
+            .map(|mb| {
+                json!({
+                    "name": mb.name(),
+                    "delimiter": mb.delimiter(),
                 })
-                .collect();
+            })
+            .collect();
 
-            let _ = session.logout();
+        let _ = session.logout().await;
 
-            Ok(json!({ "labels": labels }))
-        })
-        .await
-        .map_err(|e| Error::ToolExecution(format!("task join failed: {e}").into()))?
+        Ok(json!({ "labels": labels }))
     }
 
     // -----------------------------------------------------------------------
@@ -468,38 +461,32 @@ impl GmailTool {
             .as_u64()
             .ok_or_else(|| Error::ToolExecution("missing 'uid'".into()))?
             as u32;
-        let from_mailbox = args["mailbox"].as_str().unwrap_or("INBOX");
+        let from_mailbox = args["mailbox"].as_str().unwrap_or("INBOX").to_string();
         let to_mailbox = args["to_mailbox"]
             .as_str()
-            .ok_or_else(|| Error::ToolExecution("missing 'to_mailbox'".into()))?;
+            .ok_or_else(|| Error::ToolExecution("missing 'to_mailbox'".into()))?
+            .to_string();
 
-        let secrets = self.secrets.clone();
-        let from_mailbox = from_mailbox.to_string();
-        let to_mailbox = to_mailbox.to_string();
+        let (email, password) = self.get_credentials()?;
+        let mut session = connect_imap(&email, &password).await?;
 
-        tokio::task::spawn_blocking(move || {
-            let (email, password) = get_creds(&secrets)?;
-            let mut session = connect_imap_blocking(&email, &password)?;
+        session.select(&from_mailbox).await.map_err(|e| {
+            Error::ToolExecution(format!("select {from_mailbox} failed: {e}").into())
+        })?;
 
-            session.select(&from_mailbox).map_err(|e| {
-                Error::ToolExecution(format!("select {from_mailbox} failed: {e}").into())
-            })?;
+        session
+            .uid_mv(uid.to_string(), &to_mailbox)
+            .await
+            .map_err(|e| Error::ToolExecution(format!("move failed: {e}").into()))?;
 
-            session
-                .uid_mv(uid.to_string(), &to_mailbox)
-                .map_err(|e| Error::ToolExecution(format!("move failed: {e}").into()))?;
+        let _ = session.logout().await;
 
-            let _ = session.logout();
-
-            Ok(json!({
-                "status": "moved",
-                "uid": uid,
-                "from": from_mailbox,
-                "to": to_mailbox,
-            }))
-        })
-        .await
-        .map_err(|e| Error::ToolExecution(format!("task join failed: {e}").into()))?
+        Ok(json!({
+            "status": "moved",
+            "uid": uid,
+            "from": from_mailbox,
+            "to": to_mailbox,
+        }))
     }
 
     // -----------------------------------------------------------------------
@@ -513,27 +500,22 @@ impl GmailTool {
             as u32;
         let mailbox = args["mailbox"].as_str().unwrap_or("INBOX");
 
-        let secrets = self.secrets.clone();
-        let mailbox = mailbox.to_string();
+        let (email, password) = self.get_credentials()?;
+        let mut session = connect_imap(&email, &password).await?;
 
-        tokio::task::spawn_blocking(move || {
-            let (email, password) = get_creds(&secrets)?;
-            let mut session = connect_imap_blocking(&email, &password)?;
+        session
+            .select(mailbox)
+            .await
+            .map_err(|e| Error::ToolExecution(format!("select {mailbox} failed: {e}").into()))?;
 
-            session.select(&mailbox).map_err(|e| {
-                Error::ToolExecution(format!("select {mailbox} failed: {e}").into())
-            })?;
+        session
+            .uid_mv(uid.to_string(), "[Gmail]/Trash")
+            .await
+            .map_err(|e| Error::ToolExecution(format!("trash failed: {e}").into()))?;
 
-            session
-                .uid_mv(uid.to_string(), "[Gmail]/Trash")
-                .map_err(|e| Error::ToolExecution(format!("trash failed: {e}").into()))?;
+        let _ = session.logout().await;
 
-            let _ = session.logout();
-
-            Ok(json!({ "status": "trashed", "uid": uid }))
-        })
-        .await
-        .map_err(|e| Error::ToolExecution(format!("task join failed: {e}").into()))?
+        Ok(json!({ "status": "trashed", "uid": uid }))
     }
 
     // -----------------------------------------------------------------------
@@ -547,35 +529,38 @@ impl GmailTool {
             as u32;
         let mailbox = args["mailbox"].as_str().unwrap_or("INBOX");
 
-        let secrets = self.secrets.clone();
-        let mailbox = mailbox.to_string();
+        let (email, password) = self.get_credentials()?;
+        let mut session = connect_imap(&email, &password).await?;
 
-        tokio::task::spawn_blocking(move || {
-            let (email, password) = get_creds(&secrets)?;
-            let mut session = connect_imap_blocking(&email, &password)?;
+        session
+            .select(mailbox)
+            .await
+            .map_err(|e| Error::ToolExecution(format!("select {mailbox} failed: {e}").into()))?;
 
-            session.select(&mailbox).map_err(|e| {
-                Error::ToolExecution(format!("select {mailbox} failed: {e}").into())
-            })?;
+        // uid_store returns a stream of FETCH responses; drain it so the server
+        // response is consumed before the next command.
+        let store_query = if read {
+            "+FLAGS (\\Seen)"
+        } else {
+            "-FLAGS (\\Seen)"
+        };
+        let _drain: Vec<async_imap::types::Fetch> = session
+            .uid_store(uid.to_string(), store_query)
+            .await
+            .map_err(|e| {
+                let action = if read { "mark read" } else { "mark unread" };
+                Error::ToolExecution(format!("{action} failed: {e}").into())
+            })?
+            .try_collect()
+            .await
+            .map_err(|e| Error::ToolExecution(format!("store stream failed: {e}").into()))?;
 
-            if read {
-                session
-                    .uid_store(uid.to_string(), "+FLAGS (\\Seen)")
-                    .map_err(|e| Error::ToolExecution(format!("mark read failed: {e}").into()))?;
-            } else {
-                session
-                    .uid_store(uid.to_string(), "-FLAGS (\\Seen)")
-                    .map_err(|e| Error::ToolExecution(format!("mark unread failed: {e}").into()))?;
-            }
+        let _ = session.logout().await;
 
-            let _ = session.logout();
-
-            let status = if read { "marked_read" } else { "marked_unread" };
-            Ok(json!({ "status": status, "uid": uid }))
-        })
-        .await
-        .map_err(|e| Error::ToolExecution(format!("task join failed: {e}").into()))?
+        let status = if read { "marked_read" } else { "marked_unread" };
+        Ok(json!({ "status": status, "uid": uid }))
     }
+
     // -----------------------------------------------------------------------
     // Action: thread (fetch full reply chain for a message)
     // -----------------------------------------------------------------------
@@ -587,179 +572,181 @@ impl GmailTool {
             as u32;
         let mailbox = args["mailbox"].as_str().unwrap_or("INBOX");
 
-        let secrets = self.secrets.clone();
-        let mailbox = mailbox.to_string();
+        let (email, password) = self.get_credentials()?;
+        let mut session = connect_imap(&email, &password).await?;
 
-        tokio::task::spawn_blocking(move || {
-            let (email, password) = get_creds(&secrets)?;
-            let mut session = connect_imap_blocking(&email, &password)?;
+        // First, fetch the target message to get its References/In-Reply-To/Message-ID.
+        session
+            .select(mailbox)
+            .await
+            .map_err(|e| Error::ToolExecution(format!("select {mailbox} failed: {e}").into()))?;
 
-            // First, fetch the target message to get its References/In-Reply-To/Message-ID.
-            session.select(&mailbox).map_err(|e| {
-                Error::ToolExecution(format!("select {mailbox} failed: {e}").into())
-            })?;
+        let fetches: Vec<async_imap::types::Fetch> = session
+            .uid_fetch(uid.to_string(), "(UID RFC822)")
+            .await
+            .map_err(|e| Error::ToolExecution(format!("fetch uid {uid} failed: {e}").into()))?
+            .try_collect()
+            .await
+            .map_err(|e| Error::ToolExecution(format!("fetch stream failed: {e}").into()))?;
 
-            let fetches = session
-                .uid_fetch(uid.to_string(), "(UID RFC822)")
-                .map_err(|e| Error::ToolExecution(format!("fetch uid {uid} failed: {e}").into()))?;
+        let fetch = fetches
+            .first()
+            .ok_or_else(|| Error::ToolExecution(format!("message uid {uid} not found").into()))?;
 
-            let fetch = fetches.iter().next().ok_or_else(|| {
-                Error::ToolExecution(format!("message uid {uid} not found").into())
-            })?;
+        let raw = fetch.body().unwrap_or_default();
+        let parsed = mail_parser::MessageParser::default()
+            .parse(raw)
+            .ok_or_else(|| Error::ToolExecution("failed to parse email".into()))?;
 
-            let raw = fetch.body().unwrap_or_default();
-            let parsed = mail_parser::MessageParser::default()
-                .parse(raw)
-                .ok_or_else(|| Error::ToolExecution("failed to parse email".into()))?;
-
-            // Collect all Message-IDs in the thread: this message + References header.
-            let mut msg_ids: Vec<String> = Vec::new();
-            if let Some(mid) = parsed.message_id() {
-                msg_ids.push(mid.to_string());
+        // Collect all Message-IDs in the thread: this message + References header.
+        let mut msg_ids: Vec<String> = Vec::new();
+        if let Some(mid) = parsed.message_id() {
+            msg_ids.push(mid.to_string());
+        }
+        // References header contains the full chain of Message-IDs.
+        let refs_header = parsed.header_raw("References").unwrap_or("");
+        for token in refs_header.split_whitespace() {
+            let id = token.trim_matches(|c| c == '<' || c == '>');
+            if !id.is_empty() && !msg_ids.contains(&id.to_string()) {
+                msg_ids.push(id.to_string());
             }
-            // References header contains the full chain of Message-IDs.
-            let refs_header = parsed.header_raw("References").unwrap_or("");
-            for token in refs_header.split_whitespace() {
-                let id = token.trim_matches(|c| c == '<' || c == '>');
-                if !id.is_empty() && !msg_ids.contains(&id.to_string()) {
-                    msg_ids.push(id.to_string());
-                }
+        }
+        if let Some(irt) = parsed.header_raw("In-Reply-To") {
+            let id = irt.trim().trim_matches(|c| c == '<' || c == '>');
+            if !id.is_empty() && !msg_ids.contains(&id.to_string()) {
+                msg_ids.push(id.to_string());
             }
-            if let Some(irt) = parsed.header_raw("In-Reply-To") {
-                let id = irt.trim().trim_matches(|c| c == '<' || c == '>');
-                if !id.is_empty() && !msg_ids.contains(&id.to_string()) {
-                    msg_ids.push(id.to_string());
-                }
+        }
+
+        if msg_ids.is_empty() {
+            let _ = session.logout().await;
+            return Ok(json!({
+                "thread": [],
+                "count": 0,
+                "note": "no threading headers found on this message"
+            }));
+        }
+
+        // Search [Gmail]/All Mail for all messages matching any of these IDs.
+        session
+            .select("[Gmail]/All Mail")
+            .await
+            .map_err(|e| Error::ToolExecution(format!("select All Mail failed: {e}").into()))?;
+
+        let mut all_uids = std::collections::HashSet::new();
+        for mid in &msg_ids {
+            // Escape message IDs for IMAP query safety.
+            let escaped = mid.replace('\\', "\\\\").replace('"', "\\\"");
+            // Search for messages that reference this ID or have this ID.
+            let query = format!("X-GM-RAW \"rfc822msgid:{escaped} OR references:{escaped}\"");
+            if let Ok(uids) = session.uid_search(&query).await {
+                all_uids.extend(uids);
             }
-
-            if msg_ids.is_empty() {
-                let _ = session.logout();
-                return Ok(json!({
-                    "thread": [],
-                    "count": 0,
-                    "note": "no threading headers found on this message"
-                }));
+            // Also try standard HEADER search as fallback.
+            let query2 =
+                format!("OR HEADER Message-ID \"<{escaped}>\" HEADER References \"<{escaped}>\"");
+            if let Ok(uids) = session.uid_search(&query2).await {
+                all_uids.extend(uids);
             }
+        }
 
-            // Search [Gmail]/All Mail for all messages matching any of these IDs.
-            session
-                .select("[Gmail]/All Mail")
-                .map_err(|e| Error::ToolExecution(format!("select All Mail failed: {e}").into()))?;
+        if all_uids.is_empty() {
+            let _ = session.logout().await;
+            return Ok(json!({
+                "thread": [],
+                "count": 0,
+                "note": "could not find thread messages"
+            }));
+        }
 
-            let mut all_uids = std::collections::HashSet::new();
-            for mid in &msg_ids {
-                // Escape message IDs for IMAP query safety.
-                let escaped = mid.replace('\\', "\\\\").replace('"', "\\\"");
-                // Search for messages that reference this ID or have this ID.
-                let query = format!("X-GM-RAW \"rfc822msgid:{escaped} OR references:{escaped}\"");
-                if let Ok(uids) = session.uid_search(&query) {
-                    all_uids.extend(uids);
-                }
-                // Also try standard HEADER search as fallback.
-                let query2 = format!(
-                    "OR HEADER Message-ID \"<{escaped}>\" HEADER References \"<{escaped}>\""
-                );
-                if let Ok(uids) = session.uid_search(&query2) {
-                    all_uids.extend(uids);
-                }
-            }
+        // Fetch all thread messages.
+        let mut uid_list: Vec<u32> = all_uids.into_iter().collect();
+        uid_list.sort_unstable(); // chronological (oldest first)
 
-            if all_uids.is_empty() {
-                let _ = session.logout();
-                return Ok(json!({
-                    "thread": [],
-                    "count": 0,
-                    "note": "could not find thread messages"
-                }));
-            }
+        let uid_set = uid_list
+            .iter()
+            .map(|u| u.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
 
-            // Fetch all thread messages.
-            let mut uid_list: Vec<u32> = all_uids.into_iter().collect();
-            uid_list.sort_unstable(); // chronological (oldest first)
+        let fetches: Vec<async_imap::types::Fetch> = session
+            .uid_fetch(&uid_set, "(UID RFC822 FLAGS)")
+            .await
+            .map_err(|e| Error::ToolExecution(format!("fetch thread failed: {e}").into()))?
+            .try_collect()
+            .await
+            .map_err(|e| Error::ToolExecution(format!("fetch stream failed: {e}").into()))?;
 
-            let uid_set = uid_list
-                .iter()
-                .map(|u| u.to_string())
-                .collect::<Vec<_>>()
-                .join(",");
+        let mut messages = Vec::new();
+        for fetch in &fetches {
+            let raw_body = fetch.body().unwrap_or_default();
+            let msg = match mail_parser::MessageParser::default().parse(raw_body) {
+                Some(m) => m,
+                None => continue,
+            };
 
-            let fetches = session
-                .uid_fetch(&uid_set, "(UID RFC822 FLAGS)")
-                .map_err(|e| Error::ToolExecution(format!("fetch thread failed: {e}").into()))?;
+            let subject = msg.subject().unwrap_or("").to_string();
+            let from = msg
+                .from()
+                .and_then(|a| a.first())
+                .map(|a| {
+                    a.name()
+                        .map(|n| format!("{n} <{}>", a.address().unwrap_or("")))
+                        .unwrap_or_else(|| a.address().unwrap_or("").to_string())
+                })
+                .unwrap_or_default();
+            let to: Vec<String> = msg
+                .to()
+                .map(|addrs| {
+                    addrs
+                        .iter()
+                        .map(|a| {
+                            a.name()
+                                .map(|n| format!("{n} <{}>", a.address().unwrap_or("")))
+                                .unwrap_or_else(|| a.address().unwrap_or("").to_string())
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let date = msg.date().map(|d| d.to_string()).unwrap_or_default();
+            let message_id = msg.message_id().unwrap_or("").to_string();
+            let body_text = msg
+                .body_text(0)
+                .unwrap_or_else(|| {
+                    msg.body_html(0)
+                        .map(|h| strip_html_tags(&h).into())
+                        .unwrap_or_default()
+                })
+                .to_string();
 
-            let mut messages = Vec::new();
-            for fetch in fetches.iter() {
-                let raw_body = fetch.body().unwrap_or_default();
-                let msg = match mail_parser::MessageParser::default().parse(raw_body) {
-                    Some(m) => m,
-                    None => continue,
-                };
+            // Truncate long bodies.
+            let body_text = if body_text.len() > 4000 {
+                format!(
+                    "{}…\n[truncated, {} chars total]",
+                    &body_text[..body_text.floor_char_boundary(4000)],
+                    body_text.len()
+                )
+            } else {
+                body_text
+            };
 
-                let subject = msg.subject().unwrap_or("").to_string();
-                let from = msg
-                    .from()
-                    .and_then(|a| a.first())
-                    .map(|a| {
-                        a.name()
-                            .map(|n| format!("{n} <{}>", a.address().unwrap_or("")))
-                            .unwrap_or_else(|| a.address().unwrap_or("").to_string())
-                    })
-                    .unwrap_or_default();
-                let to: Vec<String> = msg
-                    .to()
-                    .map(|addrs| {
-                        addrs
-                            .iter()
-                            .map(|a| {
-                                a.name()
-                                    .map(|n| format!("{n} <{}>", a.address().unwrap_or("")))
-                                    .unwrap_or_else(|| a.address().unwrap_or("").to_string())
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                let date = msg.date().map(|d| d.to_string()).unwrap_or_default();
-                let message_id = msg.message_id().unwrap_or("").to_string();
-                let body_text = msg
-                    .body_text(0)
-                    .unwrap_or_else(|| {
-                        msg.body_html(0)
-                            .map(|h| strip_html_tags(&h).into())
-                            .unwrap_or_default()
-                    })
-                    .to_string();
+            messages.push(json!({
+                "uid": fetch.uid.unwrap_or(0),
+                "subject": subject,
+                "from": from,
+                "to": to,
+                "date": date,
+                "message_id": message_id,
+                "body": body_text,
+            }));
+        }
 
-                // Truncate long bodies.
-                let body_text = if body_text.len() > 4000 {
-                    format!(
-                        "{}…\n[truncated, {} chars total]",
-                        &body_text[..body_text.floor_char_boundary(4000)],
-                        body_text.len()
-                    )
-                } else {
-                    body_text
-                };
+        let _ = session.logout().await;
 
-                messages.push(json!({
-                    "uid": fetch.uid.unwrap_or(0),
-                    "subject": subject,
-                    "from": from,
-                    "to": to,
-                    "date": date,
-                    "message_id": message_id,
-                    "body": body_text,
-                }));
-            }
-
-            let _ = session.logout();
-
-            Ok(json!({
-                "thread": messages,
-                "count": messages.len(),
-            }))
-        })
-        .await
-        .map_err(|e| Error::ToolExecution(format!("task join failed: {e}").into()))?
+        Ok(json!({
+            "thread": messages,
+            "count": messages.len(),
+        }))
     }
 
     // -----------------------------------------------------------------------
@@ -778,114 +765,103 @@ impl GmailTool {
         })? as usize;
         let mailbox = args["mailbox"].as_str().unwrap_or("INBOX");
 
-        let secrets = self.secrets.clone();
-        let mailbox = mailbox.to_string();
+        let (email, password) = self.get_credentials()?;
+        let mut session = connect_imap(&email, &password).await?;
 
-        tokio::task::spawn_blocking(move || {
-            let (email, password) = get_creds(&secrets)?;
-            let mut session = connect_imap_blocking(&email, &password)?;
+        session
+            .select(mailbox)
+            .await
+            .map_err(|e| Error::ToolExecution(format!("select {mailbox} failed: {e}").into()))?;
 
-            session
-                .select(&mailbox)
-                .map_err(|e| {
-                    Error::ToolExecution(format!("select {mailbox} failed: {e}").into())
-                })?;
+        let fetches: Vec<async_imap::types::Fetch> = session
+            .uid_fetch(uid.to_string(), "(UID RFC822)")
+            .await
+            .map_err(|e| Error::ToolExecution(format!("fetch uid {uid} failed: {e}").into()))?
+            .try_collect()
+            .await
+            .map_err(|e| Error::ToolExecution(format!("fetch stream failed: {e}").into()))?;
 
-            let fetches = session
-                .uid_fetch(uid.to_string(), "(UID RFC822)")
-                .map_err(|e| {
-                    Error::ToolExecution(format!("fetch uid {uid} failed: {e}").into())
-                })?;
+        let fetch = fetches
+            .first()
+            .ok_or_else(|| Error::ToolExecution(format!("message uid {uid} not found").into()))?;
 
-            let fetch = fetches
-                .iter()
-                .next()
-                .ok_or_else(|| {
-                    Error::ToolExecution(format!("message uid {uid} not found").into())
-                })?;
+        let raw_body = fetch.body().unwrap_or_default();
+        let parsed = mail_parser::MessageParser::default()
+            .parse(raw_body)
+            .ok_or_else(|| Error::ToolExecution("failed to parse email".into()))?;
 
-            let raw_body = fetch.body().unwrap_or_default();
-            let parsed = mail_parser::MessageParser::default()
-                .parse(raw_body)
-                .ok_or_else(|| Error::ToolExecution("failed to parse email".into()))?;
-
-            use mail_parser::MimeHeaders;
-            let part = parsed.attachment(attachment_index).ok_or_else(|| {
-                Error::ToolExecution(
-                    format!(
-                        "attachment index {attachment_index} not found (message has {} attachments)",
-                        parsed.attachment_count()
-                    )
-                    .into(),
+        use mail_parser::MimeHeaders;
+        let part = parsed.attachment(attachment_index).ok_or_else(|| {
+            Error::ToolExecution(
+                format!(
+                    "attachment index {attachment_index} not found (message has {} attachments)",
+                    parsed.attachment_count()
                 )
-            })?;
+                .into(),
+            )
+        })?;
 
-            let raw_filename = part
-                .content_disposition()
-                .and_then(|cd| cd.attribute("filename"))
-                .or_else(|| part.content_type().and_then(|ct| ct.attribute("name")))
-                .unwrap_or("attachment.bin")
-                .to_string();
+        let raw_filename = part
+            .content_disposition()
+            .and_then(|cd| cd.attribute("filename"))
+            .or_else(|| part.content_type().and_then(|ct| ct.attribute("name")))
+            .unwrap_or("attachment.bin")
+            .to_string();
 
-            // Sanitize filename to prevent path traversal attacks.
-            // Strip path separators and parent-directory components,
-            // keeping only the final filename component.
-            let filename = {
-                let name = std::path::Path::new(&raw_filename)
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("attachment.bin");
-                // Reject empty or dot-only filenames
-                if name.is_empty() || name == "." || name == ".." {
-                    "attachment.bin".to_string()
-                } else {
-                    // Prefix with a UUID to avoid collisions and ensure uniqueness
-                    format!("{}_{}", uuid::Uuid::new_v4(), name)
-                }
-            };
-
-            let contents = part.contents();
-
-            // Save to a temp directory
-            let download_dir = std::env::temp_dir().join("rustykrab-attachments");
-            std::fs::create_dir_all(&download_dir)
-                .map_err(|e| Error::ToolExecution(format!("create dir failed: {e}").into()))?;
-
-            let dest = download_dir.join(&filename);
-
-            // Final safety check: ensure the destination is within download_dir
-            if let Ok(canonical_dest) = dest.canonicalize().or_else(|_| {
-                // For new files, check parent
-                dest.parent()
-                    .and_then(|p| p.canonicalize().ok())
-                    .map(|p| p.join(dest.file_name().unwrap_or_default()))
-                    .ok_or(std::io::Error::other(
-                        "cannot resolve",
-                    ))
-            }) {
-                let canonical_dir = download_dir
-                    .canonicalize()
-                    .map_err(|e| Error::ToolExecution(format!("resolve dir failed: {e}").into()))?;
-                if !canonical_dest.starts_with(&canonical_dir) {
-                    return Err(Error::ToolExecution(
-                        "attachment filename escapes download directory".into(),
-                    ));
-                }
+        // Sanitize filename to prevent path traversal attacks.
+        // Strip path separators and parent-directory components,
+        // keeping only the final filename component.
+        let filename = {
+            let name = std::path::Path::new(&raw_filename)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("attachment.bin");
+            // Reject empty or dot-only filenames
+            if name.is_empty() || name == "." || name == ".." {
+                "attachment.bin".to_string()
+            } else {
+                // Prefix with a UUID to avoid collisions and ensure uniqueness
+                format!("{}_{}", uuid::Uuid::new_v4(), name)
             }
-            std::fs::write(&dest, contents)
-                .map_err(|e| Error::ToolExecution(format!("write failed: {e}").into()))?;
+        };
 
-            let _ = session.logout();
+        let contents = part.contents();
 
-            Ok(json!({
-                "status": "downloaded",
-                "filename": filename,
-                "path": dest.to_string_lossy(),
-                "size_bytes": contents.len(),
-            }))
-        })
-        .await
-        .map_err(|e| Error::ToolExecution(format!("task join failed: {e}").into()))?
+        // Save to a temp directory
+        let download_dir = std::env::temp_dir().join("rustykrab-attachments");
+        std::fs::create_dir_all(&download_dir)
+            .map_err(|e| Error::ToolExecution(format!("create dir failed: {e}").into()))?;
+
+        let dest = download_dir.join(&filename);
+
+        // Final safety check: ensure the destination is within download_dir
+        if let Ok(canonical_dest) = dest.canonicalize().or_else(|_| {
+            // For new files, check parent
+            dest.parent()
+                .and_then(|p| p.canonicalize().ok())
+                .map(|p| p.join(dest.file_name().unwrap_or_default()))
+                .ok_or(std::io::Error::other("cannot resolve"))
+        }) {
+            let canonical_dir = download_dir
+                .canonicalize()
+                .map_err(|e| Error::ToolExecution(format!("resolve dir failed: {e}").into()))?;
+            if !canonical_dest.starts_with(&canonical_dir) {
+                return Err(Error::ToolExecution(
+                    "attachment filename escapes download directory".into(),
+                ));
+            }
+        }
+        std::fs::write(&dest, contents)
+            .map_err(|e| Error::ToolExecution(format!("write failed: {e}").into()))?;
+
+        let _ = session.logout().await;
+
+        Ok(json!({
+            "status": "downloaded",
+            "filename": filename,
+            "path": dest.to_string_lossy(),
+            "size_bytes": contents.len(),
+        }))
     }
 }
 
@@ -1010,36 +986,8 @@ impl Tool for GmailTool {
 // Module-private helpers
 // ---------------------------------------------------------------------------
 
-/// Get credentials from SecretStore (for use in spawn_blocking closures).
-fn get_creds(secrets: &SecretStore) -> Result<(String, String)> {
-    let email = secrets.get(KEY_EMAIL).map_err(|e| {
-        Error::ToolExecution(
-            format!(
-                "gmail_email not available: {e}. Run gmail(action='setup') first. \
-                 If you already stored it, the master encryption key may have changed \
-                 (set RUSTYKRAB_MASTER_KEY for persistence across restarts)."
-            )
-            .into(),
-        )
-    })?;
-    let password = secrets.get(KEY_APP_PASSWORD).map_err(|e| {
-        Error::ToolExecution(
-            format!(
-                "gmail_app_password not available: {e}. Run gmail(action='setup') first. \
-                 If you already stored it, the master encryption key may have changed \
-                 (set RUSTYKRAB_MASTER_KEY for persistence across restarts)."
-            )
-            .into(),
-        )
-    })?;
-    Ok((email, password))
-}
-
-/// Connect to Gmail IMAP over rustls (blocking, for use in spawn_blocking).
-fn connect_imap_blocking(
-    email: &str,
-    password: &str,
-) -> Result<imap::Session<rustls::StreamOwned<rustls::ClientConnection, std::net::TcpStream>>> {
+/// Connect to Gmail IMAP over rustls and authenticate.
+async fn connect_imap(email: &str, password: &str) -> Result<ImapSession> {
     let native_certs = rustls_native_certs::load_native_certs();
     let mut root_store = rustls::RootCertStore::empty();
     root_store.add_parsable_certificates(native_certs.certs);
@@ -1053,15 +1001,30 @@ fn connect_imap_blocking(
         .to_string()
         .try_into()
         .map_err(|e| Error::ToolExecution(format!("invalid server name: {e}").into()))?;
-    let tls_conn = rustls::ClientConnection::new(config, server_name)
-        .map_err(|e| Error::ToolExecution(format!("TLS setup failed: {e}").into()))?;
-    let tcp = std::net::TcpStream::connect((IMAP_HOST, IMAP_PORT))
+
+    let tcp = tokio::net::TcpStream::connect((IMAP_HOST, IMAP_PORT))
+        .await
         .map_err(|e| Error::ToolExecution(format!("IMAP connect failed: {e}").into()))?;
-    let tls_stream = rustls::StreamOwned::new(tls_conn, tcp);
-    let client = imap::Client::new(tls_stream);
+    let connector = tokio_rustls::TlsConnector::from(config);
+    let tls_stream = connector
+        .connect(server_name, tcp)
+        .await
+        .map_err(|e| Error::ToolExecution(format!("TLS handshake failed: {e}").into()))?;
+
+    let mut client = async_imap::Client::new(tls_stream);
+    // Read the server greeting so the protocol stream stays in sync.
+    let _greeting = client
+        .read_response()
+        .await
+        .map_err(|e| Error::ToolExecution(format!("IMAP greeting read failed: {e}").into()))?
+        .ok_or_else(|| {
+            Error::ToolExecution("IMAP server closed connection before greeting".into())
+        })?;
+
     let session = client
         .login(email, password)
-        .map_err(|e| Error::ToolExecution(format!("IMAP login failed: {}", e.0).into()))?;
+        .await
+        .map_err(|(e, _client)| Error::ToolExecution(format!("IMAP login failed: {e}").into()))?;
     Ok(session)
 }
 
@@ -1071,7 +1034,7 @@ fn decode_imap_string(s: &[u8]) -> String {
 }
 
 /// Format an IMAP address into a readable string.
-fn format_address(addr: &imap_proto::types::Address) -> String {
+fn format_address(addr: &imap_proto::types::Address<'_>) -> String {
     let name = addr.name.as_ref().map(|n| decode_imap_string(n));
     let mailbox = addr.mailbox.as_ref().map(|m| decode_imap_string(m));
     let host = addr.host.as_ref().map(|h| decode_imap_string(h));
