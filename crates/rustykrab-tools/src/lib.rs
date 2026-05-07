@@ -86,6 +86,9 @@ mod skills;
 mod tools_list;
 mod tools_load;
 
+// MCP connector (remote MCP servers exposed as native tools)
+mod mcp_connector;
+
 // --- Public re-exports ---
 
 // Filesystem
@@ -166,6 +169,9 @@ pub use self::skills::{SkillTool, SkillsTool};
 // Meta tools
 pub use tools_list::ToolsListTool;
 pub use tools_load::ToolsLoadTool;
+
+// MCP connector
+pub use mcp_connector::{mcp_connector_tools, McpRemoteTool};
 
 /// Collect all built-in tools that require no external backend into a Vec.
 ///

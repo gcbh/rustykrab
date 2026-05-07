@@ -690,6 +690,16 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("video tool registered");
     }
 
+    // --- MCP connector (remote MCP servers as native tools) ---
+    // Registered before the sub-agent snapshot below so sub-agents also
+    // inherit MCP tools. Per-server connect failures are logged inside
+    // and never block startup.
+    let mcp_tools = rustykrab_tools::mcp_connector_tools().await;
+    if !mcp_tools.is_empty() {
+        tracing::info!(count = mcp_tools.len(), "MCP connector tools registered");
+        tools.extend(mcp_tools);
+    }
+
     // --- Log provider status ---
     tracing::info!(provider = provider.name(), "model provider configured");
 
