@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.10.10] - 2026-05-08
+
+- fix(release): pin fastembed to 4.9.1 so Ubuntu 22.04 binary links (#418)
+
 ## [2.10.9] - 2026-05-08
 
 - ci(release): build x86_64 linux on ubuntu-22.04 for glibc 2.35 compat (#417)
