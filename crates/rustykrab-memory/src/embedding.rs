@@ -167,7 +167,7 @@ mod fastembed_impl {
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
 
-    use fastembed::{EmbeddingModel, InitOptionsWithLength, TextEmbedding};
+    use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 
     /// Production embedder backed by fastembed (ONNX Runtime).
     ///
@@ -197,7 +197,7 @@ mod fastembed_impl {
             cache_dir: PathBuf,
         ) -> std::result::Result<Self, rustykrab_core::Error> {
             let model_version = format!("{:?}", model_name);
-            let opts = InitOptionsWithLength::new(model_name)
+            let opts = InitOptions::new(model_name)
                 .with_cache_dir(cache_dir)
                 .with_show_download_progress(true);
 
