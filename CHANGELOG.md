@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.10.8] - 2026-05-08
+
+- chore: sync Cargo.lock with v2.10.7 workspace version (#416)
+
 ## [2.10.7] - 2026-05-07
 
 - Refresh README description and architecture for current agent (#415)
