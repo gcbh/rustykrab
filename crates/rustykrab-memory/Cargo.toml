@@ -23,7 +23,23 @@ tracing.workspace = true
 thiserror.workspace = true
 regex = "1"
 rusqlite = { version = "0.34", features = ["bundled"] }
-fastembed = { version = "5", optional = true, default-features = false, features = ["ort-download-binaries-rustls-tls", "hf-hub-rustls-tls"] }
+# Pinned to 5.8.0 — the last fastembed release pinning ort =2.0.0-rc.10,
+# which is both glibc-2.35 / Ubuntu 22.04 compatible and still served
+# from the active cdn.pyke.io. fastembed 5.8.1 already bumped to ort
+# =2.0.0-rc.11 (#220). ort rc.11+ ship prebuilts referencing glibc
+# 2.38+ symbols (__isoc23_strtol et al.) that fail to link on older
+# LTS distros (https://github.com/pykeio/ort/issues/523). The older
+# fastembed 4.x line uses ort rc.9, whose tarball lives on
+# parcel.pyke.io and no longer resolves at download time.
+#
+# `ort-download-binaries` pulls native-tls into the ort-sys build
+# script via ureq. ort rc.10 hardcodes native-tls for the download
+# (the rustls switch only landed later, around ort rc.12). This is
+# build-time only — native-tls is invoked once to fetch the prebuilt
+# tarball and never links into the final binary, so the runtime TLS
+# posture (rustls everywhere via lettre/reqwest, per 7054b18) is
+# unaffected. Re-evaluate once pykeio/ort#523 is resolved upstream.
+fastembed = { version = "=5.8.0", optional = true, default-features = false, features = ["ort-download-binaries", "hf-hub-rustls-tls"] }
 
 [dev-dependencies]
 tempfile = "3"

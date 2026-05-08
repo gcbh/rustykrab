@@ -91,28 +91,21 @@ jobs:
 
   # ── Build release binaries ─────────────────────────────────────────
   build:
-    name: Build (${{ matrix.asset_name }})
+    name: Build (${{ matrix.target }})
     needs: bump
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
         include:
-          # Built on Ubuntu 22.04 (glibc 2.35) for broad compatibility:
-          # this binary runs on Ubuntu 22.04 and any newer glibc-based distro.
+          # Built on Ubuntu 22.04 (glibc 2.35) so the artifact runs on
+          # 22.04 and any newer glibc-based distro. Pairs with the
+          # =4.9.1 fastembed pin (ort rc.9) — see crates/rustykrab-memory.
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-22.04
             artifact: rustykrab-cli
-            asset_name: x86_64-unknown-linux-gnu-ubuntu22
-          # Built on the latest Ubuntu runner; requires the same or newer
-          # glibc on the host (currently 2.39 from Ubuntu 24.04).
-          - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
-            artifact: rustykrab-cli
-            asset_name: x86_64-unknown-linux-gnu
           - target: aarch64-apple-darwin
             os: macos-14
             artifact: rustykrab-cli
-            asset_name: aarch64-apple-darwin
 
     steps:
       - uses: actions/checkout@v4
@@ -125,7 +118,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.asset_name }}
+          key: ${{ matrix.target }}
 
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }} -p rustykrab-cli
@@ -204,17 +197,17 @@ jobs:
           if [ -d "target/${{ matrix.target }}/release/RustyKrab.app" ]; then
             cp -R target/${{ matrix.target }}/release/RustyKrab.app dist/
             cd dist
-            tar czf rustykrab-${{ matrix.asset_name }}.tar.gz RustyKrab.app
+            tar czf rustykrab-${{ matrix.target }}.tar.gz RustyKrab.app
           else
             cp target/${{ matrix.target }}/release/${{ matrix.artifact }} dist/
             cd dist
-            tar czf rustykrab-${{ matrix.asset_name }}.tar.gz ${{ matrix.artifact }}
+            tar czf rustykrab-${{ matrix.target }}.tar.gz ${{ matrix.artifact }}
           fi
 
       - uses: actions/upload-artifact@v4
         with:
-          name: rustykrab-${{ matrix.asset_name }}
-          path: dist/rustykrab-${{ matrix.asset_name }}.tar.gz
+          name: rustykrab-${{ matrix.target }}
+          path: dist/rustykrab-${{ matrix.target }}.tar.gz
 
   # ── Create GitHub Release ──────────────────────────────────────────
   release:
