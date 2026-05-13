@@ -35,15 +35,21 @@ use crate::rlm::RecursiveExecutor;
 /// the prompt on its own.
 const MAX_PEEK_CHARS: usize = 50_000;
 
-/// Build the four recall tools.  All four take no per-call construction
-/// arguments — they resolve the active conversation's archive at
-/// `execute()` time via [`with_session_context`], so the same instances
-/// can be registered globally and shared across conversations.
+/// Maximum bytes a single `recall_append` call may stash. Bounds memory
+/// growth from a model that tries to dump a huge blob in one shot;
+/// larger payloads should be appended in chunks.
+const MAX_APPEND_BYTES: usize = 4 * 1024 * 1024;
+
+/// Build the recall tools.  All take no per-call construction arguments —
+/// they resolve the active conversation's archive at `execute()` time via
+/// [`with_session_context`], so the same instances can be registered
+/// globally and shared across conversations.
 pub fn recall_tools(
     provider: Arc<dyn ModelProvider>,
     orchestration: OrchestrationConfig,
 ) -> Vec<Arc<dyn Tool>> {
     vec![
+        Arc::new(RecallAppendTool),
         Arc::new(RecallInfoTool),
         Arc::new(RecallPeekTool),
         Arc::new(RecallSearchTool),
@@ -70,6 +76,80 @@ fn empty_archive_response() -> Value {
         "empty": true,
         "note": "no compacted history is available for this conversation yet",
     })
+}
+
+// ── recall_append ───────────────────────────────────────────────────
+
+struct RecallAppendTool;
+
+#[async_trait]
+impl Tool for RecallAppendTool {
+    fn name(&self) -> &str {
+        "recall_append"
+    }
+
+    fn description(&self) -> &str {
+        "Stash a blob of text into this conversation's recall archive so \
+         you can come back to it later via `recall_info`, `recall_peek`, \
+         and `recall_search` without paying the token cost of carrying it \
+         in every turn. The archive is append-only — new text is joined \
+         with a blank-line separator to whatever is already there. Useful \
+         for large documents, long tool outputs, or chunks of context the \
+         user pasted that you only need to consult occasionally."
+    }
+
+    fn schema(&self) -> ToolSchema {
+        ToolSchema {
+            name: self.name().to_string(),
+            description: self.description().to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "text": {
+                        "type": "string",
+                        "description": "The text to append to the archive. Maximum 4 MiB per call."
+                    }
+                },
+                "required": ["text"]
+            }),
+        }
+    }
+
+    async fn execute(&self, args: Value) -> rustykrab_core::Result<Value> {
+        let text = args["text"]
+            .as_str()
+            .ok_or_else(|| rustykrab_core::Error::ToolExecution("missing text".into()))?;
+
+        if text.len() > MAX_APPEND_BYTES {
+            return Err(rustykrab_core::Error::ToolExecution(
+                format!(
+                    "text too large: {} bytes exceeds {} byte limit; split into smaller appends",
+                    text.len(),
+                    MAX_APPEND_BYTES
+                )
+                .into(),
+            ));
+        }
+
+        let result = with_session_context(|ctx| {
+            ctx.recall.append(ctx.conversation_id, text);
+            ctx.recall
+                .get(ctx.conversation_id)
+                .map(|a| a.len())
+                .unwrap_or(0)
+        });
+
+        match result {
+            Some(archive_bytes) => Ok(json!({
+                "appended_bytes": text.len(),
+                "archive_bytes": archive_bytes,
+                "estimated_tokens": estimate_tokens(text),
+            })),
+            None => Err(rustykrab_core::Error::ToolExecution(
+                "recall_append called outside a session context".into(),
+            )),
+        }
+    }
 }
 
 // ── recall_info ─────────────────────────────────────────────────────
@@ -477,5 +557,101 @@ mod tests {
             })
             .await;
         assert!(result.is_err());
+    }
+
+    fn empty_ctx_with_store() -> (SessionToolContext, Uuid, Arc<RecallStore>) {
+        let conv = Uuid::new_v4();
+        let recall = Arc::new(RecallStore::new());
+        let ctx = SessionToolContext {
+            conversation_id: conv,
+            capabilities: Arc::new(CapabilitySet::none()),
+            all_tools: Arc::new(Vec::new()),
+            active_tools: Arc::new(ActiveToolsRegistry::new()),
+            recall: recall.clone(),
+        };
+        (ctx, conv, recall)
+    }
+
+    #[tokio::test]
+    async fn append_stashes_into_archive() {
+        let (ctx, conv, store) = empty_ctx_with_store();
+        let result = SESSION_TOOL_CONTEXT
+            .scope(ctx, async {
+                RecallAppendTool
+                    .execute(json!({"text": "hello world"}))
+                    .await
+            })
+            .await
+            .unwrap();
+        assert_eq!(result["appended_bytes"], 11);
+        assert_eq!(result["archive_bytes"], 11);
+        assert_eq!(
+            store.get(conv).as_deref().map(String::as_str),
+            Some("hello world")
+        );
+    }
+
+    #[tokio::test]
+    async fn append_is_readable_via_info_and_peek() {
+        let (ctx, _, _) = empty_ctx_with_store();
+        let result = SESSION_TOOL_CONTEXT
+            .scope(ctx, async {
+                RecallAppendTool
+                    .execute(json!({"text": "first chunk"}))
+                    .await?;
+                let info = RecallInfoTool.execute(json!({})).await?;
+                let peek = RecallPeekTool
+                    .execute(json!({"start": 0, "end": 5}))
+                    .await?;
+                Ok::<_, rustykrab_core::Error>(json!({"info": info, "peek": peek}))
+            })
+            .await
+            .unwrap();
+        assert_eq!(result["info"]["empty"], false);
+        assert_eq!(result["info"]["length_bytes"], 11);
+        assert_eq!(result["peek"]["text"], "first");
+    }
+
+    #[tokio::test]
+    async fn append_joins_with_blank_line_separator() {
+        let (ctx, conv, store) = empty_ctx_with_store();
+        SESSION_TOOL_CONTEXT
+            .scope(ctx, async {
+                RecallAppendTool
+                    .execute(json!({"text": "first"}))
+                    .await
+                    .unwrap();
+                RecallAppendTool
+                    .execute(json!({"text": "second"}))
+                    .await
+                    .unwrap();
+            })
+            .await;
+        assert_eq!(
+            store.get(conv).as_deref().map(String::as_str),
+            Some("first\n\nsecond")
+        );
+    }
+
+    #[tokio::test]
+    async fn append_rejects_oversize_payload() {
+        let (ctx, _, _) = empty_ctx_with_store();
+        let big = "x".repeat(MAX_APPEND_BYTES + 1);
+        let err = SESSION_TOOL_CONTEXT
+            .scope(ctx, async {
+                RecallAppendTool.execute(json!({"text": big})).await
+            })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("text too large"));
+    }
+
+    #[tokio::test]
+    async fn append_errors_outside_session_scope() {
+        let err = RecallAppendTool
+            .execute(json!({"text": "x"}))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("outside a session context"));
     }
 }

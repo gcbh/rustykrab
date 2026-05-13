@@ -20,12 +20,14 @@ use uuid::Uuid;
 /// Names of meta-tools that are always included in the schema sent to the
 /// model, regardless of the active tool set. The first two are how the
 /// model discovers and loads the rest of the catalog. The `recall_*`
-/// tools read the per-conversation compaction archive and need to be
+/// tools read and write the per-conversation archive and need to be
 /// always present — the model can't `tools_load` them after compaction
-/// has already dropped the detail it needs to recover.
+/// has already dropped the detail it needs to recover, and `recall_append`
+/// is the manual escape hatch for stashing content outside the prompt.
 const META_TOOL_NAMES: &[&str] = &[
     "tools_list",
     "tools_load",
+    "recall_append",
     "recall_info",
     "recall_peek",
     "recall_search",
