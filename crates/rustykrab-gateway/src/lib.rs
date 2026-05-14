@@ -10,7 +10,10 @@ mod telegram_webhook;
 mod webchat;
 
 pub use auth::generate_token;
-pub use orchestrate::{run_agent, run_agent_interactive, run_agent_streaming};
+pub use orchestrate::{
+    run_agent, run_agent_interactive, run_agent_streaming, run_agent_streaming_with_options,
+    run_agent_with_options, RunOptions,
+};
 pub use origin::OriginPolicy;
 pub use rate_limit::RateLimitConfig;
 pub use state::AppState;

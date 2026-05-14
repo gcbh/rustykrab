@@ -49,6 +49,20 @@ pub enum StreamEvent {
     Done(ModelResponse),
 }
 
+/// Constraint on whether the model must call a tool on this turn.
+///
+/// Providers that don't support a native tool_choice parameter fall back
+/// to the unconstrained behavior — the runner can still rely on a normal
+/// response and re-prompt on the next iteration if it wanted tool use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ToolChoice {
+    /// Model decides whether to call a tool.
+    #[default]
+    Auto,
+    /// Model MUST call at least one of the supplied tools (Anthropic: `{"type":"any"}`).
+    Any,
+}
+
 /// Trait implemented by every model provider (e.g. Anthropic, OpenAI).
 #[async_trait]
 pub trait ModelProvider: Send + Sync {
@@ -80,6 +94,20 @@ pub trait ModelProvider: Send + Sync {
     /// Send a conversation to the model and get back the next message.
     async fn chat(&self, messages: &[Message], tools: &[ToolSchema]) -> Result<ModelResponse>;
 
+    /// Send a conversation to the model with an explicit tool-choice constraint.
+    ///
+    /// Default implementation ignores the constraint and calls [`chat`].
+    /// Providers that natively support `tool_choice` (e.g. Anthropic)
+    /// should override this to forward the constraint to the API.
+    async fn chat_with_choice(
+        &self,
+        messages: &[Message],
+        tools: &[ToolSchema],
+        _choice: ToolChoice,
+    ) -> Result<ModelResponse> {
+        self.chat(messages, tools).await
+    }
+
     /// Stream a response, sending chunks through the callback.
     ///
     /// Default implementation falls back to non-streaming `chat()`.
@@ -97,5 +125,18 @@ pub trait ModelProvider: Send + Sync {
         }
         on_event(StreamEvent::Done(response.clone()));
         Ok(response)
+    }
+
+    /// Stream a response with an explicit tool-choice constraint.
+    ///
+    /// Default implementation ignores the constraint and calls [`chat_stream`].
+    async fn chat_stream_with_choice(
+        &self,
+        messages: &[Message],
+        tools: &[ToolSchema],
+        _choice: ToolChoice,
+        on_event: &(dyn Fn(StreamEvent) + Send + Sync),
+    ) -> Result<ModelResponse> {
+        self.chat_stream(messages, tools, on_event).await
     }
 }

@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use chrono::Utc;
 use rustykrab_core::active_tools::{ActiveToolsRegistry, SessionToolContext, SESSION_TOOL_CONTEXT};
 use rustykrab_core::capability::Capability;
-use rustykrab_core::model::{ModelProvider, ModelResponse, StopReason, StreamEvent};
+use rustykrab_core::model::{ModelProvider, ModelResponse, StopReason, StreamEvent, ToolChoice};
 use rustykrab_core::recall::RecallStore;
 use rustykrab_core::session::Session;
 use rustykrab_core::types::{
@@ -573,6 +573,11 @@ pub struct AgentConfig {
     pub compaction_threshold_pct: f64,
     /// Strategy for when to call the LLM after tool results start arriving.
     pub llm_trigger_strategy: LlmTriggerStrategy,
+    /// When `true`, the first LLM call of the run is made with
+    /// `tool_choice = "any"`, forcing the model to invoke a tool instead
+    /// of producing a greeting/acknowledgement. Set for scheduled tasks
+    /// where the first turn must be action, not chat.
+    pub force_tool_use_first_iteration: bool,
 }
 
 impl Default for AgentConfig {
@@ -585,6 +590,7 @@ impl Default for AgentConfig {
             max_context_tokens: 128_000,
             compaction_threshold_pct: 0.85,
             llm_trigger_strategy: LlmTriggerStrategy::Debounce(Duration::from_secs(2)),
+            force_tool_use_first_iteration: false,
         }
     }
 }
@@ -880,13 +886,29 @@ impl AgentRunner {
             // iteration are reflected in the next API call.
             let schemas = self.compute_schemas(session, session.conversation_id);
 
+            // Iteration-0 guard for scheduled tasks: force the model to
+            // call a tool on the first turn so it can't reply with a bare
+            // greeting like "I'm ready" and burn the slot. Only safe when
+            // we actually have tools to choose from.
+            let tool_choice = if iteration == 0
+                && self.config.force_tool_use_first_iteration
+                && !schemas.is_empty()
+            {
+                ToolChoice::Any
+            } else {
+                ToolChoice::Auto
+            };
+
             let llm_start = std::time::Instant::now();
             let ModelResponse {
                 message,
                 usage,
                 stop_reason,
                 ..
-            } = self.provider.chat(&conv.messages, &schemas).await?;
+            } = self
+                .provider
+                .chat_with_choice(&conv.messages, &schemas, tool_choice)
+                .await?;
             let llm_elapsed = llm_start.elapsed();
             tracing::info!(
                 iteration,
@@ -894,6 +916,7 @@ impl AgentRunner {
                 prompt_tokens = usage.prompt_tokens,
                 completion_tokens = usage.completion_tokens,
                 ?stop_reason,
+                ?tool_choice,
                 "LLM call completed"
             );
 
@@ -1233,6 +1256,16 @@ impl AgentRunner {
             // iteration are reflected in the next API call.
             let schemas = self.compute_schemas(session, session.conversation_id);
 
+            // Iteration-0 guard: see run_inner for rationale.
+            let tool_choice = if iteration == 0
+                && self.config.force_tool_use_first_iteration
+                && !schemas.is_empty()
+            {
+                ToolChoice::Any
+            } else {
+                ToolChoice::Auto
+            };
+
             let llm_start = std::time::Instant::now();
             let ModelResponse {
                 message,
@@ -1241,7 +1274,7 @@ impl AgentRunner {
                 ..
             } = self
                 .provider
-                .chat_stream(&conv.messages, &schemas, &stream_callback)
+                .chat_stream_with_choice(&conv.messages, &schemas, tool_choice, &stream_callback)
                 .await?;
             let llm_elapsed = llm_start.elapsed();
             tracing::info!(
@@ -1250,6 +1283,7 @@ impl AgentRunner {
                 prompt_tokens = usage.prompt_tokens,
                 completion_tokens = usage.completion_tokens,
                 ?stop_reason,
+                ?tool_choice,
                 "LLM call completed"
             );
 
@@ -3346,5 +3380,170 @@ mod response_classification_tests {
             Option A is the simplest because the integration surface is small \
             and the team already understands the moving parts.";
         assert_complete(text);
+    }
+}
+
+#[cfg(test)]
+mod tool_choice_guard_tests {
+    //! Tests for the iteration-0 force-tool-use guard used by cron tasks.
+    use super::*;
+
+    use async_trait::async_trait;
+    use rustykrab_core::capability::CapabilitySet;
+    use rustykrab_core::model::{ModelResponse, StopReason, Usage};
+    use rustykrab_core::types::ToolSchema;
+    use std::sync::Mutex;
+
+    use crate::sandbox::NoSandbox;
+
+    /// Provider that records the `ToolChoice` of every call so tests can
+    /// assert which iteration saw which choice.
+    struct RecordingProvider {
+        choices: Mutex<Vec<ToolChoice>>,
+    }
+
+    impl RecordingProvider {
+        fn new() -> Self {
+            Self {
+                choices: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for RecordingProvider {
+        fn name(&self) -> &str {
+            "recording-mock"
+        }
+
+        async fn chat(&self, _: &[Message], _: &[ToolSchema]) -> Result<ModelResponse> {
+            self.choices.lock().unwrap().push(ToolChoice::Auto);
+            Ok(canned_response())
+        }
+
+        async fn chat_with_choice(
+            &self,
+            _: &[Message],
+            _: &[ToolSchema],
+            choice: ToolChoice,
+        ) -> Result<ModelResponse> {
+            self.choices.lock().unwrap().push(choice);
+            Ok(canned_response())
+        }
+    }
+
+    fn canned_response() -> ModelResponse {
+        ModelResponse {
+            message: Message {
+                id: Uuid::new_v4(),
+                role: Role::Assistant,
+                content: MessageContent::Text("Done.".into()),
+                created_at: Utc::now(),
+            },
+            usage: Usage::default(),
+            stop_reason: StopReason::EndTurn,
+            text: None,
+        }
+    }
+
+    /// Minimal no-op tool so `compute_schemas` returns a non-empty list —
+    /// the guard skips itself when there are no tools to choose from.
+    struct DummyTool;
+
+    #[async_trait]
+    impl Tool for DummyTool {
+        fn name(&self) -> &str {
+            "dummy"
+        }
+        fn description(&self) -> &str {
+            "dummy tool for tests"
+        }
+        fn schema(&self) -> ToolSchema {
+            ToolSchema {
+                name: "dummy".into(),
+                description: "dummy".into(),
+                parameters: serde_json::json!({}),
+            }
+        }
+        async fn execute(&self, _args: serde_json::Value) -> Result<serde_json::Value> {
+            Ok(serde_json::json!({}))
+        }
+    }
+
+    fn make_conversation() -> Conversation {
+        Conversation {
+            id: Uuid::new_v4(),
+            messages: vec![Message {
+                id: Uuid::new_v4(),
+                role: Role::User,
+                content: MessageContent::Text("Do the scheduled thing.".into()),
+                created_at: Utc::now(),
+            }],
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            summary: None,
+            detected_profile: None,
+            channel_source: None,
+            channel_id: None,
+            channel_thread_id: None,
+        }
+    }
+
+    fn make_runner(provider: Arc<RecordingProvider>, force: bool) -> (AgentRunner, Session) {
+        let active = Arc::new(ActiveToolsRegistry::new());
+        let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(DummyTool)];
+        let config = AgentConfig {
+            force_tool_use_first_iteration: force,
+            ..AgentConfig::default()
+        };
+        let runner = AgentRunner::new(provider, tools, Arc::new(NoSandbox))
+            .with_config(config)
+            .with_active_tools(active.clone());
+        let conv_id = Uuid::new_v4();
+        active.activate(conv_id, ["dummy"]);
+        let caps = CapabilitySet::for_tools_permissive(&["dummy"]);
+        let session = Session::with_capabilities(conv_id, caps);
+        (runner, session)
+    }
+
+    #[tokio::test]
+    async fn iteration_zero_forces_any_when_flag_set() {
+        let provider = Arc::new(RecordingProvider::new());
+        let (runner, session) = make_runner(provider.clone(), true);
+        let mut conv = make_conversation();
+        // Override conv.id to match the session's so capabilities apply.
+        conv.id = session.conversation_id;
+
+        runner
+            .run(&mut conv, &session)
+            .await
+            .expect("agent loop should complete");
+
+        let choices = provider.choices.lock().unwrap();
+        assert_eq!(
+            choices.first().copied(),
+            Some(ToolChoice::Any),
+            "iteration 0 must use ToolChoice::Any when flag is set; got {choices:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn iteration_zero_stays_auto_when_flag_unset() {
+        let provider = Arc::new(RecordingProvider::new());
+        let (runner, session) = make_runner(provider.clone(), false);
+        let mut conv = make_conversation();
+        conv.id = session.conversation_id;
+
+        runner
+            .run(&mut conv, &session)
+            .await
+            .expect("agent loop should complete");
+
+        let choices = provider.choices.lock().unwrap();
+        assert_eq!(
+            choices.first().copied(),
+            Some(ToolChoice::Auto),
+            "iteration 0 must use ToolChoice::Auto by default; got {choices:?}"
+        );
     }
 }

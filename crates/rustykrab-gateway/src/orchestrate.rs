@@ -16,11 +16,29 @@ use rustykrab_memory::types::{ConversationTurn, LifecycleStage, TurnMetadata};
 use rustykrab_memory::MemorySystem;
 use rustykrab_skills::SystemPromptBuilder;
 
+/// Optional knobs for an agent run. Most callers (HTTP, channels) use
+/// `RunOptions::default()`; the cron scheduler uses these to inject a
+/// SKILL.md body into the system prompt and force tool use on the first
+/// iteration.
+#[derive(Debug, Clone, Default)]
+pub struct RunOptions {
+    /// When set, `(name, body)` is wrapped in `<skill_instructions>` and
+    /// appended to the system prompt so the model has the full recipe
+    /// from turn 0 without a `skills`-tool round-trip.
+    pub active_skill: Option<(String, String)>,
+    /// When `true`, the runner makes its first LLM call with
+    /// `tool_choice = "any"`, forcing the model to invoke a tool. Used
+    /// for scheduled tasks so the model can't waste the slot on a
+    /// greeting.
+    pub force_tool_use_first_iteration: bool,
+}
+
 /// Build the system prompt and inject it as the first message in the conversation.
 async fn build_and_inject_system_prompt(
     state: &AppState,
     conv: &mut Conversation,
     user_content: &str,
+    options: &RunOptions,
 ) {
     // 1. Resolve the harness profile (for agent loop config, not prompt injection).
     let profile = state.profile_for(user_content).await;
@@ -63,6 +81,16 @@ async fn build_and_inject_system_prompt(
     if !satisfied.is_empty() {
         let refs: Vec<&rustykrab_skills::SkillMd> = satisfied.iter().map(|s| s.as_ref()).collect();
         builder = builder.with_available_skills(&refs);
+    }
+
+    // When the caller (cron) has pre-resolved a SKILL.md for this run,
+    // inline its full body into the system prompt. The skill recipe is
+    // instructions, not data — placing it in `system` rather than the
+    // user message keeps it cached across iterations and clearly framed
+    // as authoritative guidance for the model.
+    if let Some((name, body)) = options.active_skill.as_ref() {
+        tracing::info!(skill = %name, "injecting skill body into system prompt");
+        builder = builder.with_active_skill(name, body);
     }
 
     let mut system_prompt = builder.build();
@@ -206,8 +234,9 @@ async fn prepare_agent(
     state: &AppState,
     conv: &mut Conversation,
     user_content: &str,
+    options: &RunOptions,
 ) -> Result<(AgentRunner, Session), StatusCode> {
-    build_and_inject_system_prompt(state, conv, user_content).await;
+    build_and_inject_system_prompt(state, conv, user_content, options).await;
 
     // Create an ephemeral session with capabilities for available registered tools.
     let tool_names: Vec<&str> = state
@@ -227,12 +256,15 @@ async fn prepare_agent(
     // Resolve profile again for agent config (cheap — no LLM call on cache hit).
     let profile = state.profile_for(user_content).await;
 
+    let mut agent_config = profile.to_agent_config();
+    agent_config.force_tool_use_first_iteration = options.force_tool_use_first_iteration;
+
     let mut runner = AgentRunner::new(
         state.provider.clone(),
         state.tools.clone(),
         state.sandbox.clone(),
     )
-    .with_config(profile.to_agent_config())
+    .with_config(agent_config)
     .with_active_tools(state.active_tools.clone())
     .with_recall_store(state.recall.clone());
 
@@ -277,8 +309,19 @@ pub async fn run_agent(
     user_content: &str,
     trace_id: Uuid,
 ) -> Result<Message, StatusCode> {
+    run_agent_with_options(state, conv, user_content, trace_id, &RunOptions::default()).await
+}
+
+/// Like [`run_agent`] but accepts caller-supplied [`RunOptions`].
+pub async fn run_agent_with_options(
+    state: &AppState,
+    conv: &mut Conversation,
+    user_content: &str,
+    trace_id: Uuid,
+    options: &RunOptions,
+) -> Result<Message, StatusCode> {
     rustykrab_core::prompt_trace::with_trace_id(trace_id, async move {
-        let (runner, session) = prepare_agent(state, conv, user_content).await?;
+        let (runner, session) = prepare_agent(state, conv, user_content, options).await?;
 
         runner.run(conv, &session).await.map_err(|e| {
             tracing::error!(%trace_id, "agent error: {e}");
@@ -311,7 +354,8 @@ pub async fn run_agent_interactive(
     StatusCode,
 > {
     rustykrab_core::prompt_trace::with_trace_id(trace_id, async move {
-        build_and_inject_system_prompt(state, &mut conv, user_content).await;
+        build_and_inject_system_prompt(state, &mut conv, user_content, &RunOptions::default())
+            .await;
 
         let tool_names: Vec<&str> = state
             .tools
@@ -349,8 +393,28 @@ pub async fn run_agent_streaming(
     on_event: &(dyn Fn(AgentEvent) + Send + Sync),
     trace_id: Uuid,
 ) -> Result<Message, StatusCode> {
+    run_agent_streaming_with_options(
+        state,
+        conv,
+        user_content,
+        on_event,
+        trace_id,
+        &RunOptions::default(),
+    )
+    .await
+}
+
+/// Like [`run_agent_streaming`] but accepts caller-supplied [`RunOptions`].
+pub async fn run_agent_streaming_with_options(
+    state: &AppState,
+    conv: &mut Conversation,
+    user_content: &str,
+    on_event: &(dyn Fn(AgentEvent) + Send + Sync),
+    trace_id: Uuid,
+    options: &RunOptions,
+) -> Result<Message, StatusCode> {
     rustykrab_core::prompt_trace::with_trace_id(trace_id, async move {
-        let (runner, session) = prepare_agent(state, conv, user_content).await?;
+        let (runner, session) = prepare_agent(state, conv, user_content, options).await?;
 
         runner
             .run_streaming(conv, &session, on_event)
