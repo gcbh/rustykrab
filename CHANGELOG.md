@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.10.12] - 2026-05-14
+
+- fix(release): use cargo-zigbuild for glibc 2.35-compatible linux build (#422)
+
 - fix(release): build linux x86_64 with cargo-zigbuild to keep glibc 2.35 compat
 - security(deps): bump lettre to 0.11.22 (RUSTSEC-2026-0141, boring-tls feature unused)
 
