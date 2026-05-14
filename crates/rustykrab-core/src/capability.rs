@@ -1,6 +1,32 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
+/// Names of the sub-agent / session-management tools that, in addition to
+/// a matching [`Capability::Tool`] grant, require [`Capability::Subagent`]
+/// to use. Centralising this list keeps [`CapabilitySet::can_use_tool`]
+/// and any consumer that filters tool schemas in sync.
+///
+/// These tools can spawn nested agent loops or coordinate other
+/// sessions, so they get an extra gate beyond the per-tool capability
+/// — they are off-by-default in `for_tools_permissive` and only granted
+/// when the runtime explicitly opts in.
+pub const SUBAGENT_TOOL_NAMES: &[&str] = &[
+    "subagents",
+    "agents_list",
+    "sessions_list",
+    "sessions_history",
+    "sessions_send",
+    "sessions_spawn",
+    "sessions_yield",
+    "session_status",
+];
+
+/// Returns whether `tool_name` is one of the sub-agent / session-management
+/// tools that require [`Capability::Subagent`].
+pub fn is_subagent_tool(tool_name: &str) -> bool {
+    SUBAGENT_TOOL_NAMES.contains(&tool_name)
+}
+
 /// A capability that can be granted to a conversation session.
 ///
 /// Capabilities follow the principle of least privilege — each
@@ -29,6 +55,11 @@ pub enum Capability {
     Tool(String),
     /// Can read/write secrets.
     SecretAccess,
+    /// Can use the sub-agent / session-management tool family
+    /// (`subagents`, `agents_list`, `sessions_*`). Required in addition
+    /// to [`Capability::Tool`] for those tools so spawning nested agent
+    /// loops is opt-in even when the tools are registered.
+    Subagent,
     /// Administrative — can manage other sessions.
     Admin,
 }
@@ -77,8 +108,19 @@ impl CapabilitySet {
     /// Normalises the tool name before lookup: trims whitespace and, if
     /// the name contains a colon separator (e.g. `"some_tool:subaction"`
     /// emitted by some models), checks the base name as well.
+    ///
+    /// For tools in [`SUBAGENT_TOOL_NAMES`] this additionally requires
+    /// [`Capability::Subagent`] — see that constant for rationale.
     pub fn can_use_tool(&self, tool_name: &str) -> bool {
         let trimmed = tool_name.trim();
+        let base = trimmed.split(':').next().unwrap_or(trimmed);
+
+        // Two-layer gate for the sub-agent family: even if `Tool(name)`
+        // is granted, the session also needs `Subagent`.
+        if is_subagent_tool(base) && !self.capabilities.contains(&Capability::Subagent) {
+            return false;
+        }
+
         if self
             .capabilities
             .contains(&Capability::Tool(trimmed.to_string()))
@@ -86,12 +128,10 @@ impl CapabilitySet {
             return true;
         }
         // Fall back to the base name before any colon separator.
-        if let Some(base) = trimmed.split(':').next() {
-            if base != trimmed {
-                return self
-                    .capabilities
-                    .contains(&Capability::Tool(base.to_string()));
-            }
+        if base != trimmed {
+            return self
+                .capabilities
+                .contains(&Capability::Tool(base.to_string()));
         }
         false
     }
@@ -178,5 +218,54 @@ mod tests {
         let caps = CapabilitySet::default_safe();
         assert!(!caps.can_use_tool("example_tool"));
         assert!(caps.has(&Capability::HttpRequest));
+    }
+
+    #[test]
+    fn subagent_tools_blocked_without_subagent_capability() {
+        // Even with `Tool("subagents")` granted, the session still needs
+        // `Subagent` to actually use it.
+        let caps = CapabilitySet::for_tools_permissive(&["subagents", "agents_list", "read"]);
+        assert!(!caps.can_use_tool("subagents"));
+        assert!(!caps.can_use_tool("agents_list"));
+        assert!(caps.can_use_tool("read"));
+    }
+
+    #[test]
+    fn subagent_tools_allowed_when_subagent_capability_granted() {
+        let mut caps = CapabilitySet::for_tools_permissive(&["subagents", "agents_list"]);
+        caps.grant(Capability::Subagent);
+        assert!(caps.can_use_tool("subagents"));
+        assert!(caps.can_use_tool("agents_list"));
+    }
+
+    #[test]
+    fn subagent_capability_alone_does_not_grant_other_tools() {
+        let mut caps = CapabilitySet::none();
+        caps.grant(Capability::Subagent);
+        // No `Tool(...)` grant, so still denied.
+        assert!(!caps.can_use_tool("subagents"));
+        assert!(!caps.can_use_tool("read"));
+    }
+
+    #[test]
+    fn all_session_tools_gated_by_subagent_capability() {
+        let names: Vec<&str> = SUBAGENT_TOOL_NAMES.to_vec();
+        let caps = CapabilitySet::for_tools_permissive(&names);
+        // Without Capability::Subagent, every tool in the family is denied.
+        for name in &names {
+            assert!(!caps.can_use_tool(name), "{name} should be denied");
+        }
+        // After granting, all are allowed.
+        let mut caps = caps;
+        caps.grant(Capability::Subagent);
+        for name in &names {
+            assert!(caps.can_use_tool(name), "{name} should be allowed");
+        }
+    }
+
+    #[test]
+    fn for_tools_permissive_does_not_grant_subagent() {
+        let caps = CapabilitySet::for_tools_permissive(&["subagents"]);
+        assert!(!caps.has(&Capability::Subagent));
     }
 }
