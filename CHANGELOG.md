@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- fix(release): build linux x86_64 with cargo-zigbuild to keep glibc 2.35 compat
+
 ## [2.10.11] - 2026-05-13
 
 - feat(agent): add recall_append for manual context stash (#420)

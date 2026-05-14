@@ -97,15 +97,21 @@ jobs:
     strategy:
       matrix:
         include:
-          # Built on Ubuntu 22.04 (glibc 2.35) so the artifact runs on
-          # 22.04 and any newer glibc-based distro. Pairs with the
-          # =4.9.1 fastembed pin (ort rc.9) — see crates/rustykrab-memory.
+          # Built with cargo-zigbuild targeting glibc 2.35 so the artifact
+          # runs on Ubuntu 22.04 and any newer glibc-based distro. We can
+          # no longer build on the ubuntu-22.04 runner directly because
+          # the Rust stable toolchain's precompiled std references glibc
+          # 2.39 symbols (even the per-crate build scripts fail to run on
+          # 22.04). zig-as-linker rewrites the glibc version refs in the
+          # final binary back down to 2.35.
           - target: x86_64-unknown-linux-gnu
-            os: ubuntu-22.04
+            os: ubuntu-latest
             artifact: rustykrab-cli
+            glibc: "2.35"
           - target: aarch64-apple-darwin
             os: macos-14
             artifact: rustykrab-cli
+            glibc: ""
 
     steps:
       - uses: actions/checkout@v4
@@ -120,8 +126,25 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
+      - name: Install zig
+        if: matrix.glibc != ''
+        uses: mlugg/setup-zig@v1
+        with:
+          version: 0.13.0
+
+      - name: Install cargo-zigbuild
+        if: matrix.glibc != ''
+        run: cargo install --locked cargo-zigbuild
+
       - name: Build release binary
-        run: cargo build --release --target ${{ matrix.target }} -p rustykrab-cli
+        run: |
+          if [ -n "${{ matrix.glibc }}" ]; then
+            cargo zigbuild --release \
+              --target "${{ matrix.target }}.${{ matrix.glibc }}" \
+              -p rustykrab-cli
+          else
+            cargo build --release --target ${{ matrix.target }} -p rustykrab-cli
+          fi
 
       - name: Import signing certificate
         if: runner.os == 'macOS'
