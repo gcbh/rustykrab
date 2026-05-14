@@ -118,6 +118,19 @@ jobs:
         with:
           ref: ${{ needs.bump.outputs.tag }}
 
+      # The macos-14 runner image ships Homebrew's `rustup-init` and a
+      # `cargo` shim that dispatches to it; calling `cargo build` then
+      # fails with "unexpected argument 'build'" because rustup-init is
+      # the installer, not the toolchain proxy. Bootstrap rustup via the
+      # official script so $HOME/.cargo/bin holds the real proxy binaries,
+      # and prepend it to PATH so subsequent steps pick them up.
+      - name: Bootstrap rustup (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --default-toolchain none --profile minimal --no-modify-path
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
