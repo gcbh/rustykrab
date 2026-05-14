@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.10.13] - 2026-05-14
+
+- fix(release): bootstrap rustup before build on macos-14 runner (#425)
+
 ## [2.10.12] - 2026-05-14
 
 - fix(release): use cargo-zigbuild for glibc 2.35-compatible linux build (#422)
