@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.10.19] - 2026-05-16
+
+- fix(release): install gcc-11 and link against its libstdc++ (#433)
+
 ## [2.10.18] - 2026-05-16
 
 - ci(release): amend merge commit on PR-merge release path (#432)
