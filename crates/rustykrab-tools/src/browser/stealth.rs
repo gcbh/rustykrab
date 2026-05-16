@@ -104,6 +104,33 @@ pub async fn apply_stealth(page: &Page, opts: &StealthOptions) -> Result<()> {
     Ok(())
 }
 
+/// Install stealth patches via `Page.addScriptToEvaluateOnNewDocument` so
+/// they run *before* the page's own JavaScript on the next navigation.
+///
+/// This is the right hook for fingerprint patches: by the time
+/// `apply_stealth` runs (post-navigation), the site has already had a
+/// chance to read `navigator.webdriver` and friends. Calling this once
+/// per page is enough — the script persists across navigations on that
+/// page. Cheaper than re-injecting after every goto.
+pub async fn install_stealth_on_new_document(page: &Page, opts: &StealthOptions) -> Result<()> {
+    if !opts.any_patches() {
+        return Ok(());
+    }
+    let mut script = build_stealth_script(opts);
+    if let Some(ref ua) = opts.user_agent {
+        let lit = serde_json::to_string(ua).unwrap_or_else(|_| "\"\"".to_string());
+        script.push_str(&format!(
+            "\ntry{{Object.defineProperty(navigator,'userAgent',{{get:()=>{lit}}});}}catch(e){{}}"
+        ));
+    }
+    page.evaluate_on_new_document(script.as_str())
+        .await
+        .map_err(|e| {
+            Error::ToolExecution(format!("evaluate_on_new_document failed: {e}").into())
+        })?;
+    Ok(())
+}
+
 /// Build the combined stealth init script. Runs in the page context.
 /// Patches are wrapped in try/catch so a failure on one doesn't break
 /// the rest.

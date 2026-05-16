@@ -476,6 +476,10 @@ impl Tool for BrowserTool {
                 // a no-op when their args are absent.
                 let stealth_opts = stealth::StealthOptions::from_args(&args);
                 let _ = stealth::apply_network_overrides(&page, &stealth_opts).await;
+                // Install DOM patches via evaluate_on_new_document so they
+                // run before the target page's own JS — this is what hides
+                // `navigator.webdriver` from frameworks that read it on load.
+                let _ = stealth::install_stealth_on_new_document(&page, &stealth_opts).await;
 
                 page.goto(url)
                     .await
@@ -883,6 +887,7 @@ impl Tool for BrowserTool {
 
                 let stealth_opts = stealth::StealthOptions::from_args(&args);
                 let _ = stealth::apply_network_overrides(&page, &stealth_opts).await;
+                let _ = stealth::install_stealth_on_new_document(&page, &stealth_opts).await;
 
                 page.goto(url)
                     .await
