@@ -118,20 +118,29 @@ jobs:
         with:
           ref: ${{ needs.bump.outputs.tag }}
 
-      # The macos-14 runner image ships Homebrew's `rustup-init` and a
-      # `cargo` shim that dispatches to it; calling `cargo build` then
-      # fails with "unexpected argument 'build'" because rustup-init is
-      # the installer, not the toolchain proxy. Bootstrap rustup via the
-      # official script so $HOME/.cargo/bin holds the real proxy binaries,
-      # and prepend it to PATH so subsequent steps pick them up.
-      - name: Bootstrap rustup (macOS)
+      # The macos-14 runner image ships a `cargo` shim that dispatches to
+      # `rustup-init` (the installer), so `cargo build` is rejected as an
+      # unknown installer argument. Reinstall rustup with the stable
+      # toolchain and build target in one shot via the official script,
+      # then prepend $HOME/.cargo/bin to PATH so subsequent steps pick up
+      # the real cargo proxy. Skip dtolnay/rust-toolchain here — running
+      # it after the bootstrap can re-shadow the proxies we just put in
+      # place.
+      - name: Install Rust toolchain (macOS)
         if: runner.os == 'macOS'
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-            | sh -s -- -y --default-toolchain none --profile minimal --no-modify-path
+            | sh -s -- -y \
+                --default-toolchain stable \
+                --profile minimal \
+                --target ${{ matrix.target }} \
+                --no-modify-path
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          "$HOME/.cargo/bin/cargo" --version
+          "$HOME/.cargo/bin/rustc" --version
 
       - uses: dtolnay/rust-toolchain@stable
+        if: runner.os != 'macOS'
         with:
           targets: ${{ matrix.target }}
 
