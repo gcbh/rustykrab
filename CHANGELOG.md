@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.0.0] - 2026-05-16
+
+- feat(security): gate subagent tools behind env var + capability (#421)
+
 ## [2.10.21] - 2026-05-16
 
 - fix(cron): inject skill body into system prompt and force tool use on iter 0 (#428)

@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use crate::AppState;
 use rustykrab_agent::{AgentEvent, AgentHandle, AgentRunner, OnMessageCallback};
-use rustykrab_core::capability::CapabilitySet;
+use rustykrab_core::capability::{Capability, CapabilitySet};
 use rustykrab_core::session::Session;
 use rustykrab_core::types::{Conversation, Message, MessageContent, Role};
 use rustykrab_memory::types::{ConversationTurn, LifecycleStage, TurnMetadata};
@@ -230,6 +230,19 @@ fn build_memory_callback(state: &AppState, conv: &Conversation) -> Option<OnMess
 
 /// Shared setup: build system prompt, inject it, create session and runner.
 /// Returns `(AgentRunner, Session)`.
+/// Build the permissive capability set for an ephemeral session, honoring
+/// the gateway's `subagents_enabled` policy. Sub-agent tools require
+/// `Capability::Subagent` in addition to the per-tool grant, so we only
+/// add it when the gateway has been opted in (see
+/// `AppState::with_subagents_enabled`).
+fn build_session_capabilities(state: &AppState, tool_names: &[&str]) -> CapabilitySet {
+    let mut caps = CapabilitySet::for_tools_permissive(tool_names);
+    if state.subagents_enabled {
+        caps.grant(Capability::Subagent);
+    }
+    caps
+}
+
 async fn prepare_agent(
     state: &AppState,
     conv: &mut Conversation,
@@ -248,9 +261,10 @@ async fn prepare_agent(
     tracing::debug!(
         tool_count = tool_names.len(),
         tools = ?tool_names,
+        subagents_enabled = state.subagents_enabled,
         "granting session capabilities for available tools"
     );
-    let caps = CapabilitySet::for_tools_permissive(&tool_names);
+    let caps = build_session_capabilities(state, &tool_names);
     let session = Session::with_capabilities(conv.id, caps);
 
     // Resolve profile again for agent config (cheap — no LLM call on cache hit).
@@ -363,7 +377,7 @@ pub async fn run_agent_interactive(
             .filter(|t| t.available())
             .map(|t| t.name())
             .collect();
-        let caps = CapabilitySet::for_tools_permissive(&tool_names);
+        let caps = build_session_capabilities(state, &tool_names);
         let session = Session::with_capabilities(conv.id, caps);
 
         let profile = state.profile_for(user_content).await;

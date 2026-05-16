@@ -706,22 +706,37 @@ async fn main() -> anyhow::Result<()> {
     // --- Orchestration config (used by RLM module and subagent throttle) ---
     let orchestration_config = load_orchestration_config(&data_dir)?;
 
-    // --- Sub-agent tools (subagents, agents_list) ---
-    // Snapshot the tool list as it stands now so the sub-agent can call
-    // every parent tool except the session/subagent meta-tools we are
-    // about to add — that prevents a sub-agent from re-spawning itself
-    // through the same registry. The per-tool depth guard inside
-    // `SubagentsTool` is the second line of defence.
-    let agent_registry = Arc::new(AgentRegistry::with_defaults());
-    let subagent_runner: Arc<dyn rustykrab_tools::SessionManager> = Arc::new(SubagentRunner::new(
-        provider.clone(),
-        tools.clone(),
-        Arc::new(ProcessSandbox::new()),
-        agent_registry,
-        orchestration_config.max_concurrent_tasks,
-    ));
-    tools.extend(rustykrab_tools::session_tools(subagent_runner));
-    tracing::info!("subagent tools registered");
+    // --- Sub-agent tools (subagents, agents_list, sessions_*) ---
+    // Gated behind `RUSTYKRAB_ENABLE_SUBAGENTS=true`. Sub-agents can spawn
+    // nested agent loops with the same toolset, which is a real
+    // amplification of any prompt-injection blast radius — keep it
+    // opt-in. Even when registered, sessions also need
+    // `Capability::Subagent` (granted by the gateway via
+    // `AppState::subagents_enabled`) before the model can actually call
+    // them.
+    let subagents_enabled = std::env::var("RUSTYKRAB_ENABLE_SUBAGENTS")
+        .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "True"))
+        .unwrap_or(false);
+    if subagents_enabled {
+        // Snapshot the tool list as it stands now so the sub-agent can call
+        // every parent tool except the session/subagent meta-tools we are
+        // about to add — that prevents a sub-agent from re-spawning itself
+        // through the same registry. The per-tool depth guard inside
+        // `SubagentsTool` is the second line of defence.
+        let agent_registry = Arc::new(AgentRegistry::with_defaults());
+        let subagent_runner: Arc<dyn rustykrab_tools::SessionManager> =
+            Arc::new(SubagentRunner::new(
+                provider.clone(),
+                tools.clone(),
+                Arc::new(ProcessSandbox::new()),
+                agent_registry,
+                orchestration_config.max_concurrent_tasks,
+            ));
+        tools.extend(rustykrab_tools::session_tools(subagent_runner));
+        tracing::info!("subagent tools registered (RUSTYKRAB_ENABLE_SUBAGENTS=true)");
+    } else {
+        tracing::info!("subagent tools disabled — set RUSTYKRAB_ENABLE_SUBAGENTS=true to enable");
+    }
 
     // --- Recall tools (read compaction-displaced history) ---
     // The store backing these tools lives on AppState and is threaded
@@ -773,7 +788,8 @@ async fn main() -> anyhow::Result<()> {
         .with_harness_router(router)
         .with_orchestration_config(orchestration_config)
         .with_skill_registry(skill_registry)
-        .with_memory(Arc::clone(&memory_system), agent_id);
+        .with_memory(Arc::clone(&memory_system), agent_id)
+        .with_subagents_enabled(subagents_enabled);
 
     // --- Attach video channel to state ---
     if let Some(vc) = video_channel {

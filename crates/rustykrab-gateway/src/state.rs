@@ -52,6 +52,11 @@ pub struct AppState {
     /// the `recall_*` tools so the agent can recover detail dropped by
     /// summarisation.
     pub recall: Arc<RecallStore>,
+    /// Whether sub-agent / session-management tools should be granted to
+    /// sessions created by this gateway. Default `false`. Driven by the
+    /// `RUSTYKRAB_ENABLE_SUBAGENTS` env var at startup; threaded through
+    /// here so `prepare_agent` knows whether to grant `Capability::Subagent`.
+    pub subagents_enabled: bool,
 }
 
 impl AppState {
@@ -81,7 +86,16 @@ impl AppState {
             agent_id: None,
             active_tools: Arc::new(ActiveToolsRegistry::new()),
             recall: Arc::new(RecallStore::new()),
+            subagents_enabled: false,
         }
+    }
+
+    /// Enable the sub-agent / session-management tool family for every
+    /// session created by this gateway. Driven by the
+    /// `RUSTYKRAB_ENABLE_SUBAGENTS` env var in the CLI; off by default.
+    pub fn with_subagents_enabled(mut self, enabled: bool) -> Self {
+        self.subagents_enabled = enabled;
+        self
     }
 
     /// Attach the memory system and the agent identifier used for writes.
