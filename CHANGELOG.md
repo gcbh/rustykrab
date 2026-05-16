@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.10.15] - 2026-05-16
+
+- fix(release): vendor openssl-sys for cargo-zigbuild Linux build (#429)
+
 ## [2.10.14] - 2026-05-16
 
 - fix(release): install full Rust toolchain in macOS bootstrap step (#426)
