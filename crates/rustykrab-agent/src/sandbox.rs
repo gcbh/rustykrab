@@ -2,6 +2,39 @@ use async_trait::async_trait;
 use rustykrab_core::{Error, Result, SandboxRequirements};
 use serde_json::Value;
 
+/// Default timeout (seconds) for network-using tools that don't appear in
+/// [`tool_timeout_secs`]. Replaces the previous blanket 300s ceiling — long
+/// enough for slow APIs, short enough that a hung call doesn't silence the
+/// agent for 5+ minutes.
+pub const DEFAULT_NET_TOOL_TIMEOUT_SECS: u64 = 120;
+
+/// Return a per-tool execution timeout in seconds, if one is configured.
+///
+/// These are tighter than the blanket `policy.timeout_secs` so a hung
+/// call surfaces quickly to the model — it can pivot to an alternate
+/// tool instead of waiting out a 5-minute sandbox timeout. Tools not
+/// listed fall back to the network-aware default in
+/// [`crate::runner`].
+pub fn tool_timeout_secs(tool_name: &str) -> Option<u64> {
+    match tool_name {
+        // Browser: launch + navigate. CDP connect itself is bounded by
+        // `remote_cdp_timeout_ms`; this covers the whole tool call.
+        "browser" => Some(60),
+        // Search APIs typically return in <5s; 15s is generous.
+        "web_search" | "x_search" => Some(15),
+        // HTTP fetches: most pages load in seconds. 30s leaves room for
+        // slow servers without making the user wait minutes.
+        "web_fetch" | "http_request" | "http_session" => Some(30),
+        // Local network APIs (Obsidian REST, Notion proxy) should be fast.
+        "obsidian" => Some(10),
+        // Shell exec: 30s is plenty for the kinds of commands the agent
+        // runs; longer-running scans use raw-net-discovery via the
+        // separate 300s budget.
+        "exec" => Some(30),
+        _ => None,
+    }
+}
+
 /// Policy that controls what a sandboxed tool execution can do.
 #[derive(Debug, Clone)]
 pub struct SandboxPolicy {
@@ -440,6 +473,20 @@ mod tests {
             .await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), args);
+    }
+
+    #[test]
+    fn tool_timeout_secs_known_tools() {
+        // Tight timeouts on the tools that historically hung the agent.
+        assert_eq!(tool_timeout_secs("browser"), Some(60));
+        assert_eq!(tool_timeout_secs("web_search"), Some(15));
+        assert_eq!(tool_timeout_secs("web_fetch"), Some(30));
+        assert_eq!(tool_timeout_secs("http_request"), Some(30));
+        assert_eq!(tool_timeout_secs("obsidian"), Some(10));
+        assert_eq!(tool_timeout_secs("exec"), Some(30));
+        // Unknown tools fall back to the caller's default.
+        assert_eq!(tool_timeout_secs("memory_save"), None);
+        assert_eq!(tool_timeout_secs("unknown_tool"), None);
     }
 
     #[tokio::test]

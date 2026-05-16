@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -38,7 +39,7 @@ fn is_meta_tool(name: &str) -> bool {
     META_TOOL_NAMES.contains(&name)
 }
 
-use crate::sandbox::{Sandbox, SandboxPolicy};
+use crate::sandbox::{tool_timeout_secs, Sandbox, SandboxPolicy, DEFAULT_NET_TOOL_TIMEOUT_SECS};
 use crate::trace::{ExecutionTracer, ToolTrace};
 
 /// Tool names whose output comes from external/untrusted sources (web pages,
@@ -448,6 +449,102 @@ fn is_idle_acknowledgment(text: &str) -> bool {
     idle_markers.iter().any(|m| lower.contains(m))
 }
 
+/// Tracks per-tool failure counts within a single agent run and disables
+/// tools that fail repeatedly.
+///
+/// Production observation (2026-05-14 → 2026-05-16): when the browser
+/// tool entered a zombie state, the model would retry it on every turn
+/// and burn 15+ minutes per call. The circuit breaker stops that loop
+/// after `threshold` consecutive failures by refusing the call locally
+/// (so the model gets an instant error) and injecting a system message
+/// nudging it to try alternative tools.
+#[derive(Debug, Clone)]
+pub struct ToolCircuitBreaker {
+    threshold: u32,
+    failures: HashMap<String, u32>,
+    disabled: HashSet<String>,
+    newly_disabled: Vec<String>,
+}
+
+impl ToolCircuitBreaker {
+    pub fn new(threshold: u32) -> Self {
+        Self {
+            threshold,
+            failures: HashMap::new(),
+            disabled: HashSet::new(),
+            newly_disabled: Vec::new(),
+        }
+    }
+
+    /// Returns `true` if this tool has tripped the breaker.
+    pub fn is_disabled(&self, tool: &str) -> bool {
+        self.disabled.contains(tool)
+    }
+
+    /// Record a successful tool call. Resets the failure counter so a
+    /// flaky tool that intermittently succeeds isn't penalised forever.
+    pub fn record_success(&mut self, tool: &str) {
+        self.failures.remove(tool);
+    }
+
+    /// Record a failed tool call. Trips the breaker if the failure count
+    /// reaches `threshold`.
+    pub fn record_failure(&mut self, tool: &str) {
+        if self.disabled.contains(tool) {
+            return;
+        }
+        let count = self.failures.entry(tool.to_string()).or_insert(0);
+        *count += 1;
+        if *count >= self.threshold {
+            self.disabled.insert(tool.to_string());
+            self.newly_disabled.push(tool.to_string());
+        }
+    }
+
+    /// Drain the list of tools that became disabled since the last call.
+    /// Used by the agent loop to inject a one-shot system message
+    /// announcing the breaker trip.
+    pub fn drain_newly_disabled(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.newly_disabled)
+    }
+
+    /// Current failure count for a tool (testing helper).
+    #[cfg(test)]
+    pub fn failures(&self, tool: &str) -> u32 {
+        self.failures.get(tool).copied().unwrap_or(0)
+    }
+}
+
+impl Default for ToolCircuitBreaker {
+    fn default() -> Self {
+        Self::new(3)
+    }
+}
+
+/// Build the system message announcing that a tool has been
+/// circuit-broken. Tells the model what's disabled and suggests
+/// alternatives where we know them.
+fn circuit_breaker_system_message(tool_name: &str, failures: u32) -> String {
+    let alternatives = match tool_name {
+        "browser" => Some("web_search, web_fetch, http_request"),
+        "web_fetch" | "http_request" | "http_session" => Some("web_search, browser"),
+        "web_search" | "x_search" => Some("web_fetch, browser"),
+        _ => None,
+    };
+    match alternatives {
+        Some(alts) => format!(
+            "[System] Tool '{tool_name}' is temporarily unavailable after \
+             {failures} consecutive failures. Use alternative tools \
+             ({alts}) for the rest of this conversation."
+        ),
+        None => format!(
+            "[System] Tool '{tool_name}' is temporarily unavailable after \
+             {failures} consecutive failures. Try a different approach \
+             for the rest of this conversation."
+        ),
+    }
+}
+
 /// Events emitted by the agent loop during streaming execution.
 ///
 /// These give callers (e.g. WebSocket handlers) real-time visibility
@@ -459,6 +556,14 @@ pub enum AgentEvent {
     TextDelta(String),
     /// The agent is about to execute a tool.
     ToolCallStart { tool_name: String, call_id: String },
+    /// A long-running tool is still executing. Emitted at
+    /// [`AgentConfig::tool_heartbeat_interval_secs`] intervals so callers
+    /// (Telegram, SSE clients) can surface progress instead of going silent.
+    ToolHeartbeat {
+        tool_name: String,
+        call_id: String,
+        elapsed_secs: u64,
+    },
     /// A tool call has completed.
     ToolCallEnd {
         tool_name: String,
@@ -466,6 +571,10 @@ pub enum AgentEvent {
         success: bool,
         error_message: Option<String>,
     },
+    /// A tool has been circuit-broken after repeated failures. The agent
+    /// will refuse further calls to it for the remainder of the run and
+    /// the model has been told to use alternatives.
+    ToolCircuitBroken { tool_name: String, failures: u32 },
     /// The agent is reflecting after repeated errors.
     Reflecting,
     /// The agent is compressing conversation memory.
@@ -578,6 +687,12 @@ pub struct AgentConfig {
     /// of producing a greeting/acknowledgement. Set for scheduled tasks
     /// where the first turn must be action, not chat.
     pub force_tool_use_first_iteration: bool,
+    /// Consecutive failures per tool before the circuit breaker trips.
+    /// 0 disables the breaker entirely.
+    pub circuit_breaker_threshold: u32,
+    /// Interval between [`AgentEvent::ToolHeartbeat`] emissions during a
+    /// long-running tool call. 0 disables heartbeats.
+    pub tool_heartbeat_interval_secs: u64,
 }
 
 impl Default for AgentConfig {
@@ -591,6 +706,8 @@ impl Default for AgentConfig {
             compaction_threshold_pct: 0.85,
             llm_trigger_strategy: LlmTriggerStrategy::Debounce(Duration::from_secs(2)),
             force_tool_use_first_iteration: false,
+            circuit_breaker_threshold: 3,
+            tool_heartbeat_interval_secs: 30,
         }
     }
 }
@@ -841,6 +958,12 @@ impl AgentRunner {
         // so we can suppress retries that might duplicate externally-visible actions.
         let mut had_side_effects = false;
 
+        // Per-run circuit breaker: a tool that fails repeatedly during this
+        // run is disabled for the rest of the conversation so the model
+        // can't burn iterations retrying a broken tool. Threshold 0
+        // disables the breaker entirely.
+        let mut breaker = ToolCircuitBreaker::new(self.config.circuit_breaker_threshold);
+
         for iteration in 0..self.config.max_iterations {
             tracer.record_iteration();
 
@@ -941,8 +1064,30 @@ impl AgentRunner {
                 }
 
                 let results = self
-                    .execute_tools_parallel_traced(calls, session, &tracer)
+                    .execute_tools_parallel_traced(calls, session, &tracer, &mut breaker, None)
                     .await;
+
+                // Inject a one-shot system message for any tools that just
+                // tripped the breaker so the model knows to use alternates.
+                for tool_name in breaker.drain_newly_disabled() {
+                    let failures = self.config.circuit_breaker_threshold;
+                    tracing::warn!(
+                        tool = %tool_name,
+                        failures,
+                        "circuit breaker tripped"
+                    );
+                    self.push_message(
+                        conv,
+                        Message {
+                            id: Uuid::new_v4(),
+                            role: Role::System,
+                            content: MessageContent::Text(circuit_breaker_system_message(
+                                &tool_name, failures,
+                            )),
+                            created_at: Utc::now(),
+                        },
+                    );
+                }
 
                 // Track side effects: check if any successfully executed tool
                 // can cause external mutations (writes, network, spawning).
@@ -1209,6 +1354,7 @@ impl AgentRunner {
         let mut planning_only_retries: usize = 0;
         let mut empty_tool_use_retries: usize = 0;
         let mut had_side_effects = false;
+        let mut breaker = ToolCircuitBreaker::new(self.config.circuit_breaker_threshold);
 
         for iteration in 0..self.config.max_iterations {
             tracer.record_iteration();
@@ -1312,8 +1458,39 @@ impl AgentRunner {
                 }
 
                 let results = self
-                    .execute_tools_parallel_traced(calls, session, &tracer)
+                    .execute_tools_parallel_traced(
+                        calls,
+                        session,
+                        &tracer,
+                        &mut breaker,
+                        Some(on_event),
+                    )
                     .await;
+
+                // Inject one-shot system message for newly-disabled tools.
+                for tool_name in breaker.drain_newly_disabled() {
+                    let failures = self.config.circuit_breaker_threshold;
+                    tracing::warn!(
+                        tool = %tool_name,
+                        failures,
+                        "circuit breaker tripped"
+                    );
+                    on_event(AgentEvent::ToolCircuitBroken {
+                        tool_name: tool_name.clone(),
+                        failures,
+                    });
+                    self.push_message(
+                        conv,
+                        Message {
+                            id: Uuid::new_v4(),
+                            role: Role::System,
+                            content: MessageContent::Text(circuit_breaker_system_message(
+                                &tool_name, failures,
+                            )),
+                            created_at: Utc::now(),
+                        },
+                    );
+                }
 
                 // Track side effects in streaming path.
                 if !had_side_effects {
@@ -1562,48 +1739,142 @@ impl AgentRunner {
     ///
     /// Each tool call is retried up to `max_tool_retries` times on failure
     /// before the error is surfaced to the model.
-    /// Execute multiple tool calls in parallel, recording execution traces.
     ///
     /// Returns `(tool_name, call_id, result)` tuples so callers always have
     /// tool identity even on the error path.
+    ///
+    /// Behaviors layered on top of the basic parallel execution:
+    /// - **Circuit breaker**: calls to tools that have tripped the breaker
+    ///   short-circuit with an immediate error so the model can pivot
+    ///   without paying another timeout.
+    /// - **Heartbeats**: if `on_event` is `Some` and the heartbeat
+    ///   interval is non-zero, [`AgentEvent::ToolHeartbeat`] is emitted
+    ///   periodically while each tool is running so callers can surface
+    ///   "still working" status to the user.
     async fn execute_tools_parallel_traced(
         &self,
         calls: Vec<&ToolCall>,
         session: &Session,
         tracer: &ExecutionTracer,
+        breaker: &mut ToolCircuitBreaker,
+        on_event: Option<&(dyn Fn(AgentEvent) + Send + Sync)>,
     ) -> Vec<(String, String, Result<ToolResult>)> {
         let max_retries = self.config.max_tool_retries;
+        let heartbeat_interval = self.config.tool_heartbeat_interval_secs;
 
+        // Short-circuit calls to disabled tools — don't even spawn.
+        // The model gets an immediate error so it can choose another tool.
+        let mut short_circuited: Vec<(String, String, Result<ToolResult>)> = Vec::new();
+        let calls: Vec<&ToolCall> = calls
+            .into_iter()
+            .filter(|c| {
+                if breaker.is_disabled(&c.name) {
+                    tracing::warn!(
+                        tool = %c.name,
+                        call_id = %c.id,
+                        "tool short-circuited: circuit breaker open"
+                    );
+                    let err = Error::ToolExecution(
+                        format!(
+                            "tool '{}' is disabled for this conversation \
+                             after repeated failures",
+                            c.name
+                        )
+                        .into(),
+                    );
+                    tracer.record(ToolTrace {
+                        tool_name: c.name.clone(),
+                        success: false,
+                        duration: std::time::Duration::ZERO,
+                        error: Some(err.to_string()),
+                    });
+                    short_circuited.push((c.name.clone(), c.id.clone(), Err(err)));
+                    false
+                } else {
+                    true
+                }
+            })
+            .collect();
+
+        // Single-call fast path: run inline (no spawn) so the watchdog can
+        // call on_event directly without crossing a task boundary.
         if calls.len() == 1 {
             let call = calls[0];
             let start = Instant::now();
-            let result = execute_with_retries(
-                call,
-                &self.tools,
-                &self.sandbox,
-                &session.capabilities,
-                session.id,
-                max_retries,
-            )
-            .await;
+            let result = if let (Some(cb), interval) = (on_event, heartbeat_interval) {
+                if interval == 0 {
+                    execute_with_retries(
+                        call,
+                        &self.tools,
+                        &self.sandbox,
+                        &session.capabilities,
+                        session.id,
+                        max_retries,
+                    )
+                    .await
+                } else {
+                    let heartbeat = |elapsed: Duration| {
+                        cb(AgentEvent::ToolHeartbeat {
+                            tool_name: call.name.clone(),
+                            call_id: call.id.clone(),
+                            elapsed_secs: elapsed.as_secs(),
+                        });
+                    };
+                    execute_with_watchdog(
+                        call,
+                        &self.tools,
+                        &self.sandbox,
+                        &session.capabilities,
+                        session.id,
+                        max_retries,
+                        Duration::from_secs(interval),
+                        &heartbeat,
+                    )
+                    .await
+                }
+            } else {
+                execute_with_retries(
+                    call,
+                    &self.tools,
+                    &self.sandbox,
+                    &session.capabilities,
+                    session.id,
+                    max_retries,
+                )
+                .await
+            };
             tracer.record(ToolTrace {
                 tool_name: call.name.clone(),
                 success: result.is_ok(),
                 duration: start.elapsed(),
                 error: result.as_ref().err().map(|e| e.to_string()),
             });
-            return vec![(call.name.clone(), call.id.clone(), result)];
+            if result.is_ok() {
+                breaker.record_success(&call.name);
+            } else {
+                breaker.record_failure(&call.name);
+            }
+            let mut out = short_circuited;
+            out.push((call.name.clone(), call.id.clone(), result));
+            return out;
         }
 
-        // Spawn all tool executions concurrently, bounded by a semaphore
-        // to prevent pathological workloads from spawning unbounded
-        // concurrent tasks (fixes ASYNC-M1).
+        if calls.is_empty() {
+            return short_circuited;
+        }
+
+        // Multi-call path: spawn each call in its own task, bounded by a
+        // semaphore (fixes ASYNC-M1). Heartbeats are routed through an
+        // mpsc channel and forwarded by the orchestrator so the spawned
+        // tasks don't need a Send + 'static handle to `on_event`.
         let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_TOOL_CALLS));
         let mut handles = Vec::with_capacity(calls.len());
         let call_meta: Vec<(String, String)> = calls
             .iter()
             .map(|c| (c.name.clone(), c.id.clone()))
             .collect();
+
+        let (hb_tx, mut hb_rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
 
         for call in calls {
             let call = call.clone();
@@ -1612,26 +1883,73 @@ impl AgentRunner {
             let session_caps = session.capabilities.clone();
             let session_id = session.id;
             let sem = semaphore.clone();
+            let hb_tx = hb_tx.clone();
+            let interval = heartbeat_interval;
 
             handles.push(tokio::spawn(async move {
                 let _permit = sem.acquire().await.expect("semaphore closed");
                 let start = Instant::now();
-                let result = execute_with_retries(
-                    &call,
-                    &tools,
-                    &sandbox,
-                    &session_caps,
-                    session_id,
-                    max_retries,
-                )
-                .await;
+                let result = if interval == 0 {
+                    execute_with_retries(
+                        &call,
+                        &tools,
+                        &sandbox,
+                        &session_caps,
+                        session_id,
+                        max_retries,
+                    )
+                    .await
+                } else {
+                    let call_name = call.name.clone();
+                    let call_id = call.id.clone();
+                    let hb_tx = hb_tx.clone();
+                    let heartbeat = move |elapsed: Duration| {
+                        let _ = hb_tx.send(AgentEvent::ToolHeartbeat {
+                            tool_name: call_name.clone(),
+                            call_id: call_id.clone(),
+                            elapsed_secs: elapsed.as_secs(),
+                        });
+                    };
+                    execute_with_watchdog(
+                        &call,
+                        &tools,
+                        &sandbox,
+                        &session_caps,
+                        session_id,
+                        max_retries,
+                        Duration::from_secs(interval),
+                        &heartbeat,
+                    )
+                    .await
+                };
                 (result, call.name.clone(), call.id.clone(), start.elapsed())
             }));
         }
+        // Drop the orchestrator's sender so the receiver closes once
+        // every spawned task finishes.
+        drop(hb_tx);
 
-        let mut results = Vec::with_capacity(handles.len());
+        let mut results = short_circuited;
+        results.reserve(handles.len());
+
+        // Collect results while concurrently forwarding heartbeats.
+        // `JoinHandle` doesn't implement Stream, so iterate them
+        // sequentially but interleave `hb_rx.recv()` via `select!` so
+        // heartbeats keep flowing while we wait on each handle.
         for (i, handle) in handles.into_iter().enumerate() {
-            match handle.await {
+            tokio::pin!(handle);
+            let joined = loop {
+                tokio::select! {
+                    biased;
+                    Some(event) = hb_rx.recv() => {
+                        if let Some(cb) = on_event {
+                            cb(event);
+                        }
+                    }
+                    r = &mut handle => break r,
+                }
+            };
+            match joined {
                 Ok((result, name, call_id, duration)) => {
                     tracer.record(ToolTrace {
                         tool_name: name.clone(),
@@ -1639,6 +1957,11 @@ impl AgentRunner {
                         duration,
                         error: result.as_ref().err().map(|e| e.to_string()),
                     });
+                    if result.is_ok() {
+                        breaker.record_success(&name);
+                    } else {
+                        breaker.record_failure(&name);
+                    }
                     results.push((name, call_id, result));
                 }
                 Err(e) => {
@@ -1649,12 +1972,20 @@ impl AgentRunner {
                         duration: std::time::Duration::ZERO,
                         error: Some(format!("task panicked: {e}")),
                     });
+                    breaker.record_failure(&name);
                     results.push((
                         name,
                         call_id,
                         Err(Error::Internal(format!("task panicked: {e}"))),
                     ));
                 }
+            }
+        }
+
+        // Drain any remaining heartbeats so we don't lose late ticks.
+        while let Ok(event) = hb_rx.try_recv() {
+            if let Some(cb) = on_event {
+                cb(event);
             }
         }
 
@@ -2300,6 +2631,41 @@ fn sanitize_error(e: &str) -> String {
     first_line.chars().take(200).collect()
 }
 
+/// Wrap [`execute_with_retries`] in a watchdog that fires `on_heartbeat`
+/// every `heartbeat_interval` while the tool is running.
+///
+/// The watchdog runs in the same task — no spawn — so `on_heartbeat`
+/// can borrow caller state freely. The tool retry/timeout logic is
+/// unchanged; the watchdog just gives the agent loop a hook to surface
+/// "still working" status during the wait.
+#[allow(clippy::too_many_arguments)]
+async fn execute_with_watchdog(
+    call: &ToolCall,
+    tools: &[Arc<dyn Tool>],
+    sandbox: &Arc<dyn Sandbox>,
+    capabilities: &rustykrab_core::capability::CapabilitySet,
+    session_id: uuid::Uuid,
+    max_retries: u32,
+    heartbeat_interval: Duration,
+    on_heartbeat: &(dyn Fn(Duration) + Send + Sync),
+) -> Result<ToolResult> {
+    let start = Instant::now();
+    let inner = execute_with_retries(call, tools, sandbox, capabilities, session_id, max_retries);
+    tokio::pin!(inner);
+    let mut ticker = tokio::time::interval(heartbeat_interval);
+    // The first tick fires immediately; consume it so the first
+    // heartbeat fires after `heartbeat_interval`, not at t=0.
+    ticker.tick().await;
+    loop {
+        tokio::select! {
+            r = &mut inner => return r,
+            _ = ticker.tick() => {
+                on_heartbeat(start.elapsed());
+            }
+        }
+    }
+}
+
 /// Retry a tool call up to `max_retries` times with exponential backoff.
 ///
 /// Auth errors (permission denied, unknown tool) are not retried since
@@ -2433,20 +2799,27 @@ async fn execute_single_tool(
     // Ask the tool what sandbox capabilities it needs.
     let requirements = tool.sandbox_requirements();
 
+    // Per-tool timeout takes precedence over the requirements-based default.
+    // The blanket 300s was the root cause of the 15-min silences seen in
+    // production: a single hung browser call would burn the full window.
+    // Raw-net-discovery tools (arp-scan, nmap) still get the full 300s.
+    let policy_timeout = if let Some(secs) = tool_timeout_secs(&call.name) {
+        secs
+    } else if requirements.needs_net_discovery {
+        300
+    } else if requirements.needs_net {
+        DEFAULT_NET_TOOL_TIMEOUT_SECS
+    } else {
+        SandboxPolicy::default().timeout_secs
+    };
+
     let policy = SandboxPolicy {
         allow_fs_read: capabilities.has(&Capability::FileRead),
         allow_fs_write: capabilities.has(&Capability::FileWrite),
         allow_net: capabilities.has(&Capability::HttpRequest),
         allow_spawn: capabilities.has(&Capability::ShellExec),
         allow_net_discovery: capabilities.has(&Capability::NetDiscovery),
-        // Network-using tools (e.g. `exec` running `nmap`, `curl`, `ssh`) can
-        // take several minutes to sweep a subnet. Use a 5-minute timeout when
-        // the tool actually needs network access; keep the default 30s otherwise.
-        timeout_secs: if requirements.needs_net || requirements.needs_net_discovery {
-            300
-        } else {
-            SandboxPolicy::default().timeout_secs
-        },
+        timeout_secs: policy_timeout,
         ..SandboxPolicy::default()
     };
 
@@ -3539,5 +3912,203 @@ mod tool_choice_guard_tests {
             Some(ToolChoice::Auto),
             "iteration 0 must use ToolChoice::Auto by default; got {choices:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod circuit_breaker_tests {
+    use super::*;
+
+    #[test]
+    fn breaker_trips_after_threshold_failures() {
+        let mut breaker = ToolCircuitBreaker::new(3);
+        assert!(!breaker.is_disabled("browser"));
+        breaker.record_failure("browser");
+        breaker.record_failure("browser");
+        assert!(!breaker.is_disabled("browser"));
+        breaker.record_failure("browser");
+        assert!(breaker.is_disabled("browser"));
+    }
+
+    #[test]
+    fn breaker_drains_newly_disabled_once() {
+        let mut breaker = ToolCircuitBreaker::new(2);
+        breaker.record_failure("browser");
+        breaker.record_failure("browser");
+        let drained = breaker.drain_newly_disabled();
+        assert_eq!(drained, vec!["browser".to_string()]);
+        // Second drain returns empty — message must not duplicate.
+        assert!(breaker.drain_newly_disabled().is_empty());
+        // Tool is still disabled though.
+        assert!(breaker.is_disabled("browser"));
+    }
+
+    #[test]
+    fn breaker_resets_failure_count_on_success() {
+        let mut breaker = ToolCircuitBreaker::new(3);
+        breaker.record_failure("browser");
+        breaker.record_failure("browser");
+        assert_eq!(breaker.failures("browser"), 2);
+        breaker.record_success("browser");
+        assert_eq!(breaker.failures("browser"), 0);
+        // After a success, two more failures should not trip it.
+        breaker.record_failure("browser");
+        breaker.record_failure("browser");
+        assert!(!breaker.is_disabled("browser"));
+    }
+
+    #[test]
+    fn breaker_isolates_failures_per_tool() {
+        let mut breaker = ToolCircuitBreaker::new(2);
+        breaker.record_failure("browser");
+        breaker.record_failure("browser");
+        breaker.record_failure("web_search");
+        assert!(breaker.is_disabled("browser"));
+        assert!(!breaker.is_disabled("web_search"));
+    }
+
+    #[test]
+    fn breaker_no_double_trip_for_same_tool() {
+        let mut breaker = ToolCircuitBreaker::new(2);
+        breaker.record_failure("browser");
+        breaker.record_failure("browser");
+        let _ = breaker.drain_newly_disabled();
+        // Further failures on the disabled tool don't re-trigger drain.
+        breaker.record_failure("browser");
+        breaker.record_failure("browser");
+        assert!(breaker.drain_newly_disabled().is_empty());
+    }
+
+    #[test]
+    fn circuit_breaker_message_mentions_alternatives_when_known() {
+        let msg = circuit_breaker_system_message("browser", 3);
+        assert!(msg.contains("browser"));
+        assert!(msg.contains("3"));
+        assert!(
+            msg.contains("web_search") || msg.contains("web_fetch"),
+            "browser breaker message should suggest alternatives: {msg}"
+        );
+    }
+
+    #[test]
+    fn circuit_breaker_message_falls_back_for_unknown_tool() {
+        let msg = circuit_breaker_system_message("weird_tool", 3);
+        assert!(msg.contains("weird_tool"));
+        assert!(msg.contains("different approach"));
+    }
+}
+
+#[cfg(test)]
+mod watchdog_tests {
+    use super::*;
+    use async_trait::async_trait;
+    use rustykrab_core::types::ToolSchema;
+
+    /// Tool that sleeps for the configured duration before returning.
+    struct SleepyTool {
+        name: String,
+        sleep: Duration,
+    }
+
+    #[async_trait]
+    impl Tool for SleepyTool {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn description(&self) -> &str {
+            "sleeps for testing"
+        }
+        fn schema(&self) -> ToolSchema {
+            ToolSchema {
+                name: self.name.clone(),
+                description: self.description().to_string(),
+                parameters: serde_json::json!({"type": "object", "properties": {}}),
+            }
+        }
+        async fn execute(&self, _args: serde_json::Value) -> Result<serde_json::Value> {
+            tokio::time::sleep(self.sleep).await;
+            Ok(serde_json::json!({"ok": true}))
+        }
+    }
+
+    #[tokio::test]
+    async fn watchdog_emits_heartbeat_during_long_running_tool() {
+        let tool = Arc::new(SleepyTool {
+            name: "sleepy".to_string(),
+            sleep: Duration::from_millis(250),
+        }) as Arc<dyn Tool>;
+        let sandbox: Arc<dyn Sandbox> = Arc::new(crate::sandbox::NoSandbox);
+        let call = ToolCall {
+            id: "c1".to_string(),
+            name: "sleepy".to_string(),
+            arguments: serde_json::json!({}),
+        };
+        let mut caps = rustykrab_core::capability::CapabilitySet::none();
+        caps.grant(Capability::Tool("sleepy".to_string()));
+
+        let beats = Arc::new(std::sync::Mutex::new(0u32));
+        let beats_clone = beats.clone();
+        let heartbeat = move |_elapsed: Duration| {
+            *beats_clone.lock().unwrap() += 1;
+        };
+
+        let result = execute_with_watchdog(
+            &call,
+            &[tool],
+            &sandbox,
+            &caps,
+            uuid::Uuid::new_v4(),
+            0,
+            Duration::from_millis(50),
+            &heartbeat,
+        )
+        .await;
+
+        assert!(result.is_ok(), "tool should complete successfully");
+        let count = *beats.lock().unwrap();
+        // 250ms / 50ms = ~5 ticks; allow 1+ to absorb scheduler jitter.
+        assert!(count >= 1, "expected at least one heartbeat, got {count}");
+    }
+
+    #[tokio::test]
+    async fn watchdog_returns_immediately_for_fast_tool() {
+        let tool = Arc::new(SleepyTool {
+            name: "fast".to_string(),
+            sleep: Duration::from_millis(5),
+        }) as Arc<dyn Tool>;
+        let sandbox: Arc<dyn Sandbox> = Arc::new(crate::sandbox::NoSandbox);
+        let call = ToolCall {
+            id: "c1".to_string(),
+            name: "fast".to_string(),
+            arguments: serde_json::json!({}),
+        };
+        let mut caps = rustykrab_core::capability::CapabilitySet::none();
+        caps.grant(Capability::Tool("fast".to_string()));
+
+        let beats = Arc::new(std::sync::Mutex::new(0u32));
+        let beats_clone = beats.clone();
+        let heartbeat = move |_elapsed: Duration| {
+            *beats_clone.lock().unwrap() += 1;
+        };
+
+        let start = Instant::now();
+        let result = execute_with_watchdog(
+            &call,
+            &[tool],
+            &sandbox,
+            &caps,
+            uuid::Uuid::new_v4(),
+            0,
+            Duration::from_secs(30),
+            &heartbeat,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        // No heartbeats fired since first tick is consumed and interval
+        // (30s) is much longer than execution.
+        assert_eq!(*beats.lock().unwrap(), 0);
+        // Watchdog must not add appreciable latency.
+        assert!(start.elapsed() < Duration::from_secs(1));
     }
 }

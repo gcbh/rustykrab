@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.2.0] - 2026-05-16
+
+- feat(agent): per-tool timeouts, circuit breaker, and tool heartbeats (#438)
+
 ## [3.1.0] - 2026-05-16
 
 - fix(browser): process tracking, health checks, and stealth at launch (#437)
