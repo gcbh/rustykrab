@@ -2382,22 +2382,16 @@ async fn execute_single_tool(
         .find(|t| t.name() == call_name_trimmed || t.name() == call_base_name)
         .ok_or_else(|| Error::ToolExecution(format!("unknown tool: {}", call.name).into()))?;
 
-    // Basic schema validation: check required parameters are present.
+    // Schema validation: missing required fields, wrong enum values, and
+    // wrong types are reported back to the model with descriptive messages
+    // so it can self-correct on the next call without re-reading the
+    // schema via tools_list.
     let schema = tool.schema();
-    if let Some(required) = schema.parameters.get("required").and_then(|r| r.as_array()) {
-        for req in required {
-            if let Some(param_name) = req.as_str() {
-                if call.arguments.get(param_name).is_none() {
-                    return Err(Error::ToolExecution(
-                        format!(
-                            "tool '{}' missing required parameter '{}'",
-                            call.name, param_name
-                        )
-                        .into(),
-                    ));
-                }
-            }
-        }
+    if let Err(mut tool_err) =
+        rustykrab_core::validate_tool_args(&schema.parameters, &call.arguments)
+    {
+        tool_err.message = format!("tool '{}': {}", call.name, tool_err.message);
+        return Err(Error::ToolExecution(tool_err));
     }
 
     tracing::info!(tool = call.name, session = %session_id, "executing tool in sandbox");
