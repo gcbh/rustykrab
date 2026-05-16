@@ -14,9 +14,12 @@ pub use rlm::RecursiveExecutor;
 pub use router::HarnessRouter;
 pub use runner::{
     AgentConfig, AgentEvent, AgentHandle, AgentRunner, InboundEvent, LlmTriggerStrategy,
-    OnMessageCallback,
+    OnMessageCallback, ToolCircuitBreaker,
 };
-pub use sandbox::{NoSandbox, ProcessSandbox, Sandbox, SandboxPolicy};
+pub use sandbox::{
+    tool_timeout_secs, NoSandbox, ProcessSandbox, Sandbox, SandboxPolicy,
+    DEFAULT_NET_TOOL_TIMEOUT_SECS,
+};
 pub use subagent::SubagentRunner;
 pub use trace::{ExecutionTracer, ToolStats, ToolTrace};
 pub use voting::ConsistencyVoter;

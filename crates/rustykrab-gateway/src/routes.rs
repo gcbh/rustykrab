@@ -295,6 +295,29 @@ async fn send_message_stream(
                         serde_json::json!({"type": "tool_start", "delta": tool_name}).to_string(),
                     )
                 }
+                AgentEvent::ToolHeartbeat {
+                    tool_name,
+                    elapsed_secs,
+                    ..
+                } => Event::default().event("tool_heartbeat").data(
+                    serde_json::json!({
+                        "type": "tool_heartbeat",
+                        "delta": tool_name,
+                        "elapsed_secs": elapsed_secs,
+                    })
+                    .to_string(),
+                ),
+                AgentEvent::ToolCircuitBroken {
+                    tool_name,
+                    failures,
+                } => Event::default().event("tool_circuit_broken").data(
+                    serde_json::json!({
+                        "type": "tool_circuit_broken",
+                        "delta": tool_name,
+                        "failures": failures,
+                    })
+                    .to_string(),
+                ),
                 AgentEvent::ToolCallEnd {
                     tool_name,
                     success,
