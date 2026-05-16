@@ -11,13 +11,17 @@
 # Usage (CI — called by GitHub Actions on PR merge):
 #   ./scripts/release.sh patch --ci --pr-title "Add foo" --pr-number 42
 #
+# Pass --amend to fold the version bump into HEAD instead of creating a new
+# commit. Used by the PR-merge release path so the merge commit absorbs the
+# bump and the tag points at it directly. Requires a force-with-lease push.
+#
 # What it does:
 #   1. Validates the working tree is clean (skipped in --ci mode)
 #   2. Computes the next version (or uses the one you gave)
 #   3. Updates workspace version in Cargo.toml
 #   4. Moves "Unreleased" entries in CHANGELOG.md under a new version heading
 #   5. Runs `cargo check` to regenerate Cargo.lock (skipped in --ci mode)
-#   6. Commits and tags as v<version>
+#   6. Commits (or amends HEAD with --amend) and tags as v<version>
 #
 # After running locally, push with:
 #   git push origin main --tags
@@ -33,12 +37,14 @@ die() { echo "error: $*" >&2; exit 1; }
 # --- Parse arguments ---
 BUMP=""
 CI_MODE=false
+AMEND=false
 PR_TITLE=""
 PR_NUMBER=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --ci)       CI_MODE=true; shift ;;
+        --amend)    AMEND=true; shift ;;
         --pr-title) PR_TITLE="$2"; shift 2 ;;
         --pr-number) PR_NUMBER="$2"; shift 2 ;;
         -*)         die "unknown flag: $1" ;;
@@ -118,7 +124,11 @@ fi
 # --- Commit and tag ---
 cd "$REPO_ROOT"
 git add Cargo.toml Cargo.lock CHANGELOG.md
-git commit -m "release: v$NEXT"
+if [ "$AMEND" = true ]; then
+    git commit --amend --no-edit
+else
+    git commit -m "release: v$NEXT"
+fi
 git tag -a "v$NEXT" -m "v$NEXT"
 
 echo ""
