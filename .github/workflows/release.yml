@@ -179,8 +179,15 @@ jobs:
       - name: Install gcc-11 toolchain (Linux)
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         run: |
+          set -euxo pipefail
           sudo apt-get update
-          sudo apt-get install -y g++-11
+          sudo apt-get install -y g++-11 libstdc++-11-dev
+          # Fail fast if the symlinks lld needs aren't where we expect them.
+          # The next step's `-L` path assumes /usr/lib/gcc/x86_64-linux-gnu/11/.
+          ls -la /usr/lib/gcc/x86_64-linux-gnu/11/libstdc++.so
+          ls -la /usr/lib/gcc/x86_64-linux-gnu/11/libgcc_s.so
+          readlink -f /usr/lib/gcc/x86_64-linux-gnu/11/libstdc++.so
+          readlink -f /usr/lib/gcc/x86_64-linux-gnu/11/libgcc_s.so
 
       - name: Build release binary
         env:
@@ -193,10 +200,16 @@ jobs:
           CFLAGS: ${{ matrix.target == 'x86_64-unknown-linux-gnu' && '-I/usr/include/x86_64-linux-gnu' || '' }}
           # The ort-sys prebuilt onnxruntime archive references libstdc++
           # symbols and expects the linker to resolve them dynamically via
-          # `-lstdc++`. Point zig's lld at the gcc-11 toolchain dir, which
-          # contains the unversioned `libstdc++.so` symlink it needs to
-          # resolve that name.
-          RUSTFLAGS: ${{ matrix.target == 'x86_64-unknown-linux-gnu' && '-C link-arg=-L/usr/lib/gcc/x86_64-linux-gnu/11' || '' }}
+          # `-lstdc++`. Adding `-L /usr/lib/gcc/x86_64-linux-gnu/11` alone
+          # wasn't enough: zig's lld doesn't always pick up the unversioned
+          # libstdc++.so symlink through it. Pass three things together:
+          #   1. -L for both the gcc-11 dir and the multiarch dir
+          #   2. an explicit `-l:libstdc++.so.6` so resolution targets the
+          #      versioned name directly (no symlink lookup required)
+          #   3. ditto for libgcc_s.so.1
+          # Rustc still emits its own `-lstdc++` / `-lgcc_s` after these,
+          # but with the search paths in place lld can resolve those too.
+          RUSTFLAGS: ${{ matrix.target == 'x86_64-unknown-linux-gnu' && '-C link-arg=-L/usr/lib/gcc/x86_64-linux-gnu/11 -C link-arg=-L/usr/lib/x86_64-linux-gnu -C link-arg=-l:libstdc++.so.6 -C link-arg=-l:libgcc_s.so.1' || '' }}
         run: |
           if [ -n "${{ matrix.glibc }}" ]; then
             cargo zigbuild --release \
