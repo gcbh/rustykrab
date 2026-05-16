@@ -158,6 +158,18 @@ jobs:
         if: matrix.glibc != ''
         run: cargo install --locked cargo-zigbuild
 
+      # Install gcc-11's libstdc++ dev symlink so zig's lld can resolve
+      # `-lstdc++` (it needs the unversioned libstdc++.so, which only the
+      # libstdc++-N-dev packages provide — Ubuntu's multiarch path only
+      # has the versioned libstdc++.so.6). Picking gcc-11 matches the
+      # libstdc++ that ships with Ubuntu 22.04 / glibc 2.35, so the final
+      # binary's GLIBCXX symbol references stay backward-compatible.
+      - name: Install gcc-11 toolchain (Linux)
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++-11
+
       - name: Build release binary
         env:
           # cargo-zigbuild's zigcc wrapper doesn't include Ubuntu's
@@ -169,9 +181,10 @@ jobs:
           CFLAGS: ${{ matrix.target == 'x86_64-unknown-linux-gnu' && '-I/usr/include/x86_64-linux-gnu' || '' }}
           # The ort-sys prebuilt onnxruntime archive references libstdc++
           # symbols and expects the linker to resolve them dynamically via
-          # `-lstdc++`. zig's lld doesn't search Ubuntu's multiarch lib
-          # path on its own, so add it explicitly for the Linux leg.
-          RUSTFLAGS: ${{ matrix.target == 'x86_64-unknown-linux-gnu' && '-C link-arg=-L/usr/lib/x86_64-linux-gnu' || '' }}
+          # `-lstdc++`. Point zig's lld at the gcc-11 toolchain dir, which
+          # contains the unversioned `libstdc++.so` symlink it needs to
+          # resolve that name.
+          RUSTFLAGS: ${{ matrix.target == 'x86_64-unknown-linux-gnu' && '-C link-arg=-L/usr/lib/gcc/x86_64-linux-gnu/11' || '' }}
         run: |
           if [ -n "${{ matrix.glibc }}" ]; then
             cargo zigbuild --release \
