@@ -159,6 +159,14 @@ jobs:
         run: cargo install --locked cargo-zigbuild
 
       - name: Build release binary
+        env:
+          # cargo-zigbuild's zigcc wrapper doesn't include Ubuntu's
+          # multiarch include path (/usr/include/x86_64-linux-gnu) that
+          # GCC adds automatically. openssl-sys's build-script probe
+          # (a transitive build-dep of ort-sys via ureq → native-tls)
+          # needs that path to find `openssl/opensslconf.h`. Pass it
+          # explicitly via CFLAGS only on the Linux cross-build leg.
+          CFLAGS: ${{ matrix.target == 'x86_64-unknown-linux-gnu' && '-I/usr/include/x86_64-linux-gnu' || '' }}
         run: |
           if [ -n "${{ matrix.glibc }}" ]; then
             cargo zigbuild --release \
