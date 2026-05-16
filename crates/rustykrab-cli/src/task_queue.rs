@@ -240,19 +240,20 @@ async fn execute_cron_task(
         }
     }
 
-    // If the task body is the bare name of a registered SKILL.md skill,
-    // inline its body into the prompt so the model executes the recipe
-    // directly instead of spinning through tool-discovery iterations to
-    // figure out it should call `skills.load`. Operators commonly schedule
-    // jobs with `task = "morning-briefing"`; that string alone gives the
-    // model nothing to do without a tool round-trip. With the body inlined,
-    // the first turn produces output.
+    // If the task body references a registered SKILL.md skill, resolve
+    // it so orchestrate.rs can inject the full recipe into the system
+    // prompt. The body in `system` is authoritative, cached across
+    // iterations, and clearly framed as guidance — versus stuffing it
+    // into the user message where the model treats it as conversational
+    // content. Operators commonly schedule jobs with `task = "morning-briefing"`,
+    // and without the body the model would have to make a tool round-trip
+    // before doing any real work.
     let resolved_skill = resolve_skill_for_task(&state.skill_registry, task_prompt);
     if let Some((ref name, _)) = resolved_skill {
         tracing::info!(
             job_id = %job_id,
             skill = %name,
-            "inlining SKILL.md body into scheduled-task prompt"
+            "injecting SKILL.md body into system prompt for scheduled task"
         );
     }
 
@@ -261,19 +262,30 @@ async fn execute_cron_task(
         job.last_run_at,
         effective_channel.as_deref(),
         effective_chat_id.as_deref(),
-        resolved_skill
-            .as_ref()
-            .map(|(n, b)| (n.as_str(), b.as_str())),
     );
+
+    let run_options = rustykrab_gateway::RunOptions {
+        active_skill: resolved_skill,
+        // Cron tasks must call a tool on iteration 0 — a bare "I'm ready"
+        // reply is never the deliverable, and the model would otherwise
+        // burn the slot.
+        force_tool_use_first_iteration: true,
+    };
 
     // Run the agent. Mint a fresh trace id per scheduled run so prompt-log
     // rows and agent logs for this job line up.
     let trace_id = Uuid::new_v4();
     tracing::info!(%trace_id, job_id = %job.id, "scheduled task starting");
     let no_op_event = |_event: AgentEvent| {};
-    let result =
-        rustykrab_gateway::run_agent_streaming(state, &mut conv, &prompt, &no_op_event, trace_id)
-            .await;
+    let result = rustykrab_gateway::run_agent_streaming_with_options(
+        state,
+        &mut conv,
+        &prompt,
+        &no_op_event,
+        trace_id,
+        &run_options,
+    )
+    .await;
 
     let (status, response_text) = match result {
         Ok(msg) => match &msg.content {
@@ -434,7 +446,6 @@ fn build_scheduled_prompt(
     last_run_at: Option<chrono::DateTime<chrono::Utc>>,
     channel: Option<&str>,
     chat_id: Option<&str>,
-    skill: Option<(&str, &str)>,
 ) -> String {
     let delivery = match (channel, chat_id) {
         (Some(c), Some(id)) => format!(
@@ -461,16 +472,7 @@ fn build_scheduled_prompt(
              Task: {task_prompt}"
         ),
     };
-    let skill_block = match skill {
-        Some((name, skill_body)) => format!(
-            "\n\nThe task names the skill `{name}`. Execute the recipe below for \
-             this turn — you do NOT need to call the `skills` tool to load it; the \
-             body is included here.\n\n\
-             <skill_instructions name=\"{name}\">\n{skill_body}\n</skill_instructions>"
-        ),
-        None => String::new(),
-    };
-    format!("{body}{skill_block}\n\n{delivery}")
+    format!("{body}\n\n{delivery}")
 }
 
 /// If `task_prompt` references a registered SKILL.md skill, return
@@ -686,7 +688,6 @@ mod tests {
             None,
             Some("telegram"),
             Some("12345"),
-            None,
         );
         assert!(prompt.contains("first time"));
         assert!(prompt.contains("Task: Write the daily briefing."));
@@ -697,7 +698,7 @@ mod tests {
     #[test]
     fn scheduled_prompt_recurring_includes_last_run() {
         let last = Utc.with_ymd_and_hms(2026, 4, 30, 9, 0, 0).unwrap();
-        let prompt = build_scheduled_prompt("Daily briefing.", Some(last), None, None, None);
+        let prompt = build_scheduled_prompt("Daily briefing.", Some(last), None, None);
         assert!(prompt.contains("due again"));
         assert!(prompt.contains("Last run was at 2026-04-30 09:00:00 UTC"));
         // No channel info → still tells the model the message IS the deliverable.
@@ -705,34 +706,14 @@ mod tests {
     }
 
     #[test]
-    fn scheduled_prompt_inlines_skill_body_when_provided() {
-        let body = "Step 1: gmail.search.\nStep 2: web_search.\nStep 3: assemble briefing.";
-        let prompt = build_scheduled_prompt(
-            "morning-briefing",
-            None,
-            Some("telegram"),
-            Some("99"),
-            Some(("morning-briefing", body)),
-        );
-        // The skill body must appear verbatim so the model can execute it
-        // without an extra `skills` tool round-trip.
-        assert!(
-            prompt.contains("<skill_instructions name=\"morning-briefing\">"),
-            "expected skill_instructions block in prompt: {prompt}"
-        );
-        assert!(prompt.contains("Step 1: gmail.search."));
-        assert!(prompt.contains("Step 3: assemble briefing."));
-        // And the prompt should explicitly tell the model NOT to call the
-        // skills tool — the body is already there.
-        assert!(prompt.contains("do NOT need to call the `skills` tool"));
-    }
-
-    #[test]
-    fn scheduled_prompt_omits_skill_block_when_none() {
-        let prompt = build_scheduled_prompt("Just do the thing", None, None, None, None);
+    fn scheduled_prompt_does_not_inline_skill_body() {
+        // Skill bodies are injected into the *system* prompt by
+        // orchestrate.rs::build_and_inject_system_prompt, not the user
+        // message. The user message stays small and uniform.
+        let prompt = build_scheduled_prompt("morning-briefing", None, Some("telegram"), Some("99"));
         assert!(
             !prompt.contains("<skill_instructions"),
-            "should not emit skill block when no skill resolved: {prompt}"
+            "user prompt should not embed skill_instructions: {prompt}"
         );
     }
 

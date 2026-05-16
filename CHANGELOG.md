@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.10.21] - 2026-05-16
+
+- fix(cron): inject skill body into system prompt and force tool use on iter 0 (#428)
+
 ## [2.10.20] - 2026-05-16
 
 - fix(release): explicit versioned libstdc++ link + install diagnostics (#434)

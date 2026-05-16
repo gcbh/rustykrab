@@ -1,7 +1,9 @@
 use async_trait::async_trait;
 use chrono::Utc;
 use rustykrab_core::error::Result;
-use rustykrab_core::model::{ModelProvider, ModelResponse, StopReason, StreamEvent, Usage};
+use rustykrab_core::model::{
+    ModelProvider, ModelResponse, StopReason, StreamEvent, ToolChoice, Usage,
+};
 use rustykrab_core::types::{
     ContentBlock as CoreContentBlock, Message, MessageContent, Role, ToolCall, ToolSchema,
 };
@@ -284,37 +286,24 @@ impl AnthropicProvider {
         })
     }
 
-    /// Map an HTTP status code to a specific error variant (#186).
-    fn map_status_error(status: reqwest::StatusCode, body: &str) -> Error {
-        match status.as_u16() {
-            400 => Error::ModelBadRequest(format!("Anthropic API: {body}")),
-            401 | 403 => Error::ModelAuthError(format!("Anthropic API: {body}")),
-            429 => Error::ModelRateLimit(format!("Anthropic API: {body}")),
-            529 => Error::ModelOverloaded(format!("Anthropic API: {body}")),
-            _ => Error::ModelProvider(format!("Anthropic API returned {status}: {body}")),
+    /// Translate our `ToolChoice` into the JSON shape Anthropic expects.
+    ///
+    /// Returns `None` for `Auto` — omitting the field lets the model
+    /// decide, matching the API's default behavior.
+    fn tool_choice_json(choice: ToolChoice) -> Option<serde_json::Value> {
+        match choice {
+            ToolChoice::Auto => None,
+            ToolChoice::Any => Some(serde_json::json!({ "type": "any" })),
         }
     }
-}
 
-#[async_trait]
-impl ModelProvider for AnthropicProvider {
-    fn name(&self) -> &str {
-        "anthropic"
-    }
-
-    fn context_limit(&self) -> Option<usize> {
-        Some(self.context_limit)
-    }
-
-    fn supports_vision(&self) -> bool {
-        true
-    }
-
-    fn requires_paired_tool_results(&self) -> bool {
-        true
-    }
-
-    async fn chat(&self, messages: &[Message], tools: &[ToolSchema]) -> Result<ModelResponse> {
+    /// Underlying chat implementation shared by `chat` and `chat_with_choice`.
+    async fn chat_inner(
+        &self,
+        messages: &[Message],
+        tools: &[ToolSchema],
+        tool_choice: ToolChoice,
+    ) -> Result<ModelResponse> {
         let (system, api_messages) = Self::build_messages(messages)?;
 
         // Fix #200: validate that the message list is not empty before calling the API.
@@ -338,11 +327,17 @@ impl ModelProvider for AnthropicProvider {
         }
         if !api_tools.is_empty() {
             body["tools"] = serde_json::to_value(&api_tools).map_err(Error::Serialization)?;
+            // tool_choice is only meaningful when tools are supplied; the API
+            // rejects the field otherwise.
+            if let Some(tc) = Self::tool_choice_json(tool_choice) {
+                body["tool_choice"] = tc;
+            }
         }
 
         tracing::debug!(
             model = %self.model,
             trace_id = ?rustykrab_core::prompt_trace::current_trace_id(),
+            ?tool_choice,
             "calling Anthropic Messages API"
         );
         rustykrab_core::prompt_trace::record_prompt(
@@ -437,11 +432,79 @@ impl ModelProvider for AnthropicProvider {
         Err(last_err.unwrap_or_else(|| Error::ModelProvider("request failed".into())))
     }
 
+    /// Map an HTTP status code to a specific error variant (#186).
+    fn map_status_error(status: reqwest::StatusCode, body: &str) -> Error {
+        match status.as_u16() {
+            400 => Error::ModelBadRequest(format!("Anthropic API: {body}")),
+            401 | 403 => Error::ModelAuthError(format!("Anthropic API: {body}")),
+            429 => Error::ModelRateLimit(format!("Anthropic API: {body}")),
+            529 => Error::ModelOverloaded(format!("Anthropic API: {body}")),
+            _ => Error::ModelProvider(format!("Anthropic API returned {status}: {body}")),
+        }
+    }
+}
+
+#[async_trait]
+impl ModelProvider for AnthropicProvider {
+    fn name(&self) -> &str {
+        "anthropic"
+    }
+
+    fn context_limit(&self) -> Option<usize> {
+        Some(self.context_limit)
+    }
+
+    fn supports_vision(&self) -> bool {
+        true
+    }
+
+    fn requires_paired_tool_results(&self) -> bool {
+        true
+    }
+
+    async fn chat(&self, messages: &[Message], tools: &[ToolSchema]) -> Result<ModelResponse> {
+        self.chat_inner(messages, tools, ToolChoice::Auto).await
+    }
+
+    async fn chat_with_choice(
+        &self,
+        messages: &[Message],
+        tools: &[ToolSchema],
+        choice: ToolChoice,
+    ) -> Result<ModelResponse> {
+        self.chat_inner(messages, tools, choice).await
+    }
+
     /// Fix #175: streaming implementation using Anthropic SSE.
     async fn chat_stream(
         &self,
         messages: &[Message],
         tools: &[ToolSchema],
+        on_event: &(dyn Fn(StreamEvent) + Send + Sync),
+    ) -> Result<ModelResponse> {
+        self.chat_stream_inner(messages, tools, ToolChoice::Auto, on_event)
+            .await
+    }
+
+    async fn chat_stream_with_choice(
+        &self,
+        messages: &[Message],
+        tools: &[ToolSchema],
+        choice: ToolChoice,
+        on_event: &(dyn Fn(StreamEvent) + Send + Sync),
+    ) -> Result<ModelResponse> {
+        self.chat_stream_inner(messages, tools, choice, on_event)
+            .await
+    }
+}
+
+impl AnthropicProvider {
+    /// Streaming chat shared by `chat_stream` and `chat_stream_with_choice`.
+    async fn chat_stream_inner(
+        &self,
+        messages: &[Message],
+        tools: &[ToolSchema],
+        tool_choice: ToolChoice,
         on_event: &(dyn Fn(StreamEvent) + Send + Sync),
     ) -> Result<ModelResponse> {
         let (system, api_messages) = Self::build_messages(messages)?;
@@ -466,11 +529,16 @@ impl ModelProvider for AnthropicProvider {
         }
         if !api_tools.is_empty() {
             body["tools"] = serde_json::to_value(&api_tools).map_err(Error::Serialization)?;
+            // tool_choice requires at least one tool; skip otherwise.
+            if let Some(tc) = Self::tool_choice_json(tool_choice) {
+                body["tool_choice"] = tc;
+            }
         }
 
         tracing::debug!(
             model = %self.model,
             trace_id = ?rustykrab_core::prompt_trace::current_trace_id(),
+            ?tool_choice,
             "calling Anthropic Messages API (streaming)"
         );
         rustykrab_core::prompt_trace::record_prompt(
@@ -918,4 +986,20 @@ struct SseMessageDeltaInfo {
 #[derive(Deserialize)]
 struct SseDeltaUsage {
     output_tokens: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tool_choice_auto_emits_no_field() {
+        assert!(AnthropicProvider::tool_choice_json(ToolChoice::Auto).is_none());
+    }
+
+    #[test]
+    fn tool_choice_any_emits_any_type() {
+        let v = AnthropicProvider::tool_choice_json(ToolChoice::Any).expect("Any → Some");
+        assert_eq!(v, serde_json::json!({ "type": "any" }));
+    }
 }
