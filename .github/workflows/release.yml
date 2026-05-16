@@ -74,8 +74,15 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number || '0' }}
           BUMP_TYPE: ${{ steps.bump-type.outputs.bump }}
         run: |
+          # Fold the bump into the merge commit on the PR path so we don't
+          # add an extra "release: vX" commit. Manual dispatch keeps the
+          # separate commit since HEAD belongs to someone else's work.
+          AMEND_FLAG=""
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            AMEND_FLAG="--amend"
+          fi
           ./scripts/release.sh "$BUMP_TYPE" \
-            --ci \
+            --ci $AMEND_FLAG \
             --pr-title "$PR_TITLE" \
             --pr-number "$PR_NUMBER"
           VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
@@ -87,7 +94,12 @@ jobs:
           APP_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           git remote set-url origin "https://x-access-token:${APP_TOKEN}@github.com/${{ github.repository }}.git"
-          git push origin main --tags
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            git push --force-with-lease origin main
+            git push origin --tags
+          else
+            git push origin main --tags
+          fi
 
   # ── Build release binaries ─────────────────────────────────────────
   build:
