@@ -344,10 +344,11 @@ impl BrowserManager {
     async fn connect_or_launch(&self, profile_name: &str) -> Result<ProfileInstance> {
         let cdp_url = self.config.resolve_cdp_url(profile_name);
         let attach_only = self.config.is_attach_only(profile_name);
+        let connect_timeout = std::time::Duration::from_millis(self.config.remote_cdp_timeout_ms);
 
         // Try connecting to an existing instance first
-        match Browser::connect(&cdp_url).await {
-            Ok((browser, handler)) => {
+        match tokio::time::timeout(connect_timeout, Browser::connect(&cdp_url)).await {
+            Ok(Ok((browser, handler))) => {
                 let mut handler = handler;
                 let handler_task =
                     tokio::spawn(async move { while let Some(_event) = handler.next().await {} });
@@ -359,7 +360,7 @@ impl BrowserManager {
                     launched_by_us: false,
                 });
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 if attach_only {
                     return Err(Error::ToolExecution(
                         format!("cannot connect to browser at {cdp_url} (attach-only mode): {e}")
@@ -369,6 +370,23 @@ impl BrowserManager {
                 tracing::info!(
                     profile = profile_name,
                     "browser not reachable at {cdp_url}, launching..."
+                );
+            }
+            Err(_) => {
+                if attach_only {
+                    return Err(Error::ToolExecution(
+                        format!(
+                            "timed out connecting to browser at {cdp_url} \
+                             after {}ms (attach-only mode)",
+                            connect_timeout.as_millis()
+                        )
+                        .into(),
+                    ));
+                }
+                tracing::info!(
+                    profile = profile_name,
+                    "browser CDP connect at {cdp_url} timed out after {}ms, launching...",
+                    connect_timeout.as_millis()
                 );
             }
         }
@@ -385,16 +403,32 @@ impl BrowserManager {
         // Wait for it to start
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
-        let (browser, handler) = Browser::connect(&cdp_url).await.map_err(|e| {
-            Error::ToolExecution(
-                format!(
-                    "browser not reachable at {cdp_url} after launch attempt: {e}. \
-                     If a browser is already running without remote debugging, \
-                     quit it first so a new instance can start."
-                )
-                .into(),
-            )
-        })?;
+        let (browser, handler) =
+            match tokio::time::timeout(connect_timeout, Browser::connect(&cdp_url)).await {
+                Ok(Ok(pair)) => pair,
+                Ok(Err(e)) => {
+                    return Err(Error::ToolExecution(
+                        format!(
+                            "browser not reachable at {cdp_url} after launch attempt: {e}. \
+                         If a browser is already running without remote debugging, \
+                         quit it first so a new instance can start."
+                        )
+                        .into(),
+                    ));
+                }
+                Err(_) => {
+                    return Err(Error::ToolExecution(
+                        format!(
+                            "timed out connecting to browser at {cdp_url} \
+                         after {}ms (post-launch). \
+                         If a browser is already running without remote debugging, \
+                         quit it first so a new instance can start.",
+                            connect_timeout.as_millis()
+                        )
+                        .into(),
+                    ));
+                }
+            };
 
         let mut handler = handler;
         let handler_task =
