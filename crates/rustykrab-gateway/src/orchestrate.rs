@@ -53,8 +53,7 @@ async fn build_and_inject_system_prompt(
     let mut builder = SystemPromptBuilder::new()
         .with_identity(&profile.agent_name)
         .with_current_date(&today)
-        .with_security_policy()
-        .with_completion_protocol();
+        .with_security_policy();
 
     // Inject SKILL.md catalog (only satisfied skills).
     let all_md = state.skill_registry.md_skills();

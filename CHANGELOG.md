@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.3.2] - 2026-05-18
+
+- refactor(agent): hide task_complete until the model uses its first tool (#442)
+
 ## [3.3.1] - 2026-05-18
 
 - feat(prompt): inject current UTC date into system prompt (#440)
