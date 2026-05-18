@@ -86,6 +86,10 @@ mod skills;
 mod tools_list;
 mod tools_load;
 
+// Completion signaling — explicit "I'm done" tool that lets the runner
+// distinguish "model paused mid-task" from "model finished the task."
+mod task_complete;
+
 // MCP connector (remote MCP servers exposed as native tools)
 mod mcp_connector;
 
@@ -170,6 +174,9 @@ pub use self::skills::{SkillTool, SkillsTool};
 pub use tools_list::ToolsListTool;
 pub use tools_load::ToolsLoadTool;
 
+// Completion signaling
+pub use task_complete::TaskCompleteTool;
+
 // MCP connector
 pub use mcp_connector::{mcp_connector_tools, McpRemoteTool};
 
@@ -184,6 +191,9 @@ pub fn builtin_tools(
         // Meta — tool discovery and lazy schema loading. Always registered.
         std::sync::Arc::new(ToolsListTool::new()),
         std::sync::Arc::new(ToolsLoadTool::new()),
+        // Completion signal — must always be reachable so the model can
+        // declare "task done" regardless of which dynamic tools are loaded.
+        std::sync::Arc::new(TaskCompleteTool::new()),
         // HTTP
         std::sync::Arc::new(HttpRequestTool::new()),
         std::sync::Arc::new(HttpSessionTool::new()),
