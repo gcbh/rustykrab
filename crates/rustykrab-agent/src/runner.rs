@@ -220,6 +220,18 @@ const TASK_COMPLETE_REMINDER: &str =
      to keep going — text alone will not end the turn now that you've started \
      working.";
 
+/// Outcome of `AgentRunner::reprompt_for_task_complete`: tell the caller
+/// whether to keep looping or accept the last response. Lets the streaming
+/// and non-streaming run paths share the retry-cap bookkeeping while still
+/// emitting their own terminal events.
+enum CompletionReminderOutcome {
+    /// A reminder was injected — caller should `continue` the loop.
+    Continue,
+    /// Retry cap exceeded — caller should accept the last response and
+    /// return `Ok(())` (after emitting any provider-specific events).
+    GiveUp,
+}
+
 /// Classify a text-only assistant response.
 fn classify_response(text: &str, _completion_tokens: u32) -> ResponseClass {
     let trimmed = text.trim();
@@ -867,6 +879,63 @@ impl AgentRunner {
         }
     }
 
+    /// Push the `task_complete` summary as the final assistant message and
+    /// log the termination. Shared by the streaming and non-streaming run
+    /// paths; the caller is responsible for emitting any provider-specific
+    /// events (e.g. `AgentEvent::TextDelta` / `AgentEvent::Done`).
+    fn finalize_task_complete(&self, conv: &mut Conversation, iteration: usize, summary: String) {
+        tracing::info!(
+            iteration,
+            "task_complete invoked — terminating run with model-supplied summary"
+        );
+        self.push_message(
+            conv,
+            Message {
+                id: Uuid::new_v4(),
+                role: Role::Assistant,
+                content: MessageContent::Text(summary),
+                created_at: Utc::now(),
+            },
+        );
+    }
+
+    /// Inject the `TASK_COMPLETE_REMINDER` as a user-role nudge after the
+    /// model produced a text-only EndTurn mid-task. Bumps `retries` and
+    /// returns `GiveUp` once the cap is exceeded so the caller can accept
+    /// the last response rather than spinning to `max_iterations`.
+    fn reprompt_for_task_complete(
+        &self,
+        conv: &mut Conversation,
+        iteration: usize,
+        retries: &mut usize,
+        classification: &ResponseClass,
+    ) -> CompletionReminderOutcome {
+        *retries += 1;
+        if *retries > TASK_COMPLETE_RETRY_LIMIT {
+            tracing::warn!(
+                retries = *retries,
+                "task_complete reminder retries exhausted — accepting last response"
+            );
+            return CompletionReminderOutcome::GiveUp;
+        }
+        tracing::warn!(
+            iteration,
+            retries = *retries,
+            ?classification,
+            "EndTurn without task_complete after tool use — re-prompting"
+        );
+        self.push_message(
+            conv,
+            Message {
+                id: Uuid::new_v4(),
+                role: Role::User,
+                content: MessageContent::Text(TASK_COMPLETE_REMINDER.to_string()),
+                created_at: Utc::now(),
+            },
+        );
+        CompletionReminderOutcome::Continue
+    }
+
     /// Start the event-driven agent loop.
     ///
     /// Returns a handle for injecting events (user messages, cancellation),
@@ -1230,19 +1299,7 @@ impl AgentRunner {
                 // pushed so the conversation history stays well-formed: every
                 // tool_call has a matching tool_result.
                 if let Some(summary) = task_complete_summary {
-                    tracing::info!(
-                        iteration,
-                        "task_complete invoked — terminating run with model-supplied summary"
-                    );
-                    self.push_message(
-                        conv,
-                        Message {
-                            id: Uuid::new_v4(),
-                            role: Role::Assistant,
-                            content: MessageContent::Text(summary),
-                            created_at: Utc::now(),
-                        },
-                    );
+                    self.finalize_task_complete(conv, iteration, summary);
                     return Ok(());
                 }
 
@@ -1276,30 +1333,15 @@ impl AgentRunner {
                     // that never learn the protocol fall through to the
                     // legacy accept-and-return behavior.
                     if has_called_any_tool {
-                        task_complete_retries += 1;
-                        if task_complete_retries > TASK_COMPLETE_RETRY_LIMIT {
-                            tracing::warn!(
-                                retries = task_complete_retries,
-                                "task_complete reminder retries exhausted — accepting last response"
-                            );
-                            return Ok(());
-                        }
-                        tracing::warn!(
-                            iteration,
-                            retries = task_complete_retries,
-                            ?classification,
-                            "EndTurn without task_complete after tool use — re-prompting"
-                        );
-                        self.push_message(
+                        match self.reprompt_for_task_complete(
                             conv,
-                            Message {
-                                id: Uuid::new_v4(),
-                                role: Role::User,
-                                content: MessageContent::Text(TASK_COMPLETE_REMINDER.to_string()),
-                                created_at: Utc::now(),
-                            },
-                        );
-                        continue;
+                            iteration,
+                            &mut task_complete_retries,
+                            &classification,
+                        ) {
+                            CompletionReminderOutcome::Continue => continue,
+                            CompletionReminderOutcome::GiveUp => return Ok(()),
+                        }
                     }
 
                     match classification {
@@ -1711,20 +1753,8 @@ impl AgentRunner {
                 // streaming UIs render the deliverable just like a model-
                 // produced final answer.
                 if let Some(summary) = task_complete_summary {
-                    tracing::info!(
-                        iteration,
-                        "task_complete invoked — terminating run with model-supplied summary"
-                    );
                     on_event(AgentEvent::TextDelta(summary.clone()));
-                    self.push_message(
-                        conv,
-                        Message {
-                            id: Uuid::new_v4(),
-                            role: Role::Assistant,
-                            content: MessageContent::Text(summary),
-                            created_at: Utc::now(),
-                        },
-                    );
+                    self.finalize_task_complete(conv, iteration, summary);
                     on_event(AgentEvent::Done);
                     return Ok(());
                 }
@@ -1755,31 +1785,18 @@ impl AgentRunner {
                     // either call `task_complete` or keep working. See
                     // run_inner for the full rationale.
                     if has_called_any_tool {
-                        task_complete_retries += 1;
-                        if task_complete_retries > TASK_COMPLETE_RETRY_LIMIT {
-                            tracing::warn!(
-                                retries = task_complete_retries,
-                                "task_complete reminder retries exhausted — accepting last response"
-                            );
-                            on_event(AgentEvent::Done);
-                            return Ok(());
-                        }
-                        tracing::warn!(
-                            iteration,
-                            retries = task_complete_retries,
-                            ?classification,
-                            "EndTurn without task_complete after tool use — re-prompting"
-                        );
-                        self.push_message(
+                        match self.reprompt_for_task_complete(
                             conv,
-                            Message {
-                                id: Uuid::new_v4(),
-                                role: Role::User,
-                                content: MessageContent::Text(TASK_COMPLETE_REMINDER.to_string()),
-                                created_at: Utc::now(),
-                            },
-                        );
-                        continue;
+                            iteration,
+                            &mut task_complete_retries,
+                            &classification,
+                        ) {
+                            CompletionReminderOutcome::Continue => continue,
+                            CompletionReminderOutcome::GiveUp => {
+                                on_event(AgentEvent::Done);
+                                return Ok(());
+                            }
+                        }
                     }
 
                     match classification {
@@ -4513,6 +4530,50 @@ mod task_complete_tests {
             .and_then(|m| m.content.as_text())
             .expect("final assistant text must be present");
         assert_eq!(last_assistant_text, "real answer");
+    }
+
+    #[tokio::test]
+    async fn task_complete_retry_limit_exhaustion_accepts_last_response() {
+        // After one real tool call the model narrates `TASK_COMPLETE_RETRY_LIMIT + 1`
+        // consecutive text-only EndTurns instead of ever calling
+        // `task_complete`. The runner must re-prompt up to the cap and then
+        // fall through to `Ok(())` — degrading gracefully to legacy
+        // behavior — rather than spinning until `max_iterations`.
+        let mut script = vec![tool_use_response("noop", serde_json::json!({}))];
+        // One more text response than the limit so the cap is exceeded.
+        for i in 0..=TASK_COMPLETE_RETRY_LIMIT {
+            script.push(text_response(&format!("still working on it ({i})")));
+        }
+        let total_provider_calls = script.len();
+        let provider = Arc::new(ScriptedProvider::new(script));
+        let (runner, session, conv_id) = make_runner(provider.clone());
+        let mut conv = make_conv();
+        conv.id = conv_id;
+
+        runner
+            .run(&mut conv, &session)
+            .await
+            .expect("loop should fall through gracefully after retries exhausted");
+
+        // Provider polled exactly once per scripted response — the loop
+        // stopped at the cap, not earlier and not later.
+        assert_eq!(*provider.chat_count.lock().unwrap(), total_provider_calls);
+
+        // The reminder must have been injected exactly `TASK_COMPLETE_RETRY_LIMIT`
+        // times: each text response below the cap triggers one reminder;
+        // the response that exceeds the cap returns without injecting.
+        let reminder_count = conv
+            .messages
+            .iter()
+            .filter(|m| {
+                m.role == Role::User
+                    && m.content
+                        .as_text()
+                        .map(|t| t.contains("did not call `task_complete`"))
+                        .unwrap_or(false)
+            })
+            .count();
+        assert_eq!(reminder_count, TASK_COMPLETE_RETRY_LIMIT);
     }
 }
 
