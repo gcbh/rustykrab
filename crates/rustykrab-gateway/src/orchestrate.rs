@@ -47,7 +47,8 @@ async fn build_and_inject_system_prompt(
     // 2. Build the minimal system prompt.
     let mut builder = SystemPromptBuilder::new()
         .with_identity(&profile.agent_name)
-        .with_security_policy();
+        .with_security_policy()
+        .with_completion_protocol();
 
     // Inject SKILL.md catalog (only satisfied skills).
     let all_md = state.skill_registry.md_skills();

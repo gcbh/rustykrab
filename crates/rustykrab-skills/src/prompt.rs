@@ -109,6 +109,29 @@ impl SystemPromptBuilder {
         self
     }
 
+    /// Tell the model how to terminate a run. Once it has called any tool
+    /// this turn, the only accepted "I'm done" signal is the `task_complete`
+    /// tool — plain text (which providers like Ollama map to `EndTurn`
+    /// regardless of intent) will be treated as an interim progress update
+    /// and the runner will re-prompt the model to continue.
+    pub fn with_completion_protocol(mut self) -> Self {
+        self.sections.push(
+            "COMPLETION:\n\
+             - When the user's request is fully handled, call the \
+               `task_complete` tool. Pass the final answer the user should \
+               see as the `summary` argument — that string is delivered \
+               verbatim, so make it complete and self-contained.\n\
+             - Do not end your turn with text alone after you have started \
+               using tools. The runner treats text-without-task_complete as \
+               an interim update and will prompt you to keep working.\n\
+             - If more work remains, call the next tool. If you genuinely \
+               cannot continue, call `task_complete` with a summary that \
+               explains why."
+                .to_string(),
+        );
+        self
+    }
+
     /// Add a skill's system prompt fragment.
     pub fn with_skill(mut self, skill_prompt: &str) -> Self {
         self.sections.push(skill_prompt.to_string());
