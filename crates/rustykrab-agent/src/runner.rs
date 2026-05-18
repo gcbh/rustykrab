@@ -25,9 +25,13 @@ use uuid::Uuid;
 /// always present — the model can't `tools_load` them after compaction
 /// has already dropped the detail it needs to recover, and `recall_append`
 /// is the manual escape hatch for stashing content outside the prompt.
-/// `task_complete` is the explicit "I'm done" signal — the runner relies
-/// on it to disambiguate "model paused mid-task" from "model finished",
-/// so it must be callable from any iteration without a `tools_load` hop.
+///
+/// `task_complete` is *not* listed here on purpose: exposing the
+/// completion signal from turn 0 tempts the model to call it for simple
+/// Q&A and greetings. The runner instead activates it via
+/// `self.active_tools` the first time the model uses any tool this run,
+/// so it appears in the schema exactly when the runner starts requiring
+/// it.
 const META_TOOL_NAMES: &[&str] = &[
     "tools_list",
     "tools_load",
@@ -36,7 +40,6 @@ const META_TOOL_NAMES: &[&str] = &[
     "recall_peek",
     "recall_search",
     "recall_sub_query",
-    "task_complete",
 ];
 
 fn is_meta_tool(name: &str) -> bool {
@@ -1094,6 +1097,14 @@ impl AgentRunner {
 
             // Handle tool calls.
             if message.content.has_tool_calls() {
+                // First tool call this run — make `task_complete` visible
+                // in the schema from the next iteration onward. We hide it
+                // on no-tool turns (greetings, direct Q&A) so the model
+                // isn't tempted to use it as a chatty turn-ender.
+                if !has_called_any_tool {
+                    self.active_tools
+                        .activate(session.conversation_id, ["task_complete"]);
+                }
                 has_called_any_tool = true;
                 empty_tool_use_retries = 0;
                 empty_response_retries = 0;
@@ -1552,6 +1563,12 @@ impl AgentRunner {
 
             // Handle tool calls.
             if message.content.has_tool_calls() {
+                // First tool call this run — reveal `task_complete` in the
+                // schema from here on. See run_inner for rationale.
+                if !has_called_any_tool {
+                    self.active_tools
+                        .activate(session.conversation_id, ["task_complete"]);
+                }
                 has_called_any_tool = true;
                 empty_tool_use_retries = 0;
                 empty_response_retries = 0;
@@ -4240,7 +4257,10 @@ mod task_complete_tests {
         let runner = AgentRunner::new(provider, tools, Arc::new(NoSandbox))
             .with_active_tools(active.clone());
         let conv_id = Uuid::new_v4();
-        active.activate(conv_id, ["noop", "task_complete"]);
+        // Pre-activate only `noop`: the runner should auto-reveal
+        // `task_complete` after the first tool call, so leaving it out
+        // here also exercises that activation path.
+        active.activate(conv_id, ["noop"]);
         let caps = CapabilitySet::for_tools_permissive(&["noop", "task_complete"]);
         let session = Session::with_capabilities(conv_id, caps);
         (runner, session, conv_id)
@@ -4340,6 +4360,129 @@ mod task_complete_tests {
 
         runner.run(&mut conv, &session).await.unwrap();
         assert_eq!(*provider.chat_count.lock().unwrap(), 1);
+    }
+
+    /// Provider that records the *names* of tools in each call's schema
+    /// so a test can assert which iterations saw `task_complete` exposed.
+    struct SchemaRecordingProvider {
+        script: Mutex<Vec<ModelResponse>>,
+        schema_names_per_call: Mutex<Vec<Vec<String>>>,
+    }
+
+    impl SchemaRecordingProvider {
+        fn new(script: Vec<ModelResponse>) -> Self {
+            Self {
+                script: Mutex::new(script),
+                schema_names_per_call: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn next(&self, tools: &[ToolSchema]) -> ModelResponse {
+            self.schema_names_per_call
+                .lock()
+                .unwrap()
+                .push(tools.iter().map(|t| t.name.clone()).collect());
+            let mut s = self.script.lock().unwrap();
+            if s.is_empty() {
+                panic!("SchemaRecordingProvider ran out of canned responses");
+            }
+            s.remove(0)
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for SchemaRecordingProvider {
+        fn name(&self) -> &str {
+            "schema-recording-mock"
+        }
+        async fn chat(&self, _: &[Message], tools: &[ToolSchema]) -> Result<ModelResponse> {
+            Ok(self.next(tools))
+        }
+        async fn chat_with_choice(
+            &self,
+            _: &[Message],
+            tools: &[ToolSchema],
+            _: ToolChoice,
+        ) -> Result<ModelResponse> {
+            Ok(self.next(tools))
+        }
+    }
+
+    #[tokio::test]
+    async fn task_complete_is_hidden_until_first_tool_call() {
+        // Iteration 0 schema must not contain `task_complete`. After the
+        // model uses any tool, iteration 1's schema must include it.
+        use rustykrab_tools::TaskCompleteTool;
+        let provider = Arc::new(SchemaRecordingProvider::new(vec![
+            tool_use_response("noop", serde_json::json!({})),
+            tool_use_response("task_complete", serde_json::json!({ "summary": "ok" })),
+        ]));
+        let active = Arc::new(ActiveToolsRegistry::new());
+        let tools: Vec<Arc<dyn Tool>> = vec![
+            Arc::new(NoopTool {
+                name: "noop".into(),
+            }),
+            Arc::new(TaskCompleteTool::new()),
+        ];
+        let runner = AgentRunner::new(provider.clone(), tools, Arc::new(NoSandbox))
+            .with_active_tools(active.clone());
+        let conv_id = Uuid::new_v4();
+        active.activate(conv_id, ["noop"]);
+        let caps = CapabilitySet::for_tools_permissive(&["noop", "task_complete"]);
+        let session = Session::with_capabilities(conv_id, caps);
+        let mut conv = make_conv();
+        conv.id = conv_id;
+
+        runner.run(&mut conv, &session).await.unwrap();
+
+        let schemas = provider.schema_names_per_call.lock().unwrap();
+        assert_eq!(schemas.len(), 2, "expected 2 chat calls");
+        assert!(
+            !schemas[0].iter().any(|n| n == "task_complete"),
+            "iteration 0 schema must not expose task_complete; got {:?}",
+            schemas[0]
+        );
+        assert!(
+            schemas[1].iter().any(|n| n == "task_complete"),
+            "iteration 1 schema must expose task_complete after tool use; got {:?}",
+            schemas[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn task_complete_hidden_for_direct_qa_path() {
+        // A user asks something the model can answer in one turn with no
+        // tools. `task_complete` must never appear in the schema, so the
+        // model isn't tempted to invoke it as a chatty turn-ender.
+        use rustykrab_tools::TaskCompleteTool;
+        let provider = Arc::new(SchemaRecordingProvider::new(vec![text_response(
+            "The answer is 42.",
+        )]));
+        let active = Arc::new(ActiveToolsRegistry::new());
+        let tools: Vec<Arc<dyn Tool>> = vec![
+            Arc::new(NoopTool {
+                name: "noop".into(),
+            }),
+            Arc::new(TaskCompleteTool::new()),
+        ];
+        let runner = AgentRunner::new(provider.clone(), tools, Arc::new(NoSandbox))
+            .with_active_tools(active.clone());
+        let conv_id = Uuid::new_v4();
+        active.activate(conv_id, ["noop"]);
+        let caps = CapabilitySet::for_tools_permissive(&["noop", "task_complete"]);
+        let session = Session::with_capabilities(conv_id, caps);
+        let mut conv = make_conv();
+        conv.id = conv_id;
+
+        runner.run(&mut conv, &session).await.unwrap();
+
+        let schemas = provider.schema_names_per_call.lock().unwrap();
+        for (i, names) in schemas.iter().enumerate() {
+            assert!(
+                !names.iter().any(|n| n == "task_complete"),
+                "iteration {i} should not expose task_complete on direct-Q&A path; got {names:?}"
+            );
+        }
     }
 
     #[tokio::test]
