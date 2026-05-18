@@ -445,7 +445,7 @@ const SNAPSHOT_JS: &str = r#"
         };
     });
     return JSON.stringify(out);
-})()
+})
 "#;
 
 /// Raw element data from the JS snapshot.
@@ -477,7 +477,7 @@ pub async fn take_snapshot(
         .unwrap_or_else(|| "null".to_string());
 
     let eval_js = format!(
-        "({SNAPSHOT_JS}).apply(null, [{}, {}, {}, {}])",
+        "({SNAPSHOT_JS})({}, {}, {}, {})",
         options.max_depth,
         if options.interactive_only {
             "true"

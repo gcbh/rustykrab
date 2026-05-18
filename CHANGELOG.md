@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.2.1] - 2026-05-18
+
+- fix(browser): stop calling .apply on the snapshot IIFE's return value (#439)
+
 ## [3.2.0] - 2026-05-16
 
 - feat(agent): per-tool timeouts, circuit breaker, and tool heartbeats (#438)
