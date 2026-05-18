@@ -45,8 +45,14 @@ async fn build_and_inject_system_prompt(
     tracing::info!(profile = %profile.name, "harness profile selected");
 
     // 2. Build the minimal system prompt.
+    //
+    // Date is rendered at day granularity so the system block stays
+    // cache-friendly: it only changes once per UTC day. Models that need
+    // sub-day precision should call a clock tool on demand.
+    let today = Utc::now().format("%Y-%m-%d").to_string();
     let mut builder = SystemPromptBuilder::new()
         .with_identity(&profile.agent_name)
+        .with_current_date(&today)
         .with_security_policy()
         .with_completion_protocol();
 
