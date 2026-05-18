@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -8,6 +8,11 @@ use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
 use crate::security;
+
+/// Upper bound on cached named sessions. Each `reqwest::Client` owns its
+/// own connection pool and cookie jar, so an unbounded map would leak
+/// sockets and FDs if a caller invents fresh session names.
+const MAX_SESSIONS: usize = 32;
 
 /// A cookie-aware HTTP client with named sessions.
 ///
@@ -21,30 +26,74 @@ use crate::security;
 /// Uses `tokio::sync::Mutex` to avoid blocking the async runtime
 /// (fixes ASYNC-H2).
 pub struct HttpSessionTool {
-    sessions: Arc<Mutex<HashMap<String, reqwest::Client>>>,
+    inner: Arc<Mutex<SessionCache>>,
+}
+
+/// LRU-bounded cache of `reqwest::Client`s keyed by session name.
+struct SessionCache {
+    clients: HashMap<String, reqwest::Client>,
+    /// Recency order: front = least-recently-used, back = most-recent.
+    order: VecDeque<String>,
+}
+
+impl SessionCache {
+    fn new() -> Self {
+        Self {
+            clients: HashMap::new(),
+            order: VecDeque::new(),
+        }
+    }
+
+    fn touch(&mut self, key: &str) {
+        if let Some(pos) = self.order.iter().position(|k| k == key) {
+            self.order.remove(pos);
+        }
+        self.order.push_back(key.to_string());
+    }
+
+    fn get_or_create(&mut self, name: &str) -> reqwest::Client {
+        if let Some(client) = self.clients.get(name).cloned() {
+            self.touch(name);
+            return client;
+        }
+        while self.clients.len() >= MAX_SESSIONS {
+            match self.order.pop_front() {
+                Some(oldest) => {
+                    self.clients.remove(&oldest);
+                }
+                None => break,
+            }
+        }
+        let client = reqwest::Client::builder()
+            .cookie_store(true)
+            .user_agent("RustyKrab/0.1 (AI Agent)")
+            .timeout(std::time::Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::limited(10))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+        self.clients.insert(name.to_string(), client.clone());
+        self.order.push_back(name.to_string());
+        client
+    }
+
+    fn remove(&mut self, name: &str) {
+        self.clients.remove(name);
+        if let Some(pos) = self.order.iter().position(|k| k == name) {
+            self.order.remove(pos);
+        }
+    }
 }
 
 impl HttpSessionTool {
     pub fn new() -> Self {
         Self {
-            sessions: Arc::new(Mutex::new(HashMap::new())),
+            inner: Arc::new(Mutex::new(SessionCache::new())),
         }
     }
 
     async fn get_or_create_client(&self, session_name: &str) -> reqwest::Client {
-        let mut sessions = self.sessions.lock().await;
-        sessions
-            .entry(session_name.to_string())
-            .or_insert_with(|| {
-                reqwest::Client::builder()
-                    .cookie_store(true)
-                    .user_agent("RustyKrab/0.1 (AI Agent)")
-                    .timeout(std::time::Duration::from_secs(30))
-                    .redirect(reqwest::redirect::Policy::limited(10))
-                    .build()
-                    .unwrap_or_else(|_| reqwest::Client::new())
-            })
-            .clone()
+        let mut cache = self.inner.lock().await;
+        cache.get_or_create(session_name)
     }
 }
 
@@ -127,8 +176,8 @@ impl Tool for HttpSessionTool {
         let action = args["action"].as_str().unwrap_or("request");
 
         if action == "clear" {
-            let mut sessions = self.sessions.lock().await;
-            sessions.remove(session_name);
+            let mut cache = self.inner.lock().await;
+            cache.remove(session_name);
             return Ok(json!({
                 "status": "session_cleared",
                 "session": session_name,
@@ -217,5 +266,65 @@ impl Tool for HttpSessionTool {
             "body": body_out,
             "truncated": truncated,
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn session_cache_evicts_lru_when_over_capacity() {
+        let tool = HttpSessionTool::new();
+        for i in 0..(MAX_SESSIONS + 5) {
+            tool.get_or_create_client(&format!("s-{i}")).await;
+        }
+        let cache = tool.inner.lock().await;
+        assert_eq!(cache.clients.len(), MAX_SESSIONS);
+        assert!(!cache.clients.contains_key("s-0"));
+        assert!(cache
+            .clients
+            .contains_key(&format!("s-{}", MAX_SESSIONS + 4)));
+    }
+
+    #[tokio::test]
+    async fn session_cache_reuses_existing_client() {
+        let tool = HttpSessionTool::new();
+        let a = tool.get_or_create_client("same").await;
+        let b = tool.get_or_create_client("same").await;
+        // reqwest::Client is cheap to clone and clones share the same inner pool.
+        // Verifying we didn't grow the map is the easier invariant.
+        let cache = tool.inner.lock().await;
+        assert_eq!(cache.clients.len(), 1);
+        drop(a);
+        drop(b);
+    }
+
+    #[tokio::test]
+    async fn session_cache_get_refreshes_recency() {
+        let tool = HttpSessionTool::new();
+        for i in 0..MAX_SESSIONS {
+            tool.get_or_create_client(&format!("s-{i}")).await;
+        }
+        // Re-accessing s-0 should bump it to most-recent so s-1 evicts next.
+        tool.get_or_create_client("s-0").await;
+        tool.get_or_create_client("overflow").await;
+
+        let cache = tool.inner.lock().await;
+        assert!(cache.clients.contains_key("s-0"));
+        assert!(!cache.clients.contains_key("s-1"));
+        assert!(cache.clients.contains_key("overflow"));
+    }
+
+    #[tokio::test]
+    async fn session_cache_remove_clears_order() {
+        let tool = HttpSessionTool::new();
+        tool.get_or_create_client("x").await;
+        {
+            let mut cache = tool.inner.lock().await;
+            cache.remove("x");
+            assert!(!cache.clients.contains_key("x"));
+            assert!(!cache.order.iter().any(|k| k == "x"));
+        }
     }
 }

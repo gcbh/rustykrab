@@ -15,7 +15,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -154,10 +154,43 @@ fn tokenize(s: &str) -> std::collections::HashSet<String> {
         .collect()
 }
 
-/// Process-wide adaptive store keyed by `auto_save_id`.
+/// Upper bound on entries in the process-wide adaptive store. Each entry
+/// holds a `Vec<Fingerprint>` of tokenized element text, so an unbounded
+/// map would grow per unique `auto_save_id` an agent invents.
+const MAX_ADAPTIVE_ENTRIES: usize = 256;
+
+/// Process-wide adaptive store keyed by `auto_save_id`. LRU-bounded so
+/// long-running daemons don't accumulate fingerprints forever.
 #[derive(Default)]
 pub struct AdaptiveStore {
-    inner: Arc<Mutex<HashMap<String, Vec<Fingerprint>>>>,
+    inner: Arc<Mutex<AdaptiveInner>>,
+}
+
+#[derive(Default)]
+struct AdaptiveInner {
+    map: HashMap<String, Vec<Fingerprint>>,
+    /// Recency order: front = least-recently-used, back = most-recent.
+    order: VecDeque<String>,
+}
+
+impl AdaptiveInner {
+    fn touch(&mut self, id: &str) {
+        if let Some(pos) = self.order.iter().position(|k| k == id) {
+            self.order.remove(pos);
+        }
+        self.order.push_back(id.to_string());
+    }
+
+    fn evict_to_capacity(&mut self) {
+        while self.map.len() > MAX_ADAPTIVE_ENTRIES {
+            match self.order.pop_front() {
+                Some(oldest) => {
+                    self.map.remove(&oldest);
+                }
+                None => break,
+            }
+        }
+    }
 }
 
 impl AdaptiveStore {
@@ -169,13 +202,19 @@ impl AdaptiveStore {
     pub async fn save(&self, id: &str, matches: &[Match]) {
         let prints: Vec<Fingerprint> = matches.iter().map(Fingerprint::from_match).collect();
         let mut g = self.inner.lock().await;
-        g.insert(id.to_string(), prints);
+        g.map.insert(id.to_string(), prints);
+        g.touch(id);
+        g.evict_to_capacity();
     }
 
     /// Look up saved fingerprints.
     pub async fn load(&self, id: &str) -> Option<Vec<Fingerprint>> {
-        let g = self.inner.lock().await;
-        g.get(id).cloned()
+        let mut g = self.inner.lock().await;
+        let hit = g.map.get(id).cloned();
+        if hit.is_some() {
+            g.touch(id);
+        }
+        hit
     }
 
     /// Find the best matching candidate from `candidates` for each saved
@@ -217,7 +256,7 @@ impl AdaptiveStore {
     pub async fn to_dump(&self) -> Value {
         let g = self.inner.lock().await;
         let mut out = Map::new();
-        for (id, prints) in g.iter() {
+        for (id, prints) in g.map.iter() {
             let arr: Vec<Value> = prints
                 .iter()
                 .map(|p| serde_json::to_value(p).unwrap_or(Value::Null))
@@ -325,5 +364,44 @@ mod tests {
             .match_against("never-saved", &[mk_match("a", "body > a", "x", &[])], 0.0)
             .await;
         assert!(scored.is_empty());
+    }
+
+    #[tokio::test]
+    async fn adaptive_evicts_lru_when_over_capacity() {
+        let store = AdaptiveStore::new();
+        let m = mk_match("a", "body > a", "x", &[("href", "/x")]);
+
+        for i in 0..(MAX_ADAPTIVE_ENTRIES + 10) {
+            store
+                .save(&format!("id-{i}"), std::slice::from_ref(&m))
+                .await;
+        }
+
+        let inner = store.inner.lock().await;
+        assert_eq!(inner.map.len(), MAX_ADAPTIVE_ENTRIES);
+        assert!(!inner.map.contains_key("id-0"));
+        assert!(inner
+            .map
+            .contains_key(&format!("id-{}", MAX_ADAPTIVE_ENTRIES + 9)));
+    }
+
+    #[tokio::test]
+    async fn adaptive_load_refreshes_recency() {
+        let store = AdaptiveStore::new();
+        let m = mk_match("a", "body > a", "x", &[("href", "/x")]);
+
+        for i in 0..MAX_ADAPTIVE_ENTRIES {
+            store
+                .save(&format!("id-{i}"), std::slice::from_ref(&m))
+                .await;
+        }
+        // Touch id-0 so it becomes most-recent; id-1 is now LRU.
+        let _ = store.load("id-0").await;
+        store.save("overflow", std::slice::from_ref(&m)).await;
+
+        let inner = store.inner.lock().await;
+        assert!(inner.map.contains_key("id-0"));
+        assert!(!inner.map.contains_key("id-1"));
+        assert!(inner.map.contains_key("overflow"));
     }
 }
