@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.3.4] - 2026-05-20
+
+- fix(tools): bound HttpSession, AdaptiveStore, and SnapshotStore caches (#445)
+
 ## [3.3.3] - 2026-05-18
 
 - refactor(agent): share task_complete loop logic + retry-cap test (#444)

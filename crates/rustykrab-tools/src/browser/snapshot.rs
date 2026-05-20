@@ -20,7 +20,7 @@
 use chromiumoxide::Page;
 use rustykrab_core::{Error, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -55,36 +55,81 @@ pub struct ElementRef {
     pub bounds: Option<[f64; 4]>,
 }
 
+/// Upper bound on cached snapshot keys. Each entry holds a full ref map
+/// (potentially hundreds of `ElementRef`s with selectors and bounds), so
+/// without a cap the store grows per `(profile, tab)` ever snapshotted.
+const MAX_SNAPSHOT_KEYS: usize = 64;
+
 /// Stores ref mappings from the most recent snapshot for each profile+tab.
+///
+/// LRU-bounded so closed tabs / stale profiles eventually drop out.
 pub struct SnapshotStore {
+    inner: Arc<Mutex<SnapshotInner>>,
+}
+
+struct SnapshotInner {
     /// Maps (profile, tab_key) -> { ref_id -> ElementRef }
-    refs: Arc<Mutex<HashMap<String, HashMap<String, ElementRef>>>>,
+    refs: HashMap<String, HashMap<String, ElementRef>>,
+    /// Recency order: front = least-recently-used, back = most-recent.
+    order: VecDeque<String>,
+}
+
+impl SnapshotInner {
+    fn touch(&mut self, key: &str) {
+        if let Some(pos) = self.order.iter().position(|k| k == key) {
+            self.order.remove(pos);
+        }
+        self.order.push_back(key.to_string());
+    }
+
+    fn evict_to_capacity(&mut self) {
+        while self.refs.len() > MAX_SNAPSHOT_KEYS {
+            match self.order.pop_front() {
+                Some(oldest) => {
+                    self.refs.remove(&oldest);
+                }
+                None => break,
+            }
+        }
+    }
 }
 
 impl SnapshotStore {
     pub fn new() -> Self {
         Self {
-            refs: Arc::new(Mutex::new(HashMap::new())),
+            inner: Arc::new(Mutex::new(SnapshotInner {
+                refs: HashMap::new(),
+                order: VecDeque::new(),
+            })),
         }
     }
 
     /// Store refs from a snapshot.
     pub async fn store(&self, key: &str, refs: HashMap<String, ElementRef>) {
-        let mut store = self.refs.lock().await;
-        store.insert(key.to_string(), refs);
+        let mut g = self.inner.lock().await;
+        g.refs.insert(key.to_string(), refs);
+        g.touch(key);
+        g.evict_to_capacity();
     }
 
     /// Look up an element ref.
     pub async fn get_ref(&self, key: &str, ref_id: &str) -> Option<ElementRef> {
-        let store = self.refs.lock().await;
-        store.get(key).and_then(|m| m.get(ref_id)).cloned()
+        let mut g = self.inner.lock().await;
+        let hit = g.refs.get(key).and_then(|m| m.get(ref_id)).cloned();
+        if hit.is_some() {
+            g.touch(key);
+        }
+        hit
     }
 
     /// Clear refs for a key.
     #[allow(dead_code)]
     pub async fn clear(&self, key: &str) {
-        let mut store = self.refs.lock().await;
-        store.remove(key);
+        let mut g = self.inner.lock().await;
+        g.refs.remove(key);
+        if let Some(pos) = g.order.iter().position(|k| k == key) {
+            g.order.remove(pos);
+        }
     }
 }
 
@@ -577,5 +622,68 @@ fn truncate(s: &str, max: usize) -> String {
             end -= 1;
         }
         format!("{}...", &s[..end])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mk_ref(id: &str) -> ElementRef {
+        ElementRef {
+            ref_id: id.to_string(),
+            selector: "body > a".to_string(),
+            role: "link".to_string(),
+            name: "x".to_string(),
+            value: None,
+            interactive: true,
+            bounds: None,
+        }
+    }
+
+    fn mk_refs(id: &str) -> HashMap<String, ElementRef> {
+        let mut m = HashMap::new();
+        m.insert(id.to_string(), mk_ref(id));
+        m
+    }
+
+    #[tokio::test]
+    async fn snapshot_evicts_lru_when_over_capacity() {
+        let store = SnapshotStore::new();
+        for i in 0..(MAX_SNAPSHOT_KEYS + 5) {
+            store.store(&format!("k-{i}"), mk_refs("1")).await;
+        }
+        let inner = store.inner.lock().await;
+        assert_eq!(inner.refs.len(), MAX_SNAPSHOT_KEYS);
+        assert!(!inner.refs.contains_key("k-0"));
+        assert!(inner
+            .refs
+            .contains_key(&format!("k-{}", MAX_SNAPSHOT_KEYS + 4)));
+    }
+
+    #[tokio::test]
+    async fn snapshot_get_ref_refreshes_recency() {
+        let store = SnapshotStore::new();
+        for i in 0..MAX_SNAPSHOT_KEYS {
+            store.store(&format!("k-{i}"), mk_refs("1")).await;
+        }
+        // Bump k-0 to most-recent via a successful get_ref.
+        assert!(store.get_ref("k-0", "1").await.is_some());
+        store.store("overflow", mk_refs("1")).await;
+
+        let inner = store.inner.lock().await;
+        assert!(inner.refs.contains_key("k-0"));
+        assert!(!inner.refs.contains_key("k-1"));
+        assert!(inner.refs.contains_key("overflow"));
+    }
+
+    #[tokio::test]
+    async fn snapshot_clear_removes_from_order() {
+        let store = SnapshotStore::new();
+        store.store("a", mk_refs("1")).await;
+        store.clear("a").await;
+        let inner = store.inner.lock().await;
+        assert!(!inner.refs.contains_key("a"));
+        assert!(!inner.order.iter().any(|k| k == "a"));
     }
 }
