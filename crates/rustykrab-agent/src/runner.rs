@@ -25,6 +25,13 @@ use uuid::Uuid;
 /// always present — the model can't `tools_load` them after compaction
 /// has already dropped the detail it needs to recover, and `recall_append`
 /// is the manual escape hatch for stashing content outside the prompt.
+///
+/// `task_complete` is *not* listed here on purpose: exposing the
+/// completion signal from turn 0 tempts the model to call it for simple
+/// Q&A and greetings. The runner instead activates it via
+/// `self.active_tools` the first time the model uses any tool this run,
+/// so it appears in the schema exactly when the runner starts requiring
+/// it.
 const META_TOOL_NAMES: &[&str] = &[
     "tools_list",
     "tools_load",
@@ -67,6 +74,13 @@ const EMPTY_RESPONSE_RETRY_LIMIT: usize = 1;
 /// Maximum retries for a planning-only response (model described intent
 /// without using tools).
 const PLANNING_ONLY_RETRY_LIMIT: usize = 2;
+/// Maximum number of times the runner will re-prompt the model to call
+/// `task_complete` after it stops with text-only output mid-task (i.e.
+/// after the agent has already invoked at least one tool this run).
+/// Past this cap the runner gives up and accepts the last text response
+/// rather than spinning until `max_iterations`. Small models that never
+/// learn to call `task_complete` thus degrade to the legacy behavior.
+const TASK_COMPLETE_RETRY_LIMIT: usize = 3;
 
 /// Default upper bound on the effective context window used when computing
 /// the compaction threshold. Keeps compaction aggressive even when the
@@ -168,6 +182,7 @@ fn compaction_summary_max_tokens() -> usize {
 }
 
 /// Classification of a model response that didn't include tool calls.
+#[derive(Debug)]
 enum ResponseClass {
     /// Substantive text — the model produced a real answer.
     Complete,
@@ -177,6 +192,44 @@ enum ResponseClass {
     /// The model described what it *plans* to do without actually doing it
     /// (e.g. "I'll read the file…", "Let me search for…").
     PlanningOnly,
+}
+
+/// Extract the `summary` argument from a `task_complete` invocation if one
+/// is present in this batch of tool calls. Returns `None` when the model
+/// did not call `task_complete`, called it without a non-empty `summary`
+/// string, or called it with a malformed payload — in those cases the
+/// runner keeps looping rather than synthesizing a blank final answer.
+fn extract_task_complete_summary(calls: &[&ToolCall]) -> Option<String> {
+    calls
+        .iter()
+        .find(|c| c.name == "task_complete")
+        .and_then(|c| c.arguments.get("summary"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// User-role nudge injected when the model produces a text-only response
+/// after it has already invoked tools this run. Reminds the model that
+/// `task_complete` is the explicit completion signal — text alone no
+/// longer terminates the loop once work is in progress.
+const TASK_COMPLETE_REMINDER: &str =
+    "You produced text but did not call `task_complete`. If the user's request \
+     is fully handled, call `task_complete` now with a `summary` containing the \
+     final answer the user should see. If more work remains, call the next tool \
+     to keep going — text alone will not end the turn now that you've started \
+     working.";
+
+/// Outcome of `AgentRunner::reprompt_for_task_complete`: tell the caller
+/// whether to keep looping or accept the last response. Lets the streaming
+/// and non-streaming run paths share the retry-cap bookkeeping while still
+/// emitting their own terminal events.
+enum CompletionReminderOutcome {
+    /// A reminder was injected — caller should `continue` the loop.
+    Continue,
+    /// Retry cap exceeded — caller should accept the last response and
+    /// return `Ok(())` (after emitting any provider-specific events).
+    GiveUp,
 }
 
 /// Classify a text-only assistant response.
@@ -826,6 +879,63 @@ impl AgentRunner {
         }
     }
 
+    /// Push the `task_complete` summary as the final assistant message and
+    /// log the termination. Shared by the streaming and non-streaming run
+    /// paths; the caller is responsible for emitting any provider-specific
+    /// events (e.g. `AgentEvent::TextDelta` / `AgentEvent::Done`).
+    fn finalize_task_complete(&self, conv: &mut Conversation, iteration: usize, summary: String) {
+        tracing::info!(
+            iteration,
+            "task_complete invoked — terminating run with model-supplied summary"
+        );
+        self.push_message(
+            conv,
+            Message {
+                id: Uuid::new_v4(),
+                role: Role::Assistant,
+                content: MessageContent::Text(summary),
+                created_at: Utc::now(),
+            },
+        );
+    }
+
+    /// Inject the `TASK_COMPLETE_REMINDER` as a user-role nudge after the
+    /// model produced a text-only EndTurn mid-task. Bumps `retries` and
+    /// returns `GiveUp` once the cap is exceeded so the caller can accept
+    /// the last response rather than spinning to `max_iterations`.
+    fn reprompt_for_task_complete(
+        &self,
+        conv: &mut Conversation,
+        iteration: usize,
+        retries: &mut usize,
+        classification: &ResponseClass,
+    ) -> CompletionReminderOutcome {
+        *retries += 1;
+        if *retries > TASK_COMPLETE_RETRY_LIMIT {
+            tracing::warn!(
+                retries = *retries,
+                "task_complete reminder retries exhausted — accepting last response"
+            );
+            return CompletionReminderOutcome::GiveUp;
+        }
+        tracing::warn!(
+            iteration,
+            retries = *retries,
+            ?classification,
+            "EndTurn without task_complete after tool use — re-prompting"
+        );
+        self.push_message(
+            conv,
+            Message {
+                id: Uuid::new_v4(),
+                role: Role::User,
+                content: MessageContent::Text(TASK_COMPLETE_REMINDER.to_string()),
+                created_at: Utc::now(),
+            },
+        );
+        CompletionReminderOutcome::Continue
+    }
+
     /// Start the event-driven agent loop.
     ///
     /// Returns a handle for injecting events (user messages, cancellation),
@@ -954,9 +1064,18 @@ impl AgentRunner {
         let mut empty_response_retries: usize = 0;
         let mut planning_only_retries: usize = 0;
         let mut empty_tool_use_retries: usize = 0;
+        // Cap re-prompts that nudge the model to call `task_complete` after
+        // it stops with text alone mid-task.
+        let mut task_complete_retries: usize = 0;
         // Track whether any side-effect tool has been executed this run,
         // so we can suppress retries that might duplicate externally-visible actions.
         let mut had_side_effects = false;
+        // Track whether the agent has called any tool this run. Used to
+        // gate the new "must call task_complete to stop" behavior: a
+        // text-only first response (greeting, direct Q&A) still ends the
+        // turn, but once the model has started using tools we expect an
+        // explicit completion signal.
+        let mut has_called_any_tool = false;
 
         // Per-run circuit breaker: a tool that fails repeatedly during this
         // run is disabled for the rest of the conversation so the model
@@ -1047,9 +1166,19 @@ impl AgentRunner {
 
             // Handle tool calls.
             if message.content.has_tool_calls() {
+                // First tool call this run — make `task_complete` visible
+                // in the schema from the next iteration onward. We hide it
+                // on no-tool turns (greetings, direct Q&A) so the model
+                // isn't tempted to use it as a chatty turn-ender.
+                if !has_called_any_tool {
+                    self.active_tools
+                        .activate(session.conversation_id, ["task_complete"]);
+                }
+                has_called_any_tool = true;
                 empty_tool_use_retries = 0;
                 empty_response_retries = 0;
                 planning_only_retries = 0;
+                task_complete_retries = 0;
                 let calls = message.content.tool_calls();
                 let tool_names: Vec<&str> = calls.iter().map(|c| c.name.as_str()).collect();
                 tracing::info!(
@@ -1058,6 +1187,12 @@ impl AgentRunner {
                     tools = ?tool_names,
                     "executing tool calls"
                 );
+
+                // Capture the `task_complete` summary up front so we can
+                // surface it as the final assistant message after the tool
+                // batch finishes — even if the call vector is moved into
+                // `execute_tools_parallel_traced` below.
+                let task_complete_summary = extract_task_complete_summary(&calls);
 
                 for call in &calls {
                     tracing::info!(tool = %call.name, call_id = %call.id, "tool call started");
@@ -1157,6 +1292,17 @@ impl AgentRunner {
                     consecutive_errors = 0;
                 }
 
+                // Explicit completion signal: the model called `task_complete`
+                // with a non-empty summary. Surface the summary as the final
+                // assistant message (so `extract_assistant_message` finds it)
+                // and exit the loop. We only break *after* tool results were
+                // pushed so the conversation history stays well-formed: every
+                // tool_call has a matching tool_result.
+                if let Some(summary) = task_complete_summary {
+                    self.finalize_task_complete(conv, iteration, summary);
+                    return Ok(());
+                }
+
                 continue;
             }
 
@@ -1177,6 +1323,26 @@ impl AgentRunner {
                 StopReason::EndTurn => {
                     let text = message.content.as_text().unwrap_or("");
                     let classification = classify_response(text, usage.completion_tokens);
+
+                    // If the agent has already called tools this run we no
+                    // longer trust an Ollama-style EndTurn as "task done":
+                    // the provider maps any text-only response to EndTurn
+                    // regardless of intent. Re-prompt the model to either
+                    // call `task_complete` with a final answer or continue
+                    // working. Cap by `TASK_COMPLETE_RETRY_LIMIT` so models
+                    // that never learn the protocol fall through to the
+                    // legacy accept-and-return behavior.
+                    if has_called_any_tool {
+                        match self.reprompt_for_task_complete(
+                            conv,
+                            iteration,
+                            &mut task_complete_retries,
+                            &classification,
+                        ) {
+                            CompletionReminderOutcome::Continue => continue,
+                            CompletionReminderOutcome::GiveUp => return Ok(()),
+                        }
+                    }
 
                     match classification {
                         ResponseClass::Complete => return Ok(()),
@@ -1353,7 +1519,9 @@ impl AgentRunner {
         let mut empty_response_retries: usize = 0;
         let mut planning_only_retries: usize = 0;
         let mut empty_tool_use_retries: usize = 0;
+        let mut task_complete_retries: usize = 0;
         let mut had_side_effects = false;
+        let mut has_called_any_tool = false;
         let mut breaker = ToolCircuitBreaker::new(self.config.circuit_breaker_threshold);
 
         for iteration in 0..self.config.max_iterations {
@@ -1437,9 +1605,17 @@ impl AgentRunner {
 
             // Handle tool calls.
             if message.content.has_tool_calls() {
+                // First tool call this run — reveal `task_complete` in the
+                // schema from here on. See run_inner for rationale.
+                if !has_called_any_tool {
+                    self.active_tools
+                        .activate(session.conversation_id, ["task_complete"]);
+                }
+                has_called_any_tool = true;
                 empty_tool_use_retries = 0;
                 empty_response_retries = 0;
                 planning_only_retries = 0;
+                task_complete_retries = 0;
                 let calls = message.content.tool_calls();
                 let tool_names: Vec<&str> = calls.iter().map(|c| c.name.as_str()).collect();
                 tracing::info!(
@@ -1448,6 +1624,11 @@ impl AgentRunner {
                     tools = ?tool_names,
                     "executing tool calls"
                 );
+
+                // Capture the `task_complete` summary up front so we can
+                // surface it as the final assistant message after this
+                // tool batch finishes — see run_inner for rationale.
+                let task_complete_summary = extract_task_complete_summary(&calls);
 
                 for call in &calls {
                     tracing::info!(tool = %call.name, call_id = %call.id, "tool call started");
@@ -1567,6 +1748,17 @@ impl AgentRunner {
                     consecutive_errors = 0;
                 }
 
+                // Explicit completion signal — see run_inner. The synthesized
+                // final assistant message is also emitted as a TextDelta so
+                // streaming UIs render the deliverable just like a model-
+                // produced final answer.
+                if let Some(summary) = task_complete_summary {
+                    on_event(AgentEvent::TextDelta(summary.clone()));
+                    self.finalize_task_complete(conv, iteration, summary);
+                    on_event(AgentEvent::Done);
+                    return Ok(());
+                }
+
                 continue;
             }
 
@@ -1587,6 +1779,25 @@ impl AgentRunner {
                 StopReason::EndTurn => {
                     let text = message.content.as_text().unwrap_or("");
                     let classification = classify_response(text, usage.completion_tokens);
+
+                    // Once the agent has called tools this run, an Ollama
+                    // EndTurn no longer terminates: re-prompt the model to
+                    // either call `task_complete` or keep working. See
+                    // run_inner for the full rationale.
+                    if has_called_any_tool {
+                        match self.reprompt_for_task_complete(
+                            conv,
+                            iteration,
+                            &mut task_complete_retries,
+                            &classification,
+                        ) {
+                            CompletionReminderOutcome::Continue => continue,
+                            CompletionReminderOutcome::GiveUp => {
+                                on_event(AgentEvent::Done);
+                                return Ok(());
+                            }
+                        }
+                    }
 
                     match classification {
                         ResponseClass::Complete => {
@@ -3912,6 +4123,457 @@ mod tool_choice_guard_tests {
             Some(ToolChoice::Auto),
             "iteration 0 must use ToolChoice::Auto by default; got {choices:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod task_complete_tests {
+    //! End-to-end tests for the `task_complete` completion-signal protocol.
+
+    use super::*;
+
+    use async_trait::async_trait;
+    use rustykrab_core::capability::CapabilitySet;
+    use rustykrab_core::model::{ModelResponse, StopReason, Usage};
+    use rustykrab_core::types::{ToolCall, ToolSchema};
+    use std::sync::Mutex;
+
+    use crate::sandbox::NoSandbox;
+
+    /// Provider that returns a queued list of canned responses, one per
+    /// chat call, then panics if asked for more. Lets tests scenarios
+    /// scripted as "first turn is X, second is Y, third is Z."
+    struct ScriptedProvider {
+        script: Mutex<Vec<ModelResponse>>,
+        chat_count: Mutex<usize>,
+    }
+
+    impl ScriptedProvider {
+        fn new(script: Vec<ModelResponse>) -> Self {
+            Self {
+                script: Mutex::new(script),
+                chat_count: Mutex::new(0),
+            }
+        }
+
+        fn next(&self) -> ModelResponse {
+            let mut s = self.script.lock().unwrap();
+            *self.chat_count.lock().unwrap() += 1;
+            if s.is_empty() {
+                panic!("ScriptedProvider ran out of canned responses");
+            }
+            s.remove(0)
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for ScriptedProvider {
+        fn name(&self) -> &str {
+            "scripted-mock"
+        }
+        async fn chat(&self, _: &[Message], _: &[ToolSchema]) -> Result<ModelResponse> {
+            Ok(self.next())
+        }
+        async fn chat_with_choice(
+            &self,
+            _: &[Message],
+            _: &[ToolSchema],
+            _: ToolChoice,
+        ) -> Result<ModelResponse> {
+            Ok(self.next())
+        }
+    }
+
+    /// Pure-compute tool used to satisfy capabilities without triggering
+    /// the side-effect retry guard. The runner only needs a non-empty
+    /// tools vec for `compute_schemas` and capability checks.
+    struct NoopTool {
+        name: String,
+    }
+
+    #[async_trait]
+    impl Tool for NoopTool {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn description(&self) -> &str {
+            "test noop"
+        }
+        fn schema(&self) -> ToolSchema {
+            ToolSchema {
+                name: self.name.clone(),
+                description: self.description().to_string(),
+                parameters: serde_json::json!({"type": "object", "properties": {}}),
+            }
+        }
+        async fn execute(&self, _args: serde_json::Value) -> Result<serde_json::Value> {
+            Ok(serde_json::json!({"ok": true}))
+        }
+    }
+
+    fn tool_use_response(name: &str, args: serde_json::Value) -> ModelResponse {
+        ModelResponse {
+            message: Message {
+                id: Uuid::new_v4(),
+                role: Role::Assistant,
+                content: MessageContent::ToolCall(ToolCall {
+                    id: Uuid::new_v4().to_string(),
+                    name: name.to_string(),
+                    arguments: args,
+                }),
+                created_at: Utc::now(),
+            },
+            usage: Usage::default(),
+            stop_reason: StopReason::ToolUse,
+            text: None,
+        }
+    }
+
+    fn text_response(text: &str) -> ModelResponse {
+        ModelResponse {
+            message: Message {
+                id: Uuid::new_v4(),
+                role: Role::Assistant,
+                content: MessageContent::Text(text.to_string()),
+                created_at: Utc::now(),
+            },
+            usage: Usage::default(),
+            stop_reason: StopReason::EndTurn,
+            text: None,
+        }
+    }
+
+    fn make_conv() -> Conversation {
+        Conversation {
+            id: Uuid::new_v4(),
+            messages: vec![Message {
+                id: Uuid::new_v4(),
+                role: Role::User,
+                content: MessageContent::Text("do the thing".into()),
+                created_at: Utc::now(),
+            }],
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            summary: None,
+            detected_profile: None,
+            channel_source: None,
+            channel_id: None,
+            channel_thread_id: None,
+        }
+    }
+
+    fn make_runner(provider: Arc<ScriptedProvider>) -> (AgentRunner, Session, Uuid) {
+        use rustykrab_tools::TaskCompleteTool;
+        let active = Arc::new(ActiveToolsRegistry::new());
+        let tools: Vec<Arc<dyn Tool>> = vec![
+            Arc::new(NoopTool {
+                name: "noop".into(),
+            }),
+            Arc::new(TaskCompleteTool::new()),
+        ];
+        let runner = AgentRunner::new(provider, tools, Arc::new(NoSandbox))
+            .with_active_tools(active.clone());
+        let conv_id = Uuid::new_v4();
+        // Pre-activate only `noop`: the runner should auto-reveal
+        // `task_complete` after the first tool call, so leaving it out
+        // here also exercises that activation path.
+        active.activate(conv_id, ["noop"]);
+        let caps = CapabilitySet::for_tools_permissive(&["noop", "task_complete"]);
+        let session = Session::with_capabilities(conv_id, caps);
+        (runner, session, conv_id)
+    }
+
+    #[tokio::test]
+    async fn task_complete_terminates_with_summary_as_final_message() {
+        // Model calls noop, then calls task_complete with a real summary.
+        // Loop must end and the conversation's last assistant text must
+        // be the summary string verbatim.
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            tool_use_response("noop", serde_json::json!({})),
+            tool_use_response(
+                "task_complete",
+                serde_json::json!({ "summary": "found 5 hotels with availability" }),
+            ),
+        ]));
+        let (runner, session, conv_id) = make_runner(provider.clone());
+        let mut conv = make_conv();
+        conv.id = conv_id;
+
+        runner
+            .run(&mut conv, &session)
+            .await
+            .expect("loop should terminate cleanly");
+
+        let last_assistant_text = conv
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::Assistant && m.content.as_text().is_some())
+            .and_then(|m| m.content.as_text())
+            .expect("final assistant text must be present");
+        assert_eq!(last_assistant_text, "found 5 hotels with availability");
+
+        // Provider should not be polled again after task_complete.
+        assert_eq!(*provider.chat_count.lock().unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn endturn_after_tool_use_reprompts_for_task_complete() {
+        // Model calls noop, then ends with planning-only text (no
+        // task_complete). The runner must re-prompt rather than accept,
+        // even though Anthropic-style classification would have accepted
+        // the second message after side-effect equivalents.
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            tool_use_response("noop", serde_json::json!({})),
+            // EndTurn without task_complete → must trigger re-prompt.
+            text_response("I'll keep digging into this for you. Stay tuned!"),
+            // Now model calls task_complete properly.
+            tool_use_response(
+                "task_complete",
+                serde_json::json!({ "summary": "done at last" }),
+            ),
+        ]));
+        let (runner, session, conv_id) = make_runner(provider.clone());
+        let mut conv = make_conv();
+        conv.id = conv_id;
+
+        runner.run(&mut conv, &session).await.unwrap();
+
+        let last_assistant_text = conv
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::Assistant && m.content.as_text().is_some())
+            .and_then(|m| m.content.as_text())
+            .expect("final assistant text must be present");
+        assert_eq!(last_assistant_text, "done at last");
+
+        // All three scripted turns must have been consumed.
+        assert_eq!(*provider.chat_count.lock().unwrap(), 3);
+
+        // The reminder must have been injected as a user-role message.
+        assert!(
+            conv.messages.iter().any(|m| m.role == Role::User
+                && m.content
+                    .as_text()
+                    .map(|t| t.contains("task_complete"))
+                    .unwrap_or(false)),
+            "expected re-prompt mentioning task_complete in the conversation"
+        );
+    }
+
+    #[tokio::test]
+    async fn iteration_zero_text_response_still_terminates() {
+        // No tools called yet — a substantive text response on iteration 0
+        // must still end the turn (greeting / direct Q&A path). This is
+        // the carve-out that keeps "what is 2+2?" → "4" from looping
+        // forever in models that don't know to call task_complete.
+        let provider = Arc::new(ScriptedProvider::new(vec![text_response(
+            "The answer is 42. Hitchhikers know.",
+        )]));
+        let (runner, session, conv_id) = make_runner(provider.clone());
+        let mut conv = make_conv();
+        conv.id = conv_id;
+
+        runner.run(&mut conv, &session).await.unwrap();
+        assert_eq!(*provider.chat_count.lock().unwrap(), 1);
+    }
+
+    /// Provider that records the *names* of tools in each call's schema
+    /// so a test can assert which iterations saw `task_complete` exposed.
+    struct SchemaRecordingProvider {
+        script: Mutex<Vec<ModelResponse>>,
+        schema_names_per_call: Mutex<Vec<Vec<String>>>,
+    }
+
+    impl SchemaRecordingProvider {
+        fn new(script: Vec<ModelResponse>) -> Self {
+            Self {
+                script: Mutex::new(script),
+                schema_names_per_call: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn next(&self, tools: &[ToolSchema]) -> ModelResponse {
+            self.schema_names_per_call
+                .lock()
+                .unwrap()
+                .push(tools.iter().map(|t| t.name.clone()).collect());
+            let mut s = self.script.lock().unwrap();
+            if s.is_empty() {
+                panic!("SchemaRecordingProvider ran out of canned responses");
+            }
+            s.remove(0)
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for SchemaRecordingProvider {
+        fn name(&self) -> &str {
+            "schema-recording-mock"
+        }
+        async fn chat(&self, _: &[Message], tools: &[ToolSchema]) -> Result<ModelResponse> {
+            Ok(self.next(tools))
+        }
+        async fn chat_with_choice(
+            &self,
+            _: &[Message],
+            tools: &[ToolSchema],
+            _: ToolChoice,
+        ) -> Result<ModelResponse> {
+            Ok(self.next(tools))
+        }
+    }
+
+    #[tokio::test]
+    async fn task_complete_is_hidden_until_first_tool_call() {
+        // Iteration 0 schema must not contain `task_complete`. After the
+        // model uses any tool, iteration 1's schema must include it.
+        use rustykrab_tools::TaskCompleteTool;
+        let provider = Arc::new(SchemaRecordingProvider::new(vec![
+            tool_use_response("noop", serde_json::json!({})),
+            tool_use_response("task_complete", serde_json::json!({ "summary": "ok" })),
+        ]));
+        let active = Arc::new(ActiveToolsRegistry::new());
+        let tools: Vec<Arc<dyn Tool>> = vec![
+            Arc::new(NoopTool {
+                name: "noop".into(),
+            }),
+            Arc::new(TaskCompleteTool::new()),
+        ];
+        let runner = AgentRunner::new(provider.clone(), tools, Arc::new(NoSandbox))
+            .with_active_tools(active.clone());
+        let conv_id = Uuid::new_v4();
+        active.activate(conv_id, ["noop"]);
+        let caps = CapabilitySet::for_tools_permissive(&["noop", "task_complete"]);
+        let session = Session::with_capabilities(conv_id, caps);
+        let mut conv = make_conv();
+        conv.id = conv_id;
+
+        runner.run(&mut conv, &session).await.unwrap();
+
+        let schemas = provider.schema_names_per_call.lock().unwrap();
+        assert_eq!(schemas.len(), 2, "expected 2 chat calls");
+        assert!(
+            !schemas[0].iter().any(|n| n == "task_complete"),
+            "iteration 0 schema must not expose task_complete; got {:?}",
+            schemas[0]
+        );
+        assert!(
+            schemas[1].iter().any(|n| n == "task_complete"),
+            "iteration 1 schema must expose task_complete after tool use; got {:?}",
+            schemas[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn task_complete_hidden_for_direct_qa_path() {
+        // A user asks something the model can answer in one turn with no
+        // tools. `task_complete` must never appear in the schema, so the
+        // model isn't tempted to invoke it as a chatty turn-ender.
+        use rustykrab_tools::TaskCompleteTool;
+        let provider = Arc::new(SchemaRecordingProvider::new(vec![text_response(
+            "The answer is 42.",
+        )]));
+        let active = Arc::new(ActiveToolsRegistry::new());
+        let tools: Vec<Arc<dyn Tool>> = vec![
+            Arc::new(NoopTool {
+                name: "noop".into(),
+            }),
+            Arc::new(TaskCompleteTool::new()),
+        ];
+        let runner = AgentRunner::new(provider.clone(), tools, Arc::new(NoSandbox))
+            .with_active_tools(active.clone());
+        let conv_id = Uuid::new_v4();
+        active.activate(conv_id, ["noop"]);
+        let caps = CapabilitySet::for_tools_permissive(&["noop", "task_complete"]);
+        let session = Session::with_capabilities(conv_id, caps);
+        let mut conv = make_conv();
+        conv.id = conv_id;
+
+        runner.run(&mut conv, &session).await.unwrap();
+
+        let schemas = provider.schema_names_per_call.lock().unwrap();
+        for (i, names) in schemas.iter().enumerate() {
+            assert!(
+                !names.iter().any(|n| n == "task_complete"),
+                "iteration {i} should not expose task_complete on direct-Q&A path; got {names:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn task_complete_with_empty_summary_does_not_terminate() {
+        // Model calls noop, then calls task_complete with empty summary
+        // (the tool itself rejects it). The runner must NOT short-circuit
+        // on a failed task_complete — it should keep looping, hit the
+        // re-prompt path, then accept the next valid completion.
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            tool_use_response("noop", serde_json::json!({})),
+            tool_use_response("task_complete", serde_json::json!({ "summary": "   " })),
+            tool_use_response(
+                "task_complete",
+                serde_json::json!({ "summary": "real answer" }),
+            ),
+        ]));
+        let (runner, session, conv_id) = make_runner(provider.clone());
+        let mut conv = make_conv();
+        conv.id = conv_id;
+
+        runner.run(&mut conv, &session).await.unwrap();
+
+        let last_assistant_text = conv
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::Assistant && m.content.as_text().is_some())
+            .and_then(|m| m.content.as_text())
+            .expect("final assistant text must be present");
+        assert_eq!(last_assistant_text, "real answer");
+    }
+
+    #[tokio::test]
+    async fn task_complete_retry_limit_exhaustion_accepts_last_response() {
+        // After one real tool call the model narrates `TASK_COMPLETE_RETRY_LIMIT + 1`
+        // consecutive text-only EndTurns instead of ever calling
+        // `task_complete`. The runner must re-prompt up to the cap and then
+        // fall through to `Ok(())` — degrading gracefully to legacy
+        // behavior — rather than spinning until `max_iterations`.
+        let mut script = vec![tool_use_response("noop", serde_json::json!({}))];
+        // One more text response than the limit so the cap is exceeded.
+        for i in 0..=TASK_COMPLETE_RETRY_LIMIT {
+            script.push(text_response(&format!("still working on it ({i})")));
+        }
+        let total_provider_calls = script.len();
+        let provider = Arc::new(ScriptedProvider::new(script));
+        let (runner, session, conv_id) = make_runner(provider.clone());
+        let mut conv = make_conv();
+        conv.id = conv_id;
+
+        runner
+            .run(&mut conv, &session)
+            .await
+            .expect("loop should fall through gracefully after retries exhausted");
+
+        // Provider polled exactly once per scripted response — the loop
+        // stopped at the cap, not earlier and not later.
+        assert_eq!(*provider.chat_count.lock().unwrap(), total_provider_calls);
+
+        // The reminder must have been injected exactly `TASK_COMPLETE_RETRY_LIMIT`
+        // times: each text response below the cap triggers one reminder;
+        // the response that exceeds the cap returns without injecting.
+        let reminder_count = conv
+            .messages
+            .iter()
+            .filter(|m| {
+                m.role == Role::User
+                    && m.content
+                        .as_text()
+                        .map(|t| t.contains("did not call `task_complete`"))
+                        .unwrap_or(false)
+            })
+            .count();
+        assert_eq!(reminder_count, TASK_COMPLETE_RETRY_LIMIT);
     }
 }
 

@@ -95,6 +95,18 @@ impl SystemPromptBuilder {
         self
     }
 
+    /// Add the current UTC date at day granularity.
+    ///
+    /// Day granularity (e.g. `2026-05-18`) is intentional: the resulting
+    /// system-prompt string only changes once per UTC day, so prompt
+    /// caching keeps hitting across iterations and across runs in the
+    /// same day. For sub-day precision, the agent should call a clock
+    /// tool on demand rather than burning the cache on every turn.
+    pub fn with_current_date(mut self, date: &str) -> Self {
+        self.sections.push(format!("Today's date is {date} (UTC)."));
+        self
+    }
+
     /// Add anti-injection security policy (simplified two-bullet version).
     pub fn with_security_policy(mut self) -> Self {
         self.sections.push(
@@ -243,6 +255,14 @@ mod tests {
             !prompt.contains("/var/lib/rustykrab/skills/local-skill"),
             "filesystem path leaked into prompt: {prompt}"
         );
+    }
+
+    #[test]
+    fn current_date_is_rendered_in_prompt() {
+        let prompt = SystemPromptBuilder::new()
+            .with_current_date("2026-05-18")
+            .build();
+        assert!(prompt.contains("Today's date is 2026-05-18 (UTC)."));
     }
 
     #[test]
