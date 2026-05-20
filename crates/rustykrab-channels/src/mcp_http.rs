@@ -11,7 +11,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE};
+use reqwest::header::{HeaderMap, ACCEPT, CONTENT_TYPE};
 use serde_json::Value;
 use tokio::sync::Mutex;
 use tracing;
@@ -36,21 +36,14 @@ pub struct McpHttpClient {
 impl McpHttpClient {
     /// Connect to a remote MCP server and run the `initialize` handshake.
     ///
-    /// `bearer_token`, if provided, is sent as `Authorization: Bearer <token>`
-    /// on every request. Per-server auth schemes other than bearer can be
-    /// added later by accepting a `HeaderMap` instead.
-    pub async fn connect(url: &str, bearer_token: Option<&str>) -> Result<Self, String> {
+    /// `extra_headers` are sent on every request — use this to express
+    /// per-server auth (bearer tokens, `x-api-key`, multi-credential schemes
+    /// like Datadog's `DD-API-KEY` + `DD-APPLICATION-KEY`, etc.).
+    pub async fn connect(url: &str, extra_headers: HeaderMap) -> Result<Self, String> {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(120))
             .build()
             .map_err(|e| format!("failed to build HTTP client: {e}"))?;
-
-        let mut extra_headers = HeaderMap::new();
-        if let Some(token) = bearer_token {
-            let value = HeaderValue::from_str(&format!("Bearer {token}"))
-                .map_err(|e| format!("invalid bearer token: {e}"))?;
-            extra_headers.insert(AUTHORIZATION, value);
-        }
 
         let this = Self {
             client,
