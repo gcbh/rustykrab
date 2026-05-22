@@ -872,7 +872,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -998,7 +998,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2072,7 +2072,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2815,6 +2815,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "rpassword"
+version = "7.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "835a57a69104632d64deb0df2e09a69945cd7a6eab4070fc9b1d7e50cf6c3edc"
+dependencies = [
+ "libc",
+ "rtoolbox",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "rtoolbox"
+version = "0.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "50a0e551c1e27e1731aba276dbeaeac73f53c7cd34d1bda485d02bd1e0f36844"
+dependencies = [
+ "libc",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
 name = "rusqlite"
 version = "0.34.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2887,7 +2908,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2946,7 +2967,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2975,7 +2996,7 @@ checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
 
 [[package]]
 name = "rustykrab-agent"
-version = "3.3.3"
+version = "3.4.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2992,7 +3013,7 @@ dependencies = [
 
 [[package]]
 name = "rustykrab-channels"
-version = "3.3.3"
+version = "3.4.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -3013,13 +3034,15 @@ dependencies = [
 
 [[package]]
 name = "rustykrab-cli"
-version = "3.3.3"
+version = "3.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
  "axum",
  "chrono",
  "dirs",
+ "reqwest 0.13.3",
+ "rpassword",
  "rustls",
  "rustykrab-agent",
  "rustykrab-channels",
@@ -3042,7 +3065,7 @@ dependencies = [
 
 [[package]]
 name = "rustykrab-core"
-version = "3.3.3"
+version = "3.4.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -3056,7 +3079,7 @@ dependencies = [
 
 [[package]]
 name = "rustykrab-gateway"
-version = "3.3.3"
+version = "3.4.0"
 dependencies = [
  "axum",
  "chrono",
@@ -3080,7 +3103,7 @@ dependencies = [
 
 [[package]]
 name = "rustykrab-memory"
-version = "3.3.3"
+version = "3.4.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -3101,7 +3124,7 @@ dependencies = [
 
 [[package]]
 name = "rustykrab-providers"
-version = "3.3.3"
+version = "3.4.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -3118,7 +3141,7 @@ dependencies = [
 
 [[package]]
 name = "rustykrab-skills"
-version = "3.3.3"
+version = "3.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3134,7 +3157,7 @@ dependencies = [
 
 [[package]]
 name = "rustykrab-store"
-version = "3.3.3"
+version = "3.4.0"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -3157,7 +3180,7 @@ dependencies = [
 
 [[package]]
 name = "rustykrab-tools"
-version = "3.3.3"
+version = "3.4.0"
 dependencies = [
  "async-imap",
  "async-trait",
@@ -3499,7 +3522,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a766e1110788c36f4fa1c2b71b387a7815aa65f88ce0229841826633d93723e"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3674,7 +3697,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4519,7 +4542,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

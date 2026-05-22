@@ -29,3 +29,5 @@ anyhow.workspace = true
 rustls.workspace = true
 dirs = "6"
 toml.workspace = true
+reqwest.workspace = true
+rpassword = "7"

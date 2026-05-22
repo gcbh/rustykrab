@@ -34,6 +34,9 @@ pub fn api_routes() -> Router<AppState> {
             "/api/conversations/{id}/messages/stream",
             post(send_message_stream),
         )
+        .route("/api/secrets", get(list_secrets))
+        .route("/api/secrets", post(set_secret))
+        .route("/api/secrets/{name}", axum::routing::delete(delete_secret))
         .route("/api/health", get(health))
         .route("/api/logout", post(logout))
 }
@@ -370,4 +373,118 @@ async fn send_message_stream(
             .interval(std::time::Duration::from_secs(15))
             .text("ping"),
     ))
+}
+
+// ---------------------------------------------------------------------------
+// Secrets management
+// ---------------------------------------------------------------------------
+//
+// These endpoints let a trusted caller (the local `rustykrab chat` CLI, or
+// future settings UI) write credentials directly into the encrypted store
+// or the OS keychain without the value passing through the model.
+//
+// All `/api/*` endpoints are already gated by the bearer-token middleware,
+// so callers must hold `RUSTYKRAB_AUTH_TOKEN`.
+
+const MAX_SECRET_VALUE_SIZE: usize = 64 * 1024;
+
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum SecretDest {
+    #[default]
+    Store,
+    Keychain,
+}
+
+#[derive(Deserialize)]
+struct SetSecretRequest {
+    /// Identifier in the encrypted store. For MCP credentials, by
+    /// convention `mcp.<server>.<field>`.
+    name: String,
+    value: String,
+    #[serde(default)]
+    dest: SecretDest,
+    /// macOS Keychain service name (required when `dest == "keychain"`).
+    #[serde(default)]
+    service: Option<String>,
+    /// macOS Keychain account name (required when `dest == "keychain"`).
+    #[serde(default)]
+    account: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct ListSecretsResponse {
+    names: Vec<String>,
+    keychain_available: bool,
+}
+
+async fn list_secrets(
+    State(state): State<AppState>,
+) -> Result<Json<ListSecretsResponse>, StatusCode> {
+    let names = state.store.secrets().list_names().map_err(|e| {
+        tracing::error!(error = %e, "list_secrets failed");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    Ok(Json(ListSecretsResponse {
+        names,
+        keychain_available: rustykrab_store::keychain::keychain_available(),
+    }))
+}
+
+async fn set_secret(
+    State(state): State<AppState>,
+    Json(body): Json<SetSecretRequest>,
+) -> Result<StatusCode, StatusCode> {
+    if body.value.len() > MAX_SECRET_VALUE_SIZE {
+        return Err(StatusCode::PAYLOAD_TOO_LARGE);
+    }
+    if body.value.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    match body.dest {
+        SecretDest::Store => {
+            state
+                .store
+                .secrets()
+                .set(&body.name, &body.value)
+                .map_err(|e| {
+                    tracing::warn!(error = %e, name = %body.name, "set_secret: store write failed");
+                    StatusCode::BAD_REQUEST
+                })?;
+            tracing::info!(name = %body.name, dest = "store", "secret stored");
+        }
+        SecretDest::Keychain => {
+            if !rustykrab_store::keychain::keychain_available() {
+                return Err(StatusCode::SERVICE_UNAVAILABLE);
+            }
+            let service = body.service.as_deref().ok_or(StatusCode::BAD_REQUEST)?;
+            let account = body.account.as_deref().ok_or(StatusCode::BAD_REQUEST)?;
+            rustykrab_store::keychain::set_credential(service, account, &body.value).map_err(
+                |e| {
+                    tracing::error!(error = %e, "set_secret: keychain write failed");
+                    StatusCode::INTERNAL_SERVER_ERROR
+                },
+            )?;
+            tracing::info!(
+                service = %service,
+                account = %account,
+                dest = "keychain",
+                "secret stored"
+            );
+        }
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn delete_secret(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<StatusCode, StatusCode> {
+    state.store.secrets().delete(&name).map_err(|e| {
+        tracing::error!(error = %e, "delete_secret failed");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    tracing::info!(name = %name, "secret deleted");
+    Ok(StatusCode::NO_CONTENT)
 }

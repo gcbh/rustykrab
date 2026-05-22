@@ -257,6 +257,71 @@ cargo run --release -p rustykrab-cli
 
 Open `http://127.0.0.1:3000` in a browser for the embedded WebChat interface.
 
+### Terminal chat (`chat` subcommand)
+
+A small REPL client that talks to the running daemon over loopback. Useful
+when no messaging channel is configured, and as the safest path for
+onboarding new credentials.
+
+```bash
+rustykrab-cli chat
+```
+
+Slash commands:
+
+- `/set <name>` — prompt for a value with no echo and store it in the
+  encrypted local secret store. The value is sent straight to
+  `POST /api/secrets` and never enters the model's context, the
+  conversation history, or any messaging channel.
+- `/set <name> --keychain <service>/<account>` — store in the macOS
+  Keychain instead.
+- `/list` — list stored secret names (no values).
+- `/delete <name>` — delete a secret.
+- `/help`, `/quit`.
+
+Anything that isn't a slash command is sent to the agent as a normal
+chat turn. The client uses `RUSTYKRAB_AUTH_TOKEN` (or the OS keychain /
+encrypted store fallbacks) and `RUSTYKRAB_GATEWAY_URL` (default
+`http://127.0.0.1:3000`).
+
+### MCP servers: credential refs
+
+Any `RUSTYKRAB_MCP_<NAME>_TOKEN`, `_HEADER_<K>`, or `_ENV_<K>` value may be
+either a literal or a reference resolved at connect time:
+
+```bash
+# Encrypted local SecretStore (namespaced to the server)
+export RUSTYKRAB_MCP_GITHUB_TOKEN=ref:store:mcp.github.token
+export RUSTYKRAB_MCP_DATADOG_HEADER_DD_API_KEY=ref:store:mcp.datadog.api_key
+
+# macOS Keychain (operator-chosen service / account)
+export RUSTYKRAB_MCP_NOTION_TOKEN=ref:keychain:Notion/api-token
+```
+
+Store refs are namespaced: server `github` can only resolve store keys
+that begin with `mcp.github.`, so a misconfigured env var can't pull
+another server's credentials. Keychain refs are not namespaced — the
+operator's choice of env var is the gate.
+
+Onboarding a token end-to-end:
+
+```text
+$ rustykrab-cli chat
+> /set mcp.github.token
+  value for mcp.github.token (hidden): ***
+  ✓ stored in encrypted local store as `mcp.github.token`
+  (MCP servers pick up new credentials at next daemon restart.)
+> /quit
+
+$ export RUSTYKRAB_MCP_SERVERS=github
+$ export RUSTYKRAB_MCP_GITHUB_URL=https://api.githubcopilot.com/mcp/
+$ export RUSTYKRAB_MCP_GITHUB_TOKEN=ref:store:mcp.github.token
+$ rustykrab-cli   # restart the daemon
+```
+
+The resolver runs entirely inside the connector — the model never sees
+the resolved values, and they are not surfaced through any tool.
+
 ## Architecture
 
 A Cargo workspace of 10 crates under `crates/`:
