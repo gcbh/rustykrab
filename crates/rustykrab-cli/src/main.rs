@@ -344,7 +344,7 @@ async fn main() -> anyhow::Result<()> {
         return handle_keychain_subcommand(&data_dir, &args[2..]);
     }
     if args.len() >= 2 && args[1] == "chat" {
-        return chat::run(&data_dir, &args[2..]).await.map_err(Into::into);
+        return chat::run(&data_dir, &args[2..]).await;
     }
 
     // --- Harness profile ---
