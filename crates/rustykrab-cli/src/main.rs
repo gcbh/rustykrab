@@ -1,3 +1,4 @@
+mod chat;
 mod prompt_log;
 mod task_queue;
 
@@ -341,6 +342,9 @@ async fn main() -> anyhow::Result<()> {
     }
     if args.len() >= 2 && args[1] == "keychain" {
         return handle_keychain_subcommand(&data_dir, &args[2..]);
+    }
+    if args.len() >= 2 && args[1] == "chat" {
+        return chat::run(&data_dir, &args[2..]).await;
     }
 
     // --- Harness profile ---
@@ -694,7 +698,7 @@ async fn main() -> anyhow::Result<()> {
     // Registered before the sub-agent snapshot below so sub-agents also
     // inherit MCP tools. Per-server connect failures are logged inside
     // and never block startup.
-    let mcp_tools = rustykrab_tools::mcp_connector_tools().await;
+    let mcp_tools = rustykrab_tools::mcp_connector_tools(&store.secrets()).await;
     if !mcp_tools.is_empty() {
         tracing::info!(count = mcp_tools.len(), "MCP connector tools registered");
         tools.extend(mcp_tools);

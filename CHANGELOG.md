@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.5.0] - 2026-05-25
+
+- feat(mcp): credential refs + chat REPL with no-echo secret onboarding (#448)
+
 ## [3.4.0] - 2026-05-20
 
 - feat(mcp): support stdio transport and arbitrary HTTP headers per server (#446)
