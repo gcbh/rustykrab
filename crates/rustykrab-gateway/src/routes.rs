@@ -310,17 +310,6 @@ async fn send_message_stream(
                     })
                     .to_string(),
                 ),
-                AgentEvent::ToolCircuitBroken {
-                    tool_name,
-                    failures,
-                } => Event::default().event("tool_circuit_broken").data(
-                    serde_json::json!({
-                        "type": "tool_circuit_broken",
-                        "delta": tool_name,
-                        "failures": failures,
-                    })
-                    .to_string(),
-                ),
                 AgentEvent::ToolCallEnd {
                     tool_name,
                     success,
