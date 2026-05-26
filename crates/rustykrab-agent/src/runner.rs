@@ -1,4 +1,3 @@
-use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -502,102 +501,6 @@ fn is_idle_acknowledgment(text: &str) -> bool {
     idle_markers.iter().any(|m| lower.contains(m))
 }
 
-/// Tracks per-tool failure counts within a single agent run and disables
-/// tools that fail repeatedly.
-///
-/// Production observation (2026-05-14 → 2026-05-16): when the browser
-/// tool entered a zombie state, the model would retry it on every turn
-/// and burn 15+ minutes per call. The circuit breaker stops that loop
-/// after `threshold` consecutive failures by refusing the call locally
-/// (so the model gets an instant error) and injecting a system message
-/// nudging it to try alternative tools.
-#[derive(Debug, Clone)]
-pub struct ToolCircuitBreaker {
-    threshold: u32,
-    failures: HashMap<String, u32>,
-    disabled: HashSet<String>,
-    newly_disabled: Vec<String>,
-}
-
-impl ToolCircuitBreaker {
-    pub fn new(threshold: u32) -> Self {
-        Self {
-            threshold,
-            failures: HashMap::new(),
-            disabled: HashSet::new(),
-            newly_disabled: Vec::new(),
-        }
-    }
-
-    /// Returns `true` if this tool has tripped the breaker.
-    pub fn is_disabled(&self, tool: &str) -> bool {
-        self.disabled.contains(tool)
-    }
-
-    /// Record a successful tool call. Resets the failure counter so a
-    /// flaky tool that intermittently succeeds isn't penalised forever.
-    pub fn record_success(&mut self, tool: &str) {
-        self.failures.remove(tool);
-    }
-
-    /// Record a failed tool call. Trips the breaker if the failure count
-    /// reaches `threshold`.
-    pub fn record_failure(&mut self, tool: &str) {
-        if self.disabled.contains(tool) {
-            return;
-        }
-        let count = self.failures.entry(tool.to_string()).or_insert(0);
-        *count += 1;
-        if *count >= self.threshold {
-            self.disabled.insert(tool.to_string());
-            self.newly_disabled.push(tool.to_string());
-        }
-    }
-
-    /// Drain the list of tools that became disabled since the last call.
-    /// Used by the agent loop to inject a one-shot system message
-    /// announcing the breaker trip.
-    pub fn drain_newly_disabled(&mut self) -> Vec<String> {
-        std::mem::take(&mut self.newly_disabled)
-    }
-
-    /// Current failure count for a tool (testing helper).
-    #[cfg(test)]
-    pub fn failures(&self, tool: &str) -> u32 {
-        self.failures.get(tool).copied().unwrap_or(0)
-    }
-}
-
-impl Default for ToolCircuitBreaker {
-    fn default() -> Self {
-        Self::new(3)
-    }
-}
-
-/// Build the system message announcing that a tool has been
-/// circuit-broken. Tells the model what's disabled and suggests
-/// alternatives where we know them.
-fn circuit_breaker_system_message(tool_name: &str, failures: u32) -> String {
-    let alternatives = match tool_name {
-        "browser" => Some("web_search, web_fetch, http_request"),
-        "web_fetch" | "http_request" | "http_session" => Some("web_search, browser"),
-        "web_search" | "x_search" => Some("web_fetch, browser"),
-        _ => None,
-    };
-    match alternatives {
-        Some(alts) => format!(
-            "[System] Tool '{tool_name}' is temporarily unavailable after \
-             {failures} consecutive failures. Use alternative tools \
-             ({alts}) for the rest of this conversation."
-        ),
-        None => format!(
-            "[System] Tool '{tool_name}' is temporarily unavailable after \
-             {failures} consecutive failures. Try a different approach \
-             for the rest of this conversation."
-        ),
-    }
-}
-
 /// Events emitted by the agent loop during streaming execution.
 ///
 /// These give callers (e.g. WebSocket handlers) real-time visibility
@@ -624,10 +527,6 @@ pub enum AgentEvent {
         success: bool,
         error_message: Option<String>,
     },
-    /// A tool has been circuit-broken after repeated failures. The agent
-    /// will refuse further calls to it for the remainder of the run and
-    /// the model has been told to use alternatives.
-    ToolCircuitBroken { tool_name: String, failures: u32 },
     /// The agent is reflecting after repeated errors.
     Reflecting,
     /// The agent is compressing conversation memory.
@@ -740,9 +639,6 @@ pub struct AgentConfig {
     /// of producing a greeting/acknowledgement. Set for scheduled tasks
     /// where the first turn must be action, not chat.
     pub force_tool_use_first_iteration: bool,
-    /// Consecutive failures per tool before the circuit breaker trips.
-    /// 0 disables the breaker entirely.
-    pub circuit_breaker_threshold: u32,
     /// Interval between [`AgentEvent::ToolHeartbeat`] emissions during a
     /// long-running tool call. 0 disables heartbeats.
     pub tool_heartbeat_interval_secs: u64,
@@ -759,7 +655,6 @@ impl Default for AgentConfig {
             compaction_threshold_pct: 0.85,
             llm_trigger_strategy: LlmTriggerStrategy::Debounce(Duration::from_secs(2)),
             force_tool_use_first_iteration: false,
-            circuit_breaker_threshold: 3,
             tool_heartbeat_interval_secs: 30,
         }
     }
@@ -1077,12 +972,6 @@ impl AgentRunner {
         // explicit completion signal.
         let mut has_called_any_tool = false;
 
-        // Per-run circuit breaker: a tool that fails repeatedly during this
-        // run is disabled for the rest of the conversation so the model
-        // can't burn iterations retrying a broken tool. Threshold 0
-        // disables the breaker entirely.
-        let mut breaker = ToolCircuitBreaker::new(self.config.circuit_breaker_threshold);
-
         for iteration in 0..self.config.max_iterations {
             tracer.record_iteration();
 
@@ -1199,30 +1088,8 @@ impl AgentRunner {
                 }
 
                 let results = self
-                    .execute_tools_parallel_traced(calls, session, &tracer, &mut breaker, None)
+                    .execute_tools_parallel_traced(calls, session, &tracer, None)
                     .await;
-
-                // Inject a one-shot system message for any tools that just
-                // tripped the breaker so the model knows to use alternates.
-                for tool_name in breaker.drain_newly_disabled() {
-                    let failures = self.config.circuit_breaker_threshold;
-                    tracing::warn!(
-                        tool = %tool_name,
-                        failures,
-                        "circuit breaker tripped"
-                    );
-                    self.push_message(
-                        conv,
-                        Message {
-                            id: Uuid::new_v4(),
-                            role: Role::System,
-                            content: MessageContent::Text(circuit_breaker_system_message(
-                                &tool_name, failures,
-                            )),
-                            created_at: Utc::now(),
-                        },
-                    );
-                }
 
                 // Track side effects: check if any successfully executed tool
                 // can cause external mutations (writes, network, spawning).
@@ -1522,7 +1389,6 @@ impl AgentRunner {
         let mut task_complete_retries: usize = 0;
         let mut had_side_effects = false;
         let mut has_called_any_tool = false;
-        let mut breaker = ToolCircuitBreaker::new(self.config.circuit_breaker_threshold);
 
         for iteration in 0..self.config.max_iterations {
             tracer.record_iteration();
@@ -1639,39 +1505,8 @@ impl AgentRunner {
                 }
 
                 let results = self
-                    .execute_tools_parallel_traced(
-                        calls,
-                        session,
-                        &tracer,
-                        &mut breaker,
-                        Some(on_event),
-                    )
+                    .execute_tools_parallel_traced(calls, session, &tracer, Some(on_event))
                     .await;
-
-                // Inject one-shot system message for newly-disabled tools.
-                for tool_name in breaker.drain_newly_disabled() {
-                    let failures = self.config.circuit_breaker_threshold;
-                    tracing::warn!(
-                        tool = %tool_name,
-                        failures,
-                        "circuit breaker tripped"
-                    );
-                    on_event(AgentEvent::ToolCircuitBroken {
-                        tool_name: tool_name.clone(),
-                        failures,
-                    });
-                    self.push_message(
-                        conv,
-                        Message {
-                            id: Uuid::new_v4(),
-                            role: Role::System,
-                            content: MessageContent::Text(circuit_breaker_system_message(
-                                &tool_name, failures,
-                            )),
-                            created_at: Utc::now(),
-                        },
-                    );
-                }
 
                 // Track side effects in streaming path.
                 if !had_side_effects {
@@ -1955,9 +1790,6 @@ impl AgentRunner {
     /// tool identity even on the error path.
     ///
     /// Behaviors layered on top of the basic parallel execution:
-    /// - **Circuit breaker**: calls to tools that have tripped the breaker
-    ///   short-circuit with an immediate error so the model can pivot
-    ///   without paying another timeout.
     /// - **Heartbeats**: if `on_event` is `Some` and the heartbeat
     ///   interval is non-zero, [`AgentEvent::ToolHeartbeat`] is emitted
     ///   periodically while each tool is running so callers can surface
@@ -1967,45 +1799,10 @@ impl AgentRunner {
         calls: Vec<&ToolCall>,
         session: &Session,
         tracer: &ExecutionTracer,
-        breaker: &mut ToolCircuitBreaker,
         on_event: Option<&(dyn Fn(AgentEvent) + Send + Sync)>,
     ) -> Vec<(String, String, Result<ToolResult>)> {
         let max_retries = self.config.max_tool_retries;
         let heartbeat_interval = self.config.tool_heartbeat_interval_secs;
-
-        // Short-circuit calls to disabled tools — don't even spawn.
-        // The model gets an immediate error so it can choose another tool.
-        let mut short_circuited: Vec<(String, String, Result<ToolResult>)> = Vec::new();
-        let calls: Vec<&ToolCall> = calls
-            .into_iter()
-            .filter(|c| {
-                if breaker.is_disabled(&c.name) {
-                    tracing::warn!(
-                        tool = %c.name,
-                        call_id = %c.id,
-                        "tool short-circuited: circuit breaker open"
-                    );
-                    let err = Error::ToolExecution(
-                        format!(
-                            "tool '{}' is disabled for this conversation \
-                             after repeated failures",
-                            c.name
-                        )
-                        .into(),
-                    );
-                    tracer.record(ToolTrace {
-                        tool_name: c.name.clone(),
-                        success: false,
-                        duration: std::time::Duration::ZERO,
-                        error: Some(err.to_string()),
-                    });
-                    short_circuited.push((c.name.clone(), c.id.clone(), Err(err)));
-                    false
-                } else {
-                    true
-                }
-            })
-            .collect();
 
         // Single-call fast path: run inline (no spawn) so the watchdog can
         // call on_event directly without crossing a task boundary.
@@ -2060,18 +1857,11 @@ impl AgentRunner {
                 duration: start.elapsed(),
                 error: result.as_ref().err().map(|e| e.to_string()),
             });
-            if result.is_ok() {
-                breaker.record_success(&call.name);
-            } else {
-                breaker.record_failure(&call.name);
-            }
-            let mut out = short_circuited;
-            out.push((call.name.clone(), call.id.clone(), result));
-            return out;
+            return vec![(call.name.clone(), call.id.clone(), result)];
         }
 
         if calls.is_empty() {
-            return short_circuited;
+            return Vec::new();
         }
 
         // Multi-call path: spawn each call in its own task, bounded by a
@@ -2140,8 +1930,7 @@ impl AgentRunner {
         // every spawned task finishes.
         drop(hb_tx);
 
-        let mut results = short_circuited;
-        results.reserve(handles.len());
+        let mut results = Vec::with_capacity(handles.len());
 
         // Collect results while concurrently forwarding heartbeats.
         // `JoinHandle` doesn't implement Stream, so iterate them
@@ -2168,11 +1957,6 @@ impl AgentRunner {
                         duration,
                         error: result.as_ref().err().map(|e| e.to_string()),
                     });
-                    if result.is_ok() {
-                        breaker.record_success(&name);
-                    } else {
-                        breaker.record_failure(&name);
-                    }
                     results.push((name, call_id, result));
                 }
                 Err(e) => {
@@ -2183,7 +1967,6 @@ impl AgentRunner {
                         duration: std::time::Duration::ZERO,
                         error: Some(format!("task panicked: {e}")),
                     });
-                    breaker.record_failure(&name);
                     results.push((
                         name,
                         call_id,
@@ -4574,89 +4357,6 @@ mod task_complete_tests {
             })
             .count();
         assert_eq!(reminder_count, TASK_COMPLETE_RETRY_LIMIT);
-    }
-}
-
-#[cfg(test)]
-mod circuit_breaker_tests {
-    use super::*;
-
-    #[test]
-    fn breaker_trips_after_threshold_failures() {
-        let mut breaker = ToolCircuitBreaker::new(3);
-        assert!(!breaker.is_disabled("browser"));
-        breaker.record_failure("browser");
-        breaker.record_failure("browser");
-        assert!(!breaker.is_disabled("browser"));
-        breaker.record_failure("browser");
-        assert!(breaker.is_disabled("browser"));
-    }
-
-    #[test]
-    fn breaker_drains_newly_disabled_once() {
-        let mut breaker = ToolCircuitBreaker::new(2);
-        breaker.record_failure("browser");
-        breaker.record_failure("browser");
-        let drained = breaker.drain_newly_disabled();
-        assert_eq!(drained, vec!["browser".to_string()]);
-        // Second drain returns empty — message must not duplicate.
-        assert!(breaker.drain_newly_disabled().is_empty());
-        // Tool is still disabled though.
-        assert!(breaker.is_disabled("browser"));
-    }
-
-    #[test]
-    fn breaker_resets_failure_count_on_success() {
-        let mut breaker = ToolCircuitBreaker::new(3);
-        breaker.record_failure("browser");
-        breaker.record_failure("browser");
-        assert_eq!(breaker.failures("browser"), 2);
-        breaker.record_success("browser");
-        assert_eq!(breaker.failures("browser"), 0);
-        // After a success, two more failures should not trip it.
-        breaker.record_failure("browser");
-        breaker.record_failure("browser");
-        assert!(!breaker.is_disabled("browser"));
-    }
-
-    #[test]
-    fn breaker_isolates_failures_per_tool() {
-        let mut breaker = ToolCircuitBreaker::new(2);
-        breaker.record_failure("browser");
-        breaker.record_failure("browser");
-        breaker.record_failure("web_search");
-        assert!(breaker.is_disabled("browser"));
-        assert!(!breaker.is_disabled("web_search"));
-    }
-
-    #[test]
-    fn breaker_no_double_trip_for_same_tool() {
-        let mut breaker = ToolCircuitBreaker::new(2);
-        breaker.record_failure("browser");
-        breaker.record_failure("browser");
-        let _ = breaker.drain_newly_disabled();
-        // Further failures on the disabled tool don't re-trigger drain.
-        breaker.record_failure("browser");
-        breaker.record_failure("browser");
-        assert!(breaker.drain_newly_disabled().is_empty());
-    }
-
-    #[test]
-    fn circuit_breaker_message_mentions_alternatives_when_known() {
-        let msg = circuit_breaker_system_message("browser", 3);
-        assert!(msg.contains("browser"));
-        assert!(msg.contains("3"));
-        assert!(
-            msg.contains("web_search") || msg.contains("web_fetch"),
-            "browser breaker message should suggest alternatives: {msg}"
-        );
-    }
-
-    #[test]
-    fn circuit_breaker_message_falls_back_for_unknown_tool() {
-        let msg = circuit_breaker_system_message("weird_tool", 3);
-        assert!(msg.contains("weird_tool"));
-        assert!(msg.contains("different approach"));
     }
 }
 

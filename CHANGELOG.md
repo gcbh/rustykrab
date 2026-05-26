@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.5.1] - 2026-05-26
+
+- Remove tool circuit breaker that disabled tools after repeated failures (#451)
+
 ## [3.5.0] - 2026-05-25
 
 - feat(mcp): credential refs + chat REPL with no-echo secret onboarding (#448)
