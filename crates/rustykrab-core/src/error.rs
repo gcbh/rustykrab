@@ -77,6 +77,32 @@ impl ToolError {
     }
 }
 
+impl ToolErrorKind {
+    /// Stable machine-readable identifier, forwarded to the model so it can
+    /// react to the failure category rather than parsing the message text.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ToolErrorKind::InvalidInput => "invalid_input",
+            ToolErrorKind::NotFound => "not_found",
+            ToolErrorKind::PermissionDenied => "permission_denied",
+            ToolErrorKind::Timeout => "timeout",
+            ToolErrorKind::RateLimited => "rate_limited",
+            ToolErrorKind::Transient => "transient",
+            ToolErrorKind::Internal => "internal",
+        }
+    }
+
+    /// Whether retrying the *same* call unchanged might succeed. Distinct from
+    /// the runner's retry policy: this is a hint to the model. `InvalidInput`
+    /// and `NotFound` are false because the model must change something first.
+    pub fn retryable(&self) -> bool {
+        matches!(
+            self,
+            ToolErrorKind::Timeout | ToolErrorKind::RateLimited | ToolErrorKind::Transient
+        )
+    }
+}
+
 impl fmt::Display for ToolError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.message)
@@ -144,4 +170,26 @@ pub enum Error {
 
     #[error("{0}")]
     Internal(String),
+}
+
+impl Error {
+    /// Best-effort categorization for surfacing the failure to the agent.
+    ///
+    /// Tool errors carry their own kind; other variants are mapped to the
+    /// closest category so the model always receives a structured signal.
+    pub fn kind(&self) -> ToolErrorKind {
+        match self {
+            Error::ToolExecution(te) => te.kind,
+            Error::ModelRateLimit(_) | Error::ModelOverloaded(_) => ToolErrorKind::RateLimited,
+            Error::ModelAuthError(_) | Error::Auth(_) => ToolErrorKind::PermissionDenied,
+            Error::ModelBadRequest(_) => ToolErrorKind::InvalidInput,
+            Error::NotFound(_) => ToolErrorKind::NotFound,
+            Error::ModelProvider(_) | Error::Channel(_) => ToolErrorKind::Transient,
+            Error::Config(_)
+            | Error::Storage(_)
+            | Error::Serialization(_)
+            | Error::ContentPolicy
+            | Error::Internal(_) => ToolErrorKind::Internal,
+        }
+    }
 }

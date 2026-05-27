@@ -5,7 +5,7 @@
 //! wait, evaluate.
 
 use chromiumoxide::Page;
-use rustykrab_core::{Error, Result};
+use rustykrab_core::{Error, Result, ToolError};
 use serde_json::{json, Value};
 
 use super::snapshot::SnapshotStore;
@@ -30,12 +30,9 @@ pub async fn execute_act(
     args: &Value,
 ) -> Result<Value> {
     let element_ref = store.get_ref(store_key, ref_id).await.ok_or_else(|| {
-        Error::ToolExecution(
-            format!(
-                "ref '{ref_id}' not found. Take a new snapshot first to get current element refs."
-            )
-            .into(),
-        )
+        Error::ToolExecution(ToolError::not_found(format!(
+            "ref '{ref_id}' not found. Take a new snapshot first to get current element refs."
+        )))
     })?;
 
     let selector = &element_ref.selector;
@@ -43,31 +40,41 @@ pub async fn execute_act(
     match action {
         "click" => act_click(page, selector).await,
         "type" | "fill" => {
-            let text = args["text"]
-                .as_str()
-                .ok_or_else(|| Error::ToolExecution("'type' action requires 'text' parameter".into()))?;
+            let text = args["text"].as_str().ok_or_else(|| {
+                Error::ToolExecution(ToolError::invalid_input(
+                    "'type' action requires 'text' parameter",
+                ))
+            })?;
             let clear = args["clear"].as_bool().unwrap_or(true); // fill clears by default
             act_type(page, selector, text, clear).await
         }
         "press" => {
-            let key = args["key"]
-                .as_str()
-                .ok_or_else(|| Error::ToolExecution("'press' action requires 'key' parameter".into()))?;
+            let key = args["key"].as_str().ok_or_else(|| {
+                Error::ToolExecution(ToolError::invalid_input(
+                    "'press' action requires 'key' parameter",
+                ))
+            })?;
             act_press(page, selector, key).await
         }
         "hover" => act_hover(page, selector).await,
         "select" => {
-            let value = args["value"]
-                .as_str()
-                .ok_or_else(|| Error::ToolExecution("'select' action requires 'value' parameter".into()))?;
+            let value = args["value"].as_str().ok_or_else(|| {
+                Error::ToolExecution(ToolError::invalid_input(
+                    "'select' action requires 'value' parameter",
+                ))
+            })?;
             act_select(page, selector, value).await
         }
         "drag" => {
-            let target_ref = args["targetRef"]
-                .as_str()
-                .ok_or_else(|| Error::ToolExecution("'drag' requires 'targetRef' parameter".into()))?;
+            let target_ref = args["targetRef"].as_str().ok_or_else(|| {
+                Error::ToolExecution(ToolError::invalid_input(
+                    "'drag' requires 'targetRef' parameter",
+                ))
+            })?;
             let target = store.get_ref(store_key, target_ref).await.ok_or_else(|| {
-                Error::ToolExecution(format!("target ref '{target_ref}' not found").into())
+                Error::ToolExecution(ToolError::not_found(format!(
+                    "target ref '{target_ref}' not found"
+                )))
             })?;
             act_drag(page, selector, &target.selector).await
         }
@@ -75,21 +82,19 @@ pub async fn execute_act(
             let timeout_ms = args["timeout_ms"].as_u64().unwrap_or(10_000);
             act_wait_for_element(page, selector, timeout_ms).await
         }
-        _ => Err(Error::ToolExecution(
-            format!(
-                "unknown act action '{action}'. Available: click, type, fill, press, hover, select, drag, wait"
-            )
-            .into(),
-        )),
+        _ => Err(Error::ToolExecution(ToolError::invalid_input(format!(
+            "unknown act action '{action}'. Available: click, type, fill, press, hover, select, drag, wait"
+        )))),
     }
 }
 
 /// Click an element by CSS selector.
 async fn act_click(page: &Page, selector: &str) -> Result<Value> {
-    let elem = page
-        .find_element(selector)
-        .await
-        .map_err(|e| Error::ToolExecution(format!("element not found '{selector}': {e}").into()))?;
+    let elem = page.find_element(selector).await.map_err(|e| {
+        Error::ToolExecution(ToolError::not_found(format!(
+            "element not found '{selector}': {e}"
+        )))
+    })?;
     elem.click()
         .await
         .map_err(|e| Error::ToolExecution(format!("click failed on '{selector}': {e}").into()))?;
@@ -98,10 +103,11 @@ async fn act_click(page: &Page, selector: &str) -> Result<Value> {
 
 /// Type text into an element, optionally clearing first.
 async fn act_type(page: &Page, selector: &str, text: &str, clear: bool) -> Result<Value> {
-    let elem = page
-        .find_element(selector)
-        .await
-        .map_err(|e| Error::ToolExecution(format!("element not found '{selector}': {e}").into()))?;
+    let elem = page.find_element(selector).await.map_err(|e| {
+        Error::ToolExecution(ToolError::not_found(format!(
+            "element not found '{selector}': {e}"
+        )))
+    })?;
 
     // Focus the element
     elem.click()
@@ -163,9 +169,9 @@ async fn act_press(page: &Page, selector: &str, key: &str) -> Result<Value> {
 
     let status: String = result.into_value().unwrap_or_else(|_| "unknown".into());
     if status == "element_not_found" {
-        return Err(Error::ToolExecution(
-            format!("element not found: '{selector}'").into(),
-        ));
+        return Err(Error::ToolExecution(ToolError::not_found(format!(
+            "element not found: '{selector}'"
+        ))));
     }
 
     Ok(json!({ "status": "pressed", "key": key, "selector": selector }))
@@ -202,9 +208,9 @@ async fn act_hover(page: &Page, selector: &str) -> Result<Value> {
 
     let status: String = result.into_value().unwrap_or_else(|_| "unknown".into());
     if status == "element_not_found" {
-        return Err(Error::ToolExecution(
-            format!("element not found: '{selector}'").into(),
-        ));
+        return Err(Error::ToolExecution(ToolError::not_found(format!(
+            "element not found: '{selector}'"
+        ))));
     }
 
     Ok(json!({ "status": "hovered", "selector": selector }))
@@ -232,9 +238,9 @@ async fn act_select(page: &Page, selector: &str, value: &str) -> Result<Value> {
 
     let status: String = result.into_value().unwrap_or_else(|_| "unknown".into());
     if status == "element_not_found" {
-        return Err(Error::ToolExecution(
-            format!("element not found: '{selector}'").into(),
-        ));
+        return Err(Error::ToolExecution(ToolError::not_found(format!(
+            "element not found: '{selector}'"
+        ))));
     }
 
     Ok(json!({ "status": "selected", "selector": selector, "value": value }))
@@ -277,12 +283,12 @@ async fn act_drag(page: &Page, source_selector: &str, target_selector: &str) -> 
 
     let status: String = result.into_value().unwrap_or_else(|_| "unknown".into());
     match status.as_str() {
-        "source_not_found" => Err(Error::ToolExecution(
-            format!("source element not found: '{source_selector}'").into(),
-        )),
-        "target_not_found" => Err(Error::ToolExecution(
-            format!("target element not found: '{target_selector}'").into(),
-        )),
+        "source_not_found" => Err(Error::ToolExecution(ToolError::not_found(format!(
+            "source element not found: '{source_selector}'"
+        )))),
+        "target_not_found" => Err(Error::ToolExecution(ToolError::not_found(format!(
+            "target element not found: '{target_selector}'"
+        )))),
         _ => Ok(json!({
             "status": "dragged",
             "source": source_selector,
