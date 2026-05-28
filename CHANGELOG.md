@@ -13,6 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   transcript, and the SSE stream emits `text`/`done` events with the
   shape Apollo's HTTP client expects.
 
+## [3.5.3] - 2026-05-28
+
+- Forward structured error context to the agent on tool failure (#453)
+
 ## [3.5.2] - 2026-05-28
 
 - fix(browser): self-heal stale refs in act instead of relying on the model (#452)

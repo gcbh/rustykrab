@@ -98,31 +98,41 @@ async fn dispatch_act(
     match action {
         "click" => act_click(page, selector).await,
         "type" | "fill" => {
-            let text = args["text"]
-                .as_str()
-                .ok_or_else(|| Error::ToolExecution("'type' action requires 'text' parameter".into()))?;
+            let text = args["text"].as_str().ok_or_else(|| {
+                Error::ToolExecution(ToolError::invalid_input(
+                    "'type' action requires 'text' parameter",
+                ))
+            })?;
             let clear = args["clear"].as_bool().unwrap_or(true); // fill clears by default
             act_type(page, selector, text, clear).await
         }
         "press" => {
-            let key = args["key"]
-                .as_str()
-                .ok_or_else(|| Error::ToolExecution("'press' action requires 'key' parameter".into()))?;
+            let key = args["key"].as_str().ok_or_else(|| {
+                Error::ToolExecution(ToolError::invalid_input(
+                    "'press' action requires 'key' parameter",
+                ))
+            })?;
             act_press(page, selector, key).await
         }
         "hover" => act_hover(page, selector).await,
         "select" => {
-            let value = args["value"]
-                .as_str()
-                .ok_or_else(|| Error::ToolExecution("'select' action requires 'value' parameter".into()))?;
+            let value = args["value"].as_str().ok_or_else(|| {
+                Error::ToolExecution(ToolError::invalid_input(
+                    "'select' action requires 'value' parameter",
+                ))
+            })?;
             act_select(page, selector, value).await
         }
         "drag" => {
-            let target_ref = args["targetRef"]
-                .as_str()
-                .ok_or_else(|| Error::ToolExecution("'drag' requires 'targetRef' parameter".into()))?;
+            let target_ref = args["targetRef"].as_str().ok_or_else(|| {
+                Error::ToolExecution(ToolError::invalid_input(
+                    "'drag' requires 'targetRef' parameter",
+                ))
+            })?;
             let target = store.get_ref(store_key, target_ref).await.ok_or_else(|| {
-                Error::ToolExecution(format!("target ref '{target_ref}' not found").into())
+                Error::ToolExecution(ToolError::not_found(format!(
+                    "target ref '{target_ref}' not found"
+                )))
             })?;
             act_drag(page, selector, &target.selector).await
         }
@@ -130,12 +140,9 @@ async fn dispatch_act(
             let timeout_ms = args["timeout_ms"].as_u64().unwrap_or(10_000);
             act_wait_for_element(page, selector, timeout_ms).await
         }
-        _ => Err(Error::ToolExecution(
-            format!(
-                "unknown act action '{action}'. Available: click, type, fill, press, hover, select, drag, wait"
-            )
-            .into(),
-        )),
+        _ => Err(Error::ToolExecution(ToolError::invalid_input(format!(
+            "unknown act action '{action}'. Available: click, type, fill, press, hover, select, drag, wait"
+        )))),
     }
 }
 
@@ -462,9 +469,9 @@ async fn act_drag(page: &Page, source_selector: &str, target_selector: &str) -> 
         "source_not_found" => Err(Error::ToolExecution(ToolError::not_found(format!(
             "source element not found: '{source_selector}'"
         )))),
-        "target_not_found" => Err(Error::ToolExecution(
-            format!("target element not found: '{target_selector}'").into(),
-        )),
+        "target_not_found" => Err(Error::ToolExecution(ToolError::not_found(format!(
+            "target element not found: '{target_selector}'"
+        )))),
         _ => Ok(json!({
             "status": "dragged",
             "source": source_selector,

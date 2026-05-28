@@ -1127,14 +1127,14 @@ impl AgentRunner {
                             }
                         }
                         Err(e) => {
-                            let err_str = sanitize_error(&e.to_string());
-                            tracing::warn!(tool = %tool_name, call_id = %call_id, error = %err_str, "tool call failed");
+                            let (output, err_str) = tool_error_output(&e);
+                            tracing::warn!(tool = %tool_name, call_id = %call_id, error = %err_str, kind = e.kind().as_str(), "tool call failed");
                             Message {
                                 id: Uuid::new_v4(),
                                 role: Role::Tool,
                                 content: MessageContent::ToolResult(ToolResult {
                                     call_id,
-                                    output: serde_json::json!({ "error": err_str }),
+                                    output,
                                     is_error: true,
                                 }),
                                 created_at: Utc::now(),
@@ -1544,14 +1544,14 @@ impl AgentRunner {
                             (msg, true, None)
                         }
                         Err(e) => {
-                            let err_str = sanitize_error(&e.to_string());
-                            tracing::warn!(tool = %tool_name, call_id = %call_id, error = %err_str, "tool call failed");
+                            let (output, err_str) = tool_error_output(&e);
+                            tracing::warn!(tool = %tool_name, call_id = %call_id, error = %err_str, kind = e.kind().as_str(), "tool call failed");
                             let msg = Message {
                                 id: Uuid::new_v4(),
                                 role: Role::Tool,
                                 content: MessageContent::ToolResult(ToolResult {
                                     call_id: call_id.clone(),
-                                    output: serde_json::json!({ "error": err_str }),
+                                    output,
                                     is_error: true,
                                 }),
                                 created_at: Utc::now(),
@@ -2620,9 +2620,89 @@ impl AgentRunner {
     }
 }
 
+/// Clamp an error message before feeding it back to the model.
+///
+/// Preserves multi-line detail — the actionable part (a suggested fix, a
+/// validation message, a stale-ref hint) is often below the first line — but
+/// caps total length so a giant stack trace or HTML body can't blow up the
+/// context window.
 fn sanitize_error(e: &str) -> String {
-    let first_line = e.lines().next().unwrap_or(e);
-    first_line.chars().take(200).collect()
+    const MAX_LEN: usize = 2000;
+    let trimmed = e.trim();
+    if trimmed.chars().count() <= MAX_LEN {
+        return trimmed.to_string();
+    }
+    let mut out: String = trimmed.chars().take(MAX_LEN).collect();
+    out.push_str("… [truncated]");
+    out
+}
+
+/// Build the structured output fed back to the model for a failed tool call.
+///
+/// Returns the JSON payload and the plain message (for logs / events). The
+/// `error_kind` and `retryable` fields let the model distinguish "fix your
+/// arguments" from "transient, retry as-is" from "permission denied, stop".
+fn tool_error_output(e: &Error) -> (serde_json::Value, String) {
+    let kind = e.kind();
+    let message = sanitize_error(&e.to_string());
+    let output = serde_json::json!({
+        "error": message,
+        "error_kind": kind.as_str(),
+        "retryable": kind.retryable(),
+    });
+    (output, message)
+}
+
+#[cfg(test)]
+mod error_output_tests {
+    use super::*;
+    use rustykrab_core::{ToolError, ToolErrorKind};
+
+    #[test]
+    fn forwards_kind_and_retryable_for_tool_errors() {
+        let e = Error::ToolExecution(ToolError::not_found("ref '12' not found"));
+        let (output, msg) = tool_error_output(&e);
+        assert_eq!(output["error_kind"], "not_found");
+        assert_eq!(output["retryable"], false);
+        assert!(output["error"]
+            .as_str()
+            .unwrap()
+            .contains("ref '12' not found"));
+        assert!(msg.contains("ref '12' not found"));
+    }
+
+    #[test]
+    fn transient_errors_are_marked_retryable() {
+        let e = Error::ToolExecution(ToolError::transient("connection reset"));
+        let (output, _) = tool_error_output(&e);
+        assert_eq!(output["error_kind"], "transient");
+        assert_eq!(output["retryable"], true);
+    }
+
+    #[test]
+    fn non_tool_error_variants_are_categorized() {
+        assert_eq!(
+            Error::Auth("x".into()).kind(),
+            ToolErrorKind::PermissionDenied
+        );
+        assert_eq!(Error::NotFound("x".into()).kind(), ToolErrorKind::NotFound);
+        assert_eq!(
+            Error::ModelRateLimit("x".into()).kind(),
+            ToolErrorKind::RateLimited
+        );
+        assert_eq!(Error::Internal("x".into()).kind(), ToolErrorKind::Internal);
+    }
+
+    #[test]
+    fn sanitize_keeps_multiline_detail_but_caps_length() {
+        let multiline = "element not found\ntake a new snapshot first";
+        assert_eq!(sanitize_error(multiline), multiline);
+
+        let huge = "x".repeat(5000);
+        let clamped = sanitize_error(&huge);
+        assert!(clamped.chars().count() < huge.chars().count());
+        assert!(clamped.ends_with("[truncated]"));
+    }
 }
 
 /// Wrap [`execute_with_retries`] in a watchdog that fires `on_heartbeat`
