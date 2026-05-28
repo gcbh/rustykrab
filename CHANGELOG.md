@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.0.0] - 2026-05-28
+
+- feat(gateway): Apollo BFF integration contract (#454)
+
+- feat(gateway): Apollo BFF integration — `/api/conversations` now lists
+  full `{id, title, createdAt, updatedAt}` objects, `POST` accepts an
+  optional `title`, `/api/conversations/{id}/messages` exposes the
+  transcript, and the SSE stream emits `text`/`done` events with the
+  shape Apollo's HTTP client expects.
+
 ## [3.5.3] - 2026-05-28
 
 - Forward structured error context to the agent on tool failure (#453)

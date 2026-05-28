@@ -2245,6 +2245,7 @@ mod cron_inheritance_tests {
             messages: Vec::new(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+            title: None,
             summary: None,
             detected_profile: None,
             channel_source: None,

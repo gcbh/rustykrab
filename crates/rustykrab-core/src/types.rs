@@ -284,6 +284,10 @@ pub struct Conversation {
     pub messages: Vec<Message>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// Optional human-readable title. Set by external clients (e.g. Apollo)
+    /// at create time; otherwise `None`.
+    #[serde(default)]
+    pub title: Option<String>,
     /// Optional summary of earlier messages for context compression.
     #[serde(default)]
     pub summary: Option<String>,

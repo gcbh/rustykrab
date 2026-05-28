@@ -5,14 +5,18 @@ use axum::http::StatusCode;
 use axum::response::sse::{Event, Sse};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use chrono::Utc;
-use serde::Deserialize;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 use uuid::Uuid;
 
 use rustykrab_agent::AgentEvent;
-use rustykrab_core::types::{Conversation, Message, MessageContent, Role};
+use rustykrab_core::types::{
+    ContentBlock, Conversation, Message, MessageContent, Role, ToolCall, ToolResult,
+};
+use rustykrab_store::ConversationSummary;
 
 use crate::logging::TraceId;
 use crate::AppState;
@@ -29,7 +33,10 @@ pub fn api_routes() -> Router<AppState> {
             "/api/conversations/{id}",
             axum::routing::delete(delete_conversation),
         )
-        .route("/api/conversations/{id}/messages", post(send_message))
+        .route(
+            "/api/conversations/{id}/messages",
+            get(list_messages).post(send_message),
+        )
         .route(
             "/api/conversations/{id}/messages/stream",
             post(send_message_stream),
@@ -41,6 +48,152 @@ pub fn api_routes() -> Router<AppState> {
         .route("/api/logout", post(logout))
 }
 
+// ---------------------------------------------------------------------------
+// Apollo integration DTOs
+// ---------------------------------------------------------------------------
+//
+// These shapes match the Apollo BFF contract documented in
+// `docs/integrations/apollo.md`. The internal `Conversation` /
+// `Message` types embed multi-modal content, tool calls and tool
+// results that Apollo doesn't model — the DTOs project those down to
+// the simple `{id, title, createdAt, updatedAt}` and
+// `{id, conversationId, role, content, createdAt}` shapes Apollo
+// expects, emitting timestamps as epoch milliseconds.
+//
+// Apollo's client accepts both camelCase and snake_case on the wire;
+// we emit camelCase since that is what the contract documents.
+
+/// Conversation summary returned by `/api/conversations` and friends.
+#[derive(Debug, Serialize)]
+struct ApolloConversation {
+    id: String,
+    title: Option<String>,
+    #[serde(rename = "createdAt")]
+    created_at: i64,
+    #[serde(rename = "updatedAt")]
+    updated_at: i64,
+}
+
+impl From<&Conversation> for ApolloConversation {
+    fn from(conv: &Conversation) -> Self {
+        Self {
+            id: conv.id.to_string(),
+            title: conv.title.clone(),
+            created_at: epoch_millis(conv.created_at),
+            updated_at: epoch_millis(conv.updated_at),
+        }
+    }
+}
+
+impl From<&ConversationSummary> for ApolloConversation {
+    fn from(s: &ConversationSummary) -> Self {
+        Self {
+            id: s.id.to_string(),
+            title: s.title.clone(),
+            created_at: epoch_millis(s.created_at),
+            updated_at: epoch_millis(s.updated_at),
+        }
+    }
+}
+
+/// Message shape exposed to Apollo. Tool calls / multi-part content
+/// collapse to a textual rendering — Apollo treats messages as plain
+/// strings.
+#[derive(Debug, Serialize)]
+struct ApolloMessage {
+    id: String,
+    #[serde(rename = "conversationId")]
+    conversation_id: String,
+    role: ApolloRole,
+    content: String,
+    #[serde(rename = "createdAt")]
+    created_at: i64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum ApolloRole {
+    User,
+    Assistant,
+    System,
+}
+
+impl ApolloMessage {
+    fn from_message(conv_id: Uuid, msg: &Message) -> Self {
+        Self {
+            id: msg.id.to_string(),
+            conversation_id: conv_id.to_string(),
+            role: apollo_role(msg.role),
+            content: render_message_content(&msg.content),
+            created_at: epoch_millis(msg.created_at),
+        }
+    }
+}
+
+fn apollo_role(role: Role) -> ApolloRole {
+    match role {
+        Role::User => ApolloRole::User,
+        Role::Assistant => ApolloRole::Assistant,
+        // `Tool` role is internal to RustyKrab; coerce to `assistant`
+        // so Apollo doesn't see an unknown value. Apollo's own client
+        // applies the same coercion defensively.
+        Role::System => ApolloRole::System,
+        Role::Tool => ApolloRole::Assistant,
+    }
+}
+
+/// Render any `MessageContent` to a plain string for Apollo. For text
+/// content this is the raw text; tool calls and tool results render
+/// to a compact, human-readable form so they don't surface as empty
+/// turns in the chat UI.
+fn render_message_content(c: &MessageContent) -> String {
+    match c {
+        MessageContent::Text(s) => s.clone(),
+        MessageContent::ToolCall(tc) => format_tool_call(tc),
+        MessageContent::MultiToolCall(tcs) => tcs
+            .iter()
+            .map(format_tool_call)
+            .collect::<Vec<_>>()
+            .join("\n"),
+        MessageContent::ToolResult(tr) => format_tool_result(tr),
+        MessageContent::MultiPart(blocks) => blocks
+            .iter()
+            .map(|b| match b {
+                ContentBlock::Text { text } => text.clone(),
+                ContentBlock::Image { media_type, .. } => format!("[image:{media_type}]"),
+                ContentBlock::ToolUse { name, .. } => format!("[tool_use:{name}]"),
+                ContentBlock::ToolResult { content, .. } => content.clone(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+    }
+}
+
+fn format_tool_call(tc: &ToolCall) -> String {
+    format!("[tool_call:{}({})]", tc.name, tc.arguments)
+}
+
+fn format_tool_result(tr: &ToolResult) -> String {
+    let prefix = if tr.is_error {
+        "[tool_error]"
+    } else {
+        "[tool_result]"
+    };
+    format!("{prefix} {}", tr.output)
+}
+
+fn epoch_millis(ts: DateTime<Utc>) -> i64 {
+    ts.timestamp_millis()
+}
+
+#[derive(Default, Deserialize)]
+struct CreateConversationRequest {
+    #[serde(default)]
+    title: Option<String>,
+}
+
+/// Body of `POST /api/conversations/{id}/messages` and the stream
+/// variant. Apollo always sends `{ "content": "..." }`.
 #[derive(Deserialize)]
 struct SendMessageRequest {
     content: String,
@@ -63,34 +216,48 @@ async fn logout(State(state): State<AppState>) -> StatusCode {
 
 async fn create_conversation(
     State(state): State<AppState>,
-) -> Result<Json<Conversation>, StatusCode> {
+    body: Option<Json<CreateConversationRequest>>,
+) -> Result<Json<ApolloConversation>, StatusCode> {
+    let title = body.and_then(|Json(b)| b.title).filter(|s| !s.is_empty());
     state
         .store
         .conversations()
-        .create()
-        .map(Json)
+        .create_with_title(title)
+        .map(|c| Json(ApolloConversation::from(&c)))
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
-async fn list_conversations(State(state): State<AppState>) -> Result<Json<Vec<Uuid>>, StatusCode> {
+async fn list_conversations(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<ApolloConversation>>, StatusCode> {
     state
         .store
         .conversations()
-        .list_ids()
-        .map(Json)
+        .list_summaries()
+        .map(|summaries| {
+            Json(
+                summaries
+                    .iter()
+                    .map(ApolloConversation::from)
+                    .collect::<Vec<_>>(),
+            )
+        })
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 async fn get_conversation(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
-) -> Result<Json<Conversation>, StatusCode> {
+) -> Result<Json<ApolloConversation>, StatusCode> {
     state
         .store
         .conversations()
         .get(id)
-        .map(Json)
-        .map_err(|_| StatusCode::NOT_FOUND)
+        .map(|c| Json(ApolloConversation::from(&c)))
+        .map_err(|e| match e {
+            rustykrab_core::Error::NotFound(_) => StatusCode::NOT_FOUND,
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        })
 }
 
 async fn delete_conversation(
@@ -108,13 +275,53 @@ async fn delete_conversation(
         })
 }
 
+/// `GET /api/conversations/{id}/messages`.
+///
+/// Returns every persisted message in the conversation projected to
+/// the Apollo wire shape. System messages and tool/result turns are
+/// included so transcript replays match what the model saw, but
+/// downstream clients (Apollo) typically filter to user/assistant
+/// before rendering.
+async fn list_messages(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Vec<ApolloMessage>>, StatusCode> {
+    let conv = state.store.conversations().get(id).map_err(|e| match e {
+        rustykrab_core::Error::NotFound(_) => StatusCode::NOT_FOUND,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    })?;
+    let msgs: Vec<ApolloMessage> = conv
+        .messages
+        .iter()
+        .map(|m| ApolloMessage::from_message(conv.id, m))
+        .collect();
+    Ok(Json(msgs))
+}
+
+/// Response body for `POST /api/conversations/{id}/messages`.
+///
+/// Apollo accepts either a bare `Message` or the envelope form
+/// `{ message, apps }`. We use the envelope whenever the agent
+/// produced one or more app specs during the turn (today the runner
+/// never does, so this is always the bare-message form — but the
+/// shape is here so a future tool emitting apps can flip the switch).
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+enum SendMessageResponse {
+    Bare(ApolloMessage),
+    Envelope {
+        message: ApolloMessage,
+        apps: Vec<Value>,
+    },
+}
+
 /// Send a user message to a conversation and get an assistant response.
 async fn send_message(
     State(state): State<AppState>,
     Extension(TraceId(trace_id)): Extension<TraceId>,
     Path(id): Path<Uuid>,
     Json(body): Json<SendMessageRequest>,
-) -> Result<Json<Message>, StatusCode> {
+) -> Result<Json<SendMessageResponse>, StatusCode> {
     if body.content.len() > MAX_MESSAGE_SIZE {
         return Err(StatusCode::PAYLOAD_TOO_LARGE);
     }
@@ -151,7 +358,26 @@ async fn send_message(
         .save(&conv)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    Ok(Json(assistant_msg))
+    let apollo_msg = ApolloMessage::from_message(conv.id, &assistant_msg);
+    let apps = extract_apps_from_text(&assistant_msg);
+    let response = if apps.is_empty() {
+        SendMessageResponse::Bare(apollo_msg)
+    } else {
+        SendMessageResponse::Envelope {
+            message: apollo_msg,
+            apps,
+        }
+    };
+    Ok(Json(response))
+}
+
+/// Look for embedded app specs in an assistant message. Today the
+/// agent doesn't produce them, so this always returns an empty vector
+/// and Apollo gets the bare-`Message` form. The hook is here so a
+/// future `app_render` tool can stash specs on the message and have
+/// them surface in the envelope form without further routing changes.
+fn extract_apps_from_text(_msg: &Message) -> Vec<Value> {
+    Vec::new()
 }
 
 /// Payload sent through the MPSC channel from the agent task to the SSE stream.
@@ -177,6 +403,7 @@ async fn send_message_stream(
         .conversations()
         .get(id)
         .map_err(|_| StatusCode::NOT_FOUND)?;
+    let conv_id = conv.id;
 
     let user_content = body.content.clone();
 
@@ -287,12 +514,18 @@ async fn send_message_stream(
     });
 
     // Map channel messages to SSE events.
-    let stream = ReceiverStream::new(rx).map(|payload| {
+    //
+    // The Apollo contract recognises three event types — `text`,
+    // `apps`, `done` — and ignores anything else. Internal tool
+    // events still flow through so the WebChat UI (which understands
+    // `tool_start`, `tool_end`, `thinking`, etc.) keeps working; the
+    // Apollo client treats those frames as no-ops.
+    let stream = ReceiverStream::new(rx).map(move |payload| {
         let event = match payload {
             SsePayload::Event(agent_event) => match agent_event {
                 AgentEvent::TextDelta(delta) => Event::default()
-                    .event("delta")
-                    .data(serde_json::json!({"type": "delta", "delta": delta}).to_string()),
+                    .event("text")
+                    .data(serde_json::json!({"type": "text", "delta": delta}).to_string()),
                 AgentEvent::ToolCallStart { tool_name, .. } => {
                     Event::default().event("tool_start").data(
                         serde_json::json!({"type": "tool_start", "delta": tool_name}).to_string(),
@@ -344,14 +577,37 @@ async fn send_message_stream(
                     .event("done")
                     .data(serde_json::json!({"type": "done"}).to_string()),
             },
-            SsePayload::Done(Ok(message)) => Event::default()
-                .event("done")
-                .data(serde_json::json!({"type": "done", "message": message}).to_string()),
+            SsePayload::Done(Ok(message)) => {
+                let apollo_msg = ApolloMessage::from_message(conv_id, &message);
+                let apps = extract_apps_from_text(&message);
+                // Emit a single Apollo-shaped terminal `done` event.
+                // The optional `apps` field is omitted when empty so
+                // the wire stays close to the documented shape.
+                let mut payload = serde_json::json!({
+                    "type": "done",
+                    "message": apollo_msg,
+                });
+                if !apps.is_empty() {
+                    payload["apps"] = serde_json::Value::Array(apps);
+                }
+                Event::default().event("done").data(payload.to_string())
+            }
             SsePayload::Done(Err(e)) => {
                 tracing::error!(error = %e, "agent stream ended with error");
-                Event::default()
-                    .event("error")
-                    .data(serde_json::json!({"type": "error", "delta": format!("{e}")}).to_string())
+                // The Apollo contract says the cleanest behaviour on
+                // mid-stream failure is to close the response, and that
+                // Apollo will synthesise an "agent unavailable" frame
+                // itself. We still emit an explicit `error` event so
+                // clients (WebChat, debug consumers) get a clear signal
+                // before the stream ends.
+                Event::default().event("error").data(
+                    serde_json::json!({
+                        "type": "error",
+                        "message": "The agent is unavailable.",
+                        "delta": format!("{e}"),
+                    })
+                    .to_string(),
+                )
             }
         };
         Ok(event)
@@ -476,4 +732,133 @@ async fn delete_secret(
     })?;
     tracing::info!(name = %name, "secret deleted");
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ts(s: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    }
+
+    #[test]
+    fn apollo_conversation_serializes_camel_case_epoch_millis() {
+        let conv = Conversation {
+            id: Uuid::nil(),
+            messages: Vec::new(),
+            created_at: ts("2024-01-01T00:00:00Z"),
+            updated_at: ts("2024-01-02T00:00:00Z"),
+            title: Some("hello".into()),
+            summary: None,
+            detected_profile: None,
+            channel_source: None,
+            channel_id: None,
+            channel_thread_id: None,
+        };
+        let json = serde_json::to_value(ApolloConversation::from(&conv)).unwrap();
+        assert_eq!(json["id"], "00000000-0000-0000-0000-000000000000");
+        assert_eq!(json["title"], "hello");
+        assert_eq!(json["createdAt"], 1_704_067_200_000_i64);
+        assert_eq!(json["updatedAt"], 1_704_153_600_000_i64);
+        // No internal-only fields leak.
+        assert!(json.get("messages").is_none());
+        assert!(json.get("channel_source").is_none());
+    }
+
+    #[test]
+    fn apollo_message_collapses_to_string_content() {
+        let conv_id = Uuid::nil();
+        let plain = Message {
+            id: Uuid::nil(),
+            role: Role::Assistant,
+            content: MessageContent::Text("hi there".into()),
+            created_at: ts("2024-01-01T00:00:00Z"),
+        };
+        let json = serde_json::to_value(ApolloMessage::from_message(conv_id, &plain)).unwrap();
+        assert_eq!(json["role"], "assistant");
+        assert_eq!(json["content"], "hi there");
+        assert_eq!(json["conversationId"], conv_id.to_string());
+        assert_eq!(json["createdAt"], 1_704_067_200_000_i64);
+    }
+
+    #[test]
+    fn apollo_message_renders_tool_call_and_result() {
+        let call = Message {
+            id: Uuid::nil(),
+            role: Role::Assistant,
+            content: MessageContent::ToolCall(ToolCall {
+                id: "1".into(),
+                name: "echo".into(),
+                arguments: serde_json::json!({"msg": "hi"}),
+            }),
+            created_at: ts("2024-01-01T00:00:00Z"),
+        };
+        let rendered = render_message_content(&call.content);
+        assert!(rendered.starts_with("[tool_call:echo("));
+        assert!(rendered.contains("msg"));
+
+        let result = MessageContent::ToolResult(ToolResult {
+            call_id: "1".into(),
+            output: serde_json::json!("ok"),
+            is_error: false,
+        });
+        assert!(render_message_content(&result).starts_with("[tool_result]"));
+
+        let err = MessageContent::ToolResult(ToolResult {
+            call_id: "1".into(),
+            output: serde_json::json!("boom"),
+            is_error: true,
+        });
+        assert!(render_message_content(&err).starts_with("[tool_error]"));
+    }
+
+    #[test]
+    fn apollo_role_coerces_tool_to_assistant() {
+        assert!(matches!(apollo_role(Role::Tool), ApolloRole::Assistant));
+        assert!(matches!(apollo_role(Role::System), ApolloRole::System));
+        assert!(matches!(apollo_role(Role::User), ApolloRole::User));
+        assert!(matches!(
+            apollo_role(Role::Assistant),
+            ApolloRole::Assistant
+        ));
+    }
+
+    #[test]
+    fn send_message_response_serializes_bare_or_envelope() {
+        let conv_id = Uuid::nil();
+        let msg = ApolloMessage {
+            id: Uuid::nil().to_string(),
+            conversation_id: conv_id.to_string(),
+            role: ApolloRole::Assistant,
+            content: "ok".into(),
+            created_at: 0,
+        };
+        let bare = serde_json::to_value(SendMessageResponse::Bare(msg)).unwrap();
+        assert_eq!(bare["content"], "ok");
+        assert!(bare.get("message").is_none());
+
+        let env = SendMessageResponse::Envelope {
+            message: ApolloMessage {
+                id: Uuid::nil().to_string(),
+                conversation_id: conv_id.to_string(),
+                role: ApolloRole::Assistant,
+                content: "ok".into(),
+                created_at: 0,
+            },
+            apps: vec![serde_json::json!({"name": "x", "html": "<p/>"})],
+        };
+        let env = serde_json::to_value(env).unwrap();
+        assert_eq!(env["message"]["content"], "ok");
+        assert_eq!(env["apps"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn create_conversation_request_accepts_missing_body() {
+        let req: CreateConversationRequest = serde_json::from_str("{}").unwrap();
+        assert_eq!(req.title, None);
+        let req: CreateConversationRequest =
+            serde_json::from_str(r#"{"title":"my chat"}"#).unwrap();
+        assert_eq!(req.title.as_deref(), Some("my chat"));
+    }
 }
