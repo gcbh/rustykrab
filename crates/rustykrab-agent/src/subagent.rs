@@ -191,6 +191,7 @@ impl SessionManager for SubagentRunner {
             ],
             created_at: now,
             updated_at: now,
+            title: None,
             summary: None,
             detected_profile: Some(def.profile.clone()),
             channel_source: Some("subagent".into()),

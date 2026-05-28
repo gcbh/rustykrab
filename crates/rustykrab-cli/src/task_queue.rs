@@ -665,6 +665,7 @@ mod tests {
             messages: Vec::new(),
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            title: None,
             summary: None,
             detected_profile: None,
             channel_source: None,

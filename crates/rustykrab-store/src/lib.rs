@@ -14,7 +14,7 @@ use std::sync::Mutex;
 use zeroize::Zeroizing;
 
 pub use chat_map::ChatMapStore;
-pub use conversation::ConversationStore;
+pub use conversation::{ConversationStore, ConversationSummary};
 pub use jobs::{JobRun, JobStore, ScheduledJob};
 pub use secret::SecretStore;
 pub use slack_chat_map::SlackChatMapStore;

@@ -889,9 +889,12 @@
 
   // ── SSE stream event handler ──────────────────────────────
   function handleStreamEvent(data) {
-    if (data.type === 'delta') {
+    // `text` is the canonical Apollo event name; `delta` is kept as
+    // a back-compat alias because older snapshots of the gateway
+    // shipped that name and Apollo accepts both. Treat them the same.
+    if (data.type === 'text' || data.type === 'delta') {
       removeAgentStatus();
-      streamBuffer += data.delta;
+      streamBuffer += (data.delta || data.text || '');
       updateStreamingMessage(streamBuffer);
     } else if (data.type === 'tool_start') {
       showAgentStatus('tool-start', `Using ${data.delta}`, true);
@@ -1011,25 +1014,19 @@
   // ── Conversations ─────────────────────────────────────────
   async function loadConversations() {
     try {
-      const ids = await api('/api/conversations');
-      conversations = [];
-      for (const id of ids) {
-        try {
-          const conv = await api(`/api/conversations/${id}`);
-          const lastMsg = conv.messages[conv.messages.length - 1];
-          const preview = lastMsg?.content
-            ? extractText(lastMsg.content)
-            : 'New conversation';
-          conversations.push({
-            id: conv.id,
-            created_at: conv.created_at,
-            updated_at: conv.updated_at,
-            preview: preview.slice(0, 60),
-            channel_source: conv.channel_source || null,
-          });
-        } catch { /* skip broken entries */ }
-      }
-      conversations.sort((a, b) => new Date(b.updated_at) - new Date(a.updated_at));
+      // The Apollo-shaped list endpoint returns
+      // `[{id, title, createdAt, updatedAt}]`. We map those into the
+      // sidebar entries directly; the preview defaults to the title
+      // (or "New conversation" when no title was set on create).
+      const list = await api('/api/conversations');
+      conversations = list.map(c => ({
+        id: c.id,
+        created_at: c.createdAt,
+        updated_at: c.updatedAt,
+        preview: (c.title && c.title.length > 0 ? c.title : 'New conversation').slice(0, 60),
+        channel_source: null,
+      }));
+      conversations.sort((a, b) => (b.updated_at || 0) - (a.updated_at || 0));
       renderConversationList();
     } catch {
       conversations = [];
@@ -1075,8 +1072,9 @@
     activeConvId = id;
     renderConversationList();
     try {
-      const conv = await api(`/api/conversations/${id}`);
-      activeMessages = conv.messages;
+      // Messages now live on a dedicated endpoint and arrive in
+      // Apollo's flat shape: `{id, conversationId, role, content, createdAt}`.
+      activeMessages = await api(`/api/conversations/${id}/messages`);
       renderMessages();
     } catch {
       activeMessages = [];
@@ -1102,9 +1100,9 @@
       const conv = await api('/api/conversations', { method: 'POST' });
       conversations.unshift({
         id: conv.id,
-        created_at: conv.created_at,
-        updated_at: conv.updated_at,
-        preview: 'New conversation',
+        created_at: conv.createdAt,
+        updated_at: conv.updatedAt,
+        preview: (conv.title && conv.title.length > 0 ? conv.title : 'New conversation').slice(0, 60),
       });
       renderConversationList();
       selectConversation(conv.id);
@@ -1136,10 +1134,15 @@
     msgContainer.innerHTML = '';
     for (const msg of activeMessages) {
       if (msg.role === 'system' || msg.role === 'tool') continue;
-      // Skip assistant messages that are tool calls (not text responses)
-      const contentType = msg.content && typeof msg.content === 'object' ? msg.content.type : null;
-      if (msg.role === 'assistant' && (contentType === 'tool_call' || contentType === 'multi_tool_call')) continue;
-      appendMessageBubble(msg.role, extractText(msg.content), msg.created_at);
+      // Apollo messages carry plain-string content; tool calls and
+      // tool results are rendered as `[tool_call:name(...)]` /
+      // `[tool_result] ...` markers by the gateway, so we skip those
+      // for the bubble view to keep the transcript readable.
+      const text = extractText(msg.content);
+      if (msg.role === 'assistant' && (text.startsWith('[tool_call:') || text.startsWith('[tool_result]') || text.startsWith('[tool_error]'))) continue;
+      // Apollo emits createdAt as epoch ms; legacy ISO strings still
+      // work because `new Date(...)` accepts both.
+      appendMessageBubble(msg.role, text, msg.createdAt || msg.created_at);
     }
     scrollToBottom();
   }
@@ -1203,13 +1206,15 @@
       activeMessages.push(message);
     }
 
-    // Update sidebar preview
+    // Update sidebar preview. The finalised message is the Apollo
+    // shape — `content` is already a string — but the legacy
+    // `extractText` helper still copes with the old object form.
     const conv = conversations.find(c => c.id === activeConvId);
     if (conv && activeMessages.length > 0) {
       const last = activeMessages[activeMessages.length - 1];
       conv.preview = extractText(last.content).slice(0, 60);
-      conv.updated_at = new Date().toISOString();
-      conversations.sort((a, b) => new Date(b.updated_at) - new Date(a.updated_at));
+      conv.updated_at = Date.now();
+      conversations.sort((a, b) => (b.updated_at || 0) - (a.updated_at || 0));
       renderConversationList();
     }
 
@@ -1227,8 +1232,8 @@
         const conv = await api('/api/conversations', { method: 'POST' });
         conversations.unshift({
           id: conv.id,
-          created_at: conv.created_at,
-          updated_at: conv.updated_at,
+          created_at: conv.createdAt,
+          updated_at: conv.updatedAt,
           preview: text.slice(0, 60),
         });
         activeConvId = conv.id;
@@ -1254,8 +1259,8 @@
     const conv = conversations.find(c => c.id === activeConvId);
     if (conv) {
       conv.preview = text.slice(0, 60);
-      conv.updated_at = new Date().toISOString();
-      conversations.sort((a, b) => new Date(b.updated_at) - new Date(a.updated_at));
+      conv.updated_at = Date.now();
+      conversations.sort((a, b) => (b.updated_at || 0) - (a.updated_at || 0));
       renderConversationList();
     }
 
