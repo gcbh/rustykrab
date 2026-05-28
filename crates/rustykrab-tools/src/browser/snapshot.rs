@@ -122,6 +122,25 @@ impl SnapshotStore {
         hit
     }
 
+    /// Find all refs under `key` whose role and name match the given identity.
+    ///
+    /// Used by `act`'s self-heal: after a stale-ref failure we re-snapshot and
+    /// look for the *same logical element* by role+name (ref ids are positional
+    /// and change between snapshots, so they can't be reused). The caller heals
+    /// only on a unique match and escalates on none or several.
+    pub async fn find_by_identity(&self, key: &str, role: &str, name: &str) -> Vec<ElementRef> {
+        let g = self.inner.lock().await;
+        g.refs
+            .get(key)
+            .map(|m| {
+                m.values()
+                    .filter(|r| r.role == role && r.name == name)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Clear refs for a key.
     #[allow(dead_code)]
     pub async fn clear(&self, key: &str) {
@@ -675,6 +694,46 @@ mod tests {
         assert!(inner.refs.contains_key("k-0"));
         assert!(!inner.refs.contains_key("k-1"));
         assert!(inner.refs.contains_key("overflow"));
+    }
+
+    #[tokio::test]
+    async fn find_by_identity_distinguishes_unique_none_and_ambiguous() {
+        let store = SnapshotStore::new();
+        let mut refs = HashMap::new();
+        for (id, sel, role, name) in [
+            ("1", "#a", "button", "Submit"),
+            ("2", "#b", "button", "Submit"),
+            ("3", "#c", "link", "Home"),
+        ] {
+            refs.insert(
+                id.to_string(),
+                ElementRef {
+                    ref_id: id.into(),
+                    selector: sel.into(),
+                    role: role.into(),
+                    name: name.into(),
+                    value: None,
+                    interactive: true,
+                    bounds: None,
+                },
+            );
+        }
+        store.store("k", refs).await;
+
+        // Unique match heals; ambiguous and absent both escalate.
+        assert_eq!(store.find_by_identity("k", "link", "Home").await.len(), 1);
+        assert_eq!(
+            store.find_by_identity("k", "button", "Submit").await.len(),
+            2
+        );
+        assert!(store
+            .find_by_identity("k", "button", "Cancel")
+            .await
+            .is_empty());
+        assert!(store
+            .find_by_identity("missing", "link", "Home")
+            .await
+            .is_empty());
     }
 
     #[tokio::test]

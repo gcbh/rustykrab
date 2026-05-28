@@ -129,6 +129,8 @@ impl Tool for BrowserTool {
          act — interact by ref (click/type/press/hover/select/drag); \
          screenshot/content/evaluate/scroll/console/cookies/pdf. \
          Cookies persist across calls. Use snapshot + act for reliable element interaction. \
+         If act returns status \"stale_ref\", the page changed: read the fresh snapshot in \
+         that response, pick a new ref, and call act again — never reuse the old ref. \
          Use fetch when JS isn't required, stealth_fetch when it is."
     }
 
