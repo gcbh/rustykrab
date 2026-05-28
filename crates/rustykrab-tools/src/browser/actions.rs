@@ -30,8 +30,8 @@ fn js_string_literal(s: &str) -> String {
 ///   and re-resolve the *same logical element* by role+name. When exactly one
 ///   element matches and the page hasn't navigated, retry the action once.
 /// - **Escalate** — if the page navigated, the element is gone, or several now
-///   match (ambiguous), return a `stale_ref` payload carrying a fresh snapshot
-///   so the model can re-pick a ref in the same turn.
+///   match (ambiguous), return a `new_snapshot` payload carrying a fresh
+///   snapshot so the model can re-pick a ref in the same turn.
 ///
 /// Healing is only attempted for pre-action "element not found" failures, where
 /// nothing happened yet — so a retry can't double-fire a click or a submit.
@@ -55,7 +55,7 @@ pub async fn execute_act(
                 store_key,
                 action,
                 ref_id,
-                "ref not found in the latest snapshot for this tab",
+                "that ref isn't present in the current snapshot for this tab",
             )
             .await);
         }
@@ -180,10 +180,10 @@ async fn heal_or_escalate(
     // Guard 1 — navigation. A changed URL means the page is semantically
     // different; never silently re-target, hand control back to the model.
     if url_before != url_after.as_deref() {
-        return Ok(escalation_payload(
+        return Ok(new_snapshot_payload(
             action,
             ref_id,
-            "the tab navigated to a different URL since the snapshot",
+            "the tab navigated to a different URL",
             snapshot,
             url_after.as_deref(),
         ));
@@ -202,25 +202,25 @@ async fn heal_or_escalate(
                 }
                 Ok(v)
             }
-            Err(_) => Ok(escalation_payload(
+            Err(_) => Ok(new_snapshot_payload(
                 action,
                 ref_id,
-                "the re-resolved element could still not be actioned",
+                "the matching element could not be actioned",
                 snapshot,
                 url_after.as_deref(),
             )),
         },
-        [] => Ok(escalation_payload(
+        [] => Ok(new_snapshot_payload(
             action,
             ref_id,
-            "the element is no longer present after the page changed",
+            "the element is no longer present on the page",
             snapshot,
             url_after.as_deref(),
         )),
-        _ => Ok(escalation_payload(
+        _ => Ok(new_snapshot_payload(
             action,
             ref_id,
-            "several elements now match the same role/name — ambiguous, cannot auto-recover",
+            "several elements now match the same role/name (ambiguous)",
             snapshot,
             url_after.as_deref(),
         )),
@@ -241,14 +241,17 @@ async fn escalate(
         .await
         .ok();
     let url = current_url(page).await;
-    escalation_payload(action, ref_id, reason, snapshot, url.as_deref())
+    new_snapshot_payload(action, ref_id, reason, snapshot, url.as_deref())
 }
 
-/// Build the `stale_ref` payload returned to the model. Returned as `Ok` (not
-/// `Err`) on purpose: the runner blindly retries failed tool calls with the
-/// same arguments, which is pointless for a stale ref. As an `Ok` payload the
-/// model gets the fresh snapshot in hand and can re-pick a ref in one turn.
-fn escalation_payload(
+/// Build the `new_snapshot` payload returned to the model. Returned as `Ok`
+/// (not `Err`) on purpose: the runner blindly retries failed tool calls with
+/// the same arguments, which is pointless when the page has moved on. As an
+/// `Ok` payload the model gets the fresh snapshot in hand and can re-pick a
+/// ref in one turn — and the framing is an observation ("here's the current
+/// state"), not a failure report, so weaker models are less likely to read it
+/// as "retry the same call."
+fn new_snapshot_payload(
     action: &str,
     ref_id: &str,
     reason: &str,
@@ -256,18 +259,18 @@ fn escalation_payload(
     url: Option<&str>,
 ) -> Value {
     json!({
-        "status": "stale_ref",
-        "action_performed": false,
-        "action": action,
-        "ref": ref_id,
-        "reason": reason,
-        "url": url,
-        "message": format!(
-            "Could not '{action}' ref {ref_id}: {reason}. The refs from the previous \
-             snapshot are no longer valid. A fresh snapshot is included under \"snapshot\" \
-             — pick a new ref from it and call act again. Do not reuse the old ref."
-        ),
+        "status": "new_snapshot",
         "snapshot": snapshot,
+        "url": url,
+        "action": action,
+        "previous_ref": ref_id,
+        "reason": reason,
+        "message": format!(
+            "Fresh snapshot taken — {reason}. The current page state is in \
+             \"snapshot\". Pick a ref from this new snapshot and call act with \
+             that ref to continue. The previous ref {ref_id} refers to an \
+             element that is not in this snapshot."
+        ),
     })
 }
 
