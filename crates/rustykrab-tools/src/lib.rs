@@ -69,6 +69,9 @@ mod http_session;
 // Email tools
 mod gmail;
 
+// Calendar tools
+mod caldav;
+
 // Notion integration
 mod notion;
 
@@ -157,6 +160,9 @@ pub use http_session::HttpSessionTool;
 // Email
 pub use gmail::GmailTool;
 
+// Calendar
+pub use caldav::CalDavTool;
+
 // Notion
 pub use notion::NotionTool;
 
@@ -223,6 +229,8 @@ pub fn builtin_tools(
         // cut the tool-schema payload sent to the model.
         // Email
         std::sync::Arc::new(GmailTool::new(secrets.clone())),
+        // Calendar (CalDAV — reuses Gmail credentials)
+        std::sync::Arc::new(CalDavTool::new(secrets.clone())),
         // Notion
         std::sync::Arc::new(NotionTool::new(secrets.clone())),
         // Obsidian

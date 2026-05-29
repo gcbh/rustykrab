@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.1.0] - 2026-05-29
+
+- Add CalDAV tool for Google Calendar integration (#456)
+
 ## [4.0.2] - 2026-05-28
 
 - build(deps): bump openssl from 0.10.79 to 0.10.80 (#447)
