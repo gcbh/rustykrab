@@ -2,6 +2,7 @@ mod chat_map;
 mod conversation;
 mod jobs;
 pub mod keychain;
+mod recall_archive;
 pub mod registry;
 mod secret;
 mod slack_chat_map;
@@ -16,6 +17,7 @@ use zeroize::Zeroizing;
 pub use chat_map::ChatMapStore;
 pub use conversation::{ConversationStore, ConversationSummary};
 pub use jobs::{JobRun, JobStore, ScheduledJob};
+pub use recall_archive::RecallArchiveStore;
 pub use secret::SecretStore;
 pub use slack_chat_map::SlackChatMapStore;
 
@@ -116,6 +118,13 @@ impl Store {
                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
                 UNIQUE(team_id, channel_id, thread_ts)
             );
+
+            CREATE TABLE IF NOT EXISTS recall_archive (
+                conversation_id TEXT PRIMARY KEY,
+                archive         TEXT NOT NULL,
+                created_at      TEXT NOT NULL,
+                updated_at      TEXT NOT NULL
+            );
             ",
         )
         .map_err(|e| Error::Storage(e.to_string()))?;
@@ -169,6 +178,13 @@ impl Store {
     /// Return a handle for Slack (team, channel, thread) → conversation mapping.
     pub fn slack_chat_map(&self) -> SlackChatMapStore {
         SlackChatMapStore::new(Arc::clone(&self.conn))
+    }
+
+    /// Return a handle for the durable recall archive (compaction-displaced
+    /// history). Implements `RecallPersistence` so it can back a
+    /// `RecallStore`.
+    pub fn recall_archive(&self) -> RecallArchiveStore {
+        RecallArchiveStore::new(Arc::clone(&self.conn))
     }
 
     /// Flush all pending writes to disk.
