@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.1.4] - 2026-06-01
+
+- Add vision (image input) support to the Ollama provider (#460)
+
 ## [4.1.3] - 2026-06-01
 
 - Raise snapshot max_depth default to 50 for deep SPAs (#461)

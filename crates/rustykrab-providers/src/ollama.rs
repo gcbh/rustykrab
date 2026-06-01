@@ -307,6 +307,7 @@ impl OllamaProvider {
                             role: role.to_string(),
                             content: Some(content),
                             tool_calls: None,
+                            images: None,
                         }
                     }
                     MessageContent::ToolCall(call) => OllamaMessage {
@@ -318,6 +319,7 @@ impl OllamaProvider {
                                 arguments: call.arguments.clone(),
                             },
                         }]),
+                        images: None,
                     },
                     MessageContent::MultiToolCall(calls) => OllamaMessage {
                         role: role.to_string(),
@@ -333,6 +335,7 @@ impl OllamaProvider {
                                 })
                                 .collect(),
                         ),
+                        images: None,
                     },
                     MessageContent::ToolResult(result) => {
                         // Fix #182: avoid double-serialization of string values.
@@ -345,9 +348,12 @@ impl OllamaProvider {
                             role: role.to_string(),
                             content: Some(content),
                             tool_calls: None,
+                            images: None,
                         }
                     }
                     MessageContent::MultiPart(blocks) => {
+                        use base64::engine::general_purpose::STANDARD;
+                        use base64::Engine;
                         let text = blocks
                             .iter()
                             .filter_map(|b| match b {
@@ -358,10 +364,24 @@ impl OllamaProvider {
                             })
                             .collect::<Vec<_>>()
                             .join("\n");
+                        // Ollama carries images at the message level as a list
+                        // of base64 strings (no data-URI prefix). Callers only
+                        // place `Image` blocks here for vision-capable models
+                        // (gated upstream by `supports_vision`).
+                        let images: Vec<String> = blocks
+                            .iter()
+                            .filter_map(|b| match b {
+                                rustykrab_core::types::ContentBlock::Image { data, .. } => {
+                                    Some(STANDARD.encode(data))
+                                }
+                                _ => None,
+                            })
+                            .collect();
                         OllamaMessage {
                             role: role.to_string(),
                             content: Some(text),
                             tool_calls: None,
+                            images: (!images.is_empty()).then_some(images),
                         }
                     }
                 })
@@ -533,6 +553,10 @@ impl ModelProvider for OllamaProvider {
 
     fn context_limit(&self) -> Option<usize> {
         self.effective_ctx().map(|v| v as usize)
+    }
+
+    fn supports_vision(&self) -> bool {
+        vision_support(&self.model)
     }
 
     async fn chat(&self, messages: &[Message], tools: &[ToolSchema]) -> Result<ModelResponse> {
@@ -971,6 +995,11 @@ struct OllamaMessage {
     content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<OllamaToolCall>>,
+    /// Base64-encoded images attached to this message (no data-URI prefix).
+    /// Ollama's chat API takes images at the message level rather than as
+    /// individual content blocks. Only populated for vision-capable models.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    images: Option<Vec<String>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1086,6 +1115,53 @@ fn parse_context_length_from_show(raw: &serde_json::Value) -> Option<u32> {
     None
 }
 
+/// Decide whether the configured Ollama model can accept image input.
+///
+/// Vision is a per-model property in Ollama (the same provider serves both
+/// text-only and multimodal models), so we key off the model tag. The
+/// `OLLAMA_VISION` env var overrides the heuristic: `true`/`1`/`on` force it
+/// on, `false`/`0`/`off` force it off, and `auto` (the default) falls back to
+/// `model_supports_vision`.
+fn vision_support(model: &str) -> bool {
+    match std::env::var("OLLAMA_VISION").ok().as_deref() {
+        Some(v) => match v.trim().to_ascii_lowercase().as_str() {
+            "true" | "1" | "on" | "yes" => true,
+            "false" | "0" | "off" | "no" => false,
+            // "auto" or anything unrecognized: fall through to the heuristic.
+            _ => model_supports_vision(model),
+        },
+        None => model_supports_vision(model),
+    }
+}
+
+/// Heuristic match against known vision-capable Ollama model families.
+///
+/// Matches on the model tag (e.g. `gemma4:26b`, `llava:13b`). New multimodal
+/// families can be added here; when in doubt users can force the answer with
+/// `OLLAMA_VISION`.
+fn model_supports_vision(model: &str) -> bool {
+    let m = model.to_ascii_lowercase();
+    const VISION_FAMILIES: &[&str] = &[
+        "gemma3",
+        "gemma4",
+        "llava",
+        "bakllava",
+        "llama3.2-vision",
+        "llama4",
+        "qwen2-vl",
+        "qwen2.5vl",
+        "qwen2.5-vl",
+        "qwen3-vl",
+        "minicpm-v",
+        "moondream",
+        "granite3.2-vision",
+        "mistral-small3.1",
+        "mistral-small3.2",
+        "pixtral",
+    ];
+    VISION_FAMILIES.iter().any(|fam| m.contains(fam))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1095,6 +1171,7 @@ mod tests {
             role: "user".to_string(),
             content: Some(content.to_string()),
             tool_calls: None,
+            images: None,
         }
     }
 
@@ -1103,6 +1180,7 @@ mod tests {
             role: "system".to_string(),
             content: Some(content.to_string()),
             tool_calls: None,
+            images: None,
         }
     }
 
@@ -1111,7 +1189,68 @@ mod tests {
             role: "tool".to_string(),
             content: Some(content.to_string()),
             tool_calls: None,
+            images: None,
         }
+    }
+
+    #[test]
+    fn model_supports_vision_matches_known_families() {
+        assert!(model_supports_vision("gemma4:26b"));
+        assert!(model_supports_vision("gemma3:12b"));
+        assert!(model_supports_vision("llava:13b"));
+        assert!(model_supports_vision("llama3.2-vision:11b"));
+        assert!(model_supports_vision("QWEN2.5VL:7B")); // case-insensitive
+
+        assert!(!model_supports_vision("llama3.1:8b"));
+        assert!(!model_supports_vision("mistral:7b"));
+        assert!(!model_supports_vision("qwen2.5:7b")); // text-only sibling
+    }
+
+    #[test]
+    fn build_messages_carries_images_for_multipart() {
+        use base64::engine::general_purpose::STANDARD;
+        use base64::Engine;
+        use rustykrab_core::types::ContentBlock;
+
+        let png = vec![0x89u8, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+        let msg = Message {
+            id: Uuid::new_v4(),
+            role: Role::User,
+            content: MessageContent::MultiPart(vec![
+                ContentBlock::Text {
+                    text: "what is this?".to_string(),
+                },
+                ContentBlock::Image {
+                    media_type: "image/png".to_string(),
+                    data: png.clone(),
+                },
+            ]),
+            created_at: Utc::now(),
+        };
+
+        let built = OllamaProvider::build_messages(&[msg]).expect("build_messages");
+        assert_eq!(built.len(), 1);
+        assert_eq!(built[0].content.as_deref(), Some("what is this?"));
+        let images = built[0].images.as_ref().expect("images present");
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0], STANDARD.encode(&png));
+        // Images must serialize as a bare base64 string with no data-URI prefix.
+        assert!(!images[0].starts_with("data:"));
+    }
+
+    #[test]
+    fn build_messages_omits_images_when_none() {
+        let msg = Message {
+            id: Uuid::new_v4(),
+            role: Role::User,
+            content: MessageContent::Text("hello".to_string()),
+            created_at: Utc::now(),
+        };
+        let built = OllamaProvider::build_messages(&[msg]).expect("build_messages");
+        assert!(built[0].images.is_none());
+        // `images` must be skipped entirely in the wire payload when absent.
+        let json = serde_json::to_value(&built[0]).unwrap();
+        assert!(json.get("images").is_none());
     }
 
     #[test]
