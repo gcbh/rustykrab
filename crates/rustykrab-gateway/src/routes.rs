@@ -268,11 +268,14 @@ async fn delete_conversation(
         .store
         .conversations()
         .delete(id)
-        .map(|_| StatusCode::NO_CONTENT)
         .map_err(|e| match e {
             rustykrab_core::Error::NotFound(_) => StatusCode::NOT_FOUND,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
-        })
+        })?;
+    // Drop the recall archive too (cache + durable row) so a deleted
+    // conversation leaves nothing behind.
+    state.recall.purge(id);
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// `GET /api/conversations/{id}/messages`.

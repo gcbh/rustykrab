@@ -66,6 +66,12 @@ impl AppState {
         provider: Arc<dyn ModelProvider>,
         auth_token: String,
     ) -> Self {
+        // Back the recall archive with SQLite so compaction-displaced
+        // history survives process restarts. The in-memory `RecallStore`
+        // acts as a write-through cache, lazily hydrated per conversation.
+        let recall = Arc::new(RecallStore::with_persistence(Arc::new(
+            store.recall_archive(),
+        )));
         Self {
             store,
             tools,
@@ -85,7 +91,7 @@ impl AppState {
             memory: None,
             agent_id: None,
             active_tools: Arc::new(ActiveToolsRegistry::new()),
-            recall: Arc::new(RecallStore::new()),
+            recall,
             subagents_enabled: false,
         }
     }
