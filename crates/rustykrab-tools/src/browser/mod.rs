@@ -246,7 +246,7 @@ impl Tool for BrowserTool {
                     },
                     "depth": {
                         "type": "integer",
-                        "description": "Snapshot: max tree depth (default: 10)"
+                        "description": "Snapshot: max tree depth (default: 50). Modern SPAs nest interactive elements 25-40 levels deep; raise this if a snapshot returns no/too few elements."
                     },
                     "highlight": {
                         "type": "boolean",
@@ -544,7 +544,7 @@ impl Tool for BrowserTool {
                     mode,
                     interactive_only: args["interactive"].as_bool().unwrap_or(false),
                     compact: args["compact"].as_bool().unwrap_or(false),
-                    max_depth: args["depth"].as_u64().unwrap_or(10) as usize,
+                    max_depth: args["depth"].as_u64().unwrap_or(50) as usize,
                     selector: args["selector"].as_str().map(|s| s.to_string()),
                     highlight: args["highlight"].as_bool().unwrap_or(false),
                 };

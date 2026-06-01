@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.1.3] - 2026-06-01
+
+- Raise snapshot max_depth default to 50 for deep SPAs (#461)
+
+## [4.1.2] - 2026-06-01
+
+- Group caldav under the integration tool category (#459)
+
 ## [4.1.1] - 2026-06-01
 
 - feat(recall): persist compaction-displaced history across restarts (#458)

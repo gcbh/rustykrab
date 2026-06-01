@@ -25,7 +25,14 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 /// Maximum depth for accessibility tree traversal.
-const DEFAULT_MAX_DEPTH: usize = 10;
+///
+/// Modern React/Angular/Vue SPAs nest interactive elements deeply — Instagram's
+/// login inputs sit ~32 levels down, and Google/Amazon are similar. A shallow
+/// limit makes the walker stop before reaching them, so a snapshot reports 0
+/// interactive elements even though they're visible and functional. 50 covers
+/// all practical cases; the walker is O(n) in DOM nodes, so the extra headroom
+/// is cheap. Callers can still override via the `depth` snapshot parameter.
+const DEFAULT_MAX_DEPTH: usize = 50;
 
 /// Marker between segments of a shadow-DOM piercing selector.
 #[allow(dead_code)]
@@ -213,7 +220,7 @@ const SNAPSHOT_JS: &str = r#"
     var SHADOW_SEP = ' >>> ';
     var IFRAME_SEP = ' ||| ';
 
-    var MAX_DEPTH = arguments[0] || 10;
+    var MAX_DEPTH = arguments[0] || 50;
     var INTERACTIVE_ONLY = arguments[1] || false;
     var SCOPE_SELECTOR = arguments[2] || null;
     var HIGHLIGHT = arguments[3] || false;
@@ -664,6 +671,20 @@ mod tests {
         let mut m = HashMap::new();
         m.insert(id.to_string(), mk_ref(id));
         m
+    }
+
+    #[test]
+    fn default_max_depth_reaches_deep_spa_elements() {
+        // Modern React/Angular/Vue SPAs nest interactive elements deeply.
+        // Instagram's login inputs sit ~32 levels down; the default must walk
+        // past that or snapshots report 0 interactive elements on such pages.
+        const DEEPEST_OBSERVED_SPA_NESTING: usize = 32;
+        assert!(
+            SnapshotOptions::default().max_depth > DEEPEST_OBSERVED_SPA_NESTING,
+            "default max_depth ({}) must exceed real-world SPA nesting ({})",
+            SnapshotOptions::default().max_depth,
+            DEEPEST_OBSERVED_SPA_NESTING,
+        );
     }
 
     #[tokio::test]

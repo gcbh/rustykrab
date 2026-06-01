@@ -16,7 +16,7 @@ pub(crate) fn categorize(name: &str) -> &'static str {
         }
         "image" | "video" | "canvas" => "media",
         "cron" | "gateway" => "automation",
-        "gmail" | "notion" | "obsidian" => "integration",
+        "gmail" | "caldav" | "notion" | "obsidian" => "integration",
         "skills" => "skills",
         "message" => "messaging",
         "nodes" => "devices",
