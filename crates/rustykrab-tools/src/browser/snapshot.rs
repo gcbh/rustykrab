@@ -192,6 +192,50 @@ impl Default for SnapshotOptions {
     }
 }
 
+/// Builtin-guard script, installed via `addScriptToEvaluateOnNewDocument`
+/// (chromiumoxide's `evaluate_on_new_document`) so it runs *before* any page
+/// JavaScript.
+///
+/// Closure-compiled sites (Instagram, Google Flights, YouTube, Google Maps)
+/// sometimes shadow global builtins — historically `Function.prototype.apply`,
+/// which broke the way we used to invoke the snapshot IIFE. Capturing the
+/// pristine native originals here, before the page can replace them, lets the
+/// snapshot read trusted builtins from `window.__rk_builtins` instead of the
+/// (possibly poisoned) live globals.
+///
+/// Idempotent: a no-op once `__rk_builtins` exists, so re-registration across
+/// navigations is harmless.
+pub(crate) const BUILTIN_GUARD_JS: &str = r#"
+(function() {
+    if (window.__rk_builtins) return;
+    var R = (typeof Reflect !== 'undefined' && Reflect.apply) ? Reflect.apply : null;
+    try {
+        window.__rk_builtins = {
+            // Used to invoke cached prototype methods without routing through a
+            // shadowable Function.prototype.apply / .call.
+            reflectApply: R,
+            apply: Function.prototype.apply,
+            call: Function.prototype.call,
+            stringify: JSON.stringify,
+            arrayFrom: Array.from,
+            arrayIsArray: Array.isArray,
+            // Bound now (while .bind is still native) so callers can invoke
+            // them as plain functions with the correct receiver.
+            getComputedStyle: window.getComputedStyle.bind(window),
+            cssEscape: (window.CSS && CSS.escape) ? CSS.escape.bind(CSS) : null,
+            // Prototype methods kept unbound; invoke via reflectApply(el, ...).
+            getAttribute: Element.prototype.getAttribute,
+            hasAttribute: Element.prototype.hasAttribute,
+            querySelector: Element.prototype.querySelector,
+            querySelectorAll: Element.prototype.querySelectorAll,
+            getBoundingClientRect: Element.prototype.getBoundingClientRect
+        };
+    } catch (e) {
+        // Leave __rk_builtins unset; the snapshot IIFE falls back to live globals.
+    }
+})();
+"#;
+
 /// JavaScript that extracts the accessibility tree from a page.
 ///
 /// Walks the document, open shadow roots, and same-origin iframes. Returns an
@@ -201,6 +245,41 @@ impl Default for SnapshotOptions {
 /// Args: [maxDepth, interactiveOnly, scopeSelector, highlight]
 const SNAPSHOT_JS: &str = r#"
 (function() {
+    // ── Builtin hardening ──────────────────────────────────────────────
+    // Prefer the pristine builtins captured at document-create time by the
+    // CDP pre-inject (BUILTIN_GUARD_JS). Fall back to live globals when the
+    // guard never ran (e.g. a tab navigated outside our `navigate` action) —
+    // hardened where we can, functional everywhere.
+    var __B = window.__rk_builtins || {};
+    var _reflectApply = __B.reflectApply ||
+        (typeof Reflect !== 'undefined' && Reflect.apply) || null;
+    // Invoke a (possibly prototype) method without touching a shadowable
+    // Function.prototype.apply / .call on the function object itself.
+    function _invoke(fn, thisArg, args) {
+        if (_reflectApply) return _reflectApply(fn, thisArg, args);
+        return fn.apply(thisArg, args);
+    }
+    var _stringify = __B.stringify || JSON.stringify;
+    var _arrayFrom = __B.arrayFrom || Array.from;
+    var _getComputedStyle = __B.getComputedStyle ||
+        function(el) { return window.getComputedStyle(el); };
+    var _cssEscapeNative = __B.cssEscape ||
+        ((window.CSS && CSS.escape) ? function(s) { return CSS.escape(s); } : null);
+    var _p_getAttribute = __B.getAttribute || Element.prototype.getAttribute;
+    var _p_hasAttribute = __B.hasAttribute || Element.prototype.hasAttribute;
+    var _p_getBCR = __B.getBoundingClientRect || Element.prototype.getBoundingClientRect;
+    // Element-receiver wrappers, guarded so non-element nodes return a benign
+    // default instead of throwing (matches the old `el.getAttribute && ...`).
+    function _getAttr(el, name) {
+        if (!el || el.nodeType !== 1) return null;
+        return _invoke(_p_getAttribute, el, [name]);
+    }
+    function _hasAttr(el, name) {
+        if (!el || el.nodeType !== 1) return false;
+        return _invoke(_p_hasAttribute, el, [name]);
+    }
+    function _bcr(el) { return _invoke(_p_getBCR, el, []); }
+
     var INTERACTIVE_ROLES = new Set([
         'button', 'link', 'textbox', 'checkbox', 'radio', 'combobox',
         'listbox', 'menuitem', 'menuitemcheckbox', 'menuitemradio',
@@ -225,7 +304,7 @@ const SNAPSHOT_JS: &str = r#"
     if (stale) stale.remove();
 
     function csqEscape(s) {
-        if (window.CSS && CSS.escape) return CSS.escape(s);
+        if (_cssEscapeNative) return _cssEscapeNative(s);
         return String(s).replace(/[^a-zA-Z0-9_-]/g, function(c) { return '\\' + c; });
     }
 
@@ -233,15 +312,15 @@ const SNAPSHOT_JS: &str = r#"
     // ShadowRoot. Prefers stable attributes.
     function localSelector(el) {
         if (el.id && !/^[0-9]/.test(el.id)) return '#' + csqEscape(el.id);
-        var tid = el.getAttribute && el.getAttribute('data-testid');
+        var tid = _getAttr(el, 'data-testid');
         if (tid) return el.tagName.toLowerCase() + '[data-testid="' + cssAttrEscape(tid) + '"]';
-        var dataQa = el.getAttribute && el.getAttribute('data-qa');
+        var dataQa = _getAttr(el, 'data-qa');
         if (dataQa) return el.tagName.toLowerCase() + '[data-qa="' + cssAttrEscape(dataQa) + '"]';
-        var name = el.getAttribute && el.getAttribute('name');
+        var name = _getAttr(el, 'name');
         if (name && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT' || el.tagName === 'BUTTON')) {
             return el.tagName.toLowerCase() + '[name="' + cssAttrEscape(name) + '"]';
         }
-        var aria = el.getAttribute && el.getAttribute('aria-label');
+        var aria = _getAttr(el, 'aria-label');
         if (aria && aria.length < 100) {
             return el.tagName.toLowerCase() + '[aria-label="' + cssAttrEscape(aria) + '"]';
         }
@@ -265,7 +344,7 @@ const SNAPSHOT_JS: &str = r#"
                 parts.unshift('#' + csqEscape(node.id));
                 break;
             }
-            var siblings = Array.from(parent.children).filter(function(c) {
+            var siblings = _arrayFrom(parent.children).filter(function(c) {
                 return c.tagName === node.tagName;
             });
             if (siblings.length === 1) {
@@ -300,19 +379,19 @@ const SNAPSHOT_JS: &str = r#"
     }
 
     function isInteractive(el) {
-        var role = (el.getAttribute && (el.getAttribute('role') || '')).toLowerCase();
+        var role = (_getAttr(el, 'role') || '').toLowerCase();
         if (INTERACTIVE_ROLES.has(role)) return true;
         if (INTERACTIVE_TAGS.has(el.tagName)) return true;
-        if (el.hasAttribute && (el.hasAttribute('onclick') || el.hasAttribute('tabindex'))) return true;
+        if (_hasAttr(el, 'onclick') || _hasAttr(el, 'tabindex')) return true;
         if (el.tagName === 'DIV' || el.tagName === 'SPAN') {
-            var style = window.getComputedStyle(el);
+            var style = _getComputedStyle(el);
             if (style.cursor === 'pointer') return true;
         }
         return false;
     }
 
     function getRole(el) {
-        var explicit = el.getAttribute && el.getAttribute('role');
+        var explicit = _getAttr(el, 'role');
         if (explicit) return explicit.toLowerCase();
         var tag = el.tagName;
         if (tag === 'A') return 'link';
@@ -338,10 +417,10 @@ const SNAPSHOT_JS: &str = r#"
     }
 
     function getName(el) {
-        if (!el.getAttribute) return '';
-        var ariaLabel = el.getAttribute('aria-label');
+        if (!el || el.nodeType !== 1) return '';
+        var ariaLabel = _getAttr(el, 'aria-label');
         if (ariaLabel) return ariaLabel;
-        var labelledBy = el.getAttribute('aria-labelledby');
+        var labelledBy = _getAttr(el, 'aria-labelledby');
         if (labelledBy) {
             var label = (el.getRootNode && el.getRootNode().getElementById)
                 ? el.getRootNode().getElementById(labelledBy)
@@ -355,9 +434,9 @@ const SNAPSHOT_JS: &str = r#"
                 var assoc = root.querySelector ? root.querySelector('label[for="' + cssAttrEscape(id) + '"]') : null;
                 if (assoc) return (assoc.textContent || '').trim().substring(0, 100);
             }
-            var placeholder = el.getAttribute('placeholder');
+            var placeholder = _getAttr(el, 'placeholder');
             if (placeholder) return placeholder;
-            var title = el.getAttribute('title');
+            var title = _getAttr(el, 'title');
             if (title) return title;
         }
         if (el.tagName === 'IMG') return el.alt || '';
@@ -370,10 +449,10 @@ const SNAPSHOT_JS: &str = r#"
     // Visibility check: layout box, computed style, opacity, viewport overlap,
     // and a center-point occlusion probe.
     function isVisible(el) {
-        var style = window.getComputedStyle(el);
+        var style = _getComputedStyle(el);
         if (style.display === 'none' || style.visibility === 'hidden') return false;
         if (parseFloat(style.opacity || '1') === 0) return false;
-        var rect = el.getBoundingClientRect();
+        var rect = _bcr(el);
         if (rect.width <= 0 || rect.height <= 0) return false;
         // Off the document entirely (negative side, beyond doc) — keep, the
         // page may scroll. We only filter purely degenerate cases above.
@@ -383,7 +462,7 @@ const SNAPSHOT_JS: &str = r#"
     // Returns true if `el` is occluded at its center by a non-descendant node.
     // Skipped for elements outside the viewport (we cannot probe those).
     function isOccluded(el) {
-        var rect = el.getBoundingClientRect();
+        var rect = _bcr(el);
         if (rect.width <= 0 || rect.height <= 0) return true;
         var vw = window.innerWidth || document.documentElement.clientWidth;
         var vh = window.innerHeight || document.documentElement.clientHeight;
@@ -404,7 +483,7 @@ const SNAPSHOT_JS: &str = r#"
     var refCounter = 0;
 
     var rootDoc = SCOPE_SELECTOR ? document.querySelector(SCOPE_SELECTOR) : document.body;
-    if (!rootDoc) return JSON.stringify({ elements: [], note: 'scope selector did not match' });
+    if (!rootDoc) return _stringify({ elements: [], note: 'scope selector did not match' });
 
     function walk(node, depth, chain) {
         if (depth > MAX_DEPTH) return;
@@ -423,7 +502,7 @@ const SNAPSHOT_JS: &str = r#"
         if (INTERACTIVE_ONLY && !interactive) collect = false;
 
         if (collect) {
-            var rect = node.getBoundingClientRect();
+            var rect = _bcr(node);
             results.push({
                 node: node,
                 chain: chain.slice(),
@@ -508,7 +587,7 @@ const SNAPSHOT_JS: &str = r#"
             depth: e.depth
         };
     });
-    return JSON.stringify(out);
+    return _stringify(out);
 })
 "#;
 
@@ -525,6 +604,21 @@ struct RawElement {
     bounds: Option<[f64; 4]>,
     #[allow(dead_code)]
     depth: usize,
+}
+
+/// Register the builtin-guard script to run before any page JavaScript on the
+/// next navigation of this page.
+///
+/// Capturing native builtins this early (via CDP
+/// `addScriptToEvaluateOnNewDocument`) is the only layer that reliably defeats
+/// sites which shadow builtins on load — by the time the snapshot IIFE runs the
+/// originals may already be gone. Best-effort: a failure here just means the
+/// IIFE falls back to whatever globals are live at snapshot time.
+pub async fn install_builtin_guard(page: &Page) -> Result<()> {
+    page.evaluate_on_new_document(BUILTIN_GUARD_JS)
+        .await
+        .map_err(|e| Error::ToolExecution(format!("builtin-guard install failed: {e}").into()))?;
+    Ok(())
 }
 
 /// Take a snapshot of the page's accessibility tree.

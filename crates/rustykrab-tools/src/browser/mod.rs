@@ -483,6 +483,11 @@ impl Tool for BrowserTool {
                 // run before the target page's own JS — this is what hides
                 // `navigator.webdriver` from frameworks that read it on load.
                 let _ = stealth::install_stealth_on_new_document(&page, &stealth_opts).await;
+                // Capture pristine builtins before the page can shadow them, so
+                // a later `snapshot` survives Closure-compiled sites (Instagram,
+                // Google Flights, YouTube) that override Function.prototype.apply
+                // and friends.
+                let _ = snapshot::install_builtin_guard(&page).await;
 
                 page.goto(url)
                     .await
