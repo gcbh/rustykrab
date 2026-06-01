@@ -202,8 +202,11 @@ impl Default for SnapshotOptions {
 /// JavaScript that extracts the accessibility tree from a page.
 ///
 /// Walks the document, open shadow roots, and same-origin iframes. Returns an
+/// object `{ elements, truncatedSubtrees, maxDepth }` where `elements` is an
 /// array of objects with: tag, role, name, value, selector (possibly chained),
-/// interactive, bounds (x, y, w, h), depth.
+/// interactive, bounds (x, y, w, h), depth. `truncatedSubtrees` counts subtree
+/// roots skipped for exceeding `maxDepth` (a non-zero value means deeper
+/// elements were not captured).
 ///
 /// Args: [maxDepth, interactiveOnly, scopeSelector, highlight]
 const SNAPSHOT_JS: &str = r#"
@@ -409,12 +412,16 @@ const SNAPSHOT_JS: &str = r#"
 
     var results = [];
     var refCounter = 0;
+    // Count subtree roots we refuse to descend into because they exceed
+    // MAX_DEPTH. Non-zero means interactive elements may be nested below the
+    // cutoff and were never captured — the caller can retry with a higher depth.
+    var truncatedSubtrees = 0;
 
     var rootDoc = SCOPE_SELECTOR ? document.querySelector(SCOPE_SELECTOR) : document.body;
     if (!rootDoc) return JSON.stringify({ elements: [], note: 'scope selector did not match' });
 
     function walk(node, depth, chain) {
-        if (depth > MAX_DEPTH) return;
+        if (depth > MAX_DEPTH) { truncatedSubtrees++; return; }
         if (!node) return;
         // Element-like node.
         if (node.nodeType !== 1) return;
@@ -515,9 +522,25 @@ const SNAPSHOT_JS: &str = r#"
             depth: e.depth
         };
     });
-    return JSON.stringify(out);
+    return JSON.stringify({ elements: out, truncatedSubtrees: truncatedSubtrees, maxDepth: MAX_DEPTH });
 })
 "#;
+
+/// Top-level result from the JS snapshot.
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct RawSnapshot {
+    #[serde(default)]
+    elements: Vec<RawElement>,
+    /// Number of subtree roots the walker skipped for exceeding `max_depth`.
+    /// Non-zero means interactive elements may be nested below the cutoff and
+    /// were not captured.
+    #[serde(default)]
+    truncated_subtrees: usize,
+    /// Optional diagnostic note from the walker (e.g. a scope-selector miss).
+    #[serde(default)]
+    note: Option<String>,
+}
 
 /// Raw element data from the JS snapshot.
 #[derive(Debug, Deserialize)]
@@ -564,15 +587,16 @@ pub async fn take_snapshot(
         .await
         .map_err(|e| Error::ToolExecution(format!("snapshot failed: {e}").into()))?;
 
-    let raw_json: String = result.into_value().unwrap_or_else(|_| "[]".to_string());
-    let elements: Vec<RawElement> = serde_json::from_str(&raw_json).unwrap_or_default();
+    let raw_json: String = result.into_value().unwrap_or_else(|_| "{}".to_string());
+    let raw: RawSnapshot = serde_json::from_str(&raw_json).unwrap_or_default();
+    let elements = &raw.elements;
 
     // Assign refs and build the output
     let mut ref_map = HashMap::new();
     let mut output_elements = Vec::new();
     let mut ref_counter = 0usize;
 
-    for elem in &elements {
+    for elem in elements {
         ref_counter += 1;
         let ref_id = match options.mode {
             SnapshotMode::Ai => format!("{ref_counter}"),
@@ -622,6 +646,14 @@ pub async fn take_snapshot(
 
     let url = page.url().await.ok().flatten().unwrap_or_default();
     let title = page.get_title().await.ok().flatten().unwrap_or_default();
+    let interactive_count = elements.iter().filter(|e| e.interactive).count();
+
+    let note = build_note(
+        options.mode,
+        options.max_depth,
+        raw.truncated_subtrees,
+        raw.note.as_deref(),
+    );
 
     Ok(serde_json::json!({
         "url": url,
@@ -629,13 +661,43 @@ pub async fn take_snapshot(
         "mode": match options.mode { SnapshotMode::Ai => "ai", SnapshotMode::Aria => "aria" },
         "elements": output_elements,
         "count": ref_counter,
-        "interactive_count": elements.iter().filter(|e| e.interactive).count(),
+        "interactive_count": interactive_count,
+        "truncated_subtrees": raw.truncated_subtrees,
+        "max_depth": options.max_depth,
         "highlight": options.highlight,
-        "note": format!(
-            "Use ref numbers with 'act' action to interact with elements (e.g., act click {}1)",
-            if options.mode == SnapshotMode::Aria { "e" } else { "" }
-        )
+        "note": note
     }))
+}
+
+/// Build the snapshot's `note` string.
+///
+/// Leads with any walker diagnostic, and when the tree was truncated adds an
+/// explicit nudge toward the `depth` parameter — so the agent has an observable
+/// reason to retry deeper instead of concluding the page is empty or bot-blocked
+/// (the failure mode that prompted this). Always ends with the `act` usage hint.
+fn build_note(
+    mode: SnapshotMode,
+    max_depth: usize,
+    truncated_subtrees: usize,
+    walker_note: Option<&str>,
+) -> String {
+    let prefix = if mode == SnapshotMode::Aria { "e" } else { "" };
+    let mut notes: Vec<String> = Vec::new();
+    if let Some(walker_note) = walker_note {
+        notes.push(walker_note.to_string());
+    }
+    if truncated_subtrees > 0 {
+        notes.push(format!(
+            "Tree walk stopped at max_depth={max_depth} and skipped {truncated_subtrees} \
+             deeper subtree(s); interactive elements nested below the cutoff were not \
+             captured. If an expected element is missing (common on deeply-nested \
+             React/Angular/Vue SPAs), retry this snapshot with a higher `depth`."
+        ));
+    }
+    notes.push(format!(
+        "Use ref numbers with 'act' action to interact with elements (e.g., act click {prefix}1)"
+    ));
+    notes.join(" ")
 }
 
 /// Truncate a string to a max length, appending "..." if truncated.
@@ -671,6 +733,35 @@ mod tests {
         let mut m = HashMap::new();
         m.insert(id.to_string(), mk_ref(id));
         m
+    }
+
+    #[test]
+    fn note_nudges_toward_depth_only_when_truncated() {
+        // No truncation: plain act hint, no depth nudge.
+        let clean = build_note(SnapshotMode::Ai, 50, 0, None);
+        assert!(clean.contains("act click 1"));
+        assert!(!clean.to_lowercase().contains("depth"));
+
+        // Truncation: must surface the cutoff and steer toward `depth`.
+        let truncated = build_note(SnapshotMode::Ai, 50, 7, None);
+        assert!(truncated.contains("max_depth=50"));
+        assert!(truncated.contains("7"));
+        assert!(truncated.contains("`depth`"));
+        // Still ends with the act usage hint.
+        assert!(truncated.contains("act click 1"));
+    }
+
+    #[test]
+    fn note_preserves_walker_diagnostic_and_aria_prefix() {
+        let note = build_note(
+            SnapshotMode::Aria,
+            50,
+            0,
+            Some("scope selector did not match"),
+        );
+        assert!(note.starts_with("scope selector did not match"));
+        // Aria mode refs are e-prefixed.
+        assert!(note.contains("act click e1"));
     }
 
     #[test]
