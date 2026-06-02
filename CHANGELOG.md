@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.2.0] - 2026-06-02
+
+- feat(agent): seed `skills` into the active set so authoring is reachable (#462)
+
 ## [4.1.4] - 2026-06-01
 
 - Add vision (image input) support to the Ollama provider (#460)
