@@ -78,6 +78,9 @@ mod notion;
 // Obsidian integration
 pub(crate) mod obsidian;
 
+// Internal wiki (filesystem-backed interlinked HTML knowledge base)
+mod wiki;
+
 // Credentials (from main)
 mod credential_read;
 mod credential_write;
@@ -168,6 +171,9 @@ pub use notion::NotionTool;
 
 // Obsidian
 pub use obsidian::ObsidianTool;
+
+// Internal wiki
+pub use wiki::WikiTool;
 
 // Credentials
 pub use credential_read::CredentialReadTool;
@@ -267,6 +273,19 @@ pub fn memory_tools(
         std::sync::Arc::new(MemoryGetTool::new(backend.clone())),
         std::sync::Arc::new(MemoryDeleteTool::new(backend)),
     ]
+}
+
+/// Collect wiki tools into a Vec.
+///
+/// The wiki is a filesystem-backed, interlinked HTML knowledge base rooted at
+/// `wiki_dir`. Page writes are additionally indexed into the supplied
+/// [`MemoryBackend`] so pages can be recalled semantically and resolved back to
+/// files on disk.
+pub fn wiki_tools(
+    wiki_dir: std::path::PathBuf,
+    memory: std::sync::Arc<dyn MemoryBackend>,
+) -> Vec<std::sync::Arc<dyn rustykrab_core::Tool>> {
+    vec![std::sync::Arc::new(WikiTool::new(wiki_dir, memory))]
 }
 
 /// Collect messaging tools that require a MessageBackend into a Vec.
