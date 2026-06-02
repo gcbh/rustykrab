@@ -662,11 +662,19 @@ async fn main() -> anyhow::Result<()> {
 
     // --- Tools ---
     let mut tools = rustykrab_tools::builtin_tools(store.secrets());
-    tools.extend(rustykrab_tools::memory_tools(memory_backend));
+    tools.extend(rustykrab_tools::memory_tools(memory_backend.clone()));
     tools.extend(rustykrab_tools::skill_tools(
         skills_dir.clone(),
         Some(skill_registry.clone()),
     ));
+
+    // --- Wiki tool (filesystem-backed interlinked HTML knowledge base) ---
+    // Pages live as static HTML under data_dir/wiki and are indexed into the
+    // hybrid memory system so they can be recalled semantically later.
+    let wiki_dir = data_dir.join("wiki");
+    std::fs::create_dir_all(&wiki_dir)?;
+    tools.extend(rustykrab_tools::wiki_tools(wiki_dir, memory_backend));
+    tracing::info!("wiki tool registered");
 
     // --- Message tool (delivers via Telegram/Slack/Signal) ---
     // Registered up-front with an empty hub; channel handles are stashed into

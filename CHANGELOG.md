@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.3.0] - 2026-06-02
+
+- Add internal wiki tool: filesystem-backed interlinked HTML knowledge base (#463)
+
 ## [4.2.0] - 2026-06-02
 
 - feat(agent): seed `skills` into the active set so authoring is reachable (#462)
