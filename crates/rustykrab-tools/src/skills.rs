@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use rustykrab_core::active_tools::with_session_context;
 use rustykrab_core::types::ToolSchema;
 use rustykrab_core::{Error, Result, SandboxRequirements, Tool};
 use rustykrab_skills::SkillRegistry;
@@ -50,6 +51,27 @@ impl SkillsTool {
         if !is_valid_name(name) {
             return Err(Error::ToolExecution(
                 "invalid skill name: must be 1-64 chars, lowercase a-z, 0-9, hyphens, underscores only".into(),
+            ));
+        }
+
+        // Reject names that collide with a live tool. Each skill is exposed
+        // as a first-class tool by its name (`skill_md_as_tools`), and
+        // built-ins like `skills` are seeded into the conversation's active
+        // set — so a skill that took one of those names could never surface
+        // as a tool (it'd be dropped at registration) and, worse, would
+        // shadow the meta-tool in the `<available_skills>` catalog. Catch it
+        // here at authoring time instead of letting it fail silently later.
+        //
+        // Best-effort: the live tool set is only visible inside a runner
+        // session context. Outside one (tests, ad-hoc CLI invocations) we
+        // skip this and rely on the on-disk existence check below.
+        let collides_with_tool =
+            with_session_context(|ctx| ctx.all_tools.iter().any(|t| t.name() == name))
+                .unwrap_or(false);
+        if collides_with_tool {
+            return Err(Error::ToolExecution(
+                format!("skill name '{name}' collides with an existing tool; choose another name")
+                    .into(),
             ));
         }
 
@@ -690,6 +712,74 @@ mod tests {
             .await;
         assert!(r.is_err());
         assert!(r.unwrap_err().to_string().contains("unknown action"));
+    }
+
+    fn ctx_with_tools(
+        tools: Vec<Arc<dyn Tool>>,
+    ) -> rustykrab_core::active_tools::SessionToolContext {
+        use rustykrab_core::active_tools::{ActiveToolsRegistry, SessionToolContext};
+        use rustykrab_core::capability::CapabilitySet;
+        use rustykrab_core::recall::RecallStore;
+        SessionToolContext {
+            conversation_id: uuid::Uuid::new_v4(),
+            capabilities: Arc::new(CapabilitySet::none()),
+            all_tools: Arc::new(tools),
+            active_tools: Arc::new(ActiveToolsRegistry::new()),
+            recall: Arc::new(RecallStore::new()),
+        }
+    }
+
+    #[tokio::test]
+    async fn create_rejects_name_colliding_with_live_tool() {
+        use rustykrab_core::SESSION_TOOL_CONTEXT;
+        let tmp = TempDir::new().unwrap();
+        let tool = SkillsTool::new(tmp.path().to_path_buf());
+        // A live tool already owns the name `skills` (the meta-tool itself,
+        // now seeded into the active set). A skill must not shadow it.
+        let existing: Vec<Arc<dyn Tool>> =
+            vec![Arc::new(SkillsTool::new(tmp.path().to_path_buf()))];
+
+        let result = SESSION_TOOL_CONTEXT
+            .scope(ctx_with_tools(existing), async {
+                tool.execute(json!({
+                    "action": "create",
+                    "name": "skills",
+                    "description": "shadow",
+                    "instructions": "nope"
+                }))
+                .await
+            })
+            .await;
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("collides"));
+        // Rejected before any disk write.
+        assert!(!tmp.path().join("skills").exists());
+    }
+
+    #[tokio::test]
+    async fn create_allows_non_colliding_name_in_context() {
+        use rustykrab_core::SESSION_TOOL_CONTEXT;
+        let tmp = TempDir::new().unwrap();
+        let tool = SkillsTool::new(tmp.path().to_path_buf());
+        let existing: Vec<Arc<dyn Tool>> =
+            vec![Arc::new(SkillsTool::new(tmp.path().to_path_buf()))];
+
+        let result = SESSION_TOOL_CONTEXT
+            .scope(ctx_with_tools(existing), async {
+                tool.execute(json!({
+                    "action": "create",
+                    "name": "fresh-skill",
+                    "description": "ok",
+                    "instructions": "do it"
+                }))
+                .await
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result["created"], true);
+        assert!(tmp.path().join("fresh-skill/SKILL.md").exists());
     }
 
     fn make_skill_md(name: &str, description: &str, body: &str) -> Arc<rustykrab_skills::SkillMd> {

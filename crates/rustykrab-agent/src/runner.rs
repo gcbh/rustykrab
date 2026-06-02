@@ -45,6 +45,24 @@ fn is_meta_tool(name: &str) -> bool {
     META_TOOL_NAMES.contains(&name)
 }
 
+/// Tool names seeded into every conversation's active set on the first
+/// schema computation, so they're visible from turn 0 without the model
+/// having to discover them via `tools_list` and turn them on with
+/// `tools_load`.
+///
+/// Unlike [`META_TOOL_NAMES`], these go through the normal per-conversation
+/// active set: they're reported by `tools_load`, capability-gated, and
+/// dropped when no tool of that name is registered. `skills` lives here
+/// because skill *authoring* (create/load/delete) is otherwise unreachable
+/// — nothing tells the model the tool exists, so it never loads it.
+///
+/// Seeding by bare name means these names must be reserved: a SKILL.md
+/// skill that took the name `skills` would collide with this tool. That
+/// collision is blocked at creation time in `rustykrab-tools`'
+/// `SkillsTool::action_create` and at registration time by
+/// `skill_md_as_tools`' dedup against the live tool set.
+const DEFAULT_ACTIVE_TOOLS: &[&str] = &["skills"];
+
 use crate::sandbox::{tool_timeout_secs, Sandbox, SandboxPolicy, DEFAULT_NET_TOOL_TIMEOUT_SECS};
 use crate::trace::{ExecutionTracer, ToolTrace};
 
@@ -721,6 +739,14 @@ impl AgentRunner {
     /// Meta-tools (`tools_list`, `tools_load`) are always included so the
     /// agent can always discover and load more tools.
     fn compute_schemas(&self, session: &Session, conv_id: Uuid) -> Vec<ToolSchema> {
+        // Seed the always-on defaults (e.g. `skills`) into this
+        // conversation's active set so they surface from the first turn
+        // without a `tools_load` round-trip. Idempotent — re-seeding an
+        // already-active name is a no-op — so this is safe to run every
+        // iteration. Names with no matching registered tool fall out in the
+        // filter below.
+        self.active_tools
+            .activate(conv_id, DEFAULT_ACTIVE_TOOLS.iter().copied());
         let active = self.active_tools.active_for(conv_id);
         self.tools
             .iter()
@@ -4151,6 +4177,51 @@ mod task_complete_tests {
         let caps = CapabilitySet::for_tools_permissive(&["noop", "task_complete"]);
         let session = Session::with_capabilities(conv_id, caps);
         (runner, session, conv_id)
+    }
+
+    #[tokio::test]
+    async fn skills_is_seeded_into_active_set() {
+        // `skills` must surface from turn 0 without a `tools_load`
+        // round-trip, while a non-seeded, non-meta tool stays hidden until
+        // it's explicitly activated.
+        let active = Arc::new(ActiveToolsRegistry::new());
+        let tools: Vec<Arc<dyn Tool>> = vec![
+            Arc::new(NoopTool {
+                name: "skills".into(),
+            }),
+            Arc::new(NoopTool {
+                name: "hidden".into(),
+            }),
+        ];
+        let runner = AgentRunner::new(
+            Arc::new(ScriptedProvider::new(vec![])),
+            tools,
+            Arc::new(NoSandbox),
+        )
+        .with_active_tools(active.clone());
+        let conv_id = Uuid::new_v4();
+        let caps = CapabilitySet::for_tools_permissive(&["skills", "hidden"]);
+        let session = Session::with_capabilities(conv_id, caps);
+
+        // Nothing activated yet — the default seed should still expose
+        // `skills` and only `skills`.
+        let names: Vec<String> = runner
+            .compute_schemas(&session, conv_id)
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert!(
+            names.contains(&"skills".to_string()),
+            "skills should be seeded into the active set, got {names:?}"
+        );
+        assert!(
+            !names.contains(&"hidden".to_string()),
+            "a non-seeded, non-meta tool must stay hidden until activated"
+        );
+
+        // The seed is recorded in the registry itself, so `tools_load`'s
+        // active listing reflects it too — not just the schema view.
+        assert!(active.active_for(conv_id).contains("skills"));
     }
 
     #[tokio::test]
