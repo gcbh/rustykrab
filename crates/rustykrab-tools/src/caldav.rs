@@ -92,7 +92,13 @@ impl CalDavTool {
                 .into(),
             )
         })?;
-        Ok((email, password))
+        // Google displays app passwords as four space-separated groups
+        // (`abcd efgh ijkl mnop`). Gmail's IMAP/SMTP tolerates the spaces
+        // server-side, but a CalDAV `Basic` auth header base64-encodes them
+        // verbatim and Google's DAV endpoint rejects it with 401. Strip all
+        // whitespace so a password stored in the displayed format still works,
+        // without requiring the user to re-enter it.
+        Ok((email.trim().to_string(), normalize_app_password(&password)))
     }
 
     /// The events collection URL for a given calendar id (defaults to the
@@ -539,6 +545,13 @@ impl CalDavTool {
 // ---------------------------------------------------------------------------
 // Pure helpers (unit-tested, no network)
 // ---------------------------------------------------------------------------
+
+/// Remove all whitespace from a Google app password. Google shows app
+/// passwords as four space-separated groups; the spaces are not part of the
+/// secret and break CalDAV `Basic` auth, so strip them.
+fn normalize_app_password(password: &str) -> String {
+    password.replace(char::is_whitespace, "")
+}
 
 /// Turn an href (possibly path-only) into an absolute Google CalDAV URL.
 fn absolutize(href: &str) -> String {
@@ -1006,6 +1019,25 @@ mod tests {
     #[test]
     fn parse_vevent_returns_none_without_event() {
         assert!(parse_vevent("BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n").is_none());
+    }
+
+    #[test]
+    fn app_password_whitespace_is_stripped() {
+        // Google's displayed format: four space-separated groups.
+        assert_eq!(
+            normalize_app_password("abcd efgh ijkl mnop"),
+            "abcdefghijklmnop"
+        );
+        // Leading/trailing and tab/newline whitespace too.
+        assert_eq!(
+            normalize_app_password("  abcd\tefgh\nijkl mnop  "),
+            "abcdefghijklmnop"
+        );
+        // Already-clean passwords are unchanged.
+        assert_eq!(
+            normalize_app_password("abcdefghijklmnop"),
+            "abcdefghijklmnop"
+        );
     }
 
     #[test]
