@@ -340,3 +340,27 @@ fn handle(enigo: &mut Enigo, cmd: Command) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn key_names_resolve() {
+        assert!(matches!(key_from_name("ctrl"), Some(Key::Control)));
+        assert!(matches!(key_from_name("Control"), Some(Key::Control)));
+        assert!(matches!(key_from_name("cmd"), Some(Key::Meta)));
+        assert!(matches!(key_from_name("Return"), Some(Key::Return)));
+        assert!(matches!(key_from_name("pageup"), Some(Key::PageUp)));
+        assert!(matches!(key_from_name("a"), Some(Key::Unicode('a'))));
+        // Multi-char tokens that aren't recognized names are rejected.
+        assert!(key_from_name("notakey").is_none());
+    }
+
+    #[test]
+    fn buttons_map() {
+        assert!(matches!(map_button(MouseButton::Left), Button::Left));
+        assert!(matches!(map_button(MouseButton::Right), Button::Right));
+        assert!(matches!(map_button(MouseButton::Middle), Button::Middle));
+    }
+}
