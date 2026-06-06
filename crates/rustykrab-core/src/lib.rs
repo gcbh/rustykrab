@@ -9,6 +9,7 @@ pub mod prompt_trace;
 pub mod recall;
 pub mod schema_validate;
 pub mod session;
+pub mod todo;
 pub mod tool;
 pub mod types;
 
@@ -23,4 +24,5 @@ pub use orchestration::{OrchestrationConfig, RecursiveCall, TaskComplexity, Vote
 pub use recall::RecallStore;
 pub use schema_validate::validate_tool_args;
 pub use session::Session;
+pub use todo::{render_todos, TodoItem, TodoStatus, TodoStore};
 pub use tool::{SandboxRequirements, Tool};

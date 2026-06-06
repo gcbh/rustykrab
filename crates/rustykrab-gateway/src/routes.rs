@@ -275,6 +275,8 @@ async fn delete_conversation(
     // Drop the recall archive too (cache + durable row) so a deleted
     // conversation leaves nothing behind.
     state.recall.purge(id);
+    // Drop the conversation's todo list as well.
+    state.todos.clear(id);
     Ok(StatusCode::NO_CONTENT)
 }
 

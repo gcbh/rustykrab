@@ -452,6 +452,7 @@ mod tests {
             all_tools: Arc::new(Vec::new()),
             active_tools: Arc::new(ActiveToolsRegistry::new()),
             recall,
+            todos: Arc::new(rustykrab_core::TodoStore::new()),
         };
         (ctx, conv)
     }
@@ -463,6 +464,7 @@ mod tests {
             all_tools: Arc::new(Vec::new()),
             active_tools: Arc::new(ActiveToolsRegistry::new()),
             recall: Arc::new(RecallStore::new()),
+            todos: Arc::new(rustykrab_core::TodoStore::new()),
         }
     }
 
@@ -568,6 +570,7 @@ mod tests {
             all_tools: Arc::new(Vec::new()),
             active_tools: Arc::new(ActiveToolsRegistry::new()),
             recall: recall.clone(),
+            todos: Arc::new(rustykrab_core::TodoStore::new()),
         };
         (ctx, conv, recall)
     }
