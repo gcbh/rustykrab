@@ -126,7 +126,8 @@ impl ComputerBackend for EnigoXcapBackend {
     }
 
     async fn mouse_move(&self, x: i32, y: i32) -> Result<()> {
-        self.dispatch(|reply| Command::MouseMove { x, y, reply }).await
+        self.dispatch(|reply| Command::MouseMove { x, y, reply })
+            .await
     }
 
     async fn click(&self, button: MouseButton, at: Option<(i32, i32)>) -> Result<()> {
@@ -135,11 +136,13 @@ impl ComputerBackend for EnigoXcapBackend {
     }
 
     async fn double_click(&self, at: Option<(i32, i32)>) -> Result<()> {
-        self.dispatch(|reply| Command::DoubleClick { at, reply }).await
+        self.dispatch(|reply| Command::DoubleClick { at, reply })
+            .await
     }
 
     async fn drag(&self, from: (i32, i32), to: (i32, i32)) -> Result<()> {
-        self.dispatch(|reply| Command::Drag { from, to, reply }).await
+        self.dispatch(|reply| Command::Drag { from, to, reply })
+            .await
     }
 
     async fn type_text(&self, text: &str) -> Result<()> {
@@ -285,7 +288,9 @@ fn handle(enigo: &mut Enigo, cmd: Command) {
                 if let Some((x, y)) = at {
                     enigo.move_mouse(x, y, Coordinate::Abs).map_err(emap)?;
                 }
-                enigo.button(map_button(button), Direction::Click).map_err(emap)
+                enigo
+                    .button(map_button(button), Direction::Click)
+                    .map_err(emap)
             })();
             let _ = reply.send(r);
         }
@@ -301,9 +306,13 @@ fn handle(enigo: &mut Enigo, cmd: Command) {
         }
         Command::Drag { from, to, reply } => {
             let r = (|| {
-                enigo.move_mouse(from.0, from.1, Coordinate::Abs).map_err(emap)?;
+                enigo
+                    .move_mouse(from.0, from.1, Coordinate::Abs)
+                    .map_err(emap)?;
                 enigo.button(Button::Left, Direction::Press).map_err(emap)?;
-                enigo.move_mouse(to.0, to.1, Coordinate::Abs).map_err(emap)?;
+                enigo
+                    .move_mouse(to.0, to.1, Coordinate::Abs)
+                    .map_err(emap)?;
                 enigo.button(Button::Left, Direction::Release).map_err(emap)
             })();
             let _ = reply.send(r);
