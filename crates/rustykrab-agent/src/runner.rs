@@ -56,12 +56,21 @@ fn is_meta_tool(name: &str) -> bool {
 /// because skill *authoring* (create/load/delete) is otherwise unreachable
 /// — nothing tells the model the tool exists, so it never loads it.
 ///
+/// `memory_search` and `memory_save` live here for the same reason: memory
+/// is a cross-cutting, reflexive capability (recall what the user told you
+/// before acting; persist facts worth keeping) that the model should reach
+/// for without a `tools_list`/`tools_load` round-trip first. Left lazy, the
+/// model rarely discovers them, so long-term memory effectively goes
+/// unused. `memory_get`/`memory_delete` stay lazy on purpose — they're
+/// occasional and (for delete) destructive, so reflexive availability isn't
+/// wanted.
+///
 /// Seeding by bare name means these names must be reserved: a SKILL.md
 /// skill that took the name `skills` would collide with this tool. That
 /// collision is blocked at creation time in `rustykrab-tools`'
 /// `SkillsTool::action_create` and at registration time by
 /// `skill_md_as_tools`' dedup against the live tool set.
-const DEFAULT_ACTIVE_TOOLS: &[&str] = &["skills"];
+const DEFAULT_ACTIVE_TOOLS: &[&str] = &["skills", "memory_search", "memory_save"];
 
 use crate::sandbox::{tool_timeout_secs, Sandbox, SandboxPolicy, DEFAULT_NET_TOOL_TIMEOUT_SECS};
 use crate::trace::{ExecutionTracer, ToolTrace};
@@ -4180,14 +4189,21 @@ mod task_complete_tests {
     }
 
     #[tokio::test]
-    async fn skills_is_seeded_into_active_set() {
-        // `skills` must surface from turn 0 without a `tools_load`
-        // round-trip, while a non-seeded, non-meta tool stays hidden until
-        // it's explicitly activated.
+    async fn default_tools_are_seeded_into_active_set() {
+        // The default-active tools (`skills`, `memory_search`, `memory_save`)
+        // must surface from turn 0 without a `tools_load` round-trip, while a
+        // non-seeded, non-meta tool stays hidden until it's explicitly
+        // activated.
         let active = Arc::new(ActiveToolsRegistry::new());
         let tools: Vec<Arc<dyn Tool>> = vec![
             Arc::new(NoopTool {
                 name: "skills".into(),
+            }),
+            Arc::new(NoopTool {
+                name: "memory_search".into(),
+            }),
+            Arc::new(NoopTool {
+                name: "memory_save".into(),
             }),
             Arc::new(NoopTool {
                 name: "hidden".into(),
@@ -4200,20 +4216,27 @@ mod task_complete_tests {
         )
         .with_active_tools(active.clone());
         let conv_id = Uuid::new_v4();
-        let caps = CapabilitySet::for_tools_permissive(&["skills", "hidden"]);
+        let caps = CapabilitySet::for_tools_permissive(&[
+            "skills",
+            "memory_search",
+            "memory_save",
+            "hidden",
+        ]);
         let session = Session::with_capabilities(conv_id, caps);
 
-        // Nothing activated yet — the default seed should still expose
-        // `skills` and only `skills`.
+        // Nothing activated yet — the default seed should expose every
+        // default-active tool but not the non-seeded one.
         let names: Vec<String> = runner
             .compute_schemas(&session, conv_id)
             .into_iter()
             .map(|s| s.name)
             .collect();
-        assert!(
-            names.contains(&"skills".to_string()),
-            "skills should be seeded into the active set, got {names:?}"
-        );
+        for expected in ["skills", "memory_search", "memory_save"] {
+            assert!(
+                names.contains(&expected.to_string()),
+                "{expected} should be seeded into the active set, got {names:?}"
+            );
+        }
         assert!(
             !names.contains(&"hidden".to_string()),
             "a non-seeded, non-meta tool must stay hidden until activated"
@@ -4221,7 +4244,10 @@ mod task_complete_tests {
 
         // The seed is recorded in the registry itself, so `tools_load`'s
         // active listing reflects it too — not just the schema view.
-        assert!(active.active_for(conv_id).contains("skills"));
+        let seeded = active.active_for(conv_id);
+        assert!(seeded.contains("skills"));
+        assert!(seeded.contains("memory_search"));
+        assert!(seeded.contains("memory_save"));
     }
 
     #[tokio::test]
