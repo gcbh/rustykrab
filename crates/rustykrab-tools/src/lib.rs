@@ -62,6 +62,10 @@ mod canvas;
 // Device tools
 mod nodes;
 
+// Computer use (screen capture + input synthesis)
+mod computer;
+pub mod computer_backend;
+
 // HTTP
 mod http_request;
 mod http_session;
@@ -155,6 +159,10 @@ pub use canvas::CanvasTool;
 
 // Devices
 pub use nodes::NodesTool;
+
+// Computer use
+pub use computer::ComputerTool;
+pub use computer_backend::{CapturedImage, ComputerBackend, MouseButton, ScrollDirection};
 
 // HTTP
 pub use http_request::HttpRequestTool;
@@ -367,4 +375,13 @@ pub fn video_tools(
     backend: std::sync::Arc<dyn VideoBackend>,
 ) -> Vec<std::sync::Arc<dyn rustykrab_core::Tool>> {
     vec![std::sync::Arc::new(VideoTool::new(backend))]
+}
+
+/// Build the computer-use tool from a [`ComputerBackend`]. Registered only
+/// when a backend is available (e.g. a display is present and the feature is
+/// enabled), mirroring how `video_tools` is gated.
+pub fn computer_tools(
+    backend: std::sync::Arc<dyn ComputerBackend>,
+) -> Vec<std::sync::Arc<dyn rustykrab_core::Tool>> {
+    vec![std::sync::Arc::new(ComputerTool::new(backend))]
 }
