@@ -348,20 +348,26 @@ async fn execute_repl_tool(
                     "error": format!("unknown tool: {}", call.name)
                 }),
                 is_error: true,
+                images: Vec::new(),
             };
         }
     };
 
     match tool.execute(call.arguments.clone()).await {
-        Ok(output) => ToolResult {
-            call_id: call.id.clone(),
-            output,
-            is_error: false,
-        },
+        Ok(output) => {
+            let (output, images) = rustykrab_core::types::split_tool_result_images(output);
+            ToolResult {
+                call_id: call.id.clone(),
+                output,
+                is_error: false,
+                images,
+            }
+        }
         Err(e) => ToolResult {
             call_id: call.id.clone(),
             output: serde_json::json!({ "error": e.to_string() }),
             is_error: true,
+            images: Vec::new(),
         },
     }
 }

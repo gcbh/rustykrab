@@ -275,6 +275,53 @@ pub struct ToolResult {
     /// so the model knows to interpret the output as an error message.
     #[serde(default)]
     pub is_error: bool,
+    /// Images produced by the tool (e.g. screenshots). Surfaced to
+    /// vision-capable models as image content blocks alongside the textual
+    /// output; ignored by providers/models without vision. Empty for the
+    /// vast majority of tools.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<ContentBlock>,
+}
+
+/// Reserved JSON key a tool may set on its (object) output to attach binary
+/// images — e.g. a screenshot — to its result. The agent runner extracts
+/// these into [`ToolResult::images`] and strips the key, so the raw base64
+/// never reaches the model as text.
+pub const TOOL_RESULT_IMAGES_KEY: &str = "_images";
+
+/// Split any [`TOOL_RESULT_IMAGES_KEY`] array out of a tool's JSON output.
+///
+/// Each entry must be an object with a `media_type` string and a base64
+/// `data` string; malformed entries are skipped. The key is always removed
+/// from the returned output so large base64 blobs never leak into the text
+/// the model reads. Returns the cleaned output and the parsed image blocks.
+pub fn split_tool_result_images(
+    mut output: serde_json::Value,
+) -> (serde_json::Value, Vec<ContentBlock>) {
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine;
+
+    let Some(obj) = output.as_object_mut() else {
+        return (output, Vec::new());
+    };
+    let Some(serde_json::Value::Array(entries)) = obj.remove(TOOL_RESULT_IMAGES_KEY) else {
+        return (output, Vec::new());
+    };
+
+    let mut images = Vec::new();
+    for entry in entries {
+        let media_type = entry.get("media_type").and_then(|v| v.as_str());
+        let data = entry.get("data").and_then(|v| v.as_str());
+        if let (Some(media_type), Some(data)) = (media_type, data) {
+            if let Ok(bytes) = STANDARD.decode(data) {
+                images.push(ContentBlock::Image {
+                    media_type: media_type.to_string(),
+                    data: bytes,
+                });
+            }
+        }
+    }
+    (output, images)
 }
 
 /// A conversation is an ordered sequence of messages.
@@ -312,4 +359,60 @@ pub struct ToolSchema {
     pub name: String,
     pub description: String,
     pub parameters: serde_json::Value,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine;
+
+    #[test]
+    fn split_tool_result_images_extracts_and_strips_key() {
+        let png = vec![0x89u8, 0x50, 0x4e, 0x47];
+        let output = serde_json::json!({
+            "text": "captured",
+            "_images": [
+                { "media_type": "image/png", "data": STANDARD.encode(&png) }
+            ]
+        });
+
+        let (cleaned, images) = split_tool_result_images(output);
+        // The reserved key is removed so base64 never leaks into model text.
+        assert!(cleaned.get(TOOL_RESULT_IMAGES_KEY).is_none());
+        assert_eq!(cleaned["text"], "captured");
+        assert_eq!(images.len(), 1);
+        match &images[0] {
+            ContentBlock::Image { media_type, data } => {
+                assert_eq!(media_type, "image/png");
+                assert_eq!(data, &png);
+            }
+            other => panic!("expected image block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn split_tool_result_images_skips_malformed_entries_but_strips_key() {
+        let output = serde_json::json!({
+            "_images": [
+                { "media_type": "image/png" },                 // missing data
+                { "data": "not-base64-$$$" },                   // missing media_type + bad b64
+                "garbage"                                        // not an object
+            ]
+        });
+        let (cleaned, images) = split_tool_result_images(output);
+        assert!(cleaned.get(TOOL_RESULT_IMAGES_KEY).is_none());
+        assert!(images.is_empty());
+    }
+
+    #[test]
+    fn split_tool_result_images_passes_through_non_object_and_missing_key() {
+        let (cleaned, images) = split_tool_result_images(serde_json::json!("plain string"));
+        assert_eq!(cleaned, serde_json::json!("plain string"));
+        assert!(images.is_empty());
+
+        let (cleaned, images) = split_tool_result_images(serde_json::json!({ "ok": true }));
+        assert_eq!(cleaned, serde_json::json!({ "ok": true }));
+        assert!(images.is_empty());
+    }
 }
