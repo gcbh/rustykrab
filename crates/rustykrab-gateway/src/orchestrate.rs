@@ -286,7 +286,8 @@ async fn prepare_agent(
     )
     .with_config(agent_config)
     .with_active_tools(state.active_tools.clone())
-    .with_recall_store(state.recall.clone());
+    .with_recall_store(state.recall.clone())
+    .with_todo_store(state.todos.clone());
 
     if let Some(cb) = build_memory_callback(state, conv) {
         // The inbound user message was pushed onto conv.messages by
@@ -392,7 +393,8 @@ pub async fn run_agent_interactive(
             state.tools.clone(),
             state.sandbox.clone(),
         )
-        .with_config(profile.to_agent_config());
+        .with_config(profile.to_agent_config())
+        .with_todo_store(state.todos.clone());
 
         // The agent loop runs in a tokio::spawn'd task inside `start`, so
         // the task-local trace id won't follow it. Re-scope the spawned

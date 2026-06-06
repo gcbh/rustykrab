@@ -5,6 +5,7 @@ pub mod router;
 mod runner;
 pub mod sandbox;
 pub mod subagent;
+pub mod todo_tools;
 pub mod trace;
 pub mod voting;
 
@@ -21,5 +22,6 @@ pub use sandbox::{
     DEFAULT_NET_TOOL_TIMEOUT_SECS,
 };
 pub use subagent::SubagentRunner;
+pub use todo_tools::todo_tools;
 pub use trace::{ExecutionTracer, ToolStats, ToolTrace};
 pub use voting::ConsistencyVoter;

@@ -4,6 +4,7 @@ use rustykrab_core::active_tools::ActiveToolsRegistry;
 use rustykrab_core::model::ModelProvider;
 use rustykrab_core::orchestration::OrchestrationConfig;
 use rustykrab_core::recall::RecallStore;
+use rustykrab_core::todo::TodoStore;
 use rustykrab_memory::MemorySystem;
 use rustykrab_skills::SkillRegistry;
 use rustykrab_store::Store;
@@ -52,6 +53,11 @@ pub struct AppState {
     /// the `recall_*` tools so the agent can recover detail dropped by
     /// summarisation.
     pub recall: Arc<RecallStore>,
+    /// Per-conversation todo list backing the `todo_*` tools. Shared across
+    /// a conversation's requests so the agent's plan persists between turns.
+    /// In-memory only: a todo list is short-horizon working state, not
+    /// durable history like `recall`.
+    pub todos: Arc<TodoStore>,
     /// Whether sub-agent / session-management tools should be granted to
     /// sessions created by this gateway. Default `false`. Driven by the
     /// `RUSTYKRAB_ENABLE_SUBAGENTS` env var at startup; threaded through
@@ -92,6 +98,7 @@ impl AppState {
             agent_id: None,
             active_tools: Arc::new(ActiveToolsRegistry::new()),
             recall,
+            todos: Arc::new(TodoStore::new()),
             subagents_enabled: false,
         }
     }
