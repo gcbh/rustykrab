@@ -1,4 +1,6 @@
 mod chat;
+#[cfg(feature = "computer-use")]
+mod computer_backend;
 mod prompt_log;
 mod task_queue;
 
@@ -700,6 +702,29 @@ async fn main() -> anyhow::Result<()> {
             Arc::new(rustykrab_tools::VideoChannelAdapter::new(vc.clone()));
         tools.extend(rustykrab_tools::video_tools(video_backend));
         tracing::info!("video tool registered");
+    }
+
+    // --- Computer-use tool (opt-in, requires the `computer-use` feature) ---
+    // Driving the desktop is a powerful capability, so it is double-gated:
+    // the binary must be built with `--features computer-use` AND
+    // RUSTYKRAB_COMPUTER_USE must be truthy at runtime. Backend init failures
+    // (e.g. no display) are logged and never block startup.
+    #[cfg(feature = "computer-use")]
+    if std::env::var("RUSTYKRAB_COMPUTER_USE")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false)
+    {
+        match computer_backend::EnigoXcapBackend::new() {
+            Ok(backend) => {
+                let backend: Arc<dyn rustykrab_tools::ComputerBackend> = Arc::new(backend);
+                let (w, h) = backend.display_size();
+                tools.extend(rustykrab_tools::computer_tools(backend));
+                tracing::info!(width = w, height = h, "computer-use tool registered");
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "computer-use enabled but backend init failed; skipping");
+            }
+        }
     }
 
     // --- MCP connector (remote MCP servers as native tools) ---

@@ -31,3 +31,13 @@ dirs = "6"
 toml.workspace = true
 reqwest.workspace = true
 rpassword = "7"
+
+# Computer-use backend (optional): screen capture + input synthesis.
+# Off by default — pulls in X11/Wayland system dependencies. Enable with
+# `--features computer-use`.
+enigo = { version = "0.6", optional = true }
+xcap = { version = "0.9", optional = true }
+
+[features]
+# Concrete enigo + xcap implementation of the computer-use backend.
+computer-use = ["dep:enigo", "dep:xcap"]
