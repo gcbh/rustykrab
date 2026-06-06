@@ -9,6 +9,7 @@ use rustykrab_core::capability::Capability;
 use rustykrab_core::model::{ModelProvider, ModelResponse, StopReason, StreamEvent, ToolChoice};
 use rustykrab_core::recall::RecallStore;
 use rustykrab_core::session::Session;
+use rustykrab_core::todo::TodoStore;
 use rustykrab_core::types::{
     ContentPart, Conversation, Message, MessageContent, Role, ToolCall, ToolResult, ToolSchema,
 };
@@ -65,12 +66,23 @@ fn is_meta_tool(name: &str) -> bool {
 /// occasional and (for delete) destructive, so reflexive availability isn't
 /// wanted.
 ///
+/// `todo_write` / `todo_read` are seeded here so the planning scratchpad is
+/// reachable from the first turn and — because this set is re-seeded on
+/// every `compute_schemas` call — remains reachable after compaction, when
+/// the model most needs to re-establish or consult its plan.
+///
 /// Seeding by bare name means these names must be reserved: a SKILL.md
 /// skill that took the name `skills` would collide with this tool. That
 /// collision is blocked at creation time in `rustykrab-tools`'
 /// `SkillsTool::action_create` and at registration time by
 /// `skill_md_as_tools`' dedup against the live tool set.
-const DEFAULT_ACTIVE_TOOLS: &[&str] = &["skills", "memory_search", "memory_save"];
+const DEFAULT_ACTIVE_TOOLS: &[&str] = &[
+    "skills",
+    "memory_search",
+    "memory_save",
+    "todo_write",
+    "todo_read",
+];
 
 use crate::sandbox::{tool_timeout_secs, Sandbox, SandboxPolicy, DEFAULT_NET_TOOL_TIMEOUT_SECS};
 use crate::trace::{ExecutionTracer, ToolTrace};
@@ -708,6 +720,7 @@ pub struct AgentRunner {
     on_message: Option<OnMessageCallback>,
     active_tools: Arc<ActiveToolsRegistry>,
     recall: Arc<RecallStore>,
+    todos: Arc<TodoStore>,
 }
 
 impl AgentRunner {
@@ -725,6 +738,7 @@ impl AgentRunner {
             on_message: None,
             active_tools: Arc::new(ActiveToolsRegistry::new()),
             recall: Arc::new(RecallStore::new()),
+            todos: Arc::new(TodoStore::new()),
         }
     }
 
@@ -740,6 +754,14 @@ impl AgentRunner {
     /// any prior request on the same conversation.
     pub fn with_recall_store(mut self, store: Arc<RecallStore>) -> Self {
         self.recall = store;
+        self
+    }
+
+    /// Share a per-gateway todo store with the runner so the agent's plan,
+    /// maintained via the `todo_*` tools, persists across the separate
+    /// requests of a single conversation rather than resetting each turn.
+    pub fn with_todo_store(mut self, store: Arc<TodoStore>) -> Self {
+        self.todos = store;
         self
     }
 
@@ -775,6 +797,7 @@ impl AgentRunner {
             all_tools: Arc::new(self.tools.clone()),
             active_tools: self.active_tools.clone(),
             recall: self.recall.clone(),
+            todos: self.todos.clone(),
         }
     }
 
@@ -895,6 +918,7 @@ impl AgentRunner {
         let on_message = self.on_message.clone();
         let active_tools = self.active_tools.clone();
         let recall = self.recall.clone();
+        let todos = self.todos.clone();
 
         // Carry the trace id from the calling task into the spawned agent
         // task so prompt-log rows and agent-loop logs share the same id.
@@ -910,6 +934,7 @@ impl AgentRunner {
                 on_message,
                 active_tools,
                 recall,
+                todos,
             };
             let body = async move {
                 runner
@@ -1171,6 +1196,7 @@ impl AgentRunner {
                                     call_id,
                                     output,
                                     is_error: true,
+                                    images: Vec::new(),
                                 }),
                                 created_at: Utc::now(),
                             }
@@ -1588,6 +1614,7 @@ impl AgentRunner {
                                     call_id: call_id.clone(),
                                     output,
                                     is_error: true,
+                                    images: Vec::new(),
                                 }),
                                 created_at: Utc::now(),
                             };
@@ -2569,6 +2596,22 @@ impl AgentRunner {
             )
         };
 
+        // Re-emit the current todo list verbatim at the top of the summary so
+        // the agent's plan survives compaction intact. The checklist is the
+        // single artifact most worth protecting from lossy summarisation —
+        // it's the run's anchor — and a few lines of markdown cost far less
+        // than re-deriving the plan. Placed first so the per-summary size cap
+        // (which truncates from the end) can never clip it. The model keeps
+        // it current with `todo_write`; the store, not this text, is the
+        // source of truth, so a later edit supersedes what's frozen here.
+        let summary_with_hint = match self.todos.render(conv.id) {
+            Some(todos) => format!(
+                "Current task list (maintained via todo_write — update statuses as you \
+                 work):\n{todos}\n\n{summary_with_hint}"
+            ),
+            None => summary_with_hint,
+        };
+
         // Synthesize the two new messages compaction produces. They need
         // to flow through on_message so memory picks them up — even though
         // they're inserted into `new_messages` directly below rather than
@@ -2961,6 +3004,10 @@ async fn execute_single_tool(
         )
     })??;
 
+    // Pull any tool-attached images out before fencing — fencing rewrites
+    // string values and would corrupt base64 payloads.
+    let (output, images) = rustykrab_core::types::split_tool_result_images(output);
+
     let output = if EXTERNAL_CONTENT_TOOLS.contains(&call.name.as_str()) {
         fence_external_output(output)
     } else {
@@ -2971,6 +3018,7 @@ async fn execute_single_tool(
         call_id: call.id.clone(),
         output,
         is_error: false,
+        images,
     })
 }
 

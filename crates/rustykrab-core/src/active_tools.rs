@@ -22,6 +22,7 @@ use uuid::Uuid;
 
 use crate::capability::CapabilitySet;
 use crate::recall::RecallStore;
+use crate::todo::TodoStore;
 use crate::tool::Tool;
 
 /// Tracks which tools are "active" for each conversation.
@@ -85,6 +86,10 @@ pub struct SessionToolContext {
     /// `recall_*` tools read from this so the model can recover detail
     /// the compaction summary dropped.
     pub recall: Arc<RecallStore>,
+    /// Per-conversation todo list.  The `todo_write` / `todo_read` tools
+    /// maintain it, and the runner re-emits it verbatim across compaction
+    /// so the agent's plan survives the churn.
+    pub todos: Arc<TodoStore>,
 }
 
 tokio::task_local! {

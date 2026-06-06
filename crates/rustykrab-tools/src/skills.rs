@@ -720,12 +720,14 @@ mod tests {
         use rustykrab_core::active_tools::{ActiveToolsRegistry, SessionToolContext};
         use rustykrab_core::capability::CapabilitySet;
         use rustykrab_core::recall::RecallStore;
+        use rustykrab_core::TodoStore;
         SessionToolContext {
             conversation_id: uuid::Uuid::new_v4(),
             capabilities: Arc::new(CapabilitySet::none()),
             all_tools: Arc::new(tools),
             active_tools: Arc::new(ActiveToolsRegistry::new()),
             recall: Arc::new(RecallStore::new()),
+            todos: Arc::new(TodoStore::new()),
         }
     }
 

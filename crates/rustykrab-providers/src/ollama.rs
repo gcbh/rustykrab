@@ -277,116 +277,136 @@ impl OllamaProvider {
     }
 
     /// Fix #195: returns Result to propagate serialization errors.
-    fn build_messages(messages: &[Message]) -> Result<Vec<OllamaMessage>> {
-        messages
-            .iter()
-            .map(|msg| {
-                let role = match msg.role {
-                    Role::System => "system",
-                    Role::User => "user",
-                    Role::Assistant => "assistant",
-                    Role::Tool => "tool",
-                };
+    fn build_messages(messages: &[Message], supports_vision: bool) -> Result<Vec<OllamaMessage>> {
+        use base64::engine::general_purpose::STANDARD;
+        use base64::Engine;
+        use rustykrab_core::types::ContentBlock;
 
-                Ok(match &msg.content {
-                    MessageContent::Text(text) => {
-                        // Strip <think> blocks from assistant messages so
-                        // model thinking is not re-submitted in history.
-                        let content = if msg.role == Role::Assistant && text.contains("<think>") {
-                            let stripped = Self::strip_thinking(text);
-                            tracing::debug!(
-                                original_len = text.len(),
-                                stripped_len = stripped.len(),
-                                "stripped thinking blocks from assistant message"
-                            );
-                            stripped
-                        } else {
-                            text.clone()
-                        };
-                        OllamaMessage {
-                            role: role.to_string(),
-                            content: Some(content),
-                            tool_calls: None,
-                            images: None,
-                        }
-                    }
-                    MessageContent::ToolCall(call) => OllamaMessage {
+        let mut out = Vec::with_capacity(messages.len());
+        for msg in messages {
+            let role = match msg.role {
+                Role::System => "system",
+                Role::User => "user",
+                Role::Assistant => "assistant",
+                Role::Tool => "tool",
+            };
+
+            match &msg.content {
+                MessageContent::Text(text) => {
+                    // Strip <think> blocks from assistant messages so
+                    // model thinking is not re-submitted in history.
+                    let content = if msg.role == Role::Assistant && text.contains("<think>") {
+                        let stripped = Self::strip_thinking(text);
+                        tracing::debug!(
+                            original_len = text.len(),
+                            stripped_len = stripped.len(),
+                            "stripped thinking blocks from assistant message"
+                        );
+                        stripped
+                    } else {
+                        text.clone()
+                    };
+                    out.push(OllamaMessage {
                         role: role.to_string(),
-                        content: None,
-                        tool_calls: Some(vec![OllamaToolCall {
-                            function: OllamaFunction {
-                                name: call.name.clone(),
-                                arguments: call.arguments.clone(),
-                            },
-                        }]),
+                        content: Some(content),
+                        tool_calls: None,
                         images: None,
-                    },
-                    MessageContent::MultiToolCall(calls) => OllamaMessage {
-                        role: role.to_string(),
-                        content: None,
-                        tool_calls: Some(
-                            calls
-                                .iter()
-                                .map(|c| OllamaToolCall {
-                                    function: OllamaFunction {
-                                        name: c.name.clone(),
-                                        arguments: c.arguments.clone(),
-                                    },
-                                })
-                                .collect(),
-                        ),
-                        images: None,
-                    },
-                    MessageContent::ToolResult(result) => {
-                        // Fix #182: avoid double-serialization of string values.
-                        // Fix #195: propagate serialization errors.
-                        let content = match &result.output {
-                            serde_json::Value::String(s) => s.clone(),
-                            other => serde_json::to_string(other).map_err(Error::Serialization)?,
-                        };
-                        OllamaMessage {
-                            role: role.to_string(),
-                            content: Some(content),
-                            tool_calls: None,
-                            images: None,
-                        }
-                    }
-                    MessageContent::MultiPart(blocks) => {
-                        use base64::engine::general_purpose::STANDARD;
-                        use base64::Engine;
-                        let text = blocks
+                    });
+                }
+                MessageContent::ToolCall(call) => out.push(OllamaMessage {
+                    role: role.to_string(),
+                    content: None,
+                    tool_calls: Some(vec![OllamaToolCall {
+                        function: OllamaFunction {
+                            name: call.name.clone(),
+                            arguments: call.arguments.clone(),
+                        },
+                    }]),
+                    images: None,
+                }),
+                MessageContent::MultiToolCall(calls) => out.push(OllamaMessage {
+                    role: role.to_string(),
+                    content: None,
+                    tool_calls: Some(
+                        calls
                             .iter()
-                            .filter_map(|b| match b {
-                                rustykrab_core::types::ContentBlock::Text { text } => {
-                                    Some(text.as_str())
-                                }
-                                _ => None,
+                            .map(|c| OllamaToolCall {
+                                function: OllamaFunction {
+                                    name: c.name.clone(),
+                                    arguments: c.arguments.clone(),
+                                },
                             })
-                            .collect::<Vec<_>>()
-                            .join("\n");
-                        // Ollama carries images at the message level as a list
-                        // of base64 strings (no data-URI prefix). Callers only
-                        // place `Image` blocks here for vision-capable models
-                        // (gated upstream by `supports_vision`).
-                        let images: Vec<String> = blocks
+                            .collect(),
+                    ),
+                    images: None,
+                }),
+                MessageContent::ToolResult(result) => {
+                    // Fix #182: avoid double-serialization of string values.
+                    // Fix #195: propagate serialization errors.
+                    let content = match &result.output {
+                        serde_json::Value::String(s) => s.clone(),
+                        other => serde_json::to_string(other).map_err(Error::Serialization)?,
+                    };
+                    out.push(OllamaMessage {
+                        role: role.to_string(),
+                        content: Some(content),
+                        tool_calls: None,
+                        images: None,
+                    });
+                    // Ollama's chat API has no image slot on a `tool` message,
+                    // so surface any tool-produced images (e.g. screenshots)
+                    // as a follow-up user message — but only for vision models.
+                    if supports_vision && !result.images.is_empty() {
+                        let imgs: Vec<String> = result
+                            .images
                             .iter()
                             .filter_map(|b| match b {
-                                rustykrab_core::types::ContentBlock::Image { data, .. } => {
-                                    Some(STANDARD.encode(data))
-                                }
+                                ContentBlock::Image { data, .. } => Some(STANDARD.encode(data)),
                                 _ => None,
                             })
                             .collect();
-                        OllamaMessage {
-                            role: role.to_string(),
-                            content: Some(text),
-                            tool_calls: None,
-                            images: (!images.is_empty()).then_some(images),
+                        if !imgs.is_empty() {
+                            out.push(OllamaMessage {
+                                role: "user".to_string(),
+                                content: Some(
+                                    "Images returned by the previous tool call:".to_string(),
+                                ),
+                                tool_calls: None,
+                                images: Some(imgs),
+                            });
                         }
                     }
-                })
-            })
-            .collect()
+                }
+                MessageContent::MultiPart(blocks) => {
+                    let text = blocks
+                        .iter()
+                        .filter_map(|b| match b {
+                            ContentBlock::Text { text } => Some(text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    // Ollama carries images at the message level as a list of
+                    // base64 strings (no data-URI prefix). Callers only place
+                    // `Image` blocks here for vision-capable models (gated
+                    // upstream by `supports_vision`).
+                    let images: Vec<String> = blocks
+                        .iter()
+                        .filter_map(|b| match b {
+                            ContentBlock::Image { data, .. } => Some(STANDARD.encode(data)),
+                            _ => None,
+                        })
+                        .collect();
+                    out.push(OllamaMessage {
+                        role: role.to_string(),
+                        content: Some(text),
+                        tool_calls: None,
+                        images: (!images.is_empty()).then_some(images),
+                    });
+                }
+            }
+        }
+        Ok(out)
     }
 
     fn build_tools(tools: &[ToolSchema]) -> Vec<OllamaTool> {
@@ -560,7 +580,7 @@ impl ModelProvider for OllamaProvider {
     }
 
     async fn chat(&self, messages: &[Message], tools: &[ToolSchema]) -> Result<ModelResponse> {
-        let ollama_messages = Self::build_messages(messages)?;
+        let ollama_messages = Self::build_messages(messages, self.supports_vision())?;
 
         // Fix #200: validate non-empty messages.
         if ollama_messages.is_empty() {
@@ -722,7 +742,7 @@ impl ModelProvider for OllamaProvider {
         tools: &[ToolSchema],
         on_event: &(dyn Fn(StreamEvent) + Send + Sync),
     ) -> Result<ModelResponse> {
-        let ollama_messages = Self::build_messages(messages)?;
+        let ollama_messages = Self::build_messages(messages, self.supports_vision())?;
 
         if ollama_messages.is_empty() {
             return Err(Error::ModelBadRequest(
@@ -1228,7 +1248,7 @@ mod tests {
             created_at: Utc::now(),
         };
 
-        let built = OllamaProvider::build_messages(&[msg]).expect("build_messages");
+        let built = OllamaProvider::build_messages(&[msg], true).expect("build_messages");
         assert_eq!(built.len(), 1);
         assert_eq!(built[0].content.as_deref(), Some("what is this?"));
         let images = built[0].images.as_ref().expect("images present");
@@ -1246,11 +1266,56 @@ mod tests {
             content: MessageContent::Text("hello".to_string()),
             created_at: Utc::now(),
         };
-        let built = OllamaProvider::build_messages(&[msg]).expect("build_messages");
+        let built = OllamaProvider::build_messages(&[msg], false).expect("build_messages");
         assert!(built[0].images.is_none());
         // `images` must be skipped entirely in the wire payload when absent.
         let json = serde_json::to_value(&built[0]).unwrap();
         assert!(json.get("images").is_none());
+    }
+
+    fn tool_result_with_image(png: &[u8]) -> Message {
+        use rustykrab_core::types::{ContentBlock, ToolResult};
+        Message {
+            id: Uuid::new_v4(),
+            role: Role::Tool,
+            content: MessageContent::ToolResult(ToolResult {
+                call_id: "call-1".to_string(),
+                output: serde_json::json!({ "ok": true }),
+                is_error: false,
+                images: vec![ContentBlock::Image {
+                    media_type: "image/png".to_string(),
+                    data: png.to_vec(),
+                }],
+            }),
+            created_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn tool_result_images_become_followup_user_message_for_vision_models() {
+        use base64::engine::general_purpose::STANDARD;
+        use base64::Engine;
+
+        let png = vec![0x89u8, 0x50, 0x4e, 0x47];
+        let built =
+            OllamaProvider::build_messages(&[tool_result_with_image(&png)], true).expect("build");
+        // One `tool` message plus an injected `user` message carrying the image.
+        assert_eq!(built.len(), 2);
+        assert_eq!(built[0].role, "tool");
+        assert!(built[0].images.is_none());
+        assert_eq!(built[1].role, "user");
+        let imgs = built[1].images.as_ref().expect("follow-up images");
+        assert_eq!(imgs, &vec![STANDARD.encode(&png)]);
+    }
+
+    #[test]
+    fn tool_result_images_dropped_for_text_only_models() {
+        let png = vec![0x89u8, 0x50, 0x4e, 0x47];
+        let built =
+            OllamaProvider::build_messages(&[tool_result_with_image(&png)], false).expect("build");
+        // No follow-up user message when the model can't see images.
+        assert_eq!(built.len(), 1);
+        assert_eq!(built[0].role, "tool");
     }
 
     #[test]

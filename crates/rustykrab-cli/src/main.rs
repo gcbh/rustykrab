@@ -760,6 +760,12 @@ async fn main() -> anyhow::Result<()> {
     ));
     tracing::info!("recall tools registered");
 
+    // --- Todo tools (intra-loop planning scratchpad) ---
+    // State is threaded through the runner's SessionToolContext (the shared
+    // TodoStore on AppState), so the tools resolve it at execute() time.
+    tools.extend(rustykrab_agent::todo_tools());
+    tracing::info!("todo tools registered");
+
     // --- SKILL.md skills as first-class tools ---
     // Each registered SKILL.md is also exposed as a tool whose name is the
     // skill name and whose `execute()` returns the skill body verbatim.

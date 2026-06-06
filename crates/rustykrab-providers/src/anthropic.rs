@@ -174,9 +174,31 @@ impl AnthropicProvider {
                     if let MessageContent::ToolResult(ref result) = msg.content {
                         // Fix #182: avoid double-serialization of string values.
                         // Fix #195: propagate serialization errors instead of swallowing them.
-                        let content = match &result.output {
+                        let text = match &result.output {
                             serde_json::Value::String(s) => s.clone(),
                             other => serde_json::to_string(other).map_err(Error::Serialization)?,
+                        };
+                        // Attach any tool-produced images (e.g. screenshots)
+                        // as image blocks alongside the text. Claude always
+                        // supports vision, so no capability gate is needed.
+                        let content = if result.images.is_empty() {
+                            ToolResultContent::Text(text)
+                        } else {
+                            use base64::engine::general_purpose::STANDARD;
+                            use base64::Engine;
+                            let mut blocks = vec![ContentBlock::Text { text }];
+                            for img in &result.images {
+                                if let CoreContentBlock::Image { media_type, data } = img {
+                                    blocks.push(ContentBlock::Image {
+                                        source: ImageSource {
+                                            source_type: "base64".to_string(),
+                                            media_type: media_type.clone(),
+                                            data: STANDARD.encode(data),
+                                        },
+                                    });
+                                }
+                            }
+                            ToolResultContent::Blocks(blocks)
                         };
                         api_messages.push(ApiMessage {
                             role: "user".to_string(),
@@ -859,10 +881,20 @@ enum ContentBlock {
     #[serde(rename = "tool_result")]
     ToolResult {
         tool_use_id: String,
-        content: String,
+        content: ToolResultContent,
         #[serde(skip_serializing_if = "is_false")]
         is_error: bool,
     },
+}
+
+/// A `tool_result` block's content is either a plain string or, when the
+/// tool returned images, an array of text/image blocks. The Anthropic API
+/// accepts both shapes; `#[serde(untagged)]` picks the right one.
+#[derive(Serialize)]
+#[serde(untagged)]
+enum ToolResultContent {
+    Text(String),
+    Blocks(Vec<ContentBlock>),
 }
 
 #[derive(Serialize)]
@@ -1001,5 +1033,60 @@ mod tests {
     fn tool_choice_any_emits_any_type() {
         let v = AnthropicProvider::tool_choice_json(ToolChoice::Any).expect("Any → Some");
         assert_eq!(v, serde_json::json!({ "type": "any" }));
+    }
+
+    #[test]
+    fn tool_result_without_images_serializes_as_string() {
+        use rustykrab_core::types::ToolResult;
+        let msg = Message {
+            id: uuid::Uuid::new_v4(),
+            role: Role::Tool,
+            content: MessageContent::ToolResult(ToolResult {
+                call_id: "call-1".to_string(),
+                output: serde_json::json!("done"),
+                is_error: false,
+                images: Vec::new(),
+            }),
+            created_at: chrono::Utc::now(),
+        };
+        let (_sys, api) = AnthropicProvider::build_messages(&[msg]).expect("build");
+        let json = serde_json::to_value(&api).unwrap();
+        let content = &json[0]["content"][0];
+        assert_eq!(content["type"], "tool_result");
+        // Plain string content (untagged enum picks the string arm).
+        assert_eq!(content["content"], "done");
+    }
+
+    #[test]
+    fn tool_result_with_images_serializes_as_block_array() {
+        use base64::engine::general_purpose::STANDARD;
+        use base64::Engine;
+        use rustykrab_core::types::{ContentBlock as CoreBlock, ToolResult};
+
+        let png = vec![0x89u8, 0x50, 0x4e, 0x47];
+        let msg = Message {
+            id: uuid::Uuid::new_v4(),
+            role: Role::Tool,
+            content: MessageContent::ToolResult(ToolResult {
+                call_id: "call-1".to_string(),
+                output: serde_json::json!("screenshot taken"),
+                is_error: false,
+                images: vec![CoreBlock::Image {
+                    media_type: "image/png".to_string(),
+                    data: png.clone(),
+                }],
+            }),
+            created_at: chrono::Utc::now(),
+        };
+        let (_sys, api) = AnthropicProvider::build_messages(&[msg]).expect("build");
+        let json = serde_json::to_value(&api).unwrap();
+        let blocks = &json[0]["content"][0]["content"];
+        // Array of [text, image] blocks.
+        assert_eq!(blocks[0]["type"], "text");
+        assert_eq!(blocks[0]["text"], "screenshot taken");
+        assert_eq!(blocks[1]["type"], "image");
+        assert_eq!(blocks[1]["source"]["type"], "base64");
+        assert_eq!(blocks[1]["source"]["media_type"], "image/png");
+        assert_eq!(blocks[1]["source"]["data"], STANDARD.encode(&png));
     }
 }
