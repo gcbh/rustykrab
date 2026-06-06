@@ -807,6 +807,7 @@ mod tests {
             call_id: "1".into(),
             output: serde_json::json!("ok"),
             is_error: false,
+            images: Vec::new(),
         });
         assert!(render_message_content(&result).starts_with("[tool_result]"));
 
@@ -814,6 +815,7 @@ mod tests {
             call_id: "1".into(),
             output: serde_json::json!("boom"),
             is_error: true,
+            images: Vec::new(),
         });
         assert!(render_message_content(&err).starts_with("[tool_error]"));
     }

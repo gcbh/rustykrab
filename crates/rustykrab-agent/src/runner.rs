@@ -1181,6 +1181,7 @@ impl AgentRunner {
                                     call_id,
                                     output,
                                     is_error: true,
+                                    images: Vec::new(),
                                 }),
                                 created_at: Utc::now(),
                             }
@@ -1598,6 +1599,7 @@ impl AgentRunner {
                                     call_id: call_id.clone(),
                                     output,
                                     is_error: true,
+                                    images: Vec::new(),
                                 }),
                                 created_at: Utc::now(),
                             };
@@ -2987,6 +2989,10 @@ async fn execute_single_tool(
         )
     })??;
 
+    // Pull any tool-attached images out before fencing — fencing rewrites
+    // string values and would corrupt base64 payloads.
+    let (output, images) = rustykrab_core::types::split_tool_result_images(output);
+
     let output = if EXTERNAL_CONTENT_TOOLS.contains(&call.name.as_str()) {
         fence_external_output(output)
     } else {
@@ -2997,6 +3003,7 @@ async fn execute_single_tool(
         call_id: call.id.clone(),
         output,
         is_error: false,
+        images,
     })
 }
 
