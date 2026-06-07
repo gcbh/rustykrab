@@ -13,12 +13,23 @@
 //! runs as a fallback so freshly written pages are findable immediately, before
 //! the memory index has caught up.
 //!
+//! Discoverability does not lean on the directory tree (folders are too rigid —
+//! a page lives in exactly one, and you outgrow the hierarchy). Instead it leans
+//! on the things mature knowledge bases converge on:
+//!   * a regenerated `index.html` that carries a one-line **summary** per page,
+//!     so the index can be scanned, not just enumerated;
+//!   * **backlinks** ("Referenced by") computed from the link graph, kept fresh
+//!     in each page and returned live by the `read` action — plus orphan
+//!     surfacing in `list` for pages nothing points at;
+//!   * **related-page suggestions** on write, so the agent updates an existing
+//!     page instead of forking a near-duplicate.
+//!
 //! Security: slugs are sanitized to stay strictly inside the wiki directory
 //! (no `..`, no absolute paths, no exotic characters), and the page body the
 //! agent supplies is written verbatim — this is a trusted, local, single-user
 //! store, not a public web server.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -37,21 +48,34 @@ const INDEX_FILE: &str = "index.html";
 const SIDECAR_FILE: &str = ".wiki.json";
 /// Cap on the plaintext we hand to the memory system per page.
 const MEMORY_EXCERPT_LIMIT: usize = 4000;
+/// Cap on a derived one-line summary.
+const SUMMARY_LIMIT: usize = 200;
+/// Markers delimiting the auto-maintained "Referenced by" region of a page, so
+/// it can be refreshed in place when the link graph changes without re-rendering
+/// the agent-authored body.
+const BACKLINKS_START: &str = "<!--wiki:backlinks-->";
+const BACKLINKS_END: &str = "<!--wiki:backlinks:end-->";
 
 // ---------------------------------------------------------------------------
 // Sidecar index
 // ---------------------------------------------------------------------------
 
-/// Per-page metadata persisted alongside the HTML so we can list pages, resolve
-/// search hits to titles, and clean up the page's memory entry on rewrite/delete.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Per-page metadata persisted alongside the HTML. This is the structured map
+/// of the wiki: it powers listing, search-hit resolution, the link graph
+/// (backlinks/orphans), and cleanup of a page's memory entry on rewrite/delete.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct PageMeta {
     title: String,
+    #[serde(default)]
+    summary: String,
     #[serde(default)]
     memory_id: Option<String>,
     updated_at: String,
     #[serde(default)]
     tags: Vec<String>,
+    /// Outgoing internal links (target slugs), the edges of the link graph.
+    #[serde(default)]
+    links: Vec<String>,
 }
 
 /// The sidecar document: slug -> metadata, kept sorted for stable index output.
@@ -103,6 +127,10 @@ impl WikiTool {
             .map_err(|e| Error::ToolExecution(format!("failed to write wiki index: {e}").into()))
     }
 
+    fn slug_to_path(&self, slug: &str) -> PathBuf {
+        self.wiki_dir.join(format!("{slug}.html"))
+    }
+
     // -- actions -----------------------------------------------------------
 
     async fn write_page(&self, args: &Value) -> Result<Value> {
@@ -110,31 +138,30 @@ impl WikiTool {
         let title = require_str(args, "title")?.to_string();
         let body = require_str(args, "html")?.to_string();
         let tags = parse_string_array(&args["tags"]);
-        let links = parse_links(&args["links"]);
+        let see_also = parse_links(&args["links"]);
 
-        let rel_root = rel_root_for(&slug);
-        let updated_at = now_rfc3339();
-        let document = render_page(&title, &body, &links, &tags, &updated_at, &rel_root);
-
-        let page_path = self.slug_to_path(&slug);
-        if let Some(parent) = page_path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| {
-                Error::ToolExecution(format!("failed to create wiki directory: {e}").into())
-            })?;
-        }
-        std::fs::write(&page_path, &document).map_err(|e| {
-            Error::ToolExecution(format!("failed to write wiki page {slug}: {e}").into())
-        })?;
-
-        // Index into hybrid memory. Replace any prior memory entry for this
-        // slug so rewrites don't pile up stale facts.
         let plaintext = html_to_text(&body);
-        let fact = build_memory_fact(&slug, &title, &tags, &plaintext);
+        let summary = match args["summary"].as_str() {
+            Some(s) if !s.trim().is_empty() => snippet(s.trim(), SUMMARY_LIMIT),
+            _ => derive_summary(&plaintext),
+        };
+        // The link graph draws on both the structured "see also" links and any
+        // internal anchors the agent put inline in the body.
+        let outgoing = collect_outgoing_links(&slug, &body, &see_also);
+
+        // Index into hybrid memory. Replace any prior memory entry for this slug
+        // so rewrites don't pile up stale facts.
+        let fact = build_memory_fact(&slug, &title, &tags, &summary, &plaintext);
         let mut mem_tags = vec!["wiki".to_string(), slug.clone()];
         mem_tags.extend(tags.iter().cloned());
 
         let guard = self.index_lock.lock().await;
         let mut index = self.load_index();
+        let prev_outgoing = index
+            .pages
+            .get(&slug)
+            .map(|p| p.links.clone())
+            .unwrap_or_default();
         if let Some(prev) = index.pages.get(&slug) {
             if let Some(old_id) = &prev.memory_id {
                 // Best-effort: a failed cleanup shouldn't block the write.
@@ -152,23 +179,70 @@ impl WikiTool {
             slug.clone(),
             PageMeta {
                 title: title.clone(),
+                summary: summary.clone(),
                 memory_id: memory_id.clone(),
-                updated_at: updated_at.clone(),
+                updated_at: now_rfc3339(),
                 tags: tags.clone(),
+                links: outgoing.clone(),
             },
         );
+
+        // Render the page itself, including its current backlinks.
+        let backlinks = backlinks_for(&index, &slug);
+        let document = render_page(
+            &title,
+            &body,
+            &see_also,
+            &tags,
+            index.pages[&slug].updated_at.as_str(),
+            &rel_root_for(&slug),
+            &backlinks,
+        );
+        let page_path = self.slug_to_path(&slug);
+        if let Some(parent) = page_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                Error::ToolExecution(format!("failed to create wiki directory: {e}").into())
+            })?;
+        }
+        std::fs::write(&page_path, &document).map_err(|e| {
+            Error::ToolExecution(format!("failed to write wiki page {slug}: {e}").into())
+        })?;
+
         self.save_index(&index)?;
         self.regenerate_index(&index)?;
+
+        // Refresh the "Referenced by" region of every page whose inbound set
+        // this write could have changed: links added, links removed, and the
+        // pages still linked (in case this page's title changed). Bounded by the
+        // number of links on the page.
+        let mut affected: BTreeSet<&String> = BTreeSet::new();
+        affected.extend(prev_outgoing.iter());
+        affected.extend(outgoing.iter());
+        for target in affected {
+            if *target != slug {
+                self.refresh_page_backlinks(target, &index);
+            }
+        }
         drop(guard);
+
+        // Related-page suggestions: nudge the agent to reuse an existing page
+        // rather than fork a near-duplicate. Excludes the page just written.
+        let related = self
+            .find_related(&format!("{title}. {summary}"), Some(&slug), 5)
+            .await;
 
         Ok(json!({
             "status": "saved",
             "slug": slug,
             "title": title,
+            "summary": summary,
             "path": page_path.to_string_lossy(),
             "url": format!("{slug}.html"),
             "indexed": memory_id.is_some(),
             "memory_id": memory_id,
+            "outgoing_links": outgoing,
+            "backlink_count": backlinks.len(),
+            "related": related,
         }))
     }
 
@@ -184,16 +258,23 @@ impl WikiTool {
             .map(|m| m.title.clone())
             .or_else(|| extract_title(&document))
             .unwrap_or_else(|| slug.clone());
+        // Backlinks computed live from the graph so they're never stale.
+        let backlinks: Vec<Value> = backlinks_for(&index, &slug)
+            .into_iter()
+            .map(|(s, t)| json!({ "slug": s, "title": t }))
+            .collect();
 
         Ok(json!({
             "slug": slug,
             "title": title,
+            "summary": meta.map(|m| m.summary.clone()).unwrap_or_default(),
             "html": document,
             "text": html_to_text(&document),
             "links": extract_links(&document)
                 .into_iter()
                 .map(|(href, text)| json!({ "href": href, "text": text }))
                 .collect::<Vec<_>>(),
+            "backlinks": backlinks,
             "tags": meta.map(|m| m.tags.clone()).unwrap_or_default(),
             "updated_at": meta.map(|m| m.updated_at.clone()),
         }))
@@ -202,95 +283,34 @@ impl WikiTool {
     async fn search_pages(&self, args: &Value) -> Result<Value> {
         let query = require_str(args, "query")?.to_string();
         let limit = args["limit"].as_u64().unwrap_or(5).clamp(1, 50) as usize;
-        let index = self.load_index();
-
-        let mut hits: Vec<Value> = Vec::new();
-        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-
-        // Primary: hybrid memory recall, resolved back to wiki pages via the
-        // [[wiki:<slug>]] marker embedded at write time. Over-fetch because the
-        // backend's hybrid search ignores tag filters, so non-wiki hits are
-        // mixed in and dropped here.
-        if let Ok(result) = self
-            .memory
-            .search(&query, &["wiki".to_string()], limit * 4)
-            .await
-        {
-            if let Some(items) = result.get("results").and_then(|r| r.as_array()) {
-                for item in items {
-                    let content = item.get("content").and_then(|c| c.as_str()).unwrap_or("");
-                    let Some(slug) = extract_wiki_marker(content) else {
-                        continue;
-                    };
-                    if !seen.insert(slug.clone()) || !self.slug_to_path(&slug).exists() {
-                        continue;
-                    }
-                    hits.push(json!({
-                        "slug": slug,
-                        "title": index.pages.get(&slug).map(|m| m.title.clone()).unwrap_or_else(|| slug.clone()),
-                        "url": format!("{slug}.html"),
-                        "snippet": snippet(content, 240),
-                        "score": item.get("score").cloned().unwrap_or(Value::Null),
-                        "source": "memory",
-                    }));
-                    if hits.len() >= limit {
-                        break;
-                    }
-                }
-            }
-        }
-
-        // Fallback / supplement: a direct text scan so pages are findable
-        // immediately, before async memory extraction has indexed them.
-        if hits.len() < limit {
-            let needles: Vec<String> = query.split_whitespace().map(|w| w.to_lowercase()).collect();
-            for (slug, meta) in &index.pages {
-                if seen.contains(slug) {
-                    continue;
-                }
-                let path = self.slug_to_path(slug);
-                let Ok(document) = std::fs::read_to_string(&path) else {
-                    continue;
-                };
-                let text = html_to_text(&document);
-                let haystack = text.to_lowercase();
-                let matches = needles.iter().filter(|n| haystack.contains(*n)).count();
-                if matches == 0 {
-                    continue;
-                }
-                seen.insert(slug.clone());
-                hits.push(json!({
-                    "slug": slug,
-                    "title": meta.title,
-                    "url": format!("{slug}.html"),
-                    "snippet": snippet(&text, 240),
-                    "score": matches,
-                    "source": "filesystem",
-                }));
-                if hits.len() >= limit {
-                    break;
-                }
-            }
-        }
-
+        let results = self.find_related(&query, None, limit).await;
         Ok(json!({
             "query": query,
-            "count": hits.len(),
-            "results": hits,
+            "count": results.len(),
+            "results": results,
         }))
     }
 
     async fn list_pages(&self, _args: &Value) -> Result<Value> {
         let index = self.load_index();
+        let mut orphans: Vec<String> = Vec::new();
         let pages: Vec<Value> = index
             .pages
             .iter()
             .map(|(slug, meta)| {
+                let inbound = backlinks_for(&index, slug).len();
+                if inbound == 0 {
+                    orphans.push(slug.clone());
+                }
                 json!({
                     "slug": slug,
                     "title": meta.title,
+                    "summary": meta.summary,
                     "url": format!("{slug}.html"),
                     "tags": meta.tags,
+                    "inbound": inbound,
+                    "outbound": meta.links.len(),
+                    "orphan": inbound == 0,
                     "updated_at": meta.updated_at,
                 })
             })
@@ -298,6 +318,7 @@ impl WikiTool {
         Ok(json!({
             "count": pages.len(),
             "pages": pages,
+            "orphans": orphans,
             "index_url": INDEX_FILE,
         }))
     }
@@ -317,6 +338,14 @@ impl WikiTool {
         let removed_file = std::fs::remove_file(&page_path).is_ok();
         self.save_index(&index)?;
         self.regenerate_index(&index)?;
+        // The pages this one used to point at lost an inbound link — refresh them.
+        if let Some(meta) = &existed {
+            for target in &meta.links {
+                if *target != slug {
+                    self.refresh_page_backlinks(target, &index);
+                }
+            }
+        }
         drop(guard);
 
         if existed.is_none() && !removed_file {
@@ -330,25 +359,128 @@ impl WikiTool {
 
     // -- helpers -----------------------------------------------------------
 
-    fn slug_to_path(&self, slug: &str) -> PathBuf {
-        self.wiki_dir.join(format!("{slug}.html"))
+    /// Find wiki pages relevant to `query`: hybrid memory recall first (resolved
+    /// back to pages via the `[[wiki:<slug>]]` marker), then a direct text scan
+    /// as a fallback so pages are findable before async memory extraction lands.
+    /// `exclude` drops a slug (used so a write doesn't recommend itself).
+    async fn find_related(&self, query: &str, exclude: Option<&str>, limit: usize) -> Vec<Value> {
+        let index = self.load_index();
+        let mut hits: Vec<Value> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        if let Some(ex) = exclude {
+            seen.insert(ex.to_string());
+        }
+
+        // Primary: hybrid memory recall. Over-fetch because the backend's hybrid
+        // search ignores tag filters, so non-wiki hits are mixed in and dropped.
+        if let Ok(result) = self
+            .memory
+            .search(query, &["wiki".to_string()], limit * 4)
+            .await
+        {
+            if let Some(items) = result.get("results").and_then(|r| r.as_array()) {
+                for item in items {
+                    let content = item.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                    let Some(slug) = extract_wiki_marker(content) else {
+                        continue;
+                    };
+                    if !seen.insert(slug.clone()) || !self.slug_to_path(&slug).exists() {
+                        continue;
+                    }
+                    hits.push(json!({
+                        "slug": slug,
+                        "title": index.pages.get(&slug).map(|m| m.title.clone()).unwrap_or_else(|| slug.clone()),
+                        "url": format!("{slug}.html"),
+                        "snippet": index.pages.get(&slug).map(|m| m.summary.clone()).filter(|s| !s.is_empty()).unwrap_or_else(|| snippet(content, 240)),
+                        "score": item.get("score").cloned().unwrap_or(Value::Null),
+                        "source": "memory",
+                    }));
+                    if hits.len() >= limit {
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Fallback / supplement: a direct text scan over page contents.
+        if hits.len() < limit {
+            let needles: Vec<String> = query.split_whitespace().map(|w| w.to_lowercase()).collect();
+            for (slug, meta) in &index.pages {
+                if seen.contains(slug) {
+                    continue;
+                }
+                let Ok(document) = std::fs::read_to_string(self.slug_to_path(slug)) else {
+                    continue;
+                };
+                let text = html_to_text(&document);
+                let haystack = text.to_lowercase();
+                let matches = needles.iter().filter(|n| haystack.contains(*n)).count();
+                if matches == 0 {
+                    continue;
+                }
+                seen.insert(slug.clone());
+                hits.push(json!({
+                    "slug": slug,
+                    "title": meta.title,
+                    "url": format!("{slug}.html"),
+                    "snippet": if meta.summary.is_empty() { snippet(&text, 240) } else { meta.summary.clone() },
+                    "score": matches,
+                    "source": "filesystem",
+                }));
+                if hits.len() >= limit {
+                    break;
+                }
+            }
+        }
+        hits
     }
 
-    /// Rewrite `index.html` as a sorted table of contents over all known pages.
+    /// Rewrite just the "Referenced by" region of an existing page in place.
+    /// Best-effort: a missing file or missing markers is silently skipped.
+    fn refresh_page_backlinks(&self, target: &str, index: &WikiIndex) {
+        let path = self.slug_to_path(target);
+        let Ok(document) = std::fs::read_to_string(&path) else {
+            return;
+        };
+        let backlinks = backlinks_for(index, target);
+        let region = render_backlinks_region(&backlinks, &rel_root_for(target));
+        let re = Regex::new(&format!(
+            "(?s){}.*?{}",
+            regex::escape(BACKLINKS_START),
+            regex::escape(BACKLINKS_END)
+        ))
+        .expect("static regex");
+        let updated = re.replace(&document, region.as_str());
+        if updated != document {
+            let _ = std::fs::write(&path, updated.as_ref());
+        }
+    }
+
+    /// Rewrite `index.html` as a scannable table of contents: title, one-line
+    /// summary, tags, and inbound-reference count per page.
     fn regenerate_index(&self, index: &WikiIndex) -> Result<()> {
         let mut items = String::new();
         for (slug, meta) in &index.pages {
+            let inbound = backlinks_for(index, slug).len();
+            let mut meta_bits = Vec::new();
+            if inbound == 0 {
+                meta_bits.push("orphan".to_string());
+            } else {
+                meta_bits.push(format!("{inbound} ref(s)"));
+            }
+            if !meta.tags.is_empty() {
+                meta_bits.push(esc(&meta.tags.join(", ")));
+            }
             items.push_str(&format!(
-                "    <li><a href=\"{slug}.html\">{title}</a>{tags}</li>\n",
+                "    <li>\n      <a href=\"{slug}.html\">{title}</a> \
+                 <span class=\"meta\">{meta_bits}</span>\n{summary}    </li>\n",
                 slug = esc(slug),
                 title = esc(&meta.title),
-                tags = if meta.tags.is_empty() {
+                meta_bits = meta_bits.join(" · "),
+                summary = if meta.summary.is_empty() {
                     String::new()
                 } else {
-                    format!(
-                        " <span class=\"tags\">{}</span>",
-                        esc(&meta.tags.join(", "))
-                    )
+                    format!("      <p class=\"summary\">{}</p>\n", esc(&meta.summary))
                 },
             ));
         }
@@ -376,10 +508,14 @@ impl Tool for WikiTool {
         "Internal wiki — a persistent, interlinked HTML knowledge base on disk. \
          Use it to capture context from documents and messages you read so you \
          can retrieve it later. Actions: 'write' creates/updates a page (HTML \
-         body, optional cross-links and tags); 'read' returns a page's content \
-         and links; 'search' finds relevant pages by meaning or text; 'list' \
-         enumerates all pages; 'delete' removes a page. Pages are addressed by a \
-         'slug' path like 'projects/rustykrab' and may link to each other."
+         body, optional one-line summary, cross-links and tags) and returns \
+         related existing pages so you can update instead of duplicating; 'read' \
+         returns a page's content, outgoing links, and backlinks; 'search' finds \
+         relevant pages by meaning or text; 'list' enumerates pages with \
+         inbound/outbound link counts and flags orphans; 'delete' removes a \
+         page. Pages are addressed by a 'slug' path like 'projects/rustykrab'. \
+         Link pages together with <a href=\"other-slug.html\"> in the body or \
+         via the 'links' field — backlinks are maintained automatically."
     }
 
     fn sandbox_requirements(&self) -> SandboxRequirements {
@@ -414,6 +550,10 @@ impl Tool for WikiTool {
                         "type": "string",
                         "description": "The page body as an HTML fragment (required for write). Written verbatim inside a page template. Use <a href=\"other-slug.html\"> to link to other wiki pages."
                     },
+                    "summary": {
+                        "type": "string",
+                        "description": "Optional one-line summary shown in the index and search results. Defaults to the first sentence of the body (write only)."
+                    },
                     "links": {
                         "type": "array",
                         "items": {
@@ -424,7 +564,7 @@ impl Tool for WikiTool {
                             },
                             "required": ["slug"]
                         },
-                        "description": "Optional related pages, rendered as a 'See also' section (write only)"
+                        "description": "Optional related pages, rendered as a 'See also' section and counted in the link graph (write only)"
                     },
                     "tags": {
                         "type": "array",
@@ -546,6 +686,69 @@ fn sanitize_slug(raw: &str) -> Result<String> {
     Ok(parts.join("/"))
 }
 
+/// Collect the outgoing internal links of a page: the structured "see also"
+/// slugs plus any internal anchors (`href="...html"`) found inline in the body,
+/// resolved relative to the page's own location. The page never links to itself.
+fn collect_outgoing_links(
+    current_slug: &str,
+    body: &str,
+    see_also: &[(String, String)],
+) -> Vec<String> {
+    let mut set: BTreeSet<String> = BTreeSet::new();
+    for (slug, _) in see_also {
+        set.insert(slug.clone());
+    }
+    for (href, _) in extract_links(body) {
+        if let Some(slug) = resolve_href_to_slug(current_slug, &href) {
+            set.insert(slug);
+        }
+    }
+    set.remove(current_slug);
+    set.into_iter().collect()
+}
+
+/// Resolve a relative `<a href>` to an internal wiki slug, or `None` if it isn't
+/// an internal page link (external URL, anchor, non-`.html`, or escapes root).
+fn resolve_href_to_slug(current_slug: &str, href: &str) -> Option<String> {
+    let href = href.split(['#', '?']).next().unwrap_or(href).trim();
+    if href.is_empty() || href.contains("://") || href.starts_with("mailto:") {
+        return None;
+    }
+    let target = href.strip_suffix(".html")?;
+    // Absolute (root-relative) hrefs resolve from the wiki root; otherwise from
+    // the current page's directory.
+    let mut parts: Vec<String> = if target.starts_with('/') {
+        Vec::new()
+    } else if let Some((dir, _)) = current_slug.rsplit_once('/') {
+        dir.split('/').map(String::from).collect()
+    } else {
+        Vec::new()
+    };
+    for seg in target.trim_start_matches('/').split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                parts.pop()?;
+            }
+            s => parts.push(s.to_string()),
+        }
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    sanitize_slug(&parts.join("/")).ok()
+}
+
+/// Pages that link to `target`, as (slug, title), excluding self-links.
+fn backlinks_for(index: &WikiIndex, target: &str) -> Vec<(String, String)> {
+    index
+        .pages
+        .iter()
+        .filter(|(slug, meta)| slug.as_str() != target && meta.links.iter().any(|l| l == target))
+        .map(|(slug, meta)| (slug.clone(), meta.title.clone()))
+        .collect()
+}
+
 /// Relative prefix to reach the wiki root from a page at the given slug depth.
 fn rel_root_for(slug: &str) -> String {
     "../".repeat(slug.matches('/').count())
@@ -562,10 +765,31 @@ fn esc(s: &str) -> String {
         .replace('"', "&quot;")
 }
 
-fn build_memory_fact(slug: &str, title: &str, tags: &[String], plaintext: &str) -> String {
+/// Derive a one-line summary from page plaintext: the first sentence if it's
+/// reasonably short, otherwise a truncated prefix.
+fn derive_summary(text: &str) -> String {
+    let t = text.trim();
+    if t.is_empty() {
+        return String::new();
+    }
+    if let Some(idx) = t.find(". ") {
+        if idx < SUMMARY_LIMIT {
+            return t[..=idx].trim().to_string();
+        }
+    }
+    snippet(t, SUMMARY_LIMIT)
+}
+
+fn build_memory_fact(
+    slug: &str,
+    title: &str,
+    tags: &[String],
+    summary: &str,
+    plaintext: &str,
+) -> String {
     let excerpt = snippet(plaintext, MEMORY_EXCERPT_LIMIT);
     format!(
-        "Wiki page: {title}\n[[wiki:{slug}]]\nTags: {tags}\n\n{excerpt}",
+        "Wiki page: {title}\n[[wiki:{slug}]]\nSummary: {summary}\nTags: {tags}\n\n{excerpt}",
         tags = tags.join(", "),
     )
 }
@@ -582,7 +806,9 @@ fn render_document(title: &str, body: &str, rel_root: &str) -> String {
 <style>\n\
 body{{font-family:system-ui,sans-serif;max-width:48rem;margin:2rem auto;padding:0 1rem;line-height:1.6;color:#1a1a1a}}\n\
 nav{{margin-bottom:1.5rem;font-size:.9rem}}\n\
-.tags{{color:#666;font-size:.85rem}}\n\
+.tags,.meta{{color:#666;font-size:.85rem}}\n\
+.summary{{margin:.2rem 0 .6rem;color:#444}}\n\
+.backlinks{{margin-top:1.5rem}}\n\
 footer{{margin-top:2rem;padding-top:1rem;border-top:1px solid #ddd;color:#666;font-size:.85rem}}\n\
 a{{color:#0366d6}}\n\
 </style>\n\
@@ -597,20 +823,41 @@ a{{color:#0366d6}}\n\
     )
 }
 
-/// Render a full content page: title, agent-supplied body, then a footer with
-/// "see also" links, tags, and the last-updated timestamp.
+/// Render the auto-maintained "Referenced by" region, always wrapped in markers
+/// so it can later be refreshed in place. Empty when nothing links here.
+fn render_backlinks_region(backlinks: &[(String, String)], rel_root: &str) -> String {
+    let mut s = String::from(BACKLINKS_START);
+    if !backlinks.is_empty() {
+        s.push_str("\n<section class=\"backlinks\">\n<h2>Referenced by</h2>\n<ul>\n");
+        for (slug, title) in backlinks {
+            s.push_str(&format!(
+                "<li><a href=\"{rel_root}{slug}.html\">{title}</a></li>\n",
+                slug = esc(slug),
+                title = esc(title),
+            ));
+        }
+        s.push_str("</ul>\n</section>\n");
+    }
+    s.push_str(BACKLINKS_END);
+    s
+}
+
+/// Render a full content page: title, agent-supplied body, a footer with "see
+/// also" links / tags / timestamp, and the auto-maintained backlinks region.
+#[allow(clippy::too_many_arguments)]
 fn render_page(
     title: &str,
     body: &str,
-    links: &[(String, String)],
+    see_also: &[(String, String)],
     tags: &[String],
     updated_at: &str,
     rel_root: &str,
+    backlinks: &[(String, String)],
 ) -> String {
     let mut footer = String::from("<footer>\n");
-    if !links.is_empty() {
+    if !see_also.is_empty() {
         footer.push_str("<p><strong>See also:</strong></p>\n<ul>\n");
-        for (slug, label) in links {
+        for (slug, label) in see_also {
             footer.push_str(&format!(
                 "<li><a href=\"{rel_root}{slug}.html\">{label}</a></li>\n",
                 slug = esc(slug),
@@ -627,7 +874,8 @@ fn render_page(
     }
     footer.push_str(&format!("<p>Updated {}</p>\n</footer>", esc(updated_at)));
 
-    let content = format!("<h1>{}</h1>\n{}\n{}", esc(title), body, footer);
+    let region = render_backlinks_region(backlinks, rel_root);
+    let content = format!("<h1>{}</h1>\n{}\n{}\n{}", esc(title), body, footer, region);
     render_document(title, &content, rel_root)
 }
 
@@ -785,8 +1033,35 @@ mod tests {
     }
 
     #[test]
+    fn resolve_href_handles_relative_paths() {
+        // sibling in same dir
+        assert_eq!(
+            resolve_href_to_slug("a/b/c", "x.html"),
+            Some("a/b/x".to_string())
+        );
+        // round-trips a generated rel_root link from depth 2 back to root slug
+        assert_eq!(
+            resolve_href_to_slug("a/b/c", "../../t.html"),
+            Some("t".to_string())
+        );
+        // external / non-page links are ignored
+        assert_eq!(resolve_href_to_slug("a", "https://example.com"), None);
+        assert_eq!(resolve_href_to_slug("a", "notes.txt"), None);
+        assert_eq!(resolve_href_to_slug("a", "#section"), None);
+    }
+
+    #[test]
+    fn derive_summary_takes_first_sentence() {
+        assert_eq!(
+            derive_summary("A short intro. More detail follows here."),
+            "A short intro."
+        );
+        assert!(derive_summary("").is_empty());
+    }
+
+    #[test]
     fn extract_wiki_marker_roundtrips() {
-        let fact = build_memory_fact("projects/foo", "Foo", &["bar".into()], "body text");
+        let fact = build_memory_fact("projects/foo", "Foo", &["bar".into()], "sum", "body text");
         assert_eq!(extract_wiki_marker(&fact), Some("projects/foo".to_string()));
     }
 
@@ -815,8 +1090,9 @@ mod tests {
         assert!(contents.contains("../index.html")); // nav uses correct rel root
         assert!(contents.contains("projects/bar.html")); // see-also link
 
-        // Index page was regenerated.
-        assert!(dir.path().join("index.html").exists());
+        // Index page was regenerated and carries the summary.
+        let index_html = std::fs::read_to_string(dir.path().join("index.html")).unwrap();
+        assert!(index_html.contains("An important note."));
 
         // Memory indexing happened with wiki tags.
         {
@@ -831,6 +1107,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(read["title"], "Foo Project");
+        assert_eq!(read["summary"], "An important note.");
         assert!(read["text"].as_str().unwrap().contains("important note"));
     }
 
@@ -851,6 +1128,99 @@ mod tests {
             mem.deleted.lock().unwrap().as_slice(),
             &["mem-123".to_string()]
         );
+    }
+
+    #[tokio::test]
+    async fn backlinks_are_tracked_and_refreshed() {
+        let (tool, dir, _mem) = tool();
+        // B has no inbound links yet.
+        tool.execute(
+            json!({ "action": "write", "slug": "b", "title": "Page B", "html": "<p>b</p>" }),
+        )
+        .await
+        .unwrap();
+        // A links to B via the structured links field.
+        tool.execute(json!({
+            "action": "write", "slug": "a", "title": "Page A", "html": "<p>see b</p>",
+            "links": [{ "slug": "b" }]
+        }))
+        .await
+        .unwrap();
+
+        // read B reports the backlink live...
+        let read_b = tool
+            .execute(json!({ "action": "read", "slug": "b" }))
+            .await
+            .unwrap();
+        assert_eq!(read_b["backlinks"][0]["slug"], "a");
+        // ...and B's HTML was refreshed in place to show "Referenced by".
+        let b_html = std::fs::read_to_string(dir.path().join("b.html")).unwrap();
+        assert!(b_html.contains("Referenced by"));
+        assert!(b_html.contains(">Page A</a>"));
+
+        // A second referrer via an inline anchor also lands in B's backlinks.
+        tool.execute(json!({
+            "action": "write", "slug": "c", "title": "Page C",
+            "html": "<p>also see <a href=\"b.html\">B</a></p>"
+        }))
+        .await
+        .unwrap();
+        let read_b = tool
+            .execute(json!({ "action": "read", "slug": "b" }))
+            .await
+            .unwrap();
+        let slugs: Vec<&str> = read_b["backlinks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["slug"].as_str().unwrap())
+            .collect();
+        assert!(slugs.contains(&"a"));
+        assert!(slugs.contains(&"c"));
+    }
+
+    #[tokio::test]
+    async fn list_flags_orphans() {
+        let (tool, _dir, _mem) = tool();
+        tool.execute(json!({ "action": "write", "slug": "hub", "title": "Hub", "html": "<p>x</p>", "links": [{ "slug": "leaf" }] }))
+            .await
+            .unwrap();
+        tool.execute(
+            json!({ "action": "write", "slug": "leaf", "title": "Leaf", "html": "<p>y</p>" }),
+        )
+        .await
+        .unwrap();
+        let listed = tool.execute(json!({ "action": "list" })).await.unwrap();
+        // hub has no inbound links (orphan); leaf is referenced by hub.
+        let orphans: Vec<&str> = listed["orphans"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(orphans, vec!["hub"]);
+    }
+
+    #[tokio::test]
+    async fn write_returns_related_pages() {
+        let (tool, _dir, mem) = tool();
+        tool.execute(json!({ "action": "write", "slug": "existing", "title": "Existing", "html": "<p>kelp</p>" }))
+            .await
+            .unwrap();
+        // Memory recall surfaces the existing page as related to the new write.
+        *mem.search_results.lock().unwrap() = vec![json!({
+            "content": "Wiki page: Existing\n[[wiki:existing]]\n\nkelp",
+            "score": 0.8
+        })];
+        let res = tool
+            .execute(json!({ "action": "write", "slug": "fresh", "title": "Fresh", "html": "<p>kelp too</p>" }))
+            .await
+            .unwrap();
+        let related = res["related"].as_array().unwrap();
+        assert_eq!(related.len(), 1);
+        assert_eq!(related[0]["slug"], "existing");
+        // It never recommends the page being written.
+        assert_ne!(related[0]["slug"], "fresh");
     }
 
     #[tokio::test]
