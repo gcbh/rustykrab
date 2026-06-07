@@ -65,6 +65,7 @@ mod nodes;
 // Computer use (screen capture + input synthesis)
 mod computer;
 pub mod computer_backend;
+mod grid;
 
 // HTTP
 mod http_request;

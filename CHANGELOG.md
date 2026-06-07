@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.5.3] - 2026-06-07
+
+- Computer-use Phase 4: labeled coordinate-grid overlay for screenshots (#470)
+
 ## [4.5.2] - 2026-06-07
 
 - Computer-use Phase 3: enigo+xcap backend + CLI wiring (optional feature) (#468)

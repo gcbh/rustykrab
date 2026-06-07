@@ -129,6 +129,14 @@ impl Tool for ComputerTool {
                     "scroll_amount": {
                         "type": "integer",
                         "description": "Number of wheel steps to scroll (action 'scroll'). Defaults to 3."
+                    },
+                    "grid": {
+                        "type": "boolean",
+                        "description": "For 'screenshot': overlay a labeled coordinate grid to read off precise [x, y] targets. Useful when clicks miss."
+                    },
+                    "grid_spacing": {
+                        "type": "integer",
+                        "description": "Grid line spacing in pixels when 'grid' is true. Defaults to 100."
                     }
                 },
                 "required": ["action"]
@@ -144,13 +152,29 @@ impl Tool for ComputerTool {
         match action {
             "screenshot" => {
                 let img = self.backend.screenshot().await?;
+                let grid = args["grid"].as_bool().unwrap_or(false);
+                // Optionally overlay a labeled coordinate grid to help the
+                // model read off pixel coordinates. A failed overlay (e.g. an
+                // unexpected image format) must not fail the screenshot, so we
+                // fall back to the raw capture.
+                let mut png = img.png;
+                if grid {
+                    let spacing = args["grid_spacing"].as_u64().unwrap_or(100) as u32;
+                    match crate::grid::annotate_with_grid(&png, spacing) {
+                        Ok(annotated) => png = annotated,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "grid overlay failed; returning raw screenshot")
+                        }
+                    }
+                }
                 Ok(json!({
                     "action": "screenshot",
                     "width": img.width,
                     "height": img.height,
+                    "grid": grid,
                     "_images": [{
                         "media_type": "image/png",
-                        "data": STANDARD.encode(&img.png),
+                        "data": STANDARD.encode(&png),
                     }],
                 }))
             }
@@ -242,10 +266,14 @@ mod tests {
     impl ComputerBackend for MockBackend {
         async fn screenshot(&self) -> Result<CapturedImage> {
             self.calls.lock().unwrap().push("screenshot".into());
+            // A real (small) PNG so the grid-overlay path can decode it.
+            let img = image::RgbaImage::from_pixel(200, 120, image::Rgba([30, 30, 30, 255]));
+            let mut buf = std::io::Cursor::new(Vec::new());
+            img.write_to(&mut buf, image::ImageFormat::Png).unwrap();
             Ok(CapturedImage {
-                png: vec![0x89, 0x50, 0x4e, 0x47],
-                width: 1920,
-                height: 1080,
+                png: buf.into_inner(),
+                width: 200,
+                height: 120,
             })
         }
         async fn mouse_move(&self, x: i32, y: i32) -> Result<()> {
@@ -314,16 +342,44 @@ mod tests {
         b.calls.lock().unwrap().clone()
     }
 
+    fn decode_image_data(out: &Value) -> Vec<u8> {
+        let imgs = out["_images"].as_array().expect("_images array");
+        assert_eq!(imgs.len(), 1);
+        assert_eq!(imgs[0]["media_type"], "image/png");
+        STANDARD
+            .decode(imgs[0]["data"].as_str().expect("base64 data"))
+            .expect("valid base64")
+    }
+
     #[tokio::test]
     async fn screenshot_returns_image_via_images_key() {
         let (t, _b) = tool();
         let out = t.execute(json!({ "action": "screenshot" })).await.unwrap();
-        assert_eq!(out["width"], 1920);
-        assert_eq!(out["height"], 1080);
-        let imgs = out["_images"].as_array().expect("_images array");
-        assert_eq!(imgs.len(), 1);
-        assert_eq!(imgs[0]["media_type"], "image/png");
-        assert_eq!(imgs[0]["data"], STANDARD.encode([0x89u8, 0x50, 0x4e, 0x47]));
+        assert_eq!(out["width"], 200);
+        assert_eq!(out["height"], 120);
+        assert_eq!(out["grid"], false);
+        let png = decode_image_data(&out);
+        let dims = image::load_from_memory(&png)
+            .unwrap()
+            .to_rgba8()
+            .dimensions();
+        assert_eq!(dims, (200, 120));
+    }
+
+    #[tokio::test]
+    async fn screenshot_with_grid_overlays_and_differs() {
+        let (t, _b) = tool();
+        let plain = decode_image_data(&t.execute(json!({ "action": "screenshot" })).await.unwrap());
+        let out = t
+            .execute(json!({ "action": "screenshot", "grid": true, "grid_spacing": 50 }))
+            .await
+            .unwrap();
+        assert_eq!(out["grid"], true);
+        let gridded = decode_image_data(&out);
+        // Same dimensions, but pixels changed by the overlay.
+        let g = image::load_from_memory(&gridded).unwrap().to_rgba8();
+        assert_eq!(g.dimensions(), (200, 120));
+        assert_ne!(plain, gridded, "grid overlay should change the image");
     }
 
     #[tokio::test]
