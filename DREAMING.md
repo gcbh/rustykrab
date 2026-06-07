@@ -5,331 +5,349 @@ off-cycle, low-activity self-improvement loop that reviews what has already
 happened and reconciles it into durable knowledge (memory and, eventually,
 skills).
 
-Status: **design / proposal.** Nothing here is implemented yet. The intent is
-to agree on the architecture, the safety boundaries, and the build deltas
-before writing code. One question is deliberately left open (see
-[Open question: evaluation](#open-question-evaluation)).
+Status: **design / proposal.** Nothing here is implemented. The intent is to
+agree on the architecture, the safety boundaries, the *objective* we are
+optimizing, and the build order before writing code. This revision supersedes
+an earlier draft; the [Revision history](#revision-history) records what
+changed and why, so the discarded reasoning survives.
 
 ## Motivation
 
-RustyKrab already has a strong substrate for learning but no loop that drives
-it:
+RustyKrab has a strong substrate for learning but no loop that drives it:
 
 - Memory **capture is manual** -- the agent must call `memory_save`.
-  Conversations are persisted (`ConversationStore`) and compaction overflow
-  lands in `recall_archive`, but nothing flows from history into memory
-  automatically.
-- The memory data model is **consolidation-ready** -- `parent_memory_ids`,
+  Conversation history and compaction overflow (`recall_archive`) are persisted
+  but never flow into memory automatically.
+- The memory model is **consolidation-ready** -- `parent_memory_ids`,
   `consolidation_generation`, soft-delete (`is_valid` / `invalidated_by` /
   `invalidated_at`), and link types like `Consolidation` / `Contradicts` all
-  exist (`crates/rustykrab-memory/src/types.rs`) -- but no pipeline uses them.
+  exist (`crates/rustykrab-memory/src/types.rs`) -- but nothing uses them.
 - Skills are **static** -- loaded from disk at startup; the agent *can* create
-  one via `SkillsTool`, but nothing triggers that from experience.
+  one via `SkillsTool`, but nothing triggers that from experience, and there is
+  no notion of whether a skill *works*.
 
-"System learning" is not one job. It is three loops with different signals:
+"System learning" is three loops with different signals:
 
-1. **In-the-moment capture (online).** Retain salient facts during/after a
-   turn. Partially present via manual `memory_save` + regex extraction.
-2. **Reconciliation / consolidation (offline).** Periodically review
-   accumulated memories: merge near-duplicates, resolve contradictions into
-   temporal narratives, promote episodic specifics into semantic
-   generalizations. This is what "dreaming" primarily means here.
-3. **Skill-ification (pattern -> procedure).** Detect *recurring* procedures
-   across many sessions and crystallize them into a `SKILL.md`.
+1. **In-the-moment capture (online).** Retain salient facts during/after a turn.
+2. **Reconciliation / consolidation (offline).** Merge near-duplicates, resolve
+   contradictions, promote episodic specifics into semantic generalizations.
+3. **Skill-ification & skill improvement (offline).** Detect recurring
+   procedures and crystallize them into skills -- and improve existing skills
+   toward better outcomes.
 
-Dreaming moves loops 2 and 3 (and the housekeeping parts of 1) off the
-critical path: they run when nobody is waiting, so they cost no online
-latency.
+Dreaming moves loops 2 and 3 (and the heavy parts of 1) into downtime so they
+cost no online latency.
 
-> **Provenance note.** "Dreaming" is used loosely. The closest real prior art
-> is *sleep-time compute* (reorganize memory before queries arrive),
-> *generative replay* / memory consolidation (the neuroscience analogy), and
-> *skill-library* construction (e.g. Voyager). We deliberately scope to
-> **consolidation of things that actually happened**, not generative rehearsal
-> of hypothetical scenarios -- the latter can manufacture confident falsehoods
-> that then get stored as memory and later retrieved as if real, which is an
+> **Provenance note.** "Dreaming" is used loosely. The closest real prior art is
+> *sleep-time compute*, *generative replay* / memory consolidation, and
+> *skill-library* construction (e.g. Voyager). We scope deliberately to
+> **consolidation and improvement based on what actually happened**, not
+> generative rehearsal of hypothetical scenarios -- the latter can manufacture
+> confident falsehoods that get stored and later retrieved as if real, an
 > unacceptable contamination risk for a security-first gateway.
 
-## Core requirements
+## Design principles
 
-Two hard requirements shape the entire design:
+Three principles, in priority order. Each was learned the hard way in design
+review (see [Revision history](#revision-history)).
 
-1. **Checkpoint / rollback.** A dream's changes must be reversible if the
-   "improvements" turn out not to be improvements.
-2. **Pause mid-dream.** A dream must yield quickly when external work arrives,
-   without losing the work it has already done.
+### P1. Off-cycle, never inline
 
-These two requirements are not independent. Because a dream must *pause* and
-let real user work interleave (Requirement 2), a coarse "snapshot the whole
-database and restore it on rollback" strategy is **disqualified** -- restoring
-a whole-DB snapshot would also discard the user messages that arrived during
-the dream. The requirements therefore *jointly force* a fine-grained,
-per-change rollback model. That is a convenient convergence, not a
-coincidence.
+Learning is the **lowest-priority background activity**. It runs only when the
+system would otherwise be idle, and it **gets out of the way the instant real
+work appears**. It must never run synchronously on the session-end path, where
+it would tax latency exactly when a follow-up is likely and contend for model
+quota exactly when there is live work. Session end may only *enqueue* work
+(an instant INSERT); the thinking happens later, in downtime.
 
-## The unifying architecture
+### P2. You cannot improve what you cannot measure
 
-> A dream is a sequence of **small, idempotent, individually-committed steps**,
-> each stamped with a `dream_cycle_id`, executed as an `AgentRunner` run under
-> a dedicated **dream harness profile** that honors `InboundEvent`.
+Optimization requires an **objective** (what "better" means), a **measurement**
+(a signal of how we are doing), and a **search** (proposing variants). We have
+the search (an LLM can propose edits); we mostly lack the first two. Therefore:
 
-Everything else falls out of this single shape:
+- **No artifact is auto-improved until its desired outcome is declared and its
+  real outcomes are measurable.** Unmeasurable artifacts are *frozen*, not
+  optimized.
+- The same outcome signal that drives optimization also decides **rollback**
+  (did the change improve subsequent outcomes?). Defining outcomes closes both
+  problems at once. This is why outcome instrumentation is **Phase 0**.
 
-| Property | How the step-machine provides it |
-|----------|----------------------------------|
-| **Pause** | Stop at the next step boundary when Cancel / activity arrives. |
-| **Resume** | Restart from the first uncommitted step (steps are idempotent). |
-| **Rollback** | Undo by `dream_cycle_id` using existing soft-delete. |
-| **Termination** | The step list is finite; convergence is "no steps left". |
-| **Bounded yield latency** | Worst-case yield time = one step's duration. |
-| **Crash safety** | Each step commits in its own transaction (WAL). |
+### P3. Reversible and conservative before autonomous
 
-The design leans on the fact that the agent runner is **already an
-event-driven loop** (see below), so a dream is largely a new *profile* + a new
-*trigger* + a *write-back trust gate*, not a new execution engine.
+The first downtime jobs are **read-only / report-only**. Mutating jobs come
+only after read-only analysis has shown value, and they mutate through a
+**stage-then-promote** path so that nothing is live until promoted and every
+promoted change is reversible.
 
-## Requirement 1: checkpoint / rollback
+## Memory vs. skills: a fundamental asymmetry
 
-Rollback has two halves that are easy to conflate: the **mechanism** (being
-able to revert) and the **evaluation** (knowing whether to). This section
-covers the mechanism; evaluation is the [open question](#open-question-evaluation).
+The two halves of the system differ on the axis that matters most -- whether a
+meaningful objective even exists:
 
-### What already exists
+| | Memory consolidation | Skill improvement |
+|---|---|---|
+| **Intrinsic objective?** | Weak but real: less redundancy, fewer contradictions, "what we kept is what's later recalled". | **None.** A skill exists only to cause an outcome; "better instructions" is undefined except relative to that outcome. |
+| **Can progress without an external goal?** | Somewhat. | No -- it would be undirected mutation, i.e. drift. |
+| **Optimization gate** | Can begin with intrinsic proxies. | **Blocked** until desired outcome is declared *and* measured. |
 
-**Files:** `crates/rustykrab-memory/src/storage.rs`,
-`crates/rustykrab-memory/src/types.rs`
+The practical consequence: **memory consolidation can start earlier; skill
+improvement is gated on outcome measurement.** Treating them as one pipeline
+(the original draft's mistake) produces mediocre memories and drifting skills.
 
-- **Soft-delete with provenance.** `invalidate(id, invalidated_by)`
-  (`storage.rs`) sets `is_valid = 0`, `lifecycle_stage = 'tombstone'`, and
-  records `invalidated_by` + `invalidated_at`. Tombstoned memories are excluded
-  from retrieval but **not destroyed**.
-- **Consolidation lineage.** `Memory` already carries `parent_memory_ids` and
-  `consolidation_generation`, so a synthesized memory can point back at the
-  originals it replaced.
-- **Per-step transactions are a proven pattern.** `batch_update_stages`
-  (`storage.rs`) uses `conn.unchecked_transaction()`. The store is a single
-  `Arc<Mutex<Connection>>` in WAL mode; DB locks are held only inside
-  `with_conn` (via `spawn_blocking` + `blocking_lock`), **not** across LLM
-  calls -- so a dream's brief write locks do not block an incoming user for
-  the duration of a synthesis call.
+## The optimization problem (desired outcomes)
 
-### What does not exist
+This section is the crux. Without it, "self-improvement" is just *change*.
 
-- **No snapshot / backup / `VACUUM INTO`.** The only checkpoint is
-  `PRAGMA wal_checkpoint(TRUNCATE)` on shutdown (`crates/rustykrab-store/src/lib.rs`).
-- **No conversation versioning.** Conversations are atomic JSON blobs
-  (`crates/rustykrab-store/src/conversation.rs`); every `save()` overwrites.
-- **No skill rollback.** Skills are an in-memory `RwLock`
-  (`crates/rustykrab-skills/src/skill.rs`) plus disk files that are never
-  auto-saved back, with no manifest and no version control.
+### Outcome signal sources, by reliability
 
-### Proposed mechanism: the `dream_cycle_id` manifest
+1. **Verifiable post-conditions** -- code compiled, calendar event exists, file
+   written, cron fired. Reliable but only available for *some* skills. **These
+   skills are the first we can genuinely optimize.**
+2. **Explicit user feedback** -- a correction, "no, do it this way," "thanks," a
+   redo. Medium reliability; currently unstructured across channels, so it must
+   be captured.
+3. **Implicit behavioral signals** -- did the user re-ask, rephrase, or abandon?
+   Did the agent need retries? Did `task_complete` fire cleanly? Cheap and
+   abundant, but biased and noisy.
+4. **LLM-as-judge against the skill's declared purpose** -- scalable, but it
+   measures *plausibility*, not correctness, and can be gamed or drift. Use only
+   as a filter, never as ground truth.
 
-A dream **never hard-deletes**. For each cycle:
+A practical system blends a cheap proxy (3) for volume with an occasional
+ground-truth check (1/2) to keep the proxy honest.
 
-1. Allocate a `dream_cycle_id` (UUID).
-2. Every memory the dream writes is stamped with that id; every memory it
-   retires is `invalidate()`d (tombstoned) with `invalidated_by` pointing at
-   the synthesized child, and the child's `parent_memory_ids` pointing back.
-3. A **manifest** records every artifact touched by the cycle.
+### Skills must declare a definition of done
 
-Rollback of cycle *N* then walks the manifest: un-tombstone the parents
-(`is_valid = 1`, restore prior `lifecycle_stage`), and `invalidate()` the
-children the cycle created. This is **selective and auditable**, and crucially
-it leaves untouched any real user work that arrived mid-dream.
+A skill becomes optimizable only if it says what success is. Proposed
+`SKILL.md` frontmatter addition:
 
-Proposed manifest table (sketch):
+```toml
+[outcome]
+# Natural-language definition of done (required for auto-improvement eligibility)
+success = "The requested calendar event exists and the user confirmed the details."
+# Optional machine-checkable post-conditions, if the skill's effect is verifiable
+checks = ["calendar.event_created", "user.confirmed"]
+# Which signal class to trust for this skill: verifiable | explicit | implicit | judge
+signal = "verifiable"
+```
+
+Skills with no `[outcome]` block are **frozen** -- they run, but the dream never
+edits them.
+
+### Skill improvement as offline learning from logged outcomes
+
+Once outcomes are captured, skill optimization is principled rather than vibes:
+
+1. Gather execution traces where the skill was used.
+2. Partition by outcome signal (success / failure / ambiguous).
+3. On the failures, propose an instruction change that would plausibly have
+   produced success.
+4. **Validate before promoting** -- counterfactually against held-out failed
+   traces, or via forward A/B on subsequent uses. Promote only on demonstrated
+   improvement; otherwise discard.
+
+This is gated on **enough traces + a real outcome signal**, not on engine
+readiness. Until then the skill is frozen.
+
+## Architecture
+
+### A deterministic pipeline, not an agent
+
+Dreaming is a **deterministic batch orchestrator** that calls the model at
+fixed synthesis/proposal points -- *not* an `AgentRunner` run where a model
+freely decides what tools to call. Letting an autonomous agent drive memory and
+skill mutation is more dangerous and less predictable than a fixed pipeline, and
+it makes idempotency, resume, and testing far harder. (The original draft chose
+the agent loop for plumbing reuse; that was the wrong trade.)
+
+### The downtime worker
+
+Off-cycle execution (P1) needs only modest pieces, most leaning on existing
+plumbing:
+
+- **Cheap idle detection** -- a per-agent `last_activity` timestamp bumped on
+  inbound; the worker runs only after N minutes of quiet. *Not* a full
+  preemption bus.
+- **A work queue** -- session end *enqueues* a small job (an INSERT next to the
+  existing `JobStore` in `crates/rustykrab-store/src/jobs.rs`); the work happens
+  later.
+- **An idle-gated background worker** -- drained on the existing `infra_handles`
+  task set; yields the instant activity appears.
+
+### Small jobs + abort-and-requeue (instead of pause/resume)
+
+The unit of work is **small** -- one session, or one small batch. When live
+work arrives, the worker does not suspend-and-resume a half-finished job with
+persisted progress; it **aborts the current job and re-enqueues it**. This gives
+immediate "get out of the way" behavior without a pause/resume state machine.
+Pause/resume earns its keep only if jobs ever get long enough that discarding
+in-flight work hurts -- deferred until proven necessary.
+
+### Resource yielding is the real reason to step aside
+
+The store is a single `Arc<Mutex<Connection>>`; even reads serialize through it,
+so a dream loading many embeddings for clustering *will* block live traffic, WAL
+notwithstanding. And a dream burning model tokens can rate-limit the user's
+calls. So the dream **takes its own read-only connection** (WAL readers don't
+block the writer), reads in small batches, and treats live activity as a signal
+to **yield model budget and the connection**, not merely as a correctness
+concern.
+
+## Checkpoint / rollback (stage-then-promote)
+
+Reversibility has two halves: the **mechanism** (below) and the **trigger**,
+which is the outcome signal from [P2](#p2-you-cannot-improve-what-you-cannot-measure).
+
+### Mechanism
+
+A mutating dream computes its entire change-set against a **frozen
+read-snapshot** and writes it to a **staging set**. Nothing touches live memory
+until an atomic **promote**:
+
+- **Checkpoint** is implicit -- the live set is untouched until promotion, so
+  there is nothing to snapshot.
+- **Abort / pause** is trivial -- discard or keep the unpromoted diff; live
+  memory is never in a half-consolidated state.
+- **Promote** applies the diff in one transaction (the `unchecked_transaction()`
+  pattern already used by `batch_update_stages`), after a **staleness
+  reconciliation** that re-verifies the snapshot's parents still exist and were
+  not modified since.
+- **Rollback (post-promote)** uses a manifest of what the cycle created/retired,
+  built on existing soft-delete (`invalidate()` tombstones rather than deletes).
+
+### Honest limits of rollback
+
+Rollback is **clean only before anything depends on the cycle's outputs.** If
+the live agent has since accessed, linked, corrected, or re-consolidated a
+dream-produced memory, naive rollback resurrects stale parents and discards
+accrued value. So rollback is offered within a **probation window** (before
+first dependent access); beyond it, rollback is **best-effort and may surface
+conflicts** rather than silently clobbering. It also does not restore decay /
+`access_count` -- it is not a time machine.
+
+### Proposed manifest (sketch)
 
 ```sql
 CREATE TABLE dream_cycles (
-    id            TEXT PRIMARY KEY,   -- dream_cycle_id
-    agent_id      TEXT NOT NULL,
-    started_at    TEXT NOT NULL,
-    finished_at   TEXT,               -- NULL while running / paused
-    status        TEXT NOT NULL,      -- running | paused | committed | rolled_back
-    summary       TEXT                -- human-readable digest of what changed
+    id          TEXT PRIMARY KEY,
+    agent_id    TEXT NOT NULL,
+    kind        TEXT NOT NULL,   -- analysis | memory | skill
+    started_at  TEXT NOT NULL,
+    promoted_at TEXT,            -- NULL until promoted
+    status      TEXT NOT NULL,   -- running | staged | promoted | rolled_back | aborted
+    summary     TEXT             -- human-readable digest of what changed
 );
-
 CREATE TABLE dream_changes (
-    cycle_id      TEXT NOT NULL REFERENCES dream_cycles(id),
-    step_index    INTEGER NOT NULL,   -- for resume + ordered rollback
-    op            TEXT NOT NULL,      -- created | invalidated | promoted | ...
-    target_kind   TEXT NOT NULL,      -- memory | link | skill_proposal
-    target_id     TEXT NOT NULL,
-    prev_state    TEXT,               -- JSON of prior values for reversible ops
-    PRIMARY KEY (cycle_id, step_index, target_id)
+    cycle_id    TEXT NOT NULL REFERENCES dream_cycles(id),
+    op          TEXT NOT NULL,   -- created | invalidated | promoted_stage | ...
+    target_kind TEXT NOT NULL,   -- memory | link | skill_proposal
+    target_id   TEXT NOT NULL,
+    prev_state  TEXT,            -- JSON of prior values for reversible ops
+    PRIMARY KEY (cycle_id, target_kind, target_id)
 );
 ```
 
-Memory gains a nullable `dream_cycle_id` column (or we tag via the existing
-`metadata` JSON to avoid a migration -- decision deferred to implementation).
+Provenance: rather than overloading `ImportanceSource` (which is about the
+*score's* origin), add a distinct **`origin`** tag to memory so retrieved items
+can carry "learned while dreaming, cycle N" -- enabling both audit and
+selective rollback.
 
-### Skills: proposal-only (defers the hard part)
+## Skills are proposal-only
 
-Because skills have no rollback story and act as system prompts, the dream
-**does not hot-register skills**. It writes skill *proposals* to a staging
-area; promotion into `SkillRegistry` is gated behind human approval and/or the
+Because skills act as system prompts and have no clean rollback story
+(in-memory `RwLock` + disk files, no manifest, not version-controlled), the
+dream **never hot-registers skills**. It writes proposals to a staging area;
+promotion into `SkillRegistry` is gated behind review and/or the
 existing-but-unused Ed25519 verification path
-(`crates/rustykrab-skills/src/verify.rs`). This:
+(`crates/rustykrab-skills/src/verify.rs`). This removes skill rollback from
+scope and keeps a human in the loop for the changes most able to alter behavior.
 
-- removes skill rollback from v1 entirely (you only ever roll back memory),
-- dissolves the cross-store atomicity problem (SQLite memory + disk skills have
-  no spanning transaction), and
-- keeps a human in the loop for the changes most able to alter agent behavior.
+**Open dependency:** proposals are useless without a **review surface**. If
+dreams run unattended at 3am, proposals must be pushed somewhere a human sees
+them (a digest to a channel, or a review prompt on next interaction). Without
+that surface, the skill tier is theater and should be cut from scope honestly.
 
-## Requirement 2: pause / preemption
+## Build order
 
-### What already exists (more than expected)
+Reordered so the prerequisite (outcomes) and the safe parts come first.
 
-**File:** `crates/rustykrab-agent/src/runner.rs`
+| Phase | What | Risk | Gate to proceed |
+|---|---|---|---|
+| **0 -- Instrument outcomes** | Extend `ExecutionTracer` to log tool/skill invocations linked to outcome signals; add `[outcome]` to `SKILL.md`. Pure data collection. | None | Outcome data is flowing for at least the verifiable-signal skills. |
+| **1 -- Downtime read-only analysis** | Trigger + queue + idle-gated worker running *report-only* jobs: near-duplicate clusters, contradictions, per-skill success rates. Abort-and-requeue on activity. | None (no writes) | Reports show real, actionable patterns worth acting on. |
+| **2 -- Memory mutation** | Consolidation that writes memory via stage-then-promote + manifest + probation-window rollback. | Medium | Consolidations measurably improve retrieval and are reliably reversible. |
+| **3 -- Skill improvement** | Per-skill optimization from logged outcomes; proposal-only with a review surface. | Higher | Per-skill measurable outcomes + a working review/promotion surface exist. |
 
-The runner is **already event-driven**. `AgentRunner::start()` spawns the run
-and returns an `AgentHandle` over an `mpsc` channel, with an `InboundEvent`
-enum that already includes both signals a dream needs:
+Notably **not** required, thanks to staging + soft-delete: a DB snapshot engine,
+a job-state machine for pausing, conversation versioning, or a preemption bus.
 
-```rust
-pub enum InboundEvent {
-    UserMessage { parts: Vec<ContentPart>, channel: Option<String>, channel_msg_id: Option<String> },
-    Cancel,
-}
-```
+## What downtime does and does not solve
 
-`AgentHandle::cancel()` sends `InboundEvent::Cancel`; an `AtomicBool alive`
-flag tracks liveness. Tool execution is already wrapped in `tokio::select!`
-(for heartbeats). **The plumbing for preemption exists end-to-end.**
+- **Solves:** latency. The session-end cost is an INSERT; thinking happens when
+  idle; live work always preempts.
+- **Does not solve:** correctness. The moment a job *mutates* autonomously, you
+  still need an outcome signal to know if it helped and to undo it if not. That
+  is why Phase 0 (outcomes) precedes Phase 2 (mutation), and why early jobs are
+  read-only.
 
-### The gap
+## Interactions & risks
 
-The last wire is not connected:
+- **Dreaming vs. the decay/lifecycle manager.** Both decide "what matters" --
+  decay demotes, the dream promotes episodic->semantic. Define precedence (e.g.
+  dream promotions set a decay floor; recent explicit user signals win) or they
+  oscillate.
+- **Clustering quality.** Cosine >= 0.85 transitive closure can form giant
+  clusters or merge textually-similar-but-distinct facts into a confidently
+  wrong memory. Needs cluster-size caps and a low-confidence "do not merge"
+  guard.
+- **Proxy bias.** Implicit outcome signals are noisy; never let a single proxy
+  drive irreversible change without a ground-truth cross-check.
 
-```rust
-// drain_inbound_to_conv, runner.rs
-InboundEvent::Cancel => {}  // <- received and ignored
-```
+## Open questions
 
-And inbound is drained only *before* and *after* `run_streaming`, not
-*during* iterations. So today a Cancel is accepted and silently dropped.
-
-Three deltas make preemption real, in increasing difficulty:
-
-1. **Honor Cancel + check inbound per iteration.** At the top of each loop
-   iteration, check the channel; on Cancel (or an activity signal), stop after
-   the current step. *Small.*
-2. **Step granularity.** Tools run to completion -- the `select!` only services
-   heartbeats; **no cancellation token is passed into a tool**. So a dream can
-   be interrupted *between* steps but not *inside* one. This is acceptable only
-   if steps are small (one cluster, one consolidation). **Worst-case yield
-   latency = one LLM synthesis call.** Keep synthesis steps short, and never
-   hold a DB write lock across an LLM call (the current `with_conn` design
-   already avoids this).
-3. **Activity bus.** Nothing today tells a dream "a user just arrived" --
-   channels each own a separate `mpsc` receiver with no unified signal. Build a
-   small broadcast `ActivityBus` that channel loops ping on inbound and that
-   the dream's `select!` watches. This is also exactly what idle-detection
-   needs, so it is shared infrastructure, not pure overhead.
-
-### Pause vs. abort, and resumability
-
-The requirement is **pause**, not abort, so a paused dream must record enough
-to resume. Because steps are idempotent and individually committed, "resume"
-is just "find the first `step_index` not present in `dream_changes` for this
-cycle and continue". The `dream_cycles.status` column carries
-`running | paused` so a resumed daemon knows what to pick up.
-
-## Tiers
-
-Ship in increasing order of risk so the safe parts land first and de-risk the
-plumbing:
-
-| Tier | What | Risk | Notes |
-|------|------|------|-------|
-| **1 -- Maintenance** | Lifecycle sweep, near-duplicate linking, embedding-drift check, tombstoning | None (no LLM) | Pure housekeeping of code that already exists but is never scheduled. Validates the scheduler / idle-detection / step-machine plumbing first. |
-| **2 -- Consolidation** | Replay `recall_archive` + recent episodics; synthesize near-duplicate clusters; resolve contradictions; promote episodic -> semantic | Medium (LLM writes memory) | All writes carry `dream_cycle_id` provenance and are rollback-able. |
-| **3 -- Skill-ification** | Detect recurring procedures across sessions; draft `SKILL.md` | Higher | **Proposal-only.** Routed through approval / verification gate; never auto-registered. |
-
-## Trigger model
-
-- **Idle vs. scheduled.** Start with a quiet-hours cron (you already have
-  `JobStore` + a cron tool) -- ~80% of the value for far less complexity.
-  True per-agent idle-detection (last-activity timestamp + cooldown so a dream
-  does not fire and immediately get interrupted) can layer on top once the
-  `ActivityBus` exists.
-- **Per-agent, not global.** "Little activity" is scoped per `agent_id`; the
-  dream operates on one agent's memory at a time.
-- **Preemptible.** The same `ActivityBus` signal both *gates* a dream from
-  starting and *pauses* one in flight.
-
-## Cost governance & safety
-
-- **Hard budget.** Token / time / iteration caps. `HarnessProfile`
-  (`crates/rustykrab-agent/src/harness.rs`) already models iteration limits;
-  the dream profile sets tight ones.
-- **Convergence / idempotency.** A dream must detect "nothing meaningful to
-  consolidate" and stop; re-dreaming the same archive must not keep generating
-  near-duplicate "insights".
-- **Auditability.** Add a `Dream` variant to `ImportanceSource`
-  (today: `Heuristic | Llm | User`) so retrieved memories carry "I learned this
-  while dreaming, not directly from you", and so a bad cycle can be found and
-  rolled back.
-- **Trust boundary.** Autonomous, unattended writes to memory are acceptable in
-  Tier 2 *because* they are reversible and provenance-tagged. Skills
-  (system-prompt-level influence) are **never** autonomous -- proposal-only.
-
-## What is net-new to build
-
-Honest deltas, grounded in the current code:
-
-1. **Honor `InboundEvent::Cancel`** + per-iteration inbound check
-   (`runner.rs`). *Small.*
-2. **`ActivityBus`** broadcast for idle-detection + preemption. *Small/medium;
-   needed anyway.*
-3. **`dream_cycles` / `dream_changes` manifest** + rollback routine over the
-   existing soft-delete API. *Medium.*
-4. **Resumable progress** (first uncommitted `step_index`). *Small, given
-   idempotent steps.*
-5. **Dream `HarnessProfile`** + dream orchestrator (trigger, step loop).
-   *Medium.*
-6. **Skill staging area** (proposal-only). *Small; defers skill rollback.*
-
-Notably **not** required, thanks to the soft-delete model: a DB snapshot
-engine, a job state machine, or conversation versioning.
-
-## Open question: evaluation
-
-The rollback *mechanism* is well-defined above. What remains undecided is the
-**evaluation** half of Requirement 1: how does the system decide a dream's
-changes were *not* improvements, i.e. when to press the rollback button?
-
-Options:
-
-- **Manual review.** The dream emits a diff / digest (`dream_cycles.summary`);
-  a human approves or rolls back. Simplest and safest; slowest.
-- **Automatic guardrails.** Invariants auto-trigger rollback -- e.g. no net
-  memory loss beyond a threshold, or retrieval quality on a held-out query set
-  does not regress.
-- **Both.** Guardrails catch the obvious; a human reviews the rest.
-
-This choice determines whether the dream needs an **eval harness** (held-out
-queries, quality metrics) or merely a **digest emitter**. It is the last thing
-to pin down before implementation begins.
+- **Per-skill outcome bootstrapping.** Requiring a `[outcome]` block is clean for
+  *new* skills; how do we backfill desired outcomes for skills that already
+  exist, or for agent-authored ones?
+- **Ground-truth coverage.** Verifiable post-conditions cover only some skills.
+  For subjective skills (e.g. "summarize well"), is LLM-as-judge acceptable as a
+  gated, audited signal, or do those skills stay frozen?
+- **Review surface for proposals.** Which channel / UX surfaces skill (and
+  risky memory) proposals for human approval?
 
 ## Key file references
 
 | Concern | File |
-|---------|------|
-| Agent event loop, `InboundEvent`, `AgentHandle`, Cancel no-op | `crates/rustykrab-agent/src/runner.rs` |
+|---|---|
+| Agent event loop, `InboundEvent`, Cancel no-op (borrow conceptually) | `crates/rustykrab-agent/src/runner.rs` |
+| Execution tracing (extend for outcome capture) | `crates/rustykrab-agent/src/runner.rs` |
 | Harness profiles (budget caps) | `crates/rustykrab-agent/src/harness.rs` |
 | Memory soft-delete, transactions, `with_conn` | `crates/rustykrab-memory/src/storage.rs` |
 | Memory model (provenance, consolidation fields) | `crates/rustykrab-memory/src/types.rs` |
 | Lifecycle sweep / near-duplicate detection | `crates/rustykrab-memory/src/lifecycle.rs` |
 | Compaction overflow store (`recall_archive`) | `crates/rustykrab-store/src/recall_archive.rs` |
 | Store connection / WAL / shutdown checkpoint | `crates/rustykrab-store/src/lib.rs` |
-| Cron / scheduled jobs | `crates/rustykrab-store/src/jobs.rs` |
-| Skill registry, disk loading, verification | `crates/rustykrab-skills/src/` |
-| Orchestration (where a post-cycle hook would attach) | `crates/rustykrab-gateway/src/orchestrate.rs` |
+| Cron / scheduled jobs (queue lives near here) | `crates/rustykrab-store/src/jobs.rs` |
+| Skill registry, disk loading, `SKILL.md`, verification | `crates/rustykrab-skills/src/` |
+| Orchestration (where the enqueue hook attaches) | `crates/rustykrab-gateway/src/orchestrate.rs` |
+
+## Revision history
+
+- **v2 (this revision).** (1) Off-cycle from day one via trigger + queue +
+  idle-gated worker -- never inline at session end. (2) Outcome measurement
+  promoted to a first-class principle and **Phase 0**; skills gated on declared,
+  measurable outcomes; the outcome signal doubles as the rollback trigger.
+  (3) Deterministic pipeline instead of an agent loop. (4) Stage-then-promote
+  instead of mutate-then-undo, with an explicit probation window and honest
+  limits on rollback cleanliness. (5) Small jobs + abort-and-requeue instead of
+  pause/resume. (6) Dream takes its own read-only connection; yielding is about
+  freeing model/connection budget, not lock safety.
+- **v1.** Original draft: dreaming as an `AgentRunner` run with a dream profile;
+  step-machine mutating live memory with a manifest for undo; pause/resume via
+  persisted progress; evaluation left as a single open question.
 
 ## Relationship to existing docs
 
-See `MEMORY_ARCHITECTURE.md` for the memory subsystem this design builds on,
-and `crates/rustykrab-memory/DEFERRED.md` for previously-deferred consolidation
-work that dreaming would finally drive.
+See `MEMORY_ARCHITECTURE.md` for the memory subsystem this builds on, and
+`crates/rustykrab-memory/DEFERRED.md` for previously-deferred consolidation work
+that dreaming would finally drive.
