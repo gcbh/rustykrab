@@ -383,6 +383,7 @@ pub fn video_tools(
 /// enabled), mirroring how `video_tools` is gated.
 pub fn computer_tools(
     backend: std::sync::Arc<dyn ComputerBackend>,
+    readonly: bool,
 ) -> Vec<std::sync::Arc<dyn rustykrab_core::Tool>> {
-    vec![std::sync::Arc::new(ComputerTool::new(backend))]
+    vec![std::sync::Arc::new(ComputerTool::new(backend, readonly))]
 }

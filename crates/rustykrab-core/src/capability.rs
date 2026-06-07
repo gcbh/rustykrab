@@ -27,6 +27,19 @@ pub fn is_subagent_tool(tool_name: &str) -> bool {
     SUBAGENT_TOOL_NAMES.contains(&tool_name)
 }
 
+/// Name of the computer-use tool which, in addition to a matching
+/// [`Capability::Tool`] grant, requires [`Capability::ComputerUse`] to use.
+/// Driving the desktop (mouse/keyboard/screen) is the most powerful
+/// capability the agent has, so it gets an extra gate beyond mere
+/// registration — granted only when the runtime explicitly opts in.
+pub const COMPUTER_USE_TOOL_NAME: &str = "computer";
+
+/// Returns whether `tool_name` is the computer-use tool, which requires
+/// [`Capability::ComputerUse`].
+pub fn is_computer_use_tool(tool_name: &str) -> bool {
+    tool_name == COMPUTER_USE_TOOL_NAME
+}
+
 /// A capability that can be granted to a conversation session.
 ///
 /// Capabilities follow the principle of least privilege — each
@@ -60,6 +73,10 @@ pub enum Capability {
     /// to [`Capability::Tool`] for those tools so spawning nested agent
     /// loops is opt-in even when the tools are registered.
     Subagent,
+    /// Can use the computer-use tool (screen capture + mouse/keyboard
+    /// synthesis). Required in addition to [`Capability::Tool("computer")`]
+    /// so driving the desktop stays opt-in even when the tool is registered.
+    ComputerUse,
     /// Administrative — can manage other sessions.
     Admin,
 }
@@ -118,6 +135,12 @@ impl CapabilitySet {
         // Two-layer gate for the sub-agent family: even if `Tool(name)`
         // is granted, the session also needs `Subagent`.
         if is_subagent_tool(base) && !self.capabilities.contains(&Capability::Subagent) {
+            return false;
+        }
+
+        // Two-layer gate for computer-use: even if `Tool("computer")` is
+        // granted, the session also needs `ComputerUse`.
+        if is_computer_use_tool(base) && !self.capabilities.contains(&Capability::ComputerUse) {
             return false;
         }
 
@@ -267,5 +290,37 @@ mod tests {
     fn for_tools_permissive_does_not_grant_subagent() {
         let caps = CapabilitySet::for_tools_permissive(&["subagents"]);
         assert!(!caps.has(&Capability::Subagent));
+    }
+
+    #[test]
+    fn computer_tool_blocked_without_computer_use_capability() {
+        // Even with `Tool("computer")` granted, the session still needs
+        // `ComputerUse` to actually drive the desktop.
+        let caps = CapabilitySet::for_tools_permissive(&["computer", "read"]);
+        assert!(!caps.can_use_tool("computer"));
+        assert!(caps.can_use_tool("read"));
+    }
+
+    #[test]
+    fn computer_tool_allowed_when_computer_use_granted() {
+        let mut caps = CapabilitySet::for_tools_permissive(&["computer"]);
+        caps.grant(Capability::ComputerUse);
+        assert!(caps.can_use_tool("computer"));
+        // Colon-suffixed variants some models emit still resolve.
+        assert!(caps.can_use_tool("computer:left_click"));
+    }
+
+    #[test]
+    fn computer_use_capability_alone_does_not_grant_the_tool() {
+        let mut caps = CapabilitySet::none();
+        caps.grant(Capability::ComputerUse);
+        // No `Tool("computer")` grant, so still denied.
+        assert!(!caps.can_use_tool("computer"));
+    }
+
+    #[test]
+    fn for_tools_permissive_does_not_grant_computer_use() {
+        let caps = CapabilitySet::for_tools_permissive(&["computer"]);
+        assert!(!caps.has(&Capability::ComputerUse));
     }
 }

@@ -63,6 +63,11 @@ pub struct AppState {
     /// `RUSTYKRAB_ENABLE_SUBAGENTS` env var at startup; threaded through
     /// here so `prepare_agent` knows whether to grant `Capability::Subagent`.
     pub subagents_enabled: bool,
+    /// Whether the computer-use tool should be granted to sessions created by
+    /// this gateway. Default `false`. Driven by `RUSTYKRAB_COMPUTER_USE` at
+    /// startup; threaded through so `prepare_agent` knows whether to grant
+    /// `Capability::ComputerUse`.
+    pub computer_use_enabled: bool,
 }
 
 impl AppState {
@@ -100,6 +105,7 @@ impl AppState {
             recall,
             todos: Arc::new(TodoStore::new()),
             subagents_enabled: false,
+            computer_use_enabled: false,
         }
     }
 
@@ -108,6 +114,15 @@ impl AppState {
     /// `RUSTYKRAB_ENABLE_SUBAGENTS` env var in the CLI; off by default.
     pub fn with_subagents_enabled(mut self, enabled: bool) -> Self {
         self.subagents_enabled = enabled;
+        self
+    }
+
+    /// Grant the computer-use tool to every session created by this gateway.
+    /// Driven by `RUSTYKRAB_COMPUTER_USE` in the CLI; off by default. Only
+    /// meaningful when the tool is actually registered (built with the
+    /// `computer-use` feature).
+    pub fn with_computer_use_enabled(mut self, enabled: bool) -> Self {
+        self.computer_use_enabled = enabled;
         self
     }
 
