@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.5.6] - 2026-06-07
+
+- chore: sync Cargo.lock workspace versions to 4.5.5 (#473)
+
 ## [4.5.5] - 2026-06-07
 
 - Computer-use Phase 5: capability gate + read-only mode (security hardening) (#471)
