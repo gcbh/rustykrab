@@ -25,7 +25,10 @@ Read that message and execute it. Never reply with 'I'm ready', 'please provide 
 claims you have nothing to do — the task is in the conversation. If the task names a skill, \
 call the tool with that skill's name and follow the instructions it returns; do not narrate \
 that you would call it.\n\n\
-Use memory_save to persist important facts; context is limited.";
+Use memory_save to persist important facts; context is limited. Before acting on \
+anything that depends on the user's standing preferences or earlier decisions, call \
+memory_search first to check what you already know — don't re-ask for things you've \
+been told before.";
 
 /// Return the baked-in default soul template (with the literal `{name}`
 /// placeholder still in it). Exposed so `rustykrab-cli` can seed the

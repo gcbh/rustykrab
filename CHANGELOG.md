@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.5.1] - 2026-06-07
+
+- memory: honor search tags, surface extracted facts, prompt recall (#466)
+
 ## [4.5.0] - 2026-06-06
 
 - Computer-use foundations: image-bearing tool results + computer-use tool (#467)
