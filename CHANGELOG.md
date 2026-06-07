@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.5.4] - 2026-06-07
+
+- Wiki discoverability: summaries, backlinks/orphans, related-page hints (#469)
+
 ## [4.5.3] - 2026-06-07
 
 - Computer-use Phase 4: labeled coordinate-grid overlay for screenshots (#470)
