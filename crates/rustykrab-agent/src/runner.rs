@@ -235,7 +235,9 @@ const TASK_COMPLETE_REMINDER: &str =
      is fully handled, call `task_complete` now with a `summary` containing the \
      final answer the user should see. If more work remains, call the next tool \
      to keep going — text alone will not end the turn now that you've started \
-     working.";
+     working. If a tool failed and you cannot complete the request, the \
+     `summary` must state the specific error — quote any status code and hint \
+     from the tool output verbatim rather than giving a vague apology.";
 
 /// Outcome of `AgentRunner::reprompt_for_task_complete`: tell the caller
 /// whether to keep looping or accept the last response. Lets the streaming
@@ -997,6 +999,11 @@ impl AgentRunner {
         // turn, but once the model has started using tools we expect an
         // explicit completion signal.
         let mut has_called_any_tool = false;
+        // The most recent tool failure that has not since been recovered
+        // (the same tool later succeeded). Carried to the accept-final-answer
+        // sites so the specific error is surfaced to the user instead of being
+        // buried under the model's narration. `(tool_name, message)`.
+        let mut last_unrecovered_error: Option<(String, String)> = None;
 
         for iteration in 0..self.config.max_iterations {
             tracer.record_iteration();
@@ -1145,6 +1152,11 @@ impl AgentRunner {
                     let tool_msg = match result {
                         Ok(tr) => {
                             tracing::info!(tool = %tool_name, call_id = %call_id, "tool call succeeded");
+                            track_tool_outcome(
+                                &mut last_unrecovered_error,
+                                &tool_name,
+                                tr.output.get("error").map(tool_error_string),
+                            );
                             Message {
                                 id: Uuid::new_v4(),
                                 role: Role::Tool,
@@ -1155,6 +1167,11 @@ impl AgentRunner {
                         Err(e) => {
                             let (output, err_str) = tool_error_output(&e);
                             tracing::warn!(tool = %tool_name, call_id = %call_id, error = %err_str, kind = e.kind().as_str(), "tool call failed");
+                            track_tool_outcome(
+                                &mut last_unrecovered_error,
+                                &tool_name,
+                                Some(err_str),
+                            );
                             Message {
                                 id: Uuid::new_v4(),
                                 role: Role::Tool,
@@ -1193,6 +1210,7 @@ impl AgentRunner {
                 // tool_call has a matching tool_result.
                 if let Some(summary) = task_complete_summary {
                     self.finalize_task_complete(conv, iteration, summary);
+                    surface_unrecovered_error(conv, &last_unrecovered_error);
                     return Ok(());
                 }
 
@@ -1233,12 +1251,18 @@ impl AgentRunner {
                             &classification,
                         ) {
                             CompletionReminderOutcome::Continue => continue,
-                            CompletionReminderOutcome::GiveUp => return Ok(()),
+                            CompletionReminderOutcome::GiveUp => {
+                                surface_unrecovered_error(conv, &last_unrecovered_error);
+                                return Ok(());
+                            }
                         }
                     }
 
                     match classification {
-                        ResponseClass::Complete => return Ok(()),
+                        ResponseClass::Complete => {
+                            surface_unrecovered_error(conv, &last_unrecovered_error);
+                            return Ok(());
+                        }
                         ResponseClass::Empty => {
                             tracing::warn!(
                                 iteration,
@@ -1249,11 +1273,13 @@ impl AgentRunner {
                                 tracing::info!(
                                     "side effects occurred — not retrying empty response"
                                 );
+                                surface_unrecovered_error(conv, &last_unrecovered_error);
                                 return Ok(());
                             }
                             empty_response_retries += 1;
                             if empty_response_retries > EMPTY_RESPONSE_RETRY_LIMIT {
                                 tracing::warn!("empty response retries exhausted");
+                                surface_unrecovered_error(conv, &last_unrecovered_error);
                                 return Ok(());
                             }
                             self.push_message(
@@ -1274,6 +1300,7 @@ impl AgentRunner {
                                 tracing::info!(
                                     "side effects occurred — accepting planning-only response"
                                 );
+                                surface_unrecovered_error(conv, &last_unrecovered_error);
                                 return Ok(());
                             }
                             planning_only_retries += 1;
@@ -1281,6 +1308,7 @@ impl AgentRunner {
                                 tracing::warn!(
                                     "planning-only retries exhausted — accepting response"
                                 );
+                                surface_unrecovered_error(conv, &last_unrecovered_error);
                                 return Ok(());
                             }
                             tracing::warn!(
@@ -1315,6 +1343,7 @@ impl AgentRunner {
                         tracing::warn!(
                             "ToolUse without tool calls after side effects — stopping to avoid duplicates"
                         );
+                        surface_unrecovered_error(conv, &last_unrecovered_error);
                         return Ok(());
                     }
                     empty_tool_use_retries += 1;
@@ -1367,6 +1396,7 @@ impl AgentRunner {
         );
         let final_response = self.provider.chat(&conv.messages, &[]).await?;
         self.push_message(conv, final_response.message);
+        surface_unrecovered_error(conv, &last_unrecovered_error);
         Ok(())
     }
 
@@ -1415,6 +1445,9 @@ impl AgentRunner {
         let mut task_complete_retries: usize = 0;
         let mut had_side_effects = false;
         let mut has_called_any_tool = false;
+        // See run_inner: most recent unrecovered tool failure, surfaced to the
+        // user at the accept-final-answer sites. `(tool_name, message)`.
+        let mut last_unrecovered_error: Option<(String, String)> = None;
 
         for iteration in 0..self.config.max_iterations {
             tracer.record_iteration();
@@ -1561,6 +1594,11 @@ impl AgentRunner {
                     let (tool_msg, success, error_message) = match result {
                         Ok(tr) => {
                             tracing::info!(tool = %tool_name, call_id = %call_id, "tool call succeeded");
+                            track_tool_outcome(
+                                &mut last_unrecovered_error,
+                                &tool_name,
+                                tr.output.get("error").map(tool_error_string),
+                            );
                             let msg = Message {
                                 id: Uuid::new_v4(),
                                 role: Role::Tool,
@@ -1572,6 +1610,11 @@ impl AgentRunner {
                         Err(e) => {
                             let (output, err_str) = tool_error_output(&e);
                             tracing::warn!(tool = %tool_name, call_id = %call_id, error = %err_str, kind = e.kind().as_str(), "tool call failed");
+                            track_tool_outcome(
+                                &mut last_unrecovered_error,
+                                &tool_name,
+                                Some(err_str.clone()),
+                            );
                             let msg = Message {
                                 id: Uuid::new_v4(),
                                 role: Role::Tool,
@@ -1616,6 +1659,7 @@ impl AgentRunner {
                 if let Some(summary) = task_complete_summary {
                     on_event(AgentEvent::TextDelta(summary.clone()));
                     self.finalize_task_complete(conv, iteration, summary);
+                    emit_unrecovered_error(conv, &last_unrecovered_error, on_event);
                     on_event(AgentEvent::Done);
                     return Ok(());
                 }
@@ -1654,6 +1698,7 @@ impl AgentRunner {
                         ) {
                             CompletionReminderOutcome::Continue => continue,
                             CompletionReminderOutcome::GiveUp => {
+                                emit_unrecovered_error(conv, &last_unrecovered_error, on_event);
                                 on_event(AgentEvent::Done);
                                 return Ok(());
                             }
@@ -1662,6 +1707,7 @@ impl AgentRunner {
 
                     match classification {
                         ResponseClass::Complete => {
+                            emit_unrecovered_error(conv, &last_unrecovered_error, on_event);
                             on_event(AgentEvent::Done);
                             return Ok(());
                         }
@@ -1675,12 +1721,14 @@ impl AgentRunner {
                                 tracing::info!(
                                     "side effects occurred — not retrying empty response"
                                 );
+                                emit_unrecovered_error(conv, &last_unrecovered_error, on_event);
                                 on_event(AgentEvent::Done);
                                 return Ok(());
                             }
                             empty_response_retries += 1;
                             if empty_response_retries > EMPTY_RESPONSE_RETRY_LIMIT {
                                 tracing::warn!("empty response retries exhausted");
+                                emit_unrecovered_error(conv, &last_unrecovered_error, on_event);
                                 on_event(AgentEvent::Done);
                                 return Ok(());
                             }
@@ -1702,6 +1750,7 @@ impl AgentRunner {
                                 tracing::info!(
                                     "side effects occurred — accepting planning-only response"
                                 );
+                                emit_unrecovered_error(conv, &last_unrecovered_error, on_event);
                                 on_event(AgentEvent::Done);
                                 return Ok(());
                             }
@@ -1710,6 +1759,7 @@ impl AgentRunner {
                                 tracing::warn!(
                                     "planning-only retries exhausted — accepting response"
                                 );
+                                emit_unrecovered_error(conv, &last_unrecovered_error, on_event);
                                 on_event(AgentEvent::Done);
                                 return Ok(());
                             }
@@ -1742,6 +1792,7 @@ impl AgentRunner {
                         tracing::warn!(
                             "ToolUse without tool calls after side effects — stopping to avoid duplicates"
                         );
+                        emit_unrecovered_error(conv, &last_unrecovered_error, on_event);
                         on_event(AgentEvent::Done);
                         return Ok(());
                     }
@@ -1803,6 +1854,7 @@ impl AgentRunner {
             .chat_stream(&conv.messages, &[], &stream_callback)
             .await?;
         self.push_message(conv, final_response.message);
+        emit_unrecovered_error(conv, &last_unrecovered_error, on_event);
         on_event(AgentEvent::Done);
         Ok(())
     }
@@ -2632,7 +2684,11 @@ impl AgentRunner {
                 text.push_str(&format!("  {}. {}\n", i + 1, err));
             }
         }
-        text.push_str("Try a different approach.");
+        text.push_str(
+            "Try a different approach. If you cannot recover, your final answer must report \
+             the specific error above to the user — including any status code and hint — \
+             rather than a vague apology.",
+        );
 
         self.push_message(
             conv,
@@ -2677,6 +2733,115 @@ fn tool_error_output(e: &Error) -> (serde_json::Value, String) {
         "retryable": kind.retryable(),
     });
     (output, message)
+}
+
+/// Render a tool error value (from a soft-error `ToolResult` payload) as a
+/// plain string. Strings are taken verbatim; anything else falls back to its
+/// JSON representation.
+fn tool_error_string(v: &serde_json::Value) -> String {
+    match v.as_str() {
+        Some(s) => s.to_string(),
+        None => v.to_string(),
+    }
+}
+
+/// Update the running "last unrecovered error" state after a tool result.
+///
+/// `error` is `Some(message)` when the tool failed (a hard `Err` or a soft
+/// error payload) and `None` on success. A failure records the error; a success
+/// clears any outstanding error *for the same tool*, treating a later success as
+/// recovery while leaving an unrelated tool's failure intact.
+fn track_tool_outcome(
+    last_error: &mut Option<(String, String)>,
+    tool_name: &str,
+    error: Option<String>,
+) {
+    match error {
+        Some(message) => *last_error = Some((tool_name.to_string(), message)),
+        None => {
+            if matches!(last_error, Some((t, _)) if t == tool_name) {
+                *last_error = None;
+            }
+        }
+    }
+}
+
+/// If a tool error went unrecovered this run, append its detail to the final
+/// assistant message so the specific failure reaches the user instead of being
+/// buried under the model's narration.
+///
+/// `last_error` is `Some((tool_name, message))` when a tool failed and was not
+/// subsequently retried successfully. Returns the footer text that was appended
+/// (so streaming callers can also emit it as a text delta), or `None` when
+/// nothing was added — either because no error is outstanding, there is no
+/// assistant message to amend, or the response already surfaces the error.
+fn surface_unrecovered_error(
+    conv: &mut Conversation,
+    last_error: &Option<(String, String)>,
+) -> Option<String> {
+    let (tool, err) = last_error.as_ref()?;
+    let target = conv
+        .messages
+        .iter_mut()
+        .rev()
+        .find(|m| m.role == Role::Assistant && m.content.as_text().is_some())?;
+    let current = target.content.as_text().unwrap_or("").to_string();
+    if response_surfaces_error(&current, err) {
+        return None;
+    }
+    let footer = format!("⚠️ {tool} failed: {err}");
+    let combined = if current.trim().is_empty() {
+        footer.clone()
+    } else {
+        format!("{current}\n\n{footer}")
+    };
+    target.content = MessageContent::Text(combined);
+    Some(footer)
+}
+
+/// Streaming counterpart to [`surface_unrecovered_error`]: append the error to
+/// the final assistant message *and* emit it as a text delta so streaming UIs
+/// (which already rendered the model's narration) also see the specific failure.
+fn emit_unrecovered_error(
+    conv: &mut Conversation,
+    last_error: &Option<(String, String)>,
+    on_event: &(dyn Fn(AgentEvent) + Send + Sync),
+) {
+    if let Some(footer) = surface_unrecovered_error(conv, last_error) {
+        on_event(AgentEvent::TextDelta(format!("\n\n{footer}")));
+    }
+}
+
+/// Does the model's own text already surface the tool error? We treat an HTTP
+/// status code (e.g. "401") as the key signal: if the error carries one and the
+/// response repeats it, the model has already reported the failure and we skip
+/// the footer to avoid double-reporting. Errors without a recognizable code
+/// always get the footer — burying the detail is worse than repeating it.
+fn response_surfaces_error(response: &str, error: &str) -> bool {
+    match extract_http_status(error) {
+        Some(code) => response.contains(&code),
+        None => false,
+    }
+}
+
+/// Pull the first standalone HTTP-status-like token (three digits, 1xx–5xx)
+/// out of an error message, e.g. "… returned HTTP 401 …" → "401". The digit
+/// run must not be part of a longer number so "4010" is not matched.
+fn extract_http_status(error: &str) -> Option<String> {
+    let bytes = error.as_bytes();
+    let mut i = 0;
+    while i + 3 <= bytes.len() {
+        let window = &bytes[i..i + 3];
+        let is_run = window.iter().all(u8::is_ascii_digit)
+            && (b'1'..=b'5').contains(&window[0])
+            && (i == 0 || !bytes[i - 1].is_ascii_digit())
+            && (i + 3 == bytes.len() || !bytes[i + 3].is_ascii_digit());
+        if is_run {
+            return Some(String::from_utf8_lossy(window).into_owned());
+        }
+        i += 1;
+    }
+    None
 }
 
 #[cfg(test)]
@@ -2728,6 +2893,151 @@ mod error_output_tests {
         let clamped = sanitize_error(&huge);
         assert!(clamped.chars().count() < huge.chars().count());
         assert!(clamped.ends_with("[truncated]"));
+    }
+}
+
+#[cfg(test)]
+mod error_surfacing_tests {
+    use super::*;
+
+    const CALDAV_401: &str = "CalDAV https://example/caldav returned HTTP 401 \
+        (401 Unauthorized — check that gmail_app_password is a Google *app* password): denied";
+
+    fn conv_with_assistant(text: &str) -> Conversation {
+        Conversation {
+            id: Uuid::new_v4(),
+            messages: vec![
+                Message {
+                    id: Uuid::new_v4(),
+                    role: Role::User,
+                    content: MessageContent::Text("check my calendar".into()),
+                    created_at: Utc::now(),
+                },
+                Message {
+                    id: Uuid::new_v4(),
+                    role: Role::Assistant,
+                    content: MessageContent::Text(text.into()),
+                    created_at: Utc::now(),
+                },
+            ],
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            title: None,
+            summary: None,
+            detected_profile: None,
+            channel_source: None,
+            channel_id: None,
+            channel_thread_id: None,
+        }
+    }
+
+    fn last_assistant_text(conv: &Conversation) -> String {
+        conv.messages
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::Assistant)
+            .and_then(|m| m.content.as_text())
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    #[test]
+    fn extracts_standalone_http_status() {
+        assert_eq!(extract_http_status(CALDAV_401).as_deref(), Some("401"));
+        assert_eq!(
+            extract_http_status("server returned HTTP 503 Service Unavailable").as_deref(),
+            Some("503")
+        );
+    }
+
+    #[test]
+    fn ignores_non_status_digit_runs() {
+        // No 1xx–5xx standalone triple, and longer numbers are not matched.
+        assert_eq!(extract_http_status("ref 4010 not found"), None);
+        assert_eq!(extract_http_status("permission denied for path"), None);
+        assert_eq!(extract_http_status("port 8080 refused"), None);
+    }
+
+    #[test]
+    fn surfaces_error_when_model_buries_it() {
+        let mut conv = conv_with_assistant("I was unable to access your calendar.");
+        let last = Some(("caldav".to_string(), CALDAV_401.to_string()));
+
+        let footer = surface_unrecovered_error(&mut conv, &last);
+
+        assert!(footer.is_some(), "footer should be appended");
+        let text = last_assistant_text(&conv);
+        assert!(text.starts_with("I was unable to access your calendar."));
+        assert!(text.contains("caldav failed"));
+        assert!(text.contains("401"));
+        assert!(text.contains("gmail_app_password"));
+    }
+
+    #[test]
+    fn does_not_duplicate_when_model_quotes_the_code() {
+        let mut conv = conv_with_assistant(
+            "I couldn't reach your calendar — the server returned a 401 Unauthorized, \
+             which usually means the app password is wrong.",
+        );
+        let last = Some(("caldav".to_string(), CALDAV_401.to_string()));
+
+        let footer = surface_unrecovered_error(&mut conv, &last);
+
+        assert!(footer.is_none(), "model already surfaced the 401");
+        assert!(!last_assistant_text(&conv).contains("caldav failed"));
+    }
+
+    #[test]
+    fn no_op_when_no_unrecovered_error() {
+        let mut conv = conv_with_assistant("All set — your next event is at noon.");
+        let footer = surface_unrecovered_error(&mut conv, &None);
+        assert!(footer.is_none());
+        assert_eq!(
+            last_assistant_text(&conv),
+            "All set — your next event is at noon."
+        );
+    }
+
+    #[test]
+    fn footer_replaces_empty_assistant_text() {
+        let mut conv = conv_with_assistant("");
+        let last = Some(("caldav".to_string(), CALDAV_401.to_string()));
+
+        assert!(surface_unrecovered_error(&mut conv, &last).is_some());
+        let text = last_assistant_text(&conv);
+        assert!(text.starts_with("⚠️ caldav failed"));
+        assert!(
+            !text.starts_with('\n'),
+            "no leading blank lines on empty text"
+        );
+    }
+
+    #[test]
+    fn track_records_failure_and_clears_on_recovery() {
+        let mut last: Option<(String, String)> = None;
+
+        track_tool_outcome(&mut last, "caldav", Some("boom".into()));
+        assert_eq!(last.as_ref().map(|(t, _)| t.as_str()), Some("caldav"));
+
+        // A different tool succeeding leaves the caldav failure intact.
+        track_tool_outcome(&mut last, "web_search", None);
+        assert!(last.is_some());
+
+        // The same tool succeeding clears it (recovered).
+        track_tool_outcome(&mut last, "caldav", None);
+        assert!(last.is_none());
+    }
+
+    #[test]
+    fn track_captures_soft_error_payloads() {
+        let mut last: Option<(String, String)> = None;
+        let payload = serde_json::json!({ "error": "bad ref" });
+        track_tool_outcome(
+            &mut last,
+            "edit",
+            payload.get("error").map(tool_error_string),
+        );
+        assert_eq!(last, Some(("edit".to_string(), "bad ref".to_string())));
     }
 }
 
@@ -4106,6 +4416,34 @@ mod task_complete_tests {
         }
     }
 
+    /// Tool that always fails with a 401-style error, mimicking the CalDAV
+    /// auth failure. `not_found` is non-retryable so the loop doesn't spin on
+    /// retries during the test.
+    struct FailingTool;
+
+    #[async_trait]
+    impl Tool for FailingTool {
+        fn name(&self) -> &str {
+            "caldav"
+        }
+        fn description(&self) -> &str {
+            "failing calendar tool"
+        }
+        fn schema(&self) -> ToolSchema {
+            ToolSchema {
+                name: "caldav".into(),
+                description: self.description().to_string(),
+                parameters: serde_json::json!({"type": "object", "properties": {}}),
+            }
+        }
+        async fn execute(&self, _args: serde_json::Value) -> Result<serde_json::Value> {
+            Err(Error::ToolExecution(rustykrab_core::ToolError::not_found(
+                "CalDAV https://example/caldav returned HTTP 401 \
+                 (401 Unauthorized — check gmail_app_password)",
+            )))
+        }
+    }
+
     fn tool_use_response(name: &str, args: serde_json::Value) -> ModelResponse {
         ModelResponse {
             message: Message {
@@ -4515,6 +4853,58 @@ mod task_complete_tests {
             })
             .count();
         assert_eq!(reminder_count, TASK_COMPLETE_RETRY_LIMIT);
+    }
+
+    #[tokio::test]
+    async fn unrecovered_tool_error_is_surfaced_in_final_answer() {
+        use rustykrab_tools::TaskCompleteTool;
+
+        // The tool fails with a 401, then the model narrates vaguely and never
+        // calls `task_complete`. After the reminder cap is hit, the runner
+        // accepts the last response — and must append the specific error so the
+        // 401 reaches the user instead of being buried under the narration.
+        let mut script = vec![tool_use_response("caldav", serde_json::json!({}))];
+        for i in 0..=TASK_COMPLETE_RETRY_LIMIT {
+            script.push(text_response(&format!(
+                "I was unable to access your calendar ({i})."
+            )));
+        }
+        let provider = Arc::new(ScriptedProvider::new(script));
+
+        let active = Arc::new(ActiveToolsRegistry::new());
+        let tools: Vec<Arc<dyn Tool>> =
+            vec![Arc::new(FailingTool), Arc::new(TaskCompleteTool::new())];
+        let runner = AgentRunner::new(provider, tools, Arc::new(NoSandbox))
+            .with_active_tools(active.clone());
+        let conv_id = Uuid::new_v4();
+        active.activate(conv_id, ["caldav"]);
+        let caps = CapabilitySet::for_tools_permissive(&["caldav", "task_complete"]);
+        let session = Session::with_capabilities(conv_id, caps);
+
+        let mut conv = make_conv();
+        conv.id = conv_id;
+
+        runner.run(&mut conv, &session).await.unwrap();
+
+        let last = conv
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::Assistant && m.content.as_text().is_some())
+            .and_then(|m| m.content.as_text())
+            .expect("final assistant text must be present");
+        assert!(
+            last.contains("I was unable to access your calendar"),
+            "model narration is preserved: {last}"
+        );
+        assert!(
+            last.contains("caldav failed"),
+            "tool identity is surfaced: {last}"
+        );
+        assert!(
+            last.contains("401"),
+            "the specific status code reaches the user: {last}"
+        );
     }
 }
 
