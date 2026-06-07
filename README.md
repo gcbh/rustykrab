@@ -378,6 +378,14 @@ rustykrab-cli          Binary entrypoint, daemon management, channel loops
         +-- Session (per-conversation isolation with expiry)
 ```
 
+## Distributed deployment
+
+The gateway, store, and memory are local to one machine, but network-facing and
+compute-heavy work (browser automation, video rendering, `signal-cli`, MCP
+servers, speech services) can run on a separate helper node. See
+[INTEL_MAC_HELPER.md](INTEL_MAC_HELPER.md) for a runbook on using a spare Intel
+Mac as a media/browser worker and service host.
+
 ## Security Model
 
 This rewrite directly addresses the vulnerability classes found in the original Node.js RustyKrab:
