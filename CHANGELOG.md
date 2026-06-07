@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.5.5] - 2026-06-07
+
+- Computer-use Phase 5: capability gate + read-only mode (security hardening) (#471)
+
 ## [4.5.4] - 2026-06-07
 
 - Wiki discoverability: summaries, backlinks/orphans, related-page hints (#469)

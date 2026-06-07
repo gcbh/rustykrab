@@ -705,10 +705,15 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // --- Computer-use tool (opt-in, requires the `computer-use` feature) ---
-    // Driving the desktop is a powerful capability, so it is double-gated:
-    // the binary must be built with `--features computer-use` AND
-    // RUSTYKRAB_COMPUTER_USE must be truthy at runtime. Backend init failures
-    // (e.g. no display) are logged and never block startup.
+    // Driving the desktop is the most powerful capability the agent has, so
+    // it is gated at four layers: (1) the binary must be built with
+    // `--features computer-use`; (2) RUSTYKRAB_COMPUTER_USE must be truthy at
+    // runtime; (3) the session must hold `Capability::ComputerUse` (granted
+    // below via `with_computer_use_enabled`); and (4) RUSTYKRAB_COMPUTER_USE_READONLY
+    // can restrict it to observe-only (screenshot / cursor position). Backend
+    // init failures (e.g. no display) are logged and never block startup.
+    #[cfg_attr(not(feature = "computer-use"), allow(unused_mut))]
+    let mut computer_use_enabled = false;
     #[cfg(feature = "computer-use")]
     if std::env::var("RUSTYKRAB_COMPUTER_USE")
         .map(|v| v == "true" || v == "1")
@@ -716,10 +721,19 @@ async fn main() -> anyhow::Result<()> {
     {
         match computer_backend::EnigoXcapBackend::new() {
             Ok(backend) => {
+                let readonly = std::env::var("RUSTYKRAB_COMPUTER_USE_READONLY")
+                    .map(|v| v == "true" || v == "1")
+                    .unwrap_or(false);
                 let backend: Arc<dyn rustykrab_tools::ComputerBackend> = Arc::new(backend);
                 let (w, h) = backend.display_size();
-                tools.extend(rustykrab_tools::computer_tools(backend));
-                tracing::info!(width = w, height = h, "computer-use tool registered");
+                tools.extend(rustykrab_tools::computer_tools(backend, readonly));
+                computer_use_enabled = true;
+                tracing::info!(
+                    width = w,
+                    height = h,
+                    readonly,
+                    "computer-use tool registered"
+                );
             }
             Err(e) => {
                 tracing::warn!(error = %e, "computer-use enabled but backend init failed; skipping");
@@ -832,7 +846,8 @@ async fn main() -> anyhow::Result<()> {
         .with_orchestration_config(orchestration_config)
         .with_skill_registry(skill_registry)
         .with_memory(Arc::clone(&memory_system), agent_id)
-        .with_subagents_enabled(subagents_enabled);
+        .with_subagents_enabled(subagents_enabled)
+        .with_computer_use_enabled(computer_use_enabled);
 
     // --- Attach video channel to state ---
     if let Some(vc) = video_channel {

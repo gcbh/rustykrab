@@ -246,6 +246,9 @@ fn build_session_capabilities(state: &AppState, tool_names: &[&str]) -> Capabili
     if state.subagents_enabled {
         caps.grant(Capability::Subagent);
     }
+    if state.computer_use_enabled {
+        caps.grant(Capability::ComputerUse);
+    }
     caps
 }
 

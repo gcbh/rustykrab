@@ -17,14 +17,22 @@ use std::sync::Arc;
 
 use crate::computer_backend::{ComputerBackend, MouseButton, ScrollDirection};
 
+/// Actions that only observe the screen and never synthesize input. These
+/// remain available in read-only mode.
+const READONLY_ACTIONS: &[&str] = &["screenshot", "cursor_position"];
+
 /// Tool exposing screen capture and input synthesis to the agent.
 pub struct ComputerTool {
     backend: Arc<dyn ComputerBackend>,
+    /// When true, only the observe-only actions in [`READONLY_ACTIONS`] are
+    /// permitted; mouse/keyboard synthesis is refused. A safety control for
+    /// running computer-use in a watch-only posture.
+    readonly: bool,
 }
 
 impl ComputerTool {
-    pub fn new(backend: Arc<dyn ComputerBackend>) -> Self {
-        Self { backend }
+    pub fn new(backend: Arc<dyn ComputerBackend>, readonly: bool) -> Self {
+        Self { backend, readonly }
     }
 
     /// Construct a `ToolExecution` error with a message.
@@ -148,6 +156,14 @@ impl Tool for ComputerTool {
         let action = args["action"]
             .as_str()
             .ok_or_else(|| Self::err("missing action"))?;
+
+        // Read-only posture: refuse any input-synthesizing action.
+        if self.readonly && !READONLY_ACTIONS.contains(&action) {
+            return Err(Self::err(format!(
+                "action '{action}' is disabled: computer-use is in read-only mode \
+                 (only {READONLY_ACTIONS:?} are allowed)"
+            )));
+        }
 
         match action {
             "screenshot" => {
@@ -335,7 +351,12 @@ mod tests {
 
     fn tool() -> (ComputerTool, Arc<MockBackend>) {
         let backend = Arc::new(MockBackend::default());
-        (ComputerTool::new(backend.clone()), backend)
+        (ComputerTool::new(backend.clone(), false), backend)
+    }
+
+    fn readonly_tool() -> (ComputerTool, Arc<MockBackend>) {
+        let backend = Arc::new(MockBackend::default());
+        (ComputerTool::new(backend.clone(), true), backend)
     }
 
     fn calls(b: &MockBackend) -> Vec<String> {
@@ -455,6 +476,37 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("unknown action"));
+    }
+
+    #[tokio::test]
+    async fn readonly_allows_observe_actions() {
+        let (t, b) = readonly_tool();
+        t.execute(json!({ "action": "screenshot" })).await.unwrap();
+        t.execute(json!({ "action": "cursor_position" }))
+            .await
+            .unwrap();
+        assert_eq!(calls(&b), vec!["screenshot", "cursor_position"]);
+    }
+
+    #[tokio::test]
+    async fn readonly_refuses_input_actions_without_touching_backend() {
+        let (t, b) = readonly_tool();
+        for action in ["left_click", "type", "key", "mouse_move", "scroll"] {
+            let err = t
+                .execute(json!({ "action": action, "text": "x", "coordinate": [1, 1], "scroll_direction": "up" }))
+                .await
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("read-only"),
+                "action {action}: {err}"
+            );
+        }
+        // No input action ever reached the backend.
+        assert!(
+            calls(&b).is_empty(),
+            "backend should not be invoked: {:?}",
+            calls(&b)
+        );
     }
 
     #[test]
