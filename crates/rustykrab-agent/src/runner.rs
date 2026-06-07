@@ -99,6 +99,16 @@ const PLANNING_ONLY_RETRY_LIMIT: usize = 2;
 /// learn to call `task_complete` thus degrade to the legacy behavior.
 const TASK_COMPLETE_RETRY_LIMIT: usize = 3;
 
+/// Maximum number of times the runner will nudge the model to *work around* an
+/// unrecovered tool failure before it accepts defeat and reports the error.
+/// While a tool error is outstanding and the model tries to stop with text, the
+/// runner re-prompts it to retry with corrected arguments, try a different tool
+/// or approach, or gather more information — giving the model room to be
+/// resourceful instead of surfacing the first failure. Past this cap the runner
+/// reports the specific error. The counter resets whenever the model actually
+/// calls a tool again, so an actively-working model is never cut short here.
+const ERROR_RECOVERY_RETRY_LIMIT: usize = 3;
+
 /// Default upper bound on the effective context window used when computing
 /// the compaction threshold. Keeps compaction aggressive even when the
 /// backing model advertises a much larger window (e.g. a 128k-ctx Ollama
@@ -238,6 +248,17 @@ const TASK_COMPLETE_REMINDER: &str =
      working. If a tool failed and you cannot complete the request, the \
      `summary` must state the specific error — quote any status code and hint \
      from the tool output verbatim rather than giving a vague apology.";
+
+/// Prefix for the nudge injected when the model tries to stop with text while a
+/// tool failure is still unresolved. Encourages the model to be resourceful and
+/// find a workaround before reporting the error. The specific failing tool and
+/// error are prepended per-call by `reprompt_for_error_recovery`.
+const ERROR_RECOVERY_REMINDER: &str =
+    "Don't give up yet. Before reporting this to the user, try to work around it: \
+     retry the call with corrected arguments, use a different tool or approach, or \
+     gather more information first. If you have genuinely exhausted your options, \
+     call `task_complete` with a `summary` that states this specific error verbatim \
+     (including any status code and hint) — do not replace it with a vague apology.";
 
 /// Outcome of `AgentRunner::reprompt_for_task_complete`: tell the caller
 /// whether to keep looping or accept the last response. Lets the streaming
@@ -859,6 +880,48 @@ impl AgentRunner {
         CompletionReminderOutcome::Continue
     }
 
+    /// Nudge the model to work around an unresolved tool failure instead of
+    /// stopping with a defeatist text answer. Mirrors
+    /// [`reprompt_for_task_complete`]'s retry-cap bookkeeping but injects the
+    /// specific failing tool and error so the model can be resourceful. Returns
+    /// `GiveUp` once `ERROR_RECOVERY_RETRY_LIMIT` is exceeded so the caller can
+    /// surface the error and accept the last response.
+    fn reprompt_for_error_recovery(
+        &self,
+        conv: &mut Conversation,
+        iteration: usize,
+        retries: &mut usize,
+        last_error: &Option<(String, String)>,
+    ) -> CompletionReminderOutcome {
+        *retries += 1;
+        if *retries > ERROR_RECOVERY_RETRY_LIMIT {
+            tracing::warn!(
+                retries = *retries,
+                "error-recovery attempts exhausted — reporting failure to the user"
+            );
+            return CompletionReminderOutcome::GiveUp;
+        }
+        let detail = match last_error {
+            Some((tool, msg)) => format!("`{tool}` failed: {msg}"),
+            None => "A tool call failed".to_string(),
+        };
+        tracing::warn!(
+            iteration,
+            retries = *retries,
+            "tool error unresolved — nudging model to find a workaround"
+        );
+        self.push_message(
+            conv,
+            Message {
+                id: Uuid::new_v4(),
+                role: Role::User,
+                content: MessageContent::Text(format!("{detail}\n\n{ERROR_RECOVERY_REMINDER}")),
+                created_at: Utc::now(),
+            },
+        );
+        CompletionReminderOutcome::Continue
+    }
+
     /// Start the event-driven agent loop.
     ///
     /// Returns a handle for injecting events (user messages, cancellation),
@@ -990,6 +1053,9 @@ impl AgentRunner {
         // Cap re-prompts that nudge the model to call `task_complete` after
         // it stops with text alone mid-task.
         let mut task_complete_retries: usize = 0;
+        // Cap re-prompts that nudge the model to work around an unresolved tool
+        // failure before we report it. Reset whenever the model calls a tool.
+        let mut recovery_retries: usize = 0;
         // Track whether any side-effect tool has been executed this run,
         // so we can suppress retries that might duplicate externally-visible actions.
         let mut had_side_effects = false;
@@ -1101,6 +1167,7 @@ impl AgentRunner {
                 empty_response_retries = 0;
                 planning_only_retries = 0;
                 task_complete_retries = 0;
+                recovery_retries = 0;
                 let calls = message.content.tool_calls();
                 let tool_names: Vec<&str> = calls.iter().map(|c| c.name.as_str()).collect();
                 tracing::info!(
@@ -1238,12 +1305,33 @@ impl AgentRunner {
                     // If the agent has already called tools this run we no
                     // longer trust an Ollama-style EndTurn as "task done":
                     // the provider maps any text-only response to EndTurn
-                    // regardless of intent. Re-prompt the model to either
-                    // call `task_complete` with a final answer or continue
-                    // working. Cap by `TASK_COMPLETE_RETRY_LIMIT` so models
-                    // that never learn the protocol fall through to the
-                    // legacy accept-and-return behavior.
+                    // regardless of intent.
                     if has_called_any_tool {
+                        // A tool failed and was never recovered, yet the model
+                        // is trying to stop with text. Prefer pushing it to work
+                        // around the failure (retry, alternative tool/approach)
+                        // before we accept defeat — only surface the error once
+                        // its resourcefulness budget is spent.
+                        if last_unrecovered_error.is_some() {
+                            match self.reprompt_for_error_recovery(
+                                conv,
+                                iteration,
+                                &mut recovery_retries,
+                                &last_unrecovered_error,
+                            ) {
+                                CompletionReminderOutcome::Continue => continue,
+                                CompletionReminderOutcome::GiveUp => {
+                                    surface_unrecovered_error(conv, &last_unrecovered_error);
+                                    return Ok(());
+                                }
+                            }
+                        }
+
+                        // No outstanding error: re-prompt the model to either
+                        // call `task_complete` with a final answer or continue
+                        // working. Cap by `TASK_COMPLETE_RETRY_LIMIT` so models
+                        // that never learn the protocol fall through to the
+                        // legacy accept-and-return behavior.
                         match self.reprompt_for_task_complete(
                             conv,
                             iteration,
@@ -1443,6 +1531,7 @@ impl AgentRunner {
         let mut planning_only_retries: usize = 0;
         let mut empty_tool_use_retries: usize = 0;
         let mut task_complete_retries: usize = 0;
+        let mut recovery_retries: usize = 0;
         let mut had_side_effects = false;
         let mut has_called_any_tool = false;
         // See run_inner: most recent unrecovered tool failure, surfaced to the
@@ -1541,6 +1630,7 @@ impl AgentRunner {
                 empty_response_retries = 0;
                 planning_only_retries = 0;
                 task_complete_retries = 0;
+                recovery_retries = 0;
                 let calls = message.content.tool_calls();
                 let tool_names: Vec<&str> = calls.iter().map(|c| c.name.as_str()).collect();
                 tracing::info!(
@@ -1686,10 +1776,25 @@ impl AgentRunner {
                     let classification = classify_response(text, usage.completion_tokens);
 
                     // Once the agent has called tools this run, an Ollama
-                    // EndTurn no longer terminates: re-prompt the model to
-                    // either call `task_complete` or keep working. See
-                    // run_inner for the full rationale.
+                    // EndTurn no longer terminates. See run_inner for the full
+                    // rationale and the error-recovery vs. task_complete split.
                     if has_called_any_tool {
+                        if last_unrecovered_error.is_some() {
+                            match self.reprompt_for_error_recovery(
+                                conv,
+                                iteration,
+                                &mut recovery_retries,
+                                &last_unrecovered_error,
+                            ) {
+                                CompletionReminderOutcome::Continue => continue,
+                                CompletionReminderOutcome::GiveUp => {
+                                    emit_unrecovered_error(conv, &last_unrecovered_error, on_event);
+                                    on_event(AgentEvent::Done);
+                                    return Ok(());
+                                }
+                            }
+                        }
+
                         match self.reprompt_for_task_complete(
                             conv,
                             iteration,
@@ -4437,10 +4542,55 @@ mod task_complete_tests {
             }
         }
         async fn execute(&self, _args: serde_json::Value) -> Result<serde_json::Value> {
-            Err(Error::ToolExecution(rustykrab_core::ToolError::not_found(
-                "CalDAV https://example/caldav returned HTTP 401 \
-                 (401 Unauthorized — check gmail_app_password)",
-            )))
+            Err(Error::ToolExecution(
+                rustykrab_core::ToolError::permission_denied(
+                    "CalDAV https://example/caldav returned HTTP 401 \
+                     (401 Unauthorized — check gmail_app_password)",
+                ),
+            ))
+        }
+    }
+
+    /// Tool that fails (non-retryably) on its first call and succeeds after,
+    /// modeling a failure the model can work around by trying again.
+    struct FlakyTool {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl FlakyTool {
+        fn new() -> Self {
+            Self {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Tool for FlakyTool {
+        fn name(&self) -> &str {
+            "flaky"
+        }
+        fn description(&self) -> &str {
+            "fails once then succeeds"
+        }
+        fn schema(&self) -> ToolSchema {
+            ToolSchema {
+                name: "flaky".into(),
+                description: self.description().to_string(),
+                parameters: serde_json::json!({"type": "object", "properties": {}}),
+            }
+        }
+        async fn execute(&self, _args: serde_json::Value) -> Result<serde_json::Value> {
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n == 0 {
+                Err(Error::ToolExecution(
+                    rustykrab_core::ToolError::permission_denied(
+                        "calendar temporarily unavailable",
+                    ),
+                ))
+            } else {
+                Ok(serde_json::json!({"events": ["lunch at noon"]}))
+            }
         }
     }
 
@@ -4859,12 +5009,14 @@ mod task_complete_tests {
     async fn unrecovered_tool_error_is_surfaced_in_final_answer() {
         use rustykrab_tools::TaskCompleteTool;
 
-        // The tool fails with a 401, then the model narrates vaguely and never
-        // calls `task_complete`. After the reminder cap is hit, the runner
-        // accepts the last response — and must append the specific error so the
-        // 401 reaches the user instead of being buried under the narration.
+        // The tool fails with a 401, then the model keeps narrating defeat
+        // instead of trying to work around it. The runner must nudge it to
+        // recover up to `ERROR_RECOVERY_RETRY_LIMIT` times and only then accept
+        // the response — appending the specific error so the 401 reaches the
+        // user instead of being buried under the narration.
         let mut script = vec![tool_use_response("caldav", serde_json::json!({}))];
-        for i in 0..=TASK_COMPLETE_RETRY_LIMIT {
+        // One more text response than the limit so the cap is exceeded.
+        for i in 0..=ERROR_RECOVERY_RETRY_LIMIT {
             script.push(text_response(&format!(
                 "I was unable to access your calendar ({i})."
             )));
@@ -4886,6 +5038,21 @@ mod task_complete_tests {
 
         runner.run(&mut conv, &session).await.unwrap();
 
+        // The model was prodded to find a workaround exactly the cap number of
+        // times before the runner reported the failure.
+        let recovery_nudges = conv
+            .messages
+            .iter()
+            .filter(|m| {
+                m.role == Role::User
+                    && m.content
+                        .as_text()
+                        .map(|t| t.contains("Don't give up yet"))
+                        .unwrap_or(false)
+            })
+            .count();
+        assert_eq!(recovery_nudges, ERROR_RECOVERY_RETRY_LIMIT);
+
         let last = conv
             .messages
             .iter()
@@ -4904,6 +5071,69 @@ mod task_complete_tests {
         assert!(
             last.contains("401"),
             "the specific status code reaches the user: {last}"
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_nudge_lets_the_model_work_around_a_failure() {
+        use rustykrab_tools::TaskCompleteTool;
+
+        // The tool fails once; the model stalls; the runner nudges it to work
+        // around the failure; the model retries the *same* tool successfully and
+        // finishes. The error was recovered, so no failure must be appended.
+        let script = vec![
+            tool_use_response("flaky", serde_json::json!({})), // fails
+            text_response("Hmm, that didn't work."),           // stall → recovery nudge
+            tool_use_response("flaky", serde_json::json!({})), // retry succeeds
+            tool_use_response(
+                "task_complete",
+                serde_json::json!({ "summary": "Your next event is lunch at noon." }),
+            ),
+        ];
+        let provider = Arc::new(ScriptedProvider::new(script));
+
+        let active = Arc::new(ActiveToolsRegistry::new());
+        let tools: Vec<Arc<dyn Tool>> = vec![
+            Arc::new(FlakyTool::new()),
+            Arc::new(TaskCompleteTool::new()),
+        ];
+        let runner = AgentRunner::new(provider, tools, Arc::new(NoSandbox))
+            .with_active_tools(active.clone());
+        let conv_id = Uuid::new_v4();
+        active.activate(conv_id, ["flaky"]);
+        let caps = CapabilitySet::for_tools_permissive(&["flaky", "task_complete"]);
+        let session = Session::with_capabilities(conv_id, caps);
+
+        let mut conv = make_conv();
+        conv.id = conv_id;
+
+        runner.run(&mut conv, &session).await.unwrap();
+
+        // The model was nudged to recover exactly once (the single stall).
+        let recovery_nudges = conv
+            .messages
+            .iter()
+            .filter(|m| {
+                m.role == Role::User
+                    && m.content
+                        .as_text()
+                        .map(|t| t.contains("Don't give up yet"))
+                        .unwrap_or(false)
+            })
+            .count();
+        assert_eq!(recovery_nudges, 1);
+
+        let last = conv
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::Assistant && m.content.as_text().is_some())
+            .and_then(|m| m.content.as_text())
+            .expect("final assistant text must be present");
+        assert_eq!(last, "Your next event is lunch at noon.");
+        assert!(
+            !last.contains("failed"),
+            "recovered error must not be surfaced: {last}"
         );
     }
 }
