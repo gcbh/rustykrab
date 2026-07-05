@@ -46,7 +46,10 @@ impl Store {
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;
              PRAGMA foreign_keys = ON;
-             PRAGMA busy_timeout = 5000;",
+             PRAGMA busy_timeout = 5000;
+             PRAGMA cache_size = -65536;
+             PRAGMA mmap_size = 268435456;
+             PRAGMA temp_store = MEMORY;",
         )
         .map_err(|e| Error::Storage(e.to_string()))?;
 
@@ -188,11 +191,45 @@ impl Store {
     }
 
     /// Flush all pending writes to disk.
-    pub fn flush(&self) -> Result<(), Error> {
+    pub async fn flush(&self) -> Result<(), Error> {
         // WAL mode checkpoints automatically; explicit checkpoint for shutdown.
-        let conn = self.conn.lock().unwrap();
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
-            .map_err(|e| Error::Storage(e.to_string()))?;
-        Ok(())
+        with_conn(&self.conn, |conn| {
+            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+                .map_err(|e| Error::Storage(e.to_string()))
+        })
+        .await
     }
+}
+
+/// Run a blocking closure on tokio's blocking pool, flattening the join
+/// error into a storage error. Keeps rusqlite work (and other CPU-heavy
+/// tasks such as Argon2 key derivation) off the async worker threads.
+pub(crate) async fn run_blocking<T, F>(f: F) -> Result<T, Error>
+where
+    F: FnOnce() -> Result<T, Error> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| Error::Storage(format!("join error: {e}")))?
+}
+
+/// Helper: run a blocking closure on the shared connection inside
+/// `spawn_blocking`, mirroring `SqliteMemoryStorage::with_conn` in
+/// rustykrab-memory. The mutex is locked on the blocking thread so async
+/// workers never park on disk I/O or the connection lock.
+pub(crate) async fn with_conn<T, F>(
+    conn: &Arc<Mutex<rusqlite::Connection>>,
+    f: F,
+) -> Result<T, Error>
+where
+    F: FnOnce(&rusqlite::Connection) -> Result<T, Error> + Send + 'static,
+    T: Send + 'static,
+{
+    let conn = Arc::clone(conn);
+    run_blocking(move || {
+        let conn = conn.lock().unwrap();
+        f(&conn)
+    })
+    .await
 }

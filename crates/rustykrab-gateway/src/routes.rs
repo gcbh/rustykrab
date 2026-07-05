@@ -223,6 +223,7 @@ async fn create_conversation(
         .store
         .conversations()
         .create_with_title(title)
+        .await
         .map(|c| Json(ApolloConversation::from(&c)))
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
@@ -234,6 +235,7 @@ async fn list_conversations(
         .store
         .conversations()
         .list_summaries()
+        .await
         .map(|summaries| {
             Json(
                 summaries
@@ -253,6 +255,7 @@ async fn get_conversation(
         .store
         .conversations()
         .get(id)
+        .await
         .map(|c| Json(ApolloConversation::from(&c)))
         .map_err(|e| match e {
             rustykrab_core::Error::NotFound(_) => StatusCode::NOT_FOUND,
@@ -268,6 +271,7 @@ async fn delete_conversation(
         .store
         .conversations()
         .delete(id)
+        .await
         .map_err(|e| match e {
             rustykrab_core::Error::NotFound(_) => StatusCode::NOT_FOUND,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
@@ -291,10 +295,15 @@ async fn list_messages(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Vec<ApolloMessage>>, StatusCode> {
-    let conv = state.store.conversations().get(id).map_err(|e| match e {
-        rustykrab_core::Error::NotFound(_) => StatusCode::NOT_FOUND,
-        _ => StatusCode::INTERNAL_SERVER_ERROR,
-    })?;
+    let conv = state
+        .store
+        .conversations()
+        .get(id)
+        .await
+        .map_err(|e| match e {
+            rustykrab_core::Error::NotFound(_) => StatusCode::NOT_FOUND,
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        })?;
     let msgs: Vec<ApolloMessage> = conv
         .messages
         .iter()
@@ -336,6 +345,7 @@ async fn send_message(
         .store
         .conversations()
         .get(id)
+        .await
         .map_err(|_| StatusCode::NOT_FOUND)?;
 
     // Clone content before moving into the message (needed for profile classification).
@@ -361,6 +371,7 @@ async fn send_message(
         .store
         .conversations()
         .save(&conv)
+        .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let apollo_msg = ApolloMessage::from_message(conv.id, &assistant_msg);
@@ -407,6 +418,7 @@ async fn send_message_stream(
         .store
         .conversations()
         .get(id)
+        .await
         .map_err(|_| StatusCode::NOT_FOUND)?;
     let conv_id = conv.id;
 
@@ -501,7 +513,7 @@ async fn send_message_stream(
 
         // Persist conversation regardless of outcome to preserve the user message.
         conv.updated_at = Utc::now();
-        if let Err(e) = agent_state.store.conversations().save(&conv) {
+        if let Err(e) = agent_state.store.conversations().save(&conv).await {
             tracing::error!("failed to save conversation: {e}");
         }
 
@@ -671,7 +683,7 @@ struct ListSecretsResponse {
 async fn list_secrets(
     State(state): State<AppState>,
 ) -> Result<Json<ListSecretsResponse>, StatusCode> {
-    let names = state.store.secrets().list_names().map_err(|e| {
+    let names = state.store.secrets().list_names().await.map_err(|e| {
         tracing::error!(error = %e, "list_secrets failed");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
@@ -698,6 +710,7 @@ async fn set_secret(
                 .store
                 .secrets()
                 .set(&body.name, &body.value)
+                .await
                 .map_err(|e| {
                     tracing::warn!(error = %e, name = %body.name, "set_secret: store write failed");
                     StatusCode::BAD_REQUEST
@@ -731,7 +744,7 @@ async fn delete_secret(
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> Result<StatusCode, StatusCode> {
-    state.store.secrets().delete(&name).map_err(|e| {
+    state.store.secrets().delete(&name).await.map_err(|e| {
         tracing::error!(error = %e, "delete_secret failed");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;

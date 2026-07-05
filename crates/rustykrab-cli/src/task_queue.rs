@@ -157,18 +157,21 @@ async fn execute_cron_task(
 
     // Load the job so we can resume its persistent conversation and use
     // last_run_at in the prompt.
-    let job = match store.jobs().get_job(job_id) {
+    let job = match store.jobs().get_job(job_id).await {
         Ok(j) => j,
         Err(e) => {
             tracing::error!(job_id = %job_id, "failed to load scheduled job: {e}");
             let finished_at = Utc::now();
-            let _ = store.jobs().record_run(
-                job_id,
-                "error",
-                Some(&format!("failed to load job: {e}")),
-                started_at,
-                finished_at,
-            );
+            let _ = store
+                .jobs()
+                .record_run(
+                    job_id,
+                    "error",
+                    Some(&format!("failed to load job: {e}")),
+                    started_at,
+                    finished_at,
+                )
+                .await;
             return;
         }
     };
@@ -183,31 +186,39 @@ async fn execute_cron_task(
             job_id = %job_id,
             "scheduled job has an empty task body — disabling so it stops firing"
         );
-        let _ = store.jobs().record_run(
-            job_id,
-            "error",
-            Some("scheduled job has an empty task body; disabled. Recreate with a non-empty task."),
-            started_at,
-            finished_at,
-        );
-        if let Err(e) = store.jobs().set_enabled(job_id, false) {
+        let _ = store
+            .jobs()
+            .record_run(
+                job_id,
+                "error",
+                Some(
+                    "scheduled job has an empty task body; disabled. Recreate with a non-empty task.",
+                ),
+                started_at,
+                finished_at,
+            )
+            .await;
+        if let Err(e) = store.jobs().set_enabled(job_id, false).await {
             tracing::warn!(job_id = %job_id, "failed to disable empty-task job: {e}");
         }
         return;
     }
 
-    let mut conv = match resume_or_create_conversation(&job, state, store) {
+    let mut conv = match resume_or_create_conversation(&job, state, store).await {
         Ok(c) => c,
         Err(e) => {
             tracing::error!(job_id = %job_id, "failed to resume conversation for scheduled job: {e}");
             let finished_at = Utc::now();
-            let _ = store.jobs().record_run(
-                job_id,
-                "error",
-                Some(&format!("failed to resume conversation: {e}")),
-                started_at,
-                finished_at,
-            );
+            let _ = store
+                .jobs()
+                .record_run(
+                    job_id,
+                    "error",
+                    Some(&format!("failed to resume conversation: {e}")),
+                    started_at,
+                    finished_at,
+                )
+                .await;
             return;
         }
     };
@@ -232,7 +243,7 @@ async fn execute_cron_task(
         effective_chat_id.as_deref(),
         effective_thread_id.as_deref(),
     ) {
-        if let Err(e) = state.store.conversations().save(&conv) {
+        if let Err(e) = state.store.conversations().save(&conv).await {
             tracing::warn!(
                 job_id = %job_id,
                 "failed to persist channel context onto job conversation: {e}"
@@ -379,18 +390,22 @@ async fn execute_cron_task(
     // Record the run before marking executed so the result is persisted
     // even if mark_executed fails.
     let finished_at = Utc::now();
-    if let Err(e) = store.jobs().record_run(
-        job_id,
-        status,
-        Some(&response_text),
-        started_at,
-        finished_at,
-    ) {
+    if let Err(e) = store
+        .jobs()
+        .record_run(
+            job_id,
+            status,
+            Some(&response_text),
+            started_at,
+            finished_at,
+        )
+        .await
+    {
         tracing::warn!(job_id = %job_id, "failed to record job run: {e}");
     }
 
     // Mark the job as executed (advances next_run_at or disables one-shot).
-    if let Err(e) = store.jobs().mark_executed(job_id) {
+    if let Err(e) = store.jobs().mark_executed(job_id).await {
         tracing::error!(job_id = %job_id, "failed to mark scheduled job as executed: {e}");
     }
 
@@ -402,14 +417,14 @@ async fn execute_cron_task(
 /// Resume this job's persistent conversation, or create one on the first
 /// run. If the stored id points at a conversation that has been deleted
 /// out from under us, silently create a fresh one and re-link.
-fn resume_or_create_conversation(
+async fn resume_or_create_conversation(
     job: &rustykrab_store::ScheduledJob,
     state: &AppState,
     store: &rustykrab_store::Store,
 ) -> Result<Conversation, rustykrab_core::Error> {
     if let Some(cid) = &job.conversation_id {
         if let Ok(uuid) = Uuid::parse_str(cid) {
-            match state.store.conversations().get(uuid) {
+            match state.store.conversations().get(uuid).await {
                 Ok(c) => return Ok(c),
                 Err(rustykrab_core::Error::NotFound(_)) => {
                     tracing::warn!(
@@ -429,10 +444,11 @@ fn resume_or_create_conversation(
         }
     }
 
-    let conv = state.store.conversations().create()?;
+    let conv = state.store.conversations().create().await?;
     store
         .jobs()
-        .set_conversation_id(&job.id, &conv.id.to_string())?;
+        .set_conversation_id(&job.id, &conv.id.to_string())
+        .await?;
     Ok(conv)
 }
 

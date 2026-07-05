@@ -128,7 +128,7 @@ impl CredentialWriteTool {
                     .as_str()
                     .ok_or_else(|| Error::ToolExecution("missing value for 'set' action".into()))?;
 
-                self.secrets.set(name, value).map_err(|e| {
+                self.secrets.set(name, value).await.map_err(|e| {
                     Error::ToolExecution(format!("failed to store secret: {e}").into())
                 })?;
 
@@ -139,7 +139,7 @@ impl CredentialWriteTool {
                 }))
             }
             "delete" => {
-                self.secrets.delete(name).map_err(|e| {
+                self.secrets.delete(name).await.map_err(|e| {
                     Error::ToolExecution(format!("failed to delete secret: {e}").into())
                 })?;
 
@@ -271,7 +271,7 @@ impl CredentialWriteTool {
             })?;
 
         // Write to local encrypted store.
-        self.secrets.set(name, &cred.value).map_err(|e| {
+        self.secrets.set(name, &cred.value).await.map_err(|e| {
             Error::ToolExecution(format!("failed to store imported secret: {e}").into())
         })?;
 

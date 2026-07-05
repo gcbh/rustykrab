@@ -107,7 +107,7 @@ impl CredentialReadTool {
                     .as_str()
                     .ok_or_else(|| Error::ToolExecution("missing name for 'get' action".into()))?;
 
-                match self.secrets.get(name) {
+                match self.secrets.get(name).await {
                     Ok(value) => Ok(json!({
                         "source": "store",
                         "name": name,
@@ -123,7 +123,7 @@ impl CredentialReadTool {
                 }
             }
             "list" => {
-                let names = self.secrets.list_names().map_err(|e| {
+                let names = self.secrets.list_names().await.map_err(|e| {
                     Error::ToolExecution(format!("failed to list secrets: {e}").into())
                 })?;
 
