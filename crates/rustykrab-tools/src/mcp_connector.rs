@@ -198,9 +198,19 @@ pub async fn mcp_connector_tools(secrets: &SecretStore) -> Vec<Arc<dyn Tool>> {
         .filter(|s| !s.is_empty())
         .collect();
 
+    // Connect to all servers concurrently — startup latency is the slowest
+    // server, not the sum. `join_all` preserves input order, so tool
+    // registration order stays deterministic.
+    let results = futures::future::join_all(
+        names
+            .iter()
+            .map(|name| async move { connect_server(name, secrets).await }),
+    )
+    .await;
+
     let mut out: Vec<Arc<dyn Tool>> = Vec::new();
-    for name in names {
-        match connect_server(&name, secrets).await {
+    for (name, result) in names.iter().zip(results) {
+        match result {
             Ok(server_tools) => out.extend(server_tools),
             Err(e) => tracing::warn!(
                 server = %name,

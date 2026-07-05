@@ -13,6 +13,17 @@ const KEY_API_KEY: &str = "obsidian_api_key";
 const KEY_SYNC_FOLDER: &str = "obsidian_sync_folder";
 const DEFAULT_API_URL: &str = "https://127.0.0.1:27124";
 
+/// Shared client for the free-function sync helpers, built once instead of
+/// per call. The Obsidian Local REST API uses a self-signed certificate by
+/// default, so invalid certs are accepted — this is a localhost-only
+/// connection.
+static SYNC_CLIENT: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(|| {
+    reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .unwrap_or_default()
+});
+
 // ---------------------------------------------------------------------------
 // Tool struct
 // ---------------------------------------------------------------------------
@@ -591,12 +602,7 @@ pub async fn try_sync_to_obsidian(
 
     let note_content = format_synced_note(title, content, notion_id, notion_url);
 
-    let client = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
-        .build()
-        .map_err(|e| format!("failed to create HTTP client: {e}"))?;
-
-    let resp = client
+    let resp = SYNC_CLIENT
         .put(format!("{api_url}/vault/{vault_path}"))
         .header("Authorization", format!("Bearer {api_key}"))
         .header("Content-Type", "text/markdown")
@@ -646,12 +652,7 @@ pub async fn try_sync_append_to_obsidian(
         None => format!("{filename}.md"),
     };
 
-    let client = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
-        .build()
-        .map_err(|e| format!("failed to create HTTP client: {e}"))?;
-
-    let resp = client
+    let resp = SYNC_CLIENT
         .patch(format!("{api_url}/vault/{vault_path}"))
         .header("Authorization", format!("Bearer {api_key}"))
         .header("Content-Type", "text/markdown")
