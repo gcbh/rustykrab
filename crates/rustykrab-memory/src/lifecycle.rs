@@ -10,6 +10,10 @@ use crate::embedding::{cosine_similarity, Embedder};
 use crate::storage::MemoryStorage;
 use crate::types::{LifecycleStage, LinkType, Memory, MemoryLink};
 
+/// Days a tombstoned memory is retained before the sweep hard-deletes it
+/// together with its chunks, extracted facts, links, and FTS rows.
+const TOMBSTONE_RETENTION_DAYS: i64 = 30;
+
 /// Statistics from a lifecycle sweep operation.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LifecycleSweepStats {
@@ -18,6 +22,9 @@ pub struct LifecycleSweepStats {
     pub demoted_to_archival: u32,
     pub tombstoned: u32,
     pub near_duplicates_found: u32,
+    /// Tombstoned memories hard-deleted after the retention window.
+    #[serde(default)]
+    pub purged: u32,
 }
 
 /// Lifecycle manager: handles promotion, demotion, consolidation,
@@ -139,12 +146,22 @@ impl LifecycleManager {
             stats.tombstoned = self.storage.batch_update_stages(&tombstones).await?;
         }
 
+        // ── Purge: hard-delete tombstones past retention ────────
+        // Without this, soft-deleted memories (and their chunks/facts)
+        // accumulate forever.
+        let purge_cutoff = now - Duration::days(TOMBSTONE_RETENTION_DAYS);
+        stats.purged = self
+            .storage
+            .purge_tombstones(agent_id, purge_cutoff)
+            .await?;
+
         info!(
             agent_id = %agent_id,
             working_promoted = stats.promoted_to_episodic,
             promoted = stats.promoted_to_semantic,
             demoted = stats.demoted_to_archival,
             tombstoned = stats.tombstoned,
+            purged = stats.purged,
             "lifecycle sweep complete"
         );
 

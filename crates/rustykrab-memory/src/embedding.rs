@@ -49,20 +49,60 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 }
 
 /// Find the top-k most similar vectors to `query` from `candidates`.
-/// Returns (index, similarity) pairs sorted by descending similarity.
-pub fn top_k_similar(
+/// Returns (id, similarity) pairs sorted by descending similarity.
+///
+/// Uses a bounded min-heap: O(n log k) instead of a full O(n log n) sort.
+/// Ties on similarity break by id for determinism.
+pub fn top_k_similar<V: AsRef<[f32]>>(
     query: &[f32],
-    candidates: &[(uuid::Uuid, Vec<f32>)],
+    candidates: &[(uuid::Uuid, V)],
     k: usize,
 ) -> Vec<(uuid::Uuid, f32)> {
-    let mut scores: Vec<(uuid::Uuid, f32)> = candidates
-        .iter()
-        .map(|(id, vec)| (*id, cosine_similarity(query, vec)))
-        .collect();
+    use std::cmp::{Ordering, Reverse};
+    use std::collections::BinaryHeap;
 
-    // Sort descending by similarity.
-    scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    scores.truncate(k);
+    #[derive(PartialEq)]
+    struct Scored(f32, uuid::Uuid);
+
+    impl Eq for Scored {}
+
+    impl Ord for Scored {
+        fn cmp(&self, other: &Self) -> Ordering {
+            self.0
+                .total_cmp(&other.0)
+                .then_with(|| self.1.cmp(&other.1))
+        }
+    }
+
+    impl PartialOrd for Scored {
+        fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+
+    if k == 0 {
+        return Vec::new();
+    }
+
+    // Min-heap of the k best scores seen so far (Reverse flips the ordering).
+    let mut heap: BinaryHeap<Reverse<Scored>> = BinaryHeap::with_capacity(k + 1);
+    for (id, vec) in candidates {
+        let entry = Scored(cosine_similarity(query, vec.as_ref()), *id);
+        if heap.len() < k {
+            heap.push(Reverse(entry));
+        } else if let Some(Reverse(worst)) = heap.peek() {
+            if entry > *worst {
+                heap.pop();
+                heap.push(Reverse(entry));
+            }
+        }
+    }
+
+    let mut scores: Vec<(uuid::Uuid, f32)> = heap
+        .into_iter()
+        .map(|Reverse(Scored(sim, id))| (id, sim))
+        .collect();
+    scores.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     scores
 }
 
@@ -281,6 +321,45 @@ mod tests {
         let v1 = embedder.embed(vec!["hello".into()]).await.unwrap();
         let v2 = embedder.embed(vec!["hello".into()]).await.unwrap();
         assert_eq!(v1, v2);
+    }
+
+    /// Deterministic pseudo-random vector generator (no rand dependency).
+    fn lcg_vectors(count: usize, dims: usize, seed: u64) -> Vec<(uuid::Uuid, Vec<f32>)> {
+        let mut state = seed;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 33) as f32 / (1u64 << 31) as f32) - 1.0
+        };
+        (0..count)
+            .map(|_| {
+                (
+                    uuid::Uuid::new_v4(),
+                    (0..dims).map(|_| next()).collect::<Vec<f32>>(),
+                )
+            })
+            .collect()
+    }
+
+    /// The heap-based top-k must match a full sort + truncate on random data.
+    #[test]
+    fn test_top_k_matches_full_sort() {
+        let candidates = lcg_vectors(200, 8, 42);
+        let query: Vec<f32> = lcg_vectors(1, 8, 7)[0].1.clone();
+
+        for k in [0, 1, 5, 50, 200, 500] {
+            let top = top_k_similar(&query, &candidates, k);
+
+            let mut reference: Vec<(uuid::Uuid, f32)> = candidates
+                .iter()
+                .map(|(id, vec)| (*id, cosine_similarity(&query, vec)))
+                .collect();
+            reference.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            reference.truncate(k);
+
+            assert_eq!(top, reference, "k={k}");
+        }
     }
 
     #[tokio::test]
