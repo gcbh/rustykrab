@@ -7,6 +7,8 @@ use rustykrab_core::Error;
 use std::sync::Mutex;
 use uuid::Uuid;
 
+use crate::with_conn;
+
 /// SQLite-backed durable store for compaction-displaced recall archives,
 /// keyed by conversation id.
 ///
@@ -25,52 +27,75 @@ impl RecallArchiveStore {
 
     /// Insert or replace the archive text for a conversation. `created_at`
     /// is preserved on update; only `updated_at` advances.
-    pub fn upsert(&self, conversation_id: Uuid, archive: &str) -> Result<(), Error> {
-        let conn = self.conn.lock().unwrap();
-        let now = Utc::now().to_rfc3339();
-        conn.execute(
-            "INSERT INTO recall_archive (conversation_id, archive, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?3)
-             ON CONFLICT(conversation_id) DO UPDATE SET
-                 archive = excluded.archive,
-                 updated_at = excluded.updated_at",
-            params![conversation_id.to_string(), archive, now],
-        )
-        .map_err(|e| Error::Storage(e.to_string()))?;
-        Ok(())
+    pub async fn upsert(&self, conversation_id: Uuid, archive: &str) -> Result<(), Error> {
+        let archive = archive.to_string();
+        with_conn(&self.conn, move |conn| {
+            upsert_row(conn, conversation_id, &archive)
+        })
+        .await
     }
 
     /// Fetch the archive text for a conversation, or `None` if absent.
-    pub fn get(&self, conversation_id: Uuid) -> Result<Option<String>, Error> {
-        let conn = self.conn.lock().unwrap();
-        conn.query_row(
-            "SELECT archive FROM recall_archive WHERE conversation_id = ?1",
-            params![conversation_id.to_string()],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()
-        .map_err(|e| Error::Storage(e.to_string()))
+    pub async fn get(&self, conversation_id: Uuid) -> Result<Option<String>, Error> {
+        with_conn(&self.conn, move |conn| get_row(conn, conversation_id)).await
     }
 
     /// Delete the archive for a conversation. Idempotent — deleting a
     /// missing row is not an error.
-    pub fn delete(&self, conversation_id: Uuid) -> Result<(), Error> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "DELETE FROM recall_archive WHERE conversation_id = ?1",
-            params![conversation_id.to_string()],
-        )
-        .map_err(|e| Error::Storage(e.to_string()))?;
-        Ok(())
+    pub async fn delete(&self, conversation_id: Uuid) -> Result<(), Error> {
+        with_conn(&self.conn, move |conn| delete_row(conn, conversation_id)).await
     }
+}
+
+fn upsert_row(
+    conn: &rusqlite::Connection,
+    conversation_id: Uuid,
+    archive: &str,
+) -> Result<(), Error> {
+    let now = Utc::now().to_rfc3339();
+    conn.execute(
+        "INSERT INTO recall_archive (conversation_id, archive, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?3)
+         ON CONFLICT(conversation_id) DO UPDATE SET
+             archive = excluded.archive,
+             updated_at = excluded.updated_at",
+        params![conversation_id.to_string(), archive, now],
+    )
+    .map_err(|e| Error::Storage(e.to_string()))?;
+    Ok(())
+}
+
+fn get_row(conn: &rusqlite::Connection, conversation_id: Uuid) -> Result<Option<String>, Error> {
+    conn.query_row(
+        "SELECT archive FROM recall_archive WHERE conversation_id = ?1",
+        params![conversation_id.to_string()],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .map_err(|e| Error::Storage(e.to_string()))
+}
+
+fn delete_row(conn: &rusqlite::Connection, conversation_id: Uuid) -> Result<(), Error> {
+    conn.execute(
+        "DELETE FROM recall_archive WHERE conversation_id = ?1",
+        params![conversation_id.to_string()],
+    )
+    .map_err(|e| Error::Storage(e.to_string()))?;
+    Ok(())
 }
 
 /// Best-effort adapter: persistence failures are logged and swallowed so
 /// they never break the agent loop. The in-memory `RecallStore` cache
 /// remains authoritative for the live session even if a write is dropped.
+///
+/// `RecallPersistence` is a synchronous trait by contract, so these
+/// methods run the rusqlite work directly on the calling thread (the same
+/// behaviour the store had before its public API moved to
+/// `spawn_blocking`).
 impl RecallPersistence for RecallArchiveStore {
     fn load(&self, conversation_id: Uuid) -> Option<String> {
-        match self.get(conversation_id) {
+        let conn = self.conn.lock().unwrap();
+        match get_row(&conn, conversation_id) {
             Ok(archive) => archive,
             Err(e) => {
                 tracing::warn!(error = %e, %conversation_id, "failed to load recall archive");
@@ -80,13 +105,15 @@ impl RecallPersistence for RecallArchiveStore {
     }
 
     fn upsert(&self, conversation_id: Uuid, archive: &str) {
-        if let Err(e) = RecallArchiveStore::upsert(self, conversation_id, archive) {
+        let conn = self.conn.lock().unwrap();
+        if let Err(e) = upsert_row(&conn, conversation_id, archive) {
             tracing::warn!(error = %e, %conversation_id, "failed to persist recall archive");
         }
     }
 
     fn delete(&self, conversation_id: Uuid) {
-        if let Err(e) = RecallArchiveStore::delete(self, conversation_id) {
+        let conn = self.conn.lock().unwrap();
+        if let Err(e) = delete_row(&conn, conversation_id) {
             tracing::warn!(error = %e, %conversation_id, "failed to delete recall archive");
         }
     }
@@ -110,44 +137,44 @@ mod tests {
         RecallArchiveStore::new(Arc::new(Mutex::new(conn)))
     }
 
-    #[test]
-    fn upsert_then_get_round_trips() {
+    #[tokio::test]
+    async fn upsert_then_get_round_trips() {
         let store = in_memory_store();
         let conv = Uuid::new_v4();
-        store.upsert(conv, "hello").unwrap();
-        assert_eq!(store.get(conv).unwrap().as_deref(), Some("hello"));
+        store.upsert(conv, "hello").await.unwrap();
+        assert_eq!(store.get(conv).await.unwrap().as_deref(), Some("hello"));
     }
 
-    #[test]
-    fn upsert_replaces_existing() {
+    #[tokio::test]
+    async fn upsert_replaces_existing() {
         let store = in_memory_store();
         let conv = Uuid::new_v4();
-        store.upsert(conv, "first").unwrap();
-        store.upsert(conv, "second").unwrap();
-        assert_eq!(store.get(conv).unwrap().as_deref(), Some("second"));
+        store.upsert(conv, "first").await.unwrap();
+        store.upsert(conv, "second").await.unwrap();
+        assert_eq!(store.get(conv).await.unwrap().as_deref(), Some("second"));
     }
 
-    #[test]
-    fn get_missing_returns_none() {
+    #[tokio::test]
+    async fn get_missing_returns_none() {
         let store = in_memory_store();
-        assert_eq!(store.get(Uuid::new_v4()).unwrap(), None);
+        assert_eq!(store.get(Uuid::new_v4()).await.unwrap(), None);
     }
 
-    #[test]
-    fn delete_is_idempotent() {
-        let store = in_memory_store();
-        let conv = Uuid::new_v4();
-        store.upsert(conv, "x").unwrap();
-        store.delete(conv).unwrap();
-        store.delete(conv).unwrap();
-        assert_eq!(store.get(conv).unwrap(), None);
-    }
-
-    #[test]
-    fn upsert_preserves_created_at_on_update() {
+    #[tokio::test]
+    async fn delete_is_idempotent() {
         let store = in_memory_store();
         let conv = Uuid::new_v4();
-        store.upsert(conv, "first").unwrap();
+        store.upsert(conv, "x").await.unwrap();
+        store.delete(conv).await.unwrap();
+        store.delete(conv).await.unwrap();
+        assert_eq!(store.get(conv).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn upsert_preserves_created_at_on_update() {
+        let store = in_memory_store();
+        let conv = Uuid::new_v4();
+        store.upsert(conv, "first").await.unwrap();
         let created: String = {
             let conn = store.conn.lock().unwrap();
             conn.query_row(
@@ -157,7 +184,7 @@ mod tests {
             )
             .unwrap()
         };
-        store.upsert(conv, "second").unwrap();
+        store.upsert(conv, "second").await.unwrap();
         let created_after: String = {
             let conn = store.conn.lock().unwrap();
             conn.query_row(

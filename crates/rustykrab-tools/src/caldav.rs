@@ -69,8 +69,8 @@ impl CalDavTool {
     }
 
     /// Fetch the Google email + app password from the shared credential store.
-    fn get_credentials(&self) -> Result<(String, String)> {
-        let email = self.secrets.get(KEY_EMAIL).map_err(|e| {
+    async fn get_credentials(&self) -> Result<(String, String)> {
+        let email = self.secrets.get(KEY_EMAIL).await.map_err(|e| {
             Error::ToolExecution(
                 format!(
                     "gmail_email not available: {e}. The CalDAV tool reuses your Gmail \
@@ -81,7 +81,7 @@ impl CalDavTool {
                 .into(),
             )
         })?;
-        let password = self.secrets.get(KEY_APP_PASSWORD).map_err(|e| {
+        let password = self.secrets.get(KEY_APP_PASSWORD).await.map_err(|e| {
             Error::ToolExecution(
                 format!(
                     "gmail_app_password not available: {e}. The CalDAV tool reuses your \
@@ -173,15 +173,16 @@ impl CalDavTool {
         if let Some(email) = args["email"].as_str() {
             self.secrets
                 .set(KEY_EMAIL, email)
+                .await
                 .map_err(|e| Error::ToolExecution(format!("failed to store email: {e}").into()))?;
         }
         if let Some(pw) = args["app_password"].as_str() {
-            self.secrets.set(KEY_APP_PASSWORD, pw).map_err(|e| {
+            self.secrets.set(KEY_APP_PASSWORD, pw).await.map_err(|e| {
                 Error::ToolExecution(format!("failed to store app password: {e}").into())
             })?;
         }
 
-        let (email, password) = self.get_credentials()?;
+        let (email, password) = self.get_credentials().await?;
 
         // Verify by enumerating calendars.
         let calendars = self.discover_calendars(&email, &password).await?;
@@ -200,7 +201,7 @@ impl CalDavTool {
     // -----------------------------------------------------------------------
 
     async fn action_list_calendars(&self) -> Result<Value> {
-        let (email, password) = self.get_credentials()?;
+        let (email, password) = self.get_credentials().await?;
         let calendars = self.discover_calendars(&email, &password).await?;
         Ok(json!({ "calendars": calendars }))
     }
@@ -291,7 +292,7 @@ impl CalDavTool {
     // -----------------------------------------------------------------------
 
     async fn action_list_events(&self, args: &Value) -> Result<Value> {
-        let (email, password) = self.get_credentials()?;
+        let (email, password) = self.get_credentials().await?;
         let calendar_id = args["calendar_id"].as_str();
         let collection = self.events_collection(&email, calendar_id);
 
@@ -370,7 +371,7 @@ impl CalDavTool {
     // -----------------------------------------------------------------------
 
     async fn action_get_event(&self, args: &Value) -> Result<Value> {
-        let (email, password) = self.get_credentials()?;
+        let (email, password) = self.get_credentials().await?;
         let url = self.resolve_event_url(args, &email)?;
         let (_, ics) = self
             .dav_request("GET", &url, &email, &password, DavReq::default())
@@ -388,7 +389,7 @@ impl CalDavTool {
     // -----------------------------------------------------------------------
 
     async fn action_create_event(&self, args: &Value) -> Result<Value> {
-        let (email, password) = self.get_credentials()?;
+        let (email, password) = self.get_credentials().await?;
         let calendar_id = args["calendar_id"].as_str();
         let collection = self.events_collection(&email, calendar_id);
 
@@ -432,7 +433,7 @@ impl CalDavTool {
     // -----------------------------------------------------------------------
 
     async fn action_update_event(&self, args: &Value) -> Result<Value> {
-        let (email, password) = self.get_credentials()?;
+        let (email, password) = self.get_credentials().await?;
         let url = self.resolve_event_url(args, &email)?;
 
         // Fetch the existing event so we can preserve its UID and any fields
@@ -503,7 +504,7 @@ impl CalDavTool {
     // -----------------------------------------------------------------------
 
     async fn action_delete_event(&self, args: &Value) -> Result<Value> {
-        let (email, password) = self.get_credentials()?;
+        let (email, password) = self.get_credentials().await?;
         let url = self.resolve_event_url(args, &email)?;
         let etag = args["etag"].as_str();
         self.dav_request(

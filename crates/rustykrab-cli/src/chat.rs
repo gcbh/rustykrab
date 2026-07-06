@@ -32,7 +32,7 @@ pub async fn run(data_dir: &Path, _args: &[String]) -> anyhow::Result<()> {
     let gateway_url =
         std::env::var("RUSTYKRAB_GATEWAY_URL").unwrap_or_else(|_| DEFAULT_GATEWAY_URL.to_string());
 
-    let token = resolve_auth_token(data_dir)?;
+    let token = resolve_auth_token(data_dir).await?;
 
     let mut auth_headers = HeaderMap::new();
     auth_headers.insert(
@@ -352,7 +352,7 @@ async fn delete_secret(client: &reqwest::Client, base: &str, name: &str) -> anyh
 // If the store is locked (daemon holds it), we fall back to env/keychain
 // only; the user can also set RUSTYKRAB_AUTH_TOKEN explicitly.
 
-fn resolve_auth_token(data_dir: &Path) -> anyhow::Result<String> {
+async fn resolve_auth_token(data_dir: &Path) -> anyhow::Result<String> {
     if let Ok(v) = std::env::var("RUSTYKRAB_AUTH_TOKEN") {
         let v = v.trim();
         if !v.is_empty() {
@@ -379,7 +379,7 @@ fn resolve_auth_token(data_dir: &Path) -> anyhow::Result<String> {
     if db_path.exists() {
         if let Ok(master_key) = rustykrab_store::keychain::resolve_master_key() {
             if let Ok(store) = rustykrab_store::Store::open(&db_path, master_key) {
-                if let Ok(v) = store.secrets().get(spec.store_name) {
+                if let Ok(v) = store.secrets().get(spec.store_name).await {
                     return Ok(v);
                 }
             }

@@ -7,6 +7,8 @@ use rustykrab_core::Error;
 use std::sync::Mutex;
 use uuid::Uuid;
 
+use crate::with_conn;
+
 /// Lightweight summary of a conversation used by listing endpoints.
 #[derive(Debug, Clone)]
 pub struct ConversationSummary {
@@ -17,6 +19,9 @@ pub struct ConversationSummary {
 }
 
 /// CRUD operations on conversations backed by SQLite.
+///
+/// All methods run their rusqlite work on tokio's blocking pool via
+/// `spawn_blocking` so async workers never park on disk I/O.
 #[derive(Clone)]
 pub struct ConversationStore {
     conn: Arc<Mutex<rusqlite::Connection>>,
@@ -28,12 +33,12 @@ impl ConversationStore {
     }
 
     /// Create a new empty conversation and return it.
-    pub fn create(&self) -> Result<Conversation, Error> {
-        self.create_with_title(None)
+    pub async fn create(&self) -> Result<Conversation, Error> {
+        self.create_with_title(None).await
     }
 
     /// Create a new empty conversation with an optional title and return it.
-    pub fn create_with_title(&self, title: Option<String>) -> Result<Conversation, Error> {
+    pub async fn create_with_title(&self, title: Option<String>) -> Result<Conversation, Error> {
         let conv = Conversation {
             id: Uuid::new_v4(),
             messages: Vec::new(),
@@ -46,103 +51,114 @@ impl ConversationStore {
             channel_id: None,
             channel_thread_id: None,
         };
-        self.save(&conv)?;
+        self.save(&conv).await?;
         Ok(conv)
     }
 
     /// Persist a conversation (insert or update).
-    pub fn save(&self, conv: &Conversation) -> Result<(), Error> {
+    pub async fn save(&self, conv: &Conversation) -> Result<(), Error> {
+        let id = conv.id.to_string();
         let data = serde_json::to_string(conv)?;
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "INSERT INTO conversations (id, data) VALUES (?1, ?2)
-             ON CONFLICT(id) DO UPDATE SET data = excluded.data",
-            params![conv.id.to_string(), data],
-        )
-        .map_err(|e| Error::Storage(e.to_string()))?;
-        Ok(())
+        with_conn(&self.conn, move |conn| {
+            conn.execute(
+                "INSERT INTO conversations (id, data) VALUES (?1, ?2)
+                 ON CONFLICT(id) DO UPDATE SET data = excluded.data",
+                params![id, data],
+            )
+            .map_err(|e| Error::Storage(e.to_string()))?;
+            Ok(())
+        })
+        .await
     }
 
     /// Retrieve a conversation by ID.
-    pub fn get(&self, id: Uuid) -> Result<Conversation, Error> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn
-            .prepare("SELECT data FROM conversations WHERE id = ?1")
-            .map_err(|e| Error::Storage(e.to_string()))?;
-        let data: String = stmt
-            .query_row(params![id.to_string()], |row| row.get(0))
-            .map_err(|e| match e {
-                rusqlite::Error::QueryReturnedNoRows => {
-                    Error::NotFound(format!("conversation {id}"))
-                }
-                other => Error::Storage(other.to_string()),
-            })?;
-        let conv: Conversation = serde_json::from_str(&data)?;
-        Ok(conv)
+    pub async fn get(&self, id: Uuid) -> Result<Conversation, Error> {
+        with_conn(&self.conn, move |conn| {
+            let mut stmt = conn
+                .prepare("SELECT data FROM conversations WHERE id = ?1")
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            let data: String = stmt
+                .query_row(params![id.to_string()], |row| row.get(0))
+                .map_err(|e| match e {
+                    rusqlite::Error::QueryReturnedNoRows => {
+                        Error::NotFound(format!("conversation {id}"))
+                    }
+                    other => Error::Storage(other.to_string()),
+                })?;
+            let conv: Conversation = serde_json::from_str(&data)?;
+            Ok(conv)
+        })
+        .await
     }
 
     /// List all conversation IDs (lightweight, doesn't deserialize messages).
-    pub fn list_ids(&self) -> Result<Vec<Uuid>, Error> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn
-            .prepare("SELECT id FROM conversations")
-            .map_err(|e| Error::Storage(e.to_string()))?;
-        let rows = stmt
-            .query_map([], |row| {
-                let id_str: String = row.get(0)?;
-                Ok(id_str)
-            })
-            .map_err(|e| Error::Storage(e.to_string()))?;
-        let mut ids = Vec::new();
-        for row in rows {
-            let id_str = row.map_err(|e| Error::Storage(e.to_string()))?;
-            let id = Uuid::parse_str(&id_str).map_err(|e| Error::Storage(e.to_string()))?;
-            ids.push(id);
-        }
-        Ok(ids)
+    pub async fn list_ids(&self) -> Result<Vec<Uuid>, Error> {
+        with_conn(&self.conn, |conn| {
+            let mut stmt = conn
+                .prepare("SELECT id FROM conversations")
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            let rows = stmt
+                .query_map([], |row| {
+                    let id_str: String = row.get(0)?;
+                    Ok(id_str)
+                })
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            let mut ids = Vec::new();
+            for row in rows {
+                let id_str = row.map_err(|e| Error::Storage(e.to_string()))?;
+                let id = Uuid::parse_str(&id_str).map_err(|e| Error::Storage(e.to_string()))?;
+                ids.push(id);
+            }
+            Ok(ids)
+        })
+        .await
     }
 
     /// List all conversation summaries (id, title, timestamps) ordered by
     /// `updated_at` descending. Skips entries whose stored JSON cannot be
     /// parsed instead of failing the whole list.
-    pub fn list_summaries(&self) -> Result<Vec<ConversationSummary>, Error> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn
-            .prepare("SELECT data FROM conversations")
-            .map_err(|e| Error::Storage(e.to_string()))?;
-        let rows = stmt
-            .query_map([], |row| row.get::<_, String>(0))
-            .map_err(|e| Error::Storage(e.to_string()))?;
-        let mut out = Vec::new();
-        for row in rows {
-            let data = row.map_err(|e| Error::Storage(e.to_string()))?;
-            if let Ok(conv) = serde_json::from_str::<Conversation>(&data) {
-                out.push(ConversationSummary {
-                    id: conv.id,
-                    title: conv.title,
-                    created_at: conv.created_at,
-                    updated_at: conv.updated_at,
-                });
+    pub async fn list_summaries(&self) -> Result<Vec<ConversationSummary>, Error> {
+        with_conn(&self.conn, |conn| {
+            let mut stmt = conn
+                .prepare("SELECT data FROM conversations")
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            let mut out = Vec::new();
+            for row in rows {
+                let data = row.map_err(|e| Error::Storage(e.to_string()))?;
+                if let Ok(conv) = serde_json::from_str::<Conversation>(&data) {
+                    out.push(ConversationSummary {
+                        id: conv.id,
+                        title: conv.title,
+                        created_at: conv.created_at,
+                        updated_at: conv.updated_at,
+                    });
+                }
             }
-        }
-        out.sort_by_key(|s| std::cmp::Reverse(s.updated_at));
-        Ok(out)
+            out.sort_by_key(|s| std::cmp::Reverse(s.updated_at));
+            Ok(out)
+        })
+        .await
     }
 
     /// Delete a conversation by ID. Returns `NotFound` if the conversation
     /// does not exist, so callers can distinguish 404 from 500.
-    pub fn delete(&self, id: Uuid) -> Result<(), Error> {
-        let conn = self.conn.lock().unwrap();
-        let affected = conn
-            .execute(
-                "DELETE FROM conversations WHERE id = ?1",
-                params![id.to_string()],
-            )
-            .map_err(|e| Error::Storage(e.to_string()))?;
-        if affected == 0 {
-            return Err(Error::NotFound(format!("conversation {id}")));
-        }
-        Ok(())
+    pub async fn delete(&self, id: Uuid) -> Result<(), Error> {
+        with_conn(&self.conn, move |conn| {
+            let affected = conn
+                .execute(
+                    "DELETE FROM conversations WHERE id = ?1",
+                    params![id.to_string()],
+                )
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            if affected == 0 {
+                return Err(Error::NotFound(format!("conversation {id}")));
+            }
+            Ok(())
+        })
+        .await
     }
 }
 
@@ -161,36 +177,37 @@ mod tests {
         ConversationStore::new(Arc::new(Mutex::new(conn)))
     }
 
-    #[test]
-    fn create_with_title_persists_title_and_round_trips() {
+    #[tokio::test]
+    async fn create_with_title_persists_title_and_round_trips() {
         let store = in_memory_store();
         let conv = store
             .create_with_title(Some("hello".into()))
+            .await
             .expect("create");
         assert_eq!(conv.title.as_deref(), Some("hello"));
-        let reloaded = store.get(conv.id).expect("get");
+        let reloaded = store.get(conv.id).await.expect("get");
         assert_eq!(reloaded.title.as_deref(), Some("hello"));
     }
 
-    #[test]
-    fn create_defaults_title_to_none() {
+    #[tokio::test]
+    async fn create_defaults_title_to_none() {
         let store = in_memory_store();
-        let conv = store.create().expect("create");
+        let conv = store.create().await.expect("create");
         assert!(conv.title.is_none());
     }
 
-    #[test]
-    fn list_summaries_returns_entries_sorted_desc_by_updated_at() {
+    #[tokio::test]
+    async fn list_summaries_returns_entries_sorted_desc_by_updated_at() {
         let store = in_memory_store();
-        let mut a = store.create_with_title(Some("a".into())).unwrap();
-        let mut b = store.create_with_title(Some("b".into())).unwrap();
+        let mut a = store.create_with_title(Some("a".into())).await.unwrap();
+        let mut b = store.create_with_title(Some("b".into())).await.unwrap();
         // Force `b` to be older than `a`.
         b.updated_at = a.updated_at - chrono::Duration::seconds(60);
-        store.save(&b).unwrap();
+        store.save(&b).await.unwrap();
         a.updated_at = Utc::now();
-        store.save(&a).unwrap();
+        store.save(&a).await.unwrap();
 
-        let summaries = store.list_summaries().unwrap();
+        let summaries = store.list_summaries().await.unwrap();
         assert_eq!(summaries.len(), 2);
         assert_eq!(
             summaries[0].id, a.id,
@@ -200,10 +217,10 @@ mod tests {
         assert_eq!(summaries[1].id, b.id);
     }
 
-    #[test]
-    fn get_returns_not_found_for_unknown_id() {
+    #[tokio::test]
+    async fn get_returns_not_found_for_unknown_id() {
         let store = in_memory_store();
-        let err = store.get(Uuid::new_v4()).unwrap_err();
+        let err = store.get(Uuid::new_v4()).await.unwrap_err();
         assert!(matches!(err, Error::NotFound(_)));
     }
 }

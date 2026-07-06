@@ -36,8 +36,8 @@ impl GmailTool {
     }
 
     /// Get email and app password from the credential store.
-    fn get_credentials(&self) -> Result<(String, String)> {
-        let email = self.secrets.get(KEY_EMAIL).map_err(|e| {
+    async fn get_credentials(&self) -> Result<(String, String)> {
+        let email = self.secrets.get(KEY_EMAIL).await.map_err(|e| {
             Error::ToolExecution(
                 format!(
                     "gmail_email not available: {e}. Store it with: \
@@ -48,7 +48,7 @@ impl GmailTool {
                 .into(),
             )
         })?;
-        let password = self.secrets.get(KEY_APP_PASSWORD).map_err(|e| {
+        let password = self.secrets.get(KEY_APP_PASSWORD).await.map_err(|e| {
             Error::ToolExecution(
                 format!(
                     "gmail_app_password not available: {e}. Store it with: \
@@ -77,9 +77,11 @@ impl GmailTool {
 
         self.secrets
             .set(KEY_EMAIL, email)
+            .await
             .map_err(|e| Error::ToolExecution(format!("failed to store email: {e}").into()))?;
         self.secrets
             .set(KEY_APP_PASSWORD, app_password)
+            .await
             .map_err(|e| {
                 Error::ToolExecution(format!("failed to store app password: {e}").into())
             })?;
@@ -107,7 +109,7 @@ impl GmailTool {
             .min(MAX_SEARCH_RESULTS as u64) as usize;
         let mailbox = args["mailbox"].as_str().unwrap_or("INBOX");
 
-        let (email, password) = self.get_credentials()?;
+        let (email, password) = self.get_credentials().await?;
         let mut session = connect_imap(&email, &password).await?;
 
         session
@@ -211,7 +213,7 @@ impl GmailTool {
             as u32;
         let mailbox = args["mailbox"].as_str().unwrap_or("INBOX");
 
-        let (email, password) = self.get_credentials()?;
+        let (email, password) = self.get_credentials().await?;
         let mut session = connect_imap(&email, &password).await?;
 
         session
@@ -373,7 +375,7 @@ impl GmailTool {
         let cc = args["cc"].as_str();
         let in_reply_to = args["in_reply_to"].as_str();
 
-        let (email, password) = self.get_credentials()?;
+        let (email, password) = self.get_credentials().await?;
 
         let mut message_builder =
             lettre::message::Message::builder()
@@ -426,7 +428,7 @@ impl GmailTool {
     // -----------------------------------------------------------------------
 
     async fn action_labels(&self) -> Result<Value> {
-        let (email, password) = self.get_credentials()?;
+        let (email, password) = self.get_credentials().await?;
         let mut session = connect_imap(&email, &password).await?;
 
         let names: Vec<async_imap::types::Name> = session
@@ -467,7 +469,7 @@ impl GmailTool {
             .ok_or_else(|| Error::ToolExecution("missing 'to_mailbox'".into()))?
             .to_string();
 
-        let (email, password) = self.get_credentials()?;
+        let (email, password) = self.get_credentials().await?;
         let mut session = connect_imap(&email, &password).await?;
 
         session.select(&from_mailbox).await.map_err(|e| {
@@ -500,7 +502,7 @@ impl GmailTool {
             as u32;
         let mailbox = args["mailbox"].as_str().unwrap_or("INBOX");
 
-        let (email, password) = self.get_credentials()?;
+        let (email, password) = self.get_credentials().await?;
         let mut session = connect_imap(&email, &password).await?;
 
         session
@@ -529,7 +531,7 @@ impl GmailTool {
             as u32;
         let mailbox = args["mailbox"].as_str().unwrap_or("INBOX");
 
-        let (email, password) = self.get_credentials()?;
+        let (email, password) = self.get_credentials().await?;
         let mut session = connect_imap(&email, &password).await?;
 
         session
@@ -572,7 +574,7 @@ impl GmailTool {
             as u32;
         let mailbox = args["mailbox"].as_str().unwrap_or("INBOX");
 
-        let (email, password) = self.get_credentials()?;
+        let (email, password) = self.get_credentials().await?;
         let mut session = connect_imap(&email, &password).await?;
 
         // First, fetch the target message to get its References/In-Reply-To/Message-ID.
@@ -765,7 +767,7 @@ impl GmailTool {
         })? as usize;
         let mailbox = args["mailbox"].as_str().unwrap_or("INBOX");
 
-        let (email, password) = self.get_credentials()?;
+        let (email, password) = self.get_credentials().await?;
         let mut session = connect_imap(&email, &password).await?;
 
         session

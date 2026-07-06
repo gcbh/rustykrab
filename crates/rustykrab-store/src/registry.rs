@@ -90,12 +90,14 @@ pub struct MissingSecret {
 ///
 /// This does **not** mutate any store — it is a read-only check suitable for
 /// startup validation.
-pub fn validate(secrets: &SecretStore) -> Vec<MissingSecret> {
-    REGISTRY
-        .iter()
-        .filter(|spec| !is_present(spec, secrets))
-        .map(|spec| MissingSecret { spec })
-        .collect()
+pub async fn validate(secrets: &SecretStore) -> Vec<MissingSecret> {
+    let mut missing = Vec::new();
+    for spec in REGISTRY {
+        if !is_present(spec, secrets).await {
+            missing.push(MissingSecret { spec });
+        }
+    }
+    missing
 }
 
 /// Resolve a secret from all sources in priority order.
@@ -104,7 +106,7 @@ pub fn validate(secrets: &SecretStore) -> Vec<MissingSecret> {
 /// so future runs can find it without the env var.
 ///
 /// Returns `None` only when the secret is absent from every source.
-pub fn resolve(spec: &SecretSpec, secrets: &SecretStore) -> Option<String> {
+pub async fn resolve(spec: &SecretSpec, secrets: &SecretStore) -> Option<String> {
     // 1. Environment variable (highest priority).
     if let Ok(val) = std::env::var(spec.env_var) {
         let val = val.trim().to_string();
@@ -113,7 +115,7 @@ pub fn resolve(spec: &SecretSpec, secrets: &SecretStore) -> Option<String> {
             if keychain::keychain_available() {
                 let _ = keychain::set_credential(KEYCHAIN_SERVICE, spec.keychain_account, &val);
             }
-            let _ = secrets.set(spec.store_name, &val);
+            let _ = secrets.set(spec.store_name, &val).await;
             return Some(val);
         }
     }
@@ -121,13 +123,13 @@ pub fn resolve(spec: &SecretSpec, secrets: &SecretStore) -> Option<String> {
     // 2. OS credential store.
     if keychain::keychain_available() {
         if let Ok(Some(cred)) = keychain::get_credential(KEYCHAIN_SERVICE, spec.keychain_account) {
-            let _ = secrets.set(spec.store_name, &cred.value);
+            let _ = secrets.set(spec.store_name, &cred.value).await;
             return Some(cred.value);
         }
     }
 
     // 3. Encrypted local store.
-    if let Ok(val) = secrets.get(spec.store_name) {
+    if let Ok(val) = secrets.get(spec.store_name).await {
         // Back-fill into keychain if available.
         if keychain::keychain_available() {
             let _ = keychain::set_credential(KEYCHAIN_SERVICE, spec.keychain_account, &val);
@@ -157,7 +159,7 @@ pub fn keychain_service() -> &'static str {
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-fn is_present(spec: &SecretSpec, secrets: &SecretStore) -> bool {
+async fn is_present(spec: &SecretSpec, secrets: &SecretStore) -> bool {
     // env var
     if let Ok(val) = std::env::var(spec.env_var) {
         if !val.trim().is_empty() {
@@ -171,5 +173,5 @@ fn is_present(spec: &SecretSpec, secrets: &SecretStore) -> bool {
         }
     }
     // store
-    secrets.get(spec.store_name).is_ok()
+    secrets.get(spec.store_name).await.is_ok()
 }

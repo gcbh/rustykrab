@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.5.9] - 2026-07-06
+
+- perf(store): run SQLite work on blocking threads, tune pragmas (#476)
+
 ## [4.5.8] - 2026-07-06
 
 - perf(providers): linear stream buffering, fix UTF-8 chunk-boundary corruption (#475)

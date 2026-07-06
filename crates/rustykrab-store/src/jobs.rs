@@ -9,6 +9,12 @@ use uuid::Uuid;
 
 use rustykrab_core::Error;
 
+use crate::with_conn;
+
+/// Maximum retained `job_runs` rows per job. Older runs are pruned on
+/// insert so the history table can't grow without bound.
+const MAX_RUNS_PER_JOB: u32 = 100;
+
 /// A persisted scheduled job.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScheduledJob {
@@ -46,6 +52,9 @@ pub struct JobRun {
 }
 
 /// Handle for scheduled-job CRUD operations, backed by SQLite.
+///
+/// All methods run their rusqlite work on tokio's blocking pool via
+/// `spawn_blocking` so async workers never park on disk I/O.
 #[derive(Clone)]
 pub struct JobStore {
     conn: Arc<Mutex<rusqlite::Connection>>,
@@ -61,7 +70,7 @@ impl JobStore {
     /// `schedule` is either a cron expression (e.g. `"0 9 * * *"`) for
     /// recurring jobs, or an ISO 8601 timestamp (e.g. `"2025-03-15T14:30:00Z"`)
     /// for one-shot jobs.
-    pub fn create_job(
+    pub async fn create_job(
         &self,
         schedule: &str,
         task: &str,
@@ -88,152 +97,181 @@ impl JobStore {
             conversation_id: None,
         };
 
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "INSERT INTO scheduled_jobs (id, schedule, task, channel, chat_id, thread_id, one_shot, enabled, next_run_at, last_run_at, created_at, conversation_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-            params![
-                job.id,
-                job.schedule,
-                job.task,
-                job.channel,
-                job.chat_id,
-                job.thread_id,
-                job.one_shot as i32,
-                job.enabled as i32,
-                job.next_run_at.to_rfc3339(),
-                job.last_run_at.map(|t| t.to_rfc3339()),
-                job.created_at.to_rfc3339(),
-                job.conversation_id,
-            ],
-        )
-        .map_err(|e| Error::Storage(e.to_string()))?;
+        let row = job.clone();
+        with_conn(&self.conn, move |conn| {
+            conn.execute(
+                "INSERT INTO scheduled_jobs (id, schedule, task, channel, chat_id, thread_id, one_shot, enabled, next_run_at, last_run_at, created_at, conversation_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                params![
+                    row.id,
+                    row.schedule,
+                    row.task,
+                    row.channel,
+                    row.chat_id,
+                    row.thread_id,
+                    row.one_shot as i32,
+                    row.enabled as i32,
+                    row.next_run_at.to_rfc3339(),
+                    row.last_run_at.map(|t| t.to_rfc3339()),
+                    row.created_at.to_rfc3339(),
+                    row.conversation_id,
+                ],
+            )
+            .map_err(|e| Error::Storage(e.to_string()))?;
+            Ok(())
+        })
+        .await?;
 
         Ok(job)
     }
 
     /// List all scheduled jobs.
-    pub fn list_jobs(&self) -> Result<Vec<ScheduledJob>, Error> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn
-            .prepare(&format!(
-                "SELECT {JOB_COLUMNS} FROM scheduled_jobs ORDER BY next_run_at",
-            ))
-            .map_err(|e| Error::Storage(e.to_string()))?;
+    pub async fn list_jobs(&self) -> Result<Vec<ScheduledJob>, Error> {
+        with_conn(&self.conn, |conn| {
+            let mut stmt = conn
+                .prepare(&format!(
+                    "SELECT {JOB_COLUMNS} FROM scheduled_jobs ORDER BY next_run_at",
+                ))
+                .map_err(|e| Error::Storage(e.to_string()))?;
 
-        let jobs = stmt
-            .query_map([], row_to_job)
-            .map_err(|e| Error::Storage(e.to_string()))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| Error::Storage(e.to_string()))?;
+            let jobs = stmt
+                .query_map([], row_to_job)
+                .map_err(|e| Error::Storage(e.to_string()))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| Error::Storage(e.to_string()))?;
 
-        Ok(jobs)
+            Ok(jobs)
+        })
+        .await
     }
 
     /// Fetch a single scheduled job by ID. Returns `NotFound` if absent.
-    pub fn get_job(&self, job_id: &str) -> Result<ScheduledJob, Error> {
-        let conn = self.conn.lock().unwrap();
-        conn.query_row(
-            &format!("SELECT {JOB_COLUMNS} FROM scheduled_jobs WHERE id = ?1"),
-            params![job_id],
-            row_to_job,
-        )
-        .map_err(|e| match e {
-            rusqlite::Error::QueryReturnedNoRows => Error::NotFound(format!("job {job_id}")),
-            other => Error::Storage(other.to_string()),
+    pub async fn get_job(&self, job_id: &str) -> Result<ScheduledJob, Error> {
+        let job_id = job_id.to_string();
+        with_conn(&self.conn, move |conn| {
+            conn.query_row(
+                &format!("SELECT {JOB_COLUMNS} FROM scheduled_jobs WHERE id = ?1"),
+                params![job_id],
+                row_to_job,
+            )
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Error::NotFound(format!("job {job_id}")),
+                other => Error::Storage(other.to_string()),
+            })
         })
+        .await
     }
 
     /// Delete a scheduled job by ID.
-    pub fn delete_job(&self, job_id: &str) -> Result<bool, Error> {
-        let conn = self.conn.lock().unwrap();
-        let rows = conn
-            .execute("DELETE FROM scheduled_jobs WHERE id = ?1", params![job_id])
-            .map_err(|e| Error::Storage(e.to_string()))?;
-        Ok(rows > 0)
+    pub async fn delete_job(&self, job_id: &str) -> Result<bool, Error> {
+        let job_id = job_id.to_string();
+        with_conn(&self.conn, move |conn| {
+            let rows = conn
+                .execute("DELETE FROM scheduled_jobs WHERE id = ?1", params![job_id])
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            Ok(rows > 0)
+        })
+        .await
     }
 
     /// Toggle a job's `enabled` flag. The cron poller skips disabled jobs.
     /// Used by the executor to retire jobs that turn out to be unrunnable
     /// (e.g. an empty task body persisted by an older build) so they stop
     /// firing every cycle.
-    pub fn set_enabled(&self, job_id: &str, enabled: bool) -> Result<(), Error> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "UPDATE scheduled_jobs SET enabled = ?1 WHERE id = ?2",
-            params![enabled as i32, job_id],
-        )
-        .map_err(|e| Error::Storage(e.to_string()))?;
-        Ok(())
+    pub async fn set_enabled(&self, job_id: &str, enabled: bool) -> Result<(), Error> {
+        let job_id = job_id.to_string();
+        with_conn(&self.conn, move |conn| {
+            conn.execute(
+                "UPDATE scheduled_jobs SET enabled = ?1 WHERE id = ?2",
+                params![enabled as i32, job_id],
+            )
+            .map_err(|e| Error::Storage(e.to_string()))?;
+            Ok(())
+        })
+        .await
     }
 
     /// Attach a conversation id to a job. Called on the first run once the
     /// executor has created (or resumed) the conversation the agent uses.
-    pub fn set_conversation_id(&self, job_id: &str, conversation_id: &str) -> Result<(), Error> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "UPDATE scheduled_jobs SET conversation_id = ?1 WHERE id = ?2",
-            params![conversation_id, job_id],
-        )
-        .map_err(|e| Error::Storage(e.to_string()))?;
-        Ok(())
+    pub async fn set_conversation_id(
+        &self,
+        job_id: &str,
+        conversation_id: &str,
+    ) -> Result<(), Error> {
+        let job_id = job_id.to_string();
+        let conversation_id = conversation_id.to_string();
+        with_conn(&self.conn, move |conn| {
+            conn.execute(
+                "UPDATE scheduled_jobs SET conversation_id = ?1 WHERE id = ?2",
+                params![conversation_id, job_id],
+            )
+            .map_err(|e| Error::Storage(e.to_string()))?;
+            Ok(())
+        })
+        .await
     }
 
     /// Return all enabled jobs whose `next_run_at` is at or before `now`.
-    pub fn get_due_jobs(&self, now: DateTime<Utc>) -> Result<Vec<ScheduledJob>, Error> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn
-            .prepare(&format!(
-                "SELECT {JOB_COLUMNS} FROM scheduled_jobs WHERE enabled = 1 AND next_run_at <= ?1",
-            ))
-            .map_err(|e| Error::Storage(e.to_string()))?;
+    pub async fn get_due_jobs(&self, now: DateTime<Utc>) -> Result<Vec<ScheduledJob>, Error> {
+        with_conn(&self.conn, move |conn| {
+            let mut stmt = conn
+                .prepare(&format!(
+                    "SELECT {JOB_COLUMNS} FROM scheduled_jobs WHERE enabled = 1 AND next_run_at <= ?1",
+                ))
+                .map_err(|e| Error::Storage(e.to_string()))?;
 
-        let jobs = stmt
-            .query_map(params![now.to_rfc3339()], row_to_job)
-            .map_err(|e| Error::Storage(e.to_string()))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| Error::Storage(e.to_string()))?;
+            let jobs = stmt
+                .query_map(params![now.to_rfc3339()], row_to_job)
+                .map_err(|e| Error::Storage(e.to_string()))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| Error::Storage(e.to_string()))?;
 
-        Ok(jobs)
+            Ok(jobs)
+        })
+        .await
     }
 
     /// Mark a job as executed: update `last_run_at`, advance `next_run_at`
     /// for recurring jobs, or disable one-shot jobs.
-    pub fn mark_executed(&self, job_id: &str) -> Result<(), Error> {
-        let conn = self.conn.lock().unwrap();
-        let now = Utc::now();
+    pub async fn mark_executed(&self, job_id: &str) -> Result<(), Error> {
+        let job_id = job_id.to_string();
+        with_conn(&self.conn, move |conn| {
+            let now = Utc::now();
 
-        // Read the job to determine schedule type.
-        let (schedule, one_shot): (String, bool) = conn
-            .query_row(
-                "SELECT schedule, one_shot FROM scheduled_jobs WHERE id = ?1",
-                params![job_id],
-                |row| Ok((row.get(0)?, row.get::<_, i32>(1)? != 0)),
-            )
-            .map_err(|e| Error::Storage(e.to_string()))?;
+            // Read the job to determine schedule type.
+            let (schedule, one_shot): (String, bool) = conn
+                .query_row(
+                    "SELECT schedule, one_shot FROM scheduled_jobs WHERE id = ?1",
+                    params![job_id],
+                    |row| Ok((row.get(0)?, row.get::<_, i32>(1)? != 0)),
+                )
+                .map_err(|e| Error::Storage(e.to_string()))?;
 
-        if one_shot {
-            // Disable one-shot jobs after execution.
-            conn.execute(
-                "UPDATE scheduled_jobs SET enabled = 0, last_run_at = ?1 WHERE id = ?2",
-                params![now.to_rfc3339(), job_id],
-            )
-            .map_err(|e| Error::Storage(e.to_string()))?;
-        } else {
-            // Advance next_run_at for recurring jobs.
-            let next = compute_next_cron_run(&schedule, now)
-                .unwrap_or_else(|_| now + chrono::Duration::hours(1));
-            conn.execute(
-                "UPDATE scheduled_jobs SET last_run_at = ?1, next_run_at = ?2 WHERE id = ?3",
-                params![now.to_rfc3339(), next.to_rfc3339(), job_id],
-            )
-            .map_err(|e| Error::Storage(e.to_string()))?;
-        }
+            if one_shot {
+                // Disable one-shot jobs after execution.
+                conn.execute(
+                    "UPDATE scheduled_jobs SET enabled = 0, last_run_at = ?1 WHERE id = ?2",
+                    params![now.to_rfc3339(), job_id],
+                )
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            } else {
+                // Advance next_run_at for recurring jobs.
+                let next = compute_next_cron_run(&schedule, now)
+                    .unwrap_or_else(|_| now + chrono::Duration::hours(1));
+                conn.execute(
+                    "UPDATE scheduled_jobs SET last_run_at = ?1, next_run_at = ?2 WHERE id = ?3",
+                    params![now.to_rfc3339(), next.to_rfc3339(), job_id],
+                )
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            }
 
-        Ok(())
+            Ok(())
+        })
+        .await
     }
-    /// Record a completed run for a job.
-    pub fn record_run(
+    /// Record a completed run for a job, pruning history beyond the most
+    /// recent [`MAX_RUNS_PER_JOB`] entries for that job.
+    pub async fn record_run(
         &self,
         job_id: &str,
         status: &str,
@@ -241,63 +279,85 @@ impl JobStore {
         started_at: DateTime<Utc>,
         finished_at: DateTime<Utc>,
     ) -> Result<JobRun, Error> {
-        let id = Uuid::new_v4().to_string();
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "INSERT INTO job_runs (id, job_id, status, output, started_at, finished_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                id,
-                job_id,
-                status,
-                output,
-                started_at.to_rfc3339(),
-                finished_at.to_rfc3339(),
-            ],
-        )
-        .map_err(|e| Error::Storage(e.to_string()))?;
-
-        Ok(JobRun {
-            id,
+        let run = JobRun {
+            id: Uuid::new_v4().to_string(),
             job_id: job_id.to_string(),
             status: status.to_string(),
             output: output.map(|s| s.to_string()),
             started_at,
             finished_at,
+        };
+        let row = run.clone();
+        with_conn(&self.conn, move |conn| {
+            conn.execute(
+                "INSERT INTO job_runs (id, job_id, status, output, started_at, finished_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    row.id,
+                    row.job_id,
+                    row.status,
+                    row.output,
+                    row.started_at.to_rfc3339(),
+                    row.finished_at.to_rfc3339(),
+                ],
+            )
+            .map_err(|e| Error::Storage(e.to_string()))?;
+
+            // Retention cap: drop rows older than the newest N for this job.
+            conn.execute(
+                "DELETE FROM job_runs
+                 WHERE job_id = ?1
+                   AND id NOT IN (
+                       SELECT id FROM job_runs
+                       WHERE job_id = ?1
+                       ORDER BY finished_at DESC
+                       LIMIT ?2
+                   )",
+                params![row.job_id, MAX_RUNS_PER_JOB],
+            )
+            .map_err(|e| Error::Storage(e.to_string()))?;
+
+            Ok(())
         })
+        .await?;
+
+        Ok(run)
     }
 
     /// List recent runs for a job, newest first.
     ///
     /// Returns at most `limit` entries.
-    pub fn list_runs(&self, job_id: &str, limit: u32) -> Result<Vec<JobRun>, Error> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, job_id, status, output, started_at, finished_at
-                 FROM job_runs
-                 WHERE job_id = ?1
-                 ORDER BY finished_at DESC
-                 LIMIT ?2",
-            )
-            .map_err(|e| Error::Storage(e.to_string()))?;
+    pub async fn list_runs(&self, job_id: &str, limit: u32) -> Result<Vec<JobRun>, Error> {
+        let job_id = job_id.to_string();
+        with_conn(&self.conn, move |conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, job_id, status, output, started_at, finished_at
+                     FROM job_runs
+                     WHERE job_id = ?1
+                     ORDER BY finished_at DESC
+                     LIMIT ?2",
+                )
+                .map_err(|e| Error::Storage(e.to_string()))?;
 
-        let runs = stmt
-            .query_map(params![job_id, limit], |row| {
-                Ok(JobRun {
-                    id: row.get(0)?,
-                    job_id: row.get(1)?,
-                    status: row.get(2)?,
-                    output: row.get(3)?,
-                    started_at: parse_stored_timestamp(row.get::<_, String>(4)?),
-                    finished_at: parse_stored_timestamp(row.get::<_, String>(5)?),
+            let runs = stmt
+                .query_map(params![job_id, limit], |row| {
+                    Ok(JobRun {
+                        id: row.get(0)?,
+                        job_id: row.get(1)?,
+                        status: row.get(2)?,
+                        output: row.get(3)?,
+                        started_at: parse_stored_timestamp(row.get::<_, String>(4)?),
+                        finished_at: parse_stored_timestamp(row.get::<_, String>(5)?),
+                    })
                 })
-            })
-            .map_err(|e| Error::Storage(e.to_string()))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| Error::Storage(e.to_string()))?;
+                .map_err(|e| Error::Storage(e.to_string()))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| Error::Storage(e.to_string()))?;
 
-        Ok(runs)
+            Ok(runs)
+        })
+        .await
     }
 }
 
@@ -512,28 +572,29 @@ mod tests {
         JobStore::new(Arc::new(Mutex::new(conn)))
     }
 
-    #[test]
-    fn conversation_id_round_trip() {
+    #[tokio::test]
+    async fn conversation_id_round_trip() {
         let jobs = in_memory_jobs();
         let job = jobs
             .create_job("*/5 * * * *", "ping", None, None, None)
+            .await
             .unwrap();
         assert!(
             job.conversation_id.is_none(),
             "newly created jobs have no conversation yet"
         );
 
-        jobs.set_conversation_id(&job.id, "conv-123").unwrap();
-        let reloaded = jobs.get_job(&job.id).unwrap();
+        jobs.set_conversation_id(&job.id, "conv-123").await.unwrap();
+        let reloaded = jobs.get_job(&job.id).await.unwrap();
         assert_eq!(reloaded.conversation_id.as_deref(), Some("conv-123"));
 
         // list_jobs and get_due_jobs also propagate the column.
-        let listed = jobs.list_jobs().unwrap();
+        let listed = jobs.list_jobs().await.unwrap();
         assert_eq!(listed[0].conversation_id.as_deref(), Some("conv-123"));
     }
 
-    #[test]
-    fn thread_id_round_trip() {
+    #[tokio::test]
+    async fn thread_id_round_trip() {
         let jobs = in_memory_jobs();
         let job = jobs
             .create_job(
@@ -543,25 +604,55 @@ mod tests {
                 Some("C012345"),
                 Some("1700000000.000100"),
             )
+            .await
             .unwrap();
         assert_eq!(job.thread_id.as_deref(), Some("1700000000.000100"));
 
-        let reloaded = jobs.get_job(&job.id).unwrap();
+        let reloaded = jobs.get_job(&job.id).await.unwrap();
         assert_eq!(reloaded.thread_id.as_deref(), Some("1700000000.000100"));
         assert_eq!(reloaded.channel.as_deref(), Some("slack"));
         assert_eq!(reloaded.chat_id.as_deref(), Some("C012345"));
 
-        let listed = jobs.list_jobs().unwrap();
+        let listed = jobs.list_jobs().await.unwrap();
         assert_eq!(listed[0].thread_id.as_deref(), Some("1700000000.000100"));
     }
 
-    #[test]
-    fn get_job_missing_returns_not_found() {
+    #[tokio::test]
+    async fn get_job_missing_returns_not_found() {
         let jobs = in_memory_jobs();
-        let err = jobs.get_job("nope").unwrap_err();
+        let err = jobs.get_job("nope").await.unwrap_err();
         assert!(
             matches!(err, Error::NotFound(_)),
             "expected NotFound, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn record_run_caps_history_per_job() {
+        let jobs = in_memory_jobs();
+        let job = jobs
+            .create_job("*/5 * * * *", "ping", None, None, None)
+            .await
+            .unwrap();
+
+        let base = Utc::now();
+        for i in 0..(MAX_RUNS_PER_JOB + 10) {
+            let ts = base + chrono::Duration::seconds(i as i64);
+            jobs.record_run(&job.id, "ok", Some("out"), ts, ts)
+                .await
+                .unwrap();
+        }
+
+        let runs = jobs.list_runs(&job.id, MAX_RUNS_PER_JOB * 2).await.unwrap();
+        assert_eq!(
+            runs.len(),
+            MAX_RUNS_PER_JOB as usize,
+            "history should be capped at MAX_RUNS_PER_JOB"
+        );
+        // The newest run survives the prune; the oldest ten are gone.
+        assert_eq!(
+            runs[0].finished_at.timestamp(),
+            (base + chrono::Duration::seconds((MAX_RUNS_PER_JOB + 9) as i64)).timestamp()
         );
     }
 }

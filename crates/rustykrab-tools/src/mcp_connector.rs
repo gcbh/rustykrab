@@ -252,7 +252,7 @@ async fn connect_http(
     let url_key = format!("RUSTYKRAB_MCP_{upper}_URL");
     let url = std::env::var(&url_key).map_err(|_| format!("missing env var {url_key}"))?;
 
-    let headers = build_http_headers(server, upper, secrets)?;
+    let headers = build_http_headers(server, upper, secrets).await?;
     let client = McpHttpClient::connect(&url, headers)
         .await
         .map_err(|e| format!("connect: {e}"))?;
@@ -285,6 +285,7 @@ async fn connect_stdio(
     let mut resolved_env: Vec<(String, String)> = Vec::new();
     for (key, raw_value) in collect_prefixed(upper, "ENV_") {
         let value = resolve_value_ref(server, &raw_value, secrets)
+            .await
             .map_err(|e| format!("ENV_{key}: {e}"))?;
         resolved_env.push((key, value));
     }
@@ -306,7 +307,7 @@ async fn connect_stdio(
 /// Assemble HTTP headers from `RUSTYKRAB_MCP_<NAME>_TOKEN` (bearer shorthand)
 /// plus every `RUSTYKRAB_MCP_<NAME>_HEADER_<KEY>` entry. Values may be
 /// `ref:` references resolved via `secrets`.
-fn build_http_headers(
+async fn build_http_headers(
     server: &str,
     upper: &str,
     secrets: &SecretStore,
@@ -314,7 +315,9 @@ fn build_http_headers(
     let mut headers = HeaderMap::new();
 
     if let Ok(raw) = std::env::var(format!("RUSTYKRAB_MCP_{upper}_TOKEN")) {
-        let token = resolve_value_ref(server, &raw, secrets).map_err(|e| format!("TOKEN: {e}"))?;
+        let token = resolve_value_ref(server, &raw, secrets)
+            .await
+            .map_err(|e| format!("TOKEN: {e}"))?;
         let value = HeaderValue::from_str(&format!("Bearer {token}"))
             .map_err(|e| format!("invalid bearer token: {e}"))?;
         headers.insert(AUTHORIZATION, value);
@@ -325,6 +328,7 @@ fn build_http_headers(
         let name = HeaderName::from_bytes(header_name.as_bytes())
             .map_err(|e| format!("invalid header name `{header_name}`: {e}"))?;
         let resolved = resolve_value_ref(server, &raw_value, secrets)
+            .await
             .map_err(|e| format!("HEADER_{key}: {e}"))?;
         let value = HeaderValue::from_str(&resolved)
             .map_err(|e| format!("invalid header value for `{header_name}`: {e}"))?;
@@ -363,7 +367,7 @@ fn collect_prefixed(upper: &str, prefix: &str) -> Vec<(String, String)> {
 ///
 /// Errors carry the ref kind but never the looked-up value. Audit logs
 /// emitted by this function never log the resolved value either.
-fn resolve_value_ref(
+async fn resolve_value_ref(
     server: &str,
     raw: &str,
     secrets: &SecretStore,
@@ -387,7 +391,7 @@ fn resolve_value_ref(
                      (must begin with `{expected_prefix}`)"
                 ));
             }
-            let value = secrets.get(name).map_err(|e| match e {
+            let value = secrets.get(name).await.map_err(|e| match e {
                 rustykrab_core::Error::NotFound(_) => {
                     format!("store ref `{name}` not found in SecretStore")
                 }
@@ -478,98 +482,119 @@ mod tests {
         store.secrets()
     }
 
-    #[test]
-    fn resolve_value_ref_passes_through_literals() {
+    #[tokio::test]
+    async fn resolve_value_ref_passes_through_literals() {
         let secrets = make_test_secrets();
-        let v = resolve_value_ref("github", "ghp_literaltoken", &secrets).unwrap();
+        let v = resolve_value_ref("github", "ghp_literaltoken", &secrets)
+            .await
+            .unwrap();
         assert_eq!(v, "ghp_literaltoken");
     }
 
-    #[test]
-    fn resolve_value_ref_store_lookup_succeeds_in_namespace() {
+    #[tokio::test]
+    async fn resolve_value_ref_store_lookup_succeeds_in_namespace() {
         let secrets = make_test_secrets();
         secrets
             .set("mcp.github.token", "stored-token-value")
+            .await
             .unwrap();
-        let v = resolve_value_ref("github", "ref:store:mcp.github.token", &secrets).unwrap();
+        let v = resolve_value_ref("github", "ref:store:mcp.github.token", &secrets)
+            .await
+            .unwrap();
         assert_eq!(v, "stored-token-value");
     }
 
-    #[test]
-    fn resolve_value_ref_store_lookup_is_case_insensitive_on_server() {
+    #[tokio::test]
+    async fn resolve_value_ref_store_lookup_is_case_insensitive_on_server() {
         let secrets = make_test_secrets();
         secrets
             .set("mcp.github.token", "stored-token-value")
+            .await
             .unwrap();
-        let v = resolve_value_ref("GitHub", "ref:store:mcp.github.token", &secrets).unwrap();
+        let v = resolve_value_ref("GitHub", "ref:store:mcp.github.token", &secrets)
+            .await
+            .unwrap();
         assert_eq!(v, "stored-token-value");
     }
 
-    #[test]
-    fn resolve_value_ref_store_rejects_cross_server_lookup() {
+    #[tokio::test]
+    async fn resolve_value_ref_store_rejects_cross_server_lookup() {
         let secrets = make_test_secrets();
         secrets
             .set("mcp.notion.token", "other-server-token")
+            .await
             .unwrap();
-        let err = resolve_value_ref("github", "ref:store:mcp.notion.token", &secrets).unwrap_err();
+        let err = resolve_value_ref("github", "ref:store:mcp.notion.token", &secrets)
+            .await
+            .unwrap_err();
         assert!(
             err.contains("outside server"),
             "expected namespace error, got: {err}"
         );
     }
 
-    #[test]
-    fn resolve_value_ref_store_rejects_unnamespaced_keys() {
+    #[tokio::test]
+    async fn resolve_value_ref_store_rejects_unnamespaced_keys() {
         let secrets = make_test_secrets();
-        secrets.set("global_secret", "x").unwrap();
-        let err = resolve_value_ref("github", "ref:store:global_secret", &secrets).unwrap_err();
+        secrets.set("global_secret", "x").await.unwrap();
+        let err = resolve_value_ref("github", "ref:store:global_secret", &secrets)
+            .await
+            .unwrap_err();
         assert!(err.contains("outside server"));
     }
 
-    #[test]
-    fn resolve_value_ref_store_missing_key_errors() {
+    #[tokio::test]
+    async fn resolve_value_ref_store_missing_key_errors() {
         let secrets = make_test_secrets();
-        let err =
-            resolve_value_ref("github", "ref:store:mcp.github.missing", &secrets).unwrap_err();
+        let err = resolve_value_ref("github", "ref:store:mcp.github.missing", &secrets)
+            .await
+            .unwrap_err();
         assert!(err.contains("not found"), "got: {err}");
     }
 
-    #[test]
-    fn resolve_value_ref_rejects_unknown_kind() {
+    #[tokio::test]
+    async fn resolve_value_ref_rejects_unknown_kind() {
         let secrets = make_test_secrets();
-        let err = resolve_value_ref("github", "ref:vault:foo", &secrets).unwrap_err();
+        let err = resolve_value_ref("github", "ref:vault:foo", &secrets)
+            .await
+            .unwrap_err();
         assert!(err.contains("unknown credential ref kind"));
     }
 
-    #[test]
-    fn resolve_value_ref_rejects_malformed_ref() {
+    #[tokio::test]
+    async fn resolve_value_ref_rejects_malformed_ref() {
         let secrets = make_test_secrets();
-        let err = resolve_value_ref("github", "ref:store", &secrets).unwrap_err();
+        let err = resolve_value_ref("github", "ref:store", &secrets)
+            .await
+            .unwrap_err();
         assert!(err.contains("malformed"));
     }
 
     #[cfg(not(target_os = "macos"))]
-    #[test]
-    fn resolve_value_ref_keychain_unavailable_on_non_mac() {
+    #[tokio::test]
+    async fn resolve_value_ref_keychain_unavailable_on_non_mac() {
         let secrets = make_test_secrets();
-        let err =
-            resolve_value_ref("github", "ref:keychain:Service/account", &secrets).unwrap_err();
+        let err = resolve_value_ref("github", "ref:keychain:Service/account", &secrets)
+            .await
+            .unwrap_err();
         assert!(err.contains("unavailable"), "got: {err}");
     }
 
-    #[test]
-    fn build_http_headers_token_becomes_bearer() {
+    #[tokio::test]
+    async fn build_http_headers_token_becomes_bearer() {
         // Safety: unique prefix; no other test reads these.
         let upper = "TESTTOKEN";
         let secrets = make_test_secrets();
         std::env::set_var(format!("RUSTYKRAB_MCP_{upper}_TOKEN"), "abc123");
-        let headers = build_http_headers("testtoken", upper, &secrets).unwrap();
+        let headers = build_http_headers("testtoken", upper, &secrets)
+            .await
+            .unwrap();
         assert_eq!(headers.get("authorization").unwrap(), "Bearer abc123");
         std::env::remove_var(format!("RUSTYKRAB_MCP_{upper}_TOKEN"));
     }
 
-    #[test]
-    fn build_http_headers_supports_arbitrary_headers() {
+    #[tokio::test]
+    async fn build_http_headers_supports_arbitrary_headers() {
         // Safety: unique prefix; no other test reads these.
         let upper = "TESTDD";
         let secrets = make_test_secrets();
@@ -581,24 +606,29 @@ mod tests {
             format!("RUSTYKRAB_MCP_{upper}_HEADER_DD_APPLICATION_KEY"),
             "key-bbb",
         );
-        let headers = build_http_headers("testdd", upper, &secrets).unwrap();
+        let headers = build_http_headers("testdd", upper, &secrets).await.unwrap();
         assert_eq!(headers.get("dd-api-key").unwrap(), "key-aaa");
         assert_eq!(headers.get("dd-application-key").unwrap(), "key-bbb");
         std::env::remove_var(format!("RUSTYKRAB_MCP_{upper}_HEADER_DD_API_KEY"));
         std::env::remove_var(format!("RUSTYKRAB_MCP_{upper}_HEADER_DD_APPLICATION_KEY"));
     }
 
-    #[test]
-    fn build_http_headers_resolves_token_ref() {
+    #[tokio::test]
+    async fn build_http_headers_resolves_token_ref() {
         // Safety: unique prefix; no other test reads these.
         let upper = "TESTREF";
         let secrets = make_test_secrets();
-        secrets.set("mcp.testref.token", "resolved-bearer").unwrap();
+        secrets
+            .set("mcp.testref.token", "resolved-bearer")
+            .await
+            .unwrap();
         std::env::set_var(
             format!("RUSTYKRAB_MCP_{upper}_TOKEN"),
             "ref:store:mcp.testref.token",
         );
-        let headers = build_http_headers("testref", upper, &secrets).unwrap();
+        let headers = build_http_headers("testref", upper, &secrets)
+            .await
+            .unwrap();
         assert_eq!(
             headers.get("authorization").unwrap(),
             "Bearer resolved-bearer"
@@ -606,32 +636,42 @@ mod tests {
         std::env::remove_var(format!("RUSTYKRAB_MCP_{upper}_TOKEN"));
     }
 
-    #[test]
-    fn build_http_headers_resolves_header_ref() {
+    #[tokio::test]
+    async fn build_http_headers_resolves_header_ref() {
         // Safety: unique prefix; no other test reads these.
         let upper = "TESTHDRREF";
         let secrets = make_test_secrets();
-        secrets.set("mcp.testhdrref.api_key", "secret-key").unwrap();
+        secrets
+            .set("mcp.testhdrref.api_key", "secret-key")
+            .await
+            .unwrap();
         std::env::set_var(
             format!("RUSTYKRAB_MCP_{upper}_HEADER_X_API_KEY"),
             "ref:store:mcp.testhdrref.api_key",
         );
-        let headers = build_http_headers("testhdrref", upper, &secrets).unwrap();
+        let headers = build_http_headers("testhdrref", upper, &secrets)
+            .await
+            .unwrap();
         assert_eq!(headers.get("x-api-key").unwrap(), "secret-key");
         std::env::remove_var(format!("RUSTYKRAB_MCP_{upper}_HEADER_X_API_KEY"));
     }
 
-    #[test]
-    fn build_http_headers_rejects_cross_server_ref() {
+    #[tokio::test]
+    async fn build_http_headers_rejects_cross_server_ref() {
         // Safety: unique prefix; no other test reads these.
         let upper = "TESTXSERVER";
         let secrets = make_test_secrets();
-        secrets.set("mcp.notion.token", "wrong-server").unwrap();
+        secrets
+            .set("mcp.notion.token", "wrong-server")
+            .await
+            .unwrap();
         std::env::set_var(
             format!("RUSTYKRAB_MCP_{upper}_TOKEN"),
             "ref:store:mcp.notion.token",
         );
-        let err = build_http_headers("testxserver", upper, &secrets).unwrap_err();
+        let err = build_http_headers("testxserver", upper, &secrets)
+            .await
+            .unwrap_err();
         assert!(err.contains("outside server"), "got: {err}");
         std::env::remove_var(format!("RUSTYKRAB_MCP_{upper}_TOKEN"));
     }

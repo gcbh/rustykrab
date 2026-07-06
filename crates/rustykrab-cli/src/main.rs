@@ -114,24 +114,30 @@ impl CronBackend for CronAdapter {
         chat_id: Option<&str>,
         thread_id: Option<&str>,
     ) -> rustykrab_core::Result<serde_json::Value> {
-        let inherited = rustykrab_core::active_tools::with_session_context(|ctx| {
-            self.store.conversations().get(ctx.conversation_id).ok()
-        })
-        .flatten();
+        let session_conv_id =
+            rustykrab_core::active_tools::with_session_context(|ctx| ctx.conversation_id);
+        let inherited = match session_conv_id {
+            Some(conv_id) => self.store.conversations().get(conv_id).await.ok(),
+            None => None,
+        };
         let (ch, cid, tid) =
             inherit_channel_for_create(channel, chat_id, thread_id, inherited.as_ref());
-        let job = self.store.jobs().create_job(
-            schedule,
-            task,
-            ch.as_deref(),
-            cid.as_deref(),
-            tid.as_deref(),
-        )?;
+        let job = self
+            .store
+            .jobs()
+            .create_job(
+                schedule,
+                task,
+                ch.as_deref(),
+                cid.as_deref(),
+                tid.as_deref(),
+            )
+            .await?;
         Ok(serde_json::to_value(&job).expect("ScheduledJob is always serializable"))
     }
 
     async fn list_jobs(&self) -> rustykrab_core::Result<serde_json::Value> {
-        let jobs = self.store.jobs().list_jobs()?;
+        let jobs = self.store.jobs().list_jobs().await?;
         Ok(serde_json::to_value(&jobs).expect("Vec<ScheduledJob> is always serializable"))
     }
 
@@ -139,19 +145,19 @@ impl CronBackend for CronAdapter {
         // Grab the conversation id (if any) before the row goes away so we
         // can reap the associated persistent conversation below. Missing
         // jobs are fine; delete_job returns `false` without error.
-        let conversation_id = match self.store.jobs().get_job(job_id) {
+        let conversation_id = match self.store.jobs().get_job(job_id).await {
             Ok(job) => job.conversation_id,
             Err(rustykrab_core::Error::NotFound(_)) => None,
             Err(e) => return Err(e),
         };
 
-        let deleted = self.store.jobs().delete_job(job_id)?;
+        let deleted = self.store.jobs().delete_job(job_id).await?;
 
         if deleted {
             if let Some(cid) = conversation_id {
                 if let Ok(uuid) = uuid::Uuid::parse_str(&cid) {
                     // NotFound is fine — the conversation may already be gone.
-                    match self.store.conversations().delete(uuid) {
+                    match self.store.conversations().delete(uuid).await {
                         Ok(()) | Err(rustykrab_core::Error::NotFound(_)) => {}
                         Err(e) => {
                             tracing::warn!(
@@ -173,7 +179,7 @@ impl CronBackend for CronAdapter {
         job_id: &str,
         limit: u32,
     ) -> rustykrab_core::Result<serde_json::Value> {
-        let runs = self.store.jobs().list_runs(job_id, limit)?;
+        let runs = self.store.jobs().list_runs(job_id, limit).await?;
         Ok(serde_json::to_value(&runs).expect("Vec<JobRun> is always serializable"))
     }
 }
@@ -343,7 +349,7 @@ async fn main() -> anyhow::Result<()> {
         return handle_skill_subcommand(&data_dir, &args[2..]);
     }
     if args.len() >= 2 && args[1] == "keychain" {
-        return handle_keychain_subcommand(&data_dir, &args[2..]);
+        return handle_keychain_subcommand(&data_dir, &args[2..]).await;
     }
     if args.len() >= 2 && args[1] == "chat" {
         return chat::run(&data_dir, &args[2..]).await;
@@ -378,7 +384,7 @@ async fn main() -> anyhow::Result<()> {
     // Required secrets that cannot be resolved from any source (env var,
     // OS keychain, or encrypted store) cause a hard startup failure.
     {
-        let missing = rustykrab_store::registry::validate(&store.secrets());
+        let missing = rustykrab_store::registry::validate(&store.secrets()).await;
         let required_missing: Vec<_> = missing.iter().filter(|m| m.spec.required).collect();
 
         if !required_missing.is_empty() {
@@ -421,7 +427,7 @@ async fn main() -> anyhow::Result<()> {
     // 2. OS credential store (persists across restarts without env var)
     // 3. Encrypted local SecretStore
     // 4. Generate a new token and persist it in Keychain + SecretStore
-    let auth_token = resolve_auth_token(&store);
+    let auth_token = resolve_auth_token(&store).await;
 
     // --- Model provider ---
     let provider_name =
@@ -452,7 +458,7 @@ async fn main() -> anyhow::Result<()> {
             Arc::new(p)
         }
         _ => {
-            let api_key = resolve_api_key(&store);
+            let api_key = resolve_api_key(&store).await;
             let model = std::env::var("ANTHROPIC_MODEL")
                 .unwrap_or_else(|_| "claude-sonnet-4-20250514".to_string());
             tracing::info!(%model, "using Anthropic provider");
@@ -1114,6 +1120,7 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("flushing database...");
     store_handle
         .flush()
+        .await
         .map_err(|e| anyhow::anyhow!("flush failed: {e}"))?;
     tracing::info!("shutdown complete");
 
@@ -1182,7 +1189,7 @@ async fn telegram_agent_loop(
                     }
                     states.remove(&key);
                 }
-                if let Err(e) = state.store.chat_map().remove(chat_id, thread_id) {
+                if let Err(e) = state.store.chat_map().remove(chat_id, thread_id).await {
                     tracing::warn!(chat_id, thread_id, "failed to remove chat map entry: {e}");
                 }
                 return;
@@ -1235,6 +1242,7 @@ async fn telegram_agent_loop(
                             .store
                             .chat_map()
                             .lookup(chat_id, thread_id)
+                            .await
                             .ok()
                             .flatten();
 
@@ -1253,14 +1261,14 @@ async fn telegram_agent_loop(
                                 );
                                 id
                             }
-                            None => match state.store.conversations().create() {
+                            None => match state.store.conversations().create().await {
                                 Ok(mut conv) => {
                                     conv.channel_source = Some("telegram".to_string());
                                     conv.channel_id = Some(chat_id.to_string());
                                     if thread_id != 0 {
                                         conv.channel_thread_id = Some(thread_id.to_string());
                                     }
-                                    if let Err(e) = state.store.conversations().save(&conv) {
+                                    if let Err(e) = state.store.conversations().save(&conv).await {
                                         tracing::warn!(
                                             chat_id,
                                             "failed to persist channel metadata: {e}"
@@ -1275,7 +1283,7 @@ async fn telegram_agent_loop(
                                         },
                                     );
                                     if let Err(e) =
-                                        state.store.chat_map().upsert(chat_id, thread_id, id)
+                                        state.store.chat_map().upsert(chat_id, thread_id, id).await
                                     {
                                         tracing::warn!(
                                             chat_id,
@@ -1357,7 +1365,7 @@ async fn process_telegram_message(
     key: (i64, i64),
 ) -> String {
     // Load the conversation.
-    let mut conv = match state.store.conversations().get(conv_id) {
+    let mut conv = match state.store.conversations().get(conv_id).await {
         Ok(c) => c,
         Err(e) => {
             tracing::error!(chat_id, thread_id, %conv_id, "failed to load conversation: {e}");
@@ -1469,7 +1477,7 @@ async fn process_telegram_message(
         match join_handle.await {
             Ok(Ok(final_conv)) => {
                 // Persist the final conversation.
-                if let Err(e) = state.store.conversations().save(&final_conv) {
+                if let Err(e) = state.store.conversations().save(&final_conv).await {
                     tracing::error!(chat_id, %conv_id, "failed to persist conversation: {e}");
                 }
                 // Extract last assistant text.
@@ -1574,11 +1582,12 @@ async fn slack_agent_loop(
                     let mut states = chat_states.lock().await;
                     states.remove(&key);
                 }
-                if let Err(e) = state.store.slack_chat_map().remove(
-                    &inbound.team_id,
-                    &inbound.channel_id,
-                    &effective_thread_ts,
-                ) {
+                if let Err(e) = state
+                    .store
+                    .slack_chat_map()
+                    .remove(&inbound.team_id, &inbound.channel_id, &effective_thread_ts)
+                    .await
+                {
                     tracing::warn!(
                         team_id = %inbound.team_id,
                         channel_id = %inbound.channel_id,
@@ -1604,6 +1613,7 @@ async fn slack_agent_loop(
                             .store
                             .slack_chat_map()
                             .lookup(&inbound.team_id, &inbound.channel_id, &effective_thread_ts)
+                            .await
                             .ok()
                             .flatten();
 
@@ -1625,12 +1635,12 @@ async fn slack_agent_loop(
                                 );
                                 id
                             }
-                            None => match state.store.conversations().create() {
+                            None => match state.store.conversations().create().await {
                                 Ok(mut conv) => {
                                     conv.channel_source = Some("slack".to_string());
                                     conv.channel_id = Some(inbound.channel_id.clone());
                                     conv.channel_thread_id = Some(effective_thread_ts.clone());
-                                    if let Err(e) = state.store.conversations().save(&conv) {
+                                    if let Err(e) = state.store.conversations().save(&conv).await {
                                         tracing::warn!(
                                             channel_id = %inbound.channel_id,
                                             "failed to persist Slack channel metadata: {e}"
@@ -1644,12 +1654,17 @@ async fn slack_agent_loop(
                                             busy: false,
                                         },
                                     );
-                                    if let Err(e) = state.store.slack_chat_map().upsert(
-                                        &inbound.team_id,
-                                        &inbound.channel_id,
-                                        &effective_thread_ts,
-                                        id,
-                                    ) {
+                                    if let Err(e) = state
+                                        .store
+                                        .slack_chat_map()
+                                        .upsert(
+                                            &inbound.team_id,
+                                            &inbound.channel_id,
+                                            &effective_thread_ts,
+                                            id,
+                                        )
+                                        .await
+                                    {
                                         tracing::warn!(
                                             team_id = %inbound.team_id,
                                             channel_id = %inbound.channel_id,
@@ -1737,7 +1752,7 @@ async fn process_slack_message(
     message: rustykrab_core::types::Message,
     user_text: &str,
 ) -> String {
-    let mut conv = match state.store.conversations().get(conv_id) {
+    let mut conv = match state.store.conversations().get(conv_id).await {
         Ok(c) => c,
         Err(e) => {
             tracing::error!(channel_id, thread_ts, %conv_id, "failed to load Slack conversation: {e}");
@@ -1802,7 +1817,7 @@ async fn process_slack_message(
         }
     };
 
-    if let Err(e) = state.store.conversations().save(&conv) {
+    if let Err(e) = state.store.conversations().save(&conv).await {
         tracing::error!(channel_id, %conv_id, "failed to persist Slack conversation: {e}");
     }
 
@@ -1830,7 +1845,7 @@ async fn job_executor_loop(store: rustykrab_store::Store, queue: task_queue::Tas
         interval.tick().await;
 
         let now = Utc::now();
-        let due_jobs = match store.jobs().get_due_jobs(now) {
+        let due_jobs = match store.jobs().get_due_jobs(now).await {
             Ok(jobs) => jobs,
             Err(e) => {
                 tracing::warn!(error = %e, "failed to query due jobs");
@@ -2017,11 +2032,11 @@ fn handle_skill_subcommand(data_dir: &std::path::Path, args: &[String]) -> anyho
 ///
 /// Uses the registry to check env / keychain / store, then generates
 /// a new token if none exists.
-fn resolve_auth_token(store: &rustykrab_store::Store) -> String {
+async fn resolve_auth_token(store: &rustykrab_store::Store) -> String {
     let spec = rustykrab_store::registry::lookup("rustykrab_auth_token")
         .expect("rustykrab_auth_token must be in the registry");
 
-    if let Some(token) = rustykrab_store::registry::resolve(spec, &store.secrets()) {
+    if let Some(token) = rustykrab_store::registry::resolve(spec, &store.secrets()).await {
         tracing::info!("auth token resolved via registry");
         return token;
     }
@@ -2035,18 +2050,18 @@ fn resolve_auth_token(store: &rustykrab_store::Store) -> String {
     if rustykrab_store::keychain::keychain_available() {
         let _ = rustykrab_store::keychain::set_credential(svc, spec.keychain_account, &token);
     }
-    let _ = store.secrets().set(spec.store_name, &token);
+    let _ = store.secrets().set(spec.store_name, &token).await;
     token
 }
 
 /// Resolve the Anthropic API key.
 ///
 /// Uses the registry to check env / keychain / store.
-fn resolve_api_key(store: &rustykrab_store::Store) -> String {
+async fn resolve_api_key(store: &rustykrab_store::Store) -> String {
     let spec = rustykrab_store::registry::lookup("anthropic_api_key")
         .expect("anthropic_api_key must be in the registry");
 
-    if let Some(key) = rustykrab_store::registry::resolve(spec, &store.secrets()) {
+    if let Some(key) = rustykrab_store::registry::resolve(spec, &store.secrets()).await {
         tracing::info!("API key resolved via registry");
         return key;
     }
@@ -2070,7 +2085,10 @@ fn resolve_api_key(store: &rustykrab_store::Store) -> String {
 ///
 /// These let the user verify Keychain connectivity, migrate legacy keychain
 /// items to the Data Protection Keychain, and manually seed credentials.
-fn handle_keychain_subcommand(data_dir: &std::path::Path, args: &[String]) -> anyhow::Result<()> {
+async fn handle_keychain_subcommand(
+    data_dir: &std::path::Path,
+    args: &[String],
+) -> anyhow::Result<()> {
     let sub = args.first().map(|s| s.as_str()).unwrap_or("status");
 
     match sub {
@@ -2185,7 +2203,7 @@ fn handle_keychain_subcommand(data_dir: &std::path::Path, args: &[String]) -> an
                 if db_path.exists() {
                     if let Ok(master_key) = rustykrab_store::keychain::resolve_master_key() {
                         if let Ok(store) = rustykrab_store::Store::open(&db_path, master_key) {
-                            let _ = store.secrets().set(sn, value);
+                            let _ = store.secrets().set(sn, value).await;
                             println!("Also stored in encrypted store as '{sn}'");
                         }
                     }
@@ -2217,7 +2235,7 @@ fn handle_keychain_subcommand(data_dir: &std::path::Path, args: &[String]) -> an
                     if let Ok(store) = rustykrab_store::Store::open(&db_path, master_key) {
                         let svc = rustykrab_store::registry::keychain_service();
                         for spec in rustykrab_store::registry::REGISTRY {
-                            if let Ok(val) = store.secrets().get(spec.store_name) {
+                            if let Ok(val) = store.secrets().get(spec.store_name).await {
                                 match rustykrab_store::keychain::set_credential(
                                     svc,
                                     spec.keychain_account,

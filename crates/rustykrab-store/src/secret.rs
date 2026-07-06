@@ -9,6 +9,8 @@ use rustykrab_core::Error;
 use std::sync::Mutex;
 use zeroize::Zeroizing;
 
+use crate::run_blocking;
+
 /// The salt length used for Argon2 key derivation.
 const SALT_LEN: usize = 16;
 /// The nonce length for AES-256-GCM (96 bits).
@@ -47,60 +49,84 @@ impl SecretStore {
     }
 
     /// Store a secret value under the given name.
-    pub fn set(&self, name: &str, value: &str) -> Result<(), Error> {
+    ///
+    /// The Argon2id key derivation and SQLite write both run on tokio's
+    /// blocking pool — neither may occupy an async worker thread.
+    pub async fn set(&self, name: &str, value: &str) -> Result<(), Error> {
         // Validate secret name to prevent injection and normalization attacks
         Self::validate_name(name)?;
 
-        let encrypted = self.encrypt(name, value.as_bytes())?;
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "INSERT INTO secrets (name, data) VALUES (?1, ?2)
-             ON CONFLICT(name) DO UPDATE SET data = excluded.data",
-            params![name, encrypted],
-        )
-        .map_err(|e| Error::Storage(e.to_string()))?;
-        Ok(())
+        let store = self.clone();
+        let name = name.to_string();
+        let value = Zeroizing::new(value.to_string());
+        run_blocking(move || {
+            let encrypted = store.encrypt(&name, value.as_bytes())?;
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO secrets (name, data) VALUES (?1, ?2)
+                 ON CONFLICT(name) DO UPDATE SET data = excluded.data",
+                params![name, encrypted],
+            )
+            .map_err(|e| Error::Storage(e.to_string()))?;
+            Ok(())
+        })
+        .await
     }
 
     /// Retrieve and decrypt a secret by name.
-    pub fn get(&self, name: &str) -> Result<String, Error> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn
-            .prepare("SELECT data FROM secrets WHERE name = ?1")
-            .map_err(|e| Error::Storage(e.to_string()))?;
-        let encrypted: Vec<u8> = stmt
-            .query_row(params![name], |row| row.get(0))
-            .map_err(|e| match e {
-                rusqlite::Error::QueryReturnedNoRows => Error::NotFound(format!("secret '{name}'")),
-                other => Error::Storage(other.to_string()),
-            })?;
-        let plaintext = self.decrypt(name, &encrypted)?;
-        String::from_utf8(plaintext)
-            .map_err(|e| Error::Storage(format!("invalid utf-8 in secret: {e}")))
+    ///
+    /// Runs on tokio's blocking pool — see [`SecretStore::set`].
+    pub async fn get(&self, name: &str) -> Result<String, Error> {
+        let store = self.clone();
+        let name = name.to_string();
+        run_blocking(move || {
+            let encrypted: Vec<u8> = {
+                let conn = store.conn.lock().unwrap();
+                let mut stmt = conn
+                    .prepare("SELECT data FROM secrets WHERE name = ?1")
+                    .map_err(|e| Error::Storage(e.to_string()))?;
+                stmt.query_row(params![name], |row| row.get(0))
+                    .map_err(|e| match e {
+                        rusqlite::Error::QueryReturnedNoRows => {
+                            Error::NotFound(format!("secret '{name}'"))
+                        }
+                        other => Error::Storage(other.to_string()),
+                    })?
+            };
+            let plaintext = store.decrypt(&name, &encrypted)?;
+            String::from_utf8(plaintext)
+                .map_err(|e| Error::Storage(format!("invalid utf-8 in secret: {e}")))
+        })
+        .await
     }
 
     /// Delete a secret.
-    pub fn delete(&self, name: &str) -> Result<(), Error> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute("DELETE FROM secrets WHERE name = ?1", params![name])
-            .map_err(|e| Error::Storage(e.to_string()))?;
-        Ok(())
+    pub async fn delete(&self, name: &str) -> Result<(), Error> {
+        let name = name.to_string();
+        crate::with_conn(&self.conn, move |conn| {
+            conn.execute("DELETE FROM secrets WHERE name = ?1", params![name])
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            Ok(())
+        })
+        .await
     }
 
     /// List all secret names (does not decrypt values).
-    pub fn list_names(&self) -> Result<Vec<String>, Error> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn
-            .prepare("SELECT name FROM secrets")
-            .map_err(|e| Error::Storage(e.to_string()))?;
-        let rows = stmt
-            .query_map([], |row| row.get(0))
-            .map_err(|e| Error::Storage(e.to_string()))?;
-        let mut names = Vec::new();
-        for row in rows {
-            names.push(row.map_err(|e| Error::Storage(e.to_string()))?);
-        }
-        Ok(names)
+    pub async fn list_names(&self) -> Result<Vec<String>, Error> {
+        crate::with_conn(&self.conn, |conn| {
+            let mut stmt = conn
+                .prepare("SELECT name FROM secrets")
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            let rows = stmt
+                .query_map([], |row| row.get(0))
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            let mut names = Vec::new();
+            for row in rows {
+                names.push(row.map_err(|e| Error::Storage(e.to_string()))?);
+            }
+            Ok(names)
+        })
+        .await
     }
 
     /// Validate that a secret name is well-formed.
