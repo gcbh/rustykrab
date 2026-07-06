@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.5.13] - 2026-07-06
+
+- chore: sync Cargo.lock with workspace version 4.5.7 (#479)
+
 ## [4.5.12] - 2026-07-06
 
 - perf(cli): lazy embedder, background index rebuild, concurrent startup (#483)
