@@ -31,7 +31,7 @@ use rustykrab_core::types::{ContentPart, MessageContent};
 use rustykrab_core::AgentRegistry;
 use rustykrab_gateway::AppState;
 use rustykrab_memory::backend::HybridMemoryBackend;
-use rustykrab_memory::embedding::FastEmbedder;
+use rustykrab_memory::embedding::LazyFastEmbedder;
 use rustykrab_memory::storage::SqliteMemoryStorage;
 use rustykrab_memory::{MemoryConfig, MemorySystem};
 use rustykrab_skills::SkillRegistry;
@@ -325,11 +325,25 @@ async fn main() -> anyhow::Result<()> {
     let file_appender = tracing_appender::rolling::daily(&log_dir, "rustykrab.log");
     let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
 
-    let env_filter = EnvFilter::from_default_env();
+    // Default to `info` when RUST_LOG is unset so verbosity doesn't silently
+    // depend on the environment; RUST_LOG still overrides as before.
+    let env_filter = EnvFilter::builder()
+        .with_default_directive(tracing_subscriber::filter::LevelFilter::INFO.into())
+        .from_env_lossy();
+
+    // The stdout layer is only active on a terminal (interactive runs) or
+    // when forced via RUSTYKRAB_LOG_STDOUT=1 — otherwise every event would
+    // be formatted twice (stdout + rolling file) for no reader. Setting
+    // RUSTYKRAB_LOG_STDOUT=0 disables it even on a TTY. The rolling file
+    // layer is always active.
+    let stdout_log_enabled = match std::env::var("RUSTYKRAB_LOG_STDOUT") {
+        Ok(v) => matches!(v.trim(), "1" | "true" | "TRUE" | "True"),
+        Err(_) => std::io::IsTerminal::is_terminal(&std::io::stdout()),
+    };
 
     tracing_subscriber::registry()
         .with(env_filter)
-        .with(fmt::layer().with_writer(std::io::stdout))
+        .with(stdout_log_enabled.then(|| fmt::layer().with_writer(std::io::stdout)))
         .with(fmt::layer().with_writer(non_blocking).with_ansi(false))
         .init();
 
@@ -429,6 +443,16 @@ async fn main() -> anyhow::Result<()> {
     // 4. Generate a new token and persist it in Keychain + SecretStore
     let auth_token = resolve_auth_token(&store).await;
 
+    // --- MCP connector (remote MCP servers as native tools) ---
+    // Kicked off now so per-server connection latency overlaps with the
+    // rest of startup (provider detection, memory init, skill loading);
+    // joined below at tool-registration time. Per-server connect failures
+    // are logged inside and never block startup.
+    let mcp_tools_task = {
+        let secrets = store.secrets();
+        tokio::spawn(async move { rustykrab_tools::mcp_connector_tools(&secrets).await })
+    };
+
     // --- Model provider ---
     let provider_name =
         std::env::var("RUSTYKRAB_PROVIDER").unwrap_or_else(|_| "anthropic".to_string());
@@ -527,8 +551,11 @@ async fn main() -> anyhow::Result<()> {
     );
     let model_cache_dir = data_dir.join("models");
     std::fs::create_dir_all(&model_cache_dir)?;
-    let embedder =
-        Arc::new(FastEmbedder::new(model_cache_dir).expect("failed to initialize embedding model"));
+    // Lazy: ONNX Runtime init (and a ~275MB model download on first run)
+    // happens off-thread on the first embed() call instead of blocking
+    // boot. Init failures surface as clear errors from the first
+    // embedding operation.
+    let embedder = Arc::new(LazyFastEmbedder::new(model_cache_dir));
     let memory_system = Arc::new(MemorySystem::new(
         MemoryConfig::default(),
         memory_storage,
@@ -555,11 +582,22 @@ async fn main() -> anyhow::Result<()> {
 
     let session_id = Uuid::new_v4();
 
-    // Rebuild FTS5 index from persisted memories (idempotent).
-    let indexed = memory_system.rebuild_indexes(agent_id).await?;
-    if indexed > 0 {
-        tracing::info!(indexed, "FTS5 index rebuilt from stored memories");
-    }
+    // Rebuild FTS5 index from persisted memories (idempotent). Runs in the
+    // background so a large corpus doesn't delay gateway bind; the handle
+    // is pushed into `infra_handles` below for graceful shutdown.
+    let index_rebuild_handle = {
+        let system = Arc::clone(&memory_system);
+        tokio::spawn(async move {
+            match system.rebuild_indexes(agent_id).await {
+                Ok(indexed) => {
+                    if indexed > 0 {
+                        tracing::info!(indexed, "FTS5 index rebuilt from stored memories");
+                    }
+                }
+                Err(e) => tracing::error!(error = %e, "FTS5 index rebuild failed"),
+            }
+        })
+    };
 
     let memory_backend: Arc<dyn MemoryBackend> = Arc::new(MemoryAdapter {
         inner: HybridMemoryBackend::new(Arc::clone(&memory_system), agent_id, session_id),
@@ -747,11 +785,13 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // --- MCP connector (remote MCP servers as native tools) ---
+    // --- MCP connector tools (join the task started before provider setup) ---
     // Registered before the sub-agent snapshot below so sub-agents also
     // inherit MCP tools. Per-server connect failures are logged inside
     // and never block startup.
-    let mcp_tools = rustykrab_tools::mcp_connector_tools(&store.secrets()).await;
+    let mcp_tools = mcp_tools_task
+        .await
+        .map_err(|e| anyhow::anyhow!("MCP connector task panicked: {e}"))?;
     if !mcp_tools.is_empty() {
         tracing::info!(count = mcp_tools.len(), "MCP connector tools registered");
         tools.extend(mcp_tools);
@@ -863,11 +903,17 @@ async fn main() -> anyhow::Result<()> {
     // Track infrastructure task JoinHandles so panics are surfaced
     // instead of silently swallowed (fixes ASYNC-H4).
     let mut infra_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    infra_handles.push(index_rebuild_handle);
 
     // --- Telegram channel (optional) ---
     // We need to take the inbound_rx before wrapping in Arc, so build in stages.
     let mut telegram_rx: Option<mpsc::Receiver<ChannelMessage>> = None;
     let mut telegram_arc: Option<Arc<TelegramChannel>> = None;
+    // Webhook registration runs concurrently with the rest of channel
+    // setup and is joined below, before the agent loops start. A
+    // registration failure stays fatal, exactly as it was inline.
+    let mut telegram_webhook_task: Option<tokio::task::JoinHandle<rustykrab_core::Result<()>>> =
+        None;
 
     if let Ok(bot_token) = std::env::var("TELEGRAM_BOT_TOKEN") {
         let allowed_chats: HashSet<i64> = std::env::var("TELEGRAM_ALLOWED_CHATS")
@@ -892,7 +938,10 @@ async fn main() -> anyhow::Result<()> {
         state = state.with_telegram(tg.clone());
 
         if let Ok(webhook_url) = std::env::var("TELEGRAM_WEBHOOK_URL") {
-            tg.set_webhook(&webhook_url).await?;
+            let tg_hook = tg.clone();
+            telegram_webhook_task = Some(tokio::spawn(async move {
+                tg_hook.set_webhook(&webhook_url).await
+            }));
             tracing::info!("Telegram: webhook mode");
         } else {
             let tg_poll = tg.clone();
@@ -961,19 +1010,30 @@ async fn main() -> anyhow::Result<()> {
         channel_hub.set_signal(sig.clone());
         state = state.with_signal(sig.clone());
 
-        // Health check — verify signal-cli-rest-api is running.
-        match sig.health_check().await {
-            Ok(()) => tracing::info!("signal-cli-rest-api connected"),
-            Err(e) => tracing::error!("signal-cli-rest-api not reachable: {e}"),
+        // Health check — verify signal-cli-rest-api is running. Runs
+        // concurrently with the rest of startup; the outcome is logged
+        // (it was never fatal).
+        {
+            let sig_health = sig.clone();
+            infra_handles.push(tokio::spawn(async move {
+                match sig_health.health_check().await {
+                    Ok(()) => tracing::info!("signal-cli-rest-api connected"),
+                    Err(e) => tracing::error!("signal-cli-rest-api not reachable: {e}"),
+                }
+            }));
         }
 
-        // Webhook or polling mode.
+        // Webhook or polling mode. Webhook registration also runs
+        // concurrently; failures are logged (as before, non-fatal).
         if let Ok(webhook_url) = std::env::var("SIGNAL_WEBHOOK_URL") {
-            if let Err(e) = sig.register_webhook(&webhook_url).await {
-                tracing::error!("failed to register Signal webhook: {e}");
-            } else {
-                tracing::info!("Signal: webhook mode");
-            }
+            let sig_hook = sig.clone();
+            infra_handles.push(tokio::spawn(async move {
+                if let Err(e) = sig_hook.register_webhook(&webhook_url).await {
+                    tracing::error!("failed to register Signal webhook: {e}");
+                } else {
+                    tracing::info!("Signal: webhook mode");
+                }
+            }));
         } else {
             let sig_poll = sig.clone();
             // Store handle so panics are not silently swallowed (fixes ASYNC-H4).
@@ -1015,6 +1075,14 @@ async fn main() -> anyhow::Result<()> {
                 "Signal allowed numbers configured"
             );
         }
+    }
+
+    // --- Join deferred Telegram webhook registration ---
+    // Ran concurrently with the Signal setup above; a failure is still
+    // fatal, exactly as when the call was inline.
+    if let Some(task) = telegram_webhook_task {
+        task.await
+            .map_err(|e| anyhow::anyhow!("Telegram webhook task panicked: {e}"))??;
     }
 
     // --- Spawn Telegram agent loop (after state is fully built) ---
