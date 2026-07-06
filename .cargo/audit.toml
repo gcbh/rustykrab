@@ -12,4 +12,21 @@ ignore = [
     # actionable upstream fix available; revisit when tokenizers releases a
     # version that drops the dependency.
     "RUSTSEC-2024-0436",
+
+    # quick-xml < 0.41.0 has two DoS advisories (quadratic attribute-name
+    # checking and unbounded namespace-declaration allocation). It is pulled
+    # in transitively, at two different versions, only via the `xcap`
+    # (screenshot capture) dependency used by the optional computer-use
+    # backend:
+    #   - `xcb` 1.7.0 depends on quick-xml ^0.30.0, used solely in its build
+    #     script to parse the crate's own bundled XCB protocol XML files
+    #     (crates.io xcb-1.7.0/build/*.rs) — not attacker-controlled input.
+    #   - `wayland-scanner` 0.31.10 depends on quick-xml ^0.39, used solely
+    #     at compile time to codegen bindings from bundled Wayland protocol
+    #     XML — likewise not attacker-controlled input.
+    # Neither xcb (latest: 1.7.0) nor wayland-scanner (latest: 0.31.10) has
+    # released a version depending on quick-xml >=0.41.0 yet. Revisit when
+    # either does.
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
 ]
