@@ -1394,7 +1394,9 @@ async fn telegram_agent_loop(
                                     if thread_id != 0 {
                                         conv.channel_thread_id = Some(thread_id.to_string());
                                     }
-                                    if let Err(e) = state.store.conversations().save(&conv).await {
+                                    if let Err(e) =
+                                        state.store.conversations().save_meta(&conv).await
+                                    {
                                         tracing::warn!(
                                             chat_id,
                                             "failed to persist channel metadata: {e}"
@@ -1490,7 +1492,9 @@ async fn process_telegram_message(
     chat_states: &Arc<tokio::sync::Mutex<HashMap<(i64, i64), ChatState>>>,
     key: (i64, i64),
 ) -> String {
-    // Load the conversation.
+    // Load the conversation. `persisted_ids` lets the post-run save
+    // append only this turn's messages (full rewrite if the agent
+    // compacted history mid-run).
     let mut conv = match state.store.conversations().get(conv_id).await {
         Ok(c) => c,
         Err(e) => {
@@ -1498,6 +1502,7 @@ async fn process_telegram_message(
             return "Internal error — please try again.".to_string();
         }
     };
+    let persisted_ids: Vec<Uuid> = conv.messages.iter().map(|m| m.id).collect();
 
     // Ensure channel metadata is present (backfills conversations created
     // before this field was populated).
@@ -1602,8 +1607,15 @@ async fn process_telegram_message(
         // Await the join handle to get the final conversation.
         match join_handle.await {
             Ok(Ok(final_conv)) => {
-                // Persist the final conversation.
-                if let Err(e) = state.store.conversations().save(&final_conv).await {
+                // Persist the turn: appends the new messages, or falls
+                // back to a full rewrite if compaction replaced the
+                // persisted prefix.
+                if let Err(e) = state
+                    .store
+                    .conversations()
+                    .save_turn(&final_conv, &persisted_ids)
+                    .await
+                {
                     tracing::error!(chat_id, %conv_id, "failed to persist conversation: {e}");
                 }
                 // Extract last assistant text.
@@ -1885,6 +1897,10 @@ async fn process_slack_message(
             return "Internal error — please try again.".to_string();
         }
     };
+    // Ids of the already-persisted messages: the post-run save appends
+    // only this turn's tail (full rewrite if the agent compacted
+    // history mid-run).
+    let persisted_ids: Vec<Uuid> = conv.messages.iter().map(|m| m.id).collect();
 
     if conv.channel_source.is_none() {
         conv.channel_source = Some("slack".to_string());
@@ -1943,7 +1959,12 @@ async fn process_slack_message(
         }
     };
 
-    if let Err(e) = state.store.conversations().save(&conv).await {
+    if let Err(e) = state
+        .store
+        .conversations()
+        .save_turn(&conv, &persisted_ids)
+        .await
+    {
         tracing::error!(channel_id, %conv_id, "failed to persist Slack conversation: {e}");
     }
 

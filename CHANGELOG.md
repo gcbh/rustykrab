@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.5.14] - 2026-07-06
+
+- perf(store): normalize conversation storage — append messages instead of rewriting the blob (#485)
+
 ## [4.5.13] - 2026-07-06
 
 - chore: sync Cargo.lock with workspace version 4.5.7 (#479)

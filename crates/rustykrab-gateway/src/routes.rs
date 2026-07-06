@@ -340,13 +340,17 @@ async fn send_message(
         return Err(StatusCode::PAYLOAD_TOO_LARGE);
     }
 
-    // Load the conversation.
+    // Load the conversation. Capture the ids of the already-persisted
+    // messages so the post-turn save can append just the new tail —
+    // save_turn falls back to a full rewrite if the agent compacted
+    // history (the persisted prefix no longer matches).
     let mut conv = state
         .store
         .conversations()
         .get(id)
         .await
         .map_err(|_| StatusCode::NOT_FOUND)?;
+    let persisted_ids: Vec<Uuid> = conv.messages.iter().map(|m| m.id).collect();
 
     // Clone content before moving into the message (needed for profile classification).
     let user_content = body.content.clone();
@@ -365,12 +369,14 @@ async fn send_message(
     let assistant_msg =
         crate::orchestrate::run_agent(&state, &mut conv, &user_content, trace_id).await?;
 
-    // Persist the full conversation (including intermediate tool call messages).
+    // Persist the turn (including intermediate tool call messages):
+    // appends the new messages and bumps updated_at, or rewrites the
+    // whole conversation if compaction replaced the persisted prefix.
     conv.updated_at = Utc::now();
     state
         .store
         .conversations()
-        .save(&conv)
+        .save_turn(&conv, &persisted_ids)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
@@ -424,13 +430,16 @@ async fn send_message_stream(
         return Err(StatusCode::PAYLOAD_TOO_LARGE);
     }
 
-    // Load the conversation.
+    // Load the conversation. `persisted_ids` lets the post-turn
+    // save_turn append only the new messages (full rewrite if the agent
+    // compacted history mid-run).
     let mut conv = state
         .store
         .conversations()
         .get(id)
         .await
         .map_err(|_| StatusCode::NOT_FOUND)?;
+    let persisted_ids: Vec<Uuid> = conv.messages.iter().map(|m| m.id).collect();
     let conv_id = conv.id;
 
     let user_content = body.content.clone();
@@ -515,9 +524,16 @@ async fn send_message_stream(
         // 5 minutes after the agent completes normally.
         monitor.abort();
 
-        // Persist conversation regardless of outcome to preserve the user message.
+        // Persist the turn regardless of outcome to preserve the user
+        // message. Appends the new tail; full rewrite when compaction
+        // replaced the persisted prefix.
         conv.updated_at = Utc::now();
-        if let Err(e) = agent_state.store.conversations().save(&conv).await {
+        if let Err(e) = agent_state
+            .store
+            .conversations()
+            .save_turn(&conv, &persisted_ids)
+            .await
+        {
             tracing::error!("failed to save conversation: {e}");
         }
 
