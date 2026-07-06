@@ -198,7 +198,8 @@ impl VideoChannel {
         template: Option<&str>,
     ) -> Result<VideoProject, String> {
         // Ensure projects directory exists.
-        std::fs::create_dir_all(&self.config.projects_dir)
+        tokio::fs::create_dir_all(&self.config.projects_dir)
+            .await
             .map_err(|e| format!("failed to create video projects dir: {e}"))?;
 
         let project_id = Uuid::new_v4().to_string();
@@ -217,8 +218,11 @@ impl VideoChannel {
                 // hyperframes init creates a directory named after the project.
                 // Rename it to our UUID-based directory.
                 let created_dir = self.config.projects_dir.join(name);
-                if created_dir.exists() && created_dir != project_dir {
-                    std::fs::rename(&created_dir, &project_dir)
+                if created_dir != project_dir
+                    && tokio::fs::try_exists(&created_dir).await.unwrap_or(false)
+                {
+                    tokio::fs::rename(&created_dir, &project_dir)
+                        .await
                         .map_err(|e| format!("failed to rename project dir: {e}"))?;
                 }
                 tracing::info!(
@@ -230,9 +234,11 @@ impl VideoChannel {
             _ => {
                 // Fallback: create the composition HTML directly.
                 tracing::debug!("hyperframes CLI not available, creating project locally");
-                std::fs::create_dir_all(&project_dir)
+                tokio::fs::create_dir_all(&project_dir)
+                    .await
                     .map_err(|e| format!("failed to create project dir: {e}"))?;
-                self.write_composition_html(&project_dir, name, width, height, duration, fps, &[])?;
+                self.write_composition_html(&project_dir, name, width, height, duration, fps, &[])
+                    .await?;
             }
         }
 
@@ -247,7 +253,7 @@ impl VideoChannel {
         };
 
         // Persist project metadata.
-        self.write_project_meta(&project)?;
+        self.write_project_meta(&project).await?;
 
         Ok(project)
     }
@@ -261,23 +267,25 @@ impl VideoChannel {
         let html_path = project.dir.join("index.html");
         let element_html = self.element_to_html(element)?;
 
-        if html_path.exists() {
-            let mut content = std::fs::read_to_string(&html_path)
-                .map_err(|e| format!("failed to read composition: {e}"))?;
-
-            // Insert before the closing </div> of the stage.
-            if let Some(pos) = content.rfind("</div>") {
-                content.insert_str(pos, &format!("    {element_html}\n  "));
-                std::fs::write(&html_path, content)
-                    .map_err(|e| format!("failed to write composition: {e}"))?;
-            } else {
-                return Err("composition HTML missing closing </div> for stage".to_string());
+        let mut content = match tokio::fs::read_to_string(&html_path).await {
+            Ok(content) => content,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(format!(
+                    "composition file not found: {}. Use create_project first.",
+                    html_path.display()
+                ));
             }
+            Err(e) => return Err(format!("failed to read composition: {e}")),
+        };
+
+        // Insert before the closing </div> of the stage.
+        if let Some(pos) = content.rfind("</div>") {
+            content.insert_str(pos, &format!("    {element_html}\n  "));
+            tokio::fs::write(&html_path, content)
+                .await
+                .map_err(|e| format!("failed to write composition: {e}"))?;
         } else {
-            return Err(format!(
-                "composition file not found: {}. Use create_project first.",
-                html_path.display()
-            ));
+            return Err("composition HTML missing closing </div> for stage".to_string());
         }
 
         // Run lint to validate the composition.
@@ -299,7 +307,8 @@ impl VideoChannel {
         html: &str,
     ) -> Result<Value, String> {
         let html_path = project.dir.join("index.html");
-        std::fs::write(&html_path, html)
+        tokio::fs::write(&html_path, html)
+            .await
             .map_err(|e| format!("failed to write composition: {e}"))?;
 
         // Run lint to validate.
@@ -380,22 +389,24 @@ impl VideoChannel {
         }
 
         // Find the output file. hyperframes may place it in a different location.
-        let actual_path = if output_path.exists() {
-            output_path
-        } else {
-            // Search common output locations.
-            let alt_paths = [
-                project.dir.join("out").join(output_filename),
-                project.dir.join("dist").join(output_filename),
-                project.dir.join(output_filename),
-            ];
-            alt_paths
-                .into_iter()
-                .find(|p| p.exists())
-                .ok_or("render completed but output file not found")?
-        };
+        let mut actual_path = None;
+        // Search the requested path first, then common output locations.
+        let candidates = [
+            output_path,
+            project.dir.join("out").join(output_filename),
+            project.dir.join("dist").join(output_filename),
+            project.dir.join(output_filename),
+        ];
+        for candidate in candidates {
+            if tokio::fs::try_exists(&candidate).await.unwrap_or(false) {
+                actual_path = Some(candidate);
+                break;
+            }
+        }
+        let actual_path = actual_path.ok_or("render completed but output file not found")?;
 
-        let size = std::fs::metadata(&actual_path)
+        let size = tokio::fs::metadata(&actual_path)
+            .await
             .map(|m| m.len())
             .unwrap_or(0);
 
@@ -416,18 +427,15 @@ impl VideoChannel {
     /// Get project status and composition info.
     pub async fn project_info(&self, project: &VideoProject) -> Result<Value, String> {
         let html_path = project.dir.join("index.html");
-        let html_exists = html_path.exists();
-        let html_size = if html_exists {
-            std::fs::metadata(&html_path).map(|m| m.len()).unwrap_or(0)
-        } else {
-            0
-        };
+        let html_meta = tokio::fs::metadata(&html_path).await.ok();
+        let html_exists = html_meta.is_some();
+        let html_size = html_meta.map(|m| m.len()).unwrap_or(0);
 
         // Check for rendered outputs.
         let mp4_path = project.dir.join("output.mp4");
         let webm_path = project.dir.join("output.webm");
-        let rendered_mp4 = mp4_path.exists();
-        let rendered_webm = webm_path.exists();
+        let rendered_mp4 = tokio::fs::try_exists(&mp4_path).await.unwrap_or(false);
+        let rendered_webm = tokio::fs::try_exists(&webm_path).await.unwrap_or(false);
 
         // Try to get composition list from CLI.
         let compositions = self
@@ -629,7 +637,8 @@ impl VideoChannel {
             .map(PathBuf::from)
             .unwrap_or_else(|| output_path.to_path_buf());
 
-        let size = std::fs::metadata(&actual_path)
+        let size = tokio::fs::metadata(&actual_path)
+            .await
             .map(|m| m.len())
             .unwrap_or(0);
 
@@ -642,18 +651,19 @@ impl VideoChannel {
     }
 
     /// Write project metadata to disk.
-    fn write_project_meta(&self, project: &VideoProject) -> Result<(), String> {
+    async fn write_project_meta(&self, project: &VideoProject) -> Result<(), String> {
         let meta = serde_json::to_string_pretty(project)
             .map_err(|e| format!("failed to serialize project meta: {e}"))?;
         let meta_path = project.dir.join("project.json");
-        std::fs::write(meta_path, meta)
+        tokio::fs::write(meta_path, meta)
+            .await
             .map_err(|e| format!("failed to write project metadata: {e}"))?;
         Ok(())
     }
 
     /// Generate an HTML composition file using hyperframes data attributes.
     #[allow(clippy::too_many_arguments)]
-    fn write_composition_html(
+    async fn write_composition_html(
         &self,
         project_dir: &Path,
         name: &str,
@@ -691,7 +701,8 @@ impl VideoChannel {
         );
 
         let html_path = project_dir.join("index.html");
-        std::fs::write(&html_path, &html)
+        tokio::fs::write(&html_path, &html)
+            .await
             .map_err(|e| format!("failed to write composition HTML: {e}"))?;
 
         Ok(())

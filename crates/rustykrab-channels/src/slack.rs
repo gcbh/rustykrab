@@ -48,6 +48,13 @@ const EVENT_ID_CACHE_SIZE: usize = 1024;
 /// Maximum reconnect backoff for the Socket Mode loop.
 const MAX_RECONNECT_DELAY_SECS: u64 = 30;
 
+/// Recent event ids: a `HashSet` for O(1) duplicate lookups plus a
+/// `VecDeque` tracking insertion order for FIFO eviction.
+struct SeenEvents {
+    set: HashSet<String>,
+    order: VecDeque<String>,
+}
+
 /// An inbound Slack message with channel-specific routing metadata.
 ///
 /// `thread_ts` is `Some` when the user posted inside an existing thread;
@@ -79,7 +86,7 @@ pub struct SlackChannel {
     /// to drop the bot's own `app_mention` echoes.
     bot_user_id: Mutex<Option<String>>,
     /// Recent `event_id`s for retry suppression.
-    seen_event_ids: Mutex<VecDeque<String>>,
+    seen_event_ids: Mutex<SeenEvents>,
     inbound_tx: mpsc::Sender<SlackInboundMessage>,
     inbound_rx: Option<mpsc::Receiver<SlackInboundMessage>>,
     shutdown_flag: Arc<AtomicBool>,
@@ -105,7 +112,10 @@ impl SlackChannel {
             allowed_channels,
             allowed_teams: HashSet::new(),
             bot_user_id: Mutex::new(None),
-            seen_event_ids: Mutex::new(VecDeque::with_capacity(EVENT_ID_CACHE_SIZE)),
+            seen_event_ids: Mutex::new(SeenEvents {
+                set: HashSet::with_capacity(EVENT_ID_CACHE_SIZE),
+                order: VecDeque::with_capacity(EVENT_ID_CACHE_SIZE),
+            }),
             inbound_tx: tx,
             inbound_rx: Some(rx),
             shutdown_flag: Arc::new(AtomicBool::new(false)),
@@ -235,15 +245,21 @@ impl SlackChannel {
 
     /// Idempotency check: returns `true` if this `event_id` was already
     /// processed recently and we should drop it.
+    ///
+    /// The `HashSet` gives O(1) membership; the `VecDeque` preserves FIFO
+    /// insertion order for eviction. The two stay in sync under the mutex.
     async fn is_duplicate_event(&self, event_id: &str) -> bool {
         let mut seen = self.seen_event_ids.lock().await;
-        if seen.iter().any(|e| e == event_id) {
+        if seen.set.contains(event_id) {
             return true;
         }
-        if seen.len() >= EVENT_ID_CACHE_SIZE {
-            seen.pop_front();
+        if seen.order.len() >= EVENT_ID_CACHE_SIZE {
+            if let Some(oldest) = seen.order.pop_front() {
+                seen.set.remove(&oldest);
+            }
         }
-        seen.push_back(event_id.to_string());
+        seen.set.insert(event_id.to_string());
+        seen.order.push_back(event_id.to_string());
         false
     }
 

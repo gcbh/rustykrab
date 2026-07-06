@@ -8,7 +8,7 @@ use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use crate::AppState;
-use rustykrab_agent::{AgentEvent, AgentHandle, AgentRunner, OnMessageCallback};
+use rustykrab_agent::{AgentEvent, AgentHandle, AgentRunner, HarnessProfile, OnMessageCallback};
 use rustykrab_core::capability::{Capability, CapabilitySet};
 use rustykrab_core::session::Session;
 use rustykrab_core::types::{Conversation, Message, MessageContent, Role};
@@ -34,17 +34,17 @@ pub struct RunOptions {
 }
 
 /// Build the system prompt and inject it as the first message in the conversation.
+///
+/// `profile` is the harness profile already resolved by the caller —
+/// resolving it once and passing it in avoids a second (potentially
+/// LLM-backed) classification per turn.
 async fn build_and_inject_system_prompt(
     state: &AppState,
     conv: &mut Conversation,
-    user_content: &str,
+    profile: &HarnessProfile,
     options: &RunOptions,
 ) {
-    // 1. Resolve the harness profile (for agent loop config, not prompt injection).
-    let profile = state.profile_for(user_content).await;
-    tracing::info!(profile = %profile.name, "harness profile selected");
-
-    // 2. Build the minimal system prompt.
+    // 1. Build the minimal system prompt.
     //
     // Date is rendered at day granularity so the system block stays
     // cache-friendly: it only changes once per UTC day. Models that need
@@ -121,7 +121,7 @@ async fn build_and_inject_system_prompt(
         tracing::debug!("no channel_source on conversation — skipping channel context");
     }
 
-    // 3. Inject system prompt as first message.
+    // 2. Inject system prompt as first message.
     if conv
         .messages
         .first()
@@ -258,7 +258,12 @@ async fn prepare_agent(
     user_content: &str,
     options: &RunOptions,
 ) -> Result<(AgentRunner, Session), StatusCode> {
-    build_and_inject_system_prompt(state, conv, user_content, options).await;
+    // Resolve the harness profile once; it drives both the system prompt
+    // and the agent config below.
+    let profile = state.profile_for(user_content).await;
+    tracing::info!(profile = %profile.name, "harness profile selected");
+
+    build_and_inject_system_prompt(state, conv, &profile, options).await;
 
     // Create an ephemeral session with capabilities for available registered tools.
     let tool_names: Vec<&str> = state
@@ -275,9 +280,6 @@ async fn prepare_agent(
     );
     let caps = build_session_capabilities(state, &tool_names);
     let session = Session::with_capabilities(conv.id, caps);
-
-    // Resolve profile again for agent config (cheap — no LLM call on cache hit).
-    let profile = state.profile_for(user_content).await;
 
     let mut agent_config = profile.to_agent_config();
     agent_config.force_tool_use_first_iteration = options.force_tool_use_first_iteration;
@@ -378,8 +380,12 @@ pub async fn run_agent_interactive(
     StatusCode,
 > {
     rustykrab_core::prompt_trace::with_trace_id(trace_id, async move {
-        build_and_inject_system_prompt(state, &mut conv, user_content, &RunOptions::default())
-            .await;
+        // Resolve the harness profile once for both the system prompt and
+        // the agent config.
+        let profile = state.profile_for(user_content).await;
+        tracing::info!(profile = %profile.name, "harness profile selected");
+
+        build_and_inject_system_prompt(state, &mut conv, &profile, &RunOptions::default()).await;
 
         let tool_names: Vec<&str> = state
             .tools
@@ -390,7 +396,6 @@ pub async fn run_agent_interactive(
         let caps = build_session_capabilities(state, &tool_names);
         let session = Session::with_capabilities(conv.id, caps);
 
-        let profile = state.profile_for(user_content).await;
         let runner = AgentRunner::new(
             state.provider.clone(),
             state.tools.clone(),

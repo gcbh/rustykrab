@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use axum::extract::Request;
-use axum::http::{header, StatusCode};
+use axum::http::{header, HeaderValue, StatusCode};
 use axum::middleware::Next;
 use axum::response::Response;
 
@@ -64,7 +64,7 @@ pub async fn origin_check_middleware(
     request: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
-    let path = request.uri().path().to_string();
+    let path = request.uri().path();
     let is_sensitive = path.starts_with("/api/") || path.starts_with("/webhook/");
 
     let allowed_origin = match request.headers().get(header::ORIGIN) {
@@ -77,7 +77,9 @@ pub async fn origin_check_middleware(
                 );
                 return Err(StatusCode::FORBIDDEN);
             }
-            Some(origin_str.to_string())
+            // Clone the already-parsed HeaderValue to echo back later —
+            // cheaper than re-parsing the origin string per response.
+            Some(origin.clone())
         }
         None if is_sensitive => {
             tracing::warn!(
@@ -94,14 +96,14 @@ pub async fn origin_check_middleware(
     // Add CORS headers when the origin was validated.
     if let Some(origin) = allowed_origin {
         let headers = response.headers_mut();
-        headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, origin.parse().unwrap());
+        headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, origin);
         headers.insert(
             header::ACCESS_CONTROL_ALLOW_METHODS,
-            "GET, POST, PUT, DELETE, PATCH, OPTIONS".parse().unwrap(),
+            HeaderValue::from_static("GET, POST, PUT, DELETE, PATCH, OPTIONS"),
         );
         headers.insert(
             header::ACCESS_CONTROL_ALLOW_HEADERS,
-            "Content-Type, Authorization".parse().unwrap(),
+            HeaderValue::from_static("Content-Type, Authorization"),
         );
     }
 

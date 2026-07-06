@@ -402,6 +402,17 @@ enum SsePayload {
     Done(Result<Message, StatusCode>),
 }
 
+/// Wire shape for the high-frequency `text` SSE event. Serialized
+/// directly with `serde_json::to_string` (no intermediate `Value` tree
+/// per token). Field order matches the previous `json!` output
+/// (alphabetical) so the wire format is byte-identical.
+#[derive(Serialize)]
+struct TextDeltaPayload<'a> {
+    delta: &'a str,
+    #[serde(rename = "type")]
+    kind: &'static str,
+}
+
 /// Send a user message and stream the assistant response as SSE events.
 async fn send_message_stream(
     State(state): State<AppState>,
@@ -448,22 +459,18 @@ async fn send_message_stream(
     let agent_state = state.clone();
     let panic_tx = tx.clone();
     let agent_handle = tokio::spawn(async move {
-        let heartbeat = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64,
-        ));
+        // Heartbeat bookkeeping uses a monotonic Instant origin; the atomic
+        // stores milliseconds elapsed since `start` (cheaper and steadier
+        // than a SystemTime/UNIX_EPOCH read per streamed event).
+        let start = std::time::Instant::now();
+        let heartbeat = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
 
         let hb = heartbeat.clone();
         let event_tx = tx.clone();
         let on_event = move |event: AgentEvent| {
             // Reset heartbeat on every event.
             hb.store(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as u64,
+                start.elapsed().as_millis() as u64,
                 std::sync::atomic::Ordering::Relaxed,
             );
             if let Err(e) = event_tx.try_send(SsePayload::Event(event)) {
@@ -480,10 +487,7 @@ async fn send_message_stream(
             loop {
                 tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
                 let last = hb_monitor.load(std::sync::atomic::Ordering::Relaxed);
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as u64;
+                let now = start.elapsed().as_millis() as u64;
                 if now.saturating_sub(last) > HEARTBEAT_TIMEOUT_MS {
                     tf.store(true, std::sync::atomic::Ordering::Relaxed);
                     break;
@@ -540,9 +544,13 @@ async fn send_message_stream(
     let stream = ReceiverStream::new(rx).map(move |payload| {
         let event = match payload {
             SsePayload::Event(agent_event) => match agent_event {
-                AgentEvent::TextDelta(delta) => Event::default()
-                    .event("text")
-                    .data(serde_json::json!({"type": "text", "delta": delta}).to_string()),
+                AgentEvent::TextDelta(delta) => Event::default().event("text").data(
+                    serde_json::to_string(&TextDeltaPayload {
+                        delta: &delta,
+                        kind: "text",
+                    })
+                    .unwrap_or_default(),
+                ),
                 AgentEvent::ToolCallStart { tool_name, .. } => {
                     Event::default().event("tool_start").data(
                         serde_json::json!({"type": "tool_start", "delta": tool_name}).to_string(),
@@ -758,6 +766,17 @@ mod tests {
 
     fn ts(s: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    }
+
+    #[test]
+    fn text_delta_payload_matches_previous_json_wire_format() {
+        let direct = serde_json::to_string(&TextDeltaPayload {
+            delta: "hi \"there\"",
+            kind: "text",
+        })
+        .unwrap();
+        let via_value = serde_json::json!({"type": "text", "delta": "hi \"there\""}).to_string();
+        assert_eq!(direct, via_value);
     }
 
     #[test]
