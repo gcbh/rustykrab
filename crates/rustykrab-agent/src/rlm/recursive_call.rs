@@ -126,7 +126,8 @@ async fn execute_repl_call_impl(
     tracing::info!(
         depth,
         context_chars = context.len(),
-        prompt_preview = &prompt[..prompt.len().min(100)],
+        // Snap to a char boundary — a byte offset can land mid-UTF-8 and panic.
+        prompt_preview = &prompt[..prompt.floor_char_boundary(100)],
         "RLM REPL: executing call"
     );
 

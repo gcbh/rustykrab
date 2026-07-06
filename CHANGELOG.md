@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.5.10] - 2026-07-06
+
+- perf(agent): stop re-serializing history and rebuilding schemas every iteration (#477)
+
 ## [4.5.9] - 2026-07-06
 
 - perf(store): run SQLite work on blocking threads, tune pragmas (#476)

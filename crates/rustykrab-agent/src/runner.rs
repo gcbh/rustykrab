@@ -1,5 +1,7 @@
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
@@ -67,9 +69,10 @@ fn is_meta_tool(name: &str) -> bool {
 /// wanted.
 ///
 /// `todo_write` / `todo_read` are seeded here so the planning scratchpad is
-/// reachable from the first turn and — because this set is re-seeded on
-/// every `compute_schemas` call — remains reachable after compaction, when
-/// the model most needs to re-establish or consult its plan.
+/// reachable from the first turn and — because the per-conversation active
+/// set persists in the registry across compaction — remains reachable
+/// afterwards, when the model most needs to re-establish or consult its
+/// plan.
 ///
 /// Seeding by bare name means these names must be reserved: a SKILL.md
 /// skill that took the name `skills` would collide with this tool. That
@@ -703,6 +706,68 @@ impl Default for AgentConfig {
 /// Used for auto-persisting turns to memory.
 pub type OnMessageCallback = Arc<dyn Fn(&Message) + Send + Sync>;
 
+/// `io::Write` sink that counts bytes without buffering them. Lets token
+/// estimation size a `serde_json::Value` via `serde_json::to_writer`
+/// without allocating the JSON string just to take its length.
+struct CountingWriter(usize);
+
+impl std::io::Write for CountingWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0 += buf.len();
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Serialized length in bytes of a JSON value, without materializing the
+/// string. Matches `value.to_string().len()` exactly (same compact encoder).
+fn json_len(value: &serde_json::Value) -> usize {
+    let mut sink = CountingWriter(0);
+    // Serializing a `Value` to an infallible sink cannot fail.
+    let _ = serde_json::to_writer(&mut sink, value);
+    sink.0
+}
+
+/// Immutable per-runner index over the tool catalog: name → tool for O(1)
+/// dispatch instead of a linear scan per call, plus each tool's schema
+/// built once — `Tool::schema()` implementations construct a fresh JSON
+/// tree on every invocation, which is wasteful on hot paths (argument
+/// validation runs for every tool call, schema collection for every
+/// agent-loop iteration).
+///
+/// Duplicate tool names keep the first registration, matching the
+/// first-match semantics of the linear scan this replaces.
+pub(crate) struct ToolIndex {
+    by_name: HashMap<String, Arc<dyn Tool>>,
+    schemas: HashMap<String, Arc<ToolSchema>>,
+}
+
+impl ToolIndex {
+    pub(crate) fn new(tools: &[Arc<dyn Tool>]) -> Self {
+        let mut by_name: HashMap<String, Arc<dyn Tool>> = HashMap::with_capacity(tools.len());
+        let mut schemas = HashMap::with_capacity(tools.len());
+        for tool in tools {
+            let name = tool.name().to_string();
+            if by_name.contains_key(&name) {
+                continue;
+            }
+            schemas.insert(name.clone(), Arc::new(tool.schema()));
+            by_name.insert(name, Arc::clone(tool));
+        }
+        Self { by_name, schemas }
+    }
+
+    fn get(&self, name: &str) -> Option<&Arc<dyn Tool>> {
+        self.by_name.get(name)
+    }
+
+    fn schema(&self, name: &str) -> Option<&Arc<ToolSchema>> {
+        self.schemas.get(name)
+    }
+}
+
 /// Runs the agent loop: send conversation to model, execute tool calls, repeat.
 ///
 /// Improvements over a basic loop:
@@ -714,6 +779,10 @@ pub type OnMessageCallback = Arc<dyn Fn(&Message) + Send + Sync>;
 pub struct AgentRunner {
     provider: Arc<dyn ModelProvider>,
     tools: Vec<Arc<dyn Tool>>,
+    /// Name → tool / schema index derived from `tools`, built once so the
+    /// hot paths (dispatch, argument validation, schema collection) never
+    /// re-scan the catalog or rebuild schema JSON.
+    tool_index: Arc<ToolIndex>,
     sandbox: Arc<dyn Sandbox>,
     config: AgentConfig,
     tracer: ExecutionTracer,
@@ -721,6 +790,13 @@ pub struct AgentRunner {
     active_tools: Arc<ActiveToolsRegistry>,
     recall: Arc<RecallStore>,
     todos: Arc<TodoStore>,
+    /// Incremental token estimate per conversation: `(message_count,
+    /// estimated_tokens)`. Updated by `push_message` and consulted by
+    /// `needs_compaction` so the per-iteration compaction check is O(1)
+    /// instead of re-serializing the whole history. Recomputed from
+    /// scratch whenever the message count disagrees (compaction rewrote
+    /// the history, or something appended outside `push_message`).
+    token_estimates: Mutex<HashMap<Uuid, (usize, usize)>>,
 }
 
 impl AgentRunner {
@@ -729,9 +805,11 @@ impl AgentRunner {
         tools: Vec<Arc<dyn Tool>>,
         sandbox: Arc<dyn Sandbox>,
     ) -> Self {
+        let tool_index = Arc::new(ToolIndex::new(&tools));
         Self {
             provider,
             tools,
+            tool_index,
             sandbox,
             config: AgentConfig::default(),
             tracer: ExecutionTracer::new(),
@@ -739,6 +817,7 @@ impl AgentRunner {
             active_tools: Arc::new(ActiveToolsRegistry::new()),
             recall: Arc::new(RecallStore::new()),
             todos: Arc::new(TodoStore::new()),
+            token_estimates: Mutex::new(HashMap::new()),
         }
     }
 
@@ -769,25 +848,61 @@ impl AgentRunner {
     /// honoring session capabilities and the per-conversation active set.
     /// Meta-tools (`tools_list`, `tools_load`) are always included so the
     /// agent can always discover and load more tools.
-    fn compute_schemas(&self, session: &Session, conv_id: Uuid) -> Vec<ToolSchema> {
+    ///
+    /// Also returns the active-set version the schema list reflects, for
+    /// use by the per-run cache in the agent loops (see
+    /// [`refresh_schema_cache`](Self::refresh_schema_cache)).
+    fn compute_schemas_versioned(
+        &self,
+        session: &Session,
+        conv_id: Uuid,
+    ) -> (u64, Vec<ToolSchema>) {
         // Seed the always-on defaults (e.g. `skills`) into this
         // conversation's active set so they surface from the first turn
         // without a `tools_load` round-trip. Idempotent — re-seeding an
-        // already-active name is a no-op — so this is safe to run every
-        // iteration. Names with no matching registered tool fall out in the
-        // filter below.
+        // already-active name is a no-op that leaves the registry version
+        // untouched. Names with no matching registered tool fall out in
+        // the filter below.
         self.active_tools
             .activate(conv_id, DEFAULT_ACTIVE_TOOLS.iter().copied());
-        let active = self.active_tools.active_for(conv_id);
-        self.tools
-            .iter()
-            .filter(|t| {
-                t.available()
-                    && session.capabilities.can_use_tool(t.name())
-                    && (is_meta_tool(t.name()) || active.contains(t.name()))
-            })
-            .map(|t| t.schema())
-            .collect()
+        self.active_tools.with_active(conv_id, |version, active| {
+            let schemas = self
+                .tools
+                .iter()
+                .filter(|t| {
+                    t.available()
+                        && session.capabilities.can_use_tool(t.name())
+                        && (is_meta_tool(t.name()) || active.contains(t.name()))
+                })
+                .map(|t| {
+                    // Serve from the per-runner schema cache; `t.schema()`
+                    // rebuilds the JSON tree on every call.
+                    self.tool_index
+                        .schema(t.name())
+                        .map(|s| ToolSchema::clone(s))
+                        .unwrap_or_else(|| t.schema())
+                })
+                .collect();
+            (version, schemas)
+        })
+    }
+
+    /// Refresh the per-run schema cache if (and only if) the
+    /// conversation's active set changed since the cache was built. Keeps
+    /// the per-iteration cost O(1): schemas are rebuilt exactly when
+    /// `tools_load` (or the runner itself) activates something new, not on
+    /// every loop iteration.
+    fn refresh_schema_cache(
+        &self,
+        session: &Session,
+        conv_id: Uuid,
+        cache: &mut Option<(u64, Vec<ToolSchema>)>,
+    ) {
+        let version = self.active_tools.version(conv_id);
+        if matches!(cache, Some((cached, _)) if *cached == version) {
+            return;
+        }
+        *cache = Some(self.compute_schemas_versioned(session, conv_id));
     }
 
     fn build_session_context(&self, session: &Session) -> SessionToolContext {
@@ -824,12 +939,77 @@ impl AgentRunner {
     /// every turn — user prompts, assistant responses, tool results,
     /// reflection injections, and the compaction summary — not just LLM
     /// responses.
+    ///
+    /// The callback fires on a borrow *before* the message is moved into
+    /// the conversation, so no clone is needed — messages can carry large
+    /// inline payloads (tool outputs, base64 image bytes).
     fn push_message(&self, conv: &mut Conversation, message: Message) {
-        conv.messages.push(message.clone());
         conv.updated_at = Utc::now();
         if let Some(ref cb) = self.on_message {
             cb(&message);
         }
+        let estimate = Self::estimate_message_tokens(&message);
+        conv.messages.push(message);
+        self.note_pushed_message(conv, estimate);
+    }
+
+    /// Fold a just-pushed message's token estimate into the cached
+    /// conversation total. If the cache disagrees with the conversation
+    /// (history was rewritten outside `push_message`), the entry is
+    /// dropped so `cached_conversation_tokens` recounts lazily.
+    fn note_pushed_message(&self, conv: &Conversation, estimate: usize) {
+        let mut cache = self
+            .token_estimates
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some((count, total)) = cache.get_mut(&conv.id) {
+            if *count + 1 == conv.messages.len() {
+                *count += 1;
+                *total += estimate;
+            } else {
+                cache.remove(&conv.id);
+            }
+        }
+    }
+
+    /// Current token estimate for the conversation: served from the
+    /// incremental cache when it is still in sync (O(1)), recounted in
+    /// full otherwise (start of a run, after compaction, or after any
+    /// out-of-band history edit).
+    fn cached_conversation_tokens(&self, conv: &Conversation) -> usize {
+        {
+            let cache = self
+                .token_estimates
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(&(count, total)) = cache.get(&conv.id) {
+                if count == conv.messages.len() {
+                    return total;
+                }
+            }
+        }
+        let total = Self::estimate_conversation_tokens(&conv.messages);
+        self.set_token_estimate(conv, total);
+        total
+    }
+
+    /// Overwrite the cached token estimate for a conversation with a
+    /// freshly computed total (used after compaction rewrites the history).
+    fn set_token_estimate(&self, conv: &Conversation, total: usize) {
+        self.token_estimates
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(conv.id, (conv.messages.len(), total));
+    }
+
+    /// Drop the cached token estimate for a conversation — used when the
+    /// history is edited in place (`repair_oversized_summary`) and at the
+    /// end of a run so long-lived runners don't accumulate entries.
+    fn forget_token_estimate(&self, conv_id: Uuid) {
+        self.token_estimates
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&conv_id);
     }
 
     /// Push the `task_complete` summary as the final assistant message and
@@ -913,6 +1093,7 @@ impl AgentRunner {
 
         let provider = self.provider.clone();
         let tools = self.tools.clone();
+        let tool_index = self.tool_index.clone();
         let sandbox = self.sandbox.clone();
         let config = self.config.clone();
         let on_message = self.on_message.clone();
@@ -928,6 +1109,7 @@ impl AgentRunner {
             let runner = AgentRunner {
                 provider,
                 tools,
+                tool_index,
                 sandbox,
                 config,
                 tracer: ExecutionTracer::new(),
@@ -935,6 +1117,7 @@ impl AgentRunner {
                 active_tools,
                 recall,
                 todos,
+                token_estimates: Mutex::new(HashMap::new()),
             };
             let body = async move {
                 runner
@@ -994,9 +1177,13 @@ impl AgentRunner {
     /// information leakage (H8).
     pub async fn run(&self, conv: &mut Conversation, session: &Session) -> Result<()> {
         let ctx = self.build_session_context(session);
-        SESSION_TOOL_CONTEXT
+        let result = SESSION_TOOL_CONTEXT
             .scope(ctx, self.run_inner(conv, session))
-            .await
+            .await;
+        // Release the per-conversation token-estimate entry so long-lived
+        // runners don't accumulate one per conversation ever served.
+        self.forget_token_estimate(conv.id);
+        result
     }
 
     async fn run_inner(&self, conv: &mut Conversation, session: &Session) -> Result<()> {
@@ -1031,6 +1218,11 @@ impl AgentRunner {
         // turn, but once the model has started using tools we expect an
         // explicit completion signal.
         let mut has_called_any_tool = false;
+        // Per-run cache of the schemas sent to the model, keyed by the
+        // active-set version so activations performed by `tools_load`
+        // during the previous iteration are reflected in the next API
+        // call without rebuilding every tool's JSON schema each iteration.
+        let mut schema_cache: Option<(u64, Vec<ToolSchema>)> = None;
 
         for iteration in 0..self.config.max_iterations {
             tracer.record_iteration();
@@ -1047,7 +1239,7 @@ impl AgentRunner {
 
             // Compaction: if conversation exceeds threshold, ask the LLM to
             // summarize before the next call (RLM paper §3.2).
-            if self.needs_compaction(&conv.messages) {
+            if self.needs_compaction(conv) {
                 tracing::info!(iteration, "conversation crossed compaction threshold");
                 self.compact_history(conv).await?;
             }
@@ -1072,10 +1264,12 @@ impl AgentRunner {
                 );
             }
 
-            // Recompute the tool schemas on every iteration so that any
-            // activations performed by `tools_load` during the previous
-            // iteration are reflected in the next API call.
-            let schemas = self.compute_schemas(session, session.conversation_id);
+            // Refresh the tool schemas only when the active set changed
+            // (e.g. `tools_load` ran during the previous iteration) so the
+            // next API call reflects new activations without rebuilding
+            // every schema each time around the loop.
+            self.refresh_schema_cache(session, session.conversation_id, &mut schema_cache);
+            let schemas: &[ToolSchema] = schema_cache.as_ref().map_or(&[], |(_, s)| s.as_slice());
 
             // Iteration-0 guard for scheduled tasks: force the model to
             // call a tool on the first turn so it can't reply with a bare
@@ -1098,7 +1292,7 @@ impl AgentRunner {
                 ..
             } = self
                 .provider
-                .chat_with_choice(&conv.messages, &schemas, tool_choice)
+                .chat_with_choice(&conv.messages, schemas, tool_choice)
                 .await?;
             let llm_elapsed = llm_start.elapsed();
             tracing::info!(
@@ -1111,7 +1305,14 @@ impl AgentRunner {
                 "LLM call completed"
             );
 
-            self.push_message(conv, message.clone());
+            self.push_message(conv, message);
+            // Re-borrow the message we just moved into the conversation so
+            // the response can be inspected without having cloned it (it
+            // may carry large tool arguments or inline image bytes).
+            let message = conv
+                .messages
+                .last()
+                .expect("push_message appends the message");
 
             // Handle tool calls.
             if message.content.has_tool_calls() {
@@ -1156,7 +1357,7 @@ impl AgentRunner {
                 if !had_side_effects {
                     for (tool_name, _, result) in &results {
                         if result.is_ok() {
-                            if let Some(t) = self.tools.iter().find(|t| t.name() == tool_name) {
+                            if let Some(t) = self.tool_index.get(tool_name) {
                                 if t.sandbox_requirements().has_side_effects() {
                                     had_side_effects = true;
                                     tracing::debug!(tool = %tool_name, "side-effect tool executed — retry guard active");
@@ -1421,9 +1622,12 @@ impl AgentRunner {
         on_event: &(dyn Fn(AgentEvent) + Send + Sync),
     ) -> Result<()> {
         let ctx = self.build_session_context(session);
-        SESSION_TOOL_CONTEXT
+        let result = SESSION_TOOL_CONTEXT
             .scope(ctx, self.run_streaming_inner(conv, session, on_event))
-            .await
+            .await;
+        // See `run` — bound the token-estimate cache to active runs.
+        self.forget_token_estimate(conv.id);
+        result
     }
 
     async fn run_streaming_inner(
@@ -1450,6 +1654,8 @@ impl AgentRunner {
         let mut task_complete_retries: usize = 0;
         let mut had_side_effects = false;
         let mut has_called_any_tool = false;
+        // Per-run schema cache — see run_inner for rationale.
+        let mut schema_cache: Option<(u64, Vec<ToolSchema>)> = None;
 
         for iteration in 0..self.config.max_iterations {
             tracer.record_iteration();
@@ -1460,7 +1666,7 @@ impl AgentRunner {
 
             // Compaction: if conversation exceeds threshold, ask the LLM to
             // summarize before the next call (RLM paper §3.2).
-            if self.needs_compaction(&conv.messages) {
+            if self.needs_compaction(conv) {
                 tracing::info!(iteration, "conversation crossed compaction threshold");
                 on_event(AgentEvent::Compressing);
                 self.compact_history(conv).await?;
@@ -1492,10 +1698,10 @@ impl AgentRunner {
                 }
             };
 
-            // Recompute the tool schemas on every iteration so that any
-            // activations performed by `tools_load` during the previous
-            // iteration are reflected in the next API call.
-            let schemas = self.compute_schemas(session, session.conversation_id);
+            // Refresh the tool schemas only when the active set changed —
+            // see run_inner for rationale.
+            self.refresh_schema_cache(session, session.conversation_id, &mut schema_cache);
+            let schemas: &[ToolSchema] = schema_cache.as_ref().map_or(&[], |(_, s)| s.as_slice());
 
             // Iteration-0 guard: see run_inner for rationale.
             let tool_choice = if iteration == 0
@@ -1515,7 +1721,7 @@ impl AgentRunner {
                 ..
             } = self
                 .provider
-                .chat_stream_with_choice(&conv.messages, &schemas, tool_choice, &stream_callback)
+                .chat_stream_with_choice(&conv.messages, schemas, tool_choice, &stream_callback)
                 .await?;
             let llm_elapsed = llm_start.elapsed();
             tracing::info!(
@@ -1528,7 +1734,12 @@ impl AgentRunner {
                 "LLM call completed"
             );
 
-            self.push_message(conv, message.clone());
+            self.push_message(conv, message);
+            // Re-borrow the just-pushed message — see run_inner.
+            let message = conv
+                .messages
+                .last()
+                .expect("push_message appends the message");
 
             // Handle tool calls.
             if message.content.has_tool_calls() {
@@ -1573,7 +1784,7 @@ impl AgentRunner {
                 if !had_side_effects {
                     for (tool_name, _, result) in &results {
                         if result.is_ok() {
-                            if let Some(t) = self.tools.iter().find(|t| t.name() == tool_name) {
+                            if let Some(t) = self.tool_index.get(tool_name) {
                                 if t.sandbox_requirements().has_side_effects() {
                                     had_side_effects = true;
                                     tracing::debug!(tool = %tool_name, "side-effect tool executed — retry guard active");
@@ -1875,7 +2086,7 @@ impl AgentRunner {
                 if interval == 0 {
                     execute_with_retries(
                         call,
-                        &self.tools,
+                        &self.tool_index,
                         &self.sandbox,
                         &session.capabilities,
                         session.id,
@@ -1892,7 +2103,7 @@ impl AgentRunner {
                     };
                     execute_with_watchdog(
                         call,
-                        &self.tools,
+                        &self.tool_index,
                         &self.sandbox,
                         &session.capabilities,
                         session.id,
@@ -1905,7 +2116,7 @@ impl AgentRunner {
             } else {
                 execute_with_retries(
                     call,
-                    &self.tools,
+                    &self.tool_index,
                     &self.sandbox,
                     &session.capabilities,
                     session.id,
@@ -1941,7 +2152,7 @@ impl AgentRunner {
 
         for call in calls {
             let call = call.clone();
-            let tools = self.tools.clone();
+            let tools = self.tool_index.clone();
             let sandbox = self.sandbox.clone();
             let session_caps = session.capabilities.clone();
             let session_id = session.id;
@@ -2051,15 +2262,18 @@ impl AgentRunner {
     // --- Compaction (RLM paper §3.2) -------------------------------------------
 
     /// Conservative token estimate for a message (~3.5 chars per token).
+    ///
+    /// JSON payloads are sized with a counting writer (`json_len`) — the
+    /// serialized bytes are counted, never materialized.
     fn estimate_message_tokens(msg: &Message) -> usize {
         let content_chars = match &msg.content {
             MessageContent::Text(t) => t.len(),
-            MessageContent::ToolCall(tc) => tc.name.len() + tc.arguments.to_string().len(),
+            MessageContent::ToolCall(tc) => tc.name.len() + json_len(&tc.arguments),
             MessageContent::MultiToolCall(tcs) => tcs
                 .iter()
-                .map(|tc| tc.name.len() + tc.arguments.to_string().len())
+                .map(|tc| tc.name.len() + json_len(&tc.arguments))
                 .sum(),
-            MessageContent::ToolResult(tr) => tr.output.to_string().len(),
+            MessageContent::ToolResult(tr) => json_len(&tr.output),
             MessageContent::MultiPart(blocks) => blocks
                 .iter()
                 .map(|b| match b {
@@ -2147,17 +2361,22 @@ impl AgentRunner {
             }
         }
         conv.summary = Some(fixed);
+        // The history was edited in place (message count unchanged), so an
+        // incremental token estimate from a previous run would be stale.
+        self.forget_token_estimate(conv.id);
     }
 
     /// Returns true if the conversation has crossed the compaction threshold.
-    fn needs_compaction(&self, messages: &[Message]) -> bool {
+    ///
+    /// Served from the incremental per-conversation token estimate, so the
+    /// per-iteration cost is O(1) rather than re-serializing every message.
+    fn needs_compaction(&self, conv: &Conversation) -> bool {
         if self.config.compaction_threshold_pct <= 0.0 {
             return false;
         }
         let threshold =
             (self.effective_context_limit() as f64 * self.config.compaction_threshold_pct) as usize;
-        let estimated = Self::estimate_conversation_tokens(messages);
-        estimated >= threshold
+        self.cached_conversation_tokens(conv) >= threshold
     }
 
     /// Render a single message as plain text for inclusion in a summarizer
@@ -2453,7 +2672,7 @@ impl AgentRunner {
     /// have grown past a single summarizer call's capacity.
     async fn compact_history(&self, conv: &mut Conversation) -> Result<()> {
         let before_len = conv.messages.len();
-        let before_tokens = Self::estimate_conversation_tokens(&conv.messages);
+        let before_tokens = self.cached_conversation_tokens(conv);
 
         tracing::info!(
             before_messages = before_len,
@@ -2505,10 +2724,13 @@ impl AgentRunner {
                 created_at: Utc::now(),
             };
 
-            let mut compaction_messages = conv.messages.clone();
-            compaction_messages.push(compaction_prompt);
-
-            let response = self.provider.chat(&compaction_messages, &[]).await?;
+            // Append the prompt in place for the summarizer call, then pop
+            // it back off — this avoids deep-cloning the entire history at
+            // the exact moment it is at its largest.
+            conv.messages.push(compaction_prompt);
+            let response = self.provider.chat(&conv.messages, &[]).await;
+            conv.messages.pop();
+            let response = response?;
             response.message.content.as_text().unwrap_or("").to_string()
         } else {
             // Recursive path: the history alone is already larger than what
@@ -2650,6 +2872,9 @@ impl AgentRunner {
         }
 
         let after_tokens = Self::estimate_conversation_tokens(&conv.messages);
+        // Compaction replaced the history wholesale; reset the incremental
+        // estimate to the fresh count so `needs_compaction` stays O(1).
+        self.set_token_estimate(conv, after_tokens);
         tracing::info!(
             before_messages = before_len,
             after_messages = conv.messages.len(),
@@ -2793,7 +3018,7 @@ mod error_output_tests {
 #[allow(clippy::too_many_arguments)]
 async fn execute_with_watchdog(
     call: &ToolCall,
-    tools: &[Arc<dyn Tool>],
+    tools: &ToolIndex,
     sandbox: &Arc<dyn Sandbox>,
     capabilities: &rustykrab_core::capability::CapabilitySet,
     session_id: uuid::Uuid,
@@ -2825,7 +3050,7 @@ async fn execute_with_watchdog(
 /// execution failures) are retried.
 async fn execute_with_retries(
     call: &ToolCall,
-    tools: &[Arc<dyn Tool>],
+    tools: &ToolIndex,
     sandbox: &Arc<dyn Sandbox>,
     capabilities: &rustykrab_core::capability::CapabilitySet,
     session_id: uuid::Uuid,
@@ -2897,7 +3122,7 @@ fn fence_external_output(value: serde_json::Value) -> serde_json::Value {
 /// Standalone function so it can be moved into a tokio::spawn.
 async fn execute_single_tool(
     call: &ToolCall,
-    tools: &[Arc<dyn Tool>],
+    tools: &ToolIndex,
     sandbox: &Arc<dyn Sandbox>,
     capabilities: &rustykrab_core::capability::CapabilitySet,
     session_id: uuid::Uuid,
@@ -2930,15 +3155,19 @@ async fn execute_single_tool(
         .next()
         .unwrap_or(call_name_trimmed);
     let tool = tools
-        .iter()
-        .find(|t| t.name() == call_name_trimmed || t.name() == call_base_name)
+        .get(call_name_trimmed)
+        .or_else(|| tools.get(call_base_name))
         .ok_or_else(|| Error::ToolExecution(format!("unknown tool: {}", call.name).into()))?;
 
     // Schema validation: missing required fields, wrong enum values, and
     // wrong types are reported back to the model with descriptive messages
     // so it can self-correct on the next call without re-reading the
-    // schema via tools_list.
-    let schema = tool.schema();
+    // schema via tools_list. Served from the per-runner schema cache —
+    // `Tool::schema()` builds a fresh JSON tree on every call.
+    let schema = tools
+        .schema(tool.name())
+        .cloned()
+        .unwrap_or_else(|| Arc::new(tool.schema()));
     if let Err(mut tool_err) =
         rustykrab_core::validate_tool_args(&schema.parameters, &call.arguments)
     {
@@ -2979,9 +3208,10 @@ async fn execute_single_tool(
     // Check that the tool's declared requirements are permitted by the policy.
     enforce_sandbox_policy(&call.name, &requirements, &policy)?;
 
-    // Run sandbox enforcement check (validates the sandbox layer agrees)
+    // Run sandbox enforcement check (validates the sandbox layer agrees).
+    // Arguments are borrowed — the sandbox only inspects them.
     sandbox
-        .execute(&call.name, call.arguments.clone(), &requirements, &policy)
+        .execute(&call.name, &call.arguments, &requirements, &policy)
         .await
         .map_err(|e| Error::Auth(format!("sandbox denied tool '{}': {e}", call.name)))?;
 
@@ -3701,6 +3931,195 @@ mod compaction_tests {
 }
 
 #[cfg(test)]
+mod token_estimate_tests {
+    use super::*;
+
+    use async_trait::async_trait;
+    use rustykrab_core::model::{ModelResponse, StopReason, Usage};
+    use rustykrab_core::types::ToolSchema;
+
+    use crate::sandbox::NoSandbox;
+
+    /// Provider that always answers with a short canned summary — enough
+    /// for compaction to run; the loop itself is never exercised here.
+    struct CannedProvider;
+
+    #[async_trait]
+    impl ModelProvider for CannedProvider {
+        fn name(&self) -> &str {
+            "canned-mock"
+        }
+        async fn chat(&self, _: &[Message], _: &[ToolSchema]) -> Result<ModelResponse> {
+            Ok(ModelResponse {
+                message: Message {
+                    id: Uuid::new_v4(),
+                    role: Role::Assistant,
+                    content: MessageContent::Text("- summarized".to_string()),
+                    created_at: Utc::now(),
+                },
+                usage: Usage::default(),
+                stop_reason: StopReason::EndTurn,
+                text: None,
+            })
+        }
+    }
+
+    fn build_runner() -> AgentRunner {
+        AgentRunner::new(Arc::new(CannedProvider), Vec::new(), Arc::new(NoSandbox))
+    }
+
+    fn empty_conv() -> Conversation {
+        Conversation {
+            id: Uuid::new_v4(),
+            messages: Vec::new(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            title: None,
+            summary: None,
+            detected_profile: None,
+            channel_source: None,
+            channel_id: None,
+            channel_thread_id: None,
+        }
+    }
+
+    fn text_msg(role: Role, text: &str) -> Message {
+        Message {
+            id: Uuid::new_v4(),
+            role,
+            content: MessageContent::Text(text.to_string()),
+            created_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn json_len_matches_to_string_len() {
+        let values = [
+            serde_json::json!({"path": "/tmp/x", "n": 42, "nested": {"a": [1, 2, 3]}}),
+            serde_json::json!("plain string with unicode: 🦀"),
+            serde_json::json!(null),
+            serde_json::json!([]),
+        ];
+        for v in &values {
+            assert_eq!(json_len(v), v.to_string().len(), "mismatch for {v}");
+        }
+    }
+
+    #[test]
+    fn incremental_estimate_matches_full_recount_after_pushes() {
+        let runner = build_runner();
+        let mut conv = empty_conv();
+
+        // Prime the cache, then push through the incremental path.
+        assert_eq!(runner.cached_conversation_tokens(&conv), 0);
+        runner.push_message(&mut conv, text_msg(Role::User, "do the thing"));
+        runner.push_message(
+            &mut conv,
+            Message {
+                id: Uuid::new_v4(),
+                role: Role::Assistant,
+                content: MessageContent::ToolCall(ToolCall {
+                    id: "c1".into(),
+                    name: "noop".into(),
+                    arguments: serde_json::json!({"key": "value", "n": [1, 2, 3]}),
+                }),
+                created_at: Utc::now(),
+            },
+        );
+        runner.push_message(
+            &mut conv,
+            Message {
+                id: Uuid::new_v4(),
+                role: Role::Tool,
+                content: MessageContent::ToolResult(ToolResult {
+                    call_id: "c1".into(),
+                    output: serde_json::json!({"result": "ok", "detail": "x".repeat(100)}),
+                    is_error: false,
+                    images: Vec::new(),
+                }),
+                created_at: Utc::now(),
+            },
+        );
+
+        assert_eq!(
+            runner.cached_conversation_tokens(&conv),
+            AgentRunner::estimate_conversation_tokens(&conv.messages),
+            "incremental total must match a from-scratch recount"
+        );
+    }
+
+    #[test]
+    fn out_of_band_history_edits_trigger_recount() {
+        let runner = build_runner();
+        let mut conv = empty_conv();
+        runner.push_message(&mut conv, text_msg(Role::User, "hello"));
+        let _ = runner.cached_conversation_tokens(&conv);
+
+        // Bypass push_message (as drain_inbound_to_conv does).
+        conv.messages.push(text_msg(Role::User, &"y".repeat(700)));
+
+        assert_eq!(
+            runner.cached_conversation_tokens(&conv),
+            AgentRunner::estimate_conversation_tokens(&conv.messages),
+            "count mismatch must force a full recount, not serve a stale total"
+        );
+    }
+
+    #[tokio::test]
+    async fn estimate_stays_consistent_after_compaction() {
+        let runner = build_runner();
+        let mut conv = empty_conv();
+        runner.push_message(&mut conv, text_msg(Role::System, "agent identity"));
+        runner.push_message(&mut conv, text_msg(Role::User, "original task"));
+        for _ in 0..4 {
+            runner.push_message(&mut conv, text_msg(Role::Assistant, &"z".repeat(2_000)));
+        }
+        let before = runner.cached_conversation_tokens(&conv);
+
+        runner
+            .compact_history(&mut conv)
+            .await
+            .expect("compaction should succeed");
+
+        let after = runner.cached_conversation_tokens(&conv);
+        assert_eq!(
+            after,
+            AgentRunner::estimate_conversation_tokens(&conv.messages),
+            "cache must be rebased onto the rewritten history"
+        );
+        assert!(after < before, "compaction should shrink the estimate");
+
+        // Incremental updates keep working after the rebase.
+        runner.push_message(&mut conv, text_msg(Role::User, "next instruction"));
+        assert_eq!(
+            runner.cached_conversation_tokens(&conv),
+            AgentRunner::estimate_conversation_tokens(&conv.messages)
+        );
+    }
+
+    #[test]
+    fn push_message_fires_callback_and_appends_without_clone() {
+        let seen: Arc<Mutex<Vec<(Uuid, usize)>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_cb = Arc::clone(&seen);
+        let runner = build_runner().with_on_message(Arc::new(move |m: &Message| {
+            let text_len = m.content.as_text().map(str::len).unwrap_or(0);
+            seen_cb.lock().unwrap().push((m.id, text_len));
+        }));
+        let mut conv = empty_conv();
+
+        let msg = text_msg(Role::User, "persist me");
+        let msg_id = msg.id;
+        runner.push_message(&mut conv, msg);
+
+        // Callback observed exactly this message, once, with full content.
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.as_slice(), &[(msg_id, "persist me".len())]);
+        // And the message landed in the conversation.
+        assert_eq!(conv.messages.last().map(|m| m.id), Some(msg_id));
+    }
+}
+
+#[cfg(test)]
 mod response_classification_tests {
     use super::*;
 
@@ -4274,11 +4693,8 @@ mod task_complete_tests {
 
         // Nothing activated yet — the default seed should expose every
         // default-active tool but not the non-seeded one.
-        let names: Vec<String> = runner
-            .compute_schemas(&session, conv_id)
-            .into_iter()
-            .map(|s| s.name)
-            .collect();
+        let (_, schemas) = runner.compute_schemas_versioned(&session, conv_id);
+        let names: Vec<String> = schemas.into_iter().map(|s| s.name).collect();
         for expected in ["skills", "memory_search", "memory_save"] {
             assert!(
                 names.contains(&expected.to_string()),
@@ -4648,7 +5064,7 @@ mod watchdog_tests {
 
         let result = execute_with_watchdog(
             &call,
-            &[tool],
+            &ToolIndex::new(&[tool]),
             &sandbox,
             &caps,
             uuid::Uuid::new_v4(),
@@ -4688,7 +5104,7 @@ mod watchdog_tests {
         let start = Instant::now();
         let result = execute_with_watchdog(
             &call,
-            &[tool],
+            &ToolIndex::new(&[tool]),
             &sandbox,
             &caps,
             uuid::Uuid::new_v4(),

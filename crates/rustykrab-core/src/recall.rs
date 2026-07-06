@@ -36,6 +36,33 @@ pub trait RecallPersistence: Send + Sync + std::fmt::Debug {
     fn delete(&self, conversation_id: Uuid);
 }
 
+/// Per-conversation archive: the appended batches plus a lazily-built,
+/// cached view of their blank-line-joined concatenation.
+///
+/// Storing segments keeps [`RecallStore::append`] O(len of the new batch)
+/// instead of rebuilding the whole archive with `format!` on every append
+/// (which made a long-running conversation's appends O(archive²) in total).
+#[derive(Debug, Default)]
+struct ArchiveEntry {
+    /// Ordered batches, one per `append` (or one for the hydrated
+    /// persisted archive).
+    segments: Vec<String>,
+    /// Cached concatenation of `segments`, invalidated on append and
+    /// rebuilt on demand by [`materialize`](Self::materialize).
+    joined: Option<Arc<String>>,
+}
+
+impl ArchiveEntry {
+    fn materialize(&mut self) -> Arc<String> {
+        if let Some(joined) = &self.joined {
+            return Arc::clone(joined);
+        }
+        let joined = Arc::new(self.segments.join("\n\n"));
+        self.joined = Some(Arc::clone(&joined));
+        joined
+    }
+}
+
 /// Thread-safe map from conversation id to the rendered text of all
 /// messages that have been displaced by compaction.
 ///
@@ -49,7 +76,7 @@ pub trait RecallPersistence: Send + Sync + std::fmt::Debug {
 /// resumed conversation re-hydrates its history on first `recall_*` access.
 #[derive(Debug, Default)]
 pub struct RecallStore {
-    inner: RwLock<HashMap<Uuid, Arc<String>>>,
+    inner: RwLock<HashMap<Uuid, ArchiveEntry>>,
     persistence: Option<Arc<dyn RecallPersistence>>,
 }
 
@@ -90,7 +117,10 @@ impl RecallStore {
             // populated the entry while we were loading.
             guard
                 .entry(conversation_id)
-                .or_insert_with(|| Arc::new(text));
+                .or_insert_with(|| ArchiveEntry {
+                    segments: vec![text],
+                    joined: None,
+                });
         }
     }
 
@@ -107,16 +137,15 @@ impl RecallStore {
         let combined = {
             let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
             let entry = guard.entry(conversation_id).or_default();
-            let combined = if entry.is_empty() {
-                Arc::new(text.to_string())
-            } else {
-                Arc::new(format!("{}\n\n{}", entry.as_str(), text))
-            };
-            *entry = Arc::clone(&combined);
-            combined
+            entry.segments.push(text.to_string());
+            entry.joined = None;
+            // Only pay for materializing the full archive when a durable
+            // mirror actually needs it; the purely in-memory store defers
+            // the join to the next `get`.
+            self.persistence.as_ref().map(|_| entry.materialize())
         };
         // Mirror to durable storage after releasing the cache lock.
-        if let Some(persistence) = &self.persistence {
+        if let (Some(persistence), Some(combined)) = (&self.persistence, combined) {
             persistence.upsert(conversation_id, &combined);
         }
     }
@@ -125,8 +154,22 @@ impl RecallStore {
     /// `None` if nothing has been archived yet.
     pub fn get(&self, conversation_id: Uuid) -> Option<Arc<String>> {
         self.hydrate(conversation_id);
-        let guard = self.inner.read().unwrap_or_else(|e| e.into_inner());
-        guard.get(&conversation_id).cloned()
+        {
+            let guard = self.inner.read().unwrap_or_else(|e| e.into_inner());
+            match guard.get(&conversation_id) {
+                None => return None,
+                Some(entry) => {
+                    if let Some(joined) = &entry.joined {
+                        return Some(Arc::clone(joined));
+                    }
+                }
+            }
+        }
+        // Joined view not built yet — take the write lock and cache it.
+        let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        guard
+            .get_mut(&conversation_id)
+            .map(|entry| entry.materialize())
     }
 
     /// Drop the in-memory cache entry for a conversation. The durable
@@ -206,6 +249,21 @@ mod tests {
         let conv = Uuid::new_v4();
         store.append(conv, "");
         assert!(store.get(conv).is_none());
+    }
+
+    #[test]
+    fn interleaved_appends_and_gets_stay_consistent() {
+        let store = RecallStore::new();
+        let conv = Uuid::new_v4();
+        store.append(conv, "one");
+        assert_eq!(store.get(conv).unwrap().as_str(), "one");
+        store.append(conv, "two");
+        store.append(conv, "three");
+        assert_eq!(store.get(conv).unwrap().as_str(), "one\n\ntwo\n\nthree");
+        // Repeat reads without intervening appends serve the cached join.
+        let a = store.get(conv).unwrap();
+        let b = store.get(conv).unwrap();
+        assert!(Arc::ptr_eq(&a, &b), "joined view should be cached");
     }
 
     #[test]
