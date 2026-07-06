@@ -153,7 +153,9 @@ async fn execute_cron_task(
     store: &rustykrab_store::Store,
 ) {
     let started_at = Utc::now();
-    tracing::info!(job_id = %job_id, task = %task_prompt, "executing scheduled job");
+    // Full task body only at debug — the info-level start marker (with
+    // trace_id) is emitted below once the run actually begins.
+    tracing::debug!(job_id = %job_id, task = %task_prompt, "executing scheduled job");
 
     // Load the job so we can resume its persistent conversation and use
     // last_run_at in the prompt.

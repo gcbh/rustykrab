@@ -236,10 +236,74 @@ mod fastembed_impl {
             &self.model_version
         }
     }
+
+    /// Lazily-initialized [`FastEmbedder`].
+    ///
+    /// Construction is instant; the underlying model (ONNX Runtime init plus
+    /// a ~275MB download on first run) is built inside `spawn_blocking` on
+    /// the first `embed()` call, so daemon startup never blocks on it.
+    /// Init failure surfaces as a clear error from `embed()` and is retried
+    /// on the next call (transient download failures are recoverable).
+    ///
+    /// Dimensions and model version match [`FastEmbedder::new`]
+    /// (Nomic-embed-text-v1.5, 768d) and are available without init.
+    pub struct LazyFastEmbedder {
+        cache_dir: PathBuf,
+        inner: tokio::sync::OnceCell<FastEmbedder>,
+        dims: usize,
+        model_version: String,
+    }
+
+    impl LazyFastEmbedder {
+        /// Create a lazy embedder using the default model
+        /// (Nomic-embed-text-v1.5, matching [`FastEmbedder::new`]).
+        pub fn new(cache_dir: PathBuf) -> Self {
+            Self {
+                cache_dir,
+                inner: tokio::sync::OnceCell::new(),
+                dims: 768,
+                model_version: format!("{:?}", EmbeddingModel::NomicEmbedTextV15),
+            }
+        }
+
+        async fn embedder(&self) -> std::result::Result<&FastEmbedder, rustykrab_core::Error> {
+            self.inner
+                .get_or_try_init(|| async {
+                    let cache_dir = self.cache_dir.clone();
+                    tracing::info!(
+                        "initializing embedding model (first use — may download model files)"
+                    );
+                    let embedder =
+                        tokio::task::spawn_blocking(move || FastEmbedder::new(cache_dir))
+                            .await
+                            .map_err(|e| {
+                                rustykrab_core::Error::Internal(format!("spawn_blocking: {e}"))
+                            })??;
+                    tracing::info!("embedding model initialized");
+                    Ok(embedder)
+                })
+                .await
+        }
+    }
+
+    #[async_trait]
+    impl Embedder for LazyFastEmbedder {
+        async fn embed(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
+            self.embedder().await?.embed(texts).await
+        }
+
+        fn dimensions(&self) -> usize {
+            self.dims
+        }
+
+        fn model_version(&self) -> &str {
+            &self.model_version
+        }
+    }
 }
 
 #[cfg(feature = "fastembed")]
-pub use fastembed_impl::FastEmbedder;
+pub use fastembed_impl::{FastEmbedder, LazyFastEmbedder};
 
 #[cfg(test)]
 mod tests {

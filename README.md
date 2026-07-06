@@ -82,7 +82,8 @@ All configuration is via environment variables. No plaintext config files.
 | `SIGNAL_ALLOWED_NUMBERS` | — | Comma-separated E.164 numbers allowed to message |
 | `SIGNAL_WEBHOOK_URL` | — | Webhook URL (omit for polling mode) |
 | `SIGNAL_WEBHOOK_SECRET` | — | Shared secret for webhook validation |
-| `RUST_LOG` | — | Log level (`info`, `debug`, `rustykrab_gateway=debug`) |
+| `RUST_LOG` | `info` | Log level (`info`, `debug`, `rustykrab_gateway=debug`) |
+| `RUSTYKRAB_LOG_STDOUT` | auto | Force stdout logging on (`1`) or off (`0`). Default: enabled only when stdout is a terminal. The rolling log file under the data directory is always written |
 
 ### Persisting credentials
 

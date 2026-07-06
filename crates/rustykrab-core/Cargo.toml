@@ -12,5 +12,9 @@ chrono.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
+# Deliberately not the workspace `full` feature set: this crate only uses
+# `tokio::task_local!` (rt) and `#[tokio::test]` (macros). Workspace feature
+# unification leaves the final binary unchanged; this keeps the leaf crate's
+# dependency graph honest and standalone builds fast.
+tokio = { version = "1", features = ["rt", "macros"] }
 uuid.workspace = true
