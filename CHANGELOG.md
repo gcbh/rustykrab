@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.5.8] - 2026-07-06
+
+- perf(providers): linear stream buffering, fix UTF-8 chunk-boundary corruption (#475)
+
 ## [4.5.7] - 2026-07-06
 
 - fix: resolve cargo-audit vulnerabilities in CI (#481)

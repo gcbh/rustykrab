@@ -17,3 +17,4 @@ tokio.workspace = true
 uuid.workspace = true
 chrono.workspace = true
 secrecy.workspace = true
+rand.workspace = true

@@ -1,3 +1,5 @@
+use crate::backoff::retry_delay;
+use crate::line_buffer::LineBuffer;
 use async_trait::async_trait;
 use chrono::Utc;
 use rustykrab_core::error::Result;
@@ -10,7 +12,7 @@ use uuid::Uuid;
 
 /// Maximum number of retries for transient errors (429, 5xx).
 const MAX_RETRIES: u32 = 3;
-/// Base delay for exponential backoff (doubles each retry).
+/// Base delay for exponential backoff (doubles each retry, with jitter).
 const RETRY_BASE_DELAY: Duration = Duration::from_secs(1);
 
 /// Configuration for Ollama model inference.
@@ -526,21 +528,25 @@ impl OllamaProvider {
         let system_count = messages.iter().take_while(|m| m.role == "system").count();
         let mut trimmed = messages;
         let mut current = total;
-        let mut dropped = 0usize;
 
-        while current > budget && trimmed.len() > system_count {
-            let removed = trimmed.remove(system_count);
-            current = current.saturating_sub(estimate_message_tokens(&removed));
-            dropped += 1;
+        // Walk forward from the first non-system message counting how many
+        // to drop, then remove them with a single `drain` — per-message
+        // `Vec::remove` would shift the entire tail once per drop (O(n·k)).
+        let mut drop_end = system_count;
+        while current > budget && drop_end < trimmed.len() {
+            current = current.saturating_sub(estimate_message_tokens(&trimmed[drop_end]));
+            drop_end += 1;
         }
 
         // If trimming left a leading orphan tool-result (no preceding
         // assistant tool_call), drop it so Ollama doesn't reject the request.
-        while trimmed.len() > system_count && trimmed[system_count].role == "tool" {
-            let removed = trimmed.remove(system_count);
-            current = current.saturating_sub(estimate_message_tokens(&removed));
-            dropped += 1;
+        while drop_end < trimmed.len() && trimmed[drop_end].role == "tool" {
+            current = current.saturating_sub(estimate_message_tokens(&trimmed[drop_end]));
+            drop_end += 1;
         }
+
+        let dropped = drop_end - system_count;
+        trimmed.drain(system_count..drop_end);
 
         tracing::warn!(
             num_ctx = total_ctx,
@@ -643,7 +649,7 @@ impl ModelProvider for OllamaProvider {
         let mut last_err = None;
         for attempt in 0..=MAX_RETRIES {
             if attempt > 0 {
-                let delay = RETRY_BASE_DELAY * 2u32.pow(attempt - 1);
+                let delay = retry_delay(RETRY_BASE_DELAY, attempt);
                 tracing::warn!(attempt, "retrying Ollama API after {delay:?}");
                 tokio::time::sleep(delay).await;
             }
@@ -802,7 +808,7 @@ impl ModelProvider for OllamaProvider {
         let mut resp = None;
         for attempt in 0..=MAX_RETRIES {
             if attempt > 0 {
-                let delay = RETRY_BASE_DELAY * 2u32.pow(attempt - 1);
+                let delay = retry_delay(RETRY_BASE_DELAY, attempt);
                 tracing::warn!(attempt, "retrying Ollama streaming API after {delay:?}");
                 tokio::time::sleep(delay).await;
             }
@@ -856,8 +862,10 @@ impl ModelProvider for OllamaProvider {
             last_err.unwrap_or_else(|| Error::ModelProvider("request failed".into()))
         })?;
 
-        // Parse newline-delimited JSON chunks.
-        let mut buffer = String::new();
+        // Parse newline-delimited JSON chunks. Raw bytes are buffered and
+        // split on `\n` before UTF-8 decoding, so multi-byte codepoints
+        // that span network chunks are reassembled instead of corrupted.
+        let mut buffer = LineBuffer::new();
         let mut full_text = String::new();
         let mut tool_calls: Vec<ToolCall> = Vec::new();
         let mut prompt_eval_count: u32 = 0;
@@ -891,17 +899,16 @@ impl ModelProvider for OllamaProvider {
             };
             chunks_received += 1;
             bytes_received += chunk.len() as u64;
-            buffer.push_str(&String::from_utf8_lossy(&chunk));
+            buffer.push_chunk(&chunk);
 
-            while let Some(newline_pos) = buffer.find('\n') {
-                let line = buffer[..newline_pos].trim().to_string();
-                buffer = buffer[newline_pos + 1..].to_string();
+            while let Some(line) = buffer.next_line() {
+                let line = line.trim();
 
                 if line.is_empty() {
                     continue;
                 }
 
-                let stream_chunk: OllamaStreamChunk = serde_json::from_str(&line).map_err(|e| {
+                let stream_chunk: OllamaStreamChunk = serde_json::from_str(line).map_err(|e| {
                     Error::ModelProvider(format!("failed to parse Ollama stream chunk: {e}"))
                 })?;
 
@@ -1093,11 +1100,35 @@ fn estimate_message_tokens(msg: &OllamaMessage) -> u32 {
         for tc in tcs {
             tokens = tokens.saturating_add(8);
             tokens = tokens.saturating_add(estimate_text_tokens(&tc.function.name));
-            tokens =
-                tokens.saturating_add(estimate_text_tokens(&tc.function.arguments.to_string()));
+            tokens = tokens.saturating_add(estimate_json_tokens(&tc.function.arguments));
         }
     }
     tokens
+}
+
+/// `io::Write` sink that counts bytes without storing them, so a JSON
+/// value's serialized size can be measured without allocating the string.
+struct CountingWriter(usize);
+
+impl std::io::Write for CountingWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0 += buf.len();
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Estimate tokens for a JSON value from its serialized byte length.
+/// Bytes ≥ chars, so multibyte content is over-counted slightly — this
+/// errs on the high side, consistent with the trimming policy above.
+fn estimate_json_tokens(v: &serde_json::Value) -> u32 {
+    let mut w = CountingWriter(0);
+    // Serializing a `Value` into an infallible sink cannot fail.
+    let _ = serde_json::to_writer(&mut w, v);
+    w.0.div_ceil(CHARS_PER_TOKEN) as u32
 }
 
 fn estimate_text_tokens(s: &str) -> u32 {
@@ -1451,5 +1482,75 @@ mod tests {
         // 4 multibyte chars should count as ceil(4/4) = 1 token, not 12 (their byte length).
         let tokens = estimate_text_tokens("日本語x");
         assert_eq!(tokens, 1);
+    }
+
+    #[test]
+    fn estimate_json_tokens_matches_serialized_length_without_allocating() {
+        let v = serde_json::json!({ "path": "/tmp/file.txt", "recursive": true });
+        let serialized_len = v.to_string().len();
+        assert_eq!(
+            estimate_json_tokens(&v),
+            serialized_len.div_ceil(CHARS_PER_TOKEN) as u32
+        );
+    }
+
+    #[test]
+    fn ndjson_stream_survives_chunk_split_inside_multibyte_char() {
+        // Two NDJSON chunks whose content contains multi-byte characters,
+        // delivered with a network-chunk boundary inside a codepoint. The
+        // byte-level line buffer must reassemble it without U+FFFD.
+        let payload = "{\"message\":{\"content\":\"héllo\"},\"done\":false}\n\
+                       {\"message\":{\"content\":\" wörld\"},\"done\":true,\"done_reason\":\"stop\"}\n";
+        let bytes = payload.as_bytes();
+        // Split one byte into the "é" (0xC3 0xA9).
+        let split = payload.find('é').unwrap() + 1;
+
+        let mut buffer = LineBuffer::new();
+        let mut full_text = String::new();
+        let mut done_reason: Option<String> = None;
+        for chunk in [&bytes[..split], &bytes[split..]] {
+            buffer.push_chunk(chunk);
+            while let Some(line) = buffer.next_line() {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                let stream_chunk: OllamaStreamChunk = serde_json::from_str(line).expect("parse");
+                if let Some(content) = stream_chunk.message.content {
+                    full_text.push_str(&content);
+                }
+                if stream_chunk.done {
+                    done_reason = stream_chunk.done_reason;
+                }
+            }
+        }
+        assert_eq!(full_text, "héllo wörld");
+        assert_eq!(done_reason.as_deref(), Some("stop"));
+    }
+
+    #[test]
+    fn ndjson_multiple_lines_in_one_chunk_parse_in_order() {
+        let payload = "{\"message\":{\"content\":\"a\"},\"done\":false}\n\
+                       {\"message\":{\"content\":\"b\"},\"done\":false}\n\
+                       {\"message\":{\"content\":\"c\"},\"done\":true}\n";
+        let mut buffer = LineBuffer::new();
+        buffer.push_chunk(payload.as_bytes());
+
+        let mut full_text = String::new();
+        let mut saw_done = false;
+        while let Some(line) = buffer.next_line() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let stream_chunk: OllamaStreamChunk = serde_json::from_str(line).expect("parse");
+            if let Some(content) = stream_chunk.message.content {
+                full_text.push_str(&content);
+            }
+            saw_done |= stream_chunk.done;
+        }
+        assert_eq!(full_text, "abc");
+        assert!(saw_done);
+        assert_eq!(buffer.len(), 0);
     }
 }
