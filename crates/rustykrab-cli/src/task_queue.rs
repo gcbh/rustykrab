@@ -243,7 +243,9 @@ async fn execute_cron_task(
         effective_chat_id.as_deref(),
         effective_thread_id.as_deref(),
     ) {
-        if let Err(e) = state.store.conversations().save(&conv).await {
+        // Metadata-only change — the resumed conversation's messages are
+        // untouched here, so skip rewriting them.
+        if let Err(e) = state.store.conversations().save_meta(&conv).await {
             tracing::warn!(
                 job_id = %job_id,
                 "failed to persist channel context onto job conversation: {e}"
