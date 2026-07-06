@@ -31,7 +31,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use async_trait::async_trait;
 use regex::Regex;
@@ -55,6 +55,29 @@ const SUMMARY_LIMIT: usize = 200;
 /// the agent-authored body.
 const BACKLINKS_START: &str = "<!--wiki:backlinks-->";
 const BACKLINKS_END: &str = "<!--wiki:backlinks:end-->";
+
+// Compiled once and reused — these run on every page read/write/search hit.
+static SCRIPT_STYLE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?is)<(script|style)\b[^>]*>.*?</(script|style)>").expect("static regex")
+});
+static TAG_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?s)<[^>]+>").expect("static regex"));
+static WHITESPACE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s+").expect("static regex"));
+static ANCHOR_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?is)<a\b[^>]*href\s*=\s*["']([^"']*)["'][^>]*>(.*?)</a>"#).expect("static regex")
+});
+static TITLE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?is)<title>(.*?)</title>").expect("static regex"));
+static WIKI_MARKER_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\[\[wiki:([^\]]+)\]\]").expect("static regex"));
+static BACKLINKS_REGION_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(&format!(
+        "(?s){}.*?{}",
+        regex::escape(BACKLINKS_START),
+        regex::escape(BACKLINKS_END)
+    ))
+    .expect("static regex")
+});
 
 // ---------------------------------------------------------------------------
 // Sidecar index
@@ -444,13 +467,7 @@ impl WikiTool {
         };
         let backlinks = backlinks_for(index, target);
         let region = render_backlinks_region(&backlinks, &rel_root_for(target));
-        let re = Regex::new(&format!(
-            "(?s){}.*?{}",
-            regex::escape(BACKLINKS_START),
-            regex::escape(BACKLINKS_END)
-        ))
-        .expect("static regex");
-        let updated = re.replace(&document, region.as_str());
+        let updated = BACKLINKS_REGION_RE.replace(&document, region.as_str());
         if updated != document {
             let _ = std::fs::write(&path, updated.as_ref());
         }
@@ -882,14 +899,8 @@ fn render_page(
 /// Strip HTML to readable plaintext: drop script/style, remove tags, decode a
 /// handful of common entities, and collapse whitespace.
 fn html_to_text(html: &str) -> String {
-    let without_blocks = Regex::new(r"(?is)<(script|style)\b[^>]*>.*?</(script|style)>")
-        .expect("static regex")
-        .replace_all(html, " ")
-        .into_owned();
-    let without_tags = Regex::new(r"(?s)<[^>]+>")
-        .expect("static regex")
-        .replace_all(&without_blocks, " ")
-        .into_owned();
+    let without_blocks = SCRIPT_STYLE_RE.replace_all(html, " ").into_owned();
+    let without_tags = TAG_RE.replace_all(&without_blocks, " ").into_owned();
     let decoded = without_tags
         .replace("&lt;", "<")
         .replace("&gt;", ">")
@@ -898,18 +909,13 @@ fn html_to_text(html: &str) -> String {
         .replace("&apos;", "'")
         .replace("&nbsp;", " ")
         .replace("&amp;", "&");
-    Regex::new(r"\s+")
-        .expect("static regex")
-        .replace_all(&decoded, " ")
-        .trim()
-        .to_string()
+    WHITESPACE_RE.replace_all(&decoded, " ").trim().to_string()
 }
 
 /// Extract `(href, text)` pairs from anchor tags.
 fn extract_links(html: &str) -> Vec<(String, String)> {
-    let re = Regex::new(r#"(?is)<a\b[^>]*href\s*=\s*["']([^"']*)["'][^>]*>(.*?)</a>"#)
-        .expect("static regex");
-    re.captures_iter(html)
+    ANCHOR_RE
+        .captures_iter(html)
         .map(|c| {
             let href = c.get(1).map(|m| m.as_str().to_string()).unwrap_or_default();
             let text = html_to_text(c.get(2).map(|m| m.as_str()).unwrap_or(""));
@@ -919,8 +925,7 @@ fn extract_links(html: &str) -> Vec<(String, String)> {
 }
 
 fn extract_title(html: &str) -> Option<String> {
-    Regex::new(r"(?is)<title>(.*?)</title>")
-        .expect("static regex")
+    TITLE_RE
         .captures(html)
         .and_then(|c| c.get(1))
         .map(|m| html_to_text(m.as_str()))
@@ -928,8 +933,7 @@ fn extract_title(html: &str) -> Option<String> {
 
 /// Pull the `[[wiki:<slug>]]` back-reference out of an indexed memory fact.
 fn extract_wiki_marker(content: &str) -> Option<String> {
-    Regex::new(r"\[\[wiki:([^\]]+)\]\]")
-        .expect("static regex")
+    WIKI_MARKER_RE
         .captures(content)
         .and_then(|c| c.get(1))
         .map(|m| m.as_str().to_string())

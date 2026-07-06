@@ -31,7 +31,10 @@ impl NotionTool {
     pub fn new(secrets: SecretStore) -> Self {
         Self {
             secrets,
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
         }
     }
 

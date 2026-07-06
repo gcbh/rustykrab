@@ -23,16 +23,99 @@ const MAX_SEARCH_RESULTS: usize = 50;
 type ImapSession = async_imap::Session<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>;
 
 // ---------------------------------------------------------------------------
+// Cached IMAP session
+// ---------------------------------------------------------------------------
+
+/// An authenticated IMAP session cached across tool calls, plus the state
+/// needed to reuse it safely. Establishing a Gmail IMAP session costs a full
+/// TCP + TLS + LOGIN round trip (300ms–1s) and Gmail throttles rapid
+/// re-authentication, so the session is kept open between operations.
+struct CachedSession {
+    session: ImapSession,
+    /// Account the session is authenticated as; a credential change
+    /// invalidates the cache.
+    email: String,
+    /// Mailbox currently SELECTed, so repeat operations on the same mailbox
+    /// skip the redundant SELECT round trip.
+    selected_mailbox: Option<String>,
+}
+
+impl std::ops::Deref for CachedSession {
+    type Target = ImapSession;
+    fn deref(&self) -> &ImapSession {
+        &self.session
+    }
+}
+
+impl std::ops::DerefMut for CachedSession {
+    fn deref_mut(&mut self) -> &mut ImapSession {
+        &mut self.session
+    }
+}
+
+/// Return a live, authenticated session for `email`, reusing the cached one
+/// when it belongs to the same account and still answers a NOOP; otherwise
+/// (re)connect lazily.
+async fn ensure_session<'a>(
+    cache: &'a mut Option<CachedSession>,
+    email: &str,
+    password: &str,
+) -> Result<&'a mut CachedSession> {
+    let reusable = match cache.as_mut() {
+        // NOOP doubles as a liveness probe and lets the server deliver
+        // pending mailbox updates (RFC 3501 §6.1.2).
+        Some(cached) if cached.email == email => cached.session.noop().await.is_ok(),
+        _ => false,
+    };
+    if !reusable {
+        // Drop rather than LOGOUT: the old connection is dead or belongs to
+        // another account, and a LOGOUT on a broken socket can stall.
+        *cache = None;
+        let session = connect_imap(email, password).await?;
+        *cache = Some(CachedSession {
+            session,
+            email: email.to_string(),
+            selected_mailbox: None,
+        });
+    }
+    Ok(cache.as_mut().expect("session was just ensured"))
+}
+
+/// SELECT `mailbox` unless it is already the selected mailbox of this session.
+async fn select_mailbox(cached: &mut CachedSession, mailbox: &str) -> Result<()> {
+    if cached.selected_mailbox.as_deref() == Some(mailbox) {
+        return Ok(());
+    }
+    // Clear first so a failed SELECT never leaves a stale mailbox recorded
+    // (RFC 3501: a failed SELECT leaves no mailbox selected).
+    cached.selected_mailbox = None;
+    cached
+        .session
+        .select(mailbox)
+        .await
+        .map_err(|e| Error::ToolExecution(format!("select {mailbox} failed: {e}").into()))?;
+    cached.selected_mailbox = Some(mailbox.to_string());
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Tool struct
 // ---------------------------------------------------------------------------
 
 pub struct GmailTool {
     secrets: SecretStore,
+    /// Cached IMAP session, reused across calls. The lock is held for the
+    /// duration of an operation — IMAP is stateful, so operations on one
+    /// connection must not interleave.
+    imap: tokio::sync::Mutex<Option<CachedSession>>,
 }
 
 impl GmailTool {
     pub fn new(secrets: SecretStore) -> Self {
-        Self { secrets }
+        Self {
+            secrets,
+            imap: tokio::sync::Mutex::new(None),
+        }
     }
 
     /// Get email and app password from the credential store.
@@ -86,9 +169,17 @@ impl GmailTool {
                 Error::ToolExecution(format!("failed to store app password: {e}").into())
             })?;
 
-        // Verify credentials by connecting to IMAP.
-        let mut session = connect_imap(email, app_password).await?;
-        let _ = session.logout().await;
+        // Verify the new credentials by connecting to IMAP, dropping any
+        // session cached for the previous account and seeding the cache with
+        // the freshly verified one.
+        let mut guard = self.imap.lock().await;
+        *guard = None;
+        let session = connect_imap(email, app_password).await?;
+        *guard = Some(CachedSession {
+            session,
+            email: email.to_string(),
+            selected_mailbox: None,
+        });
 
         Ok(json!({
             "status": "authenticated",
@@ -110,12 +201,9 @@ impl GmailTool {
         let mailbox = args["mailbox"].as_str().unwrap_or("INBOX");
 
         let (email, password) = self.get_credentials().await?;
-        let mut session = connect_imap(&email, &password).await?;
-
-        session
-            .select(mailbox)
-            .await
-            .map_err(|e| Error::ToolExecution(format!("select {mailbox} failed: {e}").into()))?;
+        let mut guard = self.imap.lock().await;
+        let session = ensure_session(&mut guard, &email, &password).await?;
+        select_mailbox(session, mailbox).await?;
 
         // Use Gmail's X-GM-RAW extension for full search syntax,
         // falling back to standard IMAP SEARCH.
@@ -141,7 +229,6 @@ impl GmailTool {
         uid_list.truncate(max_results);
 
         if uid_list.is_empty() {
-            let _ = session.logout().await;
             return Ok(json!({ "messages": [], "count": 0 }));
         }
 
@@ -194,8 +281,6 @@ impl GmailTool {
             }));
         }
 
-        let _ = session.logout().await;
-
         Ok(json!({
             "messages": messages,
             "count": messages.len(),
@@ -214,12 +299,9 @@ impl GmailTool {
         let mailbox = args["mailbox"].as_str().unwrap_or("INBOX");
 
         let (email, password) = self.get_credentials().await?;
-        let mut session = connect_imap(&email, &password).await?;
-
-        session
-            .select(mailbox)
-            .await
-            .map_err(|e| Error::ToolExecution(format!("select {mailbox} failed: {e}").into()))?;
+        let mut guard = self.imap.lock().await;
+        let session = ensure_session(&mut guard, &email, &password).await?;
+        select_mailbox(session, mailbox).await?;
 
         let fetches: Vec<async_imap::types::Fetch> = session
             .uid_fetch(uid.to_string(), "(UID RFC822 FLAGS ENVELOPE)")
@@ -334,8 +416,6 @@ impl GmailTool {
 
         let flags: Vec<String> = fetch.flags().map(|f| format!("{f:?}")).collect();
 
-        let _ = session.logout().await;
-
         let mut result = json!({
             "uid": uid,
             "subject": subject,
@@ -429,7 +509,8 @@ impl GmailTool {
 
     async fn action_labels(&self) -> Result<Value> {
         let (email, password) = self.get_credentials().await?;
-        let mut session = connect_imap(&email, &password).await?;
+        let mut guard = self.imap.lock().await;
+        let session = ensure_session(&mut guard, &email, &password).await?;
 
         let names: Vec<async_imap::types::Name> = session
             .list(Some(""), Some("*"))
@@ -448,8 +529,6 @@ impl GmailTool {
                 })
             })
             .collect();
-
-        let _ = session.logout().await;
 
         Ok(json!({ "labels": labels }))
     }
@@ -470,18 +549,14 @@ impl GmailTool {
             .to_string();
 
         let (email, password) = self.get_credentials().await?;
-        let mut session = connect_imap(&email, &password).await?;
-
-        session.select(&from_mailbox).await.map_err(|e| {
-            Error::ToolExecution(format!("select {from_mailbox} failed: {e}").into())
-        })?;
+        let mut guard = self.imap.lock().await;
+        let session = ensure_session(&mut guard, &email, &password).await?;
+        select_mailbox(session, &from_mailbox).await?;
 
         session
             .uid_mv(uid.to_string(), &to_mailbox)
             .await
             .map_err(|e| Error::ToolExecution(format!("move failed: {e}").into()))?;
-
-        let _ = session.logout().await;
 
         Ok(json!({
             "status": "moved",
@@ -503,19 +578,14 @@ impl GmailTool {
         let mailbox = args["mailbox"].as_str().unwrap_or("INBOX");
 
         let (email, password) = self.get_credentials().await?;
-        let mut session = connect_imap(&email, &password).await?;
-
-        session
-            .select(mailbox)
-            .await
-            .map_err(|e| Error::ToolExecution(format!("select {mailbox} failed: {e}").into()))?;
+        let mut guard = self.imap.lock().await;
+        let session = ensure_session(&mut guard, &email, &password).await?;
+        select_mailbox(session, mailbox).await?;
 
         session
             .uid_mv(uid.to_string(), "[Gmail]/Trash")
             .await
             .map_err(|e| Error::ToolExecution(format!("trash failed: {e}").into()))?;
-
-        let _ = session.logout().await;
 
         Ok(json!({ "status": "trashed", "uid": uid }))
     }
@@ -532,12 +602,9 @@ impl GmailTool {
         let mailbox = args["mailbox"].as_str().unwrap_or("INBOX");
 
         let (email, password) = self.get_credentials().await?;
-        let mut session = connect_imap(&email, &password).await?;
-
-        session
-            .select(mailbox)
-            .await
-            .map_err(|e| Error::ToolExecution(format!("select {mailbox} failed: {e}").into()))?;
+        let mut guard = self.imap.lock().await;
+        let session = ensure_session(&mut guard, &email, &password).await?;
+        select_mailbox(session, mailbox).await?;
 
         // uid_store returns a stream of FETCH responses; drain it so the server
         // response is consumed before the next command.
@@ -557,8 +624,6 @@ impl GmailTool {
             .await
             .map_err(|e| Error::ToolExecution(format!("store stream failed: {e}").into()))?;
 
-        let _ = session.logout().await;
-
         let status = if read { "marked_read" } else { "marked_unread" };
         Ok(json!({ "status": status, "uid": uid }))
     }
@@ -575,13 +640,11 @@ impl GmailTool {
         let mailbox = args["mailbox"].as_str().unwrap_or("INBOX");
 
         let (email, password) = self.get_credentials().await?;
-        let mut session = connect_imap(&email, &password).await?;
+        let mut guard = self.imap.lock().await;
+        let session = ensure_session(&mut guard, &email, &password).await?;
 
         // First, fetch the target message to get its References/In-Reply-To/Message-ID.
-        session
-            .select(mailbox)
-            .await
-            .map_err(|e| Error::ToolExecution(format!("select {mailbox} failed: {e}").into()))?;
+        select_mailbox(session, mailbox).await?;
 
         let fetches: Vec<async_imap::types::Fetch> = session
             .uid_fetch(uid.to_string(), "(UID RFC822)")
@@ -621,7 +684,6 @@ impl GmailTool {
         }
 
         if msg_ids.is_empty() {
-            let _ = session.logout().await;
             return Ok(json!({
                 "thread": [],
                 "count": 0,
@@ -630,10 +692,7 @@ impl GmailTool {
         }
 
         // Search [Gmail]/All Mail for all messages matching any of these IDs.
-        session
-            .select("[Gmail]/All Mail")
-            .await
-            .map_err(|e| Error::ToolExecution(format!("select All Mail failed: {e}").into()))?;
+        select_mailbox(session, "[Gmail]/All Mail").await?;
 
         let mut all_uids = std::collections::HashSet::new();
         for mid in &msg_ids {
@@ -653,7 +712,6 @@ impl GmailTool {
         }
 
         if all_uids.is_empty() {
-            let _ = session.logout().await;
             return Ok(json!({
                 "thread": [],
                 "count": 0,
@@ -743,8 +801,6 @@ impl GmailTool {
             }));
         }
 
-        let _ = session.logout().await;
-
         Ok(json!({
             "thread": messages,
             "count": messages.len(),
@@ -768,12 +824,9 @@ impl GmailTool {
         let mailbox = args["mailbox"].as_str().unwrap_or("INBOX");
 
         let (email, password) = self.get_credentials().await?;
-        let mut session = connect_imap(&email, &password).await?;
-
-        session
-            .select(mailbox)
-            .await
-            .map_err(|e| Error::ToolExecution(format!("select {mailbox} failed: {e}").into()))?;
+        let mut guard = self.imap.lock().await;
+        let session = ensure_session(&mut guard, &email, &password).await?;
+        select_mailbox(session, mailbox).await?;
 
         let fetches: Vec<async_imap::types::Fetch> = session
             .uid_fetch(uid.to_string(), "(UID RFC822)")
@@ -855,8 +908,6 @@ impl GmailTool {
         }
         std::fs::write(&dest, contents)
             .map_err(|e| Error::ToolExecution(format!("write failed: {e}").into()))?;
-
-        let _ = session.logout().await;
 
         Ok(json!({
             "status": "downloaded",

@@ -10,6 +10,9 @@
 //! Because the host is fixed to Google, there is no arbitrary-URL / SSRF
 //! surface: every request targets `apidata.googleusercontent.com`.
 
+use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex};
+
 use async_trait::async_trait;
 use chrono::{DateTime, NaiveDate, NaiveDateTime, SecondsFormat, Utc};
 use regex::Regex;
@@ -262,16 +265,13 @@ impl CalDavTool {
             )
             .await?;
 
-        // Heuristic: a calendar resourcetype contains a <...:calendar/> tag.
-        let calendar_re = Regex::new(r"<[^>]*:?calendar\s*/?>").expect("static regex");
-
         let mut calendars = Vec::new();
         for block in split_responses(&list_xml) {
             // Only collections advertising the CalDAV "calendar" resourcetype.
             if !block.contains("calendar") || !block.to_lowercase().contains("resourcetype") {
                 continue;
             }
-            if !calendar_re.is_match(&block) {
+            if !CALENDAR_TYPE_RE.is_match(&block) {
                 continue;
             }
             let href = extract_hrefs(&block).into_iter().next().unwrap_or_default();
@@ -547,6 +547,26 @@ impl CalDavTool {
 // Pure helpers (unit-tested, no network)
 // ---------------------------------------------------------------------------
 
+// WebDAV/CalDAV parsing patterns, compiled once. These run per response
+// fragment, so recompiling them per call would dominate parse time.
+
+/// Heuristic: a calendar resourcetype contains a `<...:calendar/>` tag.
+static CALENDAR_TYPE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"<[^>]*:?calendar\s*/?>").expect("static regex"));
+static CALENDAR_ID_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"/caldav/v2/([^/]+)/").expect("static regex"));
+static RESPONSE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?si)<[a-z0-9]*:?response[\s>].*?</[a-z0-9]*:?response>").expect("static regex")
+});
+static HREF_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?si)<[a-z0-9]*:?href\s*>(.*?)</[a-z0-9]*:?href>").expect("static regex")
+});
+/// Cache for the per-tag patterns built by [`extract_tag_text`]. The set of
+/// tag names is small and fixed (`displayname`, `getetag`, `calendar-data`),
+/// so this stays tiny while avoiding a recompile per fragment.
+static TAG_TEXT_RES: LazyLock<Mutex<HashMap<String, Regex>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
 /// Remove all whitespace from a Google app password. Google shows app
 /// passwords as four space-separated groups; the spaces are not part of the
 /// secret and break CalDAV `Basic` auth, so strip them.
@@ -569,9 +589,9 @@ fn absolutize(href: &str) -> String {
 /// Extract the calendar id (the segment between `/caldav/v2/` and `/events`)
 /// from an href, percent-decoding `%40` back to `@`.
 fn calendar_id_from_href(href: &str) -> String {
-    let id = Regex::new(r"/caldav/v2/([^/]+)/")
-        .ok()
-        .and_then(|re| re.captures(href).map(|c| c[1].to_string()))
+    let id = CALENDAR_ID_RE
+        .captures(href)
+        .map(|c| c[1].to_string())
         .unwrap_or_default();
     id.replace("%40", "@")
 }
@@ -588,23 +608,35 @@ fn uid_from_url(url: &str) -> String {
 /// Split a WebDAV multistatus document into individual `<response>` blocks,
 /// tolerant of any namespace prefix.
 fn split_responses(xml: &str) -> Vec<String> {
-    let re = Regex::new(r"(?si)<[a-z0-9]*:?response[\s>].*?</[a-z0-9]*:?response>")
-        .expect("static regex");
-    re.find_iter(xml).map(|m| m.as_str().to_string()).collect()
+    RESPONSE_RE
+        .find_iter(xml)
+        .map(|m| m.as_str().to_string())
+        .collect()
 }
 
 /// Extract all `<href>` text values from an XML fragment (any prefix).
 fn extract_hrefs(xml: &str) -> Vec<String> {
-    let re = Regex::new(r"(?si)<[a-z0-9]*:?href\s*>(.*?)</[a-z0-9]*:?href>").expect("static regex");
-    re.captures_iter(xml)
+    HREF_RE
+        .captures_iter(xml)
         .map(|c| unescape_xml(c[1].trim()))
         .collect()
 }
 
 /// Extract the text content of the first element with the given local name.
 fn extract_tag_text(xml: &str, local_name: &str) -> Option<String> {
-    let pattern = format!(r"(?si)<[a-z0-9]*:?{local_name}\s*>(.*?)</[a-z0-9]*:?{local_name}>");
-    let re = Regex::new(&pattern).ok()?;
+    let re = {
+        let mut cache = TAG_TEXT_RES.lock().expect("tag regex cache poisoned");
+        match cache.get(local_name) {
+            Some(re) => re.clone(),
+            None => {
+                let pattern =
+                    format!(r"(?si)<[a-z0-9]*:?{local_name}\s*>(.*?)</[a-z0-9]*:?{local_name}>");
+                let re = Regex::new(&pattern).ok()?;
+                cache.insert(local_name.to_string(), re.clone());
+                re
+            }
+        }
+    };
     re.captures(xml).map(|c| unescape_xml(c[1].trim()))
 }
 
@@ -1075,6 +1107,17 @@ mod tests {
             uid_from_url("https://x/caldav/v2/me/events/the-uid.ics"),
             "the-uid"
         );
+    }
+
+    #[test]
+    fn extract_tag_text_caches_per_tag_patterns() {
+        let xml = "<d:displayname>Work</d:displayname><d:getetag>\"abc\"</d:getetag>";
+        // Distinct tags each get their own compiled pattern...
+        assert_eq!(extract_tag_text(xml, "displayname").unwrap(), "Work");
+        assert_eq!(extract_tag_text(xml, "getetag").unwrap(), "\"abc\"");
+        // ...and repeat lookups (the cached path) behave identically.
+        assert_eq!(extract_tag_text(xml, "displayname").unwrap(), "Work");
+        assert_eq!(extract_tag_text(xml, "absent"), None);
     }
 
     #[test]
