@@ -891,9 +891,28 @@ async fn main() -> anyhow::Result<()> {
         } else {
             let tg_poll = tg.clone();
             // Store handle so panics are not silently swallowed (fixes ASYNC-H4).
+            // Supervised: restart the poller on error with capped exponential
+            // backoff so a transient failure doesn't take the channel dark.
             infra_handles.push(tokio::spawn(async move {
-                if let Err(e) = tg_poll.start_polling().await {
-                    tracing::error!("Telegram polling error: {e}");
+                let mut delay = std::time::Duration::from_secs(1);
+                loop {
+                    let started = tokio::time::Instant::now();
+                    match tg_poll.start_polling().await {
+                        Ok(()) => break, // clean shutdown
+                        Err(e) => {
+                            // A long healthy run means the previous fault was
+                            // transient — start the backoff over.
+                            if started.elapsed() >= std::time::Duration::from_secs(300) {
+                                delay = std::time::Duration::from_secs(1);
+                            }
+                            tracing::error!(
+                                delay_secs = delay.as_secs(),
+                                "Telegram polling error, restarting: {e}"
+                            );
+                            tokio::time::sleep(delay).await;
+                            delay = (delay * 2).min(std::time::Duration::from_secs(60));
+                        }
+                    }
                 }
             }));
             tracing::info!("Telegram: long-polling mode");
@@ -952,9 +971,28 @@ async fn main() -> anyhow::Result<()> {
         } else {
             let sig_poll = sig.clone();
             // Store handle so panics are not silently swallowed (fixes ASYNC-H4).
+            // Supervised: restart the poller on error with capped exponential
+            // backoff so a transient failure doesn't take the channel dark.
             infra_handles.push(tokio::spawn(async move {
-                if let Err(e) = sig_poll.start_polling().await {
-                    tracing::error!("Signal polling error: {e}");
+                let mut delay = std::time::Duration::from_secs(1);
+                loop {
+                    let started = tokio::time::Instant::now();
+                    match sig_poll.start_polling().await {
+                        Ok(()) => break, // clean shutdown
+                        Err(e) => {
+                            // A long healthy run means the previous fault was
+                            // transient — start the backoff over.
+                            if started.elapsed() >= std::time::Duration::from_secs(300) {
+                                delay = std::time::Duration::from_secs(1);
+                            }
+                            tracing::error!(
+                                delay_secs = delay.as_secs(),
+                                "Signal polling error, restarting: {e}"
+                            );
+                            tokio::time::sleep(delay).await;
+                            delay = (delay * 2).min(std::time::Duration::from_secs(60));
+                        }
+                    }
                 }
             }));
             tracing::info!("Signal: polling mode");
@@ -1014,9 +1052,29 @@ async fn main() -> anyhow::Result<()> {
         state = state.with_slack(sl.clone());
 
         let sl_socket = sl.clone();
+        // Supervised: restart the Socket Mode loop on error with capped
+        // exponential backoff so a transient failure doesn't take the
+        // channel dark.
         infra_handles.push(tokio::spawn(async move {
-            if let Err(e) = sl_socket.start_socket_mode().await {
-                tracing::error!("Slack Socket Mode error: {e}");
+            let mut delay = std::time::Duration::from_secs(1);
+            loop {
+                let started = tokio::time::Instant::now();
+                match sl_socket.start_socket_mode().await {
+                    Ok(()) => break, // clean shutdown
+                    Err(e) => {
+                        // A long healthy run means the previous fault was
+                        // transient — start the backoff over.
+                        if started.elapsed() >= std::time::Duration::from_secs(300) {
+                            delay = std::time::Duration::from_secs(1);
+                        }
+                        tracing::error!(
+                            delay_secs = delay.as_secs(),
+                            "Slack Socket Mode error, restarting: {e}"
+                        );
+                        tokio::time::sleep(delay).await;
+                        delay = (delay * 2).min(std::time::Duration::from_secs(60));
+                    }
+                }
             }
         }));
 

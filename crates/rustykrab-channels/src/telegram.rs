@@ -288,8 +288,8 @@ impl TelegramChannel {
                 continue;
             }
 
-            let raw_text = match resp.text().await {
-                Ok(t) => t,
+            let raw = match resp.bytes().await {
+                Ok(b) => b,
                 Err(e) => {
                     consecutive_errors += 1;
                     let delay = backoff_delay(consecutive_errors);
@@ -303,9 +303,16 @@ impl TelegramChannel {
                 }
             };
 
-            tracing::debug!(raw_json = %raw_text, "raw getUpdates response");
+            // Only render the raw body when debug logging is actually on;
+            // it is a per-poll allocation otherwise.
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                tracing::debug!(
+                    raw_json = %String::from_utf8_lossy(&raw),
+                    "raw getUpdates response"
+                );
+            }
 
-            let body: GetUpdatesResponse = match serde_json::from_str(&raw_text) {
+            let body: GetUpdatesResponse = match serde_json::from_slice(&raw) {
                 Ok(b) => b,
                 Err(e) => {
                     consecutive_errors += 1;

@@ -164,6 +164,14 @@ impl SignalChannel {
             "Signal polling started"
         );
 
+        // signal-cli-rest-api doesn't support long-polling, so we poll on an
+        // interval — ~1s while messages are flowing, backing off (x2 per
+        // empty batch) to a ceiling while idle, and snapping back to 1s on
+        // the first activity.
+        const ACTIVE_POLL_INTERVAL: Duration = Duration::from_secs(1);
+        const IDLE_POLL_CEILING: Duration = Duration::from_secs(15);
+        let mut poll_interval = ACTIVE_POLL_INTERVAL;
+
         loop {
             if self.shutdown_flag.load(Ordering::Relaxed) {
                 tracing::info!("Signal polling shutdown requested");
@@ -174,6 +182,9 @@ impl SignalChannel {
                 Ok(count) => {
                     if count > 0 {
                         tracing::debug!(count, "processed Signal messages");
+                        poll_interval = ACTIVE_POLL_INTERVAL;
+                    } else {
+                        poll_interval = (poll_interval * 2).min(IDLE_POLL_CEILING);
                     }
                 }
                 Err(e) => {
@@ -182,8 +193,7 @@ impl SignalChannel {
                 }
             }
 
-            // signal-cli-rest-api doesn't support long-polling, so we poll on an interval.
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            tokio::time::sleep(poll_interval).await;
         }
     }
 
