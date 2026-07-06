@@ -31,7 +31,13 @@ pub struct MemoryWriter {
     storage: Arc<dyn MemoryStorage>,
     embedder: Arc<dyn Embedder>,
     config: MemoryConfig,
+    /// Bounds concurrent background dedup/extraction tasks so heavy
+    /// ingestion cannot pile up unbounded embedding scans.
+    dedup_limiter: Arc<tokio::sync::Semaphore>,
 }
+
+/// Maximum background dedup tasks doing work at once.
+const DEDUP_MAX_CONCURRENCY: usize = 2;
 
 impl MemoryWriter {
     pub fn new(
@@ -43,6 +49,7 @@ impl MemoryWriter {
             storage,
             embedder,
             config,
+            dedup_limiter: Arc::new(tokio::sync::Semaphore::new(DEDUP_MAX_CONCURRENCY)),
         }
     }
 
@@ -124,8 +131,8 @@ impl MemoryWriter {
             invalidated_by: None,
             invalidated_at: None,
             tags: turn.metadata.tags.clone(),
+            // session_id lives in its own indexed column; don't duplicate it here.
             metadata: serde_json::json!({
-                "session_id": turn.session_id.to_string(),
                 "turn_number": turn.turn_number,
                 "speaker": turn.speaker,
             }),
@@ -139,21 +146,23 @@ impl MemoryWriter {
             self.config.chunk_max_tokens,
             self.config.chunk_overlap_ratio,
         );
+        let chunk_count = chunk_texts.len();
 
         if !chunk_texts.is_empty() {
             let embeddings = self.embedder.embed(chunk_texts.clone()).await?;
             let model_version = self.embedder.model_version().to_string();
 
+            // Consume the texts and embeddings instead of cloning each.
             let chunks: Vec<MemoryChunk> = chunk_texts
-                .iter()
-                .zip(embeddings.iter())
+                .into_iter()
+                .zip(embeddings)
                 .enumerate()
                 .map(|(i, (text, emb))| MemoryChunk {
                     id: Uuid::new_v4(),
                     memory_id,
                     chunk_index: i as u32,
-                    content: text.clone(),
-                    embedding: emb.clone(),
+                    content: text,
+                    embedding: emb,
                     embedding_model_version: model_version.clone(),
                     created_at: now,
                 })
@@ -169,9 +178,17 @@ impl MemoryWriter {
 
         // ── Track 2: Async background extraction + near-duplicate check ──
         let storage = Arc::clone(&self.storage);
-        let content = turn.content.clone();
+        let content = turn.content;
         let dedup_threshold = self.config.dedup_auto_merge_threshold as f32;
+        let limiter = Arc::clone(&self.dedup_limiter);
         tokio::spawn(async move {
+            // Bound concurrency: heavy ingestion queues here instead of
+            // running an embedding scan per write all at once.
+            let _permit = match limiter.acquire_owned().await {
+                Ok(permit) => permit,
+                Err(_) => return, // semaphore closed (shutdown)
+            };
+
             // Step 1: Extract facts.
             let facts = RegexExtractor::extract(&content, memory_id);
             if !facts.is_empty() {
@@ -190,12 +207,13 @@ impl MemoryWriter {
                 Err(_) => return,
             };
 
+            // Served from the shared per-agent embedding cache.
             let all_embeddings = match storage.get_all_chunk_embeddings(agent_id).await {
                 Ok(e) => e,
                 Err(_) => return,
             };
 
-            for (existing_id, existing_emb) in &all_embeddings {
+            for (existing_id, existing_emb) in all_embeddings.iter() {
                 if *existing_id == memory_id {
                     continue;
                 }
@@ -217,7 +235,7 @@ impl MemoryWriter {
         debug!(
             memory_id = %memory_id,
             importance = importance,
-            chunks = chunk_texts.len(),
+            chunks = chunk_count,
             ?stage,
             "memory retained"
         );
@@ -254,12 +272,11 @@ impl MemoryWriter {
     /// Call this on startup to ensure the FTS index is in sync.
     pub async fn rebuild_fts_index(&self, agent_id: Uuid) -> rustykrab_core::Result<usize> {
         let memories = self.storage.list_retrievable(agent_id).await?;
-        let count = memories.len();
-        for mem in memories {
-            self.storage
-                .fts_index(mem.id, agent_id, &mem.content)
-                .await?;
-        }
+        let entries: Vec<(Uuid, String)> =
+            memories.into_iter().map(|m| (m.id, m.content)).collect();
+        let count = entries.len();
+        // One transaction instead of two statements per memory.
+        self.storage.fts_index_batch(agent_id, entries).await?;
         debug!(agent_id = %agent_id, indexed = count, "FTS5 index rebuilt");
         Ok(count)
     }

@@ -1,15 +1,23 @@
+use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use rusqlite::params;
+use rusqlite::{params, OptionalExtension};
 use rustykrab_core::Result;
 use uuid::Uuid;
 
 use crate::types::{
     ExtractedFact, LifecycleStage, LinkType, Memory, MemoryChunk, MemoryLink, MemoryScope,
 };
+
+/// Decoded chunk embeddings for one agent: `(memory_id, embedding)` pairs.
+///
+/// Embeddings are `Arc`-shared so snapshots of the set can be copied and
+/// filtered without duplicating the underlying vector data.
+pub type EmbeddingSet = Vec<(Uuid, Arc<[f32]>)>;
 
 /// Abstract storage backend for the memory system.
 ///
@@ -21,6 +29,9 @@ pub trait MemoryStorage: Send + Sync {
 
     /// Index a memory's content in the full-text search index.
     async fn fts_index(&self, memory_id: Uuid, agent_id: Uuid, content: &str) -> Result<()>;
+
+    /// Re-index a batch of memories in one transaction (used by index rebuild).
+    async fn fts_index_batch(&self, agent_id: Uuid, entries: Vec<(Uuid, String)>) -> Result<()>;
 
     /// Search the FTS index for memories matching a query, scoped to an agent.
     /// Returns (memory_id, rank) pairs sorted by relevance.
@@ -78,6 +89,9 @@ pub trait MemoryStorage: Send + Sync {
     /// Record an access (increment access_count, update last_accessed_at).
     async fn record_access(&self, id: Uuid) -> Result<()>;
 
+    /// Record an access for each memory in a single round-trip.
+    async fn record_access_batch(&self, ids: &[Uuid]) -> Result<()>;
+
     /// Soft-delete: mark a memory as invalid.
     async fn invalidate(&self, id: Uuid, invalidated_by: Option<Uuid>) -> Result<()>;
 
@@ -90,7 +104,9 @@ pub trait MemoryStorage: Send + Sync {
     async fn get_chunks_for_memory(&self, memory_id: Uuid) -> Result<Vec<MemoryChunk>>;
 
     /// Retrieve all chunks with embeddings for an agent (for vector search).
-    async fn get_all_chunk_embeddings(&self, agent_id: Uuid) -> Result<Vec<(Uuid, Vec<f32>)>>;
+    ///
+    /// Returns a shared snapshot; implementations may serve it from a cache.
+    async fn get_all_chunk_embeddings(&self, agent_id: Uuid) -> Result<Arc<EmbeddingSet>>;
 
     // ── Extracted facts ─────────────────────────────────────────
 
@@ -108,6 +124,9 @@ pub trait MemoryStorage: Send + Sync {
     /// Get all outgoing links from a memory.
     async fn get_links_from(&self, source_id: Uuid) -> Result<Vec<MemoryLink>>;
 
+    /// Get all outgoing links from a set of memories in one query.
+    async fn get_links_from_many(&self, source_ids: &[Uuid]) -> Result<Vec<MemoryLink>>;
+
     /// Get all links involving a memory (incoming + outgoing).
     async fn get_links_for(&self, memory_id: Uuid) -> Result<Vec<MemoryLink>>;
 
@@ -115,6 +134,11 @@ pub trait MemoryStorage: Send + Sync {
 
     /// Batch update lifecycle stages (used by sweep).
     async fn batch_update_stages(&self, updates: &[(Uuid, LifecycleStage)]) -> Result<u32>;
+
+    /// Hard-delete tombstoned memories older than `older_than`, cascading to
+    /// their chunks, extracted facts, links, and FTS rows in one transaction.
+    /// Returns the number of memories purged.
+    async fn purge_tombstones(&self, agent_id: Uuid, older_than: DateTime<Utc>) -> Result<u32>;
 }
 
 // ── SQLite helpers ──────────────────────────────────────────────
@@ -204,6 +228,133 @@ fn json_to_uuids(s: &str) -> Vec<Uuid> {
     serde_json::from_str(s).unwrap_or_default()
 }
 
+// ── Embedding cache ─────────────────────────────────────────────
+
+/// Maximum number of per-agent cache entries before the whole cache is
+/// cleared to make room. Full invalidation keeps the eviction policy trivial.
+const MAX_CACHED_AGENTS: usize = 16;
+
+/// Agents with more embeddings than this are never cached; every query falls
+/// through to SQLite. Bounds worst-case memory to roughly
+/// `MAX_CACHED_AGENTS * MAX_CACHED_VECTORS * dims * 4` bytes.
+const MAX_CACHED_VECTORS: usize = 65_536;
+
+/// Per-agent cache of decoded chunk embeddings.
+///
+/// Policy:
+/// - Entries are populated lazily by `get_all_chunk_embeddings`.
+/// - `store_chunks` refreshes a present entry in place (embeddings are
+///   `Arc`-shared, so a refresh copies pointers, not vector data).
+/// - `invalidate` precisely removes the memory's pairs; mutations that can
+///   change retrievability less predictably (`upsert_memory` of an existing
+///   row, `update_stage`, `purge_tombstones`) drop the owning agent's entry,
+///   and `batch_update_stages` clears the cache entirely. Dropped entries
+///   repopulate on the next recall.
+/// - A generation counter guards against a stale snapshot being inserted by
+///   a reader that raced a concurrent mutation.
+struct EmbeddingCache {
+    entries: RwLock<HashMap<Uuid, Arc<EmbeddingSet>>>,
+    generation: AtomicU64,
+}
+
+impl EmbeddingCache {
+    fn new() -> Self {
+        Self {
+            entries: RwLock::new(HashMap::new()),
+            generation: AtomicU64::new(0),
+        }
+    }
+
+    fn generation(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
+    }
+
+    /// Bump the generation so in-flight populates discard their snapshot.
+    /// Called at the start of every mutating operation.
+    fn bump(&self) {
+        self.generation.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn lock_write(&self) -> std::sync::RwLockWriteGuard<'_, HashMap<Uuid, Arc<EmbeddingSet>>> {
+        self.entries.write().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn get(&self, agent_id: &Uuid) -> Option<Arc<EmbeddingSet>> {
+        self.entries
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(agent_id)
+            .cloned()
+    }
+
+    /// Insert a freshly loaded snapshot unless a mutation happened since
+    /// `expected_generation` was observed (the snapshot could be stale).
+    fn insert_if_unchanged(
+        &self,
+        agent_id: Uuid,
+        set: Arc<EmbeddingSet>,
+        expected_generation: u64,
+    ) {
+        if set.len() > MAX_CACHED_VECTORS {
+            return;
+        }
+        let mut entries = self.lock_write();
+        if self.generation.load(Ordering::SeqCst) != expected_generation {
+            return;
+        }
+        if !entries.contains_key(&agent_id) && entries.len() >= MAX_CACHED_AGENTS {
+            entries.clear();
+        }
+        entries.insert(agent_id, set);
+    }
+
+    fn drop_agent(&self, agent_id: &Uuid) {
+        self.bump();
+        self.lock_write().remove(agent_id);
+    }
+
+    fn clear(&self) {
+        self.bump();
+        self.lock_write().clear();
+    }
+
+    /// Remove one memory's pairs from every cached entry.
+    fn remove_memory(&self, memory_id: Uuid) {
+        self.bump();
+        let mut entries = self.lock_write();
+        for set in entries.values_mut() {
+            if set.iter().any(|(id, _)| *id == memory_id) {
+                let filtered: EmbeddingSet = set
+                    .iter()
+                    .filter(|(id, _)| *id != memory_id)
+                    .cloned()
+                    .collect();
+                *set = Arc::new(filtered);
+            }
+        }
+    }
+
+    /// Replace `memory_id`'s pairs in `agent_id`'s entry with `pairs`
+    /// (empty `pairs` removes the memory). No-op when the agent isn't cached.
+    fn refresh_memory(&self, agent_id: Uuid, memory_id: Uuid, pairs: EmbeddingSet) {
+        self.bump();
+        let mut entries = self.lock_write();
+        if let Some(set) = entries.get_mut(&agent_id) {
+            let mut next: EmbeddingSet = set
+                .iter()
+                .filter(|(id, _)| *id != memory_id)
+                .cloned()
+                .collect();
+            next.extend(pairs);
+            if next.len() > MAX_CACHED_VECTORS {
+                entries.remove(&agent_id);
+            } else {
+                *set = Arc::new(next);
+            }
+        }
+    }
+}
+
 // ── SQLite implementation ───────────────────────────────────────
 
 /// SQLite-backed implementation of [MemoryStorage].
@@ -211,8 +362,11 @@ fn json_to_uuids(s: &str) -> Vec<Uuid> {
 /// Uses WAL mode for concurrent reads, with proper indexes for each
 /// query pattern. All blocking SQLite calls are dispatched to a
 /// `spawn_blocking` pool to avoid starving the async runtime.
+/// Decoded chunk embeddings are served from an in-memory per-agent cache
+/// (see [EmbeddingCache]) so recall and dedup avoid full-table scans.
 pub struct SqliteMemoryStorage {
     conn: Arc<tokio::sync::Mutex<rusqlite::Connection>>,
+    embedding_cache: EmbeddingCache,
 }
 
 impl SqliteMemoryStorage {
@@ -235,7 +389,10 @@ impl SqliteMemoryStorage {
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;
              PRAGMA foreign_keys = ON;
-             PRAGMA busy_timeout = 5000;",
+             PRAGMA busy_timeout = 5000;
+             PRAGMA cache_size = -65536;
+             PRAGMA mmap_size = 268435456;
+             PRAGMA temp_store = MEMORY;",
         )
         .map_err(storage_err)?;
 
@@ -243,6 +400,7 @@ impl SqliteMemoryStorage {
 
         Ok(Self {
             conn: Arc::new(tokio::sync::Mutex::new(conn)),
+            embedding_cache: EmbeddingCache::new(),
         })
     }
 
@@ -309,6 +467,8 @@ impl SqliteMemoryStorage {
                 ON memories(user_id, scope) WHERE is_valid = 1;
             CREATE INDEX IF NOT EXISTS idx_memories_session
                 ON memories(session_id) WHERE is_valid = 1;
+            CREATE INDEX IF NOT EXISTS idx_memories_agent_session_stage
+                ON memories(agent_id, session_id, lifecycle_stage) WHERE is_valid = 1;
 
             CREATE TABLE IF NOT EXISTS chunks (
                 id                      TEXT PRIMARY KEY,
@@ -448,6 +608,35 @@ fn row_to_memory(row: &rusqlite::Row) -> rusqlite::Result<Memory> {
     })
 }
 
+/// Read a MemoryLink row from a rusqlite Row.
+fn row_to_link(row: &rusqlite::Row) -> rusqlite::Result<MemoryLink> {
+    let src: String = row.get("source_id")?;
+    let tgt: String = row.get("target_id")?;
+    let lt: String = row.get("link_type")?;
+    let created_str: String = row.get("created_at")?;
+    Ok(MemoryLink {
+        source_id: Uuid::parse_str(&src).unwrap_or_default(),
+        target_id: Uuid::parse_str(&tgt).unwrap_or_default(),
+        link_type: str_to_link_type(&lt),
+        weight: row.get("weight")?,
+        created_at: DateTime::parse_from_rfc3339(&created_str)
+            .map(|dt| dt.with_timezone(&Utc))
+            .unwrap_or_else(|_| Utc::now()),
+    })
+}
+
+/// Batch size for `IN (...)` queries. Keeping it fixed bounds the number of
+/// distinct SQL strings so `prepare_cached` can reuse statements.
+const IN_BATCH: usize = 32;
+
+/// Build `?N,?N+1,...` placeholders starting at `first` for `count` params.
+fn placeholders(first: usize, count: usize) -> String {
+    (first..first + count)
+        .map(|i| format!("?{i}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 #[async_trait]
 impl MemoryStorage for SqliteMemoryStorage {
     async fn fts_index(&self, memory_id: Uuid, agent_id: Uuid, content: &str) -> Result<()> {
@@ -466,6 +655,39 @@ impl MemoryStorage for SqliteMemoryStorage {
                 params![mid, aid, text],
             )
             .map_err(storage_err)?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn fts_index_batch(&self, agent_id: Uuid, entries: Vec<(Uuid, String)>) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let aid = agent_id.to_string();
+        let entries: Vec<(String, String)> = entries
+            .into_iter()
+            .map(|(id, content)| (id.to_string(), content))
+            .collect();
+        self.with_conn(move |conn| {
+            let tx = conn.unchecked_transaction().map_err(storage_err)?;
+            {
+                let mut del = tx
+                    .prepare("DELETE FROM memories_fts WHERE memory_id = ?1")
+                    .map_err(storage_err)?;
+                let mut ins = tx
+                    .prepare(
+                        "INSERT INTO memories_fts (memory_id, agent_id, content)
+                         VALUES (?1, ?2, ?3)",
+                    )
+                    .map_err(storage_err)?;
+                for (mid, content) in &entries {
+                    del.execute(params![mid]).map_err(storage_err)?;
+                    ins.execute(params![mid, aid, content])
+                        .map_err(storage_err)?;
+                }
+            }
+            tx.commit().map_err(storage_err)?;
             Ok(())
         })
         .await
@@ -521,9 +743,22 @@ impl MemoryStorage for SqliteMemoryStorage {
 
     async fn upsert_memory(&self, memory: &Memory) -> Result<()> {
         let m = memory.clone();
-        self.with_conn(move |conn| {
-            conn.execute(
-                "INSERT INTO memories (
+        let agent_id = memory.agent_id;
+        let existed = self
+            .with_conn(move |conn| {
+                // Updating an existing row can change its retrievability, which
+                // stales the embedding cache; new rows have no chunks yet.
+                let existed: bool = conn
+                    .query_row(
+                        "SELECT 1 FROM memories WHERE id = ?1",
+                        params![m.id.to_string()],
+                        |_| Ok(()),
+                    )
+                    .optional()
+                    .map_err(storage_err)?
+                    .is_some();
+                conn.execute(
+                    "INSERT INTO memories (
                     id, agent_id, content, content_hash,
                     scope, session_id, user_id,
                     lifecycle_stage, importance, importance_source,
@@ -565,43 +800,47 @@ impl MemoryStorage for SqliteMemoryStorage {
                     invalidated_at = excluded.invalidated_at,
                     tags = excluded.tags,
                     metadata = excluded.metadata",
-                params![
-                    m.id.to_string(),
-                    m.agent_id.to_string(),
-                    m.content,
-                    m.content_hash,
-                    scope_to_str(m.scope),
-                    m.session_id.map(|u| u.to_string()),
-                    m.user_id.map(|u| u.to_string()),
-                    lifecycle_to_str(m.lifecycle_stage),
-                    m.importance,
-                    match m.importance_source {
-                        crate::types::ImportanceSource::Heuristic => "heuristic",
-                        crate::types::ImportanceSource::Llm => "llm",
-                        crate::types::ImportanceSource::User => "user",
-                    },
-                    m.decay_rate,
-                    m.confidence,
-                    m.access_count,
-                    m.last_accessed_at.map(|t| t.to_rfc3339()),
-                    m.last_relevant_at.map(|t| t.to_rfc3339()),
-                    m.created_at.to_rfc3339(),
-                    uuids_to_json(&m.parent_memory_ids),
-                    m.consolidation_generation,
-                    m.proof_count,
-                    m.occurred_start.map(|t| t.to_rfc3339()),
-                    m.occurred_end.map(|t| t.to_rfc3339()),
-                    m.is_valid as i32,
-                    m.invalidated_by.map(|u| u.to_string()),
-                    m.invalidated_at.map(|t| t.to_rfc3339()),
-                    serde_json::to_string(&m.tags).unwrap_or_else(|_| "[]".into()),
-                    m.metadata.to_string(),
-                ],
-            )
-            .map_err(storage_err)?;
-            Ok(())
-        })
-        .await
+                    params![
+                        m.id.to_string(),
+                        m.agent_id.to_string(),
+                        m.content,
+                        m.content_hash,
+                        scope_to_str(m.scope),
+                        m.session_id.map(|u| u.to_string()),
+                        m.user_id.map(|u| u.to_string()),
+                        lifecycle_to_str(m.lifecycle_stage),
+                        m.importance,
+                        match m.importance_source {
+                            crate::types::ImportanceSource::Heuristic => "heuristic",
+                            crate::types::ImportanceSource::Llm => "llm",
+                            crate::types::ImportanceSource::User => "user",
+                        },
+                        m.decay_rate,
+                        m.confidence,
+                        m.access_count,
+                        m.last_accessed_at.map(|t| t.to_rfc3339()),
+                        m.last_relevant_at.map(|t| t.to_rfc3339()),
+                        m.created_at.to_rfc3339(),
+                        uuids_to_json(&m.parent_memory_ids),
+                        m.consolidation_generation,
+                        m.proof_count,
+                        m.occurred_start.map(|t| t.to_rfc3339()),
+                        m.occurred_end.map(|t| t.to_rfc3339()),
+                        m.is_valid as i32,
+                        m.invalidated_by.map(|u| u.to_string()),
+                        m.invalidated_at.map(|t| t.to_rfc3339()),
+                        serde_json::to_string(&m.tags).unwrap_or_else(|_| "[]".into()),
+                        m.metadata.to_string(),
+                    ],
+                )
+                .map_err(storage_err)?;
+                Ok(existed)
+            })
+            .await?;
+        if existed {
+            self.embedding_cache.drop_agent(&agent_id);
+        }
+        Ok(())
     }
 
     async fn get_memory(&self, id: Uuid) -> Result<Option<Memory>> {
@@ -628,17 +867,21 @@ impl MemoryStorage for SqliteMemoryStorage {
         }
         let id_strings: Vec<String> = ids.iter().map(|id| id.to_string()).collect();
         self.with_conn(move |conn| {
-            let placeholders: String = id_strings
-                .iter()
-                .map(|s| format!("'{s}'"))
-                .collect::<Vec<_>>()
-                .join(",");
-            let sql = format!("SELECT * FROM memories WHERE id IN ({placeholders})");
-            let mut stmt = conn.prepare(&sql).map_err(storage_err)?;
-            let rows = stmt.query_map([], row_to_memory).map_err(storage_err)?;
-            let mut results = Vec::new();
-            for row in rows {
-                results.push(row.map_err(storage_err)?);
+            let mut results = Vec::with_capacity(id_strings.len());
+            // Fixed-size placeholder batches keep the SQL text stable so the
+            // prepared-statement cache can reuse it (no interpolated literals).
+            for batch in id_strings.chunks(IN_BATCH) {
+                let sql = format!(
+                    "SELECT * FROM memories WHERE id IN ({})",
+                    placeholders(1, batch.len())
+                );
+                let mut stmt = conn.prepare_cached(&sql).map_err(storage_err)?;
+                let rows = stmt
+                    .query_map(rusqlite::params_from_iter(batch.iter()), row_to_memory)
+                    .map_err(storage_err)?;
+                for row in rows {
+                    results.push(row.map_err(storage_err)?);
+                }
             }
             Ok(results)
         })
@@ -704,15 +947,17 @@ impl MemoryStorage for SqliteMemoryStorage {
         let session_str = session_id.to_string();
         let stage_str = lifecycle_to_str(stage).to_string();
         self.with_conn(move |conn| {
+            // Uses the indexed session_id column (idx_memories_agent_session_stage)
+            // instead of a per-row json_extract over metadata.
             let mut stmt = conn
                 .prepare(
                     "SELECT * FROM memories
-                     WHERE agent_id = ?1 AND lifecycle_stage = ?2 AND is_valid = 1
-                       AND json_extract(metadata, '$.session_id') = ?3",
+                     WHERE agent_id = ?1 AND session_id = ?2
+                       AND lifecycle_stage = ?3 AND is_valid = 1",
                 )
                 .map_err(storage_err)?;
             let rows = stmt
-                .query_map(params![agent_str, stage_str, session_str], row_to_memory)
+                .query_map(params![agent_str, session_str, stage_str], row_to_memory)
                 .map_err(storage_err)?;
             let mut results = Vec::new();
             for row in rows {
@@ -784,15 +1029,29 @@ impl MemoryStorage for SqliteMemoryStorage {
     async fn update_stage(&self, id: Uuid, stage: LifecycleStage) -> Result<()> {
         let id_str = id.to_string();
         let stage_str = lifecycle_to_str(stage).to_string();
-        self.with_conn(move |conn| {
-            conn.execute(
-                "UPDATE memories SET lifecycle_stage = ?2 WHERE id = ?1",
-                params![id_str, stage_str],
-            )
-            .map_err(storage_err)?;
-            Ok(())
-        })
-        .await
+        let agent = self
+            .with_conn(move |conn| {
+                let agent: Option<String> = conn
+                    .query_row(
+                        "SELECT agent_id FROM memories WHERE id = ?1",
+                        params![id_str],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(storage_err)?;
+                conn.execute(
+                    "UPDATE memories SET lifecycle_stage = ?2 WHERE id = ?1",
+                    params![id_str, stage_str],
+                )
+                .map_err(storage_err)?;
+                Ok(agent)
+            })
+            .await?;
+        // A stage change can move the memory in or out of the retrievable set.
+        if let Some(agent_id) = agent.and_then(|s| Uuid::parse_str(&s).ok()) {
+            self.embedding_cache.drop_agent(&agent_id);
+        }
+        Ok(())
     }
 
     async fn record_access(&self, id: Uuid) -> Result<()> {
@@ -807,6 +1066,34 @@ impl MemoryStorage for SqliteMemoryStorage {
                 params![id_str, now],
             )
             .map_err(storage_err)?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn record_access_batch(&self, ids: &[Uuid]) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let id_strings: Vec<String> = ids.iter().map(|id| id.to_string()).collect();
+        let now = Utc::now().to_rfc3339();
+        self.with_conn(move |conn| {
+            let tx = conn.unchecked_transaction().map_err(storage_err)?;
+            for batch in id_strings.chunks(IN_BATCH) {
+                let sql = format!(
+                    "UPDATE memories
+                     SET access_count = access_count + 1,
+                         last_accessed_at = ?1
+                     WHERE id IN ({})",
+                    placeholders(2, batch.len())
+                );
+                let mut stmt = tx.prepare_cached(&sql).map_err(storage_err)?;
+                stmt.execute(rusqlite::params_from_iter(
+                    std::iter::once(&now).chain(batch.iter()),
+                ))
+                .map_err(storage_err)?;
+            }
+            tx.commit().map_err(storage_err)?;
             Ok(())
         })
         .await
@@ -829,43 +1116,97 @@ impl MemoryStorage for SqliteMemoryStorage {
             .map_err(storage_err)?;
             Ok(())
         })
-        .await
+        .await?;
+        // Tombstoned memories are no longer retrievable; drop their embeddings.
+        self.embedding_cache.remove_memory(id);
+        Ok(())
     }
 
     // ── Chunks ──────────────────────────────────────────────────
 
     async fn store_chunks(&self, chunks: &[MemoryChunk]) -> Result<()> {
         let chunks = chunks.to_vec();
-        self.with_conn(move |conn| {
-            let tx = conn.unchecked_transaction().map_err(storage_err)?;
-            {
-                let mut stmt = tx
-                    .prepare(
-                        "INSERT OR REPLACE INTO chunks
-                         (id, memory_id, chunk_index, content, embedding,
-                          embedding_model_version, created_at)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                    )
-                    .map_err(storage_err)?;
+        let cache_updates = self
+            .with_conn(move |conn| {
+                let tx = conn.unchecked_transaction().map_err(storage_err)?;
+                {
+                    let mut stmt = tx
+                        .prepare(
+                            "INSERT OR REPLACE INTO chunks
+                             (id, memory_id, chunk_index, content, embedding,
+                              embedding_model_version, created_at)
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                        )
+                        .map_err(storage_err)?;
 
-                for chunk in &chunks {
-                    let emb_blob = embedding_to_blob(&chunk.embedding);
-                    stmt.execute(params![
-                        chunk.id.to_string(),
-                        chunk.memory_id.to_string(),
-                        chunk.chunk_index,
-                        chunk.content,
-                        emb_blob,
-                        chunk.embedding_model_version,
-                        chunk.created_at.to_rfc3339(),
-                    ])
-                    .map_err(storage_err)?;
+                    for chunk in &chunks {
+                        let emb_blob = embedding_to_blob(&chunk.embedding);
+                        stmt.execute(params![
+                            chunk.id.to_string(),
+                            chunk.memory_id.to_string(),
+                            chunk.chunk_index,
+                            chunk.content,
+                            emb_blob,
+                            chunk.embedding_model_version,
+                            chunk.created_at.to_rfc3339(),
+                        ])
+                        .map_err(storage_err)?;
+                    }
                 }
-            }
-            tx.commit().map_err(storage_err)?;
-            Ok(())
-        })
-        .await
+
+                // Map each affected memory to its owning agent and current
+                // retrievability so the embedding cache can be refreshed
+                // incrementally instead of dropped.
+                let mut owners: HashMap<Uuid, Option<(Uuid, bool)>> = HashMap::new();
+                for chunk in &chunks {
+                    if owners.contains_key(&chunk.memory_id) {
+                        continue;
+                    }
+                    let owner = tx
+                        .query_row(
+                            "SELECT agent_id, is_valid, lifecycle_stage
+                             FROM memories WHERE id = ?1",
+                            params![chunk.memory_id.to_string()],
+                            |row| {
+                                let agent: String = row.get(0)?;
+                                let is_valid: i32 = row.get(1)?;
+                                let stage: String = row.get(2)?;
+                                Ok((agent, is_valid != 0, stage))
+                            },
+                        )
+                        .optional()
+                        .map_err(storage_err)?
+                        .and_then(|(agent, is_valid, stage)| {
+                            let agent_id = Uuid::parse_str(&agent).ok()?;
+                            let retrievable = is_valid && str_to_lifecycle(&stage).is_retrievable();
+                            Some((agent_id, retrievable))
+                        });
+                    owners.insert(chunk.memory_id, owner);
+                }
+                tx.commit().map_err(storage_err)?;
+
+                // (agent_id, memory_id, pairs) per affected memory; pairs is
+                // empty when the memory isn't retrievable.
+                let mut updates: HashMap<Uuid, (Uuid, EmbeddingSet)> = HashMap::new();
+                for chunk in chunks {
+                    if let Some(Some((agent_id, retrievable))) = owners.get(&chunk.memory_id) {
+                        let entry = updates
+                            .entry(chunk.memory_id)
+                            .or_insert_with(|| (*agent_id, EmbeddingSet::new()));
+                        if *retrievable && !chunk.embedding.is_empty() {
+                            entry.1.push((chunk.memory_id, Arc::from(chunk.embedding)));
+                        }
+                    }
+                }
+                Ok(updates)
+            })
+            .await?;
+
+        for (memory_id, (agent_id, pairs)) in cache_updates {
+            self.embedding_cache
+                .refresh_memory(agent_id, memory_id, pairs);
+        }
+        Ok(())
     }
 
     async fn get_chunks_for_memory(&self, memory_id: Uuid) -> Result<Vec<MemoryChunk>> {
@@ -909,39 +1250,50 @@ impl MemoryStorage for SqliteMemoryStorage {
         .await
     }
 
-    async fn get_all_chunk_embeddings(&self, agent_id: Uuid) -> Result<Vec<(Uuid, Vec<f32>)>> {
+    async fn get_all_chunk_embeddings(&self, agent_id: Uuid) -> Result<Arc<EmbeddingSet>> {
+        if let Some(cached) = self.embedding_cache.get(&agent_id) {
+            return Ok(cached);
+        }
+
+        let generation = self.embedding_cache.generation();
         let agent_str = agent_id.to_string();
-        self.with_conn(move |conn| {
-            let mut stmt = conn
-                .prepare(
-                    "SELECT c.memory_id, c.embedding
-                     FROM chunks c
-                     JOIN memories m ON m.id = c.memory_id
-                     WHERE m.agent_id = ?1 AND m.is_valid = 1
-                       AND m.lifecycle_stage IN ('working', 'episodic', 'semantic')
-                       AND c.embedding IS NOT NULL",
-                )
-                .map_err(storage_err)?;
-            let rows = stmt
-                .query_map(params![agent_str], |row| {
-                    let mem_id_str: String = row.get(0)?;
-                    let emb_blob: Vec<u8> = row.get(1)?;
-                    Ok((
-                        Uuid::parse_str(&mem_id_str).unwrap_or_default(),
-                        blob_to_embedding(&emb_blob),
-                    ))
-                })
-                .map_err(storage_err)?;
-            let mut results = Vec::new();
-            for row in rows {
-                let (id, emb) = row.map_err(storage_err)?;
-                if !emb.is_empty() {
-                    results.push((id, emb));
+        let set = self
+            .with_conn(move |conn| {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT c.memory_id, c.embedding
+                         FROM chunks c
+                         JOIN memories m ON m.id = c.memory_id
+                         WHERE m.agent_id = ?1 AND m.is_valid = 1
+                           AND m.lifecycle_stage IN ('working', 'episodic', 'semantic')
+                           AND c.embedding IS NOT NULL",
+                    )
+                    .map_err(storage_err)?;
+                let rows = stmt
+                    .query_map(params![agent_str], |row| {
+                        let mem_id_str: String = row.get(0)?;
+                        let emb_blob: Vec<u8> = row.get(1)?;
+                        Ok((
+                            Uuid::parse_str(&mem_id_str).unwrap_or_default(),
+                            blob_to_embedding(&emb_blob),
+                        ))
+                    })
+                    .map_err(storage_err)?;
+                let mut results = EmbeddingSet::new();
+                for row in rows {
+                    let (id, emb) = row.map_err(storage_err)?;
+                    if !emb.is_empty() {
+                        results.push((id, Arc::from(emb)));
+                    }
                 }
-            }
-            Ok(results)
-        })
-        .await
+                Ok(results)
+            })
+            .await?;
+
+        let set = Arc::new(set);
+        self.embedding_cache
+            .insert_if_unchanged(agent_id, Arc::clone(&set), generation);
+        Ok(set)
     }
 
     // ── Extracted facts ─────────────────────────────────────────
@@ -1059,25 +1411,36 @@ impl MemoryStorage for SqliteMemoryStorage {
                 .prepare("SELECT * FROM memory_links WHERE source_id = ?1")
                 .map_err(storage_err)?;
             let rows = stmt
-                .query_map(params![src_str], |row| {
-                    let src: String = row.get("source_id")?;
-                    let tgt: String = row.get("target_id")?;
-                    let lt: String = row.get("link_type")?;
-                    let created_str: String = row.get("created_at")?;
-                    Ok(MemoryLink {
-                        source_id: Uuid::parse_str(&src).unwrap_or_default(),
-                        target_id: Uuid::parse_str(&tgt).unwrap_or_default(),
-                        link_type: str_to_link_type(&lt),
-                        weight: row.get("weight")?,
-                        created_at: DateTime::parse_from_rfc3339(&created_str)
-                            .map(|dt| dt.with_timezone(&Utc))
-                            .unwrap_or_else(|_| Utc::now()),
-                    })
-                })
+                .query_map(params![src_str], row_to_link)
                 .map_err(storage_err)?;
             let mut results = Vec::new();
             for row in rows {
                 results.push(row.map_err(storage_err)?);
+            }
+            Ok(results)
+        })
+        .await
+    }
+
+    async fn get_links_from_many(&self, source_ids: &[Uuid]) -> Result<Vec<MemoryLink>> {
+        if source_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let id_strings: Vec<String> = source_ids.iter().map(|id| id.to_string()).collect();
+        self.with_conn(move |conn| {
+            let mut results = Vec::new();
+            for batch in id_strings.chunks(IN_BATCH) {
+                let sql = format!(
+                    "SELECT * FROM memory_links WHERE source_id IN ({})",
+                    placeholders(1, batch.len())
+                );
+                let mut stmt = conn.prepare_cached(&sql).map_err(storage_err)?;
+                let rows = stmt
+                    .query_map(rusqlite::params_from_iter(batch.iter()), row_to_link)
+                    .map_err(storage_err)?;
+                for row in rows {
+                    results.push(row.map_err(storage_err)?);
+                }
             }
             Ok(results)
         })
@@ -1094,21 +1457,7 @@ impl MemoryStorage for SqliteMemoryStorage {
                 )
                 .map_err(storage_err)?;
             let rows = stmt
-                .query_map(params![id_str], |row| {
-                    let src: String = row.get("source_id")?;
-                    let tgt: String = row.get("target_id")?;
-                    let lt: String = row.get("link_type")?;
-                    let created_str: String = row.get("created_at")?;
-                    Ok(MemoryLink {
-                        source_id: Uuid::parse_str(&src).unwrap_or_default(),
-                        target_id: Uuid::parse_str(&tgt).unwrap_or_default(),
-                        link_type: str_to_link_type(&lt),
-                        weight: row.get("weight")?,
-                        created_at: DateTime::parse_from_rfc3339(&created_str)
-                            .map(|dt| dt.with_timezone(&Utc))
-                            .unwrap_or_else(|_| Utc::now()),
-                    })
-                })
+                .query_map(params![id_str], row_to_link)
                 .map_err(storage_err)?;
             let mut results = Vec::new();
             for row in rows {
@@ -1122,27 +1471,402 @@ impl MemoryStorage for SqliteMemoryStorage {
     // ── Bulk operations ─────────────────────────────────────────
 
     async fn batch_update_stages(&self, updates: &[(Uuid, LifecycleStage)]) -> Result<u32> {
+        if updates.is_empty() {
+            return Ok(0);
+        }
         let updates: Vec<(String, String)> = updates
             .iter()
             .map(|(id, stage)| (id.to_string(), lifecycle_to_str(*stage).to_string()))
             .collect();
-        self.with_conn(move |conn| {
-            let tx = conn.unchecked_transaction().map_err(storage_err)?;
-            let mut count = 0u32;
-            {
-                let mut stmt = tx
-                    .prepare("UPDATE memories SET lifecycle_stage = ?2 WHERE id = ?1")
-                    .map_err(storage_err)?;
-                for (id_str, stage_str) in &updates {
-                    let affected = stmt
-                        .execute(params![id_str, stage_str])
+        let now = Utc::now().to_rfc3339();
+        let count = self
+            .with_conn(move |conn| {
+                let tx = conn.unchecked_transaction().map_err(storage_err)?;
+                let mut count = 0u32;
+                {
+                    // Stamp invalidated_at when tombstoning so the retention
+                    // sweep can age tombstones from their transition time.
+                    let mut stmt = tx
+                        .prepare(
+                            "UPDATE memories
+                             SET lifecycle_stage = ?2,
+                                 invalidated_at = CASE
+                                     WHEN ?2 = 'tombstone'
+                                         THEN COALESCE(invalidated_at, ?3)
+                                     ELSE invalidated_at
+                                 END
+                             WHERE id = ?1",
+                        )
                         .map_err(storage_err)?;
-                    count += affected as u32;
+                    for (id_str, stage_str) in &updates {
+                        let affected = stmt
+                            .execute(params![id_str, stage_str, now])
+                            .map_err(storage_err)?;
+                        count += affected as u32;
+                    }
                 }
+                tx.commit().map_err(storage_err)?;
+                Ok(count)
+            })
+            .await?;
+        // Stage changes can alter which memories are retrievable; this path is
+        // sweep/session-end only, so a full cache clear keeps it simple.
+        self.embedding_cache.clear();
+        Ok(count)
+    }
+
+    async fn purge_tombstones(&self, agent_id: Uuid, older_than: DateTime<Utc>) -> Result<u32> {
+        let agent_str = agent_id.to_string();
+        let cutoff = older_than.to_rfc3339();
+        let purged = self
+            .with_conn(move |conn| {
+                // Tombstone age is invalidated_at when set (soft delete or
+                // tombstoning sweep), falling back to created_at. RFC 3339
+                // UTC strings compare lexicographically.
+                const SELECTOR: &str = "SELECT id FROM memories
+                     WHERE agent_id = ?1 AND lifecycle_stage = 'tombstone'
+                       AND COALESCE(invalidated_at, created_at) < ?2";
+
+                let tx = conn.unchecked_transaction().map_err(storage_err)?;
+                for sql in [
+                    format!("DELETE FROM chunks WHERE memory_id IN ({SELECTOR})"),
+                    format!("DELETE FROM extracted_facts WHERE source_memory_id IN ({SELECTOR})"),
+                    format!(
+                        "DELETE FROM memory_links
+                         WHERE source_id IN ({SELECTOR}) OR target_id IN ({SELECTOR})"
+                    ),
+                    format!("DELETE FROM memories_fts WHERE memory_id IN ({SELECTOR})"),
+                ] {
+                    tx.execute(&sql, params![agent_str, cutoff])
+                        .map_err(storage_err)?;
+                }
+                let purged = tx
+                    .execute(
+                        "DELETE FROM memories
+                         WHERE agent_id = ?1 AND lifecycle_stage = 'tombstone'
+                           AND COALESCE(invalidated_at, created_at) < ?2",
+                        params![agent_str, cutoff],
+                    )
+                    .map_err(storage_err)?;
+                tx.commit().map_err(storage_err)?;
+                Ok(purged as u32)
+            })
+            .await?;
+        if purged > 0 {
+            self.embedding_cache.drop_agent(&agent_id);
+        }
+        Ok(purged)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::ImportanceSource;
+    use chrono::Duration;
+
+    fn test_memory(agent_id: Uuid, session_id: Option<Uuid>, content: &str) -> Memory {
+        Memory {
+            id: Uuid::new_v4(),
+            agent_id,
+            content: content.to_string(),
+            content_hash: format!("hash-{content}"),
+            scope: MemoryScope::User,
+            session_id,
+            user_id: None,
+            lifecycle_stage: LifecycleStage::Working,
+            importance: 0.5,
+            importance_source: ImportanceSource::Heuristic,
+            decay_rate: 1.0,
+            confidence: 1.0,
+            access_count: 0,
+            last_accessed_at: None,
+            last_relevant_at: None,
+            created_at: Utc::now(),
+            parent_memory_ids: Vec::new(),
+            consolidation_generation: 0,
+            proof_count: 1,
+            occurred_start: None,
+            occurred_end: None,
+            is_valid: true,
+            invalidated_by: None,
+            invalidated_at: None,
+            tags: Vec::new(),
+            metadata: serde_json::json!({}),
+        }
+    }
+
+    fn test_chunk(memory_id: Uuid, embedding: Vec<f32>) -> MemoryChunk {
+        MemoryChunk {
+            id: Uuid::new_v4(),
+            memory_id,
+            chunk_index: 0,
+            content: "chunk".to_string(),
+            embedding,
+            embedding_model_version: "test".to_string(),
+            created_at: Utc::now(),
+        }
+    }
+
+    /// The session query filters on the indexed session_id column, not on
+    /// metadata (which no longer duplicates session_id).
+    #[tokio::test]
+    async fn list_by_session_and_stage_uses_column() {
+        let storage = SqliteMemoryStorage::open_in_memory().unwrap();
+        let agent_id = Uuid::new_v4();
+        let session_a = Uuid::new_v4();
+        let session_b = Uuid::new_v4();
+
+        let in_session = test_memory(agent_id, Some(session_a), "in session");
+        let other_session = test_memory(agent_id, Some(session_b), "other session");
+        let mut wrong_stage = test_memory(agent_id, Some(session_a), "wrong stage");
+        wrong_stage.lifecycle_stage = LifecycleStage::Episodic;
+
+        for mem in [&in_session, &other_session, &wrong_stage] {
+            storage.upsert_memory(mem).await.unwrap();
+        }
+
+        let found = storage
+            .list_by_session_and_stage(agent_id, session_a, LifecycleStage::Working)
+            .await
+            .unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id, in_session.id);
+    }
+
+    /// One batched call updates access metadata on every requested row.
+    #[tokio::test]
+    async fn record_access_batch_updates_all_rows() {
+        let storage = SqliteMemoryStorage::open_in_memory().unwrap();
+        let agent_id = Uuid::new_v4();
+
+        let mut ids = Vec::new();
+        for i in 0..3 {
+            let mem = test_memory(agent_id, None, &format!("memory {i}"));
+            storage.upsert_memory(&mem).await.unwrap();
+            ids.push(mem.id);
+        }
+
+        storage.record_access_batch(&ids).await.unwrap();
+        storage.record_access_batch(&ids[..1]).await.unwrap();
+
+        for (i, id) in ids.iter().enumerate() {
+            let mem = storage.get_memory(*id).await.unwrap().unwrap();
+            let expected = if i == 0 { 2 } else { 1 };
+            assert_eq!(mem.access_count, expected, "memory {i}");
+            assert!(mem.last_accessed_at.is_some(), "memory {i}");
+        }
+    }
+
+    /// get_memories uses placeholder batches; ID sets larger than one batch
+    /// still return every row.
+    #[tokio::test]
+    async fn get_memories_spans_placeholder_batches() {
+        let storage = SqliteMemoryStorage::open_in_memory().unwrap();
+        let agent_id = Uuid::new_v4();
+
+        let mut ids = Vec::new();
+        for i in 0..(IN_BATCH + 5) {
+            let mem = test_memory(agent_id, None, &format!("memory {i}"));
+            storage.upsert_memory(&mem).await.unwrap();
+            ids.push(mem.id);
+        }
+
+        let found = storage.get_memories(&ids).await.unwrap();
+        assert_eq!(found.len(), IN_BATCH + 5);
+    }
+
+    /// Consecutive recalls share one cached snapshot; chunk writes refresh it
+    /// and invalidation (tombstone) removes the memory's embeddings.
+    #[tokio::test]
+    async fn embedding_cache_hit_refresh_and_invalidation() {
+        let storage = SqliteMemoryStorage::open_in_memory().unwrap();
+        let agent_id = Uuid::new_v4();
+
+        let first = test_memory(agent_id, None, "first");
+        storage.upsert_memory(&first).await.unwrap();
+        storage
+            .store_chunks(&[test_chunk(first.id, vec![1.0, 0.0])])
+            .await
+            .unwrap();
+
+        // Populate, then hit: same Arc snapshot means no second table scan.
+        let set1 = storage.get_all_chunk_embeddings(agent_id).await.unwrap();
+        let set2 = storage.get_all_chunk_embeddings(agent_id).await.unwrap();
+        assert!(
+            Arc::ptr_eq(&set1, &set2),
+            "second call should be a cache hit"
+        );
+        assert_eq!(set1.len(), 1);
+
+        // A chunk write for a new memory refreshes the cached entry.
+        let second = test_memory(agent_id, None, "second");
+        storage.upsert_memory(&second).await.unwrap();
+        storage
+            .store_chunks(&[test_chunk(second.id, vec![0.0, 1.0])])
+            .await
+            .unwrap();
+        let set3 = storage.get_all_chunk_embeddings(agent_id).await.unwrap();
+        assert_eq!(set3.len(), 2);
+        assert!(set3.iter().any(|(id, _)| *id == second.id));
+
+        // Tombstoning removes the memory's embeddings from the cache.
+        storage.invalidate(second.id, None).await.unwrap();
+        let set4 = storage.get_all_chunk_embeddings(agent_id).await.unwrap();
+        assert_eq!(set4.len(), 1);
+        assert!(set4.iter().all(|(id, _)| *id != second.id));
+    }
+
+    /// Purging cascades to chunks, facts, links, and the FTS index, and
+    /// leaves untombstoned memories alone.
+    #[tokio::test]
+    async fn purge_tombstones_cascades() {
+        let storage = SqliteMemoryStorage::open_in_memory().unwrap();
+        let agent_id = Uuid::new_v4();
+
+        let doomed = test_memory(agent_id, None, "practical zebra facts");
+        let survivor = test_memory(agent_id, None, "unrelated survivor");
+        storage.upsert_memory(&doomed).await.unwrap();
+        storage.upsert_memory(&survivor).await.unwrap();
+        storage
+            .store_chunks(&[test_chunk(doomed.id, vec![1.0, 0.0])])
+            .await
+            .unwrap();
+        storage
+            .store_facts(&[ExtractedFact {
+                id: Uuid::new_v4(),
+                source_memory_id: doomed.id,
+                fact_type: "preference".to_string(),
+                subject: "user".to_string(),
+                predicate: "likes".to_string(),
+                object: "zebras".to_string(),
+                confidence: 1.0,
+                valid_from: Utc::now(),
+                valid_to: None,
+                extraction_method: "regex".to_string(),
+                created_at: Utc::now(),
+            }])
+            .await
+            .unwrap();
+        for (source_id, target_id) in [(doomed.id, survivor.id), (survivor.id, doomed.id)] {
+            storage
+                .upsert_link(&MemoryLink {
+                    source_id,
+                    target_id,
+                    link_type: LinkType::SemanticSimilar,
+                    weight: 1.0,
+                    created_at: Utc::now(),
+                })
+                .await
+                .unwrap();
+        }
+        storage
+            .fts_index(doomed.id, agent_id, &doomed.content)
+            .await
+            .unwrap();
+
+        storage.invalidate(doomed.id, None).await.unwrap();
+
+        // Inside the retention window: nothing is purged.
+        let kept = storage
+            .purge_tombstones(agent_id, Utc::now() - Duration::days(1))
+            .await
+            .unwrap();
+        assert_eq!(kept, 0);
+
+        // Past the window: the tombstone and all satellite rows go away.
+        let purged = storage
+            .purge_tombstones(agent_id, Utc::now() + Duration::seconds(5))
+            .await
+            .unwrap();
+        assert_eq!(purged, 1);
+
+        assert!(storage.get_memory(doomed.id).await.unwrap().is_none());
+        assert!(storage
+            .get_chunks_for_memory(doomed.id)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(storage
+            .get_facts_for_memory(doomed.id)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(storage.get_links_for(doomed.id).await.unwrap().is_empty());
+        assert!(storage
+            .fts_search("zebra", agent_id, 10)
+            .await
+            .unwrap()
+            .is_empty());
+        // The valid memory survives untouched.
+        assert!(storage.get_memory(survivor.id).await.unwrap().is_some());
+    }
+
+    /// Tombstoning via batch_update_stages stamps invalidated_at, so old
+    /// memories still get the full retention window after tombstoning.
+    #[tokio::test]
+    async fn batch_tombstone_starts_retention_clock() {
+        let storage = SqliteMemoryStorage::open_in_memory().unwrap();
+        let agent_id = Uuid::new_v4();
+
+        let mut old = test_memory(agent_id, None, "ancient memory");
+        old.created_at = Utc::now() - Duration::days(400);
+        storage.upsert_memory(&old).await.unwrap();
+
+        let updated = storage
+            .batch_update_stages(&[(old.id, LifecycleStage::Tombstone)])
+            .await
+            .unwrap();
+        assert_eq!(updated, 1);
+
+        // Retention ages from the tombstone transition, not created_at.
+        let purged = storage
+            .purge_tombstones(agent_id, Utc::now() - Duration::days(30))
+            .await
+            .unwrap();
+        assert_eq!(purged, 0);
+        assert!(storage.get_memory(old.id).await.unwrap().is_some());
+    }
+
+    /// Batched link fetch returns the union of per-seed links.
+    #[tokio::test]
+    async fn get_links_from_many_matches_per_seed_queries() {
+        let storage = SqliteMemoryStorage::open_in_memory().unwrap();
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let c = Uuid::new_v4();
+
+        for (source_id, target_id) in [(a, b), (a, c), (b, c)] {
+            storage
+                .upsert_link(&MemoryLink {
+                    source_id,
+                    target_id,
+                    link_type: LinkType::SemanticSimilar,
+                    weight: 0.9,
+                    created_at: Utc::now(),
+                })
+                .await
+                .unwrap();
+        }
+
+        let mut batched: Vec<(Uuid, Uuid)> = storage
+            .get_links_from_many(&[a, b])
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|l| (l.source_id, l.target_id))
+            .collect();
+        batched.sort();
+
+        let mut individual = Vec::new();
+        for source in [a, b] {
+            for link in storage.get_links_from(source).await.unwrap() {
+                individual.push((link.source_id, link.target_id));
             }
-            tx.commit().map_err(storage_err)?;
-            Ok(count)
-        })
-        .await
+        }
+        individual.sort();
+
+        assert_eq!(batched, individual);
+        assert_eq!(batched.len(), 3);
     }
 }
