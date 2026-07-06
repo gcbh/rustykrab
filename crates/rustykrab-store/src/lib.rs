@@ -61,12 +61,22 @@ impl Store {
         })
     }
 
-    fn run_migrations(conn: &rusqlite::Connection) -> Result<(), Error> {
+    pub(crate) fn run_migrations(conn: &rusqlite::Connection) -> Result<(), Error> {
         conn.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS conversations (
-                id   TEXT PRIMARY KEY,
-                data TEXT NOT NULL
+                id         TEXT PRIMARY KEY,
+                data       TEXT NOT NULL,
+                title      TEXT,
+                created_at TEXT,
+                updated_at TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS messages (
+                conversation_id TEXT NOT NULL,
+                idx             INTEGER NOT NULL,
+                data            TEXT NOT NULL,
+                PRIMARY KEY (conversation_id, idx)
             );
 
             CREATE TABLE IF NOT EXISTS secrets (
@@ -154,6 +164,39 @@ impl Store {
             conn.execute("ALTER TABLE scheduled_jobs ADD COLUMN thread_id TEXT", [])
                 .map_err(|e| Error::Storage(e.to_string()))?;
         }
+
+        // Databases created before conversations were normalized have a
+        // two-column `conversations` table; add the promoted metadata
+        // columns so `list_summaries` never has to parse JSON.
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(conversations)")
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        let existing: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|e| Error::Storage(e.to_string()))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        drop(stmt);
+        for col in ["title", "created_at", "updated_at"] {
+            if !existing.iter().any(|c| c == col) {
+                conn.execute(
+                    &format!("ALTER TABLE conversations ADD COLUMN {col} TEXT"),
+                    [],
+                )
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            }
+        }
+        // Index created after the ALTERs so it exists on both fresh and
+        // upgraded databases.
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_conversations_updated_at
+                 ON conversations (updated_at DESC);",
+        )
+        .map_err(|e| Error::Storage(e.to_string()))?;
+
+        // Explode legacy whole-conversation blobs into the normalized
+        // schema. Idempotent — see `conversation::migrate_legacy_blobs`.
+        conversation::migrate_legacy_blobs(conn)?;
 
         Ok(())
     }
