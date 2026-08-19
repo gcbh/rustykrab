@@ -32,6 +32,7 @@ Two intertwined goals:
 | 6 | App auth | **Per-device pairing** with per-device tokens (revocable, attributable). |
 | 7 | Approval notifications | **In-app + badge in v1; APNs push in a later phase** (both wanted). |
 | 8 | Multi-server | **One gateway in v1, data model designed for multiple** server profiles. |
+| 9 | Evaluation | **Harness-first.** A build + end-to-end evaluation system is the first implementation stage, before any feature work. Every later phase's exit criteria are encoded as executable scenarios so agents can autonomously verify the agreed end state. |
 
 ## 3. Current state (what exists today)
 
@@ -338,20 +339,127 @@ The SQLite implementation is the only one for now (decision: keep the Macs as
 the credential home). Candidates later: HashiCorp Vault, 1Password Connect, or
 a small self-hosted service — swap without touching tools, policy, or the app.
 
-## 11. Phasing
+## 11. Workstream F — the evaluation harness (built first)
+
+**Goal:** any agent session — cloud sandbox, CI runner, or a Mac — can build
+every component, boot the system, and execute end-to-end scenarios that encode
+each phase's exit criteria. The harness is the *executable definition of
+done*: the target scenarios are written on day one and marked expected-fail
+(`xfail`); shipping a phase means flipping its scenarios to must-pass. An
+agent has reached the agreed end state exactly when the suite is green with
+zero xfails.
+
+### F1. Make the daemon buildable in agent sandboxes
+Empirical finding (2026-08-19, this Claude environment): the workspace fails
+to build because `ort-sys` (via `fastembed`) downloads a prebuilt ONNX
+runtime from `cdn.pyke.io`, which the environment's network policy blocks.
+But `rustykrab-memory` already feature-gates it (`default = []`,
+`fastembed = ["dep:fastembed"]`) and the gateway builds without it — only
+`rustykrab-cli` hard-enables the feature. Fix:
+
+- `rustykrab-cli` gains `[features] default = ["embeddings"];
+  embeddings = ["rustykrab-memory/fastembed"]`, with the embedding config
+  path in `main.rs` behind `#[cfg(feature = "embeddings")]`.
+- Release/Mac builds are unchanged (default on). Sandboxes and the E2E lane
+  build with `cargo build -p rustykrab-cli --no-default-features`.
+- Optionally, allowlisting `cdn.pyke.io` in the Claude environment's network
+  policy restores full-fidelity builds in sandboxes too.
+
+### F2. `ScriptedProvider` — deterministic agent for E2E
+A `ModelProvider` test double that replays a scripted sequence of tool calls
+and text turns, so scenarios like “the agent tries to overwrite
+`notion_api_token`” run deterministically, fast, and free — no live model.
+The same scenarios can run in **live-fire mode** against the real Anthropic
+provider when `ANTHROPIC_API_KEY` is present (optional env secret in the
+Claude environment; scripted mode is the default everywhere).
+
+### F3. E2E runner (`scripts/e2e.sh` + `crates/rustykrab-e2e`)
+Builds the daemon (`--no-default-features`), boots it on a temp data dir with
+`RUSTYKRAB_MASTER_KEY`, `RUSTYKRAB_AUTH_TOKEN`, and dummy values for the
+registry's `required` secrets (Notion, Obsidian — startup validation refuses
+to boot without them), waits for `/api/health`, then drives scenarios over
+HTTP and asserts on responses **and** on store state:
+
+1. pair a device (mint code → exchange → call API with device token)
+2. create a secret; `POST /api/secrets` on an existing name → `409`; with
+   `overwrite: true` → applied, old value archived
+3. scripted agent creates a new credential → succeeds silently
+4. scripted agent `set` on an existing name → value unchanged, one pending
+   request
+5. approve → new value live, version archived, audit row attributed to the
+   deciding device
+6. deny → value unchanged, proposal wiped
+7. agent `delete` → request; expiry sweep; stale approval → `409`
+8. revoked device → `401`
+
+Output is JSON + exit code so agents can assert mechanically. Every scenario
+maps to a phase exit criterion; a new feature ships with its scenario in the
+same PR. CI gains an `e2e` job running the same script.
+
+### F4. `ApolloKit` — the app's protocol layer, testable on Linux
+The app splits into a SwiftPM package + thin SwiftUI shell. `ApolloKit`
+(DTOs, API client, SSE parser, pairing, approvals flows) uses only
+Foundation/FoundationNetworking, so `swift build && swift test` works on
+Linux and macOS. An `apollo-e2e` executable target drives the *same scenario
+list* as F3 against a live gateway — one sandbox session can then run true
+cross-repo contract E2E: Rust daemon up, Swift client exercising it.
+Empirical finding: no Swift toolchain in the current sandbox and
+`download.swift.org` is blocked (the sandbox is Ubuntu 24.04, for which
+swift.org ships an official toolchain) — see F6. Until allowed, the Swift
+lane runs in CI.
+
+### F5. CI lanes (the only place an iOS `.app` can be verified from the cloud)
+Building the actual iOS app, simulator testing, and TestFlight are
+macOS-only — no sandbox configuration changes that. So:
+
+- **rustykrab `ci.yml`** (ubuntu): existing check/clippy/test/fmt/audit jobs
+  + new `e2e` job running `scripts/e2e.sh`.
+- **apollo-ios CI** (new): `swift test` for ApolloKit on `ubuntu-latest`;
+  `xcodebuild build test` for the app + unit tests on `macos-latest`.
+  Cloud agents iterate on the app by pushing and reading CI results (they
+  can subscribe to PR check events). macOS runner minutes bill at 10× on
+  private repos — keep the macOS job to build + unit tests per push; UI
+  tests (XCUITest) run nightly or on demand.
+- **The Mac** (local Claude Code session or the user): full-fidelity lane —
+  simulator, XCUITest against a local gateway, TestFlight archive/upload.
+
+### F6. Environment prerequisites (user-actionable)
+For the Claude cloud environment used on these repos:
+
+| Item | Unblocks | Priority |
+|------|----------|----------|
+| Allowlist `download.swift.org` (+ `swift.org`) and install the Swift toolchain in the environment setup script | F4's Swift lane inside sandboxes (build ApolloKit + run cross-repo E2E locally) | high |
+| Allowlist `cdn.pyke.io` | full-fidelity (embeddings-on) daemon builds in sandboxes; otherwise `--no-default-features` covers everything the guard needs | nice-to-have |
+| `ANTHROPIC_API_KEY` as an environment secret | live-fire E2E lane (scripted mode needs nothing) | optional |
+| Apple signing: none needed for CI build/test; App Store Connect API key only if TestFlight upload should ever run from CI | automated TestFlight from CI (otherwise upload stays on the Mac) | later |
+
+### What each lane can verify
+
+| Capability | Cloud sandbox | GitHub Actions | Mac |
+|------------|---------------|----------------|-----|
+| Build daemon + run guard E2E (scripted agent) | ✓ (after F1) | ✓ | ✓ |
+| Live-fire agent E2E | with env key | with secret | ✓ |
+| Build + test ApolloKit (Swift) | after F6 allowlist | ✓ (ubuntu) | ✓ |
+| Cross-repo contract E2E (Swift client ↔ Rust daemon) | after F6 allowlist | ✓ | ✓ |
+| Build the iOS app target | ✗ | ✓ (macos runner) | ✓ |
+| Simulator / XCUITest | ✗ | ✓ (macos runner) | ✓ |
+| TestFlight archive + upload | ✗ | possible, deferred | ✓ |
+
+## 12. Phasing
 
 | Phase | Contents | Exit criteria |
 |-------|----------|---------------|
 | **0 — Ops** | Tailscale on Mac + phone; `tailscale serve`; contract doc committed | `/api/health` reachable from the phone over HTTPS on cellular |
-| **1 — Server guard** | Workstream A (store, guard, requests, REST) + Workstream B (pairing, device auth) + WebChat approvals panel | Agent `set` on an existing name queues a request; approving from WebChat applies it; device pairs and calls the API; `cargo fmt/clippy/test` green |
-| **2 — App MVP** | Workstream C: pairing → credentials → approvals → chat (SSE) → **TestFlight build 1** to internal testers | Add a credential from the phone; approve an agent request from the phone; hold a streamed chat |
-| **3 — Notify & polish** | Workstream E (APNs), device management UI, version history + rollback UI | Lock-screen push on new request; revoke a device from the app |
-| **4 — Deferred** | `SecretsBackend` extraction; multi-server profile UI | — |
+| **1 — Evaluation harness** | Workstream F: cli `embeddings` feature gate, `ScriptedProvider`, E2E runner with the full scenario list (guard scenarios xfail), ApolloKit package skeleton + `swift test`, CI lanes in both repos | One command builds daemon (+ ApolloKit where Swift is available), boots, and runs the suite green in a fresh sandbox and in CI; target scenarios exist as xfail |
+| **2 — Server guard** | Workstream A (store, guard, requests, REST) + Workstream B (pairing, device auth) + WebChat approvals panel — each landing flips its xfail scenarios to must-pass | E2E scenarios 1–8 pass for real; `cargo fmt/clippy/test` green |
+| **3 — App MVP** | Workstream C: pairing → credentials → approvals → chat (SSE) → **TestFlight build 1** to internal testers | ApolloKit E2E green against a live gateway; macOS CI builds the app; add a credential and approve a request from the phone; hold a streamed chat |
+| **4 — Notify & polish** | Workstream E (APNs), device management UI, version history + rollback UI | Lock-screen push on new request; revoke a device from the app |
+| **5 — Deferred** | `SecretsBackend` extraction; multi-server profile UI | — |
 
-Phases 1 and 2 can overlap once Phase 1's REST surface is merged (the app can
-develop against it locally).
+Phases 2 and 3 can overlap once Phase 2's REST surface is merged (the app can
+develop against it, and the harness pins the contract from both sides).
 
-## 12. Threat-model notes
+## 13. Threat-model notes
 
 Protected against:
 - **Agent clobbering or deleting credentials** — enforced in the store layer
@@ -375,9 +483,11 @@ Explicitly out of scope:
 - The user rubber-stamping approvals without reading them.
 - Malicious tampering with the rustykrab binary itself.
 
-## 13. Open items (non-blocking, defaults chosen)
+## 14. Open items (non-blocking, defaults chosen)
 
 - Request expiry window: defaulting to 7 days.
+- macOS CI runner minutes bill at 10× on private repos — start with build +
+  unit tests per push and revisit if the bill matters.
 - Version history retention: unlimited for now; a purge command can come with
   the rollback UI in Phase 3.
 - Whether `credential_read` should ever gate value reads (e.g. per-name agent
