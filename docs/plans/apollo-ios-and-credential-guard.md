@@ -433,6 +433,32 @@ For the Claude cloud environment used on these repos:
 | `ANTHROPIC_API_KEY` as an environment secret | live-fire E2E lane (scripted mode needs nothing) | optional |
 | Apple signing: none needed for CI build/test; App Store Connect API key only if TestFlight upload should ever run from CI | automated TestFlight from CI (otherwise upload stays on the Mac) | later |
 
+### F7. Running the whole loop locally on the Mac
+The Mac is the fullest lane (Xcode, simulator, TestFlight, unrestricted
+network, real Keychain), so day-to-day development can move there entirely —
+the branch and these docs are the hand-off. Bootstrap:
+
+```sh
+mkdir -p ~/dev/apollo && cd ~/dev/apollo
+git clone https://github.com/gcbh/rustykrab.git
+git clone https://github.com/gcbh/apollo-ios.git
+(cd rustykrab  && git checkout claude/ios-app-credentials-ikd7bm)
+(cd apollo-ios && git checkout claude/ios-app-credentials-ikd7bm)
+cd rustykrab && claude --add-dir ../apollo-ios
+```
+
+Opening message for the local session:
+> Read docs/plans/apollo-ios-and-credential-guard.md and
+> docs/integrations/apollo.md, then start Phase 1 (Workstream F) on this
+> branch.
+
+Local sessions keep committing and pushing to the same branch, so cloud
+sessions and CI remain interchangeable with the Mac at any time. The
+sandbox-facing pieces of Workstream F (feature gate, ScriptedProvider,
+`scripts/e2e.sh`, CI lanes) stay in scope regardless of where development
+runs — they are what CI and any future cloud session use to verify the end
+state without a Mac.
+
 ### What each lane can verify
 
 | Capability | Cloud sandbox | GitHub Actions | Mac |
