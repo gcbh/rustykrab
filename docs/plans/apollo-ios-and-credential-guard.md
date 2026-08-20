@@ -357,9 +357,9 @@ Implemented on `claude/ios-app-credentials-ikd7bm`:
 | Piece | Where |
 |-------|-------|
 | `embeddings` feature gate (default on; `HashEmbedder` fallback when off) | `crates/rustykrab-cli/Cargo.toml`, `main.rs` |
-| `ScriptedProvider` + 5 unit tests | `crates/rustykrab-providers/src/scripted.rs` |
-| E2E runner, 15 scenarios (7 must-pass, 8 xfail) | `crates/rustykrab-e2e/`, `scripts/e2e.sh` |
-| `ApolloKit` package, 18 tests, `apollo-e2e` runner (12 scenarios) | apollo-ios `ApolloKit/` |
+| `ScriptedProvider` + 7 unit tests | `crates/rustykrab-providers/src/scripted.rs` |
+| E2E runner, 16 scenarios (8 must-pass, 8 xfail) | `crates/rustykrab-e2e/`, `scripts/e2e.sh` |
+| `ApolloKit` package, 20 tests, `apollo-e2e` runner (13 scenarios) | apollo-ios `ApolloKit/` |
 | CI: `e2e` job (rustykrab); ubuntu `swift test` + macOS lanes (apollo-ios) | both `.github/workflows/ci.yml` |
 
 Harness-only env knobs added to make a throwaway boot possible, all
@@ -369,12 +369,28 @@ defaulting to today's shipping behaviour: `RUSTYKRAB_DATA_DIR`,
 the real Keychain), `RUSTYKRAB_RATE_LIMIT_{MAX,WINDOW_SECS,LOCKOUT_SECS}`,
 and `RUSTYKRAB_PROVIDER=scripted` + `RUSTYKRAB_SCRIPT_PATH`.
 
-Measured state: `cargo fmt/clippy/test` green (477 tests); `scripts/e2e.sh`
-green (7 pass / 8 xfail / 0 fail / 0 xpass); `swift test` green (18);
-`apollo-e2e` against a live daemon green (6 pass / 6 xfail / 0 fail). The
+Measured state: `cargo fmt/clippy/test` green (479 tests); `scripts/e2e.sh`
+green (8 pass / 8 xfail / 0 fail / 0 xpass); `swift test` green (20);
+`apollo-e2e` against a live daemon green (6 pass / 7 xfail / 0 fail). The
 xfail details are the guard's own indictment — today they read
 "agent overwrote an existing credential" and "agent deleted an existing
 credential outright". Phase 2 is done when those flip.
+
+Each xfail is written against the **full** exit criterion, not a proxy
+for it, and asserts on the store tables the plan specifies
+(`secret_versions`, `secret_audit`, `credential_requests`) rather than
+only on what the REST API reveals — a scenario that could pass while the
+behaviour it names is still broken would let Phase 2 be declared done
+falsely. Concretely: the pairing scenarios mint a code via `rustykrab
+pair`, exchange it, and use the resulting device token as a bearer;
+revocation then re-uses that token and requires a `401`; deny requires
+the value unchanged *and* `proposed_data` wiped; the agent-overwrite
+scenario also greps `proposed_data` to prove the proposal is encrypted
+at rest.
+
+Phase 2 will also need a `rustykrab pair` CLI subcommand that prints the
+code and QR payload — both harnesses drive it, and both currently xfail
+with "unknown subcommand 'pair'".
 
 **Contract gap found while wiring the harness (Phase 2 work):** the
 gateway's origin-check middleware (`gateway/src/origin.rs`) *requires* an
