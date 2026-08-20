@@ -290,7 +290,14 @@ async fn execute_cron_task(
     // Run the agent. Mint a fresh trace id per scheduled run so prompt-log
     // rows and agent logs for this job line up.
     let trace_id = Uuid::new_v4();
-    tracing::info!(%trace_id, job_id = %job.id, "scheduled task starting");
+    // `version` here matches what record_run stamps onto the job_runs row,
+    // so a log line and a DB row can be tied to the same build.
+    tracing::info!(
+        %trace_id,
+        job_id = %job.id,
+        version = rustykrab_core::VERSION,
+        "scheduled task starting"
+    );
     let no_op_event = |_event: AgentEvent| {};
     let result = rustykrab_gateway::run_agent_streaming_with_options(
         state,

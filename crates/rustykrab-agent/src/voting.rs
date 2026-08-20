@@ -77,6 +77,7 @@ impl ConsistencyVoter {
                         role: Role::System,
                         content: MessageContent::Text(ctx),
                         created_at: Utc::now(),
+                        agent_version: Message::version_stamp(),
                     });
                 }
                 messages.push(Message {
@@ -84,6 +85,7 @@ impl ConsistencyVoter {
                     role: Role::User,
                     content: MessageContent::Text(query),
                     created_at: Utc::now(),
+                    agent_version: Message::version_stamp(),
                 });
 
                 let result = match tokio::time::timeout(
@@ -170,6 +172,7 @@ impl ConsistencyVoter {
             role: Role::User,
             content: MessageContent::Text(prompt),
             created_at: Utc::now(),
+            agent_version: Message::version_stamp(),
         }];
 
         let timeout_secs = self.config.model_call_timeout_secs;

@@ -182,12 +182,14 @@ async fn execute_repl_call_impl(
             role: Role::System,
             content: MessageContent::Text(system),
             created_at: Utc::now(),
+            agent_version: Message::version_stamp(),
         },
         Message {
             id: Uuid::new_v4(),
             role: Role::User,
             content: MessageContent::Text(prompt),
             created_at: Utc::now(),
+            agent_version: Message::version_stamp(),
         },
     ];
 
@@ -257,6 +259,7 @@ async fn execute_repl_call_impl(
                     role: Role::Tool,
                     content: MessageContent::ToolResult(result),
                     created_at: Utc::now(),
+                    agent_version: Message::version_stamp(),
                 });
             }
             continue;
@@ -285,6 +288,7 @@ async fn execute_repl_call_impl(
                     role: Role::User,
                     content: MessageContent::Text("Continue.".to_string()),
                     created_at: Utc::now(),
+                    agent_version: Message::version_stamp(),
                 });
                 continue;
             }
@@ -325,6 +329,7 @@ async fn execute_repl_call_impl(
                             .to_string(),
                     ),
                     created_at: Utc::now(),
+                                    agent_version: Message::version_stamp(),
                 });
                 continue;
             }
@@ -388,6 +393,7 @@ async fn direct_call(
             role: Role::System,
             content: MessageContent::Text(format!("Context:\n{context}")),
             created_at: Utc::now(),
+            agent_version: Message::version_stamp(),
         });
     }
     messages.push(Message {
@@ -395,6 +401,7 @@ async fn direct_call(
         role: Role::User,
         content: MessageContent::Text(prompt.to_string()),
         created_at: Utc::now(),
+        agent_version: Message::version_stamp(),
     });
 
     let response = provider.chat(&messages, &[]).await?;
@@ -430,6 +437,7 @@ mod tests {
                     role: Role::Assistant,
                     content: MessageContent::Text(text.to_string()),
                     created_at: Utc::now(),
+                    agent_version: None,
                 },
                 usage: Usage {
                     prompt_tokens: 10,
@@ -453,6 +461,7 @@ mod tests {
                         arguments: args,
                     }),
                     created_at: Utc::now(),
+                    agent_version: None,
                 },
                 usage: Usage {
                     prompt_tokens: 10,
