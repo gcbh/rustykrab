@@ -18,7 +18,7 @@ use rustykrab_channels::telegram::ChannelMessage;
 use rustykrab_channels::{TelegramChannel, VideoChannel, VideoConfig};
 use rustykrab_core::model::ModelProvider;
 use rustykrab_core::orchestration::OrchestrationConfig;
-use rustykrab_core::types::MessageContent;
+use rustykrab_core::types::{Conversation, Message, MessageContent, Role};
 use rustykrab_gateway::AppState;
 use rustykrab_memory::backend::HybridMemoryBackend;
 use rustykrab_memory::embedding::FastEmbedder;
@@ -882,6 +882,39 @@ async fn shutdown_signal() {
     tracing::info!("shutdown signal received");
 }
 
+/// Build the prompt for a scheduled job execution.
+fn scheduled_task_prompt(task: &str) -> String {
+    format!(
+        "[Scheduled task] The following task was scheduled by the user and is now due. \
+         Execute it and provide the result concisely.\n\nTask: {task}"
+    )
+}
+
+/// Append the scheduled prompt to `conv` as a real user turn.
+///
+/// `run_agent_*` injects only the system prompt and relies on the caller to
+/// have already appended the user message — see the `Role::System`-only
+/// injection in `rustykrab_gateway::orchestrate::build_and_inject_system_prompt`,
+/// and the interactive call sites that each push a user turn first
+/// (`routes.rs`, `process_telegram_message`). The `user_content` argument to
+/// `run_agent_*` only drives profile routing and system-prompt construction; it
+/// never becomes a message.
+///
+/// Without this, a job conversation reaches the provider carrying nothing but
+/// system/assistant/tool messages, which Ollama >= 0.32 rejects outright with
+/// `{"error":"no user query found in messages"}`. Appending here also
+/// guarantees the newest message is a user turn, so a provider that trims
+/// context oldest-first can never strand the request without one.
+fn push_scheduled_user_turn(conv: &mut Conversation, prompt: &str) {
+    conv.messages.push(Message {
+        id: Uuid::new_v4(),
+        role: Role::User,
+        content: MessageContent::Text(prompt.to_string()),
+        created_at: Utc::now(),
+    });
+    conv.updated_at = Utc::now();
+}
+
 /// Background task: poll for due scheduled jobs and execute them.
 ///
 /// Every 30 seconds, queries the job store for enabled jobs whose
@@ -929,10 +962,10 @@ async fn job_executor_loop(store: rustykrab_store::Store, state: AppState) {
                 };
 
                 // Prefix the task so the agent knows this is a scheduled execution.
-                let prompt = format!(
-                    "[Scheduled task] The following task was scheduled by the user and is now due. \
-                     Execute it and provide the result concisely.\n\nTask: {task}"
-                );
+                let prompt = scheduled_task_prompt(&task);
+
+                // A scheduled run must contribute its own user turn.
+                push_scheduled_user_turn(&mut conv, &prompt);
 
                 // Run the agent.
                 let no_op_event = |_event: AgentEvent| {};
@@ -1401,4 +1434,94 @@ fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> anyhow::R
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn empty_conv() -> Conversation {
+        let now = Utc::now();
+        Conversation {
+            id: Uuid::new_v4(),
+            messages: Vec::new(),
+            created_at: now,
+            updated_at: now,
+            summary: None,
+            detected_profile: None,
+            channel_source: None,
+            channel_id: None,
+        }
+    }
+
+    fn system_msg(text: &str) -> Message {
+        Message {
+            id: Uuid::new_v4(),
+            role: Role::System,
+            content: MessageContent::Text(text.to_string()),
+            created_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn scheduled_task_prompt_embeds_the_task() {
+        let prompt = scheduled_task_prompt("water the plants");
+        assert!(prompt.starts_with("[Scheduled task]"));
+        assert!(prompt.ends_with("Task: water the plants"));
+    }
+
+    #[test]
+    fn scheduled_run_appends_a_user_turn_with_the_prompt() {
+        let mut conv = empty_conv();
+        let prompt = scheduled_task_prompt("summarise today's mail");
+
+        push_scheduled_user_turn(&mut conv, &prompt);
+
+        let last = conv.messages.last().expect("a message was appended");
+        assert_eq!(last.role, Role::User);
+        assert_eq!(last.content.as_text(), Some(prompt.as_str()));
+    }
+
+    /// The provider rejects a request whose message array carries no `user`
+    /// role (`{"error":"no user query found in messages"}`). A scheduled run
+    /// over a conversation that only holds system/assistant/tool turns must
+    /// still reach the provider with a user turn present.
+    #[test]
+    fn scheduled_run_leaves_a_user_role_in_a_system_only_conversation() {
+        let mut conv = empty_conv();
+        conv.messages
+            .push(system_msg("You are a helpful assistant."));
+
+        assert!(!conv.messages.iter().any(|m| m.role == Role::User));
+
+        push_scheduled_user_turn(&mut conv, &scheduled_task_prompt("check the feed"));
+
+        assert!(conv.messages.iter().any(|m| m.role == Role::User));
+    }
+
+    #[test]
+    fn scheduled_user_turn_is_the_newest_message() {
+        let mut conv = empty_conv();
+        conv.messages.push(system_msg("system"));
+        conv.messages.push(Message {
+            id: Uuid::new_v4(),
+            role: Role::Assistant,
+            content: MessageContent::Text("older reply".to_string()),
+            created_at: Utc::now(),
+        });
+
+        push_scheduled_user_turn(&mut conv, &scheduled_task_prompt("run it"));
+
+        // Oldest-first context trimming can never strand the request without a
+        // user turn while the newest message is one.
+        assert_eq!(conv.messages.last().unwrap().role, Role::User);
+    }
+
+    #[test]
+    fn scheduled_user_turn_bumps_updated_at() {
+        let mut conv = empty_conv();
+        let before = conv.updated_at;
+        push_scheduled_user_turn(&mut conv, "prompt");
+        assert!(conv.updated_at >= before);
+    }
 }
