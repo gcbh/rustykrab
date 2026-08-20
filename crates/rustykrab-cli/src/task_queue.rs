@@ -66,11 +66,16 @@ impl TaskQueue {
 
     /// Submit a task to the queue. Returns `Err` if the queue is full
     /// or the worker has stopped.
+    ///
+    /// The error is boxed because tokio's `SendError` hands the unsent
+    /// `TaskRequest` back to the caller, which makes the `Err` variant far
+    /// larger than the `Ok` one — every caller would pay for that on the
+    /// success path. Boxing allocates only when the worker is already gone.
     pub async fn submit(
         &self,
         request: TaskRequest,
-    ) -> Result<(), mpsc::error::SendError<TaskRequest>> {
-        self.tx.send(request).await
+    ) -> Result<(), Box<mpsc::error::SendError<TaskRequest>>> {
+        self.tx.send(request).await.map_err(Box::new)
     }
 }
 
