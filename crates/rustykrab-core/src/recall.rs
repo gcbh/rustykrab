@@ -156,13 +156,9 @@ impl RecallStore {
         self.hydrate(conversation_id);
         {
             let guard = self.inner.read().unwrap_or_else(|e| e.into_inner());
-            match guard.get(&conversation_id) {
-                None => return None,
-                Some(entry) => {
-                    if let Some(joined) = &entry.joined {
-                        return Some(Arc::clone(joined));
-                    }
-                }
+            let entry = guard.get(&conversation_id)?;
+            if let Some(joined) = &entry.joined {
+                return Some(Arc::clone(joined));
             }
         }
         // Joined view not built yet — take the write lock and cache it.
