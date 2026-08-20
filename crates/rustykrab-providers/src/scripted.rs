@@ -188,6 +188,9 @@ fn assistant_message(content: MessageContent) -> Message {
         role: Role::Assistant,
         content,
         created_at: Utc::now(),
+        // Unstamped, like the other providers' wire conversions: the
+        // runner stamps the messages it keeps.
+        agent_version: None,
     }
 }
 
@@ -251,6 +254,7 @@ mod tests {
             role: Role::User,
             content: MessageContent::Text(text.to_string()),
             created_at: Utc::now(),
+            agent_version: None,
         }
     }
 
@@ -265,6 +269,7 @@ mod tests {
                 images: vec![],
             }),
             created_at: Utc::now(),
+            agent_version: None,
         }
     }
 
