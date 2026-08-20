@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.0.0] - 2026-08-20
+
+- Phase 1: evaluation harness for the credential guard (#487)
+
 ## [4.6.0] - 2026-08-20
 
 - fix(cron): carry real context into scheduled runs (#486)

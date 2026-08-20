@@ -1,0 +1,20 @@
+[package]
+name = "rustykrab-e2e"
+description = "End-to-end evaluation harness: boots the daemon and runs the phase exit-criteria scenarios"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rustykrab-store.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+reqwest = { workspace = true, features = ["stream"] }
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tempfile = "3"
+# Direct reads of the daemon's SQLite store, so scenarios can assert on
+# the tables the plan specifies (secret_versions, secret_audit,
+# credential_requests) and not just on what the REST API reveals.
+rusqlite = { version = "0.34", features = ["bundled"] }

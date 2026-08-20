@@ -88,7 +88,7 @@ impl AppState {
             tools,
             provider,
             auth_token: Arc::new(RwLock::new(auth_token)),
-            rate_limiter: Arc::new(RateLimiter::new(RateLimitConfig::default())),
+            rate_limiter: Arc::new(RateLimiter::new(RateLimitConfig::from_env())),
             origin_policy: OriginPolicy::default(),
             telegram: None,
             signal: None,

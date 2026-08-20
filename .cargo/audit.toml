@@ -29,4 +29,14 @@ ignore = [
     # either does.
     "RUSTSEC-2026-0194",
     "RUSTSEC-2026-0195",
+
+    # number_prefix 0.4.0 is unmaintained (the crate is archived; the
+    # advisory recommends `unit-prefix`). No vulnerability is reported
+    # against it — it only formats byte counts as "1.2 KiB". It reaches us
+    # transitively and is not selectable: indicatif 0.17 -> hf-hub ->
+    # fastembed, i.e. progress bars for the embedding-model download.
+    # Nothing calls it outside that path, and it disappears entirely from
+    # `--no-default-features` builds (the E2E lane). Revisit when indicatif
+    # switches to unit-prefix.
+    "RUSTSEC-2025-0119",
 ]

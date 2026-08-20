@@ -13,3 +13,6 @@
 # OS
 .DS_Store
 Thumbs.db
+
+# E2E harness report (written by scripts/e2e.sh)
+e2e-report.json

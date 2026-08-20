@@ -2,7 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # Feature branches build too, so cloud agents (which can't run the
+    # macOS/simulator lane) can iterate by pushing and reading checks.
+    branches: [main, 'claude/**']
   pull_request:
     branches: [main]
 
@@ -45,18 +47,44 @@ jobs:
   audit:
     name: Security Audit
     runs-on: ubuntu-latest
+    # The action publishes its findings as a check run, which the default
+    # read-only token cannot create ("Resource not accessible by
+    # integration").
+    permissions:
+      contents: read
+      checks: write
     steps:
       - uses: actions/checkout@v4
       - uses: rustsec/audit-check@v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
+  e2e:
+    name: E2E Evaluation Harness
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Builds with --no-default-features (no ONNX runtime download), boots
+      # the daemon on a temp dir, runs the exit-criteria scenarios with the
+      # scripted agent. Green = implemented scenarios pass and no Phase 2
+      # target scenario passes unexpectedly.
+      - run: scripts/e2e.sh
+      - name: Upload scenario report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-report
+          path: e2e-report.json
+          if-no-files-found: ignore
+
   # Gate job: add this as a required status check in branch protection
   # to block merges when any CI job fails.
   ci-pass:
     name: CI Pass
     if: always()
-    needs: [check, test, fmt, audit]
+    needs: [check, test, fmt, audit, e2e]
     runs-on: ubuntu-latest
     steps:
       - name: Verify all checks passed
@@ -64,11 +92,13 @@ jobs:
           if [[ "${{ needs.check.result }}" != "success" ||
                 "${{ needs.test.result }}" != "success" ||
                 "${{ needs.fmt.result }}" != "success" ||
-                "${{ needs.audit.result }}" != "success" ]]; then
+                "${{ needs.audit.result }}" != "success" ||
+                "${{ needs.e2e.result }}" != "success" ]]; then
             echo "::error::One or more CI jobs failed"
             echo "  check:  ${{ needs.check.result }}"
             echo "  test:   ${{ needs.test.result }}"
             echo "  fmt:    ${{ needs.fmt.result }}"
             echo "  audit:  ${{ needs.audit.result }}"
+            echo "  e2e:    ${{ needs.e2e.result }}"
             exit 1
           fi

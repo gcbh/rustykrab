@@ -121,7 +121,7 @@ version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "435a87a52755b8f27fcf321ac4f04b2802e337c8c4872923137471ec39c37532"
 dependencies = [
- "event-listener 5.4.1",
+ "event-listener 5.4.2",
  "event-listener-strategy",
  "futures-core",
  "pin-project-lite",
@@ -223,7 +223,7 @@ version = "3.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "290f7f2596bd5b78a9fec8088ccd89180d7f9f55b94b0576823bbbdc72ee8311"
 dependencies = [
- "event-listener 5.4.1",
+ "event-listener 5.4.2",
  "event-listener-strategy",
  "pin-project-lite",
 ]
@@ -241,7 +241,7 @@ dependencies = [
  "async-task",
  "blocking",
  "cfg-if",
- "event-listener 5.4.1",
+ "event-listener 5.4.2",
  "futures-lite",
  "rustix 1.1.4",
 ]
@@ -1416,11 +1416,10 @@ checksum = "0206175f82b8d6bf6652ff7d71a1e27fd2e4efde587fd368662814d6ec1d9ce0"
 
 [[package]]
 name = "event-listener"
-version = "5.4.1"
+version = "5.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e13b66accf52311f30a0db42147dadea9850cb48cd070028831ae5f5d4b856ab"
+checksum = "5a23add41df1562121a9393cb065eab5146a1242410f23a644851e90cfd669d2"
 dependencies = [
- "concurrent-queue",
  "parking",
  "pin-project-lite",
 ]
@@ -1431,7 +1430,7 @@ version = "0.5.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8be9f3dfaaffdae2972880079a491a1a8bb7cbed0b8dd7a347f668b4150a3b93"
 dependencies = [
- "event-listener 5.4.1",
+ "event-listener 5.4.2",
  "pin-project-lite",
 ]
 
@@ -3820,7 +3819,7 @@ dependencies = [
  "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
- "wasm-streams",
+ "wasm-streams 0.4.2",
  "web-sys",
  "webpki-roots 1.0.7",
 ]
@@ -3836,6 +3835,7 @@ dependencies = [
  "cookie",
  "cookie_store",
  "futures-core",
+ "futures-util",
  "http",
  "http-body",
  "http-body-util",
@@ -3856,12 +3856,14 @@ dependencies = [
  "sync_wrapper",
  "tokio",
  "tokio-rustls",
+ "tokio-util",
  "tower",
  "tower-http",
  "tower-service",
  "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
+ "wasm-streams 0.5.0",
  "web-sys",
 ]
 
@@ -4074,7 +4076,7 @@ checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
 
 [[package]]
 name = "rustykrab-agent"
-version = "4.5.15"
+version = "4.6.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -4091,7 +4093,7 @@ dependencies = [
 
 [[package]]
 name = "rustykrab-channels"
-version = "4.5.15"
+version = "4.6.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -4112,7 +4114,7 @@ dependencies = [
 
 [[package]]
 name = "rustykrab-cli"
-version = "4.5.15"
+version = "4.6.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4145,7 +4147,7 @@ dependencies = [
 
 [[package]]
 name = "rustykrab-core"
-version = "4.5.15"
+version = "4.6.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -4158,8 +4160,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustykrab-e2e"
+version = "4.6.0"
+dependencies = [
+ "anyhow",
+ "reqwest 0.13.3",
+ "rusqlite",
+ "rustykrab-store",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
+]
+
+[[package]]
 name = "rustykrab-gateway"
-version = "4.5.15"
+version = "4.6.0"
 dependencies = [
  "axum",
  "chrono",
@@ -4183,7 +4200,7 @@ dependencies = [
 
 [[package]]
 name = "rustykrab-memory"
-version = "4.5.15"
+version = "4.6.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -4204,7 +4221,7 @@ dependencies = [
 
 [[package]]
 name = "rustykrab-providers"
-version = "4.5.15"
+version = "4.6.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -4222,7 +4239,7 @@ dependencies = [
 
 [[package]]
 name = "rustykrab-skills"
-version = "4.5.15"
+version = "4.6.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4238,7 +4255,7 @@ dependencies = [
 
 [[package]]
 name = "rustykrab-store"
-version = "4.5.15"
+version = "4.6.0"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -4261,7 +4278,7 @@ dependencies = [
 
 [[package]]
 name = "rustykrab-tools"
-version = "4.5.15"
+version = "4.6.0"
 dependencies = [
  "async-imap",
  "async-trait",
@@ -5637,6 +5654,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "wasm-streams"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9d1ec4f6517c9e11ae630e200b2b65d193279042e28edd4a2cda233e46670bbb"
+dependencies = [
+ "futures-util",
+ "js-sys",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+]
+
+[[package]]
 name = "wasmparser"
 version = "0.244.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6465,7 +6495,7 @@ dependencies = [
  "async-trait",
  "blocking",
  "enumflags2",
- "event-listener 5.4.1",
+ "event-listener 5.4.2",
  "futures-core",
  "futures-lite",
  "hex",
