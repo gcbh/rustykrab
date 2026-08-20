@@ -36,6 +36,13 @@ pub struct ScheduledJob {
     /// run creates and persists one; subsequent runs append to the same
     /// conversation so the agent sees prior context.
     pub conversation_id: Option<String>,
+    /// RustyKrab version that created this job.
+    ///
+    /// The `task` string is written once at creation and never updated, so
+    /// its quality is fixed by whatever build produced it. Recording that
+    /// build makes "which jobs were created before fix X?" a query rather
+    /// than a guess. `None` for jobs created before this column existed.
+    pub created_version: Option<String>,
 }
 
 /// A recorded execution of a scheduled job.
@@ -49,6 +56,10 @@ pub struct JobRun {
     pub output: Option<String>,
     pub started_at: DateTime<Utc>,
     pub finished_at: DateTime<Utc>,
+    /// RustyKrab version that executed this run, so a given output can be
+    /// attributed to the build that produced it. `None` for runs recorded
+    /// before this column existed.
+    pub rustykrab_version: Option<String>,
 }
 
 /// Handle for scheduled-job CRUD operations, backed by SQLite.
@@ -95,13 +106,14 @@ impl JobStore {
             last_run_at: None,
             created_at: now,
             conversation_id: None,
+            created_version: Some(rustykrab_core::VERSION.to_string()),
         };
 
         let row = job.clone();
         with_conn(&self.conn, move |conn| {
             conn.execute(
-                "INSERT INTO scheduled_jobs (id, schedule, task, channel, chat_id, thread_id, one_shot, enabled, next_run_at, last_run_at, created_at, conversation_id)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                "INSERT INTO scheduled_jobs (id, schedule, task, channel, chat_id, thread_id, one_shot, enabled, next_run_at, last_run_at, created_at, conversation_id, created_version)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                 params![
                     row.id,
                     row.schedule,
@@ -115,6 +127,7 @@ impl JobStore {
                     row.last_run_at.map(|t| t.to_rfc3339()),
                     row.created_at.to_rfc3339(),
                     row.conversation_id,
+                    row.created_version,
                 ],
             )
             .map_err(|e| Error::Storage(e.to_string()))?;
@@ -286,12 +299,13 @@ impl JobStore {
             output: output.map(|s| s.to_string()),
             started_at,
             finished_at,
+            rustykrab_version: Some(rustykrab_core::VERSION.to_string()),
         };
         let row = run.clone();
         with_conn(&self.conn, move |conn| {
             conn.execute(
-                "INSERT INTO job_runs (id, job_id, status, output, started_at, finished_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO job_runs (id, job_id, status, output, started_at, finished_at, rustykrab_version)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
                     row.id,
                     row.job_id,
@@ -299,6 +313,7 @@ impl JobStore {
                     row.output,
                     row.started_at.to_rfc3339(),
                     row.finished_at.to_rfc3339(),
+                    row.rustykrab_version,
                 ],
             )
             .map_err(|e| Error::Storage(e.to_string()))?;
@@ -332,7 +347,7 @@ impl JobStore {
         with_conn(&self.conn, move |conn| {
             let mut stmt = conn
                 .prepare(
-                    "SELECT id, job_id, status, output, started_at, finished_at
+                    "SELECT id, job_id, status, output, started_at, finished_at, rustykrab_version
                      FROM job_runs
                      WHERE job_id = ?1
                      ORDER BY finished_at DESC
@@ -349,6 +364,7 @@ impl JobStore {
                         output: row.get(3)?,
                         started_at: parse_stored_timestamp(row.get::<_, String>(4)?),
                         finished_at: parse_stored_timestamp(row.get::<_, String>(5)?),
+                        rustykrab_version: row.get::<_, Option<String>>(6)?,
                     })
                 })
                 .map_err(|e| Error::Storage(e.to_string()))?
@@ -364,7 +380,7 @@ impl JobStore {
 /// Column list for `SELECT`s against `scheduled_jobs`. Kept in sync with
 /// [`row_to_job`].
 const JOB_COLUMNS: &str = "id, schedule, task, channel, chat_id, thread_id, one_shot, enabled, \
-     next_run_at, last_run_at, created_at, conversation_id";
+     next_run_at, last_run_at, created_at, conversation_id, created_version";
 
 /// Decode a row produced by a `SELECT {JOB_COLUMNS}` into a [`ScheduledJob`].
 fn row_to_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<ScheduledJob> {
@@ -381,6 +397,7 @@ fn row_to_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<ScheduledJob> {
         last_run_at: row.get::<_, Option<String>>(9)?.map(parse_stored_timestamp),
         created_at: parse_stored_timestamp(row.get::<_, String>(10)?),
         conversation_id: row.get::<_, Option<String>>(11)?,
+        created_version: row.get::<_, Option<String>>(12)?,
     })
 }
 
@@ -465,6 +482,114 @@ fn parse_stored_timestamp(s: String) -> DateTime<Utc> {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn create_job_stamps_the_running_version() {
+        // The `task` string is fixed at creation and never updated, so
+        // knowing which build wrote it is what makes "find every job created
+        // before fix X" a query instead of a guess.
+        let s = in_memory_jobs();
+        let job = s
+            .create_job("0 9 * * *", "Daily briefing.", None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            job.created_version.as_deref(),
+            Some(rustykrab_core::VERSION)
+        );
+
+        // And it survives the round-trip rather than only living on the
+        // returned struct.
+        let fetched = s.get_job(&job.id).await.unwrap();
+        assert_eq!(
+            fetched.created_version.as_deref(),
+            Some(rustykrab_core::VERSION)
+        );
+    }
+
+    #[tokio::test]
+    async fn record_run_stamps_version_and_list_runs_reads_it_back() {
+        let s = in_memory_jobs();
+        let job = s
+            .create_job("0 9 * * *", "Daily briefing.", None, None, None)
+            .await
+            .unwrap();
+        let now = Utc::now();
+        let run = s
+            .record_run(&job.id, "ok", Some("output"), now, now)
+            .await
+            .unwrap();
+        assert_eq!(
+            run.rustykrab_version.as_deref(),
+            Some(rustykrab_core::VERSION)
+        );
+
+        let runs = s.list_runs(&job.id, 10).await.unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(
+            runs[0].rustykrab_version.as_deref(),
+            Some(rustykrab_core::VERSION),
+            "list_runs must project the version column, not drop it"
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_adds_version_columns_without_backfilling_old_rows() {
+        // A database created by a build that predates the version columns.
+        // Rows already in it were produced by an unknown build, so they must
+        // read back as None — back-filling them with the current version
+        // would assert an attribution we don't actually have.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE scheduled_jobs (
+                 id TEXT PRIMARY KEY, schedule TEXT NOT NULL, task TEXT NOT NULL,
+                 channel TEXT, chat_id TEXT, thread_id TEXT,
+                 one_shot INTEGER NOT NULL DEFAULT 0, enabled INTEGER NOT NULL DEFAULT 1,
+                 next_run_at TEXT NOT NULL, last_run_at TEXT, created_at TEXT NOT NULL,
+                 conversation_id TEXT
+             );
+             CREATE TABLE job_runs (
+                 id TEXT PRIMARY KEY, job_id TEXT NOT NULL, status TEXT NOT NULL,
+                 output TEXT, started_at TEXT NOT NULL, finished_at TEXT NOT NULL
+             );
+             INSERT INTO scheduled_jobs (id, schedule, task, next_run_at, created_at)
+                 VALUES ('old-job', '0 9 * * *', 'legacy task',
+                         '2099-01-01T00:00:00+00:00', '2020-01-01T00:00:00+00:00');
+             INSERT INTO job_runs (id, job_id, status, output, started_at, finished_at)
+                 VALUES ('old-run', 'old-job', 'ok', 'legacy output',
+                         '2020-01-01T00:00:00+00:00', '2020-01-01T00:00:00+00:00');",
+        )
+        .unwrap();
+
+        // Migration must not fail on a table that already has rows.
+        crate::Store::run_migrations(&conn).unwrap();
+        let s = JobStore::new(Arc::new(Mutex::new(conn)));
+
+        let job = s.get_job("old-job").await.unwrap();
+        assert_eq!(job.task, "legacy task", "existing data must be preserved");
+        assert_eq!(
+            job.created_version, None,
+            "pre-existing job must not be back-filled with the current version"
+        );
+
+        let runs = s.list_runs("old-job", 10).await.unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].output.as_deref(), Some("legacy output"));
+        assert_eq!(
+            runs[0].rustykrab_version, None,
+            "pre-existing run must not be back-filled with the current version"
+        );
+
+        // New writes into the migrated database do get stamped.
+        let fresh = s
+            .create_job("0 9 * * *", "new task", None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            fresh.created_version.as_deref(),
+            Some(rustykrab_core::VERSION)
+        );
+    }
+
     #[test]
     fn compute_next_cron_5_field_expression() {
         let now = Utc::now();
@@ -540,35 +665,15 @@ mod tests {
         assert!(next_run > now);
     }
 
-    /// Build a [`JobStore`] backed by an in-memory SQLite connection with
-    /// just the schema the tests need. Avoids pulling in a tempdir crate.
+    /// Build a [`JobStore`] backed by an in-memory SQLite connection.
+    ///
+    /// Uses the real `run_migrations` rather than a hand-written copy of
+    /// the DDL: the duplicated copy silently drifted from production every
+    /// time a column was added, failing these tests for a reason that had
+    /// nothing to do with what they were checking.
     fn in_memory_jobs() -> JobStore {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE scheduled_jobs (
-                id              TEXT PRIMARY KEY,
-                schedule        TEXT NOT NULL,
-                task            TEXT NOT NULL,
-                channel         TEXT,
-                chat_id         TEXT,
-                thread_id       TEXT,
-                one_shot        INTEGER NOT NULL DEFAULT 0,
-                enabled         INTEGER NOT NULL DEFAULT 1,
-                next_run_at     TEXT NOT NULL,
-                last_run_at     TEXT,
-                created_at      TEXT NOT NULL,
-                conversation_id TEXT
-            );
-            CREATE TABLE job_runs (
-                id          TEXT PRIMARY KEY,
-                job_id      TEXT NOT NULL,
-                status      TEXT NOT NULL,
-                output      TEXT,
-                started_at  TEXT NOT NULL,
-                finished_at TEXT NOT NULL
-            );",
-        )
-        .unwrap();
+        crate::Store::run_migrations(&conn).unwrap();
         JobStore::new(Arc::new(Mutex::new(conn)))
     }
 

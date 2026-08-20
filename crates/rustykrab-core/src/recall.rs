@@ -155,6 +155,9 @@ impl RecallStore {
     pub fn get(&self, conversation_id: Uuid) -> Option<Arc<String>> {
         self.hydrate(conversation_id);
         {
+            // Scoped so the read guard is released before the write lock
+            // below. `?` returns None from the function when nothing has
+            // been archived for this conversation.
             let guard = self.inner.read().unwrap_or_else(|e| e.into_inner());
             let entry = guard.get(&conversation_id)?;
             if let Some(joined) = &entry.joined {

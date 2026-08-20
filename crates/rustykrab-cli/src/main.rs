@@ -11,7 +11,11 @@ use std::sync::Arc;
 
 use chrono::Utc;
 
-const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Re-exported so the version shown by `--version` is the same string
+/// stamped onto persisted messages, job runs, and scheduled jobs. Keep
+/// these from drifting: a `--version` that disagrees with what's in the
+/// database makes the stamps useless for attribution.
+const VERSION: &str = rustykrab_core::VERSION;
 const GIT_HASH: &str = env!("RUSTYKRAB_GIT_HASH");
 const GIT_DIRTY: &str = env!("RUSTYKRAB_GIT_DIRTY");
 const BUILD_DATE: &str = env!("RUSTYKRAB_BUILD_DATE");

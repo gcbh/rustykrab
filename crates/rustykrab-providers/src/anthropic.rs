@@ -1,7 +1,6 @@
 use crate::backoff::retry_delay;
 use crate::line_buffer::LineBuffer;
 use async_trait::async_trait;
-use chrono::Utc;
 use rustykrab_core::error::Result;
 use rustykrab_core::model::{
     ModelProvider, ModelResponse, StopReason, StreamEvent, ToolChoice, Usage,
@@ -13,7 +12,6 @@ use rustykrab_core::Error;
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
-use uuid::Uuid;
 
 /// Maximum number of retries for transient errors (429, 5xx).
 const MAX_RETRIES: u32 = 3;
@@ -285,12 +283,7 @@ impl AnthropicProvider {
             };
 
             return Ok(ModelResponse {
-                message: Message {
-                    id: Uuid::new_v4(),
-                    role: Role::Assistant,
-                    content,
-                    created_at: Utc::now(),
-                },
+                message: Message::stamped(Role::Assistant, content),
                 usage,
                 stop_reason,
                 text: if text.is_empty() { None } else { Some(text) },
@@ -298,12 +291,7 @@ impl AnthropicProvider {
         }
 
         Ok(ModelResponse {
-            message: Message {
-                id: Uuid::new_v4(),
-                role: Role::Assistant,
-                content: MessageContent::Text(text),
-                created_at: Utc::now(),
-            },
+            message: Message::stamped(Role::Assistant, MessageContent::Text(text)),
             usage,
             stop_reason,
             text: None,
@@ -811,12 +799,7 @@ impl AnthropicProvider {
         };
 
         let response = ModelResponse {
-            message: Message {
-                id: Uuid::new_v4(),
-                role: Role::Assistant,
-                content,
-                created_at: Utc::now(),
-            },
+            message: Message::stamped(Role::Assistant, content),
             usage,
             stop_reason,
             text: text_field,
@@ -1111,6 +1094,7 @@ mod tests {
                 images: Vec::new(),
             }),
             created_at: chrono::Utc::now(),
+            agent_version: None,
         };
         let (_sys, api) = AnthropicProvider::build_messages(&[msg]).expect("build");
         let json = serde_json::to_value(&api).unwrap();
@@ -1140,6 +1124,7 @@ mod tests {
                 }],
             }),
             created_at: chrono::Utc::now(),
+            agent_version: None,
         };
         let (_sys, api) = AnthropicProvider::build_messages(&[msg]).expect("build");
         let json = serde_json::to_value(&api).unwrap();

@@ -1,3 +1,13 @@
+/// The running RustyKrab version, for stamping persisted records so
+/// behaviour can be attributed to a specific build.
+///
+/// Every workspace crate sets `version.workspace = true`, so this is the
+/// workspace version and agrees across all of them. Read it from here
+/// rather than calling `env!("CARGO_PKG_VERSION")` locally: in a crate
+/// that ever stops inheriting the workspace version, a local `env!`
+/// would silently start reporting something different.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 pub mod active_tools;
 pub mod agent_def;
 pub mod capability;

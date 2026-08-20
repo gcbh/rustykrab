@@ -361,6 +361,7 @@ async fn send_message(
         role: Role::User,
         content: MessageContent::Text(body.content),
         created_at: Utc::now(),
+        agent_version: Message::version_stamp(),
     };
     conv.messages.push(user_msg);
     conv.updated_at = Utc::now();
@@ -450,6 +451,7 @@ async fn send_message_stream(
         role: Role::User,
         content: MessageContent::Text(body.content),
         created_at: Utc::now(),
+        agent_version: Message::version_stamp(),
     };
     conv.messages.push(user_msg);
     conv.updated_at = Utc::now();
@@ -827,6 +829,7 @@ mod tests {
             role: Role::Assistant,
             content: MessageContent::Text("hi there".into()),
             created_at: ts("2024-01-01T00:00:00Z"),
+            agent_version: None,
         };
         let json = serde_json::to_value(ApolloMessage::from_message(conv_id, &plain)).unwrap();
         assert_eq!(json["role"], "assistant");
@@ -846,6 +849,7 @@ mod tests {
                 arguments: serde_json::json!({"msg": "hi"}),
             }),
             created_at: ts("2024-01-01T00:00:00Z"),
+            agent_version: None,
         };
         let rendered = render_message_content(&call.content);
         assert!(rendered.starts_with("[tool_call:echo("));

@@ -290,7 +290,14 @@ async fn execute_cron_task(
     // Run the agent. Mint a fresh trace id per scheduled run so prompt-log
     // rows and agent logs for this job line up.
     let trace_id = Uuid::new_v4();
-    tracing::info!(%trace_id, job_id = %job.id, "scheduled task starting");
+    // `version` here matches what record_run stamps onto the job_runs row,
+    // so a log line and a DB row can be tied to the same build.
+    tracing::info!(
+        %trace_id,
+        job_id = %job.id,
+        version = rustykrab_core::VERSION,
+        "scheduled task starting"
+    );
     let no_op_event = |_event: AgentEvent| {};
     let result = rustykrab_gateway::run_agent_streaming_with_options(
         state,
@@ -492,7 +499,18 @@ fn build_scheduled_prompt(
              Task: {task_prompt}"
         ),
     };
-    format!("{body}\n\n{delivery}")
+    // The task string is all that survives from the conversation where this
+    // job was created — no chat history comes with it. Terse tasks ("daily
+    // briefing") therefore produce generic output unless the model first
+    // recovers the user's standing preferences from memory. Say so
+    // explicitly rather than relying on the soul prompt's general
+    // memory_search guidance.
+    let context_recovery = "You do not have the conversation this job was created in. Before \
+         composing output, call memory_search for the user's standing preferences and any \
+         earlier decisions relevant to this task (recipients, filters, format, tone, things \
+         to exclude), and apply what you find. Prefer concrete specifics you recover over \
+         generic defaults.";
+    format!("{body}\n\n{context_recovery}\n\n{delivery}")
 }
 
 /// If `task_prompt` references a registered SKILL.md skill, return
@@ -724,6 +742,30 @@ mod tests {
         assert!(prompt.contains("Last run was at 2026-04-30 09:00:00 UTC"));
         // No channel info → still tells the model the message IS the deliverable.
         assert!(prompt.contains("IS the deliverable"));
+    }
+
+    #[test]
+    fn scheduled_prompt_tells_model_it_lacks_the_creating_conversation() {
+        // The task string is the only thing carried over from the
+        // conversation where the job was created. Both the first run and
+        // recurring runs must tell the model to recover the user's standing
+        // preferences from memory, otherwise thin task strings ("daily
+        // briefing") yield generic output.
+        let first = build_scheduled_prompt("Daily briefing.", None, Some("telegram"), Some("1"));
+        let last = Utc.with_ymd_and_hms(2026, 4, 30, 9, 0, 0).unwrap();
+        let recurring =
+            build_scheduled_prompt("Daily briefing.", Some(last), Some("telegram"), Some("1"));
+
+        for (label, prompt) in [("first run", &first), ("recurring run", &recurring)] {
+            assert!(
+                prompt.contains("do not have the conversation this job was created in"),
+                "{label} should state the missing-context problem: {prompt}"
+            );
+            assert!(
+                prompt.contains("memory_search"),
+                "{label} should point at memory_search: {prompt}"
+            );
+        }
     }
 
     #[test]

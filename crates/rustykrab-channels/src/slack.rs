@@ -27,7 +27,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::Utc;
 use futures::{SinkExt, StreamExt};
 use rustykrab_core::types::{Message, MessageContent, Role};
 use rustykrab_core::{Error, Result};
@@ -35,7 +34,6 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, Mutex};
 use tokio_tungstenite::tungstenite::protocol::Message as WsMessage;
-use uuid::Uuid;
 
 /// Maximum length of a single Slack message chunk. Slack's nominal limit
 /// is ~40,000 chars but mrkdwn formatting and clients render long messages
@@ -482,12 +480,7 @@ impl SlackChannel {
             "received Slack app_mention"
         );
 
-        let message = Message {
-            id: Uuid::new_v4(),
-            role: Role::User,
-            content: MessageContent::Text(text),
-            created_at: Utc::now(),
-        };
+        let message = Message::stamped(Role::User, MessageContent::Text(text));
 
         self.inbound_tx
             .send(SlackInboundMessage {

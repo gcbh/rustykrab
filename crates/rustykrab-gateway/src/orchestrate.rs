@@ -137,6 +137,7 @@ async fn build_and_inject_system_prompt(
                 role: Role::System,
                 content: MessageContent::Text(system_prompt),
                 created_at: Utc::now(),
+                agent_version: Message::version_stamp(),
             },
         );
     }
