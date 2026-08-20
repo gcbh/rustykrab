@@ -312,12 +312,6 @@ impl MessageBackend for MessageAdapter {
     }
 }
 
-/// Store name for the APNs signing key (the `.p8` file's contents).
-/// Set it with `credential_write` or `POST /api/secrets`, so the key lives
-/// encrypted alongside every other credential rather than as a file path
-/// in configuration.
-const APNS_KEY_SECRET: &str = "apns_auth_key";
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // --- TLS crypto provider (must be set before any rustls usage) ---
@@ -467,43 +461,25 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // --- APNs push (optional) ---
-    // Only the non-secret settings come from the environment; the signing
-    // key is read from the encrypted store like any other credential, so
-    // it is never a file path baked into config. Absent configuration is
-    // the normal state and simply means no notifications.
+    // Only the non-secret settings come from the environment. The signing
+    // key is resolved on first use, not here: it is a credential, so it
+    // can be stored from the app or the CLI while the daemon is running,
+    // and rotating it does not need a restart.
     let push_notifier: Option<std::sync::Arc<dyn rustykrab_store::RequestNotifier>> =
-        match rustykrab_gateway::ApnsConfig::from_env() {
-            Some(config) => match store.secrets().get(APNS_KEY_SECRET).await {
-                Ok(key_pem) => match rustykrab_gateway::ApnsClient::new(config.clone(), &key_pem) {
-                    Ok(client) => {
-                        tracing::info!(
-                            topic = %config.topic,
-                            environment = ?config.environment,
-                            "APNs push enabled"
-                        );
-                        Some(std::sync::Arc::new(rustykrab_gateway::PushNotifier::new(
-                            std::sync::Arc::new(client),
-                            store.devices(),
-                        )))
-                    }
-                    Err(e) => {
-                        // Loud, but not fatal: approvals still work through
-                        // the app and WebChat without a notification.
-                        tracing::error!(error = %e, "APNs key rejected — push disabled");
-                        None
-                    }
-                },
-                Err(_) => {
-                    tracing::warn!(
-                        "APNs is configured but no '{APNS_KEY_SECRET}' credential is stored — \
-                         push disabled. Store the .p8 contents under that name."
-                    );
-                    None
-                }
-            },
-            None => None,
-        };
+        rustykrab_gateway::ApnsConfig::from_env().map(|config| {
+            tracing::info!(
+                topic = %config.topic,
+                environment = ?config.environment,
+                "APNs push configured (key resolved on first notification)"
+            );
+            std::sync::Arc::new(rustykrab_gateway::PushNotifier::new(
+                config,
+                store.secrets(),
+                store.devices(),
+            )) as std::sync::Arc<dyn rustykrab_store::RequestNotifier>
+        });
 
+    // Hand the notifier to the store so filing a request tells the user.
     let store = match push_notifier {
         Some(notifier) => store.with_request_notifier(notifier),
         None => store,

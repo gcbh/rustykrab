@@ -271,8 +271,15 @@ impl ApnsClient {
         )))
     }
 
-    /// True when Apple says the token is no longer valid for this app, so
-    /// the caller can stop sending to it.
+    /// True when Apple rejected our *provider* token — a rotated key or a
+    /// token outside its validity window — as opposed to the device's.
+    pub fn is_stale_provider_token(error: &Error) -> bool {
+        let text = error.to_string();
+        text.contains("InvalidProviderToken") || text.contains("ExpiredProviderToken")
+    }
+
+    /// True when Apple says the *device* token is no longer valid for this
+    /// app, so the caller can stop sending to it.
     pub fn is_dead_token(error: &Error) -> bool {
         let text = error.to_string();
         text.contains("BadDeviceToken") || text.contains("Unregistered")
@@ -280,18 +287,27 @@ impl ApnsClient {
 }
 
 /// Sends a notification to every registered device.
+///
+/// The signing key is resolved **lazily**, not at startup. It is a
+/// credential like any other, so it can be stored from the app or the CLI
+/// while the daemon is already running — reading it at boot would mean
+/// storing the key appeared to do nothing until a restart. The same
+/// property makes key rotation work: an authentication failure drops the
+/// cached client so the next notification picks up the new key.
 #[derive(Clone)]
 pub struct PushNotifier {
-    client: Arc<ApnsClient>,
+    config: ApnsConfig,
+    secrets: rustykrab_store::SecretStore,
     devices: rustykrab_store::DeviceStore,
+    client: Arc<RwLock<Option<Arc<ApnsClient>>>>,
 }
 
 impl std::fmt::Debug for PushNotifier {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // No key material or tokens in the debug output.
         f.debug_struct("PushNotifier")
-            .field("topic", &self.client.config.topic)
-            .field("environment", &self.client.config.environment)
+            .field("topic", &self.config.topic)
+            .field("environment", &self.config.environment)
             .finish()
     }
 }
@@ -313,8 +329,62 @@ impl rustykrab_store::RequestNotifier for PushNotifier {
 }
 
 impl PushNotifier {
-    pub fn new(client: Arc<ApnsClient>, devices: rustykrab_store::DeviceStore) -> Self {
-        Self { client, devices }
+    pub fn new(
+        config: ApnsConfig,
+        secrets: rustykrab_store::SecretStore,
+        devices: rustykrab_store::DeviceStore,
+    ) -> Self {
+        Self {
+            config,
+            secrets,
+            devices,
+            client: Arc::new(RwLock::new(None)),
+        }
+    }
+
+    /// The client, building it from the stored key on first use.
+    ///
+    /// Returns `None` when no key is stored yet — push is optional, and a
+    /// deployment that never sets one should not produce errors.
+    async fn client(&self) -> Option<Arc<ApnsClient>> {
+        if let Some(existing) = self
+            .client
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
+            return Some(Arc::clone(existing));
+        }
+
+        // Resolve through the registry so the key can come from an env
+        // var, the OS keychain, or the encrypted store — the same
+        // resolution order as every other credential.
+        let spec = rustykrab_store::registry::lookup("apns_auth_key")?;
+        let key_pem = rustykrab_store::registry::resolve(spec, &self.secrets).await?;
+
+        match ApnsClient::new(self.config.clone(), &key_pem) {
+            Ok(built) => {
+                let built = Arc::new(built);
+                *self.client.write().unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&built));
+                tracing::info!(
+                    topic = %self.config.topic,
+                    environment = ?self.config.environment,
+                    "APNs client ready"
+                );
+                Some(built)
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "stored APNs key is unusable — push disabled");
+                None
+            }
+        }
+    }
+
+    /// Drop the cached client so the next send re-reads the key. Used when
+    /// Apple rejects the provider token, which is what a rotated key looks
+    /// like from here.
+    fn invalidate_client(&self) {
+        *self.client.write().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
     /// Notify all devices about a filed request.
@@ -324,6 +394,10 @@ impl PushNotifier {
     /// credential. The app and WebChat both show pending requests without
     /// any notification at all.
     pub async fn announce(&self, credential_name: &str, action: &str) {
+        let Some(client) = self.client().await else {
+            tracing::debug!("no APNs key stored — skipping push");
+            return;
+        };
         let devices = match self.devices.with_push_tokens().await {
             Ok(devices) => devices,
             Err(e) => {
@@ -332,12 +406,17 @@ impl PushNotifier {
             }
         };
         for (device_id, token) in devices {
-            match self
-                .client
+            match client
                 .notify_pending_request(&token, credential_name, action)
                 .await
             {
                 Ok(()) => tracing::info!(device = %device_id, "approval push sent"),
+                Err(e) if ApnsClient::is_stale_provider_token(&e) => {
+                    // The key was rotated, or the token drifted out of
+                    // Apple's window. Rebuild on the next notification.
+                    tracing::info!("APNs provider token rejected — rebuilding client");
+                    self.invalidate_client();
+                }
                 Err(e) if ApnsClient::is_dead_token(&e) => {
                     // The app was deleted or the token was reissued. Drop it
                     // rather than retrying forever.
