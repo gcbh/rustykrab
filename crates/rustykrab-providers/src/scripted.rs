@@ -205,14 +205,17 @@ impl ModelProvider for ScriptedProvider {
             if m.role != Role::User {
                 return None;
             }
-            let text = m.content.as_text()?;
+            let text = m.content.as_text()?.to_lowercase();
             // Longest trigger wins, so one trigger being a prefix or
             // substring of another resolves to the more specific scenario
             // rather than whichever happens to be declared first.
+            // Matching is case-insensitive: when a scenario is driven from
+            // a real keyboard, iOS autocapitalizes the first letter and a
+            // case-sensitive compare would silently miss.
             self.script
                 .scenarios
                 .iter()
-                .filter(|s| text.contains(&s.trigger))
+                .filter(|s| text.contains(&s.trigger.to_lowercase()))
                 .max_by_key(|s| s.trigger.len())
                 .map(|s| (i, s))
         });
@@ -304,6 +307,15 @@ mod tests {
         let r3 = p.chat(&msgs, &[]).await.unwrap();
         assert_eq!(r3.stop_reason, StopReason::EndTurn);
         assert_eq!(r3.message.content.as_text(), Some("Done."));
+    }
+
+    /// Driving a scenario from the iOS app means typing on a keyboard that
+    /// autocapitalizes: "e2e: set token" arrives as "E2e: set token".
+    #[tokio::test]
+    async fn trigger_matching_ignores_case() {
+        let p = ScriptedProvider::from_json(SCRIPT).unwrap();
+        let r = p.chat(&[user("E2E: Set Token now")], &[]).await.unwrap();
+        assert_eq!(r.stop_reason, StopReason::ToolUse);
     }
 
     #[tokio::test]
