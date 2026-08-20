@@ -63,7 +63,37 @@ impl Tool for CronTool {
                     },
                     "task": {
                         "type": "string",
-                        "description": "The task description or prompt to execute when the schedule fires (required for create)"
+                        "description": concat!(
+                            "Required for create. The prompt that will be executed when the schedule fires.\n",
+                            "\n",
+                            "CRITICAL: this string is the ONLY thing carried forward from this conversation. ",
+                            "When the job fires — possibly days later — a fresh agent run receives this text and ",
+                            "nothing else: no chat history, no memory of what the user just told you, no access ",
+                            "to what you and the user worked out together. A short label like 'daily briefing' ",
+                            "or 'check emails' will produce a generic, useless result.\n",
+                            "\n",
+                            "Write a self-contained brief. Fold in everything the user told you that the future ",
+                            "run needs:\n",
+                            "  - What to do, as an explicit instruction (not a topic label)\n",
+                            "  - Which sources/tools to use, and what to ignore\n",
+                            "  - Any filters, thresholds, names, accounts, or projects the user named\n",
+                            "  - Output format, length, tone, and ordering the user asked for\n",
+                            "  - Any standing preferences or constraints from this conversation\n",
+                            "\n",
+                            "BAD  (too thin — produces generic output):\n",
+                            "  'Morning inbox summary'\n",
+                            "\n",
+                            "GOOD (self-contained):\n",
+                            "  'Summarize my unread email from the last 24h. Only include mail from real ",
+                            "people — skip newsletters, receipts, and automated notifications. Lead with ",
+                            "anything from my direct team (Ana, Priya, Marcus). Format as at most 5 bullets, ",
+                            "each one line, no preamble or sign-off. If nothing qualifies, reply exactly ",
+                            "\"Nothing needing attention.\"'\n",
+                            "\n",
+                            "Exception: if the task is exactly a registered SKILL.md skill name (e.g. ",
+                            "'morning-briefing'), the bare name is fine — the skill body is injected ",
+                            "automatically at fire time.",
+                        )
                     },
                     "channel": {
                         "type": "string",
@@ -266,6 +296,56 @@ mod tests {
         .await
         .expect_err("whitespace-only task must be rejected");
         assert!(!backend.called.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn task_schema_demands_a_self_contained_brief() {
+        // The task string is the only context that survives into the
+        // scheduled run — no chat history travels with it. If the schema
+        // doesn't say so, models write short topic labels ("daily
+        // briefing") and the fired job produces generic output.
+        let (_, tool) = spy();
+        let schema = tool.schema();
+        let task_desc = schema.parameters["properties"]["task"]["description"]
+            .as_str()
+            .expect("task description should be a string");
+
+        assert!(
+            task_desc.contains("ONLY thing carried forward"),
+            "schema must warn that task is the sole surviving context: {task_desc}"
+        );
+        assert!(
+            task_desc.contains("no chat history"),
+            "schema must state that chat history is not carried over: {task_desc}"
+        );
+        // A worked BAD/GOOD pair moves models off one-line labels far more
+        // reliably than an abstract instruction does.
+        assert!(
+            task_desc.contains("BAD") && task_desc.contains("GOOD"),
+            "schema should show a contrasting example pair: {task_desc}"
+        );
+        // Bare skill names must stay explicitly legal — resolve_skill_for_task
+        // relies on exact-name tasks and there is no minimum-length gate.
+        assert!(
+            task_desc.contains("SKILL.md skill name"),
+            "schema must keep the bare-skill-name path legal: {task_desc}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bare_skill_name_task_is_still_accepted() {
+        // Guard against anyone "fixing" thin tasks with a length check:
+        // `task = "morning-briefing"` is a supported path that gets the
+        // skill body injected at fire time.
+        let (backend, tool) = spy();
+        tool.execute(json!({
+            "action": "create",
+            "schedule": "0 9 * * *",
+            "task": "morning-briefing",
+        }))
+        .await
+        .expect("bare skill name should remain a valid task");
+        assert!(backend.called.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     #[tokio::test]

@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.6.0] - 2026-08-20
+
+- fix(cron): carry real context into scheduled runs (#486)
+
 ## [4.5.15] - 2026-07-06
 
 - perf(tools): reuse IMAP sessions and HTTP clients, hoist regexes, stream file reads (#478)

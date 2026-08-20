@@ -1,4 +1,3 @@
-use chrono::Utc;
 use hmac::{Hmac, Mac};
 use rustykrab_core::crypto::constant_time_eq;
 use rustykrab_core::types::{Message, MessageContent, Role};
@@ -10,7 +9,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
-use uuid::Uuid;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -492,12 +490,7 @@ impl TelegramChannel {
 
         tracing::info!(chat_id, thread_id, %from, "received Telegram message");
 
-        let message = Message {
-            id: Uuid::new_v4(),
-            role: Role::User,
-            content: MessageContent::Text(text),
-            created_at: Utc::now(),
-        };
+        let message = Message::stamped(Role::User, MessageContent::Text(text));
 
         self.inbound_tx
             .send(ChannelMessage {

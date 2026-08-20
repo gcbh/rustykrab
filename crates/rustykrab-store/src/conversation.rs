@@ -450,6 +450,7 @@ mod tests {
             role,
             content,
             created_at: Utc::now(),
+            agent_version: None,
         }
     }
 

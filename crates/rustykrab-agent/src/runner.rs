@@ -1028,6 +1028,7 @@ impl AgentRunner {
                 role: Role::Assistant,
                 content: MessageContent::Text(summary),
                 created_at: Utc::now(),
+                agent_version: Message::version_stamp(),
             },
         );
     }
@@ -1064,6 +1065,7 @@ impl AgentRunner {
                 role: Role::User,
                 content: MessageContent::Text(TASK_COMPLETE_REMINDER.to_string()),
                 created_at: Utc::now(),
+                agent_version: Message::version_stamp(),
             },
         );
         CompletionReminderOutcome::Continue
@@ -1260,6 +1262,7 @@ impl AgentRunner {
                             self.config.max_iterations
                         )),
                         created_at: Utc::now(),
+                        agent_version: Message::version_stamp(),
                     },
                 );
             }
@@ -1385,6 +1388,7 @@ impl AgentRunner {
                                 role: Role::Tool,
                                 content: MessageContent::ToolResult(tr),
                                 created_at: Utc::now(),
+                                agent_version: Message::version_stamp(),
                             }
                         }
                         Err(e) => {
@@ -1400,6 +1404,7 @@ impl AgentRunner {
                                     images: Vec::new(),
                                 }),
                                 created_at: Utc::now(),
+                                agent_version: Message::version_stamp(),
                             }
                         }
                     };
@@ -1445,6 +1450,7 @@ impl AgentRunner {
                             role: Role::User,
                             content: MessageContent::Text("Continue.".to_string()),
                             created_at: Utc::now(),
+                            agent_version: Message::version_stamp(),
                         },
                     );
                     continue;
@@ -1501,6 +1507,7 @@ impl AgentRunner {
                                         "Your response was empty. Please provide a substantive answer or take an action.".to_string(),
                                     ),
                                     created_at: Utc::now(),
+                                                                    agent_version: Message::version_stamp(),
                                 },
                             );
                             continue;
@@ -1533,6 +1540,7 @@ impl AgentRunner {
                                             .to_string(),
                                     ),
                                     created_at: Utc::now(),
+                                                                    agent_version: Message::version_stamp(),
                                 },
                             );
                             continue;
@@ -1576,6 +1584,7 @@ impl AgentRunner {
                                 "Your previous response indicated a tool call but none was found. Please retry.".to_string(),
                             ),
                             created_at: Utc::now(),
+                                                    agent_version: Message::version_stamp(),
                         },
                     );
                     continue;
@@ -1599,6 +1608,7 @@ impl AgentRunner {
                     self.config.max_iterations
                 )),
                 created_at: Utc::now(),
+                agent_version: Message::version_stamp(),
             },
         );
         let final_response = self.provider.chat(&conv.messages, &[]).await?;
@@ -1688,6 +1698,7 @@ impl AgentRunner {
                             self.config.max_iterations
                         )),
                         created_at: Utc::now(),
+                        agent_version: Message::version_stamp(),
                     },
                 );
             }
@@ -1812,6 +1823,7 @@ impl AgentRunner {
                                 role: Role::Tool,
                                 content: MessageContent::ToolResult(tr),
                                 created_at: Utc::now(),
+                                agent_version: Message::version_stamp(),
                             };
                             (msg, true, None)
                         }
@@ -1828,6 +1840,7 @@ impl AgentRunner {
                                     images: Vec::new(),
                                 }),
                                 created_at: Utc::now(),
+                                agent_version: Message::version_stamp(),
                             };
                             (msg, false, Some(err_str))
                         }
@@ -1880,6 +1893,7 @@ impl AgentRunner {
                             role: Role::User,
                             content: MessageContent::Text("Continue.".to_string()),
                             created_at: Utc::now(),
+                            agent_version: Message::version_stamp(),
                         },
                     );
                     continue;
@@ -1940,6 +1954,7 @@ impl AgentRunner {
                                         "Your response was empty. Please provide a substantive answer or take an action.".to_string(),
                                     ),
                                     created_at: Utc::now(),
+                                                                    agent_version: Message::version_stamp(),
                                 },
                             );
                             continue;
@@ -1974,6 +1989,7 @@ impl AgentRunner {
                                             .to_string(),
                                     ),
                                     created_at: Utc::now(),
+                                                                    agent_version: Message::version_stamp(),
                                 },
                             );
                             continue;
@@ -2015,6 +2031,7 @@ impl AgentRunner {
                                 "Your previous response indicated a tool call but none was found. Please retry.".to_string(),
                             ),
                             created_at: Utc::now(),
+                                                    agent_version: Message::version_stamp(),
                         },
                     );
                     continue;
@@ -2038,6 +2055,7 @@ impl AgentRunner {
                     self.config.max_iterations
                 )),
                 created_at: Utc::now(),
+                agent_version: Message::version_stamp(),
             },
         );
         let stream_callback = |event: StreamEvent| {
@@ -2489,12 +2507,14 @@ impl AgentRunner {
                 role: Role::System,
                 content: MessageContent::Text(system_prompt),
                 created_at: Utc::now(),
+                agent_version: Message::version_stamp(),
             },
             Message {
                 id: Uuid::new_v4(),
                 role: Role::User,
                 content: MessageContent::Text(input.to_string()),
                 created_at: Utc::now(),
+                agent_version: Message::version_stamp(),
             },
         ];
         let response = self.provider.chat(&messages, &[]).await?;
@@ -2722,6 +2742,7 @@ impl AgentRunner {
                      HARD LIMIT: keep the summary under {max_words} words."
                 )),
                 created_at: Utc::now(),
+                            agent_version: Message::version_stamp(),
             };
 
             // Append the prompt in place for the summarizer call, then pop
@@ -2843,6 +2864,7 @@ impl AgentRunner {
             role: Role::Assistant,
             content: MessageContent::Text(summary_with_hint.clone()),
             created_at: Utc::now(),
+            agent_version: Message::version_stamp(),
         };
         let continuation_msg = Message {
             id: Uuid::new_v4(),
@@ -2852,6 +2874,7 @@ impl AgentRunner {
                     .to_string(),
             ),
             created_at: Utc::now(),
+            agent_version: Message::version_stamp(),
         };
 
         new_messages.push(summary_msg.clone());
@@ -2918,6 +2941,7 @@ impl AgentRunner {
                 role: Role::User,
                 content: MessageContent::Text(text),
                 created_at: Utc::now(),
+                agent_version: Message::version_stamp(),
             },
         );
     }
@@ -3307,6 +3331,7 @@ fn drain_inbound_to_conv(
                     role: Role::User,
                     content,
                     created_at: Utc::now(),
+                    agent_version: None,
                 };
                 on_event(AgentEvent::UserMessageQueued { message_id: msg.id });
                 conv.messages.push(msg);
@@ -3372,6 +3397,7 @@ mod compaction_tests {
                     role: Role::Assistant,
                     content: MessageContent::Text("- summarized".to_string()),
                     created_at: Utc::now(),
+                    agent_version: None,
                 },
                 usage: Usage::default(),
                 stop_reason: StopReason::EndTurn,
@@ -3481,6 +3507,7 @@ mod compaction_tests {
             role: Role::System,
             content: MessageContent::Text("agent identity".into()),
             created_at: Utc::now(),
+            agent_version: None,
         }];
         for i in 0..8 {
             messages.push(Message {
@@ -3492,6 +3519,7 @@ mod compaction_tests {
                 },
                 content: MessageContent::Text("x".repeat(3_000)),
                 created_at: Utc::now(),
+                agent_version: None,
             });
         }
         let mut conv = Conversation {
@@ -3562,6 +3590,7 @@ mod compaction_tests {
                     role: Role::Assistant,
                     content: MessageContent::Text("x".repeat(self.response_chars)),
                     created_at: Utc::now(),
+                    agent_version: None,
                 },
                 usage: Usage::default(),
                 stop_reason: StopReason::EndTurn,
@@ -3687,24 +3716,28 @@ mod compaction_tests {
                     role: Role::System,
                     content: MessageContent::Text("agent identity".into()),
                     created_at: Utc::now(),
+                    agent_version: None,
                 },
                 Message {
                     id: Uuid::new_v4(),
                     role: Role::User,
                     content: MessageContent::Text("original task".into()),
                     created_at: Utc::now(),
+                    agent_version: None,
                 },
                 Message {
                     id: Uuid::new_v4(),
                     role: Role::Assistant,
                     content: MessageContent::Text(bloated.clone()),
                     created_at: Utc::now(),
+                    agent_version: None,
                 },
                 Message {
                     id: Uuid::new_v4(),
                     role: Role::User,
                     content: MessageContent::Text("Continue from the summary above.".into()),
                     created_at: Utc::now(),
+                    agent_version: None,
                 },
             ],
             created_at: Utc::now(),
@@ -3775,30 +3808,35 @@ mod compaction_tests {
                     role: Role::System,
                     content: MessageContent::Text("agent identity".into()),
                     created_at: Utc::now(),
+                    agent_version: None,
                 },
                 Message {
                     id: Uuid::new_v4(),
                     role: Role::User,
                     content: MessageContent::Text("original task".into()),
                     created_at: Utc::now(),
+                    agent_version: None,
                 },
                 Message {
                     id: Uuid::new_v4(),
                     role: Role::Assistant,
                     content: MessageContent::Text("UNIQUE_DETAIL_ALPHA".into()),
                     created_at: Utc::now(),
+                    agent_version: None,
                 },
                 Message {
                     id: Uuid::new_v4(),
                     role: Role::User,
                     content: MessageContent::Text("UNIQUE_DETAIL_BRAVO".into()),
                     created_at: Utc::now(),
+                    agent_version: None,
                 },
                 Message {
                     id: Uuid::new_v4(),
                     role: Role::Assistant,
                     content: MessageContent::Text("UNIQUE_DETAIL_CHARLIE".into()),
                     created_at: Utc::now(),
+                    agent_version: None,
                 },
             ],
             created_at: Utc::now(),
@@ -3867,18 +3905,21 @@ mod compaction_tests {
                     role: Role::System,
                     content: MessageContent::Text("system".into()),
                     created_at: Utc::now(),
+                    agent_version: None,
                 },
                 Message {
                     id: Uuid::new_v4(),
                     role: Role::User,
                     content: MessageContent::Text("task".into()),
                     created_at: Utc::now(),
+                    agent_version: None,
                 },
                 Message {
                     id: Uuid::new_v4(),
                     role: Role::Assistant,
                     content: MessageContent::Text(detail.into()),
                     created_at: Utc::now(),
+                    agent_version: None,
                 },
             ],
             created_at: Utc::now(),
@@ -3914,6 +3955,7 @@ mod compaction_tests {
                 role: Role::Assistant,
                 content: MessageContent::Text(small.clone()),
                 created_at: Utc::now(),
+                agent_version: None,
             }],
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -3956,6 +3998,7 @@ mod token_estimate_tests {
                     role: Role::Assistant,
                     content: MessageContent::Text("- summarized".to_string()),
                     created_at: Utc::now(),
+                    agent_version: None,
                 },
                 usage: Usage::default(),
                 stop_reason: StopReason::EndTurn,
@@ -3989,6 +4032,7 @@ mod token_estimate_tests {
             role,
             content: MessageContent::Text(text.to_string()),
             created_at: Utc::now(),
+            agent_version: None,
         }
     }
 
@@ -4024,6 +4068,7 @@ mod token_estimate_tests {
                     arguments: serde_json::json!({"key": "value", "n": [1, 2, 3]}),
                 }),
                 created_at: Utc::now(),
+                agent_version: None,
             },
         );
         runner.push_message(
@@ -4038,6 +4083,7 @@ mod token_estimate_tests {
                     images: Vec::new(),
                 }),
                 created_at: Utc::now(),
+                agent_version: None,
             },
         );
 
@@ -4387,6 +4433,7 @@ mod tool_choice_guard_tests {
                 role: Role::Assistant,
                 content: MessageContent::Text("Done.".into()),
                 created_at: Utc::now(),
+                agent_version: None,
             },
             usage: Usage::default(),
             stop_reason: StopReason::EndTurn,
@@ -4426,6 +4473,7 @@ mod tool_choice_guard_tests {
                 role: Role::User,
                 content: MessageContent::Text("Do the scheduled thing.".into()),
                 created_at: Utc::now(),
+                agent_version: None,
             }],
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -4593,6 +4641,7 @@ mod task_complete_tests {
                     arguments: args,
                 }),
                 created_at: Utc::now(),
+                agent_version: None,
             },
             usage: Usage::default(),
             stop_reason: StopReason::ToolUse,
@@ -4607,6 +4656,7 @@ mod task_complete_tests {
                 role: Role::Assistant,
                 content: MessageContent::Text(text.to_string()),
                 created_at: Utc::now(),
+                agent_version: None,
             },
             usage: Usage::default(),
             stop_reason: StopReason::EndTurn,
@@ -4622,6 +4672,7 @@ mod task_complete_tests {
                 role: Role::User,
                 content: MessageContent::Text("do the thing".into()),
                 created_at: Utc::now(),
+                agent_version: None,
             }],
             created_at: Utc::now(),
             updated_at: Utc::now(),

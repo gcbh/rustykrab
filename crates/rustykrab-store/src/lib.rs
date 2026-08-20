@@ -96,7 +96,8 @@ impl Store {
                 next_run_at     TEXT NOT NULL,
                 last_run_at     TEXT,
                 created_at      TEXT NOT NULL,
-                conversation_id TEXT
+                conversation_id TEXT,
+                created_version TEXT
             );
 
             CREATE INDEX IF NOT EXISTS idx_scheduled_jobs_due
@@ -109,7 +110,8 @@ impl Store {
                 status     TEXT NOT NULL,
                 output     TEXT,
                 started_at TEXT NOT NULL,
-                finished_at TEXT NOT NULL
+                finished_at TEXT NOT NULL,
+                rustykrab_version TEXT
             );
 
             CREATE INDEX IF NOT EXISTS idx_job_runs_job_id
@@ -162,6 +164,30 @@ impl Store {
         }
         if !existing.iter().any(|c| c == "thread_id") {
             conn.execute("ALTER TABLE scheduled_jobs ADD COLUMN thread_id TEXT", [])
+                .map_err(|e| Error::Storage(e.to_string()))?;
+        }
+        if !existing.iter().any(|c| c == "created_version") {
+            conn.execute(
+                "ALTER TABLE scheduled_jobs ADD COLUMN created_version TEXT",
+                [],
+            )
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        }
+
+        // `job_runs.rustykrab_version` records which build executed each run.
+        // Rows written before this column existed stay NULL rather than being
+        // back-filled with the current version, which would misattribute them.
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(job_runs)")
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        let existing: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|e| Error::Storage(e.to_string()))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        drop(stmt);
+        if !existing.iter().any(|c| c == "rustykrab_version") {
+            conn.execute("ALTER TABLE job_runs ADD COLUMN rustykrab_version TEXT", [])
                 .map_err(|e| Error::Storage(e.to_string()))?;
         }
 

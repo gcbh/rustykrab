@@ -1,7 +1,6 @@
 use crate::backoff::retry_delay;
 use crate::line_buffer::LineBuffer;
 use async_trait::async_trait;
-use chrono::Utc;
 use rustykrab_core::error::Result;
 use rustykrab_core::model::{ModelProvider, ModelResponse, StopReason, StreamEvent, Usage};
 use rustykrab_core::types::{Message, MessageContent, Role, ToolCall, ToolSchema};
@@ -467,12 +466,7 @@ impl OllamaProvider {
                 };
 
                 return Ok(ModelResponse {
-                    message: Message {
-                        id: Uuid::new_v4(),
-                        role: Role::Assistant,
-                        content,
-                        created_at: Utc::now(),
-                    },
+                    message: Message::stamped(Role::Assistant, content),
                     usage: Usage {
                         prompt_tokens: resp.prompt_eval_count.unwrap_or(0),
                         completion_tokens: resp.eval_count.unwrap_or(0),
@@ -485,12 +479,10 @@ impl OllamaProvider {
         }
 
         Ok(ModelResponse {
-            message: Message {
-                id: Uuid::new_v4(),
-                role: Role::Assistant,
-                content: MessageContent::Text(msg.content.unwrap_or_default()),
-                created_at: Utc::now(),
-            },
+            message: Message::stamped(
+                Role::Assistant,
+                MessageContent::Text(msg.content.unwrap_or_default()),
+            ),
             usage: Usage {
                 prompt_tokens: resp.prompt_eval_count.unwrap_or(0),
                 completion_tokens: resp.eval_count.unwrap_or(0),
@@ -967,12 +959,7 @@ impl ModelProvider for OllamaProvider {
         };
 
         let response = ModelResponse {
-            message: Message {
-                id: Uuid::new_v4(),
-                role: Role::Assistant,
-                content,
-                created_at: Utc::now(),
-            },
+            message: Message::stamped(Role::Assistant, content),
             usage: Usage {
                 prompt_tokens: prompt_eval_count,
                 completion_tokens: eval_count,
@@ -1216,6 +1203,7 @@ fn model_supports_vision(model: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
 
     fn user_msg(content: &str) -> OllamaMessage {
         OllamaMessage {
@@ -1277,6 +1265,7 @@ mod tests {
                 },
             ]),
             created_at: Utc::now(),
+            agent_version: None,
         };
 
         let built = OllamaProvider::build_messages(&[msg], true).expect("build_messages");
@@ -1296,6 +1285,7 @@ mod tests {
             role: Role::User,
             content: MessageContent::Text("hello".to_string()),
             created_at: Utc::now(),
+            agent_version: None,
         };
         let built = OllamaProvider::build_messages(&[msg], false).expect("build_messages");
         assert!(built[0].images.is_none());
@@ -1319,6 +1309,7 @@ mod tests {
                 }],
             }),
             created_at: Utc::now(),
+            agent_version: None,
         }
     }
 
