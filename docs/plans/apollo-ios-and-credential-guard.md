@@ -513,10 +513,31 @@ sandbox-facing pieces of Workstream F (feature gate, ScriptedProvider,
 runs — they are what CI and any future cloud session use to verify the end
 state without a Mac.
 
+### F8. The simulator lane (added 2026-08-19)
+
+A fourth harness, `apollo-ios/harness/simulator_e2e.py`, drives the **real
+app** in an iOS Simulator and then asserts on the daemon's SQLite store —
+the only lane that exercises SwiftUI. One command builds the daemon and
+the app, boots a device, installs, taps through the UI, and reads the
+store; everything it creates is thrown away (temp data dir, ephemeral
+port, fresh install, Keychain disabled).
+
+Today: 4 pass, 1 xfail, where the xfail is
+`agent_cannot_overwrite_a_user_credential` reporting *"the agent overwrote
+the user's credential with no approval"* — decision #1's premise,
+reproduced through the UI a user would actually touch. It flips when
+Workstream A lands.
+
+The harnesses are cross-repo by nature (they need the server binary *and*
+the app), so they are slated to move into a **third repo for agent code
+execution** — named later. The simulator harness is already written for
+that move: its paths come from flags or the environment.
+
 ### What each lane can verify
 
 | Capability | Cloud sandbox | GitHub Actions | Mac |
 |------------|---------------|----------------|-----|
+| Drive the app's UI + assert the store (F8) | ✗ | needs a macOS runner with `idb` | ✓ |
 | Build daemon + run guard E2E (scripted agent) | ✓ (after F1) | ✓ | ✓ |
 | Live-fire agent E2E | with env key | with secret | ✓ |
 | Build + test ApolloKit (Swift) | after F6 allowlist | ✓ (ubuntu) | ✓ |
