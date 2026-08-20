@@ -82,11 +82,20 @@ pub async fn origin_check_middleware(
             Some(origin.clone())
         }
         None if is_sensitive => {
-            tracing::warn!(
-                path = %path,
-                "rejected request without Origin header on sensitive endpoint"
-            );
-            return Err(StatusCode::FORBIDDEN);
+            // Server-to-server clients (e.g. the Apollo BFF) do not send an
+            // Origin header. Permit them only when they present a valid
+            // bearer service token: possession of the secret proves
+            // authorization, and a cross-origin browser cannot forge it
+            // (it can't set Authorization without a CORS preflight we reject).
+            if crate::auth::has_valid_bearer_token(&state.0, request.headers()) {
+                None
+            } else {
+                tracing::warn!(
+                    path = %path,
+                    "rejected request without Origin header on sensitive endpoint"
+                );
+                return Err(StatusCode::FORBIDDEN);
+            }
         }
         None => None,
     };
