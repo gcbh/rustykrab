@@ -101,7 +101,19 @@ impl CalDavTool {
         // verbatim and Google's DAV endpoint rejects it with 401. Strip all
         // whitespace so a password stored in the displayed format still works,
         // without requiring the user to re-enter it.
-        Ok((email.trim().to_string(), normalize_app_password(&password)))
+        let email = email.trim().to_string();
+        let password = normalize_app_password(&password);
+
+        // A mis-scoped `credential_write` can store a key's *name* as its own
+        // value. That happened here: from 2026-08-02 the store held
+        // `gmail_email = "gmail_email"`, so every request addressed
+        // `caldav/v2/gmail_email/...` and spent three retries earning a
+        // guaranteed 401. Catch it before building the URL — the endpoint
+        // can only answer "unauthorized", which reads as a password problem
+        // and sends debugging the wrong way.
+        validate_credentials(&email, &password)?;
+
+        Ok((email, password))
     }
 
     /// The events collection URL for a given calendar id (defaults to the
@@ -153,10 +165,14 @@ impl CalDavTool {
         if !(200..300).contains(&status) {
             let detail = text.chars().take(500).collect::<String>();
             let hint = if status == 401 {
-                " (401 Unauthorized — check that gmail_app_password is a Google *app* \
-                 password and that CalDAV access is permitted for the account)"
+                format!(
+                    " (401 Unauthorized — check that {KEY_APP_PASSWORD} is a Google *app* \
+                     password and that CalDAV access is permitted for the account; the \
+                     stored password is {})",
+                    describe_password_shape(password)
+                )
             } else {
-                ""
+                String::new()
             };
             return Err(Error::ToolExecution(
                 format!("CalDAV {url} returned HTTP {status}{hint}: {detail}").into(),
@@ -575,6 +591,58 @@ static TAG_TEXT_RES: LazyLock<Mutex<HashMap<String, Regex>>> =
 /// secret and break CalDAV `Basic` auth, so strip them.
 fn normalize_app_password(password: &str) -> String {
     password.replace(char::is_whitespace, "")
+}
+
+/// Reject stored credentials that cannot possibly authenticate, before any
+/// request is built.
+///
+/// A mis-scoped `credential_write` can store a key's *name* as its own
+/// value. That happened here: from 2026-08-02 the store held
+/// `gmail_email = "gmail_email"`, so every request addressed
+/// `caldav/v2/gmail_email/...` and spent three retries earning a
+/// guaranteed 401. The endpoint can only answer "unauthorized", which
+/// reads as a password problem and sends debugging the wrong way — so
+/// name the real fault here instead.
+fn validate_credentials(email: &str, password: &str) -> Result<()> {
+    if email == KEY_EMAIL || !email.contains('@') {
+        return Err(Error::ToolExecution(
+            format!(
+                "stored {KEY_EMAIL} is not an email address. Re-store it with \
+                 credential_write(action='set', name='{KEY_EMAIL}', \
+                 value='you@gmail.com'), then approve the pending request."
+            )
+            .into(),
+        ));
+    }
+    if password == KEY_APP_PASSWORD {
+        return Err(Error::ToolExecution(
+            format!(
+                "stored {KEY_APP_PASSWORD} is the literal key name, not a password. \
+                 Re-store it with credential_write(action='set', \
+                 name='{KEY_APP_PASSWORD}', value='YOUR_APP_PASSWORD'), then approve \
+                 the pending request."
+            )
+            .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Summarise a password's shape for an error message without revealing it.
+/// Once the display spacing is stripped a Google app password is 16 ASCII
+/// alphanumeric characters; anything else is worth surfacing when auth
+/// fails. The value itself must never reach a log line, so this reports
+/// only a length and a character class.
+fn describe_password_shape(password: &str) -> String {
+    let len = password.chars().count();
+    if password.chars().all(|c| c.is_ascii_alphanumeric()) {
+        format!("{len} alphanumeric characters (Google app passwords are 16)")
+    } else {
+        format!(
+            "{len} characters including non-alphanumeric ones \
+             (Google app passwords are 16 alphanumeric)"
+        )
+    }
 }
 
 /// Turn an href (possibly path-only) into an absolute Google CalDAV URL.
@@ -1055,6 +1123,57 @@ mod tests {
     #[test]
     fn parse_vevent_returns_none_without_event() {
         assert!(parse_vevent("BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n").is_none());
+    }
+
+    #[test]
+    fn clobbered_credentials_are_rejected_before_any_request() {
+        // The exact shape the store held from 2026-08-02: the key name
+        // written as its own value.
+        let err = validate_credentials("gmail_email", "abcdefghijklmnop").unwrap_err();
+        assert!(err.to_string().contains("not an email address"));
+
+        let err = validate_credentials("me@gmail.com", "gmail_app_password").unwrap_err();
+        assert!(err.to_string().contains("not a password"));
+    }
+
+    #[test]
+    fn a_value_missing_an_at_sign_is_rejected() {
+        assert!(validate_credentials("not-an-email", "abcdefghijklmnop").is_err());
+    }
+
+    #[test]
+    fn well_formed_credentials_pass() {
+        // A wrong-but-plausible password still passes here — only the
+        // endpoint can judge that, and the 401 hint carries its shape.
+        assert!(validate_credentials("me@gmail.com", "abcdefghijklmnop").is_ok());
+        assert!(validate_credentials("me@gmail.com", "wrongbutplausible").is_ok());
+    }
+
+    #[test]
+    fn password_shape_reports_length_and_class_but_never_the_value() {
+        let secret = "abcdefghijklmnop";
+        let described = describe_password_shape(secret);
+        assert!(described.contains("16"));
+        assert!(described.contains("alphanumeric"));
+        // The point of the helper: a 401 message can carry the shape
+        // without leaking the credential into a log line.
+        assert!(!described.contains(secret));
+
+        // A clobbered value reports its real shape so the mismatch is
+        // visible without anyone having to read the stored secret.
+        let wrong = describe_password_shape("gmail_app_password");
+        assert!(wrong.contains("18"));
+        assert!(wrong.contains("non-alphanumeric"));
+        assert!(!wrong.contains("gmail_app_password"));
+    }
+
+    #[test]
+    fn password_shape_counts_characters_not_bytes() {
+        // A multi-byte character must count once, so the reported length
+        // stays comparable to Google's 16.
+        let described = describe_password_shape("é");
+        assert!(described.contains('1'));
+        assert!(!described.contains("2 characters"));
     }
 
     #[test]

@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.1.4] - 2026-08-20
+
+- fix(caldav): reject clobbered credentials before issuing a request (#496)
+
 ## [5.1.3] - 2026-08-20
 
 - fix(cron): append a user turn to scheduled job runs (#494)
