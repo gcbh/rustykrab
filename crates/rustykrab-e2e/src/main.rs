@@ -27,6 +27,9 @@ use serde_json::{json, Value};
 /// Master key for the throwaway store (hex, 32 bytes). Test-only.
 const MASTER_KEY_HEX: &str = "e2e0e2e0e2e0e2e0e2e0e2e0e2e0e2e0e2e0e2e0e2e0e2e0e2e0e2e0e2e0e2e0";
 const AUTH_TOKEN: &str = "e2e-master-token";
+/// A non-loopback origin the harness allows, standing in for the tailnet
+/// hostname the phone uses.
+const ALLOWED_ORIGIN: &str = "https://harness.example.ts.net";
 
 /// Script replayed by the daemon's `RUSTYKRAB_PROVIDER=scripted` provider.
 /// Triggers here must match the messages the scenarios send. Each scenario
@@ -171,6 +174,18 @@ impl Ctx {
             .await?)
     }
 
+    /// A request that overrides the default loopback `Origin`, for
+    /// exercising the allowlist.
+    async fn get_with_origin(&self, path: &str, origin: &str) -> Result<reqwest::Response> {
+        Ok(self
+            .client
+            .get(self.url(path))
+            .bearer_auth(AUTH_TOKEN)
+            .header(reqwest::header::ORIGIN, origin)
+            .send()
+            .await?)
+    }
+
     async fn get(&self, path: &str) -> Result<reqwest::Response> {
         Ok(self
             .client
@@ -244,6 +259,45 @@ async fn health(ctx: &Ctx) -> Result<()> {
     let resp = ctx.client.get(ctx.url("/api/health")).send().await?;
     if resp.status() != 200 {
         bail!("health returned {}", resp.status());
+    }
+    Ok(())
+}
+
+/// The gateway demands an `Origin` on every `/api` request and allows
+/// only loopback plus a configured list. Apollo reaches the daemon by its
+/// tailnet name, so without this it was rejected on everything except
+/// `/api/health` — the gap this scenario now pins shut.
+async fn origin_allowlist(ctx: &Ctx) -> Result<()> {
+    // The harness boots the daemon with this origin allowed.
+    let allowed = ctx
+        .get_with_origin("/api/conversations", ALLOWED_ORIGIN)
+        .await?;
+    if allowed.status() != 200 {
+        bail!(
+            "configured origin {ALLOWED_ORIGIN} was rejected with {}",
+            allowed.status()
+        );
+    }
+
+    // Anything else still is not.
+    let refused = ctx
+        .get_with_origin("/api/conversations", "https://evil.example.com")
+        .await?;
+    if refused.status() != 403 {
+        bail!("an unlisted origin returned {}, want 403", refused.status());
+    }
+
+    // A request with no Origin at all remains refused: that is what stops
+    // a non-browser client from skipping the check entirely.
+    let bare = ctx
+        .client
+        .get(ctx.url("/api/conversations"))
+        .bearer_auth(AUTH_TOKEN)
+        .header(reqwest::header::ORIGIN, "")
+        .send()
+        .await?;
+    if bare.status() != 403 {
+        bail!("an empty Origin returned {}, want 403", bare.status());
     }
     Ok(())
 }
@@ -819,6 +873,7 @@ fn spawn_daemon(bin: &str, data_dir: &std::path::Path, port: u16) -> Result<Chil
         // IP; raise the limit for this throwaway boot only.
         .env("RUSTYKRAB_RATE_LIMIT_MAX", "100000")
         .env("RUSTYKRAB_RATE_LIMIT_LOCKOUT_SECS", "1")
+        .env("RUSTYKRAB_ALLOWED_ORIGINS", ALLOWED_ORIGIN)
         .stdout(Stdio::from(log.try_clone()?))
         .stderr(Stdio::from(log))
         .spawn()
@@ -944,6 +999,7 @@ async fn run_suite(
         // Baseline — implemented today, must pass.
         (Expected::Pass, scenario!(health)),
         (Expected::Pass, scenario!(auth_required)),
+        (Expected::Pass, scenario!(origin_allowlist)),
         (Expected::Pass, scenario!(conversations_crud)),
         (Expected::Pass, scenario!(chat_scripted_default)),
         (Expected::Pass, scenario!(chat_sse_stream)),

@@ -944,6 +944,9 @@ async fn main() -> anyhow::Result<()> {
     // Clone store handle so we can flush it after the server shuts down.
     let store_handle = store.clone();
     let mut state = rustykrab_gateway::AppState::new(store, tools, provider, auth_token)
+        // Loopback is always allowed; this adds the names other clients
+        // reach us by, e.g. the tailnet hostname the phone uses.
+        .with_origin_policy(rustykrab_gateway::OriginPolicy::from_env())
         .with_harness_router(router)
         .with_orchestration_config(orchestration_config)
         .with_skill_registry(skill_registry)

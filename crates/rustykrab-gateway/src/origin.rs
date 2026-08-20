@@ -40,7 +40,13 @@ impl OriginPolicy {
         {
             return true;
         }
-        self.allowed.contains(origin)
+        // Compare normalised forms on both sides: the allowlist is
+        // normalised when parsed, so comparing a raw header against it
+        // would reject an origin differing only in host case.
+        match Self::normalize(origin) {
+            Some(normalised) => self.allowed.contains(&normalised),
+            None => false,
+        }
     }
 }
 
@@ -48,6 +54,65 @@ impl Default for OriginPolicy {
     fn default() -> Self {
         // By default, only allow our own loopback origins.
         Self::new(std::iter::empty::<String>())
+    }
+}
+
+impl OriginPolicy {
+    /// Policy built from `RUSTYKRAB_ALLOWED_ORIGINS` — a comma-separated
+    /// list of exact origins (`https://mac.tailnet.ts.net`).
+    ///
+    /// Loopback is always permitted, so this is only needed for clients
+    /// that reach the gateway by another name. The Apollo app is the
+    /// motivating case: it sends its own `Origin`, and every `/api`
+    /// request from it was rejected with `403` until its tailnet origin
+    /// could be allowed.
+    ///
+    /// Entries are normalised (trimmed, trailing `/` removed, host
+    /// lowercased) because an origin that differs only in punctuation is
+    /// an operator typo, not a security boundary. A malformed entry is
+    /// skipped with a warning rather than silently widening or narrowing
+    /// the policy.
+    pub fn from_env() -> Self {
+        let raw = match std::env::var("RUSTYKRAB_ALLOWED_ORIGINS") {
+            Ok(v) => v,
+            Err(_) => return Self::default(),
+        };
+        let allowed: Vec<String> = raw
+            .split(',')
+            .filter_map(|entry| match Self::normalize(entry) {
+                Some(origin) => Some(origin),
+                None => {
+                    if !entry.trim().is_empty() {
+                        tracing::warn!(
+                            entry = entry.trim(),
+                            "ignoring malformed RUSTYKRAB_ALLOWED_ORIGINS entry \
+                             (expected scheme://host[:port])"
+                        );
+                    }
+                    None
+                }
+            })
+            .collect();
+        if !allowed.is_empty() {
+            tracing::info!(origins = ?allowed, "additional origins allowed");
+        }
+        Self::new(allowed)
+    }
+
+    /// `scheme://host[:port]`, lowercased host, no trailing slash or path.
+    fn normalize(entry: &str) -> Option<String> {
+        let entry = entry.trim().trim_end_matches('/');
+        let (scheme, rest) = entry.split_once("://")?;
+        if !matches!(scheme, "http" | "https") || rest.is_empty() {
+            return None;
+        }
+        // An origin is scheme + host + port; anything after the authority
+        // is not part of it.
+        let authority = rest.split(['/', '?', '#']).next()?;
+        if authority.is_empty() {
+            return None;
+        }
+        Some(format!("{}://{}", scheme, authority.to_ascii_lowercase()))
     }
 }
 
@@ -108,4 +173,77 @@ pub async fn origin_check_middleware(
     }
 
     Ok(response)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Guards against a regression that would silently expose the gateway:
+    /// with no configuration, only loopback is allowed.
+    #[test]
+    fn default_policy_allows_only_loopback() {
+        let policy = OriginPolicy::default();
+        assert!(policy.is_allowed("http://127.0.0.1:3000"));
+        assert!(policy.is_allowed("http://localhost:8080"));
+        assert!(policy.is_allowed("https://[::1]:3000"));
+        assert!(!policy.is_allowed("https://mac.tailnet.ts.net"));
+        assert!(!policy.is_allowed("https://evil.example.com"));
+    }
+
+    #[test]
+    fn configured_origins_are_allowed_alongside_loopback() {
+        let policy = OriginPolicy::new(["https://mac.tailnet.ts.net".to_string()]);
+        assert!(policy.is_allowed("https://mac.tailnet.ts.net"));
+        assert!(policy.is_allowed("http://127.0.0.1:3000"));
+        assert!(!policy.is_allowed("https://other.tailnet.ts.net"));
+    }
+
+    #[test]
+    fn normalization_ignores_trailing_slash_and_host_case() {
+        assert_eq!(
+            OriginPolicy::normalize("  https://Mac.Tailnet.TS.net/  "),
+            Some("https://mac.tailnet.ts.net".to_string())
+        );
+        // A path is not part of an origin.
+        assert_eq!(
+            OriginPolicy::normalize("https://mac.ts.net/api/health"),
+            Some("https://mac.ts.net".to_string())
+        );
+        // Ports are part of it and must survive.
+        assert_eq!(
+            OriginPolicy::normalize("http://mac.ts.net:8443"),
+            Some("http://mac.ts.net:8443".to_string())
+        );
+    }
+
+    #[test]
+    fn an_origin_matches_regardless_of_host_case() {
+        let policy = OriginPolicy::new(["https://mac.tailnet.ts.net".to_string()]);
+        assert!(policy.is_allowed("https://MAC.Tailnet.ts.net"));
+    }
+
+    #[test]
+    fn malformed_entries_are_dropped_not_widened() {
+        // Nothing here should end up permitting anything.
+        let policy = OriginPolicy::new(
+            ["not-a-url", "ftp://mac.ts.net", "https://", ""]
+                .iter()
+                .filter_map(|e| OriginPolicy::normalize(e))
+                .collect::<Vec<_>>(),
+        );
+        assert!(!policy.is_allowed("not-a-url"));
+        assert!(!policy.is_allowed("ftp://mac.ts.net"));
+        assert!(!policy.is_allowed("https://mac.ts.net"));
+        // Loopback still works.
+        assert!(policy.is_allowed("http://127.0.0.1:3000"));
+    }
+
+    #[test]
+    fn scheme_must_match_too() {
+        let policy = OriginPolicy::new(["https://mac.ts.net".to_string()]);
+        // Downgrading to http is a different origin, and allowing it
+        // would defeat the point of pinning https.
+        assert!(!policy.is_allowed("http://mac.ts.net"));
+    }
 }
