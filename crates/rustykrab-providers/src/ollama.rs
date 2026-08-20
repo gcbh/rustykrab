@@ -14,44 +14,106 @@ const MAX_RETRIES: u32 = 3;
 /// Base delay for exponential backoff (doubles each retry, with jitter).
 const RETRY_BASE_DELAY: Duration = Duration::from_secs(1);
 
+/// Context window RustyKrab pins by default when the operator hasn't chosen
+/// one.
+///
+/// Pinning matters for KV-cache reuse. Ollama sizes a model runner's KV cache
+/// from the `num_ctx` of the request that loads it; a later request asking for
+/// a different `num_ctx` forces the scheduler to tear the runner down and
+/// reload it, discarding every cached prefix. Omitting `num_ctx` entirely is
+/// worse still: the client then has no idea how much context the server
+/// actually allocated, so its own trimming budget (below) is a guess, and a
+/// prompt that overshoots gets silently truncated server-side — which moves
+/// the truncation point every turn and defeats prefix caching completely.
+///
+/// 32k matches the local-Ollama compaction budget the CLI already assumes.
+const DEFAULT_NUM_CTX: u32 = 32_768;
+
+/// Default `keep_alive` sent with every request: how long Ollama keeps the
+/// model (and its KV cache) resident after the request finishes. Ollama's own
+/// default is 5 minutes, which is far too short for a chat gateway that sees
+/// sporadic traffic — every message after a quiet spell pays a full model
+/// reload plus a cold-cache prompt eval. Override with `OLLAMA_KEEP_ALIVE`.
+const DEFAULT_KEEP_ALIVE: &str = "30m";
+
 /// Configuration for Ollama model inference.
 #[derive(Debug, Clone)]
 pub struct OllamaConfig {
     /// Temperature for sampling (0.0 = deterministic, 0.7 = creative).
     pub temperature: f32,
-    /// Explicit context-window size to send to the Ollama server as
-    /// `options.num_ctx`. When `None` (the default), the value is omitted
-    /// from the request so the server's own configuration is used — e.g.
-    /// its `OLLAMA_CONTEXT_LENGTH` env var or the per-model default.
-    /// Set `OLLAMA_NUM_CTX` on the client to force a specific override.
+    /// Explicit context-window size sent to the Ollama server as
+    /// `options.num_ctx`. Defaults to [`DEFAULT_NUM_CTX`] so client and
+    /// server agree on one stable window; see that constant for why pinning
+    /// beats deferring. `None` restores the old behaviour of omitting the
+    /// field so the server's `OLLAMA_CONTEXT_LENGTH` (or the per-model
+    /// default) wins — select it with `RUSTYKRAB_NUM_CTX=server`.
     pub num_ctx: Option<u32>,
-    /// Number of parallel inference slots.
-    pub num_parallel: u32,
+    /// How long Ollama should keep the model resident after a request, in
+    /// Ollama's duration syntax (`"30m"`, `"1h"`, `"-1"` for forever).
+    /// `None` omits the field and takes the server's 5-minute default.
+    pub keep_alive: Option<String>,
     /// Top-p nucleus sampling threshold.
     pub top_p: f32,
     /// Number of tokens to predict (-1 = unlimited, 0 = fill context).
     pub num_predict: i32,
-    /// Enable thinking mode for models that support it (e.g. Gemma 4).
-    /// When enabled, the model produces `<think>…</think>` reasoning
-    /// blocks before its answer, improving tool-calling accuracy.
-    pub think: bool,
+    /// Enable thinking mode. `None` (the default) decides per model via
+    /// [`think_support`]; `Some(_)` forces the answer. Ollama rejects
+    /// `think` outright for models that don't support it, so this must not
+    /// be sent unconditionally.
+    pub think: Option<bool>,
 }
 
-/// Read `num_ctx` from the environment. Checks `RUSTYKRAB_NUM_CTX` first
-/// (the canonical RustyKrab-namespaced name), then falls back to
-/// `OLLAMA_NUM_CTX` for backward compatibility. Returns `None` when
-/// neither var is set or parseable, so the request omits `num_ctx` and
-/// the Ollama server's own configuration (e.g. `OLLAMA_CONTEXT_LENGTH`)
-/// wins.
+/// Resolve the `num_ctx` to pin from the environment.
+///
+/// Checks `RUSTYKRAB_NUM_CTX` first (the canonical RustyKrab-namespaced
+/// name), then falls back to `OLLAMA_NUM_CTX`. A numeric value pins that
+/// window; `server`/`default`/`0` defers to the Ollama server's own
+/// configuration (returning `None`); anything unset falls back to
+/// [`DEFAULT_NUM_CTX`].
 fn num_ctx_from_env() -> Option<u32> {
-    std::env::var("RUSTYKRAB_NUM_CTX")
+    let raw = std::env::var("RUSTYKRAB_NUM_CTX")
         .ok()
-        .and_then(|v| v.parse::<u32>().ok())
-        .or_else(|| {
-            std::env::var("OLLAMA_NUM_CTX")
-                .ok()
-                .and_then(|v| v.parse::<u32>().ok())
-        })
+        .or_else(|| std::env::var("OLLAMA_NUM_CTX").ok());
+
+    let Some(raw) = raw else {
+        return Some(DEFAULT_NUM_CTX);
+    };
+    let trimmed = raw.trim();
+
+    if matches!(
+        trimmed.to_ascii_lowercase().as_str(),
+        "server" | "default" | "0" | ""
+    ) {
+        return None;
+    }
+
+    match trimmed.parse::<u32>() {
+        Ok(v) => Some(v),
+        Err(_) => {
+            tracing::warn!(
+                value = %raw,
+                default_num_ctx = DEFAULT_NUM_CTX,
+                "could not parse num_ctx override; falling back to the default"
+            );
+            Some(DEFAULT_NUM_CTX)
+        }
+    }
+}
+
+/// Resolve `keep_alive` from `OLLAMA_KEEP_ALIVE`. An empty value or the
+/// literal `server` omits the field and takes Ollama's own default.
+fn keep_alive_from_env() -> Option<String> {
+    match std::env::var("OLLAMA_KEEP_ALIVE") {
+        Ok(v) => {
+            let trimmed = v.trim();
+            if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("server") {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        }
+        Err(_) => Some(DEFAULT_KEEP_ALIVE.to_string()),
+    }
 }
 
 /// Rough characters-per-token ratio used for client-side context budgeting.
@@ -66,15 +128,19 @@ const PER_MESSAGE_OVERHEAD_TOKENS: u32 = 4;
 /// client can't easily measure (chat template, system tool preamble, etc.).
 const SAFETY_OVERHEAD_TOKENS: u32 = 2048;
 
+/// Percentage of the trimming budget to cut down to once trimming fires.
+/// See `trim_to_budget` for why this is well below 100.
+const TRIM_TARGET_PCT: u32 = 75;
+
 impl Default for OllamaConfig {
     fn default() -> Self {
         Self {
             temperature: 0.1,
             num_ctx: num_ctx_from_env(),
-            num_parallel: 6,
+            keep_alive: keep_alive_from_env(),
             top_p: 0.9,
             num_predict: 8192,
-            think: true,
+            think: None,
         }
     }
 }
@@ -84,23 +150,23 @@ impl OllamaConfig {
     pub fn tool_calling() -> Self {
         Self {
             temperature: 0.0,
-            num_ctx: num_ctx_from_env(),
-            num_parallel: 6,
-            top_p: 0.9,
             num_predict: 4096,
-            think: true,
+            ..Self::default()
         }
     }
 
     /// Configuration for creative drafting (higher temperature).
+    ///
+    /// Note that `num_predict` is a sampling parameter, so varying it
+    /// between presets does not force Ollama to reload the model runner —
+    /// unlike `num_ctx`, which is deliberately shared across all presets so
+    /// a process that mixes them keeps hitting the same warm KV cache.
     pub fn creative() -> Self {
         Self {
             temperature: 0.7,
-            num_ctx: num_ctx_from_env(),
-            num_parallel: 6,
             top_p: 0.95,
             num_predict: 16384,
-            think: true,
+            ..Self::default()
         }
     }
 }
@@ -111,9 +177,10 @@ pub struct OllamaProvider {
     base_url: String,
     model: String,
     config: OllamaConfig,
-    /// Model's native context length discovered from `/api/show`.  Used
-    /// only as a client-side prompt-trimming budget when the user hasn't
-    /// set an explicit `num_ctx`; never sent to the server.
+    /// Model's native context length discovered from `/api/show`.  Used to
+    /// clamp the pinned `num_ctx` down to something the model can actually
+    /// serve, and as the client-side prompt-trimming budget when `num_ctx`
+    /// has been explicitly set to defer to the server.
     detected_ctx: Option<u32>,
 }
 
@@ -164,6 +231,19 @@ impl OllamaProvider {
     /// `None` means the server's own configuration is used.
     pub fn num_ctx(&self) -> Option<u32> {
         self.config.num_ctx
+    }
+
+    /// Get the `keep_alive` that will be sent with each request, if any.
+    pub fn keep_alive(&self) -> Option<&str> {
+        self.config.keep_alive.as_deref()
+    }
+
+    /// Whether `think` will be sent, and with what value. An explicit
+    /// `config.think` wins; otherwise the model tag decides.
+    pub fn resolved_think(&self) -> bool {
+        self.config
+            .think
+            .unwrap_or_else(|| think_support(&self.model))
     }
 
     /// Effective context window used for client-side prompt trimming.
@@ -499,6 +579,15 @@ impl OllamaProvider {
     /// dropped along with any preceding orphaned tool-call assistant turn so
     /// the request stays well-formed.  When `total_ctx` is `None` we have no
     /// budget to enforce so messages pass through unchanged.
+    ///
+    /// Trimming is deliberately hysteretic: once it fires it drops down to
+    /// [`TRIM_TARGET_PCT`] of the budget rather than to the first arrangement
+    /// that fits.  Dropping the oldest messages rewrites the prompt directly
+    /// after the system block, which invalidates every cached token past that
+    /// point.  Trimming to exactly-fits means the very next turn overflows
+    /// again, so *every* subsequent request re-evaluates the whole prompt from
+    /// scratch.  Cutting deeper, less often, confines that cost to one turn in
+    /// many.
     fn trim_to_budget(
         messages: Vec<OllamaMessage>,
         total_ctx: Option<u32>,
@@ -517,6 +606,10 @@ impl OllamaProvider {
             return messages;
         }
 
+        // Target for this trim. `budget` remains the trigger; this is how far
+        // below it we cut once triggered.
+        let target = (budget as u64 * TRIM_TARGET_PCT as u64 / 100) as u32;
+
         let system_count = messages.iter().take_while(|m| m.role == "system").count();
         let mut trimmed = messages;
         let mut current = total;
@@ -524,8 +617,13 @@ impl OllamaProvider {
         // Walk forward from the first non-system message counting how many
         // to drop, then remove them with a single `drain` — per-message
         // `Vec::remove` would shift the entire tail once per drop (O(n·k)).
+        //
+        // The final message is always the turn we are actually asking about,
+        // so stop one short of the end: cutting to `target` must never eat
+        // the live request.
+        let last = trimmed.len().saturating_sub(1);
         let mut drop_end = system_count;
-        while current > budget && drop_end < trimmed.len() {
+        while current > target && drop_end < last {
             current = current.saturating_sub(estimate_message_tokens(&trimmed[drop_end]));
             drop_end += 1;
         }
@@ -543,6 +641,7 @@ impl OllamaProvider {
         tracing::warn!(
             num_ctx = total_ctx,
             budget,
+            target,
             estimated_tokens_before = total,
             estimated_tokens_after = current,
             messages_dropped = dropped,
@@ -611,9 +710,19 @@ impl ModelProvider for OllamaProvider {
             "model": self.model,
             "messages": ollama_messages,
             "stream": false,
-            "think": self.config.think,
             "options": options,
         });
+        // `think` is rejected outright by models that don't support it, so
+        // it is only sent when the model (or an explicit override) says yes.
+        if self.resolved_think() {
+            body["think"] = serde_json::json!(true);
+        }
+        // Keep the model — and with it the KV cache built from this prompt —
+        // resident between turns. Without this Ollama evicts after five idle
+        // minutes and the next message pays a reload plus a cold prompt eval.
+        if let Some(keep_alive) = &self.config.keep_alive {
+            body["keep_alive"] = serde_json::json!(keep_alive);
+        }
 
         if !ollama_tools.is_empty() {
             body["tools"] = serde_json::to_value(&ollama_tools).map_err(Error::Serialization)?;
@@ -769,9 +878,19 @@ impl ModelProvider for OllamaProvider {
             "model": self.model,
             "messages": ollama_messages,
             "stream": true,
-            "think": self.config.think,
             "options": options,
         });
+        // `think` is rejected outright by models that don't support it, so
+        // it is only sent when the model (or an explicit override) says yes.
+        if self.resolved_think() {
+            body["think"] = serde_json::json!(true);
+        }
+        // Keep the model — and with it the KV cache built from this prompt —
+        // resident between turns. Without this Ollama evicts after five idle
+        // minutes and the next message pays a reload plus a cold prompt eval.
+        if let Some(keep_alive) = &self.config.keep_alive {
+            body["keep_alive"] = serde_json::json!(keep_alive);
+        }
 
         if !ollama_tools.is_empty() {
             body["tools"] = serde_json::to_value(&ollama_tools).map_err(Error::Serialization)?;
@@ -1172,6 +1291,46 @@ fn vision_support(model: &str) -> bool {
     }
 }
 
+/// Decide whether to ask the configured Ollama model to think.
+///
+/// Ollama returns a 400 for `think: true` against a model that has no
+/// thinking capability, so this cannot be sent unconditionally. The
+/// `OLLAMA_THINK` env var overrides the heuristic with the same
+/// `true`/`false`/`auto` vocabulary as `OLLAMA_VISION`.
+fn think_support(model: &str) -> bool {
+    match std::env::var("OLLAMA_THINK").ok().as_deref() {
+        Some(v) => match v.trim().to_ascii_lowercase().as_str() {
+            "true" | "1" | "on" | "yes" => true,
+            "false" | "0" | "off" | "no" => false,
+            // "auto" or anything unrecognized: fall through to the heuristic.
+            _ => model_supports_thinking(model),
+        },
+        None => model_supports_thinking(model),
+    }
+}
+
+/// Heuristic match against known thinking-capable Ollama model families.
+///
+/// Thinking costs output tokens on every turn and its reasoning is stripped
+/// from history before the next call, so it is worth enabling only where it
+/// measurably helps tool-call accuracy. Users can force the answer either
+/// way with `OLLAMA_THINK`.
+fn model_supports_thinking(model: &str) -> bool {
+    let m = model.to_ascii_lowercase();
+    const THINKING_FAMILIES: &[&str] = &[
+        "gemma4",
+        "deepseek-r1",
+        "deepseek-v3.1",
+        "qwen3",
+        "qwq",
+        "gpt-oss",
+        "magistral",
+        "cogito",
+        "smallthinker",
+    ];
+    THINKING_FAMILIES.iter().any(|fam| m.contains(fam))
+}
+
 /// Heuristic match against known vision-capable Ollama model families.
 ///
 /// Matches on the model tag (e.g. `gemma4:26b`, `llava:13b`). New multimodal
@@ -1420,6 +1579,47 @@ mod tests {
     }
 
     #[test]
+    fn trim_cuts_below_budget_so_the_next_turn_does_not_retrim() {
+        // Hysteresis check: trimming to exactly-fits would make the very next
+        // turn overflow again, and each trim rewrites the prompt right after
+        // the system block — invalidating the whole cached prefix. One deep
+        // cut must leave room for several turns of growth.
+        let big = "x".repeat(4000); // ~1000 tokens each
+        let mut msgs = vec![system_msg("sys")];
+        for _ in 0..10 {
+            msgs.push(user_msg(&big));
+        }
+        msgs.push(user_msg("latest"));
+
+        let trimmed = OllamaProvider::trim_to_budget(msgs, Some(8192), 1024);
+
+        // budget = 8192 - 1024 - 2048 = 5120; target = 75% = 3840.
+        let after: u32 = trimmed.iter().map(estimate_message_tokens).sum();
+        assert!(
+            after <= 3840,
+            "expected trim to reach the 75% target, got {after} tokens"
+        );
+
+        // Re-trimming the same history must now be a no-op — that is the
+        // property that keeps the prefix stable across subsequent turns.
+        let len_before = trimmed.len();
+        let again = OllamaProvider::trim_to_budget(trimmed, Some(8192), 1024);
+        assert_eq!(again.len(), len_before);
+    }
+
+    #[test]
+    fn trim_never_drops_the_live_request() {
+        // A single message larger than the whole target must still be sent:
+        // dropping it would leave the model nothing to answer.
+        let huge = "z".repeat(200_000); // ~50k tokens
+        let msgs = vec![system_msg("sys"), user_msg(&huge)];
+        let trimmed = OllamaProvider::trim_to_budget(msgs, Some(8192), 1024);
+        assert_eq!(trimmed.len(), 2);
+        assert_eq!(trimmed[0].role, "system");
+        assert_eq!(trimmed[1].role, "user");
+    }
+
+    #[test]
     fn trim_drops_orphan_tool_results_after_truncation() {
         let big = "y".repeat(20_000); // ~5000 tokens
         let msgs = vec![
@@ -1436,36 +1636,92 @@ mod tests {
         assert_eq!(trimmed.last().unwrap().content.as_deref(), Some("latest"));
     }
 
-    #[test]
-    fn default_config_omits_num_ctx_when_env_unset() {
-        // Guard: when neither RUSTYKRAB_NUM_CTX nor OLLAMA_NUM_CTX is set,
-        // constructors leave num_ctx as None so the server's own
-        // OLLAMA_CONTEXT_LENGTH wins.
-        //
-        // std::env is process-global; restore it after the test so we don't
-        // contaminate sibling tests that may set it themselves.
-        let saved_ollama = std::env::var("OLLAMA_NUM_CTX").ok();
+    /// Run `f` with the two num_ctx env vars set to `rk` / `ollama`.
+    ///
+    /// `std::env` is process-global and `cargo test` is multi-threaded, so
+    /// every test that touches these vars serialises on one mutex and
+    /// restores the prior values on the way out.
+    fn with_num_ctx_env<T>(rk: Option<&str>, ollama: Option<&str>, f: impl FnOnce() -> T) -> T {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
         let saved_rk = std::env::var("RUSTYKRAB_NUM_CTX").ok();
-        // SAFETY: single-threaded section of this test. `cargo test` runs
-        // tests on separate threads by default but we're only reading/writing
-        // our own var and restoring it.
+        let saved_ollama = std::env::var("OLLAMA_NUM_CTX").ok();
+        // SAFETY: all writers of these vars hold ENV_LOCK for the duration.
         unsafe {
-            std::env::remove_var("OLLAMA_NUM_CTX");
-            std::env::remove_var("RUSTYKRAB_NUM_CTX");
-        }
-        assert_eq!(OllamaConfig::default().num_ctx, None);
-        assert_eq!(OllamaConfig::tool_calling().num_ctx, None);
-        assert_eq!(OllamaConfig::creative().num_ctx, None);
-        unsafe {
-            match saved_ollama {
+            match rk {
+                Some(v) => std::env::set_var("RUSTYKRAB_NUM_CTX", v),
+                None => std::env::remove_var("RUSTYKRAB_NUM_CTX"),
+            }
+            match ollama {
                 Some(v) => std::env::set_var("OLLAMA_NUM_CTX", v),
                 None => std::env::remove_var("OLLAMA_NUM_CTX"),
             }
+        }
+        let out = f();
+        unsafe {
             match saved_rk {
                 Some(v) => std::env::set_var("RUSTYKRAB_NUM_CTX", v),
                 None => std::env::remove_var("RUSTYKRAB_NUM_CTX"),
             }
+            match saved_ollama {
+                Some(v) => std::env::set_var("OLLAMA_NUM_CTX", v),
+                None => std::env::remove_var("OLLAMA_NUM_CTX"),
+            }
         }
+        out
+    }
+
+    #[test]
+    fn default_config_pins_num_ctx_when_env_unset() {
+        // Pinning one stable window is what lets Ollama keep a warm runner
+        // across requests, so every preset must land on the same value.
+        with_num_ctx_env(None, None, || {
+            assert_eq!(OllamaConfig::default().num_ctx, Some(DEFAULT_NUM_CTX));
+            assert_eq!(OllamaConfig::tool_calling().num_ctx, Some(DEFAULT_NUM_CTX));
+            assert_eq!(OllamaConfig::creative().num_ctx, Some(DEFAULT_NUM_CTX));
+        });
+    }
+
+    #[test]
+    fn num_ctx_env_override_is_honoured_with_rustykrab_taking_precedence() {
+        with_num_ctx_env(Some("16384"), None, || {
+            assert_eq!(num_ctx_from_env(), Some(16384));
+        });
+        with_num_ctx_env(None, Some("8192"), || {
+            assert_eq!(num_ctx_from_env(), Some(8192));
+        });
+        with_num_ctx_env(Some("16384"), Some("8192"), || {
+            assert_eq!(num_ctx_from_env(), Some(16384));
+        });
+    }
+
+    #[test]
+    fn num_ctx_server_sentinel_defers_to_ollama() {
+        for sentinel in ["server", "SERVER", "default", "0", " "] {
+            with_num_ctx_env(Some(sentinel), None, || {
+                assert_eq!(num_ctx_from_env(), None, "sentinel {sentinel:?}");
+            });
+        }
+    }
+
+    #[test]
+    fn unparseable_num_ctx_falls_back_to_default_rather_than_deferring() {
+        with_num_ctx_env(Some("thirty-two thousand"), None, || {
+            assert_eq!(num_ctx_from_env(), Some(DEFAULT_NUM_CTX));
+        });
+    }
+
+    #[test]
+    fn model_supports_thinking_matches_known_families() {
+        assert!(model_supports_thinking("gemma4:26b"));
+        assert!(model_supports_thinking("qwen3:32b"));
+        assert!(model_supports_thinking("DeepSeek-R1:14b")); // case-insensitive
+
+        // Sending `think` to these would be a 400 from Ollama.
+        assert!(!model_supports_thinking("llama3.1:8b"));
+        assert!(!model_supports_thinking("mistral:7b"));
+        assert!(!model_supports_thinking("qwen2.5:7b"));
     }
 
     #[test]

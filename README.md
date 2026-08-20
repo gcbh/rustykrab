@@ -52,6 +52,38 @@ export RUSTYKRAB_PROVIDER=ollama
 cargo run --release -p rustykrab-cli
 ```
 
+#### Tuning the Ollama server for KV-cache reuse
+
+An agent loop re-sends the whole conversation on every iteration, so almost
+all of its prompt is a prefix Ollama already evaluated on the previous turn.
+Reusing the cached KV for that prefix is the difference between a fast turn
+and one that re-reads the entire history. RustyKrab does its part on the
+client — it pins one `num_ctx` for the process, sends `keep_alive` so the
+runner stays resident, and trims history in infrequent deep cuts rather than
+a little every turn — but three settings on the server side matter just as
+much:
+
+```bash
+# Must be >= RUSTYKRAB_NUM_CTX, or the server silently truncates prompts.
+export OLLAMA_CONTEXT_LENGTH=32768
+
+# One slot keeps a single conversation pinned to a single warm cache.
+# Raising this splits KV memory across slots and round-robins requests, so
+# consecutive turns of one conversation can land on a cold slot.
+export OLLAMA_NUM_PARALLEL=1
+
+# Halves KV-cache memory, buying back the VRAM a larger window costs.
+# q8_0 requires flash attention and is close to lossless; q4_0 is cheaper
+# but degrades quality on long contexts.
+export OLLAMA_FLASH_ATTENTION=1
+export OLLAMA_KV_CACHE_TYPE=q8_0
+```
+
+Keep `OLLAMA_CONTEXT_LENGTH` and `RUSTYKRAB_NUM_CTX` in sync. If the server
+window is the smaller of the two, RustyKrab's own trimming budget is too
+generous and the server truncates from the front of the prompt — which moves
+the truncation point every turn and throws away the cached prefix each time.
+
 ## Configuration
 
 All configuration is via environment variables. No plaintext config files.
@@ -67,8 +99,11 @@ All configuration is via environment variables. No plaintext config files.
 | `RUSTYKRAB_COMPACTION_SUMMARY_MAX_TOKENS` | `8192` | Env-configurable upper bound on the final compaction summary. The effective cap is further bounded by `RUSTYKRAB_MAX_CONTEXT_TOKENS / 4`, so on a 32k local-Ollama deployment the summary stays under 8k regardless of this value. If the summarizer returns a summary larger than the effective cap, it is re-summarized (up to 3 passes) and eventually truncated |
 | `OLLAMA_MODEL` | `gemma4:26b` | Ollama model name |
 | `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama server address |
-| `RUSTYKRAB_NUM_CTX` | — | Explicit client-side `num_ctx` override for local providers. Takes precedence over `OLLAMA_NUM_CTX`. Omitted by default so the server's own `OLLAMA_CONTEXT_LENGTH` (or per-model default) wins |
+| `RUSTYKRAB_NUM_CTX` | `32768` | Context window pinned on every Ollama request. Takes precedence over `OLLAMA_NUM_CTX`. Clamped down to the model's native context length when that is smaller. Set to `server` to omit the field and let the server's `OLLAMA_CONTEXT_LENGTH` decide — this disables client-side trimming, since the client then cannot know what the server allocated |
 | `OLLAMA_NUM_CTX` | — | Legacy alias for `RUSTYKRAB_NUM_CTX`. Used only when `RUSTYKRAB_NUM_CTX` is unset |
+| `OLLAMA_KEEP_ALIVE` | `30m` | How long Ollama keeps the model and its KV cache resident after a request (Ollama duration syntax; `-1` for forever). Ollama's own default is 5 minutes, short enough that a sporadically-used gateway reloads the model on most messages. Set to `server` to omit the field |
+| `OLLAMA_THINK` | `auto` | Whether to request thinking mode: `true`, `false`, or `auto` to decide from the model tag. Ollama returns a 400 for `think` against models that don't support it, so `auto` only enables it for known thinking families |
+| `OLLAMA_VISION` | `auto` | Whether the model accepts image input: `true`, `false`, or `auto` to decide from the model tag |
 | `OLLAMA_TIMEOUT_SECS` | `900` | HTTP request timeout for Ollama in seconds |
 | `CHROME_CDP_URL` | `ws://127.0.0.1:9222` | Chrome DevTools Protocol endpoint |
 | `RUSTYKRAB_AUTH_TOKEN` | auto-generated | Bearer token for API auth |
