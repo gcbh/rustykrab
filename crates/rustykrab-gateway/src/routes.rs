@@ -53,6 +53,9 @@ pub fn api_routes() -> Router<AppState> {
             "/api/credential-requests/{id}/deny",
             post(deny_credential_request),
         )
+        .route("/api/pair", post(pair_device))
+        .route("/api/devices", get(list_devices))
+        .route("/api/devices/{id}", axum::routing::delete(revoke_device))
         .route("/api/health", get(health))
         .route("/api/logout", post(logout))
 }
@@ -904,27 +907,129 @@ async fn list_credential_requests(
 
 async fn approve_credential_request(
     State(state): State<AppState>,
+    principal: Option<Extension<rustykrab_store::Principal>>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, StatusCode> {
-    decide_credential_request(state, id, true).await
+    decide_credential_request(state, id, true, principal.map(|p| p.0)).await
 }
 
 async fn deny_credential_request(
     State(state): State<AppState>,
+    principal: Option<Extension<rustykrab_store::Principal>>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, StatusCode> {
-    decide_credential_request(state, id, false).await
+    decide_credential_request(state, id, false, principal.map(|p| p.0)).await
+}
+
+// ── device pairing ──────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct PairRequest {
+    code: String,
+    #[serde(rename = "deviceName")]
+    device_name: String,
+}
+
+#[derive(Serialize)]
+struct PairResponse {
+    #[serde(rename = "deviceId")]
+    device_id: String,
+    /// Shown exactly once. Stored server-side only as a hash.
+    #[serde(rename = "deviceToken")]
+    device_token: String,
+}
+
+/// Exchange a one-time code for a device token.
+///
+/// The only unauthenticated `/api` route besides health: a device has no
+/// token yet, which is the point. Protection is the code itself (single
+/// use, five-minute TTL, hashed at rest) plus the rate limiter in front.
+async fn pair_device(
+    State(state): State<AppState>,
+    Json(body): Json<PairRequest>,
+) -> Result<Json<PairResponse>, StatusCode> {
+    let (device, token) = state
+        .store
+        .devices()
+        .redeem_pairing_code(&body.code, &body.device_name)
+        .await
+        .map_err(|e| {
+            // Deliberately uniform: a caller learns "that didn't work",
+            // not whether the code was wrong, used, or merely expired.
+            tracing::warn!(error = %e, "pairing attempt refused");
+            StatusCode::FORBIDDEN
+        })?;
+    tracing::info!(device = %device.name, id = %device.id, "device paired");
+    Ok(Json(PairResponse {
+        device_id: device.id,
+        device_token: token,
+    }))
+}
+
+#[derive(Serialize)]
+struct DeviceResponse {
+    id: String,
+    name: String,
+    #[serde(rename = "createdAt")]
+    created_at: i64,
+    #[serde(rename = "lastSeenAt", skip_serializing_if = "Option::is_none")]
+    last_seen_at: Option<i64>,
+}
+
+async fn list_devices(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<DeviceResponse>>, StatusCode> {
+    let devices = state.store.devices().list().await.map_err(|e| {
+        tracing::error!(error = %e, "listing devices failed");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    Ok(Json(
+        devices
+            .into_iter()
+            .map(|d| DeviceResponse {
+                id: d.id,
+                name: d.name,
+                created_at: d.created_at,
+                last_seen_at: d.last_seen_at,
+            })
+            .collect(),
+    ))
+}
+
+/// Revoke a device — the lost-phone story. Its token stops working
+/// immediately, without disturbing any other device.
+async fn revoke_device(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, StatusCode> {
+    state
+        .store
+        .devices()
+        .revoke(&id)
+        .await
+        .map_err(|e| match e {
+            rustykrab_core::Error::NotFound(_) => StatusCode::NOT_FOUND,
+            other => {
+                tracing::error!(error = %other, %id, "revoking device failed");
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
+        })?;
+    tracing::info!(%id, "device revoked");
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn decide_credential_request(
     state: AppState,
     id: String,
     approve: bool,
+    principal: Option<rustykrab_store::Principal>,
 ) -> Result<StatusCode, StatusCode> {
     let requests = state.store.credential_requests();
-    // TODO(devices): attribute to the deciding device once per-device
-    // tokens land; until then every decision is the master token.
-    let decided_by = "webchat";
+    // Which device decided, for the audit trail.
+    let decided_by = principal
+        .map(|p| p.describe())
+        .unwrap_or_else(|| "webchat".to_string());
+    let decided_by = decided_by.as_str();
     let result = if approve {
         requests.approve(&id, decided_by).await
     } else {

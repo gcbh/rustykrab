@@ -1,6 +1,7 @@
 mod chat_map;
 mod conversation;
 mod credential_request;
+mod device;
 mod guarded;
 mod jobs;
 pub mod keychain;
@@ -19,6 +20,7 @@ use zeroize::Zeroizing;
 pub use chat_map::ChatMapStore;
 pub use conversation::{ConversationStore, ConversationSummary};
 pub use credential_request::{CredentialRequest, CredentialRequestStore, RequestAction};
+pub use device::{Device, DeviceStore, Principal};
 pub use guarded::{GuardedSecrets, WriteOutcome};
 pub use jobs::{JobRun, JobStore, ScheduledJob};
 pub use recall_archive::RecallArchiveStore;
@@ -195,6 +197,26 @@ impl Store {
 
             CREATE INDEX IF NOT EXISTS idx_secret_audit_name
                 ON secret_audit (name, at DESC);
+
+            -- Paired devices. Tokens are stored only as SHA-256 hashes, so
+            -- reading this table yields nothing that can authenticate.
+            -- Revoked rows are kept so audit entries naming them resolve.
+            CREATE TABLE IF NOT EXISTS devices (
+                id           TEXT PRIMARY KEY,
+                name         TEXT NOT NULL,
+                token_hash   BLOB NOT NULL,
+                created_at   INTEGER NOT NULL,
+                last_seen_at INTEGER,
+                revoked_at   INTEGER,
+                push_token   TEXT
+            );
+
+            -- One-time pairing codes: hashed, short-lived, single use.
+            CREATE TABLE IF NOT EXISTS pairing_codes (
+                code_hash  BLOB PRIMARY KEY,
+                expires_at INTEGER NOT NULL,
+                used_at    INTEGER
+            );
             ",
         )
         .map_err(|e| Error::Storage(e.to_string()))?;
@@ -337,6 +359,11 @@ impl Store {
     /// forgetting a check.
     pub fn guarded_secrets(&self) -> GuardedSecrets {
         GuardedSecrets::new(self.secrets(), self.credential_requests())
+    }
+
+    /// Handle for paired devices and pairing codes.
+    pub fn devices(&self) -> DeviceStore {
+        DeviceStore::new(Arc::clone(&self.conn))
     }
 
     /// Return a handle for scheduled-job operations.

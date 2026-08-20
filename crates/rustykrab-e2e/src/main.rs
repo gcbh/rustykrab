@@ -86,7 +86,15 @@ const AGENT_SCRIPT: &str = r#"{
 enum Expected {
     /// Implemented behaviour — must pass.
     Pass,
-    /// Phase 2 target behaviour — expected to fail until the guard lands.
+    /// Target behaviour that is not built yet: the suite stays green while
+    /// it fails, and an unexpected pass turns the suite red so the
+    /// scenario gets promoted.
+    ///
+    /// Currently unconstructed, because every scenario has been promoted —
+    /// which is exactly what "the server is done" looks like. Kept because
+    /// the next phase's targets are written as xfail first; deleting it
+    /// would throw away the convention the moment it had proved itself.
+    #[allow(dead_code)]
     XFail,
 }
 
@@ -884,6 +892,17 @@ async fn main() -> Result<()> {
     if keep_tmp {
         let path = tmp.keep();
         eprintln!("E2E_KEEP_TMP set — data dir kept at {}", path.display());
+    } else {
+        // Delete the throwaway data dir explicitly rather than relying on
+        // TempDir's Drop: this process exits via `std::process::exit` when
+        // the suite is red, which skips destructors. Leaving it implicit
+        // meant every red run — and going red is how an xpass gets
+        // noticed — leaked a daemon data dir and its logs.
+        let path = tmp.path().to_path_buf();
+        drop(tmp);
+        if path.exists() {
+            let _ = std::fs::remove_dir_all(&path);
+        }
     }
     println!("{}", serde_json::to_string_pretty(&report)?);
     if !ok {
@@ -933,15 +952,15 @@ async fn run_suite(
         (Expected::Pass, scenario!(agent_creates_new_credential)),
         // Workstream A — the credential guard. Shipped: these assert the
         // real behaviour now.
-        // Workstream B — device pairing, not built yet.
-        (Expected::XFail, scenario!(pair_device_target)),
+        // Workstream B — device pairing.
+        (Expected::Pass, scenario!(pair_device_target)),
         (Expected::Pass, scenario!(secrets_create_only_409)),
         (Expected::Pass, scenario!(secrets_overwrite_archives)),
         (Expected::Pass, scenario!(agent_overwrite_files_request)),
         (Expected::Pass, scenario!(approve_applies_change)),
         (Expected::Pass, scenario!(deny_preserves_value)),
         (Expected::Pass, scenario!(agent_delete_files_request)),
-        (Expected::XFail, scenario!(revoked_device_401)),
+        (Expected::Pass, scenario!(revoked_device_401)),
     ];
 
     let mut reports = Vec::new();
