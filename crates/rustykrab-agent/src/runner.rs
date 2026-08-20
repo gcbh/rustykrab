@@ -2318,10 +2318,30 @@ impl AgentRunner {
     /// so runaway local-model context windows still trigger compaction
     /// at a sane size.
     fn effective_context_limit(&self) -> usize {
-        self.provider
+        let reported = self
+            .provider
             .context_limit()
-            .unwrap_or(self.config.max_context_tokens)
-            .min(compaction_context_ceiling())
+            .unwrap_or(self.config.max_context_tokens);
+        let ceiling = compaction_context_ceiling();
+        if reported > ceiling {
+            // The ceiling exists to stop a model that *advertises* a huge
+            // window from driving compaction budgets its GPU can't sustain.
+            // But it applies just as bluntly to a window the operator pinned
+            // on purpose, which then does nothing above the ceiling — the
+            // symptom being "I raised RUSTYKRAB_NUM_CTX and nothing changed".
+            // Say so once rather than silently discarding the setting.
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                tracing::warn!(
+                    provider_context_limit = reported,
+                    compaction_context_ceiling = ceiling,
+                    "provider reports more usable context than the compaction ceiling allows; \
+                     compaction will fire at 85% of the ceiling. Raise \
+                     RUSTYKRAB_COMPACTION_CONTEXT_CEILING to use the full window"
+                );
+            });
+        }
+        reported.min(ceiling)
     }
 
     /// Effective cap on the compacted-history summary in tokens. Combines

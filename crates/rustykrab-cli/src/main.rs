@@ -508,7 +508,8 @@ async fn main() -> anyhow::Result<()> {
                 %model,
                 %base_url,
                 num_ctx = ?config.num_ctx,
-                "using Ollama provider (num_ctx=None defers to server's OLLAMA_CONTEXT_LENGTH)"
+                keep_alive = ?config.keep_alive,
+                "using Ollama provider (set RUSTYKRAB_NUM_CTX=server to defer to OLLAMA_CONTEXT_LENGTH)"
             );
             let p = rustykrab_providers::OllamaProvider::new(model)
                 .with_base_url(base_url)
@@ -518,6 +519,8 @@ async fn main() -> anyhow::Result<()> {
             tracing::info!(
                 num_ctx = ?p.num_ctx(),
                 effective_ctx = ?p.effective_ctx(),
+                keep_alive = ?p.keep_alive(),
+                think = p.resolved_think(),
                 "Ollama client-side context settings"
             );
             Arc::new(p)
