@@ -286,6 +286,12 @@ impl OllamaProvider {
     /// unfamiliar (e.g. an architecture we don't recognize).  Network and
     /// HTTP errors are propagated so the caller can decide how to react.
     pub async fn detect_context_window(&self) -> Result<Option<u32>> {
+        Ok(self.detect_model_shape().await?.0)
+    }
+
+    /// Query `/api/show` for both the model's native context length and the
+    /// attention geometry needed to size its KV cache.
+    async fn detect_model_shape(&self) -> Result<(Option<u32>, Option<KvGeometry>)> {
         let url = format!("{}/api/show", self.base_url);
         let resp = self
             .client
@@ -304,7 +310,38 @@ impl OllamaProvider {
         let raw: serde_json::Value = resp.json().await.map_err(|e| {
             Error::ModelProvider(format!("failed to parse /api/show response: {e}"))
         })?;
-        Ok(parse_context_length_from_show(&raw))
+        Ok((
+            parse_context_length_from_show(&raw),
+            parse_kv_geometry_from_show(&raw),
+        ))
+    }
+
+    /// Report what the pinned window will cost in KV cache.
+    ///
+    /// Choosing `num_ctx` is a VRAM decision, and without this the operator
+    /// has no way to make it except trial and error against an OOM. Logged at
+    /// startup for the window actually in use, plus the model's native
+    /// maximum so the gap between "what it supports" and "what it costs" is
+    /// visible in one place.
+    fn log_kv_cache_estimate(&self, geometry: KvGeometry, native_ctx: Option<u32>) {
+        let Some(window) = self.effective_ctx() else {
+            return;
+        };
+        // f16 is Ollama's default; OLLAMA_KV_CACHE_TYPE=q8_0 halves it.
+        const F16: u64 = 2;
+        let gib = |bytes: u64| bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+
+        tracing::info!(
+            num_ctx = window,
+            layers = geometry.layers,
+            kv_heads = geometry.kv_heads,
+            kv_cache_gib_f16 = format!("{:.1}", gib(geometry.cache_bytes(window, F16))),
+            kv_cache_gib_q8_0 = format!("{:.1}", gib(geometry.cache_bytes(window, 1))),
+            native_ctx_kv_cache_gib_f16 = native_ctx
+                .map(|n| format!("{:.1}", gib(geometry.cache_bytes(n, F16))))
+                .unwrap_or_else(|| "unknown".to_string()),
+            "estimated KV cache footprint (upper bound; sliding-window layers cost less)"
+        );
     }
 
     /// Detect the model's native context length and cache it for client-side
@@ -314,41 +351,8 @@ impl OllamaProvider {
     /// is logged — startup must not fail just because Ollama is momentarily
     /// unreachable.
     pub async fn with_detected_context_window(mut self) -> Self {
-        match self.detect_context_window().await {
-            Ok(Some(detected)) => {
-                self.detected_ctx = Some(detected);
-                if let Some(requested) = self.config.num_ctx {
-                    if requested > detected {
-                        tracing::info!(
-                            model = %self.model,
-                            requested_num_ctx = requested,
-                            detected_num_ctx = detected,
-                            "clamping explicit num_ctx to model's native context length"
-                        );
-                        self.config.num_ctx = Some(detected);
-                    } else {
-                        tracing::debug!(
-                            model = %self.model,
-                            num_ctx = requested,
-                            detected_num_ctx = detected,
-                            "explicit num_ctx fits within model's native context length"
-                        );
-                    }
-                } else {
-                    tracing::debug!(
-                        model = %self.model,
-                        detected_num_ctx = detected,
-                        "no explicit num_ctx set; deferring to server while using detected value for client-side trimming"
-                    );
-                }
-            }
-            Ok(None) => {
-                tracing::warn!(
-                    model = %self.model,
-                    num_ctx = ?self.config.num_ctx,
-                    "could not detect model context length from /api/show"
-                );
-            }
+        let (detected, geometry) = match self.detect_model_shape().await {
+            Ok(pair) => pair,
             Err(e) => {
                 tracing::warn!(
                     model = %self.model,
@@ -356,7 +360,55 @@ impl OllamaProvider {
                     error = %e,
                     "failed to query /api/show"
                 );
+                return self;
             }
+        };
+
+        match detected {
+            Some(detected) => {
+                self.detected_ctx = Some(detected);
+                match self.config.num_ctx {
+                    Some(requested) if requested > detected => {
+                        tracing::info!(
+                            model = %self.model,
+                            requested_num_ctx = requested,
+                            detected_num_ctx = detected,
+                            "clamping num_ctx to model's native context length"
+                        );
+                        self.config.num_ctx = Some(detected);
+                    }
+                    Some(requested) => {
+                        tracing::debug!(
+                            model = %self.model,
+                            num_ctx = requested,
+                            detected_num_ctx = detected,
+                            "num_ctx fits within model's native context length"
+                        );
+                    }
+                    None => {
+                        tracing::debug!(
+                            model = %self.model,
+                            detected_num_ctx = detected,
+                            "no explicit num_ctx set; deferring to server while using detected value for client-side trimming"
+                        );
+                    }
+                }
+            }
+            None => {
+                tracing::warn!(
+                    model = %self.model,
+                    num_ctx = ?self.config.num_ctx,
+                    "could not detect model context length from /api/show"
+                );
+            }
+        }
+
+        match geometry {
+            Some(geometry) => self.log_kv_cache_estimate(geometry, detected),
+            None => tracing::debug!(
+                model = %self.model,
+                "could not read attention geometry from /api/show; skipping KV cache estimate"
+            ),
         }
         self
     }
@@ -1377,6 +1429,83 @@ fn estimate_text_tokens(s: &str) -> u32 {
     chars.div_ceil(CHARS_PER_TOKEN) as u32
 }
 
+/// Attention geometry needed to size a model's KV cache, read from
+/// `/api/show`'s `model_info` (which surfaces the GGUF metadata).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KvGeometry {
+    /// Number of transformer blocks (layers).
+    pub layers: u32,
+    /// Key/value heads per layer. Smaller than the query head count on any
+    /// model using grouped-query attention, which is what makes long
+    /// contexts affordable at all.
+    pub kv_heads: u32,
+    /// Per-head key dimension.
+    pub key_length: u32,
+    /// Per-head value dimension.
+    pub value_length: u32,
+}
+
+impl KvGeometry {
+    /// Bytes of KV cache a context of `num_ctx` tokens needs, at
+    /// `bytes_per_element` per stored scalar (2 for the f16 default, 1 for
+    /// `OLLAMA_KV_CACHE_TYPE=q8_0`).
+    ///
+    /// This is an **upper bound**. Models that interleave sliding-window
+    /// local attention with global attention — Gemma's architecture does
+    /// exactly this — only allocate the full window for the global layers,
+    /// so their real footprint is a fraction of this figure. Treat it as
+    /// "no more than", not "exactly".
+    pub fn cache_bytes(&self, num_ctx: u32, bytes_per_element: u64) -> u64 {
+        let per_token = self.layers as u64
+            * self.kv_heads as u64
+            * (self.key_length as u64 + self.value_length as u64)
+            * bytes_per_element;
+        per_token * num_ctx as u64
+    }
+}
+
+/// Read a `model_info` field that may be stored as a scalar or as a
+/// per-layer array. Arrays take the maximum, so the estimate stays an
+/// upper bound for models with heterogeneous layers.
+fn model_info_u32(info: &serde_json::Map<String, serde_json::Value>, key: &str) -> Option<u32> {
+    let v = info.get(key)?;
+    let n = match v {
+        serde_json::Value::Array(items) => items.iter().filter_map(|i| i.as_u64()).max()?,
+        other => other.as_u64()?,
+    };
+    u32::try_from(n).ok().filter(|&n| n > 0)
+}
+
+/// Pull the attention geometry out of a `/api/show` response, so the KV
+/// cache cost of a given window can be reported rather than guessed at.
+/// Returns `None` when the metadata doesn't carry enough to compute it.
+fn parse_kv_geometry_from_show(raw: &serde_json::Value) -> Option<KvGeometry> {
+    let info = raw.get("model_info")?.as_object()?;
+    let arch = info.get("general.architecture")?.as_str()?;
+
+    let layers = model_info_u32(info, &format!("{arch}.block_count"))?;
+    let kv_heads = model_info_u32(info, &format!("{arch}.attention.head_count_kv"))?;
+
+    // `key_length`/`value_length` are optional in GGUF; when absent the head
+    // dimension is embedding_length / head_count.
+    let fallback_head_dim = || {
+        let embedding = model_info_u32(info, &format!("{arch}.embedding_length"))?;
+        let heads = model_info_u32(info, &format!("{arch}.attention.head_count"))?;
+        Some(embedding / heads).filter(|&d| d > 0)
+    };
+    let key_length =
+        model_info_u32(info, &format!("{arch}.attention.key_length")).or_else(fallback_head_dim)?;
+    let value_length = model_info_u32(info, &format!("{arch}.attention.value_length"))
+        .or_else(fallback_head_dim)?;
+
+    Some(KvGeometry {
+        layers,
+        kv_heads,
+        key_length,
+        value_length,
+    })
+}
+
 /// Pull a context-length value out of a `/api/show` response.  Ollama reports
 /// it under `model_info` keyed by architecture (e.g. `llama.context_length`,
 /// `qwen3.context_length`).  We accept any key suffixed `.context_length`.
@@ -1658,6 +1787,85 @@ mod tests {
             }
         });
         assert_eq!(parse_context_length_from_show(&raw), Some(16384));
+    }
+
+    #[test]
+    fn parses_kv_geometry_from_explicit_key_value_lengths() {
+        let raw = serde_json::json!({
+            "model_info": {
+                "general.architecture": "gemma4",
+                "gemma4.block_count": 62u64,
+                "gemma4.attention.head_count_kv": 8u64,
+                "gemma4.attention.key_length": 256u64,
+                "gemma4.attention.value_length": 256u64,
+            }
+        });
+        assert_eq!(
+            parse_kv_geometry_from_show(&raw),
+            Some(KvGeometry {
+                layers: 62,
+                kv_heads: 8,
+                key_length: 256,
+                value_length: 256,
+            })
+        );
+    }
+
+    #[test]
+    fn kv_geometry_falls_back_to_embedding_over_head_count() {
+        // key_length/value_length are optional in GGUF; the head dimension
+        // is then embedding_length / head_count.
+        let raw = serde_json::json!({
+            "model_info": {
+                "general.architecture": "llama",
+                "llama.block_count": 32u64,
+                "llama.attention.head_count_kv": 8u64,
+                "llama.attention.head_count": 32u64,
+                "llama.embedding_length": 4096u64,
+            }
+        });
+        let geo = parse_kv_geometry_from_show(&raw).expect("geometry");
+        assert_eq!(geo.key_length, 128);
+        assert_eq!(geo.value_length, 128);
+    }
+
+    #[test]
+    fn kv_geometry_takes_the_max_of_per_layer_arrays() {
+        // Some GGUFs store head_count_kv per layer. Taking the max keeps the
+        // estimate an upper bound rather than an optimistic one.
+        let raw = serde_json::json!({
+            "model_info": {
+                "general.architecture": "novel",
+                "novel.block_count": 4u64,
+                "novel.attention.head_count_kv": [2u64, 8u64, 2u64, 4u64],
+                "novel.attention.key_length": 64u64,
+                "novel.attention.value_length": 64u64,
+            }
+        });
+        assert_eq!(parse_kv_geometry_from_show(&raw).unwrap().kv_heads, 8);
+    }
+
+    #[test]
+    fn kv_geometry_is_none_without_enough_metadata() {
+        let raw = serde_json::json!({
+            "model_info": { "general.architecture": "llama", "llama.block_count": 32u64 }
+        });
+        assert_eq!(parse_kv_geometry_from_show(&raw), None);
+    }
+
+    #[test]
+    fn kv_cache_bytes_scale_linearly_with_window_and_element_size() {
+        let geo = KvGeometry {
+            layers: 62,
+            kv_heads: 8,
+            key_length: 256,
+            value_length: 256,
+        };
+        // 62 layers * 8 heads * 512 dims * 2 bytes = 507,904 bytes per token.
+        assert_eq!(geo.cache_bytes(1, 2), 507_904);
+        assert_eq!(geo.cache_bytes(1024, 2), 507_904 * 1024);
+        // q8_0 halves it.
+        assert_eq!(geo.cache_bytes(1024, 1), 507_904 * 512);
     }
 
     #[test]

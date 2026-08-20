@@ -105,6 +105,28 @@ Two consequences worth knowing:
   pre-empt compaction" warning, the loaded tool schemas have grown large
   enough to invert it — raise `RUSTYKRAB_NUM_CTX` or load fewer tools.
 
+- **Going above ~64k takes two settings, not one.** `RUSTYKRAB_NUM_CTX` sizes
+  the window; `RUSTYKRAB_COMPACTION_CONTEXT_CEILING` caps the budget the agent
+  loop will actually grow into, and defaults to 65,536. Raise only the first
+  and compaction still fires at ~56k — the extra window goes unused. RustyKrab
+  logs a warning when the ceiling is clipping the window, but the pairing is
+  easy to miss:
+
+  ```bash
+  export RUSTYKRAB_NUM_CTX=131072
+  export OLLAMA_CONTEXT_LENGTH=131072
+  export RUSTYKRAB_COMPACTION_CONTEXT_CEILING=131072
+  ```
+
+  The default is deliberately below what a long-context model advertises.
+  A model supporting 256k does not mean 256k is the right operating point:
+  the KV cache is allocated for the whole window up front, and attention cost
+  grows with how much of it is filled. At startup RustyKrab logs the measured
+  footprint for your model and window (`estimated KV cache footprint`, with
+  both f16 and q8_0 figures and what the model's native maximum would cost) —
+  pick a window from those numbers and your free VRAM rather than from the
+  model's advertised limit.
+
 - **Loading tools invalidates the KV cache.** Tool definitions render into the
   prompt *prefix*, ahead of the conversation, so a tool set that changes
   mid-run moves every token after it and forces a full prompt re-evaluation.
