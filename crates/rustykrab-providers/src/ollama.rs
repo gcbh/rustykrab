@@ -2030,9 +2030,12 @@ mod tests {
 
     #[test]
     fn trim_always_leaves_a_user_turn() {
-        // Ollama >= 0.32 rejects any /api/chat request whose message array
-        // carries no `user` role, so an over-long conversation must degrade
-        // rather than become a hard failure.
+        // Some model chat templates reject an /api/chat request whose
+        // message array carries no `user` role, so an over-long conversation
+        // must degrade rather than become a hard failure. Verified against
+        // Ollama 0.32.14: qwen3.8:27b returns 500 `no user query found in
+        // messages`; gemma4:26b and qwen3:32b accept the same array. It is
+        // the template, not the Ollama version.
         let big = "x".repeat(40_000); // ~10k tokens each
         let msgs = vec![
             system_msg("sys"),
@@ -2120,6 +2123,152 @@ mod tests {
         assert!(
             trimmed.iter().any(|m| m.role == "user"),
             "a user turn must survive even when the history ends in a tool result"
+        );
+    }
+
+    // ---- Live tests against a real Ollama daemon -------------------------
+    //
+    // Ignored by default: they need a running Ollama and the model named by
+    // RK_LIVE_MODEL (default qwen3.8:27b). Run with:
+    //
+    //   cargo test -p rustykrab-providers --  --ignored --test-threads=1
+    //
+    // These exist because the failure they cover is not reproducible in a
+    // unit test: it lives in the model's chat template, server-side. Note
+    // that the rejection is template-specific, NOT a blanket Ollama
+    // behaviour — qwen3.8:27b rejects a user-less message array while
+    // gemma4:26b, qwen3:32b and qwen3:30b-a3b all accept one.
+
+    fn live_model() -> String {
+        std::env::var("RK_LIVE_MODEL").unwrap_or_else(|_| "qwen3.8:27b".to_string())
+    }
+
+    fn live_provider() -> OllamaProvider {
+        let mut cfg = OllamaConfig {
+            num_predict: 8,
+            ..Default::default()
+        };
+        cfg.num_ctx = Some(8192);
+        OllamaProvider::new(live_model())
+            .with_base_url("http://127.0.0.1:11434")
+            .with_config(cfg)
+    }
+
+    fn core_msg(role: Role, text: &str) -> Message {
+        Message {
+            id: Uuid::new_v4(),
+            role,
+            content: MessageContent::Text(text.to_string()),
+            created_at: Utc::now(),
+            agent_version: None,
+        }
+    }
+
+    /// Negative control. The exact array a resumed job conversation produced
+    /// before the fix — system + assistant, no user turn — must still be
+    /// rejected by the live model. If this ever starts passing, the premise
+    /// behind the fix has changed and the other live tests prove nothing.
+    #[tokio::test]
+    #[ignore = "requires a live Ollama daemon"]
+    async fn live_resumed_job_shape_without_a_user_turn_is_rejected() {
+        let provider = live_provider();
+        let msgs = vec![
+            core_msg(Role::System, "You are a helpful assistant."),
+            core_msg(Role::Assistant, "result of the previous scheduled run"),
+        ];
+
+        let err = provider
+            .chat(&msgs, &[])
+            .await
+            .expect_err("a user-less array must be rejected by the live model");
+
+        let text = err.to_string();
+        assert!(
+            text.contains("no user query found in messages"),
+            "expected the documented provider rejection, got: {text}"
+        );
+    }
+
+    /// Fix 1, end to end: the same conversation with the scheduled prompt
+    /// appended as a real user turn goes through the live model.
+    #[tokio::test]
+    #[ignore = "requires a live Ollama daemon"]
+    async fn live_resumed_job_shape_with_a_user_turn_succeeds() {
+        let provider = live_provider();
+        let msgs = vec![
+            core_msg(Role::System, "You are a helpful assistant."),
+            core_msg(Role::Assistant, "result of the previous scheduled run"),
+            core_msg(
+                Role::User,
+                "[Scheduled task] Execute it and reply concisely.",
+            ),
+        ];
+
+        provider
+            .chat(&msgs, &[])
+            .await
+            .expect("appending the scheduled user turn must make the request valid");
+    }
+
+    /// Fix 2 on the shape production actually produces once Fix 1 is in
+    /// place: a long history whose newest message is the scheduled user turn.
+    /// Trimming must drop the old bulk and keep the request valid.
+    #[tokio::test]
+    #[ignore = "requires a live Ollama daemon"]
+    async fn live_overlong_history_ending_in_a_user_turn_succeeds() {
+        let provider = live_provider();
+        let big = "x".repeat(40_000); // ~10k tokens each
+
+        let mut msgs = vec![core_msg(Role::System, "You are a helpful assistant.")];
+        msgs.push(core_msg(Role::User, "an old user turn"));
+        for _ in 0..3 {
+            msgs.push(core_msg(Role::Assistant, &big));
+        }
+        // Fix 1 puts the scheduled prompt last; this is the live shape.
+        msgs.push(core_msg(
+            Role::User,
+            "[Scheduled task] Execute it and reply concisely.",
+        ));
+
+        provider
+            .chat(&msgs, &[])
+            .await
+            .expect("a history ending in a user turn must survive trimming");
+    }
+
+    /// KNOWN LIMITATION, asserted so it cannot regress silently.
+    ///
+    /// When the last user turn is old and large content follows it, the clamp
+    /// pins `drop_end` to that turn and the trimmer — which only drops from
+    /// the front — can free nothing. The over-budget request is then truncated
+    /// server-side, oldest-first, which discards the user turn and reproduces
+    /// the very rejection the clamp exists to prevent. `trim_to_budget` logs
+    /// this via the `error!` branch but cannot currently fix it: escaping it
+    /// requires dropping from the middle, which trades away the KV-cache
+    /// prefix stability #488 was built for.
+    ///
+    /// Flip this assertion to `expect(...)` when that is addressed.
+    #[tokio::test]
+    #[ignore = "requires a live Ollama daemon"]
+    async fn live_old_user_turn_followed_by_bulk_is_a_known_failure() {
+        let provider = live_provider();
+        let big = "x".repeat(40_000);
+
+        let mut msgs = vec![
+            core_msg(Role::System, "You are a helpful assistant."),
+            core_msg(Role::User, "the only user turn"),
+        ];
+        for _ in 0..3 {
+            msgs.push(core_msg(Role::Assistant, &big));
+        }
+
+        let err = provider
+            .chat(&msgs, &[])
+            .await
+            .expect_err("documented limitation: an old user turn buried under bulk still fails");
+        assert!(
+            err.to_string().contains("no user query found in messages"),
+            "expected the documented rejection, got: {err}"
         );
     }
 
