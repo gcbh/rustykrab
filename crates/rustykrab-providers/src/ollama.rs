@@ -6,6 +6,9 @@ use rustykrab_core::model::{ModelProvider, ModelResponse, StopReason, StreamEven
 use rustykrab_core::types::{Message, MessageContent, Role, ToolCall, ToolSchema};
 use rustykrab_core::Error;
 use serde::{Deserialize, Serialize};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -26,8 +29,15 @@ const RETRY_BASE_DELAY: Duration = Duration::from_secs(1);
 /// prompt that overshoots gets silently truncated server-side — which moves
 /// the truncation point every turn and defeats prefix caching completely.
 ///
-/// 32k matches the local-Ollama compaction budget the CLI already assumes.
-const DEFAULT_NUM_CTX: u32 = 32_768;
+/// 64k matches `DEFAULT_COMPACTION_CONTEXT_CEILING` in the agent runner, so
+/// the provider's window and the compaction budget agree instead of one
+/// silently capping the other. It is clamped down to the model's own native
+/// length at startup, so a smaller model still gets a sane value.
+///
+/// This costs VRAM: the KV cache is allocated for the whole window when the
+/// runner loads. Lower it with `RUSTYKRAB_NUM_CTX` if the model won't fit, or
+/// halve the cache with `OLLAMA_KV_CACHE_TYPE=q8_0` (see README).
+const DEFAULT_NUM_CTX: u32 = 65_536;
 
 /// Default `keep_alive` sent with every request: how long Ollama keeps the
 /// model (and its KV cache) resident after the request finishes. Ollama's own
@@ -124,9 +134,22 @@ const CHARS_PER_TOKEN: usize = 4;
 /// Per-message overhead (role tag, framing) the server adds on top of content.
 const PER_MESSAGE_OVERHEAD_TOKENS: u32 = 4;
 
-/// Tokens reserved for tool schemas in the prompt and other framing the
-/// client can't easily measure (chat template, system tool preamble, etc.).
-const SAFETY_OVERHEAD_TOKENS: u32 = 2048;
+/// Tokens reserved for chat-template framing the client can't measure:
+/// role tags, the tool-call preamble most templates emit, BOS/EOS scaffolding.
+///
+/// Tool schemas used to be lumped in here at a flat 2048. They aren't any
+/// more — they're measured per request, because the real figure moves by an
+/// order of magnitude as the model loads tools (~1.8k tokens for the set
+/// seeded at turn 0, ~10k with the full catalog loaded). A flat guess
+/// over-reserved on a fresh conversation and badly under-reserved on a
+/// tool-heavy one, which is how a "trimmed" prompt could still overflow.
+const FRAMING_OVERHEAD_TOKENS: u32 = 512;
+
+/// Stand-in for the tool-schema block used by [`OllamaProvider::context_limit`],
+/// which is called without knowing the conversation's active tool set. Sized
+/// for a typical mid-conversation set; the per-request path measures the real
+/// thing instead.
+const ASSUMED_TOOL_TOKENS: u32 = 2048;
 
 /// Percentage of the trimming budget to cut down to once trimming fires.
 /// See `trim_to_budget` for why this is well below 100.
@@ -139,7 +162,7 @@ impl Default for OllamaConfig {
             num_ctx: num_ctx_from_env(),
             keep_alive: keep_alive_from_env(),
             top_p: 0.9,
-            num_predict: 8192,
+            num_predict: 4096,
             think: None,
         }
     }
@@ -182,6 +205,10 @@ pub struct OllamaProvider {
     /// serve, and as the client-side prompt-trimming budget when `num_ctx`
     /// has been explicitly set to defer to the server.
     detected_ctx: Option<u32>,
+    /// Fingerprint of the tool block sent on the previous request, so a
+    /// change can be reported.  See [`OllamaProvider::note_tool_block`].
+    /// `0` means "nothing sent yet".
+    last_tool_fingerprint: AtomicU64,
 }
 
 impl OllamaProvider {
@@ -204,6 +231,7 @@ impl OllamaProvider {
             model: model.into(),
             config: OllamaConfig::default(),
             detected_ctx: None,
+            last_tool_fingerprint: AtomicU64::new(0),
         }
     }
 
@@ -592,14 +620,12 @@ impl OllamaProvider {
         messages: Vec<OllamaMessage>,
         total_ctx: Option<u32>,
         num_predict: i32,
+        tool_tokens: u32,
     ) -> Vec<OllamaMessage> {
         let Some(total_ctx) = total_ctx else {
             return messages;
         };
-        let reserved_output = num_predict.max(0) as u32;
-        let budget = total_ctx
-            .saturating_sub(reserved_output)
-            .saturating_sub(SAFETY_OVERHEAD_TOKENS);
+        let budget = input_budget(total_ctx, num_predict, tool_tokens);
 
         let total: u32 = messages.iter().map(estimate_message_tokens).sum();
         if total <= budget {
@@ -651,6 +677,64 @@ impl OllamaProvider {
         trimmed
     }
 
+    /// Record the tool block about to be sent, and report when it differs
+    /// from the previous request's.
+    ///
+    /// This is not bookkeeping for its own sake. Chat templates render tool
+    /// definitions into the prompt *prefix*, ahead of the conversation, so
+    /// changing the tool set moves every subsequent token — the cached prefix
+    /// stops matching at the tool block and the server re-evaluates the whole
+    /// prompt. On a long conversation that is by far the most expensive thing
+    /// that can happen to a turn, and it is invisible without this log line.
+    ///
+    /// The set is driven by the `tools_load` meta-tool, so it changes when the
+    /// model discovers and loads new tools. That is the intended design — the
+    /// full catalog is far too large to send every turn — but it means tool
+    /// loading is best done in one batch early, not drip-fed across a run.
+    fn note_tool_block(&self, tools: &[OllamaTool], tool_tokens: u32) {
+        // Names alone, in order: that is what the prompt prefix is sensitive
+        // to, and it avoids re-hashing the (much larger) parameter schemas.
+        let mut hasher = DefaultHasher::new();
+        for t in tools {
+            t.function.name.hash(&mut hasher);
+        }
+        // Reserve 0 for "nothing sent yet" so the first request isn't
+        // mistaken for a change.
+        let fingerprint = hasher.finish() | 1;
+
+        let previous = self
+            .last_tool_fingerprint
+            .swap(fingerprint, Ordering::Relaxed);
+        if previous != 0 && previous != fingerprint {
+            tracing::info!(
+                num_tools = tools.len(),
+                tool_tokens,
+                "tool set changed since the last request — Ollama must re-evaluate                  the whole prompt, since tool definitions sit in the cached prefix"
+            );
+        }
+
+        // Compaction is supposed to run before trimming: it summarizes and
+        // archives, where trimming just drops the oldest turns. The runner
+        // derives its threshold from `context_limit()`, which has to assume a
+        // typical tool block; if the real one is much bigger, the trimming
+        // budget falls below that threshold and trimming pre-empts compaction.
+        if let Some(window) = self.effective_ctx() {
+            let assumed = input_budget(window, self.config.num_predict, ASSUMED_TOOL_TOKENS);
+            let actual = input_budget(window, self.config.num_predict, tool_tokens);
+            // The runner compacts at 85% of the budget it was told about.
+            let compaction_threshold = assumed / 100 * 85;
+            if actual < compaction_threshold {
+                tracing::warn!(
+                    num_ctx = window,
+                    tool_tokens,
+                    trim_budget = actual,
+                    compaction_threshold,
+                    "loaded tool schemas are large enough that history trimming will                      pre-empt compaction — raise RUSTYKRAB_NUM_CTX or load fewer tools"
+                );
+            }
+        }
+    }
+
     /// Map an HTTP status code to a specific error variant (#186).
     fn map_status_error(status: reqwest::StatusCode, body: &str) -> Error {
         match status.as_u16() {
@@ -668,8 +752,23 @@ impl ModelProvider for OllamaProvider {
         "ollama"
     }
 
+    /// Reports the usable *input* budget rather than the raw window.
+    ///
+    /// The trait documents this as the single source of truth for downstream
+    /// budgets — compaction thresholds, prompt trimming — and those budgets
+    /// are about how much history fits, not how big the window is. Reporting
+    /// the raw window put the runner's compaction threshold (85% of the
+    /// window) *above* this provider's trimming budget (window minus output
+    /// and overhead), so trimming always fired first and compaction was
+    /// effectively unreachable on Ollama. Subtracting the same reservations
+    /// here restores the intended order: compact first, trim only as a
+    /// backstop.
     fn context_limit(&self) -> Option<usize> {
-        self.effective_ctx().map(|v| v as usize)
+        self.effective_ctx()
+            .map(|window| {
+                input_budget(window, self.config.num_predict, ASSUMED_TOOL_TOKENS) as usize
+            })
+            .filter(|&v| v > 0)
     }
 
     fn supports_vision(&self) -> bool {
@@ -686,13 +785,16 @@ impl ModelProvider for OllamaProvider {
             ));
         }
 
+        let ollama_tools = Self::build_tools(tools);
+        let tool_tokens = estimate_tool_tokens(&ollama_tools);
+        self.note_tool_block(&ollama_tools, tool_tokens);
+
         let ollama_messages = Self::trim_to_budget(
             ollama_messages,
             self.effective_ctx(),
             self.config.num_predict,
+            tool_tokens,
         );
-
-        let ollama_tools = Self::build_tools(tools);
 
         let mut options = serde_json::json!({
             "temperature": self.config.temperature,
@@ -733,6 +835,8 @@ impl ModelProvider for OllamaProvider {
             base_url = %self.base_url,
             num_messages = ollama_messages.len(),
             num_ctx = ?self.config.num_ctx,
+            num_tools = ollama_tools.len(),
+            tool_tokens,
             trace_id = ?rustykrab_core::prompt_trace::current_trace_id(),
             "calling Ollama chat API"
         );
@@ -857,13 +961,16 @@ impl ModelProvider for OllamaProvider {
             ));
         }
 
+        let ollama_tools = Self::build_tools(tools);
+        let tool_tokens = estimate_tool_tokens(&ollama_tools);
+        self.note_tool_block(&ollama_tools, tool_tokens);
+
         let ollama_messages = Self::trim_to_budget(
             ollama_messages,
             self.effective_ctx(),
             self.config.num_predict,
+            tool_tokens,
         );
-
-        let ollama_tools = Self::build_tools(tools);
 
         let mut options = serde_json::json!({
             "temperature": self.config.temperature,
@@ -901,6 +1008,8 @@ impl ModelProvider for OllamaProvider {
             base_url = %self.base_url,
             num_messages = ollama_messages.len(),
             num_ctx = ?self.config.num_ctx,
+            num_tools = ollama_tools.len(),
+            tool_tokens,
             trace_id = ?rustykrab_core::prompt_trace::current_trace_id(),
             "calling Ollama chat API (streaming)"
         );
@@ -1195,6 +1304,31 @@ struct OllamaStreamMessage {
     tool_calls: Option<Vec<OllamaToolCall>>,
 }
 
+/// Usable input budget: what's left of the context window once the output
+/// reservation, the tool-schema block, and chat-template framing are taken
+/// out. This is the single figure both the client-side trimmer and
+/// [`OllamaProvider::context_limit`] derive from, so the agent runner's
+/// compaction threshold and this provider's trimming budget can't drift into
+/// disagreeing about how much room there is.
+fn input_budget(window: u32, num_predict: i32, tool_tokens: u32) -> u32 {
+    window
+        .saturating_sub(num_predict.max(0) as u32)
+        .saturating_sub(tool_tokens)
+        .saturating_sub(FRAMING_OVERHEAD_TOKENS)
+}
+
+/// Measure the tool-schema block exactly as it will be serialized into the
+/// request body. Tool definitions are rendered into the prompt *prefix* by
+/// essentially every chat template Ollama ships, so this is both a real cost
+/// against the window and — when the set changes mid-conversation — the point
+/// at which the cached prefix stops matching.
+fn estimate_tool_tokens(tools: &[OllamaTool]) -> u32 {
+    let mut w = CountingWriter(0);
+    // Serializing into an infallible sink cannot fail.
+    let _ = serde_json::to_writer(&mut w, tools);
+    w.0.div_ceil(CHARS_PER_TOKEN) as u32
+}
+
 /// Approximate the number of prompt tokens an `OllamaMessage` will cost.
 /// Errs on the high side so trimming converges instead of oscillating.
 fn estimate_message_tokens(msg: &OllamaMessage) -> u32 {
@@ -1363,6 +1497,11 @@ fn model_supports_vision(model: &str) -> bool {
 mod tests {
     use super::*;
     use chrono::Utc;
+
+    /// Tool-block size used by the trimming tests. Chosen so that
+    /// `TEST_TOOL_TOKENS + FRAMING_OVERHEAD_TOKENS` equals the flat 2048 these
+    /// cases were originally written against, keeping their arithmetic intact.
+    const TEST_TOOL_TOKENS: u32 = 1536;
 
     fn user_msg(content: &str) -> OllamaMessage {
         OllamaMessage {
@@ -1541,7 +1680,7 @@ mod tests {
     fn trim_returns_unchanged_when_under_budget() {
         let msgs = vec![system_msg("sys"), user_msg("hi")];
         let original_len = msgs.len();
-        let trimmed = OllamaProvider::trim_to_budget(msgs, Some(8192), 1024);
+        let trimmed = OllamaProvider::trim_to_budget(msgs, Some(8192), 1024, TEST_TOOL_TOKENS);
         assert_eq!(trimmed.len(), original_len);
     }
 
@@ -1552,7 +1691,7 @@ mod tests {
         let big = "x".repeat(40_000);
         let msgs = vec![system_msg("sys"), user_msg(&big), user_msg("latest")];
         let original_len = msgs.len();
-        let trimmed = OllamaProvider::trim_to_budget(msgs, None, 256);
+        let trimmed = OllamaProvider::trim_to_budget(msgs, None, 256, TEST_TOOL_TOKENS);
         assert_eq!(trimmed.len(), original_len);
     }
 
@@ -1569,7 +1708,7 @@ mod tests {
             user_msg("latest"),
         ];
         // budget = 4096 - 256 - SAFETY_OVERHEAD_TOKENS(2048) = 1792 tokens
-        let trimmed = OllamaProvider::trim_to_budget(msgs, Some(4096), 256);
+        let trimmed = OllamaProvider::trim_to_budget(msgs, Some(4096), 256, TEST_TOOL_TOKENS);
         // System message must survive.
         assert_eq!(trimmed[0].role, "system");
         // Latest message must survive.
@@ -1591,7 +1730,7 @@ mod tests {
         }
         msgs.push(user_msg("latest"));
 
-        let trimmed = OllamaProvider::trim_to_budget(msgs, Some(8192), 1024);
+        let trimmed = OllamaProvider::trim_to_budget(msgs, Some(8192), 1024, TEST_TOOL_TOKENS);
 
         // budget = 8192 - 1024 - 2048 = 5120; target = 75% = 3840.
         let after: u32 = trimmed.iter().map(estimate_message_tokens).sum();
@@ -1603,7 +1742,7 @@ mod tests {
         // Re-trimming the same history must now be a no-op — that is the
         // property that keeps the prefix stable across subsequent turns.
         let len_before = trimmed.len();
-        let again = OllamaProvider::trim_to_budget(trimmed, Some(8192), 1024);
+        let again = OllamaProvider::trim_to_budget(trimmed, Some(8192), 1024, TEST_TOOL_TOKENS);
         assert_eq!(again.len(), len_before);
     }
 
@@ -1613,7 +1752,7 @@ mod tests {
         // dropping it would leave the model nothing to answer.
         let huge = "z".repeat(200_000); // ~50k tokens
         let msgs = vec![system_msg("sys"), user_msg(&huge)];
-        let trimmed = OllamaProvider::trim_to_budget(msgs, Some(8192), 1024);
+        let trimmed = OllamaProvider::trim_to_budget(msgs, Some(8192), 1024, TEST_TOOL_TOKENS);
         assert_eq!(trimmed.len(), 2);
         assert_eq!(trimmed[0].role, "system");
         assert_eq!(trimmed[1].role, "user");
@@ -1628,7 +1767,7 @@ mod tests {
             tool_msg("orphaned tool result"),
             user_msg("latest"),
         ];
-        let trimmed = OllamaProvider::trim_to_budget(msgs, Some(4096), 256);
+        let trimmed = OllamaProvider::trim_to_budget(msgs, Some(4096), 256, TEST_TOOL_TOKENS);
         // Orphan tool result must not become the first non-system message.
         assert_ne!(trimmed.get(1).map(|m| m.role.as_str()), Some("tool"));
         // System and latest user message survive.
@@ -1722,6 +1861,103 @@ mod tests {
         assert!(!model_supports_thinking("llama3.1:8b"));
         assert!(!model_supports_thinking("mistral:7b"));
         assert!(!model_supports_thinking("qwen2.5:7b"));
+    }
+
+    #[test]
+    fn compaction_threshold_sits_below_the_trimming_budget() {
+        // The regression this guards: compaction (summarize + archive) must
+        // fire before trimming (drop the oldest turns outright). The runner
+        // compacts at 85% of what `context_limit()` reports, so that figure
+        // has to be the *usable* budget, not the raw window — otherwise the
+        // threshold lands above the trim budget and trimming always wins.
+        for window in [8_192u32, 16_384, 32_768, 65_536, 131_072] {
+            let provider = OllamaProvider::new("probe").with_config(OllamaConfig {
+                num_ctx: Some(window),
+                num_predict: 4096,
+                ..OllamaConfig::default()
+            });
+
+            let reported = provider.context_limit().expect("limit") as u32;
+            let compaction_threshold = (reported as f64 * 0.85) as u32;
+            let trim_budget = input_budget(window, 4096, ASSUMED_TOOL_TOKENS);
+
+            assert!(
+                compaction_threshold < trim_budget,
+                "window {window}: compaction at {compaction_threshold} must precede \
+                 trimming at {trim_budget}"
+            );
+        }
+    }
+
+    #[test]
+    fn context_limit_excludes_output_and_overhead_reservations() {
+        let provider = OllamaProvider::new("probe").with_config(OllamaConfig {
+            num_ctx: Some(32_768),
+            num_predict: 4096,
+            ..OllamaConfig::default()
+        });
+        let expected = 32_768 - 4096 - ASSUMED_TOOL_TOKENS - FRAMING_OVERHEAD_TOKENS;
+        assert_eq!(provider.context_limit(), Some(expected as usize));
+    }
+
+    #[test]
+    fn context_limit_is_none_when_reservations_exceed_the_window() {
+        // A window smaller than the reservations would otherwise report 0 and
+        // make every downstream budget collapse to nothing.
+        let provider = OllamaProvider::new("probe").with_config(OllamaConfig {
+            num_ctx: Some(1024),
+            num_predict: 4096,
+            ..OllamaConfig::default()
+        });
+        assert_eq!(provider.context_limit(), None);
+    }
+
+    #[test]
+    fn trim_budget_shrinks_as_the_tool_block_grows() {
+        // Tool schemas are part of the prompt, so loading more tools has to
+        // leave less room for history. The old flat 2048 reservation missed
+        // this entirely: a conversation with the full catalog loaded could be
+        // "trimmed" and still overflow the window.
+        let big = "x".repeat(4000); // ~1000 tokens each
+        let build = || {
+            let mut msgs = vec![system_msg("sys")];
+            for _ in 0..10 {
+                msgs.push(user_msg(&big));
+            }
+            msgs.push(user_msg("latest"));
+            msgs
+        };
+
+        let few = OllamaProvider::trim_to_budget(build(), Some(16_384), 1024, 500);
+        let many = OllamaProvider::trim_to_budget(build(), Some(16_384), 1024, 10_000);
+        assert!(
+            many.len() < few.len(),
+            "a 10k-token tool block must force more history out than a 500-token one \
+             (kept {} vs {})",
+            many.len(),
+            few.len()
+        );
+    }
+
+    #[test]
+    fn estimate_tool_tokens_tracks_serialized_size() {
+        let tools = vec![OllamaTool {
+            r#type: "function".to_string(),
+            function: OllamaToolDef {
+                name: "read".to_string(),
+                description: "Read a file".to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": { "path": { "type": "string" } },
+                    "required": ["path"],
+                }),
+            },
+        }];
+        let serialized_len = serde_json::to_string(&tools).unwrap().len();
+        assert_eq!(
+            estimate_tool_tokens(&tools),
+            serialized_len.div_ceil(CHARS_PER_TOKEN) as u32
+        );
     }
 
     #[test]

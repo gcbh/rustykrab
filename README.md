@@ -65,7 +65,7 @@ much:
 
 ```bash
 # Must be >= RUSTYKRAB_NUM_CTX, or the server silently truncates prompts.
-export OLLAMA_CONTEXT_LENGTH=32768
+export OLLAMA_CONTEXT_LENGTH=65536
 
 # One slot keeps a single conversation pinned to a single warm cache.
 # Raising this splits KV memory across slots and round-robins requests, so
@@ -84,6 +84,36 @@ window is the smaller of the two, RustyKrab's own trimming budget is too
 generous and the server truncates from the front of the prompt — which moves
 the truncation point every turn and throws away the cached prefix each time.
 
+#### Where the context window goes
+
+The pinned window is not all available for conversation history. On the 64k
+default, a turn is budgeted roughly like this:
+
+| Reservation | Tokens | Why |
+|---|---|---|
+| `num_predict` (output) | 4,096 | The turn's own response has to fit alongside the prompt |
+| Tool schemas | ~1,800–10,000 | Measured per request; grows as the model loads tools |
+| Template framing | 512 | Role tags, tool preamble, BOS/EOS |
+| **Usable for history** | **~50,000–58,000** | Compaction fires at 85% of this |
+
+Two consequences worth knowing:
+
+- **Compaction runs before trimming, by design.** Compaction summarizes
+  displaced history into the `recall_*` archive, so detail stays reachable;
+  trimming just drops the oldest turns. RustyKrab derives both budgets from
+  the same figure to keep that order. If you see the "history trimming will
+  pre-empt compaction" warning, the loaded tool schemas have grown large
+  enough to invert it — raise `RUSTYKRAB_NUM_CTX` or load fewer tools.
+
+- **Loading tools invalidates the KV cache.** Tool definitions render into the
+  prompt *prefix*, ahead of the conversation, so a tool set that changes
+  mid-run moves every token after it and forces a full prompt re-evaluation.
+  This is the price of the `tools_list` / `tools_load` design, which exists
+  because the full catalog is ~10k tokens and cannot be sent every turn. The
+  cost is per *change*, not per tool, so loading everything a task needs in
+  one `tools_load` call is much cheaper than discovering tools incrementally.
+  The `tool set changed since the last request` log line marks each one.
+
 ## Configuration
 
 All configuration is via environment variables. No plaintext config files.
@@ -99,7 +129,7 @@ All configuration is via environment variables. No plaintext config files.
 | `RUSTYKRAB_COMPACTION_SUMMARY_MAX_TOKENS` | `8192` | Env-configurable upper bound on the final compaction summary. The effective cap is further bounded by `RUSTYKRAB_MAX_CONTEXT_TOKENS / 4`, so on a 32k local-Ollama deployment the summary stays under 8k regardless of this value. If the summarizer returns a summary larger than the effective cap, it is re-summarized (up to 3 passes) and eventually truncated |
 | `OLLAMA_MODEL` | `gemma4:26b` | Ollama model name |
 | `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama server address |
-| `RUSTYKRAB_NUM_CTX` | `32768` | Context window pinned on every Ollama request. Takes precedence over `OLLAMA_NUM_CTX`. Clamped down to the model's native context length when that is smaller. Set to `server` to omit the field and let the server's `OLLAMA_CONTEXT_LENGTH` decide — this disables client-side trimming, since the client then cannot know what the server allocated |
+| `RUSTYKRAB_NUM_CTX` | `65536` | Context window pinned on every Ollama request. Takes precedence over `OLLAMA_NUM_CTX`. Clamped down to the model's native context length when that is smaller. The whole window is allocated as KV cache when the model loads, so lower this (or enable KV quantization, below) if the model won't fit in VRAM. Set to `server` to omit the field and let the server's `OLLAMA_CONTEXT_LENGTH` decide — this disables client-side trimming, since the client then cannot know what the server allocated |
 | `OLLAMA_NUM_CTX` | — | Legacy alias for `RUSTYKRAB_NUM_CTX`. Used only when `RUSTYKRAB_NUM_CTX` is unset |
 | `OLLAMA_KEEP_ALIVE` | `30m` | How long Ollama keeps the model and its KV cache resident after a request (Ollama duration syntax; `-1` for forever). Ollama's own default is 5 minutes, short enough that a sporadically-used gateway reloads the model on most messages. Set to `server` to omit the field |
 | `OLLAMA_THINK` | `auto` | Whether to request thinking mode: `true`, `false`, or `auto` to decide from the model tag. Ollama returns a 400 for `think` against models that don't support it, so `auto` only enables it for known thinking families |
