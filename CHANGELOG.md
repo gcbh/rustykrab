@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.1.6] - 2026-08-20
+
+- Phase 2 (C): origin allowlist + WebChat approvals panel — completes Phase 2 (#491)
+
 ## [5.1.5] - 2026-08-20
 
 - Phase 2 (B): device pairing, per-device tokens, revocation — suite reaches 16/16 (#490)
