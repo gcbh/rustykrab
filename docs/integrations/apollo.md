@@ -20,6 +20,13 @@ Conventions, all endpoints:
   `404` not found, `409` conflict, `413` too large, `429` rate limited.
 - Requests are rate-limited and origin-checked by gateway middleware;
   responses carry strict security headers.
+- **`Origin` is mandatory on every `/api/*` request** (not just browser
+  ones): the middleware rejects a missing `Origin` on sensitive paths with
+  `403`, and today only loopback origins are allowed —
+  `OriginPolicy::default()` starts with an empty allowlist. Apollo sends
+  `Origin: <scheme>://<host>[:port]` of its base URL, so **Phase 1 server
+  work must make the allowlist configurable** (the tailnet hostname needs
+  to be in it) or every app request past `/api/health` gets a `403`.
 
 ## Health — Implemented
 

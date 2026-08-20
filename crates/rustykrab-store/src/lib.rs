@@ -38,6 +38,12 @@ impl Store {
     /// sourced from the OS keychain or an environment variable — never
     /// stored alongside the database.
     pub fn open(path: impl AsRef<Path>, master_key: Vec<u8>) -> Result<Self, Error> {
+        std::fs::create_dir_all(path.as_ref()).map_err(|e| {
+            Error::Storage(format!(
+                "cannot create store directory {}: {e}",
+                path.as_ref().display()
+            ))
+        })?;
         let db_path = path.as_ref().join("store.db");
         let conn =
             rusqlite::Connection::open(&db_path).map_err(|e| Error::Storage(e.to_string()))?;

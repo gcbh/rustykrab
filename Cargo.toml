@@ -11,6 +11,7 @@ members = [
     "crates/rustykrab-skills",
     "crates/rustykrab-cli",
     "crates/rustykrab-memory",
+    "crates/rustykrab-e2e",
 ]
 
 [workspace.package]

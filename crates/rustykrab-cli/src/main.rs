@@ -31,6 +31,9 @@ use rustykrab_core::types::{ContentPart, MessageContent};
 use rustykrab_core::AgentRegistry;
 use rustykrab_gateway::AppState;
 use rustykrab_memory::backend::HybridMemoryBackend;
+#[cfg(not(feature = "embeddings"))]
+use rustykrab_memory::embedding::HashEmbedder;
+#[cfg(feature = "embeddings")]
 use rustykrab_memory::embedding::LazyFastEmbedder;
 use rustykrab_memory::storage::SqliteMemoryStorage;
 use rustykrab_memory::{MemoryConfig, MemorySystem};
@@ -313,9 +316,15 @@ async fn main() -> anyhow::Result<()> {
         .expect("Failed to install rustls crypto provider");
 
     // --- Data directory ---
-    let data_dir = dirs::data_local_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join("rustykrab");
+    // RUSTYKRAB_DATA_DIR overrides the OS default so tests and the E2E
+    // harness can boot on a throwaway directory.
+    let data_dir = std::env::var_os("RUSTYKRAB_DATA_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            dirs::data_local_dir()
+                .unwrap_or_else(|| std::path::PathBuf::from("."))
+                .join("rustykrab")
+        });
     std::fs::create_dir_all(&data_dir)?;
 
     // --- Logging: stdout + rolling file ---
@@ -367,6 +376,15 @@ async fn main() -> anyhow::Result<()> {
     }
     if args.len() >= 2 && args[1] == "chat" {
         return chat::run(&data_dir, &args[2..]).await;
+    }
+    // An unrecognized subcommand must not silently fall through to
+    // "start the daemon" — a typo would boot a full agent instead of
+    // reporting the mistake.
+    if let Some(unknown) = args.get(1).filter(|a| !a.starts_with('-')) {
+        eprintln!("unknown subcommand '{unknown}'");
+        eprintln!("subcommands: skill, keychain, chat");
+        eprintln!("run with no arguments to start the daemon");
+        std::process::exit(2);
     }
 
     // --- Harness profile ---
@@ -458,6 +476,25 @@ async fn main() -> anyhow::Result<()> {
         std::env::var("RUSTYKRAB_PROVIDER").unwrap_or_else(|_| "anthropic".to_string());
     let provider_name = provider_name.trim().to_lowercase();
     let provider: Arc<dyn ModelProvider> = match provider_name.as_str() {
+        // Deterministic replay provider for the E2E harness — no model,
+        // no network. Requires RUSTYKRAB_SCRIPT_PATH; refuses to start
+        // without it rather than silently answering every turn with the
+        // default text.
+        "scripted" => {
+            let path = std::env::var("RUSTYKRAB_SCRIPT_PATH").unwrap_or_else(|_| {
+                eprintln!("ERROR: RUSTYKRAB_PROVIDER=scripted requires RUSTYKRAB_SCRIPT_PATH");
+                std::process::exit(1);
+            });
+            let path = std::path::PathBuf::from(path);
+            tracing::warn!(
+                path = %path.display(),
+                "RUSTYKRAB_PROVIDER=scripted — replaying a fixed script instead of \
+                 calling a model. This is the E2E harness provider and must never \
+                 be set on a real deployment."
+            );
+            let p = rustykrab_providers::ScriptedProvider::from_path(&path)?;
+            Arc::new(p)
+        }
         "ollama" => {
             let model = std::env::var("OLLAMA_MODEL").unwrap_or_else(|_| "gemma4:26b".to_string());
             let base_url = std::env::var("OLLAMA_BASE_URL")
@@ -555,7 +592,16 @@ async fn main() -> anyhow::Result<()> {
     // happens off-thread on the first embed() call instead of blocking
     // boot. Init failures surface as clear errors from the first
     // embedding operation.
+    #[cfg(feature = "embeddings")]
     let embedder = Arc::new(LazyFastEmbedder::new(model_cache_dir));
+    // Without the `embeddings` feature there is no ONNX runtime; a
+    // deterministic hash embedder (same 768 dims as Nomic-embed-text-v1.5)
+    // keeps the memory system functional for tests and sandboxed builds.
+    #[cfg(not(feature = "embeddings"))]
+    let embedder = {
+        let _ = &model_cache_dir;
+        Arc::new(HashEmbedder::new(768))
+    };
     let memory_system = Arc::new(MemorySystem::new(
         MemoryConfig::default(),
         memory_storage,
@@ -1201,8 +1247,19 @@ async fn main() -> anyhow::Result<()> {
     // --- Gateway with security middleware ---
     let app = rustykrab_gateway::router(state);
 
-    // Bind to loopback only — never 0.0.0.0.
-    let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
+    // Bind to loopback only — never 0.0.0.0. The port is overridable via
+    // RUSTYKRAB_PORT (the E2E harness boots on an ephemeral port so it
+    // never collides with a live instance); the loopback bind is not.
+    let port: u16 = std::env::var("RUSTYKRAB_PORT")
+        .ok()
+        .map(|p| {
+            p.trim().parse().unwrap_or_else(|_| {
+                eprintln!("ERROR: RUSTYKRAB_PORT must be a port number, got '{p}'");
+                std::process::exit(1);
+            })
+        })
+        .unwrap_or(3000);
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
     tracing::info!(%addr, "RustyKrab gateway listening");
 
     let listener = tokio::net::TcpListener::bind(addr).await?;

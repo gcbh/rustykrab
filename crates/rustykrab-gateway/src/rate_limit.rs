@@ -42,6 +42,60 @@ impl Default for RateLimitConfig {
     }
 }
 
+impl RateLimitConfig {
+    /// Config with env-var overrides applied over the defaults:
+    /// `RUSTYKRAB_RATE_LIMIT_MAX`, `RUSTYKRAB_RATE_LIMIT_WINDOW_SECS`,
+    /// `RUSTYKRAB_RATE_LIMIT_LOCKOUT_SECS`.
+    ///
+    /// The defaults are the shipping posture; the overrides exist so a
+    /// test/E2E boot can drive hundreds of requests from one IP without
+    /// tripping the lockout. Unset or unparseable values keep the default.
+    pub fn from_env() -> Self {
+        let default = Self::default();
+        // Zero and unparseable values fall back to the default: a limit of
+        // 0 would reject every request, and a 0-second window would disable
+        // limiting entirely — neither is ever what an operator meant.
+        fn positive(key: &str) -> Option<u64> {
+            let raw = std::env::var(key).ok()?;
+            let raw = raw.trim();
+            match raw.parse::<u64>() {
+                Ok(v) if v > 0 => Some(v),
+                _ => {
+                    tracing::warn!(
+                        var = key,
+                        value = raw,
+                        "ignoring invalid rate-limit override — using the default"
+                    );
+                    None
+                }
+            }
+        }
+        let config = Self {
+            max_requests: positive("RUSTYKRAB_RATE_LIMIT_MAX")
+                .and_then(|v| u32::try_from(v).ok())
+                .unwrap_or(default.max_requests),
+            window: positive("RUSTYKRAB_RATE_LIMIT_WINDOW_SECS")
+                .map(Duration::from_secs)
+                .unwrap_or(default.window),
+            lockout: positive("RUSTYKRAB_RATE_LIMIT_LOCKOUT_SECS")
+                .map(Duration::from_secs)
+                .unwrap_or(default.lockout),
+        };
+        if config.max_requests != default.max_requests
+            || config.window != default.window
+            || config.lockout != default.lockout
+        {
+            tracing::warn!(
+                max_requests = config.max_requests,
+                window_secs = config.window.as_secs(),
+                lockout_secs = config.lockout.as_secs(),
+                "rate limiter running with non-default limits from the environment"
+            );
+        }
+        config
+    }
+}
+
 struct IpRecord {
     attempts: Vec<Instant>,
     locked_until: Option<Instant>,

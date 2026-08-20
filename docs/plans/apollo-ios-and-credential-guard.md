@@ -1,6 +1,7 @@
 # Plan: Apollo iOS app + credential write-protection
 
-**Status:** approved plan, not yet implemented
+**Status:** Phase 1 (Workstream F, the evaluation harness) implemented on
+`claude/ios-app-credentials-ikd7bm` in both repos; Phases 2–5 not started.
 **Date:** 2026-08-19
 **Repos:** `gcbh/rustykrab` (server work), `gcbh/apollo-ios` (app work)
 
@@ -348,6 +349,43 @@ done*: the target scenarios are written on day one and marked expected-fail
 (`xfail`); shipping a phase means flipping its scenarios to must-pass. An
 agent has reached the agreed end state exactly when the suite is green with
 zero xfails.
+
+### F0. What Phase 1 actually shipped (2026-08-19)
+
+Implemented on `claude/ios-app-credentials-ikd7bm`:
+
+| Piece | Where |
+|-------|-------|
+| `embeddings` feature gate (default on; `HashEmbedder` fallback when off) | `crates/rustykrab-cli/Cargo.toml`, `main.rs` |
+| `ScriptedProvider` + 5 unit tests | `crates/rustykrab-providers/src/scripted.rs` |
+| E2E runner, 15 scenarios (7 must-pass, 8 xfail) | `crates/rustykrab-e2e/`, `scripts/e2e.sh` |
+| `ApolloKit` package, 18 tests, `apollo-e2e` runner (12 scenarios) | apollo-ios `ApolloKit/` |
+| CI: `e2e` job (rustykrab); ubuntu `swift test` + macOS lanes (apollo-ios) | both `.github/workflows/ci.yml` |
+
+Harness-only env knobs added to make a throwaway boot possible, all
+defaulting to today's shipping behaviour: `RUSTYKRAB_DATA_DIR`,
+`RUSTYKRAB_PORT` (loopback bind unchanged), `RUSTYKRAB_DISABLE_KEYCHAIN`
+(also forces the master key to come from the env — never reads or writes
+the real Keychain), `RUSTYKRAB_RATE_LIMIT_{MAX,WINDOW_SECS,LOCKOUT_SECS}`,
+and `RUSTYKRAB_PROVIDER=scripted` + `RUSTYKRAB_SCRIPT_PATH`.
+
+Measured state: `cargo fmt/clippy/test` green (477 tests); `scripts/e2e.sh`
+green (7 pass / 8 xfail / 0 fail / 0 xpass); `swift test` green (18);
+`apollo-e2e` against a live daemon green (6 pass / 6 xfail / 0 fail). The
+xfail details are the guard's own indictment — today they read
+"agent overwrote an existing credential" and "agent deleted an existing
+credential outright". Phase 2 is done when those flip.
+
+**Contract gap found while wiring the harness (Phase 2 work):** the
+gateway's origin-check middleware (`gateway/src/origin.rs`) *requires* an
+`Origin` header on every `/api/*` request and only allows loopback
+origins — `OriginPolicy::default()` is an empty allowlist and the CLI
+never calls `with_origin_policy`. An app on the tailnet sending
+`Origin: https://<mac>.<tailnet>.ts.net` is therefore rejected with `403`,
+and so is a client sending no `Origin` at all. Phase 2 must make the
+allowed origins configurable (env var and/or automatic tailnet hostname)
+before the app can reach anything but `/api/health`. ApolloKit already
+sends its own origin; the server side is the missing half.
 
 ### F1. Make the daemon buildable in agent sandboxes
 Empirical finding (2026-08-19, this Claude environment): the workspace fails

@@ -14,7 +14,7 @@ rustykrab-tools.workspace = true
 rustykrab-channels.workspace = true
 rustykrab-skills.workspace = true
 rustykrab-providers.workspace = true
-rustykrab-memory = { workspace = true, features = ["fastembed"] }
+rustykrab-memory.workspace = true
 axum.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
@@ -39,5 +39,11 @@ enigo = { version = "0.6", optional = true }
 xcap = { version = "0.9", optional = true }
 
 [features]
+default = ["embeddings"]
+# Real ONNX embeddings for the memory system via fastembed. Disable
+# (`--no-default-features`) in network-restricted environments where
+# ort-sys cannot download the prebuilt ONNX runtime from cdn.pyke.io;
+# a deterministic hash embedder stands in for memory retrieval.
+embeddings = ["rustykrab-memory/fastembed"]
 # Concrete enigo + xcap implementation of the computer-use backend.
 computer-use = ["dep:enigo", "dep:xcap"]
