@@ -115,7 +115,7 @@ pub async fn resolve(spec: &SecretSpec, secrets: &SecretStore) -> Option<String>
             if keychain::keychain_available() {
                 let _ = keychain::set_credential(KEYCHAIN_SERVICE, spec.keychain_account, &val);
             }
-            let _ = secrets.set(spec.store_name, &val).await;
+            let _ = secrets.upsert_system(spec.store_name, &val).await;
             return Some(val);
         }
     }
@@ -123,7 +123,7 @@ pub async fn resolve(spec: &SecretSpec, secrets: &SecretStore) -> Option<String>
     // 2. OS credential store.
     if keychain::keychain_available() {
         if let Ok(Some(cred)) = keychain::get_credential(KEYCHAIN_SERVICE, spec.keychain_account) {
-            let _ = secrets.set(spec.store_name, &cred.value).await;
+            let _ = secrets.upsert_system(spec.store_name, &cred.value).await;
             return Some(cred.value);
         }
     }

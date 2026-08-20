@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.1.1] - 2026-08-20
+
+- Phase 2 (A): the agent can no longer overwrite or delete a credential (#489)
+
 ## [5.1.0] - 2026-08-20
 
 - perf(providers): make Ollama requests KV-cache friendly (#488)

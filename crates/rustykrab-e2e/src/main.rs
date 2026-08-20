@@ -931,14 +931,16 @@ async fn run_suite(
         (Expected::Pass, scenario!(chat_sse_stream_with_tools)),
         (Expected::Pass, scenario!(secrets_create_and_delete)),
         (Expected::Pass, scenario!(agent_creates_new_credential)),
-        // Phase 2 exit criteria — xfail until the guard lands.
+        // Workstream A — the credential guard. Shipped: these assert the
+        // real behaviour now.
+        // Workstream B — device pairing, not built yet.
         (Expected::XFail, scenario!(pair_device_target)),
-        (Expected::XFail, scenario!(secrets_create_only_409)),
-        (Expected::XFail, scenario!(secrets_overwrite_archives)),
-        (Expected::XFail, scenario!(agent_overwrite_files_request)),
-        (Expected::XFail, scenario!(approve_applies_change)),
-        (Expected::XFail, scenario!(deny_preserves_value)),
-        (Expected::XFail, scenario!(agent_delete_files_request)),
+        (Expected::Pass, scenario!(secrets_create_only_409)),
+        (Expected::Pass, scenario!(secrets_overwrite_archives)),
+        (Expected::Pass, scenario!(agent_overwrite_files_request)),
+        (Expected::Pass, scenario!(approve_applies_change)),
+        (Expected::Pass, scenario!(deny_preserves_value)),
+        (Expected::Pass, scenario!(agent_delete_files_request)),
         (Expected::XFail, scenario!(revoked_device_401)),
     ];
 

@@ -760,7 +760,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // --- Tools ---
-    let mut tools = rustykrab_tools::builtin_tools(store.secrets());
+    let mut tools = rustykrab_tools::builtin_tools(store.secrets(), store.guarded_secrets());
     tools.extend(rustykrab_tools::memory_tools(memory_backend.clone()));
     tools.extend(rustykrab_tools::skill_tools(
         skills_dir.clone(),
@@ -2261,7 +2261,7 @@ async fn resolve_auth_token(store: &rustykrab_store::Store) -> String {
     if rustykrab_store::keychain::keychain_available() {
         let _ = rustykrab_store::keychain::set_credential(svc, spec.keychain_account, &token);
     }
-    let _ = store.secrets().set(spec.store_name, &token).await;
+    let _ = store.secrets().upsert_system(spec.store_name, &token).await;
     token
 }
 
@@ -2414,7 +2414,7 @@ async fn handle_keychain_subcommand(
                 if db_path.exists() {
                     if let Ok(master_key) = rustykrab_store::keychain::resolve_master_key() {
                         if let Ok(store) = rustykrab_store::Store::open(&db_path, master_key) {
-                            let _ = store.secrets().set(sn, value).await;
+                            let _ = store.secrets().upsert_system(sn, value).await;
                             println!("Also stored in encrypted store as '{sn}'");
                         }
                     }
