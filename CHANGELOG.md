@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.1.3] - 2026-08-20
+
+- fix(cron): append a user turn to scheduled job runs (#494)
+
 ## [5.1.2] - 2026-08-20
 
 - fix: repair two lint failures from the Rust 1.98 toolchain bump (#495)
