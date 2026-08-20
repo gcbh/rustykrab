@@ -242,6 +242,64 @@ impl DeviceStore {
         .await
     }
 
+    /// Record the APNs token a device wants notifications on.
+    ///
+    /// Replaces any previous token for that device: iOS reissues them, and
+    /// keeping a stale one only produces failed sends.
+    pub async fn set_push_token(&self, id: &str, push_token: &str) -> Result<(), Error> {
+        let id = id.to_string();
+        let push_token = push_token.to_string();
+        crate::with_conn(&self.conn, move |conn| {
+            let n = conn
+                .execute(
+                    "UPDATE devices SET push_token = ?2 WHERE id = ?1 AND revoked_at IS NULL",
+                    params![id, push_token],
+                )
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            if n == 0 {
+                return Err(Error::NotFound(format!("device '{id}'")));
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    /// Forget a push token Apple has told us is dead.
+    pub async fn clear_push_token(&self, id: &str) -> Result<(), Error> {
+        let id = id.to_string();
+        crate::with_conn(&self.conn, move |conn| {
+            conn.execute(
+                "UPDATE devices SET push_token = NULL WHERE id = ?1",
+                params![id],
+            )
+            .map_err(|e| Error::Storage(e.to_string()))?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Active devices that have registered for notifications, as
+    /// `(device id, push token)`.
+    pub async fn with_push_tokens(&self) -> Result<Vec<(String, String)>, Error> {
+        crate::with_conn(&self.conn, |conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, push_token FROM devices
+                     WHERE revoked_at IS NULL AND push_token IS NOT NULL",
+                )
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            let rows = stmt
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.map_err(|e| Error::Storage(e.to_string()))?);
+            }
+            Ok(out)
+        })
+        .await
+    }
+
     /// Drop expired pairing codes. Called opportunistically on mint.
     pub async fn sweep_expired_codes(&self) -> Result<usize, Error> {
         crate::with_conn(&self.conn, |conn| {
@@ -324,6 +382,58 @@ mod tests {
         // Revoking twice is a NotFound rather than a silent success.
         assert!(matches!(
             devices.revoke(&device.id).await,
+            Err(Error::NotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn push_tokens_are_recorded_replaced_and_cleared() {
+        let (_dir, devices) = devices();
+        let code = devices.mint_pairing_code().await.unwrap();
+        let (device, _) = devices.redeem_pairing_code(&code, "Phone").await.unwrap();
+
+        // Nothing registered yet.
+        assert!(devices.with_push_tokens().await.unwrap().is_empty());
+
+        devices
+            .set_push_token(&device.id, "apns-token-1")
+            .await
+            .unwrap();
+        assert_eq!(
+            devices.with_push_tokens().await.unwrap(),
+            vec![(device.id.clone(), "apns-token-1".to_string())]
+        );
+
+        // iOS reissues tokens; the new one replaces the old.
+        devices
+            .set_push_token(&device.id, "apns-token-2")
+            .await
+            .unwrap();
+        assert_eq!(
+            devices.with_push_tokens().await.unwrap(),
+            vec![(device.id.clone(), "apns-token-2".to_string())]
+        );
+
+        devices.clear_push_token(&device.id).await.unwrap();
+        assert!(devices.with_push_tokens().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_revoked_device_stops_receiving_pushes() {
+        let (_dir, devices) = devices();
+        let code = devices.mint_pairing_code().await.unwrap();
+        let (device, _) = devices.redeem_pairing_code(&code, "Lost").await.unwrap();
+        devices
+            .set_push_token(&device.id, "apns-token")
+            .await
+            .unwrap();
+
+        devices.revoke(&device.id).await.unwrap();
+
+        // A revoked phone must not keep getting approval prompts.
+        assert!(devices.with_push_tokens().await.unwrap().is_empty());
+        assert!(matches!(
+            devices.set_push_token(&device.id, "new-token").await,
             Err(Error::NotFound(_))
         ));
     }

@@ -56,6 +56,7 @@ pub fn api_routes() -> Router<AppState> {
         .route("/api/pair", post(pair_device))
         .route("/api/devices", get(list_devices))
         .route("/api/devices/{id}", axum::routing::delete(revoke_device))
+        .route("/api/devices/{id}/push-token", post(set_push_token))
         .route("/api/health", get(health))
         .route("/api/logout", post(logout))
 }
@@ -994,6 +995,42 @@ async fn list_devices(
             })
             .collect(),
     ))
+}
+
+#[derive(Deserialize)]
+struct PushTokenRequest {
+    token: String,
+}
+
+/// Register the APNs token a device wants approval prompts on.
+///
+/// The app calls this after iOS hands it a token, and again whenever iOS
+/// reissues one.
+async fn set_push_token(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<PushTokenRequest>,
+) -> Result<StatusCode, StatusCode> {
+    let token = body.token.trim();
+    // An APNs token is hex; anything else is a client bug worth rejecting
+    // rather than storing and failing on later.
+    if token.is_empty() || token.len() > 200 || !token.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    state
+        .store
+        .devices()
+        .set_push_token(&id, token)
+        .await
+        .map_err(|e| match e {
+            rustykrab_core::Error::NotFound(_) => StatusCode::NOT_FOUND,
+            other => {
+                tracing::error!(error = %other, %id, "storing push token failed");
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
+        })?;
+    tracing::info!(%id, "push token registered");
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// Revoke a device — the lost-phone story. Its token stops working

@@ -27,7 +27,9 @@ tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["rustls-tls-native-roots", "connect"] }
 axum = "0.8"
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "query"] }
+# `http2` is required for APNs, which refuses HTTP/1.1. It was absent, so
+# `h2` was not in the tree at all and a push would have failed at connect.
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "query", "http2"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -63,6 +65,9 @@ hmac = "0.12"
 sha2 = "0.10"
 hex = "0.4"
 base64 = "0.22"
+# ES256 for APNs provider tokens. Already in the tree via rustls, so
+# this adds no new code — only a direct dependency edge.
+ring = "0.17"
 aes-gcm = "0.10"
 argon2 = "0.5"
 security-framework = { version = "3", features = ["OSX_10_15"] }

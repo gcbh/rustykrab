@@ -19,7 +19,9 @@ use zeroize::Zeroizing;
 
 pub use chat_map::ChatMapStore;
 pub use conversation::{ConversationStore, ConversationSummary};
-pub use credential_request::{CredentialRequest, CredentialRequestStore, RequestAction};
+pub use credential_request::{
+    CredentialRequest, CredentialRequestStore, RequestAction, RequestNotifier,
+};
 pub use device::{Device, DeviceStore, Principal};
 pub use guarded::{GuardedSecrets, WriteOutcome};
 pub use jobs::{JobRun, JobStore, ScheduledJob};
@@ -35,6 +37,9 @@ pub use slack_chat_map::SlackChatMapStore;
 pub struct Store {
     conn: Arc<Mutex<rusqlite::Connection>>,
     master_key: Zeroizing<Vec<u8>>,
+    /// Told when the agent files a credential change, so the user can be
+    /// notified. `None` when push isn't configured, which is normal.
+    request_notifier: Option<Arc<dyn credential_request::RequestNotifier>>,
 }
 
 impl Store {
@@ -70,6 +75,7 @@ impl Store {
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             master_key: Zeroizing::new(master_key),
+            request_notifier: None,
         })
     }
 
@@ -347,10 +353,23 @@ impl Store {
         SecretStore::new(Arc::clone(&self.conn), self.master_key.clone())
     }
 
+    /// Attach a notifier that is told whenever the agent files a change.
+    pub fn with_request_notifier(
+        mut self,
+        notifier: Arc<dyn credential_request::RequestNotifier>,
+    ) -> Self {
+        self.request_notifier = Some(notifier);
+        self
+    }
+
     /// Handle for the credential-change requests the agent files and the
     /// user resolves.
     pub fn credential_requests(&self) -> CredentialRequestStore {
-        CredentialRequestStore::new(Arc::clone(&self.conn), self.secrets())
+        let requests = CredentialRequestStore::new(Arc::clone(&self.conn), self.secrets());
+        match &self.request_notifier {
+            Some(notifier) => requests.with_notifier(Arc::clone(notifier)),
+            None => requests,
+        }
     }
 
     /// The agent-facing view of credential storage: create-only, with
