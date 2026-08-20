@@ -1,5 +1,7 @@
 mod chat_map;
 mod conversation;
+mod credential_request;
+mod guarded;
 mod jobs;
 pub mod keychain;
 mod recall_archive;
@@ -16,9 +18,11 @@ use zeroize::Zeroizing;
 
 pub use chat_map::ChatMapStore;
 pub use conversation::{ConversationStore, ConversationSummary};
+pub use credential_request::{CredentialRequest, CredentialRequestStore, RequestAction};
+pub use guarded::{GuardedSecrets, WriteOutcome};
 pub use jobs::{JobRun, JobStore, ScheduledJob};
 pub use recall_archive::RecallArchiveStore;
-pub use secret::SecretStore;
+pub use secret::{SecretMeta, SecretStore, WriteAuthority};
 pub use slack_chat_map::SlackChatMapStore;
 
 /// Top-level database handle wrapping a SQLite connection.
@@ -146,6 +150,51 @@ impl Store {
                 created_at      TEXT NOT NULL,
                 updated_at      TEXT NOT NULL
             );
+
+            -- Credential guard (docs/plans/apollo-ios-and-credential-guard.md).
+            -- An agent-authored change to an existing credential lands here
+            -- instead of being applied, and the user resolves it.
+            CREATE TABLE IF NOT EXISTS credential_requests (
+                id              TEXT PRIMARY KEY,
+                name            TEXT NOT NULL,
+                action          TEXT NOT NULL,      -- 'update' | 'delete'
+                proposed_data   BLOB,               -- encrypted; NULL for delete
+                reason          TEXT,
+                conversation_id TEXT,
+                status          TEXT NOT NULL DEFAULT 'pending',
+                created_at      INTEGER NOT NULL,
+                decided_at      INTEGER,
+                decided_by      TEXT,
+                -- Version of the target when the request was filed, so a
+                -- stale approval cannot clobber a newer user edit.
+                target_version  INTEGER
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_credential_requests_pending
+                ON credential_requests (name) WHERE status = 'pending';
+
+            -- Superseded values, kept encrypted, so an approved change or a
+            -- mistaken delete is recoverable.
+            CREATE TABLE IF NOT EXISTS secret_versions (
+                name        TEXT NOT NULL,
+                version     INTEGER NOT NULL,
+                data        BLOB NOT NULL,
+                replaced_at INTEGER NOT NULL,
+                replaced_by TEXT NOT NULL,
+                PRIMARY KEY (name, version)
+            );
+
+            CREATE TABLE IF NOT EXISTS secret_audit (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                name       TEXT NOT NULL,
+                op         TEXT NOT NULL,   -- create|overwrite|delete|approve|deny
+                authority  TEXT NOT NULL,
+                request_id TEXT,
+                at         INTEGER NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_secret_audit_name
+                ON secret_audit (name, at DESC);
             ",
         )
         .map_err(|e| Error::Storage(e.to_string()))?;
@@ -178,6 +227,39 @@ impl Store {
                 [],
             )
             .map_err(|e| Error::Storage(e.to_string()))?;
+        }
+
+        // Versioning columns on `secrets`. Rows written before the guard
+        // existed keep NULL timestamps — back-filling them with "now" would
+        // claim every old credential was created at upgrade time — and read
+        // as version 1.
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(secrets)")
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        let existing: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|e| Error::Storage(e.to_string()))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        drop(stmt);
+        for (column, ddl) in [
+            (
+                "created_at",
+                "ALTER TABLE secrets ADD COLUMN created_at INTEGER",
+            ),
+            (
+                "updated_at",
+                "ALTER TABLE secrets ADD COLUMN updated_at INTEGER",
+            ),
+            (
+                "version",
+                "ALTER TABLE secrets ADD COLUMN version INTEGER NOT NULL DEFAULT 1",
+            ),
+        ] {
+            if !existing.iter().any(|c| c == column) {
+                conn.execute(ddl, [])
+                    .map_err(|e| Error::Storage(e.to_string()))?;
+            }
         }
 
         // `job_runs.rustykrab_version` records which build executed each run.
@@ -241,6 +323,20 @@ impl Store {
     /// Return a handle for encrypted secret operations.
     pub fn secrets(&self) -> SecretStore {
         SecretStore::new(Arc::clone(&self.conn), self.master_key.clone())
+    }
+
+    /// Handle for the credential-change requests the agent files and the
+    /// user resolves.
+    pub fn credential_requests(&self) -> CredentialRequestStore {
+        CredentialRequestStore::new(Arc::clone(&self.conn), self.secrets())
+    }
+
+    /// The agent-facing view of credential storage: create-only, with
+    /// overwrites and deletes queued for approval. Tools receive this
+    /// rather than [`SecretStore`], so the guard cannot be bypassed by
+    /// forgetting a check.
+    pub fn guarded_secrets(&self) -> GuardedSecrets {
+        GuardedSecrets::new(self.secrets(), self.credential_requests())
     }
 
     /// Return a handle for scheduled-job operations.

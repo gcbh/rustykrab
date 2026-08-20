@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use rustykrab_core::types::ToolSchema;
 use rustykrab_core::{Error, Result, Tool};
-use rustykrab_store::SecretStore;
+use rustykrab_store::{GuardedSecrets, WriteOutcome};
 use serde_json::{json, Value};
 
 /// A tool that writes credentials to the encrypted SecretStore or macOS
@@ -11,11 +11,11 @@ use serde_json::{json, Value};
 /// action copies a credential from the macOS Keychain into the encrypted local
 /// store so it is available even when not running on macOS.
 pub struct CredentialWriteTool {
-    secrets: SecretStore,
+    secrets: GuardedSecrets,
 }
 
 impl CredentialWriteTool {
-    pub fn new(secrets: SecretStore) -> Self {
+    pub fn new(secrets: GuardedSecrets) -> Self {
         Self { secrets }
     }
 }
@@ -128,26 +128,56 @@ impl CredentialWriteTool {
                     .as_str()
                     .ok_or_else(|| Error::ToolExecution("missing value for 'set' action".into()))?;
 
-                self.secrets.set(name, value).await.map_err(|e| {
+                let outcome = self.secrets.set(name, value).await.map_err(|e| {
                     Error::ToolExecution(format!("failed to store secret: {e}").into())
                 })?;
 
-                Ok(json!({
-                    "status": "stored",
-                    "source": "store",
-                    "name": name,
-                }))
+                // A queued change is a normal result, not a failure: the
+                // model should relay what the user needs to approve rather
+                // than treat it as an error to retry around.
+                Ok(match outcome {
+                    WriteOutcome::Created => json!({
+                        "status": "stored",
+                        "source": "store",
+                        "name": name,
+                    }),
+                    WriteOutcome::PendingApproval { request_id } => json!({
+                        "status": "pending_approval",
+                        "source": "store",
+                        "name": name,
+                        "request_id": request_id,
+                        "message": format!(
+                            "'{name}' already exists, so replacing it needs the user's \
+                             approval. Tell them it is waiting in Apollo or WebChat \
+                             (request {request_id}); do not retry."
+                        ),
+                    }),
+                })
             }
             "delete" => {
-                self.secrets.delete(name).await.map_err(|e| {
+                let outcome = self.secrets.delete(name).await.map_err(|e| {
                     Error::ToolExecution(format!("failed to delete secret: {e}").into())
                 })?;
 
-                Ok(json!({
-                    "status": "deleted",
-                    "source": "store",
-                    "name": name,
-                }))
+                Ok(match outcome {
+                    WriteOutcome::PendingApproval { request_id } => json!({
+                        "status": "pending_approval",
+                        "source": "store",
+                        "name": name,
+                        "request_id": request_id,
+                        "message": format!(
+                            "Deleting '{name}' needs the user's approval (request \
+                             {request_id}); do not retry."
+                        ),
+                    }),
+                    // Deletes are always queued; this arm only makes the
+                    // match total.
+                    WriteOutcome::Created => json!({
+                        "status": "deleted",
+                        "source": "store",
+                        "name": name,
+                    }),
+                })
             }
             other => Err(Error::ToolExecution(
                 format!(
@@ -191,6 +221,32 @@ impl CredentialWriteTool {
                     .as_str()
                     .ok_or_else(|| Error::ToolExecution("missing value for 'set' action".into()))?;
 
+                // Same create-only rule as the store: an existing
+                // service/account pair is someone else's credential.
+                //
+                // Unlike a store write this is refused rather than queued —
+                // the request table applies approved changes to the store,
+                // and it cannot write the Keychain. Queuing Keychain
+                // changes is follow-up work; refusing keeps the guard
+                // honest in the meantime.
+                let occupied = rustykrab_store::keychain::get_credential(service, account)
+                    .map(|c| c.is_some())
+                    .unwrap_or(false);
+                if occupied {
+                    return Ok(json!({
+                        "status": "refused",
+                        "source": "keychain",
+                        "name": name,
+                        "service": service,
+                        "account": account,
+                        "message": format!(
+                            "A Keychain credential already exists for {service}/{account}. \
+                             Replacing it is the user's call — ask them to update it in \
+                             Keychain Access or via the app; do not retry."
+                        ),
+                    }));
+                }
+
                 rustykrab_store::keychain::set_credential(service, account, value).map_err(
                     |e| Error::ToolExecution(format!("failed to store in keychain: {e}").into()),
                 )?;
@@ -210,15 +266,17 @@ impl CredentialWriteTool {
                 }))
             }
             "delete" => {
-                rustykrab_store::keychain::delete_credential(service, account).map_err(|e| {
-                    Error::ToolExecution(format!("failed to delete from keychain: {e}").into())
-                })?;
-
+                // Destroying a Keychain item is not the agent's call, and
+                // there is nothing to archive if it gets it wrong.
                 Ok(json!({
-                    "status": "deleted",
+                    "status": "refused",
                     "source": "keychain",
                     "service": service,
                     "account": account,
+                    "message": format!(
+                        "Deleting the Keychain credential {service}/{account} is the \
+                         user's call. Ask them to remove it themselves; do not retry."
+                    ),
                 }))
             }
             other => Err(Error::ToolExecution(

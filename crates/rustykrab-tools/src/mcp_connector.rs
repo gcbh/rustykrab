@@ -505,7 +505,7 @@ mod tests {
     async fn resolve_value_ref_store_lookup_succeeds_in_namespace() {
         let secrets = make_test_secrets();
         secrets
-            .set("mcp.github.token", "stored-token-value")
+            .create("mcp.github.token", "stored-token-value")
             .await
             .unwrap();
         let v = resolve_value_ref("github", "ref:store:mcp.github.token", &secrets)
@@ -518,7 +518,7 @@ mod tests {
     async fn resolve_value_ref_store_lookup_is_case_insensitive_on_server() {
         let secrets = make_test_secrets();
         secrets
-            .set("mcp.github.token", "stored-token-value")
+            .create("mcp.github.token", "stored-token-value")
             .await
             .unwrap();
         let v = resolve_value_ref("GitHub", "ref:store:mcp.github.token", &secrets)
@@ -531,7 +531,7 @@ mod tests {
     async fn resolve_value_ref_store_rejects_cross_server_lookup() {
         let secrets = make_test_secrets();
         secrets
-            .set("mcp.notion.token", "other-server-token")
+            .create("mcp.notion.token", "other-server-token")
             .await
             .unwrap();
         let err = resolve_value_ref("github", "ref:store:mcp.notion.token", &secrets)
@@ -546,7 +546,7 @@ mod tests {
     #[tokio::test]
     async fn resolve_value_ref_store_rejects_unnamespaced_keys() {
         let secrets = make_test_secrets();
-        secrets.set("global_secret", "x").await.unwrap();
+        secrets.create("global_secret", "x").await.unwrap();
         let err = resolve_value_ref("github", "ref:store:global_secret", &secrets)
             .await
             .unwrap_err();
@@ -629,7 +629,7 @@ mod tests {
         let upper = "TESTREF";
         let secrets = make_test_secrets();
         secrets
-            .set("mcp.testref.token", "resolved-bearer")
+            .create("mcp.testref.token", "resolved-bearer")
             .await
             .unwrap();
         std::env::set_var(
@@ -652,7 +652,7 @@ mod tests {
         let upper = "TESTHDRREF";
         let secrets = make_test_secrets();
         secrets
-            .set("mcp.testhdrref.api_key", "secret-key")
+            .create("mcp.testhdrref.api_key", "secret-key")
             .await
             .unwrap();
         std::env::set_var(
@@ -672,7 +672,7 @@ mod tests {
         let upper = "TESTXSERVER";
         let secrets = make_test_secrets();
         secrets
-            .set("mcp.notion.token", "wrong-server")
+            .create("mcp.notion.token", "wrong-server")
             .await
             .unwrap();
         std::env::set_var(

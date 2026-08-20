@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use futures::TryStreamExt;
 use rustykrab_core::types::ToolSchema;
 use rustykrab_core::{Error, Result, SandboxRequirements, Tool};
-use rustykrab_store::SecretStore;
+use rustykrab_store::GuardedSecrets;
 use serde_json::{json, Value};
 
 // ---------------------------------------------------------------------------
@@ -103,7 +103,7 @@ async fn select_mailbox(cached: &mut CachedSession, mailbox: &str) -> Result<()>
 // ---------------------------------------------------------------------------
 
 pub struct GmailTool {
-    secrets: SecretStore,
+    secrets: GuardedSecrets,
     /// Cached IMAP session, reused across calls. The lock is held for the
     /// duration of an operation — IMAP is stateful, so operations on one
     /// connection must not interleave.
@@ -111,7 +111,7 @@ pub struct GmailTool {
 }
 
 impl GmailTool {
-    pub fn new(secrets: SecretStore) -> Self {
+    pub fn new(secrets: GuardedSecrets) -> Self {
         Self {
             secrets,
             imap: tokio::sync::Mutex::new(None),
@@ -159,11 +159,11 @@ impl GmailTool {
             .ok_or_else(|| Error::ToolExecution("missing 'app_password' parameter".into()))?;
 
         self.secrets
-            .set(KEY_EMAIL, email)
+            .set_strict(KEY_EMAIL, email)
             .await
             .map_err(|e| Error::ToolExecution(format!("failed to store email: {e}").into()))?;
         self.secrets
-            .set(KEY_APP_PASSWORD, app_password)
+            .set_strict(KEY_APP_PASSWORD, app_password)
             .await
             .map_err(|e| {
                 Error::ToolExecution(format!("failed to store app password: {e}").into())

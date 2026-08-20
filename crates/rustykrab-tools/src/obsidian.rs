@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use rustykrab_core::types::ToolSchema;
 use rustykrab_core::{Error, Result, SandboxRequirements, Tool};
-use rustykrab_store::SecretStore;
+use rustykrab_store::GuardedSecrets;
 use serde_json::{json, Value};
 
 // ---------------------------------------------------------------------------
@@ -29,12 +29,12 @@ static SYNC_CLIENT: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::
 // ---------------------------------------------------------------------------
 
 pub struct ObsidianTool {
-    secrets: SecretStore,
+    secrets: GuardedSecrets,
     client: reqwest::Client,
 }
 
 impl ObsidianTool {
-    pub fn new(secrets: SecretStore) -> Self {
+    pub fn new(secrets: GuardedSecrets) -> Self {
         // The Obsidian Local REST API uses a self-signed certificate by default.
         // Accept invalid certs since this is a localhost-only connection.
         let client = reqwest::Client::builder()
@@ -112,19 +112,22 @@ impl ObsidianTool {
             .ok_or_else(|| Error::ToolExecution("missing 'api_key' parameter".into()))?;
 
         self.secrets
-            .set(KEY_API_KEY, api_key)
+            .set_strict(KEY_API_KEY, api_key)
             .await
             .map_err(|e| Error::ToolExecution(format!("failed to store API key: {e}").into()))?;
 
         if let Some(url) = args["api_url"].as_str() {
-            self.secrets.set(KEY_API_URL, url).await.map_err(|e| {
-                Error::ToolExecution(format!("failed to store API URL: {e}").into())
-            })?;
+            self.secrets
+                .set_strict(KEY_API_URL, url)
+                .await
+                .map_err(|e| {
+                    Error::ToolExecution(format!("failed to store API URL: {e}").into())
+                })?;
         }
 
         if let Some(folder) = args["sync_folder"].as_str() {
             self.secrets
-                .set(KEY_SYNC_FOLDER, folder)
+                .set_strict(KEY_SYNC_FOLDER, folder)
                 .await
                 .map_err(|e| {
                     Error::ToolExecution(format!("failed to store sync folder: {e}").into())
@@ -571,7 +574,7 @@ fn format_synced_note(
 /// Returns `Ok(Some(json))` on success, `Ok(None)` if Obsidian is not configured,
 /// or `Err(message)` if sync was attempted but failed.
 pub async fn try_sync_to_obsidian(
-    secrets: &SecretStore,
+    secrets: &GuardedSecrets,
     title: &str,
     content: Option<&str>,
     notion_id: Option<&str>,
@@ -627,7 +630,7 @@ pub async fn try_sync_to_obsidian(
 ///
 /// Same return semantics as [`try_sync_to_obsidian`].
 pub async fn try_sync_append_to_obsidian(
-    secrets: &SecretStore,
+    secrets: &GuardedSecrets,
     title: &str,
     content: &str,
 ) -> std::result::Result<Option<Value>, String> {

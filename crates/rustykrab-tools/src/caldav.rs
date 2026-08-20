@@ -18,7 +18,7 @@ use chrono::{DateTime, NaiveDate, NaiveDateTime, SecondsFormat, Utc};
 use regex::Regex;
 use rustykrab_core::types::ToolSchema;
 use rustykrab_core::{Error, Result, SandboxRequirements, Tool};
-use rustykrab_store::SecretStore;
+use rustykrab_store::GuardedSecrets;
 use serde_json::{json, Value};
 
 // ---------------------------------------------------------------------------
@@ -56,12 +56,12 @@ struct DavReq<'a> {
 }
 
 pub struct CalDavTool {
-    secrets: SecretStore,
+    secrets: GuardedSecrets,
     client: reqwest::Client,
 }
 
 impl CalDavTool {
-    pub fn new(secrets: SecretStore) -> Self {
+    pub fn new(secrets: GuardedSecrets) -> Self {
         Self {
             secrets,
             client: reqwest::Client::builder()
@@ -175,14 +175,17 @@ impl CalDavTool {
         // whatever the Gmail integration already stored.
         if let Some(email) = args["email"].as_str() {
             self.secrets
-                .set(KEY_EMAIL, email)
+                .set_strict(KEY_EMAIL, email)
                 .await
                 .map_err(|e| Error::ToolExecution(format!("failed to store email: {e}").into()))?;
         }
         if let Some(pw) = args["app_password"].as_str() {
-            self.secrets.set(KEY_APP_PASSWORD, pw).await.map_err(|e| {
-                Error::ToolExecution(format!("failed to store app password: {e}").into())
-            })?;
+            self.secrets
+                .set_strict(KEY_APP_PASSWORD, pw)
+                .await
+                .map_err(|e| {
+                    Error::ToolExecution(format!("failed to store app password: {e}").into())
+                })?;
         }
 
         let (email, password) = self.get_credentials().await?;

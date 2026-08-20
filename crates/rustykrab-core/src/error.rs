@@ -168,6 +168,21 @@ pub enum Error {
     #[error("not found: {0}")]
     NotFound(String),
 
+    /// A create-only write hit an existing name. Distinct from `Storage` so
+    /// callers can offer "overwrite?" instead of reporting a failure.
+    #[error("already exists: {0}")]
+    AlreadyExists(String),
+
+    /// An agent-authored credential change was queued for the user to
+    /// approve rather than applied. Carries the request id so the agent can
+    /// tell the user what to look for.
+    ///
+    /// Not really an error — it is the guard working — but it travels the
+    /// error path so every tool that writes credentials reports it without
+    /// per-tool code.
+    #[error("change to '{name}' needs your approval (request {request_id})")]
+    PendingApproval { request_id: String, name: String },
+
     #[error("{0}")]
     Internal(String),
 }
@@ -184,6 +199,10 @@ impl Error {
             Error::ModelAuthError(_) | Error::Auth(_) => ToolErrorKind::PermissionDenied,
             Error::ModelBadRequest(_) => ToolErrorKind::InvalidInput,
             Error::NotFound(_) => ToolErrorKind::NotFound,
+            Error::AlreadyExists(_) => ToolErrorKind::InvalidInput,
+            // The agent asked for something it isn't allowed to do
+            // unilaterally; the user now has to decide.
+            Error::PendingApproval { .. } => ToolErrorKind::PermissionDenied,
             Error::ModelProvider(_) | Error::Channel(_) => ToolErrorKind::Transient,
             Error::Config(_)
             | Error::Storage(_)
