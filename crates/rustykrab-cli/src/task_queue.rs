@@ -5,7 +5,7 @@ use tokio::sync::{mpsc, Mutex, Semaphore};
 
 use chrono::Utc;
 use rustykrab_agent::AgentEvent;
-use rustykrab_core::types::{Conversation, MessageContent};
+use rustykrab_core::types::{Conversation, Message, MessageContent, Role};
 use rustykrab_gateway::AppState;
 use rustykrab_skills::SkillRegistry;
 use uuid::Uuid;
@@ -66,11 +66,16 @@ impl TaskQueue {
 
     /// Submit a task to the queue. Returns `Err` if the queue is full
     /// or the worker has stopped.
+    ///
+    /// The error is boxed because tokio's `SendError` hands the unsent
+    /// `TaskRequest` back to the caller, which makes the `Err` variant far
+    /// larger than the `Ok` one — every caller would pay for that on the
+    /// success path. Boxing allocates only when the worker is already gone.
     pub async fn submit(
         &self,
         request: TaskRequest,
-    ) -> Result<(), mpsc::error::SendError<TaskRequest>> {
-        self.tx.send(request).await
+    ) -> Result<(), Box<mpsc::error::SendError<TaskRequest>>> {
+        self.tx.send(request).await.map_err(Box::new)
     }
 }
 
@@ -141,6 +146,33 @@ async fn execute_task(task: &TaskRequest, state: &AppState, store: &rustykrab_st
             .await;
         }
     }
+}
+
+/// Append the scheduled prompt to `conv` as a real user turn.
+///
+/// `run_agent_*` injects only the system prompt and relies on the caller to
+/// have already appended the user message — see the comment in
+/// `orchestrate::prepare_agent` noting that routes.rs pushes the inbound user
+/// message before the runner is constructed. The `user_content` argument only
+/// drives profile routing and system-prompt construction; it never becomes a
+/// message.
+///
+/// Without this, a resumed job conversation reaches the provider carrying only
+/// system/assistant/tool messages. Some model chat templates reject that
+/// outright: verified against Ollama 0.32.14, `qwen3.8:27b` (the deployed
+/// model) returns 500 `{"error":"no user query found in messages"}`, while
+/// gemma4:26b and qwen3:32b accept it. Appending here also
+/// guarantees the newest message is a user turn, so the provider's oldest-first
+/// trimming can never strand the request without one.
+fn push_scheduled_user_turn(conv: &mut Conversation, prompt: &str) {
+    conv.messages.push(Message {
+        id: Uuid::new_v4(),
+        role: Role::User,
+        content: MessageContent::Text(prompt.to_string()),
+        created_at: Utc::now(),
+        agent_version: Message::version_stamp(),
+    });
+    conv.updated_at = Utc::now();
 }
 
 async fn execute_cron_task(
@@ -278,6 +310,9 @@ async fn execute_cron_task(
         effective_channel.as_deref(),
         effective_chat_id.as_deref(),
     );
+
+    // A scheduled run must contribute its own user turn.
+    push_scheduled_user_turn(&mut conv, &prompt);
 
     let run_options = rustykrab_gateway::RunOptions {
         active_skill: resolved_skill,
@@ -718,6 +753,45 @@ mod tests {
         c.channel_id = Some(id.to_string());
         c.channel_thread_id = thread.map(|s| s.to_string());
         c
+    }
+
+    #[test]
+    fn scheduled_run_appends_a_user_turn_carrying_the_prompt() {
+        let mut conv = empty_conv();
+        let prompt = build_scheduled_prompt("Write the daily briefing.", None, None, None);
+
+        push_scheduled_user_turn(&mut conv, &prompt);
+
+        let last = conv.messages.last().expect("a message was appended");
+        assert_eq!(last.role, Role::User);
+        assert_eq!(last.content.as_text(), Some(prompt.as_str()));
+    }
+
+    /// Some model chat templates reject a request whose message array carries
+    /// no `user` role (qwen3.8:27b does; gemma4:26b does not). A resumed job
+    /// conversation holding only system/assistant/tool turns must still reach
+    /// the provider with a user turn present.
+    #[test]
+    fn scheduled_run_leaves_a_user_role_in_a_conversation_without_one() {
+        let mut conv = channel_conv("telegram", "12345", None);
+        conv.messages.push(Message {
+            id: Uuid::new_v4(),
+            role: Role::Assistant,
+            content: MessageContent::Text("result of the previous run".to_string()),
+            created_at: Utc::now(),
+            agent_version: Message::version_stamp(),
+        });
+        assert!(!conv.messages.iter().any(|m| m.role == Role::User));
+
+        push_scheduled_user_turn(
+            &mut conv,
+            &build_scheduled_prompt("Check the feed.", None, Some("telegram"), Some("12345")),
+        );
+
+        assert!(conv.messages.iter().any(|m| m.role == Role::User));
+        // Newest message being a user turn is what keeps oldest-first
+        // trimming from stranding the request without one.
+        assert_eq!(conv.messages.last().unwrap().role, Role::User);
     }
 
     #[test]

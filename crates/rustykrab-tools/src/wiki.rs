@@ -398,7 +398,7 @@ impl WikiTool {
         // search ignores tag filters, so non-wiki hits are mixed in and dropped.
         if let Ok(result) = self
             .memory
-            .search(query, &["wiki".to_string()], limit * 4)
+            .search(query, &["wiki".to_string()], limit * 4, None)
             .await
         {
             if let Some(items) = result.get("results").and_then(|r| r.as_array()) {
@@ -965,7 +965,13 @@ mod tests {
 
     #[async_trait]
     impl MemoryBackend for MockMemory {
-        async fn search(&self, _query: &str, _tags: &[String], _limit: usize) -> Result<Value> {
+        async fn search(
+            &self,
+            _query: &str,
+            _tags: &[String],
+            _limit: usize,
+            _session_id: Option<&str>,
+        ) -> Result<Value> {
             let results = self.search_results.lock().unwrap().clone();
             Ok(json!({ "results": results, "count": results.len() }))
         }

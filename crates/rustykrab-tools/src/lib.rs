@@ -203,10 +203,12 @@ pub use mcp_connector::{mcp_connector_tools, McpRemoteTool};
 
 /// Collect all built-in tools that require no external backend into a Vec.
 ///
-/// Tools that need access to the secret store (credential_read, credential_write)
-/// require a `SecretStore` handle. The remaining tools are stateless or self-contained.
+/// Tools that read credentials take a `SecretStore`; every tool that can
+/// *write* one takes [`GuardedSecrets`] instead, so the create-only policy
+/// is carried by the handle rather than by a check each tool remembers.
 pub fn builtin_tools(
     secrets: rustykrab_store::SecretStore,
+    guarded: rustykrab_store::GuardedSecrets,
 ) -> Vec<std::sync::Arc<dyn rustykrab_core::Tool>> {
     vec![
         // Meta — tool discovery and lazy schema loading. Always registered.
@@ -243,16 +245,16 @@ pub fn builtin_tools(
         // net_scan/net_admin/net_audit/net_discovery tools were removed to
         // cut the tool-schema payload sent to the model.
         // Email
-        std::sync::Arc::new(GmailTool::new(secrets.clone())),
+        std::sync::Arc::new(GmailTool::new(guarded.clone())),
         // Calendar (CalDAV — reuses Gmail credentials)
-        std::sync::Arc::new(CalDavTool::new(secrets.clone())),
+        std::sync::Arc::new(CalDavTool::new(guarded.clone())),
         // Notion
-        std::sync::Arc::new(NotionTool::new(secrets.clone())),
+        std::sync::Arc::new(NotionTool::new(guarded.clone())),
         // Obsidian
-        std::sync::Arc::new(ObsidianTool::new(secrets.clone())),
+        std::sync::Arc::new(ObsidianTool::new(guarded.clone())),
         // Credentials
         std::sync::Arc::new(CredentialReadTool::new(secrets.clone())),
-        std::sync::Arc::new(CredentialWriteTool::new(secrets)),
+        std::sync::Arc::new(CredentialWriteTool::new(guarded)),
     ]
 }
 

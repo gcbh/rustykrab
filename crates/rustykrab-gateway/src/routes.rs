@@ -44,6 +44,19 @@ pub fn api_routes() -> Router<AppState> {
         .route("/api/secrets", get(list_secrets))
         .route("/api/secrets", post(set_secret))
         .route("/api/secrets/{name}", axum::routing::delete(delete_secret))
+        .route("/api/credential-requests", get(list_credential_requests))
+        .route(
+            "/api/credential-requests/{id}/approve",
+            post(approve_credential_request),
+        )
+        .route(
+            "/api/credential-requests/{id}/deny",
+            post(deny_credential_request),
+        )
+        .route("/api/pair", post(pair_device))
+        .route("/api/devices", get(list_devices))
+        .route("/api/devices/{id}", axum::routing::delete(revoke_device))
+        .route("/api/devices/{id}/push-token", post(set_push_token))
         .route("/api/health", get(health))
         .route("/api/logout", post(logout))
 }
@@ -698,24 +711,60 @@ struct SetSecretRequest {
     /// macOS Keychain account name (required when `dest == "keychain"`).
     #[serde(default)]
     account: Option<String>,
+    /// Replace an existing credential rather than refusing with `409`.
+    ///
+    /// Clients send this only after an explicit confirmation — that flag
+    /// *is* the user's approval for a user-initiated overwrite.
+    #[serde(default)]
+    overwrite: bool,
+}
+
+/// Per-secret metadata. Values are never included.
+#[derive(serde::Serialize)]
+struct SecretEntry {
+    name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    created_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    updated_at: Option<i64>,
+    version: i64,
 }
 
 #[derive(serde::Serialize)]
 struct ListSecretsResponse {
+    /// Names only, kept so existing clients keep working.
     names: Vec<String>,
+    /// Name + timestamps + version.
+    secrets: Vec<SecretEntry>,
     keychain_available: bool,
+    /// Same value under the camelCase name the app's contract uses. Both
+    /// are emitted so the WebChat UI and Apollo can each read the shape
+    /// they expect without a flag day.
+    #[serde(rename = "keychainAvailable")]
+    keychain_available_camel: bool,
 }
 
 async fn list_secrets(
     State(state): State<AppState>,
 ) -> Result<Json<ListSecretsResponse>, StatusCode> {
-    let names = state.store.secrets().list_names().await.map_err(|e| {
+    let meta = state.store.secrets().metadata().await.map_err(|e| {
         tracing::error!(error = %e, "list_secrets failed");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
+    let available = rustykrab_store::keychain::keychain_available();
     Ok(Json(ListSecretsResponse {
-        names,
-        keychain_available: rustykrab_store::keychain::keychain_available(),
+        names: meta.iter().map(|m| m.name.clone()).collect(),
+        secrets: meta
+            .into_iter()
+            .map(|m| SecretEntry {
+                name: m.name,
+                created_at: m.created_at,
+                updated_at: m.updated_at,
+                version: m.version,
+            })
+            .collect(),
+        keychain_available: available,
+        keychain_available_camel: available,
     }))
 }
 
@@ -732,16 +781,38 @@ async fn set_secret(
 
     match body.dest {
         SecretDest::Store => {
-            state
-                .store
-                .secrets()
-                .set(&body.name, &body.value)
-                .await
-                .map_err(|e| {
-                    tracing::warn!(error = %e, name = %body.name, "set_secret: store write failed");
+            let secrets = state.store.secrets();
+            // Create-only by default. Replacing an existing credential is a
+            // separate, explicit act — the client must have asked the user
+            // first and sent `overwrite: true`.
+            let result = if body.overwrite {
+                secrets
+                    .overwrite(
+                        &body.name,
+                        &body.value,
+                        rustykrab_store::WriteAuthority::User { device: None },
+                    )
+                    .await
+            } else {
+                secrets.create(&body.name, &body.value).await
+            };
+            result.map_err(|e| match e {
+                rustykrab_core::Error::AlreadyExists(_) => {
+                    tracing::info!(name = %body.name, "set_secret: refused, name exists");
+                    StatusCode::CONFLICT
+                }
+                rustykrab_core::Error::NotFound(_) => StatusCode::NOT_FOUND,
+                other => {
+                    tracing::warn!(error = %other, name = %body.name, "set_secret: store write failed");
                     StatusCode::BAD_REQUEST
-                })?;
-            tracing::info!(name = %body.name, dest = "store", "secret stored");
+                }
+            })?;
+            tracing::info!(
+                name = %body.name,
+                dest = "store",
+                overwrite = body.overwrite,
+                "secret stored"
+            );
         }
         SecretDest::Keychain => {
             if !rustykrab_store::keychain::keychain_available() {
@@ -770,11 +841,251 @@ async fn delete_secret(
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> Result<StatusCode, StatusCode> {
-    state.store.secrets().delete(&name).await.map_err(|e| {
-        tracing::error!(error = %e, "delete_secret failed");
+    state
+        .store
+        .secrets()
+        .delete(
+            &name,
+            rustykrab_store::WriteAuthority::User { device: None },
+        )
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "delete_secret failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    tracing::info!(name = %name, "secret deleted");
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ── credential change requests ──────────────────────────────────────
+//
+// The agent files these; only an authenticated user resolves them. The
+// agent runs in-process and holds no HTTP credentials, so it physically
+// cannot reach these routes.
+
+/// A pending change, as the app and WebChat see it. Never the value.
+#[derive(serde::Serialize)]
+struct ChangeRequestResponse {
+    id: String,
+    name: String,
+    action: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+    #[serde(rename = "conversationId", skip_serializing_if = "Option::is_none")]
+    conversation_id: Option<String>,
+    status: String,
+    #[serde(rename = "createdAt")]
+    created_at: i64,
+}
+
+async fn list_credential_requests(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<ChangeRequestResponse>>, StatusCode> {
+    let pending = state
+        .store
+        .credential_requests()
+        .pending()
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "listing credential requests failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    Ok(Json(
+        pending
+            .into_iter()
+            .map(|r| ChangeRequestResponse {
+                id: r.id,
+                name: r.name,
+                action: r.action.as_str().to_string(),
+                reason: r.reason,
+                conversation_id: r.conversation_id,
+                status: r.status,
+                created_at: r.created_at,
+            })
+            .collect(),
+    ))
+}
+
+async fn approve_credential_request(
+    State(state): State<AppState>,
+    principal: Option<Extension<rustykrab_store::Principal>>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, StatusCode> {
+    decide_credential_request(state, id, true, principal.map(|p| p.0)).await
+}
+
+async fn deny_credential_request(
+    State(state): State<AppState>,
+    principal: Option<Extension<rustykrab_store::Principal>>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, StatusCode> {
+    decide_credential_request(state, id, false, principal.map(|p| p.0)).await
+}
+
+// ── device pairing ──────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct PairRequest {
+    code: String,
+    #[serde(rename = "deviceName")]
+    device_name: String,
+}
+
+#[derive(Serialize)]
+struct PairResponse {
+    #[serde(rename = "deviceId")]
+    device_id: String,
+    /// Shown exactly once. Stored server-side only as a hash.
+    #[serde(rename = "deviceToken")]
+    device_token: String,
+}
+
+/// Exchange a one-time code for a device token.
+///
+/// The only unauthenticated `/api` route besides health: a device has no
+/// token yet, which is the point. Protection is the code itself (single
+/// use, five-minute TTL, hashed at rest) plus the rate limiter in front.
+async fn pair_device(
+    State(state): State<AppState>,
+    Json(body): Json<PairRequest>,
+) -> Result<Json<PairResponse>, StatusCode> {
+    let (device, token) = state
+        .store
+        .devices()
+        .redeem_pairing_code(&body.code, &body.device_name)
+        .await
+        .map_err(|e| {
+            // Deliberately uniform: a caller learns "that didn't work",
+            // not whether the code was wrong, used, or merely expired.
+            tracing::warn!(error = %e, "pairing attempt refused");
+            StatusCode::FORBIDDEN
+        })?;
+    tracing::info!(device = %device.name, id = %device.id, "device paired");
+    Ok(Json(PairResponse {
+        device_id: device.id,
+        device_token: token,
+    }))
+}
+
+#[derive(Serialize)]
+struct DeviceResponse {
+    id: String,
+    name: String,
+    #[serde(rename = "createdAt")]
+    created_at: i64,
+    #[serde(rename = "lastSeenAt", skip_serializing_if = "Option::is_none")]
+    last_seen_at: Option<i64>,
+}
+
+async fn list_devices(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<DeviceResponse>>, StatusCode> {
+    let devices = state.store.devices().list().await.map_err(|e| {
+        tracing::error!(error = %e, "listing devices failed");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
-    tracing::info!(name = %name, "secret deleted");
+    Ok(Json(
+        devices
+            .into_iter()
+            .map(|d| DeviceResponse {
+                id: d.id,
+                name: d.name,
+                created_at: d.created_at,
+                last_seen_at: d.last_seen_at,
+            })
+            .collect(),
+    ))
+}
+
+#[derive(Deserialize)]
+struct PushTokenRequest {
+    token: String,
+}
+
+/// Register the APNs token a device wants approval prompts on.
+///
+/// The app calls this after iOS hands it a token, and again whenever iOS
+/// reissues one.
+async fn set_push_token(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<PushTokenRequest>,
+) -> Result<StatusCode, StatusCode> {
+    let token = body.token.trim();
+    // An APNs token is hex; anything else is a client bug worth rejecting
+    // rather than storing and failing on later.
+    if token.is_empty() || token.len() > 200 || !token.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    state
+        .store
+        .devices()
+        .set_push_token(&id, token)
+        .await
+        .map_err(|e| match e {
+            rustykrab_core::Error::NotFound(_) => StatusCode::NOT_FOUND,
+            other => {
+                tracing::error!(error = %other, %id, "storing push token failed");
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
+        })?;
+    tracing::info!(%id, "push token registered");
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Revoke a device — the lost-phone story. Its token stops working
+/// immediately, without disturbing any other device.
+async fn revoke_device(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, StatusCode> {
+    state
+        .store
+        .devices()
+        .revoke(&id)
+        .await
+        .map_err(|e| match e {
+            rustykrab_core::Error::NotFound(_) => StatusCode::NOT_FOUND,
+            other => {
+                tracing::error!(error = %other, %id, "revoking device failed");
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
+        })?;
+    tracing::info!(%id, "device revoked");
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn decide_credential_request(
+    state: AppState,
+    id: String,
+    approve: bool,
+    principal: Option<rustykrab_store::Principal>,
+) -> Result<StatusCode, StatusCode> {
+    let requests = state.store.credential_requests();
+    // Which device decided, for the audit trail.
+    let decided_by = principal
+        .map(|p| p.describe())
+        .unwrap_or_else(|| "webchat".to_string());
+    let decided_by = decided_by.as_str();
+    let result = if approve {
+        requests.approve(&id, decided_by).await
+    } else {
+        requests.deny(&id, decided_by).await
+    };
+    result.map_err(|e| match e {
+        // Already decided, or the credential moved since the request was
+        // filed — approving now would undo whatever the user did instead.
+        rustykrab_core::Error::AlreadyExists(reason) => {
+            tracing::info!(%id, %reason, "credential request decision refused as stale");
+            StatusCode::CONFLICT
+        }
+        rustykrab_core::Error::NotFound(_) => StatusCode::NOT_FOUND,
+        other => {
+            tracing::error!(error = %other, %id, "credential request decision failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    })?;
+    tracing::info!(%id, approved = approve, "credential request decided");
     Ok(StatusCode::NO_CONTENT)
 }
 

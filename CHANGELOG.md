@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.1.9] - 2026-08-21
+
+- test(memory): executable harness for every lifecycle stage transition (#499)
+
+## [5.1.8] - 2026-08-21
+
+- feat(memory): admission control, duplicate-write counter split, and scoped recall (#498)
+
+## [5.1.7] - 2026-08-21
+
+- Phase 4 (E): APNs push for pending credential requests (#493)
+
+## [5.1.6] - 2026-08-20
+
+- Phase 2 (C): origin allowlist + WebChat approvals panel — completes Phase 2 (#491)
+
+## [5.1.5] - 2026-08-20
+
+- Phase 2 (B): device pairing, per-device tokens, revocation — suite reaches 16/16 (#490)
+
+## [5.1.4] - 2026-08-20
+
+- fix(caldav): reject clobbered credentials before issuing a request (#496)
+
+## [5.1.3] - 2026-08-20
+
+- fix(cron): append a user turn to scheduled job runs (#494)
+
+## [5.1.2] - 2026-08-20
+
+- fix: repair two lint failures from the Rust 1.98 toolchain bump (#495)
+
+## [5.1.1] - 2026-08-20
+
+- Phase 2 (A): the agent can no longer overwrite or delete a credential (#489)
+
 ## [5.1.0] - 2026-08-20
 
 - perf(providers): make Ollama requests KV-cache friendly (#488)

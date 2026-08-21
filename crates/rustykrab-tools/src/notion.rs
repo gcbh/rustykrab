@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use rustykrab_core::types::ToolSchema;
 use rustykrab_core::{Error, Result, SandboxRequirements, Tool};
-use rustykrab_store::SecretStore;
+use rustykrab_store::GuardedSecrets;
 use serde_json::{json, Value};
 
 // ---------------------------------------------------------------------------
@@ -23,12 +23,12 @@ const MAX_BLOCKS_PER_REQUEST: usize = 100;
 // ---------------------------------------------------------------------------
 
 pub struct NotionTool {
-    secrets: SecretStore,
+    secrets: GuardedSecrets,
     client: reqwest::Client,
 }
 
 impl NotionTool {
-    pub fn new(secrets: SecretStore) -> Self {
+    pub fn new(secrets: GuardedSecrets) -> Self {
         Self {
             secrets,
             client: reqwest::Client::builder()
@@ -104,14 +104,14 @@ impl NotionTool {
             .ok_or_else(|| Error::ToolExecution("missing 'api_token' parameter".into()))?;
 
         self.secrets
-            .set(KEY_API_TOKEN, api_token)
+            .set_strict(KEY_API_TOKEN, api_token)
             .await
             .map_err(|e| Error::ToolExecution(format!("failed to store API token: {e}").into()))?;
 
         // Optionally store a default parent page ID.
         if let Some(parent_id) = args["default_parent_page_id"].as_str() {
             self.secrets
-                .set(KEY_DEFAULT_PARENT, parent_id)
+                .set_strict(KEY_DEFAULT_PARENT, parent_id)
                 .await
                 .map_err(|e| {
                     Error::ToolExecution(format!("failed to store default parent: {e}").into())

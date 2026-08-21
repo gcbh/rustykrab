@@ -739,6 +739,19 @@
       </button>
     </div>
     <div class="conversation-list" id="conversationList"></div>
+
+    <!-- Credential changes the agent asked for. Hidden until there is
+         something to decide, so it costs nothing when idle. -->
+    <div id="approvalsSection" style="display:none;border-top:1px solid var(--border);">
+      <div class="sidebar-header">
+        <span class="sidebar-title">
+          Approvals
+          <span id="approvalsBadge" style="display:inline-block;min-width:18px;padding:1px 6px;margin-left:6px;border-radius:9px;background:#d9534f;color:#fff;font-size:11px;text-align:center;">0</span>
+        </span>
+      </div>
+      <div id="approvalsList" style="padding:0 12px 12px;"></div>
+    </div>
+
     <div style="padding:12px;border-top:1px solid var(--border);">
       <button class="btn-icon" id="logoutBtn" title="Logout" style="width:100%;display:flex;align-items:center;gap:8px;padding:8px;border-radius:8px;font-size:13px;color:var(--text-secondary);">
         <svg viewBox="0 0 24 24" style="width:16px;height:16px;"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
@@ -1094,6 +1107,79 @@
     }
     renderConversationList();
   }
+
+  // ── Credential approvals ──────────────────────────────────
+  //
+  // The agent can create a credential under a new name, but replacing or
+  // deleting one files a request that only a user can resolve. This panel
+  // is the WebChat half of that; the Apollo app is the other.
+  //
+  // Values are never shown, because no endpoint returns one — a row is a
+  // name, an action, and the agent's reason.
+  const approvalsSection = $('#approvalsSection');
+  const approvalsList    = $('#approvalsList');
+  const approvalsBadge   = $('#approvalsBadge');
+
+  const escapeHtml = (s) => String(s).replace(/[&<>"']/g, (c) => (
+    { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+  ));
+
+  async function refreshApprovals() {
+    let pending;
+    try {
+      pending = await api('/api/credential-requests?status=pending');
+    } catch (err) {
+      // An older server has no such endpoint; leave the panel hidden
+      // rather than showing an error for a feature it doesn't have.
+      approvalsSection.style.display = 'none';
+      return;
+    }
+    if (!pending || pending.length === 0) {
+      approvalsSection.style.display = 'none';
+      approvalsList.innerHTML = '';
+      return;
+    }
+    approvalsSection.style.display = 'block';
+    approvalsBadge.textContent = pending.length;
+    approvalsList.innerHTML = pending.map((req) => `
+      <div style="padding:8px 0;border-bottom:1px solid var(--border);font-size:13px;">
+        <div style="color:var(--text-secondary);">
+          The agent wants to <strong>${escapeHtml(req.action)}</strong>
+          <code>${escapeHtml(req.name)}</code>
+        </div>
+        ${req.reason ? `<div style="margin-top:2px;color:var(--text-secondary);font-size:12px;">${escapeHtml(req.reason)}</div>` : ''}
+        <div style="margin-top:6px;display:flex;gap:6px;">
+          <button data-approve="${escapeHtml(req.id)}" style="flex:1;padding:4px 8px;border-radius:6px;font-size:12px;cursor:pointer;">Approve</button>
+          <button data-deny="${escapeHtml(req.id)}" style="flex:1;padding:4px 8px;border-radius:6px;font-size:12px;cursor:pointer;">Deny</button>
+        </div>
+      </div>
+    `).join('');
+  }
+
+  approvalsList.addEventListener('click', async (event) => {
+    const approveId = event.target.getAttribute('data-approve');
+    const denyId    = event.target.getAttribute('data-deny');
+    const id = approveId || denyId;
+    if (!id) return;
+
+    if (approveId && !confirm('Approve this change? The credential will be replaced.')) return;
+    event.target.disabled = true;
+    try {
+      await api(`/api/credential-requests/${id}/${approveId ? 'approve' : 'deny'}`, { method: 'POST' });
+    } catch (err) {
+      // 409 means the credential moved since the request was filed, so
+      // approving would undo whatever was done in the meantime.
+      alert(String(err).includes('409')
+        ? 'That credential changed since the request was filed, so it was not applied. Refreshing.'
+        : `Could not complete that: ${err}`);
+    }
+    await refreshApprovals();
+  });
+
+  // Poll while the tab is open. Push notification is a later phase; until
+  // then this plus the app's foreground refresh is how a request surfaces.
+  refreshApprovals();
+  setInterval(() => { if (token) refreshApprovals(); }, 15000);
 
   newChatBtn.addEventListener('click', async () => {
     try {

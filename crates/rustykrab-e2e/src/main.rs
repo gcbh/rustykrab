@@ -27,6 +27,9 @@ use serde_json::{json, Value};
 /// Master key for the throwaway store (hex, 32 bytes). Test-only.
 const MASTER_KEY_HEX: &str = "e2e0e2e0e2e0e2e0e2e0e2e0e2e0e2e0e2e0e2e0e2e0e2e0e2e0e2e0e2e0e2e0";
 const AUTH_TOKEN: &str = "e2e-master-token";
+/// A non-loopback origin the harness allows, standing in for the tailnet
+/// hostname the phone uses.
+const ALLOWED_ORIGIN: &str = "https://harness.example.ts.net";
 
 /// Script replayed by the daemon's `RUSTYKRAB_PROVIDER=scripted` provider.
 /// Triggers here must match the messages the scenarios send. Each scenario
@@ -86,7 +89,15 @@ const AGENT_SCRIPT: &str = r#"{
 enum Expected {
     /// Implemented behaviour — must pass.
     Pass,
-    /// Phase 2 target behaviour — expected to fail until the guard lands.
+    /// Target behaviour that is not built yet: the suite stays green while
+    /// it fails, and an unexpected pass turns the suite red so the
+    /// scenario gets promoted.
+    ///
+    /// Currently unconstructed, because every scenario has been promoted —
+    /// which is exactly what "the server is done" looks like. Kept because
+    /// the next phase's targets are written as xfail first; deleting it
+    /// would throw away the convention the moment it had proved itself.
+    #[allow(dead_code)]
     XFail,
 }
 
@@ -159,6 +170,18 @@ impl Ctx {
             .client
             .get(self.url(path))
             .bearer_auth(token)
+            .send()
+            .await?)
+    }
+
+    /// A request that overrides the default loopback `Origin`, for
+    /// exercising the allowlist.
+    async fn get_with_origin(&self, path: &str, origin: &str) -> Result<reqwest::Response> {
+        Ok(self
+            .client
+            .get(self.url(path))
+            .bearer_auth(AUTH_TOKEN)
+            .header(reqwest::header::ORIGIN, origin)
             .send()
             .await?)
     }
@@ -236,6 +259,45 @@ async fn health(ctx: &Ctx) -> Result<()> {
     let resp = ctx.client.get(ctx.url("/api/health")).send().await?;
     if resp.status() != 200 {
         bail!("health returned {}", resp.status());
+    }
+    Ok(())
+}
+
+/// The gateway demands an `Origin` on every `/api` request and allows
+/// only loopback plus a configured list. Apollo reaches the daemon by its
+/// tailnet name, so without this it was rejected on everything except
+/// `/api/health` — the gap this scenario now pins shut.
+async fn origin_allowlist(ctx: &Ctx) -> Result<()> {
+    // The harness boots the daemon with this origin allowed.
+    let allowed = ctx
+        .get_with_origin("/api/conversations", ALLOWED_ORIGIN)
+        .await?;
+    if allowed.status() != 200 {
+        bail!(
+            "configured origin {ALLOWED_ORIGIN} was rejected with {}",
+            allowed.status()
+        );
+    }
+
+    // Anything else still is not.
+    let refused = ctx
+        .get_with_origin("/api/conversations", "https://evil.example.com")
+        .await?;
+    if refused.status() != 403 {
+        bail!("an unlisted origin returned {}, want 403", refused.status());
+    }
+
+    // A request with no Origin at all remains refused: that is what stops
+    // a non-browser client from skipping the check entirely.
+    let bare = ctx
+        .client
+        .get(ctx.url("/api/conversations"))
+        .bearer_auth(AUTH_TOKEN)
+        .header(reqwest::header::ORIGIN, "")
+        .send()
+        .await?;
+    if bare.status() != 403 {
+        bail!("an empty Origin returned {}, want 403", bare.status());
     }
     Ok(())
 }
@@ -811,6 +873,7 @@ fn spawn_daemon(bin: &str, data_dir: &std::path::Path, port: u16) -> Result<Chil
         // IP; raise the limit for this throwaway boot only.
         .env("RUSTYKRAB_RATE_LIMIT_MAX", "100000")
         .env("RUSTYKRAB_RATE_LIMIT_LOCKOUT_SECS", "1")
+        .env("RUSTYKRAB_ALLOWED_ORIGINS", ALLOWED_ORIGIN)
         .stdout(Stdio::from(log.try_clone()?))
         .stderr(Stdio::from(log))
         .spawn()
@@ -884,6 +947,17 @@ async fn main() -> Result<()> {
     if keep_tmp {
         let path = tmp.keep();
         eprintln!("E2E_KEEP_TMP set — data dir kept at {}", path.display());
+    } else {
+        // Delete the throwaway data dir explicitly rather than relying on
+        // TempDir's Drop: this process exits via `std::process::exit` when
+        // the suite is red, which skips destructors. Leaving it implicit
+        // meant every red run — and going red is how an xpass gets
+        // noticed — leaked a daemon data dir and its logs.
+        let path = tmp.path().to_path_buf();
+        drop(tmp);
+        if path.exists() {
+            let _ = std::fs::remove_dir_all(&path);
+        }
     }
     println!("{}", serde_json::to_string_pretty(&report)?);
     if !ok {
@@ -925,21 +999,24 @@ async fn run_suite(
         // Baseline — implemented today, must pass.
         (Expected::Pass, scenario!(health)),
         (Expected::Pass, scenario!(auth_required)),
+        (Expected::Pass, scenario!(origin_allowlist)),
         (Expected::Pass, scenario!(conversations_crud)),
         (Expected::Pass, scenario!(chat_scripted_default)),
         (Expected::Pass, scenario!(chat_sse_stream)),
         (Expected::Pass, scenario!(chat_sse_stream_with_tools)),
         (Expected::Pass, scenario!(secrets_create_and_delete)),
         (Expected::Pass, scenario!(agent_creates_new_credential)),
-        // Phase 2 exit criteria — xfail until the guard lands.
-        (Expected::XFail, scenario!(pair_device_target)),
-        (Expected::XFail, scenario!(secrets_create_only_409)),
-        (Expected::XFail, scenario!(secrets_overwrite_archives)),
-        (Expected::XFail, scenario!(agent_overwrite_files_request)),
-        (Expected::XFail, scenario!(approve_applies_change)),
-        (Expected::XFail, scenario!(deny_preserves_value)),
-        (Expected::XFail, scenario!(agent_delete_files_request)),
-        (Expected::XFail, scenario!(revoked_device_401)),
+        // Workstream A — the credential guard. Shipped: these assert the
+        // real behaviour now.
+        // Workstream B — device pairing.
+        (Expected::Pass, scenario!(pair_device_target)),
+        (Expected::Pass, scenario!(secrets_create_only_409)),
+        (Expected::Pass, scenario!(secrets_overwrite_archives)),
+        (Expected::Pass, scenario!(agent_overwrite_files_request)),
+        (Expected::Pass, scenario!(approve_applies_change)),
+        (Expected::Pass, scenario!(deny_preserves_value)),
+        (Expected::Pass, scenario!(agent_delete_files_request)),
+        (Expected::Pass, scenario!(revoked_device_401)),
     ];
 
     let mut reports = Vec::new();

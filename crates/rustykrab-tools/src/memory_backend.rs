@@ -4,7 +4,15 @@ use serde_json::Value;
 
 #[async_trait]
 pub trait MemoryBackend: Send + Sync {
-    async fn search(&self, query: &str, tags: &[String], limit: usize) -> Result<Value>;
+    /// Search memories. `session_id` (a conversation id) restricts results to
+    /// memories recorded during that conversation.
+    async fn search(
+        &self,
+        query: &str,
+        tags: &[String],
+        limit: usize,
+        session_id: Option<&str>,
+    ) -> Result<Value>;
     async fn get(&self, memory_id: &str) -> Result<Value>;
     /// Save a fact with association tags. Returns the new memory ID.
     async fn save(&self, fact: &str, tags: &[String]) -> Result<Value>;

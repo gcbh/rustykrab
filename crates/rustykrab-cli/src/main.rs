@@ -64,8 +64,24 @@ impl MemoryBackend for MemoryAdapter {
         query: &str,
         tags: &[String],
         limit: usize,
+        session_id: Option<&str>,
     ) -> rustykrab_core::Result<serde_json::Value> {
-        self.inner.search(query, tags, limit).await
+        match session_id {
+            Some(raw) => match Uuid::parse_str(raw.trim()) {
+                Ok(sid) => self.inner.search(query, tags, limit, Some(sid)).await,
+                Err(_) => {
+                    // Degrade to a global search, but say so — a silently
+                    // widened scope would let the model attribute other
+                    // conversations' memories to this one.
+                    let mut result = self.inner.search(query, tags, limit, None).await?;
+                    result["session_scope"] = serde_json::json!(
+                        "session_id was not a valid conversation id; results are global"
+                    );
+                    Ok(result)
+                }
+            },
+            None => self.inner.search(query, tags, limit, None).await,
+        }
     }
     async fn get(&self, memory_id: &str) -> rustykrab_core::Result<serde_json::Value> {
         self.inner.get(memory_id).await
@@ -381,12 +397,15 @@ async fn main() -> anyhow::Result<()> {
     if args.len() >= 2 && args[1] == "chat" {
         return chat::run(&data_dir, &args[2..]).await;
     }
+    if args.len() >= 2 && args[1] == "pair" {
+        return handle_pair_subcommand(&data_dir).await;
+    }
     // An unrecognized subcommand must not silently fall through to
     // "start the daemon" — a typo would boot a full agent instead of
     // reporting the mistake.
     if let Some(unknown) = args.get(1).filter(|a| !a.starts_with('-')) {
         eprintln!("unknown subcommand '{unknown}'");
-        eprintln!("subcommands: skill, keychain, chat");
+        eprintln!("subcommands: skill, keychain, chat, pair");
         eprintln!("run with no arguments to start the daemon");
         std::process::exit(2);
     }
@@ -456,6 +475,31 @@ async fn main() -> anyhow::Result<()> {
             );
         }
     }
+
+    // --- APNs push (optional) ---
+    // Only the non-secret settings come from the environment. The signing
+    // key is resolved on first use, not here: it is a credential, so it
+    // can be stored from the app or the CLI while the daemon is running,
+    // and rotating it does not need a restart.
+    let push_notifier: Option<std::sync::Arc<dyn rustykrab_store::RequestNotifier>> =
+        rustykrab_gateway::ApnsConfig::from_env().map(|config| {
+            tracing::info!(
+                topic = %config.topic,
+                environment = ?config.environment,
+                "APNs push configured (key resolved on first notification)"
+            );
+            std::sync::Arc::new(rustykrab_gateway::PushNotifier::new(
+                config,
+                store.secrets(),
+                store.devices(),
+            )) as std::sync::Arc<dyn rustykrab_store::RequestNotifier>
+        });
+
+    // Hand the notifier to the store so filing a request tells the user.
+    let store = match push_notifier {
+        Some(notifier) => store.with_request_notifier(notifier),
+        None => store,
+    };
 
     // --- Auth token ---
     // Resolution order (via registry):
@@ -760,7 +804,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // --- Tools ---
-    let mut tools = rustykrab_tools::builtin_tools(store.secrets());
+    let mut tools = rustykrab_tools::builtin_tools(store.secrets(), store.guarded_secrets());
     tools.extend(rustykrab_tools::memory_tools(memory_backend.clone()));
     tools.extend(rustykrab_tools::skill_tools(
         skills_dir.clone(),
@@ -941,6 +985,9 @@ async fn main() -> anyhow::Result<()> {
     // Clone store handle so we can flush it after the server shuts down.
     let store_handle = store.clone();
     let mut state = rustykrab_gateway::AppState::new(store, tools, provider, auth_token)
+        // Loopback is always allowed; this adds the names other clients
+        // reach us by, e.g. the tailnet hostname the phone uses.
+        .with_origin_policy(rustykrab_gateway::OriginPolicy::from_env())
         .with_harness_router(router)
         .with_orchestration_config(orchestration_config)
         .with_skill_registry(skill_registry)
@@ -2243,6 +2290,53 @@ fn handle_skill_subcommand(data_dir: &std::path::Path, args: &[String]) -> anyho
 ///
 /// Uses the registry to check env / keychain / store, then generates
 /// a new token if none exists.
+/// `rustykrab pair` — mint a one-time code for a phone to redeem.
+///
+/// Prints the code and the QR payload the app scans. Runs against the same
+/// data directory as the daemon; the daemon does not need to be running,
+/// since the code lives in the shared database.
+async fn handle_pair_subcommand(data_dir: &std::path::Path) -> anyhow::Result<()> {
+    let master_key = match rustykrab_store::keychain::resolve_master_key() {
+        Ok(key) => key,
+        Err(e) => {
+            eprintln!("ERROR: {e}");
+            std::process::exit(1);
+        }
+    };
+    let store = rustykrab_store::Store::open(data_dir.join("db"), master_key)?;
+    let devices = store.devices();
+    let _ = devices.sweep_expired_codes().await;
+    let code = devices.mint_pairing_code().await?;
+
+    // The URL the app should talk to. On a tailnet this is the ts.net
+    // hostname; there is no way to detect that from here, so it is
+    // overridable and defaults to the loopback the daemon binds.
+    let url = std::env::var("RUSTYKRAB_PUBLIC_URL").unwrap_or_else(|_| {
+        let port = std::env::var("RUSTYKRAB_PORT").unwrap_or_else(|_| "3000".to_string());
+        format!("http://127.0.0.1:{port}")
+    });
+
+    // Bare code on stdout's first line so scripts can read it; the QR
+    // payload follows for the app to scan.
+    println!("{code}");
+    println!();
+    println!("  Pairing code: {code}");
+    println!("  Valid for 5 minutes, single use.");
+    println!();
+    println!(
+        "  QR payload: {}",
+        serde_json::json!({ "url": url, "code": code })
+    );
+    println!();
+    if url.contains("127.0.0.1") {
+        println!(
+            "  Note: that URL is loopback-only. Set RUSTYKRAB_PUBLIC_URL to your\n  \
+             tailnet hostname (https://<mac>.<tailnet>.ts.net) before pairing a phone."
+        );
+    }
+    Ok(())
+}
+
 async fn resolve_auth_token(store: &rustykrab_store::Store) -> String {
     let spec = rustykrab_store::registry::lookup("rustykrab_auth_token")
         .expect("rustykrab_auth_token must be in the registry");
@@ -2261,7 +2355,7 @@ async fn resolve_auth_token(store: &rustykrab_store::Store) -> String {
     if rustykrab_store::keychain::keychain_available() {
         let _ = rustykrab_store::keychain::set_credential(svc, spec.keychain_account, &token);
     }
-    let _ = store.secrets().set(spec.store_name, &token).await;
+    let _ = store.secrets().upsert_system(spec.store_name, &token).await;
     token
 }
 
@@ -2414,7 +2508,7 @@ async fn handle_keychain_subcommand(
                 if db_path.exists() {
                     if let Ok(master_key) = rustykrab_store::keychain::resolve_master_key() {
                         if let Ok(store) = rustykrab_store::Store::open(&db_path, master_key) {
-                            let _ = store.secrets().set(sn, value).await;
+                            let _ = store.secrets().upsert_system(sn, value).await;
                             println!("Also stored in encrypted store as '{sn}'");
                         }
                     }
