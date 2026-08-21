@@ -91,6 +91,90 @@ freely." The outer loop is **governed**: reversible everywhere, rate-limited,
 conservative by default, and human-gated at the highest-risk edge (skills). It
 is a *supervised* controller, not an unbounded self-modifier.
 
+## Prior art: ACE (Agentic Context Engineering)
+
+The closest published system is **ACE** -- "Agentic Context Engineering:
+Evolving Contexts for Self-Improving Language Models" (arXiv 2510.04618,
+Stanford/SambaNova, ICLR 2026; camera-ready retitled "Learning Comprehensive
+Contexts for Self-Improving Language Models"; open-source at
+`github.com/ace-agent/ace`). ACE self-improves by evolving *contexts* rather
+than weights: context is a **playbook** of itemized bullets
+(`[id] helpful=X harmful=Y :: content` -- stable identifier + outcome
+counters), adapted by three roles: a **Generator** (produces reasoning
+trajectories), a **Reflector** (distills concrete insights from successes and
+errors), and a **Curator** (an LLM step emitting compact, itemized **delta
+entries**), with the deltas merged into the playbook by **deterministic,
+non-LLM logic** -- new IDs append, existing bullets update in place (counters
+increment), embedding-based dedup prunes (cosine >= 0.9 in the reference
+implementation). Verified headline results: +10.6% on agent benchmarks
+(AppWorld), +8.6% on finance reasoning (FiNER/XBRL), −86.9% average adaptation
+latency vs. baselines like GEPA and Dynamic Cheatsheet.
+
+### Mapping to this design
+
+| ACE | This design |
+|---|---|
+| Offline context optimization (system prompts) | Skill improvement (skills are system prompts) |
+| Online adaptation (agent memory) | Memory consolidation |
+| Generator trajectories | Inner-loop traces (**Monitor**) |
+| Reflector | Phase 1 read-only analysis (**Analyze**) |
+| Curator delta entries | Staged proposals (**Plan**) |
+| Deterministic non-LLM merge | Promote step (**Execute**) |
+| helpful/harmful counters | `proof_count` + outcome attribution |
+| Grow-and-refine dedup (>= 0.9) | `detect_near_duplicates` (>= 0.85 link / >= 0.95 invalidate) |
+
+### Empirical validation of two choices made here on first principles
+
+- **Context collapse proves the stability argument.** With monolithic LLM
+  rewriting, ACE's AppWorld case study shows an accumulated context going from
+  18,282 tokens / 66.7 accuracy at step 60 to **122 tokens / 57.1 accuracy at
+  step 61** -- worse than no adaptation (63.7). "Brevity bias" (summaries
+  dropping domain insights) is the companion failure. This is published
+  evidence for our stage-then-promote / small-deltas / **no monolithic
+  rewrites** rules, and for rejecting naive summarize-and-replace as the
+  consolidation mechanism.
+- **Feedback-quality dependence proves P2.** ACE adapts label-free from
+  execution feedback (+14.8% over ReAct baseline without ground-truth labels),
+  but the paper states that without reliable feedback both ACE and similar
+  methods "may degrade" and the context "can be polluted by spurious or
+  misleading signals." That is this document's "you cannot improve what you
+  cannot measure," independently discovered and measured. Caution for us: ACE's
+  gains come from benchmarks with *clear* execution feedback; a chat gateway's
+  feedback is murkier, so the outcome-signal hierarchy and freeze rule are
+  load-bearing.
+
+### What ACE lacks that this design adds
+
+ACE has **no rollback, no staging, no probation window, no human gate, and no
+idle scheduling** -- playbooks update in place during adaptation runs, which is
+fine for benchmark runs and unacceptable for a persistent, security-first,
+multi-channel production gateway. It also carries the whole playbook in-context
+(leaning on long-context models), where we retrieve selectively -- our memory
+system already solves the growth problem that ACE's lazy dedup only patches.
+The two systems compose: ACE supplies the update algebra; this design supplies
+governance, persistence, scheduling, and retrieval.
+
+### Amendments adopted from ACE
+
+1. **Delta algebra as the promote step.** Unit of change = itemized entry with
+   a stable ID + helpful/harmful counters; the Reflector-analog emits delta
+   entries; **promote = deterministic merge** (append new IDs, increment
+   counters in place, dedup). The staging area is *where* deltas wait; ACE's
+   merge is *how* promote applies them.
+2. **Skill bodies restructured for delta-updatability.** Split `SKILL.md` into
+   human-authored prose (immutable by the loop) plus a loop-managed
+   `## Learned strategies` itemized section. Enables a **graduated gate**:
+   counter increments on existing bullets auto-promote; new or edited bullet
+   *text* still requires review -- softening the human bottleneck without
+   giving up the security stance.
+3. **`harmful_count` alongside `proof_count`**, with Phase 0 attributing
+   per-trace outcomes to the specific memories/bullets retrieved -- the
+   credit-assignment mechanism the control-loop section requires.
+4. **"No monolithic rewrites" is a hard rule**, citable to the collapse case
+   study.
+5. **Mine `github.com/ace-agent/ace`** for Reflector/Curator prompts and
+   thresholds; port concepts, not code.
+
 ## Design principles
 
 Three principles, in priority order, each learned in design review.
@@ -363,7 +447,15 @@ a job-state machine for pausing, conversation versioning, or a preemption bus.
 
 ## Revision history
 
-- **v3 (this revision).** Reframed around the **outer loop**: an explicit
+- **v4 (this revision).** Added the ACE prior-art analysis (arXiv 2510.04618,
+  ICLR 2026) after verifying its mechanism and results against the paper text
+  and the authors' open-source implementation. ACE independently validates two
+  first-principles choices here (context collapse -> no monolithic rewrites /
+  stage-then-promote; feedback-quality dependence -> P2). Adopted amendments:
+  itemized delta algebra with helpful/harmful counters as the promote step,
+  loop-managed `## Learned strategies` sections in `SKILL.md` with a graduated
+  gate, `harmful_count` + per-trace credit assignment in Phase 0.
+- **v3.** Reframed around the **outer loop**: an explicit
   two-timescale control view (inner `AgentRunner` loop vs. ongoing outer loop),
   MAPE-K mapping, and control-loop consequences (setpoint = desired outcome;
   stability/hysteresis/low gain; feedback lag & credit assignment; Goodhart).
