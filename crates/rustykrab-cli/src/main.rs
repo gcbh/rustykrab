@@ -460,6 +460,31 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // --- APNs push (optional) ---
+    // Only the non-secret settings come from the environment. The signing
+    // key is resolved on first use, not here: it is a credential, so it
+    // can be stored from the app or the CLI while the daemon is running,
+    // and rotating it does not need a restart.
+    let push_notifier: Option<std::sync::Arc<dyn rustykrab_store::RequestNotifier>> =
+        rustykrab_gateway::ApnsConfig::from_env().map(|config| {
+            tracing::info!(
+                topic = %config.topic,
+                environment = ?config.environment,
+                "APNs push configured (key resolved on first notification)"
+            );
+            std::sync::Arc::new(rustykrab_gateway::PushNotifier::new(
+                config,
+                store.secrets(),
+                store.devices(),
+            )) as std::sync::Arc<dyn rustykrab_store::RequestNotifier>
+        });
+
+    // Hand the notifier to the store so filing a request tells the user.
+    let store = match push_notifier {
+        Some(notifier) => store.with_request_notifier(notifier),
+        None => store,
+    };
+
     // --- Auth token ---
     // Resolution order (via registry):
     // 1. Environment variable (CI, Docker, explicit override)

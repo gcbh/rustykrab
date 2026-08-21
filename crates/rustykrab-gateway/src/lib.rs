@@ -2,6 +2,7 @@ pub mod auth;
 pub mod logging;
 mod orchestrate;
 pub mod origin;
+pub mod push;
 pub mod rate_limit;
 mod routes;
 mod signal_webhook;
@@ -15,6 +16,7 @@ pub use orchestrate::{
     run_agent_with_options, RunOptions,
 };
 pub use origin::OriginPolicy;
+pub use push::{ApnsClient, ApnsConfig, ApnsEnvironment, PushNotifier};
 pub use rate_limit::RateLimitConfig;
 pub use state::AppState;
 

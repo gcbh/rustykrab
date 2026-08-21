@@ -56,10 +56,25 @@ pub struct CredentialRequest {
     pub created_at: i64,
 }
 
+/// Told when a request is filed, so something can go and tell the user.
+///
+/// Implemented outside this crate (the gateway sends the push) so storage
+/// stays unaware of notification transports, matching the backend-trait
+/// pattern used elsewhere in the workspace.
+///
+/// Deliberately fire-and-forget: a notification that fails must never stop
+/// a request being recorded, because the record is what protects the
+/// credential. The app and WebChat both list pending requests without any
+/// notification at all.
+pub trait RequestNotifier: Send + Sync + std::fmt::Debug {
+    fn request_filed(&self, credential_name: &str, action: &str);
+}
+
 #[derive(Clone)]
 pub struct CredentialRequestStore {
     conn: Arc<Mutex<rusqlite::Connection>>,
     secrets: SecretStore,
+    notifier: Option<Arc<dyn RequestNotifier>>,
 }
 
 fn now_ms() -> i64 {
@@ -68,7 +83,17 @@ fn now_ms() -> i64 {
 
 impl CredentialRequestStore {
     pub(crate) fn new(conn: Arc<Mutex<rusqlite::Connection>>, secrets: SecretStore) -> Self {
-        Self { conn, secrets }
+        Self {
+            conn,
+            secrets,
+            notifier: None,
+        }
+    }
+
+    /// Attach something that tells the user a request is waiting.
+    pub fn with_notifier(mut self, notifier: Arc<dyn RequestNotifier>) -> Self {
+        self.notifier = Some(notifier);
+        self
     }
 
     /// Queue a replacement of an existing credential.
@@ -137,6 +162,7 @@ impl CredentialRequestStore {
         target_version: Option<i64>,
     ) -> Result<(), Error> {
         let name = name.to_string();
+        let announce_name = name.clone();
         let conversation = conversation_id.map(|c| c.to_string());
         crate::with_conn(&self.conn, move |conn| {
             // Newer intent replaces older intent for the same credential.
@@ -165,7 +191,14 @@ impl CredentialRequestStore {
             .map_err(|e| Error::Storage(e.to_string()))?;
             Ok(())
         })
-        .await
+        .await?;
+
+        // Only after the row is durable: a notification about a request
+        // that failed to record would send the user looking for nothing.
+        if let Some(notifier) = &self.notifier {
+            notifier.request_filed(&announce_name, action.as_str());
+        }
+        Ok(())
     }
 
     /// Pending requests, newest first. Expired ones are swept on the way

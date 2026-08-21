@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.1.7] - 2026-08-21
+
+- Phase 4 (E): APNs push for pending credential requests (#493)
+
 ## [5.1.6] - 2026-08-20
 
 - Phase 2 (C): origin allowlist + WebChat approvals panel — completes Phase 2 (#491)
