@@ -41,3 +41,6 @@ xcap = { version = "0.9", optional = true }
 [features]
 # Concrete enigo + xcap implementation of the computer-use backend.
 computer-use = ["dep:enigo", "dep:xcap"]
+
+[dev-dependencies]
+tempfile = "3"

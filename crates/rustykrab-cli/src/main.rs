@@ -2,6 +2,7 @@ mod chat;
 #[cfg(feature = "computer-use")]
 mod computer_backend;
 mod prompt_log;
+mod runs;
 mod task_queue;
 
 use std::collections::{HashMap, HashSet};
@@ -367,6 +368,12 @@ async fn main() -> anyhow::Result<()> {
     }
     if args.len() >= 2 && args[1] == "chat" {
         return chat::run(&data_dir, &args[2..]).await;
+    }
+    if args.len() >= 2 && args[1] == "runs" {
+        return runs::handle_list(&data_dir, &args[2..]);
+    }
+    if args.len() >= 2 && args[1] == "run" {
+        return runs::handle_show(&data_dir, &args[2..]);
     }
 
     // --- Harness profile ---

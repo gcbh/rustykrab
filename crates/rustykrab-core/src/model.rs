@@ -40,6 +40,67 @@ pub struct Usage {
     pub cache_creation_tokens: u32,
 }
 
+/// Server-reported timing breakdown for a single request.
+///
+/// Only providers that report it populate this — currently Ollama, whose
+/// `/api/chat` response carries nanosecond durations for each phase. The
+/// split matters on local deployments: prompt evaluation is the phase that
+/// prefix-cache reuse can skip, and `load` is non-zero only when the model
+/// had to be pulled back into memory after an idle eviction.
+///
+/// All values are milliseconds, converted from the provider's native units
+/// at parse time so consumers don't have to know which unit a provider uses.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProviderTiming {
+    /// Wall time for the whole request as the server measured it.
+    pub total_ms: u64,
+    /// Time spent loading the model into memory. Non-zero indicates the
+    /// model was evicted and reloaded — on a large local model this can
+    /// dominate everything else.
+    pub load_ms: u64,
+    /// Time spent evaluating the prompt. This is the phase that a prefix
+    /// cache hit skips.
+    pub prompt_eval_ms: u64,
+    /// Time spent generating the response tokens.
+    pub eval_ms: u64,
+}
+
+/// How long one model call took, from both vantage points.
+///
+/// `wall_ms` is what the client measured around the request — it includes
+/// network time and any queuing on the server. `server` is the provider's
+/// own breakdown of what it did with that time, when it reports one. The
+/// gap between them is where the time went that the provider doesn't
+/// account for.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RequestTiming {
+    pub wall_ms: u64,
+    pub server: Option<ProviderTiming>,
+}
+
+impl ProviderTiming {
+    /// Build from nanosecond fields, the unit Ollama reports. Returns
+    /// `None` when the provider omitted every field, so a response with no
+    /// timing at all stays distinguishable from one that reported zeros.
+    pub fn from_nanos(
+        total: Option<u64>,
+        load: Option<u64>,
+        prompt_eval: Option<u64>,
+        eval: Option<u64>,
+    ) -> Option<Self> {
+        if total.is_none() && load.is_none() && prompt_eval.is_none() && eval.is_none() {
+            return None;
+        }
+        const NANOS_PER_MILLI: u64 = 1_000_000;
+        Some(Self {
+            total_ms: total.unwrap_or(0) / NANOS_PER_MILLI,
+            load_ms: load.unwrap_or(0) / NANOS_PER_MILLI,
+            prompt_eval_ms: prompt_eval.unwrap_or(0) / NANOS_PER_MILLI,
+            eval_ms: eval.unwrap_or(0) / NANOS_PER_MILLI,
+        })
+    }
+}
+
 /// A chunk of a streaming response.
 #[derive(Debug, Clone)]
 pub enum StreamEvent {

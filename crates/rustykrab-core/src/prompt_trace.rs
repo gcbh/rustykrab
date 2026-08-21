@@ -16,10 +16,10 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 
 use chrono::{DateTime, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::model::{StopReason, Usage};
+use crate::model::{RequestTiming, StopReason, Usage};
 use crate::types::{Message, ToolSchema};
 
 tokio::task_local! {
@@ -44,7 +44,12 @@ where
 
 /// One row in the trace log. Internally tagged via the `kind` field so a
 /// reader can distinguish prompt rows from response rows.
-#[derive(Debug, Clone, Serialize)]
+///
+/// `Deserialize` is derived so the log is readable back — the
+/// `rustykrab-cli runs` / `run` subcommands parse these rows to reconstruct
+/// a past execution. Unknown fields are tolerated by default, so a log
+/// written by an older binary still parses.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TraceRecord {
     /// Outbound submission to the model.
@@ -73,7 +78,24 @@ pub enum TraceRecord {
         /// Stringified [`StopReason`] so consumers don't need the core
         /// enum to parse the log.
         stop_reason: String,
+        /// Wall time measured by the client, around the whole request.
         duration_ms: u64,
+        /// Server-reported timing breakdown, when the provider supplies one.
+        /// Absent for providers that don't (currently everything but Ollama)
+        /// and for rows written before timing capture existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        server_total_ms: Option<u64>,
+        /// Time the server spent loading the model. Non-zero means it had
+        /// been evicted and was reloaded for this request.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        load_ms: Option<u64>,
+        /// Time the server spent evaluating the prompt — the phase a
+        /// prefix-cache hit skips.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prompt_eval_ms: Option<u64>,
+        /// Time the server spent generating response tokens.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        eval_ms: Option<u64>,
     },
 }
 
@@ -117,6 +139,9 @@ pub fn record_prompt(
 
 /// Write a response record to the global sink, tagged with the current
 /// trace id. Same no-op semantics as [`record_prompt`].
+///
+/// `timing` carries the client-measured wall time and, for providers that
+/// report one, the server's own phase breakdown.
 pub fn record_response(
     provider: &str,
     model: &str,
@@ -124,7 +149,7 @@ pub fn record_response(
     message: &Message,
     usage: &Usage,
     stop_reason: &StopReason,
-    duration_ms: u64,
+    timing: RequestTiming,
 ) {
     let Some(sink) = SINK.get() else { return };
     let Some(trace_id) = current_trace_id() else {
@@ -142,7 +167,11 @@ pub fn record_response(
         cache_read_tokens: usage.cache_read_tokens,
         cache_creation_tokens: usage.cache_creation_tokens,
         stop_reason: format!("{stop_reason:?}"),
-        duration_ms,
+        duration_ms: timing.wall_ms,
+        server_total_ms: timing.server.map(|t| t.total_ms),
+        load_ms: timing.server.map(|t| t.load_ms),
+        prompt_eval_ms: timing.server.map(|t| t.prompt_eval_ms),
+        eval_ms: timing.server.map(|t| t.eval_ms),
     });
 }
 

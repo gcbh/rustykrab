@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 use rustykrab_core::error::Result;
 use rustykrab_core::model::{
-    ModelProvider, ModelResponse, StopReason, StreamEvent, ToolChoice, Usage,
+    ModelProvider, ModelResponse, RequestTiming, StopReason, StreamEvent, ToolChoice, Usage,
 };
 use rustykrab_core::types::{
     ContentBlock as CoreContentBlock, Message, MessageContent, Role, ToolCall, ToolSchema,
@@ -438,7 +438,11 @@ impl AnthropicProvider {
                     &response.message,
                     &response.usage,
                     &response.stop_reason,
-                    request_start.elapsed().as_millis() as u64,
+                    // The Messages API reports no server-side phase timing.
+                    RequestTiming {
+                        wall_ms: request_start.elapsed().as_millis() as u64,
+                        server: None,
+                    },
                 );
                 return Ok(response);
             }
@@ -847,7 +851,10 @@ impl AnthropicProvider {
             &response.message,
             &response.usage,
             &response.stop_reason,
-            stream_start.elapsed().as_millis() as u64,
+            RequestTiming {
+                wall_ms: stream_start.elapsed().as_millis() as u64,
+                server: None,
+            },
         );
         on_event(StreamEvent::Done(response.clone()));
         Ok(response)

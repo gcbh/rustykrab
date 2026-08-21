@@ -84,6 +84,7 @@ All configuration is via environment variables. No plaintext config files.
 | `SIGNAL_WEBHOOK_SECRET` | — | Shared secret for webhook validation |
 | `RUST_LOG` | `info` | Log level (`info`, `debug`, `rustykrab_gateway=debug`) |
 | `RUSTYKRAB_LOG_STDOUT` | auto | Force stdout logging on (`1`) or off (`0`). Default: enabled only when stdout is a terminal. The rolling log file under the data directory is always written |
+| `RUSTYKRAB_PROMPT_LOG` | off | Set to `1` to record every model submission, response, and provider timing to `logs/prompts.log` as JSONL. Required by the `runs` / `run` subcommands. Off by default because the records can contain secrets |
 
 ### Persisting credentials
 
@@ -284,6 +285,47 @@ Anything that isn't a slash command is sent to the agent as a normal
 chat turn. The client uses `RUSTYKRAB_AUTH_TOKEN` (or the OS keychain /
 encrypted store fallbacks) and `RUSTYKRAB_GATEWAY_URL` (default
 `http://127.0.0.1:3000`).
+
+### Inspecting past runs (`runs` / `run` subcommands)
+
+When the daemon runs with `RUSTYKRAB_PROMPT_LOG=1`, every model submission
+and response is written to `logs/prompts.log` as JSONL, tagged with the
+run's trace id. Two subcommands read that log back.
+
+```bash
+rustykrab-cli runs                  # recent runs, newest first
+rustykrab-cli runs --limit 50       # or --all
+rustykrab-cli run 3b636809          # replay one run (id prefix is enough)
+rustykrab-cli run 3b636809 --full   # untruncated text + full tool lists
+```
+
+`runs` lists each run with its iteration count, tool calls, wall time,
+prompt-eval time, and outcome. `run` replays it iteration by iteration —
+what was sent, what came back, which tools were called, and where the time
+went:
+
+```
+── iteration 1 ──────────────────────────────────────────────
+  → sent   4 message(s), 8 tool schema(s)   19:55:37.856
+    tool set changed: +read
+  ← got    ToolUse · 3200 in / 120 out · 5.4s
+    server:  prompt-eval 4.9s · generate 500ms · load 0ms
+    calls:   read
+```
+
+Two lines there are worth knowing about when running local models:
+
+- **`tool set changed`** marks an iteration where the schema block differed
+  from the previous request. That is the event that breaks prefix-cache
+  reuse, so it usually explains a spike in the `prompt-eval` figure below it.
+- **`load`** is non-zero only when the server had to pull the model back
+  into memory. On a large local model that can dominate the whole request,
+  and it has nothing to do with prompt size — Ollama evicts an idle model
+  after a few minutes by default, so intermittent use pays it repeatedly.
+
+Server-side timing comes from the provider. Ollama reports it; the Anthropic
+Messages API does not, so those rows show `(this provider reports no phase
+timing)` and only client-measured wall time.
 
 ### MCP servers: credential refs
 

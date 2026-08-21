@@ -3,7 +3,9 @@ use crate::line_buffer::LineBuffer;
 use async_trait::async_trait;
 use chrono::Utc;
 use rustykrab_core::error::Result;
-use rustykrab_core::model::{ModelProvider, ModelResponse, StopReason, StreamEvent, Usage};
+use rustykrab_core::model::{
+    ModelProvider, ModelResponse, ProviderTiming, RequestTiming, StopReason, StreamEvent, Usage,
+};
 use rustykrab_core::types::{Message, MessageContent, Role, ToolCall, ToolSchema};
 use rustykrab_core::Error;
 use serde::{Deserialize, Serialize};
@@ -689,7 +691,29 @@ impl ModelProvider for OllamaProvider {
                 let ollama_resp: OllamaResponse = serde_json::from_str(&raw_body).map_err(|e| {
                     Error::ModelProvider(format!("failed to parse Ollama response: {e}"))
                 })?;
+                // Capture the server's timing breakdown before the response
+                // is consumed by the converter.
+                let timing = ProviderTiming::from_nanos(
+                    ollama_resp.total_duration,
+                    ollama_resp.load_duration,
+                    ollama_resp.prompt_eval_duration,
+                    ollama_resp.eval_duration,
+                );
                 let response = Self::parse_response(ollama_resp)?;
+
+                if let Some(t) = timing {
+                    tracing::info!(
+                        model = %self.model,
+                        prompt_tokens = response.usage.prompt_tokens,
+                        completion_tokens = response.usage.completion_tokens,
+                        server_total_ms = t.total_ms,
+                        load_ms = t.load_ms,
+                        prompt_eval_ms = t.prompt_eval_ms,
+                        eval_ms = t.eval_ms,
+                        trace_id = ?rustykrab_core::prompt_trace::current_trace_id(),
+                        "ollama timing"
+                    );
+                }
 
                 // Debug: dump raw response when message text is empty
                 // despite having completion tokens.
@@ -716,7 +740,10 @@ impl ModelProvider for OllamaProvider {
                     &response.message,
                     &response.usage,
                     &response.stop_reason,
-                    request_start.elapsed().as_millis() as u64,
+                    RequestTiming {
+                        wall_ms: request_start.elapsed().as_millis() as u64,
+                        server: timing,
+                    },
                 );
                 return Ok(response);
             }
@@ -871,6 +898,7 @@ impl ModelProvider for OllamaProvider {
         let mut prompt_eval_count: u32 = 0;
         let mut eval_count: u32 = 0;
         let mut done_reason: Option<String> = None;
+        let mut timing: Option<ProviderTiming> = None;
 
         let mut response = resp;
         let mut chunks_received: u64 = 0;
@@ -934,6 +962,12 @@ impl ModelProvider for OllamaProvider {
                     prompt_eval_count = stream_chunk.prompt_eval_count.unwrap_or(0);
                     eval_count = stream_chunk.eval_count.unwrap_or(0);
                     done_reason = stream_chunk.done_reason;
+                    timing = ProviderTiming::from_nanos(
+                        stream_chunk.total_duration,
+                        stream_chunk.load_duration,
+                        stream_chunk.prompt_eval_duration,
+                        stream_chunk.eval_duration,
+                    );
                 }
             }
         }
@@ -999,6 +1033,20 @@ impl ModelProvider for OllamaProvider {
             );
         }
 
+        if let Some(t) = timing {
+            tracing::info!(
+                model = %self.model,
+                prompt_tokens = response.usage.prompt_tokens,
+                completion_tokens = response.usage.completion_tokens,
+                server_total_ms = t.total_ms,
+                load_ms = t.load_ms,
+                prompt_eval_ms = t.prompt_eval_ms,
+                eval_ms = t.eval_ms,
+                trace_id = ?rustykrab_core::prompt_trace::current_trace_id(),
+                "ollama timing"
+            );
+        }
+
         rustykrab_core::prompt_trace::record_response(
             self.name(),
             &self.model,
@@ -1006,7 +1054,10 @@ impl ModelProvider for OllamaProvider {
             &response.message,
             &response.usage,
             &response.stop_reason,
-            stream_start.elapsed().as_millis() as u64,
+            RequestTiming {
+                wall_ms: stream_start.elapsed().as_millis() as u64,
+                server: timing,
+            },
         );
         on_event(StreamEvent::Done(response.clone()));
         Ok(response)
@@ -1061,6 +1112,17 @@ struct OllamaResponse {
     /// Fix #192: parse done_reason to detect truncation.
     #[serde(default)]
     done_reason: Option<String>,
+    // Server-reported phase durations, in nanoseconds. Ollama has always
+    // sent these; we simply weren't parsing them, so every response threw
+    // away the only direct evidence of where a slow request went.
+    #[serde(default)]
+    total_duration: Option<u64>,
+    #[serde(default)]
+    load_duration: Option<u64>,
+    #[serde(default)]
+    prompt_eval_duration: Option<u64>,
+    #[serde(default)]
+    eval_duration: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -1080,6 +1142,16 @@ struct OllamaStreamChunk {
     prompt_eval_count: Option<u32>,
     #[serde(default)]
     eval_count: Option<u32>,
+    // Present only on the final (`done: true`) chunk, same units as the
+    // non-streaming response.
+    #[serde(default)]
+    total_duration: Option<u64>,
+    #[serde(default)]
+    load_duration: Option<u64>,
+    #[serde(default)]
+    prompt_eval_duration: Option<u64>,
+    #[serde(default)]
+    eval_duration: Option<u64>,
 }
 
 #[derive(Deserialize)]
