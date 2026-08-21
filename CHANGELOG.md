@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.1.10] - 2026-08-21
+
+- Dreaming (stack base): design for the self-improvement outer loop (#472)
+
 ## [5.1.9] - 2026-08-21
 
 - test(memory): executable harness for every lifecycle stage transition (#499)
