@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.1.11] - 2026-08-21
+
+- feat: add official macOS install flow (#501)
+
 ## [5.1.10] - 2026-08-21
 
 - Dreaming (stack base): design for the self-improvement outer loop (#472)

@@ -285,13 +285,21 @@ jobs:
               --force \
               "$APP"
 
-          codesign -vvv "$APP"
+          # Fail the release job if the bundle cannot be verified strictly.
+          # This catches malformed signatures before an artifact is published.
+          codesign --verify --deep --strict --verbose=2 "$APP"
 
       - name: Package artifact
         run: |
           mkdir -p dist
           if [ -d "target/${{ matrix.target }}/release/RustyKrab.app" ]; then
             cp -R target/${{ matrix.target }}/release/RustyKrab.app dist/
+            hdiutil create \
+              -volname RustyKrab \
+              -srcfolder dist/RustyKrab.app \
+              -ov \
+              -format UDZO \
+              "dist/rustykrab-${{ matrix.target }}.dmg"
             cd dist
             tar czf rustykrab-${{ matrix.target }}.tar.gz RustyKrab.app
           else
@@ -299,6 +307,32 @@ jobs:
             cd dist
             tar czf rustykrab-${{ matrix.target }}.tar.gz ${{ matrix.artifact }}
           fi
+          shasum -a 256 dist/rustykrab-${{ matrix.target }}.* > dist/rustykrab-${{ matrix.target }}.sha256
+
+      - name: Notarize and staple macOS bundle
+        if: runner.os == 'macOS'
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          test -n "$APPLE_ID" || { echo "APPLE_ID secret is required for macOS releases" >&2; exit 1; }
+          test -n "$APPLE_TEAM_ID" || { echo "APPLE_TEAM_ID secret is required for macOS releases" >&2; exit 1; }
+          test -n "$APPLE_APP_PASSWORD" || { echo "APPLE_APP_PASSWORD secret is required for macOS releases" >&2; exit 1; }
+          xcrun notarytool submit \
+            "dist/rustykrab-${{ matrix.target }}.dmg" \
+            --apple-id "$APPLE_ID" \
+            --team-id "$APPLE_TEAM_ID" \
+            --password "$APPLE_APP_PASSWORD" \
+            --wait
+          xcrun stapler staple "dist/rustykrab-${{ matrix.target }}.dmg"
+          xcrun stapler staple target/${{ matrix.target }}/release/RustyKrab.app
+          codesign --verify --deep --strict target/${{ matrix.target }}/release/RustyKrab.app
+          rm -f "dist/rustykrab-${{ matrix.target }}.tar.gz" "dist/rustykrab-${{ matrix.target }}.sha256"
+          tar -C target/${{ matrix.target }}/release -czf \
+            "dist/rustykrab-${{ matrix.target }}.tar.gz" RustyKrab.app
+          shasum -a 256 dist/rustykrab-${{ matrix.target }}.* > \
+            "dist/rustykrab-${{ matrix.target }}.sha256"
 
       - uses: actions/upload-artifact@v4
         with:

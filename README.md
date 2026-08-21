@@ -26,6 +26,23 @@ On macOS, `make` automatically ad-hoc codesigns the binary with the
 `keychain-access-groups` entitlement required by the Data Protection Keychain.
 You can also run `make codesign` or `make codesign-debug` separately.
 
+### macOS LaunchAgent installation
+
+For a signed release bundle, install the app and register its per-user
+LaunchAgent with:
+
+```bash
+scripts/install.sh /path/to/RustyKrab.app
+```
+
+The installer verifies the bundle signature, installs it under
+`~/Applications/RustyKrab.app`, preserves the previous bundle for rollback,
+and starts `com.gcbh.rustykrab` at login. Use `scripts/uninstall.sh` to remove
+the agent while retaining the app and data, or `scripts/uninstall.sh --purge`
+to remove the app bundle as well. `--allow-adhoc` is available only for local
+development builds; published releases should pass strict signature
+verification.
+
 ## Quick Start
 
 ### Option A: Run with Claude (recommended)
