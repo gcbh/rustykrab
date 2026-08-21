@@ -93,7 +93,20 @@ impl AnthropicProvider {
             match msg.role {
                 Role::System => {
                     if let MessageContent::Text(ref text) = msg.content {
-                        system_prompt = Some(text.clone());
+                        if system_prompt.is_none() {
+                            system_prompt = Some(text.clone());
+                        } else {
+                            // A mid-conversation System message (iteration
+                            // warning, harness notice) must not REPLACE the
+                            // real system prompt — render it as an inline
+                            // user-role note instead.
+                            api_messages.push(ApiMessage {
+                                role: "user".to_string(),
+                                content: ApiContent::Blocks(vec![ContentBlock::Text {
+                                    text: format!("[System notice]\n{text}"),
+                                }]),
+                            });
+                        }
                     }
                 }
                 Role::User => match &msg.content {

@@ -89,6 +89,13 @@ pub trait MemoryStorage: Send + Sync {
     /// Record an access (increment access_count, update last_accessed_at).
     async fn record_access(&self, id: Uuid) -> Result<()>;
 
+    /// Record a duplicate write (increment proof_count, update
+    /// last_relevant_at). Deliberately does NOT touch access_count or
+    /// last_accessed_at: a re-save is corroboration, not evidence the
+    /// memory was useful at retrieval time, and must not reset the decay
+    /// clock or inflate the retrieval boost.
+    async fn record_duplicate(&self, id: Uuid) -> Result<()>;
+
     /// Record an access for each memory in a single round-trip.
     async fn record_access_batch(&self, ids: &[Uuid]) -> Result<()>;
 
@@ -1064,6 +1071,23 @@ impl MemoryStorage for SqliteMemoryStorage {
                 "UPDATE memories
                  SET access_count = access_count + 1,
                      last_accessed_at = ?2
+                 WHERE id = ?1",
+                params![id_str, now],
+            )
+            .map_err(storage_err)?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn record_duplicate(&self, id: Uuid) -> Result<()> {
+        let id_str = id.to_string();
+        let now = Utc::now().to_rfc3339();
+        self.with_conn(move |conn| {
+            conn.execute(
+                "UPDATE memories
+                 SET proof_count = proof_count + 1,
+                     last_relevant_at = ?2
                  WHERE id = ?1",
                 params![id_str, now],
             )

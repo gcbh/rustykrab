@@ -51,6 +51,22 @@ impl MemoryRetriever {
         agent_id: Uuid,
         limit: usize,
     ) -> rustykrab_core::Result<Vec<RetrievalResult>> {
+        self.recall_filtered(query, agent_id, limit, None).await
+    }
+
+    /// [`Self::recall`] with an optional session (conversation) filter.
+    ///
+    /// The filter is applied BEFORE access recording: memories excluded by
+    /// it must not receive an access bump or a decay-clock reset, otherwise
+    /// every scoped search would grant a phantom relevance boost to other
+    /// conversations' memories.
+    pub async fn recall_filtered(
+        &self,
+        query: &str,
+        agent_id: Uuid,
+        limit: usize,
+        session_id: Option<Uuid>,
+    ) -> rustykrab_core::Result<Vec<RetrievalResult>> {
         let candidates = self.config.retrieval_candidates_per_arm;
 
         // ── Stage 1: Query preprocessing ────────────────────────
@@ -116,6 +132,11 @@ impl MemoryRetriever {
 
         for (memory_id, rrf_score, sources) in &fused {
             if let Some(mem) = memories.iter().find(|m| m.id == *memory_id) {
+                if let Some(sid) = session_id {
+                    if mem.session_id != Some(sid) {
+                        continue;
+                    }
+                }
                 if !mem.is_valid || !mem.lifecycle_stage.is_retrievable() {
                     continue;
                 }
