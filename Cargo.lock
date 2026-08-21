@@ -4076,7 +4076,7 @@ checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
 
 [[package]]
 name = "rustykrab-agent"
-version = "4.6.0"
+version = "5.1.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -4093,7 +4093,7 @@ dependencies = [
 
 [[package]]
 name = "rustykrab-channels"
-version = "4.6.0"
+version = "5.1.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -4114,7 +4114,7 @@ dependencies = [
 
 [[package]]
 name = "rustykrab-cli"
-version = "4.6.0"
+version = "5.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4147,7 +4147,7 @@ dependencies = [
 
 [[package]]
 name = "rustykrab-core"
-version = "4.6.0"
+version = "5.1.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -4161,7 +4161,7 @@ dependencies = [
 
 [[package]]
 name = "rustykrab-e2e"
-version = "4.6.0"
+version = "5.1.0"
 dependencies = [
  "anyhow",
  "reqwest 0.13.3",
@@ -4176,7 +4176,7 @@ dependencies = [
 
 [[package]]
 name = "rustykrab-gateway"
-version = "4.6.0"
+version = "5.1.0"
 dependencies = [
  "axum",
  "chrono",
@@ -4200,7 +4200,7 @@ dependencies = [
 
 [[package]]
 name = "rustykrab-memory"
-version = "4.6.0"
+version = "5.1.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -4221,7 +4221,7 @@ dependencies = [
 
 [[package]]
 name = "rustykrab-providers"
-version = "4.6.0"
+version = "5.1.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -4239,7 +4239,7 @@ dependencies = [
 
 [[package]]
 name = "rustykrab-skills"
-version = "4.6.0"
+version = "5.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4255,10 +4255,11 @@ dependencies = [
 
 [[package]]
 name = "rustykrab-store"
-version = "4.6.0"
+version = "5.1.0"
 dependencies = [
  "aes-gcm",
  "argon2",
+ "async-trait",
  "chrono",
  "croner",
  "hex",
@@ -4278,7 +4279,7 @@ dependencies = [
 
 [[package]]
 name = "rustykrab-tools"
-version = "4.6.0"
+version = "5.1.0"
 dependencies = [
  "async-imap",
  "async-trait",

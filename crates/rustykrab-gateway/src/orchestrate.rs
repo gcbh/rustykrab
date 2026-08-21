@@ -293,7 +293,19 @@ async fn prepare_agent(
     .with_config(agent_config)
     .with_active_tools(state.active_tools.clone())
     .with_recall_store(state.recall.clone())
-    .with_todo_store(state.todos.clone());
+    .with_todo_store(state.todos.clone())
+    .with_retrieval_log(state.retrieval_log.clone());
+
+    // Outcome instrumentation (see `DREAMING.md`). Observational only: the
+    // runner records how the run went and to which artifacts it should be
+    // credited. Attributing to the active skill needs its name, which the
+    // runner does not otherwise know.
+    if state.outcome_capture_enabled {
+        runner = runner.with_outcome_sink(Arc::new(state.store.outcomes()));
+        if let Some((name, _)) = options.active_skill.as_ref() {
+            runner = runner.with_active_skill(name.clone());
+        }
+    }
 
     if let Some(cb) = build_memory_callback(state, conv) {
         // The inbound user message was pushed onto conv.messages by

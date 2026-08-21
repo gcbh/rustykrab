@@ -2,6 +2,7 @@ mod chat_map;
 mod conversation;
 mod jobs;
 pub mod keychain;
+mod outcomes;
 mod recall_archive;
 pub mod registry;
 mod secret;
@@ -17,6 +18,7 @@ use zeroize::Zeroizing;
 pub use chat_map::ChatMapStore;
 pub use conversation::{ConversationStore, ConversationSummary};
 pub use jobs::{JobRun, JobStore, ScheduledJob};
+pub use outcomes::OutcomeStore;
 pub use recall_archive::RecallArchiveStore;
 pub use secret::SecretStore;
 pub use slack_chat_map::SlackChatMapStore;
@@ -146,6 +148,49 @@ impl Store {
                 created_at      TEXT NOT NULL,
                 updated_at      TEXT NOT NULL
             );
+
+            -- Outcome instrumentation (see DREAMING.md). Written once,
+            -- never updated: per-artifact tallies are derived by
+            -- aggregating these rows, so scoring can change without
+            -- losing the underlying evidence.
+            CREATE TABLE IF NOT EXISTS outcome_records (
+                id              TEXT PRIMARY KEY,
+                conversation_id TEXT NOT NULL,
+                session_id      TEXT NOT NULL,
+                recorded_at     TEXT NOT NULL,
+                verdict         TEXT NOT NULL
+                    CHECK (verdict IN ('success','failure','ambiguous')),
+                signal          TEXT NOT NULL
+                    CHECK (signal IN ('verifiable','explicit','implicit','judge')),
+                confidence      REAL NOT NULL DEFAULT 1.0,
+                detail          TEXT,
+                tool_calls      INTEGER NOT NULL DEFAULT 0,
+                tool_failures   INTEGER NOT NULL DEFAULT 0,
+                iterations      INTEGER NOT NULL DEFAULT 0,
+                compactions     INTEGER NOT NULL DEFAULT 0,
+                rustykrab_version TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_outcome_records_recorded_at
+                ON outcome_records (recorded_at DESC);
+
+            CREATE INDEX IF NOT EXISTS idx_outcome_records_conversation
+                ON outcome_records (conversation_id, recorded_at DESC);
+
+            -- Credit assignment: which artifacts were in play for a turn.
+            -- Without this an outcome says only 'that turn went badly',
+            -- which is not actionable.
+            CREATE TABLE IF NOT EXISTS outcome_attributions (
+                record_id TEXT NOT NULL
+                    REFERENCES outcome_records(id) ON DELETE CASCADE,
+                kind      TEXT NOT NULL
+                    CHECK (kind IN ('skill','memory','tool')),
+                target_id TEXT NOT NULL,
+                PRIMARY KEY (record_id, kind, target_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_outcome_attributions_target
+                ON outcome_attributions (kind, target_id);
             ",
         )
         .map_err(|e| Error::Storage(e.to_string()))?;
@@ -246,6 +291,11 @@ impl Store {
     /// Return a handle for scheduled-job operations.
     pub fn jobs(&self) -> JobStore {
         JobStore::new(Arc::clone(&self.conn))
+    }
+
+    /// Return a handle for outcome-record persistence (see `DREAMING.md`).
+    pub fn outcomes(&self) -> OutcomeStore {
+        OutcomeStore::new(Arc::clone(&self.conn))
     }
 
     /// Return a handle for Telegram chat/thread → conversation mapping.
