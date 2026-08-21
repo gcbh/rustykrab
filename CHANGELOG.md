@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.1.9] - 2026-08-21
+
+- test(memory): executable harness for every lifecycle stage transition (#499)
+
 ## [5.1.8] - 2026-08-21
 
 - feat(memory): admission control, duplicate-write counter split, and scoped recall (#498)
