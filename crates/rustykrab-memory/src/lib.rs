@@ -51,6 +51,7 @@
 //! # }
 //! ```
 
+pub mod admission;
 pub mod backend;
 pub mod chunking;
 pub mod config;
@@ -135,7 +136,7 @@ impl MemorySystem {
         &self,
         turn: ConversationTurn,
         agent_id: Uuid,
-    ) -> rustykrab_core::Result<Uuid> {
+    ) -> rustykrab_core::Result<Option<Uuid>> {
         self.writer.retain(turn, agent_id).await
     }
 
@@ -146,7 +147,7 @@ impl MemorySystem {
         turn: ConversationTurn,
         agent_id: Uuid,
         stage: LifecycleStage,
-    ) -> rustykrab_core::Result<Uuid> {
+    ) -> rustykrab_core::Result<Option<Uuid>> {
         self.writer.retain_with_stage(turn, agent_id, stage).await
     }
 
@@ -166,6 +167,21 @@ impl MemorySystem {
         limit: usize,
     ) -> rustykrab_core::Result<Vec<RetrievalResult>> {
         self.retriever.recall(query, agent_id, limit).await
+    }
+
+    /// [`Self::recall`] restricted to memories written during one
+    /// conversation. The filter runs inside retrieval, before access
+    /// recording, so out-of-session memories get no phantom access boost.
+    pub async fn recall_in_session(
+        &self,
+        query: &str,
+        agent_id: Uuid,
+        limit: usize,
+        session_id: Uuid,
+    ) -> rustykrab_core::Result<Vec<RetrievalResult>> {
+        self.retriever
+            .recall_filtered(query, agent_id, limit, Some(session_id))
+            .await
     }
 
     // ── Lifecycle management ────────────────────────────────────

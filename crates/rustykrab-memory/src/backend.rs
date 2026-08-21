@@ -81,11 +81,18 @@ impl HybridMemoryBackend {
     /// decisions) attached to the source memory, so a caller searching for
     /// "what does the user prefer" surfaces the structured fact, not just the
     /// raw conversational text it was lifted from.
+    /// When `session_id` is given, results are restricted to memories written
+    /// during that conversation. The filter runs inside retrieval, before
+    /// access recording. An empty scoped result falls back to a labeled
+    /// global search: facts saved via `memory_save` carry the daemon's
+    /// session id, not the conversation's, and an unlabeled empty result
+    /// would teach the model that a fact it saved earlier does not exist.
     pub async fn search(
         &self,
         query: &str,
         tags: &[String],
         limit: usize,
+        session_id: Option<Uuid>,
     ) -> rustykrab_core::Result<Value> {
         // Over-fetch when tag-filtering so the post-filter can still fill `limit`.
         let fetch = if tags.is_empty() {
@@ -93,7 +100,25 @@ impl HybridMemoryBackend {
         } else {
             (limit * 4).min(100)
         };
-        let results = self.system.recall(query, self.agent_id, fetch).await?;
+        let mut scope_note: Option<&'static str> = None;
+        let results = match session_id {
+            Some(sid) => {
+                let scoped = self
+                    .system
+                    .recall_in_session(query, self.agent_id, fetch, sid)
+                    .await?;
+                if scoped.is_empty() {
+                    scope_note = Some(
+                        "no matches within this conversation; showing global results \
+                         (explicitly saved facts are stored globally)",
+                    );
+                    self.system.recall(query, self.agent_id, fetch).await?
+                } else {
+                    scoped
+                }
+            }
+            None => self.system.recall(query, self.agent_id, fetch).await?,
+        };
 
         let mut items: Vec<Value> = Vec::with_capacity(limit);
         for r in &results {
@@ -134,10 +159,14 @@ impl HybridMemoryBackend {
             }
         }
 
-        Ok(json!({
+        let mut response = json!({
             "results": items,
             "count": items.len(),
-        }))
+        });
+        if let Some(note) = scope_note {
+            response["session_scope"] = json!(note);
+        }
+        Ok(response)
     }
 
     /// Get a specific memory by ID.
@@ -174,16 +203,29 @@ impl HybridMemoryBackend {
 
     /// Save a fact with association tags, creating a new memory.
     pub async fn save(&self, fact: &str, tags: &[String]) -> rustykrab_core::Result<Value> {
-        let memory_id = self
+        // Pre-check admission here so the tool response can carry the
+        // per-cause reason (the writer's gate only reports "refused").
+        if let Err(rejection) = crate::admission::admit(fact) {
+            return Ok(json!({
+                "status": "rejected",
+                "reason": rejection.reason(),
+            }));
+        }
+        match self
             .system
             .writer()
             .save_fact(self.agent_id, self.session_id, fact, tags)
-            .await?;
-
-        Ok(json!({
-            "id": memory_id.to_string(),
-            "status": "saved",
-        }))
+            .await?
+        {
+            Some(memory_id) => Ok(json!({
+                "id": memory_id.to_string(),
+                "status": "saved",
+            })),
+            None => Ok(json!({
+                "status": "rejected",
+                "reason": "content was refused by memory admission control",
+            })),
+        }
     }
 
     /// Delete (invalidate) a memory by ID.
@@ -280,12 +322,12 @@ mod tests {
             .unwrap();
 
         // Untagged search returns both memories.
-        let all = backend.search("preferences", &[], 10).await.unwrap();
+        let all = backend.search("preferences", &[], 10, None).await.unwrap();
         assert_eq!(all["count"], 2, "untagged search should return both");
 
         // Tag-scoped search returns only the matching memory.
         let ui = backend
-            .search("preferences", &["ui".to_string()], 10)
+            .search("preferences", &["ui".to_string()], 10, None)
             .await
             .unwrap();
         assert_eq!(ui["count"], 1, "tag filter should drop the ops memory");
@@ -293,5 +335,73 @@ mod tests {
         assert_eq!(results[0]["content"], "I prefer dark mode");
         let tags = results[0]["tags"].as_array().unwrap();
         assert!(tags.iter().any(|t| t == "ui"));
+    }
+}
+
+#[cfg(test)]
+mod session_scope_tests {
+    use super::*;
+    use crate::embedding::ZeroEmbedder;
+    use crate::storage::SqliteMemoryStorage;
+    use crate::types::{ConversationTurn, TurnMetadata};
+    use crate::{MemoryConfig, MemorySystem};
+
+    fn system() -> Arc<MemorySystem> {
+        Arc::new(MemorySystem::new(
+            MemoryConfig::default(),
+            Arc::new(SqliteMemoryStorage::open_in_memory().unwrap()),
+            Arc::new(ZeroEmbedder::new(8)),
+        ))
+    }
+
+    fn turn(session_id: Uuid, content: &str) -> ConversationTurn {
+        ConversationTurn {
+            id: Uuid::new_v4(),
+            session_id,
+            turn_number: 0,
+            speaker: "user".to_string(),
+            content: content.to_string(),
+            token_count: None,
+            metadata: TurnMetadata::default(),
+        }
+    }
+
+    /// A session-scoped search must not bump access_count or reset the decay
+    /// clock on memories belonging to other conversations — the filter runs
+    /// inside retrieval, before access recording.
+    #[tokio::test]
+    async fn scoped_search_does_not_touch_other_sessions_access_counts() {
+        let sys = system();
+        let agent = Uuid::new_v4();
+        let mine = Uuid::new_v4();
+        let theirs = Uuid::new_v4();
+
+        let a = sys
+            .retain(turn(mine, "Palermo trip departs on October 3rd."), agent)
+            .await
+            .unwrap()
+            .unwrap();
+        let b = sys
+            .retain(turn(theirs, "Maui trip departs on May 24th."), agent)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let _ = sys
+            .recall_in_session("trip departure", agent, 10, mine)
+            .await
+            .unwrap();
+
+        let other = sys.get_memory(b).await.unwrap().unwrap();
+        assert_eq!(
+            other.access_count, 0,
+            "out-of-session memory must get no phantom access bump"
+        );
+        assert!(
+            other.last_accessed_at.is_none(),
+            "out-of-session memory's decay clock must not be reset"
+        );
+        // Sanity: the in-session memory is still reachable.
+        assert!(sys.get_memory(a).await.unwrap().is_some());
     }
 }

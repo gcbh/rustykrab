@@ -24,7 +24,12 @@ impl Tool for MemorySearchTool {
     }
 
     fn description(&self) -> &str {
-        "Search long-term memory entries by tags or keywords."
+        "Search long-term memory for facts, preferences, decisions, and past \
+         conversation turns. Use this whenever the user refers to something \
+         not visible in the current context — earlier conversations, stated \
+         preferences, prior plans or decisions — or when you are uncertain \
+         about a detail you may have known before. Pass session_id to search \
+         only one conversation's history."
     }
 
     fn schema(&self) -> ToolSchema {
@@ -46,6 +51,11 @@ impl Tool for MemorySearchTool {
                     "limit": {
                         "type": "integer",
                         "description": "Maximum number of results to return (default 10)"
+                    },
+                    "session_id": {
+                        "type": "string",
+                        "description": "Optional conversation id; restricts the search to \
+                                        memories from that conversation's history"
                     }
                 },
                 "required": ["query"]
@@ -68,10 +78,11 @@ impl Tool for MemorySearchTool {
             .unwrap_or_default();
 
         let limit = args["limit"].as_u64().unwrap_or(10) as usize;
+        let session_id = args["session_id"].as_str();
 
         let results = self
             .backend
-            .search(query, &tags, limit)
+            .search(query, &tags, limit, session_id)
             .await
             .map_err(|e| rustykrab_core::Error::ToolExecution(e.to_string().into()))?;
 

@@ -64,8 +64,24 @@ impl MemoryBackend for MemoryAdapter {
         query: &str,
         tags: &[String],
         limit: usize,
+        session_id: Option<&str>,
     ) -> rustykrab_core::Result<serde_json::Value> {
-        self.inner.search(query, tags, limit).await
+        match session_id {
+            Some(raw) => match Uuid::parse_str(raw.trim()) {
+                Ok(sid) => self.inner.search(query, tags, limit, Some(sid)).await,
+                Err(_) => {
+                    // Degrade to a global search, but say so — a silently
+                    // widened scope would let the model attribute other
+                    // conversations' memories to this one.
+                    let mut result = self.inner.search(query, tags, limit, None).await?;
+                    result["session_scope"] = serde_json::json!(
+                        "session_id was not a valid conversation id; results are global"
+                    );
+                    Ok(result)
+                }
+            },
+            None => self.inner.search(query, tags, limit, None).await,
+        }
     }
     async fn get(&self, memory_id: &str) -> rustykrab_core::Result<serde_json::Value> {
         self.inner.get(memory_id).await
