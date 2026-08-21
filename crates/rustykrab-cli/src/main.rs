@@ -696,8 +696,17 @@ async fn main() -> anyhow::Result<()> {
         })
     };
 
+    // Outcome instrumentation (see DREAMING.md). Observational only: the
+    // memory backend records which memories it surfaces, and a completed
+    // run credits its outcome to them. Opt-in, off by default.
+    let outcome_capture_enabled = std::env::var("RUSTYKRAB_OUTCOME_CAPTURE")
+        .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "True"))
+        .unwrap_or(false);
+    let retrieval_log = rustykrab_core::retrieval_log::RetrievalLog::new();
+
     let memory_backend: Arc<dyn MemoryBackend> = Arc::new(MemoryAdapter {
-        inner: HybridMemoryBackend::new(Arc::clone(&memory_system), agent_id, session_id),
+        inner: HybridMemoryBackend::new(Arc::clone(&memory_system), agent_id, session_id)
+            .with_retrieval_log(retrieval_log.clone()),
     });
     tracing::info!(%agent_id, "memory system initialized");
 
@@ -993,7 +1002,9 @@ async fn main() -> anyhow::Result<()> {
         .with_skill_registry(skill_registry)
         .with_memory(Arc::clone(&memory_system), agent_id)
         .with_subagents_enabled(subagents_enabled)
-        .with_computer_use_enabled(computer_use_enabled);
+        .with_computer_use_enabled(computer_use_enabled)
+        .with_retrieval_log(retrieval_log)
+        .with_outcome_capture(outcome_capture_enabled);
 
     // --- Attach video channel to state ---
     if let Some(vc) = video_channel {

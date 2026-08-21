@@ -9,7 +9,11 @@ use chrono::Utc;
 use rustykrab_core::active_tools::{ActiveToolsRegistry, SessionToolContext, SESSION_TOOL_CONTEXT};
 use rustykrab_core::capability::Capability;
 use rustykrab_core::model::{ModelProvider, ModelResponse, StopReason, StreamEvent, ToolChoice};
+use rustykrab_core::outcome::{
+    classify_run, Attribution, ExecutionCounters, OutcomeRecord, OutcomeSink, SignalClass,
+};
 use rustykrab_core::recall::RecallStore;
+use rustykrab_core::retrieval_log::RetrievalLog;
 use rustykrab_core::session::Session;
 use rustykrab_core::todo::TodoStore;
 use rustykrab_core::types::{
@@ -797,6 +801,15 @@ pub struct AgentRunner {
     /// scratch whenever the message count disagrees (compaction rewrote
     /// the history, or something appended outside `push_message`).
     token_estimates: Mutex<HashMap<Uuid, (usize, usize)>>,
+    /// Where completed runs report how they went. `None` disables outcome
+    /// instrumentation entirely (see `DREAMING.md`).
+    outcome_sink: Option<Arc<dyn OutcomeSink>>,
+    /// Which memories were surfaced into each conversation, so an outcome
+    /// can be attributed to them rather than to the turn as a whole.
+    retrieval_log: Option<RetrievalLog>,
+    /// Name of the skill driving this run, recorded for attribution. The
+    /// runner does not otherwise know about skills.
+    active_skill: Option<String>,
 }
 
 impl AgentRunner {
@@ -818,6 +831,94 @@ impl AgentRunner {
             recall: Arc::new(RecallStore::new()),
             todos: Arc::new(TodoStore::new()),
             token_estimates: Mutex::new(HashMap::new()),
+            outcome_sink: None,
+            retrieval_log: None,
+            active_skill: None,
+        }
+    }
+
+    /// Report how each completed run went, for later offline analysis.
+    ///
+    /// Purely observational: recording failures are logged and swallowed,
+    /// never surfaced to the caller, because instrumentation exists to
+    /// observe the system rather than to gate it.
+    pub fn with_outcome_sink(mut self, sink: Arc<dyn OutcomeSink>) -> Self {
+        self.outcome_sink = Some(sink);
+        self
+    }
+
+    /// Share the retrieval log that records which memories were surfaced,
+    /// so outcomes can be attributed to specific memories.
+    pub fn with_retrieval_log(mut self, log: RetrievalLog) -> Self {
+        self.retrieval_log = Some(log);
+        self
+    }
+
+    /// Record which skill is driving this run, so its outcomes can be
+    /// attributed to that skill.
+    pub fn with_active_skill(mut self, name: impl Into<String>) -> Self {
+        self.active_skill = Some(name.into());
+        self
+    }
+
+    /// Record how a completed run went, attributed to the artifacts that
+    /// were in play for it.
+    ///
+    /// Best-effort throughout: a run that succeeded must not be reported as
+    /// failed because its instrumentation could not be written, so every
+    /// error here is logged and swallowed. Does nothing when no sink is
+    /// configured.
+    ///
+    /// The verdict rests on behavioural evidence only — whether the run
+    /// completed and whether its tools failed. That is a proxy, not proof:
+    /// a clean run that produced a wrong answer is indistinguishable here,
+    /// which is why the record is stamped `Implicit` and carries low
+    /// confidence. See `DREAMING.md`.
+    async fn capture_outcome(&self, session: &Session, tracer: &ExecutionTracer, errored: bool) {
+        let Some(sink) = self.outcome_sink.as_ref() else {
+            return;
+        };
+
+        let stats = tracer.tool_stats();
+        let counters = ExecutionCounters {
+            tool_calls: stats.values().map(|s| s.calls).sum(),
+            tool_failures: stats.values().map(|s| s.failures).sum(),
+            iterations: tracer.iterations(),
+            compactions: tracer.compressions(),
+        };
+
+        let (verdict, confidence, detail) = classify_run(errored, counters);
+
+        // Credit assignment: the skill driving the run, the memories that
+        // were surfaced into it, and the tools it actually called.
+        let mut attributions = Vec::new();
+        if let Some(skill) = self.active_skill.as_deref() {
+            attributions.push(Attribution::skill(skill));
+        }
+        if let Some(log) = self.retrieval_log.as_ref() {
+            // Drained, so the next turn is credited only with what it
+            // recalled rather than everything the conversation has seen.
+            for memory_id in log.take(session.conversation_id) {
+                attributions.push(Attribution::memory(memory_id));
+            }
+        }
+        for name in stats.keys() {
+            attributions.push(Attribution::tool(name.clone()));
+        }
+
+        let record = OutcomeRecord::new(
+            session.conversation_id,
+            session.id,
+            verdict,
+            SignalClass::Implicit,
+        )
+        .with_confidence(confidence)
+        .with_detail(detail)
+        .with_counters(counters)
+        .with_attributions(attributions);
+
+        if let Err(e) = sink.record_outcome(record).await {
+            tracing::warn!(error = %e, "failed to record run outcome");
         }
     }
 
@@ -1102,6 +1203,9 @@ impl AgentRunner {
         let active_tools = self.active_tools.clone();
         let recall = self.recall.clone();
         let todos = self.todos.clone();
+        let outcome_sink = self.outcome_sink.clone();
+        let retrieval_log = self.retrieval_log.clone();
+        let active_skill = self.active_skill.clone();
 
         // Carry the trace id from the calling task into the spawned agent
         // task so prompt-log rows and agent-loop logs share the same id.
@@ -1120,6 +1224,9 @@ impl AgentRunner {
                 recall,
                 todos,
                 token_estimates: Mutex::new(HashMap::new()),
+                outcome_sink,
+                retrieval_log,
+                active_skill,
             };
             let body = async move {
                 runner
@@ -1179,8 +1286,15 @@ impl AgentRunner {
     /// information leakage (H8).
     pub async fn run(&self, conv: &mut Conversation, session: &Session) -> Result<()> {
         let ctx = self.build_session_context(session);
+        // Created here rather than inside `run_inner` so the outcome
+        // capture below sees the run's traces regardless of which of the
+        // inner loop's many exit paths fired. Still one tracer per run,
+        // so there is no cross-session leakage (H8).
+        let tracer = ExecutionTracer::new();
         let result = SESSION_TOOL_CONTEXT
-            .scope(ctx, self.run_inner(conv, session))
+            .scope(ctx, self.run_inner(conv, session, &tracer))
+            .await;
+        self.capture_outcome(session, &tracer, result.is_err())
             .await;
         // Release the per-conversation token-estimate entry so long-lived
         // runners don't accumulate one per conversation ever served.
@@ -1188,7 +1302,12 @@ impl AgentRunner {
         result
     }
 
-    async fn run_inner(&self, conv: &mut Conversation, session: &Session) -> Result<()> {
+    async fn run_inner(
+        &self,
+        conv: &mut Conversation,
+        session: &Session,
+        tracer: &ExecutionTracer,
+    ) -> Result<()> {
         if session.is_expired() {
             return Err(Error::Auth("session has expired".into()));
         }
@@ -1198,9 +1317,6 @@ impl AgentRunner {
         // the first model call doesn't get a prompt large enough to trip
         // the provider HTTP timeout.
         self.repair_oversized_summary(conv);
-
-        // Create a per-run tracer to prevent cross-session data leaks (H8)
-        let tracer = ExecutionTracer::new();
 
         let mut consecutive_errors = 0;
         let mut soft_warning_injected = false;
@@ -1352,7 +1468,7 @@ impl AgentRunner {
                 }
 
                 let results = self
-                    .execute_tools_parallel_traced(calls, session, &tracer, None)
+                    .execute_tools_parallel_traced(calls, session, tracer, None)
                     .await;
 
                 // Track side effects: check if any successfully executed tool
@@ -1632,8 +1748,15 @@ impl AgentRunner {
         on_event: &(dyn Fn(AgentEvent) + Send + Sync),
     ) -> Result<()> {
         let ctx = self.build_session_context(session);
+        // See `run` — hoisted so outcome capture sees the run's traces.
+        let tracer = ExecutionTracer::new();
         let result = SESSION_TOOL_CONTEXT
-            .scope(ctx, self.run_streaming_inner(conv, session, on_event))
+            .scope(
+                ctx,
+                self.run_streaming_inner(conv, session, on_event, &tracer),
+            )
+            .await;
+        self.capture_outcome(session, &tracer, result.is_err())
             .await;
         // See `run` — bound the token-estimate cache to active runs.
         self.forget_token_estimate(conv.id);
@@ -1645,6 +1768,7 @@ impl AgentRunner {
         conv: &mut Conversation,
         session: &Session,
         on_event: &(dyn Fn(AgentEvent) + Send + Sync),
+        tracer: &ExecutionTracer,
     ) -> Result<()> {
         if session.is_expired() {
             return Err(Error::Auth("session has expired".into()));
@@ -1653,8 +1777,6 @@ impl AgentRunner {
         // Repair stored state before the loop: older compactions could
         // persist summaries that exceed the current cap. See run_inner.
         self.repair_oversized_summary(conv);
-
-        let tracer = ExecutionTracer::new();
 
         let mut consecutive_errors = 0;
         let mut soft_warning_injected = false;
@@ -1788,7 +1910,7 @@ impl AgentRunner {
                 }
 
                 let results = self
-                    .execute_tools_parallel_traced(calls, session, &tracer, Some(on_event))
+                    .execute_tools_parallel_traced(calls, session, tracer, Some(on_event))
                     .await;
 
                 // Track side effects in streaming path.
@@ -5191,5 +5313,323 @@ mod watchdog_tests {
         assert_eq!(*beats.lock().unwrap(), 0);
         // Watchdog must not add appreciable latency.
         assert!(start.elapsed() < Duration::from_secs(1));
+    }
+}
+
+#[cfg(test)]
+mod outcome_capture_tests {
+    //! Tests for outcome instrumentation — the Monitor stage of the
+    //! self-improvement outer loop (see `DREAMING.md`).
+    //!
+    //! Two properties matter here. First, capture must be *observational*:
+    //! it never changes what the run returns, and a broken sink must not
+    //! break a working agent. Second, attribution must be *honest*: an
+    //! outcome is credited only to artifacts that were actually in play,
+    //! and a behavioural verdict is never dressed up as ground truth.
+
+    use super::*;
+
+    use async_trait::async_trait;
+    use rustykrab_core::capability::CapabilitySet;
+    use rustykrab_core::model::{ModelResponse, Usage};
+    use rustykrab_core::outcome::{AttributionKind, OutcomeVerdict};
+    use rustykrab_core::types::{ToolCall, ToolSchema};
+    use std::sync::Mutex as StdMutex;
+
+    use crate::sandbox::NoSandbox;
+
+    /// Captures whatever the runner reports, so tests can assert on it.
+    #[derive(Default)]
+    struct RecordingSink {
+        records: StdMutex<Vec<OutcomeRecord>>,
+    }
+
+    impl RecordingSink {
+        fn records(&self) -> Vec<OutcomeRecord> {
+            self.records.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl OutcomeSink for RecordingSink {
+        async fn record_outcome(&self, record: OutcomeRecord) -> Result<()> {
+            self.records.lock().unwrap().push(record);
+            Ok(())
+        }
+    }
+
+    /// A sink that always fails, to prove capture is best-effort.
+    struct BrokenSink;
+
+    #[async_trait]
+    impl OutcomeSink for BrokenSink {
+        async fn record_outcome(&self, _record: OutcomeRecord) -> Result<()> {
+            Err(Error::Storage("disk on fire".into()))
+        }
+    }
+
+    struct ScriptedProvider {
+        script: StdMutex<Vec<ModelResponse>>,
+    }
+
+    impl ScriptedProvider {
+        fn new(script: Vec<ModelResponse>) -> Self {
+            Self {
+                script: StdMutex::new(script),
+            }
+        }
+        fn next(&self) -> ModelResponse {
+            let mut s = self.script.lock().unwrap();
+            if s.is_empty() {
+                panic!("ScriptedProvider ran out of canned responses");
+            }
+            s.remove(0)
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for ScriptedProvider {
+        fn name(&self) -> &str {
+            "scripted-mock"
+        }
+        async fn chat(&self, _: &[Message], _: &[ToolSchema]) -> Result<ModelResponse> {
+            Ok(self.next())
+        }
+        async fn chat_with_choice(
+            &self,
+            _: &[Message],
+            _: &[ToolSchema],
+            _: ToolChoice,
+        ) -> Result<ModelResponse> {
+            Ok(self.next())
+        }
+    }
+
+    /// Succeeds or fails on demand, so both verdict paths are reachable.
+    struct FlakyTool {
+        name: String,
+        should_fail: bool,
+    }
+
+    #[async_trait]
+    impl Tool for FlakyTool {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn description(&self) -> &str {
+            "test tool"
+        }
+        fn schema(&self) -> ToolSchema {
+            ToolSchema {
+                name: self.name.clone(),
+                description: self.description().to_string(),
+                parameters: serde_json::json!({"type": "object", "properties": {}}),
+            }
+        }
+        async fn execute(&self, _args: serde_json::Value) -> Result<serde_json::Value> {
+            if self.should_fail {
+                Err(Error::Internal("tool blew up".into()))
+            } else {
+                Ok(serde_json::json!({"ok": true}))
+            }
+        }
+    }
+
+    fn tool_use_response(name: &str, args: serde_json::Value) -> ModelResponse {
+        ModelResponse {
+            message: Message {
+                id: Uuid::new_v4(),
+                role: Role::Assistant,
+                content: MessageContent::ToolCall(ToolCall {
+                    id: Uuid::new_v4().to_string(),
+                    name: name.to_string(),
+                    arguments: args,
+                }),
+                created_at: Utc::now(),
+                agent_version: None,
+            },
+            usage: Usage::default(),
+            stop_reason: StopReason::ToolUse,
+            text: None,
+        }
+    }
+
+    fn make_conv(conv_id: Uuid) -> Conversation {
+        Conversation {
+            id: conv_id,
+            messages: vec![Message {
+                id: Uuid::new_v4(),
+                role: Role::User,
+                content: MessageContent::Text("do the thing".into()),
+                created_at: Utc::now(),
+                agent_version: None,
+            }],
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            title: None,
+            summary: None,
+            detected_profile: None,
+            channel_source: None,
+            channel_id: None,
+            channel_thread_id: None,
+        }
+    }
+
+    /// A runner scripted to call `work` once, then `task_complete`.
+    fn make_runner(tool_fails: bool) -> (AgentRunner, Session, Conversation) {
+        use rustykrab_tools::TaskCompleteTool;
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            tool_use_response("work", serde_json::json!({})),
+            tool_use_response("task_complete", serde_json::json!({ "summary": "done" })),
+        ]));
+        let active = Arc::new(ActiveToolsRegistry::new());
+        let tools: Vec<Arc<dyn Tool>> = vec![
+            Arc::new(FlakyTool {
+                name: "work".into(),
+                should_fail: tool_fails,
+            }),
+            Arc::new(TaskCompleteTool::new()),
+        ];
+        let runner = AgentRunner::new(provider, tools, Arc::new(NoSandbox))
+            .with_active_tools(active.clone());
+        let conv_id = Uuid::new_v4();
+        active.activate(conv_id, ["work"]);
+        let caps = CapabilitySet::for_tools_permissive(&["work", "task_complete"]);
+        let session = Session::with_capabilities(conv_id, caps);
+        (runner, session, make_conv(conv_id))
+    }
+
+    #[tokio::test]
+    async fn clean_run_is_recorded_as_implicit_success() {
+        let sink = Arc::new(RecordingSink::default());
+        let (runner, session, mut conv) = make_runner(false);
+        let runner = runner.with_outcome_sink(sink.clone());
+
+        runner.run(&mut conv, &session).await.unwrap();
+
+        let records = sink.records();
+        assert_eq!(records.len(), 1, "one run should produce one record");
+        let r = &records[0];
+        assert_eq!(r.verdict, OutcomeVerdict::Success);
+        // A clean run is behavioural evidence, not proof the answer was
+        // right — it must never be recorded as ground truth.
+        assert_eq!(r.signal, SignalClass::Implicit);
+        assert!(!r.is_actionable());
+        assert_eq!(r.conversation_id, conv.id);
+        assert_eq!(r.session_id, session.id);
+        assert_eq!(r.counters.tool_failures, 0);
+        assert!(r.counters.tool_calls >= 1);
+    }
+
+    #[tokio::test]
+    async fn run_with_a_failing_tool_is_ambiguous_not_failure() {
+        // The run still completed. Calling it a failure would blame the
+        // artifacts for something we cannot actually attribute to them.
+        let sink = Arc::new(RecordingSink::default());
+        let (runner, session, mut conv) = make_runner(true);
+        let runner = runner.with_outcome_sink(sink.clone());
+
+        let _ = runner.run(&mut conv, &session).await;
+
+        let records = sink.records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].verdict, OutcomeVerdict::Ambiguous);
+        assert!(records[0].counters.tool_failures >= 1);
+    }
+
+    #[tokio::test]
+    async fn tools_and_skill_are_attributed() {
+        let sink = Arc::new(RecordingSink::default());
+        let (runner, session, mut conv) = make_runner(false);
+        let runner = runner
+            .with_outcome_sink(sink.clone())
+            .with_active_skill("trip-planner");
+
+        runner.run(&mut conv, &session).await.unwrap();
+
+        let records = sink.records();
+        let attributions = &records[0].attributions;
+
+        assert!(
+            attributions.contains(&Attribution::skill("trip-planner")),
+            "the driving skill must be credited, got {attributions:?}"
+        );
+        assert!(
+            attributions
+                .iter()
+                .any(|a| a.kind == AttributionKind::Tool && a.id == "work"),
+            "tools actually called must be credited, got {attributions:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn surfaced_memories_are_attributed_and_drained() {
+        let log = RetrievalLog::new();
+        let sink = Arc::new(RecordingSink::default());
+        let (runner, session, mut conv) = make_runner(false);
+        let memory_id = Uuid::new_v4();
+        log.record(conv.id, [memory_id]);
+
+        let runner = runner
+            .with_outcome_sink(sink.clone())
+            .with_retrieval_log(log.clone());
+
+        runner.run(&mut conv, &session).await.unwrap();
+
+        let records = sink.records();
+        assert!(
+            records[0]
+                .attributions
+                .contains(&Attribution::memory(memory_id)),
+            "memories surfaced into the turn must be credited"
+        );
+        // Draining is what keeps the next turn from inheriting this turn's
+        // credit; without it every later outcome would re-blame the same
+        // memories forever.
+        assert!(
+            log.peek(conv.id).is_empty(),
+            "the log must be drained once its ids have been credited"
+        );
+    }
+
+    #[tokio::test]
+    async fn memories_from_another_conversation_are_not_credited() {
+        let log = RetrievalLog::new();
+        let sink = Arc::new(RecordingSink::default());
+        let (runner, session, mut conv) = make_runner(false);
+        let other_memory = Uuid::new_v4();
+        log.record(Uuid::new_v4(), [other_memory]);
+
+        let runner = runner
+            .with_outcome_sink(sink.clone())
+            .with_retrieval_log(log.clone());
+
+        runner.run(&mut conv, &session).await.unwrap();
+
+        assert!(
+            !sink.records()[0]
+                .attributions
+                .contains(&Attribution::memory(other_memory)),
+            "attribution must not leak across conversations"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failing_sink_does_not_fail_the_run() {
+        // Instrumentation observes the system; it must never gate it.
+        let (runner, session, mut conv) = make_runner(false);
+        let runner = runner.with_outcome_sink(Arc::new(BrokenSink));
+
+        let result = runner.run(&mut conv, &session).await;
+        assert!(
+            result.is_ok(),
+            "a broken outcome sink must not break a working run"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_sink_configured_is_a_no_op() {
+        let (runner, session, mut conv) = make_runner(false);
+        assert!(runner.run(&mut conv, &session).await.is_ok());
     }
 }
