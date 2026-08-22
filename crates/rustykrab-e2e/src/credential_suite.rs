@@ -371,6 +371,23 @@ pub async fn run(
     // surfaces at five trials is 150 model round trips — hours, not
     // minutes — and finding that out by watching it is not a good way to
     // find it out.
+    // Restored from credeval, where it was deliberate and I dropped it in
+    // the port. A Signal trial cannot answer: the daemon parses the
+    // message, checks the allowlist, queues it — and nothing reads the
+    // queue, because `take_inbound_rx` is wired for Telegram and Slack
+    // only. Every trial sits until the timeout and is classified as a
+    // non-answer, which reads as "the agent chose not to ask" when the
+    // agent never saw anything. A measurement that cannot distinguish
+    // those two is worse than no measurement.
+    if surfaces.contains(&Surface::Signal) {
+        bail!(
+            "the signal surface cannot answer: the daemon has no agent loop reading \
+             SignalChannel's inbound queue (take_inbound_rx is called for Telegram and \
+             Slack only), so every trial times out and scores as a non-answer. Wire a \
+             Signal agent loop first, then remove this guard."
+        );
+    }
+
     let cells = selected.len() * surfaces.len();
     eprintln!(
         "credential suite: {} scenarios x {} surfaces x {trials} trials = {} trials",

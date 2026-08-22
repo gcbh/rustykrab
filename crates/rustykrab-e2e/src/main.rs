@@ -1201,7 +1201,8 @@ FLAGS:
     --mode SUITE                scripted | model | credential | all
                                 (default: scripted)
     --surfaces LIST             Surfaces for --mode credential
-                                (default: gateway,telegram,signal)
+                                (default: gateway,telegram; signal has no
+                                agent loop reading it and will error)
     --trials N                  Trials per credential cell (default: 5)
     --resume                    Reuse trials already in the sidecar rather
                                 than paying for them twice
@@ -1240,11 +1241,10 @@ fn parse_args(argv: &[String]) -> std::result::Result<Args, String> {
         reps: 3,
         trials: 5,
         resume: false,
-        surfaces: vec![
-            surface::Surface::Gateway,
-            surface::Surface::Telegram,
-            surface::Surface::Signal,
-        ],
+        // Signal is omitted on purpose: nothing in the daemon reads its
+        // inbound queue, so every trial would time out. Requesting it
+        // explicitly gets a clear error rather than a silent hour.
+        surfaces: vec![surface::Surface::Gateway, surface::Surface::Telegram],
         case_filter: None,
         quick: false,
         model: std::env::var("OLLAMA_MODEL").unwrap_or_else(|_| "gemma4:26b".to_string()),
