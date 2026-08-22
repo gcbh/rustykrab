@@ -11,6 +11,7 @@ members = [
     "crates/rustykrab-skills",
     "crates/rustykrab-cli",
     "crates/rustykrab-memory",
+    "crates/rustykrab-dream",
     "crates/rustykrab-e2e",
 ]
 
@@ -106,6 +107,7 @@ rustykrab-channels = { path = "crates/rustykrab-channels" }
 rustykrab-skills = { path = "crates/rustykrab-skills" }
 rustykrab-cli = { path = "crates/rustykrab-cli" }
 rustykrab-memory = { path = "crates/rustykrab-memory" }
+rustykrab-dream = { path = "crates/rustykrab-dream" }
 
 [profile.release]
 lto = true
