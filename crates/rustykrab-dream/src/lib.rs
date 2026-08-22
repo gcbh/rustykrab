@@ -13,10 +13,14 @@
 //! the **Analyze** stage only: deterministic, read-only reporting over
 //! recorded outcomes. Nothing here calls a model or changes any artifact.
 
+pub mod engine;
+pub mod mutation;
 pub mod report;
 pub mod store_source;
 pub mod worker;
 
+pub use engine::{promote, rollback, rollback_blockers, CyclePolicy, Promotion, PromotionRefusal};
+pub use mutation::{MemoryFacts, MemoryMutator};
 pub use report::{
     analyze, AnalysisReport, ArtifactFinding, FindingVerdict, OutcomeSource, Readiness,
     SignalQuality, MIN_OBSERVATIONS, UNDERPERFORMING_BELOW,
