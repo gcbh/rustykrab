@@ -145,26 +145,18 @@ pub struct StubSpec {
 
 /// Tools the agent loop drives by name, which `replace` must never strip.
 ///
-/// `task_complete` is the runner's completion signal — it activates the
-/// tool itself once the model has used any tool, then re-prompts up to
-/// three times insisting it be called. The `recall_*` family is how
-/// compacted detail is retrieved, and the model cannot load them after
-/// compaction has already dropped what it needs.
+/// Only `task_complete` qualifies. The runner activates it as soon as the
+/// model uses any tool and then re-prompts up to three times insisting it
+/// be called, so removing the implementation leaves the model ordered to
+/// call something that does not exist.
 ///
-/// `tools_list` and `tools_load` are deliberately *not* here. They are the
-/// discovery mechanism, and `replace` exists precisely to fix the tool set
-/// — there is nothing left to discover. Keeping them measurably hurt:
-/// re-advertising them sent the model exploring instead of calling the
-/// memory tools already in front of it, turning a 22-second scenario into
-/// a 425-second one.
-pub const PROTOCOL_TOOLS: &[&str] = &[
-    "task_complete",
-    "recall_append",
-    "recall_info",
-    "recall_peek",
-    "recall_search",
-    "recall_sub_query",
-];
+/// Nothing else is forced. The `tools_*` and `recall_*` families were
+/// tried here and taken back out: `replace` exists to fix the tool set,
+/// and offering a small model extra tools it was not asked about sends it
+/// exploring instead of doing the task. Both turned a 22-second scenario
+/// into a 350-second one. A scenario that needs them can name them in
+/// `keep`.
+pub const PROTOCOL_TOOLS: &[&str] = &["task_complete"];
 
 /// How the stub file interacts with the daemon's real tool registry.
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
@@ -424,13 +416,11 @@ mod tests {
         ];
         let applied = file.apply(real);
         let kept: Vec<&str> = applied.iter().map(|t| t.name()).collect();
-        assert!(kept.contains(&"task_complete"));
-        assert!(kept.contains(&"recall_search"));
-        assert!(!kept.contains(&"gmail"), "domain tools are still replaced");
-        assert!(
-            !kept.contains(&"tools_load"),
-            "discovery has nothing to discover once the set is fixed, and offering it \
-             sends the model exploring instead of using what it has"
+        assert_eq!(
+            kept,
+            vec!["task_complete"],
+            "only the tool the runner forces survives; everything else the model would \
+             merely be tempted to explore"
         );
     }
 

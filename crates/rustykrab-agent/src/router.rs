@@ -11,6 +11,10 @@ use crate::harness::HarnessProfile;
 /// then returns the appropriate profile. No LLM call needed — profile
 /// detection happens instantly based on message content.
 pub struct HarnessRouter {
+    /// Profile fields the operator named explicitly, which a preset must
+    /// not override. Empty means "the operator said nothing", so the
+    /// preset decides everything.
+    pinned: Vec<String>,
     /// Base profile to use as a template. Task-specific fields get overlaid.
     base: HarnessProfile,
     /// A model provider kept for potential future use (e.g. RLM context
@@ -24,7 +28,15 @@ impl HarnessRouter {
         Self {
             _classifier: classifier,
             base: HarnessProfile::default(),
+            pinned: Vec::new(),
         }
+    }
+
+    /// Pin the profile fields the operator set explicitly, so a routed
+    /// preset cannot quietly replace them.
+    pub fn with_pinned_fields(mut self, fields: Vec<String>) -> Self {
+        self.pinned = fields;
+        self
     }
 
     /// Use a custom base profile that gets task-specific overlays applied.
@@ -58,23 +70,23 @@ impl HarnessRouter {
         profile.compaction_threshold_pct = self.base.compaction_threshold_pct;
 
         // The loop parameters are the preset's to choose — that is what a
-        // preset is for — *unless* the operator set them. A value in the
-        // base that differs from the shipped default is a deliberate
-        // choice, and silently replacing it means a harness.toml asking
-        // for two tool retries quietly gets three whenever a message
-        // happens to classify as "coding".
-        let default = HarnessProfile::default();
-        if self.base.max_iterations != default.max_iterations {
-            profile.max_iterations = self.base.max_iterations;
-        }
-        if self.base.soft_iteration_warning != default.soft_iteration_warning {
-            profile.soft_iteration_warning = self.base.soft_iteration_warning;
-        }
-        if self.base.max_consecutive_errors != default.max_consecutive_errors {
-            profile.max_consecutive_errors = self.base.max_consecutive_errors;
-        }
-        if self.base.max_tool_retries != default.max_tool_retries {
-            profile.max_tool_retries = self.base.max_tool_retries;
+        // preset is for — *unless* the operator named them. "Named" rather
+        // than "differs from the default": an operator who writes
+        // `max_tool_retries = 2` means 2, even though 2 is also the
+        // default, and a preset asking for 3 would still be overriding a
+        // stated choice.
+        for field in &self.pinned {
+            match field.as_str() {
+                "max_iterations" => profile.max_iterations = self.base.max_iterations,
+                "soft_iteration_warning" => {
+                    profile.soft_iteration_warning = self.base.soft_iteration_warning
+                }
+                "max_consecutive_errors" => {
+                    profile.max_consecutive_errors = self.base.max_consecutive_errors
+                }
+                "max_tool_retries" => profile.max_tool_retries = self.base.max_tool_retries,
+                _ => {}
+            }
         }
         profile
     }
@@ -320,7 +332,7 @@ mod base_preservation_tests {
     }
 
     #[tokio::test]
-    async fn an_operator_set_loop_parameter_survives_a_preset() {
+    async fn a_named_loop_parameter_survives_a_preset() {
         // "write some code" classifies as coding, whose preset asks for 3
         // tool retries. An operator who wrote 1 in harness.toml meant 1.
         let base = HarnessProfile {
@@ -328,8 +340,8 @@ mod base_preservation_tests {
             max_iterations: 20,
             ..HarnessProfile::default()
         };
-
         let routed = router_with_base(base)
+            .with_pinned_fields(vec!["max_tool_retries".into(), "max_iterations".into()])
             .route("please write some code for me")
             .await;
 
@@ -338,11 +350,29 @@ mod base_preservation_tests {
     }
 
     #[tokio::test]
-    async fn an_untouched_parameter_still_comes_from_the_preset() {
+    async fn a_named_parameter_wins_even_when_it_equals_the_default() {
+        // Why this keys on "was it named" rather than "does it differ from
+        // the default": 2 is also the default, so a differs-from-default
+        // rule hands this to the preset's 3 and silently overrides a
+        // stated choice.
+        assert_eq!(HarnessProfile::default().max_tool_retries, 2);
+        let base = HarnessProfile {
+            max_tool_retries: 2,
+            ..HarnessProfile::default()
+        };
+        let routed = router_with_base(base)
+            .with_pinned_fields(vec!["max_tool_retries".into()])
+            .route("please write some code for me")
+            .await;
+
+        assert_eq!(routed.max_tool_retries, 2);
+    }
+
+    #[tokio::test]
+    async fn an_unnamed_parameter_still_comes_from_the_preset() {
         // Where the operator expressed no opinion, the preset decides —
         // that is the whole point of routing.
-        let base = HarnessProfile::default();
-        let routed = router_with_base(base)
+        let routed = router_with_base(HarnessProfile::default())
             .route("please write some code for me")
             .await;
         assert_eq!(
