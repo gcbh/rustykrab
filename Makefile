@@ -1,4 +1,4 @@
-.PHONY: build release debug codesign codesign-debug clean version e2e eval eval-quick eval-cred eval-list e2e eval eval-quick eval-list
+.PHONY: build release debug codesign codesign-debug bundle bundle-debug clean version e2e eval eval-quick eval-cred eval-list e2e eval eval-quick eval-list
 
 # Default: release build + codesign
 build: release
@@ -20,6 +20,17 @@ codesign:
 
 codesign-debug:
 	./scripts/codesign.sh
+
+# Bundle + sign into a .app. Required for Data Protection Keychain access:
+# a bare signed binary falls back to the legacy keychain and prompts on every
+# credential read. Use these for any build you intend to run.
+bundle:
+	cargo build --release -p rustykrab-cli
+	./scripts/bundle.sh --release
+
+bundle-debug:
+	cargo build -p rustykrab-cli
+	./scripts/bundle.sh --debug
 
 clean:
 	cargo clean
