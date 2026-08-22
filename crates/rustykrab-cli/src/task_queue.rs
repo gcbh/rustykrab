@@ -911,6 +911,7 @@ mod tests {
                 requires: SkillRequirements::default(),
                 user_invocable: true,
                 emoji: None,
+                outcome: None,
                 extra: HashMap::new(),
             },
             raw_body: body.to_string(),

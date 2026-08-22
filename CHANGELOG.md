@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.1.17] - 2026-08-22
+
+- Dreaming P0 (4/6): let a SKILL.md declare what success means (#515)
+
 ## [5.1.16] - 2026-08-22
 
 - fix(tools): parse quoted shell operators safely (#513)
