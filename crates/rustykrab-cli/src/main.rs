@@ -988,6 +988,33 @@ async fn main() -> anyhow::Result<()> {
         "skill-tools registered"
     );
 
+    // --- Tool stubs (evaluation harness only) ---
+    // RUSTYKRAB_TOOL_STUBS swaps real tools for scripted stand-ins whose
+    // answers the harness controls, so a scenario can reach an upstream
+    // that fails once, or never, or returns more text than the context
+    // window holds. The mirror image of RUSTYKRAB_PROVIDER=scripted, and
+    // like it, must never be set on a real deployment.
+    //
+    // Applied last, after every real tool has registered, so `replace`
+    // means the whole registry rather than whichever part of it had been
+    // built by this point.
+    let tools = match std::env::var_os("RUSTYKRAB_TOOL_STUBS") {
+        Some(path) => {
+            let path = std::path::PathBuf::from(path);
+            let stubs = rustykrab_tools::StubFile::from_path(&path)?;
+            let stubbed = stubs.apply(tools);
+            tracing::warn!(
+                path = %path.display(),
+                mode = ?stubs.mode,
+                tools = ?stubbed.iter().map(|t| t.name()).collect::<Vec<_>>(),
+                "RUSTYKRAB_TOOL_STUBS is set — the tool registry has been replaced with \
+                 scripted stubs. This is the evaluation harness switch."
+            );
+            stubbed
+        }
+        None => tools,
+    };
+
     // --- Harness router (auto-selects profile per message) ---
     // Reuses the main provider for classification to avoid model swapping.
     // The classification prompt is ~50 tokens — negligible overhead on any model.
