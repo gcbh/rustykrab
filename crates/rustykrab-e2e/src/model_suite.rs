@@ -64,8 +64,11 @@ impl ModelCase {
             turns: Vec::new(),
             // Replace the registry by default: thirty real tools give a
             // small model thirty ways to wander off, and the scenario stops
-            // measuring what it meant to.
-            stubs: json!({ "mode": "replace", "keep": [], "tools": [] }),
+            // measuring what it meant to. `task_complete` stays, because
+            // it is how the runner is told the work is done — without it
+            // every scenario ends on the "you did not call task_complete"
+            // nudge instead of on its answer.
+            stubs: json!({ "mode": "replace", "keep": ["task_complete"], "tools": [] }),
             harness_toml: None,
             assertions: Vec::new(),
             judge: None,
@@ -89,8 +92,14 @@ impl ModelCase {
 
     /// Keep these real tools alongside the stubs — the memory scenarios
     /// need the genuine `memory_*` tools, since those are what they test.
+    /// Adds to the default kept set rather than replacing it, so a
+    /// scenario does not silently lose `task_complete` by asking for
+    /// something else.
     fn keeping(mut self, names: &[&str]) -> Self {
-        self.stubs["keep"] = json!(names);
+        let keep = self.stubs["keep"].as_array_mut().unwrap();
+        for name in names {
+            keep.push(json!(name));
+        }
         self
     }
 
@@ -126,6 +135,17 @@ fn tight_harness() -> String {
 
 /// The default config for non-compaction scenarios: a normal window, but a
 /// low iteration cap so a wandering model fails fast instead of slowly.
+/// [`bounded_harness`] with the runner's own tool retries switched off.
+///
+/// `execute_with_retries` retries a failed tool up to `max_tool_retries`
+/// times before the model ever hears about it, so with the default of 2 a
+/// "fails once, then succeeds" stub is absorbed inside a single
+/// model-visible call — the model has nothing to recover from. Scenarios
+/// measuring how the *model* handles a tool failure have to let it through.
+fn no_retry_harness() -> String {
+    bounded_harness().replace("max_tool_retries = 2", "max_tool_retries = 0")
+}
+
 fn bounded_harness() -> String {
     "name = \"e2e\"\n\
      agent_name = \"RustyKrab\"\n\
@@ -316,7 +336,7 @@ pub fn cases() -> Vec<ModelCase> {
             "model-recovers-from-a-transient-tool-error",
             "A tool that fails once and then succeeds still produces a correct answer",
         )
-        .with_harness(bounded_harness())
+        .with_harness(no_retry_harness())
         .with_tool(tool(
             "weather_lookup",
             "Get the current weather for a city. Returns temperature in Celsius and conditions.",
@@ -713,7 +733,18 @@ async fn run_once(
         for turn in &case.turns {
             ctx.send(&conv_id, turn).await?;
         }
-        let conv = ctx.conversation(&conv_id).await?;
+        // Read the conversation out of the daemon's own store rather than
+        // over HTTP. `GET /api/conversations/{id}` returns the Apollo
+        // projection — id, title, timestamps, no messages — and
+        // `/messages` renders each turn to a display string that has
+        // already thrown away the structured tool calls an assertion is
+        // about. The store holds the real thing.
+        let conv = serde_json::to_value(
+            store
+                .conversations()
+                .get(uuid::Uuid::parse_str(&conv_id)?)
+                .await?,
+        )?;
         let mut transcript = Transcript::parse(&conv);
         transcript.duration_ms = started.elapsed().as_millis();
         Ok::<_, anyhow::Error>(transcript)

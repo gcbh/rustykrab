@@ -383,17 +383,6 @@ impl Ctx {
         Ok(resp.json().await?)
     }
 
-    /// Read a conversation back out of the daemon's store. The reply body
-    /// is only the last assistant message; this is the whole exchange,
-    /// tool traffic and compaction bookmark included.
-    async fn conversation(&self, conv_id: &str) -> Result<Value> {
-        let resp = self.get(&format!("/api/conversations/{conv_id}")).await?;
-        if resp.status() != 200 {
-            bail!("get conversation returned {}", resp.status());
-        }
-        Ok(resp.json().await?)
-    }
-
     /// Create a conversation, send one message, return the assistant reply.
     async fn chat(&self, content: &str) -> Result<Value> {
         let conv: Value = self
@@ -1031,6 +1020,26 @@ fn spawn_daemon(bin: &str, data_dir: &std::path::Path, port: u16) -> Result<Chil
     spawn_daemon_with(bin, data_dir, port, &Backend::Scripted)
 }
 
+/// The budget the daemon picks for Ollama when nothing overrides it
+/// (`resolve_max_context_tokens`). A scenario asking for less than this is
+/// shrinking the window on purpose.
+const OLLAMA_DEFAULT_CONTEXT_BUDGET: usize = 32_000;
+
+/// Read `max_context_tokens` back out of the `harness.toml` a scenario
+/// wrote, if it set one.
+fn harness_context_budget(data_dir: &std::path::Path) -> Option<usize> {
+    let toml = std::fs::read_to_string(data_dir.join("harness.toml")).ok()?;
+    toml.lines()
+        .find_map(|line| line.trim().strip_prefix("max_context_tokens"))
+        .and_then(|rest| {
+            rest.trim()
+                .strip_prefix('=')
+                .map(str::trim)
+                .map(str::to_string)
+        })
+        .and_then(|v| v.parse().ok())
+}
+
 fn spawn_daemon_with(
     bin: &str,
     data_dir: &std::path::Path,
@@ -1085,11 +1094,38 @@ fn spawn_daemon_with(
         } => {
             command
                 .env("RUSTYKRAB_PROVIDER", "ollama")
+                // Scenarios set their own iteration caps, retry budget and
+                // context window; the auto-router would replace the whole
+                // profile with a preset and discard them.
+                .env("RUSTYKRAB_HARNESS_ROUTER", "off")
                 .env("OLLAMA_MODEL", model)
                 .env("OLLAMA_BASE_URL", ollama_url)
                 // Compaction summarisation on a local model is
                 // prefill-heavy; the default would cut it off.
                 .env("OLLAMA_TIMEOUT_SECS", "900");
+
+            // `max_context_tokens` from `harness.toml` is overwritten at
+            // startup by a provider-derived default (32k for Ollama), so a
+            // scenario that shrinks the window to force compaction never
+            // gets it. `RUSTYKRAB_MAX_CONTEXT_TOKENS` is the documented
+            // override that survives; carry the profile's value through it
+            // so the toml stays the single source of truth.
+            // Only when the scenario is deliberately shrinking the window.
+            // The ordinary profiles set a budget far above Ollama's own
+            // default, and pinning `num_ctx` that high would allocate a KV
+            // cache to match for every scenario.
+            if let Some(budget) =
+                harness_context_budget(data_dir).filter(|&b| b < OLLAMA_DEFAULT_CONTEXT_BUDGET)
+            {
+                command.env("RUSTYKRAB_MAX_CONTEXT_TOKENS", budget.to_string());
+                // The runner sizes the compaction threshold off the
+                // *provider's* reported window in preference to the
+                // profile's budget, so leaving Ollama at its default 64k
+                // puts the trigger ~55k out of reach and compaction never
+                // fires however small the profile says the window is.
+                // Shrink the provider window to match.
+                command.env("RUSTYKRAB_NUM_CTX", budget.to_string());
+            }
 
             // An empty spec means "leave the registry alone" — the
             // credential suite needs the real tools, because its premise

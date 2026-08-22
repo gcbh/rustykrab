@@ -171,7 +171,11 @@ impl StubFile {
             .map_err(|e| Error::Config(format!("reading tool stubs {}: {e}", path.display())))?;
         let parsed: Self = serde_json::from_str(&raw)
             .map_err(|e| Error::Config(format!("parsing tool stubs {}: {e}", path.display())))?;
-        if parsed.tools.is_empty() && parsed.mode == StubMode::Replace {
+        // Only the combination that leaves the registry genuinely empty is
+        // a mistake. `tools: []` with a non-empty `keep` is a legitimate
+        // spec — the memory scenarios stub nothing and keep the real
+        // `memory_*` tools, because those are what they are testing.
+        if parsed.tools.is_empty() && parsed.keep.is_empty() && parsed.mode == StubMode::Replace {
             return Err(Error::Config(format!(
                 "{} replaces the tool registry with nothing — the agent would have no tools",
                 path.display()

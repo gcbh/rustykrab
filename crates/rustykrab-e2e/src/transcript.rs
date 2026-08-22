@@ -108,24 +108,21 @@ impl Transcript {
             }
         }
 
-        let folded_messages = match conv["compacted_through"].as_str() {
-            Some(bookmark) => messages
-                .iter()
-                .position(|m| m["id"].as_str() == Some(bookmark))
-                .map(|i| i + 1)
-                .unwrap_or(0),
-            None => 0,
-        };
+        // A compacted conversation is one carrying a summary: `summary` is
+        // the only compaction state a `Conversation` actually holds. There
+        // is no bookmark field and no generation counter, so how much was
+        // folded away cannot be read back — only that it happened.
+        let compacted = conv["summary"].as_str().is_some_and(|s| !s.is_empty());
 
         Self {
             final_text: assistant_texts.last().cloned().unwrap_or_default(),
             assistant_texts,
             calls,
-            compacted: !conv["compacted_through"].is_null(),
-            compaction_generation: conv["compaction_generation"].as_u64().unwrap_or(0),
+            compacted,
+            compaction_generation: u64::from(compacted),
             summary: conv["summary"].as_str().map(str::to_string),
-            folded_messages,
-            live_messages: messages.len().saturating_sub(folded_messages),
+            folded_messages: 0,
+            live_messages: messages.len(),
             total_messages: messages.len(),
             duration_ms: 0,
             error: None,
@@ -272,21 +269,28 @@ mod tests {
     }
 
     #[test]
-    fn reads_the_compaction_bookmark() {
+    fn reads_compaction_state_from_the_summary() {
+        let messages = json!([
+            { "id": "m1", "role": "user", "content": { "type": "text", "data": "old" } },
+            { "id": "m2", "role": "assistant", "content": { "type": "text", "data": "older" } },
+            { "id": "m3", "role": "user", "content": { "type": "text", "data": "new" } }
+        ]);
+
+        // A summary is the whole of the compaction state a `Conversation`
+        // carries — there is no bookmark and no generation counter to read.
         let t = Transcript::parse(&conv(
-            json!([
-                { "id": "m1", "role": "user", "content": { "type": "text", "data": "old" } },
-                { "id": "m2", "role": "assistant", "content": { "type": "text", "data": "older" } },
-                { "id": "m3", "role": "user", "content": { "type": "text", "data": "new" } }
-            ]),
-            json!({ "compacted_through": "m2", "summary": "earlier chat",
-                    "compaction_generation": 2 }),
+            messages.clone(),
+            json!({ "summary": "earlier chat" }),
         ));
         assert!(t.compacted);
-        assert_eq!(t.folded_messages, 2);
-        assert_eq!(t.live_messages, 1);
-        assert_eq!(t.compaction_generation, 2);
+        assert_eq!(t.compaction_generation, 1);
+        assert_eq!(t.summary.as_deref(), Some("earlier chat"));
         // History is hidden, never destroyed.
         assert_eq!(t.total_messages, 3);
+        assert_eq!(t.live_messages, 3);
+
+        let t = Transcript::parse(&conv(messages, json!({ "summary": null })));
+        assert!(!t.compacted);
+        assert_eq!(t.compaction_generation, 0);
     }
 }

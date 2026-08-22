@@ -1005,12 +1005,47 @@ async fn main() -> anyhow::Result<()> {
         None => tools,
     };
 
+    // A stubbed registry is a closed world: the harness has already said
+    // "these are the only tools." Progressive disclosure exists to keep a
+    // thirty-tool registry from swamping a small model, and `replace` mode
+    // removes `tools_load` itself — so without this the stubs are
+    // registered but never active, and the model is sent no schemas at
+    // all. Seed them so they are visible from turn 0.
+    let active_tools = match std::env::var_os("RUSTYKRAB_TOOL_STUBS") {
+        Some(_) => Arc::new(
+            rustykrab_core::active_tools::ActiveToolsRegistry::with_seed(
+                tools.iter().map(|t| t.name().to_string()),
+            ),
+        ),
+        None => Arc::new(rustykrab_core::active_tools::ActiveToolsRegistry::new()),
+    };
+
     // --- Harness router (auto-selects profile per message) ---
     // Reuses the main provider for classification to avoid model swapping.
     // The classification prompt is ~50 tokens — negligible overhead on any model.
     let classifier: Arc<dyn ModelProvider> = provider.clone();
 
-    let router = Arc::new(HarnessRouter::new(classifier).with_base(profile));
+    // The router classifies each message and swaps in a preset profile,
+    // which discards the configured one — including its iteration caps,
+    // retry budget and context window. `RUSTYKRAB_HARNESS_ROUTER=off`
+    // pins the configured profile instead, so a caller that has set those
+    // deliberately (the evaluation harness) actually gets them.
+    let routing_enabled = !matches!(
+        std::env::var("RUSTYKRAB_HARNESS_ROUTER")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "off" | "0" | "false" | "no"
+    );
+    let router = routing_enabled
+        .then(|| Arc::new(HarnessRouter::new(classifier).with_base(profile.clone())));
+    if !routing_enabled {
+        tracing::info!(
+            profile = %profile.name,
+            "harness routing disabled — using the configured profile for every message"
+        );
+    }
 
     // --- Build gateway state ---
     // Clone store handle so we can flush it after the server shuts down.
@@ -1019,12 +1054,16 @@ async fn main() -> anyhow::Result<()> {
         // Loopback is always allowed; this adds the names other clients
         // reach us by, e.g. the tailnet hostname the phone uses.
         .with_origin_policy(rustykrab_gateway::OriginPolicy::from_env())
-        .with_harness_router(router)
+        // Also the fallback the gateway uses when routing is off, so
+        // `harness.toml` still decides the caps in that mode.
+        .with_harness_profile(profile)
+        .with_harness_router_opt(router)
         .with_orchestration_config(orchestration_config)
         .with_skill_registry(skill_registry)
         .with_memory(Arc::clone(&memory_system), agent_id)
         .with_subagents_enabled(subagents_enabled)
         .with_computer_use_enabled(computer_use_enabled);
+    state.active_tools = active_tools;
 
     // --- Attach video channel to state ---
     if let Some(vc) = video_channel {
