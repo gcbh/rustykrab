@@ -50,9 +50,32 @@ impl HarnessRouter {
             _ => self.base.clone(),
         };
         // Preserve user customizations from the base profile.
+        //
+        // These three are unconditional: they describe the deployment, not
+        // the task.
         profile.agent_name = self.base.agent_name.clone();
         profile.max_context_tokens = self.base.max_context_tokens;
         profile.compaction_threshold_pct = self.base.compaction_threshold_pct;
+
+        // The loop parameters are the preset's to choose — that is what a
+        // preset is for — *unless* the operator set them. A value in the
+        // base that differs from the shipped default is a deliberate
+        // choice, and silently replacing it means a harness.toml asking
+        // for two tool retries quietly gets three whenever a message
+        // happens to classify as "coding".
+        let default = HarnessProfile::default();
+        if self.base.max_iterations != default.max_iterations {
+            profile.max_iterations = self.base.max_iterations;
+        }
+        if self.base.soft_iteration_warning != default.soft_iteration_warning {
+            profile.soft_iteration_warning = self.base.soft_iteration_warning;
+        }
+        if self.base.max_consecutive_errors != default.max_consecutive_errors {
+            profile.max_consecutive_errors = self.base.max_consecutive_errors;
+        }
+        if self.base.max_tool_retries != default.max_tool_retries {
+            profile.max_tool_retries = self.base.max_tool_retries;
+        }
         profile
     }
 }
@@ -253,5 +276,78 @@ mod tests {
             "creative"
         );
         assert_eq!(classify_profile_keywords("hello there"), "general");
+    }
+}
+
+#[cfg(test)]
+mod base_preservation_tests {
+    use super::*;
+
+    use async_trait::async_trait;
+    use chrono::Utc;
+    use rustykrab_core::error::Result;
+    use rustykrab_core::model::{ModelResponse, StopReason, Usage};
+    use rustykrab_core::types::{Message, MessageContent, Role, ToolSchema};
+    use uuid::Uuid;
+
+    /// `route` classifies by keyword and never calls the model, so the
+    /// classifier only has to exist.
+    struct UnusedProvider;
+
+    #[async_trait]
+    impl ModelProvider for UnusedProvider {
+        fn name(&self) -> &str {
+            "unused"
+        }
+        async fn chat(&self, _: &[Message], _: &[ToolSchema]) -> Result<ModelResponse> {
+            Ok(ModelResponse {
+                message: Message {
+                    id: Uuid::new_v4(),
+                    role: Role::Assistant,
+                    content: MessageContent::Text(String::new()),
+                    created_at: Utc::now(),
+                    agent_version: None,
+                },
+                usage: Usage::default(),
+                stop_reason: StopReason::EndTurn,
+                text: None,
+            })
+        }
+    }
+
+    fn router_with_base(base: HarnessProfile) -> HarnessRouter {
+        HarnessRouter::new(Arc::new(UnusedProvider)).with_base(base)
+    }
+
+    #[tokio::test]
+    async fn an_operator_set_loop_parameter_survives_a_preset() {
+        // "write some code" classifies as coding, whose preset asks for 3
+        // tool retries. An operator who wrote 1 in harness.toml meant 1.
+        let base = HarnessProfile {
+            max_tool_retries: 1,
+            max_iterations: 20,
+            ..HarnessProfile::default()
+        };
+
+        let routed = router_with_base(base)
+            .route("please write some code for me")
+            .await;
+
+        assert_eq!(routed.max_tool_retries, 1, "the operator's value must win");
+        assert_eq!(routed.max_iterations, 20);
+    }
+
+    #[tokio::test]
+    async fn an_untouched_parameter_still_comes_from_the_preset() {
+        // Where the operator expressed no opinion, the preset decides —
+        // that is the whole point of routing.
+        let base = HarnessProfile::default();
+        let routed = router_with_base(base)
+            .route("please write some code for me")
+            .await;
+        assert_eq!(
+            routed.max_tool_retries,
+            HarnessProfile::coding().max_tool_retries
+        );
     }
 }

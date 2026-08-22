@@ -147,14 +147,18 @@ pub struct StubSpec {
 ///
 /// `task_complete` is the runner's completion signal — it activates the
 /// tool itself once the model has used any tool, then re-prompts up to
-/// three times insisting it be called. The `recall_*` and `tools_*`
-/// families are always advertised to the model regardless of the active
-/// set, so removing their implementations advertises tools that cannot
-/// run.
+/// three times insisting it be called. The `recall_*` family is how
+/// compacted detail is retrieved, and the model cannot load them after
+/// compaction has already dropped what it needs.
+///
+/// `tools_list` and `tools_load` are deliberately *not* here. They are the
+/// discovery mechanism, and `replace` exists precisely to fix the tool set
+/// — there is nothing left to discover. Keeping them measurably hurt:
+/// re-advertising them sent the model exploring instead of calling the
+/// memory tools already in front of it, turning a 22-second scenario into
+/// a 425-second one.
 pub const PROTOCOL_TOOLS: &[&str] = &[
     "task_complete",
-    "tools_list",
-    "tools_load",
     "recall_append",
     "recall_info",
     "recall_peek",
@@ -415,6 +419,7 @@ mod tests {
         let real: Vec<Arc<dyn Tool>> = vec![
             Arc::new(NamedTool("task_complete")),
             Arc::new(NamedTool("recall_search")),
+            Arc::new(NamedTool("tools_load")),
             Arc::new(NamedTool("gmail")),
         ];
         let applied = file.apply(real);
@@ -422,6 +427,11 @@ mod tests {
         assert!(kept.contains(&"task_complete"));
         assert!(kept.contains(&"recall_search"));
         assert!(!kept.contains(&"gmail"), "domain tools are still replaced");
+        assert!(
+            !kept.contains(&"tools_load"),
+            "discovery has nothing to discover once the set is fixed, and offering it \
+             sends the model exploring instead of using what it has"
+        );
     }
 
     #[test]

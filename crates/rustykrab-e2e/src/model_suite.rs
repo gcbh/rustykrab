@@ -380,6 +380,41 @@ pub fn cases() -> Vec<ModelCase> {
             max: 3,
         })
         .expect(Assertion::FinalContainsAll(s(&["17", "sleet"]))),
+        // The scenario above tests the runner's *internal* retry, which the
+        // model never sees. This one exhausts it: max_tool_retries is 2, so
+        // three failures burn the whole budget and the error is surfaced to
+        // the model, which then has to decide to try again itself.
+        ModelCase::new(
+            "model-retries-after-the-runner-gives-up",
+            "When the runner's own retries are exhausted, the model tries again itself",
+        )
+        .with_harness(bounded_harness())
+        .with_num_ctx(TIGHT_NUM_CTX)
+        .with_tool(tool(
+            "weather_lookup",
+            "Get the current weather for a city. Returns temperature in Celsius and conditions.",
+            json!({ "city": { "type": "string", "description": "Name of the city" } }),
+            json!(["city"]),
+            json!([
+                { "type": "err", "message": "upstream weather service timed out",
+                  "kind": "transient" },
+                { "type": "err", "message": "upstream weather service timed out",
+                  "kind": "transient" },
+                { "type": "err", "message": "upstream weather service timed out",
+                  "kind": "transient" },
+                { "type": "ok", "value": { "city": "Reykjavik", "temperature_c": 17,
+                                           "conditions": "sleet" } }
+            ]),
+        ))
+        .ask(
+            "What is the weather in Reykjavik? Use the tool. If it errors, try it once \
+             more before giving up.",
+        )
+        .expect(Assertion::NoRunError)
+        .expect(Assertion::RecoveredFrom {
+            tool: "weather_lookup".into(),
+            then_says: s(&["17", "sleet"]),
+        }),
         ModelCase::new(
             "model-reports-a-permanent-tool-failure",
             "A tool that always fails is reported honestly, without fabrication or looping",
