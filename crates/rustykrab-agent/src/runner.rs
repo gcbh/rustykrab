@@ -91,6 +91,24 @@ const DEFAULT_ACTIVE_TOOLS: &[&str] = &[
     "todo_read",
 ];
 
+/// Tool names to seed into every conversation's active set on top of
+/// [`DEFAULT_ACTIVE_TOOLS`], from `RUSTYKRAB_ACTIVE_TOOLS` (comma
+/// separated). Read once: the environment does not change under a running
+/// daemon, and this is on the path of every turn.
+fn extra_active_tools() -> &'static [String] {
+    static EXTRA: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    EXTRA.get_or_init(|| {
+        std::env::var("RUSTYKRAB_ACTIVE_TOOLS")
+            .map(|raw| {
+                raw.split(',')
+                    .map(|n| n.trim().to_string())
+                    .filter(|n| !n.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default()
+    })
+}
+
 use crate::sandbox::{tool_timeout_secs, Sandbox, SandboxPolicy, DEFAULT_NET_TOOL_TIMEOUT_SECS};
 use crate::trace::{ExecutionTracer, ToolTrace};
 
@@ -150,6 +168,11 @@ fn compaction_context_ceiling() -> usize {
 /// deciding whether a single-shot summarization call will fit. Subtracted
 /// from `effective_context_limit()` to derive the input budget.
 const SUMMARIZER_RESPONSE_RESERVE_TOKENS: usize = 4_096;
+
+/// Floor for a single compaction call's input budget. Chunking history
+/// into pieces smaller than this costs one model call per piece and
+/// summarizes too little context per call to be worth it.
+const MIN_COMPACTION_INPUT_TOKENS: usize = 512;
 
 /// Fraction of `effective_context_limit()` that any single compaction call
 /// may consume as input. Kept well below a regular request's budget
@@ -966,6 +989,14 @@ impl AgentRunner {
         // the filter below.
         self.active_tools
             .activate(conv_id, DEFAULT_ACTIVE_TOOLS.iter().copied());
+        // Names from RUSTYKRAB_ACTIVE_TOOLS are seeded alongside the
+        // defaults. Lazy activation keeps thirty schemas out of the
+        // prompt, but it also means a freshly registered tool is invisible
+        // to the model until something calls `tools_load` — which a
+        // deployment that registered the tool on purpose, or an eval
+        // pinning one scenario to one tool, has no way to arrange.
+        self.active_tools
+            .activate(conv_id, extra_active_tools().iter().map(String::as_str));
         self.active_tools.with_active(conv_id, |version, active| {
             let schemas = self
                 .tools
@@ -2850,8 +2881,20 @@ impl AgentRunner {
         // tool turns, so individual prompt sizes are smaller in practice).
         let ceiling = self.effective_context_limit();
         let ratio = compaction_input_budget_ratio();
-        let input_budget =
-            ((ceiling as f64 * ratio) as usize).saturating_sub(SUMMARIZER_RESPONSE_RESERVE_TOKENS);
+        let ratioed = (ceiling as f64 * ratio) as usize;
+        // The response reserve is a fixed 4096, which is larger than the
+        // whole ratioed budget once the context limit is modest. Subtracting
+        // it flat then yields 0, and an input budget of 0 does not fail —
+        // it sends the recursive path into chunks of nothing, one model call
+        // per fragment. Observed cost: a compaction that should take seconds
+        // ran for 31 minutes.
+        //
+        // Cap the reserve at half the budget it is being taken out of, so
+        // there is always room left to actually put history in.
+        let reserve = SUMMARIZER_RESPONSE_RESERVE_TOKENS.min(ratioed / 2);
+        let input_budget = ratioed
+            .saturating_sub(reserve)
+            .max(MIN_COMPACTION_INPUT_TOKENS);
         let summary_cap_tokens = self.effective_compaction_summary_cap();
         tracing::debug!(
             ceiling,
@@ -5670,5 +5713,49 @@ mod outcome_capture_tests {
     async fn no_sink_configured_is_a_no_op() {
         let (runner, session, mut conv) = make_runner(false);
         assert!(runner.run(&mut conv, &session).await.is_ok());
+    }
+}
+
+#[cfg(test)]
+mod compaction_budget_tests {
+    use super::*;
+
+    /// The budget a compaction call gets, for a given effective context
+    /// limit — mirrors the arithmetic in `compact_history`.
+    fn input_budget_for(ceiling: usize) -> usize {
+        let ratioed = (ceiling as f64 * DEFAULT_COMPACTION_INPUT_BUDGET_RATIO) as usize;
+        let reserve = SUMMARIZER_RESPONSE_RESERVE_TOKENS.min(ratioed / 2);
+        ratioed
+            .saturating_sub(reserve)
+            .max(MIN_COMPACTION_INPUT_TOKENS)
+    }
+
+    #[test]
+    fn a_modest_context_limit_still_leaves_room_for_input() {
+        // A flat 4096 reserve is larger than the whole ratioed budget here.
+        // Subtracting it left 0, and a budget of 0 chunks the history into
+        // pieces of nothing — one model call each.
+        for ceiling in [1_024, 1_536, 4_096, 8_192] {
+            let budget = input_budget_for(ceiling);
+            assert!(
+                budget >= MIN_COMPACTION_INPUT_TOKENS,
+                "ceiling {ceiling} produced an unusable budget of {budget}"
+            );
+            assert!(
+                budget < ceiling,
+                "ceiling {ceiling} produced a budget larger than the window"
+            );
+        }
+    }
+
+    #[test]
+    fn a_large_context_limit_keeps_the_full_response_reserve() {
+        // Where the reserve is affordable, nothing changes.
+        let ceiling = 120_000;
+        let ratioed = (ceiling as f64 * DEFAULT_COMPACTION_INPUT_BUDGET_RATIO) as usize;
+        assert_eq!(
+            input_budget_for(ceiling),
+            ratioed - SUMMARIZER_RESPONSE_RESERVE_TOKENS
+        );
     }
 }
