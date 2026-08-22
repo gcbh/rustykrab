@@ -4181,6 +4181,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustykrab-dream"
+version = "5.1.11"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "rustykrab-core",
+ "rustykrab-store",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "rustykrab-e2e"
 version = "5.1.12"
 dependencies = [
