@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use rustykrab_core::types::ToolSchema;
-use rustykrab_core::{Result, SandboxRequirements, Tool};
+use rustykrab_core::{Result, SandboxRequirements, Tool, ToolError};
 use serde_json::{json, Value};
 use std::time::Duration;
 use tokio::time::timeout;
@@ -263,13 +263,15 @@ impl Tool for ExecTool {
     }
 
     async fn execute(&self, args: Value) -> Result<Value> {
-        let command = args["command"]
-            .as_str()
-            .ok_or_else(|| rustykrab_core::Error::ToolExecution("missing command".into()))?;
+        let command = args["command"].as_str().ok_or_else(|| {
+            rustykrab_core::Error::ToolExecution(ToolError::invalid_input("missing command"))
+        })?;
 
         // Validate command against allowlist
         validate_command(command).map_err(|e| {
-            rustykrab_core::Error::ToolExecution(format!("command rejected: {e}").into())
+            rustykrab_core::Error::ToolExecution(ToolError::invalid_input(format!(
+                "command rejected: {e}"
+            )))
         })?;
 
         let timeout_secs = args["timeout_secs"].as_u64().unwrap_or(30).min(120);
@@ -291,11 +293,13 @@ impl Tool for ExecTool {
         let output = timeout(Duration::from_secs(timeout_secs), future)
             .await
             .map_err(|_| {
-                rustykrab_core::Error::ToolExecution(
-                    format!("command timed out after {timeout_secs}s").into(),
-                )
+                rustykrab_core::Error::ToolExecution(ToolError::timeout(format!(
+                    "command timed out after {timeout_secs}s"
+                )))
             })?
-            .map_err(|e| rustykrab_core::Error::ToolExecution(e.to_string().into()))?;
+            .map_err(|e| {
+                rustykrab_core::Error::ToolExecution(ToolError::transient(e.to_string()))
+            })?;
 
         let stdout = truncate_output(String::from_utf8_lossy(&output.stdout).into_owned());
         let stderr = truncate_output(String::from_utf8_lossy(&output.stderr).into_owned());
@@ -306,5 +310,32 @@ impl Tool for ExecTool {
             "stdout": stdout,
             "stderr": stderr,
         }))
+    }
+}
+
+#[cfg(test)]
+mod error_typing_tests {
+    use super::ExecTool;
+    use rustykrab_core::{Tool, ToolErrorKind};
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn invalid_commands_are_typed_as_invalid_input() {
+        let error = ExecTool::new()
+            .execute(json!({"command": "definitely-not-allowed"}))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.kind(), ToolErrorKind::InvalidInput);
+    }
+
+    #[tokio::test]
+    async fn command_timeouts_are_typed_as_timeout() {
+        let error = ExecTool::new()
+            .execute(json!({"command": "sleep 1", "timeout_secs": 0}))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.kind(), ToolErrorKind::Timeout);
     }
 }

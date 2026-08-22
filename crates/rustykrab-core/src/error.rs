@@ -92,14 +92,12 @@ impl ToolErrorKind {
         }
     }
 
-    /// Whether retrying the *same* call unchanged might succeed. Distinct from
-    /// the runner's retry policy: this is a hint to the model. `InvalidInput`
-    /// and `NotFound` are false because the model must change something first.
+    /// Whether retrying the *same* call unchanged might succeed. Timeouts are
+    /// false because a model must narrow the work or explicitly request a
+    /// longer tool timeout; repeating an unchanged call only burns the same
+    /// timeout again.
     pub fn retryable(&self) -> bool {
-        matches!(
-            self,
-            ToolErrorKind::Timeout | ToolErrorKind::RateLimited | ToolErrorKind::Transient
-        )
+        matches!(self, ToolErrorKind::RateLimited | ToolErrorKind::Transient)
     }
 }
 
