@@ -102,6 +102,17 @@ pub trait MemoryStorage: Send + Sync {
     /// Soft-delete: mark a memory as invalid.
     async fn invalidate(&self, id: Uuid, invalidated_by: Option<Uuid>) -> Result<()>;
 
+    /// Return a soft-deleted memory to the retrievable set.
+    ///
+    /// The inverse of [`MemoryStorage::invalidate`], and what makes a
+    /// promoted consolidation reversible (see `DREAMING.md`). Restores to
+    /// `episodic` rather than to whatever stage the memory held before:
+    /// the prior stage is not recorded, and episodic is the conservative
+    /// choice -- a restored memory re-earns promotion through the normal
+    /// lifecycle rather than being handed back a status it may no longer
+    /// deserve.
+    async fn restore(&self, id: Uuid) -> Result<()>;
+
     // ── Chunk operations ────────────────────────────────────────
 
     /// Store embedding chunks for a memory.
@@ -1145,6 +1156,27 @@ impl MemoryStorage for SqliteMemoryStorage {
         .await?;
         // Tombstoned memories are no longer retrievable; drop their embeddings.
         self.embedding_cache.remove_memory(id);
+        Ok(())
+    }
+
+    async fn restore(&self, id: Uuid) -> Result<()> {
+        let id_str = id.to_string();
+        self.with_conn(move |conn| {
+            conn.execute(
+                "UPDATE memories
+                 SET is_valid = 1,
+                     lifecycle_stage = 'episodic',
+                     invalidated_by = NULL,
+                     invalidated_at = NULL
+                 WHERE id = ?1",
+                params![id_str],
+            )
+            .map_err(storage_err)?;
+            Ok(())
+        })
+        .await?;
+        // The memory is retrievable again, so its embeddings must be
+        // rebuilt; the cache is dropped for the agent on next write.
         Ok(())
     }
 
