@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use rustykrab_core::active_tools::with_session_context;
+use rustykrab_core::retrieval_log::RetrievalLog;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
@@ -37,6 +39,9 @@ pub struct HybridMemoryBackend {
     agent_id: Uuid,
     session_id: Uuid,
     user_id: Option<Uuid>,
+    /// Records which memories were handed to the model, so a later outcome
+    /// can be attributed to them. See `DREAMING.md`.
+    retrieval_log: Option<RetrievalLog>,
 }
 
 impl HybridMemoryBackend {
@@ -46,12 +51,19 @@ impl HybridMemoryBackend {
             agent_id,
             session_id,
             user_id: None,
+            retrieval_log: None,
         }
     }
 
     /// Set the user ID for scoped retrieval.
     pub fn with_user_id(mut self, user_id: Uuid) -> Self {
         self.user_id = Some(user_id);
+        self
+    }
+
+    /// Record surfaced memories into a shared log for outcome attribution.
+    pub fn with_retrieval_log(mut self, log: RetrievalLog) -> Self {
+        self.retrieval_log = Some(log);
         self
     }
 
@@ -156,6 +168,24 @@ impl HybridMemoryBackend {
             items.push(item);
             if items.len() >= limit {
                 break;
+            }
+        }
+
+        // Attribution: log only what survived filtering and the limit —
+        // a memory that was recalled but never handed to the model did not
+        // contribute to whatever happens next. The conversation id comes
+        // from the enclosing runner scope; outside one there is nothing to
+        // attribute to, so recording is skipped.
+        if let Some(log) = self.retrieval_log.as_ref() {
+            let surfaced: Vec<Uuid> = items
+                .iter()
+                .filter_map(|i| i.get("id").and_then(|v| v.as_str()))
+                .filter_map(|s| Uuid::parse_str(s).ok())
+                .collect();
+            if !surfaced.is_empty() {
+                if let Some(conversation_id) = with_session_context(|ctx| ctx.conversation_id) {
+                    log.record(conversation_id, surfaced);
+                }
             }
         }
 

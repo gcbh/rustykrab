@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.1.19] - 2026-08-22
+
+- Dreaming P0 (6/6): wire outcome capture into the gateway, memory, and CLI (#508)
+
 ## [5.1.18] - 2026-08-22
 
 - Dreaming P0 (5/6): record how each run went, and to what it is attributable (#507)

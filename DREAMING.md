@@ -5,11 +5,12 @@ off-cycle process -- "dreaming" -- that continuously improves how the system
 executes by reviewing what has already happened and reconciling it into durable
 knowledge (memory and, eventually, skills).
 
-Status: **design / proposal.** Nothing here is implemented. The intent is to
-agree on the architecture, the safety boundaries, the *objective* being
-optimized, and the build order before writing code. The
-[Revision history](#revision-history) records how the design evolved so the
-discarded reasoning survives.
+Status: **Phase 0 implemented; Phases 1-3 proposed.** Outcome instrumentation
+and credit assignment are in the tree, opt-in behind
+`RUSTYKRAB_OUTCOME_CAPTURE` and observational only -- see
+[Phase 0 as built](#phase-0-as-built). Everything downstream of that is still
+design. The [Revision history](#revision-history) records how the design
+evolved so the discarded reasoning survives.
 
 ## Motivation
 
@@ -391,13 +392,54 @@ surface, the skill tier is theater and should be cut from scope honestly.
 
 | Phase | What | Risk | Gate to proceed |
 |---|---|---|---|
-| **0 -- Instrument outcomes (Monitor)** | Extend `ExecutionTracer` to log tool/skill invocations linked to outcome signals; add `[outcome]` to `SKILL.md`. Pure data collection. | None | Outcome data flowing for at least verifiable-signal skills. |
+| **0 -- Instrument outcomes (Monitor)** | *(implemented)* Outcome records + credit assignment; `[outcome]` in `SKILL.md`. Pure data collection, opt-in via `RUSTYKRAB_OUTCOME_CAPTURE`. | None | Outcome data flowing for at least verifiable-signal skills. |
 | **1 -- Downtime read-only analysis (Analyze)** | Trigger + queue + idle-gated worker running *report-only* jobs; abort-and-requeue on activity. | None (no writes) | Reports show real, actionable patterns. |
 | **2 -- Memory mutation (Plan+Execute)** | Consolidation that writes memory via stage-then-promote + manifest + probation-window rollback; low gain, rate-limited. | Medium | Consolidations measurably improve retrieval and are reliably reversible. |
 | **3 -- Skill improvement** | Per-skill optimization from logged outcomes; proposal-only with a review surface. | Higher | Per-skill measurable outcomes + a working review/promotion surface. |
 
 Notably **not** required, thanks to staging + soft-delete: a DB snapshot engine,
 a job-state machine for pausing, conversation versioning, or a preemption bus.
+
+## Phase 0 as built
+
+Shipped and opt-in behind `RUSTYKRAB_OUTCOME_CAPTURE` (off by default).
+
+- **`rustykrab-core::outcome`** — the shared vocabulary: `SignalClass`
+  (`Verifiable` > `Explicit` > `Implicit` > `Judge`, with `is_ground_truth()`
+  gating what may justify a costly change), `OutcomeVerdict`,
+  `Attribution`/`AttributionKind`, `ExecutionCounters`, `OutcomeRecord`,
+  `OutcomeTally`, and the `OutcomeSink` trait.
+- **`rustykrab-core::retrieval_log`** — the missing join. The retrieval path
+  knew *what was recalled* and the run-completion path knew *how the turn
+  went*, with nothing connecting them. `RetrievalLog` connects them: the
+  memory backend records the ids it actually hands to the model, and the
+  runner drains them when the run ends.
+- **`rustykrab-store::outcomes`** — `outcome_records` + `outcome_attributions`,
+  written once and never updated, pruned at 50k rows. Tallies are derived by
+  `GROUP BY` on read, with a `ground_truth_only` filter so proxy signals
+  cannot launder a verifiable failure.
+- **`SKILL.md` `[outcome]` block** — `success`, optional `checks`, and
+  `signal`. `SkillMd::is_optimizable()` implements the freeze rule; an
+  unset or unparseable `signal` degrades to `Implicit` rather than
+  something stronger, so an unclear declaration buys no authority.
+- **`AgentRunner::capture_outcome`** — the per-run tracer was hoisted from
+  `run_inner` to the `run`/`run_streaming` wrappers so capture sees the run's
+  traces regardless of which of the inner loop's ~10 exit paths fired.
+  Best-effort by construction: a failing sink is logged and swallowed.
+
+Two deliberate deviations from the plan above:
+
+1. **`harmful_count` on `Memory` is deferred to Phase 2.** `Memory` has no
+   constructor, so adding a field touches every struct literal plus four
+   hand-numbered placeholder lists in `upsert_memory`, and
+   `SqliteMemoryStorage` has no additive-migration phase to extend. Since
+   tallies are *derived* from records rather than incremented in place, the
+   column buys nothing until something mutates memory — which is Phase 2.
+2. **Verdicts are `Implicit` only.** Nothing yet checks a post-condition or
+   captures an explicit correction, so every record carries behavioural
+   evidence at low confidence and `is_actionable()` returns false for all of
+   them. That is the honest state: Phase 1 reports can be built on this,
+   Phase 2/3 promotion cannot.
 
 ## What downtime does and does not solve
 
