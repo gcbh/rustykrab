@@ -80,17 +80,73 @@ impl Tool for MemorySearchTool {
         let limit = args["limit"].as_u64().unwrap_or(10) as usize;
         let session_id = args["session_id"].as_str();
 
-        let results = self
+        // The backend already answers with `{ results, count }` (plus a
+        // `session_scope` note when it widened the search). Wrapping that
+        // again nested the real payload one level down and — because the
+        // response is an object, not an array — made `count` 0 on every
+        // single call.
+        //
+        // The model reads that count. `{"count": 0, "results": {"count": 6,
+        // ...}}` says "nothing found" in the field a reader checks first,
+        // while six memories sit inside it, which is a good way to make
+        // recall look unreliable when retrieval worked perfectly.
+        Ok(self
             .backend
             .search(query, &tags, limit, session_id)
             .await
-            .map_err(|e| rustykrab_core::Error::ToolExecution(e.to_string().into()))?;
+            .map_err(|e| rustykrab_core::Error::ToolExecution(e.to_string().into()))?)
+    }
+}
 
-        let count = results.as_array().map(|a| a.len()).unwrap_or(0);
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use std::sync::Arc;
 
-        Ok(json!({
-            "results": results,
-            "count": count,
-        }))
+    struct SixResults;
+
+    #[async_trait]
+    impl MemoryBackend for SixResults {
+        async fn search(
+            &self,
+            _query: &str,
+            _tags: &[String],
+            _limit: usize,
+            _session_id: Option<&str>,
+        ) -> rustykrab_core::Result<Value> {
+            Ok(json!({
+                "results": (0..6).map(|i| json!({ "content": format!("memory {i}") }))
+                    .collect::<Vec<_>>(),
+                "count": 6,
+            }))
+        }
+        async fn get(&self, _: &str) -> rustykrab_core::Result<Value> {
+            Ok(json!({}))
+        }
+        async fn save(&self, _: &str, _: &[String]) -> rustykrab_core::Result<Value> {
+            Ok(json!({}))
+        }
+        async fn delete(&self, _: &str) -> rustykrab_core::Result<Value> {
+            Ok(json!({}))
+        }
+        async fn list(&self) -> rustykrab_core::Result<Value> {
+            Ok(json!({}))
+        }
+    }
+
+    #[tokio::test]
+    async fn reports_the_count_the_backend_found() {
+        // The model reads `count` first. Reporting 0 while six memories sit
+        // nested inside says "nothing found" about a search that worked.
+        let tool = MemorySearchTool::new(Arc::new(SixResults));
+        let out = tool.execute(json!({ "query": "kettle" })).await.unwrap();
+
+        assert_eq!(out["count"], 6);
+        assert_eq!(
+            out["results"].as_array().map(|a| a.len()),
+            Some(6),
+            "results must be the array itself, not an object wrapping one"
+        );
     }
 }
