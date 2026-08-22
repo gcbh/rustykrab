@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.1.22] - 2026-08-22
+
+- fix(agent): stop retrying deterministic exec failures (#514)
+
 ## [5.1.21] - 2026-08-22
 
 - Dreaming P1 (3/3): run analysis in downtime, yielding to real work (#511)

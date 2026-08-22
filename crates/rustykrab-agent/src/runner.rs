@@ -3149,6 +3149,14 @@ mod error_output_tests {
     }
 
     #[test]
+    fn timeouts_require_the_model_to_change_approach() {
+        let e = Error::ToolExecution(ToolError::timeout("command timed out"));
+        let (output, _) = tool_error_output(&e);
+        assert_eq!(output["error_kind"], "timeout");
+        assert_eq!(output["retryable"], false);
+    }
+
+    #[test]
     fn non_tool_error_variants_are_categorized() {
         assert_eq!(
             Error::Auth("x".into()).kind(),
@@ -3211,9 +3219,26 @@ async fn execute_with_watchdog(
 
 /// Retry a tool call up to `max_retries` times with exponential backoff.
 ///
-/// Auth errors (permission denied, unknown tool) are not retried since
-/// they will fail deterministically. Only transient errors (timeouts,
-/// execution failures) are retried.
+/// Invalid input, permission failures, and timeouts require the model to
+/// change its approach rather than repeating the exact same call. Preserve
+/// the existing retry behavior for other failures, which may be transient.
+fn should_retry_unchanged_tool_call(error: &Error) -> bool {
+    if matches!(error, Error::Auth(_)) {
+        return false;
+    }
+
+    !matches!(
+        error,
+        Error::ToolExecution(tool_error)
+            if matches!(
+                tool_error.kind,
+                ToolErrorKind::InvalidInput
+                    | ToolErrorKind::PermissionDenied
+                    | ToolErrorKind::Timeout
+            )
+    )
+}
+
 async fn execute_with_retries(
     call: &ToolCall,
     tools: &ToolIndex,
@@ -3227,19 +3252,8 @@ async fn execute_with_retries(
         match execute_single_tool(call, tools, sandbox, capabilities, session_id).await {
             Ok(result) => return Ok(result),
             Err(e) => {
-                // Don't retry auth errors — they'll fail the same way every time.
-                if matches!(e, Error::Auth(_)) {
+                if !should_retry_unchanged_tool_call(&e) {
                     return Err(e);
-                }
-                // Don't retry deterministic tool errors — but allow
-                // NotFound one retry since the agent may correct a typo.
-                if let Error::ToolExecution(ref te) = e {
-                    if matches!(
-                        te.kind,
-                        ToolErrorKind::InvalidInput | ToolErrorKind::PermissionDenied
-                    ) {
-                        return Err(e);
-                    }
                 }
                 tracing::warn!(
                     tool = call.name,
@@ -3259,6 +3273,34 @@ async fn execute_with_retries(
     }
     Err(last_err
         .unwrap_or_else(|| rustykrab_core::Error::ToolExecution("all retries exhausted".into())))
+}
+
+#[cfg(test)]
+mod retry_policy_tests {
+    use super::should_retry_unchanged_tool_call;
+    use rustykrab_core::{Error, ToolError};
+
+    #[test]
+    fn avoids_retries_that_require_a_changed_call() {
+        assert!(should_retry_unchanged_tool_call(&Error::ToolExecution(
+            ToolError::transient("connection reset")
+        )));
+        assert!(should_retry_unchanged_tool_call(&Error::ToolExecution(
+            ToolError::rate_limited("slow down")
+        )));
+        assert!(!should_retry_unchanged_tool_call(&Error::ToolExecution(
+            ToolError::timeout("command timed out")
+        )));
+        assert!(!should_retry_unchanged_tool_call(&Error::ToolExecution(
+            ToolError::invalid_input("bad command")
+        )));
+        assert!(should_retry_unchanged_tool_call(&Error::Internal(
+            "uncategorized execution failure".into()
+        )));
+        assert!(!should_retry_unchanged_tool_call(&Error::Auth(
+            "permission denied".into()
+        )));
+    }
 }
 
 /// Wrap string values in a JSON `Value` with adversarial-content markers.
@@ -3391,13 +3433,10 @@ async fn execute_single_tool(
     })
     .await
     .map_err(|_| {
-        Error::ToolExecution(
-            format!(
-                "tool '{}' exceeded sandbox timeout of {}s",
-                call.name, policy.timeout_secs
-            )
-            .into(),
-        )
+        Error::ToolExecution(rustykrab_core::ToolError::timeout(format!(
+            "tool '{}' exceeded sandbox timeout of {}s",
+            call.name, policy.timeout_secs
+        )))
     })??;
 
     // Pull any tool-attached images out before fencing — fencing rewrites
