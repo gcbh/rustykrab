@@ -231,6 +231,12 @@ impl AppState {
         self
     }
 
+    /// Set the router, or leave static-profile mode in place when `None`.
+    pub fn with_harness_router_opt(mut self, router: Option<Arc<HarnessRouter>>) -> Self {
+        self.harness_router = router;
+        self
+    }
+
     /// Set the skill registry.
     pub fn with_skill_registry(mut self, registry: Arc<SkillRegistry>) -> Self {
         self.skill_registry = registry;

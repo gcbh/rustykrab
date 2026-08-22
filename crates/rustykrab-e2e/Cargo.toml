@@ -23,3 +23,4 @@ tempfile = "3"
 # the tables the plan specifies (secret_versions, secret_audit,
 # credential_requests) and not just on what the REST API reveals.
 rusqlite = { version = "0.34", features = ["bundled"] }
+uuid.workspace = true
