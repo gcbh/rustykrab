@@ -15,6 +15,7 @@ pub mod crypto;
 pub mod error;
 pub mod model;
 pub mod orchestration;
+pub mod outcome;
 pub mod prompt_trace;
 pub mod recall;
 pub mod schema_validate;
@@ -31,6 +32,10 @@ pub use capability::{is_subagent_tool, Capability, CapabilitySet, SUBAGENT_TOOL_
 pub use error::{Error, Result, ToolError, ToolErrorKind};
 pub use model::ModelProvider;
 pub use orchestration::{OrchestrationConfig, RecursiveCall, TaskComplexity, VoteResult};
+pub use outcome::{
+    classify_run, Attribution, AttributionKind, ExecutionCounters, OutcomeRecord, OutcomeSink,
+    OutcomeTally, OutcomeVerdict, SignalClass,
+};
 pub use recall::RecallStore;
 pub use schema_validate::validate_tool_args;
 pub use session::Session;
