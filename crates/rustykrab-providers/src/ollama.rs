@@ -210,6 +210,11 @@ pub struct OllamaProvider {
     /// serve, and as the client-side prompt-trimming budget when `num_ctx`
     /// has been explicitly set to defer to the server.
     detected_ctx: Option<u32>,
+    /// What Ollama itself reports the model can do, from `/api/show`.
+    /// `None` when it could not be read (server unreachable, or a release
+    /// predating the `capabilities` field), in which case the tag-matching
+    /// heuristics stand in.
+    detected_caps: Option<ModelCapabilities>,
     /// Fingerprint of the tool block sent on the previous request, so a
     /// change can be reported.  See [`OllamaProvider::note_tool_block`].
     /// `0` means "nothing sent yet".
@@ -236,6 +241,7 @@ impl OllamaProvider {
             model: model.into(),
             config: OllamaConfig::default(),
             detected_ctx: None,
+            detected_caps: None,
             last_tool_fingerprint: AtomicU64::new(0),
         }
     }
@@ -272,11 +278,12 @@ impl OllamaProvider {
     }
 
     /// Whether `think` will be sent, and with what value. An explicit
-    /// `config.think` wins; otherwise the model tag decides.
+    /// `config.think` wins, then `OLLAMA_THINK`, then what Ollama reports
+    /// for the model, and only then the model-tag heuristic.
     pub fn resolved_think(&self) -> bool {
         self.config
             .think
-            .unwrap_or_else(|| think_support(&self.model))
+            .unwrap_or_else(|| think_support(&self.model, self.detected_caps))
     }
 
     /// Effective context window used for client-side prompt trimming.
@@ -291,12 +298,13 @@ impl OllamaProvider {
     /// unfamiliar (e.g. an architecture we don't recognize).  Network and
     /// HTTP errors are propagated so the caller can decide how to react.
     pub async fn detect_context_window(&self) -> Result<Option<u32>> {
-        Ok(self.detect_model_shape().await?.0)
+        Ok(self.detect_model_shape().await?.ctx)
     }
 
-    /// Query `/api/show` for both the model's native context length and the
-    /// attention geometry needed to size its KV cache.
-    async fn detect_model_shape(&self) -> Result<(Option<u32>, Option<KvGeometry>)> {
+    /// Query `/api/show` for the model's native context length, the
+    /// attention geometry needed to size its KV cache, and the capabilities
+    /// Ollama reports for it.
+    async fn detect_model_shape(&self) -> Result<ModelShape> {
         let url = format!("{}/api/show", self.base_url);
         let resp = self
             .client
@@ -315,10 +323,11 @@ impl OllamaProvider {
         let raw: serde_json::Value = resp.json().await.map_err(|e| {
             Error::ModelProvider(format!("failed to parse /api/show response: {e}"))
         })?;
-        Ok((
-            parse_context_length_from_show(&raw),
-            parse_kv_geometry_from_show(&raw),
-        ))
+        Ok(ModelShape {
+            ctx: parse_context_length_from_show(&raw),
+            geometry: parse_kv_geometry_from_show(&raw),
+            caps: parse_capabilities_from_show(&raw),
+        })
     }
 
     /// Report what the pinned window will cost in KV cache.
@@ -356,8 +365,12 @@ impl OllamaProvider {
     /// is logged — startup must not fail just because Ollama is momentarily
     /// unreachable.
     pub async fn with_detected_context_window(mut self) -> Self {
-        let (detected, geometry) = match self.detect_model_shape().await {
-            Ok(pair) => pair,
+        let ModelShape {
+            ctx: detected,
+            geometry,
+            caps,
+        } = match self.detect_model_shape().await {
+            Ok(shape) => shape,
             Err(e) => {
                 tracing::warn!(
                     model = %self.model,
@@ -413,6 +426,20 @@ impl OllamaProvider {
             None => tracing::debug!(
                 model = %self.model,
                 "could not read attention geometry from /api/show; skipping KV cache estimate"
+            ),
+        }
+
+        self.detected_caps = caps;
+        match caps {
+            Some(caps) => tracing::info!(
+                model = %self.model,
+                vision = caps.vision,
+                thinking = caps.thinking,
+                "capabilities reported by Ollama"
+            ),
+            None => tracing::debug!(
+                model = %self.model,
+                "Ollama reported no capability list; falling back to model-tag heuristics"
             ),
         }
         self
@@ -897,7 +924,7 @@ impl ModelProvider for OllamaProvider {
     }
 
     fn supports_vision(&self) -> bool {
-        vision_support(&self.model)
+        vision_support(&self.model, self.detected_caps)
     }
 
     async fn chat(&self, messages: &[Message], tools: &[ToolSchema]) -> Result<ModelResponse> {
@@ -1555,6 +1582,44 @@ fn empty_response_error(
     ))
 }
 
+/// What Ollama reports a model can do, from `/api/show`'s `capabilities`.
+///
+/// Ollama knows this authoritatively — it is derived from the model's own
+/// files rather than guessed from its name — so it beats any tag-matching
+/// heuristic. Notably it distinguishes builds that share a tag prefix,
+/// which a substring match cannot: `qwen3.8:27b-mlx` reports `vision`
+/// while the plain `qwen3.8` family match says it has none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ModelCapabilities {
+    pub vision: bool,
+    pub thinking: bool,
+}
+
+/// Everything worth reading out of one `/api/show` call.
+#[derive(Debug, Clone, Copy, Default)]
+struct ModelShape {
+    ctx: Option<u32>,
+    geometry: Option<KvGeometry>,
+    caps: Option<ModelCapabilities>,
+}
+
+/// Pull the reported capability list out of an `/api/show` response.
+/// Returns `None` when the field is absent, so the caller can tell
+/// "Ollama says this model has no vision" apart from "Ollama did not say".
+fn parse_capabilities_from_show(raw: &serde_json::Value) -> Option<ModelCapabilities> {
+    let listed = raw.get("capabilities")?.as_array()?;
+    let has = |name: &str| {
+        listed
+            .iter()
+            .filter_map(|c| c.as_str())
+            .any(|c| c.eq_ignore_ascii_case(name))
+    };
+    Some(ModelCapabilities {
+        vision: has("vision"),
+        thinking: has("thinking"),
+    })
+}
+
 /// Attention geometry needed to size a model's KV cache, read from
 /// `/api/show`'s `model_info` (which surfaces the GGUF metadata).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1664,38 +1729,45 @@ fn parse_context_length_from_show(raw: &serde_json::Value) -> Option<u32> {
 /// Decide whether the configured Ollama model can accept image input.
 ///
 /// Vision is a per-model property in Ollama (the same provider serves both
-/// text-only and multimodal models), so we key off the model tag. The
-/// `OLLAMA_VISION` env var overrides the heuristic: `true`/`1`/`on` force it
-/// on, `false`/`0`/`off` force it off, and `auto` (the default) falls back to
-/// `model_supports_vision`.
-fn vision_support(model: &str) -> bool {
-    match std::env::var("OLLAMA_VISION").ok().as_deref() {
-        Some(v) => match v.trim().to_ascii_lowercase().as_str() {
-            "true" | "1" | "on" | "yes" => true,
-            "false" | "0" | "off" | "no" => false,
-            // "auto" or anything unrecognized: fall through to the heuristic.
-            _ => model_supports_vision(model),
-        },
-        None => model_supports_vision(model),
+/// text-only and multimodal models). Resolution order, most to least
+/// authoritative: the `OLLAMA_VISION` env var (`true`/`1`/`on` force it on,
+/// `false`/`0`/`off` force it off, `auto` defers), then the capability list
+/// Ollama reports for the model, then the `model_supports_vision` tag
+/// heuristic for servers that report nothing.
+fn vision_support(model: &str, reported: Option<ModelCapabilities>) -> bool {
+    capability_override("OLLAMA_VISION")
+        .or_else(|| reported.map(|c| c.vision))
+        .unwrap_or_else(|| model_supports_vision(model))
+}
+
+/// Read a `true`/`false`/`auto` capability override from the environment.
+/// `None` means "not set, or set to auto" — defer to whatever comes next in
+/// the resolution order.
+fn capability_override(var: &str) -> Option<bool> {
+    match std::env::var(var)
+        .ok()?
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "true" | "1" | "on" | "yes" => Some(true),
+        "false" | "0" | "off" | "no" => Some(false),
+        // "auto" or anything unrecognized: defer.
+        _ => None,
     }
 }
 
 /// Decide whether to ask the configured Ollama model to think.
 ///
 /// Ollama returns a 400 for `think: true` against a model that has no
-/// thinking capability, so this cannot be sent unconditionally. The
-/// `OLLAMA_THINK` env var overrides the heuristic with the same
-/// `true`/`false`/`auto` vocabulary as `OLLAMA_VISION`.
-fn think_support(model: &str) -> bool {
-    match std::env::var("OLLAMA_THINK").ok().as_deref() {
-        Some(v) => match v.trim().to_ascii_lowercase().as_str() {
-            "true" | "1" | "on" | "yes" => true,
-            "false" | "0" | "off" | "no" => false,
-            // "auto" or anything unrecognized: fall through to the heuristic.
-            _ => model_supports_thinking(model),
-        },
-        None => model_supports_thinking(model),
-    }
+/// thinking capability, so this cannot be sent unconditionally. Resolved
+/// the same way as vision: `OLLAMA_THINK` first (same `true`/`false`/`auto`
+/// vocabulary as `OLLAMA_VISION`), then Ollama's reported capabilities,
+/// then the tag heuristic.
+fn think_support(model: &str, reported: Option<ModelCapabilities>) -> bool {
+    capability_override("OLLAMA_THINK")
+        .or_else(|| reported.map(|c| c.thinking))
+        .unwrap_or_else(|| model_supports_thinking(model))
 }
 
 /// Heuristic match against known thinking-capable Ollama model families.
@@ -2283,6 +2355,156 @@ mod tests {
         assert!(!is_empty_generation("", Some(1))); // count without text
     }
 
+    // ---- Reported capabilities -------------------------------------------
+
+    /// Run `f` with `var` set to `value` (or removed when `None`).
+    /// `std::env` is process-global and `cargo test` is multi-threaded, so
+    /// these serialise on one mutex and restore the prior value on the way
+    /// out.
+    fn with_env<T>(var: &str, value: Option<&str>, f: impl FnOnce() -> T) -> T {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved = std::env::var(var).ok();
+        // SAFETY: all writers of these vars hold ENV_LOCK for the duration.
+        unsafe {
+            match value {
+                Some(v) => std::env::set_var(var, v),
+                None => std::env::remove_var(var),
+            }
+        }
+        let out = f();
+        unsafe {
+            match saved {
+                Some(v) => std::env::set_var(var, v),
+                None => std::env::remove_var(var),
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn capabilities_are_read_from_show() {
+        let caps = parse_capabilities_from_show(&serde_json::json!({
+            "capabilities": ["completion", "vision", "tools", "thinking"]
+        }))
+        .expect("a capability list must parse");
+        assert!(caps.vision);
+        assert!(caps.thinking);
+
+        let caps = parse_capabilities_from_show(&serde_json::json!({
+            "capabilities": ["completion", "tools", "thinking"]
+        }))
+        .expect("a capability list must parse");
+        assert!(!caps.vision);
+        assert!(caps.thinking);
+    }
+
+    /// An Ollama release predating `capabilities` must be distinguishable
+    /// from one reporting no vision, so the heuristic can stand in.
+    #[test]
+    fn absent_capability_list_is_none_not_empty() {
+        assert!(parse_capabilities_from_show(&serde_json::json!({ "model_info": {} })).is_none());
+    }
+
+    /// The two real cases that motivated reading capabilities at all. Both
+    /// tags are misclassified by the substring heuristic, in opposite
+    /// directions — verified against Ollama 0.32.15.
+    #[test]
+    fn reported_vision_overrules_the_tag_heuristic_both_ways() {
+        with_env("OLLAMA_VISION", None, || {
+            // qwen3.8:27b-mlx accepts images; the heuristic says it does not.
+            let seen = ModelCapabilities {
+                vision: true,
+                thinking: true,
+            };
+            assert!(!model_supports_vision("qwen3.8:27b-mlx"));
+            assert!(vision_support("qwen3.8:27b-mlx", Some(seen)));
+
+            // The other direction, which is why extending the family list
+            // would not have been enough: a build can report *less* than
+            // its family implies. `gemma4:26b-mlx` rejects images with
+            // "this model does not support image input" while the `gemma4`
+            // family match says it accepts them. (Not a deployed model —
+            // it is the cheapest reproduction of the false positive.)
+            let seen = ModelCapabilities {
+                vision: false,
+                thinking: true,
+            };
+            assert!(model_supports_vision("gemma4:26b-mlx"));
+            assert!(!vision_support("gemma4:26b-mlx", Some(seen)));
+        });
+    }
+
+    /// The supported `gemma4:26b` build is not affected by any of this:
+    /// what Ollama reports and what the tag heuristic concludes already
+    /// agree, so reading capabilities changes nothing for it. Asserted so
+    /// the fix cannot start moving the default model's behaviour.
+    #[test]
+    fn supported_gemma4_behaviour_is_unchanged() {
+        // Exactly what `/api/show` returns for gemma4:26b on Ollama 0.32.15.
+        let reported = ModelCapabilities {
+            vision: true,
+            thinking: true,
+        };
+        with_env("OLLAMA_VISION", None, || {
+            assert_eq!(
+                vision_support("gemma4:26b", Some(reported)),
+                model_supports_vision("gemma4:26b")
+            );
+            assert!(vision_support("gemma4:26b", Some(reported)));
+        });
+        with_env("OLLAMA_THINK", None, || {
+            assert_eq!(
+                think_support("gemma4:26b", Some(reported)),
+                model_supports_thinking("gemma4:26b")
+            );
+            assert!(think_support("gemma4:26b", Some(reported)));
+        });
+    }
+
+    #[test]
+    fn tag_heuristic_stands_in_when_nothing_is_reported() {
+        with_env("OLLAMA_VISION", None, || {
+            assert!(vision_support("gemma4:26b", None));
+            assert!(!vision_support("llama3.1:8b", None));
+        });
+    }
+
+    #[test]
+    fn env_override_beats_reported_capabilities() {
+        let no_vision = ModelCapabilities {
+            vision: false,
+            thinking: false,
+        };
+        with_env("OLLAMA_VISION", Some("true"), || {
+            assert!(vision_support("gemma4:26b-mlx", Some(no_vision)));
+        });
+        let vision = ModelCapabilities {
+            vision: true,
+            thinking: true,
+        };
+        with_env("OLLAMA_VISION", Some("false"), || {
+            assert!(!vision_support("qwen3.8:27b-mlx", Some(vision)));
+        });
+        // "auto" defers to the reported list.
+        with_env("OLLAMA_VISION", Some("auto"), || {
+            assert!(vision_support("gemma4:26b-mlx", Some(vision)));
+        });
+    }
+
+    #[test]
+    fn reported_thinking_resolves_the_same_way() {
+        with_env("OLLAMA_THINK", None, || {
+            let no_think = ModelCapabilities {
+                vision: false,
+                thinking: false,
+            };
+            assert!(model_supports_thinking("qwen3.8:27b-mlx"));
+            assert!(!think_support("qwen3.8:27b-mlx", Some(no_think)));
+            assert!(think_support("qwen3.8:27b-mlx", None));
+        });
+    }
+
     // ---- Live tests against a real Ollama daemon -------------------------
     //
     // Ignored by default: they need a running Ollama and the model named by
@@ -2395,6 +2617,76 @@ mod tests {
             .chat(&msgs, &[])
             .await
             .expect("a history ending in a user turn must survive trimming");
+    }
+
+    /// The point of reading capabilities: whether an image reaches the
+    /// model must follow what Ollama says the model can do.
+    ///
+    /// The agent gates images on `supports_vision()` before they ever reach
+    /// the provider (`MessageContent::from_parts`), so this drives both
+    /// halves through that gate rather than around it.
+    ///
+    /// Skips when the server reports no capability list at all (Ollama
+    /// releases predating the field), since there is then nothing to check.
+    #[tokio::test]
+    #[ignore = "requires a live Ollama daemon"]
+    async fn live_images_follow_the_reported_vision_capability() {
+        use rustykrab_core::types::{ContentBlock, ContentPart};
+
+        let provider = live_provider().with_detected_context_window().await;
+        let Some(caps) = provider.detected_caps else {
+            eprintln!("server reported no capabilities; nothing to verify");
+            return;
+        };
+        assert_eq!(
+            provider.supports_vision(),
+            caps.vision,
+            "the provider must honour what Ollama reports"
+        );
+
+        // 8x8 solid red PNG.
+        const RED_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAIAAABLbSncAAAAEklEQVR4nGP4\
+                                   z8CAFWEXHbQSACj/P8Fu7N9hAAAAAElFTkSuQmCC";
+        let red_png = {
+            use base64::engine::general_purpose::STANDARD;
+            use base64::Engine;
+            STANDARD
+                .decode(RED_PNG_B64.replace(char::is_whitespace, ""))
+                .expect("the fixture is valid base64")
+        };
+
+        let parts = vec![
+            ContentPart::Text {
+                text: "What is in this image? Answer in one word.".to_string(),
+            },
+            ContentPart::Image {
+                media_type: "image/png".to_string(),
+                data: red_png,
+            },
+        ];
+        let content = MessageContent::from_parts(&parts, provider.supports_vision());
+        let carries_image = matches!(&content, MessageContent::MultiPart(blocks)
+            if blocks.iter().any(|b| matches!(b, ContentBlock::Image { .. })));
+        assert_eq!(
+            carries_image, caps.vision,
+            "the image must survive the gate for a vision model and be dropped otherwise"
+        );
+
+        let msg = Message {
+            id: Uuid::new_v4(),
+            role: Role::User,
+            content,
+            created_at: Utc::now(),
+            agent_version: None,
+        };
+
+        // Either way the request must go through: with the image for a model
+        // that can see, without it for one that cannot. Before capabilities
+        // were read, qwen3.8:27b-mlx silently lost every image a user sent.
+        provider
+            .chat(&[msg], &[])
+            .await
+            .expect("the gated request must be accepted by the model");
     }
 
     /// KNOWN LIMITATION, asserted so it cannot regress silently.
