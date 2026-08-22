@@ -4097,7 +4097,7 @@ checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
 
 [[package]]
 name = "rustykrab-agent"
-version = "5.1.12"
+version = "5.1.18"
 dependencies = [
  "async-trait",
  "chrono",
@@ -4114,7 +4114,7 @@ dependencies = [
 
 [[package]]
 name = "rustykrab-channels"
-version = "5.1.12"
+version = "5.1.18"
 dependencies = [
  "async-trait",
  "chrono",
@@ -4135,7 +4135,7 @@ dependencies = [
 
 [[package]]
 name = "rustykrab-cli"
-version = "5.1.12"
+version = "5.1.18"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4168,7 +4168,7 @@ dependencies = [
 
 [[package]]
 name = "rustykrab-core"
-version = "5.1.12"
+version = "5.1.18"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -4181,8 +4181,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustykrab-credeval"
+version = "5.1.18"
+dependencies = [
+ "anyhow",
+ "axum",
+ "reqwest 0.13.3",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
+]
+
+[[package]]
 name = "rustykrab-e2e"
-version = "5.1.12"
+version = "5.1.18"
 dependencies = [
  "anyhow",
  "reqwest 0.13.3",
@@ -4197,7 +4212,7 @@ dependencies = [
 
 [[package]]
 name = "rustykrab-gateway"
-version = "5.1.12"
+version = "5.1.18"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -4224,7 +4239,7 @@ dependencies = [
 
 [[package]]
 name = "rustykrab-memory"
-version = "5.1.12"
+version = "5.1.18"
 dependencies = [
  "async-trait",
  "chrono",
@@ -4245,7 +4260,7 @@ dependencies = [
 
 [[package]]
 name = "rustykrab-providers"
-version = "5.1.12"
+version = "5.1.18"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -4263,7 +4278,7 @@ dependencies = [
 
 [[package]]
 name = "rustykrab-skills"
-version = "5.1.12"
+version = "5.1.18"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4279,7 +4294,7 @@ dependencies = [
 
 [[package]]
 name = "rustykrab-store"
-version = "5.1.12"
+version = "5.1.18"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -4304,7 +4319,7 @@ dependencies = [
 
 [[package]]
 name = "rustykrab-tools"
-version = "5.1.12"
+version = "5.1.18"
 dependencies = [
  "async-imap",
  "async-trait",

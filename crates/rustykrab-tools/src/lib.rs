@@ -88,6 +88,7 @@ mod wiki;
 
 // Credentials (from main)
 mod credential_read;
+mod credential_request;
 mod credential_write;
 
 // Skill tools
@@ -186,6 +187,7 @@ pub use wiki::WikiTool;
 
 // Credentials
 pub use credential_read::CredentialReadTool;
+pub use credential_request::CredentialRequestTool;
 pub use credential_write::CredentialWriteTool;
 
 // Skills
@@ -209,6 +211,7 @@ pub use mcp_connector::{mcp_connector_tools, McpRemoteTool};
 pub fn builtin_tools(
     secrets: rustykrab_store::SecretStore,
     guarded: rustykrab_store::GuardedSecrets,
+    requests: rustykrab_store::CredentialRequestStore,
 ) -> Vec<std::sync::Arc<dyn rustykrab_core::Tool>> {
     vec![
         // Meta — tool discovery and lazy schema loading. Always registered.
@@ -245,7 +248,7 @@ pub fn builtin_tools(
         // net_scan/net_admin/net_audit/net_discovery tools were removed to
         // cut the tool-schema payload sent to the model.
         // Email
-        std::sync::Arc::new(GmailTool::new(guarded.clone())),
+        std::sync::Arc::new(GmailTool::new(guarded.clone()).with_requests(requests.clone())),
         // Calendar (CalDAV — reuses Gmail credentials)
         std::sync::Arc::new(CalDavTool::new(guarded.clone())),
         // Notion
@@ -255,6 +258,9 @@ pub fn builtin_tools(
         // Credentials
         std::sync::Arc::new(CredentialReadTool::new(secrets.clone())),
         std::sync::Arc::new(CredentialWriteTool::new(guarded)),
+        // Asking for a credential nobody has stored yet — the only one of
+        // the three that produces a prompt on the user's phone.
+        std::sync::Arc::new(CredentialRequestTool::new(requests)),
     ]
 }
 
