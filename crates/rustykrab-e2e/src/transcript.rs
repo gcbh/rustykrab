@@ -47,7 +47,6 @@ pub struct Transcript {
     pub archived_chars: usize,
     /// Messages still in the conversation.
     pub live_messages: usize,
-    pub total_messages: usize,
     pub duration_ms: u128,
     /// Set when the run itself failed rather than merely scoring badly.
     pub error: Option<String>,
@@ -61,12 +60,15 @@ impl Transcript {
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
         )?;
 
-        let meta_raw: String = conn.query_row(
+        // Not read for its contents — compaction state lives in the
+        // messages on this branch — but a missing row means the caller
+        // handed us an id that never existed, which should say so rather
+        // than come back as an empty transcript.
+        let _: String = conn.query_row(
             "SELECT data FROM conversations WHERE id = ?1",
             [conv_id],
             |row| row.get(0),
         )?;
-        let meta: Value = serde_json::from_str(&meta_raw)?;
 
         let mut stmt =
             conn.prepare("SELECT data FROM messages WHERE conversation_id = ?1 ORDER BY idx")?;
@@ -76,7 +78,7 @@ impl Transcript {
             .filter_map(|raw| serde_json::from_str::<Value>(&raw).ok())
             .collect();
 
-        let mut transcript = Self::parse(&meta, &messages);
+        let mut transcript = Self::parse(&messages);
         // Displaced history lives in recall_archive, not in the
         // conversation — this is where a compaction's cost is visible.
         transcript.archived_chars = conn
@@ -90,8 +92,8 @@ impl Transcript {
         Ok(transcript)
     }
 
-    /// Assemble from the conversation metadata and its messages.
-    pub fn parse(conv: &Value, messages: &[Value]) -> Self {
+    /// Assemble from the conversation's messages.
+    pub fn parse(messages: &[Value]) -> Self {
         let empty = Vec::new();
 
         let mut assistant_texts = Vec::new();
@@ -179,7 +181,6 @@ impl Transcript {
             summary,
             archived_chars: 0,
             live_messages: messages.len(),
-            total_messages: messages.len(),
             duration_ms: 0,
             error: None,
         }
@@ -248,7 +249,7 @@ mod tests {
 
     /// Test shim: the store hands these back separately.
     fn parse_pair(pair: &(Value, Vec<Value>)) -> Transcript {
-        Transcript::parse(&pair.0, &pair.1)
+        Transcript::parse(&pair.1)
     }
 
     #[test]

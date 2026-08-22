@@ -383,17 +383,6 @@ impl Ctx {
         Ok(resp.json().await?)
     }
 
-    /// Read a conversation back out of the daemon's store. The reply body
-    /// is only the last assistant message; this is the whole exchange,
-    /// tool traffic and compaction bookmark included.
-    async fn conversation(&self, conv_id: &str) -> Result<Value> {
-        let resp = self.get(&format!("/api/conversations/{conv_id}")).await?;
-        if resp.status() != 200 {
-            bail!("get conversation returned {}", resp.status());
-        }
-        Ok(resp.json().await?)
-    }
-
     /// Create a conversation, send one message, return the assistant reply.
     async fn chat(&self, content: &str) -> Result<Value> {
         let conv: Value = self
