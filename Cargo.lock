@@ -4149,6 +4149,7 @@ dependencies = [
  "rustykrab-agent",
  "rustykrab-channels",
  "rustykrab-core",
+ "rustykrab-dream",
  "rustykrab-gateway",
  "rustykrab-memory",
  "rustykrab-providers",
@@ -4192,6 +4193,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

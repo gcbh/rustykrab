@@ -703,6 +703,7 @@ async fn main() -> anyhow::Result<()> {
         .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "True"))
         .unwrap_or(false);
     let retrieval_log = rustykrab_core::retrieval_log::RetrievalLog::new();
+    let activity_tracker = rustykrab_core::activity::ActivityTracker::new();
 
     let memory_backend: Arc<dyn MemoryBackend> = Arc::new(MemoryAdapter {
         inner: HybridMemoryBackend::new(Arc::clone(&memory_system), agent_id, session_id)
@@ -1004,6 +1005,7 @@ async fn main() -> anyhow::Result<()> {
         .with_subagents_enabled(subagents_enabled)
         .with_computer_use_enabled(computer_use_enabled)
         .with_retrieval_log(retrieval_log)
+        .with_activity_tracker(activity_tracker.clone())
         .with_outcome_capture(outcome_capture_enabled);
 
     // --- Attach video channel to state ---
@@ -1295,6 +1297,23 @@ async fn main() -> anyhow::Result<()> {
     );
     infra_handles.push(queue_handle);
     tracing::info!(max_concurrent, "task queue started");
+
+    // --- Downtime outcome analysis (see DREAMING.md) ---
+    // Read-only: it aggregates recorded outcomes and logs a digest. It
+    // starts only after the system has been quiet, and abandons a pass if
+    // activity arrives mid-flight. Gated on the same flag as the capture
+    // that produces its input -- with no records to read there is nothing
+    // for it to say.
+    if outcome_capture_enabled {
+        let worker = rustykrab_dream::DreamWorker::new(
+            std::sync::Arc::new(rustykrab_dream::StoreOutcomeSource::new(
+                store_handle.outcomes(),
+            )),
+            activity_tracker,
+            rustykrab_dream::WorkerConfig::new(agent_id),
+        );
+        infra_handles.push(tokio::spawn(worker.run()));
+    }
 
     // --- Job executor (scheduled task runner) ---
     {

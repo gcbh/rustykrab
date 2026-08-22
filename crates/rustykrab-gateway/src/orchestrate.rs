@@ -259,6 +259,13 @@ async fn prepare_agent(
     user_content: &str,
     options: &RunOptions,
 ) -> Result<(AgentRunner, Session), StatusCode> {
+    // Mark the system busy. Every channel reaches the agent through here,
+    // so this one call covers Telegram, Slack, WebChat and scheduled runs
+    // alike, and keeps the downtime worker from starting mid-turn.
+    if let Some(agent_id) = state.agent_id {
+        state.activity.record(agent_id);
+    }
+
     // Resolve the harness profile once; it drives both the system prompt
     // and the agent config below.
     let profile = state.profile_for(user_content).await;
@@ -367,6 +374,13 @@ pub async fn run_agent_with_options(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
+        // Mark busy again on the way out. Recording only at the start
+        // would leave a long turn looking idle from the moment it began,
+        // and the worker could fire while it was still running.
+        if let Some(agent_id) = state.agent_id {
+            state.activity.record(agent_id);
+        }
+
         extract_assistant_message(conv)
     })
     .await
@@ -466,6 +480,12 @@ pub async fn run_agent_streaming_with_options(
                 tracing::error!(%trace_id, "agent error: {e}");
                 StatusCode::INTERNAL_SERVER_ERROR
             })?;
+
+        // See `run_agent_with_options` -- a long turn must not read as
+        // idle from the moment it started.
+        if let Some(agent_id) = state.agent_id {
+            state.activity.record(agent_id);
+        }
 
         extract_assistant_message(conv)
     })

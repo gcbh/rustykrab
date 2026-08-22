@@ -15,9 +15,11 @@
 
 pub mod report;
 pub mod store_source;
+pub mod worker;
 
 pub use report::{
     analyze, AnalysisReport, ArtifactFinding, FindingVerdict, OutcomeSource, Readiness,
     SignalQuality, MIN_OBSERVATIONS, UNDERPERFORMING_BELOW,
 };
 pub use store_source::StoreOutcomeSource;
+pub use worker::{DreamWorker, PassOutcome, WorkerConfig};
