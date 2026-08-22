@@ -155,6 +155,66 @@ fn truncate_output(s: String) -> String {
     }
 }
 
+/// Split a shell command on control operators that occur outside quotes.
+///
+/// This is intentionally narrower than a complete shell parser: command
+/// execution still belongs to `sh -c`, while this pass only identifies the
+/// command boundaries that must be checked against the allowlist. Treating
+/// quoted operators as boundaries would turn a grep pattern such as
+/// `'GMAIL|EMAIL|PASSWORD'` into three apparent commands.
+fn command_segments(command: &str) -> std::result::Result<Vec<&str>, String> {
+    #[derive(Clone, Copy)]
+    enum Quote {
+        Single,
+        Double,
+    }
+
+    let mut segments = Vec::new();
+    let mut start = 0;
+    let mut quote = None;
+    let mut escaped = false;
+
+    for (index, ch) in command.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+
+        match quote {
+            Some(Quote::Single) => {
+                if ch == '\'' {
+                    quote = None;
+                }
+            }
+            Some(Quote::Double) => match ch {
+                '"' => quote = None,
+                '\\' => escaped = true,
+                _ => {}
+            },
+            None => match ch {
+                '\'' => quote = Some(Quote::Single),
+                '"' => quote = Some(Quote::Double),
+                '\\' => escaped = true,
+                '|' | ';' | '&' => {
+                    segments.push(&command[start..index]);
+                    start = index + ch.len_utf8();
+                }
+                _ => {}
+            },
+        }
+    }
+
+    if escaped {
+        return Err("command ends with an incomplete escape".into());
+    }
+    if quote.is_some() {
+        return Err("command contains an unterminated quote".into());
+    }
+
+    segments.push(&command[start..]);
+    Ok(segments)
+}
+
 /// Validate that all commands in a potentially piped command are allowed.
 ///
 /// The allowlist prevents arbitrary binary execution. Variable expansion,
@@ -177,51 +237,78 @@ fn validate_command(command: &str) -> std::result::Result<(), String> {
         );
     }
 
-    // Split by pipes, semicolons, &&, || and validate each command segment.
-    for segment in command.split(&['|', ';'][..]) {
+    // Split on unquoted shell control operators and validate every command
+    // segment. Empty segments account for the second byte in && and ||.
+    for segment in command_segments(command)? {
         let segment = segment.trim();
         if segment.is_empty() {
             continue;
         }
 
-        for sub in segment.split("&&").flat_map(|s| s.split("||")) {
-            let sub = sub.trim();
-            if sub.is_empty() {
-                continue;
-            }
-
-            // Skip redirect-only fragments (e.g. "> file", "2>&1").
-            if sub.starts_with('>') || sub.starts_with('<') {
-                continue;
-            }
-
-            // Find the actual command, skipping leading variable assignments
-            // (e.g. `FOO=bar python3 script.py` → check `python3`).
-            let mut found_allowed = false;
-            for token in sub.split_whitespace() {
-                // Variable assignments (KEY=value) are not commands — skip them.
-                if token.contains('=') && !token.starts_with('=') {
-                    continue;
-                }
-                let cmd_name = token.rsplit('/').next().unwrap_or(token);
-                if ALLOWED_COMMANDS.contains(&cmd_name) {
-                    found_allowed = true;
-                    break;
-                }
-                // First non-assignment token that isn't allowed → reject.
-                return Err(format!(
-                    "command '{}' is not in the allowlist. Allowed commands: {}",
-                    cmd_name,
-                    ALLOWED_COMMANDS.join(", ")
-                ));
-            }
-            // If segment was all variable assignments with no command, that's fine
-            // (sh -c handles bare assignments).
-            let _ = found_allowed;
+        // Skip redirect-only fragments (e.g. "> file", "2>&1").
+        if segment.starts_with('>') || segment.starts_with('<') {
+            continue;
         }
+
+        // Find the actual command, skipping leading variable assignments
+        // (e.g. `FOO=bar python3 script.py` → check `python3`).
+        let mut found_allowed = false;
+        for token in segment.split_whitespace() {
+            // Variable assignments (KEY=value) are not commands — skip them.
+            if token.contains('=') && !token.starts_with('=') {
+                continue;
+            }
+            let cmd_name = token.rsplit('/').next().unwrap_or(token);
+            if ALLOWED_COMMANDS.contains(&cmd_name) {
+                found_allowed = true;
+                break;
+            }
+            // First non-assignment token that isn't allowed → reject.
+            return Err(format!(
+                "command '{}' is not in the allowlist. Allowed commands: {}",
+                cmd_name,
+                ALLOWED_COMMANDS.join(", ")
+            ));
+        }
+        // If segment was all variable assignments with no command, that's fine
+        // (sh -c handles bare assignments).
+        let _ = found_allowed;
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod validation_tests {
+    use super::validate_command;
+
+    #[test]
+    fn permits_control_operators_inside_quotes() {
+        validate_command("grep -E 'GMAIL|EMAIL|PASSWORD' config.txt").unwrap();
+        validate_command("echo \"one; two && three || four | five\"").unwrap();
+    }
+
+    #[test]
+    fn permits_escaped_control_operators() {
+        validate_command(r"echo one\|two\;three\&four").unwrap();
+    }
+
+    #[test]
+    fn validates_each_unquoted_command_segment() {
+        validate_command("grep -E 'one|two' file | sort").unwrap();
+
+        let error = validate_command("echo safe | definitely-not-allowed").unwrap_err();
+        assert!(error.contains("definitely-not-allowed"));
+
+        let error = validate_command("echo safe & definitely-not-allowed").unwrap_err();
+        assert!(error.contains("definitely-not-allowed"));
+    }
+
+    #[test]
+    fn rejects_incomplete_shell_quoting() {
+        assert!(validate_command("echo 'unterminated").is_err());
+        assert!(validate_command("echo incomplete\\").is_err());
+    }
 }
 
 #[async_trait]
