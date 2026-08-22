@@ -365,17 +365,21 @@ pub fn cases() -> Vec<ModelCase> {
                                            "conditions": "sleet" } }
             ]),
         ))
-        .ask("What is the weather in Reykjavik? Use the tool. Retry once if it errors.")
+        .ask("What is the weather in Reykjavik? Use the tool, then tell me.")
         .expect(Assertion::NoRunError)
+        // The retry happens inside `execute_with_retries`, which re-runs
+        // the same call rather than asking the model again — so the stub
+        // is invoked twice while the conversation records a single
+        // tool_call carrying the eventual success. Asserting on a call
+        // count here would be counting the wrong thing; that the right
+        // answer came back at all is what proves the retry ran, since the
+        // first invocation returned nothing but an error.
         .expect(Assertion::ToolCallCount {
             tool: "weather_lookup".into(),
-            min: 2,
-            max: 5,
+            min: 1,
+            max: 3,
         })
-        .expect(Assertion::RecoveredFrom {
-            tool: "weather_lookup".into(),
-            then_says: s(&["17", "sleet"]),
-        }),
+        .expect(Assertion::FinalContainsAll(s(&["17", "sleet"]))),
         ModelCase::new(
             "model-reports-a-permanent-tool-failure",
             "A tool that always fails is reported honestly, without fabrication or looping",

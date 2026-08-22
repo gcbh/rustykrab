@@ -143,6 +143,25 @@ pub struct StubSpec {
     pub script: StubScript,
 }
 
+/// Tools the agent loop drives by name, which `replace` must never strip.
+///
+/// `task_complete` is the runner's completion signal — it activates the
+/// tool itself once the model has used any tool, then re-prompts up to
+/// three times insisting it be called. The `recall_*` and `tools_*`
+/// families are always advertised to the model regardless of the active
+/// set, so removing their implementations advertises tools that cannot
+/// run.
+pub const PROTOCOL_TOOLS: &[&str] = &[
+    "task_complete",
+    "tools_list",
+    "tools_load",
+    "recall_append",
+    "recall_info",
+    "recall_peek",
+    "recall_search",
+    "recall_sub_query",
+];
+
 /// How the stub file interacts with the daemon's real tool registry.
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -185,12 +204,21 @@ impl StubFile {
     }
 
     /// Apply this file to the daemon's tool list.
+    ///
+    /// `replace` swaps out the *domain* tools. It never removes the ones
+    /// the agent loop itself drives: the runner activates `task_complete`
+    /// as soon as the model uses any tool and then re-prompts demanding it
+    /// be called, and the recall tools are how compacted detail is
+    /// retrieved. Stripping those leaves the model being ordered to call a
+    /// tool that no longer exists.
     pub fn apply(&self, real: Vec<Arc<dyn Tool>>) -> Vec<Arc<dyn Tool>> {
         let stub_names: Vec<&str> = self.tools.iter().map(|s| s.name.as_str()).collect();
         let mut tools: Vec<Arc<dyn Tool>> = match self.mode {
             StubMode::Replace => real
                 .into_iter()
-                .filter(|t| self.keep.iter().any(|k| k == t.name()))
+                .filter(|t| {
+                    PROTOCOL_TOOLS.contains(&t.name()) || self.keep.iter().any(|k| k == t.name())
+                })
                 .collect(),
             // A stub shadows a real tool of the same name rather than
             // sitting beside it — two tools with one name is a schema the
@@ -351,6 +379,49 @@ mod tests {
         let out = tool.execute(json!({})).await.unwrap();
         assert_eq!(out["lines"], 50);
         assert_eq!(out["content"].as_str().unwrap().lines().count(), 51);
+    }
+
+    /// A minimal real tool, to check what `replace` keeps.
+    struct NamedTool(&'static str);
+
+    #[async_trait]
+    impl Tool for NamedTool {
+        fn name(&self) -> &str {
+            self.0
+        }
+        fn description(&self) -> &str {
+            "a real tool"
+        }
+        fn schema(&self) -> ToolSchema {
+            ToolSchema {
+                name: self.0.to_string(),
+                description: "a real tool".to_string(),
+                parameters: json!({ "type": "object" }),
+            }
+        }
+        async fn execute(&self, _args: Value) -> Result<Value> {
+            Ok(json!({}))
+        }
+    }
+
+    #[test]
+    fn replace_keeps_the_tools_the_agent_loop_drives_by_name() {
+        // The runner activates `task_complete` once the model uses any
+        // tool and then re-prompts demanding it. Stripping it leaves the
+        // model being ordered to call something that does not exist —
+        // observed as `task_complete:error` and a failed scenario.
+        let file: StubFile =
+            serde_json::from_str(r#"{"mode":"replace","keep":[],"tools":[]}"#).unwrap();
+        let real: Vec<Arc<dyn Tool>> = vec![
+            Arc::new(NamedTool("task_complete")),
+            Arc::new(NamedTool("recall_search")),
+            Arc::new(NamedTool("gmail")),
+        ];
+        let applied = file.apply(real);
+        let kept: Vec<&str> = applied.iter().map(|t| t.name()).collect();
+        assert!(kept.contains(&"task_complete"));
+        assert!(kept.contains(&"recall_search"));
+        assert!(!kept.contains(&"gmail"), "domain tools are still replaced");
     }
 
     #[test]

@@ -116,12 +116,12 @@ impl Tool for CredentialRequestTool {
             .ok_or_else(|| Error::ToolExecution("'fields' must be an array".into()))?;
         let mut fields = Vec::with_capacity(raw.len());
         for entry in raw {
-            let key = entry["key"].as_str().ok_or_else(|| {
-                Error::ToolExecution("every field needs a 'key'".into())
-            })?;
-            let label = entry["label"].as_str().ok_or_else(|| {
-                Error::ToolExecution("every field needs a 'label'".into())
-            })?;
+            let key = entry["key"]
+                .as_str()
+                .ok_or_else(|| Error::ToolExecution("every field needs a 'key'".into()))?;
+            let label = entry["label"]
+                .as_str()
+                .ok_or_else(|| Error::ToolExecution("every field needs a 'label'".into()))?;
             fields.push(RequestedField {
                 key: key.to_string(),
                 label: label.to_string(),
