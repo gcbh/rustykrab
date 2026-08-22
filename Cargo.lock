@@ -4283,6 +4283,7 @@ version = "5.1.12"
 dependencies = [
  "aes-gcm",
  "argon2",
+ "async-trait",
  "chrono",
  "croner",
  "hex",
