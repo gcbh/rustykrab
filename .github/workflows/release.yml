@@ -109,17 +109,19 @@ jobs:
     strategy:
       matrix:
         include:
-          # Built with cargo-zigbuild targeting glibc 2.35 so the artifact
-          # runs on Ubuntu 22.04 and any newer glibc-based distro. We can
-          # no longer build on the ubuntu-22.04 runner directly because
-          # the Rust stable toolchain's precompiled std references glibc
-          # 2.39 symbols (even the per-crate build scripts fail to run on
-          # 22.04). zig-as-linker rewrites the glibc version refs in the
-          # final binary back down to 2.35.
+          # Built with cargo-zigbuild targeting glibc 2.31 so the artifact
+          # runs on Ubuntu 20.04 and any newer glibc-based distro. We can
+          # no longer build on an older runner directly because the Rust
+          # stable toolchain's precompiled std references newer glibc
+          # symbols (even the per-crate build scripts fail to run on
+          # older Ubuntu). zig-as-linker rewrites the glibc version refs
+          # in the final binary back down to 2.31. libstdc++ is statically
+          # linked (see RUSTFLAGS below) so the binary doesn't need the
+          # newer libstdc++ that gcc-11 produces references against.
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             artifact: rustykrab-cli
-            glibc: "2.35"
+            glibc: "2.31"
           - target: aarch64-apple-darwin
             os: macos-14
             artifact: rustykrab-cli
@@ -170,23 +172,25 @@ jobs:
         if: matrix.glibc != ''
         run: cargo install --locked cargo-zigbuild
 
-      # Install gcc-11's libstdc++ dev symlink so zig's lld can resolve
-      # `-lstdc++` (it needs the unversioned libstdc++.so, which only the
-      # libstdc++-N-dev packages provide — Ubuntu's multiarch path only
-      # has the versioned libstdc++.so.6). Picking gcc-11 matches the
-      # libstdc++ that ships with Ubuntu 22.04 / glibc 2.35, so the final
-      # binary's GLIBCXX symbol references stay backward-compatible.
+      # Install gcc-11's libstdc++ dev package so zig's lld can resolve
+      # the static archive (libstdc++.a) we link via `-static-libstdc++`.
+      # libstdc++-11-dev provides both the unversioned libstdc++.so
+      # symlink and libstdc++.a. We statically link libstdc++ at the
+      # RUSTFLAGS step below to avoid depending on the host's
+      # libstdc++.so.6 at runtime — Ubuntu 20.04's libstdc++ is too old
+      # for what gcc-11 references, so static linking lets us keep
+      # gcc-11 (matching the ort-sys prebuilt's expectations) while
+      # still running on 20.04.
       - name: Install gcc-11 toolchain (Linux)
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         run: |
           set -euxo pipefail
           sudo apt-get update
           sudo apt-get install -y g++-11 libstdc++-11-dev
-          # Fail fast if the symlinks lld needs aren't where we expect them.
-          # The next step's `-L` path assumes /usr/lib/gcc/x86_64-linux-gnu/11/.
-          ls -la /usr/lib/gcc/x86_64-linux-gnu/11/libstdc++.so
+          # Fail fast if the files lld needs aren't where we expect them.
+          # The RUSTFLAGS step's `-L` path assumes /usr/lib/gcc/x86_64-linux-gnu/11/.
+          ls -la /usr/lib/gcc/x86_64-linux-gnu/11/libstdc++.a
           ls -la /usr/lib/gcc/x86_64-linux-gnu/11/libgcc_s.so
-          readlink -f /usr/lib/gcc/x86_64-linux-gnu/11/libstdc++.so
           readlink -f /usr/lib/gcc/x86_64-linux-gnu/11/libgcc_s.so
 
       - name: Build release binary
@@ -199,17 +203,15 @@ jobs:
           # explicitly via CFLAGS only on the Linux cross-build leg.
           CFLAGS: ${{ matrix.target == 'x86_64-unknown-linux-gnu' && '-I/usr/include/x86_64-linux-gnu' || '' }}
           # The ort-sys prebuilt onnxruntime archive references libstdc++
-          # symbols and expects the linker to resolve them dynamically via
-          # `-lstdc++`. Adding `-L /usr/lib/gcc/x86_64-linux-gnu/11` alone
-          # wasn't enough: zig's lld doesn't always pick up the unversioned
-          # libstdc++.so symlink through it. Pass three things together:
-          #   1. -L for both the gcc-11 dir and the multiarch dir
-          #   2. an explicit `-l:libstdc++.so.6` so resolution targets the
-          #      versioned name directly (no symlink lookup required)
-          #   3. ditto for libgcc_s.so.1
-          # Rustc still emits its own `-lstdc++` / `-lgcc_s` after these,
-          # but with the search paths in place lld can resolve those too.
-          RUSTFLAGS: ${{ matrix.target == 'x86_64-unknown-linux-gnu' && '-C link-arg=-L/usr/lib/gcc/x86_64-linux-gnu/11 -C link-arg=-L/usr/lib/x86_64-linux-gnu -C link-arg=-l:libstdc++.so.6 -C link-arg=-l:libgcc_s.so.1' || '' }}
+          # symbols. We statically link libstdc++ via `-static-libstdc++`
+          # so the resulting binary doesn't depend on the host's
+          # libstdc++.so.6 — Ubuntu 20.04 ships gcc-9's libstdc++
+          # (GLIBCXX_3.4.28), which is too old for what gcc-11 emits.
+          # Static linking sidesteps that entirely. We still need the
+          # search paths so lld can find the static archive (libstdc++.a)
+          # plus the unversioned libgcc_s.so symlink for the dynamic
+          # `-lgcc_s` that rustc still emits.
+          RUSTFLAGS: ${{ matrix.target == 'x86_64-unknown-linux-gnu' && '-C link-arg=-L/usr/lib/gcc/x86_64-linux-gnu/11 -C link-arg=-L/usr/lib/x86_64-linux-gnu -C link-arg=-static-libstdc++ -C link-arg=-l:libgcc_s.so.1' || '' }}
         run: |
           if [ -n "${{ matrix.glibc }}" ]; then
             cargo zigbuild --release \
