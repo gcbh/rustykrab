@@ -101,6 +101,13 @@ impl Promotion {
 ///
 /// A `CreateMemory` has no precondition — it introduces a new id, so there
 /// is nothing to have moved.
+///
+/// For a retirement, the collision that actually happens is *someone else
+/// retired it first*: memory content is immutable in this system
+/// (`upsert_memory` omits content from its conflict clause), so an "edit"
+/// is really a retire-and-recreate. The content-hash comparison is kept as
+/// defence-in-depth in case that ever changes, but `is_valid` is the check
+/// that earns its keep today.
 async fn is_still_applicable(mutator: &dyn MemoryMutator, change: &StagedChange) -> Result<bool> {
     match change {
         StagedChange::CreateMemory { .. } => Ok(true),

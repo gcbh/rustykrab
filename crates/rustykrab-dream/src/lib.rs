@@ -14,12 +14,14 @@
 //! recorded outcomes. Nothing here calls a model or changes any artifact.
 
 pub mod engine;
+pub mod memory_mutator;
 pub mod mutation;
 pub mod report;
 pub mod store_source;
 pub mod worker;
 
 pub use engine::{promote, rollback, rollback_blockers, CyclePolicy, Promotion, PromotionRefusal};
+pub use memory_mutator::MemorySystemMutator;
 pub use mutation::{MemoryFacts, MemoryMutator};
 pub use report::{
     analyze, AnalysisReport, ArtifactFinding, FindingVerdict, OutcomeSource, Readiness,
