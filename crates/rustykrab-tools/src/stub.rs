@@ -171,11 +171,15 @@ impl StubFile {
             .map_err(|e| Error::Config(format!("reading tool stubs {}: {e}", path.display())))?;
         let parsed: Self = serde_json::from_str(&raw)
             .map_err(|e| Error::Config(format!("parsing tool stubs {}: {e}", path.display())))?;
+        // An empty replace is legitimate, not a mistake: "answer this with
+        // no tools available" is a scenario worth running, and it is how a
+        // harness checks that the agent does not invent a tool call when
+        // there is nothing to call. Say it out loud rather than refusing.
         if parsed.tools.is_empty() && parsed.mode == StubMode::Replace {
-            return Err(Error::Config(format!(
-                "{} replaces the tool registry with nothing — the agent would have no tools",
-                path.display()
-            )));
+            tracing::warn!(
+                path = %path.display(),
+                "tool stubs replace the registry with nothing — the agent will have no tools"
+            );
         }
         Ok(parsed)
     }
@@ -347,6 +351,14 @@ mod tests {
         let out = tool.execute(json!({})).await.unwrap();
         assert_eq!(out["lines"], 50);
         assert_eq!(out["content"].as_str().unwrap().lines().count(), 51);
+    }
+
+    #[test]
+    fn an_empty_replace_is_allowed_and_leaves_no_tools() {
+        // "Answer with no tools available" is a scenario, not a typo.
+        let file: StubFile =
+            serde_json::from_str(r#"{"mode":"replace","keep":[],"tools":[]}"#).unwrap();
+        assert!(file.apply(vec![]).is_empty());
     }
 
     #[test]

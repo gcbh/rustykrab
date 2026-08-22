@@ -713,8 +713,12 @@ async fn run_once(
         for turn in &case.turns {
             ctx.send(&conv_id, turn).await?;
         }
-        let conv = ctx.conversation(&conv_id).await?;
-        let mut transcript = Transcript::parse(&conv);
+        // Read the run back out of the daemon's store rather than the REST
+        // API: the API speaks an app-facing shape with content flattened to
+        // a string, so tool calls, tool results and the compaction bookmark
+        // are simply not in it.
+        let mut transcript =
+            Transcript::from_store(&data_dir.join("db").join("store.db"), &conv_id)?;
         transcript.duration_ms = started.elapsed().as_millis();
         Ok::<_, anyhow::Error>(transcript)
     }

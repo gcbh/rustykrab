@@ -1,11 +1,17 @@
 //! What a scenario actually produced, read back out of the daemon.
 //!
-//! Everything here comes from `GET /api/conversations/{id}` — the same
-//! record the daemon persisted. That is deliberate: an in-process harness
-//! can watch tool calls through a side channel, but then it is asserting
-//! on its own bookkeeping rather than on what the system stored. Tool
-//! calls, tool results, the compaction bookmark, and the summary are all
-//! in the persisted conversation, so the assertions read the real thing.
+//! Everything here is read out of the daemon's own SQLite store, which is
+//! the only place it exists. The REST API speaks an app-facing shape —
+//! `{role, content}` with content flattened to a string — so tool calls,
+//! tool arguments, tool results, and the whole compaction bookmark are
+//! invisible over HTTP. Reading the store is not a shortcut around the
+//! API; it is the only way to see what the run actually did, and it has
+//! the side benefit that assertions check what the system persisted
+//! rather than the harness's own bookkeeping.
+//!
+//! `conversations.data` holds the conversation minus its messages (where
+//! the summary and bookmark live); `messages.data` holds one serialized
+//! `Message` per row, in `idx` order.
 
 use serde_json::Value;
 
@@ -44,10 +50,34 @@ pub struct Transcript {
 }
 
 impl Transcript {
-    /// Parse a conversation as returned by the REST API.
-    pub fn parse(conv: &Value) -> Self {
+    /// Read a conversation straight out of the daemon's store.
+    pub fn from_store(db_path: &std::path::Path, conv_id: &str) -> anyhow::Result<Self> {
+        let conn = rusqlite::Connection::open_with_flags(
+            db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+
+        let meta_raw: String = conn.query_row(
+            "SELECT data FROM conversations WHERE id = ?1",
+            [conv_id],
+            |row| row.get(0),
+        )?;
+        let meta: Value = serde_json::from_str(&meta_raw)?;
+
+        let mut stmt =
+            conn.prepare("SELECT data FROM messages WHERE conversation_id = ?1 ORDER BY idx")?;
+        let messages: Vec<Value> = stmt
+            .query_map([conv_id], |row| row.get::<_, String>(0))?
+            .filter_map(|r| r.ok())
+            .filter_map(|raw| serde_json::from_str::<Value>(&raw).ok())
+            .collect();
+
+        Ok(Self::parse(&meta, &messages))
+    }
+
+    /// Assemble from the conversation metadata and its messages.
+    pub fn parse(conv: &Value, messages: &[Value]) -> Self {
         let empty = Vec::new();
-        let messages = conv["messages"].as_array().unwrap_or(&empty);
 
         let mut assistant_texts = Vec::new();
         let mut calls: Vec<ToolInvocation> = Vec::new();
@@ -178,23 +208,29 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn conv(messages: Value, extra: Value) -> Value {
-        let mut c = json!({
+    /// Build the two halves the store keeps separately: conversation
+    /// metadata, and the messages.
+    fn conv(messages: Value, extra: Value) -> (Value, Vec<Value>) {
+        let mut meta = json!({
             "id": "c1",
-            "messages": messages,
             "summary": null,
             "compacted_through": null,
             "compaction_generation": 0,
         });
         for (k, v) in extra.as_object().unwrap() {
-            c[k] = v.clone();
+            meta[k] = v.clone();
         }
-        c
+        (meta, messages.as_array().unwrap().clone())
+    }
+
+    /// Test shim: the store hands these back separately.
+    fn parse_pair(pair: &(Value, Vec<Value>)) -> Transcript {
+        Transcript::parse(&pair.0, &pair.1)
     }
 
     #[test]
     fn pairs_tool_results_with_their_calls_by_id() {
-        let t = Transcript::parse(&conv(
+        let t = parse_pair(&conv(
             json!([
                 { "id": "m1", "role": "assistant",
                   "content": { "type": "tool_call",
@@ -224,7 +260,7 @@ mod tests {
         // The agent loop treats an `error` key in the output as a failed
         // call even without is_error, so the transcript must agree — or a
         // recovery scenario would think nothing ever went wrong.
-        let t = Transcript::parse(&conv(
+        let t = parse_pair(&conv(
             json!([
                 { "id": "m1", "role": "assistant",
                   "content": { "type": "tool_call",
@@ -240,7 +276,7 @@ mod tests {
 
     #[test]
     fn splits_parallel_tool_calls_into_separate_invocations() {
-        let t = Transcript::parse(&conv(
+        let t = parse_pair(&conv(
             json!([
                 { "id": "m1", "role": "assistant",
                   "content": { "type": "multi_tool_call",
@@ -257,7 +293,7 @@ mod tests {
 
     #[test]
     fn reads_text_out_of_a_multi_part_reply() {
-        let t = Transcript::parse(&conv(
+        let t = parse_pair(&conv(
             json!([
                 { "id": "m1", "role": "assistant",
                   "content": { "type": "multi_part",
@@ -273,7 +309,7 @@ mod tests {
 
     #[test]
     fn reads_the_compaction_bookmark() {
-        let t = Transcript::parse(&conv(
+        let t = parse_pair(&conv(
             json!([
                 { "id": "m1", "role": "user", "content": { "type": "text", "data": "old" } },
                 { "id": "m2", "role": "assistant", "content": { "type": "text", "data": "older" } },

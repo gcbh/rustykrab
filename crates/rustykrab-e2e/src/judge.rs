@@ -181,7 +181,13 @@ impl Judge {
                         { "role": "user", "content": prompt },
                     ],
                     "stream": false,
-                    "options": { "temperature": 0, "num_predict": 512 },
+                    // gemma4 and friends emit reasoning that counts against
+                    // this budget before a single character of the answer
+                    // appears. 512 is enough for the verdict but not always
+                    // for the thinking in front of it, and a judge that runs
+                    // out mid-thought returns nothing parseable and scores
+                    // the run 0 for reasons that have nothing to do with it.
+                    "options": { "temperature": 0, "num_predict": 1536 },
                 });
                 let resp: Value = self
                     .client
