@@ -4,6 +4,7 @@ pub mod credential_backend;
 mod credential_request;
 mod device;
 mod dream_reports;
+mod dream_cycles;
 mod guarded;
 mod jobs;
 pub mod keychain;
@@ -28,6 +29,7 @@ pub use credential_request::{
 };
 pub use device::{Device, DeviceStore, Principal};
 pub use dream_reports::{DreamReportStore, StoredReport};
+pub use dream_cycles::DreamCycleStore;
 pub use guarded::{GuardedSecrets, WriteOutcome};
 pub use jobs::{JobRun, JobStore, ScheduledJob};
 pub use outcomes::OutcomeStore;
@@ -336,6 +338,38 @@ impl Store {
 
             CREATE INDEX IF NOT EXISTS idx_dream_reports_generated_at
                 ON dream_reports (generated_at DESC);
+            -- Dream cycles (see DREAMING.md). A mutating cycle records its
+            -- whole change-set here before touching anything, which is what
+            -- makes staged work inert and promoted work reversible.
+            CREATE TABLE IF NOT EXISTS dream_cycles (
+                id          TEXT PRIMARY KEY,
+                agent_id    TEXT NOT NULL,
+                kind        TEXT NOT NULL,
+                status      TEXT NOT NULL
+                    CHECK (status IN ('staged','promoted','rolled_back','aborted')),
+                started_at  TEXT NOT NULL,
+                promoted_at TEXT,
+                summary     TEXT,
+                rustykrab_version TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_dream_cycles_agent_status
+                ON dream_cycles (agent_id, status, started_at DESC);
+
+            -- The change-set itself, stored as JSON in planned order.
+            -- Applied forwards; reversed backwards.
+            CREATE TABLE IF NOT EXISTS dream_changes (
+                cycle_id  TEXT NOT NULL
+                    REFERENCES dream_cycles(id) ON DELETE CASCADE,
+                seq       INTEGER NOT NULL,
+                op        TEXT NOT NULL,
+                target_id TEXT NOT NULL,
+                payload   TEXT NOT NULL,
+                PRIMARY KEY (cycle_id, seq)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_dream_changes_target
+                ON dream_changes (target_id);
             ",
         )
         .map_err(|e| Error::Storage(e.to_string()))?;
@@ -591,6 +625,11 @@ impl Store {
     /// Return a handle for persisted analysis passes (see `DREAMING.md`).
     pub fn dream_reports(&self) -> DreamReportStore {
         DreamReportStore::new(Arc::clone(&self.conn))
+    }
+
+    /// Return a handle for dream-cycle persistence (see `DREAMING.md`).
+    pub fn dream_cycles(&self) -> DreamCycleStore {
+        DreamCycleStore::new(Arc::clone(&self.conn))
     }
 
     /// Return a handle for outcome-record persistence (see `DREAMING.md`).
