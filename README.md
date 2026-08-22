@@ -88,7 +88,9 @@ schemas is roughly 8k tokens before any conversation, and `-np N` divides the
 context between N slots. `--jinja` is required for tool calling.
 
 Point `OPENAI_BASE_URL` at another machine on the LAN or tailnet to run
-inference on separate hardware.
+inference on separate hardware — see [Delegating to a peer node](#delegating-to-a-peer-node)
+below to also delegate whole *agent tasks*, not just inference, to that
+machine.
 
 #### Tuning the Ollama server for KV-cache reuse
 
@@ -201,6 +203,8 @@ All configuration is via environment variables. No plaintext config files.
 | `OPENAI_TEMPERATURE` | `0.1` | Sampling temperature |
 | `OPENAI_MAX_TOKENS` | `8192` | Max tokens to generate per response |
 | `OPENAI_INCLUDE_USAGE` | `1` | Request usage in the final stream chunk; set `0` for servers that reject `stream_options` |
+| `RUSTYKRAB_NODES` | unset | JSON array of peer instances the `nodes` tool can delegate to. See [Delegating to a peer node](#delegating-to-a-peer-node) |
+| `RUSTYKRAB_NODE_TIMEOUT_SECS` | `900` | Per-request timeout for delegated tasks. Generous by default: a peer running a local model at single-digit tokens/sec can legitimately take minutes |
 | `CHROME_CDP_URL` | `ws://127.0.0.1:9222` | Chrome DevTools Protocol endpoint |
 | `RUSTYKRAB_AUTH_TOKEN` | auto-generated | Bearer token for API auth |
 | `RUSTYKRAB_MASTER_KEY` | auto-generated | Encryption key for secrets at rest |
@@ -455,6 +459,31 @@ $ rustykrab-cli   # restart the daemon
 
 The resolver runs entirely inside the connector — the model never sees
 the resolved values, and they are not surfaced through any tool.
+
+### Delegating to a peer node
+
+A RustyKrab instance can hand a self-contained task to another RustyKrab
+instance running on different hardware — useful for a slower machine with a
+stronger local model, or simply more compute you'd like the primary to draw
+on. This is delegation, not shared execution: the task runs entirely on the
+peer, using *its* tools and filesystem, and returns only a text result.
+
+```bash
+export RUSTYKRAB_NODES='[
+  {
+    "id": "m4max",
+    "url": "https://your-node.your-tailnet.ts.net",
+    "token": "<the node auth token>",
+    "description": "M4 Max 32GB — qwen3.8:27b-mlx. Slower but capable; good for self-contained coding tasks with its own checkout at ~/code/rustycrab."
+  }
+]'
+```
+
+The `nodes` tool (`list`, `discover`, `send`) is hidden from the model until
+`RUSTYKRAB_NODES` is set. See `scripts/setup-delegation-node.md` for standing
+up a node, exposing it safely (Tailscale Serve, not the raw gateway port),
+and measured latency expectations — a delegated task on a local model
+typically takes minutes, not seconds.
 
 ## Architecture
 
