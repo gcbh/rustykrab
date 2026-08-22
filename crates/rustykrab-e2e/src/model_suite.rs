@@ -676,6 +676,9 @@ async fn run_once(
         model,
         ollama_url,
         tool_stubs: &stubs,
+        // These scenarios drive the gateway directly; the credential
+        // suite is the one that varies the surface.
+        channel: None,
     };
     let mut child = spawn_daemon_with(bin, &data_dir, port, &backend)?;
 

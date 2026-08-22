@@ -69,6 +69,23 @@ impl Transcript {
                         }
                     }
                 }
+                // A channel that delivered an image alongside the reply
+                // produces multi_part rather than text. Reading only the
+                // text blocks keeps a picture from silently emptying the
+                // answer an assertion is about to check.
+                ("assistant", "multi_part") => {
+                    let text = data
+                        .as_array()
+                        .unwrap_or(&empty)
+                        .iter()
+                        .filter_map(|block| block["text"].as_str())
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    let text = text.trim();
+                    if !text.is_empty() {
+                        assistant_texts.push(text.to_string());
+                    }
+                }
                 (_, "tool_call") => push_call(&mut calls, &mut by_call_id, data),
                 (_, "multi_tool_call") => {
                     for call in data.as_array().unwrap_or(&empty) {
@@ -236,6 +253,22 @@ mod tests {
         ));
         assert_eq!(t.calls.len(), 2);
         assert_eq!(t.calls[1].tool, "two");
+    }
+
+    #[test]
+    fn reads_text_out_of_a_multi_part_reply() {
+        let t = Transcript::parse(&conv(
+            json!([
+                { "id": "m1", "role": "assistant",
+                  "content": { "type": "multi_part",
+                               "data": [
+                                   { "type": "image", "media_type": "image/png" },
+                                   { "type": "text", "text": "the kettle is a Stagg" }
+                               ] } }
+            ]),
+            json!({}),
+        ));
+        assert_eq!(t.final_text, "the kettle is a Stagg");
     }
 
     #[test]

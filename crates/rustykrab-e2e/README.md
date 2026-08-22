@@ -1,48 +1,72 @@
 # rustykrab-e2e
 
-End-to-end evaluation harness. Boots a throwaway daemon on its own data
-directory and an ephemeral port, drives scenarios over HTTP, and asserts on
-the responses **and** on what the daemon persisted. Prints a JSON report
-and exits 0 when green.
+Every eval runs through here. One binary, one report, one exit code.
 
 ```sh
 make e2e            # deterministic plumbing scenarios — no model, seconds
 make eval           # gemma4:26b behaviour scenarios, 3 repetitions each
-make eval-quick     # one repetition, skipping the slow scenarios
+make eval-cred      # the credential-ask measurement, per surface
 make eval-list      # list every scenario
 ```
 
 Flags pass through: `make eval ARGS="--case compaction"`, or call
-`./scripts/e2e.sh --mode all --release` directly.
+`./scripts/e2e.sh --mode all --release`.
 
-## Two modes, deliberately not comparable
+## Three modes, and why they are not one number
 
-**scripted** — `RUSTYKRAB_PROVIDER=scripted` replays a fixed JSON script of
-tool calls and text turns. No model, no network, no sampling. It answers
-"does the server still do what it says": auth, the origin allowlist,
-conversation CRUD, SSE framing, secrets, the credential guard, device
-pairing. Every scenario must pass every run — determinism is the point, so
-two out of three is a broken scenario, not an acceptable rate. This is the
-mode for CI.
+| mode | provider | scored by | gates CI |
+|---|---|---|---|
+| `scripted` | replayed script, no model | boolean assertions | yes — must pass **every** run |
+| `model` | real model, stubbed tools | boolean assertions + LLM judge | yes — must pass a **majority** of repetitions |
+| `credential` | real model, real tools, empty credential store | outcome **distribution** | no — reports a rate |
 
-**model** — a real model with the tool registry replaced by scripted stubs.
-It answers "how does the framework behave with a model in the loop": tool
-selection, argument fidelity, recovery from a broken tool, honest reporting
-when a tool never recovers, what survives compaction, whether memory comes
-back. Slow, sampled, and scored as a pass rate over repetitions, because
-with a 26B model "passed once" and "passed every time" are both misleading.
-A scenario passes on a majority of its repetitions and is flagged `~flaky`
-when it passes some and fails others.
+The three answer different questions and the report never merges them.
 
-The report never merges the two. A scripted pass says the plumbing works; a
-model pass says the plumbing works *and* gemma4 could use it.
+**scripted** answers *"does the server still do what it says"*: auth, the
+origin allowlist, conversation CRUD, SSE framing, secrets, the credential
+guard, device pairing. Deterministic, so one failure in three is a broken
+scenario rather than an acceptable rate. This is the mode for CI.
+
+**model** answers *"how does the framework behave with a model in the
+loop"*: tool selection, argument fidelity, recovery from a broken tool,
+what survives compaction, whether memory comes back. Sampled, so it is
+scored as a pass rate and flagged `~flaky` when repetitions disagree.
+
+**credential** answers *"when the agent needs a credential it does not
+have, does it ask over a protocol the user can answer on"*. That question
+has no single right answer — it has a distribution over outcomes, per
+surface — so these scenarios are `Expected::Measure`: they report and never
+turn the suite red.
+
+### Why `Measure` exists
+
+`xfail` is boolean by construction: a scenario either passed or it did
+not, and an unexpected pass turns the suite red so it gets promoted. A
+*rate* has no such thing. Forcing the credential suite into pass/fail
+would throw away the distribution that is its entire product, and a
+threshold pretending to be an xfail would make the report lie about what
+was measured. So there is a third expectation. Give a measured scenario a
+threshold when you want it to gate; until then it reports.
+
+## Surfaces
+
+The credential suite runs every scenario on every surface — `gateway`,
+`telegram`, `signal` — because the agent behaves differently on each, and
+a behavioural result that does not name its surface is not a result. A
+capture server stands in for the Telegram Bot API and signal-cli, so a
+trial can read what the bot *would* have sent with no network egress. It
+answers both channels' long-poll shapes, which matters: reply with the
+wrong one and the daemon's poll loop logs a decode error every second for
+the length of the trial.
 
 ## Scripting the model, scripting the tools
 
 `ScriptedProvider` scripts the **model** so the plumbing can be tested
 without one. `RUSTYKRAB_TOOL_STUBS` is the mirror image: it scripts the
 **tools** so a real model can be tested against situations a live tool
-would only reach by luck.
+would only reach by luck — an upstream that times out once and then works,
+one that never works, a search that legitimately returns nothing, a result
+larger than the context window.
 
 ```json
 {
@@ -62,72 +86,66 @@ would only reach by luck.
 }
 ```
 
-`responses` is indexed by call number. `repeat_last` (default true) makes
-the final entry answer every later call; set it false and further calls
-fail with "script exhausted", which is how a scenario checks that an agent
-stops retrying. Response types are `ok`, `err` (with a real
-`ToolErrorKind`, so the agent loop's retry and reflection paths actually
-fire), `filler` (an oversized payload, for pushing a window past the
-compaction trigger), and `delay`.
+`responses` is indexed by call number; `repeat_last: false` makes further
+calls fail, which is how a scenario checks that an agent *stops* retrying.
+Error kinds map onto `ToolErrorKind` because the agent loop branches on
+them — without the mapping a "timeout" scenario would quietly exercise the
+generic error path instead.
 
-`mode: "replace"` leaves the model with only the stubs plus anything in
-`keep`. That is usually what you want: thirty real tools give a small model
-thirty ways to wander off, and the scenario stops measuring what it meant
-to. The memory scenarios keep the genuine `memory_*` tools, because those
-are the thing under test.
+The credential suite deliberately uses **no** stubs: its premise is that
+the real tools cannot run because the credential they need is absent.
 
-## How assertions see the run
+## How assertions see a run
 
-Everything comes from `GET /api/conversations/{id}` — the record the daemon
-persisted. Tool calls, tool arguments, tool *results*, the compaction
-bookmark, the summary, and the full message history are all in there, so
-the assertions read what the system stored rather than the harness's own
-bookkeeping. `ToolOutputContainsAny` is the useful consequence: a memory
-scenario can assert that retrieval actually returned the fact, separately
-from whether the model then used it well.
+Everything comes from `GET /api/conversations/{id}` — the record the
+daemon persisted. Tool calls, arguments, tool *results*, the compaction
+bookmark, and the summary are all in there, so assertions read what the
+system stored rather than the harness's own bookkeeping. That is what
+makes `ToolOutputContainsAny` possible: a memory scenario can check that
+retrieval returned the fact, separately from whether the model then used
+it well.
 
-An LLM judge covers only what substring matching cannot — whether an answer
-that admits a tool failed is an honest report or a hedge around an invented
-number. `claude-sonnet-5` grades when `ANTHROPIC_API_KEY` is set, the model
-under test grades itself otherwise, and the report always names the judge.
+An LLM judge covers only what substring matching cannot — whether an
+answer admitting a tool failed is an honest report or a hedge around an
+invented number. `claude-sonnet-5` grades when `ANTHROPIC_API_KEY` is set,
+the model under test grades itself otherwise, and the report names which.
 The judge only runs on repetitions whose hard assertions already passed.
 
 ## Compaction without an hour of inference
 
-Compaction fires on estimated tokens, so the compaction scenarios write a
-`harness.toml` into the throwaway data dir with `max_context_tokens =
-6000`. That reaches `AgentRunner::maybe_compact` — the same code path, the
-same bookmark logic — after a handful of turns instead of hundreds. Facts
-that must survive are stated in the first turn, so they land in the region
-that gets folded away; a fact sitting in the verbatim tail proves nothing
-about the summary.
+The compaction scenarios write `harness.toml` into the throwaway data dir
+with `max_context_tokens = 6000` — the daemon's own config path, the same
+`maybe_compact` code, a handful of turns instead of hundreds. Facts that
+must survive are stated in the first turn so they land in the folded
+region; a fact in the verbatim tail proves nothing about the summary.
+
+## Surviving a killed run
+
+A full credential run is hours long and the summary is only written at the
+end. Every trial is appended to `e2e-credential-trials.jsonl` the moment it
+finishes, and `--resume` replays what is already there instead of paying
+for it twice. Without `--resume` the file is truncated, so a fresh run
+never silently inherits an old one's trials.
 
 ## Prerequisites
 
-The scripted mode needs nothing but a build. The model mode needs Ollama
+`scripted` needs nothing but a build. `model` and `credential` need Ollama
 running with the model pulled (`ollama pull gemma4:26b`).
 
-Preflight checks all of it up front, including one trivial generation:
-Ollama serves one request at a time per model, so another client holding
-the slot — a running RustyKrab daemon is the usual culprit — does not slow
-the suite down, it stops it. Better to fail in one line than to time out
-every scenario twenty minutes in.
-
-## The xfail convention
-
-A scenario encoding behaviour that is not built yet is marked `XFail`. The
-suite stays green while it fails, and an **unexpected pass turns the suite
-red** so the scenario gets promoted to `Pass`. Shipping a phase is then a
-matter of flipping its scenarios over.
+Preflight checks that up front, including one trivial generation: Ollama
+serves one request at a time per model, so another client holding the slot
+— a running RustyKrab daemon is the usual culprit — does not slow the
+suite down, it stops it. Better to fail in one line than to time out every
+scenario twenty minutes in.
 
 ## Known limits
 
 - Scenarios run sequentially. One 26B model behind one GPU means
   concurrency would only make each scenario slower and the timings
   meaningless.
-- The model mode boots a fresh daemon per repetition. That costs a few
-  seconds each and buys the only thing that makes repetitions meaningful:
-  no scenario can pass on state another one left behind.
+- `model` and `credential` boot a fresh daemon per repetition. That costs
+  a few seconds each and buys the only thing that makes repetitions
+  meaningful: no scenario can pass on state another left behind.
 - Skills are not installed into the throwaway data dir, so the system
   prompt carries no skill catalog. Nothing in the current scenarios
   depends on one.

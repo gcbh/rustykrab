@@ -14,6 +14,10 @@ serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
 regex.workspace = true
+# The capture server that stands in for the Telegram Bot API and
+# signal-cli, so a trial can read what the bot would have sent without
+# any network egress.
+axum.workspace = true
 tempfile = "3"
 # Direct reads of the daemon's SQLite store, so scenarios can assert on
 # the tables the plan specifies (secret_versions, secret_audit,

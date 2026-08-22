@@ -18,8 +18,11 @@
 //! ```
 
 mod assertion;
+mod classify;
+mod credential_suite;
 mod judge;
 mod model_suite;
+mod surface;
 mod transcript;
 
 use std::process::{Child, Command, Stdio};
@@ -94,6 +97,12 @@ const AGENT_SCRIPT: &str = r#"{
 enum Expected {
     /// Implemented behaviour — must pass.
     Pass,
+    /// A behavioural measurement rather than a test. Reports an outcome
+    /// distribution and never turns the suite red: there is no single
+    /// right answer to "what does the model do when it lacks a
+    /// credential", only a rate, and a rate that moved is news rather
+    /// than a failure. Gate one of these by giving it a threshold.
+    Measure,
     /// Target behaviour that is not built yet: the suite stays green while
     /// it fails, and an unexpected pass turns the suite red so the
     /// scenario gets promoted.
@@ -108,7 +117,7 @@ enum Expected {
 
 #[derive(Debug, Serialize)]
 struct ScenarioReport {
-    id: &'static str,
+    id: String,
     /// "scripted" or "model". The two are not comparable — one says the
     /// plumbing works, the other says a real model could use it — and the
     /// report must never let them be read as a single number.
@@ -123,6 +132,14 @@ struct ScenarioReport {
     /// Distinct failure reasons across repetitions.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     details: Vec<String>,
+    /// Outcome-class counts, for cells scored by a classifier rather than
+    /// by boolean assertions. A distribution is the product of a
+    /// measurement; collapsing it to pass/fail would throw it away.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    classes: Vec<(String, usize)>,
+    /// The rate this cell measures, when it measures one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rate: Option<f64>,
 }
 
 /// A model scenario passes when it passes strictly more than this fraction
@@ -133,7 +150,7 @@ const MODEL_MAJORITY: f64 = 0.5;
 
 impl ScenarioReport {
     fn new(
-        id: &'static str,
+        id: impl Into<String>,
         mode: &'static str,
         expected: Expected,
         runs: usize,
@@ -150,9 +167,13 @@ impl ScenarioReport {
             (Expected::Pass, false) => "fail",
             (Expected::XFail, false) => "xfail",
             (Expected::XFail, true) => "xpass",
+            // A measurement reports; it does not judge. Its rate is in the
+            // report either way, and the suite's colour does not depend on
+            // which way the model happened to go this run.
+            (Expected::Measure, _) => "measure",
         };
         Self {
-            id,
+            id: id.into(),
             mode,
             expected,
             passed,
@@ -161,6 +182,37 @@ impl ScenarioReport {
             passes,
             mean_ms,
             details,
+            classes: Vec::new(),
+            rate: None,
+        }
+    }
+
+    /// A measured cell: an outcome distribution and a rate, with no
+    /// verdict. `passed` is true so the suite's colour never depends on
+    /// which way the model happened to go.
+    #[allow(clippy::too_many_arguments)]
+    fn measured(
+        id: impl Into<String>,
+        expected: Expected,
+        runs: usize,
+        passes: usize,
+        classes: Vec<(String, usize)>,
+        rate: f64,
+        mean_ms: u128,
+        details: Vec<String>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            mode: "credential",
+            expected,
+            passed: true,
+            outcome: "measure",
+            runs,
+            passes,
+            mean_ms,
+            details,
+            classes,
+            rate: Some(rate),
         }
     }
 
@@ -968,6 +1020,10 @@ pub enum Backend<'a> {
         model: &'a str,
         ollama_url: &'a str,
         tool_stubs: &'a str,
+        /// Which channel to wire up, and the base URL of the capture
+        /// server standing in for its API. `None` drives the gateway
+        /// directly, which needs no channel configuration.
+        channel: Option<(crate::surface::Surface, &'a str)>,
     },
 }
 
@@ -1025,17 +1081,33 @@ fn spawn_daemon_with(
             model,
             ollama_url,
             tool_stubs,
+            channel,
         } => {
-            let stub_path = data_dir.join("tool-stubs.json");
-            std::fs::write(&stub_path, tool_stubs)?;
             command
                 .env("RUSTYKRAB_PROVIDER", "ollama")
                 .env("OLLAMA_MODEL", model)
                 .env("OLLAMA_BASE_URL", ollama_url)
                 // Compaction summarisation on a local model is
                 // prefill-heavy; the default would cut it off.
-                .env("OLLAMA_TIMEOUT_SECS", "900")
-                .env("RUSTYKRAB_TOOL_STUBS", &stub_path);
+                .env("OLLAMA_TIMEOUT_SECS", "900");
+
+            // An empty spec means "leave the registry alone" — the
+            // credential suite needs the real tools, because its premise
+            // is that they cannot run without a credential. Writing an
+            // empty file and pointing the daemon at it would instead fail
+            // its JSON parse and stop the daemon from booting at all.
+            if !tool_stubs.trim().is_empty() {
+                let stub_path = data_dir.join("tool-stubs.json");
+                std::fs::write(&stub_path, tool_stubs)?;
+                command.env("RUSTYKRAB_TOOL_STUBS", &stub_path);
+            }
+
+            // Channel wiring points the daemon's outbound calls at the
+            // capture server, so a trial can read what the bot would have
+            // sent without any network egress.
+            if let Some((surface, capture_base)) = channel {
+                crate::surface::configure_channel(command, *surface, capture_base);
+            }
         }
     }
 
@@ -1089,7 +1161,13 @@ USAGE:
     cargo run -p rustykrab-e2e -- [FLAGS]
 
 FLAGS:
-    --mode scripted|model|all   Which suite to run (default: scripted)
+    --mode SUITE                scripted | model | credential | all
+                                (default: scripted)
+    --surfaces LIST             Surfaces for --mode credential
+                                (default: gateway,telegram,signal)
+    --trials N                  Trials per credential cell (default: 5)
+    --resume                    Reuse trials already in the sidecar rather
+                                than paying for them twice
     --reps N                    Repetitions per model scenario (default: 3)
     --case SUBSTRING            Only scenarios whose id contains SUBSTRING
     --quick                     Skip scenarios tagged slow
@@ -1109,6 +1187,9 @@ ENVIRONMENT:
 struct Args {
     mode: String,
     reps: usize,
+    trials: usize,
+    surfaces: Vec<surface::Surface>,
+    resume: bool,
     case_filter: Option<String>,
     quick: bool,
     model: String,
@@ -1120,6 +1201,13 @@ fn parse_args(argv: &[String]) -> std::result::Result<Args, String> {
     let mut args = Args {
         mode: "scripted".to_string(),
         reps: 3,
+        trials: 5,
+        resume: false,
+        surfaces: vec![
+            surface::Surface::Gateway,
+            surface::Surface::Telegram,
+            surface::Surface::Signal,
+        ],
         case_filter: None,
         quick: false,
         model: std::env::var("OLLAMA_MODEL").unwrap_or_else(|_| "gemma4:26b".to_string()),
@@ -1137,12 +1225,16 @@ fn parse_args(argv: &[String]) -> std::result::Result<Args, String> {
         match argv[i].as_str() {
             "--list" => args.list = true,
             "--quick" => args.quick = true,
+            "--resume" => args.resume = true,
             "-h" | "--help" => return Err(String::new()),
             "--mode" => {
                 args.mode = value(i, "--mode")?.to_lowercase();
-                if !matches!(args.mode.as_str(), "scripted" | "model" | "all") {
+                if !matches!(
+                    args.mode.as_str(),
+                    "scripted" | "model" | "credential" | "all"
+                ) {
                     return Err(format!(
-                        "--mode: expected scripted|model|all, got {}",
+                        "--mode: expected scripted|model|credential|all, got {}",
                         args.mode
                     ));
                 }
@@ -1160,6 +1252,25 @@ fn parse_args(argv: &[String]) -> std::result::Result<Args, String> {
             }
             "--case" => {
                 args.case_filter = Some(value(i, "--case")?);
+                i += 1;
+            }
+            "--trials" => {
+                let v = value(i, "--trials")?;
+                args.trials = v
+                    .parse()
+                    .map_err(|_| format!("--trials: not a number: {v}"))?;
+                if args.trials == 0 {
+                    return Err("--trials must be at least 1".to_string());
+                }
+                i += 1;
+            }
+            "--surfaces" => {
+                let v = value(i, "--surfaces")?;
+                args.surfaces = v
+                    .split(',')
+                    .map(surface::Surface::parse)
+                    .collect::<Result<Vec<_>>>()
+                    .map_err(|e| format!("--surfaces: {e}"))?;
                 i += 1;
             }
             "--model" => {
@@ -1196,6 +1307,10 @@ async fn main() -> Result<()> {
         for (_, (id, _)) in scripted_scenarios() {
             eprintln!("  {id}");
         }
+        eprintln!("\n── credential (measured, per surface) ──");
+        for sc in credential_suite::SCENARIOS {
+            eprintln!("  {:<42}{}", sc.id, sc.service);
+        }
         eprintln!("\n── model ──");
         for case in model_suite::cases() {
             let slow = if case.slow { "  (slow)" } else { "" };
@@ -1212,6 +1327,7 @@ async fn main() -> Result<()> {
 
     let mut reports: Vec<ScenarioReport> = Vec::new();
     let mut judge_name: Option<String> = None;
+    let mut trials: Vec<credential_suite::TrialResult> = Vec::new();
 
     if args.mode == "scripted" || args.mode == "all" {
         reports.extend(run_scripted(&bin).await?);
@@ -1230,6 +1346,22 @@ async fn main() -> Result<()> {
         judge_name = Some(name);
     }
 
+    if args.mode == "credential" || args.mode == "all" {
+        let (cells, trial_results) = credential_suite::run(
+            &bin,
+            &args.model,
+            &args.ollama_url,
+            args.trials,
+            &args.surfaces,
+            args.case_filter.as_deref(),
+            Duration::from_secs(900),
+            args.resume,
+        )
+        .await?;
+        reports.extend(cells);
+        trials = trial_results;
+    }
+
     let count = |o: &str| reports.iter().filter(|r| r.outcome == o).count();
     let (pass, fail, xfail, xpass) = (count("pass"), count("fail"), count("xfail"), count("xpass"));
     // Green means every implemented scenario passed and no target scenario
@@ -1238,12 +1370,16 @@ async fn main() -> Result<()> {
     let ok = fail == 0 && xpass == 0;
     let report = json!({
         "scenarios": reports,
+        // Every trial, verbatim, so any rate in the summary can be audited
+        // back to the reply that produced it.
+        "credential_trials": trials,
         "summary": {
             "pass": pass,
             "fail": fail,
             "xfail": xfail,
             "xpass": xpass,
             "flaky": reports.iter().filter(|r| r.flaky()).count(),
+            "measured": count("measure"),
             "judge": judge_name,
             "ok": ok,
         },

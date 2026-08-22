@@ -4181,25 +4181,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "rustykrab-credeval"
-version = "5.1.18"
-dependencies = [
- "anyhow",
- "axum",
- "reqwest 0.13.3",
- "rusqlite",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tokio-stream",
-]
-
-[[package]]
 name = "rustykrab-e2e"
 version = "5.1.18"
 dependencies = [
  "anyhow",
+ "axum",
  "regex",
  "reqwest 0.13.3",
  "rusqlite",
