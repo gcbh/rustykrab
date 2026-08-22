@@ -4149,6 +4149,7 @@ dependencies = [
  "rustykrab-agent",
  "rustykrab-channels",
  "rustykrab-core",
+ "rustykrab-dream",
  "rustykrab-gateway",
  "rustykrab-memory",
  "rustykrab-providers",
@@ -4177,6 +4178,21 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "rustykrab-dream"
+version = "5.1.11"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "rustykrab-core",
+ "rustykrab-store",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
  "uuid",
 ]
 

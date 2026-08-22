@@ -1,6 +1,7 @@
 use rustykrab_agent::{HarnessProfile, HarnessRouter, ProcessSandbox, Sandbox};
 use rustykrab_channels::{SignalChannel, SlackChannel, TelegramChannel, VideoChannel};
 use rustykrab_core::active_tools::ActiveToolsRegistry;
+use rustykrab_core::activity::ActivityTracker;
 use rustykrab_core::model::ModelProvider;
 use rustykrab_core::orchestration::OrchestrationConfig;
 use rustykrab_core::recall::RecallStore;
@@ -69,6 +70,10 @@ pub struct AppState {
     /// startup; threaded through so `prepare_agent` knows whether to grant
     /// `Capability::ComputerUse`.
     pub computer_use_enabled: bool,
+    /// When each agent last saw inbound activity. Gates the downtime
+    /// analysis worker, which must run only when nothing else needs the
+    /// machine and must yield the moment it does. See `DREAMING.md`.
+    pub activity: ActivityTracker,
     /// Records which memories were surfaced into each conversation so a
     /// completed run's outcome can be attributed to them. Shared with the
     /// memory backend, which writes it, and the agent runner, which drains
@@ -116,6 +121,7 @@ impl AppState {
             todos: Arc::new(TodoStore::new()),
             subagents_enabled: false,
             computer_use_enabled: false,
+            activity: ActivityTracker::new(),
             retrieval_log: RetrievalLog::new(),
             outcome_capture_enabled: false,
         }
@@ -127,6 +133,13 @@ impl AppState {
     /// behaves. Driven by `RUSTYKRAB_OUTCOME_CAPTURE` in the CLI.
     pub fn with_outcome_capture(mut self, enabled: bool) -> Self {
         self.outcome_capture_enabled = enabled;
+        self
+    }
+
+    /// Share the activity tracker with the downtime worker, so the worker
+    /// sees the traffic this gateway serves.
+    pub fn with_activity_tracker(mut self, activity: ActivityTracker) -> Self {
+        self.activity = activity;
         self
     }
 

@@ -45,7 +45,7 @@ the scenario gets promoted. See
 
 ## Project structure
 
-Workspace with 10 crates under `crates/`:
+Workspace with 11 crates under `crates/`:
 
 - **rustykrab-cli** — Binary entrypoint, daemon management, channel loops
 - **rustykrab-core** — Shared traits (`Tool`, `ModelProvider`), error types
@@ -57,6 +57,7 @@ Workspace with 10 crates under `crates/`:
 - **rustykrab-channels** — Telegram, Signal, WebChat, Video, MCP adapters
 - **rustykrab-memory** — Hybrid retrieval (vector + BM25 + temporal + graph)
 - **rustykrab-skills** — SKILL.md loader and Ed25519 verification
+- **rustykrab-dream** — Off-cycle self-improvement: read-only outcome analysis (see `DREAMING.md`)
 
 ## Key patterns
 

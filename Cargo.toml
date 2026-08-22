@@ -11,11 +11,12 @@ members = [
     "crates/rustykrab-skills",
     "crates/rustykrab-cli",
     "crates/rustykrab-memory",
+    "crates/rustykrab-dream",
     "crates/rustykrab-e2e",
 ]
 
 [workspace.package]
-version = "5.1.20"
+version = "5.1.21"
 edition = "2021"
 rust-version = "1.88"
 license = "MIT"
@@ -106,6 +107,7 @@ rustykrab-channels = { path = "crates/rustykrab-channels" }
 rustykrab-skills = { path = "crates/rustykrab-skills" }
 rustykrab-cli = { path = "crates/rustykrab-cli" }
 rustykrab-memory = { path = "crates/rustykrab-memory" }
+rustykrab-dream = { path = "crates/rustykrab-dream" }
 
 [profile.release]
 lto = true

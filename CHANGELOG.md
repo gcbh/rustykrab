@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.1.21] - 2026-08-22
+
+- Dreaming P1 (3/3): run analysis in downtime, yielding to real work (#511)
+
 ## [5.1.20] - 2026-08-22
 
 - Dreaming P1 (1/3): track when the system was last busy (#509)
