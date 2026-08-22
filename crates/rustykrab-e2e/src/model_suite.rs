@@ -613,7 +613,10 @@ pub fn cases() -> Vec<ModelCase> {
             "memory-round-trip",
             "A fact saved in one conversation is recalled in a different one",
         )
-        .slow()
+        // No longer slow. It averaged 137s and once took 777s while
+        // memory_search was reporting count 0 on every call — the model
+        // was being told the search found nothing, so it retried and cast
+        // about. With the count reporting honestly it runs in 18s.
         .with_harness(bounded_harness())
         .with_num_ctx(TIGHT_NUM_CTX)
         .keeping(&["memory_save", "memory_search", "memory_get"])
