@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.1.14] - 2026-08-22
+
+- chore: sync Cargo.lock with the workspace manifests (#512)
+
 ## [5.1.13] - 2026-08-22
 
 - Dreaming P0 (2/6): retrieval log linking recalled memories to a conversation (#504)
