@@ -490,7 +490,11 @@ pub fn cases() -> Vec<ModelCase> {
         // them behind a bookmark, so "nothing was destroyed" means the
         // displaced history reached the recall archive.
         .expect(Assertion::ArchivedAtLeast(2_000))
-        .expect(Assertion::LiveMessagesAtMost(8))
+        // Generous on purpose: the run keeps talking after the compaction,
+        // so the live window is what was left plus the turns that followed.
+        // Compacted and ArchivedAtLeast are the real signals; this only
+        // catches a compaction that shrank nothing at all.
+        .expect(Assertion::LiveMessagesAtMost(12))
         .expect(Assertion::FinalNonEmpty),
         ModelCase::new(
             "compaction-preserves-an-early-fact",
