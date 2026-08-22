@@ -66,6 +66,14 @@ pub struct ModelCase {
     /// Contents of the daemon's `harness.toml`, when the scenario needs a
     /// non-default agent config.
     pub harness_toml: Option<String>,
+    /// Run the turns after the first in a *separate* conversation, against
+    /// the same daemon and the same memory store.
+    ///
+    /// Without this a memory scenario proves nothing: both turns share a
+    /// context window, so the model can answer from scrollback and never
+    /// touch memory at all. The assertions then run against the second
+    /// conversation, where a correct answer can only have come from recall.
+    pub split_conversation: bool,
     /// The context window to give the provider, via RUSTYKRAB_NUM_CTX.
     ///
     /// This, not `harness.toml`, is what drives compaction: the runner
@@ -89,6 +97,7 @@ impl ModelCase {
             // measuring what it meant to.
             stubs: json!({ "mode": "replace", "keep": [], "tools": [] }),
             harness_toml: None,
+            split_conversation: false,
             num_ctx: None,
             assertions: Vec::new(),
             judge: None,
@@ -119,6 +128,11 @@ impl ModelCase {
 
     fn with_harness(mut self, toml: impl Into<String>) -> Self {
         self.harness_toml = Some(toml.into());
+        self
+    }
+
+    fn across_conversations(mut self) -> Self {
+        self.split_conversation = true;
         self
     }
 
@@ -597,19 +611,23 @@ pub fn cases() -> Vec<ModelCase> {
         .expect(Assertion::ToolCalled("memory_save".into())),
         ModelCase::new(
             "memory-round-trip",
-            "A fact saved in one turn is retrievable through memory in a later turn",
+            "A fact saved in one conversation is recalled in a different one",
         )
         .slow()
         .with_harness(bounded_harness())
         .with_num_ctx(TIGHT_NUM_CTX)
         .keeping(&["memory_save", "memory_search", "memory_get"])
+        // The second turn runs in a fresh conversation. Sharing one would
+        // let the model answer from scrollback, which is what it did while
+        // this scenario was single-conversation: it saved the fact, then
+        // read the answer back out of its own context and never searched.
+        .across_conversations()
         .ask("Remember that my kettle is a Stagg EKG Pro. Save that to memory.")
         .ask(
             "Search your memory: what model is my kettle? If it is not in memory, say so — \
              do not guess.",
         )
         .expect(Assertion::NoRunError)
-        .expect(Assertion::ToolCalled("memory_save".into()))
         .expect(Assertion::ToolCalled("memory_search".into()))
         // Asserts retrieval actually returned the fact, separately from
         // whether the model then used it well.
@@ -797,8 +815,14 @@ async fn run_once(
         };
 
         let started = Instant::now();
-        let conv_id = ctx.create_conversation().await?;
-        for turn in &case.turns {
+        // A split scenario opens a second conversation after the first
+        // turn; the transcript then comes from that one, so an answer can
+        // only have reached it through the memory store.
+        let mut conv_id = ctx.create_conversation().await?;
+        for (index, turn) in case.turns.iter().enumerate() {
+            if index == 1 && case.split_conversation {
+                conv_id = ctx.create_conversation().await?;
+            }
             ctx.send(&conv_id, turn).await?;
         }
         // Read the run back out of the daemon's store rather than the REST
