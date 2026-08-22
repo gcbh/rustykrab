@@ -126,6 +126,16 @@ impl ExecutionTracer {
         self.lock_inner().stats.clone()
     }
 
+    /// Iterations completed this run.
+    pub fn iterations(&self) -> u32 {
+        self.lock_inner().iterations
+    }
+
+    /// Compactions triggered this run.
+    pub fn compressions(&self) -> u32 {
+        self.lock_inner().compressions
+    }
+
     /// Get the full trace log.
     pub fn traces(&self) -> Vec<ToolTrace> {
         self.lock_inner().traces.clone()
