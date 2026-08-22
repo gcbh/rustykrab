@@ -12,7 +12,6 @@ members = [
     "crates/rustykrab-cli",
     "crates/rustykrab-memory",
     "crates/rustykrab-e2e",
-    "crates/rustykrab-credeval",
 ]
 
 [workspace.package]
