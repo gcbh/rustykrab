@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.1.20] - 2026-08-22
+
+- Dreaming P1 (1/3): track when the system was last busy (#509)
+
 ## [5.1.19] - 2026-08-22
 
 - Dreaming P0 (6/6): wire outcome capture into the gateway, memory, and CLI (#508)
