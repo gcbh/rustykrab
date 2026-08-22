@@ -13,6 +13,7 @@ reqwest = { workspace = true, features = ["stream"] }
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
+regex.workspace = true
 tempfile = "3"
 # Direct reads of the daemon's SQLite store, so scenarios can assert on
 # the tables the plan specifies (secret_versions, secret_audit,

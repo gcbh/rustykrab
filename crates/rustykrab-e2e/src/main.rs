@@ -17,6 +17,11 @@
 //! RUSTYKRAB_BIN=target/debug/rustykrab-cli cargo run -p rustykrab-e2e
 //! ```
 
+mod assertion;
+mod judge;
+mod model_suite;
+mod transcript;
+
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
@@ -104,12 +109,83 @@ enum Expected {
 #[derive(Debug, Serialize)]
 struct ScenarioReport {
     id: &'static str,
+    /// "scripted" or "model". The two are not comparable — one says the
+    /// plumbing works, the other says a real model could use it — and the
+    /// report must never let them be read as a single number.
+    mode: &'static str,
     expected: Expected,
     passed: bool,
     /// "pass" | "fail" | "xfail" | "xpass"
     outcome: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    detail: Option<String>,
+    runs: usize,
+    passes: usize,
+    mean_ms: u128,
+    /// Distinct failure reasons across repetitions.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    details: Vec<String>,
+}
+
+/// A model scenario passes when it passes strictly more than this fraction
+/// of its repetitions. Scripted scenarios are deterministic and must pass
+/// every run instead: one failure in three is a broken scenario, not an
+/// acceptable rate.
+const MODEL_MAJORITY: f64 = 0.5;
+
+impl ScenarioReport {
+    fn new(
+        id: &'static str,
+        mode: &'static str,
+        expected: Expected,
+        runs: usize,
+        passes: usize,
+        details: Vec<String>,
+        mean_ms: u128,
+    ) -> Self {
+        let passed = match mode {
+            "model" => runs > 0 && (passes as f64 / runs as f64) > MODEL_MAJORITY,
+            _ => runs > 0 && passes == runs,
+        };
+        let outcome = match (expected, passed) {
+            (Expected::Pass, true) => "pass",
+            (Expected::Pass, false) => "fail",
+            (Expected::XFail, false) => "xfail",
+            (Expected::XFail, true) => "xpass",
+        };
+        Self {
+            id,
+            mode,
+            expected,
+            passed,
+            outcome,
+            runs,
+            passes,
+            mean_ms,
+            details,
+        }
+    }
+
+    /// Passed some repetitions but not all — the interesting middle, where
+    /// the framework is neither reliably right nor reliably wrong.
+    fn flaky(&self) -> bool {
+        self.passes > 0 && self.passes < self.runs
+    }
+
+    fn line(&self) -> String {
+        let reps = if self.runs > 1 {
+            format!(" {}/{}", self.passes, self.runs)
+        } else {
+            String::new()
+        };
+        let flaky = if self.flaky() { " ~flaky" } else { "" };
+        let detail = match self.details.first() {
+            Some(d) if self.expected == Expected::Pass && !self.passed => format!(" — {d}"),
+            _ => String::new(),
+        };
+        format!(
+            "[{:>5}] {}{reps} ({}ms){flaky}{detail}",
+            self.outcome, self.id, self.mean_ms
+        )
+    }
 }
 
 struct Ctx {
@@ -227,6 +303,43 @@ impl Ctx {
             bail!("store value for {name} is not what was just written");
         }
         Ok(())
+    }
+
+    async fn create_conversation(&self) -> Result<String> {
+        let conv: Value = self
+            .post("/api/conversations", json!({}))
+            .await?
+            .json()
+            .await?;
+        Ok(conv["id"]
+            .as_str()
+            .ok_or_else(|| anyhow!("conversation create returned no id: {conv}"))?
+            .to_string())
+    }
+
+    /// Send one message to an existing conversation, returning the reply.
+    async fn send(&self, conv_id: &str, content: &str) -> Result<Value> {
+        let resp = self
+            .post(
+                &format!("/api/conversations/{conv_id}/messages"),
+                json!({ "content": content }),
+            )
+            .await?;
+        if resp.status() != 200 {
+            bail!("send_message returned {}", resp.status());
+        }
+        Ok(resp.json().await?)
+    }
+
+    /// Read a conversation back out of the daemon's store. The reply body
+    /// is only the last assistant message; this is the whole exchange,
+    /// tool traffic and compaction bookmark included.
+    async fn conversation(&self, conv_id: &str) -> Result<Value> {
+        let resp = self.get(&format!("/api/conversations/{conv_id}")).await?;
+        if resp.status() != 200 {
+            bail!("get conversation returned {}", resp.status());
+        }
+        Ok(resp.json().await?)
     }
 
     /// Create a conversation, send one message, return the assistant reply.
@@ -845,11 +958,33 @@ fn pick_free_port() -> Result<u16> {
     Ok(listener.local_addr()?.port())
 }
 
+/// Which provider the daemon under test should run.
+pub enum Backend<'a> {
+    /// Replay a fixed script — no model, no network, deterministic.
+    Scripted,
+    /// A real model via Ollama, with the tool registry replaced by stubs
+    /// the scenario controls.
+    Model {
+        model: &'a str,
+        ollama_url: &'a str,
+        tool_stubs: &'a str,
+    },
+}
+
 fn spawn_daemon(bin: &str, data_dir: &std::path::Path, port: u16) -> Result<Child> {
-    let script_path = data_dir.join("e2e-script.json");
-    std::fs::write(&script_path, AGENT_SCRIPT)?;
+    spawn_daemon_with(bin, data_dir, port, &Backend::Scripted)
+}
+
+fn spawn_daemon_with(
+    bin: &str,
+    data_dir: &std::path::Path,
+    port: u16,
+    backend: &Backend<'_>,
+) -> Result<Child> {
     let log = std::fs::File::create(data_dir.join("daemon.log"))?;
-    let child = Command::new(bin)
+    let mut command = Command::new(bin);
+    let command = &mut command;
+    let command = command
         // Start from an empty environment: the developer's shell may hold
         // real credentials (which would be written into this throwaway
         // store) and RUSTYKRAB_* settings that would change behaviour and
@@ -859,8 +994,6 @@ fn spawn_daemon(bin: &str, data_dir: &std::path::Path, port: u16) -> Result<Chil
         .env("HOME", std::env::var("HOME").unwrap_or_default())
         .env("RUSTYKRAB_DATA_DIR", data_dir)
         .env("RUSTYKRAB_PORT", port.to_string())
-        .env("RUSTYKRAB_PROVIDER", "scripted")
-        .env("RUSTYKRAB_SCRIPT_PATH", &script_path)
         .env("RUSTYKRAB_MASTER_KEY", MASTER_KEY_HEX)
         .env("RUSTYKRAB_AUTH_TOKEN", AUTH_TOKEN)
         // Never touch the host's real Keychain from a throwaway boot.
@@ -874,11 +1007,52 @@ fn spawn_daemon(bin: &str, data_dir: &std::path::Path, port: u16) -> Result<Chil
         .env("RUSTYKRAB_RATE_LIMIT_MAX", "100000")
         .env("RUSTYKRAB_RATE_LIMIT_LOCKOUT_SECS", "1")
         .env("RUSTYKRAB_ALLOWED_ORIGINS", ALLOWED_ORIGIN)
+        // Share one embedding-model download across every throwaway boot.
+        // Without this the model suite, which boots a daemon per
+        // repetition, re-fetches hundreds of megabytes into each new
+        // temporary data dir.
+        .env("RUSTYKRAB_MODEL_CACHE_DIR", shared_model_cache());
+
+    match backend {
+        Backend::Scripted => {
+            let script_path = data_dir.join("e2e-script.json");
+            std::fs::write(&script_path, AGENT_SCRIPT)?;
+            command
+                .env("RUSTYKRAB_PROVIDER", "scripted")
+                .env("RUSTYKRAB_SCRIPT_PATH", &script_path);
+        }
+        Backend::Model {
+            model,
+            ollama_url,
+            tool_stubs,
+        } => {
+            let stub_path = data_dir.join("tool-stubs.json");
+            std::fs::write(&stub_path, tool_stubs)?;
+            command
+                .env("RUSTYKRAB_PROVIDER", "ollama")
+                .env("OLLAMA_MODEL", model)
+                .env("OLLAMA_BASE_URL", ollama_url)
+                // Compaction summarisation on a local model is
+                // prefill-heavy; the default would cut it off.
+                .env("OLLAMA_TIMEOUT_SECS", "900")
+                .env("RUSTYKRAB_TOOL_STUBS", &stub_path);
+        }
+    }
+
+    let child = command
         .stdout(Stdio::from(log.try_clone()?))
         .stderr(Stdio::from(log))
         .spawn()
         .with_context(|| format!("failed to spawn daemon binary {bin}"))?;
     Ok(child)
+}
+
+/// A stable cache for the embedding model, outside the throwaway data
+/// dirs. Without it every scenario re-downloads the ONNX weights.
+fn shared_model_cache() -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join("rustykrab-e2e-models");
+    let _ = std::fs::create_dir_all(&dir);
+    dir
 }
 
 async fn wait_for_health(base: &str, client: &reqwest::Client, child: &mut Child) -> Result<()> {
@@ -908,32 +1082,205 @@ macro_rules! scenario {
     }};
 }
 
+const USAGE: &str = "\
+rustykrab-e2e — end-to-end evaluation harness
+
+USAGE:
+    cargo run -p rustykrab-e2e -- [FLAGS]
+
+FLAGS:
+    --mode scripted|model|all   Which suite to run (default: scripted)
+    --reps N                    Repetitions per model scenario (default: 3)
+    --case SUBSTRING            Only scenarios whose id contains SUBSTRING
+    --quick                     Skip scenarios tagged slow
+    --model TAG                 Ollama model for --mode model (default: gemma4:26b)
+    --ollama-url URL            Ollama base URL (default: http://localhost:11434)
+    --list                      List scenarios and exit
+    -h, --help                  Show this message
+
+ENVIRONMENT:
+    RUSTYKRAB_BIN       Daemon binary (default: target/debug/rustykrab-cli)
+    ANTHROPIC_API_KEY   Grades model-mode rubrics with claude-sonnet-5.
+                        Without it the model under test grades itself, and
+                        the report says so.
+    E2E_KEEP_TMP        Keep the throwaway data dir for post-mortems.
+";
+
+struct Args {
+    mode: String,
+    reps: usize,
+    case_filter: Option<String>,
+    quick: bool,
+    model: String,
+    ollama_url: String,
+    list: bool,
+}
+
+fn parse_args(argv: &[String]) -> std::result::Result<Args, String> {
+    let mut args = Args {
+        mode: "scripted".to_string(),
+        reps: 3,
+        case_filter: None,
+        quick: false,
+        model: std::env::var("OLLAMA_MODEL").unwrap_or_else(|_| "gemma4:26b".to_string()),
+        ollama_url: std::env::var("OLLAMA_BASE_URL")
+            .unwrap_or_else(|_| "http://localhost:11434".to_string()),
+        list: false,
+    };
+    let value = |i: usize, name: &str| -> std::result::Result<String, String> {
+        argv.get(i + 1)
+            .cloned()
+            .ok_or_else(|| format!("{name} requires a value"))
+    };
+    let mut i = 0;
+    while i < argv.len() {
+        match argv[i].as_str() {
+            "--list" => args.list = true,
+            "--quick" => args.quick = true,
+            "-h" | "--help" => return Err(String::new()),
+            "--mode" => {
+                args.mode = value(i, "--mode")?.to_lowercase();
+                if !matches!(args.mode.as_str(), "scripted" | "model" | "all") {
+                    return Err(format!(
+                        "--mode: expected scripted|model|all, got {}",
+                        args.mode
+                    ));
+                }
+                i += 1;
+            }
+            "--reps" => {
+                let v = value(i, "--reps")?;
+                args.reps = v
+                    .parse()
+                    .map_err(|_| format!("--reps: not a number: {v}"))?;
+                if args.reps == 0 {
+                    return Err("--reps must be at least 1".to_string());
+                }
+                i += 1;
+            }
+            "--case" => {
+                args.case_filter = Some(value(i, "--case")?);
+                i += 1;
+            }
+            "--model" => {
+                args.model = value(i, "--model")?;
+                i += 1;
+            }
+            "--ollama-url" => {
+                args.ollama_url = value(i, "--ollama-url")?;
+                i += 1;
+            }
+            other => return Err(format!("unknown flag: {other}")),
+        }
+        i += 1;
+    }
+    Ok(args)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let args = match parse_args(&argv) {
+        Ok(a) => a,
+        Err(message) => {
+            if !message.is_empty() {
+                eprintln!("error: {message}\n");
+            }
+            eprint!("{USAGE}");
+            std::process::exit(if message.is_empty() { 0 } else { 2 });
+        }
+    };
+
+    if args.list {
+        eprintln!("── scripted ──");
+        for (_, (id, _)) in scripted_scenarios() {
+            eprintln!("  {id}");
+        }
+        eprintln!("\n── model ──");
+        for case in model_suite::cases() {
+            let slow = if case.slow { "  (slow)" } else { "" };
+            eprintln!("  {:<42}{slow}\n      {}", case.id, case.description);
+        }
+        return Ok(());
+    }
+
     let bin =
         std::env::var("RUSTYKRAB_BIN").unwrap_or_else(|_| "target/debug/rustykrab-cli".to_string());
     if !std::path::Path::new(&bin).exists() {
         bail!("daemon binary not found at {bin} — build it first or set RUSTYKRAB_BIN");
     }
 
+    let mut reports: Vec<ScenarioReport> = Vec::new();
+    let mut judge_name: Option<String> = None;
+
+    if args.mode == "scripted" || args.mode == "all" {
+        reports.extend(run_scripted(&bin).await?);
+    }
+    if args.mode == "model" || args.mode == "all" {
+        let (model_reports, name) = model_suite::run(
+            &bin,
+            &args.model,
+            &args.ollama_url,
+            args.reps,
+            args.case_filter.as_deref(),
+            args.quick,
+        )
+        .await?;
+        reports.extend(model_reports);
+        judge_name = Some(name);
+    }
+
+    let count = |o: &str| reports.iter().filter(|r| r.outcome == o).count();
+    let (pass, fail, xfail, xpass) = (count("pass"), count("fail"), count("xfail"), count("xpass"));
+    // Green means every implemented scenario passed and no target scenario
+    // passed unexpectedly — an xpass must be promoted before the suite can
+    // go green again.
+    let ok = fail == 0 && xpass == 0;
+    let report = json!({
+        "scenarios": reports,
+        "summary": {
+            "pass": pass,
+            "fail": fail,
+            "xfail": xfail,
+            "xpass": xpass,
+            "flaky": reports.iter().filter(|r| r.flaky()).count(),
+            "judge": judge_name,
+            "ok": ok,
+        },
+    });
+
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    if !ok {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// The scripted suite shares one daemon across every scenario — they are
+/// deterministic and independent, so a boot each would only add minutes.
+async fn run_scripted(bin: &str) -> Result<Vec<ScenarioReport>> {
     let tmp = tempfile::Builder::new()
         .prefix("rustykrab-e2e-")
         .tempdir()?;
-    let keep_tmp = std::env::var("E2E_KEEP_TMP").is_ok();
     let data_dir = tmp.path().to_path_buf();
     let port = pick_free_port()?;
 
-    let mut child = spawn_daemon(&bin, &data_dir, port)?;
+    let mut child = spawn_daemon(bin, &data_dir, port)?;
+    let result = run_suite(bin, &data_dir, port, &mut child).await;
+    shutdown_daemon(child).await;
+    keep_or_drop(tmp);
+    result
+}
 
-    let result = run_suite(&bin, &data_dir, port, &mut child).await;
-
-    // Graceful shutdown first (SIGTERM) so the store flushes; hard-kill on
-    // timeout or if TERM couldn't be sent.
+/// SIGTERM first so the store flushes; hard-kill only if it will not go.
+async fn shutdown_daemon(mut child: Child) {
     let _ = Command::new("kill").arg(child.id().to_string()).status();
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
-        if child.try_wait()?.is_some() {
-            break;
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {}
+            Err(_) => break,
         }
         if std::time::Instant::now() > deadline {
             let _ = child.kill();
@@ -942,28 +1289,60 @@ async fn main() -> Result<()> {
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
+}
 
-    let (report, ok) = result?;
-    if keep_tmp {
+/// The throwaway data dir must be removed explicitly rather than by
+/// TempDir's Drop: this process exits via `std::process::exit` when the
+/// suite is red, which skips destructors, and going red is exactly when a
+/// run would otherwise leak its dir and logs.
+fn keep_or_drop(tmp: tempfile::TempDir) {
+    if std::env::var("E2E_KEEP_TMP").is_ok() {
         let path = tmp.keep();
         eprintln!("E2E_KEEP_TMP set — data dir kept at {}", path.display());
-    } else {
-        // Delete the throwaway data dir explicitly rather than relying on
-        // TempDir's Drop: this process exits via `std::process::exit` when
-        // the suite is red, which skips destructors. Leaving it implicit
-        // meant every red run — and going red is how an xpass gets
-        // noticed — leaked a daemon data dir and its logs.
-        let path = tmp.path().to_path_buf();
-        drop(tmp);
-        if path.exists() {
-            let _ = std::fs::remove_dir_all(&path);
-        }
+        return;
     }
-    println!("{}", serde_json::to_string_pretty(&report)?);
-    if !ok {
-        std::process::exit(1);
+    let path = tmp.path().to_path_buf();
+    drop(tmp);
+    if path.exists() {
+        let _ = std::fs::remove_dir_all(&path);
     }
-    Ok(())
+}
+
+/// The last few lines of the daemon log — a startup failure is otherwise
+/// reported as a bare exit status, which says nothing about the cause.
+fn log_tail(data_dir: &std::path::Path) -> String {
+    let Ok(text) = std::fs::read_to_string(data_dir.join("daemon.log")) else {
+        return "(no daemon.log)".to_string();
+    };
+    let lines: Vec<&str> = text.lines().collect();
+    lines[lines.len().saturating_sub(25)..].join("\n")
+}
+
+/// The deterministic plumbing scenarios, in run order.
+fn scripted_scenarios() -> Vec<(Expected, (&'static str, ScenarioFn))> {
+    vec![
+        // Baseline — implemented today, must pass.
+        (Expected::Pass, scenario!(health)),
+        (Expected::Pass, scenario!(auth_required)),
+        (Expected::Pass, scenario!(origin_allowlist)),
+        (Expected::Pass, scenario!(conversations_crud)),
+        (Expected::Pass, scenario!(chat_scripted_default)),
+        (Expected::Pass, scenario!(chat_sse_stream)),
+        (Expected::Pass, scenario!(chat_sse_stream_with_tools)),
+        (Expected::Pass, scenario!(secrets_create_and_delete)),
+        (Expected::Pass, scenario!(agent_creates_new_credential)),
+        // Workstream A — the credential guard. Shipped: these assert the
+        // real behaviour now.
+        // Workstream B — device pairing.
+        (Expected::Pass, scenario!(pair_device_target)),
+        (Expected::Pass, scenario!(secrets_create_only_409)),
+        (Expected::Pass, scenario!(secrets_overwrite_archives)),
+        (Expected::Pass, scenario!(agent_overwrite_files_request)),
+        (Expected::Pass, scenario!(approve_applies_change)),
+        (Expected::Pass, scenario!(deny_preserves_value)),
+        (Expected::Pass, scenario!(agent_delete_files_request)),
+        (Expected::Pass, scenario!(revoked_device_401)),
+    ]
 }
 
 async fn run_suite(
@@ -971,7 +1350,7 @@ async fn run_suite(
     data_dir: &std::path::Path,
     port: u16,
     child: &mut Child,
-) -> Result<(Value, bool)> {
+) -> Result<Vec<ScenarioReport>> {
     let base = format!("http://127.0.0.1:{port}");
     // The origin-check middleware requires an Origin header on every
     // /api request (loopback origins are always allowed).
@@ -995,76 +1374,31 @@ async fn run_suite(
         data_dir: data_dir.to_path_buf(),
     };
 
-    let scenarios: Vec<(Expected, (&'static str, ScenarioFn))> = vec![
-        // Baseline — implemented today, must pass.
-        (Expected::Pass, scenario!(health)),
-        (Expected::Pass, scenario!(auth_required)),
-        (Expected::Pass, scenario!(origin_allowlist)),
-        (Expected::Pass, scenario!(conversations_crud)),
-        (Expected::Pass, scenario!(chat_scripted_default)),
-        (Expected::Pass, scenario!(chat_sse_stream)),
-        (Expected::Pass, scenario!(chat_sse_stream_with_tools)),
-        (Expected::Pass, scenario!(secrets_create_and_delete)),
-        (Expected::Pass, scenario!(agent_creates_new_credential)),
-        // Workstream A — the credential guard. Shipped: these assert the
-        // real behaviour now.
-        // Workstream B — device pairing.
-        (Expected::Pass, scenario!(pair_device_target)),
-        (Expected::Pass, scenario!(secrets_create_only_409)),
-        (Expected::Pass, scenario!(secrets_overwrite_archives)),
-        (Expected::Pass, scenario!(agent_overwrite_files_request)),
-        (Expected::Pass, scenario!(approve_applies_change)),
-        (Expected::Pass, scenario!(deny_preserves_value)),
-        (Expected::Pass, scenario!(agent_delete_files_request)),
-        (Expected::Pass, scenario!(revoked_device_401)),
-    ];
+    let scenarios = scripted_scenarios();
 
     let mut reports = Vec::new();
     for (expected, (id, f)) in scenarios {
+        let started = std::time::Instant::now();
         let outcome = tokio::time::timeout(Duration::from_secs(120), f(ctx)).await;
-        let (passed, detail) = match outcome {
-            Ok(Ok(())) => (true, None),
-            Ok(Err(e)) => (false, Some(format!("{e:#}"))),
-            Err(_) => (false, Some("scenario timed out after 120s".to_string())),
+        let (passes, details) = match outcome {
+            Ok(Ok(())) => (1, vec![]),
+            Ok(Err(e)) => (0, vec![format!("{e:#}")]),
+            Err(_) => (0, vec!["scenario timed out after 120s".to_string()]),
         };
-        let outcome = match (expected, passed) {
-            (Expected::Pass, true) => "pass",
-            (Expected::Pass, false) => "fail",
-            (Expected::XFail, false) => "xfail",
-            (Expected::XFail, true) => "xpass",
-        };
-        eprintln!(
-            "[{outcome:>5}] {id}{}",
-            match &detail {
-                Some(d) if expected == Expected::Pass => format!(" — {d}"),
-                _ => String::new(),
-            }
-        );
-        reports.push(ScenarioReport {
+        let report = ScenarioReport::new(
             id,
+            "scripted",
             expected,
-            passed,
-            outcome,
-            detail,
-        });
+            1,
+            passes,
+            details,
+            started.elapsed().as_millis(),
+        );
+        eprintln!("{}", report.line());
+        reports.push(report);
     }
 
-    let count = |o: &str| reports.iter().filter(|r| r.outcome == o).count();
-    let (pass, fail, xfail, xpass) = (count("pass"), count("fail"), count("xfail"), count("xpass"));
-    // Green means: every implemented scenario passes and no target
-    // scenario passes unexpectedly (an xpass must be promoted to Pass).
-    let ok = fail == 0 && xpass == 0;
-    let report = json!({
-        "scenarios": reports,
-        "summary": {
-            "pass": pass,
-            "fail": fail,
-            "xfail": xfail,
-            "xpass": xpass,
-            "ok": ok,
-        },
-    });
-    Ok((report, ok))
+    Ok(reports)
 }
 
 fn hex_decode(s: &str) -> Result<Vec<u8>> {

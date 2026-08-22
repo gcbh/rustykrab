@@ -4201,6 +4201,7 @@ name = "rustykrab-e2e"
 version = "5.1.22"
 dependencies = [
  "anyhow",
+ "regex",
  "reqwest 0.13.3",
  "rusqlite",
  "rustykrab-store",
