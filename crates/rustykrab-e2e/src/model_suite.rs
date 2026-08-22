@@ -29,7 +29,7 @@ use crate::{
 
 /// Ceiling for one repetition, including daemon boot and every turn. A
 /// local 26B model compacting a conversation is slow, but not this slow.
-const CASE_TIMEOUT: Duration = Duration::from_secs(1_200);
+const CASE_TIMEOUT: Duration = Duration::from_secs(2_700);
 
 /// Context budget for the compaction scenarios.
 ///
@@ -39,14 +39,19 @@ const CASE_TIMEOUT: Duration = Duration::from_secs(1_200);
 /// code path is identical; only the threshold moves.
 const TIGHT_CONTEXT_TOKENS: usize = 6_000;
 
-/// The provider context window the compaction scenarios run under.
+/// The provider context window every model scenario runs under.
 ///
 /// `needs_compaction` compares the conversation against
-/// `effective_context_limit()`, which prefers what the provider reports.
+/// `effective_context_limit()`, which prefers what the provider reports;
 /// Ollama always reports, so this is the only lever that moves the
-/// trigger; a `max_context_tokens` in the profile is a fallback that never
-/// applies here. At 6144 the threshold lands near 5.2k tokens, which a
-/// handful of bulky turns reaches in about a minute.
+/// trigger, and a `max_context_tokens` in the profile never applies.
+///
+/// It is one value for the whole suite rather than per scenario because
+/// Ollama unloads and reloads 17GB of weights whenever the window
+/// changes. Varying it per scenario spent more time reloading than
+/// running. At 6144 the compaction threshold lands near 5.2k tokens,
+/// which two bulky turns reach, and every other scenario stays far below
+/// it.
 const TIGHT_NUM_CTX: u32 = 6_144;
 
 pub struct ModelCase {
@@ -199,6 +204,7 @@ pub fn cases() -> Vec<ModelCase> {
             "A single question through the whole daemon returns a correct answer",
         )
         .with_harness(bounded_harness())
+        .with_num_ctx(TIGHT_NUM_CTX)
         .ask("What is the capital city of Iceland? Answer in one short sentence.")
         .expect(Assertion::NoRunError)
         .expect(Assertion::FinalContainsAny(s(&["reykjav"])))
@@ -213,6 +219,7 @@ pub fn cases() -> Vec<ModelCase> {
             "A fact from the first turn is still available three turns later",
         )
         .with_harness(bounded_harness())
+        .with_num_ctx(TIGHT_NUM_CTX)
         .ask("My deployment is codenamed Vireo. Just acknowledge that briefly.")
         .ask("I also run a nightly backup at 02:30. Acknowledge briefly.")
         .ask("What is my deployment codenamed?")
@@ -223,6 +230,7 @@ pub fn cases() -> Vec<ModelCase> {
             "The agent declines to invent facts it cannot have",
         )
         .with_harness(bounded_harness())
+        .with_num_ctx(TIGHT_NUM_CTX)
         .ask(
             "What was the exact closing share price of the company Vantablack Logistics \
              on 14 March 2031?",
@@ -240,6 +248,7 @@ pub fn cases() -> Vec<ModelCase> {
             "A strict output-format instruction is followed exactly",
         )
         .with_harness(bounded_harness())
+        .with_num_ctx(TIGHT_NUM_CTX)
         .ask(
             "Reply with exactly three words separated by single commas and nothing else: \
              the three primary additive colours, lowercase.",
@@ -255,6 +264,7 @@ pub fn cases() -> Vec<ModelCase> {
             "The agent picks the right tool, fills its schema, and reports the result",
         )
         .with_harness(bounded_harness())
+        .with_num_ctx(TIGHT_NUM_CTX)
         .with_tool(tool(
             "weather_lookup",
             "Get the current weather for a city. Returns temperature in Celsius and conditions.",
@@ -279,6 +289,7 @@ pub fn cases() -> Vec<ModelCase> {
             "Every required field of a three-argument schema is filled correctly",
         )
         .with_harness(bounded_harness())
+        .with_num_ctx(TIGHT_NUM_CTX)
         .with_tool(tool(
             "book_room",
             "Reserve a meeting room. All three arguments are required.",
@@ -316,6 +327,7 @@ pub fn cases() -> Vec<ModelCase> {
             "A present but irrelevant tool is not called",
         )
         .with_harness(bounded_harness())
+        .with_num_ctx(TIGHT_NUM_CTX)
         .with_tool(tool(
             "send_invoice",
             "Email an invoice to a customer. Only use when explicitly asked to bill someone.",
@@ -340,6 +352,7 @@ pub fn cases() -> Vec<ModelCase> {
             "A tool that fails once and then succeeds still produces a correct answer",
         )
         .with_harness(bounded_harness())
+        .with_num_ctx(TIGHT_NUM_CTX)
         .with_tool(tool(
             "weather_lookup",
             "Get the current weather for a city. Returns temperature in Celsius and conditions.",
@@ -368,6 +381,7 @@ pub fn cases() -> Vec<ModelCase> {
             "A tool that always fails is reported honestly, without fabrication or looping",
         )
         .with_harness(bounded_harness())
+        .with_num_ctx(TIGHT_NUM_CTX)
         .with_tool(tool(
             "stock_quote",
             "Get the latest share price for a ticker symbol.",
@@ -395,6 +409,7 @@ pub fn cases() -> Vec<ModelCase> {
             "An empty-but-successful result is reported as empty, not as an error",
         )
         .with_harness(bounded_harness())
+        .with_num_ctx(TIGHT_NUM_CTX)
         .with_tool(tool(
             "search_orders",
             "Search customer orders. Returns a list, which may be empty.",
@@ -419,6 +434,7 @@ pub fn cases() -> Vec<ModelCase> {
             "One tool's output becomes the next tool's input",
         )
         .with_harness(bounded_harness())
+        .with_num_ctx(TIGHT_NUM_CTX)
         .with_tool(tool(
             "find_order",
             "Look up an order id from a customer name.",
@@ -451,6 +467,7 @@ pub fn cases() -> Vec<ModelCase> {
             "A short conversation under budget is never compacted",
         )
         .with_harness(bounded_harness())
+        .with_num_ctx(TIGHT_NUM_CTX)
         .ask("We are planning a small migration next week. Acknowledge briefly.")
         .ask("In one sentence, what did I say I was planning?")
         .expect(Assertion::NoRunError)
@@ -466,9 +483,6 @@ pub fn cases() -> Vec<ModelCase> {
         .ask("We are auditing the ingest pipeline. Acknowledge in one sentence.")
         .ask(bulky_note(1))
         .ask(bulky_note(2))
-        .ask(bulky_note(3))
-        .ask(bulky_note(4))
-        .ask(bulky_note(5))
         .ask("Summarise where we are in one sentence.")
         .expect(Assertion::NoRunError)
         .expect(Assertion::Compacted(true))
@@ -491,9 +505,6 @@ pub fn cases() -> Vec<ModelCase> {
         )
         .ask(bulky_note(1))
         .ask(bulky_note(2))
-        .ask(bulky_note(3))
-        .ask(bulky_note(4))
-        .ask(bulky_note(5))
         .ask("What is the staging cluster called, and who owns incidents for this service?")
         .expect(Assertion::NoRunError)
         .expect(Assertion::Compacted(true))
@@ -517,9 +528,6 @@ pub fn cases() -> Vec<ModelCase> {
         .ask("We are auditing the ingest pipeline. Acknowledge in one sentence.")
         .ask(bulky_note(1))
         .ask(bulky_note(2))
-        .ask(bulky_note(3))
-        .ask(bulky_note(4))
-        .ask(bulky_note(5))
         .ask(
             "Forget the audit for a moment. My postgres replica is called selkie-2. \
              Repeat its name back to me exactly.",
@@ -536,6 +544,7 @@ pub fn cases() -> Vec<ModelCase> {
             "An explicit request to remember something reaches the memory store",
         )
         .with_harness(bounded_harness())
+        .with_num_ctx(TIGHT_NUM_CTX)
         .keeping(&["memory_save", "memory_search", "memory_get"])
         .ask(
             "Please remember this for later: my postgres replica is called selkie-2. \
@@ -549,6 +558,7 @@ pub fn cases() -> Vec<ModelCase> {
         )
         .slow()
         .with_harness(bounded_harness())
+        .with_num_ctx(TIGHT_NUM_CTX)
         .keeping(&["memory_save", "memory_search", "memory_get"])
         .ask("Remember that my kettle is a Stagg EKG Pro. Save that to memory.")
         .ask(
@@ -570,6 +580,7 @@ pub fn cases() -> Vec<ModelCase> {
             "A query with no matching memory produces an honest miss, not an invention",
         )
         .with_harness(bounded_harness())
+        .with_num_ctx(TIGHT_NUM_CTX)
         .keeping(&["memory_save", "memory_search", "memory_get"])
         .ask(
             "Search your memory for my bicycle's serial number and tell me what it is. \
@@ -702,6 +713,8 @@ async fn run_once(
         model,
         ollama_url,
         num_ctx: case.num_ctx,
+        // The model suite names its tools through the stub file.
+        active_tools: &[],
         tool_stubs: &stubs,
         // These scenarios drive the gateway directly; the credential
         // suite is the one that varies the surface.
@@ -719,7 +732,12 @@ async fn run_once(
             .default_headers(headers)
             // A local 26B model answering a compacted conversation can take
             // minutes; the per-repetition timeout is the real bound.
-            .timeout(Duration::from_secs(900))
+            // A turn that triggers compaction pays for a summarisation
+            // call over the whole window on top of its own inference. The
+            // case timeout is the real bound; this must sit above it or it
+            // fires first and reports a transport error instead of a
+            // scenario result.
+            .timeout(Duration::from_secs(1_800))
             .build()?;
         wait_for_health(&base, &client, &mut child).await?;
 

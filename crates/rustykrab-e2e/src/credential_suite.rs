@@ -321,6 +321,10 @@ async fn drive_webhook(
 
 // ── running the suite ────────────────────────────────────────────────
 
+/// The tool families these scenarios reach for. Seeded into the active set
+/// so a trial measures credential behaviour rather than tool discovery.
+const CREDENTIAL_TOOLS: &[&str] = &["gmail", "browser"];
+
 /// One trial's record, kept verbatim so every count in the summary can be
 /// audited back to the reply that produced it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -520,6 +524,12 @@ async fn run_trial_inner(
         model,
         ollama_url,
         num_ctx: None,
+        // The premise is that the agent needs a credential it does not
+        // have — which presupposes it got as far as reaching for the tool.
+        // Without these the measurement quietly becomes "did it discover
+        // the tool", and a scenario that never found `gmail` looks
+        // identical to one that found it and declined to ask.
+        active_tools: CREDENTIAL_TOOLS,
         tool_stubs: "",
         channel: Some((surface, &capture_base)),
     };

@@ -1023,6 +1023,11 @@ pub enum Backend<'a> {
         /// default; the compaction scenarios lower it, because that is
         /// what `effective_context_limit()` actually reads.
         num_ctx: Option<u32>,
+        /// Tools to seed into the active set. Registering a tool is not
+        /// enough for the model to see it — schemas are only sent for
+        /// active tools — so a scenario has to name what it is testing or
+        /// it measures tool discovery instead.
+        active_tools: &'a [&'a str],
         tool_stubs: &'a str,
         /// Which channel to wire up, and the base URL of the capture
         /// server standing in for its API. `None` drives the gateway
@@ -1062,6 +1067,13 @@ fn spawn_daemon_with(
         .env("NOTION_API_TOKEN", "e2e-dummy-notion")
         .env("OBSIDIAN_API_KEY", "e2e-dummy-obsidian")
         .env("RUSTYKRAB_LOG_STDOUT", "1")
+        // The spawn clears the environment, which also clears RUST_LOG, so
+        // a scenario that misbehaves leaves a log with nothing in it to
+        // explain why. E2E_DAEMON_LOG turns the detail back on.
+        .env(
+            "RUST_LOG",
+            std::env::var("E2E_DAEMON_LOG").unwrap_or_else(|_| "info".to_string()),
+        )
         // The suite drives far more than the shipping 20 req/min from one
         // IP; raise the limit for this throwaway boot only.
         .env("RUSTYKRAB_RATE_LIMIT_MAX", "100000")
@@ -1085,6 +1097,7 @@ fn spawn_daemon_with(
             model,
             ollama_url,
             num_ctx,
+            active_tools,
             tool_stubs,
             channel,
         } => {
@@ -1108,15 +1121,19 @@ fn spawn_daemon_with(
                 let stub_path = data_dir.join("tool-stubs.json");
                 std::fs::write(&stub_path, tool_stubs)?;
                 command.env("RUSTYKRAB_TOOL_STUBS", &stub_path);
+            }
 
-                // Registering a stub is not enough to make the model aware
-                // of it: schemas are only sent for tools in the active set,
-                // and a scenario cannot rely on the model calling
-                // `tools_load` to discover the one tool it is being tested
-                // on. Activate exactly the stubs this scenario declares.
-                if let Some(names) = stub_tool_names(tool_stubs) {
-                    command.env("RUSTYKRAB_ACTIVE_TOOLS", names);
-                }
+            // Registering a tool is not enough to make the model aware of
+            // it: schemas are only sent for tools in the active set, and a
+            // scenario cannot rely on the model calling `tools_load` to
+            // discover the one thing it is being tested on. Name the stubs
+            // this scenario declares, plus anything it asked for outright.
+            let mut active: Vec<String> = active_tools.iter().map(|n| (*n).to_string()).collect();
+            if let Some(names) = stub_tool_names(tool_stubs) {
+                active.push(names);
+            }
+            if !active.is_empty() {
+                command.env("RUSTYKRAB_ACTIVE_TOOLS", active.join(","));
             }
 
             // Channel wiring points the daemon's outbound calls at the
