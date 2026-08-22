@@ -135,8 +135,20 @@ fn count(db: &std::path::Path, sql: &str) -> i64 {
         .unwrap_or(0)
 }
 
+/// Outstanding credential requests — the ones a user could actually act
+/// on.
+///
+/// Counting every row overstates it badly. The store supersedes an older
+/// pending request when a newer one names the same credential, so an agent
+/// that retries a failing tool leaves a trail of superseded rows behind
+/// one live ask. A single trial reported 21 "filed" requests that way,
+/// which looked like the daemon failing to deduplicate when it had in fact
+/// deduplicated correctly every time.
 fn credential_requests_filed(db: &std::path::Path) -> i64 {
-    count(db, "SELECT COUNT(*) FROM credential_requests")
+    count(
+        db,
+        "SELECT COUNT(*) FROM credential_requests WHERE status = 'pending'",
+    )
 }
 
 fn secrets_written(db: &std::path::Path) -> i64 {
