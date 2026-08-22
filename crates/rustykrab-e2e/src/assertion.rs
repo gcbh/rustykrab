@@ -59,16 +59,17 @@ pub enum Assertion {
     RetriesAtMost { tool: String, max: usize },
     /// Compaction did (or didn't) run.
     Compacted(bool),
-    /// The compaction generation counter reached at least this value.
-    CompactionGenerationAtLeast(u64),
+
     /// The generated summary contains at least one of these — the facts
     /// that had to survive the fold.
     SummaryContainsAny(Vec<String>),
-    /// At least this many messages were folded out of the live window.
-    FoldedAtLeast(usize),
-    /// Full history is retained after compaction: nothing is destroyed,
-    /// only hidden from the model.
-    HistoryRetainedAtLeast(usize),
+    /// At least this many characters of displaced history were archived
+    /// for the recall tools. Compaction replaces the live messages, so
+    /// this is where "nothing was destroyed" is actually checked.
+    ArchivedAtLeast(usize),
+    /// The live window shrank to at most this many messages — a
+    /// compaction that does not shrink anything has not helped.
+    LiveMessagesAtMost(usize),
     /// The agent finished within this many assistant turns.
     IterationsAtMost(usize),
 }
@@ -99,10 +100,10 @@ impl Assertion {
             Assertion::RecoveredFrom { tool, .. } => format!("recovered from {tool} failure"),
             Assertion::RetriesAtMost { tool, max } => format!("{tool} called at most {max}x"),
             Assertion::Compacted(b) => format!("compacted == {b}"),
-            Assertion::CompactionGenerationAtLeast(n) => format!("compaction generation >= {n}"),
+
             Assertion::SummaryContainsAny(v) => format!("summary contains any {v:?}"),
-            Assertion::FoldedAtLeast(n) => format!("folded >= {n} messages"),
-            Assertion::HistoryRetainedAtLeast(n) => format!("history retained >= {n} messages"),
+            Assertion::ArchivedAtLeast(n) => format!("archived >= {n} chars of history"),
+            Assertion::LiveMessagesAtMost(n) => format!("live window <= {n} messages"),
             Assertion::IterationsAtMost(n) => format!("assistant turns <= {n}"),
         }
     }
@@ -266,42 +267,32 @@ impl Assertion {
                 }
             }
 
-            Assertion::CompactionGenerationAtLeast(n) => {
-                if t.compaction_generation >= *n {
-                    Ok(())
-                } else {
-                    Err(format!(
-                        "compaction generation is {}, expected >= {n}",
-                        t.compaction_generation
-                    ))
-                }
-            }
-
             Assertion::SummaryContainsAny(needles) => match &t.summary {
                 None => Err("no summary was produced".into()),
                 Some(s) => contains_any(s, needles)
                     .map_err(|m| format!("none of {m:?} in summary: {}", excerpt(s))),
             },
 
-            Assertion::FoldedAtLeast(n) => {
-                if t.folded_messages >= *n {
+            Assertion::ArchivedAtLeast(n) => {
+                if t.archived_chars >= *n {
                     Ok(())
                 } else {
                     Err(format!(
-                        "only {} messages folded, expected >= {n}",
-                        t.folded_messages
+                        "{} chars archived, expected >= {n} — compaction dropped the \
+                         displaced history instead of preserving it for recall",
+                        t.archived_chars
                     ))
                 }
             }
 
-            Assertion::HistoryRetainedAtLeast(n) => {
-                if t.total_messages >= *n {
+            Assertion::LiveMessagesAtMost(n) => {
+                if t.live_messages <= *n {
                     Ok(())
                 } else {
                     Err(format!(
-                        "history holds {} messages, expected >= {n} — compaction destroyed \
-                         history instead of hiding it",
-                        t.total_messages
+                        "{} messages still live, expected <= {n} — the compaction did not \
+                         shrink the window",
+                        t.live_messages
                     ))
                 }
             }

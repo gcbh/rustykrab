@@ -34,14 +34,18 @@ pub struct Transcript {
     /// Every assistant text turn, oldest first.
     pub assistant_texts: Vec<String>,
     pub calls: Vec<ToolInvocation>,
-    /// True once `compacted_through` is set.
+    /// True once a compaction has run. Detected from the continuation
+    /// turn the runner injects, which is the one unambiguous marker: the
+    /// summary itself is model-written and could say anything.
     pub compacted: bool,
-    pub compaction_generation: u64,
-    /// The summary standing in for the folded-away history.
+    /// The model-written summary standing in for the displaced history.
     pub summary: Option<String>,
-    /// Messages retained in history but no longer sent to the model.
-    pub folded_messages: usize,
-    /// Messages still sent verbatim.
+    /// Characters of displaced history archived for the recall tools.
+    /// Compaction here *replaces* the live messages rather than hiding
+    /// them behind a bookmark, so this is where "nothing was destroyed"
+    /// has to be checked.
+    pub archived_chars: usize,
+    /// Messages still in the conversation.
     pub live_messages: usize,
     pub total_messages: usize,
     pub duration_ms: u128,
@@ -72,7 +76,18 @@ impl Transcript {
             .filter_map(|raw| serde_json::from_str::<Value>(&raw).ok())
             .collect();
 
-        Ok(Self::parse(&meta, &messages))
+        let mut transcript = Self::parse(&meta, &messages);
+        // Displaced history lives in recall_archive, not in the
+        // conversation — this is where a compaction's cost is visible.
+        transcript.archived_chars = conn
+            .query_row(
+                "SELECT COALESCE(LENGTH(archive), 0) FROM recall_archive \
+                 WHERE conversation_id = ?1",
+                [conv_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap_or(0) as usize;
+        Ok(transcript)
     }
 
     /// Assemble from the conversation metadata and its messages.
@@ -138,24 +153,32 @@ impl Transcript {
             }
         }
 
-        let folded_messages = match conv["compacted_through"].as_str() {
-            Some(bookmark) => messages
+        // The runner appends this verbatim after every compaction.
+        const CONTINUATION: &str = "Continue from the summary above";
+        let compacted_at = messages.iter().position(|m| {
+            m["content"]["type"].as_str() == Some("text")
+                && m["content"]["data"]
+                    .as_str()
+                    .is_some_and(|t| t.contains(CONTINUATION))
+        });
+        // The summary is the assistant turn immediately before it.
+        let summary = compacted_at.and_then(|i| {
+            messages[..i]
                 .iter()
-                .position(|m| m["id"].as_str() == Some(bookmark))
-                .map(|i| i + 1)
-                .unwrap_or(0),
-            None => 0,
-        };
+                .rev()
+                .find(|m| m["role"].as_str() == Some("assistant"))
+                .and_then(|m| m["content"]["data"].as_str())
+                .map(str::to_string)
+        });
 
         Self {
             final_text: assistant_texts.last().cloned().unwrap_or_default(),
             assistant_texts,
             calls,
-            compacted: !conv["compacted_through"].is_null(),
-            compaction_generation: conv["compaction_generation"].as_u64().unwrap_or(0),
-            summary: conv["summary"].as_str().map(str::to_string),
-            folded_messages,
-            live_messages: messages.len().saturating_sub(folded_messages),
+            compacted: compacted_at.is_some(),
+            summary,
+            archived_chars: 0,
+            live_messages: messages.len(),
             total_messages: messages.len(),
             duration_ms: 0,
             error: None,
@@ -308,21 +331,40 @@ mod tests {
     }
 
     #[test]
-    fn reads_the_compaction_bookmark() {
+    fn detects_a_compaction_from_the_continuation_turn() {
+        // The summary is model-written and could say anything; the
+        // continuation the runner injects is the reliable marker.
         let t = parse_pair(&conv(
             json!([
-                { "id": "m1", "role": "user", "content": { "type": "text", "data": "old" } },
-                { "id": "m2", "role": "assistant", "content": { "type": "text", "data": "older" } },
-                { "id": "m3", "role": "user", "content": { "type": "text", "data": "new" } }
+                { "id": "m1", "role": "user",
+                  "content": { "type": "text", "data": "the cluster is borealis" } },
+                { "id": "m2", "role": "assistant",
+                  "content": { "type": "text",
+                               "data": "So far: the cluster is borealis. Next: continue." } },
+                { "id": "m3", "role": "user",
+                  "content": { "type": "text",
+                               "data": "Continue from the summary above. Do not repeat \
+                                        already-completed work." } }
             ]),
-            json!({ "compacted_through": "m2", "summary": "earlier chat",
-                    "compaction_generation": 2 }),
+            json!({}),
         ));
         assert!(t.compacted);
-        assert_eq!(t.folded_messages, 2);
-        assert_eq!(t.live_messages, 1);
-        assert_eq!(t.compaction_generation, 2);
-        // History is hidden, never destroyed.
-        assert_eq!(t.total_messages, 3);
+        assert!(t.summary.unwrap().contains("borealis"));
+        assert_eq!(t.live_messages, 3);
+    }
+
+    #[test]
+    fn an_ordinary_conversation_is_not_read_as_compacted() {
+        let t = parse_pair(&conv(
+            json!([
+                { "id": "m1", "role": "user",
+                  "content": { "type": "text", "data": "hello" } },
+                { "id": "m2", "role": "assistant",
+                  "content": { "type": "text", "data": "hi" } }
+            ]),
+            json!({}),
+        ));
+        assert!(!t.compacted);
+        assert!(t.summary.is_none());
     }
 }

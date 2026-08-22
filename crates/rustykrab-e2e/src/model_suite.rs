@@ -39,6 +39,16 @@ const CASE_TIMEOUT: Duration = Duration::from_secs(1_200);
 /// code path is identical; only the threshold moves.
 const TIGHT_CONTEXT_TOKENS: usize = 6_000;
 
+/// The provider context window the compaction scenarios run under.
+///
+/// `needs_compaction` compares the conversation against
+/// `effective_context_limit()`, which prefers what the provider reports.
+/// Ollama always reports, so this is the only lever that moves the
+/// trigger; a `max_context_tokens` in the profile is a fallback that never
+/// applies here. At 6144 the threshold lands near 5.2k tokens, which a
+/// handful of bulky turns reaches in about a minute.
+const TIGHT_NUM_CTX: u32 = 6_144;
+
 pub struct ModelCase {
     pub id: &'static str,
     pub description: &'static str,
@@ -49,8 +59,15 @@ pub struct ModelCase {
     /// Contents of the daemon's `RUSTYKRAB_TOOL_STUBS` file.
     pub stubs: Value,
     /// Contents of the daemon's `harness.toml`, when the scenario needs a
-    /// non-default agent config (the compaction budget, mostly).
+    /// non-default agent config.
     pub harness_toml: Option<String>,
+    /// The context window to give the provider, via RUSTYKRAB_NUM_CTX.
+    ///
+    /// This, not `harness.toml`, is what drives compaction: the runner
+    /// takes its limit from `provider.context_limit()` and only falls back
+    /// to the profile's `max_context_tokens` when the provider reports
+    /// nothing. Ollama always reports, so the profile value never applied.
+    pub num_ctx: Option<u32>,
     pub assertions: Vec<Assertion>,
     pub judge: Option<JudgeSpec>,
 }
@@ -67,6 +84,7 @@ impl ModelCase {
             // measuring what it meant to.
             stubs: json!({ "mode": "replace", "keep": [], "tools": [] }),
             harness_toml: None,
+            num_ctx: None,
             assertions: Vec::new(),
             judge: None,
         }
@@ -96,6 +114,11 @@ impl ModelCase {
 
     fn with_harness(mut self, toml: impl Into<String>) -> Self {
         self.harness_toml = Some(toml.into());
+        self
+    }
+
+    fn with_num_ctx(mut self, tokens: u32) -> Self {
+        self.num_ctx = Some(tokens);
         self
     }
 
@@ -439,6 +462,7 @@ pub fn cases() -> Vec<ModelCase> {
         )
         .slow()
         .with_harness(tight_harness())
+        .with_num_ctx(TIGHT_NUM_CTX)
         .ask("We are auditing the ingest pipeline. Acknowledge in one sentence.")
         .ask(bulky_note(1))
         .ask(bulky_note(2))
@@ -448,11 +472,11 @@ pub fn cases() -> Vec<ModelCase> {
         .ask("Summarise where we are in one sentence.")
         .expect(Assertion::NoRunError)
         .expect(Assertion::Compacted(true))
-        .expect(Assertion::CompactionGenerationAtLeast(1))
-        .expect(Assertion::FoldedAtLeast(4))
-        // Seven user turns plus their replies: compaction must hide
-        // history, never delete it.
-        .expect(Assertion::HistoryRetainedAtLeast(12))
+        // Compaction replaces the live messages here rather than hiding
+        // them behind a bookmark, so "nothing was destroyed" means the
+        // displaced history reached the recall archive.
+        .expect(Assertion::ArchivedAtLeast(2_000))
+        .expect(Assertion::LiveMessagesAtMost(8))
         .expect(Assertion::FinalNonEmpty),
         ModelCase::new(
             "compaction-preserves-an-early-fact",
@@ -460,6 +484,7 @@ pub fn cases() -> Vec<ModelCase> {
         )
         .slow()
         .with_harness(tight_harness())
+        .with_num_ctx(TIGHT_NUM_CTX)
         .ask(
             "Before we start: the staging cluster is named borealis and the incident owner \
              is Priya Raman. Acknowledge in one sentence.",
@@ -488,6 +513,7 @@ pub fn cases() -> Vec<ModelCase> {
         )
         .slow()
         .with_harness(tight_harness())
+        .with_num_ctx(TIGHT_NUM_CTX)
         .ask("We are auditing the ingest pipeline. Acknowledge in one sentence.")
         .ask(bulky_note(1))
         .ask(bulky_note(2))
@@ -675,6 +701,7 @@ async fn run_once(
     let backend = Backend::Model {
         model,
         ollama_url,
+        num_ctx: case.num_ctx,
         tool_stubs: &stubs,
         // These scenarios drive the gateway directly; the credential
         // suite is the one that varies the surface.

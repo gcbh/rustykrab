@@ -519,6 +519,7 @@ async fn run_trial_inner(
     let backend = Backend::Model {
         model,
         ollama_url,
+        num_ctx: None,
         tool_stubs: "",
         channel: Some((surface, &capture_base)),
     };

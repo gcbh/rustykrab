@@ -1019,6 +1019,10 @@ pub enum Backend<'a> {
     Model {
         model: &'a str,
         ollama_url: &'a str,
+        /// Context window for the provider. `None` leaves the daemon's
+        /// default; the compaction scenarios lower it, because that is
+        /// what `effective_context_limit()` actually reads.
+        num_ctx: Option<u32>,
         tool_stubs: &'a str,
         /// Which channel to wire up, and the base URL of the capture
         /// server standing in for its API. `None` drives the gateway
@@ -1080,6 +1084,7 @@ fn spawn_daemon_with(
         Backend::Model {
             model,
             ollama_url,
+            num_ctx,
             tool_stubs,
             channel,
         } => {
@@ -1090,6 +1095,9 @@ fn spawn_daemon_with(
                 // Compaction summarisation on a local model is
                 // prefill-heavy; the default would cut it off.
                 .env("OLLAMA_TIMEOUT_SECS", "900");
+            if let Some(n) = num_ctx {
+                command.env("RUSTYKRAB_NUM_CTX", n.to_string());
+            }
 
             // An empty spec means "leave the registry alone" — the
             // credential suite needs the real tools, because its premise
@@ -1100,6 +1108,15 @@ fn spawn_daemon_with(
                 let stub_path = data_dir.join("tool-stubs.json");
                 std::fs::write(&stub_path, tool_stubs)?;
                 command.env("RUSTYKRAB_TOOL_STUBS", &stub_path);
+
+                // Registering a stub is not enough to make the model aware
+                // of it: schemas are only sent for tools in the active set,
+                // and a scenario cannot rely on the model calling
+                // `tools_load` to discover the one tool it is being tested
+                // on. Activate exactly the stubs this scenario declares.
+                if let Some(names) = stub_tool_names(tool_stubs) {
+                    command.env("RUSTYKRAB_ACTIVE_TOOLS", names);
+                }
             }
 
             // Channel wiring points the daemon's outbound calls at the
@@ -1117,6 +1134,20 @@ fn spawn_daemon_with(
         .spawn()
         .with_context(|| format!("failed to spawn daemon binary {bin}"))?;
     Ok(child)
+}
+
+/// The tool names a stub file declares, comma separated.
+fn stub_tool_names(tool_stubs: &str) -> Option<String> {
+    let parsed: Value = serde_json::from_str(tool_stubs).ok()?;
+    let names: Vec<&str> = parsed["tools"]
+        .as_array()?
+        .iter()
+        .filter_map(|t| t["name"].as_str())
+        .collect();
+    if names.is_empty() {
+        return None;
+    }
+    Some(names.join(","))
 }
 
 /// A stable cache for the embedding model, outside the throwaway data
