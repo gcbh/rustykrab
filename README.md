@@ -69,6 +69,27 @@ export RUSTYKRAB_PROVIDER=ollama
 cargo run --release -p rustykrab-cli
 ```
 
+### Option C: Run against any OpenAI-compatible server
+
+Works with `llama-server` (llama.cpp), mistral.rs, vllm-mlx, `mlx_lm.server`,
+LM Studio's headless daemon, exo, and OpenAI-compatible hosted APIs.
+
+```bash
+llama-server -m model.gguf --jinja --cache-reuse 256 -np 1 -c 32768 --port 8080
+
+export RUSTYKRAB_PROVIDER=llama-server
+export OPENAI_BASE_URL=http://localhost:8080
+export OPENAI_MODEL=my-model
+cargo run --release -p rustykrab-cli
+```
+
+Size the context deliberately: the system prompt plus the built-in tool
+schemas is roughly 8k tokens before any conversation, and `-np N` divides the
+context between N slots. `--jinja` is required for tool calling.
+
+Point `OPENAI_BASE_URL` at another machine on the LAN or tailnet to run
+inference on separate hardware.
+
 #### Tuning the Ollama server for KV-cache reuse
 
 An agent loop re-sends the whole conversation on every iteration, so almost
@@ -159,7 +180,7 @@ All configuration is via environment variables. No plaintext config files.
 
 | Variable | Default | Description |
 |---|---|---|
-| `RUSTYKRAB_PROVIDER` | `anthropic` | Model backend: `anthropic` or `ollama` |
+| `RUSTYKRAB_PROVIDER` | `anthropic` | Model backend: `anthropic`, `ollama`, `scripted` (E2E harness), or an OpenAI-compatible alias (`openai`, `llama-server`, `llamacpp`, `mistralrs`, `lmstudio`, `mlx`, `exo`, `vllm`) |
 | `ANTHROPIC_API_KEY` | — | Anthropic API key (required for Claude) |
 | `ANTHROPIC_MODEL` | `claude-sonnet-4-20250514` | Claude model to use. The Claude 4.X family (Opus 4.7 `claude-opus-4-7`, Sonnet 4.6 `claude-sonnet-4-6`, Haiku 4.5 `claude-haiku-4-5-20251001`) is recommended for new deployments |
 | `ANTHROPIC_CONTEXT_LENGTH` | `200000` | Context window in tokens for the selected Claude model. Anthropic doesn't expose a discovery endpoint, so set this when enabling a non-default window (e.g. the 1M-token beta) so compaction thresholds stay in sync |
@@ -174,6 +195,12 @@ All configuration is via environment variables. No plaintext config files.
 | `OLLAMA_THINK` | `auto` | Whether to request thinking mode: `true`, `false`, or `auto` to decide from the model tag. Ollama returns a 400 for `think` against models that don't support it, so `auto` only enables it for known thinking families |
 | `OLLAMA_VISION` | `auto` | Whether the model accepts image input: `true`, `false`, or `auto` to decide from the model tag |
 | `OLLAMA_TIMEOUT_SECS` | `900` | HTTP request timeout for Ollama in seconds |
+| `OPENAI_MODEL` | `local-model` | Model name sent to the OpenAI-compatible server |
+| `OPENAI_BASE_URL` | `http://localhost:8080` | OpenAI-compatible server address (with or without a `/v1` suffix) |
+| `OPENAI_API_KEY` | — | Bearer token; optional, ignored by most local servers |
+| `OPENAI_TEMPERATURE` | `0.1` | Sampling temperature |
+| `OPENAI_MAX_TOKENS` | `8192` | Max tokens to generate per response |
+| `OPENAI_INCLUDE_USAGE` | `1` | Request usage in the final stream chunk; set `0` for servers that reject `stream_options` |
 | `CHROME_CDP_URL` | `ws://127.0.0.1:9222` | Chrome DevTools Protocol endpoint |
 | `RUSTYKRAB_AUTH_TOKEN` | auto-generated | Bearer token for API auth |
 | `RUSTYKRAB_MASTER_KEY` | auto-generated | Encryption key for secrets at rest |
@@ -182,7 +209,7 @@ All configuration is via environment variables. No plaintext config files.
 | `TELEGRAM_WEBHOOK_URL` | — | Public webhook URL (omit for long-polling mode) |
 | `TELEGRAM_WEBHOOK_SECRET` | — | Secret token for webhook validation |
 | `SIGNAL_ACCOUNT` | — | Your Signal phone number (E.164, e.g. `+1234567890`) |
-| `SIGNAL_CLI_URL` | `http://localhost:8080` | signal-cli-rest-api URL |
+| `SIGNAL_CLI_URL` | `http://localhost:8080` | signal-cli-rest-api URL (shares its default port with `OPENAI_BASE_URL` — change one if running both) |
 | `SIGNAL_ALLOWED_NUMBERS` | — | Comma-separated E.164 numbers allowed to message |
 | `SIGNAL_WEBHOOK_URL` | — | Webhook URL (omit for polling mode) |
 | `SIGNAL_WEBHOOK_SECRET` | — | Shared secret for webhook validation |

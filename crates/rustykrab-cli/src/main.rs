@@ -569,6 +569,40 @@ async fn main() -> anyhow::Result<()> {
             );
             Arc::new(p)
         }
+        // Any server exposing an OpenAI-compatible /v1/chat/completions API:
+        // llama-server, mistral.rs, vllm-mlx, mlx_lm.server, LM Studio's
+        // headless daemon, exo, or a hosted OpenAI-compatible endpoint. The
+        // aliases exist so logs and error messages name the actual backend;
+        // they behave identically otherwise.
+        "openai" | "openai-compat" | "llama-server" | "llamacpp" | "mistralrs" | "lmstudio"
+        | "mlx" | "exo" | "vllm" => {
+            let model = std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "local-model".to_string());
+            let base_url = std::env::var("OPENAI_BASE_URL")
+                .unwrap_or_else(|_| "http://localhost:8080".to_string());
+
+            let mut config = rustykrab_providers::OpenAiConfig::default();
+            if let Some(t) = env_parse::<f32>("OPENAI_TEMPERATURE") {
+                config.temperature = t;
+            }
+            if let Some(m) = env_parse::<u32>("OPENAI_MAX_TOKENS") {
+                config.max_tokens = m;
+            }
+            // Escape hatch for servers that reject `stream_options`.
+            if let Ok(v) = std::env::var("OPENAI_INCLUDE_USAGE") {
+                config.include_usage = !matches!(v.trim(), "0" | "false" | "no");
+            }
+
+            tracing::info!(%model, %base_url, provider = %provider_name, "using OpenAI-compatible provider");
+            let mut p = rustykrab_providers::OpenAiProvider::new(model)
+                .with_base_url(base_url)
+                .with_provider_name(provider_name.clone())
+                .with_config(config);
+            // Optional — most local servers ignore it.
+            if let Ok(key) = std::env::var("OPENAI_API_KEY") {
+                p = p.with_api_key(key);
+            }
+            Arc::new(p)
+        }
         _ => {
             let api_key = resolve_api_key(&store).await;
             let model = std::env::var("ANTHROPIC_MODEL")
@@ -2365,6 +2399,18 @@ async fn handle_pair_subcommand(data_dir: &std::path::Path) -> anyhow::Result<()
         );
     }
     Ok(())
+}
+
+/// Parse an optional env var, warning (rather than failing) on garbage.
+fn env_parse<T: std::str::FromStr>(key: &str) -> Option<T> {
+    let raw = std::env::var(key).ok()?;
+    match raw.trim().parse::<T>() {
+        Ok(v) => Some(v),
+        Err(_) => {
+            tracing::warn!(%key, value = %raw, "ignoring unparseable env var");
+            None
+        }
+    }
 }
 
 async fn resolve_auth_token(store: &rustykrab_store::Store) -> String {
