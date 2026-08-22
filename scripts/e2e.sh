@@ -7,16 +7,26 @@
 # scripted agent. Prints a JSON report; exit code 0 means green
 # (implemented scenarios pass, Phase 2 target scenarios are xfail).
 #
-# Usage: scripts/e2e.sh [--release]
+# Usage:
+#   scripts/e2e.sh                      # scripted plumbing suite (fast, CI)
+#   scripts/e2e.sh --mode model         # gemma4 behaviour suite (slow)
+#   scripts/e2e.sh --mode all --release
+#
+# Any flag other than --release is passed through to the runner.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 PROFILE=debug
 CARGO_FLAGS=()
-if [[ "${1:-}" == "--release" ]]; then
-  PROFILE=release
-  CARGO_FLAGS+=(--release)
-fi
+RUNNER_ARGS=()
+for arg in "$@"; do
+  if [[ "$arg" == "--release" ]]; then
+    PROFILE=release
+    CARGO_FLAGS+=(--release)
+  else
+    RUNNER_ARGS+=("$arg")
+  fi
+done
 
 echo "building daemon (--no-default-features)..." >&2
 cargo build -p rustykrab-cli --no-default-features "${CARGO_FLAGS[@]+"${CARGO_FLAGS[@]}"}"
@@ -27,6 +37,6 @@ cargo build -p rustykrab-e2e "${CARGO_FLAGS[@]+"${CARGO_FLAGS[@]}"}"
 # artifact); the exit code is the runner's.
 set +e
 RUSTYKRAB_BIN="target/$PROFILE/rustykrab-cli" "target/$PROFILE/rustykrab-e2e" \
-  | tee e2e-report.json
+  "${RUNNER_ARGS[@]+"${RUNNER_ARGS[@]}"}" | tee e2e-report.json
 status=${PIPESTATUS[0]}
 exit "$status"
