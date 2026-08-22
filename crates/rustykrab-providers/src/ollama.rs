@@ -598,7 +598,7 @@ impl OllamaProvider {
         args
     }
 
-    fn parse_response(resp: OllamaResponse) -> Result<ModelResponse> {
+    fn parse_response(model: &str, resp: OllamaResponse) -> Result<ModelResponse> {
         let msg = resp.message;
 
         // Fix #192: parse done_reason to detect truncation.
@@ -638,11 +638,17 @@ impl OllamaProvider {
             }
         }
 
+        let text = msg.content.unwrap_or_default();
+        if is_empty_generation(&text, resp.eval_count) {
+            return Err(empty_response_error(
+                model,
+                resp.prompt_eval_count,
+                resp.done_reason.as_deref(),
+            ));
+        }
+
         Ok(ModelResponse {
-            message: Message::stamped(
-                Role::Assistant,
-                MessageContent::Text(msg.content.unwrap_or_default()),
-            ),
+            message: Message::stamped(Role::Assistant, MessageContent::Text(text)),
             usage: Usage {
                 prompt_tokens: resp.prompt_eval_count.unwrap_or(0),
                 completion_tokens: resp.eval_count.unwrap_or(0),
@@ -982,7 +988,7 @@ impl ModelProvider for OllamaProvider {
                 let ollama_resp: OllamaResponse = serde_json::from_str(&raw_body).map_err(|e| {
                     Error::ModelProvider(format!("failed to parse Ollama response: {e}"))
                 })?;
-                let response = Self::parse_response(ollama_resp)?;
+                let response = Self::parse_response(&self.model, ollama_resp)?;
 
                 // Debug: dump raw response when message text is empty
                 // despite having completion tokens.
@@ -1271,6 +1277,15 @@ impl ModelProvider for OllamaProvider {
                 MessageContent::MultiToolCall(tool_calls)
             }
         } else {
+            // Same silent-empty failure as the non-streaming path; a stream
+            // that yields nothing must not read as a successful empty turn.
+            if is_empty_generation(&full_text, Some(eval_count)) {
+                return Err(empty_response_error(
+                    &self.model,
+                    Some(prompt_eval_count),
+                    done_reason.as_deref(),
+                ));
+            }
             MessageContent::Text(full_text)
         };
 
@@ -1463,6 +1478,50 @@ fn estimate_text_tokens(s: &str) -> u32 {
     // chars().count() (not len()) so multibyte characters aren't over-counted.
     let chars = s.chars().count();
     chars.div_ceil(CHARS_PER_TOKEN) as u32
+}
+
+/// Whether a finished response carries no assistant output whatsoever:
+/// no text, no tool calls (checked by the caller), and zero generated
+/// tokens.
+///
+/// The token count is what makes this safe to treat as a failure. A
+/// thinking model legitimately returns empty `content` while spending
+/// tokens on reasoning, and a tool call legitimately has no text — both
+/// report `eval_count > 0`. Zero generated tokens means the server
+/// produced nothing at all.
+fn is_empty_generation(text: &str, eval_count: Option<u32>) -> bool {
+    text.trim().is_empty() && eval_count.unwrap_or(0) == 0
+}
+
+/// Ollama can answer HTTP 200 with no output at all — no content, no tool
+/// calls, zero generated tokens.
+///
+/// Observed on Ollama 0.32.15 with `qwen3.8:27b-mlx` whenever the prompt
+/// overruns the server's context window: the MLX runner truncates, finds
+/// no user turn left, and returns `done_reason: "stop"` with an absent
+/// `eval_count`. The llama.cpp runner rejects the same request outright
+/// with `no user query found in messages`, so which failure you get is a
+/// property of the runner, not of the conversation.
+///
+/// Passing the empty string on as an assistant turn makes a failed call
+/// indistinguishable from a successful one: the agent loop records an
+/// empty reply, and a scheduled job "completes" having done nothing. Fail
+/// loudly instead, matching the llama.cpp path.
+fn empty_response_error(
+    model: &str,
+    prompt_tokens: Option<u32>,
+    done_reason: Option<&str>,
+) -> Error {
+    Error::ModelProvider(format!(
+        "Ollama returned an empty response from {model}: no content, no tool calls, \
+         and zero generated tokens (prompt_eval_count={}, done_reason={}). The prompt \
+         most likely overran the model's context window — lower the prompt size or \
+         raise num_ctx (RUSTYKRAB_NUM_CTX / OLLAMA_NUM_CTX).",
+        prompt_tokens
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "absent".to_string()),
+        done_reason.unwrap_or("absent"),
+    ))
 }
 
 /// Attention geometry needed to size a model's KV cache, read from
@@ -2126,21 +2185,92 @@ mod tests {
         );
     }
 
+    // ---- Empty-generation guard ------------------------------------------
+
+    fn parse_raw(v: serde_json::Value) -> Result<ModelResponse> {
+        OllamaProvider::parse_response("test-model", serde_json::from_value(v).unwrap())
+    }
+
+    /// The exact shape `qwen3.8:27b-mlx` returns when the prompt overruns
+    /// its context window: 200 OK, `done_reason: "stop"`, no content and no
+    /// `eval_count`. It must not become a successful empty assistant turn.
+    #[test]
+    fn empty_generation_is_an_error_not_an_empty_turn() {
+        let err = parse_raw(serde_json::json!({
+            "message": { "content": "" },
+            "prompt_eval_count": 15045,
+            "done_reason": "stop",
+        }))
+        .expect_err("a response with zero generated tokens must be an error");
+
+        let text = err.to_string();
+        assert!(text.contains("empty response"), "got: {text}");
+        assert!(
+            text.contains("15045"),
+            "prompt size must be reported: {text}"
+        );
+    }
+
+    /// A tool call carries no text by design — the guard must not fire on it.
+    #[test]
+    fn tool_call_without_text_is_not_treated_as_empty() {
+        let resp = parse_raw(serde_json::json!({
+            "message": {
+                "content": "",
+                "tool_calls": [{ "function": { "name": "get_weather",
+                                               "arguments": { "city": "Paris" } } }]
+            },
+            "prompt_eval_count": 100,
+            "eval_count": 75,
+            "done_reason": "stop",
+        }))
+        .expect("a tool call is real output");
+        assert_eq!(resp.stop_reason, StopReason::ToolUse);
+    }
+
+    /// A thinking model can spend its whole budget reasoning and emit no
+    /// visible text. Tokens were generated, so this is a truncation, not the
+    /// silent-empty failure — it must still come back as a response.
+    #[test]
+    fn empty_text_with_generated_tokens_is_not_treated_as_empty() {
+        let resp = parse_raw(serde_json::json!({
+            "message": { "content": "" },
+            "prompt_eval_count": 100,
+            "eval_count": 8,
+            "done_reason": "length",
+        }))
+        .expect("tokens were generated, so this is not the empty-response failure");
+        assert_eq!(resp.stop_reason, StopReason::MaxTokens);
+    }
+
+    #[test]
+    fn is_empty_generation_predicate() {
+        assert!(is_empty_generation("", None));
+        assert!(is_empty_generation("", Some(0)));
+        assert!(is_empty_generation("   \n ", Some(0)));
+        assert!(!is_empty_generation("hi", Some(0))); // text without a count
+        assert!(!is_empty_generation("", Some(1))); // count without text
+    }
+
     // ---- Live tests against a real Ollama daemon -------------------------
     //
     // Ignored by default: they need a running Ollama and the model named by
-    // RK_LIVE_MODEL (default qwen3.8:27b). Run with:
+    // RK_LIVE_MODEL (default qwen3.8:27b-mlx, the deployed build). Run with:
     //
     //   cargo test -p rustykrab-providers --  --ignored --test-threads=1
     //
     // These exist because the failure they cover is not reproducible in a
     // unit test: it lives in the model's chat template, server-side. Note
     // that the rejection is template-specific, NOT a blanket Ollama
-    // behaviour — qwen3.8:27b rejects a user-less message array while
-    // gemma4:26b, qwen3:32b and qwen3:30b-a3b all accept one.
+    // behaviour — both qwen3.8:27b builds reject a user-less message array
+    // while gemma4:26b, qwen3:32b and qwen3:30b-a3b all accept one.
+    //
+    // The runner matters as well as the template: on the GGUF build an
+    // over-budget prompt is rejected outright, while the MLX build returns
+    // 200 with nothing generated. Tests that turn on the difference say so.
 
     fn live_model() -> String {
-        std::env::var("RK_LIVE_MODEL").unwrap_or_else(|_| "qwen3.8:27b".to_string())
+        std::env::var("RK_LIVE_MODEL").unwrap_or_else(|_| "qwen3.8:27b-mlx".to_string())
     }
 
     fn live_provider() -> OllamaProvider {
@@ -2266,9 +2396,13 @@ mod tests {
             .chat(&msgs, &[])
             .await
             .expect_err("documented limitation: an old user turn buried under bulk still fails");
+        let text = err.to_string();
         assert!(
-            err.to_string().contains("no user query found in messages"),
-            "expected the documented rejection, got: {err}"
+            // llama.cpp rejects the truncated prompt outright; the MLX runner
+            // returns 200 with nothing generated, which the empty-generation
+            // guard turns into this error. Either way it must fail loudly.
+            text.contains("no user query found in messages") || text.contains("empty response"),
+            "expected a documented rejection, got: {text}"
         );
     }
 
