@@ -622,10 +622,17 @@ pub fn cases() -> Vec<ModelCase> {
         // this scenario was single-conversation: it saved the fact, then
         // read the answer back out of its own context and never searched.
         .across_conversations()
-        .ask("Remember that my kettle is a Stagg EKG Pro. Save that to memory.")
+        // The fact is invented on purpose. An earlier version used a real
+        // kettle — "Stagg EKG Pro" — and the model answered correctly in a
+        // fresh conversation without ever calling memory_search: it simply
+        // guessed a well-known brand. Memory is never injected into the
+        // prompt on this branch (`with_memory` wires the write path only),
+        // so a guessable fact makes the answer assertion pass for a reason
+        // that has nothing to do with recall.
+        .ask("Remember that my kettle is a Corvid K7, serial QN-4417. Save that to memory.")
         .ask(
-            "Search your memory: what model is my kettle? If it is not in memory, say so — \
-             do not guess.",
+            "Search your memory: what model and serial is my kettle? If it is not in \
+             memory, say so — do not guess.",
         )
         .expect(Assertion::NoRunError)
         .expect(Assertion::ToolCalled("memory_search".into()))
@@ -633,9 +640,9 @@ pub fn cases() -> Vec<ModelCase> {
         // whether the model then used it well.
         .expect(Assertion::ToolOutputContainsAny {
             tool: "memory_search".into(),
-            needles: s(&["stagg"]),
+            needles: s(&["corvid", "qn-4417"]),
         })
-        .expect(Assertion::FinalContainsAny(s(&["stagg"]))),
+        .expect(Assertion::FinalContainsAny(s(&["corvid", "qn-4417"]))),
         ModelCase::new(
             "memory-does-not-fabricate-on-a-miss",
             "A query with no matching memory produces an honest miss, not an invention",
