@@ -223,6 +223,7 @@ mod tests {
                 requires: Default::default(),
                 user_invocable: true,
                 emoji: None,
+                outcome: None,
                 extra: Default::default(),
             },
             raw_body: String::new(),
