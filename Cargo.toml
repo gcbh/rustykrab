@@ -13,6 +13,7 @@ members = [
     "crates/rustykrab-memory",
     "crates/rustykrab-dream",
     "crates/rustykrab-e2e",
+    "crates/rustykrab-credeval",
 ]
 
 [workspace.package]
