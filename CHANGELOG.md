@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.1.15] - 2026-08-22
+
+- Dreaming P0 (3/6): persist outcome records and their attributions (#505)
+
 ## [5.1.14] - 2026-08-22
 
 - chore: sync Cargo.lock with the workspace manifests (#512)
