@@ -95,15 +95,28 @@ generic error path instead.
 The credential suite deliberately uses **no** stubs: its premise is that
 the real tools cannot run because the credential they need is absent.
 
+**Registering a tool is not enough for the model to see it.** Schemas are
+only sent for tools in the conversation's *active* set —
+`DEFAULT_ACTIVE_TOOLS` plus whatever `tools_load` has pulled in — so a
+freshly registered tool is invisible until something activates it. The
+harness sets `RUSTYKRAB_ACTIVE_TOOLS` to exactly the stubs each scenario
+declares, and the credential suite names the real tool families it reaches
+for. Without that a scenario measures tool discovery instead of the thing
+it is about, and an assertion like "the irrelevant tool was not called"
+passes for the wrong reason.
+
 ## How assertions see a run
 
-Everything comes from `GET /api/conversations/{id}` — the record the
-daemon persisted. Tool calls, arguments, tool *results*, the compaction
-bookmark, and the summary are all in there, so assertions read what the
-system stored rather than the harness's own bookkeeping. That is what
-makes `ToolOutputContainsAny` possible: a memory scenario can check that
-retrieval returned the fact, separately from whether the model then used
-it well.
+Out of the daemon's SQLite, not the REST API. The API speaks an
+app-facing shape — `{role, content}` with content flattened to a string —
+so tool calls, tool arguments, tool results and the whole compaction state
+are simply not in it. `conversations.data` and the `messages` rows have
+all of it, which is also how the credential suite reads
+`credential_requests`.
+
+That is what makes `ToolOutputContainsAny` possible: a memory scenario can
+check that retrieval returned the fact, separately from whether the model
+then used it well.
 
 An LLM judge covers only what substring matching cannot — whether an
 answer admitting a tool failed is an honest report or a hedge around an
@@ -111,13 +124,31 @@ invented number. `claude-sonnet-5` grades when `ANTHROPIC_API_KEY` is set,
 the model under test grades itself otherwise, and the report names which.
 The judge only runs on repetitions whose hard assertions already passed.
 
-## Compaction without an hour of inference
+## Compaction, and the lever that actually moves it
 
-The compaction scenarios write `harness.toml` into the throwaway data dir
-with `max_context_tokens = 6000` — the daemon's own config path, the same
-`maybe_compact` code, a handful of turns instead of hundreds. Facts that
-must survive are stated in the first turn so they land in the folded
-region; a fact in the verbatim tail proves nothing about the summary.
+Compaction fires when the conversation crosses
+`compaction_threshold_pct` of `effective_context_limit()`. That limit is
+whatever the **provider** reports, falling back to the profile's
+`max_context_tokens` only when the provider reports nothing. Ollama always
+reports, so setting `max_context_tokens` in `harness.toml` does nothing —
+the scenarios set `RUSTYKRAB_NUM_CTX` instead, which is what that function
+reads.
+
+One window serves the whole model suite rather than one per scenario:
+Ollama unloads and reloads 17GB of weights whenever the window changes,
+and varying it per scenario spent more time reloading than running.
+
+Compaction here does not leave a bookmark. It **replaces** the live
+messages with a model-written summary plus a continuation turn, and
+archives the displaced history into `recall_archive` for the recall tools.
+So a scenario detects compaction from the continuation turn — the summary
+is model-written and could say anything — and checks that nothing was
+destroyed against the archive, not against a message count that is now
+expected to shrink.
+
+Facts that must survive are stated in the first turn so they land in the
+displaced region; a fact still in the live window proves nothing about the
+summary.
 
 ## Surviving a killed run
 
@@ -149,3 +180,6 @@ scenario twenty minutes in.
 - Skills are not installed into the throwaway data dir, so the system
   prompt carries no skill catalog. Nothing in the current scenarios
   depends on one.
+- `E2E_DAEMON_LOG` sets the daemon's `RUST_LOG`. The spawn clears the
+  environment, which clears `RUST_LOG` with it, so a misbehaving scenario
+  otherwise leaves a log with nothing in it to explain why.
