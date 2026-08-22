@@ -367,6 +367,18 @@ pub async fn run(
     // full run is hours long and the summary is only written at the end,
     // so without this anything that kills the process — a SIGTERM, a
     // laptop sleeping — loses every reply already collected.
+    // Say the size of the run before starting it. Ten scenarios over three
+    // surfaces at five trials is 150 model round trips — hours, not
+    // minutes — and finding that out by watching it is not a good way to
+    // find it out.
+    let cells = selected.len() * surfaces.len();
+    eprintln!(
+        "credential suite: {} scenarios x {} surfaces x {trials} trials = {} trials",
+        selected.len(),
+        surfaces.len(),
+        cells * trials
+    );
+
     let mut sidecar = Sidecar::open(SIDECAR_PATH, resume)?;
     eprintln!("per-trial records: {SIDECAR_PATH}");
     if resume {
