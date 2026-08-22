@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use chrono::Utc;
-use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
 use uuid::Uuid;
 
@@ -94,11 +93,7 @@ impl MemoryWriter {
         }
 
         // ── SHA-256 dedup ───────────────────────────────────────
-        let content_hash = {
-            let mut hasher = Sha256::new();
-            hasher.update(turn.content.as_bytes());
-            hex::encode(hasher.finalize())
-        };
+        let content_hash = crate::hash_content(&turn.content);
 
         if let Some(existing) = self
             .storage
