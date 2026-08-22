@@ -278,39 +278,6 @@ fn validate_command(command: &str) -> std::result::Result<(), String> {
     Ok(())
 }
 
-#[cfg(test)]
-mod validation_tests {
-    use super::validate_command;
-
-    #[test]
-    fn permits_control_operators_inside_quotes() {
-        validate_command("grep -E 'GMAIL|EMAIL|PASSWORD' config.txt").unwrap();
-        validate_command("echo \"one; two && three || four | five\"").unwrap();
-    }
-
-    #[test]
-    fn permits_escaped_control_operators() {
-        validate_command(r"echo one\|two\;three\&four").unwrap();
-    }
-
-    #[test]
-    fn validates_each_unquoted_command_segment() {
-        validate_command("grep -E 'one|two' file | sort").unwrap();
-
-        let error = validate_command("echo safe | definitely-not-allowed").unwrap_err();
-        assert!(error.contains("definitely-not-allowed"));
-
-        let error = validate_command("echo safe & definitely-not-allowed").unwrap_err();
-        assert!(error.contains("definitely-not-allowed"));
-    }
-
-    #[test]
-    fn rejects_incomplete_shell_quoting() {
-        assert!(validate_command("echo 'unterminated").is_err());
-        assert!(validate_command("echo incomplete\\").is_err());
-    }
-}
-
 #[async_trait]
 impl Tool for ExecTool {
     fn name(&self) -> &str {
@@ -393,5 +360,38 @@ impl Tool for ExecTool {
             "stdout": stdout,
             "stderr": stderr,
         }))
+    }
+}
+
+#[cfg(test)]
+mod validation_tests {
+    use super::validate_command;
+
+    #[test]
+    fn permits_control_operators_inside_quotes() {
+        validate_command("grep -E 'GMAIL|EMAIL|PASSWORD' config.txt").unwrap();
+        validate_command("echo \"one; two && three || four | five\"").unwrap();
+    }
+
+    #[test]
+    fn permits_escaped_control_operators() {
+        validate_command(r"echo one\|two\;three\&four").unwrap();
+    }
+
+    #[test]
+    fn validates_each_unquoted_command_segment() {
+        validate_command("grep -E 'one|two' file | sort").unwrap();
+
+        let error = validate_command("echo safe | definitely-not-allowed").unwrap_err();
+        assert!(error.contains("definitely-not-allowed"));
+
+        let error = validate_command("echo safe & definitely-not-allowed").unwrap_err();
+        assert!(error.contains("definitely-not-allowed"));
+    }
+
+    #[test]
+    fn rejects_incomplete_shell_quoting() {
+        assert!(validate_command("echo 'unterminated").is_err());
+        assert!(validate_command("echo incomplete\\").is_err());
     }
 }
