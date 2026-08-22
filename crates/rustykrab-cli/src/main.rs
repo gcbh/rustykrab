@@ -412,7 +412,8 @@ async fn main() -> anyhow::Result<()> {
 
     // --- Harness profile ---
     // Load from file or use a preset. Supported: default, coding, research, creative
-    let mut profile = load_harness_profile(&data_dir)?;
+    let (mut profile, profile_context_tokens, pinned_profile_fields) =
+        load_harness_profile(&data_dir)?;
     tracing::info!(profile = %profile.name, "harness profile loaded");
 
     // --- Master key for credential encryption ---
@@ -585,7 +586,7 @@ async fn main() -> anyhow::Result<()> {
     // local Ollama deployments on consumer hardware can't chew through
     // anywhere near that before the HTTP timeout fires, so default to
     // 32k for Ollama and keep the 128k default for everything else.
-    profile.max_context_tokens = resolve_max_context_tokens(&provider_name);
+    profile.max_context_tokens = resolve_max_context_tokens(&provider_name, profile_context_tokens);
     tracing::info!(
         max_context_tokens = profile.max_context_tokens,
         provider = %provider_name,
@@ -1020,7 +1021,11 @@ async fn main() -> anyhow::Result<()> {
     // The classification prompt is ~50 tokens — negligible overhead on any model.
     let classifier: Arc<dyn ModelProvider> = provider.clone();
 
-    let router = Arc::new(HarnessRouter::new(classifier).with_base(profile));
+    let router = Arc::new(
+        HarnessRouter::new(classifier)
+            .with_base(profile)
+            .with_pinned_fields(pinned_profile_fields),
+    );
 
     // --- Build gateway state ---
     // Clone store handle so we can flush it after the server shuts down.
@@ -2237,14 +2242,23 @@ fn load_orchestration_config(data_dir: &std::path::Path) -> anyhow::Result<Orche
 ///
 /// Priority:
 /// 1. `RUSTYKRAB_MAX_CONTEXT_TOKENS` env var when set to a positive integer
-/// 2. Provider-aware default: 32k for Ollama (local inference with
+/// 2. `max_context_tokens` named in `harness.toml`, via `profile_set`
+/// 3. Provider-aware default: 32k for Ollama (local inference with
 ///    limited GPU memory), 128k for everything else (cloud models)
-fn resolve_max_context_tokens(provider_name: &str) -> usize {
+///
+/// Step 2 is the one that was missing. A `max_context_tokens` written in
+/// `harness.toml` was loaded and then immediately overwritten by the
+/// provider default — silently, so a profile asking for a small window got
+/// a large one and nothing said why.
+fn resolve_max_context_tokens(provider_name: &str, profile_set: Option<usize>) -> usize {
     if let Some(v) = std::env::var("RUSTYKRAB_MAX_CONTEXT_TOKENS")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|&v| v > 0)
     {
+        return v;
+    }
+    if let Some(v) = profile_set.filter(|&v| v > 0) {
         return v;
     }
     match provider_name {
@@ -2259,12 +2273,33 @@ fn resolve_max_context_tokens(provider_name: &str) -> usize {
 /// 1. `data_dir/harness.toml` — full custom profile
 /// 2. `RUSTYKRAB_HARNESS` env var — one of: default, coding, research, creative
 /// 3. Fallback to default profile
-fn load_harness_profile(data_dir: &std::path::Path) -> anyhow::Result<HarnessProfile> {
+///
+/// Returns the profile, the context budget it named, and every key it
+/// named.
+///
+/// The last two exist because `HarnessProfile` defaults every field, so a
+/// loaded profile alone cannot tell "the operator wants 6000" from "the
+/// operator said nothing and serde filled in a default". The context
+/// resolver and the harness router both need that distinction, and both
+/// were silently overriding stated choices without it.
+fn load_harness_profile(
+    data_dir: &std::path::Path,
+) -> anyhow::Result<(HarnessProfile, Option<usize>, Vec<String>)> {
     let profile_path = data_dir.join("harness.toml");
     if profile_path.exists() {
         let contents = std::fs::read_to_string(&profile_path)?;
         let profile: HarnessProfile = toml::from_str(&contents)?;
-        return Ok(profile);
+        let table = contents.parse::<toml::Table>().ok();
+        let explicit = table
+            .as_ref()
+            .and_then(|t| t.get("max_context_tokens").and_then(|v| v.as_integer()))
+            .map(|v| v as usize);
+        // Every key the file named. The router uses this to tell a stated
+        // choice from a serde default, which it otherwise cannot do.
+        let named = table
+            .map(|t| t.keys().cloned().collect())
+            .unwrap_or_default();
+        return Ok((profile, explicit, named));
     }
 
     let preset = std::env::var("RUSTYKRAB_HARNESS").unwrap_or_else(|_| "default".to_string());
@@ -2275,7 +2310,9 @@ fn load_harness_profile(data_dir: &std::path::Path) -> anyhow::Result<HarnessPro
         _ => HarnessProfile::default(),
     };
 
-    Ok(profile)
+    // A preset names nothing of its own, so the provider default applies
+    // and the router is free to choose.
+    Ok((profile, None, Vec::new()))
 }
 
 /// Handle `skill list` and `skill install <path>` subcommands.
