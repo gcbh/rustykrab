@@ -4,6 +4,7 @@ use rustykrab_core::active_tools::ActiveToolsRegistry;
 use rustykrab_core::model::ModelProvider;
 use rustykrab_core::orchestration::OrchestrationConfig;
 use rustykrab_core::recall::RecallStore;
+use rustykrab_core::retrieval_log::RetrievalLog;
 use rustykrab_core::todo::TodoStore;
 use rustykrab_memory::MemorySystem;
 use rustykrab_skills::SkillRegistry;
@@ -68,6 +69,15 @@ pub struct AppState {
     /// startup; threaded through so `prepare_agent` knows whether to grant
     /// `Capability::ComputerUse`.
     pub computer_use_enabled: bool,
+    /// Records which memories were surfaced into each conversation so a
+    /// completed run's outcome can be attributed to them. Shared with the
+    /// memory backend, which writes it, and the agent runner, which drains
+    /// it. See `DREAMING.md`.
+    pub retrieval_log: RetrievalLog,
+    /// Whether completed runs report their outcome to the store. Off by
+    /// default: instrumentation is opt-in, driven by
+    /// `RUSTYKRAB_OUTCOME_CAPTURE` at startup.
+    pub outcome_capture_enabled: bool,
 }
 
 impl AppState {
@@ -106,7 +116,25 @@ impl AppState {
             todos: Arc::new(TodoStore::new()),
             subagents_enabled: false,
             computer_use_enabled: false,
+            retrieval_log: RetrievalLog::new(),
+            outcome_capture_enabled: false,
         }
+    }
+
+    /// Record how each completed run went, for later offline analysis.
+    ///
+    /// Purely observational — it changes nothing about how the agent
+    /// behaves. Driven by `RUSTYKRAB_OUTCOME_CAPTURE` in the CLI.
+    pub fn with_outcome_capture(mut self, enabled: bool) -> Self {
+        self.outcome_capture_enabled = enabled;
+        self
+    }
+
+    /// Share the retrieval log with the memory backend, which records the
+    /// memories it surfaces so runs can be credited to them.
+    pub fn with_retrieval_log(mut self, log: RetrievalLog) -> Self {
+        self.retrieval_log = log;
+        self
     }
 
     /// Enable the sub-agent / session-management tool family for every
