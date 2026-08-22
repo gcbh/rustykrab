@@ -3,6 +3,7 @@
 // Security utilities
 pub mod sanitize;
 pub mod security;
+pub mod stub;
 
 // Sandboxed subprocess execution
 mod sandboxed_spawn;
@@ -140,6 +141,7 @@ pub use memory_delete::MemoryDeleteTool;
 pub use memory_get::MemoryGetTool;
 pub use memory_save::MemorySaveTool;
 pub use memory_search::MemorySearchTool;
+pub use stub::{StubFile, StubMode, StubSpec, StubTool};
 
 // Messaging
 pub use message::MessageTool;
