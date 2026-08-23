@@ -158,7 +158,10 @@ async fn speed_probe(client: &reqwest::Client, url: &str, model: &str, w: u32) -
     match ollama_chat(client, url, model, "hi", w, 2, Duration::from_secs(900)).await {
         Ok(r) => probe.load_secs = r["load_duration"].as_f64().unwrap_or(0.0) / 1e9,
         Err(e) => {
-            probe.error = Some(format!("load failed: {e:#}"));
+            probe.error = Some(format!(
+                "load failed: {e:#} — a timeout here usually means another client holds \
+                 Ollama's inference slot, not that the window cannot be served"
+            ));
             return probe;
         }
     }
@@ -391,6 +394,16 @@ pub fn render_markdown(report: &Value) -> String {
     out.push_str("## Speed\n\n| window | load s | resident GB | gen t/s | prompt t/s (fixed) | prompt t/s (scaled) |\n|---|---|---|---|---|---|\n");
     for win in report["windows"].as_array().unwrap_or(&Vec::new()) {
         let sp = &win["speed"];
+        // A probe that failed must say so, not render as a measured zero —
+        // a busy inference slot and an unservable window both land here,
+        // and "0 t/s" reads as data.
+        if let Some(err) = sp["error"].as_str() {
+            out.push_str(&format!(
+                "| {} | probe failed: {err} |||||\n",
+                win["window"]
+            ));
+            continue;
+        }
         out.push_str(&format!(
             "| {} | {:.1} | {:.1} | {:.0} | {:.0} | {} |\n",
             win["window"],

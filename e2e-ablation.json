@@ -1,0 +1,21 @@
+{
+  "compaction_ceiling": 65536,
+  "expand_target": 131072,
+  "model": "gemma4:26b",
+  "model_max_context": 262144,
+  "windows": [
+    {
+      "speed": {
+        "error": "load failed: error sending request for url (http://localhost:11434/api/chat): operation timed out",
+        "gen_tps": 0.0,
+        "load_secs": 0.0,
+        "prompt_tps_fixed": 0.0,
+        "size_bytes": 0,
+        "size_vram_bytes": 0,
+        "window": 8192
+      },
+      "suite": null,
+      "window": 8192
+    }
+  ]
+}
