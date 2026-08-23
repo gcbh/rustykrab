@@ -814,7 +814,11 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // --- Tools ---
-    let mut tools = rustykrab_tools::builtin_tools(store.secrets(), store.guarded_secrets());
+    let mut tools = rustykrab_tools::builtin_tools(
+        store.secrets(),
+        store.guarded_secrets(),
+        store.credential_requests(),
+    );
     tools.extend(rustykrab_tools::memory_tools(memory_backend.clone()));
     tools.extend(rustykrab_tools::skill_tools(
         skills_dir.clone(),

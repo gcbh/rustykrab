@@ -21,7 +21,7 @@ use zeroize::Zeroizing;
 pub use chat_map::ChatMapStore;
 pub use conversation::{ConversationStore, ConversationSummary};
 pub use credential_request::{
-    CredentialRequest, CredentialRequestStore, RequestAction, RequestNotifier,
+    CredentialRequest, CredentialRequestStore, RequestAction, RequestNotifier, RequestedField,
 };
 pub use device::{Device, DeviceStore, Principal};
 pub use guarded::{GuardedSecrets, WriteOutcome};
@@ -299,6 +299,36 @@ impl Store {
                 [],
             )
             .map_err(|e| Error::Storage(e.to_string()))?;
+        }
+
+        // `service` and `fields` arrived with fulfil requests, where the
+        // agent asks the user for a credential instead of proposing one.
+        // Rows predating them are update/delete requests, which have no
+        // fields to render, so NULL is the correct value and there is
+        // nothing to back-fill.
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(credential_requests)")
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        let existing: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|e| Error::Storage(e.to_string()))?
+            .filter_map(|r| r.ok())
+            .collect();
+        drop(stmt);
+        for (column, ddl) in [
+            (
+                "service",
+                "ALTER TABLE credential_requests ADD COLUMN service TEXT",
+            ),
+            (
+                "fields",
+                "ALTER TABLE credential_requests ADD COLUMN fields TEXT",
+            ),
+        ] {
+            if !existing.iter().any(|c| c == column) {
+                conn.execute(ddl, [])
+                    .map_err(|e| Error::Storage(e.to_string()))?;
+            }
         }
 
         // Versioning columns on `secrets`. Rows written before the guard

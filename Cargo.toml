@@ -13,10 +13,11 @@ members = [
     "crates/rustykrab-memory",
     "crates/rustykrab-dream",
     "crates/rustykrab-e2e",
+    "crates/rustykrab-credeval",
 ]
 
 [workspace.package]
-version = "5.1.22"
+version = "5.1.23"
 edition = "2021"
 rust-version = "1.88"
 license = "MIT"

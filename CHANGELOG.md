@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.1.23] - 2026-08-23
+
+- Let the agent ask for credentials it does not have (#521)
+
 ## [5.1.22] - 2026-08-22
 
 - fix(agent): stop retrying deterministic exec failures (#514)

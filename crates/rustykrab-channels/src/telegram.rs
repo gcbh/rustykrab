@@ -69,7 +69,16 @@ impl TelegramChannel {
             .expect("failed to build HTTP client");
         Self {
             client,
-            api_base: format!("https://api.telegram.org/bot{bot_token}"),
+            // `TELEGRAM_API_BASE` redirects the Bot API at a local stand-in so
+            // harnesses can observe what the bot would have sent without
+            // talking to Telegram. Unset in every real deployment, where this
+            // is the documented api.telegram.org endpoint.
+            api_base: match std::env::var("TELEGRAM_API_BASE") {
+                Ok(base) if !base.trim().is_empty() => {
+                    format!("{}/bot{bot_token}", base.trim_end_matches('/'))
+                }
+                _ => format!("https://api.telegram.org/bot{bot_token}"),
+            },
             bot_token,
             allowed_chats,
             webhook_secret: None,
