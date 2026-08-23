@@ -151,6 +151,11 @@ const FRAMING_OVERHEAD_TOKENS: u32 = 512;
 /// thing instead.
 const ASSUMED_TOOL_TOKENS: u32 = 2048;
 
+/// Smallest input budget [`OllamaProvider::context_limit`] will report when
+/// the reserves exceed the window. Small enough to be honest about a tiny
+/// window, large enough that a caller does not compact on every turn.
+const MIN_REPORTED_INPUT_BUDGET: u32 = 512;
+
 /// Percentage of the trimming budget to cut down to once trimming fires.
 /// See `trim_to_budget` for why this is well below 100.
 const TRIM_TARGET_PCT: u32 = 75;
@@ -852,11 +857,37 @@ impl ModelProvider for OllamaProvider {
     /// here restores the intended order: compact first, trim only as a
     /// backstop.
     fn context_limit(&self) -> Option<usize> {
-        self.effective_ctx()
-            .map(|window| {
-                input_budget(window, self.config.num_predict, ASSUMED_TOOL_TOKENS) as usize
-            })
-            .filter(|&v| v > 0)
+        self.effective_ctx().map(|window| {
+            let budget = input_budget(window, self.config.num_predict, ASSUMED_TOOL_TOKENS);
+            if budget > 0 {
+                return budget as usize;
+            }
+            // The reserves swallowed the whole window. Reporting `None`
+            // here reads as "I don't know my limit", and the caller then
+            // falls back to the profile's `max_context_tokens` — a number
+            // this provider will never honour, because the per-request
+            // path still trims against the real budget. The visible
+            // result is that compaction never fires and history is
+            // silently trimmed away instead of being summarised.
+            //
+            // Report a floor instead, so the caller compacts at a point
+            // that is actually reachable, and say once why.
+            let floor = (window / 4).max(MIN_REPORTED_INPUT_BUDGET);
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                tracing::warn!(
+                    num_ctx = window,
+                    num_predict = self.config.num_predict,
+                    assumed_tool_tokens = ASSUMED_TOOL_TOKENS,
+                    framing_overhead = FRAMING_OVERHEAD_TOKENS,
+                    reported_budget = floor,
+                    "num_predict and the fixed reserves exceed num_ctx, leaving no room for \
+                     input; reporting a floor so compaction still engages. Raise \
+                     RUSTYKRAB_NUM_CTX or lower num_predict."
+                );
+            });
+            floor as usize
+        })
     }
 
     fn supports_vision(&self) -> bool {
@@ -2398,15 +2429,34 @@ mod tests {
     }
 
     #[test]
-    fn context_limit_is_none_when_reservations_exceed_the_window() {
-        // A window smaller than the reservations would otherwise report 0 and
-        // make every downstream budget collapse to nothing.
+    fn context_limit_floors_when_reservations_exceed_the_window() {
+        // A window smaller than the reservations must not report 0, which
+        // would collapse every downstream budget to nothing. It must not
+        // report `None` either: the caller reads that as "unknown" and
+        // falls back to the profile's max_context_tokens — a number this
+        // provider will never honour, because the per-request path still
+        // trims against the real budget. Compaction then never fires and
+        // history is silently trimmed away instead of summarised.
         let provider = OllamaProvider::new("probe").with_config(OllamaConfig {
             num_ctx: Some(1024),
             num_predict: 4096,
             ..OllamaConfig::default()
         });
-        assert_eq!(provider.context_limit(), None);
+        let limit = provider
+            .context_limit()
+            .expect("a configured window reports something");
+        assert!(limit > 0, "0 would collapse every downstream budget");
+        assert!(limit < 1024, "the floor stays below the window");
+    }
+
+    #[test]
+    fn context_limit_floor_is_a_quarter_of_the_window() {
+        let provider = OllamaProvider::new("probe").with_config(OllamaConfig {
+            num_ctx: Some(6144),
+            num_predict: 4096,
+            ..OllamaConfig::default()
+        });
+        assert_eq!(provider.context_limit(), Some(1536));
     }
 
     #[test]

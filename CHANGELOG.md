@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.1.25] - 2026-08-23
+
+- fix(ollama): a window swallowed by its reserves silently killed compaction (#533)
+
 ## [5.1.24] - 2026-08-23
 
 - tools: scripted stand-in tools for the evaluation harness (#524)
