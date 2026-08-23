@@ -143,6 +143,21 @@ pub struct StubSpec {
     pub script: StubScript,
 }
 
+/// Tools the agent loop drives by name, which `replace` must never strip.
+///
+/// Only `task_complete` qualifies. The runner activates it as soon as the
+/// model uses any tool and then re-prompts up to three times insisting it
+/// be called, so removing the implementation leaves the model ordered to
+/// call something that does not exist.
+///
+/// Nothing else is forced. The `tools_*` and `recall_*` families were
+/// tried here and taken back out: `replace` exists to fix the tool set,
+/// and offering a small model extra tools it was not asked about sends it
+/// exploring instead of doing the task. Both turned a 22-second scenario
+/// into a 350-second one. A scenario that needs them can name them in
+/// `keep`.
+pub const PROTOCOL_TOOLS: &[&str] = &["task_complete"];
+
 /// How the stub file interacts with the daemon's real tool registry.
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -171,22 +186,35 @@ impl StubFile {
             .map_err(|e| Error::Config(format!("reading tool stubs {}: {e}", path.display())))?;
         let parsed: Self = serde_json::from_str(&raw)
             .map_err(|e| Error::Config(format!("parsing tool stubs {}: {e}", path.display())))?;
+        // An empty replace is legitimate, not a mistake: "answer this with
+        // no tools available" is a scenario worth running, and it is how a
+        // harness checks that the agent does not invent a tool call when
+        // there is nothing to call. Say it out loud rather than refusing.
         if parsed.tools.is_empty() && parsed.mode == StubMode::Replace {
-            return Err(Error::Config(format!(
-                "{} replaces the tool registry with nothing — the agent would have no tools",
-                path.display()
-            )));
+            tracing::warn!(
+                path = %path.display(),
+                "tool stubs replace the registry with nothing — the agent will have no tools"
+            );
         }
         Ok(parsed)
     }
 
     /// Apply this file to the daemon's tool list.
+    ///
+    /// `replace` swaps out the *domain* tools. It never removes the ones
+    /// the agent loop itself drives: the runner activates `task_complete`
+    /// as soon as the model uses any tool and then re-prompts demanding it
+    /// be called, and the recall tools are how compacted detail is
+    /// retrieved. Stripping those leaves the model being ordered to call a
+    /// tool that no longer exists.
     pub fn apply(&self, real: Vec<Arc<dyn Tool>>) -> Vec<Arc<dyn Tool>> {
         let stub_names: Vec<&str> = self.tools.iter().map(|s| s.name.as_str()).collect();
         let mut tools: Vec<Arc<dyn Tool>> = match self.mode {
             StubMode::Replace => real
                 .into_iter()
-                .filter(|t| self.keep.iter().any(|k| k == t.name()))
+                .filter(|t| {
+                    PROTOCOL_TOOLS.contains(&t.name()) || self.keep.iter().any(|k| k == t.name())
+                })
                 .collect(),
             // A stub shadows a real tool of the same name rather than
             // sitting beside it — two tools with one name is a schema the
@@ -347,6 +375,61 @@ mod tests {
         let out = tool.execute(json!({})).await.unwrap();
         assert_eq!(out["lines"], 50);
         assert_eq!(out["content"].as_str().unwrap().lines().count(), 51);
+    }
+
+    /// A minimal real tool, to check what `replace` keeps.
+    struct NamedTool(&'static str);
+
+    #[async_trait]
+    impl Tool for NamedTool {
+        fn name(&self) -> &str {
+            self.0
+        }
+        fn description(&self) -> &str {
+            "a real tool"
+        }
+        fn schema(&self) -> ToolSchema {
+            ToolSchema {
+                name: self.0.to_string(),
+                description: "a real tool".to_string(),
+                parameters: json!({ "type": "object" }),
+            }
+        }
+        async fn execute(&self, _args: Value) -> Result<Value> {
+            Ok(json!({}))
+        }
+    }
+
+    #[test]
+    fn replace_keeps_the_tools_the_agent_loop_drives_by_name() {
+        // The runner activates `task_complete` once the model uses any
+        // tool and then re-prompts demanding it. Stripping it leaves the
+        // model being ordered to call something that does not exist —
+        // observed as `task_complete:error` and a failed scenario.
+        let file: StubFile =
+            serde_json::from_str(r#"{"mode":"replace","keep":[],"tools":[]}"#).unwrap();
+        let real: Vec<Arc<dyn Tool>> = vec![
+            Arc::new(NamedTool("task_complete")),
+            Arc::new(NamedTool("recall_search")),
+            Arc::new(NamedTool("tools_load")),
+            Arc::new(NamedTool("gmail")),
+        ];
+        let applied = file.apply(real);
+        let kept: Vec<&str> = applied.iter().map(|t| t.name()).collect();
+        assert_eq!(
+            kept,
+            vec!["task_complete"],
+            "only the tool the runner forces survives; everything else the model would \
+             merely be tempted to explore"
+        );
+    }
+
+    #[test]
+    fn an_empty_replace_is_allowed_and_leaves_no_tools() {
+        // "Answer with no tools available" is a scenario, not a typo.
+        let file: StubFile =
+            serde_json::from_str(r#"{"mode":"replace","keep":[],"tools":[]}"#).unwrap();
+        assert!(file.apply(vec![]).is_empty());
     }
 
     #[test]
