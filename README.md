@@ -171,8 +171,8 @@ All configuration is via environment variables. No plaintext config files.
 | `RUSTYKRAB_NUM_CTX` | `65536` | Context window pinned on every Ollama request. Takes precedence over `OLLAMA_NUM_CTX`. Clamped down to the model's native context length when that is smaller. The whole window is allocated as KV cache when the model loads, so lower this (or enable KV quantization, below) if the model won't fit in VRAM. Set to `server` to omit the field and let the server's `OLLAMA_CONTEXT_LENGTH` decide — this disables client-side trimming, since the client then cannot know what the server allocated |
 | `OLLAMA_NUM_CTX` | — | Legacy alias for `RUSTYKRAB_NUM_CTX`. Used only when `RUSTYKRAB_NUM_CTX` is unset |
 | `OLLAMA_KEEP_ALIVE` | `30m` | How long Ollama keeps the model and its KV cache resident after a request (Ollama duration syntax; `-1` for forever). Ollama's own default is 5 minutes, short enough that a sporadically-used gateway reloads the model on most messages. Set to `server` to omit the field |
-| `OLLAMA_THINK` | `auto` | Whether to request thinking mode: `true`, `false`, or `auto` to decide from the model tag. Ollama returns a 400 for `think` against models that don't support it, so `auto` only enables it for known thinking families |
-| `OLLAMA_VISION` | `auto` | Whether the model accepts image input: `true`, `false`, or `auto` to decide from the model tag |
+| `OLLAMA_THINK` | `auto` | Whether to request thinking mode: `true`, `false`, or `auto` to ask Ollama what the model supports (falling back to the model tag if it doesn't say). Ollama returns a 400 for `think` against models that don't support it |
+| `OLLAMA_VISION` | `auto` | Whether the model accepts image input: `true`, `false`, or `auto` to ask Ollama what the model supports (falling back to the model tag if it doesn't say) |
 | `OLLAMA_TIMEOUT_SECS` | `900` | HTTP request timeout for Ollama in seconds |
 | `CHROME_CDP_URL` | `ws://127.0.0.1:9222` | Chrome DevTools Protocol endpoint |
 | `RUSTYKRAB_AUTH_TOKEN` | auto-generated | Bearer token for API auth |
