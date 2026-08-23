@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.1.28] - 2026-08-23
+
+- fix(providers): fail loudly when Ollama generates nothing (#530)
+
 ## [5.1.27] - 2026-08-23
 
 - e2e: adopt the better mechanisms from the parallel investigation (#532) (#540)
