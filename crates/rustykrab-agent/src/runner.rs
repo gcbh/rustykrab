@@ -146,6 +146,40 @@ fn compaction_context_ceiling() -> usize {
     })
 }
 
+/// Parse `RUSTYKRAB_COMPACTION_EXPAND_CTX`. A positive integer expands
+/// every summarization call to that context window; anything else (unset,
+/// `off`, `0`, garbage) leaves compaction at the everyday window.
+fn parse_expand_ctx(raw: Option<&str>) -> Option<u32> {
+    raw?.trim().parse::<u32>().ok().filter(|&v| v > 0)
+}
+
+/// The expanded context window for compaction calls, read once.
+///
+/// Compaction is the one moment the agent genuinely wants a bigger window
+/// than it runs its turns at: the summarizer's input budget derives from
+/// the window, and a small window forces the history into chunks — one
+/// model call each. Ollama resizes its KV cache in about three seconds, so
+/// paying that twice around a summarization that would otherwise chunk is
+/// usually a large win. Off by default; a provider that cannot resize
+/// ignores the hint via the `chat_with_ctx` default.
+fn compaction_expand_ctx() -> Option<u32> {
+    static EXPAND: OnceLock<Option<u32>> = OnceLock::new();
+    *EXPAND.get_or_init(|| {
+        let v = parse_expand_ctx(
+            std::env::var("RUSTYKRAB_COMPACTION_EXPAND_CTX")
+                .ok()
+                .as_deref(),
+        );
+        if let Some(ctx) = v {
+            tracing::info!(
+                ctx,
+                "compaction will expand the context window per summarization call"
+            );
+        }
+        v
+    })
+}
+
 /// Tokens reserved for the summarizer's response + prompt framing when
 /// deciding whether a single-shot summarization call will fit. Subtracted
 /// from `effective_context_limit()` to derive the input budget.
@@ -2664,7 +2698,10 @@ impl AgentRunner {
                 agent_version: Message::version_stamp(),
             },
         ];
-        let response = self.provider.chat(&messages, &[]).await?;
+        let response = match compaction_expand_ctx() {
+            Some(ctx) => self.provider.chat_with_ctx(&messages, &[], ctx).await?,
+            None => self.provider.chat(&messages, &[]).await?,
+        };
         Ok(response.message.content.as_text().unwrap_or("").to_string())
     }
 
@@ -2853,7 +2890,13 @@ impl AgentRunner {
         // tokens can exceed the provider HTTP timeout even though a regular
         // request of the same size would not (regular requests intersperse
         // tool turns, so individual prompt sizes are smaller in practice).
-        let ceiling = self.effective_context_limit();
+        // With expansion on, the summarizer runs at its own, larger window,
+        // so the input budget derives from that instead of the everyday
+        // limit — which is the entire point: more history per call, fewer
+        // or no chunks.
+        let ceiling = compaction_expand_ctx()
+            .map(|c| c as usize)
+            .unwrap_or_else(|| self.effective_context_limit());
         let ratio = compaction_input_budget_ratio();
         let ratioed = (ceiling as f64 * ratio) as usize;
         // The response reserve is a fixed 4096, which is larger than the
@@ -2908,7 +2951,15 @@ impl AgentRunner {
             // it back off — this avoids deep-cloning the entire history at
             // the exact moment it is at its largest.
             conv.messages.push(compaction_prompt);
-            let response = self.provider.chat(&conv.messages, &[]).await;
+            // Must follow the expanded window when one is set: the expanded
+            // input budget is what routed this history to the fast path, and
+            // a plain chat() would trim it back to the everyday window — the
+            // model would summarize a truncated fragment while this code
+            // believes it saw everything.
+            let response = match compaction_expand_ctx() {
+                Some(ctx) => self.provider.chat_with_ctx(&conv.messages, &[], ctx).await,
+                None => self.provider.chat(&conv.messages, &[]).await,
+            };
             conv.messages.pop();
             let response = response?;
             response.message.content.as_text().unwrap_or("").to_string()
@@ -5693,6 +5744,24 @@ mod outcome_capture_tests {
 #[cfg(test)]
 mod compaction_budget_tests {
     use super::*;
+
+    #[test]
+    fn expand_ctx_parses_positive_integers_and_nothing_else() {
+        assert_eq!(parse_expand_ctx(Some("65536")), Some(65536));
+        assert_eq!(parse_expand_ctx(Some(" 131072 ")), Some(131072));
+        assert_eq!(
+            parse_expand_ctx(Some("0")),
+            None,
+            "zero is off, not a window"
+        );
+        assert_eq!(parse_expand_ctx(Some("off")), None);
+        assert_eq!(
+            parse_expand_ctx(Some("max")),
+            None,
+            "no magic words — a number or nothing"
+        );
+        assert_eq!(parse_expand_ctx(None), None);
+    }
 
     /// The budget a compaction call gets, for a given effective context
     /// limit — mirrors the arithmetic in `compact_history`.

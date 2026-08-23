@@ -94,6 +94,25 @@ pub trait ModelProvider: Send + Sync {
     /// Send a conversation to the model and get back the next message.
     async fn chat(&self, messages: &[Message], tools: &[ToolSchema]) -> Result<ModelResponse>;
 
+    /// Like [`Self::chat`], but asking the provider to serve this one call
+    /// with at least `num_ctx` tokens of context, where it can.
+    ///
+    /// Exists for compaction: a summarization call wants to see far more
+    /// history than a normal turn, and a provider that can resize its
+    /// window per request (Ollama rebuilds the KV cache in ~3s) can honour
+    /// that without changing the window every other call runs at.
+    ///
+    /// The default ignores the hint — cloud providers have one fixed
+    /// window and it is already large.
+    async fn chat_with_ctx(
+        &self,
+        messages: &[Message],
+        tools: &[ToolSchema],
+        _num_ctx: u32,
+    ) -> Result<ModelResponse> {
+        self.chat(messages, tools).await
+    }
+
     /// Send a conversation to the model with an explicit tool-choice constraint.
     ///
     /// Default implementation ignores the constraint and calls [`chat`].

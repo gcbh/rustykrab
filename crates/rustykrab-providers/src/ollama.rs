@@ -289,6 +289,184 @@ impl OllamaProvider {
     /// Effective context window used for client-side prompt trimming.
     /// Prefers the user's explicit `num_ctx`, then the value detected from
     /// the model via `/api/show`, else `None` (no trimming).
+    /// The real chat implementation. `window_override` serves this one
+    /// call at a different context window: both the client-side trim and
+    /// the `num_ctx` sent to the server use it, so an expanded
+    /// summarization call is not quietly trimmed back to the everyday
+    /// window before the model ever sees it.
+    async fn chat_at(
+        &self,
+        messages: &[Message],
+        tools: &[ToolSchema],
+        window_override: Option<u32>,
+    ) -> Result<ModelResponse> {
+        let window = window_override.or(self.effective_ctx());
+        let ollama_messages = Self::build_messages(messages, self.supports_vision())?;
+        // Fix #200: validate non-empty messages.
+        if ollama_messages.is_empty() {
+            return Err(Error::ModelBadRequest(
+                "cannot call Ollama API with an empty message list".into(),
+            ));
+        }
+
+        let ollama_tools = Self::build_tools(tools);
+        let tool_tokens = estimate_tool_tokens(&ollama_tools);
+        self.note_tool_block(&ollama_tools, tool_tokens);
+
+        let num_predict = clamp_num_predict(window, self.config.num_predict);
+        let ollama_messages =
+            Self::trim_to_budget(ollama_messages, window, num_predict, tool_tokens);
+
+        let mut options = serde_json::json!({
+            "temperature": self.config.temperature,
+            "top_p": self.config.top_p,
+            "num_predict": num_predict,
+        });
+        // Only override the server's context length when the user has asked
+        // for it explicitly — otherwise leave `num_ctx` out so `OLLAMA_CONTEXT_LENGTH`
+        // (or the model default) wins.
+        if let Some(num_ctx) = window_override.or(self.config.num_ctx) {
+            options["num_ctx"] = serde_json::json!(num_ctx);
+        }
+
+        let mut body = serde_json::json!({
+            "model": self.model,
+            "messages": ollama_messages,
+            "stream": false,
+            "options": options,
+        });
+        // `think` is rejected outright by models that don't support it, so
+        // it is only sent when the model (or an explicit override) says yes.
+        if self.resolved_think() {
+            body["think"] = serde_json::json!(true);
+        }
+        // Keep the model — and with it the KV cache built from this prompt —
+        // resident between turns. Without this Ollama evicts after five idle
+        // minutes and the next message pays a reload plus a cold prompt eval.
+        if let Some(keep_alive) = &self.config.keep_alive {
+            body["keep_alive"] = serde_json::json!(keep_alive);
+        }
+
+        if !ollama_tools.is_empty() {
+            body["tools"] = serde_json::to_value(&ollama_tools).map_err(Error::Serialization)?;
+        }
+
+        tracing::debug!(
+            model = %self.model,
+            base_url = %self.base_url,
+            num_messages = ollama_messages.len(),
+            num_ctx = ?self.config.num_ctx,
+            num_tools = ollama_tools.len(),
+            tool_tokens,
+            trace_id = ?rustykrab_core::prompt_trace::current_trace_id(),
+            "calling Ollama chat API"
+        );
+        rustykrab_core::prompt_trace::record_prompt(
+            self.name(),
+            &self.model,
+            false,
+            messages,
+            tools,
+        );
+
+        let url = format!("{}/api/chat", self.base_url);
+
+        let request_start = std::time::Instant::now();
+        let mut last_err = None;
+        for attempt in 0..=MAX_RETRIES {
+            if attempt > 0 {
+                let delay = retry_delay(RETRY_BASE_DELAY, attempt);
+                tracing::warn!(attempt, "retrying Ollama API after {delay:?}");
+                tokio::time::sleep(delay).await;
+            }
+
+            let resp = match self.client.post(&url).json(&body).send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    // Don't retry timeouts: retrying the same 99K-token prompt
+                    // would just burn another 15-minute budget for the same
+                    // failure.  The caller (agent loop) needs to reduce context
+                    // or abort before re-trying.
+                    if e.is_timeout() {
+                        tracing::warn!(
+                            model = %self.model,
+                            num_messages = ollama_messages.len(),
+                            num_ctx = ?self.config.num_ctx,
+                            "Ollama request timed out — not retrying (reduce context or raise OLLAMA_TIMEOUT_SECS)"
+                        );
+                        return Err(Error::ModelProvider(format!(
+                            "Ollama request timed out after the configured HTTP timeout. \
+                             Reduce prompt size or raise OLLAMA_TIMEOUT_SECS: {e}"
+                        )));
+                    }
+                    last_err = Some(Error::ModelProvider(format!(
+                        "failed to connect to Ollama at {}: {e}. Is Ollama running?",
+                        self.base_url
+                    )));
+                    continue;
+                }
+            };
+
+            let status = resp.status();
+            if status.is_success() {
+                let raw_body = resp.text().await.map_err(|e| {
+                    Error::ModelProvider(format!("failed to read Ollama response body: {e}"))
+                })?;
+                let ollama_resp: OllamaResponse = serde_json::from_str(&raw_body).map_err(|e| {
+                    Error::ModelProvider(format!("failed to parse Ollama response: {e}"))
+                })?;
+                let response = Self::parse_response(&self.model, ollama_resp)?;
+
+                // Debug: dump raw response when message text is empty
+                // despite having completion tokens.
+                if response.usage.completion_tokens > 0
+                    && !response.message.content.has_tool_calls()
+                    && response
+                        .message
+                        .content
+                        .as_text()
+                        .is_none_or(|t| t.is_empty())
+                {
+                    tracing::warn!(
+                        completion_tokens = response.usage.completion_tokens,
+                        ?response.stop_reason,
+                        "empty message text with completion tokens — dumping raw response"
+                    );
+                    tracing::warn!(raw_body = %raw_body, "raw Ollama API response");
+                }
+
+                rustykrab_core::prompt_trace::record_response(
+                    self.name(),
+                    &self.model,
+                    false,
+                    &response.message,
+                    &response.usage,
+                    &response.stop_reason,
+                    request_start.elapsed().as_millis() as u64,
+                );
+                return Ok(response);
+            }
+
+            let error_body = resp.text().await.unwrap_or_default();
+            tracing::warn!(
+                status = %status,
+                num_ctx = ?self.config.num_ctx,
+                num_messages = ollama_messages.len(),
+                error_body = %error_body,
+                "Ollama API error"
+            );
+            let is_retryable = matches!(status.as_u16(), 429 | 500 | 502 | 503 | 529);
+            // Fix #186: map status codes to specific error variants.
+            last_err = Some(Self::map_status_error(status, &error_body));
+
+            if !is_retryable {
+                break;
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| Error::ModelProvider("request failed".into())))
+    }
+
     pub fn effective_ctx(&self) -> Option<u32> {
         self.config.num_ctx.or(self.detected_ctx)
     }
@@ -928,174 +1106,16 @@ impl ModelProvider for OllamaProvider {
     }
 
     async fn chat(&self, messages: &[Message], tools: &[ToolSchema]) -> Result<ModelResponse> {
-        let ollama_messages = Self::build_messages(messages, self.supports_vision())?;
+        self.chat_at(messages, tools, None).await
+    }
 
-        // Fix #200: validate non-empty messages.
-        if ollama_messages.is_empty() {
-            return Err(Error::ModelBadRequest(
-                "cannot call Ollama API with an empty message list".into(),
-            ));
-        }
-
-        let ollama_tools = Self::build_tools(tools);
-        let tool_tokens = estimate_tool_tokens(&ollama_tools);
-        self.note_tool_block(&ollama_tools, tool_tokens);
-
-        let ollama_messages = Self::trim_to_budget(
-            ollama_messages,
-            self.effective_ctx(),
-            self.config.num_predict,
-            tool_tokens,
-        );
-
-        let mut options = serde_json::json!({
-            "temperature": self.config.temperature,
-            "top_p": self.config.top_p,
-            "num_predict": self.config.num_predict,
-        });
-        // Only override the server's context length when the user has asked
-        // for it explicitly — otherwise leave `num_ctx` out so `OLLAMA_CONTEXT_LENGTH`
-        // (or the model default) wins.
-        if let Some(num_ctx) = self.config.num_ctx {
-            options["num_ctx"] = serde_json::json!(num_ctx);
-        }
-
-        let mut body = serde_json::json!({
-            "model": self.model,
-            "messages": ollama_messages,
-            "stream": false,
-            "options": options,
-        });
-        // `think` is rejected outright by models that don't support it, so
-        // it is only sent when the model (or an explicit override) says yes.
-        if self.resolved_think() {
-            body["think"] = serde_json::json!(true);
-        }
-        // Keep the model — and with it the KV cache built from this prompt —
-        // resident between turns. Without this Ollama evicts after five idle
-        // minutes and the next message pays a reload plus a cold prompt eval.
-        if let Some(keep_alive) = &self.config.keep_alive {
-            body["keep_alive"] = serde_json::json!(keep_alive);
-        }
-
-        if !ollama_tools.is_empty() {
-            body["tools"] = serde_json::to_value(&ollama_tools).map_err(Error::Serialization)?;
-        }
-
-        tracing::debug!(
-            model = %self.model,
-            base_url = %self.base_url,
-            num_messages = ollama_messages.len(),
-            num_ctx = ?self.config.num_ctx,
-            num_tools = ollama_tools.len(),
-            tool_tokens,
-            trace_id = ?rustykrab_core::prompt_trace::current_trace_id(),
-            "calling Ollama chat API"
-        );
-        rustykrab_core::prompt_trace::record_prompt(
-            self.name(),
-            &self.model,
-            false,
-            messages,
-            tools,
-        );
-
-        let url = format!("{}/api/chat", self.base_url);
-
-        let request_start = std::time::Instant::now();
-        let mut last_err = None;
-        for attempt in 0..=MAX_RETRIES {
-            if attempt > 0 {
-                let delay = retry_delay(RETRY_BASE_DELAY, attempt);
-                tracing::warn!(attempt, "retrying Ollama API after {delay:?}");
-                tokio::time::sleep(delay).await;
-            }
-
-            let resp = match self.client.post(&url).json(&body).send().await {
-                Ok(r) => r,
-                Err(e) => {
-                    // Don't retry timeouts: retrying the same 99K-token prompt
-                    // would just burn another 15-minute budget for the same
-                    // failure.  The caller (agent loop) needs to reduce context
-                    // or abort before re-trying.
-                    if e.is_timeout() {
-                        tracing::warn!(
-                            model = %self.model,
-                            num_messages = ollama_messages.len(),
-                            num_ctx = ?self.config.num_ctx,
-                            "Ollama request timed out — not retrying (reduce context or raise OLLAMA_TIMEOUT_SECS)"
-                        );
-                        return Err(Error::ModelProvider(format!(
-                            "Ollama request timed out after the configured HTTP timeout. \
-                             Reduce prompt size or raise OLLAMA_TIMEOUT_SECS: {e}"
-                        )));
-                    }
-                    last_err = Some(Error::ModelProvider(format!(
-                        "failed to connect to Ollama at {}: {e}. Is Ollama running?",
-                        self.base_url
-                    )));
-                    continue;
-                }
-            };
-
-            let status = resp.status();
-            if status.is_success() {
-                let raw_body = resp.text().await.map_err(|e| {
-                    Error::ModelProvider(format!("failed to read Ollama response body: {e}"))
-                })?;
-                let ollama_resp: OllamaResponse = serde_json::from_str(&raw_body).map_err(|e| {
-                    Error::ModelProvider(format!("failed to parse Ollama response: {e}"))
-                })?;
-                let response = Self::parse_response(&self.model, ollama_resp)?;
-
-                // Debug: dump raw response when message text is empty
-                // despite having completion tokens.
-                if response.usage.completion_tokens > 0
-                    && !response.message.content.has_tool_calls()
-                    && response
-                        .message
-                        .content
-                        .as_text()
-                        .is_none_or(|t| t.is_empty())
-                {
-                    tracing::warn!(
-                        completion_tokens = response.usage.completion_tokens,
-                        ?response.stop_reason,
-                        "empty message text with completion tokens — dumping raw response"
-                    );
-                    tracing::warn!(raw_body = %raw_body, "raw Ollama API response");
-                }
-
-                rustykrab_core::prompt_trace::record_response(
-                    self.name(),
-                    &self.model,
-                    false,
-                    &response.message,
-                    &response.usage,
-                    &response.stop_reason,
-                    request_start.elapsed().as_millis() as u64,
-                );
-                return Ok(response);
-            }
-
-            let error_body = resp.text().await.unwrap_or_default();
-            tracing::warn!(
-                status = %status,
-                num_ctx = ?self.config.num_ctx,
-                num_messages = ollama_messages.len(),
-                error_body = %error_body,
-                "Ollama API error"
-            );
-            let is_retryable = matches!(status.as_u16(), 429 | 500 | 502 | 503 | 529);
-            // Fix #186: map status codes to specific error variants.
-            last_err = Some(Self::map_status_error(status, &error_body));
-
-            if !is_retryable {
-                break;
-            }
-        }
-
-        Err(last_err.unwrap_or_else(|| Error::ModelProvider("request failed".into())))
+    async fn chat_with_ctx(
+        &self,
+        messages: &[Message],
+        tools: &[ToolSchema],
+        num_ctx: u32,
+    ) -> Result<ModelResponse> {
+        self.chat_at(messages, tools, Some(num_ctx)).await
     }
 
     /// Fix #175: streaming implementation using Ollama NDJSON.
@@ -1471,6 +1491,29 @@ struct OllamaStreamMessage {
 /// [`OllamaProvider::context_limit`] derive from, so the agent runner's
 /// compaction threshold and this provider's trimming budget can't drift into
 /// disagreeing about how much room there is.
+/// A positive `num_predict` at least half the window is unservable: the
+/// generation reserve alone crowds out the input, the trim budget
+/// saturates toward zero, and the conversation is stripped to almost
+/// nothing while the server truncates whatever survives. Clamp to half the
+/// window — the same floor `context_limit()` uses — and say so.
+///
+/// Negative and zero values are Ollama sentinels (unlimited / fill) and
+/// pass through untouched.
+fn clamp_num_predict(window: Option<u32>, configured: i32) -> i32 {
+    match (window, configured) {
+        (Some(w), p) if p > 0 && p as u32 >= w / 2 => {
+            tracing::warn!(
+                num_ctx = w,
+                configured_num_predict = p,
+                clamped_num_predict = w / 2,
+                "num_predict does not fit the context window; clamping to half"
+            );
+            (w / 2) as i32
+        }
+        (_, p) => p,
+    }
+}
+
 fn input_budget(window: u32, num_predict: i32, tool_tokens: u32) -> u32 {
     window
         .saturating_sub(num_predict.max(0) as u32)
@@ -3008,5 +3051,32 @@ mod tests {
         assert_eq!(full_text, "abc");
         assert!(saw_done);
         assert_eq!(buffer.len(), 0);
+    }
+}
+
+#[cfg(test)]
+mod num_predict_clamp_tests {
+    use super::*;
+
+    #[test]
+    fn a_num_predict_that_cannot_fit_is_clamped_to_half_the_window() {
+        // 4096 predict in a 4096 window leaves zero input budget; the trim
+        // then strips the conversation while the server truncates the rest.
+        assert_eq!(clamp_num_predict(Some(4096), 4096), 2048);
+        assert_eq!(clamp_num_predict(Some(4096), 8192), 2048);
+    }
+
+    #[test]
+    fn a_num_predict_that_fits_passes_through() {
+        assert_eq!(clamp_num_predict(Some(65536), 4096), 4096);
+        assert_eq!(clamp_num_predict(None, 4096), 4096);
+    }
+
+    #[test]
+    fn ollama_sentinels_are_never_clamped() {
+        // -1 = unlimited, 0 = fill-context; both are server-side semantics
+        // the clamp must not reinterpret.
+        assert_eq!(clamp_num_predict(Some(4096), -1), -1);
+        assert_eq!(clamp_num_predict(Some(4096), 0), 0);
     }
 }
