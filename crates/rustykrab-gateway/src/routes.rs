@@ -53,6 +53,10 @@ pub fn api_routes() -> Router<AppState> {
             "/api/credential-requests/{id}/deny",
             post(deny_credential_request),
         )
+        .route(
+            "/api/credential-requests/{id}/fulfil",
+            post(fulfil_credential_request),
+        )
         .route("/api/pair", post(pair_device))
         .route("/api/devices", get(list_devices))
         .route("/api/devices/{id}", axum::routing::delete(revoke_device))
@@ -876,6 +880,22 @@ struct ChangeRequestResponse {
     status: String,
     #[serde(rename = "createdAt")]
     created_at: i64,
+    /// Present on `fulfil` requests: what the credential is for, and the
+    /// inputs to render. Omitted entirely for update/delete, which are a
+    /// yes/no decision and carry no form.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    service: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    fields: Vec<FieldResponse>,
+}
+
+#[derive(Serialize)]
+struct FieldResponse {
+    key: String,
+    label: String,
+    secret: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hint: Option<String>,
 }
 
 async fn list_credential_requests(
@@ -901,6 +921,17 @@ async fn list_credential_requests(
                 conversation_id: r.conversation_id,
                 status: r.status,
                 created_at: r.created_at,
+                service: r.service,
+                fields: r
+                    .fields
+                    .into_iter()
+                    .map(|f| FieldResponse {
+                        key: f.key,
+                        label: f.label,
+                        secret: f.secret,
+                        hint: f.hint,
+                    })
+                    .collect(),
             })
             .collect(),
     ))
@@ -920,6 +951,49 @@ async fn deny_credential_request(
     Path(id): Path<String>,
 ) -> Result<StatusCode, StatusCode> {
     decide_credential_request(state, id, false, principal.map(|p| p.0)).await
+}
+
+/// The values a user typed into a fulfil request's form, keyed by the
+/// field's `key`. Sent once, over TLS, and never echoed back by any
+/// endpoint.
+#[derive(Deserialize)]
+struct FulfilRequest {
+    values: std::collections::HashMap<String, String>,
+}
+
+async fn fulfil_credential_request(
+    State(state): State<AppState>,
+    principal: Option<Extension<rustykrab_store::Principal>>,
+    Path(id): Path<String>,
+    Json(body): Json<FulfilRequest>,
+) -> Result<StatusCode, StatusCode> {
+    let decided_by = principal
+        .map(|p| p.0.describe())
+        .unwrap_or_else(|| "webchat".to_string());
+    let values: Vec<(String, String)> = body.values.into_iter().collect();
+    state
+        .store
+        .credential_requests()
+        .fulfil(&id, &values, &decided_by)
+        .await
+        .map_err(|e| match e {
+            rustykrab_core::Error::AlreadyExists(reason) => {
+                tracing::info!(%id, %reason, "fulfil refused as stale");
+                StatusCode::CONFLICT
+            }
+            rustykrab_core::Error::NotFound(_) => StatusCode::NOT_FOUND,
+            // A field the request never asked for, or a blank answer. The
+            // reason is deliberately not echoed: it is about credential
+            // names, and this is an unauthenticated-shaped error path.
+            other => {
+                tracing::warn!(error = %other, %id, "fulfil rejected");
+                StatusCode::BAD_REQUEST
+            }
+        })?;
+    // Deliberately no value, no name, no count — a successful fulfil says
+    // only that it happened.
+    tracing::info!(%id, "credential request fulfilled");
+    Ok(StatusCode::NO_CONTENT)
 }
 
 // ── device pairing ──────────────────────────────────────────────────

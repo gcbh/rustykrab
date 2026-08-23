@@ -108,6 +108,11 @@ pub struct GmailTool {
     /// duration of an operation — IMAP is stateful, so operations on one
     /// connection must not interleave.
     imap: tokio::sync::Mutex<Option<CachedSession>>,
+    /// Where to file a request when the credentials are absent. Optional
+    /// so the tool still constructs in tests and anywhere the daemon has
+    /// not assembled a store; without it the tool reports the gap and asks
+    /// nobody, which is the behaviour this exists to end.
+    requests: Option<rustykrab_store::CredentialRequestStore>,
 }
 
 impl GmailTool {
@@ -115,35 +120,99 @@ impl GmailTool {
         Self {
             secrets,
             imap: tokio::sync::Mutex::new(None),
+            requests: None,
+        }
+    }
+
+    /// Let the tool ask the user for what it is missing.
+    pub fn with_requests(mut self, requests: rustykrab_store::CredentialRequestStore) -> Self {
+        self.requests = Some(requests);
+        self
+    }
+
+    /// File a request for the Gmail credentials and describe it to the
+    /// model.
+    ///
+    /// Filing is best-effort by design: if the store rejects it, the caller
+    /// still gets an error explaining the gap, because a failure to ask is
+    /// not a reason to pretend the credential exists.
+    async fn ask_for_credentials(&self, needs: &str) -> String {
+        let Some(requests) = &self.requests else {
+            return String::new();
+        };
+        let fields = vec![
+            rustykrab_store::RequestedField {
+                key: KEY_EMAIL.to_string(),
+                label: "Gmail address".to_string(),
+                secret: false,
+                hint: None,
+            },
+            rustykrab_store::RequestedField {
+                key: KEY_APP_PASSWORD.to_string(),
+                label: "App password".to_string(),
+                // Not the account password: Gmail's IMAP and SMTP take a
+                // 16-character app password, generated per application.
+                secret: true,
+                hint: Some(
+                    "Sign in to Google and generate an app password — Apollo can do this for you."
+                        .to_string(),
+                ),
+            },
+        ];
+        match requests
+            .file_fulfil(
+                KEY_APP_PASSWORD,
+                Some("Gmail".to_string()),
+                fields,
+                Some(format!("so it can use your Gmail account — it needs {needs}")),
+                None,
+            )
+            .await
+        {
+            Ok(_) => " A prompt asking for them is now waiting in the Apollo app —                        tell the user that, in one sentence, and stop. Do not ask for                        the password in chat and do not retry until they answer."
+                .to_string(),
+            Err(e) => {
+                tracing::warn!(error = %e, "could not file a Gmail credential request");
+                String::new()
+            }
         }
     }
 
     /// Get email and app password from the credential store.
+    ///
+    /// When either is absent this asks the *user* for them rather than
+    /// instructing the model to invent a `credential_write` call: the model
+    /// has no password to write, so that advice could only ever produce a
+    /// fabricated value or a dead end. The old text also leaked an internal
+    /// tool name into whatever the user was reading.
     async fn get_credentials(&self) -> Result<(String, String)> {
-        let email = self.secrets.get(KEY_EMAIL).await.map_err(|e| {
-            Error::ToolExecution(
-                format!(
-                    "gmail_email not available: {e}. Store it with: \
-                     credential_write(action='set', name='gmail_email', value='you@gmail.com'). \
-                     If you already stored it, the master encryption key may have changed \
-                     (set RUSTYKRAB_MASTER_KEY for persistence across restarts)."
-                )
-                .into(),
-            )
-        })?;
-        let password = self.secrets.get(KEY_APP_PASSWORD).await.map_err(|e| {
-            Error::ToolExecution(
-                format!(
-                    "gmail_app_password not available: {e}. Store it with: \
-                     credential_write(action='set', name='gmail_app_password', \
-                     value='YOUR_APP_PASSWORD'). If you already stored it, the master \
-                     encryption key may have changed (set RUSTYKRAB_MASTER_KEY for \
-                     persistence across restarts)."
-                )
-                .into(),
-            )
-        })?;
-        Ok((email, password))
+        let email = self.secrets.get(KEY_EMAIL).await.ok();
+        let password = self.secrets.get(KEY_APP_PASSWORD).await.ok();
+
+        match (email, password) {
+            (Some(email), Some(password)) => Ok((email, password)),
+            (email, password) => {
+                // Two phrasings: one for the model's error, one shown to
+                // the user in the app, where "gmail_app_password" would
+                // mean nothing.
+                let (missing, needed) = match (email.is_some(), password.is_some()) {
+                    (false, false) => (
+                        "the Gmail address and app password are missing",
+                        "your Gmail address and app password",
+                    ),
+                    (true, false) => (
+                        "the Gmail app password is missing",
+                        "your Gmail app password",
+                    ),
+                    (false, true) => ("the Gmail address is missing", "your Gmail address"),
+                    (true, true) => unreachable!("both present is handled above"),
+                };
+                let asked = self.ask_for_credentials(needed).await;
+                Err(Error::ToolExecution(
+                    format!("Gmail is not set up yet: {missing}.{asked}").into(),
+                ))
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
