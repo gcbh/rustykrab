@@ -413,8 +413,17 @@ impl CredentialRequestStore {
                 .map_err(|e| Error::Storage(e.to_string()))?;
             let mut out = Vec::new();
             for row in rows {
-                let (id, name, action, reason, conversation_id, status, created_at, service, fields) =
-                    row.map_err(|e| Error::Storage(e.to_string()))?;
+                let (
+                    id,
+                    name,
+                    action,
+                    reason,
+                    conversation_id,
+                    status,
+                    created_at,
+                    service,
+                    fields,
+                ) = row.map_err(|e| Error::Storage(e.to_string()))?;
                 out.push(CredentialRequest {
                     id,
                     name,

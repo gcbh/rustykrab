@@ -341,11 +341,7 @@ async fn start_capture_server(captured: Captured) -> Result<String> {
     use axum::response::IntoResponse;
     use axum::Json;
 
-    async fn handle(
-        State(cap): State<Captured>,
-        uri: Uri,
-        body: Bytes,
-    ) -> impl IntoResponse {
+    async fn handle(State(cap): State<Captured>, uri: Uri, body: Bytes) -> impl IntoResponse {
         // Telegram calls it `text`, signal-cli calls it `message`.
         if let Ok(v) = serde_json::from_slice::<Value>(&body) {
             for key in ["text", "message"] {
@@ -503,13 +499,13 @@ fn tail(s: &str, n: usize) -> String {
 /// assertion rather than on a SQL error against a store that predates the
 /// table.
 fn count(db: &std::path::Path, sql: &str) -> i64 {
-    let Ok(conn) = rusqlite::Connection::open_with_flags(
-        db,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    ) else {
+    let Ok(conn) =
+        rusqlite::Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+    else {
         return 0;
     };
-    conn.query_row(sql, [], |row| row.get::<_, i64>(0)).unwrap_or(0)
+    conn.query_row(sql, [], |row| row.get::<_, i64>(0))
+        .unwrap_or(0)
 }
 
 fn credential_requests_filed(db: &std::path::Path) -> i64 {
@@ -791,9 +787,7 @@ async fn run_trial_inner(
         let fut = async {
             match surface {
                 Surface::Gateway => drive_gateway(&daemon, &client, turn, &mut conv).await,
-                _ => {
-                    drive_webhook(&daemon, &client, surface, turn, &captured, cfg.timeout()).await
-                }
+                _ => drive_webhook(&daemon, &client, surface, turn, &captured, cfg.timeout()).await,
             }
         };
         match tokio::time::timeout(cfg.timeout(), fut).await {
@@ -888,10 +882,7 @@ fn parse_args() -> Result<Config> {
                 let want = need(i)?;
                 if want != "all" {
                     let ids: Vec<&str> = want.split(',').map(|s| s.trim()).collect();
-                    cfg.scenarios = SCENARIOS
-                        .iter()
-                        .filter(|s| ids.contains(&s.id))
-                        .collect();
+                    cfg.scenarios = SCENARIOS.iter().filter(|s| ids.contains(&s.id)).collect();
                     if cfg.scenarios.is_empty() {
                         bail!("no scenario matched '{want}'");
                     }
@@ -943,7 +934,10 @@ fn rate(results: &[&TrialResult], f: impl Fn(Outcome) -> bool) -> f64 {
 async fn main() -> Result<()> {
     let cfg = parse_args()?;
     if !std::path::Path::new(&cfg.bin).exists() {
-        bail!("daemon binary not found at {} — build it first or set RUSTYKRAB_BIN", cfg.bin);
+        bail!(
+            "daemon binary not found at {} — build it first or set RUSTYKRAB_BIN",
+            cfg.bin
+        );
     }
 
     // The daemon never consumes SignalChannel's inbound queue — only
@@ -1018,17 +1012,13 @@ async fn main() -> Result<()> {
         .with_context(|| format!("cannot open {jsonl_path}"))?;
     eprintln!("per-trial records: {jsonl_path}");
 
-    let mut results: Vec<TrialResult> = prior_results.drain(..).collect();
+    let mut results: Vec<TrialResult> = std::mem::take(&mut prior_results);
     results.reserve(total);
     let mut done = 0usize;
     for &surface in &cfg.surfaces {
         for scenario in &cfg.scenarios {
             for trial in 1..=cfg.trials {
-                if already.contains(&(
-                    surface.name().to_string(),
-                    scenario.id.to_string(),
-                    trial,
-                )) {
+                if already.contains(&(surface.name().to_string(), scenario.id.to_string(), trial)) {
                     done += 1;
                     continue;
                 }
@@ -1062,17 +1052,14 @@ async fn main() -> Result<()> {
     let all: Vec<&TrialResult> = results.iter().collect();
     let mut by_outcome: std::collections::BTreeMap<String, usize> = Default::default();
     for r in &results {
-        *by_outcome
-            .entry(format!("{:?}", r.outcome))
-            .or_default() += 1;
+        *by_outcome.entry(format!("{:?}", r.outcome)).or_default() += 1;
     }
 
     let by_surface = cfg
         .surfaces
         .iter()
         .map(|s| {
-            let sub: Vec<&TrialResult> =
-                results.iter().filter(|r| r.surface == s.name()).collect();
+            let sub: Vec<&TrialResult> = results.iter().filter(|r| r.surface == s.name()).collect();
             (
                 s.name().to_string(),
                 rate(&sub, Outcome::is_actionable_ask),
@@ -1085,8 +1072,7 @@ async fn main() -> Result<()> {
         .scenarios
         .iter()
         .map(|s| {
-            let sub: Vec<&TrialResult> =
-                results.iter().filter(|r| r.scenario == s.id).collect();
+            let sub: Vec<&TrialResult> = results.iter().filter(|r| r.scenario == s.id).collect();
             (
                 s.id.to_string(),
                 rate(&sub, Outcome::is_actionable_ask),
@@ -1125,7 +1111,11 @@ async fn main() -> Result<()> {
         report.any_ask_rate * 100.0
     );
     for (name, actionable, any) in &report.by_surface {
-        eprintln!("  {name:<9} actionable {:.0}%  any {:.0}%", actionable * 100.0, any * 100.0);
+        eprintln!(
+            "  {name:<9} actionable {:.0}%  any {:.0}%",
+            actionable * 100.0,
+            any * 100.0
+        );
     }
     Ok(())
 }
