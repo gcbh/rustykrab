@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.1.26] - 2026-08-23
+
+- fix(agent): the router preserved three of the seven fields it claimed to (#535)
+
 ## [5.1.25] - 2026-08-23
 
 - fix(ollama): a window swallowed by its reserves silently killed compaction (#533)
