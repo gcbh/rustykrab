@@ -81,12 +81,16 @@ pub struct ModelCase {
     /// to the profile's `max_context_tokens` when the provider reports
     /// nothing. Ollama always reports, so the profile value never applied.
     pub num_ctx: Option<u32>,
+    /// Extra environment for the daemon this case boots. The ablation
+    /// driver uses it to A/B `RUSTYKRAB_COMPACTION_EXPAND_CTX` on
+    /// otherwise-identical scenarios.
+    pub extra_env: Vec<(String, String)>,
     pub assertions: Vec<Assertion>,
     pub judge: Option<JudgeSpec>,
 }
 
 impl ModelCase {
-    fn new(id: &'static str, description: &'static str) -> Self {
+    pub(crate) fn new(id: &'static str, description: &'static str) -> Self {
         Self {
             id,
             description,
@@ -99,54 +103,55 @@ impl ModelCase {
             harness_toml: None,
             split_conversation: false,
             num_ctx: None,
+            extra_env: Vec::new(),
             assertions: Vec::new(),
             judge: None,
         }
     }
 
-    fn ask(mut self, turn: impl Into<String>) -> Self {
+    pub(crate) fn ask(mut self, turn: impl Into<String>) -> Self {
         self.turns.push(turn.into());
         self
     }
 
-    fn slow(mut self) -> Self {
+    pub(crate) fn slow(mut self) -> Self {
         self.slow = true;
         self
     }
 
-    fn with_tool(mut self, tool: Value) -> Self {
+    pub(crate) fn with_tool(mut self, tool: Value) -> Self {
         self.stubs["tools"].as_array_mut().unwrap().push(tool);
         self
     }
 
     /// Keep these real tools alongside the stubs — the memory scenarios
     /// need the genuine `memory_*` tools, since those are what they test.
-    fn keeping(mut self, names: &[&str]) -> Self {
+    pub(crate) fn keeping(mut self, names: &[&str]) -> Self {
         self.stubs["keep"] = json!(names);
         self
     }
 
-    fn with_harness(mut self, toml: impl Into<String>) -> Self {
+    pub(crate) fn with_harness(mut self, toml: impl Into<String>) -> Self {
         self.harness_toml = Some(toml.into());
         self
     }
 
-    fn across_conversations(mut self) -> Self {
+    pub(crate) fn across_conversations(mut self) -> Self {
         self.split_conversation = true;
         self
     }
 
-    fn with_num_ctx(mut self, tokens: u32) -> Self {
+    pub(crate) fn with_num_ctx(mut self, tokens: u32) -> Self {
         self.num_ctx = Some(tokens);
         self
     }
 
-    fn expect(mut self, a: Assertion) -> Self {
+    pub(crate) fn expect(mut self, a: Assertion) -> Self {
         self.assertions.push(a);
         self
     }
 
-    fn judged(mut self, j: JudgeSpec) -> Self {
+    pub(crate) fn judged(mut self, j: JudgeSpec) -> Self {
         self.judge = Some(j);
         self
     }
@@ -168,7 +173,7 @@ fn tight_harness() -> String {
 
 /// The default config for non-compaction scenarios: a normal window, but a
 /// low iteration cap so a wandering model fails fast instead of slowly.
-fn bounded_harness() -> String {
+pub(crate) fn bounded_harness() -> String {
     "name = \"e2e\"\n\
      agent_name = \"RustyKrab\"\n\
      max_iterations = 10\n\
@@ -195,7 +200,7 @@ fn tool(
 }
 
 /// Filler text used to inflate turns toward the compaction trigger.
-fn bulky_note(index: usize) -> String {
+pub(crate) fn bulky_note(index: usize) -> String {
     let mut out =
         format!("Here is batch {index} of the audit log. Acknowledge it in one short sentence.\n");
     for i in 0..40 {
@@ -677,16 +682,29 @@ pub async fn run(
     case_filter: Option<&str>,
     quick: bool,
 ) -> Result<(Vec<ScenarioReport>, String)> {
-    preflight(model, ollama_url).await?;
-
-    let judge = Judge::new(model, ollama_url);
-    eprintln!("model suite: {model}, judged by {}", judge.name());
-
     let selected: Vec<ModelCase> = cases()
         .into_iter()
         .filter(|c| case_filter.is_none_or(|needle| c.id.contains(needle)))
         .filter(|c| !(quick && c.slow))
         .collect();
+    run_cases(bin, model, ollama_url, reps, selected, None).await
+}
+
+/// Run an explicit case list, optionally forcing every case onto one
+/// context window. The ablation driver sweeps windows by calling this once
+/// per window with the same cases.
+pub async fn run_cases(
+    bin: &str,
+    model: &str,
+    ollama_url: &str,
+    reps: usize,
+    selected: Vec<ModelCase>,
+    ctx_override: Option<u32>,
+) -> Result<(Vec<ScenarioReport>, String)> {
+    preflight(model, ollama_url).await?;
+
+    let judge = Judge::new(model, ollama_url);
+    eprintln!("model suite: {model}, judged by {}", judge.name());
 
     let mut reports = Vec::new();
     for case in &selected {
@@ -695,17 +713,18 @@ pub async fn run(
         let mut details: Vec<String> = Vec::new();
 
         for _ in 0..reps {
-            let transcript =
-                match tokio::time::timeout(CASE_TIMEOUT, run_once(bin, model, ollama_url, case))
-                    .await
-                {
-                    Ok(Ok(t)) => t,
-                    Ok(Err(e)) => Transcript::failed(format!("{e:#}"), 0),
-                    Err(_) => Transcript::failed(
-                        format!("timed out after {}s", CASE_TIMEOUT.as_secs()),
-                        0,
-                    ),
-                };
+            let transcript = match tokio::time::timeout(
+                CASE_TIMEOUT,
+                run_once(bin, model, ollama_url, case, ctx_override),
+            )
+            .await
+            {
+                Ok(Ok(t)) => t,
+                Ok(Err(e)) => Transcript::failed(format!("{e:#}"), 0),
+                Err(_) => {
+                    Transcript::failed(format!("timed out after {}s", CASE_TIMEOUT.as_secs()), 0)
+                }
+            };
 
             let failures: Vec<String> = case
                 .assertions
@@ -769,6 +788,7 @@ async fn run_once(
     model: &str,
     ollama_url: &str,
     case: &ModelCase,
+    ctx_override: Option<u32>,
 ) -> Result<Transcript> {
     let tmp = tempfile::Builder::new()
         .prefix("rustykrab-e2e-model-")
@@ -783,13 +803,14 @@ async fn run_once(
     let backend = Backend::Model {
         model,
         ollama_url,
-        num_ctx: case.num_ctx,
+        num_ctx: ctx_override.or(case.num_ctx),
         // The model suite names its tools through the stub file.
         active_tools: &[],
         tool_stubs: &stubs,
         // These scenarios drive the gateway directly; the credential
         // suite is the one that varies the surface.
         channel: None,
+        extra_env: &case.extra_env,
     };
     let mut child = spawn_daemon_with(bin, &data_dir, port, &backend)?;
 

@@ -572,6 +572,7 @@ async fn run_trial_inner(
         // identical to one that found it and declined to ask.
         active_tools: CREDENTIAL_TOOLS,
         tool_stubs: "",
+        extra_env: &[],
         channel: Some((surface, &capture_base)),
     };
     let mut child = spawn_daemon_with(bin, &data_dir, port, &backend)?;

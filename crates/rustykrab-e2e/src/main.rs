@@ -17,6 +17,7 @@
 //! RUSTYKRAB_BIN=target/debug/rustykrab-cli cargo run -p rustykrab-e2e
 //! ```
 
+mod ablation;
 mod assertion;
 mod classify;
 mod credential_suite;
@@ -1012,6 +1013,9 @@ pub enum Backend<'a> {
         /// default; the compaction scenarios lower it, because that is
         /// what `effective_context_limit()` actually reads.
         num_ctx: Option<u32>,
+        /// Extra environment for this daemon, applied last so a case can
+        /// override anything the harness sets by default.
+        extra_env: &'a [(String, String)],
         /// Tools to seed into the active set. Registering a tool is not
         /// enough for the model to see it — schemas are only sent for
         /// active tools — so a scenario has to name what it is testing or
@@ -1109,6 +1113,7 @@ fn spawn_daemon_with(
             active_tools,
             tool_stubs,
             channel,
+            extra_env,
         } => {
             command
                 .env("RUSTYKRAB_PROVIDER", "ollama")
@@ -1183,6 +1188,11 @@ fn spawn_daemon_with(
             if let Some((surface, capture_base)) = channel {
                 crate::surface::configure_channel(command, *surface, capture_base);
             }
+
+            // Last, so a case can override any default above.
+            for (key, value) in *extra_env {
+                command.env(key, value);
+            }
         }
     }
 
@@ -1250,8 +1260,10 @@ USAGE:
     cargo run -p rustykrab-e2e -- [FLAGS]
 
 FLAGS:
-    --mode SUITE                scripted | model | credential | all
+    --mode SUITE                scripted | model | credential | ablation | all
                                 (default: scripted)
+    --ctx-list A,B,C            Windows for --mode ablation (default:
+                                4096,8192,16384,32768,65536,131072,262144)
     --surfaces LIST             Surfaces for --mode credential
                                 (default: gateway,telegram; signal has no
                                 agent loop reading it and will error)
@@ -1284,6 +1296,7 @@ struct Args {
     quick: bool,
     model: String,
     ollama_url: String,
+    ctx_list: Vec<u32>,
     list: bool,
 }
 
@@ -1302,6 +1315,7 @@ fn parse_args(argv: &[String]) -> std::result::Result<Args, String> {
         model: std::env::var("OLLAMA_MODEL").unwrap_or_else(|_| "gemma4:26b".to_string()),
         ollama_url: std::env::var("OLLAMA_BASE_URL")
             .unwrap_or_else(|_| "http://localhost:11434".to_string()),
+        ctx_list: vec![4_096, 8_192, 16_384, 32_768, 65_536, 131_072, 262_144],
         list: false,
     };
     let value = |i: usize, name: &str| -> std::result::Result<String, String> {
@@ -1320,10 +1334,10 @@ fn parse_args(argv: &[String]) -> std::result::Result<Args, String> {
                 args.mode = value(i, "--mode")?.to_lowercase();
                 if !matches!(
                     args.mode.as_str(),
-                    "scripted" | "model" | "credential" | "all"
+                    "scripted" | "model" | "credential" | "ablation" | "all"
                 ) {
                     return Err(format!(
-                        "--mode: expected scripted|model|credential|all, got {}",
+                        "--mode: expected scripted|model|credential|ablation|all, got {}",
                         args.mode
                     ));
                 }
@@ -1370,6 +1384,18 @@ fn parse_args(argv: &[String]) -> std::result::Result<Args, String> {
                 args.ollama_url = value(i, "--ollama-url")?;
                 i += 1;
             }
+            "--ctx-list" => {
+                let v = value(i, "--ctx-list")?;
+                args.ctx_list = v
+                    .split(',')
+                    .map(|n| n.trim().parse::<u32>())
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .map_err(|_| format!("--ctx-list: not a number list: {v}"))?;
+                if args.ctx_list.is_empty() {
+                    return Err("--ctx-list needs at least one window".to_string());
+                }
+                i += 1;
+            }
             other => return Err(format!("unknown flag: {other}")),
         }
         i += 1;
@@ -1412,6 +1438,26 @@ async fn main() -> Result<()> {
         std::env::var("RUSTYKRAB_BIN").unwrap_or_else(|_| "target/debug/rustykrab-cli".to_string());
     if !std::path::Path::new(&bin).exists() {
         bail!("daemon binary not found at {bin} — build it first or set RUSTYKRAB_BIN");
+    }
+
+    if args.mode == "ablation" {
+        let report = ablation::run(
+            &bin,
+            &args.model,
+            &args.ollama_url,
+            &args.ctx_list,
+            args.reps,
+            args.case_filter.as_deref(),
+            args.quick,
+        )
+        .await?;
+        let md = ablation::render_markdown(&report);
+        std::fs::write("e2e-ablation.json", serde_json::to_string_pretty(&report)?)?;
+        std::fs::write("e2e-ablation.md", &md)?;
+        eprintln!("{md}");
+        eprintln!("written: e2e-ablation.json, e2e-ablation.md");
+        // A measurement, not a gate.
+        return Ok(());
     }
 
     let mut reports: Vec<ScenarioReport> = Vec::new();
