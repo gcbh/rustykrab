@@ -34,19 +34,49 @@ struct ActiveEntry {
     version: u64,
 }
 
+impl ActiveEntry {
+    /// A fresh entry pre-populated with the registry's seed. Version stays
+    /// 0: the seed is where every conversation starts, not a change to it.
+    fn seeded(seed: &HashSet<String>) -> Self {
+        Self {
+            names: seed.clone(),
+            version: 0,
+        }
+    }
+}
+
 /// Tracks which tools are "active" for each conversation.
 ///
-/// Conversations start with an empty active set. The meta-tool `tools_load`
-/// populates it; the runner filters the schemas sent to the model down to
-/// (meta tools) ∪ (active set).
+/// Conversations start with the seed set (empty unless one was given). The
+/// meta-tool `tools_load` adds to it; the runner filters the schemas sent
+/// to the model down to (meta tools) ∪ (active set).
 #[derive(Debug, Default)]
 pub struct ActiveToolsRegistry {
     inner: RwLock<HashMap<Uuid, ActiveEntry>>,
+    /// Names every conversation starts with, in addition to whatever
+    /// `tools_load` turns on later. Empty for a normal deployment, where
+    /// discovery is the point; used when the registry is small and known
+    /// up front, so requiring a `tools_load` round-trip to reach it would
+    /// be pure overhead.
+    seed: HashSet<String>,
 }
 
 impl ActiveToolsRegistry {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A registry whose conversations all start with `names` already
+    /// active.
+    pub fn with_seed<I, S>(names: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self {
+            inner: RwLock::new(HashMap::new()),
+            seed: names.into_iter().map(Into::into).collect(),
+        }
     }
 
     /// Mark the given tools as active for a conversation. Bumps the
@@ -59,7 +89,9 @@ impl ActiveToolsRegistry {
         S: Into<String>,
     {
         let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
-        let entry = guard.entry(conversation_id).or_default();
+        let entry = guard
+            .entry(conversation_id)
+            .or_insert_with(|| ActiveEntry::seeded(&self.seed));
         let mut changed = false;
         for name in names {
             changed |= entry.names.insert(name.into());
@@ -78,7 +110,7 @@ impl ActiveToolsRegistry {
         guard
             .get(&conversation_id)
             .map(|entry| entry.names.clone())
-            .unwrap_or_default()
+            .unwrap_or_else(|| self.seed.clone())
     }
 
     /// Run `f` against the active set for a conversation without cloning
@@ -93,7 +125,7 @@ impl ActiveToolsRegistry {
         let guard = self.inner.read().unwrap_or_else(|e| e.into_inner());
         match guard.get(&conversation_id) {
             Some(entry) => f(entry.version, &entry.names),
-            None => f(0, &HashSet::new()),
+            None => f(0, &self.seed),
         }
     }
 
@@ -115,7 +147,7 @@ impl ActiveToolsRegistry {
         guard
             .get(&conversation_id)
             .map(|entry| entry.names.contains(name))
-            .unwrap_or(false)
+            .unwrap_or_else(|| self.seed.contains(name))
     }
 
     /// Forget the active set for a conversation (used on session teardown).

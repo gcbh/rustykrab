@@ -60,11 +60,10 @@ impl Transcript {
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
         )?;
 
-        // Not read for its contents — compaction state lives in the
-        // messages on this branch — but a missing row means the caller
-        // handed us an id that never existed, which should say so rather
-        // than come back as an empty transcript.
-        let _: String = conn.query_row(
+        // Carries the compaction state; a missing row also means the
+        // caller handed us an id that never existed, which should say so
+        // rather than come back as an empty transcript.
+        let meta_raw: String = conn.query_row(
             "SELECT data FROM conversations WHERE id = ?1",
             [conv_id],
             |row| row.get(0),
@@ -78,7 +77,8 @@ impl Transcript {
             .filter_map(|raw| serde_json::from_str::<Value>(&raw).ok())
             .collect();
 
-        let mut transcript = Self::parse(&messages);
+        let meta: Value = serde_json::from_str(&meta_raw)?;
+        let mut transcript = Self::parse(&meta, &messages);
         // Displaced history lives in recall_archive, not in the
         // conversation — this is where a compaction's cost is visible.
         transcript.archived_chars = conn
@@ -92,8 +92,8 @@ impl Transcript {
         Ok(transcript)
     }
 
-    /// Assemble from the conversation's messages.
-    pub fn parse(messages: &[Value]) -> Self {
+    /// Assemble from the conversation metadata and its messages.
+    pub fn parse(conv: &Value, messages: &[Value]) -> Self {
         let empty = Vec::new();
 
         let mut assistant_texts = Vec::new();
@@ -155,29 +155,24 @@ impl Transcript {
             }
         }
 
-        // The runner appends this verbatim after every compaction.
-        const CONTINUATION: &str = "Continue from the summary above";
-        let compacted_at = messages.iter().position(|m| {
-            m["content"]["type"].as_str() == Some("text")
-                && m["content"]["data"]
-                    .as_str()
-                    .is_some_and(|t| t.contains(CONTINUATION))
-        });
-        // The summary is the assistant turn immediately before it.
-        let summary = compacted_at.and_then(|i| {
-            messages[..i]
-                .iter()
-                .rev()
-                .find(|m| m["role"].as_str() == Some("assistant"))
-                .and_then(|m| m["content"]["data"].as_str())
-                .map(str::to_string)
-        });
+        // `summary` is the compaction state a Conversation actually
+        // carries — `compact_history` sets it, and there is a test in the
+        // runner asserting so. An earlier version of this inferred
+        // compaction from the continuation turn the runner injects, which
+        // works but reads a side effect rather than the state itself; the
+        // field is both simpler and harder to fool.
+        //
+        // (Adopted from the parallel investigation in #532.)
+        let summary = conv["summary"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
 
         Self {
             final_text: assistant_texts.last().cloned().unwrap_or_default(),
             assistant_texts,
             calls,
-            compacted: compacted_at.is_some(),
+            compacted: summary.is_some(),
             summary,
             archived_chars: 0,
             live_messages: messages.len(),
@@ -249,7 +244,7 @@ mod tests {
 
     /// Test shim: the store hands these back separately.
     fn parse_pair(pair: &(Value, Vec<Value>)) -> Transcript {
-        Transcript::parse(&pair.1)
+        Transcript::parse(&pair.0, &pair.1)
     }
 
     #[test]
@@ -332,26 +327,24 @@ mod tests {
     }
 
     #[test]
-    fn detects_a_compaction_from_the_continuation_turn() {
-        // The summary is model-written and could say anything; the
-        // continuation the runner injects is the reliable marker.
+    fn detects_a_compaction_from_the_summary_the_runner_sets() {
+        // `compact_history` sets `conv.summary`; that field is the whole of
+        // the compaction state a Conversation carries.
         let t = parse_pair(&conv(
             json!([
                 { "id": "m1", "role": "user",
-                  "content": { "type": "text", "data": "the cluster is borealis" } },
-                { "id": "m2", "role": "assistant",
-                  "content": { "type": "text",
-                               "data": "So far: the cluster is borealis. Next: continue." } },
-                { "id": "m3", "role": "user",
-                  "content": { "type": "text",
-                               "data": "Continue from the summary above. Do not repeat \
-                                        already-completed work." } }
+                  "content": { "type": "text", "data": "the cluster is borealis" } }
             ]),
-            json!({}),
+            json!({ "summary": "So far: the cluster is borealis. Next: continue." }),
         ));
         assert!(t.compacted);
         assert!(t.summary.unwrap().contains("borealis"));
-        assert_eq!(t.live_messages, 3);
+    }
+
+    #[test]
+    fn an_empty_summary_is_not_a_compaction() {
+        let t = parse_pair(&conv(json!([]), json!({ "summary": "" })));
+        assert!(!t.compacted, "an empty summary is absence, not a fold");
     }
 
     #[test]

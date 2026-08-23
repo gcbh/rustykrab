@@ -1016,16 +1016,78 @@ async fn main() -> anyhow::Result<()> {
         None => tools,
     };
 
+    // A stubbed registry is a closed world: the harness has already said
+    // "these are the only tools." Progressive disclosure exists to keep a
+    // thirty-tool registry from swamping a small model, and `replace` mode
+    // removes `tools_load` itself — so without this the stubs are
+    // registered but never active, and the model is sent no schemas at
+    // all. Seed them so they are visible from turn 0.
+    //
+    // RUSTYKRAB_ACTIVE_TOOLS seeds names directly, for the case a stub file
+    // cannot express: activating *real* tools. The credential scenarios
+    // need `gmail` and `browser` live from turn 0 — they stub nothing,
+    // because their whole premise is that the real tools cannot run
+    // without a credential — and without the seed they measure whether the
+    // model discovers a tool rather than what it does when it lacks a
+    // secret.
+    let mut seed: Vec<String> = Vec::new();
+    if std::env::var_os("RUSTYKRAB_TOOL_STUBS").is_some() {
+        seed.extend(tools.iter().map(|t| t.name().to_string()));
+    }
+    if let Ok(raw) = std::env::var("RUSTYKRAB_ACTIVE_TOOLS") {
+        seed.extend(
+            raw.split(',')
+                .map(str::trim)
+                .filter(|n| !n.is_empty())
+                .map(str::to_string),
+        );
+    }
+    let active_tools = if seed.is_empty() {
+        Arc::new(rustykrab_core::active_tools::ActiveToolsRegistry::new())
+    } else {
+        tracing::warn!(
+            seeded = ?seed,
+            "tools seeded active from turn 0 — an evaluation switch, not a deployment one"
+        );
+        Arc::new(rustykrab_core::active_tools::ActiveToolsRegistry::with_seed(seed))
+    };
+
     // --- Harness router (auto-selects profile per message) ---
     // Reuses the main provider for classification to avoid model swapping.
     // The classification prompt is ~50 tokens — negligible overhead on any model.
     let classifier: Arc<dyn ModelProvider> = provider.clone();
 
-    let router = Arc::new(
-        HarnessRouter::new(classifier)
-            .with_base(profile)
-            .with_pinned_fields(pinned_profile_fields),
+    // Two separate concerns, both needed.
+    //
+    // Pinning fixes the silent override for everyone: the router swaps in a
+    // preset per message and restores only three of the seven profile
+    // fields, so a harness.toml naming `max_tool_retries` quietly lost it.
+    // The pinned names come from the keys the file actually set.
+    //
+    // RUSTYKRAB_HARNESS_ROUTER=off goes further and pins the whole profile,
+    // which is what an eval wants: one configured profile for every
+    // message, no classification in the loop at all. (From #532.)
+    let routing_enabled = !matches!(
+        std::env::var("RUSTYKRAB_HARNESS_ROUTER")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "off" | "0" | "false" | "no"
     );
+    let router = routing_enabled.then(|| {
+        Arc::new(
+            HarnessRouter::new(classifier)
+                .with_base(profile.clone())
+                .with_pinned_fields(pinned_profile_fields),
+        )
+    });
+    if !routing_enabled {
+        tracing::info!(
+            profile = %profile.name,
+            "harness routing disabled — using the configured profile for every message"
+        );
+    }
 
     // --- Build gateway state ---
     // Clone store handle so we can flush it after the server shuts down.
@@ -1034,7 +1096,10 @@ async fn main() -> anyhow::Result<()> {
         // Loopback is always allowed; this adds the names other clients
         // reach us by, e.g. the tailnet hostname the phone uses.
         .with_origin_policy(rustykrab_gateway::OriginPolicy::from_env())
-        .with_harness_router(router)
+        // Also the fallback the gateway uses when routing is off, so
+        // `harness.toml` still decides the caps in that mode.
+        .with_harness_profile(profile)
+        .with_harness_router_opt(router)
         .with_orchestration_config(orchestration_config)
         .with_skill_registry(skill_registry)
         .with_memory(Arc::clone(&memory_system), agent_id)
@@ -1043,6 +1108,7 @@ async fn main() -> anyhow::Result<()> {
         .with_retrieval_log(retrieval_log)
         .with_activity_tracker(activity_tracker.clone())
         .with_outcome_capture(outcome_capture_enabled);
+    state.active_tools = active_tools;
 
     // --- Attach video channel to state ---
     if let Some(vc) = video_channel {

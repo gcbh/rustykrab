@@ -91,24 +91,6 @@ const DEFAULT_ACTIVE_TOOLS: &[&str] = &[
     "todo_read",
 ];
 
-/// Tool names to seed into every conversation's active set on top of
-/// [`DEFAULT_ACTIVE_TOOLS`], from `RUSTYKRAB_ACTIVE_TOOLS` (comma
-/// separated). Read once: the environment does not change under a running
-/// daemon, and this is on the path of every turn.
-fn extra_active_tools() -> &'static [String] {
-    static EXTRA: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
-    EXTRA.get_or_init(|| {
-        std::env::var("RUSTYKRAB_ACTIVE_TOOLS")
-            .map(|raw| {
-                raw.split(',')
-                    .map(|n| n.trim().to_string())
-                    .filter(|n| !n.is_empty())
-                    .collect()
-            })
-            .unwrap_or_default()
-    })
-}
-
 use crate::sandbox::{tool_timeout_secs, Sandbox, SandboxPolicy, DEFAULT_NET_TOOL_TIMEOUT_SECS};
 use crate::trace::{ExecutionTracer, ToolTrace};
 
@@ -989,14 +971,6 @@ impl AgentRunner {
         // the filter below.
         self.active_tools
             .activate(conv_id, DEFAULT_ACTIVE_TOOLS.iter().copied());
-        // Names from RUSTYKRAB_ACTIVE_TOOLS are seeded alongside the
-        // defaults. Lazy activation keeps thirty schemas out of the
-        // prompt, but it also means a freshly registered tool is invisible
-        // to the model until something calls `tools_load` — which a
-        // deployment that registered the tool on purpose, or an eval
-        // pinning one scenario to one tool, has no way to arrange.
-        self.active_tools
-            .activate(conv_id, extra_active_tools().iter().map(String::as_str));
         self.active_tools.with_active(conv_id, |version, active| {
             let schemas = self
                 .tools
