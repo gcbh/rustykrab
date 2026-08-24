@@ -72,5 +72,10 @@ eval-quick:
 eval-cred:
 	./scripts/e2e.sh --mode credential --trials 5 $(ARGS)
 
+# Reaches the real internet with real credentials, so it is never part of
+# `all` and skips unless RK_LOGIN_* is set. See crates/rustykrab-e2e/README.md.
+eval-login:
+	./scripts/e2e.sh --mode login --trials 3 $(ARGS)
+
 eval-list:
 	@./scripts/e2e.sh --list

@@ -144,7 +144,7 @@ fn count(db: &std::path::Path, sql: &str) -> i64 {
 /// one live ask. A single trial reported 21 "filed" requests that way,
 /// which looked like the daemon failing to deduplicate when it had in fact
 /// deduplicated correctly every time.
-fn credential_requests_filed(db: &std::path::Path) -> i64 {
+pub(crate) fn credential_requests_filed(db: &std::path::Path) -> i64 {
     count(
         db,
         "SELECT COUNT(*) FROM credential_requests WHERE status = 'pending'",
@@ -161,12 +161,12 @@ fn secrets_written(db: &std::path::Path) -> i64 {
 
 // ── driving each surface ─────────────────────────────────────────────
 
-struct Reply {
-    text: String,
-    tools: Vec<String>,
+pub(crate) struct Reply {
+    pub(crate) text: String,
+    pub(crate) tools: Vec<String>,
 }
 
-async fn drive_gateway(
+pub(crate) async fn drive_gateway(
     base: &str,
     client: &reqwest::Client,
     prompt: &str,
