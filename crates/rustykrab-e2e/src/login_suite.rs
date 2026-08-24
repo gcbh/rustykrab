@@ -368,7 +368,7 @@ async fn run_trial_inner(
         // Turn 1: the agent hits a provider it has no credential for.
         let opening = scenario.prompt.replace("{url}", &provider.url);
         let first = drive_gateway(&base, &client, &opening, &mut conv).await?;
-        result.reply = first.text.clone();
+        result.reply = redact(&first.text, provider);
 
         // Answer whatever it asked for. Nothing to answer means the trial
         // cannot proceed, and that is its own outcome.
@@ -390,7 +390,10 @@ async fn run_trial_inner(
             &mut conv,
         )
         .await?;
-        result.reply = format!("{}\n---\n{}", first.text.trim(), second.text.trim());
+        result.reply = redact(
+            &format!("{}\n---\n{}", first.text.trim(), second.text.trim()),
+            provider,
+        );
 
         result.outcome = classify(&result.reply, want, true);
         Ok(())
@@ -398,7 +401,10 @@ async fn run_trial_inner(
     .await;
 
     if outcome.is_err() {
-        eprintln!("--- daemon.log tail ---\n{}", crate::log_tail(&data_dir));
+        eprintln!(
+            "--- daemon.log tail ---\n{}",
+            redact(&crate::log_tail(&data_dir), provider)
+        );
     }
     shutdown_daemon(child).await;
     keep_or_drop(tmp);
@@ -409,6 +415,23 @@ async fn run_trial_inner(
 /// that it preserved capitalisation on the way.
 fn contains(haystack: &str, needle: &str) -> bool {
     haystack.to_lowercase().contains(&needle.to_lowercase())
+}
+
+/// Strip the live password out of anything that gets stored.
+///
+/// Not paranoia: against the local fixture the agent wrote the credentials
+/// straight into its answer — "signed in with the credentials you supplied
+/// (tester@example.com / hunter2)" — and `LoginTrial::reply` is kept
+/// verbatim and serialised into `e2e-report.json`, which CI uploads as an
+/// artifact. A live password would land in a build artifact on every run.
+///
+/// The username is left alone: it is not a secret, and knowing which
+/// account a trial used is most of what makes a failure diagnosable.
+fn redact(text: &str, provider: &LiveProvider) -> String {
+    if provider.pass.is_empty() {
+        return text.to_string();
+    }
+    text.replace(&provider.pass, "[redacted]")
 }
 
 /// Score a finished trial.
@@ -505,6 +528,28 @@ mod tests {
         assert_eq!(
             classify(got, want, false),
             LoginOutcome::SucceededWithoutAsking
+        );
+    }
+
+    #[test]
+    fn password_never_survives_into_a_stored_reply() {
+        let p = LiveProvider {
+            url: "https://provider.example".into(),
+            user: "someone@example.com".into(),
+            pass: "hunter2".into(),
+            expect: "Signed in".into(),
+            mail_expect: None,
+        };
+        let leaked = "signed in with the credentials you supplied \
+                      (someone@example.com / hunter2)";
+        let safe = redact(leaked, &p);
+        assert!(!safe.contains("hunter2"), "password survived: {safe}");
+        assert!(safe.contains("[redacted]"), "no marker left: {safe}");
+        // The account is not a secret and naming it is what makes a
+        // failure diagnosable.
+        assert!(
+            safe.contains("someone@example.com"),
+            "user was lost: {safe}"
         );
     }
 
