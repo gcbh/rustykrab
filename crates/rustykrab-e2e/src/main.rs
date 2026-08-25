@@ -21,6 +21,7 @@ mod assertion;
 mod classify;
 mod credential_suite;
 mod judge;
+mod login_suite;
 mod model_suite;
 mod surface;
 mod transcript;
@@ -1260,8 +1261,11 @@ USAGE:
     cargo run -p rustykrab-e2e -- [FLAGS]
 
 FLAGS:
-    --mode SUITE                scripted | model | credential | all
-                                (default: scripted)
+    --mode SUITE                scripted | model | credential | login | all
+                                (default: scripted). `login` reaches the
+                                real internet with real credentials and is
+                                never included in `all`; it skips unless
+                                RK_LOGIN_URL/USER/PASS are set.
     --surfaces LIST             Surfaces for --mode credential
                                 (default: gateway,telegram; signal has no
                                 agent loop reading it and will error)
@@ -1330,10 +1334,10 @@ fn parse_args(argv: &[String]) -> std::result::Result<Args, String> {
                 args.mode = value(i, "--mode")?.to_lowercase();
                 if !matches!(
                     args.mode.as_str(),
-                    "scripted" | "model" | "credential" | "all"
+                    "scripted" | "model" | "credential" | "login" | "all"
                 ) {
                     return Err(format!(
-                        "--mode: expected scripted|model|credential|all, got {}",
+                        "--mode: expected scripted|model|credential|login|all, got {}",
                         args.mode
                     ));
                 }
@@ -1415,6 +1419,10 @@ async fn main() -> Result<()> {
             let slow = if case.slow { "  (slow)" } else { "" };
             eprintln!("  {:<42}{slow}\n      {}", case.id, case.description);
         }
+        eprintln!("\n── login (live network, opt-in, xfail) ──");
+        for sc in login_suite::SCENARIOS {
+            eprintln!("  {:<42}\n      {}", sc.id, sc.description);
+        }
         return Ok(());
     }
 
@@ -1427,6 +1435,7 @@ async fn main() -> Result<()> {
     let mut reports: Vec<ScenarioReport> = Vec::new();
     let mut judge_name: Option<String> = None;
     let mut trials: Vec<credential_suite::TrialResult> = Vec::new();
+    let mut login_trials: Vec<login_suite::LoginTrial> = Vec::new();
 
     if args.mode == "scripted" || args.mode == "all" {
         reports.extend(run_scripted(&bin).await?);
@@ -1460,6 +1469,22 @@ async fn main() -> Result<()> {
         reports.extend(cells);
         trials = trial_results;
     }
+    // Not in `all`: this is the only mode that reaches the public internet
+    // with live credentials, so it is never swept up by a broad run. Ask
+    // for it by name.
+    if args.mode == "login" {
+        let (cells, login_results) = login_suite::run(
+            &bin,
+            &args.model,
+            &args.ollama_url,
+            args.trials,
+            args.case_filter.as_deref(),
+            Duration::from_secs(900),
+        )
+        .await?;
+        reports.extend(cells);
+        login_trials = login_results;
+    }
 
     let count = |o: &str| reports.iter().filter(|r| r.outcome == o).count();
     let (pass, fail, xfail, xpass) = (count("pass"), count("fail"), count("xfail"), count("xpass"));
@@ -1472,6 +1497,7 @@ async fn main() -> Result<()> {
         // Every trial, verbatim, so any rate in the summary can be audited
         // back to the reply that produced it.
         "credential_trials": trials,
+        "login_trials": login_trials,
         "summary": {
             "pass": pass,
             "fail": fail,

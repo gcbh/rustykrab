@@ -6,6 +6,7 @@ Every eval runs through here. One binary, one report, one exit code.
 make e2e            # deterministic plumbing scenarios — no model, seconds
 make eval           # gemma4:26b behaviour scenarios, 3 repetitions each
 make eval-cred      # the credential-ask measurement, per surface
+make eval-login     # live-network login flows (opt-in; skips unless RK_LOGIN_* set)
 make eval-list      # list every scenario
 ```
 
@@ -19,8 +20,9 @@ Flags pass through: `make eval ARGS="--case compaction"`, or call
 | `scripted` | replayed script, no model | boolean assertions | yes — must pass **every** run |
 | `model` | real model, stubbed tools | boolean assertions + LLM judge | yes — must pass a **majority** of repetitions |
 | `credential` | real model, real tools, empty credential store | outcome **distribution** | no — reports a rate |
+| `login` | real model, real tools, **the real internet** | outcome distribution | no — xfail, and opt-in |
 
-The three answer different questions and the report never merges them.
+The four answer different questions and the report never merges them.
 
 **scripted** answers *"does the server still do what it says"*: auth, the
 origin allowlist, conversation CRUD, SSE framing, secrets, the credential
@@ -37,6 +39,21 @@ have, does it ask over a protocol the user can answer on"*. That question
 has no single right answer — it has a distribution over outcomes, per
 surface — so these scenarios are `Expected::Measure`: they report and never
 turn the suite red.
+
+**login** answers *"can the agent get into a provider it has never seen, and
+then use what is behind the door"*. It carries the credential loop past the
+ask: the request is answered with real credentials and the question becomes
+whether the agent then signs in and finishes the job. Two scenarios,
+deliberately separate — signing in and using what is inside fail
+independently, and one scenario covering both cannot say which broke.
+
+This is the only mode that leaves the machine, so it is opt-in
+(`RK_LOGIN_URL`/`RK_LOGIN_USER`/`RK_LOGIN_PASS`), excluded from `--mode all`,
+and `Expected::XFail` until the capability lands. A fixture would not do:
+pointed at a local one, the agent read the password out of the fixture's own
+source with its filesystem tools and "signed in" without asking. Anything the
+harness can reach on this machine, so can the agent under test. Use a
+throwaway account.
 
 ### Why `Measure` exists
 
