@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.1.32] - 2026-08-25
+
+- fix(webchat): make the client run, and answer credential requests (#544)
+
 ## [5.1.31] - 2026-08-25
 
 - fix(agent): let the agent ask for a credential without tripping over one (#543)
