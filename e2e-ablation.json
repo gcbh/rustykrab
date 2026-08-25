@@ -5,16 +5,49 @@
   "model_max_context": 262144,
   "windows": [
     {
+      "compaction_cost": [
+        {
+          "expected": "pass",
+          "id": "ablation-compaction-8192-baseline",
+          "mean_ms": 492052,
+          "mode": "model",
+          "outcome": "pass",
+          "passed": true,
+          "passes": 1,
+          "runs": 1
+        },
+        {
+          "expected": "pass",
+          "id": "ablation-compaction-8192-expanded",
+          "mean_ms": 758651,
+          "mode": "model",
+          "outcome": "pass",
+          "passed": true,
+          "passes": 1,
+          "runs": 1
+        }
+      ],
+      "judge": "gemma4:26b (self-judging fallback)",
       "speed": {
-        "error": "load failed: error sending request for url (http://localhost:11434/api/chat): operation timed out",
-        "gen_tps": 0.0,
-        "load_secs": 0.0,
-        "prompt_tps_fixed": 0.0,
-        "size_bytes": 0,
-        "size_vram_bytes": 0,
+        "gen_tps": 50.90554198295381,
+        "load_secs": 28.497618666,
+        "prompt_tps_fixed": 628.6765966887673,
+        "size_bytes": 17610729062,
+        "size_vram_bytes": 17610729062,
         "window": 8192
       },
-      "suite": null,
+      "suite": [
+        {
+          "expected": "pass",
+          "id": "model-calls-one-tool",
+          "mean_ms": 12691,
+          "mode": "model",
+          "outcome": "pass",
+          "passed": true,
+          "passes": 1,
+          "runs": 1
+        }
+      ],
       "window": 8192
     }
   ]
