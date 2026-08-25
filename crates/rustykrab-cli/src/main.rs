@@ -1107,7 +1107,8 @@ async fn main() -> anyhow::Result<()> {
         .with_computer_use_enabled(computer_use_enabled)
         .with_retrieval_log(retrieval_log)
         .with_activity_tracker(activity_tracker.clone())
-        .with_outcome_capture(outcome_capture_enabled);
+        .with_outcome_capture(outcome_capture_enabled)
+        .with_credential_page_policy(rustykrab_gateway::PageIdentityPolicy::from_env());
     state.active_tools = active_tools;
 
     // --- Attach video channel to state ---

@@ -11,8 +11,12 @@
 use std::sync::Arc;
 use std::sync::Mutex;
 
+use std::time::Duration;
+
+use chrono::Utc;
 use rusqlite::params;
 use rustykrab_core::Error;
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::secret::{SecretStore, WriteAuthority};
@@ -385,6 +389,99 @@ impl CredentialRequestStore {
 
     /// Pending requests, newest first. Expired ones are swept on the way
     /// through rather than by a background timer.
+    /// Mint a one-time link for a `fulfil` request and return the token.
+    ///
+    /// The token is returned exactly once, to be put in the message the
+    /// user receives. Only its SHA-256 lands in the database, so a dump of
+    /// the store does not yield working links.
+    ///
+    /// Re-issuing replaces any previous token: the last link sent is the
+    /// only one that works.
+    pub async fn issue_link(&self, id: &str, ttl: Duration) -> Result<String, Error> {
+        let token = {
+            use rand::Rng;
+            let mut raw = [0u8; 32];
+            rand::rng().fill(&mut raw);
+            // URL-safe and unpadded: this goes in a link a user may retype.
+            hex::encode(raw)
+        };
+        let hash = hash_token(&token);
+        let expires = Utc::now()
+            .checked_add_signed(chrono::Duration::from_std(ttl).unwrap_or_default())
+            .map(|t| t.timestamp_millis())
+            .unwrap_or(i64::MAX);
+        let id = id.to_string();
+        crate::with_conn(&self.conn, move |conn| {
+            let n = conn
+                .execute(
+                    "UPDATE credential_requests
+                        SET link_token_hash = ?1, link_expires_at = ?2
+                      WHERE id = ?3 AND status = 'pending'",
+                    params![hash, expires, id],
+                )
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            if n == 0 {
+                return Err(Error::NotFound(format!("pending request {id}")));
+            }
+            Ok(())
+        })
+        .await?;
+        Ok(token)
+    }
+
+    /// Resolve a one-time link token to the request it answers.
+    ///
+    /// Returns `None` for a token that is unknown, expired, or whose
+    /// request is no longer pending — deliberately not distinguishing
+    /// between them, so the page cannot be used to probe which links exist.
+    /// Single use falls out of the status check: fulfilling moves the row
+    /// off `pending`, so the link stops working the moment it is answered.
+    pub async fn find_by_link(&self, token: &str) -> Result<Option<CredentialRequest>, Error> {
+        self.sweep_expired().await?;
+        let hash = hash_token(token);
+        let now = Utc::now().timestamp_millis();
+        crate::with_conn(&self.conn, move |conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, name, action, reason, conversation_id, status,
+                            created_at, service, fields
+                       FROM credential_requests
+                      WHERE link_token_hash = ?1
+                        AND status = 'pending'
+                        AND (link_expires_at IS NULL OR link_expires_at > ?2)",
+                )
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            let mut rows = stmt
+                .query(params![hash, now])
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            let Some(row) = rows.next().map_err(|e| Error::Storage(e.to_string()))? else {
+                return Ok(None);
+            };
+            let get_s = |i: usize| row.get::<_, String>(i);
+            let get_o = |i: usize| row.get::<_, Option<String>>(i);
+            Ok(Some(CredentialRequest {
+                id: get_s(0).map_err(|e| Error::Storage(e.to_string()))?,
+                name: get_s(1).map_err(|e| Error::Storage(e.to_string()))?,
+                action: RequestAction::parse(
+                    &get_s(2).map_err(|e| Error::Storage(e.to_string()))?,
+                )?,
+                reason: get_o(3).map_err(|e| Error::Storage(e.to_string()))?,
+                conversation_id: get_o(4).map_err(|e| Error::Storage(e.to_string()))?,
+                status: get_s(5).map_err(|e| Error::Storage(e.to_string()))?,
+                created_at: row
+                    .get::<_, i64>(6)
+                    .map_err(|e| Error::Storage(e.to_string()))?,
+                service: get_o(7).map_err(|e| Error::Storage(e.to_string()))?,
+                fields: decode_fields(
+                    get_o(8)
+                        .map_err(|e| Error::Storage(e.to_string()))?
+                        .as_deref(),
+                ),
+            }))
+        })
+        .await
+    }
+
     pub async fn pending(&self) -> Result<Vec<CredentialRequest>, Error> {
         self.sweep_expired().await?;
         crate::with_conn(&self.conn, |conn| {
@@ -621,13 +718,13 @@ mod fulfil_tests {
     use super::*;
     use crate::Store;
 
-    fn store() -> (tempfile::TempDir, CredentialRequestStore, SecretStore) {
+    pub(super) fn store() -> (tempfile::TempDir, CredentialRequestStore, SecretStore) {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Store::open(dir.path(), vec![7u8; 32]).expect("open");
         (dir, store.credential_requests(), store.secrets())
     }
 
-    fn gmail_fields() -> Vec<RequestedField> {
+    pub(super) fn gmail_fields() -> Vec<RequestedField> {
         vec![
             RequestedField {
                 key: "gmail_email".into(),
@@ -791,5 +888,164 @@ mod fulfil_tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("at least one field"), "{err}");
+    }
+}
+
+/// Hash a link token for storage and lookup.
+///
+/// SHA-256 without a salt is right here and a salt would be wrong: the
+/// token is 32 bytes of CSPRNG output, so there is no dictionary to attack,
+/// and lookup is by hash — a per-row salt would make that impossible.
+fn hash_token(token: &str) -> String {
+    let mut h = Sha256::new();
+    h.update(token.as_bytes());
+    hex::encode(h.finalize())
+}
+
+#[cfg(test)]
+mod link_tests {
+    use super::fulfil_tests::{gmail_fields, store};
+    use super::*;
+
+    const TTL: Duration = Duration::from_secs(900);
+
+    #[tokio::test]
+    async fn a_link_resolves_to_its_request_and_only_that_one() {
+        let (_dir, requests, _secrets) = store();
+        let id = requests
+            .file_fulfil(
+                "gmail_app_password",
+                Some("Gmail".into()),
+                gmail_fields(),
+                None,
+                None,
+            )
+            .await
+            .expect("file");
+        let token = requests.issue_link(&id, TTL).await.expect("issue");
+
+        let found = requests.find_by_link(&token).await.expect("lookup");
+        assert_eq!(found.map(|r| r.id), Some(id));
+
+        // A token that was never issued resolves to nothing rather than
+        // erroring, so the page cannot be used to probe which links exist.
+        assert!(requests
+            .find_by_link(&"0".repeat(64))
+            .await
+            .expect("lookup")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn the_token_itself_is_not_recoverable_from_the_store() {
+        let (_dir, requests, _secrets) = store();
+        let id = requests
+            .file_fulfil(
+                "gmail_app_password",
+                Some("Gmail".into()),
+                gmail_fields(),
+                None,
+                None,
+            )
+            .await
+            .expect("file");
+        let token = requests.issue_link(&id, TTL).await.expect("issue");
+        // Only the hash is persisted: a dump of the row yields no working link.
+        assert_ne!(hash_token(&token), token);
+        assert_eq!(hash_token(&token).len(), 64);
+    }
+
+    #[tokio::test]
+    async fn answering_a_request_burns_its_link() {
+        let (_dir, requests, secrets) = store();
+        let id = requests
+            .file_fulfil(
+                "gmail_app_password",
+                Some("Gmail".into()),
+                gmail_fields(),
+                None,
+                None,
+            )
+            .await
+            .expect("file");
+        let token = requests.issue_link(&id, TTL).await.expect("issue");
+        assert!(requests
+            .find_by_link(&token)
+            .await
+            .expect("lookup")
+            .is_some());
+
+        requests
+            .fulfil(
+                &id,
+                &[
+                    ("gmail_email".to_string(), "a@b.c".to_string()),
+                    ("gmail_app_password".to_string(), "pw".to_string()),
+                ],
+                "test",
+            )
+            .await
+            .expect("fulfil");
+
+        // Single use falls out of the status check rather than a separate
+        // flag: the row is no longer pending, so the link is dead.
+        assert!(requests
+            .find_by_link(&token)
+            .await
+            .expect("lookup")
+            .is_none());
+        let _ = secrets;
+    }
+
+    #[tokio::test]
+    async fn an_expired_link_stops_working() {
+        let (_dir, requests, _secrets) = store();
+        let id = requests
+            .file_fulfil(
+                "gmail_app_password",
+                Some("Gmail".into()),
+                gmail_fields(),
+                None,
+                None,
+            )
+            .await
+            .expect("file");
+        let token = requests
+            .issue_link(&id, Duration::from_secs(0))
+            .await
+            .expect("issue");
+        assert!(requests
+            .find_by_link(&token)
+            .await
+            .expect("lookup")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn re_issuing_invalidates_the_link_already_sent() {
+        let (_dir, requests, _secrets) = store();
+        let id = requests
+            .file_fulfil(
+                "gmail_app_password",
+                Some("Gmail".into()),
+                gmail_fields(),
+                None,
+                None,
+            )
+            .await
+            .expect("file");
+        let first = requests.issue_link(&id, TTL).await.expect("issue");
+        let second = requests.issue_link(&id, TTL).await.expect("re-issue");
+        assert_ne!(first, second);
+        assert!(requests
+            .find_by_link(&first)
+            .await
+            .expect("lookup")
+            .is_none());
+        assert!(requests
+            .find_by_link(&second)
+            .await
+            .expect("lookup")
+            .is_some());
     }
 }

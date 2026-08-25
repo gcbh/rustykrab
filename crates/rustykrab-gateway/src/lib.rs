@@ -1,4 +1,5 @@
 pub mod auth;
+mod credential_page;
 pub mod logging;
 mod orchestrate;
 pub mod origin;
@@ -61,6 +62,7 @@ pub fn router(state: AppState) -> Router {
         .merge(routes::api_routes())
         .merge(telegram_webhook::telegram_routes())
         .merge(signal_webhook::signal_routes())
+        .merge(credential_page::routes())
         .merge(webchat::static_routes())
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -78,3 +80,5 @@ pub fn router(state: AppState) -> Router {
         .layer(middleware::from_fn(security_headers_middleware))
         .with_state(state)
 }
+
+pub use credential_page::PageIdentityPolicy;

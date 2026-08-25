@@ -324,6 +324,18 @@ impl Store {
                 "fields",
                 "ALTER TABLE credential_requests ADD COLUMN fields TEXT",
             ),
+            // A one-time link the user opens to answer a fulfil request.
+            // Only the hash is stored: the token is shown once, in the
+            // message the agent sends, and is unrecoverable from the
+            // database afterwards.
+            (
+                "link_token_hash",
+                "ALTER TABLE credential_requests ADD COLUMN link_token_hash TEXT",
+            ),
+            (
+                "link_expires_at",
+                "ALTER TABLE credential_requests ADD COLUMN link_expires_at INTEGER",
+            ),
         ] {
             if !existing.iter().any(|c| c == column) {
                 conn.execute(ddl, [])
