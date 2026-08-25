@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.1.31] - 2026-08-25
+
+- fix(agent): let the agent ask for a credential without tripping over one (#543)
+
 ## [5.1.30] - 2026-08-25
 
 - feat: hand over a credential through a tailnet-only page (#545)

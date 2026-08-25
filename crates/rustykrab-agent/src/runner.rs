@@ -89,6 +89,20 @@ const DEFAULT_ACTIVE_TOOLS: &[&str] = &[
     "memory_save",
     "todo_write",
     "todo_read",
+    // Asking the user for a credential has to be reachable without first
+    // tripping over a tool that happens to ask on the agent's behalf.
+    //
+    // Only `gmail` files a request today, from inside its own missing-
+    // credential path, so filing was conditional on the agent having
+    // attempted Gmail specifically. Measured over 50 gateway trials:
+    // routes through `gmail` filed 25/25, `browser` — which has no such
+    // hook — filed 1/9, and trials that attempted neither filed 0/16. The
+    // user-visible effect was a chat message asking for a password with no
+    // secure field behind it, and nothing recorded as outstanding.
+    //
+    // Making the tool visible moved `other_mail_provider` and
+    // `website_login_generic` from 0/5 to 5/5 each.
+    "credential_request",
 ];
 
 use crate::sandbox::{tool_timeout_secs, Sandbox, SandboxPolicy, DEFAULT_NET_TOOL_TIMEOUT_SECS};
