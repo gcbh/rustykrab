@@ -83,6 +83,8 @@ pub struct AppState {
     /// default: instrumentation is opt-in, driven by
     /// `RUSTYKRAB_OUTCOME_CAPTURE` at startup.
     pub outcome_capture_enabled: bool,
+    /// Who may open the credential page served at `/c/{token}`.
+    pub credential_page_policy: crate::PageIdentityPolicy,
 }
 
 impl AppState {
@@ -124,6 +126,7 @@ impl AppState {
             activity: ActivityTracker::new(),
             retrieval_log: RetrievalLog::new(),
             outcome_capture_enabled: false,
+            credential_page_policy: crate::PageIdentityPolicy::default(),
         }
     }
 
@@ -228,6 +231,12 @@ impl AppState {
     /// selects the right harness profile on-the-fly.
     pub fn with_harness_router(mut self, router: Arc<HarnessRouter>) -> Self {
         self.harness_router = Some(router);
+        self
+    }
+
+    /// Who may open the credential page. Fails closed by default.
+    pub fn with_credential_page_policy(mut self, p: crate::PageIdentityPolicy) -> Self {
+        self.credential_page_policy = p;
         self
     }
 

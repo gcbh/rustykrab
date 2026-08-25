@@ -433,7 +433,8 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    let store = rustykrab_store::Store::open(data_dir.join("db"), master_key)?;
+    let store = rustykrab_store::Store::open(data_dir.join("db"), master_key)?
+        .with_credential_backend(credential_backend_from_env());
 
     // --- Validate required secrets (central registry) ---
     // Every credential the app needs is declared in `registry::REGISTRY`.
@@ -1107,7 +1108,8 @@ async fn main() -> anyhow::Result<()> {
         .with_computer_use_enabled(computer_use_enabled)
         .with_retrieval_log(retrieval_log)
         .with_activity_tracker(activity_tracker.clone())
-        .with_outcome_capture(outcome_capture_enabled);
+        .with_outcome_capture(outcome_capture_enabled)
+        .with_credential_page_policy(rustykrab_gateway::PageIdentityPolicy::from_env());
     state.active_tools = active_tools;
 
     // --- Attach video channel to state ---
@@ -2330,6 +2332,35 @@ fn resolve_max_context_tokens(provider_name: &str, profile_set: Option<usize>) -
     match provider_name {
         "ollama" => 32_000,
         _ => 128_000,
+    }
+}
+
+/// Choose where live credential values are kept.
+///
+/// The platform's own secure store by default. `RUSTYKRAB_CREDENTIAL_BACKEND=memory`
+/// substitutes an in-process one, which exists so the evaluation harness can
+/// exercise the credential flow without a keychain — the same shape as
+/// `RUSTYKRAB_PROVIDER=scripted` and `RUSTYKRAB_TOOL_STUBS`, and warned about
+/// just as loudly, because a real deployment running this keeps every
+/// credential in memory and loses them all on restart.
+fn credential_backend_from_env(
+) -> std::sync::Arc<dyn rustykrab_store::credential_backend::CredentialBackend> {
+    match std::env::var("RUSTYKRAB_CREDENTIAL_BACKEND")
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "memory" => {
+            tracing::warn!(
+                "RUSTYKRAB_CREDENTIAL_BACKEND=memory — credentials are held in \
+                 memory only, are lost on restart, and are protected by nothing. \
+                 This is the evaluation harness switch and must never be set on a \
+                 real deployment."
+            );
+            std::sync::Arc::new(rustykrab_store::credential_backend::MemoryBackend::new())
+        }
+        _ => rustykrab_store::credential_backend::default_backend(),
     }
 }
 

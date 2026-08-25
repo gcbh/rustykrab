@@ -287,6 +287,11 @@ impl Ctx {
             .env("RUSTYKRAB_MASTER_KEY", MASTER_KEY_HEX)
             .env("RUSTYKRAB_AUTH_TOKEN", AUTH_TOKEN)
             .env("RUSTYKRAB_DISABLE_KEYCHAIN", "1")
+            // Credentials must go to a secure store, and there isn't one here —
+            // the line above saw to that. Without this the harness cannot
+            // exercise fulfil at all; with it, nothing touches the developer's
+            // real keychain.
+            .env("RUSTYKRAB_CREDENTIAL_BACKEND", "memory")
             .env("NOTION_API_TOKEN", "e2e-dummy-notion")
             .env("OBSIDIAN_API_KEY", "e2e-dummy-obsidian")
             .output()?)
@@ -1072,6 +1077,11 @@ fn spawn_daemon_with(
         .env("RUSTYKRAB_AUTH_TOKEN", AUTH_TOKEN)
         // Never touch the host's real Keychain from a throwaway boot.
         .env("RUSTYKRAB_DISABLE_KEYCHAIN", "1")
+        // Credentials must go to a secure store, and there isn't one here —
+        // the line above saw to that. Without this the harness cannot
+        // exercise fulfil at all; with it, nothing touches the developer's
+        // real keychain.
+        .env("RUSTYKRAB_CREDENTIAL_BACKEND", "memory")
         // Dummy values for the registry's startup-required secrets.
         .env("NOTION_API_TOKEN", "e2e-dummy-notion")
         .env("OBSIDIAN_API_KEY", "e2e-dummy-obsidian")

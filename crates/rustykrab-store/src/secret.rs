@@ -87,17 +87,26 @@ fn now_ms() -> i64 {
 pub struct SecretStore {
     conn: Arc<Mutex<rusqlite::Connection>>,
     master_key: Arc<Zeroizing<Vec<u8>>>,
+    /// Where live credential values are kept — never this database.
+    credentials: Arc<dyn crate::credential_backend::CredentialBackend>,
 }
 
 impl SecretStore {
     pub(crate) fn new(
         conn: Arc<Mutex<rusqlite::Connection>>,
         master_key: Zeroizing<Vec<u8>>,
+        credentials: Arc<dyn crate::credential_backend::CredentialBackend>,
     ) -> Self {
         Self {
             conn,
             master_key: Arc::new(master_key),
+            credentials,
         }
+    }
+
+    /// The secure store live credential values go to.
+    pub fn credential_backend(&self) -> &Arc<dyn crate::credential_backend::CredentialBackend> {
+        &self.credentials
     }
 
     /// Store a **new** secret. Fails with [`Error::AlreadyExists`] if the
@@ -185,6 +194,105 @@ impl SecretStore {
     /// Skipping no-op writes matters: the registry runs on every boot, and
     /// rewriting an unchanged value would inflate the version and fill the
     /// audit trail with events nobody performed.
+    /// Deposit a user-supplied credential into the OS keychain, keeping the
+    /// value out of the database entirely.
+    ///
+    /// The `secrets` row still exists, and deliberately: version, timestamps
+    /// and the audit trail are what the overwrite-approval guard is built
+    /// on, and dropping the row would quietly disarm it. What the row no
+    /// longer holds is the credential — `data` carries an empty ciphertext,
+    /// so a dump of the database yields nothing usable.
+    ///
+    /// The superseded value *is* archived, encrypted, so an approved change
+    /// can still be rolled back. That is a deliberate asymmetry: the live
+    /// credential lives only in hardware, its history does not.
+    ///
+    /// Refuses rather than falling back when there is no keychain. Writing
+    /// to the database instead would put the credential exactly where the
+    /// caller asked it not to go, and a warning in a log is not consent.
+    pub async fn put_hardware(
+        &self,
+        name: &str,
+        value: &str,
+        authority: WriteAuthority,
+    ) -> Result<(), Error> {
+        Self::validate_name(name)?;
+        if authority.is_agent() {
+            return Err(Error::Auth(format!(
+                "the agent cannot write '{name}' directly"
+            )));
+        }
+        if !self.credentials.available() {
+            return Err(Error::Storage(format!(
+                "'{name}' must go to a secure credential store, and this system has \
+                 only {}. Refusing rather than writing it to the database.",
+                self.credentials.name()
+            )));
+        }
+
+        let account = crate::registry::keychain_account_for(name);
+
+        // Read what is there now so it can be archived: with the live value
+        // in the backend, the database no longer holds a previous copy.
+        let previous = self.credentials.get(&account).ok().flatten();
+
+        let store = self.clone();
+        let name_owned = name.to_string();
+        let previous_for_db = previous.clone();
+        run_blocking(move || {
+            // Empty ciphertext: the column is NOT NULL and the row has to
+            // exist, but there is no credential to put in it.
+            let empty = store.encrypt(&name_owned, b"")?;
+            let mut conn = store.conn.lock().unwrap();
+            let tx = conn
+                .transaction()
+                .map_err(|e| Error::Storage(e.to_string()))?;
+
+            match Self::current_row(&tx, &name_owned)? {
+                Some((_, version)) => {
+                    if let Some(prev) = previous_for_db.as_deref() {
+                        let archived = store.encrypt(&name_owned, prev.as_bytes())?;
+                        Self::archive(&tx, &name_owned, version, &archived, &authority)?;
+                    }
+                    tx.execute(
+                        "UPDATE secrets SET data = ?2, updated_at = ?3, version = ?4
+                          WHERE name = ?1",
+                        params![name_owned, empty, now_ms(), version + 1],
+                    )
+                    .map_err(|e| Error::Storage(e.to_string()))?;
+                    Self::audit(&tx, &name_owned, "overwrite", &authority.describe(), None)?;
+                }
+                None => {
+                    tx.execute(
+                        "INSERT INTO secrets (name, data, created_at, updated_at, version)
+                         VALUES (?1, ?2, ?3, ?3, 1)",
+                        params![name_owned, empty, now_ms()],
+                    )
+                    .map_err(|e| Error::Storage(e.to_string()))?;
+                    Self::audit(&tx, &name_owned, "create", &authority.describe(), None)?;
+                }
+            }
+            tx.commit().map_err(|e| Error::Storage(e.to_string()))?;
+            Ok(())
+        })
+        .await?;
+
+        // Last, so a failed database write does not leave a credential in
+        // the backend that nothing knows about.
+        self.credentials.set(&account, value)
+    }
+
+    /// Read a credential held by the secure backend, if it holds one.
+    pub fn get_hardware(&self, name: &str) -> Option<String> {
+        if !self.credentials.available() {
+            return None;
+        }
+        self.credentials
+            .get(&crate::registry::keychain_account_for(name))
+            .ok()
+            .flatten()
+    }
+
     pub async fn upsert_system(&self, name: &str, value: &str) -> Result<(), Error> {
         match self.get(name).await {
             Ok(existing) if existing == value => Ok(()),

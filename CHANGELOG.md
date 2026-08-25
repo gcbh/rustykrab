@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.1.30] - 2026-08-25
+
+- feat: hand over a credential through a tailnet-only page (#545)
+
 ## [5.1.29] - 2026-08-23
 
 - fix(providers): ask Ollama what a model can do instead of guessing (#541)
