@@ -1,5 +1,6 @@
 mod chat_map;
 mod conversation;
+pub mod credential_backend;
 mod credential_request;
 mod device;
 mod guarded;
@@ -42,6 +43,8 @@ pub struct Store {
     /// Told when the agent files a credential change, so the user can be
     /// notified. `None` when push isn't configured, which is normal.
     request_notifier: Option<Arc<dyn credential_request::RequestNotifier>>,
+    /// Where live credential values are kept. Never the database.
+    credential_backend: Arc<dyn credential_backend::CredentialBackend>,
 }
 
 impl Store {
@@ -78,6 +81,7 @@ impl Store {
             conn: Arc::new(Mutex::new(conn)),
             master_key: Zeroizing::new(master_key),
             request_notifier: None,
+            credential_backend: credential_backend::default_backend(),
         })
     }
 
@@ -435,8 +439,27 @@ impl Store {
     }
 
     /// Return a handle for encrypted secret operations.
+    /// Choose where live credential values are kept.
+    ///
+    /// Defaults to the platform's own store (the Keychain on macOS,
+    /// nothing elsewhere). Tests and harnesses pass
+    /// [`credential_backend::MemoryBackend`] so they never touch the real
+    /// one — an early version of this work deposited a developer's Gmail
+    /// app password into their login keychain from a unit test.
+    pub fn with_credential_backend(
+        mut self,
+        backend: Arc<dyn credential_backend::CredentialBackend>,
+    ) -> Self {
+        self.credential_backend = backend;
+        self
+    }
+
     pub fn secrets(&self) -> SecretStore {
-        SecretStore::new(Arc::clone(&self.conn), self.master_key.clone())
+        SecretStore::new(
+            Arc::clone(&self.conn),
+            self.master_key.clone(),
+            Arc::clone(&self.credential_backend),
+        )
     }
 
     /// Attach a notifier that is told whenever the agent files a change.

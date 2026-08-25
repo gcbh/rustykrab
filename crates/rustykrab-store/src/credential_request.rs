@@ -284,16 +284,14 @@ impl CredentialRequestStore {
             device: Some(decided_by.to_string()),
         };
         for (key, value) in values {
-            // Whether this is the first time the credential has existed is
-            // not the user's problem; both paths are a user-authored write.
-            match self.secrets.version_of(key).await? {
-                Some(_) => {
-                    self.secrets
-                        .overwrite(key, value, authority.clone())
-                        .await?
-                }
-                None => self.secrets.create(key, value).await?,
-            }
+            // Straight into the OS keychain. The user typed this on the
+            // understanding it was going somewhere safe, and the database is
+            // not that: `put_hardware` keeps the value out of it entirely and
+            // refuses outright where there is no keychain, rather than
+            // quietly choosing the weaker home.
+            self.secrets
+                .put_hardware(key, value, authority.clone())
+                .await?;
         }
 
         self.decide(id, "approved", decided_by, &row.name, "fulfil")
@@ -718,9 +716,19 @@ mod fulfil_tests {
     use super::*;
     use crate::Store;
 
+    /// Every test store gets an in-memory credential backend.
+    ///
+    /// Not a stylistic choice: before this existed, running the suite on a
+    /// Mac deposited `gmail-app-password` into the developer's own login
+    /// keychain, because `fulfil` writes to whatever backend it is handed.
+    /// Tests must never be able to reach the real one.
     pub(super) fn store() -> (tempfile::TempDir, CredentialRequestStore, SecretStore) {
         let dir = tempfile::tempdir().expect("tempdir");
-        let store = Store::open(dir.path(), vec![7u8; 32]).expect("open");
+        let store = Store::open(dir.path(), vec![7u8; 32])
+            .expect("open")
+            .with_credential_backend(std::sync::Arc::new(
+                crate::credential_backend::MemoryBackend::new(),
+            ));
         (dir, store.credential_requests(), store.secrets())
     }
 
@@ -786,12 +794,94 @@ mod fulfil_tests {
             .await
             .unwrap();
 
-        assert_eq!(secrets.get("gmail_email").await.unwrap(), "me@gmail.com");
+        // Readable through the path the tools use...
         assert_eq!(
-            secrets.get("gmail_app_password").await.unwrap(),
-            "abcdefghijklmnop"
+            secrets.get_hardware("gmail_email").as_deref(),
+            Some("me@gmail.com")
         );
+        assert_eq!(
+            secrets.get_hardware("gmail_app_password").as_deref(),
+            Some("abcdefghijklmnop")
+        );
+
+        // ...and not out of the database, which is the point. The row
+        // exists so the overwrite guard still has a version to compare and
+        // the audit trail still names the write; what it no longer holds is
+        // the credential.
+        assert_ne!(
+            secrets.get("gmail_app_password").await.ok().as_deref(),
+            Some("abcdefghijklmnop")
+        );
+        assert_eq!(
+            secrets.version_of("gmail_app_password").await.unwrap(),
+            Some(1)
+        );
+
         assert!(requests.pending().await.unwrap().is_empty());
+    }
+
+    /// The credential must not be sitting in the database file, however it
+    /// got there — the API returning the wrong thing is not the same as the
+    /// bytes being absent.
+    #[tokio::test]
+    async fn the_supplied_value_is_nowhere_in_the_database_file() {
+        let (dir, requests, _secrets) = store();
+        let id = requests
+            .file_fulfil("gmail_app_password", None, gmail_fields(), None, None)
+            .await
+            .unwrap();
+        requests
+            .fulfil(
+                &id,
+                &[
+                    ("gmail_email".into(), "me@gmail.com".into()),
+                    ("gmail_app_password".into(), "correct-horse-battery".into()),
+                ],
+                "device:test",
+            )
+            .await
+            .unwrap();
+
+        let raw = std::fs::read(dir.path().join("store.db")).unwrap_or_default();
+        assert!(
+            !String::from_utf8_lossy(&raw).contains("correct-horse-battery"),
+            "the credential was found in the database file"
+        );
+    }
+
+    /// With no secure store there is nowhere safe to put a credential, and
+    /// the database is not an acceptable second choice.
+    #[tokio::test]
+    async fn fulfilling_is_refused_when_no_secure_backend_is_available() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path(), vec![7u8; 32])
+            .expect("open")
+            .with_credential_backend(std::sync::Arc::new(crate::credential_backend::NoBackend));
+        let requests = store.credential_requests();
+        let id = requests
+            .file_fulfil("gmail_app_password", None, gmail_fields(), None, None)
+            .await
+            .unwrap();
+
+        let err = requests
+            .fulfil(
+                &id,
+                &[
+                    ("gmail_email".into(), "me@gmail.com".into()),
+                    ("gmail_app_password".into(), "abcdefghijklmnop".into()),
+                ],
+                "device:test",
+            )
+            .await
+            .expect_err("must refuse rather than fall back to the database");
+        assert!(
+            err.to_string().contains("Refusing"),
+            "the refusal should say why: {err}"
+        );
+
+        // And the request stays pending: nothing was written, so nothing was
+        // decided.
+        assert_eq!(requests.pending().await.unwrap().len(), 1);
     }
 
     /// The request is the authorisation. A device answering a Gmail prompt
