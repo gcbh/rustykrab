@@ -11,8 +11,12 @@
 use std::sync::Arc;
 use std::sync::Mutex;
 
+use std::time::Duration;
+
+use chrono::Utc;
 use rusqlite::params;
 use rustykrab_core::Error;
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::secret::{SecretStore, WriteAuthority};
@@ -280,16 +284,14 @@ impl CredentialRequestStore {
             device: Some(decided_by.to_string()),
         };
         for (key, value) in values {
-            // Whether this is the first time the credential has existed is
-            // not the user's problem; both paths are a user-authored write.
-            match self.secrets.version_of(key).await? {
-                Some(_) => {
-                    self.secrets
-                        .overwrite(key, value, authority.clone())
-                        .await?
-                }
-                None => self.secrets.create(key, value).await?,
-            }
+            // Straight into the OS keychain. The user typed this on the
+            // understanding it was going somewhere safe, and the database is
+            // not that: `put_hardware` keeps the value out of it entirely and
+            // refuses outright where there is no keychain, rather than
+            // quietly choosing the weaker home.
+            self.secrets
+                .put_hardware(key, value, authority.clone())
+                .await?;
         }
 
         self.decide(id, "approved", decided_by, &row.name, "fulfil")
@@ -385,6 +387,99 @@ impl CredentialRequestStore {
 
     /// Pending requests, newest first. Expired ones are swept on the way
     /// through rather than by a background timer.
+    /// Mint a one-time link for a `fulfil` request and return the token.
+    ///
+    /// The token is returned exactly once, to be put in the message the
+    /// user receives. Only its SHA-256 lands in the database, so a dump of
+    /// the store does not yield working links.
+    ///
+    /// Re-issuing replaces any previous token: the last link sent is the
+    /// only one that works.
+    pub async fn issue_link(&self, id: &str, ttl: Duration) -> Result<String, Error> {
+        let token = {
+            use rand::Rng;
+            let mut raw = [0u8; 32];
+            rand::rng().fill(&mut raw);
+            // URL-safe and unpadded: this goes in a link a user may retype.
+            hex::encode(raw)
+        };
+        let hash = hash_token(&token);
+        let expires = Utc::now()
+            .checked_add_signed(chrono::Duration::from_std(ttl).unwrap_or_default())
+            .map(|t| t.timestamp_millis())
+            .unwrap_or(i64::MAX);
+        let id = id.to_string();
+        crate::with_conn(&self.conn, move |conn| {
+            let n = conn
+                .execute(
+                    "UPDATE credential_requests
+                        SET link_token_hash = ?1, link_expires_at = ?2
+                      WHERE id = ?3 AND status = 'pending'",
+                    params![hash, expires, id],
+                )
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            if n == 0 {
+                return Err(Error::NotFound(format!("pending request {id}")));
+            }
+            Ok(())
+        })
+        .await?;
+        Ok(token)
+    }
+
+    /// Resolve a one-time link token to the request it answers.
+    ///
+    /// Returns `None` for a token that is unknown, expired, or whose
+    /// request is no longer pending — deliberately not distinguishing
+    /// between them, so the page cannot be used to probe which links exist.
+    /// Single use falls out of the status check: fulfilling moves the row
+    /// off `pending`, so the link stops working the moment it is answered.
+    pub async fn find_by_link(&self, token: &str) -> Result<Option<CredentialRequest>, Error> {
+        self.sweep_expired().await?;
+        let hash = hash_token(token);
+        let now = Utc::now().timestamp_millis();
+        crate::with_conn(&self.conn, move |conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, name, action, reason, conversation_id, status,
+                            created_at, service, fields
+                       FROM credential_requests
+                      WHERE link_token_hash = ?1
+                        AND status = 'pending'
+                        AND (link_expires_at IS NULL OR link_expires_at > ?2)",
+                )
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            let mut rows = stmt
+                .query(params![hash, now])
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            let Some(row) = rows.next().map_err(|e| Error::Storage(e.to_string()))? else {
+                return Ok(None);
+            };
+            let get_s = |i: usize| row.get::<_, String>(i);
+            let get_o = |i: usize| row.get::<_, Option<String>>(i);
+            Ok(Some(CredentialRequest {
+                id: get_s(0).map_err(|e| Error::Storage(e.to_string()))?,
+                name: get_s(1).map_err(|e| Error::Storage(e.to_string()))?,
+                action: RequestAction::parse(
+                    &get_s(2).map_err(|e| Error::Storage(e.to_string()))?,
+                )?,
+                reason: get_o(3).map_err(|e| Error::Storage(e.to_string()))?,
+                conversation_id: get_o(4).map_err(|e| Error::Storage(e.to_string()))?,
+                status: get_s(5).map_err(|e| Error::Storage(e.to_string()))?,
+                created_at: row
+                    .get::<_, i64>(6)
+                    .map_err(|e| Error::Storage(e.to_string()))?,
+                service: get_o(7).map_err(|e| Error::Storage(e.to_string()))?,
+                fields: decode_fields(
+                    get_o(8)
+                        .map_err(|e| Error::Storage(e.to_string()))?
+                        .as_deref(),
+                ),
+            }))
+        })
+        .await
+    }
+
     pub async fn pending(&self) -> Result<Vec<CredentialRequest>, Error> {
         self.sweep_expired().await?;
         crate::with_conn(&self.conn, |conn| {
@@ -621,13 +716,23 @@ mod fulfil_tests {
     use super::*;
     use crate::Store;
 
-    fn store() -> (tempfile::TempDir, CredentialRequestStore, SecretStore) {
+    /// Every test store gets an in-memory credential backend.
+    ///
+    /// Not a stylistic choice: before this existed, running the suite on a
+    /// Mac deposited `gmail-app-password` into the developer's own login
+    /// keychain, because `fulfil` writes to whatever backend it is handed.
+    /// Tests must never be able to reach the real one.
+    pub(super) fn store() -> (tempfile::TempDir, CredentialRequestStore, SecretStore) {
         let dir = tempfile::tempdir().expect("tempdir");
-        let store = Store::open(dir.path(), vec![7u8; 32]).expect("open");
+        let store = Store::open(dir.path(), vec![7u8; 32])
+            .expect("open")
+            .with_credential_backend(std::sync::Arc::new(
+                crate::credential_backend::MemoryBackend::new(),
+            ));
         (dir, store.credential_requests(), store.secrets())
     }
 
-    fn gmail_fields() -> Vec<RequestedField> {
+    pub(super) fn gmail_fields() -> Vec<RequestedField> {
         vec![
             RequestedField {
                 key: "gmail_email".into(),
@@ -689,12 +794,94 @@ mod fulfil_tests {
             .await
             .unwrap();
 
-        assert_eq!(secrets.get("gmail_email").await.unwrap(), "me@gmail.com");
+        // Readable through the path the tools use...
         assert_eq!(
-            secrets.get("gmail_app_password").await.unwrap(),
-            "abcdefghijklmnop"
+            secrets.get_hardware("gmail_email").as_deref(),
+            Some("me@gmail.com")
         );
+        assert_eq!(
+            secrets.get_hardware("gmail_app_password").as_deref(),
+            Some("abcdefghijklmnop")
+        );
+
+        // ...and not out of the database, which is the point. The row
+        // exists so the overwrite guard still has a version to compare and
+        // the audit trail still names the write; what it no longer holds is
+        // the credential.
+        assert_ne!(
+            secrets.get("gmail_app_password").await.ok().as_deref(),
+            Some("abcdefghijklmnop")
+        );
+        assert_eq!(
+            secrets.version_of("gmail_app_password").await.unwrap(),
+            Some(1)
+        );
+
         assert!(requests.pending().await.unwrap().is_empty());
+    }
+
+    /// The credential must not be sitting in the database file, however it
+    /// got there — the API returning the wrong thing is not the same as the
+    /// bytes being absent.
+    #[tokio::test]
+    async fn the_supplied_value_is_nowhere_in_the_database_file() {
+        let (dir, requests, _secrets) = store();
+        let id = requests
+            .file_fulfil("gmail_app_password", None, gmail_fields(), None, None)
+            .await
+            .unwrap();
+        requests
+            .fulfil(
+                &id,
+                &[
+                    ("gmail_email".into(), "me@gmail.com".into()),
+                    ("gmail_app_password".into(), "correct-horse-battery".into()),
+                ],
+                "device:test",
+            )
+            .await
+            .unwrap();
+
+        let raw = std::fs::read(dir.path().join("store.db")).unwrap_or_default();
+        assert!(
+            !String::from_utf8_lossy(&raw).contains("correct-horse-battery"),
+            "the credential was found in the database file"
+        );
+    }
+
+    /// With no secure store there is nowhere safe to put a credential, and
+    /// the database is not an acceptable second choice.
+    #[tokio::test]
+    async fn fulfilling_is_refused_when_no_secure_backend_is_available() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path(), vec![7u8; 32])
+            .expect("open")
+            .with_credential_backend(std::sync::Arc::new(crate::credential_backend::NoBackend));
+        let requests = store.credential_requests();
+        let id = requests
+            .file_fulfil("gmail_app_password", None, gmail_fields(), None, None)
+            .await
+            .unwrap();
+
+        let err = requests
+            .fulfil(
+                &id,
+                &[
+                    ("gmail_email".into(), "me@gmail.com".into()),
+                    ("gmail_app_password".into(), "abcdefghijklmnop".into()),
+                ],
+                "device:test",
+            )
+            .await
+            .expect_err("must refuse rather than fall back to the database");
+        assert!(
+            err.to_string().contains("Refusing"),
+            "the refusal should say why: {err}"
+        );
+
+        // And the request stays pending: nothing was written, so nothing was
+        // decided.
+        assert_eq!(requests.pending().await.unwrap().len(), 1);
     }
 
     /// The request is the authorisation. A device answering a Gmail prompt
@@ -791,5 +978,164 @@ mod fulfil_tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("at least one field"), "{err}");
+    }
+}
+
+/// Hash a link token for storage and lookup.
+///
+/// SHA-256 without a salt is right here and a salt would be wrong: the
+/// token is 32 bytes of CSPRNG output, so there is no dictionary to attack,
+/// and lookup is by hash — a per-row salt would make that impossible.
+fn hash_token(token: &str) -> String {
+    let mut h = Sha256::new();
+    h.update(token.as_bytes());
+    hex::encode(h.finalize())
+}
+
+#[cfg(test)]
+mod link_tests {
+    use super::fulfil_tests::{gmail_fields, store};
+    use super::*;
+
+    const TTL: Duration = Duration::from_secs(900);
+
+    #[tokio::test]
+    async fn a_link_resolves_to_its_request_and_only_that_one() {
+        let (_dir, requests, _secrets) = store();
+        let id = requests
+            .file_fulfil(
+                "gmail_app_password",
+                Some("Gmail".into()),
+                gmail_fields(),
+                None,
+                None,
+            )
+            .await
+            .expect("file");
+        let token = requests.issue_link(&id, TTL).await.expect("issue");
+
+        let found = requests.find_by_link(&token).await.expect("lookup");
+        assert_eq!(found.map(|r| r.id), Some(id));
+
+        // A token that was never issued resolves to nothing rather than
+        // erroring, so the page cannot be used to probe which links exist.
+        assert!(requests
+            .find_by_link(&"0".repeat(64))
+            .await
+            .expect("lookup")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn the_token_itself_is_not_recoverable_from_the_store() {
+        let (_dir, requests, _secrets) = store();
+        let id = requests
+            .file_fulfil(
+                "gmail_app_password",
+                Some("Gmail".into()),
+                gmail_fields(),
+                None,
+                None,
+            )
+            .await
+            .expect("file");
+        let token = requests.issue_link(&id, TTL).await.expect("issue");
+        // Only the hash is persisted: a dump of the row yields no working link.
+        assert_ne!(hash_token(&token), token);
+        assert_eq!(hash_token(&token).len(), 64);
+    }
+
+    #[tokio::test]
+    async fn answering_a_request_burns_its_link() {
+        let (_dir, requests, secrets) = store();
+        let id = requests
+            .file_fulfil(
+                "gmail_app_password",
+                Some("Gmail".into()),
+                gmail_fields(),
+                None,
+                None,
+            )
+            .await
+            .expect("file");
+        let token = requests.issue_link(&id, TTL).await.expect("issue");
+        assert!(requests
+            .find_by_link(&token)
+            .await
+            .expect("lookup")
+            .is_some());
+
+        requests
+            .fulfil(
+                &id,
+                &[
+                    ("gmail_email".to_string(), "a@b.c".to_string()),
+                    ("gmail_app_password".to_string(), "pw".to_string()),
+                ],
+                "test",
+            )
+            .await
+            .expect("fulfil");
+
+        // Single use falls out of the status check rather than a separate
+        // flag: the row is no longer pending, so the link is dead.
+        assert!(requests
+            .find_by_link(&token)
+            .await
+            .expect("lookup")
+            .is_none());
+        let _ = secrets;
+    }
+
+    #[tokio::test]
+    async fn an_expired_link_stops_working() {
+        let (_dir, requests, _secrets) = store();
+        let id = requests
+            .file_fulfil(
+                "gmail_app_password",
+                Some("Gmail".into()),
+                gmail_fields(),
+                None,
+                None,
+            )
+            .await
+            .expect("file");
+        let token = requests
+            .issue_link(&id, Duration::from_secs(0))
+            .await
+            .expect("issue");
+        assert!(requests
+            .find_by_link(&token)
+            .await
+            .expect("lookup")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn re_issuing_invalidates_the_link_already_sent() {
+        let (_dir, requests, _secrets) = store();
+        let id = requests
+            .file_fulfil(
+                "gmail_app_password",
+                Some("Gmail".into()),
+                gmail_fields(),
+                None,
+                None,
+            )
+            .await
+            .expect("file");
+        let first = requests.issue_link(&id, TTL).await.expect("issue");
+        let second = requests.issue_link(&id, TTL).await.expect("re-issue");
+        assert_ne!(first, second);
+        assert!(requests
+            .find_by_link(&first)
+            .await
+            .expect("lookup")
+            .is_none());
+        assert!(requests
+            .find_by_link(&second)
+            .await
+            .expect("lookup")
+            .is_some());
     }
 }

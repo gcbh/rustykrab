@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.1.34] - 2026-08-26
+
+- fix(ci): correct shasum paths in Package artifact step (#546)
+
+## [5.1.33] - 2026-08-25
+
+- e2e: live login scenarios, split from the credential ask (#542)
+
+## [5.1.32] - 2026-08-25
+
+- fix(webchat): make the client run, and answer credential requests (#544)
+
+## [5.1.31] - 2026-08-25
+
+- fix(agent): let the agent ask for a credential without tripping over one (#543)
+
+## [5.1.30] - 2026-08-25
+
+- feat: hand over a credential through a tailnet-only page (#545)
+
 ## [5.1.29] - 2026-08-23
 
 - fix(providers): ask Ollama what a model can do instead of guessing (#541)

@@ -1120,10 +1120,6 @@
   const approvalsList    = $('#approvalsList');
   const approvalsBadge   = $('#approvalsBadge');
 
-  const escapeHtml = (s) => String(s).replace(/[&<>"']/g, (c) => (
-    { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
-  ));
-
   async function refreshApprovals() {
     let pending;
     try {
@@ -1141,7 +1137,18 @@
     }
     approvalsSection.style.display = 'block';
     approvalsBadge.textContent = pending.length;
-    approvalsList.innerHTML = pending.map((req) => `
+    approvalsList.innerHTML = pending.map((req) => (
+      // A request carrying fields is asking the *user* for a value the
+      // agent does not have, so it needs a form. Approve/Deny is for the
+      // update and delete requests, which are a yes/no about a credential
+      // that already exists — answering those with a form would be asking
+      // for a value nobody was asked for.
+      (req.fields && req.fields.length) ? renderFulfil(req) : renderDecision(req)
+    )).join('');
+  }
+
+  function renderDecision(req) {
+    return `
       <div style="padding:8px 0;border-bottom:1px solid var(--border);font-size:13px;">
         <div style="color:var(--text-secondary);">
           The agent wants to <strong>${escapeHtml(req.action)}</strong>
@@ -1153,10 +1160,87 @@
           <button data-deny="${escapeHtml(req.id)}" style="flex:1;padding:4px 8px;border-radius:6px;font-size:12px;cursor:pointer;">Deny</button>
         </div>
       </div>
+    `;
+  }
+
+  function renderFulfil(req) {
+    const service = req.service ? escapeHtml(req.service) : escapeHtml(req.name);
+    const inputs = req.fields.map((f) => `
+      <label style="display:block;margin-top:6px;font-size:12px;color:var(--text-secondary);">
+        ${escapeHtml(f.label)}
+        <input
+          data-field="${escapeHtml(f.key)}"
+          type="${f.secret ? 'password' : 'text'}"
+          autocomplete="off"
+          ${f.secret ? 'spellcheck="false"' : ''}
+          placeholder="${f.hint ? escapeHtml(f.hint) : ''}"
+          style="width:100%;margin-top:2px;padding:5px 7px;border-radius:6px;
+                 border:1px solid var(--border);font-size:13px;box-sizing:border-box;" />
+      </label>
     `).join('');
+    return `
+      <div data-fulfil-for="${escapeHtml(req.id)}"
+           style="padding:8px 0;border-bottom:1px solid var(--border);font-size:13px;">
+        <div style="color:var(--text-secondary);">
+          <strong>${service}</strong> needs a credential
+        </div>
+        ${req.reason ? `<div style="margin-top:2px;color:var(--text-secondary);font-size:12px;">${escapeHtml(req.reason)}</div>` : ''}
+        ${inputs}
+        <div style="margin-top:8px;display:flex;gap:6px;">
+          <button data-submit="${escapeHtml(req.id)}" style="flex:1;padding:4px 8px;border-radius:6px;font-size:12px;cursor:pointer;">Save</button>
+          <button data-deny="${escapeHtml(req.id)}" style="flex:1;padding:4px 8px;border-radius:6px;font-size:12px;cursor:pointer;">Not now</button>
+        </div>
+        <div data-fulfil-error style="display:none;margin-top:6px;font-size:12px;color:#c0392b;"></div>
+      </div>
+    `;
+  }
+
+  async function submitFulfil(id, button) {
+    const card = approvalsList.querySelector(`[data-fulfil-for="${CSS.escape(id)}"]`);
+    if (!card) return;
+    const errorBox = card.querySelector('[data-fulfil-error]');
+    const inputs = Array.from(card.querySelectorAll('[data-field]'));
+
+    const values = {};
+    for (const input of inputs) {
+      const v = input.value.trim();
+      if (!v) {
+        errorBox.textContent = 'Fill in every field.';
+        errorBox.style.display = 'block';
+        input.focus();
+        return;
+      }
+      values[input.getAttribute('data-field')] = v;
+    }
+
+    button.disabled = true;
+    errorBox.style.display = 'none';
+    try {
+      await api(`/api/credential-requests/${id}/fulfil`, {
+        method: 'POST',
+        body: JSON.stringify({ values }),
+      });
+    } catch (err) {
+      button.disabled = false;
+      errorBox.textContent = `Could not save that: ${err}`;
+      errorBox.style.display = 'block';
+      return;
+    } finally {
+      // Clear the values whether or not it worked: a failed save should
+      // not leave a password sitting in the DOM waiting for the next
+      // screenshot or a shoulder.
+      for (const input of inputs) input.value = '';
+    }
+    await refreshApprovals();
   }
 
   approvalsList.addEventListener('click', async (event) => {
+    const submitId = event.target.getAttribute('data-submit');
+    if (submitId) {
+      await submitFulfil(submitId, event.target);
+      return;
+    }
+
     const approveId = event.target.getAttribute('data-approve');
     const denyId    = event.target.getAttribute('data-deny');
     const id = approveId || denyId;

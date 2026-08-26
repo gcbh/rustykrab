@@ -307,7 +307,7 @@ jobs:
             cd dist
             tar czf rustykrab-${{ matrix.target }}.tar.gz ${{ matrix.artifact }}
           fi
-          shasum -a 256 dist/rustykrab-${{ matrix.target }}.* > dist/rustykrab-${{ matrix.target }}.sha256
+          shasum -a 256 rustykrab-${{ matrix.target }}.* > rustykrab-${{ matrix.target }}.sha256
 
       - name: Notarize and staple macOS bundle
         if: runner.os == 'macOS'

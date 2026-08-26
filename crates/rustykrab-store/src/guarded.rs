@@ -110,7 +110,16 @@ impl GuardedSecrets {
 
     // -- reads pass straight through --------------------------------------
 
+    /// Hardware first, then the encrypted store.
+    ///
+    /// `gmail` and `caldav` read through here, and a credential the user
+    /// handed over now lives in the keychain rather than the database — so
+    /// consulting only the database would find nothing and report the
+    /// credential missing immediately after the user supplied it.
     pub async fn get(&self, name: &str) -> Result<String, Error> {
+        if let Some(v) = self.secrets.get_hardware(name) {
+            return Ok(v);
+        }
         self.secrets.get(name).await
     }
 
