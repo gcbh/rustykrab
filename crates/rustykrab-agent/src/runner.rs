@@ -128,11 +128,21 @@ const PLANNING_ONLY_RETRY_LIMIT: usize = 2;
 const TASK_COMPLETE_RETRY_LIMIT: usize = 3;
 
 /// Default upper bound on the effective context window used when computing
-/// the compaction threshold. Keeps compaction aggressive even when the
-/// backing model advertises a much larger window (e.g. a 128k-ctx Ollama
-/// deployment whose GPU can't actually evaluate that much in reasonable
-/// time). Override with the `RUSTYKRAB_COMPACTION_CONTEXT_CEILING` env var.
-const DEFAULT_COMPACTION_CONTEXT_CEILING: usize = 65_536;
+/// the compaction threshold. Guards against a model that *advertises* a
+/// window its GPU cannot evaluate in reasonable time — the budget would
+/// otherwise be derived from a number nothing can serve.
+///
+/// It must track `DEFAULT_NUM_CTX` in the Ollama provider. When the ceiling
+/// sits below the served window the symptom is silent: compaction keeps
+/// triggering at the old threshold, the extra context goes unused, and
+/// "I raised RUSTYKRAB_NUM_CTX and nothing changed" is the only visible
+/// effect. `effective_context_limit` warns once when that happens.
+///
+/// Raised to 128k alongside the provider default on measured evidence:
+/// across 4k→128k on gemma4:26b, generation throughput held at ~51 t/s and
+/// the whole KV cache grew by 1.2 GB. Override with
+/// `RUSTYKRAB_COMPACTION_CONTEXT_CEILING`.
+const DEFAULT_COMPACTION_CONTEXT_CEILING: usize = 131_072;
 
 /// Return the compaction context ceiling, reading the env var once.
 fn compaction_context_ceiling() -> usize {

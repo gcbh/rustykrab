@@ -29,15 +29,29 @@ const RETRY_BASE_DELAY: Duration = Duration::from_secs(1);
 /// prompt that overshoots gets silently truncated server-side — which moves
 /// the truncation point every turn and defeats prefix caching completely.
 ///
-/// 64k matches `DEFAULT_COMPACTION_CONTEXT_CEILING` in the agent runner, so
+/// 128k matches `DEFAULT_COMPACTION_CONTEXT_CEILING` in the agent runner, so
 /// the provider's window and the compaction budget agree instead of one
 /// silently capping the other. It is clamped down to the model's own native
 /// length at startup, so a smaller model still gets a sane value.
 ///
-/// This costs VRAM: the KV cache is allocated for the whole window when the
-/// runner loads. Lower it with `RUSTYKRAB_NUM_CTX` if the model won't fit, or
-/// halve the cache with `OLLAMA_KV_CACHE_TYPE=q8_0` (see README).
-const DEFAULT_NUM_CTX: u32 = 65_536;
+/// This costs VRAM — but far less than the linear intuition suggests, at
+/// least for the architectures we target. Measured on gemma4:26b (Q4_K_M,
+/// M1 Max), resident size against window:
+///
+/// ```text
+///   4k → 17.38 GB     32k → 17.66 GB     128k → 18.57 GB
+///   8k → 17.61 GB     64k → 18.30 GB
+/// ```
+///
+/// 32× the context for 1.2 GB, because Gemma interleaves local and global
+/// attention and only the global layers hold a full-length cache. Generation
+/// throughput was flat at ~51 t/s across that whole range; the only cost that
+/// grows is prompt processing on proportionally larger prompts (~517 → ~413
+/// tokens/s). A dense-attention model will not be this cheap.
+///
+/// Lower it with `RUSTYKRAB_NUM_CTX` if the model won't fit, or halve the
+/// cache with `OLLAMA_KV_CACHE_TYPE=q8_0` (see README).
+const DEFAULT_NUM_CTX: u32 = 131_072;
 
 /// Default `keep_alive` sent with every request: how long Ollama keeps the
 /// model (and its KV cache) resident after the request finishes. Ollama's own
