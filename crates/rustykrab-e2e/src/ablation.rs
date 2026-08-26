@@ -12,7 +12,7 @@
 //!   scenarios whose standard seed cannot reach the trigger at a given
 //!   window are annotated rather than counted as failures — a scenario
 //!   that cannot fire is not a scenario that failed.
-//! - **A compaction cost probe**: history scaled to ~95% of that window's
+//! - **A compaction cost probe**: history seeded past that window's
 //!   trigger, run twice — expansion off, expansion on
 //!   (`RUSTYKRAB_COMPACTION_EXPAND_CTX`) — on otherwise-identical input.
 //!   This is the direct measurement behind "should compaction expand the
@@ -80,6 +80,11 @@ struct SpeedProbe {
     /// Resident size after load, bytes, from /api/ps.
     size_bytes: u64,
     size_vram_bytes: u64,
+    /// The context length Ollama reports actually serving. Makes the row
+    /// self-validating: a request for a window the server quietly declines
+    /// would otherwise be reported as a measurement of that window.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    served_ctx: Option<u64>,
     /// Generation throughput, tokens/second.
     gen_tps: f64,
     /// Prompt-processing throughput on a fixed ~8k-token prompt.
@@ -146,6 +151,7 @@ async fn speed_probe(client: &reqwest::Client, url: &str, model: &str, w: u32) -
         load_secs: 0.0,
         size_bytes: 0,
         size_vram_bytes: 0,
+        served_ctx: None,
         gen_tps: 0.0,
         prompt_tps_fixed: 0.0,
         prompt_tps_scaled: None,
@@ -166,12 +172,27 @@ async fn speed_probe(client: &reqwest::Client, url: &str, model: &str, w: u32) -
         }
     }
 
+    // Let the runner settle before reading /api/ps: querying the instant
+    // the request returns can catch the previous runner's numbers, which
+    // is how a 262144 row once reported less resident memory than 131072.
+    tokio::time::sleep(Duration::from_secs(2)).await;
     if let Ok(ps) = client.get(format!("{url}/api/ps")).send().await {
         if let Ok(v) = ps.json::<Value>().await {
             if let Some(m) = v["models"].as_array().and_then(|a| a.first()) {
                 probe.size_bytes = m["size"].as_u64().unwrap_or(0);
                 probe.size_vram_bytes = m["size_vram"].as_u64().unwrap_or(0);
+                probe.served_ctx = m["context_length"]
+                    .as_u64()
+                    .or_else(|| m["details"]["context_length"].as_u64());
             }
+        }
+    }
+    if let Some(served) = probe.served_ctx {
+        if served != w as u64 {
+            probe.error = Some(format!(
+                "requested num_ctx {w} but Ollama is serving {served}; this row measures \
+                 the served window, not the requested one"
+            ));
         }
     }
 
@@ -234,7 +255,12 @@ async fn speed_probe(client: &reqwest::Client, url: &str, model: &str, w: u32) -
 /// The A/B compaction cost probe at one window: identical seeded history,
 /// summarized with expansion off and then on.
 fn compaction_probe_cases(w: u32) -> Vec<ModelCase> {
-    let notes = ((approx_threshold(w) * 95 / 100) / NOTE_TOKENS).clamp(1, 45);
+    // Overshoot the trigger. An earlier version seeded 95% of it, which
+    // is below it by construction — the 32768 and 65536 cells duly
+    // reported "no compaction ran" after half an hour of seeding each.
+    // 130% leaves room for the estimator disagreeing with itself about
+    // exactly where the threshold sits.
+    let notes = ((approx_threshold(w) * 130 / 100) / NOTE_TOKENS).clamp(1, 45);
     let mut variants = Vec::new();
     for (mode, env) in [
         ("baseline", Vec::new()),
@@ -350,8 +376,18 @@ pub async fn run(
         // stops growing, so re-measuring it would repeat the 65536 cell.
         let cost_probe = if (w as usize) <= COMPACTION_CEILING {
             let (reports, _) =
-                model_suite::run_cases(bin, model, ollama_url, 1, compaction_probe_cases(w), None)
-                    .await?;
+                // Same repetition count as the suite: with a thinking model
+                // the summarizer's cost varies enormously call to call, and a
+                // single sample of each arm cannot separate arm from noise.
+                model_suite::run_cases(
+                    bin,
+                    model,
+                    ollama_url,
+                    reps,
+                    compaction_probe_cases(w),
+                    None,
+                )
+                .await?;
             Some(
                 reports
                     .iter()
@@ -391,7 +427,7 @@ pub fn render_markdown(report: &Value) -> String {
         report["expand_target"],
     ));
 
-    out.push_str("## Speed\n\n| window | load s | resident GB | gen t/s | prompt t/s (fixed) | prompt t/s (scaled) |\n|---|---|---|---|---|---|\n");
+    out.push_str("## Speed\n\n| window | served | load s | resident GB | gen t/s | prompt t/s (fixed) | prompt t/s (scaled) |\n|---|---|---|---|---|---|---|\n");
     for win in report["windows"].as_array().unwrap_or(&Vec::new()) {
         let sp = &win["speed"];
         // A probe that failed must say so, not render as a measured zero —
@@ -399,14 +435,18 @@ pub fn render_markdown(report: &Value) -> String {
         // and "0 t/s" reads as data.
         if let Some(err) = sp["error"].as_str() {
             out.push_str(&format!(
-                "| {} | probe failed: {err} |||||\n",
+                "| {} | probe failed: {err} ||||||\n",
                 win["window"]
             ));
             continue;
         }
         out.push_str(&format!(
-            "| {} | {:.1} | {:.1} | {:.0} | {:.0} | {} |\n",
+            "| {} | {} | {:.1} | {:.1} | {:.0} | {:.0} | {} |\n",
             win["window"],
+            sp["served_ctx"]
+                .as_u64()
+                .map(|v| v.to_string())
+                .unwrap_or("?".into()),
             sp["load_secs"].as_f64().unwrap_or(0.0),
             sp["size_bytes"].as_u64().unwrap_or(0) as f64 / 1e9,
             sp["gen_tps"].as_f64().unwrap_or(0.0),
@@ -453,7 +493,7 @@ pub fn render_markdown(report: &Value) -> String {
         ));
     }
 
-    out.push_str("\n## Compaction cost (identical history; expansion off vs on)\n\n| window | baseline ms | baseline ok | expanded ms | expanded ok |\n|---|---|---|---|---|\n");
+    out.push_str("\n## Compaction cost (identical history; expansion off vs on)\n\n| window | baseline ms | baseline | expanded ms | expanded |\n|---|---|---|---|---|\n");
     for win in report["windows"].as_array().unwrap_or(&Vec::new()) {
         let Some(probe) = win["compaction_cost"].as_array() else {
             continue;
@@ -464,7 +504,13 @@ pub fn render_markdown(report: &Value) -> String {
                 .find(|r| r["id"].as_str().is_some_and(|i| i.ends_with(mode)))
                 .map(|r| match field {
                     "ms" => r["mean_ms"].to_string(),
-                    _ => r["outcome"].as_str().unwrap_or("?").to_string(),
+                    // pass/fail alone hides a split verdict; show the rate.
+                    _ => format!(
+                        "{} {}/{}",
+                        r["outcome"].as_str().unwrap_or("?"),
+                        r["passes"],
+                        r["runs"]
+                    ),
                 })
                 .unwrap_or("—".into())
         };
@@ -516,6 +562,14 @@ mod tests {
         let large = compaction_probe_cases(65_536);
         assert!(small[0].turns.len() < large[0].turns.len());
         assert!(large[0].turns.len() <= 47, "seed is capped");
+        // The seed must exceed the trigger, not approach it: sizing to 95%
+        // of the threshold meant compaction never fired at 32k and 64k.
+        let seeded_tokens = (large[0].turns.len() - 2) * NOTE_TOKENS;
+        assert!(
+            seeded_tokens > approx_threshold(65_536),
+            "seed {seeded_tokens} must exceed the {} trigger",
+            approx_threshold(65_536)
+        );
         // The two arms differ only in environment.
         assert_eq!(large[0].turns, large[1].turns);
         assert!(large[0].extra_env.is_empty());

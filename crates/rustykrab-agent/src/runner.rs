@@ -2698,11 +2698,28 @@ impl AgentRunner {
                 agent_version: Message::version_stamp(),
             },
         ];
-        let response = match compaction_expand_ctx() {
+        let started = std::time::Instant::now();
+        let expand = compaction_expand_ctx();
+        let response = match expand {
             Some(ctx) => self.provider.chat_with_ctx(&messages, &[], ctx).await?,
             None => self.provider.chat(&messages, &[]).await?,
         };
-        Ok(response.message.content.as_text().unwrap_or("").to_string())
+        let text = response.message.content.as_text().unwrap_or("").to_string();
+        // One line per summarizer call, so a slow compaction can be
+        // attributed rather than guessed at: how many calls, how big each
+        // prompt was, and how much of the time went to generation. Local
+        // thinking models vary enormously call to call, and without this
+        // the only visible symptom is a long silence.
+        tracing::info!(
+            expanded_ctx = ?expand,
+            input_chars = input.len(),
+            prompt_tokens = response.usage.prompt_tokens,
+            completion_tokens = response.usage.completion_tokens,
+            output_chars = text.len(),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "compaction: summarizer call"
+        );
+        Ok(text)
     }
 
     /// Summarize a set of text fragments, recursively reducing until a
