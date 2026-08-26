@@ -20,3 +20,6 @@ e2e-report.json
 # Eval run artefacts (the harness and its scenarios are versioned; results are not)
 /e2e-report.json
 /e2e-credential-trials.jsonl
+/e2e-ablation.json
+/e2e-ablation.md
+/sweep.log

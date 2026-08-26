@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.1.35] - 2026-08-26
+
+- feat: default to a 128k context window, with the ablation that justifies it (#547)
+
 ## [5.1.34] - 2026-08-26
 
 - fix(ci): correct shasum paths in Package artifact step (#546)

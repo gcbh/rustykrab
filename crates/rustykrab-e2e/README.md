@@ -13,6 +13,74 @@ make eval-list      # list every scenario
 Flags pass through: `make eval ARGS="--case compaction"`, or call
 `./scripts/e2e.sh --mode all --release`.
 
+## The system, as the harness sees it
+
+```mermaid
+flowchart TB
+    subgraph HARNESS["rustykrab-e2e (one binary, one report, one exit code)"]
+        MODES["--mode scripted | model | credential | ablation"]
+        JUDGE["LLM judge<br/>claude-sonnet-5, or the model<br/>under test (report says which)"]
+        ASSERT["assertions + transcript<br/>read from the daemon's SQLite,<br/>not the REST API"]
+        ABL["ablation driver<br/>speed probes · suite per window ·<br/>compaction cost A/B"]
+    end
+
+    subgraph DAEMON["throwaway daemon per scenario (rustykrab-cli)"]
+        GW["gateway (axum)<br/>bearer auth · origin allowlist · rate limit"]
+        ROUTER["HarnessRouter<br/>keyword preset, minus the fields<br/>harness.toml named; =off pins all"]
+        RUNNER["AgentRunner loop"]
+        ACTIVE["ActiveToolsRegistry<br/>lazy activation + seed<br/>(stubs / RUSTYKRAB_ACTIVE_TOOLS)"]
+        TOOLS["tools: stubbed (scripted responses)<br/>or real · task_complete protocol"]
+        COMPACT["compact_history<br/>fast path or chunked ·<br/>optional expanded window"]
+    end
+
+    subgraph PROVIDER["OllamaProvider"]
+        CTX["window resolution<br/>RUSTYKRAB_NUM_CTX → 65536 default"]
+        BUDGET["context_limit = window − reserves<br/>(floor: window/4) · num_predict clamp"]
+        TRIM["trim_to_budget (per request)"]
+    end
+
+    subgraph STORES["state"]
+        SQL["SQLite: conversations · messages ·<br/>credential_requests · recall_archive"]
+        MEM["memory system<br/>hybrid retrieval, memory_* tools"]
+    end
+
+    OLLAMA["Ollama · gemma4:26b Q4_K_M<br/>model max 262,144 ctx · ~3s KV resize,<br/>~28s cold load"]
+
+    MODES -->|"HTTP + webhooks<br/>(capture server for telegram/signal)"| GW
+    GW --> ROUTER --> RUNNER
+    RUNNER --> ACTIVE --> TOOLS
+    RUNNER --> COMPACT
+    RUNNER --> CTX
+    COMPACT -->|"chat_with_ctx(expanded)"| CTX
+    CTX --> BUDGET --> TRIM --> OLLAMA
+    RUNNER --> SQL
+    COMPACT -->|"displaced history"| SQL
+    TOOLS --> MEM
+    ASSERT --> SQL
+    ABL -->|"probes bypass the daemon"| OLLAMA
+    MODES --> JUDGE
+```
+
+### Where a token budget actually comes from
+
+```mermaid
+flowchart LR
+    W["num_ctx (serving window)"] --> R["− num_predict (clamped to ≤ window/2)<br/>− tool block − framing"]
+    R --> IB["input budget<br/>(floor: window/4)"]
+    IB --> T75["trim: cut history to 75%<br/>of budget, per request"]
+    IB --> CEIL["min(budget, compaction ceiling 65,536)"]
+    CEIL --> TRIG["compaction trigger:<br/>85% of effective limit"]
+    TRIG --> CH["compact_history input budget:<br/>½ effective − summarizer reserve<br/>(reserve capped at half, floor 512)"]
+    EX["RUSTYKRAB_COMPACTION_EXPAND_CTX"] -.->|"summarization calls only,<br/>~3s KV resize each way"| CH
+```
+
+The load-bearing facts: the trigger must sit **below** what the trim
+destroys, or history silently vanishes instead of being summarized (the
+`context_limit` floor exists for exactly this); the ceiling means windows
+above 65,536 change nothing about compaction; and the expansion switch is
+what lets everyday turns run small and hot while summarization sees far
+more history per call.
+
 ## Three modes, and why they are not one number
 
 | mode | provider | scored by | gates CI |

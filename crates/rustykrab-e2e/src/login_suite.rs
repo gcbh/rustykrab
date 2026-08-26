@@ -346,6 +346,7 @@ async fn run_trial_inner(
         active_tools: LOGIN_TOOLS,
         tool_stubs: "",
         channel: None,
+        extra_env: &[],
     };
     let mut child = spawn_daemon_with(bin, &data_dir, port, &backend)?;
 

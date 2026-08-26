@@ -1,0 +1,246 @@
+── window 4096 ──
+  load 2.7s  gen 49 t/s  prompt 571 t/s  resident 17.4 GB
+warm-up: gemma4:26b responded in 8.3s
+model suite: gemma4:26b, judged by gemma4:26b (self-judging fallback)
+[ pass] model-answers-a-question (16321ms)
+[ pass] model-keeps-multi-turn-context (17076ms)
+[ pass] model-admits-ignorance (15164ms)
+[ pass] model-honours-a-tight-output-format (6831ms)
+[ pass] model-calls-one-tool (3986ms)
+[ pass] model-fills-a-multi-argument-schema (7161ms)
+[ pass] model-leaves-irrelevant-tools-alone (3195ms)
+[ pass] model-recovers-from-a-transient-tool-error (4462ms)
+[ pass] model-retries-after-the-runner-gives-up (8074ms)
+[ pass] model-reports-a-permanent-tool-failure (84463ms)
+[ pass] model-distinguishes-empty-from-failed (16388ms)
+[ pass] model-chains-dependent-tool-calls (9194ms)
+[ pass] compaction-does-not-fire-early (10521ms)
+[ pass] compaction-triggers-and-keeps-history (576347ms)
+[ pass] compaction-preserves-an-early-fact (397635ms)
+[ fail] compaction-keeps-the-newest-turn-verbatim (661620ms) — final contains any ["selkie-2"]: none of ["selkie-2"] in final answer: "The audit of the ingest pipeline cannot proceed because the current session lacks the necessary permissions to access the required files, tools, and memory (specifically, `memory_search` returned a `p"…
+[ pass] memory-saves-when-asked (126409ms)
+[ fail] memory-round-trip (521054ms) — called memory_search: memory_search was never called (called: task_complete)
+[ pass] memory-does-not-fabricate-on-a-miss (33099ms)
+warm-up: gemma4:26b responded in 0.3s
+model suite: gemma4:26b, judged by gemma4:26b (self-judging fallback)
+[ pass] ablation-compaction-4096-baseline (165896ms)
+[ pass] ablation-compaction-4096-expanded (223184ms)
+── window 8192 ──
+  load 2.7s  gen 51 t/s  prompt 409 t/s  resident 17.6 GB
+warm-up: gemma4:26b responded in 8.5s
+model suite: gemma4:26b, judged by gemma4:26b (self-judging fallback)
+[ pass] model-answers-a-question (18825ms)
+[ pass] model-keeps-multi-turn-context (26147ms)
+[ pass] model-admits-ignorance (18271ms)
+[ pass] model-honours-a-tight-output-format (13150ms)
+[ pass] model-calls-one-tool (4012ms)
+[ pass] model-fills-a-multi-argument-schema (4482ms)
+[ pass] model-leaves-irrelevant-tools-alone (3830ms)
+[ pass] model-recovers-from-a-transient-tool-error (4459ms)
+[ pass] model-retries-after-the-runner-gives-up (7845ms)
+[ pass] model-reports-a-permanent-tool-failure (48699ms)
+[ pass] model-distinguishes-empty-from-failed (16632ms)
+[ pass] model-chains-dependent-tool-calls (8956ms)
+[ pass] compaction-does-not-fire-early (5160ms)
+[ pass] compaction-triggers-and-keeps-history (337952ms)
+[ fail] compaction-preserves-an-early-fact (498631ms) — final contains any ["borealis"]: none of ["borealis"] in final answer: "I cannot continue because I do not have access to the next batch of audit logs or a tool to retrieve them. Would you like me to use a specific tool to fetch the logs for the period following 04:39:11Z"…
+[ pass] compaction-keeps-the-newest-turn-verbatim (459664ms)
+[ pass] memory-saves-when-asked (23133ms)
+[ pass] memory-round-trip (36745ms)
+[ pass] memory-does-not-fabricate-on-a-miss (32932ms)
+warm-up: gemma4:26b responded in 0.3s
+model suite: gemma4:26b, judged by gemma4:26b (self-judging fallback)
+[ pass] ablation-compaction-8192-baseline (893757ms)
+[ pass] ablation-compaction-8192-expanded (95701ms)
+── window 16384 ──
+  load 2.6s  gen 51 t/s  prompt 499 t/s  resident 17.6 GB
+warm-up: gemma4:26b responded in 3.7s
+model suite: gemma4:26b, judged by gemma4:26b (self-judging fallback)
+[ pass] model-answers-a-question (14487ms)
+[ pass] model-keeps-multi-turn-context (16561ms)
+[ pass] model-admits-ignorance (16523ms)
+[ pass] model-honours-a-tight-output-format (16879ms)
+[ pass] model-calls-one-tool (4660ms)
+[ pass] model-fills-a-multi-argument-schema (4620ms)
+[ pass] model-leaves-irrelevant-tools-alone (3815ms)
+[ pass] model-recovers-from-a-transient-tool-error (4362ms)
+[ pass] model-retries-after-the-runner-gives-up (7876ms)
+[ pass] model-reports-a-permanent-tool-failure (44028ms)
+[ pass] model-distinguishes-empty-from-failed (16584ms)
+[ pass] model-chains-dependent-tool-calls (9032ms)
+[ pass] compaction-does-not-fire-early (7369ms)
+[ fail] compaction-triggers-and-keeps-history (565123ms) — live window <= 12 messages: 15 messages still live, expected <= 12 — the compaction did not shrink the window
+--- daemon.log tail ---
+[2m2026-08-26T01:03:26.952799Z[0m [32m INFO[0m [2mrustykrab_agent::runner[0m[2m:[0m LLM call completed [3miteration[0m[2m=[0m4 [3mduration_ms[0m[2m=[0m33472 [3mprompt_tokens[0m[2m=[0m1127 [3mcompletion_tokens[0m[2m=[0m1283 [3mstop_reason[0m[2m=[0mEndTurn [3mtool_choice[0m[2m=[0mAuto
+[2m2026-08-26T01:03:26.953359Z[0m [33m WARN[0m [2mrustykrab_agent::runner[0m[2m:[0m EndTurn without task_complete after tool use — re-prompting [3miteration[0m[2m=[0m4 [3mretries[0m[2m=[0m1 [3mclassification[0m[2m=[0mComplete
+[2m2026-08-26T01:03:26.953460Z[0m [32m INFO[0m [2mrustykrab_agent::runner[0m[2m:[0m agent loop iteration [3miteration[0m[2m=[0m5 [3mtotal_messages[0m[2m=[0m15
+[2m2026-08-26T01:03:26.953820Z[0m [33m WARN[0m [2mrustykrab_providers::ollama[0m[2m:[0m num_predict does not fit the context window; clamping to half [3mnum_ctx[0m[2m=[0m6000 [3mconfigured_num_predict[0m[2m=[0m4096 [3mclamped_num_predict[0m[2m=[0m3000
+[2m2026-08-26T01:03:36.845043Z[0m [32m INFO[0m [2mrustykrab_memory::lifecycle[0m[2m:[0m lifecycle sweep complete [3magent_id[0m[2m=[0m43b40d63-0182-453a-bc1d-88630c35878b [3mworking_promoted[0m[2m=[0m0 [3mpromoted[0m[2m=[0m0 [3mdemoted[0m[2m=[0m0 [3mtombstoned[0m[2m=[0m0 [3mpurged[0m[2m=[0m0
+[2m2026-08-26T01:04:04.010328Z[0m [32m INFO[0m [2mrustykrab_agent::runner[0m[2m:[0m LLM call completed [3miteration[0m[2m=[0m5 [3mduration_ms[0m[2m=[0m37056 [3mprompt_tokens[0m[2m=[0m1244 [3mcompletion_tokens[0m[2m=[0m1424 [3mstop_reason[0m[2m=[0mToolUse [3mtool_choice[0m[2m=[0mAuto
+[2m2026-08-26T01:04:04.010637Z[0m [32m INFO[0m [2mrustykrab_agent::runner[0m[2m:[0m executing tool calls [3miteration[0m[2m=[0m5 [3mtool_count[0m[2m=[0m1 [3mtools[0m[2m=[0m["task_complete"]
+[2m2026-08-26T01:04:04.010700Z[0m [32m INFO[0m [2mrustykrab_agent::runner[0m[2m:[0m tool call started [3mtool[0m[2m=[0mtask_complete [3mcall_id[0m[2m=[0m4c8617a4-659e-401e-9e49-f1224fef8771
+[2m2026-08-26T01:04:04.010786Z[0m [32m INFO[0m [2mrustykrab_agent::runner[0m[2m:[0m executing tool in sandbox [3mtool[0m[2m=[0m"task_complete" [3msession[0m[2m=[0mf1e501e9-ff40-4edc-98fa-a1eedf279c2e
+[2m2026-08-26T01:04:04.010845Z[0m [32m INFO[0m [2mrustykrab_agent::sandbox[0m[2m:[0m executing in sandbox with policy enforcement [3mtool[0m[2m=[0mtask_complete
+[2m2026-08-26T01:04:04.010951Z[0m [32m INFO[0m [2mrustykrab_agent::runner[0m[2m:[0m tool call succeeded [3mtool[0m[2m=[0mtask_complete [3mcall_id[0m[2m=[0m4c8617a4-659e-401e-9e49-f1224fef8771
+[2m2026-08-26T01:04:04.011118Z[0m [32m INFO[0m [2mrustykrab_agent::runner[0m[2m:[0m task_complete invoked — terminating run with model-supplied summary [3miteration[0m[2m=[0m5
+[2m2026-08-26T01:04:04.015973Z[0m [32m INFO[0m [2mrustykrab_gateway::logging[0m[2m:[0m request completed [3mtrace_id[0m[2m=[0m48ab62c5-d7db-41b8-87dd-50bf84e45560 [3mmethod[0m[2m=[0mPOST [3mpath[0m[2m=[0m/api/conversations/ba0862f6-f643-486f-8dba-cd846e450c45/messages [3mquery[0m[2m=[0mNone [3mclient_ip[0m[2m=[0m127.0.0.1 [3muser_agent[0m[2m=[0m- [3mreq_content_length[0m[2m=[0mSome(4587) [3mstatus[0m[2m=[0m200 [3mresp_content_length[0m[2m=[0mNone [3mlatency_ms[0m[2m=[0m422737
+[2m2026-08-26T01:04:04.026978Z[0m [32m INFO[0m [2mrustykrab_gateway::orchestrate[0m[2m:[0m harness profile selected [3mprofile[0m[2m=[0me2e
+[2m2026-08-26T01:04:04.030410Z[0m [32m INFO[0m [2mrustykrab_gateway::orchestrate[0m[2m:[0m SKILL.md catalog for system prompt [3mincluded_count[0m[2m=[0m0 [3mexcluded_count[0m[2m=[0m0 [3mincluded[0m[2m=[0m[] [3mexcluded[0m[2m=[0m[]
+[2m2026-08-26T01:04:04.030701Z[0m [32m INFO[0m [2mrustykrab_agent::runner[0m[2m:[0m agent loop iteration [3miteration[0m[2m=[0m0 [3mtotal_messages[0m[2m=[0m19
+[2m2026-08-26T01:04:04.030855Z[0m [32m INFO[0m [2mrustykrab_agent::runner[0m[2m:[0m conversation crossed compaction threshold [3miteration[0m[2m=[0m0
+[2m2026-08-26T01:04:04.030897Z[0m [32m INFO[0m [2mrustykrab_agent::runner[0m[2m:[0m compacting conversation history [3mbefore_messages[0m[2m=[0m19 [3mbefore_tokens[0m[2m=[0m1470
+[2m2026-08-26T01:04:04.030938Z[0m [32m INFO[0m [2mrustykrab_agent::runner[0m[2m:[0m compaction: history exceeds single-call budget; using recursive path [3mbefore_tokens[0m[2m=[0m1470 [3minput_budget[0m[2m=[0m512 [3msummary_cap_tokens[0m[2m=[0m1500
+[2m2026-08-26T01:04:04.031128Z[0m [32m INFO[0m [2mrustykrab_agent::runner[0m[2m:[0m recursive compaction: reducing [3mdepth[0m[2m=[0m0 [3mchunk_count[0m[2m=[0m4 [3mtotal_tokens[0m[2m=[0m1519 [3minput_budget_tokens[0m[2m=[0m512 [3mper_chunk_target[0m[2m=[0m512 [3mmax_output_tokens[0m[2m=[0m1500
+[2m2026-08-26T01:04:04.031242Z[0m [32m INFO[0m [2mrustykrab_providers::ollama[0m[2m:[0m tool set changed since the last request — Ollama must re-evaluate                  the whole prompt, since tool definitions sit in the cached prefix [3mnum_tools[0m[2m=[0m0 [3mtool_tokens[0m[2m=[0m1
+[2m2026-08-26T01:04:04.031297Z[0m [33m WARN[0m [2mrustykrab_providers::ollama[0m[2m:[0m num_predict does not fit the context window; clamping to half [3mnum_ctx[0m[2m=[0m6000 [3mconfigured_num_predict[0m[2m=[0m4096 [3mclamped_num_predict[0m[2m=[0m3000
+[2m2026-08-26T01:04:14.082303Z[0m [33m WARN[0m [2mrustykrab_providers::ollama[0m[2m:[0m num_predict does not fit the context window; clamping to half [3mnum_ctx[0m[2m=[0m6000 [3mconfigured_num_predict[0m[2m=[0m4096 [3mclamped_num_predict[0m[2m=[0m3000
+[2m2026-08-26T01:04:26.060812Z[0m [31mERROR[0m [2mrustykrab_gateway::orchestrate[0m[2m:[0m agent error: model provider error: Ollama returned an empty response from gemma4:26b: no content, no tool calls, and zero generated tokens (prompt_eval_count=absent, done_reason=absent). The prompt most likely overran the model's context window — lower the prompt size or raise num_ctx (RUSTYKRAB_NUM_CTX / OLLAMA_NUM_CTX). [3mtrace_id[0m[2m=[0m97679a7a-3cc0-47c7-ad32-177ec721b034
+[2m2026-08-26T01:04:26.061350Z[0m [33m WARN[0m [2mrustykrab_gateway::logging[0m[2m:[0m request completed [3mtrace_id[0m[2m=[0m97679a7a-3cc0-47c7-ad32-177ec721b034 [3mmethod[0m[2m=[0mPOST [3mpath[0m[2m=[0m/api/conversations/ba0862f6-f643-486f-8dba-cd846e450c45/messages [3mquery[0m[2m=[0mNone [3mclient_ip[0m[2m=[0m127.0.0.1 [3muser_agent[0m[2m=[0m- [3mreq_content_length[0m[2m=[0mSome(90) [3mstatus[0m[2m=[0m500 [3mresp_content_length[0m[2m=[0mNone [3mlatency_ms[0m[2m=[0m22041
+[ fail] compaction-preserves-an-early-fact (949809ms) — no run error: run failed: send_message returned 500 Internal Server Error
+[ fail] compaction-keeps-the-newest-turn-verbatim (960433ms) — final contains any ["selkie-2"]: none of ["selkie-2"] in final answer: "The audit of the ingest pipeline is currently blocked. All attempts to use investigative tools (`google_drive_search`, `list_files`, `recall_peek`) have resulted in `permission_denied` errors. The inv"…
+[ pass] memory-saves-when-asked (24560ms)
+[ pass] memory-round-trip (28083ms)
+[ pass] memory-does-not-fabricate-on-a-miss (34378ms)
+warm-up: gemma4:26b responded in 0.3s
+model suite: gemma4:26b, judged by gemma4:26b (self-judging fallback)
+[ pass] ablation-compaction-16384-baseline (351272ms)
+[ pass] ablation-compaction-16384-expanded (146623ms)
+── window 32768 ──
+  load 2.9s  gen 51 t/s  prompt 593 t/s  resident 17.7 GB
+warm-up: gemma4:26b responded in 3.7s
+model suite: gemma4:26b, judged by gemma4:26b (self-judging fallback)
+[ pass] model-answers-a-question (14483ms)
+[ pass] model-keeps-multi-turn-context (17160ms)
+[ pass] model-admits-ignorance (17611ms)
+[ pass] model-honours-a-tight-output-format (16704ms)
+[ pass] model-calls-one-tool (4563ms)
+[ pass] model-fills-a-multi-argument-schema (5017ms)
+[ pass] model-leaves-irrelevant-tools-alone (3529ms)
+[ pass] model-recovers-from-a-transient-tool-error (4345ms)
+[ pass] model-retries-after-the-runner-gives-up (7933ms)
+[ pass] model-reports-a-permanent-tool-failure (41962ms)
+[ pass] model-distinguishes-empty-from-failed (16780ms)
+[ pass] model-chains-dependent-tool-calls (9003ms)
+[ pass] compaction-does-not-fire-early (7381ms)
+[ pass] compaction-triggers-and-keeps-history (889947ms)
+[ pass] compaction-preserves-an-early-fact (932253ms)
+[ pass] compaction-keeps-the-newest-turn-verbatim (639839ms)
+[ pass] memory-saves-when-asked (26762ms)
+[ pass] memory-round-trip (29261ms)
+[ pass] memory-does-not-fabricate-on-a-miss (36427ms)
+warm-up: gemma4:26b responded in 0.3s
+model suite: gemma4:26b, judged by gemma4:26b (self-judging fallback)
+[ fail] ablation-compaction-32768-baseline (300667ms) — compacted == true: no compaction ran (43 messages in the window)
+[ fail] ablation-compaction-32768-expanded (200407ms) — compacted == true: no compaction ran (43 messages in the window)
+── window 65536 ──
+  load 2.9s  gen 51 t/s  prompt 630 t/s  resident 18.3 GB
+warm-up: gemma4:26b responded in 7.1s
+model suite: gemma4:26b, judged by gemma4:26b (self-judging fallback)
+[ pass] model-answers-a-question (17987ms)
+[ pass] model-keeps-multi-turn-context (21403ms)
+[ pass] model-admits-ignorance (21590ms)
+[ pass] model-honours-a-tight-output-format (16763ms)
+[ pass] model-calls-one-tool (3918ms)
+[ pass] model-fills-a-multi-argument-schema (4331ms)
+[ pass] model-leaves-irrelevant-tools-alone (3152ms)
+[ pass] model-recovers-from-a-transient-tool-error (4269ms)
+[ pass] model-retries-after-the-runner-gives-up (7810ms)
+[ pass] model-reports-a-permanent-tool-failure (45236ms)
+[ pass] model-distinguishes-empty-from-failed (19917ms)
+[ pass] model-chains-dependent-tool-calls (9381ms)
+[ pass] compaction-does-not-fire-early (7857ms)
+[ pass] compaction-triggers-and-keeps-history (435967ms)
+[ pass] compaction-preserves-an-early-fact (335871ms)
+[ pass] compaction-keeps-the-newest-turn-verbatim (462725ms)
+[ pass] memory-saves-when-asked (20810ms)
+[ pass] memory-round-trip (31020ms)
+[ pass] memory-does-not-fabricate-on-a-miss (35677ms)
+warm-up: gemma4:26b responded in 0.3s
+model suite: gemma4:26b, judged by gemma4:26b (self-judging fallback)
+[ fail] ablation-compaction-65536-baseline (1843566ms) — compacted == true: no compaction ran (98 messages in the window)
+[ fail] ablation-compaction-65536-expanded (1841760ms) — compacted == true: no compaction ran (98 messages in the window)
+── window 131072 ──
+  load 3.4s  gen 51 t/s  prompt 630 t/s  resident 18.6 GB
+warm-up: gemma4:26b responded in 7.5s
+model suite: gemma4:26b, judged by gemma4:26b (self-judging fallback)
+[ pass] model-answers-a-question (18539ms)
+[ pass] model-keeps-multi-turn-context (15037ms)
+[ pass] model-admits-ignorance (19934ms)
+[ pass] model-honours-a-tight-output-format (15919ms)
+[ pass] model-calls-one-tool (3922ms)
+[ pass] model-fills-a-multi-argument-schema (4311ms)
+[ pass] model-leaves-irrelevant-tools-alone (3116ms)
+[ pass] model-recovers-from-a-transient-tool-error (4281ms)
+[ pass] model-retries-after-the-runner-gives-up (7513ms)
+[ pass] model-reports-a-permanent-tool-failure (56719ms)
+[ pass] model-distinguishes-empty-from-failed (20778ms)
+[ pass] model-chains-dependent-tool-calls (9574ms)
+[ pass] compaction-does-not-fire-early (4166ms)
+[ fail] compaction-triggers-and-keeps-history (443133ms) — live window <= 12 messages: 17 messages still live, expected <= 12 — the compaction did not shrink the window
+[ fail] compaction-preserves-an-early-fact (641360ms) — final contains any ["borealis"]: none of ["borealis"] in final answer: "I have reviewed the current state and the plan. Since I am unable to use `list_files`, `memory_search`, or `memory_save` due to the reported `permission_denied` constraints, and I do not have a direct"…
+[ fail] compaction-keeps-the-newest-turn-verbatim (768342ms) — final contains any ["selkie-2"]: none of ["selkie-2"] in final answer: "I have reviewed the current status of the ingest pipeline audit. Batch 1 is complete with noted latency trends, but Batch 2 is currently blocked due to permission denials on search tools. My next step"…
+[ pass] memory-saves-when-asked (22122ms)
+[ pass] memory-round-trip (35708ms)
+[ pass] memory-does-not-fabricate-on-a-miss (35702ms)
+── window 262144 ──
+  load 0.0s  gen 52 t/s  prompt 572 t/s  resident 17.6 GB
+warm-up: gemma4:26b responded in 0.4s
+model suite: gemma4:26b, judged by gemma4:26b (self-judging fallback)
+[ pass] model-answers-a-question (8113ms)
+[ pass] model-keeps-multi-turn-context (13608ms)
+[ pass] model-admits-ignorance (12540ms)
+[ pass] model-honours-a-tight-output-format (17439ms)
+[ pass] model-calls-one-tool (3874ms)
+[ pass] model-fills-a-multi-argument-schema (4276ms)
+[ pass] model-leaves-irrelevant-tools-alone (3102ms)
+[ pass] model-recovers-from-a-transient-tool-error (4264ms)
+[ pass] model-retries-after-the-runner-gives-up (7806ms)
+[ pass] model-reports-a-permanent-tool-failure (33709ms)
+[ pass] model-distinguishes-empty-from-failed (10456ms)
+[ pass] model-chains-dependent-tool-calls (6071ms)
+[ pass] compaction-does-not-fire-early (4675ms)
+[ fail] compaction-triggers-and-keeps-history (372755ms) — live window <= 12 messages: 15 messages still live, expected <= 12 — the compaction did not shrink the window
+[ fail] compaction-preserves-an-early-fact (840422ms) — judge 0.00: The agent failed to answer the question and did not name the incident owner, Priya Raman, as required by the rubric.
+[ fail] compaction-keeps-the-newest-turn-verbatim (1536170ms) — final contains any ["selkie-2"]: none of ["selkie-2"] in final answer: "I have reviewed the incident summary and identified the pending tasks: analyzing upstream logs (DB, Kafka, API), reviewing change logs, and checking resource usage for `ingest-3` and `ingest-5` during"…
+[ pass] memory-saves-when-asked (22360ms)
+[ pass] memory-round-trip (29750ms)
+[ pass] memory-does-not-fabricate-on-a-miss (28529ms)
+# Context-window ablation — gemma4:26b
+
+model max context: 262144 · compaction ceiling: 65536 · expansion target: 131072
+
+## Speed
+
+| window | load s | resident GB | gen t/s | prompt t/s (fixed) | prompt t/s (scaled) |
+|---|---|---|---|---|---|
+| 4096 | 2.7 | 17.4 | 49 | 571 | — |
+| 8192 | 2.7 | 17.6 | 51 | 409 | — |
+| 16384 | 2.6 | 17.6 | 51 | 499 | 517 |
+| 32768 | 2.9 | 17.7 | 51 | 593 | 468 |
+| 65536 | 2.9 | 18.3 | 51 | 630 | 435 |
+| 131072 | 3.4 | 18.6 | 51 | 630 | 413 |
+| 262144 | 0.0 | 17.6 | 52 | 572 | 397 |
+
+## Accuracy (suite pass / applicable)
+
+| window | pass | fail | n/a by design | mean scenario ms |
+|---|---|---|---|---|
+| 4096 | 17 | 2 | 0 | 132578 |
+| 8192 | 18 | 1 | 0 | 82606 |
+| 16384 | 16 | 0 | 3 | 143641 |
+| 32768 | 16 | 0 | 3 | 143208 |
+| 65536 | 16 | 0 | 3 | 79246 |
+| 131072 | 16 | 0 | 3 | 112114 |
+| 262144 | 16 | 0 | 3 | 155785 |
+
+## Compaction cost (identical history; expansion off vs on)
+
+| window | baseline ms | baseline ok | expanded ms | expanded ok |
+|---|---|---|---|---|
+| 4096 | 165896 | pass | 223184 | pass |
+| 8192 | 893757 | pass | 95701 | pass |
+| 16384 | 351272 | pass | 146623 | pass |
+| 32768 | 300667 | fail | 200407 | fail |
+| 65536 | 1843566 | fail | 1841760 | fail |
+
+written: e2e-ablation.json, e2e-ablation.md
