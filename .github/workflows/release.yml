@@ -316,9 +316,13 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
         run: |
-          test -n "$APPLE_ID" || { echo "APPLE_ID secret is required for macOS releases" >&2; exit 1; }
-          test -n "$APPLE_TEAM_ID" || { echo "APPLE_TEAM_ID secret is required for macOS releases" >&2; exit 1; }
-          test -n "$APPLE_APP_PASSWORD" || { echo "APPLE_APP_PASSWORD secret is required for macOS releases" >&2; exit 1; }
+          if [ -z "$APPLE_ID" ] || [ -z "$APPLE_TEAM_ID" ] || [ -z "$APPLE_APP_PASSWORD" ]; then
+            echo "::notice::Apple notarization secrets are not set; publishing the Developer ID-signed bundle without a notarization ticket."
+            echo "The signed tarball from the Package step is published as-is. Notarization is only"
+            echo "needed for bundles downloaded through a browser, which get a Gatekeeper quarantine"
+            echo "attribute. Set APPLE_ID, APPLE_TEAM_ID and APPLE_APP_PASSWORD to enable it."
+            exit 0
+          fi
           xcrun notarytool submit \
             "dist/rustykrab-${{ matrix.target }}.dmg" \
             --apple-id "$APPLE_ID" \
