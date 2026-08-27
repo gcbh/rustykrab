@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.1.37] - 2026-08-27
+
+- build: app-bundle signing for Data Protection Keychain access (#549)
+
 ## [5.1.36] - 2026-08-27
 
 - feat(providers): OpenAI-compatible model provider (#526)
