@@ -216,6 +216,8 @@ All configuration is via environment variables. No plaintext config files.
 | `RUST_LOG` | `info` | Log level (`info`, `debug`, `rustykrab_gateway=debug`) |
 | `RUSTYKRAB_LOG_STDOUT` | auto | Force stdout logging on (`1`) or off (`0`). Default: enabled only when stdout is a terminal. The rolling log file under the data directory is always written |
 | `RUSTYKRAB_OUTCOME_CAPTURE` | `0` | Record how each completed run went, and which skill, memories, and tools were in play, into the `outcome_records` table. Observational only — it changes nothing about how the agent behaves. Groundwork for the self-improvement outer loop; see `DREAMING.md` |
+| `RUSTYKRAB_PUBLIC_URL` | unset | Base URL the agent puts in a credential link, e.g. `https://mac.tailnet.ts.net`. Unset, the agent falls back to telling the user a prompt is waiting in the app — so a link is never minted and the failure is silent |
+| `RUSTYKRAB_TAILNET_USERS` | unset | Comma-separated tailnet logins allowed to open a credential page. Empty means any authenticated tailnet user. Requires `tailscale serve` in front to inject `Tailscale-User-Login` |
 | | | When enabled, this also starts a **downtime analysis worker**: read-only, it aggregates recorded outcomes and logs a digest once the system has been quiet for 10 minutes, abandoning a pass if activity arrives mid-flight. It never writes and never calls a model |
 
 ### Persisting credentials
@@ -271,6 +273,35 @@ docker run --rm \
 Per-credential values (Anthropic, Notion, Telegram, etc.) come from their `RUSTYKRAB_*`/service-specific env vars — see the table above and the registry at `crates/rustykrab-store/src/registry.rs`. Anything resolved from an env var is also persisted into the encrypted SQLite store on first run, so subsequent restarts only need `RUSTYKRAB_MASTER_KEY` plus whatever you want to rotate.
 
 The `rustykrab-cli keychain` subcommand is macOS-only; on Linux/Docker use env vars or the gateway's secrets API.
+
+### Serving the credential page over your tailnet
+
+The gateway binds loopback. `tailscale serve` fronts it with a real
+Let's Encrypt certificate so a phone on the tailnet can open the secure
+form the agent links to.
+
+```sh
+# 1. Enable HTTPS certificates for the tailnet, once, in the admin console:
+#    https://login.tailscale.com/admin/dns  ->  HTTPS Certificates  ->  Enable
+
+# 2. Front the gateway (3000 is the default port):
+tailscale serve --bg https / http://127.0.0.1:3000
+tailscale serve status          # confirms the https:// URL it now answers on
+
+# 3. Point the daemon at that name, and say who may answer:
+export RUSTYKRAB_PUBLIC_URL=https://<mac>.<tailnet>.ts.net
+export RUSTYKRAB_TAILNET_USERS=you@example.com
+export RUSTYKRAB_ALLOWED_ORIGINS=https://<mac>.<tailnet>.ts.net
+```
+
+`RUSTYKRAB_ALLOWED_ORIGINS` matters: the form posts back from that origin,
+and the origin check rejects a POST it does not recognise.
+
+Without `tailscale serve` in front there is no `Tailscale-User-Login`
+header, so the page refuses every request — which is the intended failure.
+`RUSTYKRAB_CREDENTIAL_PAGE_ANONYMOUS=1` turns that check off and exists
+only for loopback development; `scripts/install.sh` deliberately does not
+forward it, so it cannot be inherited into an installed service.
 
 ## Usage
 
