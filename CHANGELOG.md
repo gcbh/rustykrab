@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.1.39] - 2026-08-27
+
+- feat(tools): real peer delegation for the nodes tool (#552)
+
 ## [5.1.38] - 2026-08-27
 
 - fix(ci): skip notarization when Apple secrets are absent (#550)
