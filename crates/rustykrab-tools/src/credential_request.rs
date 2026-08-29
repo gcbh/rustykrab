@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use rustykrab_core::active_tools::with_session_context;
 use rustykrab_core::types::ToolSchema;
 use rustykrab_core::{Error, Result, Tool};
 use std::time::Duration;
@@ -146,9 +147,15 @@ impl Tool for CredentialRequestTool {
             ));
         }
 
+        // Which conversation is asking. This is what makes the answer
+        // resumable: when the user supplies the value, this is the turn to
+        // bring back. `None` outside a runner scope — the request is still
+        // answerable in the app, it just cannot wake anything.
+        let conversation_id = with_session_context(|c| c.conversation_id);
+
         let id = self
             .requests
-            .file_fulfil(name, service.clone(), fields, reason, None)
+            .file_fulfil(name, service.clone(), fields, reason, conversation_id)
             .await
             .map_err(|e| {
                 Error::ToolExecution(format!("could not file the credential request: {e}").into())

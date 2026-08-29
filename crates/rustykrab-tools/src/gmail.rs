@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use futures::TryStreamExt;
+use rustykrab_core::active_tools::with_session_context;
 use rustykrab_core::types::ToolSchema;
 use rustykrab_core::{Error, Result, SandboxRequirements, Tool};
 use rustykrab_store::GuardedSecrets;
@@ -159,13 +160,18 @@ impl GmailTool {
                 ),
             },
         ];
+        // This is the path that actually fires in practice — measured at
+        // 25/25 against `browser`'s 1/9 — so a request filed here without
+        // a conversation would leave the common case unresumable.
+        let conversation_id = with_session_context(|c| c.conversation_id);
+
         match requests
             .file_fulfil(
                 KEY_APP_PASSWORD,
                 Some("Gmail".to_string()),
                 fields,
                 Some(format!("so it can use your Gmail account — it needs {needs}")),
-                None,
+                conversation_id,
             )
             .await
         {
