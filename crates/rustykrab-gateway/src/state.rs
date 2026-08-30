@@ -85,6 +85,10 @@ pub struct AppState {
     pub outcome_capture_enabled: bool,
     /// Who may open the credential page served at `/c/{token}`.
     pub credential_page_policy: crate::PageIdentityPolicy,
+    /// Wake-up channel and cancellation registry for the delegated-task
+    /// queue. Shared between the `/api/tasks` handlers, which enqueue and
+    /// cancel, and the worker, which drains.
+    pub task_signal: crate::tasks::TaskQueueSignal,
 }
 
 impl AppState {
@@ -127,6 +131,7 @@ impl AppState {
             retrieval_log: RetrievalLog::new(),
             outcome_capture_enabled: false,
             credential_page_policy: crate::PageIdentityPolicy::default(),
+            task_signal: crate::tasks::TaskQueueSignal::new(),
         }
     }
 

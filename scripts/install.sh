@@ -73,8 +73,14 @@ PB=(/usr/libexec/PlistBuddy -c)
 # set at install time. The credential-page settings are on the list because
 # without RUSTYKRAB_PUBLIC_URL the agent cannot mint a link at all, and the
 # failure is silent — it just falls back to telling the user to open the app.
+#
+# RUSTYKRAB_NODES carries a peer's bearer token, so it lands in a plist that is
+# chmod 600 below — the same posture as the systemd EnvironmentFile documented
+# in the README. Without forwarding it, a daemon installed as a LaunchAgent can
+# never be configured to delegate, whatever the installing shell had exported.
 for key in RUSTYKRAB_PROVIDER RUSTYKRAB_PORT RUSTYKRAB_WEB_UI RUST_LOG \
     OLLAMA_BASE_URL OLLAMA_MODEL OLLAMA_NUM_CTX RUSTYKRAB_NUM_CTX \
+    RUSTYKRAB_NODES RUSTYKRAB_NODE_TIMEOUT_SECS \
     TELEGRAM_ALLOWED_CHATS TELEGRAM_BOT_TOKEN \
     RUSTYKRAB_PUBLIC_URL RUSTYKRAB_TAILNET_USERS RUSTYKRAB_ALLOWED_ORIGINS; do
     if [[ -n "${!key:-}" ]]; then

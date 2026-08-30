@@ -32,6 +32,18 @@ pub struct RemoteNode {
     /// model so it can pick a node deliberately.
     #[serde(default)]
     pub description: Option<String>,
+    /// How many further delegation hops this node may make with work we
+    /// send it. Defaults to 0: the node runs the task itself and may not
+    /// hand any part of it onward.
+    ///
+    /// This is the cross-machine recursion guard. Two peers that each
+    /// list the other — the natural configuration when the node is
+    /// another copy of the same program — would otherwise bounce a task
+    /// between them indefinitely, at minutes of local inference per hop.
+    /// The local `subagents` tool has an equivalent depth counter; it
+    /// cannot help here because it is process-local.
+    #[serde(default)]
+    pub hop_budget: Option<i64>,
 }
 
 impl RemoteNode {
@@ -116,6 +128,25 @@ impl NodesTool {
         })
     }
 
+    /// Resolve the `node_id` argument for an action that targets one node.
+    fn target(nodes: &[RemoteNode], args: &Value, action: &str) -> Result<RemoteNode> {
+        let node_id = args["node_id"]
+            .as_str()
+            .ok_or_else(|| Error::ToolExecution(format!("'{action}' requires node_id").into()))?;
+        Self::find(nodes, node_id)
+    }
+
+    fn task_id<'a>(args: &'a Value, action: &str) -> Result<&'a str> {
+        args["task_id"]
+            .as_str()
+            .filter(|id| !id.trim().is_empty())
+            .ok_or_else(|| {
+                Error::ToolExecution(
+                    format!("'{action}' requires the task_id returned by 'send'").into(),
+                )
+            })
+    }
+
     /// Probe a node's public health endpoint. Returns round-trip latency.
     async fn probe(&self, node: &RemoteNode) -> std::result::Result<u128, String> {
         let start = Instant::now();
@@ -134,11 +165,118 @@ impl NodesTool {
         }
     }
 
-    /// Send a task to a node and return its reply.
+    /// Submit a task and return a handle, without waiting for it to run.
     ///
-    /// Creates a fresh conversation on the peer so delegated work does not share
-    /// context with whatever else that node is doing.
-    async fn send(&self, node: &RemoteNode, message: &str) -> Result<Value> {
+    /// Delegation is asynchronous because a delegated task on a local
+    /// model routinely takes minutes, and the agent loop that called this
+    /// tool cannot be held open that long — the runner caps a network
+    /// tool at [`DEFAULT_NET_TOOL_TIMEOUT_SECS`-equivalent] wall-clock,
+    /// well under the time a real task needs. Submitting returns in about
+    /// a second; the model polls with `check` on later turns and does
+    /// other work in between.
+    async fn submit(
+        &self,
+        node: &RemoteNode,
+        message: &str,
+        conversation_id: Option<&str>,
+    ) -> Result<Value> {
+        let body = json!({
+            "message": message,
+            "conversationId": conversation_id,
+            "hopBudget": node.hop_budget.unwrap_or(0),
+        });
+
+        let accepted = match self.post(node, &node.api("/tasks"), body).await {
+            Ok(value) => value,
+            // A node on a build without the task queue has no /api/tasks.
+            // Fall back so a mixed-version fleet keeps working, and say
+            // so — the synchronous path is bounded by this tool's own
+            // timeout and will fail on anything long.
+            Err(e) if is_missing_endpoint(&e) => {
+                tracing::warn!(
+                    node = %node.id,
+                    "node has no /api/tasks; falling back to a synchronous delegation"
+                );
+                return self.legacy_send(node, message).await;
+            }
+            Err(e) => return Err(e),
+        };
+
+        let task_id = accepted["id"].as_str().unwrap_or_default().to_string();
+        if task_id.is_empty() {
+            return Err(Error::ToolExecution(
+                format!("node '{}' accepted the task but returned no id", node.id).into(),
+            ));
+        }
+
+        Ok(json!({
+            "node_id": node.id,
+            "task_id": task_id,
+            "status": accepted["status"].as_str().unwrap_or("queued"),
+            "next": "The node is working. Call nodes with action='check', the same \
+                     node_id, and this task_id to collect the result. Do other work \
+                     first — a delegated task usually takes minutes.",
+        }))
+    }
+
+    /// Read a submitted task's current state, and its result once done.
+    async fn check(&self, node: &RemoteNode, task_id: &str) -> Result<Value> {
+        let task: Value = self
+            .get(node, &node.api(&format!("/tasks/{task_id}")))
+            .await?;
+
+        let status = task["status"].as_str().unwrap_or("unknown");
+        let mut out = json!({
+            "node_id": node.id,
+            "task_id": task_id,
+            "status": status,
+            "elapsed_secs": task["elapsedSecs"],
+        });
+
+        // The conversation id is what makes a follow-up cheap: passing it
+        // back on the next `send` continues the same thread on the node,
+        // reusing its evaluated prompt prefix instead of re-reading the
+        // whole system prompt and tool schemas.
+        if let Some(convo) = task["conversationId"].as_str() {
+            out["conversation_id"] = json!(convo);
+        }
+
+        match status {
+            "done" => {
+                out["response"] = task["result"].clone();
+            }
+            "failed" | "cancelled" => {
+                out["error"] = task["error"].clone();
+            }
+            _ => {
+                out["next"] = json!(
+                    "Still running. Check again later rather than resubmitting — \
+                     a resubmit starts the work over from scratch."
+                );
+            }
+        }
+        Ok(out)
+    }
+
+    /// Cancel a submitted task, aborting it if the node has already started.
+    async fn cancel(&self, node: &RemoteNode, task_id: &str) -> Result<Value> {
+        let task: Value = self
+            .delete(node, &node.api(&format!("/tasks/{task_id}")))
+            .await?;
+        Ok(json!({
+            "node_id": node.id,
+            "task_id": task_id,
+            "status": task["status"].as_str().unwrap_or("cancelled"),
+        }))
+    }
+
+    /// Pre-queue delegation: create a conversation and post a message,
+    /// blocking until the node's whole agent turn finishes.
+    ///
+    /// Retained only so a primary on this build can still drive a node on
+    /// an older one. It is bounded by the caller's tool timeout, so it
+    /// fails on exactly the long tasks delegation exists for.
+    async fn legacy_send(&self, node: &RemoteNode, message: &str) -> Result<Value> {
         let started = Instant::now();
 
         let convo: Value = self
@@ -169,16 +307,36 @@ impl NodesTool {
             "conversation_id": convo_id,
             "response": text,
             "elapsed_secs": started.elapsed().as_secs(),
+            "warning": "This node runs a build without the delegated-task queue, so \
+                        the task ran synchronously. Upgrade it to delegate work that \
+                        takes longer than this tool's timeout.",
         }))
     }
 
+    async fn get(&self, node: &RemoteNode, url: &str) -> Result<Value> {
+        self.send_request(node, self.client.get(url), url).await
+    }
+
+    async fn delete(&self, node: &RemoteNode, url: &str) -> Result<Value> {
+        self.send_request(node, self.client.delete(url), url).await
+    }
+
     async fn post(&self, node: &RemoteNode, url: &str, body: Value) -> Result<Value> {
-        let resp = self
-            .client
-            .post(url)
+        self.send_request(node, self.client.post(url).json(&body), url)
+            .await
+    }
+
+    /// Issue one request to a node, mapping transport and HTTP failures
+    /// into errors the model can act on.
+    async fn send_request(
+        &self,
+        node: &RemoteNode,
+        request: reqwest::RequestBuilder,
+        url: &str,
+    ) -> Result<Value> {
+        let resp = request
             .bearer_auth(&node.token)
             .header("Origin", node.origin())
-            .json(&body)
             .send()
             .await
             .map_err(|e| {
@@ -192,17 +350,38 @@ impl NodesTool {
             let body = resp.text().await.unwrap_or_default();
             let hint = match status.as_u16() {
                 401 | 403 => " (check the node's token, and that its gateway is reachable)",
+                404 => " (the node may be running a build without this endpoint)",
                 _ => "",
             };
             return Err(Error::ToolExecution(
-                format!("node '{}' returned {status}{hint}: {body}", node.id).into(),
+                format!(
+                    "node '{}' returned {status}{hint} for {url}: {body}",
+                    node.id
+                )
+                .into(),
             ));
         }
 
-        resp.json().await.map_err(|e| {
+        // A 202 with no body is a legitimate response for some servers;
+        // treat an unparseable success as an empty object rather than an
+        // error, so the caller's own field checks produce the message.
+        let text = resp.text().await.unwrap_or_default();
+        if text.trim().is_empty() {
+            return Ok(json!({}));
+        }
+        serde_json::from_str(&text).map_err(|e| {
             Error::ToolExecution(format!("node '{}' returned invalid JSON: {e}", node.id).into())
         })
     }
+}
+
+/// Whether an error came from a node that does not know an endpoint.
+///
+/// Used to detect a peer predating the delegated-task queue so the tool
+/// can fall back instead of failing a mixed-version fleet.
+fn is_missing_endpoint(err: &Error) -> bool {
+    let text = err.to_string();
+    text.contains("404") || text.contains("405")
 }
 
 impl Default for NodesTool {
@@ -220,9 +399,13 @@ impl Tool for NodesTool {
     fn description(&self) -> &str {
         "Delegate a task to a peer RustyKrab instance on another machine. Use \
          'list' to see available nodes and what each is suited for, 'discover' to \
-         check which are online, and 'send' to hand a self-contained task to one \
-         and get its result. Delegated tasks run with that node's own tools and \
-         filesystem, so include everything the node needs in the message."
+         check which are online, 'send' to hand a self-contained task to one, \
+         'check' to collect the result later, and 'cancel' to stop one. Delegation \
+         is asynchronous: 'send' returns a task_id immediately and the node works \
+         in the background, typically for minutes — do other work and check back \
+         rather than waiting. Delegated tasks run with that node's own tools and \
+         filesystem and cannot see this machine's files, so include everything the \
+         node needs in the message."
     }
 
     fn sandbox_requirements(&self) -> SandboxRequirements {
@@ -249,16 +432,24 @@ impl Tool for NodesTool {
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["discover", "list", "send"],
-                        "description": "'list' shows configured nodes, 'discover' probes which are online, 'send' delegates a task"
+                        "enum": ["discover", "list", "send", "check", "cancel"],
+                        "description": "'list' shows configured nodes, 'discover' probes which are online, 'send' delegates a task and returns a task_id, 'check' reads that task's status and result, 'cancel' stops it"
                     },
                     "node_id": {
                         "type": "string",
-                        "description": "Target node id (required for 'send')"
+                        "description": "Target node id (required for 'send', 'check' and 'cancel')"
                     },
                     "message": {
                         "type": "string",
-                        "description": "The task to delegate (required for 'send'). Must be self-contained: the node does not share this conversation's context."
+                        "description": "The task to delegate (required for 'send'). Must be self-contained: the node does not share this conversation's context, cannot see this machine's files, and starts from a blank slate unless conversation_id continues an earlier thread."
+                    },
+                    "task_id": {
+                        "type": "string",
+                        "description": "The id returned by 'send' (required for 'check' and 'cancel')"
+                    },
+                    "conversation_id": {
+                        "type": "string",
+                        "description": "Optional, for 'send': continue an earlier delegated thread on that node instead of starting fresh. Use the conversation_id from a previous 'check' when this task follows on from it — a continued thread starts answering in seconds where a new one spends a minute or more re-reading its own prompt."
                     }
                 },
                 "required": ["action"]
@@ -309,9 +500,7 @@ impl Tool for NodesTool {
             }
 
             "send" => {
-                let node_id = args["node_id"]
-                    .as_str()
-                    .ok_or_else(|| Error::ToolExecution("'send' requires node_id".into()))?;
+                let node = Self::target(&nodes, &args, "send")?;
                 let message = args["message"]
                     .as_str()
                     .ok_or_else(|| Error::ToolExecution("'send' requires message".into()))?;
@@ -320,12 +509,27 @@ impl Tool for NodesTool {
                         "'send' requires a non-empty message".into(),
                     ));
                 }
-                let node = Self::find(&nodes, node_id)?;
-                self.send(&node, message).await
+                self.submit(&node, message, args["conversation_id"].as_str())
+                    .await
+            }
+
+            "check" => {
+                let node = Self::target(&nodes, &args, "check")?;
+                let task_id = Self::task_id(&args, "check")?;
+                self.check(&node, task_id).await
+            }
+
+            "cancel" => {
+                let node = Self::target(&nodes, &args, "cancel")?;
+                let task_id = Self::task_id(&args, "cancel")?;
+                self.cancel(&node, task_id).await
             }
 
             other => Err(Error::ToolExecution(
-                format!("unknown action '{other}' (expected discover, list, or send)").into(),
+                format!(
+                    "unknown action '{other}' (expected discover, list, send, check, or cancel)"
+                )
+                .into(),
             )),
         }
     }
@@ -389,6 +593,80 @@ mod tests {
             "tool output must not carry tokens into model context: {rendered}"
         );
         std::env::remove_var("RUSTYKRAB_NODES");
+    }
+
+    #[test]
+    fn hop_budget_defaults_to_no_onward_delegation() {
+        let nodes: Vec<RemoteNode> = serde_json::from_str(&nodes_json()).unwrap();
+        // Unset means zero, not unlimited. A node configured without
+        // thinking about recursion must not be able to delegate onward.
+        assert_eq!(nodes[0].hop_budget.unwrap_or(0), 0);
+
+        let explicit: Vec<RemoteNode> =
+            serde_json::from_str(r#"[{"id":"n","url":"http://x","token":"t","hop_budget":2}]"#)
+                .unwrap();
+        assert_eq!(explicit[0].hop_budget, Some(2));
+    }
+
+    #[test]
+    fn a_missing_endpoint_is_distinguishable_from_a_dead_node() {
+        // Drives the fallback for a peer predating the task queue. An
+        // unreachable node must not be mistaken for an old one, or the
+        // tool would retry a synchronous send against nothing.
+        assert!(is_missing_endpoint(&Error::ToolExecution(
+            "node 'm4max' returned 404 Not Found for /api/tasks: ".into()
+        )));
+        assert!(!is_missing_endpoint(&Error::ToolExecution(
+            "node 'm4max' at https://x is unreachable: connection refused".into()
+        )));
+        assert!(!is_missing_endpoint(&Error::ToolExecution(
+            "node 'm4max' returned 401 Unauthorized for /api/tasks: ".into()
+        )));
+    }
+
+    #[test]
+    fn check_and_cancel_require_a_task_id() {
+        // Exercised through the argument helpers rather than `execute` so
+        // this does not touch RUSTYKRAB_NODES: the var is process-global
+        // and `list_never_leaks_tokens` owns it.
+        for action in ["check", "cancel"] {
+            let err = NodesTool::task_id(&json!({"node_id": "m4max"}), action)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("task_id"), "got: {err}");
+            // An empty string is not a usable handle either.
+            let err = NodesTool::task_id(&json!({"task_id": "  "}), action)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("task_id"), "got: {err}");
+        }
+        assert_eq!(
+            NodesTool::task_id(&json!({"task_id": "abc"}), "check").unwrap(),
+            "abc"
+        );
+    }
+
+    #[test]
+    fn targeting_an_action_reports_the_missing_node_id() {
+        let nodes: Vec<RemoteNode> = serde_json::from_str(&nodes_json()).unwrap();
+        let err = NodesTool::target(&nodes, &json!({"task_id": "abc"}), "check")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("node_id"), "got: {err}");
+    }
+
+    #[test]
+    fn the_schema_advertises_the_asynchronous_actions() {
+        let schema = NodesTool::new().schema();
+        let actions = schema.parameters["properties"]["action"]["enum"].clone();
+        let actions: Vec<String> = serde_json::from_value(actions).unwrap();
+        // Without check the model can submit work it can never collect.
+        for expected in ["list", "discover", "send", "check", "cancel"] {
+            assert!(
+                actions.iter().any(|a| a == expected),
+                "'{expected}' missing from {actions:?}"
+            );
+        }
     }
 
     #[test]

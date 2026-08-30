@@ -469,6 +469,7 @@ async fn execute_cron_task(
         // reply is never the deliverable, and the model would otherwise
         // burn the slot.
         force_tool_use_first_iteration: true,
+        ..rustykrab_gateway::RunOptions::default()
     };
 
     // Run the agent. Mint a fresh trace id per scheduled run so prompt-log
