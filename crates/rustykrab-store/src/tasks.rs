@@ -94,6 +94,11 @@ pub struct DelegatedTask {
     /// Remaining delegation hops. A node may only hand work onward while
     /// this is above zero, which is what stops A -> B -> A recursion.
     pub hop_budget: i64,
+    /// Tools the submitting peer asked to limit this task to. Advisory in
+    /// one direction only: the node intersects it with its own policy, so
+    /// a task can ask for less than the node allows and never more.
+    /// `None` means the peer expressed no preference.
+    pub allowed_tools: Option<Vec<String>>,
     /// The caller's trace id, so one delegation correlates across both
     /// machines' logs.
     pub trace_id: Option<String>,
@@ -118,6 +123,11 @@ impl DelegatedTask {
             error: row.get("error")?,
             principal: row.get("principal")?,
             hop_budget: row.get("hop_budget")?,
+            // A row we cannot parse must not silently widen the ceiling,
+            // so an unreadable list is treated as "allow nothing".
+            allowed_tools: row
+                .get::<_, Option<String>>("allowed_tools")?
+                .map(|raw| serde_json::from_str(&raw).unwrap_or_default()),
             trace_id: row.get("trace_id")?,
             created_at: parse_time(Some(created)).unwrap_or_else(Utc::now),
             started_at: parse_time(row.get("started_at")?),
@@ -127,7 +137,8 @@ impl DelegatedTask {
 }
 
 const COLUMNS: &str = "id, message, conversation_id, status, result, error, principal, \
-                       hop_budget, trace_id, created_at, started_at, finished_at";
+                       hop_budget, allowed_tools, trace_id, created_at, started_at, \
+                       finished_at";
 
 /// Handle for delegated-task CRUD, backed by SQLite.
 ///
@@ -150,6 +161,7 @@ impl TaskStore {
         conversation_id: Option<&str>,
         principal: Option<&str>,
         hop_budget: i64,
+        allowed_tools: Option<Vec<String>>,
         trace_id: Option<&str>,
     ) -> Result<DelegatedTask, Error> {
         let task = DelegatedTask {
@@ -161,6 +173,7 @@ impl TaskStore {
             error: None,
             principal: principal.map(str::to_string),
             hop_budget: hop_budget.max(0),
+            allowed_tools,
             trace_id: trace_id.map(str::to_string),
             created_at: Utc::now(),
             started_at: None,
@@ -171,7 +184,8 @@ impl TaskStore {
         with_conn(&self.conn, move |conn| {
             conn.execute(
                 "INSERT INTO delegated_tasks (id, message, conversation_id, status, principal, \
-                 hop_budget, trace_id, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                 hop_budget, allowed_tools, trace_id, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 params![
                     row.id,
                     row.message,
@@ -179,6 +193,9 @@ impl TaskStore {
                     row.status.as_str(),
                     row.principal,
                     row.hop_budget,
+                    row.allowed_tools
+                        .as_ref()
+                        .map(|t| serde_json::to_string(t).unwrap_or_default()),
                     row.trace_id,
                     row.created_at.to_rfc3339(),
                 ],
@@ -413,7 +430,7 @@ mod tests {
     async fn a_submitted_task_is_claimable_exactly_once() {
         let s = store();
         let task = s
-            .enqueue("do it", None, Some("m1max"), 0, None)
+            .enqueue("do it", None, Some("m1max"), 0, None, None)
             .await
             .unwrap();
         assert_eq!(task.status, TaskStatus::Queued);
@@ -434,11 +451,11 @@ mod tests {
     async fn claims_are_fifo_but_prefer_the_warm_conversation() {
         let s = store();
         let older = s
-            .enqueue("first", Some("convo-a"), None, 0, None)
+            .enqueue("first", Some("convo-a"), None, 0, None, None)
             .await
             .unwrap();
         let newer = s
-            .enqueue("second", Some("convo-b"), None, 0, None)
+            .enqueue("second", Some("convo-b"), None, 0, None, None)
             .await
             .unwrap();
 
@@ -455,7 +472,10 @@ mod tests {
     #[tokio::test]
     async fn a_cancel_mid_run_survives_the_run_finishing() {
         let s = store();
-        let task = s.enqueue("long job", None, None, 0, None).await.unwrap();
+        let task = s
+            .enqueue("long job", None, None, 0, None, None)
+            .await
+            .unwrap();
         s.claim_next(None).await.unwrap();
 
         let previous = s.cancel(&task.id).await.unwrap();
@@ -476,7 +496,10 @@ mod tests {
     #[tokio::test]
     async fn cancelling_a_queued_task_reports_that_nothing_is_running() {
         let s = store();
-        let task = s.enqueue("not started", None, None, 0, None).await.unwrap();
+        let task = s
+            .enqueue("not started", None, None, 0, None, None)
+            .await
+            .unwrap();
         assert_eq!(s.cancel(&task.id).await.unwrap(), Some(TaskStatus::Queued));
         // And the worker must never pick it up afterwards.
         assert!(s.claim_next(None).await.unwrap().is_none());
@@ -491,10 +514,13 @@ mod tests {
     #[tokio::test]
     async fn a_restart_fails_tasks_it_interrupted() {
         let s = store();
-        let running = s.enqueue("interrupted", None, None, 0, None).await.unwrap();
+        let running = s
+            .enqueue("interrupted", None, None, 0, None, None)
+            .await
+            .unwrap();
         s.claim_next(None).await.unwrap();
         let queued = s
-            .enqueue("not yet started", None, None, 0, None)
+            .enqueue("not yet started", None, None, 0, None, None)
             .await
             .unwrap();
 
@@ -513,10 +539,13 @@ mod tests {
     async fn the_sweeper_keeps_unfinished_work_however_old() {
         let s = store();
         let queued = s
-            .enqueue("still waiting", None, None, 0, None)
+            .enqueue("still waiting", None, None, 0, None, None)
             .await
             .unwrap();
-        let done = s.enqueue("finished", None, None, 0, None).await.unwrap();
+        let done = s
+            .enqueue("finished", None, None, 0, None, None)
+            .await
+            .unwrap();
         s.claim_next(None).await.unwrap();
         s.finish(&done.id, "result").await.unwrap();
 
@@ -534,7 +563,7 @@ mod tests {
     async fn the_worker_records_the_conversation_it_opened() {
         let s = store();
         let task = s
-            .enqueue("fresh thread", None, None, 0, None)
+            .enqueue("fresh thread", None, None, 0, None, None)
             .await
             .unwrap();
         assert!(task.conversation_id.is_none());
@@ -548,22 +577,86 @@ mod tests {
     async fn a_hop_budget_round_trips_and_never_goes_negative() {
         let s = store();
         let task = s
-            .enqueue("delegate onward", None, None, 2, None)
+            .enqueue("delegate onward", None, None, 2, None, None)
             .await
             .unwrap();
         assert_eq!(task.hop_budget, 2);
 
         // A caller cannot ask for a negative budget and have it read back
         // as anything other than "no further hops".
-        let task = s.enqueue("no hops", None, None, -5, None).await.unwrap();
+        let task = s
+            .enqueue("no hops", None, None, -5, None, None)
+            .await
+            .unwrap();
         assert_eq!(task.hop_budget, 0);
+    }
+
+    #[tokio::test]
+    async fn a_requested_tool_limit_round_trips() {
+        let s = store();
+        let task = s
+            .enqueue(
+                "read-only please",
+                None,
+                None,
+                0,
+                Some(vec!["read".to_string(), "web_fetch".to_string()]),
+                None,
+            )
+            .await
+            .unwrap();
+        let reloaded = s.get(&task.id).await.unwrap().unwrap();
+        assert_eq!(
+            reloaded.allowed_tools,
+            Some(vec!["read".to_string(), "web_fetch".to_string()])
+        );
+
+        // No preference stays absent rather than becoming an empty list —
+        // the two mean opposite things to the node's ceiling.
+        let task = s
+            .enqueue("anything goes", None, None, 0, None, None)
+            .await
+            .unwrap();
+        let reloaded = s.get(&task.id).await.unwrap().unwrap();
+        assert_eq!(reloaded.allowed_tools, None);
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_tool_limit_allows_nothing() {
+        // A corrupt column must not read back as "no preference", which
+        // would silently widen the ceiling to whatever the node permits.
+        let s = store();
+        let task = s
+            .enqueue(
+                "limited",
+                None,
+                None,
+                0,
+                Some(vec!["read".to_string()]),
+                None,
+            )
+            .await
+            .unwrap();
+        {
+            let conn = s.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE delegated_tasks SET allowed_tools = 'not json' WHERE id = ?1",
+                params![task.id],
+            )
+            .unwrap();
+        }
+        let reloaded = s.get(&task.id).await.unwrap().unwrap();
+        assert_eq!(reloaded.allowed_tools, Some(Vec::new()));
     }
 
     #[tokio::test]
     async fn tasks_list_newest_first() {
         let s = store();
-        s.enqueue("first", None, None, 0, None).await.unwrap();
-        let second = s.enqueue("second", None, None, 0, None).await.unwrap();
+        s.enqueue("first", None, None, 0, None, None).await.unwrap();
+        let second = s
+            .enqueue("second", None, None, 0, None, None)
+            .await
+            .unwrap();
         let listed = s.list(10).await.unwrap();
         assert_eq!(listed.len(), 2);
         assert_eq!(listed[0].id, second.id);

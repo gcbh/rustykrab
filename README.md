@@ -204,6 +204,7 @@ All configuration is via environment variables. No plaintext config files.
 | `OPENAI_MAX_TOKENS` | `8192` | Max tokens to generate per response |
 | `OPENAI_INCLUDE_USAGE` | `1` | Request usage in the final stream chunk; set `0` for servers that reject `stream_options` |
 | `RUSTYKRAB_NODES` | unset | JSON array of peer instances the `nodes` tool can delegate to: `{id, url, token, description, hop_budget}`. `hop_budget` defaults to `0`, which denies the node onward delegation. See [Delegating to a peer node](#delegating-to-a-peer-node) |
+| `RUSTYKRAB_DELEGATION_TOOLS` | unset | On a *node*: which tools a task delegated by a peer may use. Unset applies the default posture (everything registered except the credential family, `message` and `gateway`); `all` lifts the allowlist but not those fixed denials; a comma-separated list names the only tools a delegated run may touch. Node-authoritative — a submitting peer can narrow this per task but never widen it. The sub-agent tool family is withheld from delegated runs unconditionally |
 | `RUSTYKRAB_NODE_TIMEOUT_SECS` | `900` | HTTP timeout for calls to a peer. Since delegation is asynchronous these calls are short (submit, poll, cancel); the generous default now only covers the fallback path against a peer too old to have the task queue |
 | `CHROME_CDP_URL` | `ws://127.0.0.1:9222` | Chrome DevTools Protocol endpoint |
 | `RUSTYKRAB_AUTH_TOKEN` | auto-generated | Bearer token for API auth |
@@ -505,6 +506,17 @@ list the other — the natural configuration when the node is another copy of
 the same program — bounce a task between them indefinitely at minutes of
 local inference per hop. The local `subagents` depth counter cannot help,
 because it is process-local.
+
+**A delegated run is scoped on the node, not by the caller.** The task text
+is composed by the *peer's model*, so anything that reached that peer as
+untrusted input — a fetched page, a search result — can arrive here phrased
+as an instruction. So the node withholds the credential family, `message`
+and `gateway` from every delegated run, and withholds the sub-agent tool
+family unconditionally: a node is a sub-agent, and work it needs to break up
+it queues for itself rather than spawning further agents. Narrow it further
+with `RUSTYKRAB_DELEGATION_TOOLS`. A submitting peer may request a tighter
+limit still (`allowedTools` on the task), which intersects with the node's
+policy and can never widen it.
 
 See `scripts/setup-delegation-node.md` for standing up a node, exposing it
 safely (Tailscale Serve, not the raw gateway port), and measured latency
