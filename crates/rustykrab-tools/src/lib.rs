@@ -1,6 +1,7 @@
 #![recursion_limit = "512"]
 
 // Security utilities
+pub mod credential_link;
 pub mod origin_key;
 pub mod sanitize;
 pub mod security;
