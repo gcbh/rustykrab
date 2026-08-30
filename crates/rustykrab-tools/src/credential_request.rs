@@ -58,7 +58,25 @@ impl Tool for CredentialRequestTool {
          {\"name\": \"gmail_app_password\", \"service\": \"Gmail\", \
          \"reason\": \"to search your inbox\", \"fields\": [\
          {\"key\": \"gmail_email\", \"label\": \"Gmail address\", \"secret\": false}, \
-         {\"key\": \"gmail_app_password\", \"label\": \"App password\", \"secret\": true}]}"
+         {\"key\": \"gmail_app_password\", \"label\": \"App password\", \"secret\": true}]}\n\n\
+         For a website login, name the keys after the site's host so the same \
+         site always gets the same names: web_<host>_username and \
+         web_<host>_password, with every dot and dash written as an \
+         underscore. https://portal.example.com/login therefore gives \
+         web_portal_example_com_username and web_portal_example_com_password. \
+         Drop any leading 'www.'. Getting this right matters — the browser \
+         looks the credential up under exactly this name.\n\n\
+         Example — a website login:\n\
+         {\"name\": \"web_portal_example_com_password\", \"service\": \
+         \"portal.example.com\", \"reason\": \"to download your invoice\", \
+         \"fields\": [\
+         {\"key\": \"web_portal_example_com_username\", \"label\": \"Username\", \"secret\": false}, \
+         {\"key\": \"web_portal_example_com_password\", \"label\": \"Password\", \"secret\": true}]}\n\n\
+         Once stored, sign in with browser(action='fill_credential', ref=..., \
+         field='username'|'password') — it types the value straight into the \
+         page. Never read a password back with credential_read to type it \
+         yourself: that puts it in this conversation, which is the one thing \
+         this whole flow exists to avoid."
     }
 
     fn schema(&self) -> ToolSchema {
