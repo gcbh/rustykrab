@@ -11,6 +11,7 @@ mod recall_archive;
 pub mod registry;
 mod secret;
 mod slack_chat_map;
+mod tasks;
 
 use std::path::Path;
 use std::sync::Arc;
@@ -31,6 +32,7 @@ pub use outcomes::OutcomeStore;
 pub use recall_archive::RecallArchiveStore;
 pub use secret::{SecretMeta, SecretStore, WriteAuthority};
 pub use slack_chat_map::SlackChatMapStore;
+pub use tasks::{DelegatedTask, TaskStatus, TaskStore};
 
 /// Top-level database handle wrapping a SQLite connection.
 ///
@@ -222,6 +224,28 @@ impl Store {
                 revoked_at   INTEGER,
                 push_token   TEXT
             );
+
+            -- Tasks a peer node delegated to this instance. The caller
+            -- holds only the id, so the row is the authoritative record of
+            -- a delegation's progress and result.
+            CREATE TABLE IF NOT EXISTS delegated_tasks (
+                id              TEXT PRIMARY KEY,
+                message         TEXT NOT NULL,
+                conversation_id TEXT,
+                status          TEXT NOT NULL,
+                result          TEXT,
+                error           TEXT,
+                principal       TEXT,
+                hop_budget      INTEGER NOT NULL DEFAULT 0,
+                trace_id        TEXT,
+                created_at      TEXT NOT NULL,
+                started_at      TEXT,
+                finished_at     TEXT
+            );
+
+            -- The worker's only hot query is the oldest queued task.
+            CREATE INDEX IF NOT EXISTS idx_delegated_tasks_queue
+                ON delegated_tasks (status, created_at);
 
             -- One-time pairing codes: hashed, short-lived, single use.
             CREATE TABLE IF NOT EXISTS pairing_codes (
@@ -492,6 +516,12 @@ impl Store {
     /// Handle for paired devices and pairing codes.
     pub fn devices(&self) -> DeviceStore {
         DeviceStore::new(Arc::clone(&self.conn))
+    }
+
+    /// Return a handle for the delegated-task queue drained by the
+    /// node worker (`rustykrab_gateway::tasks`).
+    pub fn tasks(&self) -> TaskStore {
+        TaskStore::new(Arc::clone(&self.conn))
     }
 
     /// Return a handle for scheduled-job operations.

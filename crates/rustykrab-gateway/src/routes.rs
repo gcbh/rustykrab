@@ -57,6 +57,8 @@ pub fn api_routes() -> Router<AppState> {
             "/api/credential-requests/{id}/fulfil",
             post(fulfil_credential_request),
         )
+        .route("/api/tasks", post(submit_task).get(list_tasks))
+        .route("/api/tasks/{id}", get(get_task).delete(cancel_task))
         .route("/api/pair", post(pair_device))
         .route("/api/devices", get(list_devices))
         .route("/api/devices/{id}", axum::routing::delete(revoke_device))
@@ -409,6 +411,187 @@ async fn send_message(
         }
     };
     Ok(Json(response))
+}
+
+// ---------------------------------------------------------------------------
+// Delegated tasks
+//
+// The asynchronous half of peer delegation: a peer submits work and gets
+// an id back at once, then polls. The synchronous alternative — holding
+// the HTTP request open for the whole agent turn — cannot work here,
+// because a delegated task on a local model routinely runs for minutes
+// and the caller's own tool-call timeout fires long before it returns.
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct SubmitTaskRequest {
+    /// The instruction to run. Self-contained: this node does not share
+    /// the caller's conversation.
+    message: String,
+    /// Continue an earlier delegated thread instead of opening a fresh
+    /// conversation. Worth passing whenever the work is a follow-up: a
+    /// continued thread reuses its evaluated prompt prefix, where a new
+    /// one re-prefills the whole system prompt and tool schemas.
+    #[serde(default, rename = "conversationId")]
+    conversation_id: Option<String>,
+    /// How many further delegation hops this task may make. Absent or
+    /// zero means the run may not delegate onward at all.
+    #[serde(default, rename = "hopBudget")]
+    hop_budget: Option<i64>,
+    /// The caller's trace id, so one delegation is greppable across both
+    /// machines' logs.
+    #[serde(default, rename = "traceId")]
+    trace_id: Option<String>,
+}
+
+#[derive(Serialize)]
+struct TaskResponse {
+    id: String,
+    status: String,
+    #[serde(rename = "conversationId", skip_serializing_if = "Option::is_none")]
+    conversation_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    #[serde(rename = "createdAt")]
+    created_at: String,
+    #[serde(rename = "startedAt", skip_serializing_if = "Option::is_none")]
+    started_at: Option<String>,
+    #[serde(rename = "finishedAt", skip_serializing_if = "Option::is_none")]
+    finished_at: Option<String>,
+    /// Seconds the task has been alive, so a caller can report progress
+    /// without tracking submission time itself.
+    #[serde(rename = "elapsedSecs")]
+    elapsed_secs: i64,
+}
+
+impl TaskResponse {
+    fn from_task(task: rustykrab_store::DelegatedTask) -> Self {
+        let until = task.finished_at.unwrap_or_else(Utc::now);
+        Self {
+            id: task.id,
+            status: task.status.as_str().to_string(),
+            conversation_id: task.conversation_id,
+            result: task.result,
+            error: task.error,
+            created_at: task.created_at.to_rfc3339(),
+            started_at: task.started_at.map(|t| t.to_rfc3339()),
+            finished_at: task.finished_at.map(|t| t.to_rfc3339()),
+            elapsed_secs: (until - task.created_at).num_seconds().max(0),
+        }
+    }
+}
+
+/// Accept a delegated task and return its handle. Runs nothing inline —
+/// the worker picks it up.
+async fn submit_task(
+    State(state): State<AppState>,
+    Extension(TraceId(trace_id)): Extension<TraceId>,
+    principal: Option<Extension<rustykrab_store::Principal>>,
+    Json(body): Json<SubmitTaskRequest>,
+) -> Result<(StatusCode, Json<TaskResponse>), StatusCode> {
+    if body.message.len() > MAX_MESSAGE_SIZE {
+        return Err(StatusCode::PAYLOAD_TOO_LARGE);
+    }
+    if body.message.trim().is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    // Attribute the task to the peer that sent it. Without this a
+    // delegated turn is indistinguishable from local user input in the
+    // node's own logs.
+    let who = principal.map(|Extension(p)| p.describe());
+
+    // Fall back to this request's own trace id so the task is always
+    // correlatable, even from a caller that sends none.
+    let trace = body
+        .trace_id
+        .clone()
+        .unwrap_or_else(|| trace_id.to_string());
+
+    let task = state
+        .store
+        .tasks()
+        .enqueue(
+            &body.message,
+            body.conversation_id.as_deref(),
+            who.as_deref(),
+            body.hop_budget.unwrap_or(0),
+            Some(&trace),
+        )
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "could not enqueue delegated task");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    tracing::info!(
+        task_id = %task.id,
+        principal = task.principal.as_deref().unwrap_or("unknown"),
+        "accepted delegated task"
+    );
+    state.task_signal.wake();
+
+    Ok((StatusCode::ACCEPTED, Json(TaskResponse::from_task(task))))
+}
+
+async fn get_task(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<TaskResponse>, StatusCode> {
+    match state.store.tasks().get(&id).await {
+        Ok(Some(task)) => Ok(Json(TaskResponse::from_task(task))),
+        Ok(None) => Err(StatusCode::NOT_FOUND),
+        Err(e) => {
+            tracing::error!(error = %e, "could not read delegated task");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+/// Recent tasks, newest first. Bounded so a long-lived node cannot
+/// return an unbounded history.
+async fn list_tasks(State(state): State<AppState>) -> Result<Json<Vec<TaskResponse>>, StatusCode> {
+    match state.store.tasks().list(50).await {
+        Ok(tasks) => Ok(Json(
+            tasks.into_iter().map(TaskResponse::from_task).collect(),
+        )),
+        Err(e) => {
+            tracing::error!(error = %e, "could not list delegated tasks");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+/// Cancel a task. Marks the row terminal, and additionally aborts the
+/// agent loop when the task is already running — otherwise a cancel
+/// would return promptly while the node kept burning inference on work
+/// nobody will collect.
+async fn cancel_task(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<TaskResponse>, StatusCode> {
+    let previous = state.store.tasks().cancel(&id).await.map_err(|e| {
+        tracing::error!(error = %e, "could not cancel delegated task");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    let Some(previous) = previous else {
+        return Err(StatusCode::NOT_FOUND);
+    };
+    if previous == rustykrab_store::TaskStatus::Running {
+        let aborted = state.task_signal.abort(&id);
+        tracing::info!(task_id = %id, aborted, "cancelled a running delegated task");
+    }
+
+    match state.store.tasks().get(&id).await {
+        Ok(Some(task)) => Ok(Json(TaskResponse::from_task(task))),
+        Ok(None) => Err(StatusCode::NOT_FOUND),
+        Err(e) => {
+            tracing::error!(error = %e, "could not read cancelled task");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
 }
 
 /// Look for embedded app specs in an assistant message. Today the

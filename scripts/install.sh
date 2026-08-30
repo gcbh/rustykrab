@@ -69,8 +69,14 @@ PB=(/usr/libexec/PlistBuddy -c)
 "${PB[@]}" "Add :EnvironmentVariables:HOME string $HOME" "$PLIST"
 "${PB[@]}" 'Add :EnvironmentVariables:PATH string /opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin' "$PLIST"
 
+# RUSTYKRAB_NODES carries a peer's bearer token, so it lands in a plist
+# that is chmod 600 below -- the same posture as the systemd EnvironmentFile
+# documented in the README. Without forwarding it, a daemon installed as a
+# LaunchAgent can never be configured to delegate, whatever the installing
+# shell had exported.
 for key in RUSTYKRAB_PROVIDER RUSTYKRAB_PORT RUSTYKRAB_WEB_UI RUST_LOG \
     OLLAMA_BASE_URL OLLAMA_MODEL OLLAMA_NUM_CTX RUSTYKRAB_NUM_CTX \
+    RUSTYKRAB_NODES RUSTYKRAB_NODE_TIMEOUT_SECS \
     TELEGRAM_ALLOWED_CHATS TELEGRAM_BOT_TOKEN; do
     if [[ -n "${!key:-}" ]]; then
         "${PB[@]}" "Add :EnvironmentVariables:$key string ${!key}" "$PLIST"

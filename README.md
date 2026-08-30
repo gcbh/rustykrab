@@ -203,8 +203,8 @@ All configuration is via environment variables. No plaintext config files.
 | `OPENAI_TEMPERATURE` | `0.1` | Sampling temperature |
 | `OPENAI_MAX_TOKENS` | `8192` | Max tokens to generate per response |
 | `OPENAI_INCLUDE_USAGE` | `1` | Request usage in the final stream chunk; set `0` for servers that reject `stream_options` |
-| `RUSTYKRAB_NODES` | unset | JSON array of peer instances the `nodes` tool can delegate to. See [Delegating to a peer node](#delegating-to-a-peer-node) |
-| `RUSTYKRAB_NODE_TIMEOUT_SECS` | `900` | Per-request timeout for delegated tasks. Generous by default: a peer running a local model at single-digit tokens/sec can legitimately take minutes |
+| `RUSTYKRAB_NODES` | unset | JSON array of peer instances the `nodes` tool can delegate to: `{id, url, token, description, hop_budget}`. `hop_budget` defaults to `0`, which denies the node onward delegation. See [Delegating to a peer node](#delegating-to-a-peer-node) |
+| `RUSTYKRAB_NODE_TIMEOUT_SECS` | `900` | HTTP timeout for calls to a peer. Since delegation is asynchronous these calls are short (submit, poll, cancel); the generous default now only covers the fallback path against a peer too old to have the task queue |
 | `CHROME_CDP_URL` | `ws://127.0.0.1:9222` | Chrome DevTools Protocol endpoint |
 | `RUSTYKRAB_AUTH_TOKEN` | auto-generated | Bearer token for API auth |
 | `RUSTYKRAB_MASTER_KEY` | auto-generated | Encryption key for secrets at rest |
@@ -474,16 +474,41 @@ export RUSTYKRAB_NODES='[
     "id": "m4max",
     "url": "https://your-node.your-tailnet.ts.net",
     "token": "<the node auth token>",
-    "description": "M4 Max 32GB — qwen3.8:27b-mlx. Slower but capable; good for self-contained coding tasks with its own checkout at ~/code/rustycrab."
+    "description": "M4 Max 32GB — qwen3.8:27b-mlx. Slower but capable; good for self-contained coding tasks with its own checkout at ~/code/rustycrab.",
+    "hop_budget": 0
   }
 ]'
 ```
 
-The `nodes` tool (`list`, `discover`, `send`) is hidden from the model until
-`RUSTYKRAB_NODES` is set. See `scripts/setup-delegation-node.md` for standing
-up a node, exposing it safely (Tailscale Serve, not the raw gateway port),
-and measured latency expectations — a delegated task on a local model
-typically takes minutes, not seconds.
+The `nodes` tool (`list`, `discover`, `send`, `check`, `cancel`) is hidden
+from the model until `RUSTYKRAB_NODES` is set.
+
+**Delegation is asynchronous.** `send` submits the task and returns a
+`task_id` in about a second; the node runs it in the background and the
+model collects the result with `check` on a later turn. That split is not a
+convenience — a delegated task on a local model routinely runs for minutes,
+and the agent loop caps a network tool call at 120 seconds, so a synchronous
+delegation would be killed on the caller while the node kept working on a
+result nobody could collect. `cancel` calls one off, aborting it mid-run if
+the node has already started.
+
+Pass the `conversation_id` from a previous `check` back into the next `send`
+to continue the same thread on the node. Worth doing for any follow-up: a
+continued thread reuses the prompt prefix the node already evaluated, where
+a fresh one re-reads the whole system prompt and tool schemas first — a
+measured 79.5s versus 3.3s on the same machine.
+
+`hop_budget` is the recursion guard, and defaults to `0`. A node given zero
+hops runs the task itself and is denied the `nodes` tool outright, so it
+cannot hand any part of the work onward. Without this, two peers that each
+list the other — the natural configuration when the node is another copy of
+the same program — bounce a task between them indefinitely at minutes of
+local inference per hop. The local `subagents` depth counter cannot help,
+because it is process-local.
+
+See `scripts/setup-delegation-node.md` for standing up a node, exposing it
+safely (Tailscale Serve, not the raw gateway port), and measured latency
+expectations.
 
 ## Architecture
 

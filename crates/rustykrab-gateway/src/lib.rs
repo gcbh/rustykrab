@@ -8,6 +8,7 @@ pub mod rate_limit;
 mod routes;
 mod signal_webhook;
 mod state;
+pub mod tasks;
 mod telegram_webhook;
 mod webchat;
 
@@ -20,6 +21,7 @@ pub use origin::OriginPolicy;
 pub use push::{ApnsClient, ApnsConfig, ApnsEnvironment, PushNotifier};
 pub use rate_limit::RateLimitConfig;
 pub use state::AppState;
+pub use tasks::{run_task_worker, TaskQueueSignal};
 
 use axum::extract::Request;
 use axum::http::header;

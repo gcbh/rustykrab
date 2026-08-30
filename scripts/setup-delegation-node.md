@@ -14,11 +14,59 @@ Consequences worth planning around:
   files on the primary.
 - **Results come back as text**, not as edits on the primary. To move actual code,
   have the node commit and push a branch, then pull it here.
-- **Each `send` starts a fresh conversation** on the node, so the message must be
-  self-contained — restate the goal, paths, and constraints every time.
+- **The message must be self-contained** — restate the goal, paths, and
+  constraints. The node does not share the primary's conversation.
 
 If what you want is "one agent, more compute", this is not that. It is "a second,
 independent agent you can hand a well-specified job to."
+
+## How a delegation runs
+
+`send` does not wait. It submits the task to the node's queue and returns a
+`task_id` in about a second; the model then does other work and collects the
+result with `check` on a later turn.
+
+```
+nodes send   -> {"task_id": "...", "status": "queued"}
+nodes check  -> {"status": "running", "elapsed_secs": 94}
+nodes check  -> {"status": "done", "response": "...", "conversation_id": "..."}
+nodes cancel -> {"status": "cancelled"}      # aborts it mid-run if started
+```
+
+Three things follow from that shape:
+
+- **A long task no longer dies on the caller.** The agent loop caps a network
+  tool call at 120 seconds. A synchronous delegation exceeded that on anything
+  real — the caller timed out while the node kept running, and the result was
+  unreachable.
+- **The node runs one task at a time.** Its model has a single KV-cache slot
+  (`OLLAMA_NUM_PARALLEL=1`), so interleaving two delegated conversations evicts
+  both prompt prefixes; serialising is faster than sharing. Queued work is
+  drained oldest-first, except that a task continuing the conversation the node
+  just ran is preferred — that thread's prefix is still warm.
+- **Follow-ups should continue the thread.** Pass the `conversation_id` from
+  `check` back into the next `send`. On this hardware a fresh thread spent 79.5s
+  evaluating its own prompt before answering; the second turn of the same thread
+  spent 3.3s.
+
+Tasks survive a restart of either machine: the queue is persisted, and a task
+the node was mid-way through when it died is reported as failed rather than
+left pending forever.
+
+## Recursion
+
+`hop_budget` on a node entry says how many further delegations the work may
+make, and defaults to `0`. At zero the node is denied the `nodes` tool for that
+run, so it cannot hand any part of the task onward.
+
+This matters specifically because the node is another copy of the same program.
+If it also lists the primary in its own `RUSTYKRAB_NODES`, a task can bounce
+between the two machines indefinitely, costing minutes of local inference per
+hop. The `subagents` tool's depth counter does not help — it is process-local
+and does not cross the network.
+
+If a node genuinely needs to break work into parts, it should queue those parts
+for itself rather than delegate them outward.
 
 ## 1. On the node machine
 
@@ -104,14 +152,19 @@ export RUSTYKRAB_NODE_TIMEOUT_SECS=1800
 Restart the primary so it picks up the config. The `nodes` tool stays hidden from
 the model until `RUSTYKRAB_NODES` is set.
 
+If the primary runs as an installed LaunchAgent rather than from a shell,
+re-run `scripts/install.sh` after exporting these: the installer copies a fixed
+list of variables into the plist, and a daemon started by launchd sees only
+what is in there.
+
 ## 4. Verify
 
 ```bash
 RUSTYKRAB_NODES='...' cargo test -p rustykrab-tools --test nodes_live -- --ignored --nocapture
 ```
 
-That checks `list`, `discover` (reachability + latency), and a real `send` round
-trip.
+That checks `list`, `discover` (reachability + latency), a real submit-and-poll
+round trip, and a cancel.
 
 ## Measured tuning findings
 
@@ -143,8 +196,8 @@ Four things worth knowing, three of which contradict commonly repeated advice:
 **Multi-turn is much cheaper than cold turns.** In a two-turn conversation with a
 ~4.9k-token system prompt, turn 1 paid 79.5 s of prefill and turn 2 paid only
 **3.3 s** — the slot cache reuses the prefix. Long-running conversations amortize
-well; it is *fresh* delegated tasks that pay full price. Since every `nodes send`
-starts a new conversation, each delegation is a cold turn by construction.
+well; it is *fresh* delegated tasks that pay full price. `send` accepts a
+`conversation_id` precisely so a follow-up need not be one.
 
 ## Performance expectations
 
@@ -163,6 +216,8 @@ Plan accordingly:
 
 - Delegate **batch or background work**, not anything interactive.
 - Prefer **few large tasks** over many small ones — per-task overhead dominates.
+- Continue a thread rather than opening a new one, which is what turns that
+  per-task overhead from ~80s into ~3s.
 - Benchmark the node first with `scripts/bench-local-models.md`. If prompt
   processing there is slow, every delegated task inherits it.
 - A faster model on the node often beats a smarter one, because the overhead is
