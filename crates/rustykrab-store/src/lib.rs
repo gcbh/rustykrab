@@ -237,6 +237,7 @@ impl Store {
                 error           TEXT,
                 principal       TEXT,
                 hop_budget      INTEGER NOT NULL DEFAULT 0,
+                allowed_tools   TEXT,
                 trace_id        TEXT,
                 created_at      TEXT NOT NULL,
                 started_at      TEXT,

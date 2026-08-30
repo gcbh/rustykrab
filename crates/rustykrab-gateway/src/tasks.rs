@@ -256,7 +256,7 @@ async fn execute(state: AppState, task: DelegatedTask) -> Result<TaskReply, Stri
         .unwrap_or_else(Uuid::new_v4);
 
     let options = RunOptions {
-        denied_tools: denied_tools_for(&task),
+        denied_tools: denied_tools_for(&available_tool_names(&state), &task),
         ..RunOptions::default()
     };
 
@@ -288,19 +288,102 @@ async fn execute(state: AppState, task: DelegatedTask) -> Result<TaskReply, Stri
     })
 }
 
-/// Tools a delegated run may not use, given its remaining hop budget.
+/// Tool names this node currently offers, which the ceiling is expressed
+/// against — a denial only means anything for a tool that exists.
+fn available_tool_names(state: &AppState) -> Vec<&str> {
+    state
+        .tools
+        .iter()
+        .filter(|t| t.available())
+        .map(|t| t.name())
+        .collect()
+}
+
+/// Tools withheld from every delegated run regardless of configuration.
 ///
-/// With no hops left the node may not delegate onward. That is the
-/// cross-machine analogue of the local recursion guard in the
-/// `subagents` tool, and without it a node whose own `RUSTYKRAB_NODES`
-/// points back at the primary would recurse indefinitely — each hop
-/// costing minutes of local inference.
-fn denied_tools_for(task: &DelegatedTask) -> Vec<String> {
-    if task.hop_budget > 0 {
-        Vec::new()
-    } else {
-        vec!["nodes".to_string()]
+/// The credential family and the outbound `message` tool are the two
+/// ways a delegated instruction could reach past the task it was given —
+/// into this machine's stored secrets, or out through its own Telegram
+/// and Signal accounts. A delegated instruction is composed by the
+/// peer's *model*, so anything that reaches the peer as untrusted text
+/// (a fetched web page, a search result) can end up phrased as a task
+/// for this node. Withholding these here means the node's own operator
+/// decides that, not the sentence that arrived over the network.
+const ALWAYS_DENIED: &[&str] = &[
+    "credential_read",
+    "credential_write",
+    "credential_request",
+    "message",
+    "gateway",
+];
+
+/// Tools a delegated run may use, as configured on this node.
+///
+/// `RUSTYKRAB_DELEGATION_TOOLS` is node-authoritative: unset applies the
+/// default posture below, `all` lifts it, and a comma-separated list
+/// names the only tools a delegated run may use. The submitting peer can
+/// narrow this further per task but can never widen it — this machine
+/// decides what a peer may do on it, not the peer.
+fn configured_allowlist() -> Option<Vec<String>> {
+    let raw = std::env::var("RUSTYKRAB_DELEGATION_TOOLS").ok()?;
+    let raw = raw.trim();
+    if raw.is_empty() || raw.eq_ignore_ascii_case("all") {
+        return None;
     }
+    Some(
+        raw.split(',')
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+            .collect(),
+    )
+}
+
+/// Tools this particular delegated run may not use.
+///
+/// Three layers, most specific last:
+///
+/// 1. The sub-agent family, always. A node is a sub-agent; letting it
+///    spawn its own would make the topology a tree of unknown depth
+///    across machines. Work it needs to break up, it queues for itself.
+/// 2. [`ALWAYS_DENIED`], plus anything outside this node's configured
+///    allowlist.
+/// 3. `nodes`, once the hop budget is spent, so the task cannot be
+///    handed onward. Without it two peers listing each other bounce a
+///    task between them indefinitely, at minutes of local inference per
+///    hop; the `subagents` depth counter cannot help, being process-local.
+fn denied_tools_for(available: &[&str], task: &DelegatedTask) -> Vec<String> {
+    let mut denied: Vec<String> = rustykrab_core::capability::SUBAGENT_TOOL_NAMES
+        .iter()
+        .map(|t| t.to_string())
+        .collect();
+    denied.extend(ALWAYS_DENIED.iter().map(|t| t.to_string()));
+
+    if let Some(allowed) = configured_allowlist() {
+        for name in available {
+            if !allowed.iter().any(|a| a == name) {
+                denied.push((*name).to_string());
+            }
+        }
+    }
+
+    // Per-task narrowing from the submitting peer. Intersects with the
+    // above rather than replacing it: a task may ask for less than the
+    // node allows, never more.
+    if let Some(requested) = task.allowed_tools.as_ref() {
+        for name in available {
+            if !requested.iter().any(|a| a == name) {
+                denied.push((*name).to_string());
+            }
+        }
+    }
+
+    if task.hop_budget <= 0 {
+        denied.push("nodes".to_string());
+    }
+
+    denied.sort();
+    denied.dedup();
+    denied
 }
 
 /// Whether a status means the caller should keep polling.
@@ -312,6 +395,22 @@ pub fn is_pending(status: TaskStatus) -> bool {
 mod tests {
     use super::*;
 
+    /// A representative slice of what a node actually offers.
+    const AVAILABLE: &[&str] = &[
+        "read",
+        "write",
+        "exec",
+        "web_fetch",
+        "nodes",
+        "subagents",
+        "agents_list",
+        "credential_read",
+        "credential_write",
+        "credential_request",
+        "message",
+        "gateway",
+    ];
+
     fn task(hop_budget: i64) -> DelegatedTask {
         DelegatedTask {
             id: "t1".to_string(),
@@ -322,6 +421,7 @@ mod tests {
             error: None,
             principal: None,
             hop_budget,
+            allowed_tools: None,
             trace_id: None,
             created_at: Utc::now(),
             started_at: None,
@@ -329,11 +429,101 @@ mod tests {
         }
     }
 
+    fn denied(task: &DelegatedTask) -> Vec<String> {
+        denied_tools_for(AVAILABLE, task)
+    }
+
     #[test]
     fn a_spent_hop_budget_denies_onward_delegation() {
-        assert_eq!(denied_tools_for(&task(0)), vec!["nodes".to_string()]);
-        assert_eq!(denied_tools_for(&task(-1)), vec!["nodes".to_string()]);
-        assert!(denied_tools_for(&task(1)).is_empty());
+        assert!(denied(&task(0)).contains(&"nodes".to_string()));
+        assert!(denied(&task(-1)).contains(&"nodes".to_string()));
+        assert!(
+            !denied(&task(1)).contains(&"nodes".to_string()),
+            "a node with hops left may delegate onward"
+        );
+    }
+
+    #[test]
+    fn a_delegated_run_never_gets_the_subagent_family() {
+        // This is what makes the node a sub-agent rather than another
+        // orchestrator: it does its own work, and splits it by queueing
+        // for itself rather than spawning further agents.
+        let denied = denied(&task(5));
+        for tool in rustykrab_core::capability::SUBAGENT_TOOL_NAMES {
+            assert!(
+                denied.contains(&tool.to_string()),
+                "'{tool}' must be withheld from a delegated run"
+            );
+        }
+    }
+
+    #[test]
+    fn credentials_and_outbound_messaging_are_always_withheld() {
+        // A delegated instruction is composed by the peer's model, so it
+        // can carry text this node never vetted. It must not be able to
+        // reach this machine's secrets or send from its accounts.
+        let denied = denied(&task(0));
+        for tool in ALWAYS_DENIED {
+            assert!(
+                denied.contains(&tool.to_string()),
+                "'{tool}' must be withheld from a delegated run"
+            );
+        }
+        // Ordinary work is still possible.
+        assert!(!denied.contains(&"read".to_string()));
+        assert!(!denied.contains(&"exec".to_string()));
+    }
+
+    #[test]
+    fn a_task_can_narrow_the_ceiling_but_not_widen_it() {
+        let mut narrowed = task(9);
+        // Asks for read plus two tools the node always withholds.
+        narrowed.allowed_tools = Some(vec![
+            "read".to_string(),
+            "credential_read".to_string(),
+            "message".to_string(),
+        ]);
+        let denied = denied(&narrowed);
+
+        assert!(!denied.contains(&"read".to_string()), "read was requested");
+        // Everything else the node offers is now off, because the task
+        // asked to be limited.
+        assert!(denied.contains(&"exec".to_string()));
+        assert!(denied.contains(&"web_fetch".to_string()));
+        // And the request cannot buy back what the node withholds.
+        assert!(denied.contains(&"credential_read".to_string()));
+        assert!(denied.contains(&"message".to_string()));
+    }
+
+    #[test]
+    fn the_node_allowlist_overrides_what_a_task_may_touch() {
+        // Process-global: this is the only test that sets the var.
+        std::env::set_var("RUSTYKRAB_DELEGATION_TOOLS", "read, web_fetch");
+        let denied = denied(&task(0));
+        assert!(!denied.contains(&"read".to_string()));
+        assert!(!denied.contains(&"web_fetch".to_string()));
+        assert!(
+            denied.contains(&"exec".to_string()),
+            "a tool outside the node's allowlist must be withheld"
+        );
+
+        // `all` lifts the allowlist without lifting the fixed denials.
+        std::env::set_var("RUSTYKRAB_DELEGATION_TOOLS", "all");
+        let denied = denied_tools_for(AVAILABLE, &task(0));
+        assert!(!denied.contains(&"exec".to_string()));
+        assert!(denied.contains(&"credential_read".to_string()));
+
+        std::env::remove_var("RUSTYKRAB_DELEGATION_TOOLS");
+    }
+
+    #[test]
+    fn denials_are_deduplicated() {
+        // `nodes` can be denied by both the hop budget and an allowlist;
+        // the runner should see it once.
+        let denied = denied(&task(0));
+        let mut unique = denied.clone();
+        unique.dedup();
+        assert_eq!(denied, unique);
     }
 
     #[test]

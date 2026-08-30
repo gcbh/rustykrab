@@ -438,6 +438,11 @@ struct SubmitTaskRequest {
     /// zero means the run may not delegate onward at all.
     #[serde(default, rename = "hopBudget")]
     hop_budget: Option<i64>,
+    /// Tools the caller wants this task limited to. Intersected with this
+    /// node's own policy, never substituted for it — a peer can ask for
+    /// less than the node allows and never more.
+    #[serde(default, rename = "allowedTools")]
+    allowed_tools: Option<Vec<String>>,
     /// The caller's trace id, so one delegation is greppable across both
     /// machines' logs.
     #[serde(default, rename = "traceId")]
@@ -518,6 +523,7 @@ async fn submit_task(
             body.conversation_id.as_deref(),
             who.as_deref(),
             body.hop_budget.unwrap_or(0),
+            body.allowed_tools.clone(),
             Some(&trace),
         )
         .await

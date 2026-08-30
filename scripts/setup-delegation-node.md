@@ -224,11 +224,41 @@ Plan accordingly:
   paid per task regardless. Worth A/B-ing gemma4:26b against qwen3.8:27b on your
   actual workload before committing.
 
+## What a delegated task is allowed to do
+
+A delegated instruction is written by the *primary's model*, not by you. If
+something the primary read — a web page, a search result, an email — carried
+instructions, they can arrive on this node phrased as a task. So the node, not
+the caller, decides what a delegation may touch.
+
+Withheld from every delegated run, regardless of configuration:
+
+- the credential family (`credential_read`, `credential_write`,
+  `credential_request`) and the node's own stored secrets;
+- `message` and `gateway`, which would let a delegated task send from this
+  machine's Telegram or Signal accounts;
+- the sub-agent family (`subagents`, `agents_list`, `sessions_*`). This is what
+  makes the node a sub-agent rather than a second orchestrator.
+
+Narrow it further with an allowlist:
+
+```bash
+# Only these tools, for anything a peer delegates here.
+export RUSTYKRAB_DELEGATION_TOOLS='read,write,edit,apply_patch,exec,web_fetch'
+
+# Or lift the allowlist entirely (the fixed denials above still apply).
+export RUSTYKRAB_DELEGATION_TOOLS=all
+```
+
+The submitting peer can ask for a tighter limit per task, which intersects with
+this list. It cannot ask for more than the node allows.
+
 ## Security notes
 
 - Auth is the node's **bearer token**, over a private network. Treat the token as
   a credential: it grants full agent access, including shell execution on that
-  machine.
+  machine. `RUSTYKRAB_DELEGATION_TOOLS` bounds what a *delegated task* may do;
+  it does not bound what the token can do through the rest of the API.
 - Keep the node bound to loopback and reach it via tailnet or SSH. Do not expose
   the gateway port directly.
 - `nodes list` deliberately never returns tokens — tool output goes into the
