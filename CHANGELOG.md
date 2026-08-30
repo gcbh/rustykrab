@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.1.41] - 2026-08-30
+
+- fix(credentials): record which conversation asked for a credential (#555)
+
 ## [5.1.40] - 2026-08-27
 
 - docs: fleet config and local-model benchmark script (#554)
