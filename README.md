@@ -507,6 +507,11 @@ the same program — bounce a task between them indefinitely at minutes of
 local inference per hop. The local `subagents` depth counter cannot help,
 because it is process-local.
 
+Prefer a paired token over the node's master token for the `token` field:
+run `rustykrab-cli pair` on the node and redeem the code from the primary
+with `POST /api/pair`. The result is accepted everywhere the master token
+is, but it is attributable in the node's logs and individually revocable.
+
 **A delegated run is scoped on the node, not by the caller.** The task text
 is composed by the *peer's model*, so anything that reached that peer as
 untrusted input — a fetched page, a search result — can arrive here phrased
