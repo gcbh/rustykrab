@@ -65,6 +65,29 @@ pub fn next_step(link: Option<&str>, service: &str) -> String {
     }
 }
 
+/// What to tell the model when the link is delivered out of band.
+///
+/// The model must not invent, guess, or promise a URL it has not been
+/// given — it has not been given one, on purpose. Its job is to say a
+/// request has been made and stop.
+pub fn next_step_out_of_band(link_queued: bool, service: &str) -> String {
+    if link_queued {
+        format!(
+            "Tell the user, in one sentence, that you have asked for their {service} \
+             details and that a secure link is being sent to them right now. Do NOT \
+             write a URL yourself — you have not been given one and any link you \
+             compose will be wrong. Do not ask for the value in chat. Stop this task \
+             until they answer."
+        )
+    } else {
+        format!(
+            "Tell the user you have asked for their {service} details and that a \
+             prompt is waiting in the Apollo app. Do not write a URL. Do not ask for \
+             the value in chat. Stop this task until they answer."
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -86,6 +109,25 @@ mod tests {
         // whole flow exists to avoid; neither branch may omit it.
         assert!(next_step(Some("https://x/c/t"), "Gmail").contains("Stop this task"));
         assert!(next_step(None, "Gmail").contains("Stop this task"));
+    }
+
+    #[test]
+    fn the_out_of_band_wording_never_hands_the_model_a_url() {
+        for queued in [true, false] {
+            let s = next_step_out_of_band(queued, "Gmail");
+            assert!(
+                !s.contains("http"),
+                "the model must not be given a URL to copy: {s}"
+            );
+            assert!(s.contains("Stop this task"), "{s}");
+            assert!(s.contains("Do not ask for the value in chat"), "{s}");
+        }
+    }
+
+    #[test]
+    fn it_tells_the_model_not_to_invent_a_link() {
+        assert!(next_step_out_of_band(true, "Gmail").contains("Do NOT"));
+        assert!(next_step_out_of_band(false, "Gmail").contains("Do not write a URL"));
     }
 
     #[test]
