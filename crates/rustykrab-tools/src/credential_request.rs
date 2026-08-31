@@ -71,6 +71,14 @@ impl Tool for CredentialRequestTool {
          this whole flow exists to avoid."
     }
 
+    /// Once the request is filed there is nothing further the agent can
+    /// do until the user answers, so the turn should end with one
+    /// sentence saying so — not be pushed toward a `task_complete` it
+    /// cannot honestly call.
+    fn blocks_turn(&self) -> bool {
+        true
+    }
+
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: self.name().to_string(),

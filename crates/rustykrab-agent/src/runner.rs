@@ -1399,6 +1399,11 @@ impl AgentRunner {
         // turn, but once the model has started using tools we expect an
         // explicit completion signal.
         let mut has_called_any_tool = false;
+        // Set when a tool reports the turn is now waiting on someone
+        // else. Not reset per iteration: once the agent has asked the
+        // user for something, every later EndTurn this run is a stop,
+        // not an early exit.
+        let mut turn_blocked = false;
         // Per-run cache of the schemas sent to the model, keyed by the
         // active-set version so activations performed by `tools_load`
         // during the previous iteration are reflected in the next API
@@ -1550,6 +1555,26 @@ impl AgentRunner {
                     }
                 }
 
+                // A tool that succeeded and blocks the turn (e.g. asking
+                // the user for a credential) means the right next move is
+                // one sentence and a stop.
+                if !turn_blocked {
+                    for (tool_name, _, result) in &results {
+                        if result.is_ok() {
+                            if let Some(t) = self.tool_index.get(tool_name) {
+                                if t.blocks_turn() {
+                                    turn_blocked = true;
+                                    tracing::info!(
+                                        tool = %tool_name,
+                                        "turn is blocked on the user — EndTurn will be accepted"
+                                    );
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+
                 let had_errors = results.iter().any(|(_, _, r)| {
                     if let Ok(tr) = r {
                         tr.output.get("error").is_some()
@@ -1646,7 +1671,7 @@ impl AgentRunner {
                     // working. Cap by `TASK_COMPLETE_RETRY_LIMIT` so models
                     // that never learn the protocol fall through to the
                     // legacy accept-and-return behavior.
-                    if has_called_any_tool {
+                    if has_called_any_tool && !turn_blocked {
                         match self.reprompt_for_task_complete(
                             conv,
                             iteration,
@@ -1849,6 +1874,11 @@ impl AgentRunner {
         let mut task_complete_retries: usize = 0;
         let mut had_side_effects = false;
         let mut has_called_any_tool = false;
+        // Set when a tool reports the turn is now waiting on someone
+        // else. Not reset per iteration: once the agent has asked the
+        // user for something, every later EndTurn this run is a stop,
+        // not an early exit.
+        let mut turn_blocked = false;
         // Per-run schema cache — see run_inner for rationale.
         let mut schema_cache: Option<(u64, Vec<ToolSchema>)> = None;
 
@@ -1991,6 +2021,26 @@ impl AgentRunner {
                     }
                 }
 
+                // A tool that succeeded and blocks the turn (e.g. asking
+                // the user for a credential) means the right next move is
+                // one sentence and a stop.
+                if !turn_blocked {
+                    for (tool_name, _, result) in &results {
+                        if result.is_ok() {
+                            if let Some(t) = self.tool_index.get(tool_name) {
+                                if t.blocks_turn() {
+                                    turn_blocked = true;
+                                    tracing::info!(
+                                        tool = %tool_name,
+                                        "turn is blocked on the user — EndTurn will be accepted"
+                                    );
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+
                 let had_errors = results.iter().any(|(_, _, r)| {
                     if let Ok(tr) = r {
                         tr.output.get("error").is_some()
@@ -2091,7 +2141,7 @@ impl AgentRunner {
                     // EndTurn no longer terminates: re-prompt the model to
                     // either call `task_complete` or keep working. See
                     // run_inner for the full rationale.
-                    if has_called_any_tool {
+                    if has_called_any_tool && !turn_blocked {
                         match self.reprompt_for_task_complete(
                             conv,
                             iteration,
@@ -5346,6 +5396,99 @@ mod task_complete_tests {
             })
             .count();
         assert_eq!(reminder_count, TASK_COMPLETE_RETRY_LIMIT);
+    }
+
+    /// A tool that blocks the turn, and is otherwise a noop.
+    struct BlockingTool;
+
+    #[async_trait]
+    impl Tool for BlockingTool {
+        fn name(&self) -> &str {
+            "ask_the_user"
+        }
+        fn description(&self) -> &str {
+            "test blocking tool"
+        }
+        fn schema(&self) -> ToolSchema {
+            ToolSchema {
+                name: "ask_the_user".into(),
+                description: "test blocking tool".into(),
+                parameters: serde_json::json!({"type": "object", "properties": {}}),
+            }
+        }
+        fn blocks_turn(&self) -> bool {
+            true
+        }
+        async fn execute(&self, _args: serde_json::Value) -> Result<serde_json::Value> {
+            Ok(serde_json::json!({"status": "requested"}))
+        }
+    }
+
+    fn runner_with_blocking_tool(provider: Arc<ScriptedProvider>) -> (AgentRunner, Session, Uuid) {
+        use rustykrab_tools::TaskCompleteTool;
+        let active = Arc::new(ActiveToolsRegistry::new());
+        let tools: Vec<Arc<dyn Tool>> =
+            vec![Arc::new(BlockingTool), Arc::new(TaskCompleteTool::new())];
+        let runner = AgentRunner::new(provider, tools, Arc::new(NoSandbox))
+            .with_active_tools(active.clone());
+        let conv_id = Uuid::new_v4();
+        active.activate(conv_id, ["ask_the_user"]);
+        let caps = CapabilitySet::for_tools_permissive(&["ask_the_user", "task_complete"]);
+        let session = Session::with_capabilities(conv_id, caps);
+        (runner, session, conv_id)
+    }
+
+    /// Asking the user for something is a legitimate reason to stop, and
+    /// the loop must let the turn end.
+    ///
+    /// Without this the runner demands `task_complete` after any tool
+    /// call. The model cannot honestly call it — the task is blocked, not
+    /// done — so it churns instead. Observed against gemma4:26b: the
+    /// agent filed a credential request at iteration 29 and was still
+    /// going at 46, calling `todo_write` and `exec` to fill the turns.
+    #[tokio::test]
+    async fn a_blocked_turn_ends_without_task_complete() {
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            tool_use_response("ask_the_user", serde_json::json!({})),
+            // The one sentence telling the user, then stop.
+            text_response("I've asked for your Gmail app password."),
+        ]));
+        let (runner, session, conv_id) = runner_with_blocking_tool(provider.clone());
+        let mut conv = make_conv();
+        conv.id = conv_id;
+
+        runner.run(&mut conv, &session).await.unwrap();
+
+        // Two calls: the tool use, and the sentence. A third would mean
+        // the runner re-prompted for `task_complete`.
+        assert_eq!(
+            *provider.chat_count.lock().unwrap(),
+            2,
+            "a blocked turn must not be re-prompted for task_complete"
+        );
+    }
+
+    /// The suppression is specific to blocking tools — an ordinary tool
+    /// followed by a bare EndTurn must still be re-prompted, or this fix
+    /// would disable the completion protocol wholesale.
+    #[tokio::test]
+    async fn a_normal_tool_is_still_reprompted() {
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            tool_use_response("noop", serde_json::json!({})),
+            text_response("I'll keep digging into this for you."),
+            tool_use_response("task_complete", serde_json::json!({ "summary": "done" })),
+        ]));
+        let (runner, session, conv_id) = make_runner(provider.clone());
+        let mut conv = make_conv();
+        conv.id = conv_id;
+
+        runner.run(&mut conv, &session).await.unwrap();
+
+        assert_eq!(
+            *provider.chat_count.lock().unwrap(),
+            3,
+            "a non-blocking tool must still be held to the completion protocol"
+        );
     }
 }
 
