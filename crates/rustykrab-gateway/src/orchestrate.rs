@@ -31,6 +31,14 @@ pub struct RunOptions {
     /// for scheduled tasks so the model can't waste the slot on a
     /// greeting.
     pub force_tool_use_first_iteration: bool,
+    /// Ceiling on agent iterations for this run, overriding the profile.
+    ///
+    /// The profile default is 200 (100 on the coding profile), which is a
+    /// budget rather than a safety net: a run that cannot make progress
+    /// spends all of it. Callers that know their work should be short --
+    /// a credential wake resuming one stalled turn -- say so here, so a
+    /// stuck run reports quickly instead of grinding.
+    pub max_iterations: Option<usize>,
     /// Tools this run may not use, withheld before capabilities are
     /// granted rather than rejected at call time — a tool the session
     /// has no capability for is never offered to the model, so it does
@@ -300,6 +308,9 @@ async fn prepare_agent(
 
     let mut agent_config = profile.to_agent_config();
     agent_config.force_tool_use_first_iteration = options.force_tool_use_first_iteration;
+    if let Some(cap) = options.max_iterations {
+        agent_config.max_iterations = cap;
+    }
 
     let mut runner = AgentRunner::new(
         state.provider.clone(),
