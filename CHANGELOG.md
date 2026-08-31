@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.2.4] - 2026-08-31
+
+- feat(credentials): send the link as its own message, not through the model (#571)
+
 ## [5.2.3] - 2026-08-31
 
 - docs(nodes): pair the primary instead of sharing the node's master token (#569)

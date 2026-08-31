@@ -19,11 +19,26 @@ use serde_json::{json, Value};
 /// a website's username and password are all the same request shape.
 pub struct CredentialRequestTool {
     requests: CredentialRequestStore,
+    /// Where a minted link waits until the turn has finished speaking.
+    ///
+    /// Optional so the tool still constructs without one; without it the
+    /// request is filed and answerable in the app, there is simply no
+    /// link to send.
+    pending_links: Option<rustykrab_store::PendingLinks>,
 }
 
 impl CredentialRequestTool {
     pub fn new(requests: CredentialRequestStore) -> Self {
-        Self { requests }
+        Self {
+            requests,
+            pending_links: None,
+        }
+    }
+
+    /// Deliver minted links out of band, after the turn.
+    pub fn with_pending_links(mut self, links: rustykrab_store::PendingLinks) -> Self {
+        self.pending_links = Some(links);
+        self
     }
 }
 
@@ -186,15 +201,32 @@ impl Tool for CredentialRequestTool {
         // Telegram or Signal there is no app in the loop — a tappable URL
         // is the only way to hand someone a password field from a chat
         // message.
+        // The link is minted here and handed to the deliverer, never to
+        // the model. Asking a model to relay 64 hex characters verbatim
+        // does not work reliably -- observed relaying 55 of 64, which the
+        // user opens to a page that says "Link expired" and cannot
+        // distinguish from a real timeout. Keeping it out of the result
+        // also keeps it out of the transcript, where a live credential
+        // capture URL would otherwise sit for as long as it works.
         let link = crate::credential_link::mint_link(&self.requests, &id).await;
-        let next_step = crate::credential_link::next_step(link.as_deref(), &where_to_look);
+        let queued = match (&self.pending_links, conversation_id, &link) {
+            (Some(pending), Some(conv), Some(url)) => {
+                pending.push(conv, url.clone());
+                true
+            }
+            _ => false,
+        };
+
+        let next_step = crate::credential_link::next_step_out_of_band(queued, &where_to_look);
 
         Ok(json!({
             "status": "requested",
             "request_id": id,
-            "link": link,
-            // Phrased for the model's next turn: it should tell the user
-            // and stop, not poll, and not carry on as if it had the value.
+            // Deliberately no link. Reporting whether one is on its way is
+            // enough for the model to describe what happens next.
+            "link_sent_separately": queued,
+            // Phrased for the model's next turn: tell the user and stop,
+            // do not poll, and do not carry on as if it had the value.
             "next_step": next_step
         }))
     }
