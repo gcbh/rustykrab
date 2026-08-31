@@ -22,6 +22,7 @@ use zeroize::Zeroizing;
 
 pub use chat_map::ChatMapStore;
 pub use conversation::{ConversationStore, ConversationSummary};
+pub mod pending_links;
 pub use credential_request::{
     CredentialRequest, CredentialRequestStore, RequestAction, RequestNotifier, RequestedField,
 };
@@ -29,6 +30,7 @@ pub use device::{Device, DeviceStore, Principal};
 pub use guarded::{GuardedSecrets, WriteOutcome};
 pub use jobs::{JobRun, JobStore, ScheduledJob};
 pub use outcomes::OutcomeStore;
+pub use pending_links::PendingLinks;
 pub use recall_archive::RecallArchiveStore;
 pub use secret::{SecretMeta, SecretStore, WriteAuthority};
 pub use slack_chat_map::SlackChatMapStore;
@@ -47,6 +49,9 @@ pub struct Store {
     request_notifier: Option<Arc<dyn credential_request::RequestNotifier>>,
     /// Where live credential values are kept. Never the database.
     credential_backend: Arc<dyn credential_backend::CredentialBackend>,
+    /// Credential links minted this turn, waiting to be sent to the user
+    /// once the agent has finished speaking. In memory only.
+    pending_links: PendingLinks,
 }
 
 impl Store {
@@ -84,6 +89,7 @@ impl Store {
             master_key: Zeroizing::new(master_key),
             request_notifier: None,
             credential_backend: credential_backend::default_backend(),
+            pending_links: PendingLinks::new(),
         })
     }
 
@@ -498,6 +504,13 @@ impl Store {
 
     /// Handle for the credential-change requests the agent files and the
     /// user resolves.
+    /// Links minted but not yet delivered.
+    ///
+    /// Shared handle: the tool pushes, the channel that just spoke takes.
+    pub fn pending_links(&self) -> PendingLinks {
+        self.pending_links.clone()
+    }
+
     pub fn credential_requests(&self) -> CredentialRequestStore {
         let requests = CredentialRequestStore::new(Arc::clone(&self.conn), self.secrets());
         match &self.request_notifier {

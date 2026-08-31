@@ -863,6 +863,7 @@ async fn main() -> anyhow::Result<()> {
         store.secrets(),
         store.guarded_secrets(),
         store.credential_requests(),
+        store.pending_links(),
     );
     tools.extend(rustykrab_tools::memory_tools(memory_backend.clone()));
     tools.extend(rustykrab_tools::skill_tools(
@@ -1775,6 +1776,16 @@ async fn telegram_agent_loop(
             // Send response back to Telegram (in the correct thread).
             if let Err(e) = tg.send_text(chat_id, &reply, thread_id).await {
                 tracing::error!(chat_id, thread_id, "failed to send Telegram reply: {e}");
+            }
+
+            // Then any credential link the turn asked for, as its own
+            // message. It goes after the agent's text so the user reads
+            // why before they are handed the form, and it never passed
+            // through the model, so it cannot have been truncated.
+            for link in state.store.pending_links().take(conv_id) {
+                if let Err(e) = tg.send_text(chat_id, &link, thread_id).await {
+                    tracing::error!(chat_id, thread_id, "failed to send credential link: {e}");
+                }
             }
         });
     }
