@@ -166,6 +166,44 @@ pub struct ValidatedUrl {
     pub host: String,
 }
 
+/// Hosts the operator has explicitly permitted to resolve to private
+/// addresses, from `RUSTYKRAB_SSRF_ALLOW_HOSTS` (comma-separated).
+///
+/// Empty by default, so the guard is unchanged unless someone opts in.
+///
+/// This exists because the blanket private-IP block makes the agent
+/// unable to reach anything on the machine's own network — including
+/// services the operator runs deliberately and reaches by name over a
+/// tailnet. Blocking those is not SSRF protection, it is a capability
+/// gap: the attack SSRF defends against is the agent being *talked into*
+/// reaching somewhere internal, not the operator naming a host up front.
+///
+/// Matching is exact and case-insensitive. No wildcards: a pattern like
+/// `*.example.com` is easy to write and hard to reason about, and the
+/// whole value of this list is that its entries are unambiguous.
+fn ssrf_allowed_hosts() -> Vec<String> {
+    parse_allow_hosts(&std::env::var("RUSTYKRAB_SSRF_ALLOW_HOSTS").unwrap_or_default())
+}
+
+/// Split, trim, lowercase, drop blanks. Pure, so it is testable without
+/// touching process-global state.
+fn parse_allow_hosts(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(|h| h.trim().to_ascii_lowercase())
+        .filter(|h| !h.is_empty())
+        .collect()
+}
+
+/// Whether `host_lower` appears in `allowed`.
+///
+/// Split from the environment lookup so it can be tested without touching
+/// process-global state. `std::env::set_var` races every other thread in
+/// the process, and a test that mutates the environment will eventually
+/// break an unrelated one that reads it.
+fn host_matches(allowed: &[String], host_lower: &str) -> bool {
+    !host_lower.is_empty() && allowed.iter().any(|h| h == host_lower)
+}
+
 /// Validate a URL for SSRF protection.
 ///
 /// Blocks:
@@ -174,6 +212,11 @@ pub struct ValidatedUrl {
 /// - Non-HTTP(S) schemes
 /// - URLs without a host
 ///
+/// Hosts named in `RUSTYKRAB_SSRF_ALLOW_HOSTS` are exempt from the
+/// private-address checks. The cloud metadata endpoint never is, and
+/// neither is `localhost`: those are the canonical SSRF targets, and an
+/// operator who wants the local machine can name it by hostname.
+///
 /// Returns resolved socket addresses to prevent DNS rebinding (TOCTOU)
 /// attacks. Callers should use the returned addresses to pin connections
 /// rather than re-resolving the hostname.
@@ -181,6 +224,17 @@ pub struct ValidatedUrl {
 /// DNS resolution uses `tokio::net::lookup_host` to avoid blocking the
 /// async runtime (fixes ASYNC-H1).
 pub async fn validate_url(url: &str) -> Result<ValidatedUrl, String> {
+    validate_url_with_allowlist(url, &ssrf_allowed_hosts()).await
+}
+
+/// [`validate_url`] against an explicit allowlist.
+///
+/// Exists so the guard can be tested without setting an environment
+/// variable, which would race every other thread in the process.
+pub(crate) async fn validate_url_with_allowlist(
+    url: &str,
+    allowed: &[String],
+) -> Result<ValidatedUrl, String> {
     let parsed = url::Url::parse(url).map_err(|e| format!("invalid URL: {e}"))?;
 
     // Only allow http and https schemes
@@ -197,7 +251,9 @@ pub async fn validate_url(url: &str) -> Result<ValidatedUrl, String> {
 
     // Check for IP-based hosts
     if let Ok(ip) = host.parse::<IpAddr>() {
-        if is_private_ip(&ip) {
+        // An allowlisted literal IP is checked further down, once
+        // `host_lower` exists; here we only reject when it is not.
+        if is_private_ip(&ip) && !host_matches(allowed, &host.to_lowercase()) {
             return Err(format!(
                 "requests to private/internal IP addresses ({ip}) are blocked (SSRF protection)"
             ));
@@ -211,6 +267,10 @@ pub async fn validate_url(url: &str) -> Result<ValidatedUrl, String> {
         "metadata.google.com",
     ];
     let host_lower = host.to_lowercase();
+    // Decided before any address check so both the literal-IP and the
+    // resolved-address paths honour the same answer.
+    let allowlisted = host_matches(allowed, &host_lower);
+
     for blocked in &blocked_hosts {
         if host_lower == *blocked {
             return Err(format!(
@@ -243,7 +303,21 @@ pub async fn validate_url(url: &str) -> Result<ValidatedUrl, String> {
 
     for addr in &addrs {
         let ip = addr.ip();
+        // The metadata endpoint stays blocked whatever the allowlist says.
+        // It is the highest-value SSRF target there is, and no legitimate
+        // entry on this list resolves to it.
+        if ip.to_string() == "169.254.169.254" {
+            return Err("requests to cloud metadata endpoint are blocked (SSRF protection)".into());
+        }
         if is_private_ip(&ip) {
+            if allowlisted {
+                tracing::debug!(
+                    host = %host,
+                    %ip,
+                    "host is in RUSTYKRAB_SSRF_ALLOW_HOSTS — permitting a private address"
+                );
+                continue;
+            }
             return Err(format!("URL resolves to private IP {ip} — possible SSRF"));
         }
     }
@@ -278,5 +352,128 @@ fn is_private_ip(ip: &IpAddr) -> bool {
                     v4.is_loopback() || v4.is_private() || v4.is_link_local()
                 }).unwrap_or(false)
         }
+    }
+}
+
+#[cfg(test)]
+mod ssrf_allowlist_tests {
+    use super::*;
+
+    fn list(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// These tests never touch the environment. An earlier version set
+    /// `RUSTYKRAB_SSRF_ALLOW_HOSTS` around each case, which raced
+    /// `nodes::tests::list_never_leaks_tokens` -- that test carries a
+    /// comment asking to remain the only one mutating env, and it was
+    /// right to. Pure inputs remove the hazard instead of coordinating
+    /// around it.
+    #[test]
+    fn an_empty_list_matches_nothing() {
+        assert!(!host_matches(&[], "portal.example.com"));
+    }
+
+    #[test]
+    fn matching_is_exact() {
+        let allowed = list(&["portal.example.com"]);
+        assert!(host_matches(&allowed, "portal.example.com"));
+        assert!(
+            !host_matches(&allowed, "evil-portal.example.com"),
+            "a suffix is not a match"
+        );
+        assert!(
+            !host_matches(&allowed, "example.com"),
+            "a parent domain is not a match"
+        );
+        assert!(
+            !host_matches(&allowed, "portal.example.com.evil.test"),
+            "a prefix is not a match"
+        );
+    }
+
+    #[test]
+    fn an_empty_host_never_matches() {
+        assert!(!host_matches(&list(&[""]), ""));
+    }
+
+    /// Parsing lowercases and trims, so the matcher only ever sees
+    /// normalised entries; this pins that the two halves agree.
+    #[test]
+    fn parsing_normalises_and_drops_blanks() {
+        assert!(parse_allow_hosts("").is_empty(), "unset means empty");
+        assert_eq!(
+            parse_allow_hosts(" A.example.com , ,b.EXAMPLE.com "),
+            vec!["a.example.com".to_string(), "b.example.com".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_tailnet_address_is_private_by_default() {
+        // The range this whole feature exists for: CGNAT, which Tailscale
+        // uses, and which the guard blocks unless explicitly named.
+        let ip: IpAddr = "100.77.3.57".parse().unwrap();
+        assert!(is_private_ip(&ip));
+    }
+
+    #[test]
+    fn the_metadata_address_is_private() {
+        let ip: IpAddr = "169.254.169.254".parse().unwrap();
+        assert!(is_private_ip(&ip), "must never be reachable");
+    }
+
+    #[tokio::test]
+    async fn an_empty_allowlist_blocks_a_tailnet_address() {
+        let err = validate_url_with_allowlist("http://100.77.3.57/", &[])
+            .await
+            .unwrap_err();
+        assert!(err.contains("private"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_named_host_may_resolve_privately() {
+        assert!(
+            validate_url_with_allowlist("http://100.77.3.57/", &list(&["100.77.3.57"]))
+                .await
+                .is_ok(),
+            "an explicitly named host should be reachable"
+        );
+    }
+
+    #[tokio::test]
+    async fn naming_one_host_does_not_permit_another() {
+        let err = validate_url_with_allowlist("http://10.0.0.5/", &list(&["100.77.3.57"]))
+            .await
+            .unwrap_err();
+        assert!(err.contains("private"), "{err}");
+    }
+
+    /// The highest-value SSRF target there is. No entry on this list has a
+    /// legitimate reason to reach it, so naming it changes nothing.
+    #[tokio::test]
+    async fn the_metadata_endpoint_is_never_allowlistable() {
+        let err = validate_url_with_allowlist(
+            "http://169.254.169.254/latest/meta-data/",
+            &list(&["169.254.169.254"]),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("metadata"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn the_allowlist_never_relaxes_the_scheme_check() {
+        let err = validate_url_with_allowlist("file:///etc/passwd", &list(&["evil.example.com"]))
+            .await
+            .unwrap_err();
+        assert!(err.contains("scheme") || err.contains("host"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn localhost_is_blocked_even_when_named() {
+        let err = validate_url_with_allowlist("http://localhost:8099/", &list(&["localhost"]))
+            .await
+            .unwrap_err();
+        assert!(err.contains("blocked"), "{err}");
     }
 }
