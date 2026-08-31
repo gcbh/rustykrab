@@ -223,6 +223,10 @@ async fn execute_credential_wake(
     // see the note on `TaskSource::CredentialFulfilled`.
     let (channel, chat_id, thread_id) = resolve_delivery_target(None, None, None, &conv);
 
+    // Message ids as they stand before this turn, so `save_turn` appends
+    // what the resume adds instead of rewriting the history.
+    let persisted: Vec<Uuid> = conv.messages.iter().map(|m| m.id).collect();
+
     push_scheduled_user_turn(&mut conv, prompt);
 
     let run_options = rustykrab_gateway::RunOptions {
@@ -264,6 +268,23 @@ async fn execute_credential_wake(
             return;
         }
     };
+
+    // Persist before delivering. A user who receives an answer the
+    // conversation has no record of will find the agent has forgotten it
+    // on the next turn -- and the resumed turn is exactly the one that
+    // did the work they asked for.
+    if let Err(e) = state
+        .store
+        .conversations()
+        .save_turn(&conv, &persisted)
+        .await
+    {
+        tracing::error!(
+            credential = %credential_name,
+            conversation_id = %conversation_id,
+            "could not persist the resumed turn: {e}"
+        );
+    }
 
     deliver_response(
         credential_name,
