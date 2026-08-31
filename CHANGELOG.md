@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.2.0] - 2026-08-31
+
+- feat(credentials): resume the stalled turn when a credential arrives (#556)
+
 ## [5.1.41] - 2026-08-30
 
 - fix(credentials): record which conversation asked for a credential (#555)

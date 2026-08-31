@@ -497,11 +497,20 @@ async fn main() -> anyhow::Result<()> {
             )) as std::sync::Arc<dyn rustykrab_store::RequestNotifier>
         });
 
-    // Hand the notifier to the store so filing a request tells the user.
-    let store = match push_notifier {
-        Some(notifier) => store.with_request_notifier(notifier),
-        None => store,
-    };
+    // Both halves of the credential loop go through one notifier: filing
+    // tells the user, fulfilling wakes the agent. It is attached
+    // unconditionally now — the wake half does not depend on APNs being
+    // configured, and gating on it would silently disable resume on any
+    // deployment without push.
+    //
+    // The task queue does not exist yet (it needs `state`, built below),
+    // so it arrives later through this cell.
+    let wake_queue: Arc<std::sync::OnceLock<task_queue::TaskQueue>> =
+        Arc::new(std::sync::OnceLock::new());
+    let store = store.with_request_notifier(Arc::new(CredentialNotifier {
+        push: push_notifier,
+        queue: wake_queue.clone(),
+    }));
 
     // --- Auth token ---
     // Resolution order (via registry):
@@ -1434,6 +1443,10 @@ async fn main() -> anyhow::Result<()> {
         store_handle.clone(),
     );
     infra_handles.push(queue_handle);
+    // Close the loop: from here a fulfilled credential can wake the
+    // conversation that asked for it. Requests answered before this point
+    // log and are dropped rather than queueing against a dead channel.
+    let _ = wake_queue.set(task_queue.clone());
     tracing::info!(max_concurrent, "task queue started");
 
     // --- Downtime outcome analysis (see DREAMING.md) ---
@@ -2849,6 +2862,83 @@ fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> anyhow::R
         }
     }
     Ok(())
+}
+
+/// Carries credential-request events to both parties.
+///
+/// Filing goes outward to the user (APNs, when configured). Fulfilling
+/// goes back inward to the agent, by queueing a wake for the conversation
+/// that asked. Keeping both on one notifier means the store has a single
+/// hook and neither half can be wired without the other.
+struct CredentialNotifier {
+    push: Option<Arc<dyn rustykrab_store::RequestNotifier>>,
+    /// Filled once the task queue exists. `TaskQueue` needs `AppState`,
+    /// which is built after the store, so this cannot be a plain field.
+    queue: Arc<std::sync::OnceLock<task_queue::TaskQueue>>,
+}
+
+impl std::fmt::Debug for CredentialNotifier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CredentialNotifier")
+            .field("push", &self.push.is_some())
+            .field("queue_ready", &self.queue.get().is_some())
+            .finish()
+    }
+}
+
+impl rustykrab_store::RequestNotifier for CredentialNotifier {
+    fn request_filed(&self, credential_name: &str, action: &str) {
+        if let Some(push) = &self.push {
+            push.request_filed(credential_name, action);
+        }
+    }
+
+    fn request_fulfilled(
+        &self,
+        conversation_id: Option<&str>,
+        credential_name: &str,
+        service: Option<&str>,
+    ) {
+        let Some(conversation_id) = conversation_id else {
+            // Filed outside a runner scope. The credential is stored and
+            // usable; there is simply no turn to return to.
+            tracing::debug!(
+                credential = %credential_name,
+                "credential supplied, but the request recorded no conversation — nothing to wake"
+            );
+            return;
+        };
+        let Some(queue) = self.queue.get() else {
+            tracing::warn!(
+                credential = %credential_name,
+                "credential supplied before the task queue was ready — not resuming"
+            );
+            return;
+        };
+
+        let request = task_queue::TaskRequest {
+            prompt: task_queue::credential_wake_prompt(credential_name, service),
+            source: task_queue::TaskSource::CredentialFulfilled {
+                conversation_id: conversation_id.to_string(),
+                credential_name: credential_name.to_string(),
+            },
+            // One wake per conversation. A request answered with two
+            // fields, or two requests answered together, must not start
+            // two agent runs over the same history.
+            dedupe_key: Some(format!("credential-wake:{conversation_id}")),
+        };
+
+        // `request_fulfilled` is synchronous and must not block the write
+        // that triggered it, so the submit is detached. Losing it costs
+        // the resume, never the credential.
+        let queue = queue.clone();
+        let name = credential_name.to_string();
+        tokio::spawn(async move {
+            if let Err(e) = queue.submit(request).await {
+                tracing::error!(credential = %name, "could not queue credential wake: {e}");
+            }
+        });
+    }
 }
 
 #[cfg(test)]

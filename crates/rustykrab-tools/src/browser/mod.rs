@@ -52,6 +52,12 @@ pub struct BrowserTool {
     manager: BrowserManager,
     snapshot_store: SnapshotStore,
     adaptive_store: AdaptiveStore,
+    /// Read access to stored credentials, for `fill_credential`.
+    ///
+    /// Optional so a browser built without a store still works for
+    /// everything else; the action reports itself unavailable rather than
+    /// the tool disappearing.
+    secrets: Option<rustykrab_store::GuardedSecrets>,
 }
 
 impl BrowserTool {
@@ -60,7 +66,15 @@ impl BrowserTool {
             manager: BrowserManager::from_config(),
             snapshot_store: SnapshotStore::new(),
             adaptive_store: AdaptiveStore::new(),
+            secrets: None,
         }
+    }
+
+    /// Let the browser type a stored credential without the model ever
+    /// holding it.
+    pub fn with_secrets(mut self, secrets: rustykrab_store::GuardedSecrets) -> Self {
+        self.secrets = Some(secrets);
+        self
     }
 
     /// Resolve the profile name from args, falling back to the default.
@@ -157,9 +171,14 @@ impl Tool for BrowserTool {
                             "navigate", "snapshot", "act", "screenshot",
                             "content", "evaluate", "scroll",
                             "console", "cookies", "pdf",
-                            "fetch", "stealth_fetch", "select", "wait_for"
+                            "fetch", "stealth_fetch", "select", "wait_for",
+                            "fill_credential"
                         ],
                         "description": "Action to perform"
+                    },
+                    "field": {
+                        "type": "string",
+                        "description": "Which part of the login to fill (fill_credential action): 'username' or 'password'. Defaults to 'password'."
                     },
                     "profile": {
                         "type": "string",
@@ -572,6 +591,74 @@ impl Tool for BrowserTool {
 
                 actions::execute_act(&page, &self.snapshot_store, &key, act_action, ref_id, &args)
                     .await
+            }
+            // Type a stored credential into a field without the value
+            // passing through the model.
+            //
+            // `act` with `fill` would work mechanically, but only by
+            // putting the password in `text` — which means in the tool
+            // call, in the conversation, and in every transcript. The
+            // whole point of asking the user through a secure field is
+            // that the value never reaches the context window, and a
+            // fill action that undoes that on the way back in would make
+            // the rest of this pointless.
+            "fill_credential" => {
+                let ref_id = args["ref"].as_str().ok_or_else(|| {
+                    Error::ToolExecution(
+                        "'fill_credential' requires 'ref' from a previous snapshot".into(),
+                    )
+                })?;
+                let field = args["field"].as_str().unwrap_or(crate::PASSWORD);
+                let secrets = self.secrets.as_ref().ok_or_else(|| {
+                    Error::ToolExecution(
+                        "credential fill is unavailable: this browser has no credential store"
+                            .into(),
+                    )
+                })?;
+
+                let _ = self.manager.get_browser(&profile).await?;
+                let page = self.manager.get_page(&profile, target_id).await?;
+
+                // The page's own URL, so the key matches wherever the
+                // agent actually is rather than where it meant to be.
+                let url = match args["url"].as_str() {
+                    Some(u) => u.to_string(),
+                    None => page.url().await.ok().flatten().unwrap_or_default(),
+                };
+                let cred_key = crate::origin_credential_key(&url, field)?;
+
+                let value = secrets.get(&cred_key).await.map_err(|_| {
+                    // Names the key so the agent can ask for exactly it.
+                    Error::ToolExecution(
+                        format!(
+                            "no credential stored under '{cred_key}'. Ask the user for it with \
+                             credential_request using that exact name, then try again."
+                        )
+                        .into(),
+                    )
+                })?;
+
+                let store_key = Self::store_key(&profile, target_id);
+                let fill_args = json!({ "text": value, "clear": true });
+                actions::execute_act(
+                    &page,
+                    &self.snapshot_store,
+                    &store_key,
+                    "fill",
+                    ref_id,
+                    &fill_args,
+                )
+                .await?;
+
+                // A fresh result rather than the fill's own. Nothing
+                // derived from the value travels back to the model — not
+                // its length, which for a password is worth guessing with.
+                Ok(json!({
+                    "status": "filled",
+                    "field": field,
+                    "credentialKey": cred_key,
+                    "ref": ref_id,
+                }))
             }
 
             // ── Screenshot ─────────────────────────────────────────

@@ -111,6 +111,27 @@ pub struct CredentialRequest {
 /// notification at all.
 pub trait RequestNotifier: Send + Sync + std::fmt::Debug {
     fn request_filed(&self, credential_name: &str, action: &str);
+
+    /// The user answered: the credential now exists.
+    ///
+    /// This is the other half of the loop. Filing tells the user a turn
+    /// is blocked; this tells whatever was blocked that it no longer is.
+    ///
+    /// `conversation_id` is whichever conversation filed the request.
+    /// `None` means the ask was made outside a runner scope and there is
+    /// nothing to wake — still a valid request, just not a resumable one.
+    ///
+    /// Defaulted, so a notifier that only announces new requests need not
+    /// care. Fire-and-forget for the same reason as `request_filed`: a
+    /// wake that fails must never undo a credential the user has already
+    /// handed over.
+    fn request_fulfilled(
+        &self,
+        _conversation_id: Option<&str>,
+        _credential_name: &str,
+        _service: Option<&str>,
+    ) {
+    }
 }
 
 #[derive(Clone)]
@@ -295,7 +316,20 @@ impl CredentialRequestStore {
         }
 
         self.decide(id, "approved", decided_by, &row.name, "fulfil")
-            .await
+            .await?;
+
+        // Only once the credential is durable and the row is decided. A
+        // wake fired earlier could reach a turn that then reads a
+        // credential which is not there yet, and the resumed agent would
+        // conclude the user's answer had failed.
+        if let Some(notifier) = &self.notifier {
+            notifier.request_fulfilled(
+                row.conversation_id.as_deref(),
+                &row.name,
+                row.service.as_deref(),
+            );
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -660,7 +694,8 @@ impl CredentialRequestStore {
         crate::with_conn(&self.conn, move |conn| {
             let mut stmt = conn
                 .prepare(
-                    "SELECT name, action, proposed_data, status, target_version, fields
+                    "SELECT name, action, proposed_data, status, target_version, fields,
+                            conversation_id, service
                      FROM credential_requests WHERE id = ?1",
                 )
                 .map_err(|e| Error::Storage(e.to_string()))?;
@@ -673,6 +708,8 @@ impl CredentialRequestStore {
                         row.get::<_, String>(3)?,
                         row.get::<_, Option<i64>>(4)?,
                         row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, Option<String>>(7)?,
                     ))
                 })
                 .map_err(|e| match e {
@@ -688,6 +725,8 @@ impl CredentialRequestStore {
                 status: row.3,
                 target_version: row.4,
                 fields: decode_fields(row.5.as_deref()),
+                conversation_id: row.6,
+                service: row.7,
             })
         })
         .await
@@ -701,6 +740,11 @@ struct StoredRequest {
     status: String,
     target_version: Option<i64>,
     fields: Vec<RequestedField>,
+    /// Who asked, so fulfilling can wake them.
+    conversation_id: Option<String>,
+    /// Carried alongside so the woken turn can name the service in words
+    /// the user recognises, rather than the store key.
+    service: Option<String>,
 }
 
 /// A row written before the column existed, or one holding junk, yields no
@@ -1137,5 +1181,158 @@ mod link_tests {
             .await
             .expect("lookup")
             .is_some());
+    }
+}
+
+#[cfg(test)]
+mod wake_tests {
+    use super::fulfil_tests::gmail_fields;
+    use super::*;
+
+    /// One `request_fulfilled` call, captured.
+    ///
+    /// A named struct rather than a tuple: the assertions read better for
+    /// it, and three string-ish fields in a row is exactly the shape
+    /// `clippy::type_complexity` objects to.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct Fulfilment {
+        conversation_id: Option<String>,
+        credential: String,
+        service: Option<String>,
+    }
+
+    /// Records what it was told, so the assertion reads the hook's
+    /// arguments rather than trusting a log line.
+    #[derive(Debug, Default)]
+    struct RecordingNotifier {
+        fulfilled: Mutex<Vec<Fulfilment>>,
+    }
+
+    impl RequestNotifier for RecordingNotifier {
+        fn request_filed(&self, _credential_name: &str, _action: &str) {}
+
+        fn request_fulfilled(
+            &self,
+            conversation_id: Option<&str>,
+            credential_name: &str,
+            service: Option<&str>,
+        ) {
+            self.fulfilled.lock().unwrap().push(Fulfilment {
+                conversation_id: conversation_id.map(str::to_string),
+                credential: credential_name.to_string(),
+                service: service.map(str::to_string),
+            });
+        }
+    }
+
+    fn store_with(notifier: Arc<RecordingNotifier>) -> (tempfile::TempDir, CredentialRequestStore) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = crate::Store::open(dir.path(), vec![7u8; 32])
+            .expect("open")
+            .with_credential_backend(Arc::new(crate::credential_backend::MemoryBackend::new()))
+            .with_request_notifier(notifier);
+        let requests = store.credential_requests();
+        (dir, requests)
+    }
+
+    fn answers() -> Vec<(String, String)> {
+        vec![
+            ("gmail_email".to_string(), "a@example.com".to_string()),
+            ("gmail_app_password".to_string(), "pw".to_string()),
+        ]
+    }
+
+    /// The wake needs the conversation that asked, and it has to survive
+    /// the round trip: written when the request is filed, read back when
+    /// it is fulfilled.
+    #[tokio::test]
+    async fn fulfilling_announces_the_conversation_that_asked() {
+        let notifier = Arc::new(RecordingNotifier::default());
+        let (_dir, requests) = store_with(notifier.clone());
+
+        let conv = Uuid::new_v4();
+        let id = requests
+            .file_fulfil(
+                "gmail_app_password",
+                Some("Gmail".into()),
+                gmail_fields(),
+                None,
+                Some(conv),
+            )
+            .await
+            .expect("file");
+        requests
+            .fulfil(&id, &answers(), "test")
+            .await
+            .expect("fulfil");
+
+        let seen = notifier.fulfilled.lock().unwrap();
+        assert_eq!(seen.len(), 1, "one wake per fulfilment");
+        assert_eq!(
+            seen[0].conversation_id.as_deref(),
+            Some(conv.to_string().as_str()),
+            "the wake must name the conversation that filed the request"
+        );
+        assert_eq!(seen[0].credential, "gmail_app_password");
+        // Carried so the resumed turn can say "Gmail", not the store key.
+        assert_eq!(seen[0].service.as_deref(), Some("Gmail"));
+    }
+
+    /// A request filed outside a runner scope still fulfils. It simply
+    /// has nothing to wake, which is not an error.
+    #[tokio::test]
+    async fn a_request_with_no_conversation_still_fulfils() {
+        let notifier = Arc::new(RecordingNotifier::default());
+        let (_dir, requests) = store_with(notifier.clone());
+
+        let id = requests
+            .file_fulfil("gmail_app_password", None, gmail_fields(), None, None)
+            .await
+            .expect("file");
+        requests
+            .fulfil(&id, &answers(), "test")
+            .await
+            .expect("fulfil");
+
+        let seen = notifier.fulfilled.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(
+            seen[0].conversation_id, None,
+            "nothing to resume, and that is fine"
+        );
+    }
+
+    /// A failed fulfil must not announce success. The credential never
+    /// landed, so waking the agent would resume it into a turn that still
+    /// cannot proceed.
+    #[tokio::test]
+    async fn a_rejected_fulfil_wakes_nothing() {
+        let notifier = Arc::new(RecordingNotifier::default());
+        let (_dir, requests) = store_with(notifier.clone());
+
+        let id = requests
+            .file_fulfil(
+                "gmail_app_password",
+                Some("Gmail".into()),
+                gmail_fields(),
+                None,
+                Some(Uuid::new_v4()),
+            )
+            .await
+            .expect("file");
+        // A field the request never asked for.
+        let result = requests
+            .fulfil(
+                &id,
+                &[("anthropic_api_key".to_string(), "sk-x".to_string())],
+                "test",
+            )
+            .await;
+
+        assert!(result.is_err(), "an unrequested field must be refused");
+        assert!(
+            notifier.fulfilled.lock().unwrap().is_empty(),
+            "a refused fulfil must not wake anything"
+        );
     }
 }

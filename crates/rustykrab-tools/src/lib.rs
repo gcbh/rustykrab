@@ -1,6 +1,8 @@
 #![recursion_limit = "512"]
 
 // Security utilities
+pub mod credential_link;
+pub mod origin_key;
 pub mod sanitize;
 pub mod security;
 pub mod stub;
@@ -191,6 +193,7 @@ pub use wiki::WikiTool;
 pub use credential_read::CredentialReadTool;
 pub use credential_request::CredentialRequestTool;
 pub use credential_write::CredentialWriteTool;
+pub use origin_key::{origin_credential_key, PASSWORD, USERNAME};
 
 // Skills
 pub use self::skills::{SkillTool, SkillsTool};
@@ -241,7 +244,7 @@ pub fn builtin_tools(
         // Media
         std::sync::Arc::new(ImageTool::new()),
         // UI
-        std::sync::Arc::new(BrowserTool::new()),
+        std::sync::Arc::new(BrowserTool::new().with_secrets(guarded.clone())),
         std::sync::Arc::new(CanvasTool::new()),
         // Devices
         std::sync::Arc::new(NodesTool::new()),

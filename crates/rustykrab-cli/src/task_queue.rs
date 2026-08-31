@@ -23,6 +23,34 @@ pub enum TaskSource {
         /// (numeric string). Slack: thread_ts. `None` posts at top level.
         thread_id: Option<String>,
     },
+    /// A credential the agent asked for has been supplied, and the turn
+    /// that stalled waiting for it can go again.
+    ///
+    /// Carries no channel of its own: the conversation already records
+    /// where it came from, and `resolve_delivery_target` reads it. A wake
+    /// that guessed its own target could answer somewhere the user never
+    /// asked from.
+    CredentialFulfilled {
+        /// The conversation that filed the request — the one to resume.
+        conversation_id: String,
+        /// Store key of the credential, for logs and deduplication.
+        credential_name: String,
+    },
+}
+
+/// The turn appended to a resumed conversation when a credential lands.
+///
+/// Deliberately says only that the value now exists, never what it is:
+/// this text becomes a real user message in the conversation, so anything
+/// put here is in the context window and in every transcript from now on.
+pub fn credential_wake_prompt(credential_name: &str, service: Option<&str>) -> String {
+    let what = service.unwrap_or(credential_name);
+    format!(
+        "The {what} credential you asked for is now stored and available. \
+         Continue the task you stopped for it — retry the tool that failed. \
+         Do not ask for the credential again, and do not repeat any value \
+         back to me."
+    )
 }
 
 /// A unit of work submitted to the task queue.
@@ -145,7 +173,107 @@ async fn execute_task(task: &TaskRequest, state: &AppState, store: &rustykrab_st
             )
             .await;
         }
+        TaskSource::CredentialFulfilled {
+            conversation_id,
+            credential_name,
+        } => {
+            execute_credential_wake(conversation_id, credential_name, &task.prompt, state).await;
+        }
     }
+}
+
+/// Resume the conversation that asked for a credential, now that it has
+/// one.
+///
+/// Unlike a scheduled job there is nothing to record and nothing to
+/// disable on failure: the credential is already stored, and the worst
+/// case is that the user asks again by hand. So every failure here logs
+/// and returns rather than trying to repair anything.
+async fn execute_credential_wake(
+    conversation_id: &str,
+    credential_name: &str,
+    prompt: &str,
+    state: &AppState,
+) {
+    let Ok(uuid) = Uuid::parse_str(conversation_id) else {
+        tracing::warn!(
+            credential = %credential_name,
+            conversation_id = %conversation_id,
+            "credential wake has a malformed conversation id; nothing to resume"
+        );
+        return;
+    };
+
+    let mut conv = match state.store.conversations().get(uuid).await {
+        Ok(c) => c,
+        Err(e) => {
+            // The conversation was deleted between asking and answering.
+            // The credential is still stored and usable; only the resume
+            // is lost.
+            tracing::warn!(
+                credential = %credential_name,
+                conversation_id = %conversation_id,
+                "cannot resume conversation for credential wake: {e}"
+            );
+            return;
+        }
+    };
+
+    // Where the answer goes. Read from the conversation, never guessed —
+    // see the note on `TaskSource::CredentialFulfilled`.
+    let (channel, chat_id, thread_id) = resolve_delivery_target(None, None, None, &conv);
+
+    push_scheduled_user_turn(&mut conv, prompt);
+
+    let run_options = rustykrab_gateway::RunOptions {
+        active_skill: None,
+        // The point of waking is to finish the job, so the first move
+        // should be retrying the tool that failed rather than announcing
+        // that it can now be retried.
+        force_tool_use_first_iteration: true,
+    };
+
+    let trace_id = Uuid::new_v4();
+    tracing::info!(
+        %trace_id,
+        credential = %credential_name,
+        conversation_id = %conversation_id,
+        "credential supplied — resuming the turn that stalled"
+    );
+
+    let no_op_event = |_event: AgentEvent| {};
+    let response_text = match rustykrab_gateway::run_agent_streaming_with_options(
+        state,
+        &mut conv,
+        prompt,
+        &no_op_event,
+        trace_id,
+        &run_options,
+    )
+    .await
+    {
+        Ok(msg) => match &msg.content {
+            MessageContent::Text(t) => t.clone(),
+            _ => return,
+        },
+        Err(e) => {
+            tracing::error!(
+                credential = %credential_name,
+                "agent error resuming after credential fulfilment: {e}"
+            );
+            return;
+        }
+    };
+
+    deliver_response(
+        credential_name,
+        channel.as_deref(),
+        chat_id.as_deref(),
+        thread_id.as_deref(),
+        &response_text,
+        state,
+    )
+    .await;
 }
 
 /// Append the scheduled prompt to `conv` as a real user turn.
@@ -362,76 +490,15 @@ async fn execute_cron_task(
     };
 
     // Route the response to the originating channel.
-    match effective_channel.as_deref() {
-        Some("telegram") => {
-            if let (Some(tg), Some(cid)) = (&state.telegram, effective_chat_id.as_deref()) {
-                if let Ok(chat_id_num) = cid.parse::<i64>() {
-                    let tg_thread = effective_thread_id
-                        .as_deref()
-                        .and_then(|s| s.parse::<i64>().ok())
-                        .unwrap_or(0);
-                    if let Err(e) = tg.send_text(chat_id_num, &response_text, tg_thread).await {
-                        tracing::error!(job_id = %job_id, "failed to send scheduled job result to Telegram: {e}");
-                    }
-                } else {
-                    tracing::error!(job_id = %job_id, chat_id = %cid, "invalid Telegram chat_id");
-                }
-            } else {
-                tracing::warn!(
-                    job_id = %job_id,
-                    has_telegram = state.telegram.is_some(),
-                    has_chat_id = effective_chat_id.is_some(),
-                    "telegram routing unavailable; result discarded: {response_text}"
-                );
-            }
-        }
-        Some("slack") => {
-            if let (Some(sl), Some(channel_id)) = (&state.slack, effective_chat_id.as_deref()) {
-                if let Err(e) = sl
-                    .send_text(channel_id, &response_text, effective_thread_id.as_deref())
-                    .await
-                {
-                    tracing::error!(job_id = %job_id, "failed to send scheduled job result to Slack: {e}");
-                }
-            } else {
-                tracing::warn!(
-                    job_id = %job_id,
-                    has_slack = state.slack.is_some(),
-                    has_chat_id = effective_chat_id.is_some(),
-                    "slack routing unavailable; result discarded: {response_text}"
-                );
-            }
-        }
-        Some("signal") => {
-            if let (Some(sig), Some(number)) = (&state.signal, effective_chat_id.as_deref()) {
-                if let Err(e) = sig.send_text(number, &response_text).await {
-                    tracing::error!(job_id = %job_id, "failed to send scheduled job result to Signal: {e}");
-                }
-            } else {
-                tracing::warn!(
-                    job_id = %job_id,
-                    has_signal = state.signal.is_some(),
-                    has_chat_id = effective_chat_id.is_some(),
-                    "signal routing unavailable; result discarded: {response_text}"
-                );
-            }
-        }
-        Some(other) => {
-            tracing::warn!(
-                job_id = %job_id,
-                channel = %other,
-                "unknown channel for scheduled job; result discarded: {response_text}"
-            );
-        }
-        None => {
-            tracing::warn!(
-                job_id = %job_id,
-                "scheduled job has no delivery channel — set channel/chat_id on the \
-                 job, or set RUSTYKRAB_DEFAULT_CHANNEL + RUSTYKRAB_DEFAULT_CHAT_ID. \
-                 Result discarded: {response_text}"
-            );
-        }
-    }
+    deliver_response(
+        job_id,
+        effective_channel.as_deref(),
+        effective_chat_id.as_deref(),
+        effective_thread_id.as_deref(),
+        &response_text,
+        state,
+    )
+    .await;
 
     // Record the run before marking executed so the result is persisted
     // even if mark_executed fails.
@@ -720,6 +787,92 @@ fn resolve_delivery_target(
         .or_else(|| std::env::var(DEFAULT_THREAD_ID_ENV).ok())
         .filter(|s| !s.is_empty());
     (channel, chat_id, thread_id)
+}
+
+/// Route a finished agent response back to the channel it came from.
+///
+/// Shared by the scheduled-job path and the credential-wake path. Both
+/// end the same way — some text, and a `(channel, chat, thread)` triple
+/// resolved from the conversation — and a second copy of this match would
+/// drift the moment one of them gained a channel the other did not.
+///
+/// `target` names the originator in logs: a job id for a scheduled run,
+/// the credential name for a wake. Everything here is best-effort; a
+/// channel that cannot be reached is logged with the text that was lost,
+/// never retried, because the agent has already run and re-running it
+/// would repeat its side effects.
+async fn deliver_response(
+    target: &str,
+    channel: Option<&str>,
+    chat_id: Option<&str>,
+    thread_id: Option<&str>,
+    response_text: &str,
+    state: &AppState,
+) {
+    match channel {
+        Some("telegram") => {
+            if let (Some(tg), Some(cid)) = (&state.telegram, chat_id) {
+                if let Ok(chat_id_num) = cid.parse::<i64>() {
+                    let tg_thread = thread_id.and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+                    if let Err(e) = tg.send_text(chat_id_num, response_text, tg_thread).await {
+                        tracing::error!(target = %target, "failed to send result to Telegram: {e}");
+                    }
+                } else {
+                    tracing::error!(target = %target, chat_id = %cid, "invalid Telegram chat_id");
+                }
+            } else {
+                tracing::warn!(
+                    target = %target,
+                    has_telegram = state.telegram.is_some(),
+                    has_chat_id = chat_id.is_some(),
+                    "telegram routing unavailable; result discarded: {response_text}"
+                );
+            }
+        }
+        Some("slack") => {
+            if let (Some(sl), Some(channel_id)) = (&state.slack, chat_id) {
+                if let Err(e) = sl.send_text(channel_id, response_text, thread_id).await {
+                    tracing::error!(target = %target, "failed to send result to Slack: {e}");
+                }
+            } else {
+                tracing::warn!(
+                    target = %target,
+                    has_slack = state.slack.is_some(),
+                    has_chat_id = chat_id.is_some(),
+                    "slack routing unavailable; result discarded: {response_text}"
+                );
+            }
+        }
+        Some("signal") => {
+            if let (Some(sig), Some(number)) = (&state.signal, chat_id) {
+                if let Err(e) = sig.send_text(number, response_text).await {
+                    tracing::error!(target = %target, "failed to send result to Signal: {e}");
+                }
+            } else {
+                tracing::warn!(
+                    target = %target,
+                    has_signal = state.signal.is_some(),
+                    has_chat_id = chat_id.is_some(),
+                    "signal routing unavailable; result discarded: {response_text}"
+                );
+            }
+        }
+        Some(other) => {
+            tracing::warn!(
+                target = %target,
+                channel = %other,
+                "unknown channel; result discarded: {response_text}"
+            );
+        }
+        None => {
+            tracing::warn!(
+                target = %target,
+                "no delivery channel — set channel/chat_id on the originating \
+                 conversation, or set RUSTYKRAB_DEFAULT_CHANNEL + \
+                 RUSTYKRAB_DEFAULT_CHAT_ID. Result discarded: {response_text}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

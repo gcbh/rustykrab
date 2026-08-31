@@ -2,15 +2,7 @@ use async_trait::async_trait;
 use rustykrab_core::active_tools::with_session_context;
 use rustykrab_core::types::ToolSchema;
 use rustykrab_core::{Error, Result, Tool};
-use std::time::Duration;
-
 use rustykrab_store::{CredentialRequestStore, RequestedField};
-
-/// How long a credential link stays good.
-///
-/// Long enough to walk to a phone and generate an app password, short
-/// enough that a link left in a chat log is usually already dead.
-const LINK_TTL: Duration = Duration::from_secs(15 * 60);
 use serde_json::{json, Value};
 
 /// Asks the user for a credential the agent does not have.
@@ -58,7 +50,33 @@ impl Tool for CredentialRequestTool {
          {\"name\": \"gmail_app_password\", \"service\": \"Gmail\", \
          \"reason\": \"to search your inbox\", \"fields\": [\
          {\"key\": \"gmail_email\", \"label\": \"Gmail address\", \"secret\": false}, \
-         {\"key\": \"gmail_app_password\", \"label\": \"App password\", \"secret\": true}]}"
+         {\"key\": \"gmail_app_password\", \"label\": \"App password\", \"secret\": true}]}\n\n\
+         For a website login, name the keys after the site's host so the same \
+         site always gets the same names: web_<host>_username and \
+         web_<host>_password, with every dot and dash written as an \
+         underscore. https://portal.example.com/login therefore gives \
+         web_portal_example_com_username and web_portal_example_com_password. \
+         Drop any leading 'www.'. Getting this right matters — the browser \
+         looks the credential up under exactly this name.\n\n\
+         Example — a website login:\n\
+         {\"name\": \"web_portal_example_com_password\", \"service\": \
+         \"portal.example.com\", \"reason\": \"to download your invoice\", \
+         \"fields\": [\
+         {\"key\": \"web_portal_example_com_username\", \"label\": \"Username\", \"secret\": false}, \
+         {\"key\": \"web_portal_example_com_password\", \"label\": \"Password\", \"secret\": true}]}\n\n\
+         Once stored, sign in with browser(action='fill_credential', ref=..., \
+         field='username'|'password') — it types the value straight into the \
+         page. Never read a password back with credential_read to type it \
+         yourself: that puts it in this conversation, which is the one thing \
+         this whole flow exists to avoid."
+    }
+
+    /// Once the request is filed there is nothing further the agent can
+    /// do until the user answers, so the turn should end with one
+    /// sentence saying so — not be pushed toward a `task_complete` it
+    /// cannot honestly call.
+    fn blocks_turn(&self) -> bool {
+        true
     }
 
     fn schema(&self) -> ToolSchema {
@@ -167,39 +185,9 @@ impl Tool for CredentialRequestTool {
         // Apollo app can render this request from the pending list, but on
         // Telegram or Signal there is no app in the loop — a tappable URL
         // is the only way to hand someone a password field from a chat
-        // message. The token is minted here and shown once; only its hash
-        // is stored.
-        let link = match std::env::var("RUSTYKRAB_PUBLIC_URL")
-            .ok()
-            .map(|u| u.trim_end_matches('/').to_string())
-            .filter(|u| !u.is_empty())
-        {
-            Some(base) => match self.requests.issue_link(&id, LINK_TTL).await {
-                Ok(token) => Some(format!("{base}/c/{token}")),
-                Err(e) => {
-                    // The request is filed and answerable in the app; only
-                    // the convenience of a link is lost.
-                    tracing::warn!(error = %e, "could not mint a credential link");
-                    None
-                }
-            },
-            None => None,
-        };
-
-        let next_step = match &link {
-            Some(url) => format!(
-                "Give the user this link and nothing else about the credential: {url} \
-                 — say it opens a secure form for their {where_to_look} details, that \
-                 it works once and expires in {} minutes. Do not ask for the value in \
-                 chat. Stop this task until they answer.",
-                LINK_TTL.as_secs() / 60
-            ),
-            None => format!(
-                "Tell the user you have asked for their {where_to_look} details \
-                 and that a prompt is waiting in the Apollo app. Do not ask for \
-                 the value in chat. Stop this task until they answer."
-            ),
-        };
+        // message.
+        let link = crate::credential_link::mint_link(&self.requests, &id).await;
+        let next_step = crate::credential_link::next_step(link.as_deref(), &where_to_look);
 
         Ok(json!({
             "status": "requested",
