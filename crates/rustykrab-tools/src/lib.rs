@@ -80,6 +80,10 @@ mod gmail;
 // Calendar tools
 mod caldav;
 
+// The Google account credential both of them authenticate with, and the
+// one way of asking the user for it.
+pub mod google_credentials;
+
 // Notion integration
 mod notion;
 
@@ -255,8 +259,9 @@ pub fn builtin_tools(
         // cut the tool-schema payload sent to the model.
         // Email
         std::sync::Arc::new(GmailTool::new(guarded.clone()).with_requests(requests.clone())),
-        // Calendar (CalDAV — reuses Gmail credentials)
-        std::sync::Arc::new(CalDavTool::new(guarded.clone())),
+        // Calendar (CalDAV — reuses Gmail credentials, and asks for them
+        // the same way when they are absent)
+        std::sync::Arc::new(CalDavTool::new(guarded.clone()).with_requests(requests.clone())),
         // Notion
         std::sync::Arc::new(NotionTool::new(guarded.clone())),
         // Obsidian
