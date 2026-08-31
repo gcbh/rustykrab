@@ -107,7 +107,38 @@ impl CredentialReadTool {
                     .as_str()
                     .ok_or_else(|| Error::ToolExecution("missing name for 'get' action".into()))?;
 
+                // A credential the user supplied through the secure form
+                // lives in the OS credential store; the database keeps an
+                // empty placeholder row so the name and version still
+                // exist. Decrypting that row yields `""`, and returning it
+                // as a value tells the agent it holds an empty password.
+                //
+                // Measured: the agent then submits the empty string
+                // (`LOGIN FAILED user='' pw_len=0`) or invents one, and
+                // re-reads the store ten to fourteen times a turn trying
+                // to get something better. It is not being obtuse -- it
+                // was told the read succeeded.
+                //
+                // So say what is true: it is stored, it is deliberately
+                // not readable here, and here is how to use it.
+                let held_in_backend = self.secrets.get_hardware(name).is_some();
                 match self.secrets.get(name).await {
+                    Ok(value) if value.is_empty() && held_in_backend => Ok(json!({
+                        "source": "store",
+                        "name": name,
+                        "stored": true,
+                        "readable": false,
+                        "why": "This credential is held in the OS secure store. Its value is \
+                                deliberately not returned here so it never enters the \
+                                conversation.",
+                        "how_to_use": format!(
+                            "Do not try to read it again — the answer will not change. \
+                             To sign in with it, take a browser snapshot and call \
+                             browser(action='fill_credential', ref=<ref>, field='username') \
+                             then field='password'. That reads '{name}' directly and types \
+                             it into the page without showing it to you."
+                        ),
+                    })),
                     Ok(value) => Ok(json!({
                         "source": "store",
                         "name": name,
@@ -127,10 +158,28 @@ impl CredentialReadTool {
                     Error::ToolExecution(format!("failed to list secrets: {e}").into())
                 })?;
 
+                // Split by whether the value can be read here. An agent
+                // that sees a name and assumes it can fetch the value
+                // wastes the turn discovering otherwise; one that is told
+                // "you have this, use fill_credential" can act on it. This
+                // is the case where the agent already *has* what it needs
+                // and should simply proceed.
+                let (held_in_backend, readable): (Vec<&String>, Vec<&String>) = names
+                    .iter()
+                    .partition(|n| self.secrets.get_hardware(n).is_some());
+
                 Ok(json!({
                     "source": "store",
                     "secrets": names,
                     "count": names.len(),
+                    "readable_here": readable,
+                    "held_in_secure_store": held_in_backend,
+                    "note": "Names under 'held_in_secure_store' are present and usable, but \
+                             their values are deliberately not readable — do not call 'get' \
+                             for them. Sign in with browser(action='fill_credential', \
+                             ref=<ref>, field='username'|'password'), which reads them \
+                             directly. You already have these; there is no need to ask the \
+                             user for them again.",
                     "keychain_available": rustykrab_store::keychain::keychain_available(),
                 }))
             }
@@ -207,5 +256,146 @@ impl CredentialReadTool {
                 format!("unknown action '{other}', expected 'get' or 'list'").into(),
             )),
         }
+    }
+}
+
+#[cfg(test)]
+mod hardware_held_tests {
+    use super::*;
+    use rustykrab_store::{Store, WriteAuthority};
+
+    /// A store whose credentials live in a backend, as they do after a
+    /// user answers the secure form.
+    fn store() -> (tempfile::TempDir, Store) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path(), vec![3u8; 32])
+            .expect("open")
+            .with_credential_backend(std::sync::Arc::new(
+                rustykrab_store::credential_backend::MemoryBackend::new(),
+            ));
+        (dir, store)
+    }
+
+    /// The bug this exists for: `put_hardware` leaves an empty placeholder
+    /// row, `get` decrypts it to `""`, and returning that as a value told
+    /// the agent it held an empty password. Measured consequence was a
+    /// submitted blank form and ten-plus re-reads per turn.
+    #[tokio::test]
+    async fn a_securely_held_credential_is_not_reported_as_an_empty_value() {
+        let (_dir, store) = store();
+        store
+            .secrets()
+            .put_hardware(
+                "web_example_com_password",
+                "hunter2",
+                WriteAuthority::User { device: None },
+            )
+            .await
+            .expect("put_hardware");
+
+        let out = CredentialReadTool::new(store.secrets())
+            .execute(json!({"action": "get", "name": "web_example_com_password"}))
+            .await
+            .expect("read");
+
+        assert_eq!(
+            out["value"],
+            serde_json::Value::Null,
+            "never return a value"
+        );
+        assert_eq!(out["stored"], true, "the agent must know it has this");
+        assert_eq!(out["readable"], false);
+        assert!(
+            out["how_to_use"]
+                .as_str()
+                .unwrap()
+                .contains("fill_credential"),
+            "must point at the action that can actually use it: {out}"
+        );
+    }
+
+    /// The value must not leak through the new shape either.
+    #[tokio::test]
+    async fn the_secret_never_appears_in_the_response() {
+        let (_dir, store) = store();
+        store
+            .secrets()
+            .put_hardware(
+                "web_example_com_password",
+                "hunter2",
+                WriteAuthority::User { device: None },
+            )
+            .await
+            .expect("put_hardware");
+
+        let out = CredentialReadTool::new(store.secrets())
+            .execute(json!({"action": "get", "name": "web_example_com_password"}))
+            .await
+            .expect("read");
+
+        assert!(!out.to_string().contains("hunter2"), "leaked: {out}");
+    }
+
+    /// An ordinary stored secret still reads normally — the change must
+    /// not break credentials that are meant to be readable.
+    #[tokio::test]
+    async fn an_ordinary_secret_still_returns_its_value() {
+        let (_dir, store) = store();
+        store
+            .secrets()
+            .create("plain_token", "abc123")
+            .await
+            .expect("create");
+
+        let out = CredentialReadTool::new(store.secrets())
+            .execute(json!({"action": "get", "name": "plain_token"}))
+            .await
+            .expect("read");
+
+        assert_eq!(out["value"], "abc123");
+    }
+
+    /// Listing is where an agent decides whether it already has what it
+    /// needs, so it has to distinguish "present and usable" from
+    /// "present and fetchable".
+    #[tokio::test]
+    async fn list_separates_held_from_readable() {
+        let (_dir, store) = store();
+        store
+            .secrets()
+            .create("plain_token", "abc123")
+            .await
+            .expect("create");
+        store
+            .secrets()
+            .put_hardware(
+                "web_example_com_password",
+                "hunter2",
+                WriteAuthority::User { device: None },
+            )
+            .await
+            .expect("put_hardware");
+
+        let out = CredentialReadTool::new(store.secrets())
+            .execute(json!({"action": "list"}))
+            .await
+            .expect("list");
+
+        let held: Vec<&str> = out["held_in_secure_store"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        let readable: Vec<&str> = out["readable_here"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+
+        assert_eq!(held, vec!["web_example_com_password"]);
+        assert_eq!(readable, vec!["plain_token"]);
+        assert!(!out.to_string().contains("hunter2"), "leaked: {out}");
     }
 }
