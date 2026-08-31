@@ -38,6 +38,18 @@ pub enum TaskSource {
     },
 }
 
+/// How many iterations a resumed turn may take before it is cut off.
+///
+/// Generous for the work it has to do, and far below the profile default,
+/// so a wake that is going nowhere says so in minutes rather than an hour.
+const WAKE_MAX_ITERATIONS: usize = 25;
+
+/// A bound, not a budget. Enforced at compile time so the reasoning
+/// cannot drift: high enough for snapshot, two fills, submit and read;
+/// far enough below the profile default of 200 that a stuck wake reports
+/// in minutes rather than an hour.
+const _: () = assert!(WAKE_MAX_ITERATIONS >= 10 && WAKE_MAX_ITERATIONS <= 30);
+
 /// The turn appended to a resumed conversation when a credential lands.
 ///
 /// Deliberately says only that the value now exists, never what it is:
@@ -46,10 +58,16 @@ pub enum TaskSource {
 pub fn credential_wake_prompt(credential_name: &str, service: Option<&str>) -> String {
     let what = service.unwrap_or(credential_name);
     format!(
-        "The {what} credential you asked for is now stored and available. \
-         Continue the task you stopped for it — retry the tool that failed. \
-         Do not ask for the credential again, and do not repeat any value \
-         back to me."
+        "The {what} credential you asked for is now stored. Carry on from where \
+         you stopped.\n\n\
+         If this is a website sign-in: take a fresh browser snapshot to get the \
+         current element refs, then fill the form with \
+         browser(action='fill_credential', ref=<ref>, field='username') and \
+         again with field='password', and submit it. That action looks the \
+         value up itself — you do not have the password and must not type one; \
+         anything you type will be wrong.\n\n\
+         Do not ask for the credential again, and do not repeat any value back \
+         to me."
     )
 }
 
@@ -232,9 +250,14 @@ async fn execute_credential_wake(
     let run_options = rustykrab_gateway::RunOptions {
         active_skill: None,
         // The point of waking is to finish the job, so the first move
-        // should be retrying the tool that failed rather than announcing
-        // that it can now be retried.
+        // should be acting rather than announcing that it can now act.
         force_tool_use_first_iteration: true,
+        // A wake resumes one stalled turn: snapshot, fill two fields,
+        // submit, read the page. The profile default of 200 is a budget,
+        // not a bound — an agent that cannot work out how to proceed
+        // spends all of it. One observed run reached 96 iterations
+        // without ever attempting the login, and would have continued.
+        max_iterations: Some(WAKE_MAX_ITERATIONS),
         ..rustykrab_gateway::RunOptions::default()
     };
 
@@ -470,6 +493,7 @@ async fn execute_cron_task(
         // reply is never the deliverable, and the model would otherwise
         // burn the slot.
         force_tool_use_first_iteration: true,
+        max_iterations: None,
         ..rustykrab_gateway::RunOptions::default()
     };
 
@@ -895,6 +919,58 @@ async fn deliver_response(
                  RUSTYKRAB_DEFAULT_CHAT_ID. Result discarded: {response_text}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod wake_prompt_tests {
+    use super::*;
+
+    /// The prompt used to say "retry the tool that failed". Nothing had
+    /// failed — the agent hit a login wall, which is not a tool error —
+    /// so the resumed turn was pointed at something that did not exist
+    /// and left to improvise. One run spent 96 iterations doing so.
+    #[test]
+    fn it_does_not_send_the_agent_after_a_failure_that_never_happened() {
+        let p = credential_wake_prompt("web_example_com_login", Some("example.com"));
+        assert!(
+            !p.contains("retry the tool that failed"),
+            "no tool failed; saying so sends the agent looking for one"
+        );
+    }
+
+    /// Naming the mechanism is what changed behaviour when the same gap
+    /// was fixed in the browser tool description, so the wake says it too.
+    #[test]
+    fn it_names_the_action_that_actually_signs_in() {
+        let p = credential_wake_prompt("web_example_com_login", Some("example.com"));
+        assert!(p.contains("fill_credential"), "{p}");
+        assert!(p.contains("field='username'"), "{p}");
+        assert!(p.contains("field='password'"), "{p}");
+        assert!(p.contains("snapshot"), "refs come from a snapshot: {p}");
+    }
+
+    /// The agent has no password. Left unsaid, it invents one — observed
+    /// typing the credential's own key name into the form.
+    #[test]
+    fn it_says_the_agent_does_not_hold_the_value() {
+        let p = credential_wake_prompt("web_example_com_login", Some("example.com"));
+        assert!(p.contains("do not have the password"), "{p}");
+        assert!(p.contains("must not type one"), "{p}");
+    }
+
+    #[test]
+    fn it_never_repeats_a_value_back() {
+        let p = credential_wake_prompt("gmail_app_password", Some("Gmail"));
+        assert!(p.contains("do not repeat any value back"), "{p}");
+        assert!(p.contains("Do not ask for the credential again"), "{p}");
+    }
+
+    /// Falls back to the store key when there is no friendly name.
+    #[test]
+    fn it_names_the_service_when_there_is_one() {
+        assert!(credential_wake_prompt("k", Some("Gmail")).contains("Gmail"));
+        assert!(credential_wake_prompt("gmail_app_password", None).contains("gmail_app_password"));
     }
 }
 
