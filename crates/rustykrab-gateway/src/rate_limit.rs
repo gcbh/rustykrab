@@ -292,6 +292,31 @@ pub async fn rate_limit_middleware(
         return Ok(next.run(request).await);
     }
 
+    // A request carrying a token this gateway accepts is not what this
+    // limiter defends against. Its purpose is brute-force and
+    // unauthenticated abuse (CVE-2026-32025); a caller that already holds
+    // the secret has full agent access on this machine, up to and
+    // including shell execution, so counting its requests protects
+    // nothing.
+    //
+    // It does break legitimate use. Peer delegation is asynchronous, so
+    // collecting a result means polling `/api/tasks/{id}` — which exhausts
+    // a 20-request window in well under a minute and then earns a
+    // five-minute lockout. Behind `tailscale serve` it is worse: the proxy
+    // connects from loopback, so every delegated request and the node's
+    // own WebChat share one bucket.
+    //
+    // Guesses, which is what brute force actually looks like, do not match
+    // and are still counted and locked out below.
+    // Lifted out of the request before the await: holding a `&Request`
+    // across one makes the middleware future non-Send, since the body
+    // type is not Sync.
+    let bearer = bearer_token(request.headers());
+
+    if is_authenticated(&state, bearer.as_deref()).await {
+        return Ok(next.run(request).await);
+    }
+
     let client_ip = extract_client_ip(&request, addr.ip());
 
     if !state.rate_limiter.check(client_ip) {
@@ -300,6 +325,47 @@ pub async fn rate_limit_middleware(
     }
 
     Ok(next.run(request).await)
+}
+
+/// Pull the bearer credential out of an `Authorization` header.
+///
+/// Returns `None` for anything that is not a non-empty `Bearer` value, so
+/// a malformed or empty header can never be mistaken for a credential and
+/// is rate-limited like any other anonymous request.
+fn bearer_token(headers: &axum::http::HeaderMap) -> Option<String> {
+    headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(str::to_string)
+}
+
+/// Whether the request carries a bearer token this gateway accepts.
+///
+/// Deliberately mirrors [`crate::auth::require_auth`]'s notion of a valid
+/// token — master or per-device — so the two middlewares cannot disagree
+/// about who is authenticated. A token that fails both checks falls
+/// through to the limiter, so an attacker cannot buy an exemption by
+/// attaching an `Authorization` header to a guess.
+async fn is_authenticated(state: &crate::AppState, token: Option<&str>) -> bool {
+    let Some(token) = token else {
+        return false;
+    };
+
+    // Held across the comparison to avoid a TOCTOU race with rotation,
+    // and reduced to a bool so the guard cannot live across the await
+    // below — the same discipline `require_auth` uses.
+    let is_master = {
+        let guard = state.auth_token.read().unwrap_or_else(|e| e.into_inner());
+        rustykrab_core::crypto::constant_time_eq(token, &guard)
+    };
+    if is_master {
+        return true;
+    }
+
+    matches!(state.store.devices().authenticate(token).await, Ok(Some(_)))
 }
 
 #[cfg(test)]
@@ -317,6 +383,69 @@ mod tests {
 
     fn ip(a: u8, b: u8, c: u8, d: u8) -> IpAddr {
         IpAddr::V4(Ipv4Addr::new(a, b, c, d))
+    }
+
+    /// Build an Authorization header map.
+    fn headers(value: &str) -> axum::http::HeaderMap {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert(
+            axum::http::header::AUTHORIZATION,
+            axum::http::HeaderValue::from_str(value).unwrap(),
+        );
+        h
+    }
+
+    #[test]
+    fn a_bearer_credential_is_recognised() {
+        assert_eq!(
+            bearer_token(&headers("Bearer abc123")).as_deref(),
+            Some("abc123")
+        );
+    }
+
+    #[test]
+    fn anonymous_and_malformed_requests_stay_rate_limited() {
+        // Each of these must yield no credential, so the caller falls
+        // through to the counter. An attacker must not be able to buy an
+        // exemption just by attaching an Authorization header.
+        assert_eq!(bearer_token(&axum::http::HeaderMap::new()), None);
+        assert_eq!(bearer_token(&headers("Bearer ")), None);
+        assert_eq!(bearer_token(&headers("Bearer    ")), None);
+        assert_eq!(bearer_token(&headers("Basic abc123")), None);
+        assert_eq!(bearer_token(&headers("abc123")), None);
+        // Case matters: the scheme is "Bearer", and a near-miss is not a
+        // credential.
+        assert_eq!(bearer_token(&headers("bearer abc123")), None);
+    }
+
+    #[test]
+    fn a_guess_is_not_a_credential() {
+        // The exemption turns on the token *matching*, not merely being
+        // present — brute force is exactly a stream of well-formed
+        // guesses, and those must still be counted and locked out.
+        let master = "the-real-token";
+        let guess = bearer_token(&headers("Bearer not-the-real-token")).unwrap();
+        assert!(!rustykrab_core::crypto::constant_time_eq(&guess, master));
+
+        let real = bearer_token(&headers("Bearer the-real-token")).unwrap();
+        assert!(rustykrab_core::crypto::constant_time_eq(&real, master));
+    }
+
+    #[test]
+    fn the_limiter_still_locks_out_unauthenticated_floods() {
+        // The exemption is in the middleware, not the limiter: the
+        // counter itself is unchanged, so anonymous traffic behaves
+        // exactly as before.
+        let limiter = RateLimiter::new(config(3));
+        let client = ip(10, 0, 0, 7);
+        for _ in 0..3 {
+            assert!(limiter.check(client));
+        }
+        assert!(
+            !limiter.check(client),
+            "fourth request must trip the lockout"
+        );
+        assert!(!limiter.check(client), "and stay locked out");
     }
 
     #[test]
