@@ -31,6 +31,14 @@ pub struct RunOptions {
     /// for scheduled tasks so the model can't waste the slot on a
     /// greeting.
     pub force_tool_use_first_iteration: bool,
+    /// Tools this run may not use, withheld before capabilities are
+    /// granted rather than rejected at call time — a tool the session
+    /// has no capability for is never offered to the model, so it does
+    /// not waste a turn discovering it is forbidden.
+    ///
+    /// Used by the delegated-task worker to deny onward delegation to a
+    /// run whose hop budget is spent.
+    pub denied_tools: Vec<String>,
 }
 
 /// Build the system prompt and inject it as the first message in the conversation.
@@ -279,6 +287,7 @@ async fn prepare_agent(
         .iter()
         .filter(|t| t.available())
         .map(|t| t.name())
+        .filter(|name| !options.denied_tools.iter().any(|denied| denied == name))
         .collect();
     tracing::debug!(
         tool_count = tool_names.len(),

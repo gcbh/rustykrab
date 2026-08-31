@@ -235,6 +235,7 @@ async fn execute_credential_wake(
         // should be retrying the tool that failed rather than announcing
         // that it can now be retried.
         force_tool_use_first_iteration: true,
+        ..rustykrab_gateway::RunOptions::default()
     };
 
     let trace_id = Uuid::new_v4();
@@ -469,6 +470,7 @@ async fn execute_cron_task(
         // reply is never the deliverable, and the model would otherwise
         // burn the slot.
         force_tool_use_first_iteration: true,
+        ..rustykrab_gateway::RunOptions::default()
     };
 
     // Run the agent. Mint a fresh trace id per scheduled run so prompt-log

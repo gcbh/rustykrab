@@ -1466,6 +1466,19 @@ async fn main() -> anyhow::Result<()> {
         infra_handles.push(tokio::spawn(worker.run()));
     }
 
+    // --- Delegated-task worker (peer delegation) ---
+    // Drains tasks a peer node submitted with POST /api/tasks. One at a
+    // time: this machine's model has a single KV-cache slot, so running
+    // two delegated conversations at once evicts both prompt prefixes and
+    // is slower than running them back to back.
+    {
+        let worker_state = state.clone();
+        infra_handles.push(tokio::spawn(async move {
+            rustykrab_gateway::run_task_worker(worker_state).await;
+        }));
+        tracing::info!("delegated-task worker started");
+    }
+
     // --- Job executor (scheduled task runner) ---
     {
         let executor_store = store_handle.clone();
