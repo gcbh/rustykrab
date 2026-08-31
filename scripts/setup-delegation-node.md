@@ -109,6 +109,39 @@ Start it and note the auth token it prints on first run (or set
 ./target/release/RustyKrab.app/Contents/MacOS/rustykrab-cli
 ```
 
+### Give the primary its own token, not this one
+
+That token is the node's **master** credential. Handing it to the primary means
+the two machines share one secret: you cannot revoke the primary's access
+without rotating everything else that uses it, and the node's logs cannot tell
+you which of them did what.
+
+Pair the primary instead, the same way a phone pairs. On the **node**:
+
+```bash
+rustykrab-cli pair          # prints a single-use code, valid 5 minutes
+```
+
+On the **primary**, redeem it for a token of its own:
+
+```bash
+curl -s -X POST https://your-node.your-tailnet.ts.net/api/pair \
+  -H 'Content-Type: application/json' \
+  -d '{"code":"<the code>","device_name":"m1max-primary"}'
+# -> {"device_id":"...","device_token":"..."}
+```
+
+Put that `device_token` in `RUSTYKRAB_NODES` below. It is accepted everywhere
+the master token is, but it is attributable — delegated tasks are recorded
+against `m1max-primary` rather than `master` — and individually revocable:
+
+```bash
+rustykrab-cli chat          # or: GET /api/devices, DELETE /api/devices/{id}
+```
+
+The token is stored in the node's database, so it survives restarts without
+needing `RUSTYKRAB_AUTH_TOKEN` pinned in the environment on either side.
+
 ## 2. Make it reachable
 
 The gateway binds to **loopback only, by design** — that is not configurable, and
