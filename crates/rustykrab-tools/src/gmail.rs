@@ -1,10 +1,13 @@
 use async_trait::async_trait;
 use futures::TryStreamExt;
-use rustykrab_core::active_tools::with_session_context;
 use rustykrab_core::types::ToolSchema;
 use rustykrab_core::{Error, Result, SandboxRequirements, Tool};
 use rustykrab_store::GuardedSecrets;
 use serde_json::{json, Value};
+
+// The account credential is shared with the calendar; so is everything
+// about obtaining it.
+use crate::google_credentials::{KEY_APP_PASSWORD, KEY_EMAIL};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -13,10 +16,6 @@ use serde_json::{json, Value};
 const IMAP_HOST: &str = "imap.gmail.com";
 const IMAP_PORT: u16 = 993;
 const SMTP_HOST: &str = "smtp.gmail.com";
-
-// SecretStore keys
-const KEY_EMAIL: &str = "gmail_email";
-const KEY_APP_PASSWORD: &str = "gmail_app_password";
 
 /// Maximum messages to return from a search.
 const MAX_SEARCH_RESULTS: usize = 50;
@@ -131,105 +130,13 @@ impl GmailTool {
         self
     }
 
-    /// File a request for the Gmail credentials and describe it to the
-    /// model.
+    /// Get email and app password from the credential store, asking the
+    /// user when they are absent.
     ///
-    /// Filing is best-effort by design: if the store rejects it, the caller
-    /// still gets an error explaining the gap, because a failure to ask is
-    /// not a reason to pretend the credential exists.
-    async fn ask_for_credentials(&self, needs: &str) -> String {
-        let Some(requests) = &self.requests else {
-            return String::new();
-        };
-        let fields = vec![
-            rustykrab_store::RequestedField {
-                key: KEY_EMAIL.to_string(),
-                label: "Gmail address".to_string(),
-                secret: false,
-                hint: None,
-            },
-            rustykrab_store::RequestedField {
-                key: KEY_APP_PASSWORD.to_string(),
-                label: "App password".to_string(),
-                // Not the account password: Gmail's IMAP and SMTP take a
-                // 16-character app password, generated per application.
-                secret: true,
-                hint: Some(
-                    "Sign in to Google and generate an app password — Apollo can do this for you."
-                        .to_string(),
-                ),
-            },
-        ];
-        // This is the path that actually fires in practice — measured at
-        // 25/25 against `browser`'s 1/9 — so a request filed here without
-        // a conversation would leave the common case unresumable.
-        let conversation_id = with_session_context(|c| c.conversation_id);
-
-        match requests
-            .file_fulfil(
-                KEY_APP_PASSWORD,
-                Some("Gmail".to_string()),
-                fields,
-                Some(format!(
-                    "so it can use your Gmail account — it needs {needs}"
-                )),
-                conversation_id,
-            )
-            .await
-        {
-            Ok(id) => {
-                // Gmail files most of the requests that ever get filed, so
-                // without this it is also the path that most often leaves
-                // the user with "open the app" and no way to answer from
-                // the chat they are actually in.
-                let link = crate::credential_link::mint_link(requests, &id).await;
-                format!(
-                    " {}",
-                    crate::credential_link::next_step(link.as_deref(), "Gmail")
-                )
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "could not file a Gmail credential request");
-                String::new()
-            }
-        }
-    }
-
-    /// Get email and app password from the credential store.
-    ///
-    /// When either is absent this asks the *user* for them rather than
-    /// instructing the model to invent a `credential_write` call: the model
-    /// has no password to write, so that advice could only ever produce a
-    /// fabricated value or a dead end. The old text also leaked an internal
-    /// tool name into whatever the user was reading.
+    /// One line, because the calendar needs exactly the same thing from the
+    /// same account: see [`crate::google_credentials`].
     async fn get_credentials(&self) -> Result<(String, String)> {
-        let email = self.secrets.get(KEY_EMAIL).await.ok();
-        let password = self.secrets.get(KEY_APP_PASSWORD).await.ok();
-
-        match (email, password) {
-            (Some(email), Some(password)) => Ok((email, password)),
-            (email, password) => {
-                // Two phrasings: one for the model's error, one shown to
-                // the user in the app, where "gmail_app_password" would
-                // mean nothing.
-                let (missing, needed) = match (email.is_some(), password.is_some()) {
-                    (false, false) => (
-                        "the Gmail address and app password are missing",
-                        "your Gmail address and app password",
-                    ),
-                    (true, false) => (
-                        "the Gmail app password is missing",
-                        "your Gmail app password",
-                    ),
-                    (false, true) => ("the Gmail address is missing", "your Gmail address"),
-                    (true, true) => unreachable!("both present is handled above"),
-                };
-                let asked = self.ask_for_credentials(needed).await;
-                Err(Error::ToolExecution(
-                    format!("Gmail is not set up yet: {missing}.{asked}").into(),
-                ))
-            }
-        }
+        crate::google_credentials::load(&self.secrets, self.requests.as_ref(), "Gmail").await
     }
 
     // -----------------------------------------------------------------------

@@ -30,10 +30,10 @@ const CALDAV_HOST: &str = "https://apidata.googleusercontent.com";
 /// Base path for CalDAV v2 collections.
 const CALDAV_BASE: &str = "https://apidata.googleusercontent.com/caldav/v2/";
 
-// SecretStore keys — shared with the Gmail tool so one app password covers
-// both mail and calendar.
-const KEY_EMAIL: &str = "gmail_email";
-const KEY_APP_PASSWORD: &str = "gmail_app_password";
+// The account credential is shared with the Gmail tool so one app password
+// covers both mail and calendar — and so is the code that reads it and asks
+// for it when it is absent.
+use crate::google_credentials::{describe_password_shape, KEY_APP_PASSWORD, KEY_EMAIL};
 
 /// Maximum events returned from a single `list_events` call.
 const MAX_EVENTS: usize = 200;
@@ -58,6 +58,11 @@ struct DavReq<'a> {
 pub struct CalDavTool {
     secrets: GuardedSecrets,
     client: reqwest::Client,
+    /// Where to file a request when the credentials are absent. Optional
+    /// so the tool still constructs in tests and anywhere the daemon has
+    /// not assembled a store; without it the tool reports the gap and asks
+    /// nobody, which is the behaviour this exists to end.
+    requests: Option<rustykrab_store::CredentialRequestStore>,
 }
 
 impl CalDavTool {
@@ -68,52 +73,24 @@ impl CalDavTool {
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
+            requests: None,
         }
     }
 
-    /// Fetch the Google email + app password from the shared credential store.
+    /// Let the tool ask the user for what it is missing.
+    pub fn with_requests(mut self, requests: rustykrab_store::CredentialRequestStore) -> Self {
+        self.requests = Some(requests);
+        self
+    }
+
+    /// Fetch the Google email + app password, asking the user when they are
+    /// absent or unusable.
+    ///
+    /// One line, because mail and calendar are one account: see
+    /// [`crate::google_credentials`].
     async fn get_credentials(&self) -> Result<(String, String)> {
-        let email = self.secrets.get(KEY_EMAIL).await.map_err(|e| {
-            Error::ToolExecution(
-                format!(
-                    "gmail_email not available: {e}. The CalDAV tool reuses your Gmail \
-                     credentials. Store it with: credential_write(action='set', \
-                     name='gmail_email', value='you@gmail.com'), or set it up via the \
-                     gmail tool's setup action."
-                )
-                .into(),
-            )
-        })?;
-        let password = self.secrets.get(KEY_APP_PASSWORD).await.map_err(|e| {
-            Error::ToolExecution(
-                format!(
-                    "gmail_app_password not available: {e}. The CalDAV tool reuses your \
-                     Gmail app password. Store it with: credential_write(action='set', \
-                     name='gmail_app_password', value='YOUR_APP_PASSWORD'). Generate an \
-                     app password at https://myaccount.google.com/apppasswords."
-                )
-                .into(),
-            )
-        })?;
-        // Google displays app passwords as four space-separated groups
-        // (`abcd efgh ijkl mnop`). Gmail's IMAP/SMTP tolerates the spaces
-        // server-side, but a CalDAV `Basic` auth header base64-encodes them
-        // verbatim and Google's DAV endpoint rejects it with 401. Strip all
-        // whitespace so a password stored in the displayed format still works,
-        // without requiring the user to re-enter it.
-        let email = email.trim().to_string();
-        let password = normalize_app_password(&password);
-
-        // A mis-scoped `credential_write` can store a key's *name* as its own
-        // value. That happened here: from 2026-08-02 the store held
-        // `gmail_email = "gmail_email"`, so every request addressed
-        // `caldav/v2/gmail_email/...` and spent three retries earning a
-        // guaranteed 401. Catch it before building the URL — the endpoint
-        // can only answer "unauthorized", which reads as a password problem
-        // and sends debugging the wrong way.
-        validate_credentials(&email, &password)?;
-
-        Ok((email, password))
+        crate::google_credentials::load(&self.secrets, self.requests.as_ref(), "Google Calendar")
+            .await
     }
 
     /// The events collection URL for a given calendar id (defaults to the
@@ -585,65 +562,6 @@ static HREF_RE: LazyLock<Regex> = LazyLock::new(|| {
 /// so this stays tiny while avoiding a recompile per fragment.
 static TAG_TEXT_RES: LazyLock<Mutex<HashMap<String, Regex>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
-
-/// Remove all whitespace from a Google app password. Google shows app
-/// passwords as four space-separated groups; the spaces are not part of the
-/// secret and break CalDAV `Basic` auth, so strip them.
-fn normalize_app_password(password: &str) -> String {
-    password.replace(char::is_whitespace, "")
-}
-
-/// Reject stored credentials that cannot possibly authenticate, before any
-/// request is built.
-///
-/// A mis-scoped `credential_write` can store a key's *name* as its own
-/// value. That happened here: from 2026-08-02 the store held
-/// `gmail_email = "gmail_email"`, so every request addressed
-/// `caldav/v2/gmail_email/...` and spent three retries earning a
-/// guaranteed 401. The endpoint can only answer "unauthorized", which
-/// reads as a password problem and sends debugging the wrong way — so
-/// name the real fault here instead.
-fn validate_credentials(email: &str, password: &str) -> Result<()> {
-    if email == KEY_EMAIL || !email.contains('@') {
-        return Err(Error::ToolExecution(
-            format!(
-                "stored {KEY_EMAIL} is not an email address. Re-store it with \
-                 credential_write(action='set', name='{KEY_EMAIL}', \
-                 value='you@gmail.com'), then approve the pending request."
-            )
-            .into(),
-        ));
-    }
-    if password == KEY_APP_PASSWORD {
-        return Err(Error::ToolExecution(
-            format!(
-                "stored {KEY_APP_PASSWORD} is the literal key name, not a password. \
-                 Re-store it with credential_write(action='set', \
-                 name='{KEY_APP_PASSWORD}', value='YOUR_APP_PASSWORD'), then approve \
-                 the pending request."
-            )
-            .into(),
-        ));
-    }
-    Ok(())
-}
-
-/// Summarise a password's shape for an error message without revealing it.
-/// Once the display spacing is stripped a Google app password is 16 ASCII
-/// alphanumeric characters; anything else is worth surfacing when auth
-/// fails. The value itself must never reach a log line, so this reports
-/// only a length and a character class.
-fn describe_password_shape(password: &str) -> String {
-    let len = password.chars().count();
-    if password.chars().all(|c| c.is_ascii_alphanumeric()) {
-        format!("{len} alphanumeric characters (Google app passwords are 16)")
-    } else {
-        format!(
-            "{len} characters including non-alphanumeric ones \
-             (Google app passwords are 16 alphanumeric)"
-        )
-    }
-}
 
 /// Turn an href (possibly path-only) into an absolute Google CalDAV URL.
 fn absolutize(href: &str) -> String {
@@ -1123,76 +1041,6 @@ mod tests {
     #[test]
     fn parse_vevent_returns_none_without_event() {
         assert!(parse_vevent("BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n").is_none());
-    }
-
-    #[test]
-    fn clobbered_credentials_are_rejected_before_any_request() {
-        // The exact shape the store held from 2026-08-02: the key name
-        // written as its own value.
-        let err = validate_credentials("gmail_email", "abcdefghijklmnop").unwrap_err();
-        assert!(err.to_string().contains("not an email address"));
-
-        let err = validate_credentials("me@gmail.com", "gmail_app_password").unwrap_err();
-        assert!(err.to_string().contains("not a password"));
-    }
-
-    #[test]
-    fn a_value_missing_an_at_sign_is_rejected() {
-        assert!(validate_credentials("not-an-email", "abcdefghijklmnop").is_err());
-    }
-
-    #[test]
-    fn well_formed_credentials_pass() {
-        // A wrong-but-plausible password still passes here — only the
-        // endpoint can judge that, and the 401 hint carries its shape.
-        assert!(validate_credentials("me@gmail.com", "abcdefghijklmnop").is_ok());
-        assert!(validate_credentials("me@gmail.com", "wrongbutplausible").is_ok());
-    }
-
-    #[test]
-    fn password_shape_reports_length_and_class_but_never_the_value() {
-        let secret = "abcdefghijklmnop";
-        let described = describe_password_shape(secret);
-        assert!(described.contains("16"));
-        assert!(described.contains("alphanumeric"));
-        // The point of the helper: a 401 message can carry the shape
-        // without leaking the credential into a log line.
-        assert!(!described.contains(secret));
-
-        // A clobbered value reports its real shape so the mismatch is
-        // visible without anyone having to read the stored secret.
-        let wrong = describe_password_shape("gmail_app_password");
-        assert!(wrong.contains("18"));
-        assert!(wrong.contains("non-alphanumeric"));
-        assert!(!wrong.contains("gmail_app_password"));
-    }
-
-    #[test]
-    fn password_shape_counts_characters_not_bytes() {
-        // A multi-byte character must count once, so the reported length
-        // stays comparable to Google's 16.
-        let described = describe_password_shape("é");
-        assert!(described.contains('1'));
-        assert!(!described.contains("2 characters"));
-    }
-
-    #[test]
-    fn app_password_whitespace_is_stripped() {
-        // Google's displayed format: four space-separated groups.
-        assert_eq!(
-            normalize_app_password("abcd efgh ijkl mnop"),
-            "abcdefghijklmnop"
-        );
-        // Leading/trailing and tab/newline whitespace too.
-        assert_eq!(
-            normalize_app_password("  abcd\tefgh\nijkl mnop  "),
-            "abcdefghijklmnop"
-        );
-        // Already-clean passwords are unchanged.
-        assert_eq!(
-            normalize_app_password("abcdefghijklmnop"),
-            "abcdefghijklmnop"
-        );
     }
 
     #[test]
