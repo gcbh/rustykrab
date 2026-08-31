@@ -60,8 +60,8 @@ use serde_json::{json, Value};
 
 use crate::credential_suite::{credential_requests_filed, drive_gateway};
 use crate::{
-    keep_or_drop, pick_free_port, shutdown_daemon, spawn_daemon_with, wait_for_health, Backend,
-    Expected, ScenarioReport, ALLOWED_ORIGIN,
+    keep_or_drop, kill_browser_for, pick_free_port, shutdown_daemon, spawn_daemon_with,
+    wait_for_health, Backend, Expected, ScenarioReport, ALLOWED_ORIGIN,
 };
 
 /// Seeded active from turn 0 for the same reason the credential suite seeds
@@ -73,6 +73,22 @@ const LOGIN_TOOLS: &[&str] = &["browser", "http_session"];
 /// How long to wait for the agent to file a credential request after the
 /// opening turn before concluding it never intends to.
 const ASK_WINDOW: Duration = Duration::from_secs(20);
+
+/// Default ceiling on a single trial.
+///
+/// Sized from what an *isolated* trial takes. That qualifier is the whole
+/// point: successes measured at 62-128s came from runs that shared one
+/// warm browser profile, and per-trial isolation means a cold browser
+/// launch every time. Setting the ceiling from the warm numbers cut into
+/// the working range -- at 300s no trial got as far as filing a
+/// credential request, where at 900s three of five did.
+///
+/// 600s is above everything the isolated configuration has been observed
+/// to need while still saving a third against the old 900s. Raise it with
+/// `--trial-timeout` for a slower model or provider; lower it once there
+/// is a measured distribution of how long a *successful* isolated trial
+/// actually takes, which does not exist yet.
+pub const DEFAULT_TRIAL_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// The variables that have to be set for this suite to run at all.
 const REQUIRED_VARS: &[&str] = &["RK_LOGIN_URL", "RK_LOGIN_USER", "RK_LOGIN_PASS"];
@@ -297,45 +313,67 @@ async fn run_trial(
         reply: String::new(),
     };
 
-    match tokio::time::timeout(
-        timeout,
-        run_trial_inner(
-            bin,
-            model,
-            ollama_url,
-            scenario,
-            provider,
-            want,
-            &mut result,
-        ),
-    )
-    .await
-    {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => {
-            result.outcome = LoginOutcome::Error;
-            result.reply = format!("harness error: {e:#}");
-        }
-        Err(_) => result.outcome = LoginOutcome::Timeout,
-    }
-    result.elapsed_secs = started.elapsed().as_secs_f64();
-    result
-}
-
-async fn run_trial_inner(
-    bin: &str,
-    model: &str,
-    ollama_url: &str,
-    scenario: &LoginScenario,
-    provider: &LiveProvider,
-    want: &str,
-    result: &mut LoginTrial,
-) -> Result<()> {
-    let tmp = tempfile::Builder::new()
+    // The trial's directory and daemon are owned *here*, outside the
+    // cancellable region. Held inside it, a timeout cancels the future
+    // before its cleanup runs: `TempDir::drop` then deletes the data dir,
+    // so `E2E_KEEP_TMP` preserved exactly the trials that finished and
+    // discarded the ones that timed out -- which are the only ones anyone
+    // wants to inspect. The daemon leaked for the same reason.
+    let tmp = match tempfile::Builder::new()
         .prefix("rustykrab-e2e-login-")
-        .tempdir()?;
+        .tempdir()
+    {
+        Ok(t) => t,
+        Err(e) => {
+            result.outcome = LoginOutcome::Error;
+            result.reply = format!("harness error: tempdir: {e}");
+            result.elapsed_secs = started.elapsed().as_secs_f64();
+            return result;
+        }
+    };
     let data_dir = tmp.path().to_path_buf();
-    let port = pick_free_port()?;
+
+    let port = match pick_free_port() {
+        Ok(p) => p,
+        Err(e) => {
+            result.outcome = LoginOutcome::Error;
+            result.reply = format!("harness error: port: {e}");
+            result.elapsed_secs = started.elapsed().as_secs_f64();
+            keep_or_drop(tmp);
+            return result;
+        }
+    };
+
+    // A provider on the operator's own network is still an unseen login to
+    // the agent, but the SSRF guard blocks private and CGNAT ranges by
+    // default -- so without this the suite could only target the public
+    // internet. Forwarded, not invented: the daemon reads the same
+    // variable in production, and it stays empty unless the operator set
+    // it.
+    let allow_hosts = std::env::var("RUSTYKRAB_SSRF_ALLOW_HOSTS").unwrap_or_default();
+    let mut extra_env: Vec<(String, String)> = Vec::new();
+    if !allow_hosts.is_empty() {
+        extra_env.push(("RUSTYKRAB_SSRF_ALLOW_HOSTS".to_string(), allow_hosts));
+    }
+
+    // A CDP port of this trial's own.
+    //
+    // The browser is addressed by a port derived from the profile name, and
+    // `connect_or_launch` attaches to whatever answers there before it
+    // considers launching. In production that is the point: a daemon that
+    // restarts reattaches to its warm, logged-in browser instead of paying
+    // a cold start. In a suite it means trial 2 attaches to trial 1's
+    // browser -- still signed in -- so it reports success without ever
+    // asking. Measured: five trials produced one real login and four
+    // echoes of it, every run, until this.
+    //
+    // Isolating `HOME` was not enough. That gave each trial its own
+    // user-data-dir, but nothing ever launched with it, because something
+    // already answered on the shared port.
+    let cdp_port = pick_free_port().unwrap_or(0);
+    if cdp_port != 0 {
+        extra_env.push(("CHROME_CDP_PORT".to_string(), cdp_port.to_string()));
+    }
 
     // Real tools and an empty credential store, exactly as a first run
     // against a new provider would find it.
@@ -346,10 +384,83 @@ async fn run_trial_inner(
         active_tools: LOGIN_TOOLS,
         tool_stubs: "",
         channel: None,
-        extra_env: &[],
+        extra_env: &extra_env,
     };
-    let mut child = spawn_daemon_with(bin, &data_dir, port, &backend)?;
+    let mut child = match spawn_daemon_with(bin, &data_dir, port, &backend) {
+        Ok(c) => c,
+        Err(e) => {
+            result.outcome = LoginOutcome::Error;
+            result.reply = format!("harness error: spawn: {e:#}");
+            result.elapsed_secs = started.elapsed().as_secs_f64();
+            keep_or_drop(tmp);
+            return result;
+        }
+    };
 
+    let timed_out = match tokio::time::timeout(
+        timeout,
+        run_trial_inner(
+            &data_dir,
+            port,
+            &mut child,
+            scenario,
+            provider,
+            want,
+            &mut result,
+            timeout,
+        ),
+    )
+    .await
+    {
+        Ok(Ok(())) => false,
+        Ok(Err(e)) => {
+            result.outcome = LoginOutcome::Error;
+            result.reply = format!("harness error: {e:#}");
+            true
+        }
+        Err(_) => {
+            result.outcome = LoginOutcome::Timeout;
+            true
+        }
+    };
+
+    if timed_out {
+        eprintln!(
+            "--- daemon.log tail (trial {trial}) ---\n{}",
+            redact(&crate::log_tail(&data_dir), provider)
+        );
+    }
+
+    shutdown_daemon(child).await;
+    // Chrome is a grandchild: the daemon spawns it and does not reap it,
+    // so killing the daemon leaves it running. Left alone these
+    // accumulate for the length of a suite, each holding a port and a
+    // profile, and the next trial may attach to one. Matched on this
+    // trial's own directory so no other browser on the machine is touched.
+    kill_browser_for(&data_dir);
+    keep_or_drop(tmp);
+
+    result.elapsed_secs = started.elapsed().as_secs_f64();
+    result
+}
+
+// The trial's whole context: where it lives, how to reach it, and what
+// it is testing. Bundling these into a struct would move the argument
+// list into a type without making either easier to read.
+#[allow(clippy::too_many_arguments)]
+async fn run_trial_inner(
+    data_dir: &std::path::Path,
+    port: u16,
+    child: &mut std::process::Child,
+    scenario: &LoginScenario,
+    provider: &LiveProvider,
+    want: &str,
+    result: &mut LoginTrial,
+    // Bounds a single HTTP request as well as the trial. One agent turn
+    // can legitimately take most of a trial, so they share a value rather
+    // than the client keeping a second, larger one of its own.
+    timeout: Duration,
+) -> Result<()> {
     let outcome = async {
         let base = format!("http://127.0.0.1:{port}");
         let mut headers = reqwest::header::HeaderMap::new();
@@ -358,10 +469,10 @@ async fn run_trial_inner(
             reqwest::header::HeaderValue::from_static(ALLOWED_ORIGIN),
         );
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(900))
+            .timeout(timeout)
             .default_headers(headers)
             .build()?;
-        wait_for_health(&base, &client, &mut child).await?;
+        wait_for_health(&base, &client, child).await?;
 
         let db_path = data_dir.join("db").join("store.db");
         let mut conv: Option<String> = None;
@@ -373,11 +484,14 @@ async fn run_trial_inner(
 
         // Answer whatever it asked for. Nothing to answer means the trial
         // cannot proceed, and that is its own outcome.
-        let filed = fulfil_pending(&base, &client, provider).await?;
-        // Counted before fulfilling: `credential_requests_filed` counts rows
-        // still `pending`, and fulfilling one moves it out of that state, so
-        // reading it afterwards reports 0 for every trial that worked.
+        // Counted before fulfilling, which is what the count means:
+        // `credential_requests_filed` counts rows still `pending`, and
+        // fulfilling one moves it out of that state. Read afterwards it
+        // reported 0 for every trial -- including the ones that asked,
+        // were answered, and signed in -- which reads in the report as
+        // "never asked" and is the opposite of what happened.
         result.requests_filed = credential_requests_filed(&db_path);
+        let filed = fulfil_pending(&base, &client, provider).await?;
         if !filed {
             result.outcome = classify(&result.reply, want, false);
             return Ok::<_, anyhow::Error>(());
@@ -401,14 +515,6 @@ async fn run_trial_inner(
     }
     .await;
 
-    if outcome.is_err() {
-        eprintln!(
-            "--- daemon.log tail ---\n{}",
-            redact(&crate::log_tail(&data_dir), provider)
-        );
-    }
-    shutdown_daemon(child).await;
-    keep_or_drop(tmp);
     outcome
 }
 
