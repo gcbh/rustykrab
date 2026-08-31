@@ -109,6 +109,10 @@ impl Tool for CredentialRequestTool {
                         "type": "string",
                         "description": "What the user knows this as, e.g. 'Gmail' or 'secure.examplebank.com'."
                     },
+                    "url": {
+                        "type": "string",
+                        "description": "For a website login, the page URL. Supply it and the credential names are derived from it for you, so a mistyped name cannot leave the credential somewhere the browser will not look."
+                    },
                     "reason": {
                         "type": "string",
                         "description": "One short phrase on why you need it, shown to the user, e.g. 'to search your inbox'."
@@ -174,6 +178,38 @@ impl Tool for CredentialRequestTool {
                 hint: entry["hint"].as_str().map(|s| s.to_string()),
             });
         }
+        // Repair website keys against the origin before anything is
+        // stored under them.
+        //
+        // The agent authors these and has to reproduce them exactly twice
+        // -- once here, once when the browser looks them up -- and it does
+        // not reliably manage it. One observed run asked for
+        // `web_m1_max_64_gb_..._password` while the browser derived
+        // `web_m1_max_64gb_..._password`; a single underscore meant the
+        // credential was stored where nothing would ever find it, the
+        // lookup failed twelve times, and the login could not complete.
+        // The same run spelled the username correctly, so nothing looked
+        // broken from either side alone.
+        //
+        // `url` is preferred; `service` is used when it looks like a host,
+        // because the agent supplies that already.
+        let origin = args["url"]
+            .as_str()
+            .map(|u| u.to_string())
+            .or_else(|| service.as_deref().and_then(crate::origin_from_service));
+        if let Some(origin) = &origin {
+            for f in fields.iter_mut() {
+                if let Some(canonical) = crate::canonical_web_key(origin, &f.key) {
+                    tracing::info!(
+                        from = %f.key,
+                        to = %canonical,
+                        "repaired a website credential key to match the origin"
+                    );
+                    f.key = canonical;
+                }
+            }
+        }
+
         if fields.is_empty() {
             return Err(Error::ToolExecution(
                 "'fields' must name at least one value to ask for".into(),

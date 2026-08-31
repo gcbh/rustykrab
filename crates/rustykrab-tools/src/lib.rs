@@ -197,7 +197,9 @@ pub use wiki::WikiTool;
 pub use credential_read::CredentialReadTool;
 pub use credential_request::CredentialRequestTool;
 pub use credential_write::CredentialWriteTool;
-pub use origin_key::{origin_credential_key, PASSWORD, USERNAME};
+pub use origin_key::{
+    canonical_web_key, origin_credential_key, origin_from_service, PASSWORD, USERNAME,
+};
 
 // Skills
 pub use self::skills::{SkillTool, SkillsTool};
