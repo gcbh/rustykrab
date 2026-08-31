@@ -787,6 +787,29 @@ impl Tool for BrowserTool {
                     )
                 })?;
 
+                // What is about to be typed, without saying it.
+                //
+                // `status: "filled"` was returned whether or not the right
+                // string reached the field, so a wrong fill and a right
+                // one were indistinguishable from outside -- the same
+                // shape of defect as a read that returns "" and calls it
+                // success. Length plus a short digest is enough to tell
+                // "the value arrived" from "something else did" when
+                // reading a failed run, and neither reveals the secret.
+                let digest = {
+                    use sha2::{Digest, Sha256};
+                    let mut h = Sha256::new();
+                    h.update(value.as_bytes());
+                    hex::encode(&h.finalize()[..4])
+                };
+                tracing::debug!(
+                    key = %cred_key,
+                    field,
+                    value_len = value.len(),
+                    value_sha256_prefix = %digest,
+                    "filling a credential field"
+                );
+
                 let store_key = Self::store_key(&profile, target_id);
                 let fill_args = json!({ "text": value, "clear": true });
                 actions::execute_act(
@@ -802,11 +825,14 @@ impl Tool for BrowserTool {
                 // A fresh result rather than the fill's own. Nothing
                 // derived from the value travels back to the model — not
                 // its length, which for a password is worth guessing with.
+                // The length is reported so a caller can tell an empty
+                // or placeholder fill from a real one. The value is not.
                 Ok(json!({
                     "status": "filled",
                     "field": field,
                     "credentialKey": cred_key,
                     "ref": ref_id,
+                    "value_len": value.len(),
                 }))
             }
 

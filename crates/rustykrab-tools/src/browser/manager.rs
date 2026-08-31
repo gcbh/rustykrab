@@ -73,6 +73,21 @@ pub struct BrowserManager {
     sticky: Arc<std::sync::Mutex<HashMap<(String, String), String>>>,
 }
 
+/// How many tabs one profile's browser may hold.
+///
+/// The browser is deliberately long-lived: it keeps the operator's
+/// logged-in profile warm and survives daemon restarts, which is what
+/// gets an agent past bot protection without signing in again. The cost
+/// of that choice is that nothing ever closes a tab -- the agent opens
+/// them and rarely tidies up, so a browser that lives for weeks
+/// accumulates them until it is the largest process on the machine.
+///
+/// A cap keeps reuse constant-cost. When a new tab would exceed it the
+/// oldest is closed first, on the reasoning that the agent is working on
+/// what it opened most recently. Closing is best-effort: failing to tidy
+/// must never fail the navigation the user actually asked for.
+const MAX_TABS_PER_PROFILE: usize = 8;
+
 impl BrowserManager {
     pub fn new(config: BrowserConfig) -> Self {
         let mgr = Self {
@@ -306,17 +321,68 @@ impl BrowserManager {
 
         let nav_timeout = Duration::from_millis(self.config.remote_cdp_timeout_ms.max(10_000));
 
+        // `new_page` creates the tab *and* navigates, so this budget covers
+        // a page load, not just a CDP round trip. Timing the two phases
+        // separately is the difference between "the browser is wedged" and
+        // "the site is slow", which the old single error could not tell
+        // apart.
+        // Keep reuse bounded before adding to it.
+        // `Page::close` consumes self (CDP `Target.closeTarget`), so the
+        // stale pages are taken by value rather than borrowed -- same
+        // reason `close_tab` uses `swap_remove`.
+        if let Ok(mut existing) = inst.browser.pages().await {
+            if existing.len() >= MAX_TABS_PER_PROFILE {
+                let excess = existing.len() + 1 - MAX_TABS_PER_PROFILE;
+                for stale in existing.drain(..excess) {
+                    match stale.close().await {
+                        Ok(()) => tracing::debug!("closed the oldest tab to stay within the cap"),
+                        // A tab that will not close is not a reason to
+                        // refuse the navigation the user asked for.
+                        Err(e) => tracing::warn!(error = %e, "could not close a stale tab"),
+                    }
+                }
+                tracing::info!(
+                    closed = excess,
+                    cap = MAX_TABS_PER_PROFILE,
+                    "reaped stale tabs before opening a new one"
+                );
+            }
+        }
+
+        let open_started = std::time::Instant::now();
         let page = tokio::time::timeout(nav_timeout, inst.browser.new_page(url))
             .await
             .map_err(|_| {
+                tracing::warn!(
+                    url,
+                    budget_ms = nav_timeout.as_millis() as u64,
+                    "new_page timed out — tab creation plus navigation exceeded the budget"
+                );
                 Error::ToolExecution(
-                    format!("open_tab timed out after {}ms", nav_timeout.as_millis()).into(),
+                    format!(
+                        "open_tab timed out after {}ms waiting for the tab to be created \
+                         and '{url}' to load. The browser was reachable (the instance is \
+                         alive); the page did not finish in the budget.",
+                        nav_timeout.as_millis()
+                    )
+                    .into(),
                 )
             })?
             .map_err(|e| Error::ToolExecution(format!("failed to open tab: {e}").into()))?;
+        let open_ms = open_started.elapsed().as_millis() as u64;
 
         // Bound wait_for_navigation so a slow page can't hang the call forever.
-        let _ = tokio::time::timeout(nav_timeout, page.wait_for_navigation()).await;
+        let nav_started = std::time::Instant::now();
+        let settled = tokio::time::timeout(nav_timeout, page.wait_for_navigation())
+            .await
+            .is_ok();
+        tracing::info!(
+            url,
+            open_ms,
+            settle_ms = nav_started.elapsed().as_millis() as u64,
+            settled,
+            "opened tab"
+        );
         let actual_url = page.url().await.ok().flatten().unwrap_or_default();
         let title = page.get_title().await.ok().flatten().unwrap_or_default();
 
@@ -777,10 +843,37 @@ fn launch_browser_blocking(
         )
     })?;
 
+    // Chrome's own stderr, kept next to its profile.
+    //
+    // It used to go to /dev/null, which meant a browser that failed to
+    // start, crashed, or refused a profile lock said exactly nothing --
+    // the only visible symptom was a tool timeout further up, with no way
+    // to tell "never launched" from "launched and slow". Diagnosing
+    // `open_tab timed out` from outside the process is guesswork without
+    // this.
+    let chrome_log_path = user_data_dir.join("chrome-stderr.log");
+    let chrome_log = std::fs::File::create(&chrome_log_path).ok();
+
     let mut cmd = std::process::Command::new(&exe);
-    cmd.args(&args)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+    cmd.args(&args);
+    match chrome_log {
+        Some(f) => {
+            let dup = f.try_clone().ok();
+            cmd.stdout(std::process::Stdio::from(f));
+            match dup {
+                Some(d) => {
+                    cmd.stderr(std::process::Stdio::from(d));
+                }
+                None => {
+                    cmd.stderr(std::process::Stdio::null());
+                }
+            }
+        }
+        None => {
+            cmd.stdout(std::process::Stdio::null());
+            cmd.stderr(std::process::Stdio::null());
+        }
+    }
 
     // macOS: prevent App Nap from suspending the headed browser's timers.
     // Headed Chrome backgrounded on macOS will throttle its event loop and
@@ -799,6 +892,9 @@ fn launch_browser_blocking(
         profile = profile_name,
         %profile_dir_name,
         pid = child.id(),
+        executable = %exe,
+        user_data_dir = %user_data_dir.display(),
+        stderr_log = %chrome_log_path.display(),
         "launched browser with remote debugging"
     );
     Ok(child)
