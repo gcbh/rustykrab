@@ -1189,11 +1189,23 @@ mod wake_tests {
     use super::fulfil_tests::gmail_fields;
     use super::*;
 
+    /// One `request_fulfilled` call, captured.
+    ///
+    /// A named struct rather than a tuple: the assertions read better for
+    /// it, and three string-ish fields in a row is exactly the shape
+    /// `clippy::type_complexity` objects to.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct Fulfilment {
+        conversation_id: Option<String>,
+        credential: String,
+        service: Option<String>,
+    }
+
     /// Records what it was told, so the assertion reads the hook's
     /// arguments rather than trusting a log line.
     #[derive(Debug, Default)]
     struct RecordingNotifier {
-        fulfilled: Mutex<Vec<(Option<String>, String, Option<String>)>>,
+        fulfilled: Mutex<Vec<Fulfilment>>,
     }
 
     impl RequestNotifier for RecordingNotifier {
@@ -1205,11 +1217,11 @@ mod wake_tests {
             credential_name: &str,
             service: Option<&str>,
         ) {
-            self.fulfilled.lock().unwrap().push((
-                conversation_id.map(str::to_string),
-                credential_name.to_string(),
-                service.map(str::to_string),
-            ));
+            self.fulfilled.lock().unwrap().push(Fulfilment {
+                conversation_id: conversation_id.map(str::to_string),
+                credential: credential_name.to_string(),
+                service: service.map(str::to_string),
+            });
         }
     }
 
@@ -1257,13 +1269,13 @@ mod wake_tests {
         let seen = notifier.fulfilled.lock().unwrap();
         assert_eq!(seen.len(), 1, "one wake per fulfilment");
         assert_eq!(
-            seen[0].0.as_deref(),
+            seen[0].conversation_id.as_deref(),
             Some(conv.to_string().as_str()),
             "the wake must name the conversation that filed the request"
         );
-        assert_eq!(seen[0].1, "gmail_app_password");
+        assert_eq!(seen[0].credential, "gmail_app_password");
         // Carried so the resumed turn can say "Gmail", not the store key.
-        assert_eq!(seen[0].2.as_deref(), Some("Gmail"));
+        assert_eq!(seen[0].service.as_deref(), Some("Gmail"));
     }
 
     /// A request filed outside a runner scope still fulfils. It simply
@@ -1284,7 +1296,10 @@ mod wake_tests {
 
         let seen = notifier.fulfilled.lock().unwrap();
         assert_eq!(seen.len(), 1);
-        assert_eq!(seen[0].0, None, "nothing to resume, and that is fine");
+        assert_eq!(
+            seen[0].conversation_id, None,
+            "nothing to resume, and that is fine"
+        );
     }
 
     /// A failed fulfil must not announce success. The credential never
