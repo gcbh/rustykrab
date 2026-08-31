@@ -180,21 +180,35 @@ impl NodesTool {
             "hopBudget": node.hop_budget.unwrap_or(0),
         });
 
-        let accepted = match self.post(node, &node.api("/tasks"), body).await {
-            Ok(value) => value,
-            // A node on a build without the task queue has no /api/tasks.
-            // Fall back so a mixed-version fleet keeps working, and say
-            // so — the synchronous path is bounded by this tool's own
-            // timeout and will fail on anything long.
-            Err(e) if is_missing_endpoint(&e) => {
-                tracing::warn!(
-                    node = %node.id,
-                    "node has no /api/tasks; falling back to a synchronous delegation"
-                );
-                return self.legacy_send(node, message).await;
-            }
-            Err(e) => return Err(e),
-        };
+        let url = node.api("/tasks");
+        let resp = self
+            .send_raw(node, self.client.post(&url).json(&body))
+            .await?;
+
+        // A node on a build without the task queue does not serve
+        // /api/tasks. Fall back so a mixed-version fleet keeps working —
+        // the synchronous path is bounded by this tool's own timeout and
+        // will fail on anything long, but it beats refusing outright.
+        //
+        // Both statuses matter, and which one you get is not obvious:
+        // axum answers 404 when no route matches the path at all, but 405
+        // when the path exists for a different method. A build that has
+        // `GET /api/tasks/{id}` but not `POST /api/tasks` returns 405, so
+        // treating only 404 as "missing" would strand exactly the peers
+        // this fallback is for. Observed against a real v5.2.0 node: 405.
+        if matches!(
+            resp.status(),
+            reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::METHOD_NOT_ALLOWED
+        ) {
+            tracing::warn!(
+                node = %node.id,
+                status = %resp.status(),
+                "node does not serve /api/tasks; falling back to a synchronous delegation"
+            );
+            return self.legacy_send(node, message).await;
+        }
+
+        let accepted = self.interpret(node, resp, &url).await?;
 
         let task_id = accepted["id"].as_str().unwrap_or_default().to_string();
         if task_id.is_empty() {
@@ -320,15 +334,16 @@ impl NodesTool {
             .await
     }
 
-    /// Issue one request to a node, mapping transport and HTTP failures
-    /// into errors the model can act on.
-    async fn send_request(
+    /// Issue one request to a node, returning the response whatever its
+    /// status. Only transport failures become errors here, so callers
+    /// that need to branch on a status code can do so before it is
+    /// flattened into an error string.
+    async fn send_raw(
         &self,
         node: &RemoteNode,
         request: reqwest::RequestBuilder,
-        url: &str,
-    ) -> Result<Value> {
-        let resp = request
+    ) -> Result<reqwest::Response> {
+        request
             .bearer_auth(&node.token)
             .header("Origin", node.origin())
             .send()
@@ -337,14 +352,22 @@ impl NodesTool {
                 Error::ToolExecution(
                     format!("node '{}' at {} is unreachable: {e}", node.id, node.url).into(),
                 )
-            })?;
+            })
+    }
 
+    /// Turn a peer's response into JSON, or an error the model can act on.
+    async fn interpret(
+        &self,
+        node: &RemoteNode,
+        resp: reqwest::Response,
+        url: &str,
+    ) -> Result<Value> {
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
             let hint = match status.as_u16() {
                 401 | 403 => " (check the node's token, and that its gateway is reachable)",
-                404 => " (the node may be running a build without this endpoint)",
+                404 | 405 => " (the node may be running a build without this endpoint)",
                 _ => "",
             };
             return Err(Error::ToolExecution(
@@ -367,15 +390,16 @@ impl NodesTool {
             Error::ToolExecution(format!("node '{}' returned invalid JSON: {e}", node.id).into())
         })
     }
-}
 
-/// Whether an error came from a node that does not know an endpoint.
-///
-/// Used to detect a peer predating the delegated-task queue so the tool
-/// can fall back instead of failing a mixed-version fleet.
-fn is_missing_endpoint(err: &Error) -> bool {
-    let text = err.to_string();
-    text.contains("404") || text.contains("405")
+    async fn send_request(
+        &self,
+        node: &RemoteNode,
+        request: reqwest::RequestBuilder,
+        url: &str,
+    ) -> Result<Value> {
+        let resp = self.send_raw(node, request).await?;
+        self.interpret(node, resp, url).await
+    }
 }
 
 impl Default for NodesTool {
@@ -603,19 +627,41 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_endpoint_is_distinguishable_from_a_dead_node() {
-        // Drives the fallback for a peer predating the task queue. An
-        // unreachable node must not be mistaken for an old one, or the
-        // tool would retry a synchronous send against nothing.
-        assert!(is_missing_endpoint(&Error::ToolExecution(
-            "node 'm4max' returned 404 Not Found for /api/tasks: ".into()
-        )));
-        assert!(!is_missing_endpoint(&Error::ToolExecution(
-            "node 'm4max' at https://x is unreachable: connection refused".into()
-        )));
-        assert!(!is_missing_endpoint(&Error::ToolExecution(
-            "node 'm4max' returned 401 Unauthorized for /api/tasks: ".into()
-        )));
+    fn both_missing_endpoint_statuses_trigger_the_fallback() {
+        // Which one a peer returns is not obvious: axum answers 404 when
+        // no route matches the path, but 405 when the path exists for a
+        // different method. A real v5.2.0 node returned 405, so matching
+        // only 404 would strand exactly the peers this fallback serves.
+        for status in [
+            reqwest::StatusCode::NOT_FOUND,
+            reqwest::StatusCode::METHOD_NOT_ALLOWED,
+        ] {
+            assert!(
+                matches!(
+                    status,
+                    reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::METHOD_NOT_ALLOWED
+                ),
+                "{status} must fall back"
+            );
+        }
+
+        // And nothing else does. An auth failure or a server error means
+        // the endpoint is there and something else is wrong; retrying
+        // synchronously would just fail twice and hide the real cause.
+        for status in [
+            reqwest::StatusCode::UNAUTHORIZED,
+            reqwest::StatusCode::FORBIDDEN,
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+        ] {
+            assert!(
+                !matches!(
+                    status,
+                    reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::METHOD_NOT_ALLOWED
+                ),
+                "{status} must not fall back"
+            );
+        }
     }
 
     #[test]
