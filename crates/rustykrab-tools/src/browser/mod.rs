@@ -141,6 +141,12 @@ impl Tool for BrowserTool {
          wait_for — wait for selector / network idle / fixed delay; \
          snapshot — accessibility-tree with element refs; \
          act — interact by ref (click/type/press/hover/select/drag); \
+         fill_credential — type a STORED credential into a field by ref, without \
+         ever seeing its value: pass 'ref' and 'field' ('username' or 'password'). \
+         Always sign in with this. Never use act/type for a password: you do not \
+         have the value, and typing a placeholder or the credential's own name just \
+         fails the login. If nothing is stored yet the error names the exact key — \
+         ask for it with credential_request under that name, then retry; \
          screenshot/content/evaluate/scroll/console/cookies/pdf. \
          Cookies persist across calls. Use snapshot + act for reliable element interaction. \
          If act returns status \"new_snapshot\", the page state moved on: the response \
