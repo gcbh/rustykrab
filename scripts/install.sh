@@ -69,9 +69,14 @@ PB=(/usr/libexec/PlistBuddy -c)
 "${PB[@]}" "Add :EnvironmentVariables:HOME string $HOME" "$PLIST"
 "${PB[@]}" 'Add :EnvironmentVariables:PATH string /opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin' "$PLIST"
 
+# Anything not listed here never reaches the installed daemon, however it was
+# set at install time. The credential-page settings are on the list because
+# without RUSTYKRAB_PUBLIC_URL the agent cannot mint a link at all, and the
+# failure is silent — it just falls back to telling the user to open the app.
 for key in RUSTYKRAB_PROVIDER RUSTYKRAB_PORT RUSTYKRAB_WEB_UI RUST_LOG \
     OLLAMA_BASE_URL OLLAMA_MODEL OLLAMA_NUM_CTX RUSTYKRAB_NUM_CTX \
-    TELEGRAM_ALLOWED_CHATS TELEGRAM_BOT_TOKEN; do
+    TELEGRAM_ALLOWED_CHATS TELEGRAM_BOT_TOKEN \
+    RUSTYKRAB_PUBLIC_URL RUSTYKRAB_TAILNET_USERS RUSTYKRAB_ALLOWED_ORIGINS; do
     if [[ -n "${!key:-}" ]]; then
         "${PB[@]}" "Add :EnvironmentVariables:$key string ${!key}" "$PLIST"
     fi

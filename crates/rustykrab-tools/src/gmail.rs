@@ -170,13 +170,24 @@ impl GmailTool {
                 KEY_APP_PASSWORD,
                 Some("Gmail".to_string()),
                 fields,
-                Some(format!("so it can use your Gmail account — it needs {needs}")),
+                Some(format!(
+                    "so it can use your Gmail account — it needs {needs}"
+                )),
                 conversation_id,
             )
             .await
         {
-            Ok(_) => " A prompt asking for them is now waiting in the Apollo app —                        tell the user that, in one sentence, and stop. Do not ask for                        the password in chat and do not retry until they answer."
-                .to_string(),
+            Ok(id) => {
+                // Gmail files most of the requests that ever get filed, so
+                // without this it is also the path that most often leaves
+                // the user with "open the app" and no way to answer from
+                // the chat they are actually in.
+                let link = crate::credential_link::mint_link(requests, &id).await;
+                format!(
+                    " {}",
+                    crate::credential_link::next_step(link.as_deref(), "Gmail")
+                )
+            }
             Err(e) => {
                 tracing::warn!(error = %e, "could not file a Gmail credential request");
                 String::new()
