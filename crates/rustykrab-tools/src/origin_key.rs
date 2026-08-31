@@ -157,3 +157,119 @@ mod tests {
         assert!(origin_credential_key("https://example.com", "  ").is_err());
     }
 }
+
+/// Field roles a website login key may end in.
+///
+/// Only these are canonicalised. A key ending in something else is left
+/// alone: the point is to repair a mistyped *host*, not to second-guess
+/// what the agent is asking for.
+const WEB_KEY_ROLES: &[&str] = &["username", "password", "email", "totp", "otp", "pin"];
+
+/// Rebuild a website credential key so its host matches what
+/// [`origin_credential_key`] derives, keeping the role the agent chose.
+///
+/// The agent authors these keys and must reproduce them exactly twice —
+/// once when asking, once when the browser looks them up. It does not
+/// reliably manage that. Observed against gemma4:26b: it asked for
+/// `web_m1_max_64_gb_..._password` and the browser derived
+/// `web_m1_max_64gb_..._password`, one underscore apart, so the lookup
+/// missed twelve times and the login could never complete. The same run
+/// spelled the username key correctly, which is why this survived until
+/// the two sides were compared directly.
+///
+/// Returns `None` when there is nothing to do: a key that is not a
+/// website key, has no recognised role, or already matches.
+pub fn canonical_web_key(origin: &str, key: &str) -> Option<String> {
+    if !key.starts_with("web_") {
+        return None;
+    }
+    let role = WEB_KEY_ROLES
+        .iter()
+        .find(|r| key.ends_with(&format!("_{r}")))?;
+    let canonical = origin_credential_key(origin, role).ok()?;
+    (canonical != key).then_some(canonical)
+}
+
+/// Best-effort URL for a `service` string the agent supplied.
+///
+/// `service` is meant to be what the user recognises — "Gmail",
+/// "portal.example.com/login" — so it is only usable here when it looks
+/// like a host. Anything without a dot is a product name, not an origin.
+pub fn origin_from_service(service: &str) -> Option<String> {
+    let s = service
+        .trim()
+        .trim_start_matches("https://")
+        .trim_start_matches("http://");
+    let host = s.split(['/', '?', '#']).next()?;
+    (host.contains('.') && !host.contains(' ')).then(|| format!("https://{host}"))
+}
+
+#[cfg(test)]
+mod canonical_tests {
+    use super::*;
+
+    /// The exact failure observed in a live run.
+    #[test]
+    fn a_mistyped_host_is_repaired() {
+        let got = canonical_web_key(
+            "https://m1-max-64gb.tail84017e.ts.net/demo/",
+            "web_m1_max_64_gb_tail84017e_ts_net_password",
+        );
+        assert_eq!(
+            got.as_deref(),
+            Some("web_m1_max_64gb_tail84017e_ts_net_password")
+        );
+    }
+
+    #[test]
+    fn a_correct_key_is_left_alone() {
+        assert_eq!(
+            canonical_web_key(
+                "https://m1-max-64gb.tail84017e.ts.net/demo/",
+                "web_m1_max_64gb_tail84017e_ts_net_username"
+            ),
+            None
+        );
+    }
+
+    /// Service credentials are not website keys and must not be rewritten.
+    #[test]
+    fn a_named_service_credential_is_untouched() {
+        assert_eq!(
+            canonical_web_key("https://example.com", "gmail_app_password"),
+            None
+        );
+        assert_eq!(
+            canonical_web_key("https://example.com", "anthropic_api_key"),
+            None
+        );
+    }
+
+    /// An unrecognised role is left alone rather than guessed at.
+    #[test]
+    fn an_unknown_role_is_not_rewritten() {
+        assert_eq!(
+            canonical_web_key("https://example.com", "web_example_com_wibble"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_service_that_looks_like_a_host_yields_an_origin() {
+        assert_eq!(
+            origin_from_service("m1-max-64gb.tail84017e.ts.net/demo/").as_deref(),
+            Some("https://m1-max-64gb.tail84017e.ts.net")
+        );
+        assert_eq!(
+            origin_from_service("https://portal.example.com/login").as_deref(),
+            Some("https://portal.example.com")
+        );
+    }
+
+    /// A product name is not an origin.
+    #[test]
+    fn a_plain_service_name_yields_nothing() {
+        assert_eq!(origin_from_service("Gmail"), None);
+        assert_eq!(origin_from_service("my bank"), None);
+    }
+}
