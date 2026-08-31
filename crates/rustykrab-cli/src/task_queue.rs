@@ -235,6 +235,7 @@ async fn execute_credential_wake(
         // should be retrying the tool that failed rather than announcing
         // that it can now be retried.
         force_tool_use_first_iteration: true,
+        ..rustykrab_gateway::RunOptions::default()
     };
 
     let trace_id = Uuid::new_v4();
