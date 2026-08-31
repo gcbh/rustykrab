@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.2.2] - 2026-08-31
+
+- fix(tools): stop the nodes tests racing over a process-global env var (#565)
+
 ## [5.2.1] - 2026-08-31
 
 - feat(security): let the operator name hosts the SSRF guard may reach (#560)

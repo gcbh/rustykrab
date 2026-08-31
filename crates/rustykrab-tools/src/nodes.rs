@@ -82,7 +82,13 @@ impl NodesTool {
             Ok(v) if !v.trim().is_empty() => v,
             _ => return Ok(Vec::new()),
         };
-        serde_json::from_str(&raw).map_err(|e| {
+        Self::parse_nodes(&raw)
+    }
+
+    /// Parse a node list, separated from reading the environment so it can
+    /// be exercised without touching a process-global variable.
+    fn parse_nodes(raw: &str) -> Result<Vec<RemoteNode>> {
+        serde_json::from_str(raw).map_err(|e| {
             Error::ToolExecution(
                 format!(
                     "RUSTYKRAB_NODES is not valid JSON ({e}). Expected an array of \
@@ -387,9 +393,12 @@ mod tests {
 
     #[test]
     fn malformed_config_is_a_clear_error() {
-        std::env::set_var("RUSTYKRAB_NODES", "not json");
-        let err = NodesTool::configured_nodes().unwrap_err().to_string();
+        // Parsed directly rather than through the environment. Setting a
+        // process-global var races every other test in this binary --
+        // cargo runs them as threads of one process -- and this test
+        // previously fought `list_never_leaks_tokens` for RUSTYKRAB_NODES,
+        // failing whichever one lost the interleaving.
+        let err = NodesTool::parse_nodes("not json").unwrap_err().to_string();
         assert!(err.contains("RUSTYKRAB_NODES"), "got: {err}");
-        std::env::remove_var("RUSTYKRAB_NODES");
     }
 }
