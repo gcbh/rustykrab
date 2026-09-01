@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.2.12] - 2026-09-01
+
+- refactor(browser): make the isolated root a config field, read once (#586)
+
 ## [5.2.11] - 2026-09-01
 
 - fix(credentials): ask for a new app password when Google rejects the stored one (#597)
