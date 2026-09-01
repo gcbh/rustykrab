@@ -258,8 +258,7 @@ const MAX_SUMMARY_CAP_RESUMMARIZE_ATTEMPTS: usize = 3;
 /// Cuts on a UTF-8 char boundary and appends a short marker so the
 /// downstream agent can tell the summary was clipped.
 fn truncate_summary_to_tokens(s: &str, max_tokens: usize) -> String {
-    // Inverse of `AgentRunner::estimate_text_tokens`: ~3.5 chars/token.
-    let max_bytes = (max_tokens as f64 * 3.5) as usize;
+    let max_bytes = rustykrab_core::max_bytes_for_tokens(max_tokens);
     if s.len() <= max_bytes {
         return s.to_string();
     }
@@ -2514,7 +2513,8 @@ impl AgentRunner {
 
     // --- Compaction (RLM paper §3.2) -------------------------------------------
 
-    /// Conservative token estimate for a message (~3.5 chars per token).
+    /// Conservative token estimate for a message, including the framing
+    /// overhead charged per message by `rustykrab_core::token_estimate`.
     ///
     /// JSON payloads are sized with a counting writer (`json_len`) — the
     /// serialized bytes are counted, never materialized.
@@ -2536,8 +2536,7 @@ impl AgentRunner {
                 })
                 .sum(),
         };
-        // +4 per message for role/framing overhead.
-        (content_chars as f64 / 3.5).ceil() as usize + 4
+        rustykrab_core::estimate_message_bytes(content_chars)
     }
 
     /// Estimate total token count for the conversation.
@@ -2689,10 +2688,10 @@ impl AgentRunner {
         format!("[{role}] {body}")
     }
 
-    /// Estimate tokens for a plain string using the same ~3.5 chars/token
-    /// heuristic as `estimate_message_tokens`.
+    /// Estimate tokens for a plain string. Shares the estimator with
+    /// `estimate_message_tokens`, minus the per-message framing overhead.
     fn estimate_text_tokens(text: &str) -> usize {
-        (text.len() as f64 / 3.5).ceil() as usize
+        rustykrab_core::estimate_text_tokens(text)
     }
 
     /// Pack text fragments into chunks whose token estimates each fit the

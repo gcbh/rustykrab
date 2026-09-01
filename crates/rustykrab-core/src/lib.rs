@@ -24,6 +24,7 @@ pub mod retrieval_log;
 pub mod schema_validate;
 pub mod session;
 pub mod todo;
+pub mod token_estimate;
 pub mod tool;
 pub mod types;
 
@@ -46,4 +47,7 @@ pub use retrieval_log::RetrievalLog;
 pub use schema_validate::validate_tool_args;
 pub use session::Session;
 pub use todo::{render_todos, TodoItem, TodoStatus, TodoStore};
+pub use token_estimate::{
+    estimate_bytes, estimate_message_bytes, estimate_text_tokens, max_bytes_for_tokens,
+};
 pub use tool::{SandboxRequirements, Tool};

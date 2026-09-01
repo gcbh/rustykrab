@@ -196,8 +196,9 @@ fn message_to_turn(msg: &Message, session_id: Uuid, turn_number: u32) -> Convers
             | MessageContent::MultiToolCall(_)
             | MessageContent::ToolResult(_)
     );
-    // Same estimator the agent runner uses for compaction budgeting.
-    let token_count = Some(((content.len() as f64 / 3.5).ceil() as u32).saturating_add(4));
+    // Literally the same estimator the agent runner uses for compaction
+    // budgeting, not a second copy of it that has to be kept in step.
+    let token_count = Some(rustykrab_core::estimate_message_bytes(content.len()) as u32);
 
     ConversationTurn {
         id: msg.id,
