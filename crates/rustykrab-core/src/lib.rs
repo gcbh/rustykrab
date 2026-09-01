@@ -14,6 +14,7 @@ pub mod agent_def;
 pub mod capability;
 pub mod crypto;
 pub mod error;
+pub mod memory_backend;
 pub mod model;
 pub mod orchestration;
 pub mod outcome;
@@ -33,6 +34,7 @@ pub use activity::ActivityTracker;
 pub use agent_def::{AgentDefinition, AgentRegistry};
 pub use capability::{is_subagent_tool, Capability, CapabilitySet, SUBAGENT_TOOL_NAMES};
 pub use error::{Error, Result, ToolError, ToolErrorKind};
+pub use memory_backend::MemoryBackend;
 pub use model::ModelProvider;
 pub use orchestration::{OrchestrationConfig, RecursiveCall, TaskComplexity, VoteResult};
 pub use outcome::{
