@@ -878,7 +878,7 @@ async fn deliver_response(
 
     // Each link goes as its own message and never passed through the model,
     // so it cannot have been truncated or paraphrased on the way here.
-    for link in state.store.pending_links().take(conversation_id) {
+    for link in state.agent.store.pending_links().take(conversation_id) {
         deliver_text(target, channel, chat_id, thread_id, &link, state).await;
     }
 }

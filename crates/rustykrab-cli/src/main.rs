@@ -2288,7 +2288,7 @@ async fn slack_agent_loop(
             // the link never passed through the model so it cannot have
             // been truncated. Slack has no app in the loop, so without
             // this the ask is a dead end here.
-            for link in state.store.pending_links().take(conv_id) {
+            for link in state.agent.store.pending_links().take(conv_id) {
                 if let Err(e) = sl
                     .send_text(&inbound.channel_id, &link, Some(&effective_thread_ts))
                     .await
