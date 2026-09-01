@@ -461,6 +461,44 @@ impl CredentialRequestStore {
         Ok(token)
     }
 
+    /// Whether `name` already has a pending request with a link that still
+    /// works.
+    ///
+    /// Exists so a caller can decline to ask twice. Filing a second request
+    /// for the same credential supersedes the first, and superseding
+    /// invalidates the link already sent — so an agent that trips over one
+    /// dead credential in four different tool calls sends the user four
+    /// links of which only the last works, and a superseded link renders
+    /// the same "Link expired" page a genuine expiry does. The user cannot
+    /// tell which of the four to trust, and three of them are already dead
+    /// on arrival.
+    ///
+    /// Deliberately checks the link rather than just the request: a pending
+    /// request whose link has expired *should* be asked again, because the
+    /// user has nothing usable left.
+    pub async fn has_live_link(&self, name: &str) -> Result<bool, Error> {
+        let name = name.to_string();
+        let now = Utc::now().timestamp_millis();
+        crate::with_conn(&self.conn, move |conn| {
+            let live: i64 = conn
+                .query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM credential_requests
+                          WHERE name = ?1
+                            AND status = 'pending'
+                            AND link_token_hash IS NOT NULL
+                            AND link_token_hash <> ''
+                            AND link_expires_at > ?2
+                     )",
+                    params![name, now],
+                    |row| row.get(0),
+                )
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            Ok(live != 0)
+        })
+        .await
+    }
+
     /// Resolve a one-time link token to the request it answers.
     ///
     /// Returns `None` for a token that is unknown, expired, or whose
@@ -774,6 +812,45 @@ mod fulfil_tests {
                 crate::credential_backend::MemoryBackend::new(),
             ));
         (dir, store.credential_requests(), store.secrets())
+    }
+
+    #[tokio::test]
+    async fn a_live_link_suppresses_a_second_ask_and_an_expired_one_does_not() {
+        let (_dir, requests, _secrets) = store();
+        let id = requests
+            .file_fulfil("gmail_app_password", None, gmail_fields(), None, None)
+            .await
+            .unwrap();
+
+        // Nothing minted yet: the user has nothing to open, so asking again
+        // is the right call.
+        assert!(!requests.has_live_link("gmail_app_password").await.unwrap());
+
+        requests
+            .issue_link(&id, std::time::Duration::from_secs(900))
+            .await
+            .unwrap();
+        assert!(
+            requests.has_live_link("gmail_app_password").await.unwrap(),
+            "a link the user can still open must suppress a second ask, or \
+             superseding it kills the one they were sent"
+        );
+
+        // An unrelated credential must not be suppressed by this one.
+        assert!(!requests.has_live_link("notion_api_token").await.unwrap());
+
+        // Expired: the user has nothing usable left, so the next tool to
+        // trip over the credential should ask again rather than leave them
+        // with a dead link and no way to get a fresh one.
+        requests
+            .issue_link(&id, std::time::Duration::from_millis(1))
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(
+            !requests.has_live_link("gmail_app_password").await.unwrap(),
+            "an expired link must not suppress a fresh ask"
+        );
     }
 
     pub(super) fn gmail_fields() -> Vec<RequestedField> {

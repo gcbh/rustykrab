@@ -295,10 +295,11 @@ async fn delete_conversation(
             rustykrab_core::Error::NotFound(_) => StatusCode::NOT_FOUND,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         })?;
-    // Drop the recall archive too (cache + durable row) so a deleted
-    // conversation leaves nothing behind.
+    // Everything the conversation owns in the database — messages, recall
+    // archive, channel bindings — goes with it by cascade, so this handler
+    // no longer has to know the list. What is left is process state, which
+    // the database cannot reach: the recall cache and the todo list.
     state.recall.purge(id);
-    // Drop the conversation's todo list as well.
     state.todos.clear(id);
     Ok(StatusCode::NO_CONTENT)
 }

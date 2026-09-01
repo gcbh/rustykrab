@@ -294,7 +294,10 @@ const ELEMENT_OP_BUDGET: std::time::Duration = std::time::Duration::from_secs(10
 /// "Request timed out" told the agent nothing, so it reissued the same
 /// call until the trial ended. A fresh snapshot re-reads the document and
 /// yields refs that work, so say that.
-async fn find_element_bounded(page: &Page, selector: &str) -> Result<chromiumoxide::Element> {
+pub(super) async fn find_element_bounded(
+    page: &Page,
+    selector: &str,
+) -> Result<chromiumoxide::Element> {
     match tokio::time::timeout(ELEMENT_OP_BUDGET, page.find_element(selector)).await {
         Ok(Ok(elem)) => Ok(elem),
         Ok(Err(e)) => Err(Error::ToolExecution(ToolError::not_found(format!(

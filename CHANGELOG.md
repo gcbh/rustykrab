@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - fix(context): anchor compaction to actual token usage, and stop the MaxTokens spiral
 
+## [5.2.15] - 2026-09-01
+
+- perf(agent): keep the tool block on the compaction call (#600)
+
+## [5.2.14] - 2026-09-01
+
+- feat(store): enforce the foreign keys the schema already claimed (#590)
+
+## [5.2.13] - 2026-09-01
+
+- fix(browser): bound the renderer round trips that decorate a result (#587)
+
+## [5.2.12] - 2026-09-01
+
+- refactor(browser): make the isolated root a config field, read once (#586)
+
+## [5.2.11] - 2026-09-01
+
+- fix(credentials): ask for a new app password when Google rejects the stored one (#597)
+
 ## [5.2.10] - 2026-09-01
 
 - fix(browser): bound element lookups, and say what went wrong (#581)

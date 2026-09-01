@@ -26,6 +26,22 @@ pub struct BrowserConfig {
     #[serde(default = "default_profile_name")]
     pub default_profile: String,
 
+    /// Root for browser profile data, when the caller wants a browser of
+    /// its own rather than the account's.
+    ///
+    /// Set it and two things follow: profile data lives under this root
+    /// instead of `~/.rustykrab/browser`, and the symlink to the real
+    /// Chrome profile is suppressed. Unset -- the normal case -- nothing
+    /// changes, and the real profile is borrowed because that is where
+    /// the logins are.
+    ///
+    /// The obvious way to get an isolated browser is to point HOME at a
+    /// scratch directory. That does not work: Chrome wedges its renderer
+    /// when HOME is an empty directory, committing a page's URL while the
+    /// document never arrives. Isolate this one directory instead.
+    #[serde(default)]
+    pub isolated_root: Option<PathBuf>,
+
     /// Run browsers in headless mode.
     #[serde(default)]
     pub headless: bool,
@@ -152,6 +168,9 @@ impl Default for BrowserConfig {
             enabled: true,
             evaluate_enabled: false,
             default_profile: "rustykrab".to_string(),
+            // Unset by default: normal use borrows the real Chrome
+            // profile, which is where the logins are.
+            isolated_root: None,
             headless: false,
             no_sandbox: false,
             attach_only: false,
@@ -209,6 +228,11 @@ impl BrowserConfig {
         if let Ok(path) = std::env::var("CHROME_EXECUTABLE") {
             config.executable_path = Some(path);
         }
+        if let Ok(root) = std::env::var("RUSTYKRAB_BROWSER_ISOLATED_ROOT") {
+            if !root.is_empty() {
+                config.isolated_root = Some(PathBuf::from(root));
+            }
+        }
         if std::env::var("BROWSER_HEADLESS").as_deref() == Ok("1") {
             config.headless = true;
         }
@@ -254,21 +278,8 @@ impl BrowserConfig {
                 return PathBuf::from(dir);
             }
         }
-        // An explicit isolated root, for callers that need a browser of
-        // their own without borrowing anything from the real account.
-        //
-        // The obvious way to get that is to point HOME at a scratch dir,
-        // and it does not work: Chrome wedges its renderer when HOME is
-        // an empty directory. The page commits its URL and the document
-        // never arrives, which is indistinguishable from a hung site. A
-        // 2x2 over (stealth flags, sandboxed HOME) put it beyond doubt --
-        // every run with a redirected HOME wedged, every run without it
-        // loaded in ~2s. So isolate the one directory that needs
-        // isolating and leave HOME alone.
-        if let Ok(root) = std::env::var("RUSTYKRAB_BROWSER_ISOLATED_ROOT") {
-            if !root.is_empty() {
-                return PathBuf::from(root).join(profile_name).join("user-data");
-            }
+        if let Some(root) = &self.isolated_root {
+            return root.join(profile_name).join("user-data");
         }
         let home = std::env::var("HOME")
             .or_else(|_| std::env::var("USERPROFILE"))
@@ -331,4 +342,56 @@ fn default_remote_cdp_timeout() -> u64 {
 
 fn default_color() -> String {
     "#FF6B00".to_string()
+}
+
+#[cfg(test)]
+mod isolated_root_tests {
+    use super::*;
+
+    /// The point of holding this as config rather than reading the
+    /// environment where it is used: it can be exercised without mutating
+    /// process-global state, which every other test in this binary shares.
+    #[test]
+    fn an_isolated_root_places_profile_data_under_it() {
+        let config = BrowserConfig {
+            isolated_root: Some(PathBuf::from("/tmp/trial-7/browser")),
+            ..Default::default()
+        };
+        assert_eq!(
+            config.resolve_user_data_dir("rustykrab"),
+            PathBuf::from("/tmp/trial-7/browser/rustykrab/user-data")
+        );
+    }
+
+    #[test]
+    fn without_one_the_account_directory_is_used() {
+        let dir = BrowserConfig::default().resolve_user_data_dir("rustykrab");
+        let shown = dir.display().to_string();
+        assert!(shown.contains(".rustykrab/browser/rustykrab"), "{shown}");
+    }
+
+    /// Normal use must keep borrowing the real Chrome profile; that is
+    /// where the logins are.
+    #[test]
+    fn isolation_is_off_by_default() {
+        assert!(BrowserConfig::default().isolated_root.is_none());
+    }
+
+    /// A per-profile override still wins, as it did before.
+    #[test]
+    fn an_explicit_profile_directory_outranks_the_isolated_root() {
+        let mut config = BrowserConfig {
+            isolated_root: Some(PathBuf::from("/tmp/trial-7/browser")),
+            ..Default::default()
+        };
+        config
+            .profiles
+            .entry("rustykrab".to_string())
+            .or_default()
+            .user_data_dir = Some("/explicit/path".to_string());
+        assert_eq!(
+            config.resolve_user_data_dir("rustykrab"),
+            PathBuf::from("/explicit/path")
+        );
+    }
 }

@@ -446,13 +446,16 @@ impl BrowserTool {
             return None;
         }
         let pinned = self.manager.sticky_target(session, profile)?;
-        if self.manager.target_is_live(profile, &pinned).await {
-            Some(pinned)
-        } else {
-            // The tab was closed out from under us. Drop the pin rather than
-            // failing every subsequent action on a dead target.
-            self.manager.clear_sticky_target(session, profile);
-            None
+        match self.manager.target_is_live(profile, &pinned).await {
+            // Definitely gone: the tab was closed out from under us. Drop the
+            // pin rather than failing every subsequent action on it.
+            Some(false) => {
+                self.manager.clear_sticky_target(session, profile);
+                None
+            }
+            // Live, or the browser could not answer in time. Keep the pin —
+            // a slow Chrome is not a reason to lose the page mid-task.
+            _ => Some(pinned),
         }
     }
 
@@ -466,9 +469,13 @@ impl BrowserTool {
         target_id: Option<&str>,
     ) -> Result<chromiumoxide::Page> {
         let page = self.manager.get_page(profile, target_id).await?;
-        let url = page.url().await.ok().flatten().unwrap_or_default();
-        let navigated = self.manager.sticky_target(session, profile).is_some();
-        Self::reject_blank_read(action, &url, navigated)?;
+        // Bounded: a page that will not answer is not evidence of a blank
+        // tab, so an inconclusive probe skips the guard rather than
+        // rejecting a read the model may well be able to complete.
+        if let Some(url) = manager::probe_page_url_once(&page).await {
+            let navigated = self.manager.sticky_target(session, profile).is_some();
+            Self::reject_blank_read(action, &url, navigated)?;
+        }
         Ok(page)
     }
 
@@ -734,7 +741,9 @@ impl Tool for BrowserTool {
                     tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
                 }
 
-                let title = page.get_title().await.ok().flatten().unwrap_or_default();
+                let title = manager::probe_page_title_once(&page)
+                    .await
+                    .unwrap_or_default();
                 let current_url = page.url().await.ok().flatten().unwrap_or_default();
 
                 // Pin the tab we just loaded so the snapshot/content call
@@ -921,11 +930,9 @@ impl Tool for BrowserTool {
                 let selector = args["selector"].as_str();
 
                 let png_bytes = if let Some(sel) = selector {
-                    let elem = page.find_element(sel).await.map_err(|e| {
-                        Error::ToolExecution(
-                            format!("element not found for selector '{sel}': {e}").into(),
-                        )
-                    })?;
+                    // Same bound the `act` path got: an element lookup
+                    // against a wedged document never returns on its own.
+                    let elem = actions::find_element_bounded(&page, sel).await?;
                     elem.screenshot(
                         chromiumoxide::cdp::browser_protocol::page::CaptureScreenshotFormat::Png,
                     )
@@ -976,7 +983,9 @@ impl Tool for BrowserTool {
                 };
 
                 let (truncated_content, was_truncated) = truncate_utf8(&content, MAX_CONTENT_BYTES);
-                let title = page.get_title().await.ok().flatten().unwrap_or_default();
+                let title = manager::probe_page_title_once(&page)
+                    .await
+                    .unwrap_or_default();
                 let current_url = page.url().await.ok().flatten().unwrap_or_default();
 
                 Ok(json!({
@@ -1197,7 +1206,9 @@ impl Tool for BrowserTool {
                 let b64 = base64::engine::general_purpose::STANDARD.encode(&pdf_bytes);
 
                 let url = page.url().await.ok().flatten().unwrap_or_default();
-                let title = page.get_title().await.ok().flatten().unwrap_or_default();
+                let title = manager::probe_page_title_once(&page)
+                    .await
+                    .unwrap_or_default();
 
                 Ok(json!({
                     "pdf": b64,
@@ -1289,7 +1300,9 @@ impl Tool for BrowserTool {
                 }
 
                 let final_url = page.url().await.ok().flatten().unwrap_or_default();
-                let title = page.get_title().await.ok().flatten().unwrap_or_default();
+                let title = manager::probe_page_title_once(&page)
+                    .await
+                    .unwrap_or_default();
                 let html = page.content().await.unwrap_or_default();
                 let text = page
                     .evaluate("document.body ? document.body.innerText : ''")
