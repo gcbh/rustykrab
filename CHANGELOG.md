@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- fix(context): anchor compaction to actual token usage, and stop the MaxTokens spiral
+
 ## [5.2.10] - 2026-09-01
 
 - fix(browser): bound element lookups, and say what went wrong (#581)

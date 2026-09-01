@@ -479,6 +479,14 @@ impl ModelProvider for AnthropicProvider {
         Some(self.context_limit)
     }
 
+    fn total_context_window(&self) -> Option<usize> {
+        Some(self.context_limit)
+    }
+
+    fn output_reserve_tokens(&self) -> usize {
+        self.max_tokens as usize
+    }
+
     fn supports_vision(&self) -> bool {
         true
     }

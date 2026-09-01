@@ -198,6 +198,10 @@ async fn execute_repl_call_impl(
     let timeout_secs = config.model_call_timeout_secs;
     let mut empty_tool_use_retries: usize = 0;
     let max_empty_tool_use_retries: usize = 3;
+    // Consecutive MaxTokens responses. A model that truncates every turn
+    // makes no progress from "Continue." — cap it like the other retry
+    // categories instead of burning the remaining rounds.
+    let mut max_tokens_retries: usize = 0;
 
     for round in 0..max_rounds {
         // Acquire a semaphore permit for the LLM call only — released
@@ -231,6 +235,7 @@ async fn execute_repl_call_impl(
         // If the model wants to use tools, execute them and continue.
         if response.message.content.has_tool_calls() {
             empty_tool_use_retries = 0;
+            max_tokens_retries = 0;
             messages.push(response.message.clone());
 
             let calls = response.message.content.tool_calls();
@@ -277,6 +282,17 @@ async fn execute_repl_call_impl(
                 return Ok(answer);
             }
             StopReason::MaxTokens => {
+                max_tokens_retries += 1;
+                if max_tokens_retries > 3 {
+                    let answer = response.message.content.as_text().unwrap_or("").to_string();
+                    tracing::warn!(
+                        depth,
+                        round,
+                        answer_len = answer.len(),
+                        "RLM REPL: max-tokens retries exhausted — returning truncated answer"
+                    );
+                    return Ok(answer);
+                }
                 tracing::warn!(
                     depth,
                     round,

@@ -80,6 +80,25 @@ pub trait ModelProvider: Send + Sync {
         None
     }
 
+    /// Total raw context window in tokens (input + output), when known.
+    ///
+    /// Distinct from [`Self::context_limit`], which may report a *usable
+    /// input budget* after the provider's own reserves. This is the figure
+    /// actual usage counts are measured against: a response whose
+    /// `Usage::prompt_tokens + completion_tokens` reaches this value was
+    /// cut off by the window itself, not by the generation cap.
+    fn total_context_window(&self) -> Option<usize> {
+        None
+    }
+
+    /// Tokens the provider reserves for generation within the window
+    /// (Ollama's `num_predict`, Anthropic's `max_tokens`). Callers that
+    /// predict whether the next request fits subtract this from
+    /// [`Self::total_context_window`].
+    fn output_reserve_tokens(&self) -> usize {
+        4096
+    }
+
     /// Whether this provider supports image content in messages.
     fn supports_vision(&self) -> bool {
         false
@@ -99,8 +118,14 @@ pub trait ModelProvider: Send + Sync {
     ///
     /// Exists for compaction: a summarization call wants to see far more
     /// history than a normal turn, and a provider that can resize its
-    /// window per request (Ollama rebuilds the KV cache in ~3s) can honour
-    /// that without changing the window every other call runs at.
+    /// window per request can honour that without changing the window
+    /// every other call runs at. Resizing is far from free, though —
+    /// Ollama tears the runner down and reloads the model on a `num_ctx`
+    /// change, discarding every cached prefix (measured at tens of
+    /// seconds round-trip plus a full re-prefill; see
+    /// `compaction_expand_ctx` in rustykrab-agent for numbers), so
+    /// callers should treat this as an expensive escape hatch, not a
+    /// per-call knob.
     ///
     /// The default ignores the hint — cloud providers have one fixed
     /// window and it is already large.

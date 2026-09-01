@@ -8,7 +8,9 @@ use std::time::{Duration, Instant};
 use chrono::Utc;
 use rustykrab_core::active_tools::{ActiveToolsRegistry, SessionToolContext, SESSION_TOOL_CONTEXT};
 use rustykrab_core::capability::Capability;
-use rustykrab_core::model::{ModelProvider, ModelResponse, StopReason, StreamEvent, ToolChoice};
+use rustykrab_core::model::{
+    ModelProvider, ModelResponse, StopReason, StreamEvent, ToolChoice, Usage,
+};
 use rustykrab_core::outcome::{
     classify_run, Attribution, ExecutionCounters, OutcomeRecord, OutcomeSink, SignalClass,
 };
@@ -140,6 +142,24 @@ const PLANNING_ONLY_RETRY_LIMIT: usize = 2;
 /// rather than spinning until `max_iterations`. Small models that never
 /// learn to call `task_complete` thus degrade to the legacy behavior.
 const TASK_COMPLETE_RETRY_LIMIT: usize = 3;
+
+/// Maximum consecutive `MaxTokens` responses before the runner gives up
+/// rather than re-prompting "Continue." again. Each retry re-sends the
+/// whole prompt, and when the cutoff was caused by the context *window*
+/// (not the generation cap) the retry also shrinks the model's remaining
+/// room — observed in production as completions walking down ~12 tokens
+/// per iteration (788, 779, … 5) until the daemon was restarted. The
+/// window-exhaustion case forces a compaction first, so hitting this cap
+/// means even a freshly compacted history couldn't get a complete
+/// response out.
+const MAX_TOKENS_RETRY_LIMIT: usize = 3;
+
+/// Slack for deciding that a `MaxTokens` stop was the context window
+/// rather than `num_predict`: prompt + completion within this many tokens
+/// of the provider's total window counts as window exhaustion. The gap is
+/// never large — Ollama stops generation exactly at `num_ctx` — but chat
+/// templates cost a few tokens the usage figures don't itemize.
+const MAX_TOKENS_WINDOW_SLACK: usize = 64;
 
 /// Default upper bound on the effective context window used when computing
 /// the compaction threshold. Guards against a model that *advertises* a
@@ -864,6 +884,18 @@ pub struct AgentRunner {
     /// scratch whenever the message count disagrees (compaction rewrote
     /// the history, or something appended outside `push_message`).
     token_estimates: Mutex<HashMap<Uuid, (usize, usize)>>,
+    /// Ground-truth context anchor per conversation: `(message_count at
+    /// the moment of the last LLM response, actual tokens covering those
+    /// messages)` where the token figure is the response's
+    /// `prompt_tokens + completion_tokens`. The chars-per-token heuristic
+    /// in `estimate_message_tokens` undercounts JSON-heavy history by
+    /// ~40% (browser snapshots tokenize at ~2.5 chars/token, not 3.5),
+    /// which let real prompts reach the raw window while the estimate sat
+    /// comfortably under the compaction threshold. The anchor pins the
+    /// running total to what the provider actually measured, so only the
+    /// handful of messages appended since the last call are ever
+    /// estimated. See `predicted_prompt_tokens`.
+    usage_anchors: Mutex<HashMap<Uuid, (usize, usize)>>,
     /// Where completed runs report how they went. `None` disables outcome
     /// instrumentation entirely (see `DREAMING.md`).
     outcome_sink: Option<Arc<dyn OutcomeSink>>,
@@ -894,6 +926,7 @@ impl AgentRunner {
             recall: Arc::new(RecallStore::new()),
             todos: Arc::new(TodoStore::new()),
             token_estimates: Mutex::new(HashMap::new()),
+            usage_anchors: Mutex::new(HashMap::new()),
             outcome_sink: None,
             retrieval_log: None,
             active_skill: None,
@@ -1176,6 +1209,60 @@ impl AgentRunner {
             .remove(&conv_id);
     }
 
+    /// Record the ground-truth context anchor from a just-completed LLM
+    /// call. Called after the response message is pushed, so
+    /// `conv.messages.len()` covers exactly what `prompt_tokens` (the
+    /// request) plus `completion_tokens` (the pushed response) measured —
+    /// including the tool schemas and chat-template framing the
+    /// char-based estimator never sees.
+    ///
+    /// A zero usage total is ignored: scripted/test providers report no
+    /// usage, and anchoring to 0 would suppress compaction entirely.
+    fn record_usage_anchor(&self, conv: &Conversation, usage: &Usage) {
+        let total = usage.prompt_tokens as usize + usage.completion_tokens as usize;
+        if total == 0 {
+            return;
+        }
+        self.usage_anchors
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(conv.id, (conv.messages.len(), total));
+    }
+
+    /// Drop the usage anchor — required whenever the history is rewritten
+    /// (compaction, in-place summary repair): the anchored token total
+    /// describes messages that no longer exist, and once the rewritten
+    /// history grows past the anchored count the staleness would be
+    /// undetectable.
+    fn forget_usage_anchor(&self, conv_id: Uuid) {
+        self.usage_anchors
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&conv_id);
+    }
+
+    /// Predicted token size of the *next* request: the last actual usage
+    /// total plus heuristic estimates for only the messages appended
+    /// since. `None` when no anchor exists (no LLM call yet, or the
+    /// provider reports no usage) or when the history shrank below the
+    /// anchored count (rewritten outside `push_message`) — callers fall
+    /// back to the pure heuristic.
+    fn predicted_prompt_tokens(&self, conv: &Conversation) -> Option<usize> {
+        let (anchored_len, anchored_total) = *self
+            .usage_anchors
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&conv.id)?;
+        if anchored_len > conv.messages.len() {
+            return None;
+        }
+        let appended: usize = conv.messages[anchored_len..]
+            .iter()
+            .map(Self::estimate_message_tokens)
+            .sum();
+        Some(anchored_total + appended)
+    }
+
     /// Push the `task_complete` summary as the final assistant message and
     /// log the termination. Shared by the streaming and non-streaming run
     /// paths; the caller is responsible for emitting any provider-specific
@@ -1287,6 +1374,7 @@ impl AgentRunner {
                 recall,
                 todos,
                 token_estimates: Mutex::new(HashMap::new()),
+                usage_anchors: Mutex::new(HashMap::new()),
                 outcome_sink,
                 retrieval_log,
                 active_skill,
@@ -1359,9 +1447,11 @@ impl AgentRunner {
             .await;
         self.capture_outcome(session, &tracer, result.is_err())
             .await;
-        // Release the per-conversation token-estimate entry so long-lived
-        // runners don't accumulate one per conversation ever served.
+        // Release the per-conversation token-estimate and usage-anchor
+        // entries so long-lived runners don't accumulate one per
+        // conversation ever served.
         self.forget_token_estimate(conv.id);
+        self.forget_usage_anchor(conv.id);
         result
     }
 
@@ -1387,6 +1477,7 @@ impl AgentRunner {
         let mut empty_response_retries: usize = 0;
         let mut planning_only_retries: usize = 0;
         let mut empty_tool_use_retries: usize = 0;
+        let mut max_tokens_retries: usize = 0;
         // Cap re-prompts that nudge the model to call `task_complete` after
         // it stops with text alone mid-task.
         let mut task_complete_retries: usize = 0;
@@ -1493,6 +1584,7 @@ impl AgentRunner {
             );
 
             self.push_message(conv, message);
+            self.record_usage_anchor(conv, &usage);
             // Re-borrow the message we just moved into the conversation so
             // the response can be inspected without having cloned it (it
             // may carry large tool arguments or inline image bytes).
@@ -1515,6 +1607,7 @@ impl AgentRunner {
                 empty_tool_use_retries = 0;
                 empty_response_retries = 0;
                 planning_only_retries = 0;
+                max_tokens_retries = 0;
                 task_complete_retries = 0;
                 let calls = message.content.tool_calls();
                 let tool_names: Vec<&str> = calls.iter().map(|c| c.name.as_str()).collect();
@@ -1646,7 +1739,35 @@ impl AgentRunner {
 
             match stop_reason {
                 StopReason::MaxTokens => {
-                    tracing::warn!("model hit max tokens, prompting to continue");
+                    max_tokens_retries += 1;
+                    if max_tokens_retries > MAX_TOKENS_RETRY_LIMIT {
+                        tracing::warn!(
+                            iteration,
+                            "max-tokens retries exhausted — accepting the truncated response"
+                        );
+                        return Ok(());
+                    }
+                    // Distinguish the two ways a generation gets cut off.
+                    // `num_predict` exhaustion means a verbose response —
+                    // "Continue." genuinely helps. *Window* exhaustion means
+                    // the prompt ate the model's room, and re-prompting only
+                    // shrinks it further (every retry appends messages), so
+                    // compact first and retry with room to work.
+                    let used = usage.prompt_tokens as usize + usage.completion_tokens as usize;
+                    let window_exhausted = self
+                        .provider
+                        .total_context_window()
+                        .is_some_and(|w| used + MAX_TOKENS_WINDOW_SLACK >= w);
+                    if window_exhausted {
+                        tracing::warn!(
+                            iteration,
+                            used_tokens = used,
+                            "generation cut off by the context window — compacting before retrying"
+                        );
+                        self.compact_history(conv).await?;
+                    } else {
+                        tracing::warn!(iteration, "model hit max tokens, prompting to continue");
+                    }
                     self.push_message(
                         conv,
                         Message {
@@ -1848,6 +1969,7 @@ impl AgentRunner {
             .await;
         // See `run` — bound the token-estimate cache to active runs.
         self.forget_token_estimate(conv.id);
+        self.forget_usage_anchor(conv.id);
         result
     }
 
@@ -1871,6 +1993,7 @@ impl AgentRunner {
         let mut empty_response_retries: usize = 0;
         let mut planning_only_retries: usize = 0;
         let mut empty_tool_use_retries: usize = 0;
+        let mut max_tokens_retries: usize = 0;
         let mut task_complete_retries: usize = 0;
         let mut had_side_effects = false;
         let mut has_called_any_tool = false;
@@ -1961,6 +2084,7 @@ impl AgentRunner {
             );
 
             self.push_message(conv, message);
+            self.record_usage_anchor(conv, &usage);
             // Re-borrow the just-pushed message — see run_inner.
             let message = conv
                 .messages
@@ -1979,6 +2103,7 @@ impl AgentRunner {
                 empty_tool_use_retries = 0;
                 empty_response_retries = 0;
                 planning_only_retries = 0;
+                max_tokens_retries = 0;
                 task_complete_retries = 0;
                 let calls = message.content.tool_calls();
                 let tool_names: Vec<&str> = calls.iter().map(|c| c.name.as_str()).collect();
@@ -2120,7 +2245,33 @@ impl AgentRunner {
 
             match stop_reason {
                 StopReason::MaxTokens => {
-                    tracing::warn!("model hit max tokens, prompting to continue");
+                    max_tokens_retries += 1;
+                    if max_tokens_retries > MAX_TOKENS_RETRY_LIMIT {
+                        tracing::warn!(
+                            iteration,
+                            "max-tokens retries exhausted — accepting the truncated response"
+                        );
+                        on_event(AgentEvent::Done);
+                        return Ok(());
+                    }
+                    // See run_inner: window exhaustion needs compaction,
+                    // not another "Continue." shrinking the model's room.
+                    let used = usage.prompt_tokens as usize + usage.completion_tokens as usize;
+                    let window_exhausted = self
+                        .provider
+                        .total_context_window()
+                        .is_some_and(|w| used + MAX_TOKENS_WINDOW_SLACK >= w);
+                    if window_exhausted {
+                        tracing::warn!(
+                            iteration,
+                            used_tokens = used,
+                            "generation cut off by the context window — compacting before retrying"
+                        );
+                        on_event(AgentEvent::Compressing);
+                        self.compact_history(conv).await?;
+                    } else {
+                        tracing::warn!(iteration, "model hit max tokens, prompting to continue");
+                    }
                     self.push_message(
                         conv,
                         Message {
@@ -2635,16 +2786,55 @@ impl AgentRunner {
         }
         conv.summary = Some(fixed);
         // The history was edited in place (message count unchanged), so an
-        // incremental token estimate from a previous run would be stale.
+        // incremental token estimate from a previous run would be stale —
+        // and so would a usage anchor, undetectably (the count check can't
+        // catch an in-place edit).
         self.forget_token_estimate(conv.id);
+        self.forget_usage_anchor(conv.id);
     }
 
     /// Returns true if the conversation has crossed the compaction threshold.
     ///
-    /// Served from the incremental per-conversation token estimate, so the
-    /// per-iteration cost is O(1) rather than re-serializing every message.
+    /// Two paths, tried in order:
+    ///
+    /// 1. **Anchored** — when a usage anchor exists and the provider knows
+    ///    its raw window, compare the predicted size of the next request
+    ///    (last actual usage plus estimates for only the messages appended
+    ///    since) against the window minus the generation reserve. The
+    ///    anchor already includes tool schemas and template framing, so
+    ///    nothing further is subtracted for those. This is the accurate
+    ///    path: the heuristic below undercounts JSON-heavy history badly
+    ///    enough (~40% on browser snapshots) that prompts reached the raw
+    ///    window while the estimate sat under the threshold, and the model
+    ///    silently lost its generation room.
+    /// 2. **Heuristic** — the original estimate-only check, still used for
+    ///    the first call of a run and for providers that report no usage.
+    ///
+    /// Both paths respect `RUSTYKRAB_COMPACTION_CONTEXT_CEILING` and cost
+    /// O(1) per iteration.
     fn needs_compaction(&self, conv: &Conversation) -> bool {
         if self.config.compaction_threshold_pct <= 0.0 {
+            return false;
+        }
+        if let (Some(predicted), Some(window)) = (
+            self.predicted_prompt_tokens(conv),
+            self.provider.total_context_window(),
+        ) {
+            let budget = window
+                .saturating_sub(self.provider.output_reserve_tokens())
+                .min(compaction_context_ceiling());
+            let threshold = (budget as f64 * self.config.compaction_threshold_pct) as usize;
+            if predicted >= threshold {
+                tracing::info!(
+                    predicted_prompt_tokens = predicted,
+                    threshold,
+                    window,
+                    estimated_tokens = self.cached_conversation_tokens(conv),
+                    source = "anchored",
+                    "compaction threshold crossed"
+                );
+                return true;
+            }
             return false;
         }
         let threshold =
@@ -3197,8 +3387,11 @@ impl AgentRunner {
 
         let after_tokens = Self::estimate_conversation_tokens(&conv.messages);
         // Compaction replaced the history wholesale; reset the incremental
-        // estimate to the fresh count so `needs_compaction` stays O(1).
+        // estimate to the fresh count so `needs_compaction` stays O(1),
+        // and drop the usage anchor — it measured messages that no longer
+        // exist. The next LLM call re-anchors on the compacted history.
         self.set_token_estimate(conv, after_tokens);
+        self.forget_usage_anchor(conv.id);
         tracing::info!(
             before_messages = before_len,
             after_messages = conv.messages.len(),
@@ -4389,6 +4582,108 @@ mod token_estimate_tests {
         }
     }
 
+    /// Canned provider that also reports a raw window, for exercising the
+    /// anchored compaction-threshold path.
+    struct WindowedProvider {
+        window: usize,
+        reserve: usize,
+    }
+
+    #[async_trait]
+    impl ModelProvider for WindowedProvider {
+        fn name(&self) -> &str {
+            "windowed-mock"
+        }
+        fn total_context_window(&self) -> Option<usize> {
+            Some(self.window)
+        }
+        fn output_reserve_tokens(&self) -> usize {
+            self.reserve
+        }
+        async fn chat(&self, _: &[Message], _: &[ToolSchema]) -> Result<ModelResponse> {
+            unreachable!("threshold tests never call the model")
+        }
+    }
+
+    fn usage(prompt: u32, completion: u32) -> Usage {
+        Usage {
+            prompt_tokens: prompt,
+            completion_tokens: completion,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn anchored_prediction_is_actual_plus_appended_estimates() {
+        let runner = build_runner();
+        let mut conv = empty_conv();
+        conv.messages.push(text_msg(Role::User, "hi"));
+        runner.record_usage_anchor(&conv, &usage(5_000, 200));
+        assert_eq!(runner.predicted_prompt_tokens(&conv), Some(5_200));
+
+        // Messages appended after the anchor are estimated, not assumed
+        // free — the anchor total only covers what the provider measured.
+        let appended = text_msg(Role::User, &"y".repeat(350));
+        let est = AgentRunner::estimate_message_tokens(&appended);
+        conv.messages.push(appended);
+        assert_eq!(runner.predicted_prompt_tokens(&conv), Some(5_200 + est));
+    }
+
+    #[test]
+    fn needs_compaction_prefers_anchor_over_heuristic() {
+        let provider = Arc::new(WindowedProvider {
+            window: 10_000,
+            reserve: 1_000,
+        });
+        let runner = AgentRunner::new(provider, Vec::new(), Arc::new(NoSandbox));
+
+        // The char heuristic sees almost nothing, but the anchor knows the
+        // last real prompt nearly filled the window (tool schemas, template
+        // framing, JSON undercounting — all invisible to the estimator).
+        let mut conv = empty_conv();
+        conv.messages.push(text_msg(Role::User, "small"));
+        runner.record_usage_anchor(&conv, &usage(8_000, 200));
+        assert!(
+            runner.needs_compaction(&conv),
+            "anchored 8200 >= 0.85 * (10000 - 1000) must fire"
+        );
+
+        // The reverse: a message the heuristic wildly overcounts, anchored
+        // to a tiny actual usage, must NOT fire (and must not fall through
+        // to the heuristic).
+        let mut conv2 = empty_conv();
+        conv2
+            .messages
+            .push(text_msg(Role::User, &"x".repeat(600_000)));
+        runner.record_usage_anchor(&conv2, &usage(100, 10));
+        assert!(
+            !runner.needs_compaction(&conv2),
+            "an anchored 110-token conversation must not compact"
+        );
+    }
+
+    #[test]
+    fn anchor_is_ignored_after_history_shrinks() {
+        let runner = build_runner();
+        let mut conv = empty_conv();
+        conv.messages.push(text_msg(Role::User, "one"));
+        conv.messages.push(text_msg(Role::Assistant, "two"));
+        runner.record_usage_anchor(&conv, &usage(50, 5));
+        // History rewritten outside push_message (compaction path): the
+        // anchor no longer describes these messages.
+        conv.messages.truncate(1);
+        assert_eq!(runner.predicted_prompt_tokens(&conv), None);
+    }
+
+    #[test]
+    fn zero_usage_does_not_anchor() {
+        let runner = build_runner();
+        let mut conv = empty_conv();
+        conv.messages.push(text_msg(Role::User, "hi"));
+        runner.record_usage_anchor(&conv, &Usage::default());
+        assert_eq!(runner.predicted_prompt_tokens(&conv), None);
+    }
+
     #[test]
     fn incremental_estimate_matches_full_recount_after_pushes() {
         let runner = build_runner();
@@ -5044,6 +5339,138 @@ mod task_complete_tests {
         let caps = CapabilitySet::for_tools_permissive(&["noop", "task_complete"]);
         let session = Session::with_capabilities(conv_id, caps);
         (runner, session, conv_id)
+    }
+
+    fn max_tokens_response(
+        text: &str,
+        prompt_tokens: u32,
+        completion_tokens: u32,
+    ) -> ModelResponse {
+        ModelResponse {
+            message: Message {
+                id: Uuid::new_v4(),
+                role: Role::Assistant,
+                content: MessageContent::Text(text.to_string()),
+                created_at: Utc::now(),
+                agent_version: None,
+            },
+            usage: Usage {
+                prompt_tokens,
+                completion_tokens,
+                ..Default::default()
+            },
+            stop_reason: StopReason::MaxTokens,
+            text: None,
+        }
+    }
+
+    /// ScriptedProvider that also reports a raw context window, for
+    /// exercising the window-exhaustion branch of the MaxTokens valve.
+    struct WindowedScripted {
+        inner: ScriptedProvider,
+        window: usize,
+        reserve: usize,
+    }
+
+    #[async_trait]
+    impl ModelProvider for WindowedScripted {
+        fn name(&self) -> &str {
+            "windowed-scripted-mock"
+        }
+        fn total_context_window(&self) -> Option<usize> {
+            Some(self.window)
+        }
+        fn output_reserve_tokens(&self) -> usize {
+            self.reserve
+        }
+        async fn chat(&self, m: &[Message], t: &[ToolSchema]) -> Result<ModelResponse> {
+            self.inner.chat(m, t).await
+        }
+        async fn chat_with_choice(
+            &self,
+            m: &[Message],
+            t: &[ToolSchema],
+            c: ToolChoice,
+        ) -> Result<ModelResponse> {
+            self.inner.chat_with_choice(m, t, c).await
+        }
+    }
+
+    #[tokio::test]
+    async fn consecutive_max_tokens_responses_are_capped() {
+        // Four straight MaxTokens responses: three get a "Continue."
+        // re-prompt, the fourth exhausts the cap and the run ends instead
+        // of looping until max_iterations (200) with an ever-growing
+        // history.
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            max_tokens_response("partial a", 0, 0),
+            max_tokens_response("partial b", 0, 0),
+            max_tokens_response("partial c", 0, 0),
+            max_tokens_response("partial d", 0, 0),
+        ]));
+        let (runner, session, conv_id) = make_runner(provider.clone());
+        let mut conv = make_conv();
+        conv.id = conv_id;
+
+        runner
+            .run(&mut conv, &session)
+            .await
+            .expect("run must end cleanly at the retry cap");
+
+        assert_eq!(*provider.chat_count.lock().unwrap(), 4);
+        let continues = conv
+            .messages
+            .iter()
+            .filter(|m| m.role == Role::User && m.content.as_text() == Some("Continue."))
+            .count();
+        assert_eq!(continues, 3, "only the first three truncations re-prompt");
+    }
+
+    #[tokio::test]
+    async fn window_exhaustion_compacts_before_reprompting() {
+        // A MaxTokens response whose usage reaches the provider's raw
+        // window is context exhaustion, not verbosity: the valve must
+        // compact (consuming one summarizer call) so the retry has room
+        // to generate, instead of appending "Continue." to a full window.
+        let provider = Arc::new(WindowedScripted {
+            inner: ScriptedProvider::new(vec![
+                // 900 + 80 within 64 tokens of the 1000-token window.
+                max_tokens_response("cut off mid-thought", 900, 80),
+                // Consumed by compact_history's summarizer call.
+                text_response("- compacted summary"),
+                // Post-compaction retry completes normally.
+                text_response("all done"),
+            ]),
+            window: 1_000,
+            reserve: 100,
+        });
+        use rustykrab_tools::TaskCompleteTool;
+        let active = Arc::new(ActiveToolsRegistry::new());
+        let tools: Vec<Arc<dyn Tool>> = vec![
+            Arc::new(NoopTool {
+                name: "noop".into(),
+            }),
+            Arc::new(TaskCompleteTool::new()),
+        ];
+        let runner = AgentRunner::new(provider.clone(), tools, Arc::new(NoSandbox))
+            .with_active_tools(active.clone());
+        let conv_id = Uuid::new_v4();
+        active.activate(conv_id, ["noop"]);
+        let caps = CapabilitySet::for_tools_permissive(&["noop", "task_complete"]);
+        let session = Session::with_capabilities(conv_id, caps);
+        let mut conv = make_conv();
+        conv.id = conv_id;
+
+        runner
+            .run(&mut conv, &session)
+            .await
+            .expect("run must recover after compacting");
+
+        assert!(
+            conv.summary.is_some(),
+            "window exhaustion must have forced a compaction"
+        );
+        assert_eq!(*provider.inner.chat_count.lock().unwrap(), 3);
     }
 
     #[tokio::test]
