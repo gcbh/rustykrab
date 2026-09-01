@@ -27,6 +27,17 @@ const POST_LAUNCH_TIMEOUT_MS: u64 = 15_000;
 /// Cap on the per-probe HTTP timeout when polling `/json/version`.
 const HEALTH_PROBE_TIMEOUT_MS: u64 = 3_000;
 
+/// Cap on a single `Page::url()` probe. `url()` is a CDP round trip, and an
+/// unbounded one inherits the client's own 30s fallback — long enough that a
+/// tool call is killed by its budget and retried, three times over, before
+/// the browser ever answers.
+const PAGE_PROBE_TIMEOUT_MS: u64 = 2_000;
+
+/// Cap on the *total* spent probing pages while resolving which tab to use.
+/// Bounds the whole loop, not each call, so a profile at its tab cap cannot
+/// multiply the per-probe budget by the number of tabs.
+const RESOLVE_PROBE_BUDGET_MS: u64 = 5_000;
+
 /// Stealth-oriented Chrome launch flags. These reduce the most obvious
 /// "this is a headed automation browser" signals — automation banner,
 /// `navigator.webdriver`, and the timer throttling that causes the macOS
@@ -302,10 +313,13 @@ impl BrowserManager {
         // `HashMap`, so position in that list is arbitrary and unstable
         // between calls — a positional `tab_N` names a different page from
         // one call to the next.
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(RESOLVE_PROBE_BUDGET_MS);
         let mut rows = Vec::new();
         for page in pages.iter() {
-            let url = page.url().await.ok().flatten().unwrap_or_default();
-            let title = page.get_title().await.ok().flatten().unwrap_or_default();
+            // One unresponsive tab should still leave the listing usable, so
+            // it is reported with what could be read rather than blocking it.
+            let url = probe_page_url(page, deadline).await.unwrap_or_default();
+            let title = probe_page_title(page, deadline).await.unwrap_or_default();
             rows.push((page.target_id().inner().clone(), url, title));
         }
         // Sort so the listing itself is stable across calls; `pages()` is not.
@@ -356,12 +370,23 @@ impl BrowserManager {
                 // unpinned tabs. Pinned tabs are never candidates.
                 let mut blank = Vec::new();
                 let mut other = Vec::new();
+                let deadline =
+                    tokio::time::Instant::now() + Duration::from_millis(RESOLVE_PROBE_BUDGET_MS);
                 for page in existing {
                     if pinned.contains(page.target_id().inner()) {
                         continue;
                     }
-                    let url = page.url().await.ok().flatten().unwrap_or_default();
-                    if is_blank_url(&url) {
+                    // Bounded, and deliberately the opposite polarity to
+                    // `get_page`: there an unreadable tab is ranked with the
+                    // blank ones so it cannot win, here it is ranked away
+                    // from them so it does not get closed. Both directions
+                    // are "when in doubt, leave it alone".
+                    let blank_page = probe_page_url(&page, deadline)
+                        .await
+                        .as_deref()
+                        .map(is_blank_url)
+                        .unwrap_or(false);
+                    if blank_page {
                         blank.push(page);
                     } else {
                         other.push(page);
@@ -432,7 +457,7 @@ impl BrowserManager {
             "opened tab"
         );
         let actual_url = page.url().await.ok().flatten().unwrap_or_default();
-        let title = page.get_title().await.ok().flatten().unwrap_or_default();
+        let title = probe_page_title_once(&page).await.unwrap_or_default();
 
         Ok(serde_json::json!({
             "status": "opened",
@@ -500,7 +525,7 @@ impl BrowserManager {
             .map_err(|e| Error::ToolExecution(format!("failed to focus tab: {e}").into()))?;
 
         let url = page.url().await.ok().flatten().unwrap_or_default();
-        let title = page.get_title().await.ok().flatten().unwrap_or_default();
+        let title = probe_page_title_once(page).await.unwrap_or_default();
 
         Ok(serde_json::json!({
             "status": "focused",
@@ -562,15 +587,29 @@ impl BrowserManager {
     }
 
     /// Whether `target_id` still names a live tab in this profile.
-    pub async fn target_is_live(&self, profile_name: &str, target_id: &str) -> bool {
+    ///
+    /// `Some(false)` only when the browser answered and the tab was absent.
+    /// `None` means the probe could not tell — a browser that is merely slow
+    /// must not cost a session the tab it is working in, so callers keep the
+    /// pin on `None` and only drop it on a definite answer.
+    pub async fn target_is_live(&self, profile_name: &str, target_id: &str) -> Option<bool> {
         let instances = self.instances.lock().await;
+        // No instance is a definite answer, not an inconclusive one: a
+        // profile with no browser has no tabs, so a pin naming one is dead.
+        // This is the path a pin takes across a Chrome relaunch.
         let Some(inst) = instances.get(profile_name) else {
-            return false;
+            return Some(false);
         };
-        let Ok(pages) = inst.browser.pages().await else {
-            return false;
-        };
-        pages.iter().any(|p| p.target_id().inner() == target_id)
+        let listing = tokio::time::timeout(
+            Duration::from_millis(HEALTH_PROBE_TIMEOUT_MS),
+            inst.browser.pages(),
+        )
+        .await;
+        match listing {
+            Ok(Ok(pages)) => Some(pages.iter().any(|p| p.target_id().inner() == target_id)),
+            // Timed out, or the handler is gone: inconclusive.
+            _ => None,
+        }
     }
 
     /// Get a specific page by targetId, or the session's current page.
@@ -606,10 +645,19 @@ impl BrowserManager {
         // different pages, one of them the permanent `about:blank` startup
         // tab. Rank instead: real pages before blank ones, ties broken on
         // target ID, so repeated calls agree on the same page.
+        //
+        // Probing costs a CDP round trip per tab, so it runs under a shared
+        // deadline: a tab that will not answer ranks alongside the blank ones
+        // rather than stalling resolution or winning by default.
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(RESOLVE_PROBE_BUDGET_MS);
         let mut ranked: Vec<(bool, String, usize)> = Vec::with_capacity(pages.len());
         for (i, page) in pages.iter().enumerate() {
-            let url = page.url().await.ok().flatten().unwrap_or_default();
-            ranked.push((is_blank_url(&url), page.target_id().inner().clone(), i));
+            let blank = probe_page_url(page, deadline)
+                .await
+                .as_deref()
+                .map(is_blank_url)
+                .unwrap_or(true);
+            ranked.push((blank, page.target_id().inner().clone(), i));
         }
         ranked.sort();
 
@@ -1139,6 +1187,62 @@ async fn probe_cdp(url: &str, timeout: Duration) -> bool {
     )
 }
 
+/// Read a page's URL under a bound, returning `None` when it will not answer.
+///
+/// Measured: `url()` is served from the handler's cached target info, so it
+/// returns in microseconds even against a spinning renderer. The bound is
+/// insurance for the case the handler itself is saturated, not a fix for a
+/// hang — [`probe_page_title`] is where the real exposure is.
+///
+/// Callers treat `None` as "cannot tell", never as a fact about the page.
+pub(super) async fn probe_page_url(
+    page: &chromiumoxide::Page,
+    deadline: tokio::time::Instant,
+) -> Option<String> {
+    let now = tokio::time::Instant::now();
+    if now >= deadline {
+        return None;
+    }
+    let budget = Duration::from_millis(PAGE_PROBE_TIMEOUT_MS).min(deadline - now);
+    match tokio::time::timeout(budget, page.url()).await {
+        Ok(Ok(url)) => url,
+        _ => None,
+    }
+}
+
+/// Read a page's title under a bound, returning `None` when it will not answer.
+///
+/// Unlike [`probe_page_url`], this is a real round trip to the renderer, so a
+/// page spinning in JavaScript never answers it. Measured against a tab in a
+/// `while(true)` loop, an unbounded call had still not returned after 40s —
+/// long enough to blow a tool-call budget and be retried on top.
+pub(super) async fn probe_page_title(
+    page: &chromiumoxide::Page,
+    deadline: tokio::time::Instant,
+) -> Option<String> {
+    let now = tokio::time::Instant::now();
+    if now >= deadline {
+        return None;
+    }
+    let budget = Duration::from_millis(PAGE_PROBE_TIMEOUT_MS).min(deadline - now);
+    match tokio::time::timeout(budget, page.get_title()).await {
+        Ok(Ok(title)) => title,
+        _ => None,
+    }
+}
+
+/// [`probe_page_title`] with a fresh single-probe deadline.
+pub(super) async fn probe_page_title_once(page: &chromiumoxide::Page) -> Option<String> {
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(PAGE_PROBE_TIMEOUT_MS);
+    probe_page_title(page, deadline).await
+}
+
+/// [`probe_page_url`] with a fresh single-probe deadline.
+pub(super) async fn probe_page_url_once(page: &chromiumoxide::Page) -> Option<String> {
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(PAGE_PROBE_TIMEOUT_MS);
+    probe_page_url(page, deadline).await
+}
+
 /// True for URLs that carry no page content: Chrome's startup tab and the
 /// placeholder [`BrowserManager::get_page`] creates when a profile has none.
 pub(super) fn is_blank_url(url: &str) -> bool {
@@ -1197,6 +1301,95 @@ mod tests {
 
         mgr.clear_sticky_target("conv-a", "default");
         assert_eq!(mgr.sticky_target("conv-a", "default"), None);
+    }
+
+    #[tokio::test]
+    async fn a_pin_with_no_browser_is_definitely_dead() {
+        // The relaunch path: Chrome went away, so a pin naming one of its
+        // tabs cannot survive. This must be a definite answer, or the pin
+        // would be kept forever against a browser that no longer exists.
+        let mgr = manager();
+        assert_eq!(
+            mgr.target_is_live("nonexistent", "SOME-TARGET").await,
+            Some(false)
+        );
+    }
+
+    /// A tab spinning in JavaScript must not stall work on the others.
+    ///
+    /// `get_title()` is a real round trip to the renderer, so a page in a
+    /// `while(true)` loop never answers it; measured unbounded, it had still
+    /// not returned after 40s. `tabs` reads a title per tab, so one wedged
+    /// page used to hang the whole listing well past any tool-call budget.
+    /// (`url()` is served from the handler's cache and returns in
+    /// microseconds even then — it is not the exposure.)
+    ///
+    /// Launches a real headless Chrome; ignored by default.
+    #[tokio::test]
+    #[ignore = "launches a real Chrome"]
+    async fn live_a_wedged_tab_cannot_stall_the_others() {
+        const WEDGE: &str = "data:text/html,<title>wedge</title>\
+<script>setTimeout(()=>{while(true){}},1500)</script>";
+        const NORMAL: &str = "data:text/html,<title>normal</title><h1>ok</h1>";
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").expect("free port");
+            l.local_addr().unwrap().port()
+        };
+        let profile = "wedged-tab-test";
+        let mut config = BrowserConfig {
+            default_profile: profile.to_string(),
+            ..Default::default()
+        };
+        config.profiles.insert(
+            profile.to_string(),
+            super::super::config::BrowserProfile {
+                cdp_port: Some(port),
+                user_data_dir: Some(dir.path().display().to_string()),
+                headless: Some(true),
+                ..Default::default()
+            },
+        );
+        let mgr = BrowserManager::new(config);
+        mgr.start(profile).await.expect("launch chrome");
+
+        mgr.open_tab(profile, NORMAL).await.expect("open normal");
+        mgr.open_tab(profile, WEDGE).await.expect("open wedge");
+        // Let the wedge tab enter its loop.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        // Every probe shares one budget, so the listing is bounded by
+        // RESOLVE_PROBE_BUDGET_MS however many tabs are stuck.
+        let started = std::time::Instant::now();
+        let tabs = mgr.tabs(profile).await.expect("tabs must not hang");
+        let elapsed = started.elapsed();
+        eprintln!("tabs() with a wedged tab -> {:?}", elapsed);
+        assert!(
+            elapsed < Duration::from_millis(RESOLVE_PROBE_BUDGET_MS + 2_000),
+            "tabs() took {elapsed:?}"
+        );
+
+        // The healthy tab is still fully described; only the wedged one
+        // loses its title.
+        let listed = tabs["tabs"].as_array().expect("tabs array");
+        assert!(
+            listed.iter().any(|t| t["title"] == "normal"),
+            "the healthy tab should still report its title: {tabs}"
+        );
+
+        // Resolution stays fast, and must not pick the wedged tab over the
+        // healthy one just because it could not be read.
+        let started = std::time::Instant::now();
+        let page = mgr.get_page(profile, None).await.expect("resolve");
+        eprintln!(
+            "get_page(None) with a wedged tab -> {:?}",
+            started.elapsed()
+        );
+        assert!(started.elapsed() < Duration::from_secs(6));
+        assert!(!page.target_id().inner().is_empty());
+
+        let _ = mgr.stop(profile).await;
     }
 
     /// Live regression check for the bug this addressing scheme replaced.
