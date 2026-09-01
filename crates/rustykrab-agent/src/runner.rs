@@ -182,10 +182,36 @@ fn parse_expand_ctx(raw: Option<&str>) -> Option<u32> {
 /// Compaction is the one moment the agent genuinely wants a bigger window
 /// than it runs its turns at: the summarizer's input budget derives from
 /// the window, and a small window forces the history into chunks — one
-/// model call each. Ollama resizes its KV cache in about three seconds, so
-/// paying that twice around a summarization that would otherwise chunk is
-/// usually a large win. Off by default; a provider that cannot resize
-/// ignores the hint via the `chat_with_ctx` default.
+/// model call each.
+///
+/// **The cost is not "a KV resize", and the ~3 second figure this comment
+/// used to carry was wrong by an order of magnitude.** Ollama sizes a
+/// runner's KV cache from the `num_ctx` that loaded it, so asking for a
+/// different one tears the runner down and reloads the model, discarding
+/// every cached prefix with it. Measured on gemma4:26b (Q4_K_M, M1 Max,
+/// Ollama 0.33.1) switching 32k -> 64k and back, on a byte-identical
+/// 4485-token prompt:
+///
+/// ```text
+///   warm  @32k   prompt_eval 0.16 s   load  0.0 s
+///   switch@64k   prompt_eval 8.75 s   load 47.2 s
+///   back  @32k   prompt_eval 9.18 s   load  3.0 s
+/// ```
+///
+/// So the round trip is a model reload in each direction plus a *full*
+/// re-prefill — and that re-prefill scales with the conversation, which at
+/// a compaction trigger is the largest it ever gets. Budget roughly
+/// `2 x reload + history_tokens / prefill_rate` (~500 tok/s on this
+/// model), not six seconds.
+///
+/// It can still pay off when the alternative is many chunked summarizer
+/// calls, but the break-even is much further out than it looks. Prefer
+/// pinning a larger `RUSTYKRAB_NUM_CTX` permanently where the KV cache
+/// allows it — on Gemma's interleaved attention 32x the window costs about
+/// 1.2 GB — so the switch never happens.
+///
+/// Off by default; a provider that cannot resize ignores the hint via the
+/// `chat_with_ctx` default.
 fn compaction_expand_ctx() -> Option<u32> {
     static EXPAND: OnceLock<Option<u32>> = OnceLock::new();
     *EXPAND.get_or_init(|| {
