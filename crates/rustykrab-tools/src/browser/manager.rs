@@ -1032,7 +1032,16 @@ fn detect_profile_name(chrome_dir: &std::path::Path) -> String {
 /// Set up a wrapper data directory that symlinks back to the user's real
 /// Chrome profile, preserving cookies and sessions.
 fn setup_profile_link(user_data_dir: &std::path::Path) -> String {
-    let Some(chrome_dir) = chrome_data_dir() else {
+    // Borrowing the real profile is the point in normal use -- it carries
+    // the logins. Under an isolated root it is precisely what the caller
+    // asked to avoid, and in an eval it silently invalidates the result:
+    // a trial that inherits a signed-in cookie looks like a successful
+    // sign-in without ever signing in.
+    let isolated = std::env::var("RUSTYKRAB_BROWSER_ISOLATED_ROOT")
+        .map(|v| !v.is_empty())
+        .unwrap_or(false);
+    let Some(chrome_dir) = chrome_data_dir().filter(|_| !isolated) else {
+        write_local_state(user_data_dir, "Default");
         return "Default".to_string();
     };
 
@@ -1049,20 +1058,25 @@ fn setup_profile_link(user_data_dir: &std::path::Path) -> String {
         }
     }
 
-    // Write minimal Local State to disable profile picker
-    let local_state_dest = user_data_dir.join("Local State");
+    write_local_state(user_data_dir, &profile_name);
+
+    profile_name
+}
+
+/// Minimal `Local State`, which keeps Chrome's profile picker from
+/// appearing. A picker means no page, and no page means every action
+/// times out with nothing to say why.
+fn write_local_state(user_data_dir: &std::path::Path, profile_name: &str) {
     let local_state = serde_json::json!({
         "profile": {
-            "last_used": &profile_name,
-            "last_active_profiles": [&profile_name],
+            "last_used": profile_name,
+            "last_active_profiles": [profile_name],
             "picker_shown": false
         }
     });
-    if let Err(e) = std::fs::write(&local_state_dest, local_state.to_string()) {
+    if let Err(e) = std::fs::write(user_data_dir.join("Local State"), local_state.to_string()) {
         tracing::warn!("could not write Chrome Local State: {e}");
     }
-
-    profile_name
 }
 
 /// Detect the Chrome/Chromium executable path for the current platform.

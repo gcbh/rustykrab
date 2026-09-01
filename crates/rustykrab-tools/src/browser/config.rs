@@ -254,6 +254,22 @@ impl BrowserConfig {
                 return PathBuf::from(dir);
             }
         }
+        // An explicit isolated root, for callers that need a browser of
+        // their own without borrowing anything from the real account.
+        //
+        // The obvious way to get that is to point HOME at a scratch dir,
+        // and it does not work: Chrome wedges its renderer when HOME is
+        // an empty directory. The page commits its URL and the document
+        // never arrives, which is indistinguishable from a hung site. A
+        // 2x2 over (stealth flags, sandboxed HOME) put it beyond doubt --
+        // every run with a redirected HOME wedged, every run without it
+        // loaded in ~2s. So isolate the one directory that needs
+        // isolating and leave HOME alone.
+        if let Ok(root) = std::env::var("RUSTYKRAB_BROWSER_ISOLATED_ROOT") {
+            if !root.is_empty() {
+                return PathBuf::from(root).join(profile_name).join("user-data");
+            }
+        }
         let home = std::env::var("HOME")
             .or_else(|_| std::env::var("USERPROFILE"))
             .unwrap_or_else(|_| ".".to_string());
