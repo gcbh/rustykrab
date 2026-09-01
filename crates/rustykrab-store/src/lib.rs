@@ -1,4 +1,4 @@
-mod chat_map;
+mod channel_binding;
 mod conversation;
 pub mod credential_backend;
 mod credential_request;
@@ -10,7 +10,6 @@ mod outcomes;
 mod recall_archive;
 pub mod registry;
 mod secret;
-mod slack_chat_map;
 mod tasks;
 
 use std::path::Path;
@@ -20,7 +19,7 @@ use rustykrab_core::Error;
 use std::sync::Mutex;
 use zeroize::Zeroizing;
 
-pub use chat_map::ChatMapStore;
+pub use channel_binding::{ChannelAddress, ChannelBindingStore};
 pub use conversation::{ConversationStore, ConversationSummary};
 pub mod pending_links;
 pub use credential_request::{
@@ -33,7 +32,6 @@ pub use outcomes::OutcomeStore;
 pub use pending_links::PendingLinks;
 pub use recall_archive::RecallArchiveStore;
 pub use secret::{SecretMeta, SecretStore, WriteAuthority};
-pub use slack_chat_map::SlackChatMapStore;
 pub use tasks::{DelegatedTask, TaskStatus, TaskStore};
 
 /// Top-level database handle wrapping a SQLite connection.
@@ -149,22 +147,26 @@ impl Store {
             CREATE INDEX IF NOT EXISTS idx_job_runs_job_id
                 ON job_runs (job_id, finished_at DESC);
 
-            CREATE TABLE IF NOT EXISTS telegram_chat_map (
-                chat_id    INTEGER NOT NULL,
-                thread_id  INTEGER NOT NULL DEFAULT 0,
-                conv_id    TEXT NOT NULL,
-                created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                UNIQUE(chat_id, thread_id)
+            -- Which conversation a channel address is bound to, for every
+            -- channel. `external_key` is the channel's addressing tuple
+            -- flattened by `ChannelAddress::external_key`, so the spelling is
+            -- derived in one place rather than at each call site.
+            --
+            -- The foreign key is the point of the table: a binding that
+            -- outlives its conversation makes the channel fail every later
+            -- message, because the id it resolves no longer loads.
+            CREATE TABLE IF NOT EXISTS channel_bindings (
+                channel      TEXT NOT NULL,
+                external_key TEXT NOT NULL,
+                conv_id      TEXT NOT NULL
+                    REFERENCES conversations(id) ON DELETE CASCADE,
+                created_at   TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (channel, external_key)
             );
 
-            CREATE TABLE IF NOT EXISTS slack_chat_map (
-                team_id    TEXT NOT NULL,
-                channel_id TEXT NOT NULL,
-                thread_ts  TEXT NOT NULL DEFAULT '',
-                conv_id    TEXT NOT NULL,
-                created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                UNIQUE(team_id, channel_id, thread_ts)
-            );
+            -- Covers the cascade, which deletes by `conv_id`.
+            CREATE INDEX IF NOT EXISTS idx_channel_bindings_conv
+                ON channel_bindings (conv_id);
 
             CREATE TABLE IF NOT EXISTS recall_archive (
                 conversation_id TEXT PRIMARY KEY,
@@ -457,6 +459,12 @@ impl Store {
         )
         .map_err(|e| Error::Storage(e.to_string()))?;
 
+        // Fold the per-channel map tables into `channel_bindings` and drop
+        // them. Idempotent — see `channel_binding::migrate_legacy_chat_maps`.
+        // Runs before the blob migration so it sees the same `conversations`
+        // rows the foreign key will be checked against.
+        channel_binding::migrate_legacy_chat_maps(conn)?;
+
         // Explode legacy whole-conversation blobs into the normalized
         // schema. Idempotent — see `conversation::migrate_legacy_blobs`.
         conversation::migrate_legacy_blobs(conn)?;
@@ -548,14 +556,11 @@ impl Store {
         OutcomeStore::new(Arc::clone(&self.conn))
     }
 
-    /// Return a handle for Telegram chat/thread → conversation mapping.
-    pub fn chat_map(&self) -> ChatMapStore {
-        ChatMapStore::new(Arc::clone(&self.conn))
-    }
-
-    /// Return a handle for Slack (team, channel, thread) → conversation mapping.
-    pub fn slack_chat_map(&self) -> SlackChatMapStore {
-        SlackChatMapStore::new(Arc::clone(&self.conn))
+    /// Return a handle for channel address → conversation bindings, for
+    /// every channel. Address a row with a [`ChannelAddress`] rather than a
+    /// hand-built key.
+    pub fn channel_bindings(&self) -> ChannelBindingStore {
+        ChannelBindingStore::new(Arc::clone(&self.conn))
     }
 
     /// Return a handle for the durable recall archive (compaction-displaced
@@ -603,8 +608,52 @@ where
 {
     let conn = Arc::clone(conn);
     run_blocking(move || {
-        let conn = conn.lock().unwrap();
+        // Recover a poisoned lock rather than propagating the panic.
+        //
+        // Every database call in the process goes through here, so
+        // `unwrap()` turned one panic while holding the lock into a
+        // permanent outage: the mutex stayed poisoned and every subsequent
+        // call panicked with it. The data is not damaged by a panic — the
+        // connection is unchanged, and any transaction that was open is
+        // rolled back when its guard drops — so continuing is both safe and
+        // the only option that recovers.
+        //
+        // `RetrievalLog` and `AppState::rotate_token` already do this.
+        let conn = conn.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         f(&conn)
     })
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A panic while holding the connection lock used to end the process's
+    /// ability to touch the database at all: the mutex stayed poisoned and
+    /// every later call panicked with it. A recoverable fault must not
+    /// become a permanent outage.
+    #[tokio::test]
+    async fn a_poisoned_connection_lock_does_not_end_the_process() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        Store::run_migrations(&conn).unwrap();
+        let conn = Arc::new(Mutex::new(conn));
+
+        // Poison it the only way it can be poisoned: panic while holding it.
+        let poisoner = Arc::clone(&conn);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.lock().unwrap();
+            panic!("simulated panic while holding the connection");
+        })
+        .join();
+        assert!(conn.is_poisoned(), "the test must actually poison the lock");
+
+        let count: i64 = with_conn(&conn, |conn| {
+            conn.query_row("SELECT COUNT(*) FROM conversations", [], |row| row.get(0))
+                .map_err(|e| Error::Storage(e.to_string()))
+        })
+        .await
+        .expect("the store must still serve queries after a poisoned lock");
+        assert_eq!(count, 0);
+    }
 }

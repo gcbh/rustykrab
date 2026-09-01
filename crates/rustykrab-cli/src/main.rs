@@ -1568,6 +1568,75 @@ const HEARTBEAT_TIMEOUT_SECS: u64 = 1800; // 30 minutes
 /// Telegram's typing indicator expires after ~5 seconds.
 const TYPING_INTERVAL_SECS: u64 = 4;
 
+/// Load the conversation bound to a channel address, minting a fresh one if
+/// the binding has outlived it.
+///
+/// Deleting a conversation through the API takes its binding with it
+/// (`channel_bindings` cascades), but a channel loop that has already
+/// resolved the id keeps it in an in-process cache and never consults the
+/// binding again. Loading it then fails, and — because the cache is not
+/// invalidated either — it fails identically for every message after this
+/// one, until the user happens to send /reset.
+///
+/// So a conversation that no longer loads is treated as an instruction to
+/// start a new one rather than as an error. Returns the conversation and
+/// whether it replaced a dead id, so the caller can refresh its cache.
+///
+/// Only `NotFound` is healed. A storage failure is a real error and is
+/// propagated: minting a replacement conversation because the disk is
+/// unhappy would silently discard history that is still there.
+async fn load_or_rebind(
+    state: &AppState,
+    address: &rustykrab_store::ChannelAddress,
+    conv_id: Uuid,
+    channel_source: &str,
+    channel_id: Option<String>,
+    channel_thread_id: Option<String>,
+) -> Result<(rustykrab_core::types::Conversation, bool), rustykrab_core::Error> {
+    match state.store.conversations().get(conv_id).await {
+        Ok(conv) => Ok((conv, false)),
+        Err(rustykrab_core::Error::NotFound(_)) => {
+            tracing::warn!(
+                channel = address.channel(),
+                stale_conv_id = %conv_id,
+                "bound conversation no longer exists — starting a new one"
+            );
+            let mut conv = state.store.conversations().create().await?;
+            conv.channel_source = Some(channel_source.to_string());
+            conv.channel_id = channel_id;
+            conv.channel_thread_id = channel_thread_id;
+            state.store.conversations().save_meta(&conv).await?;
+            state
+                .store
+                .channel_bindings()
+                .bind(address, conv.id)
+                .await?;
+            Ok((conv, true))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Address of a Telegram chat (or forum topic) for
+/// [`rustykrab_store::ChannelBindingStore`].
+fn telegram_address(chat_id: i64, thread_id: i64) -> rustykrab_store::ChannelAddress {
+    rustykrab_store::ChannelAddress::Telegram { chat_id, thread_id }
+}
+
+/// Address of a Slack channel or thread for
+/// [`rustykrab_store::ChannelBindingStore`].
+fn slack_address(
+    team_id: &str,
+    channel_id: &str,
+    thread_ts: &str,
+) -> rustykrab_store::ChannelAddress {
+    rustykrab_store::ChannelAddress::Slack {
+        team_id: team_id.to_string(),
+        channel_id: channel_id.to_string(),
+        thread_ts: thread_ts.to_string(),
+    }
+}
+
 fn epoch_millis() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1621,8 +1690,13 @@ async fn telegram_agent_loop(
                     }
                     states.remove(&key);
                 }
-                if let Err(e) = state.store.chat_map().remove(chat_id, thread_id).await {
-                    tracing::warn!(chat_id, thread_id, "failed to remove chat map entry: {e}");
+                if let Err(e) = state
+                    .store
+                    .channel_bindings()
+                    .unbind(&telegram_address(chat_id, thread_id))
+                    .await
+                {
+                    tracing::warn!(chat_id, thread_id, "failed to remove channel binding: {e}");
                 }
                 return;
             }
@@ -1672,8 +1746,8 @@ async fn telegram_agent_loop(
                     None => {
                         let db_id = state
                             .store
-                            .chat_map()
-                            .lookup(chat_id, thread_id)
+                            .channel_bindings()
+                            .lookup(&telegram_address(chat_id, thread_id))
                             .await
                             .ok()
                             .flatten();
@@ -1716,13 +1790,16 @@ async fn telegram_agent_loop(
                                             active_handle: None,
                                         },
                                     );
-                                    if let Err(e) =
-                                        state.store.chat_map().upsert(chat_id, thread_id, id).await
+                                    if let Err(e) = state
+                                        .store
+                                        .channel_bindings()
+                                        .bind(&telegram_address(chat_id, thread_id), id)
+                                        .await
                                     {
                                         tracing::warn!(
                                             chat_id,
                                             thread_id,
-                                            "failed to persist chat map: {e}"
+                                            "failed to persist channel binding: {e}"
                                         );
                                     }
                                     tracing::info!(
@@ -1811,13 +1888,32 @@ async fn process_telegram_message(
     // Load the conversation. `persisted_ids` lets the post-run save
     // append only this turn's messages (full rewrite if the agent
     // compacted history mid-run).
-    let mut conv = match state.store.conversations().get(conv_id).await {
-        Ok(c) => c,
+    let address = telegram_address(chat_id, thread_id);
+    let (mut conv, rebound) = match load_or_rebind(
+        state,
+        &address,
+        conv_id,
+        "telegram",
+        Some(chat_id.to_string()),
+        (thread_id != 0).then(|| thread_id.to_string()),
+    )
+    .await
+    {
+        Ok(pair) => pair,
         Err(e) => {
             tracing::error!(chat_id, thread_id, %conv_id, "failed to load conversation: {e}");
             return "Internal error — please try again.".to_string();
         }
     };
+    // The cached id is the one that just failed to load; leaving it in place
+    // would send the next message down the same dead path.
+    let conv_id = conv.id;
+    if rebound {
+        let mut states = chat_states.lock().await;
+        if let Some(cs) = states.get_mut(&key) {
+            cs.conv_id = conv_id;
+        }
+    }
     let persisted_ids: Vec<Uuid> = conv.messages.iter().map(|m| m.id).collect();
 
     // Ensure channel metadata is present (backfills conversations created
@@ -2038,15 +2134,19 @@ async fn slack_agent_loop(
                 }
                 if let Err(e) = state
                     .store
-                    .slack_chat_map()
-                    .remove(&inbound.team_id, &inbound.channel_id, &effective_thread_ts)
+                    .channel_bindings()
+                    .unbind(&slack_address(
+                        &inbound.team_id,
+                        &inbound.channel_id,
+                        &effective_thread_ts,
+                    ))
                     .await
                 {
                     tracing::warn!(
                         team_id = %inbound.team_id,
                         channel_id = %inbound.channel_id,
                         thread_ts = %effective_thread_ts,
-                        "failed to remove Slack chat map entry: {e}"
+                        "failed to remove Slack channel binding: {e}"
                     );
                 }
                 return;
@@ -2065,8 +2165,12 @@ async fn slack_agent_loop(
                     None => {
                         let db_id = state
                             .store
-                            .slack_chat_map()
-                            .lookup(&inbound.team_id, &inbound.channel_id, &effective_thread_ts)
+                            .channel_bindings()
+                            .lookup(&slack_address(
+                                &inbound.team_id,
+                                &inbound.channel_id,
+                                &effective_thread_ts,
+                            ))
                             .await
                             .ok()
                             .flatten();
@@ -2110,11 +2214,13 @@ async fn slack_agent_loop(
                                     );
                                     if let Err(e) = state
                                         .store
-                                        .slack_chat_map()
-                                        .upsert(
-                                            &inbound.team_id,
-                                            &inbound.channel_id,
-                                            &effective_thread_ts,
+                                        .channel_bindings()
+                                        .bind(
+                                            &slack_address(
+                                                &inbound.team_id,
+                                                &inbound.channel_id,
+                                                &effective_thread_ts,
+                                            ),
                                             id,
                                         )
                                         .await
@@ -2123,7 +2229,7 @@ async fn slack_agent_loop(
                                             team_id = %inbound.team_id,
                                             channel_id = %inbound.channel_id,
                                             thread_ts = %effective_thread_ts,
-                                            "failed to persist Slack chat map: {e}"
+                                            "failed to persist Slack channel binding: {e}"
                                         );
                                     }
                                     tracing::info!(
@@ -2163,9 +2269,10 @@ async fn slack_agent_loop(
                 }
             }
 
-            let reply = process_slack_message(
+            let (used_conv_id, reply) = process_slack_message(
                 &state,
                 conv_id,
+                &inbound.team_id,
                 &inbound.channel_id,
                 &effective_thread_ts,
                 inbound.message,
@@ -2173,11 +2280,15 @@ async fn slack_agent_loop(
             )
             .await;
 
-            // Clear busy.
+            // Clear busy, and adopt the conversation actually used: it
+            // differs when the cached id had outlived its conversation and
+            // a new one was started. Leaving the dead id cached would send
+            // the next message down the same path.
             {
                 let mut states = chat_states.lock().await;
                 if let Some(cs) = states.get_mut(&key) {
                     cs.busy = false;
+                    cs.conv_id = used_conv_id;
                 }
             }
 
@@ -2217,21 +2328,36 @@ async fn slack_agent_loop(
 }
 
 /// Process a single Slack message: load conversation, run agent, persist.
+/// Returns the conversation id actually used alongside the reply: it differs
+/// from the one passed in when the binding had outlived its conversation and
+/// [`load_or_rebind`] started a new one.
 async fn process_slack_message(
     state: &AppState,
     conv_id: Uuid,
+    team_id: &str,
     channel_id: &str,
     thread_ts: &str,
     message: rustykrab_core::types::Message,
     user_text: &str,
-) -> String {
-    let mut conv = match state.store.conversations().get(conv_id).await {
-        Ok(c) => c,
+) -> (Uuid, String) {
+    let address = slack_address(team_id, channel_id, thread_ts);
+    let (mut conv, _rebound) = match load_or_rebind(
+        state,
+        &address,
+        conv_id,
+        "slack",
+        Some(channel_id.to_string()),
+        Some(thread_ts.to_string()),
+    )
+    .await
+    {
+        Ok(pair) => pair,
         Err(e) => {
             tracing::error!(channel_id, thread_ts, %conv_id, "failed to load Slack conversation: {e}");
-            return "Internal error — please try again.".to_string();
+            return (conv_id, "Internal error — please try again.".to_string());
         }
     };
+    let conv_id = conv.id;
     // Ids of the already-persisted messages: the post-run save appends
     // only this turn's tail (full rewrite if the agent compacted
     // history mid-run).
@@ -2303,7 +2429,7 @@ async fn process_slack_message(
         tracing::error!(channel_id, %conv_id, "failed to persist Slack conversation: {e}");
     }
 
-    reply
+    (conv_id, reply)
 }
 
 async fn shutdown_signal() {
