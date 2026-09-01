@@ -3,7 +3,7 @@
 //! Manages multiple isolated browser instances, each with its own CDP port,
 //! user-data directory, and lifecycle. The manager handles:
 //! - Launching/connecting to Chrome instances per profile
-//! - Tab management (list, open, close, focus) with targetId addressing
+//! - Tab management (list, open, close, focus) by stable Chrome target ID
 //! - Browser lifecycle (start, stop, status)
 //! - Chrome profile symlink setup for cookie/session persistence
 //! - Process tracking (Child handles) so spawned Chromes can be killed
@@ -64,6 +64,13 @@ pub struct BrowserManager {
     /// (synchronous) can kill them even while the async `instances` lock
     /// is held elsewhere.
     children: Arc<std::sync::Mutex<HashMap<String, std::process::Child>>>,
+    /// The tab each session last navigated, keyed by `(session, profile)`.
+    ///
+    /// Without this, an action that omits `targetId` re-resolves the page
+    /// from scratch every call, and one browser profile is shared by every
+    /// concurrent run. Pinning the navigated tab is what keeps a `navigate`
+    /// and the `snapshot` after it on the same page.
+    sticky: Arc<std::sync::Mutex<HashMap<(String, String), String>>>,
 }
 
 impl BrowserManager {
@@ -72,6 +79,7 @@ impl BrowserManager {
             config,
             instances: Arc::new(Mutex::new(HashMap::new())),
             children: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sticky: Arc::new(std::sync::Mutex::new(HashMap::new())),
         };
         if std::env::var("RUSTYKRAB_BROWSER_SWEEP").as_deref() == Ok("1") {
             sweep_stale_processes();
@@ -258,19 +266,29 @@ impl BrowserManager {
             .await
             .map_err(|e| Error::ToolExecution(format!("failed to list tabs: {e}").into()))?;
 
-        let mut tabs = Vec::new();
-        for (i, page) in pages.iter().enumerate() {
+        // Address tabs by Chrome's own target ID. `pages()` walks a
+        // `HashMap`, so position in that list is arbitrary and unstable
+        // between calls — a positional `tab_N` names a different page from
+        // one call to the next.
+        let mut rows = Vec::new();
+        for page in pages.iter() {
             let url = page.url().await.ok().flatten().unwrap_or_default();
             let title = page.get_title().await.ok().flatten().unwrap_or_default();
-            // Use the page's target ID for deterministic addressing
-            let target_id = format!("tab_{i}");
-            tabs.push(serde_json::json!({
-                "targetId": target_id,
-                "index": i,
-                "url": url,
-                "title": title,
-            }));
+            rows.push((page.target_id().inner().clone(), url, title));
         }
+        // Sort so the listing itself is stable across calls; `pages()` is not.
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let tabs: Vec<serde_json::Value> = rows
+            .into_iter()
+            .map(|(target_id, url, title)| {
+                serde_json::json!({
+                    "targetId": target_id,
+                    "url": url,
+                    "title": title,
+                })
+            })
+            .collect();
 
         Ok(serde_json::json!({
             "tabs": tabs,
@@ -301,13 +319,12 @@ impl BrowserManager {
         let _ = tokio::time::timeout(nav_timeout, page.wait_for_navigation()).await;
         let actual_url = page.url().await.ok().flatten().unwrap_or_default();
         let title = page.get_title().await.ok().flatten().unwrap_or_default();
-        let pages = inst.browser.pages().await.map(|p| p.len()).unwrap_or(0);
 
         Ok(serde_json::json!({
             "status": "opened",
             "url": actual_url,
             "title": title,
-            "targetId": format!("tab_{}", pages.saturating_sub(1)),
+            "targetId": page.target_id().inner().clone(),
             "profile": profile_name
         }))
     }
@@ -323,18 +340,13 @@ impl BrowserManager {
             Error::ToolExecution(format!("browser not running for profile '{profile_name}'").into())
         })?;
 
-        let idx = parse_tab_index(target_id)?;
         let mut pages = inst
             .browser
             .pages()
             .await
             .map_err(|e| Error::ToolExecution(format!("failed to list tabs: {e}").into()))?;
 
-        if idx >= pages.len() {
-            return Err(Error::ToolExecution(
-                format!("tab index {idx} out of range (have {} tabs)", pages.len()).into(),
-            ));
-        }
+        let idx = find_target_index(&pages, target_id)?;
 
         // `Page::close` (the CDP `Target.closeTarget`) consumes self, so we
         // take the page by value out of the Vec. This avoids `window.close()`
@@ -362,20 +374,13 @@ impl BrowserManager {
             Error::ToolExecution(format!("browser not running for profile '{profile_name}'").into())
         })?;
 
-        let idx = parse_tab_index(target_id)?;
         let pages = inst
             .browser
             .pages()
             .await
             .map_err(|e| Error::ToolExecution(format!("failed to list tabs: {e}").into()))?;
 
-        if idx >= pages.len() {
-            return Err(Error::ToolExecution(
-                format!("tab index {idx} out of range (have {} tabs)", pages.len()).into(),
-            ));
-        }
-
-        let page = &pages[idx];
+        let page = &pages[find_target_index(&pages, target_id)?];
         page.bring_to_front()
             .await
             .map_err(|e| Error::ToolExecution(format!("failed to focus tab: {e}").into()))?;
@@ -392,7 +397,52 @@ impl BrowserManager {
         }))
     }
 
-    /// Get a specific page by targetId, or the first active page.
+    /// Pin the tab this session is working in, so later actions that omit
+    /// `targetId` address the same page.
+    pub fn set_sticky_target(&self, session: &str, profile: &str, target_id: &str) {
+        let key = (session.to_string(), profile.to_string());
+        let mut sticky = match self.sticky.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        sticky.insert(key, target_id.to_string());
+    }
+
+    /// The tab this session last navigated, if any.
+    pub fn sticky_target(&self, session: &str, profile: &str) -> Option<String> {
+        let key = (session.to_string(), profile.to_string());
+        let sticky = match self.sticky.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        sticky.get(&key).cloned()
+    }
+
+    /// Forget this session's pinned tab — called when it turns out to be
+    /// gone, so the next action falls back to normal resolution instead of
+    /// failing forever on a closed target.
+    pub fn clear_sticky_target(&self, session: &str, profile: &str) {
+        let key = (session.to_string(), profile.to_string());
+        let mut sticky = match self.sticky.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        sticky.remove(&key);
+    }
+
+    /// Whether `target_id` still names a live tab in this profile.
+    pub async fn target_is_live(&self, profile_name: &str, target_id: &str) -> bool {
+        let instances = self.instances.lock().await;
+        let Some(inst) = instances.get(profile_name) else {
+            return false;
+        };
+        let Ok(pages) = inst.browser.pages().await else {
+            return false;
+        };
+        pages.iter().any(|p| p.target_id().inner() == target_id)
+    }
+
+    /// Get a specific page by targetId, or the session's current page.
     pub async fn get_page(
         &self,
         profile_name: &str,
@@ -415,23 +465,32 @@ impl BrowserManager {
             .map_err(|e| Error::ToolExecution(format!("failed to list pages: {e}").into()))?;
 
         if let Some(tid) = target_id {
-            let idx = parse_tab_index(tid)?;
-            if idx < pages.len() {
-                Ok(pages.into_iter().nth(idx).unwrap())
-            } else {
-                Err(Error::ToolExecution(
-                    format!("tab {tid} not found (have {} tabs)", pages.len()).into(),
-                ))
-            }
-        } else if let Some(page) = pages.into_iter().next() {
-            Ok(page)
-        } else {
-            // No pages — create one
-            inst.browser
-                .new_page("about:blank")
-                .await
-                .map_err(|e| Error::ToolExecution(format!("failed to create tab: {e}").into()))
+            let idx = find_target_index(&pages, tid)?;
+            return Ok(pages.into_iter().nth(idx).unwrap());
         }
+
+        // No explicit target. `pages()` walks a `HashMap`, so `pages[0]` is
+        // an arbitrary tab that can differ between two consecutive calls —
+        // that is how a `navigate` and the `snapshot` after it end up on
+        // different pages, one of them the permanent `about:blank` startup
+        // tab. Rank instead: real pages before blank ones, ties broken on
+        // target ID, so repeated calls agree on the same page.
+        let mut ranked: Vec<(bool, String, usize)> = Vec::with_capacity(pages.len());
+        for (i, page) in pages.iter().enumerate() {
+            let url = page.url().await.ok().flatten().unwrap_or_default();
+            ranked.push((is_blank_url(&url), page.target_id().inner().clone(), i));
+        }
+        ranked.sort();
+
+        if let Some((_, _, idx)) = ranked.into_iter().next() {
+            return Ok(pages.into_iter().nth(idx).unwrap());
+        }
+
+        // No pages — create one.
+        inst.browser
+            .new_page("about:blank")
+            .await
+            .map_err(|e| Error::ToolExecution(format!("failed to create tab: {e}").into()))
     }
 
     /// Connect to an existing browser or launch a new one for the given profile.
@@ -905,13 +964,188 @@ async fn probe_cdp(url: &str, timeout: Duration) -> bool {
     )
 }
 
-/// Parse a targetId like "tab_3" into an index.
-fn parse_tab_index(target_id: &str) -> Result<usize> {
-    let idx_str = target_id.strip_prefix("tab_").unwrap_or(target_id);
-    idx_str.parse::<usize>().map_err(|_| {
-        Error::ToolExecution(
-            format!("invalid targetId '{target_id}'. Expected format: 'tab_N' (e.g., 'tab_0')")
+/// True for URLs that carry no page content: Chrome's startup tab and the
+/// placeholder [`BrowserManager::get_page`] creates when a profile has none.
+pub(super) fn is_blank_url(url: &str) -> bool {
+    url.is_empty() || url == "about:blank" || url.starts_with("chrome://new-tab")
+}
+
+/// Resolve a CDP target ID to its index in `pages`.
+///
+/// Target IDs are Chrome's own opaque per-tab identifiers, stable for the
+/// life of the tab. They replaced positional `tab_N` ids, which indexed a
+/// `HashMap` iteration and so named a different page from call to call.
+fn find_target_index(pages: &[chromiumoxide::Page], target_id: &str) -> Result<usize> {
+    pages
+        .iter()
+        .position(|p| p.target_id().inner() == target_id)
+        .ok_or_else(|| {
+            Error::ToolExecution(
+                format!(
+                    "tab '{target_id}' not found (have {} open). It may have been closed — \
+                     call action 'tabs' for the current targetIds.",
+                    pages.len()
+                )
                 .into(),
-        )
-    })
+            )
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn manager() -> BrowserManager {
+        BrowserManager::new(BrowserConfig::default())
+    }
+
+    #[test]
+    fn blank_urls_are_recognized() {
+        assert!(is_blank_url(""));
+        assert!(is_blank_url("about:blank"));
+        assert!(is_blank_url("chrome://new-tab-page"));
+        assert!(!is_blank_url("https://www.instagram.com/cutty13/"));
+        // Not blank just because the host is unusual.
+        assert!(!is_blank_url("about:config"));
+    }
+
+    #[test]
+    fn sticky_target_round_trips() {
+        let mgr = manager();
+        assert_eq!(mgr.sticky_target("conv-a", "default"), None);
+
+        mgr.set_sticky_target("conv-a", "default", "TARGET-1");
+        assert_eq!(
+            mgr.sticky_target("conv-a", "default").as_deref(),
+            Some("TARGET-1")
+        );
+
+        mgr.clear_sticky_target("conv-a", "default");
+        assert_eq!(mgr.sticky_target("conv-a", "default"), None);
+    }
+
+    /// Live regression check for the bug this addressing scheme replaced.
+    ///
+    /// Chrome always has a blank startup tab, and `pages()` walks a
+    /// `HashMap`, so the old `pages()[0]` resolution could hand a read the
+    /// blank tab moments after a navigate loaded content into another one.
+    /// Launches a real headless Chrome; ignored by default:
+    ///
+    /// ```sh
+    /// cargo test -p rustykrab-tools --no-default-features \
+    ///   browser::manager::tests::live -- --ignored --nocapture
+    /// ```
+    #[tokio::test]
+    #[ignore = "launches a real Chrome"]
+    async fn live_resolution_never_lands_on_the_blank_tab() {
+        const CONTENT: &str = "data:text/html,<title>cutty13</title><h1>profile</h1>";
+        let dir = tempfile::tempdir().expect("tempdir");
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").expect("free port");
+            l.local_addr().unwrap().port()
+        };
+        let profile = "tab-resolution-test";
+
+        let mut config = BrowserConfig {
+            default_profile: profile.to_string(),
+            ..Default::default()
+        };
+        config.profiles.insert(
+            profile.to_string(),
+            super::super::config::BrowserProfile {
+                cdp_port: Some(port),
+                user_data_dir: Some(dir.path().display().to_string()),
+                headless: Some(true),
+                ..Default::default()
+            },
+        );
+
+        let mgr = BrowserManager::new(config);
+        mgr.start(profile).await.expect("launch chrome");
+
+        // The hazard has to actually be present, or the test proves nothing:
+        // a blank startup tab sitting alongside the page we care about.
+        let startup = mgr.get_page(profile, None).await.expect("startup page");
+        let startup_url = startup.url().await.ok().flatten().unwrap_or_default();
+        assert!(
+            is_blank_url(&startup_url),
+            "expected a blank startup tab, got {startup_url}"
+        );
+
+        let opened = mgr.open_tab(profile, CONTENT).await.expect("open content");
+        let content_id = opened["targetId"].as_str().expect("targetId").to_string();
+        assert!(
+            !content_id.starts_with("tab_"),
+            "targetId must be Chrome's own id, got {content_id}"
+        );
+
+        // Resolution must be stable: same page every call, never the blank
+        // tab. Meanwhile record what the old `pages()[0]` rule would have
+        // returned, so the run reports whether the hazard fired.
+        let mut raw_blank_hits = 0;
+        for i in 0..20 {
+            let page = mgr.get_page(profile, None).await.expect("resolve page");
+            let url = page.url().await.ok().flatten().unwrap_or_default();
+            assert!(!is_blank_url(&url), "iteration {i} resolved to a blank tab");
+            assert_eq!(
+                page.target_id().inner(),
+                &content_id,
+                "iteration {i} resolved to a different tab"
+            );
+
+            let instances = mgr.instances.lock().await;
+            let pages = instances[profile].browser.pages().await.expect("pages");
+            let first = pages.first().expect("at least one page");
+            let first_url = first.url().await.ok().flatten().unwrap_or_default();
+            if is_blank_url(&first_url) {
+                raw_blank_hits += 1;
+            }
+        }
+        eprintln!("old pages()[0] rule would have hit the blank tab {raw_blank_hits}/20 times");
+
+        // An id that no longer names a tab is an error, not a silent
+        // fallback to some other page.
+        let err = mgr
+            .get_page(profile, Some("NO-SUCH-TARGET"))
+            .await
+            .expect_err("stale target must fail");
+        assert!(err.to_string().contains("not found"), "{err}");
+
+        // The listing is stable across calls too.
+        let first_listing = mgr.tabs(profile).await.expect("tabs");
+        let second_listing = mgr.tabs(profile).await.expect("tabs");
+        assert_eq!(first_listing["tabs"], second_listing["tabs"]);
+
+        let _ = mgr.stop(profile).await;
+    }
+
+    #[test]
+    fn sticky_targets_are_scoped_per_session_and_profile() {
+        let mgr = manager();
+        mgr.set_sticky_target("conv-a", "default", "TARGET-A");
+        mgr.set_sticky_target("conv-b", "default", "TARGET-B");
+        mgr.set_sticky_target("conv-a", "work", "TARGET-C");
+
+        // Two conversations browsing the same profile must not steer each
+        // other's page.
+        assert_eq!(
+            mgr.sticky_target("conv-a", "default").as_deref(),
+            Some("TARGET-A")
+        );
+        assert_eq!(
+            mgr.sticky_target("conv-b", "default").as_deref(),
+            Some("TARGET-B")
+        );
+        assert_eq!(
+            mgr.sticky_target("conv-a", "work").as_deref(),
+            Some("TARGET-C")
+        );
+
+        mgr.clear_sticky_target("conv-a", "default");
+        assert_eq!(mgr.sticky_target("conv-a", "default"), None);
+        assert_eq!(
+            mgr.sticky_target("conv-b", "default").as_deref(),
+            Some("TARGET-B")
+        );
+    }
 }
