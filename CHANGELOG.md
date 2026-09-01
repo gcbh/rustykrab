@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.2.14] - 2026-09-01
+
+- feat(store): enforce the foreign keys the schema already claimed (#590)
+
 ## [5.2.13] - 2026-09-01
 
 - fix(browser): bound the renderer round trips that decorate a result (#587)

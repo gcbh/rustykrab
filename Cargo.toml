@@ -16,7 +16,7 @@ members = [
 ]
 
 [workspace.package]
-version = "5.2.13"
+version = "5.2.14"
 edition = "2021"
 rust-version = "1.88"
 license = "MIT"
