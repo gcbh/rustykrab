@@ -257,9 +257,20 @@ mod fastembed_impl {
         async fn embed(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
             let model = Arc::clone(&self.model);
             tokio::task::spawn_blocking(move || {
-                let mut guard = model
-                    .lock()
-                    .map_err(|e| rustykrab_core::Error::Internal(format!("embedder lock: {e}")))?;
+                // Recover a poisoned lock rather than failing forever.
+                //
+                // `TextEmbedding::embed` runs ONNX inference, which can abort
+                // the thread — an OOM on a large batch is the realistic case.
+                // That poisons the mutex, and because the embedder is created
+                // once and shared, every later call returned "embedder lock:
+                // poisoned": one bad batch permanently disabled memory for the
+                // life of the process, with no path back short of a restart.
+                //
+                // The model behind the lock is not left invalid by a panic in
+                // `embed` — the next call re-enters it with its own inputs —
+                // so continuing is safe, and a subsequent smaller batch
+                // succeeds where the previous one died.
+                let mut guard = model.lock().unwrap_or_else(|p| p.into_inner());
                 guard
                     .embed(&texts, None)
                     .map_err(|e| rustykrab_core::Error::Internal(format!("fastembed: {e}")))
