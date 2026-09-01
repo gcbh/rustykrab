@@ -316,6 +316,7 @@ async fn execute_credential_wake(
         chat_id.as_deref(),
         thread_id.as_deref(),
         &response_text,
+        conv.id,
         state,
     )
     .await;
@@ -543,6 +544,7 @@ async fn execute_cron_task(
         effective_chat_id.as_deref(),
         effective_thread_id.as_deref(),
         &response_text,
+        conv.id,
         state,
     )
     .await;
@@ -848,7 +850,40 @@ fn resolve_delivery_target(
 /// channel that cannot be reached is logged with the text that was lost,
 /// never retried, because the agent has already run and re-running it
 /// would repeat its side effects.
+/// Deliver a turn's text, then any credential link that turn minted.
+///
+/// The link is a second message, after the text, for the same reason the
+/// Telegram inbound loop sends it that way: the user should read *why* they
+/// are being asked before they are handed the form.
+///
+/// `conversation_id` exists solely to drain [`PendingLinks`], which is keyed
+/// by conversation. Before this, only the inbound Telegram loop drained that
+/// queue, so a link minted by a scheduled job or a resumed delegated task was
+/// pushed and never delivered — and `next_step_out_of_band` had already told
+/// the model to say "a secure link is being sent to them right now" and not
+/// to write a URL itself. The user was promised a link that could not arrive
+/// and shown nothing. Draining here rather than at the call sites means a
+/// future delivery path cannot reintroduce that by forgetting a step.
 async fn deliver_response(
+    target: &str,
+    channel: Option<&str>,
+    chat_id: Option<&str>,
+    thread_id: Option<&str>,
+    response_text: &str,
+    conversation_id: Uuid,
+    state: &AppState,
+) {
+    deliver_text(target, channel, chat_id, thread_id, response_text, state).await;
+
+    // Each link goes as its own message and never passed through the model,
+    // so it cannot have been truncated or paraphrased on the way here.
+    for link in state.store.pending_links().take(conversation_id) {
+        deliver_text(target, channel, chat_id, thread_id, &link, state).await;
+    }
+}
+
+/// Send one message to whichever channel this turn belongs to.
+async fn deliver_text(
     target: &str,
     channel: Option<&str>,
     chat_id: Option<&str>,

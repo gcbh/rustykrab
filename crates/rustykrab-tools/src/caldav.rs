@@ -63,6 +63,10 @@ pub struct CalDavTool {
     /// not assembled a store; without it the tool reports the gap and asks
     /// nobody, which is the behaviour this exists to end.
     requests: Option<rustykrab_store::CredentialRequestStore>,
+    /// Where a minted link waits until the turn has finished speaking.
+    /// Without it the request is still filed and answerable in the app,
+    /// there is simply no link to send to a chat surface.
+    pending_links: Option<rustykrab_store::PendingLinks>,
 }
 
 impl CalDavTool {
@@ -74,6 +78,7 @@ impl CalDavTool {
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
             requests: None,
+            pending_links: None,
         }
     }
 
@@ -83,14 +88,25 @@ impl CalDavTool {
         self
     }
 
+    /// Deliver minted links out of band, after the turn.
+    pub fn with_pending_links(mut self, links: rustykrab_store::PendingLinks) -> Self {
+        self.pending_links = Some(links);
+        self
+    }
+
     /// Fetch the Google email + app password, asking the user when they are
     /// absent or unusable.
     ///
     /// One line, because mail and calendar are one account: see
     /// [`crate::google_credentials`].
     async fn get_credentials(&self) -> Result<(String, String)> {
-        crate::google_credentials::load(&self.secrets, self.requests.as_ref(), "Google Calendar")
-            .await
+        crate::google_credentials::load(
+            &self.secrets,
+            self.requests.as_ref(),
+            self.pending_links.as_ref(),
+            "Google Calendar",
+        )
+        .await
     }
 
     /// The events collection URL for a given calendar id (defaults to the
@@ -141,18 +157,28 @@ impl CalDavTool {
 
         if !(200..300).contains(&status) {
             let detail = text.chars().take(500).collect::<String>();
-            let hint = if status == 401 {
-                format!(
-                    " (401 Unauthorized — check that {KEY_APP_PASSWORD} is a Google *app* \
-                     password and that CalDAV access is permitted for the account; the \
-                     stored password is {})",
-                    describe_password_shape(password)
+            // A 401 here is Google refusing the stored app password —
+            // revoked, expired, or never permitted for DAV. `get_credentials`
+            // cannot see that: the value is present and well formed, so it
+            // passes through, and only this response proves it dead. Telling
+            // the model to "check that the password is an app password" was
+            // advice nobody could act on; ask the user for a new one instead,
+            // the same way an absent one is asked for.
+            if status == 401 {
+                return Err(crate::google_credentials::rejected(
+                    self.requests.as_ref(),
+                    self.pending_links.as_ref(),
+                    "Google Calendar",
+                    format!(
+                        "CalDAV {url} returned HTTP 401 Unauthorized — Google rejected the \
+                         stored {KEY_APP_PASSWORD}, which is {}: {detail}",
+                        describe_password_shape(password)
+                    ),
                 )
-            } else {
-                String::new()
-            };
+                .await);
+            }
             return Err(Error::ToolExecution(
-                format!("CalDAV {url} returned HTTP {status}{hint}: {detail}").into(),
+                format!("CalDAV {url} returned HTTP {status}: {detail}").into(),
             ));
         }
 

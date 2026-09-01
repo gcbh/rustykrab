@@ -260,10 +260,18 @@ pub fn builtin_tools(
         // net_scan/net_admin/net_audit/net_discovery tools were removed to
         // cut the tool-schema payload sent to the model.
         // Email
-        std::sync::Arc::new(GmailTool::new(guarded.clone()).with_requests(requests.clone())),
+        std::sync::Arc::new(
+            GmailTool::new(guarded.clone())
+                .with_requests(requests.clone())
+                .with_pending_links(pending_links.clone()),
+        ),
         // Calendar (CalDAV — reuses Gmail credentials, and asks for them
         // the same way when they are absent)
-        std::sync::Arc::new(CalDavTool::new(guarded.clone()).with_requests(requests.clone())),
+        std::sync::Arc::new(
+            CalDavTool::new(guarded.clone())
+                .with_requests(requests.clone())
+                .with_pending_links(pending_links.clone()),
+        ),
         // Notion
         std::sync::Arc::new(NotionTool::new(guarded.clone())),
         // Obsidian

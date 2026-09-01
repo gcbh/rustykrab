@@ -15,7 +15,7 @@
 //! is missing or unusable, normalise what comes back — and the tools call
 //! it rather than reimplementing it.
 
-use rustykrab_core::{Error, Result};
+use rustykrab_core::{Error, Result, ToolError};
 use rustykrab_store::{CredentialRequestStore, GuardedSecrets, RequestedField};
 
 /// SecretStore keys. Named for Gmail because that is where they came from;
@@ -61,10 +61,40 @@ pub fn fields() -> Vec<RequestedField> {
 /// Filing is best-effort by design: if the store rejects it, the caller
 /// still gets an error explaining the gap, because a failure to ask is not
 /// a reason to pretend the credential exists.
-pub async fn ask(requests: Option<&CredentialRequestStore>, service: &str, needs: &str) -> String {
+pub async fn ask(
+    requests: Option<&CredentialRequestStore>,
+    links: Option<&rustykrab_store::PendingLinks>,
+    service: &str,
+    needs: &str,
+) -> String {
     let Some(requests) = requests else {
         return String::new();
     };
+
+    // One dead credential, one link — however many tools trip over it.
+    //
+    // A briefing calls Gmail and the calendar and each may call twice, so a
+    // single revoked app password reached `ask` four times in one turn. The
+    // request deduped correctly (the store supersedes), but every call still
+    // minted a link, and superseding kills the token on the row it replaced.
+    // The user got four messages, three already dead, and a superseded link
+    // renders the same "Link expired" page a real expiry does — so there was
+    // no way to tell which one to trust. Measured at 4/4 before this guard.
+    //
+    // Checked against the link rather than the request: a pending request
+    // whose link has expired should ask again, because the user has nothing
+    // they can still open.
+    if requests
+        .has_live_link(KEY_APP_PASSWORD)
+        .await
+        .unwrap_or(false)
+    {
+        return format!(
+            " {}",
+            crate::credential_link::next_step_out_of_band(true, service)
+        );
+    }
+
     // This is the path that actually fires in practice — measured at 25/25
     // against `browser`'s 1/9 — so a request filed here without a
     // conversation would leave the common case unresumable.
@@ -83,14 +113,26 @@ pub async fn ask(requests: Option<&CredentialRequestStore>, service: &str, needs
         .await
     {
         Ok(id) => {
-            // These tools file most of the requests that ever get filed, so
-            // without a link they are also what most often leaves the user
-            // with "open the app" and no way to answer from the chat they
-            // are actually in.
+            // Out of band, not in the tool result. These tools file most of
+            // the requests that ever get filed, so they are also where
+            // handing the URL to the model costs the most: gemma4:26b was
+            // measured relaying 55 of 64 hex characters, and a truncated
+            // token opens the same "Link expired" page a real expiry does,
+            // so the user cannot tell a typo from a timeout. Parking it
+            // means the model never sees it and cannot mangle it — and the
+            // live capture URL stays out of the context window and the
+            // transcript. See `rustykrab_store::pending_links`.
             let link = crate::credential_link::mint_link(requests, &id).await;
+            let queued = match (links, conversation_id, &link) {
+                (Some(pending), Some(conv), Some(url)) => {
+                    pending.push(conv, url.clone());
+                    true
+                }
+                _ => false,
+            };
             format!(
                 " {}",
-                crate::credential_link::next_step(link.as_deref(), service)
+                crate::credential_link::next_step_out_of_band(queued, service)
             )
         }
         Err(e) => {
@@ -98,6 +140,49 @@ pub async fn ask(requests: Option<&CredentialRequestStore>, service: &str, needs
             String::new()
         }
     }
+}
+
+/// Google rejected a credential that looked fine from here: ask for a new one.
+///
+/// [`load`] asks when a value is absent or self-evidently unusable, and that
+/// is everything it can judge locally. A revoked or expired app password is
+/// neither: it is present, sixteen characters, and indistinguishable from a
+/// working one until Google refuses it. That refusal arrives *after* `load`
+/// has already handed the value over — as an IMAP `AUTHENTICATIONFAILED` or
+/// a CalDAV 401 — so the call site is the only place that learns of it, and
+/// without this it ends the run with an error string, no request filed and
+/// no link sent. That was the observed failure: the daily briefing wrote
+/// "please update gmail_app_password in the credential store" into its own
+/// output for days, which is not something the user can act on from chat.
+///
+/// A dead credential takes the same route as an absent one, for the same
+/// reason: one request under [`KEY_APP_PASSWORD`], shared by both protocols,
+/// and fulfilling it overwrites what is stored.
+///
+/// `reason` is the unwrapped message, not an [`Error`] — displaying one
+/// would drop a "tool execution error:" prefix into the middle of the
+/// sentence `ask` appends to.
+///
+/// The result is [`ToolErrorKind::PermissionDenied`], which is both accurate
+/// and load-bearing: the runner retries an untyped tool error three times,
+/// and each retry would file another request and mint another link, so the
+/// user would get three one-time URLs for one dead password.
+///
+/// [`ToolErrorKind::PermissionDenied`]: rustykrab_core::ToolErrorKind::PermissionDenied
+pub async fn rejected(
+    requests: Option<&CredentialRequestStore>,
+    links: Option<&rustykrab_store::PendingLinks>,
+    service: &str,
+    reason: impl std::fmt::Display,
+) -> Error {
+    let asked = ask(
+        requests,
+        links,
+        service,
+        "a working Google account address and app password",
+    )
+    .await;
+    Error::ToolExecution(ToolError::permission_denied(format!("{reason}{asked}")))
 }
 
 /// Read the Google address and app password, asking the user for whatever
@@ -111,6 +196,7 @@ pub async fn ask(requests: Option<&CredentialRequestStore>, service: &str, needs
 pub async fn load(
     secrets: &GuardedSecrets,
     requests: Option<&CredentialRequestStore>,
+    links: Option<&rustykrab_store::PendingLinks>,
     service: &str,
 ) -> Result<(String, String)> {
     let email = secrets.get(KEY_EMAIL).await.ok();
@@ -134,7 +220,7 @@ pub async fn load(
                 ),
                 (true, true) => unreachable!("both present is handled above"),
             };
-            let asked = ask(requests, service, needed).await;
+            let asked = ask(requests, links, service, needed).await;
             return Err(Error::ToolExecution(
                 format!("{service} is not set up yet: {missing}.{asked}").into(),
             ));
@@ -155,6 +241,7 @@ pub async fn load(
         Err(Error::ToolExecution(reason)) => {
             let asked = ask(
                 requests,
+                links,
                 service,
                 "a working Google account address and app password",
             )
@@ -253,7 +340,7 @@ mod tests {
         let (_dir, store) = test_store();
         let requests = store.credential_requests();
 
-        let err = load(&store.guarded_secrets(), Some(&requests), "Gmail")
+        let err = load(&store.guarded_secrets(), Some(&requests), None, "Gmail")
             .await
             .unwrap_err()
             .to_string();
@@ -277,8 +364,10 @@ mod tests {
         let requests = store.credential_requests();
         let secrets = store.guarded_secrets();
 
-        load(&secrets, Some(&requests), "Gmail").await.unwrap_err();
-        load(&secrets, Some(&requests), "Google Calendar")
+        load(&secrets, Some(&requests), None, "Gmail")
+            .await
+            .unwrap_err();
+        load(&secrets, Some(&requests), None, "Google Calendar")
             .await
             .unwrap_err();
 
@@ -294,7 +383,9 @@ mod tests {
         let requests = store.credential_requests();
         let secrets = store.guarded_secrets();
 
-        load(&secrets, Some(&requests), "Gmail").await.unwrap_err();
+        load(&secrets, Some(&requests), None, "Gmail")
+            .await
+            .unwrap_err();
         let id = requests.pending().await.unwrap()[0].id.clone();
         requests
             .fulfil(
@@ -313,7 +404,7 @@ mod tests {
             .unwrap();
 
         for service in ["Gmail", "Google Calendar"] {
-            let (email, password) = load(&secrets, Some(&requests), service)
+            let (email, password) = load(&secrets, Some(&requests), None, service)
                 .await
                 .expect("credentials should be readable after one answer");
             assert_eq!(email, "me@gmail.com");
@@ -334,19 +425,75 @@ mod tests {
             .await
             .unwrap();
 
-        let err = load(&store.guarded_secrets(), Some(&requests), "Google Calendar")
-            .await
-            .unwrap_err()
-            .to_string();
+        let err = load(
+            &store.guarded_secrets(),
+            Some(&requests),
+            None,
+            "Google Calendar",
+        )
+        .await
+        .unwrap_err()
+        .to_string();
 
         assert!(err.contains("not an email address"), "{err}");
         assert_eq!(requests.pending().await.unwrap().len(), 1);
     }
 
     #[tokio::test]
+    async fn a_credential_the_server_rejects_asks_for_a_new_one() {
+        let (_dir, store) = test_store();
+        let requests = store.credential_requests();
+        let secrets = store.secrets();
+        // Present, well formed, sixteen characters — everything `load` can
+        // check locally passes. Only Google knows it has been revoked.
+        secrets.create(KEY_EMAIL, "me@gmail.com").await.unwrap();
+        secrets
+            .create(KEY_APP_PASSWORD, "abcdefghijklmnop")
+            .await
+            .unwrap();
+        load(&store.guarded_secrets(), Some(&requests), None, "Gmail")
+            .await
+            .expect("a well-formed credential is handed over, not questioned");
+
+        let err = rejected(
+            Some(&requests),
+            None,
+            "Gmail",
+            "IMAP login failed: [AUTHENTICATIONFAILED] Invalid credentials",
+        )
+        .await;
+
+        let pending = requests.pending().await.unwrap();
+        assert_eq!(pending.len(), 1, "expected one request, got {pending:?}");
+        assert_eq!(pending[0].name, KEY_APP_PASSWORD);
+        let text = err.to_string();
+        assert!(text.contains("AUTHENTICATIONFAILED"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_rejection_is_not_retried_into_a_second_link() {
+        let (_dir, store) = test_store();
+        let requests = store.credential_requests();
+
+        let err = rejected(Some(&requests), None, "Google Calendar", "HTTP 401").await;
+
+        // The runner repeats an untyped tool error three times. Each repeat
+        // files another request and mints another one-time URL, so one dead
+        // password would reach the user as three competing links.
+        let rustykrab_core::Error::ToolExecution(tool_error) = &err else {
+            panic!("expected a tool error, got {err:?}");
+        };
+        assert_eq!(
+            tool_error.kind,
+            rustykrab_core::ToolErrorKind::PermissionDenied,
+            "a rejected credential must not be retryable"
+        );
+    }
+
+    #[tokio::test]
     async fn without_a_request_store_it_still_reports_the_gap() {
         let (_dir, store) = test_store();
-        let err = load(&store.guarded_secrets(), None, "Gmail")
+        let err = load(&store.guarded_secrets(), None, None, "Gmail")
             .await
             .unwrap_err()
             .to_string();
