@@ -82,10 +82,27 @@ pub struct BrowserManager {
 /// them and rarely tidies up, so a browser that lives for weeks
 /// accumulates them until it is the largest process on the machine.
 ///
-/// A cap keeps reuse constant-cost. When a new tab would exceed it the
-/// oldest is closed first, on the reasoning that the agent is working on
-/// what it opened most recently. Closing is best-effort: failing to tidy
-/// must never fail the navigation the user actually asked for.
+/// A cap keeps reuse constant-cost.
+///
+/// It deliberately does not claim to close the *oldest* tab. There is no
+/// age to sort by: `Browser::pages()` collects from a `HashMap` with
+/// `values_mut()`, and the handler permutes that map on every poll
+/// (`remove_entry` + `insert`, and `swap_remove` on its id list), so the
+/// order is arbitrary and unstable between calls. Chrome's target IDs are
+/// opaque and carry no age either. An earlier version drained the front of
+/// that list and described it as oldest-first; it closed an arbitrary
+/// subset.
+///
+/// So reap by what can actually be known: blank startup tabs first, which
+/// are always safe, and never a tab some session has pinned. One profile
+/// is shared by every concurrent run, so closing a pinned tab would take a
+/// page out from under an agent mid-task -- recoverable, since
+/// `resolve_target` clears a dead pin and falls back, but the agent
+/// silently loses the page it was working on. If every tab is pinned,
+/// exceed the cap rather than break someone's session.
+///
+/// Closing is best-effort: failing to tidy must never fail the navigation
+/// the user actually asked for.
 const MAX_TABS_PER_PROFILE: usize = 8;
 
 impl BrowserManager {
@@ -330,22 +347,53 @@ impl BrowserManager {
         // `Page::close` consumes self (CDP `Target.closeTarget`), so the
         // stale pages are taken by value rather than borrowed -- same
         // reason `close_tab` uses `swap_remove`.
-        if let Ok(mut existing) = inst.browser.pages().await {
+        if let Ok(existing) = inst.browser.pages().await {
             if existing.len() >= MAX_TABS_PER_PROFILE {
-                let excess = existing.len() + 1 - MAX_TABS_PER_PROFILE;
-                for stale in existing.drain(..excess) {
+                let wanted = existing.len() + 1 - MAX_TABS_PER_PROFILE;
+                let pinned = self.pinned_targets(profile_name);
+
+                // Rank what may go: blank startup tabs first, then other
+                // unpinned tabs. Pinned tabs are never candidates.
+                let mut blank = Vec::new();
+                let mut other = Vec::new();
+                for page in existing {
+                    if pinned.contains(page.target_id().inner()) {
+                        continue;
+                    }
+                    let url = page.url().await.ok().flatten().unwrap_or_default();
+                    if is_blank_url(&url) {
+                        blank.push(page);
+                    } else {
+                        other.push(page);
+                    }
+                }
+                blank.extend(other);
+
+                let mut closed = 0;
+                for stale in blank.into_iter().take(wanted) {
                     match stale.close().await {
-                        Ok(()) => tracing::debug!("closed the oldest tab to stay within the cap"),
+                        Ok(()) => closed += 1,
                         // A tab that will not close is not a reason to
                         // refuse the navigation the user asked for.
                         Err(e) => tracing::warn!(error = %e, "could not close a stale tab"),
                     }
                 }
                 tracing::info!(
-                    closed = excess,
+                    closed,
+                    wanted,
+                    pinned = pinned.len(),
                     cap = MAX_TABS_PER_PROFILE,
-                    "reaped stale tabs before opening a new one"
+                    "reaped tabs before opening a new one"
                 );
+                if closed < wanted {
+                    // Over the cap because the rest are in use. Say so:
+                    // silently exceeding a documented limit is the kind of
+                    // thing that reads as a leak later.
+                    tracing::debug!(
+                        short_by = wanted - closed,
+                        "kept tabs that sessions are using; over the cap for now"
+                    );
+                }
             }
         }
 
@@ -482,6 +530,23 @@ impl BrowserManager {
             Err(p) => p.into_inner(),
         };
         sticky.get(&key).cloned()
+    }
+
+    /// Every target pinned by any session for this profile.
+    ///
+    /// The reap needs "is anyone using this tab", not "is *this* session
+    /// using it": the profile is shared, so another conversation's pinned
+    /// page is exactly what must not be closed.
+    pub fn pinned_targets(&self, profile: &str) -> std::collections::HashSet<String> {
+        let sticky = match self.sticky.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        sticky
+            .iter()
+            .filter(|((_, p), _)| p == profile)
+            .map(|(_, target)| target.clone())
+            .collect()
     }
 
     /// Forget this session's pinned tab — called when it turns out to be
@@ -1243,5 +1308,31 @@ mod tests {
             mgr.sticky_target("conv-b", "default").as_deref(),
             Some("TARGET-B")
         );
+    }
+
+    /// The reap must not be able to close a tab another session is on.
+    /// One Chrome profile is shared by every concurrent run, so this is
+    /// the difference between tidying and taking a page out from under
+    /// an agent mid-task.
+    #[test]
+    fn pinned_targets_are_gathered_across_sessions_for_one_profile() {
+        let mgr = manager();
+        mgr.set_sticky_target("session-a", "rustykrab", "TARGET-A");
+        mgr.set_sticky_target("session-b", "rustykrab", "TARGET-B");
+        mgr.set_sticky_target("session-c", "other-profile", "TARGET-C");
+
+        let pinned = mgr.pinned_targets("rustykrab");
+        assert_eq!(pinned.len(), 2, "{pinned:?}");
+        assert!(pinned.contains("TARGET-A"));
+        assert!(pinned.contains("TARGET-B"));
+        assert!(
+            !pinned.contains("TARGET-C"),
+            "another profile's pin is not this profile's business: {pinned:?}"
+        );
+    }
+
+    #[test]
+    fn a_profile_with_no_pins_has_nothing_to_protect() {
+        assert!(manager().pinned_targets("rustykrab").is_empty());
     }
 }
