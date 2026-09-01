@@ -60,6 +60,296 @@ pub struct BrowserTool {
     secrets: Option<rustykrab_store::GuardedSecrets>,
 }
 
+/// Resolve the action the caller meant.
+///
+/// `fill_credential` is the only ref-based operation that lives at the
+/// top level; every other one -- click, type, fill, press -- is an
+/// `actAction` under `act`. A model holding a ref from a snapshot
+/// reaches for `act` + `actAction: "fill_credential"`, which is where
+/// the pattern says it should be, and was told the sub-action was
+/// invalid.
+///
+/// Observed, not hypothesised: a trial did exactly this, was refused
+/// twice, and fell back to `fill` with the credential's *key name* as
+/// the text -- typing `web_..._username` and `web_..._password` into
+/// the login form and failing the sign-in. The tool's shape turned a
+/// correct intention into a wrong action, so accept the spelling the
+/// model already reaches for.
+/// The browser tool's parameter schema, as a free function so tests can
+/// assert on what the model is actually told without building a tool.
+fn schema_parameters() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": [
+                    "status", "start", "stop", "profiles",
+                    "tabs", "open", "close", "focus",
+                    "navigate", "snapshot", "act", "screenshot",
+                    "content", "evaluate", "scroll",
+                    "console", "cookies", "pdf",
+                    "fetch", "stealth_fetch", "select", "wait_for",
+                    "fill_credential"
+                ],
+                "description": "Action to perform"
+            },
+            "field": {
+                "type": "string",
+                "description": "Which part of the login to fill (fill_credential action): 'username' or 'password'. Defaults to 'password'."
+            },
+            "profile": {
+                "type": "string",
+                "description": "Browser profile name (default: configured default profile)"
+            },
+            "url": {
+                "type": "string",
+                "description": "URL to navigate to or open (navigate/open actions)"
+            },
+            "targetId": {
+                "type": "string",
+                "description": "Tab identifier from 'tabs' action (e.g., 'tab_0'). Used by close/focus/navigate/snapshot/act/screenshot/content/evaluate"
+            },
+            "ref": {
+                "type": "string",
+                "description": "Element ref from a snapshot (e.g., '12' or 'e12'). Used by 'act' action"
+            },
+            "actAction": {
+                "type": "string",
+                "enum": ["click", "type", "fill", "press", "hover", "select", "drag", "wait", "fill_credential"],
+                "description": "Sub-action for 'act' (e.g., click, type, press). Requires 'ref' from snapshot. 'fill_credential' fills a stored credential without its value passing through you — set 'field' to 'username' or 'password'; do not put the secret in 'text'"
+            },
+            "text": {
+                "type": "string",
+                "description": "Text to type (act type/fill action)"
+            },
+            "key": {
+                "type": "string",
+                "description": "Key to press (act press action, e.g., 'Enter', 'Tab', 'Escape')"
+            },
+            "value": {
+                "type": "string",
+                "description": "Value to select (act select action)"
+            },
+            "targetRef": {
+                "type": "string",
+                "description": "Target element ref for drag action"
+            },
+            "clear": {
+                "type": "boolean",
+                "description": "Clear field before typing (default: true for fill, false for type)"
+            },
+            "selector": {
+                "type": "string",
+                "description": "CSS selector — use 'ref' from snapshot instead when possible. For screenshot element targeting or snapshot scoping"
+            },
+            "expression": {
+                "type": "string",
+                "description": "JavaScript to evaluate (evaluate action)"
+            },
+            "format": {
+                "type": "string",
+                "enum": ["text", "html", "ai", "aria"],
+                "description": "Content format (text/html for content action; ai/aria for snapshot mode)"
+            },
+            "full_page": {
+                "type": "boolean",
+                "description": "Full page screenshot (default: false)"
+            },
+            "direction": {
+                "type": "string",
+                "enum": ["down", "up", "bottom", "top"],
+                "description": "Scroll direction"
+            },
+            "amount": {
+                "type": "integer",
+                "description": "Scroll amount in pixels (default: 500)"
+            },
+            "domain": {
+                "type": "string",
+                "description": "Cookie domain filter (cookies action)"
+            },
+            "timeout_ms": {
+                "type": "integer",
+                "description": "Timeout in milliseconds (wait/navigate, default: 10000)"
+            },
+            "interactive": {
+                "type": "boolean",
+                "description": "Snapshot: only include interactive elements (default: false)"
+            },
+            "compact": {
+                "type": "boolean",
+                "description": "Snapshot: compact output format (default: false)"
+            },
+            "depth": {
+                "type": "integer",
+                "description": "Snapshot: max tree depth (default: 50). Modern SPAs nest interactive elements 25-40 levels deep; raise this if a snapshot returns no/too few elements."
+            },
+            "highlight": {
+                "type": "boolean",
+                "description": "Snapshot: paint numbered overlay boxes on each ref so a subsequent screenshot shows the labels (default: false). Overlays auto-clear on the next snapshot."
+            },
+
+            "method": {
+                "type": "string",
+                "enum": ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"],
+                "description": "HTTP method for 'fetch' (default: GET)"
+            },
+            "body": {
+                "type": "string",
+                "description": "Raw request body for 'fetch'"
+            },
+            "json": {
+                "description": "JSON body for 'fetch' (object/array/value sent as application/json)"
+            },
+            "form": {
+                "type": "object",
+                "description": "Form-encoded body for 'fetch'",
+                "additionalProperties": {"type": "string"}
+            },
+            "extra_headers": {
+                "type": "object",
+                "description": "Extra headers for 'fetch'/'stealth_fetch'/'navigate'",
+                "additionalProperties": {"type": "string"}
+            },
+            "cookies": {
+                "type": "object",
+                "description": "Cookies map for 'fetch' (sent as Cookie header)",
+                "additionalProperties": {"type": "string"}
+            },
+            "user_agent": {
+                "type": "string",
+                "description": "Custom User-Agent for 'fetch' or 'stealth_fetch'"
+            },
+            "impersonate": {
+                "type": "string",
+                "description": "Browser pack to impersonate: chrome, firefox, safari, edge (also accepts versioned variants like 'chrome131')"
+            },
+            "stealthy_headers": {
+                "type": "boolean",
+                "description": "fetch: send a coordinated browser-like header pack (Sec-Ch-Ua, Sec-Fetch-*, Accept-Language, etc.)"
+            },
+            "follow_redirects": {
+                "type": "boolean",
+                "description": "fetch: follow redirects (default: true)"
+            },
+            "max_redirects": {
+                "type": "integer",
+                "description": "fetch: redirect limit (default: 10)"
+            },
+            "retries": {
+                "type": "integer",
+                "description": "fetch: retry count on transport failure (default: 0)"
+            },
+            "proxy": {
+                "type": "string",
+                "description": "fetch/stealth_fetch: proxy URL (e.g. http://user:pass@host:8080)"
+            },
+            "verify_tls": {
+                "type": "boolean",
+                "description": "fetch: verify TLS certificates (default: true)"
+            },
+
+            "wait_selector": {
+                "type": "string",
+                "description": "navigate/stealth_fetch/wait_for: CSS selector to wait for"
+            },
+            "wait_selector_state": {
+                "type": "string",
+                "enum": ["attached", "detached", "visible", "hidden"],
+                "description": "wait_selector state (default: visible)"
+            },
+            "network_idle": {
+                "type": "boolean",
+                "description": "navigate/stealth_fetch/wait_for: wait for the network to be idle (no new requests for ~500ms)"
+            },
+            "solve_cloudflare": {
+                "type": "boolean",
+                "description": "navigate/stealth_fetch: best-effort wait for Cloudflare challenge to clear"
+            },
+            "block_webrtc": {
+                "type": "boolean",
+                "description": "stealth_fetch/navigate: block WebRTC to prevent IP leaks"
+            },
+            "hide_canvas": {
+                "type": "boolean",
+                "description": "stealth_fetch/navigate: add noise to canvas/WebGL fingerprints"
+            },
+            "disable_resources": {
+                "type": "boolean",
+                "description": "stealth_fetch/navigate: don't load images/fonts/media (faster)"
+            },
+            "block_images": {
+                "type": "boolean",
+                "description": "stealth_fetch/navigate: block image loads only"
+            },
+            "hide_webdriver": {
+                "type": "boolean",
+                "description": "stealth_fetch/navigate: hide navigator.webdriver and other automation tells (default: true)"
+            },
+
+            "html": {
+                "type": "string",
+                "description": "select: parse this static HTML body instead of querying the live tab"
+            },
+            "css": {
+                "type": "string",
+                "description": "select: CSS selector. Supports Scrapling pseudo-selectors ::text and ::attr(name)"
+            },
+            "xpath": {
+                "type": "string",
+                "description": "select: XPath query (live mode only — requires an active tab)"
+            },
+            "find_by_text": {
+                "type": "string",
+                "description": "select: filter matches by text (substring or regex when 'regex' is true)"
+            },
+            "regex": {
+                "type": "boolean",
+                "description": "select: treat find_by_text as a regex (default: false)"
+            },
+            "limit": {
+                "type": "integer",
+                "description": "select: max number of matches to return (default 500, hard cap 500)"
+            },
+            "include_html": {
+                "type": "boolean",
+                "description": "select: include each match's outerHTML"
+            },
+            "auto_save": {
+                "type": "boolean",
+                "description": "select: store fingerprints of the matches under 'auto_save_id' for adaptive matching later"
+            },
+            "auto_match": {
+                "type": "boolean",
+                "description": "select: if the selector returns nothing, locate closest matches by similarity to fingerprints saved under 'auto_save_id'"
+            },
+            "auto_save_id": {
+                "type": "string",
+                "description": "select: identifier for the saved fingerprint set"
+            },
+            "auto_match_threshold": {
+                "type": "number",
+                "description": "select: minimum similarity (0-1) to accept an adaptive match (default 0.6)"
+            },
+
+            "delay_ms": {
+                "type": "integer",
+                "description": "wait_for/stealth_fetch: extra delay in ms after other waits resolve"
+            }
+        },
+        "required": ["action"]
+    })
+}
+
+fn effective_action<'a>(action: &'a str, args: &serde_json::Value) -> &'a str {
+    if action == "act" && args["actAction"] == "fill_credential" {
+        "fill_credential"
+    } else {
+        action
+    }
+}
+
 impl BrowserTool {
     pub fn new() -> Self {
         Self {
@@ -281,268 +571,7 @@ impl Tool for BrowserTool {
         ToolSchema {
             name: self.name().to_string(),
             description: self.description().to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": [
-                            "status", "start", "stop", "profiles",
-                            "tabs", "open", "close", "focus",
-                            "navigate", "snapshot", "act", "screenshot",
-                            "content", "evaluate", "scroll",
-                            "console", "cookies", "pdf",
-                            "fetch", "stealth_fetch", "select", "wait_for",
-                            "fill_credential"
-                        ],
-                        "description": "Action to perform"
-                    },
-                    "field": {
-                        "type": "string",
-                        "description": "Which part of the login to fill (fill_credential action): 'username' or 'password'. Defaults to 'password'."
-                    },
-                    "profile": {
-                        "type": "string",
-                        "description": "Browser profile name (default: configured default profile)"
-                    },
-                    "url": {
-                        "type": "string",
-                        "description": "URL to navigate to or open (navigate/open actions)"
-                    },
-                    "targetId": {
-                        "type": "string",
-                        "description": "Tab identifier from 'tabs' action (e.g., 'tab_0'). Used by close/focus/navigate/snapshot/act/screenshot/content/evaluate"
-                    },
-                    "ref": {
-                        "type": "string",
-                        "description": "Element ref from a snapshot (e.g., '12' or 'e12'). Used by 'act' action"
-                    },
-                    "actAction": {
-                        "type": "string",
-                        "enum": ["click", "type", "fill", "press", "hover", "select", "drag", "wait"],
-                        "description": "Sub-action for 'act' (e.g., click, type, press). Requires 'ref' from snapshot"
-                    },
-                    "text": {
-                        "type": "string",
-                        "description": "Text to type (act type/fill action)"
-                    },
-                    "key": {
-                        "type": "string",
-                        "description": "Key to press (act press action, e.g., 'Enter', 'Tab', 'Escape')"
-                    },
-                    "value": {
-                        "type": "string",
-                        "description": "Value to select (act select action)"
-                    },
-                    "targetRef": {
-                        "type": "string",
-                        "description": "Target element ref for drag action"
-                    },
-                    "clear": {
-                        "type": "boolean",
-                        "description": "Clear field before typing (default: true for fill, false for type)"
-                    },
-                    "selector": {
-                        "type": "string",
-                        "description": "CSS selector — use 'ref' from snapshot instead when possible. For screenshot element targeting or snapshot scoping"
-                    },
-                    "expression": {
-                        "type": "string",
-                        "description": "JavaScript to evaluate (evaluate action)"
-                    },
-                    "format": {
-                        "type": "string",
-                        "enum": ["text", "html", "ai", "aria"],
-                        "description": "Content format (text/html for content action; ai/aria for snapshot mode)"
-                    },
-                    "full_page": {
-                        "type": "boolean",
-                        "description": "Full page screenshot (default: false)"
-                    },
-                    "direction": {
-                        "type": "string",
-                        "enum": ["down", "up", "bottom", "top"],
-                        "description": "Scroll direction"
-                    },
-                    "amount": {
-                        "type": "integer",
-                        "description": "Scroll amount in pixels (default: 500)"
-                    },
-                    "domain": {
-                        "type": "string",
-                        "description": "Cookie domain filter (cookies action)"
-                    },
-                    "timeout_ms": {
-                        "type": "integer",
-                        "description": "Timeout in milliseconds (wait/navigate, default: 10000)"
-                    },
-                    "interactive": {
-                        "type": "boolean",
-                        "description": "Snapshot: only include interactive elements (default: false)"
-                    },
-                    "compact": {
-                        "type": "boolean",
-                        "description": "Snapshot: compact output format (default: false)"
-                    },
-                    "depth": {
-                        "type": "integer",
-                        "description": "Snapshot: max tree depth (default: 50). Modern SPAs nest interactive elements 25-40 levels deep; raise this if a snapshot returns no/too few elements."
-                    },
-                    "highlight": {
-                        "type": "boolean",
-                        "description": "Snapshot: paint numbered overlay boxes on each ref so a subsequent screenshot shows the labels (default: false). Overlays auto-clear on the next snapshot."
-                    },
-
-                    "method": {
-                        "type": "string",
-                        "enum": ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"],
-                        "description": "HTTP method for 'fetch' (default: GET)"
-                    },
-                    "body": {
-                        "type": "string",
-                        "description": "Raw request body for 'fetch'"
-                    },
-                    "json": {
-                        "description": "JSON body for 'fetch' (object/array/value sent as application/json)"
-                    },
-                    "form": {
-                        "type": "object",
-                        "description": "Form-encoded body for 'fetch'",
-                        "additionalProperties": {"type": "string"}
-                    },
-                    "extra_headers": {
-                        "type": "object",
-                        "description": "Extra headers for 'fetch'/'stealth_fetch'/'navigate'",
-                        "additionalProperties": {"type": "string"}
-                    },
-                    "cookies": {
-                        "type": "object",
-                        "description": "Cookies map for 'fetch' (sent as Cookie header)",
-                        "additionalProperties": {"type": "string"}
-                    },
-                    "user_agent": {
-                        "type": "string",
-                        "description": "Custom User-Agent for 'fetch' or 'stealth_fetch'"
-                    },
-                    "impersonate": {
-                        "type": "string",
-                        "description": "Browser pack to impersonate: chrome, firefox, safari, edge (also accepts versioned variants like 'chrome131')"
-                    },
-                    "stealthy_headers": {
-                        "type": "boolean",
-                        "description": "fetch: send a coordinated browser-like header pack (Sec-Ch-Ua, Sec-Fetch-*, Accept-Language, etc.)"
-                    },
-                    "follow_redirects": {
-                        "type": "boolean",
-                        "description": "fetch: follow redirects (default: true)"
-                    },
-                    "max_redirects": {
-                        "type": "integer",
-                        "description": "fetch: redirect limit (default: 10)"
-                    },
-                    "retries": {
-                        "type": "integer",
-                        "description": "fetch: retry count on transport failure (default: 0)"
-                    },
-                    "proxy": {
-                        "type": "string",
-                        "description": "fetch/stealth_fetch: proxy URL (e.g. http://user:pass@host:8080)"
-                    },
-                    "verify_tls": {
-                        "type": "boolean",
-                        "description": "fetch: verify TLS certificates (default: true)"
-                    },
-
-                    "wait_selector": {
-                        "type": "string",
-                        "description": "navigate/stealth_fetch/wait_for: CSS selector to wait for"
-                    },
-                    "wait_selector_state": {
-                        "type": "string",
-                        "enum": ["attached", "detached", "visible", "hidden"],
-                        "description": "wait_selector state (default: visible)"
-                    },
-                    "network_idle": {
-                        "type": "boolean",
-                        "description": "navigate/stealth_fetch/wait_for: wait for the network to be idle (no new requests for ~500ms)"
-                    },
-                    "solve_cloudflare": {
-                        "type": "boolean",
-                        "description": "navigate/stealth_fetch: best-effort wait for Cloudflare challenge to clear"
-                    },
-                    "block_webrtc": {
-                        "type": "boolean",
-                        "description": "stealth_fetch/navigate: block WebRTC to prevent IP leaks"
-                    },
-                    "hide_canvas": {
-                        "type": "boolean",
-                        "description": "stealth_fetch/navigate: add noise to canvas/WebGL fingerprints"
-                    },
-                    "disable_resources": {
-                        "type": "boolean",
-                        "description": "stealth_fetch/navigate: don't load images/fonts/media (faster)"
-                    },
-                    "block_images": {
-                        "type": "boolean",
-                        "description": "stealth_fetch/navigate: block image loads only"
-                    },
-                    "hide_webdriver": {
-                        "type": "boolean",
-                        "description": "stealth_fetch/navigate: hide navigator.webdriver and other automation tells (default: true)"
-                    },
-
-                    "html": {
-                        "type": "string",
-                        "description": "select: parse this static HTML body instead of querying the live tab"
-                    },
-                    "css": {
-                        "type": "string",
-                        "description": "select: CSS selector. Supports Scrapling pseudo-selectors ::text and ::attr(name)"
-                    },
-                    "xpath": {
-                        "type": "string",
-                        "description": "select: XPath query (live mode only — requires an active tab)"
-                    },
-                    "find_by_text": {
-                        "type": "string",
-                        "description": "select: filter matches by text (substring or regex when 'regex' is true)"
-                    },
-                    "regex": {
-                        "type": "boolean",
-                        "description": "select: treat find_by_text as a regex (default: false)"
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "description": "select: max number of matches to return (default 500, hard cap 500)"
-                    },
-                    "include_html": {
-                        "type": "boolean",
-                        "description": "select: include each match's outerHTML"
-                    },
-                    "auto_save": {
-                        "type": "boolean",
-                        "description": "select: store fingerprints of the matches under 'auto_save_id' for adaptive matching later"
-                    },
-                    "auto_match": {
-                        "type": "boolean",
-                        "description": "select: if the selector returns nothing, locate closest matches by similarity to fingerprints saved under 'auto_save_id'"
-                    },
-                    "auto_save_id": {
-                        "type": "string",
-                        "description": "select: identifier for the saved fingerprint set"
-                    },
-                    "auto_match_threshold": {
-                        "type": "number",
-                        "description": "select: minimum similarity (0-1) to accept an adaptive match (default 0.6)"
-                    },
-
-                    "delay_ms": {
-                        "type": "integer",
-                        "description": "wait_for/stealth_fetch: extra delay in ms after other waits resolve"
-                    }
-                },
-                "required": ["action"]
-            }),
+            parameters: schema_parameters(),
         }
     }
 
@@ -550,6 +579,8 @@ impl Tool for BrowserTool {
         let action = args["action"]
             .as_str()
             .ok_or_else(|| Error::ToolExecution("missing 'action' parameter".into()))?;
+
+        let action = effective_action(action, &args);
 
         if !self.manager.config().enabled {
             return Err(Error::ToolExecution(
@@ -1541,5 +1572,67 @@ mod tests {
             BrowserTool::store_key("default", Some("TARGET-2"))
         );
         assert_eq!(BrowserTool::store_key("default", None), "default:active");
+    }
+}
+
+#[cfg(test)]
+mod act_action_tests {
+    use super::effective_action;
+    use serde_json::json;
+
+    #[test]
+    fn fill_credential_as_a_sub_action_is_accepted() {
+        // The spelling a model reaches for when it holds a snapshot ref.
+        let args = json!({"action": "act", "ref": "e12", "actAction": "fill_credential",
+                          "field": "password"});
+        assert_eq!(effective_action("act", &args), "fill_credential");
+    }
+
+    #[test]
+    fn top_level_spelling_still_works() {
+        let args = json!({"action": "fill_credential", "ref": "e12", "field": "password"});
+        assert_eq!(
+            effective_action("fill_credential", &args),
+            "fill_credential"
+        );
+    }
+
+    #[test]
+    fn other_sub_actions_are_untouched() {
+        for sub in [
+            "click", "type", "fill", "press", "hover", "select", "drag", "wait",
+        ] {
+            let args = json!({"action": "act", "ref": "e1", "actAction": sub});
+            assert_eq!(
+                effective_action("act", &args),
+                "act",
+                "{sub} should stay an act"
+            );
+        }
+    }
+
+    #[test]
+    fn act_without_a_sub_action_is_untouched() {
+        let args = json!({"action": "act", "ref": "e1"});
+        assert_eq!(effective_action("act", &args), "act");
+    }
+
+    #[test]
+    fn the_schema_advertises_it_so_the_model_need_not_guess() {
+        // The fallback that made this matter was the model typing the
+        // credential's key name into the form; it should not have to
+        // infer the spelling from a rejection.
+        let params = super::schema_parameters();
+        let sub = &params["properties"]["actAction"];
+        let variants: Vec<&str> = sub["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(
+            variants.contains(&"fill_credential"),
+            "actAction enum: {variants:?}"
+        );
     }
 }

@@ -1423,7 +1423,8 @@ ENVIRONMENT:
     ANTHROPIC_API_KEY   Grades model-mode rubrics with claude-sonnet-5.
                         Without it the model under test grades itself, and
                         the report says so.
-    E2E_KEEP_TMP        Keep the throwaway data dir for post-mortems.
+    E2E_KEEP_TMP        Keep the throwaway data dir for post-mortems (logs
+                        only; the Chrome profile is shed to save disk).
 ";
 
 struct Args {
@@ -1747,10 +1748,88 @@ async fn shutdown_daemon(mut child: Child) {
 /// TempDir's Drop: this process exits via `std::process::exit` when the
 /// suite is red, which skips destructors, and going red is exactly when a
 /// run would otherwise leak its dir and logs.
+/// Keep the evidence, not the browser profile.
+///
+/// A retained trial is worth keeping for its logs, which are kilobytes.
+/// The Chrome user-data dir beside them is hundreds of megabytes, and
+/// nothing in a post-mortem reads it except `chrome-stderr.log`. Fifteen
+/// retained trials filled the disk and stopped the machine mid-run --
+/// including the suite that was still going -- so retention now keeps
+/// what gets read and sheds what does not.
+fn shed_browser_profile(root: &std::path::Path) -> String {
+    let mut freed = 0u64;
+    for user_data in find_user_data_dirs(root) {
+        // The one file worth rescuing before the profile goes.
+        let stderr_log = user_data.join("chrome-stderr.log");
+        let rescued = std::fs::read(&stderr_log).ok();
+        freed += dir_size(&user_data);
+        if std::fs::remove_dir_all(&user_data).is_ok() {
+            if let Some(bytes) = rescued {
+                let _ = std::fs::create_dir_all(&user_data);
+                let _ = std::fs::write(&stderr_log, bytes);
+            }
+        }
+    }
+    if freed == 0 {
+        String::new()
+    } else {
+        format!(
+            " (browser profile shed, {} MiB freed; chrome-stderr.log kept)",
+            freed / (1024 * 1024)
+        )
+    }
+}
+
+fn find_user_data_dirs(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut found = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            if path.file_name().is_some_and(|n| n == "user-data") {
+                found.push(path);
+            } else {
+                stack.push(path);
+            }
+        }
+    }
+    found
+}
+
+fn dir_size(dir: &std::path::Path) -> u64 {
+    let mut total = 0;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            match entry.metadata() {
+                Ok(m) if m.is_dir() => stack.push(path),
+                Ok(m) => total += m.len(),
+                Err(_) => {}
+            }
+        }
+    }
+    total
+}
+
 fn keep_or_drop(tmp: tempfile::TempDir) {
     if std::env::var("E2E_KEEP_TMP").is_ok() {
         let path = tmp.keep();
-        eprintln!("E2E_KEEP_TMP set — data dir kept at {}", path.display());
+        let freed = shed_browser_profile(&path);
+        eprintln!(
+            "E2E_KEEP_TMP set — data dir kept at {}{}",
+            path.display(),
+            freed
+        );
         return;
     }
     let path = tmp.path().to_path_buf();
