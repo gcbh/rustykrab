@@ -1327,10 +1327,30 @@ async fn preflight_model(ollama_url: &str, model: &str) -> Result<()> {
             resp.status()
         );
     }
+    let elapsed = started.elapsed();
     eprintln!(
         "preflight: {model} answered in {:.1}s",
-        started.elapsed().as_secs_f64()
+        elapsed.as_secs_f64()
     );
+
+    // A one-word prompt that takes this long is not a fast model having a
+    // slow day. Ollama serves one request at a time per model, so the
+    // usual cause is something else holding the slot -- a running
+    // RustyKrab daemon is the usual culprit -- and the run that follows
+    // will produce trials that look like agent failures and are not.
+    //
+    // This is a warning rather than an error because a cold load of a
+    // large model legitimately takes tens of seconds. It is loud because
+    // the timing was already printed, and was read past.
+    if elapsed > Duration::from_secs(PREFLIGHT_SLOW_SECS) {
+        eprintln!(
+            "preflight: WARNING — {:.0}s for a one-word prompt suggests something \
+             else is holding {model}'s slot (a running RustyKrab daemon is the \
+             usual culprit). Trials will time out and look like agent failures. \
+             Stop it, or expect to throw this run away.",
+            elapsed.as_secs_f64()
+        );
+    }
     Ok(())
 }
 
@@ -1362,6 +1382,9 @@ fn isolated_browser_root(data_dir: &std::path::Path) -> std::ffi::OsString {
 }
 
 const PREFLIGHT_BUDGET_SECS: u64 = 120;
+
+/// Above this, a trivial generation means contention, not model speed.
+const PREFLIGHT_SLOW_SECS: u64 = 20;
 
 async fn wait_for_health(base: &str, client: &reqwest::Client, child: &mut Child) -> Result<()> {
     for _ in 0..240 {

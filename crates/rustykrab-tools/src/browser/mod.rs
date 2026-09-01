@@ -773,7 +773,29 @@ impl Tool for BrowserTool {
                 };
 
                 let key = Self::store_key(&profile, target_id);
-                snapshot::take_snapshot(&page, &options, &self.snapshot_store, &key).await
+                let snap =
+                    snapshot::take_snapshot(&page, &options, &self.snapshot_store, &key).await;
+
+                // How much of the page the agent actually received.
+                //
+                // When an agent reports only a page's heading, two very
+                // different things could have happened: the snapshot held
+                // one node because the document was still arriving, or it
+                // held the whole page and the model quoted the first line.
+                // Those need opposite fixes and the reply cannot tell them
+                // apart. Sizes settle it; the page's text is deliberately
+                // not logged, because a snapshot can contain anything the
+                // page contains.
+                if let Ok(ref v) = snap {
+                    let url = page.url().await.ok().flatten().unwrap_or_default();
+                    tracing::debug!(
+                        url = %url,
+                        chars = v.to_string().len(),
+                        nodes = v["elements"].as_array().map(|a| a.len()).unwrap_or(0),
+                        "took page snapshot"
+                    );
+                }
+                snap
             }
 
             // ── Act (ref-based actions) ────────────────────────────
