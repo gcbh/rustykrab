@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.2.15] - 2026-09-01
+
+- perf(agent): keep the tool block on the compaction call (#600)
+
 ## [5.2.14] - 2026-09-01
 
 - feat(store): enforce the foreign keys the schema already claimed (#590)
