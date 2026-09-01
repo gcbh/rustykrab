@@ -645,11 +645,35 @@ impl Tool for BrowserTool {
                 // `navigator.webdriver` from frameworks that read it on load.
                 let _ = stealth::install_stealth_on_new_document(&page, &stealth_opts).await;
 
-                page.goto(url)
-                    .await
-                    .map_err(|e| Error::ToolExecution(format!("navigation failed: {e}").into()))?;
-
+                // `goto` gets the caller's budget too, not just the settle
+                // wait below. Unbounded, it falls through to the CDP client's
+                // own request timeout, so `timeout_ms` silently did not bound
+                // the navigation it names -- a server that accepts the
+                // connection and never answers cost 30s per attempt, and the
+                // runner then retried it.
                 let timeout_ms = args["timeout_ms"].as_u64().unwrap_or(10_000);
+                match tokio::time::timeout(
+                    std::time::Duration::from_millis(timeout_ms),
+                    page.goto(url),
+                )
+                .await
+                {
+                    Ok(r) => r.map_err(|e| {
+                        Error::ToolExecution(format!("navigation failed: {e}").into())
+                    })?,
+                    Err(_) => {
+                        return Err(Error::ToolExecution(
+                            format!(
+                                "navigation to '{url}' did not complete within {timeout_ms}ms. \
+                                 The browser is alive and accepted the request, so this is the \
+                                 page or the server it talks to, not the browser: a server that \
+                                 accepts the connection and never responds looks exactly like \
+                                 this. Retrying the same URL will usually fail the same way."
+                            )
+                            .into(),
+                        ));
+                    }
+                };
                 let _ = tokio::time::timeout(
                     std::time::Duration::from_millis(timeout_ms),
                     page.wait_for_navigation(),
@@ -1154,11 +1178,35 @@ impl Tool for BrowserTool {
                 let _ = stealth::apply_network_overrides(&page, &stealth_opts).await;
                 let _ = stealth::install_stealth_on_new_document(&page, &stealth_opts).await;
 
-                page.goto(url)
-                    .await
-                    .map_err(|e| Error::ToolExecution(format!("navigation failed: {e}").into()))?;
-
+                // `goto` gets the caller's budget too, not just the settle
+                // wait below. Unbounded, it falls through to the CDP client's
+                // own request timeout, so `timeout_ms` silently did not bound
+                // the navigation it names -- a server that accepts the
+                // connection and never answers cost 30s per attempt, and the
+                // runner then retried it.
                 let timeout_ms = args["timeout_ms"].as_u64().unwrap_or(30_000);
+                match tokio::time::timeout(
+                    std::time::Duration::from_millis(timeout_ms),
+                    page.goto(url),
+                )
+                .await
+                {
+                    Ok(r) => r.map_err(|e| {
+                        Error::ToolExecution(format!("navigation failed: {e}").into())
+                    })?,
+                    Err(_) => {
+                        return Err(Error::ToolExecution(
+                            format!(
+                                "navigation to '{url}' did not complete within {timeout_ms}ms. \
+                                 The browser is alive and accepted the request, so this is the \
+                                 page or the server it talks to, not the browser: a server that \
+                                 accepts the connection and never responds looks exactly like \
+                                 this. Retrying the same URL will usually fail the same way."
+                            )
+                            .into(),
+                        ));
+                    }
+                };
                 let _ = tokio::time::timeout(
                     std::time::Duration::from_millis(timeout_ms),
                     page.wait_for_navigation(),

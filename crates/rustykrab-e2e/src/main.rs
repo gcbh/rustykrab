@@ -284,7 +284,11 @@ impl Ctx {
             .args(args)
             .env_clear()
             .env("PATH", std::env::var("PATH").unwrap_or_default())
-            .env("HOME", sandboxed_home(&self.data_dir))
+            .env("HOME", std::env::var("HOME").unwrap_or_default())
+            .env(
+                "RUSTYKRAB_BROWSER_ISOLATED_ROOT",
+                isolated_browser_root(&self.data_dir),
+            )
             .env("RUSTYKRAB_DATA_DIR", &self.data_dir)
             .env("RUSTYKRAB_MASTER_KEY", MASTER_KEY_HEX)
             .env("RUSTYKRAB_AUTH_TOKEN", AUTH_TOKEN)
@@ -1072,11 +1076,16 @@ fn spawn_daemon_with(
         // Start from an empty environment: the developer's shell may hold
         // real credentials (which would be written into this throwaway
         // store) and RUSTYKRAB_* settings that would change behaviour and
-        // break determinism. Only PATH is carried over; HOME is
-        // redirected into the trial dir -- see `sandboxed_home`.
+        // break determinism. PATH and HOME are carried over: Chrome
+        // needs a real HOME (see `isolated_browser_root`), so the browser
+        // is isolated by its own root instead.
         .env_clear()
         .env("PATH", std::env::var("PATH").unwrap_or_default())
-        .env("HOME", sandboxed_home(data_dir))
+        .env("HOME", std::env::var("HOME").unwrap_or_default())
+        .env(
+            "RUSTYKRAB_BROWSER_ISOLATED_ROOT",
+            isolated_browser_root(data_dir),
+        )
         .env("RUSTYKRAB_DATA_DIR", data_dir)
         .env("RUSTYKRAB_PORT", port.to_string())
         .env("RUSTYKRAB_MASTER_KEY", MASTER_KEY_HEX)
@@ -1097,7 +1106,13 @@ fn spawn_daemon_with(
         // explain why. E2E_DAEMON_LOG turns the detail back on.
         .env(
             "RUST_LOG",
-            std::env::var("E2E_DAEMON_LOG").unwrap_or_else(|_| "info".to_string()),
+            // The browser tool's diagnostics -- fill digests, tab timings --
+            // are `debug`, deliberately: a four-byte hash prefix of a secret
+            // is a partial fingerprint and does not belong in a production
+            // log by default. The harness wants them, so it asks for that
+            // one target rather than raising the level everywhere.
+            std::env::var("E2E_DAEMON_LOG")
+                .unwrap_or_else(|_| "info,rustykrab_tools::browser=debug".to_string()),
         )
         // The suite drives far more than the shipping 20 req/min from one
         // IP; raise the limit for this throwaway boot only.
@@ -1331,10 +1346,19 @@ fn kill_browser_for(data_dir: &std::path::Path) {
     }
 }
 
-fn sandboxed_home(data_dir: &std::path::Path) -> std::ffi::OsString {
-    let home = data_dir.join("home");
-    let _ = std::fs::create_dir_all(&home);
-    home.into_os_string()
+/// A browser root of this trial's own, so no trial inherits another's
+/// cookies or borrows the developer's signed-in Chrome profile.
+///
+/// This used to be done by pointing HOME at the trial directory, which
+/// isolated the browser and broke it: Chrome wedges its renderer when
+/// HOME is an empty directory -- the page commits its URL and the
+/// document never arrives. Every browser call then burns its full
+/// timeout, which reads as a slow site or a hung agent and is neither.
+/// Isolate the browser root; leave HOME alone.
+fn isolated_browser_root(data_dir: &std::path::Path) -> std::ffi::OsString {
+    let root = data_dir.join("browser");
+    let _ = std::fs::create_dir_all(&root);
+    root.into_os_string()
 }
 
 const PREFLIGHT_BUDGET_SECS: u64 = 120;
