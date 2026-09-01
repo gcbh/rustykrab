@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.2.8] - 2026-09-01
+
+- fix(credentials): stop telling the agent a stored credential is empty (#575)
+
 ## [5.2.7] - 2026-08-31
 
 - fix(credentials): derive website credential keys instead of trusting the spelling (#574)

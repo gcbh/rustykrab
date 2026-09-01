@@ -165,6 +165,22 @@ mod tests {
 /// what the agent is asking for.
 const WEB_KEY_ROLES: &[&str] = &["username", "password", "email", "totp", "otp", "pin"];
 
+/// The role a web credential key encodes, if it encodes one.
+///
+/// `web_example_com_password` -> `password`. Callers that need to say
+/// *how* a credential is used need the role rather than a guess: a key
+/// may be a totp or a pin as easily as a password, and advice written
+/// for a username/password pair is wrong for the rest.
+pub fn role_of_web_key(key: &str) -> Option<&'static str> {
+    if !key.starts_with("web_") {
+        return None;
+    }
+    WEB_KEY_ROLES
+        .iter()
+        .find(|r| key.ends_with(&format!("_{r}")))
+        .copied()
+}
+
 /// Rebuild a website credential key so its host matches what
 /// [`origin_credential_key`] derives, keeping the role the agent chose.
 ///
