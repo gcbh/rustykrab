@@ -17,6 +17,25 @@
 //! closer to 4 bytes per token on English prose, and the gap is the safety
 //! margin. Over-estimating costs a slightly early compaction;
 //! under-estimating costs a request the provider rejects.
+//!
+//! # This is the *caller-side* estimator. Do not fold providers into it.
+//!
+//! `rustykrab-providers` deliberately estimates differently — Ollama uses
+//! `CHARS_PER_TOKEN = 4` for its own budget accounting. The ~14% gap is not
+//! an oversight, and collapsing it would remove headroom that the compaction
+//! path currently depends on.
+//!
+//! The reason: the runner compacts at a fraction of the provider's reported
+//! budget, and the provider then trims history against its own budget. If a
+//! large loaded tool set pushes the provider's trim budget below the runner's
+//! compaction threshold, trimming fires first and *deletes* the oldest turns
+//! outright, where compaction would have summarised them. The estimator gap
+//! pushes that crossover several thousand tool-tokens further out.
+//!
+//! The root cause is addressed properly by `ModelProvider::context_limit_with_tools`,
+//! which lets a provider report the budget for the tool set actually loaded
+//! rather than an assumed one. Until you have confirmed that path covers
+//! every provider in use, treat the two estimators as separate on purpose.
 
 /// Bytes per token.
 pub const BYTES_PER_TOKEN: f64 = 3.5;
