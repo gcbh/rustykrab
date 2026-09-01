@@ -608,8 +608,52 @@ where
 {
     let conn = Arc::clone(conn);
     run_blocking(move || {
-        let conn = conn.lock().unwrap();
+        // Recover a poisoned lock rather than propagating the panic.
+        //
+        // Every database call in the process goes through here, so
+        // `unwrap()` turned one panic while holding the lock into a
+        // permanent outage: the mutex stayed poisoned and every subsequent
+        // call panicked with it. The data is not damaged by a panic — the
+        // connection is unchanged, and any transaction that was open is
+        // rolled back when its guard drops — so continuing is both safe and
+        // the only option that recovers.
+        //
+        // `RetrievalLog` and `AppState::rotate_token` already do this.
+        let conn = conn.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         f(&conn)
     })
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A panic while holding the connection lock used to end the process's
+    /// ability to touch the database at all: the mutex stayed poisoned and
+    /// every later call panicked with it. A recoverable fault must not
+    /// become a permanent outage.
+    #[tokio::test]
+    async fn a_poisoned_connection_lock_does_not_end_the_process() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        Store::run_migrations(&conn).unwrap();
+        let conn = Arc::new(Mutex::new(conn));
+
+        // Poison it the only way it can be poisoned: panic while holding it.
+        let poisoner = Arc::clone(&conn);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.lock().unwrap();
+            panic!("simulated panic while holding the connection");
+        })
+        .join();
+        assert!(conn.is_poisoned(), "the test must actually poison the lock");
+
+        let count: i64 = with_conn(&conn, |conn| {
+            conn.query_row("SELECT COUNT(*) FROM conversations", [], |row| row.get(0))
+                .map_err(|e| Error::Storage(e.to_string()))
+        })
+        .await
+        .expect("the store must still serve queries after a poisoned lock");
+        assert_eq!(count, 0);
+    }
 }
