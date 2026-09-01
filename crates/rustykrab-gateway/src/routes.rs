@@ -239,6 +239,7 @@ async fn create_conversation(
 ) -> Result<Json<ApolloConversation>, StatusCode> {
     let title = body.and_then(|Json(b)| b.title).filter(|s| !s.is_empty());
     state
+        .agent
         .store
         .conversations()
         .create_with_title(title)
@@ -251,6 +252,7 @@ async fn list_conversations(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<ApolloConversation>>, StatusCode> {
     state
+        .agent
         .store
         .conversations()
         .list_summaries()
@@ -271,6 +273,7 @@ async fn get_conversation(
     Path(id): Path<Uuid>,
 ) -> Result<Json<ApolloConversation>, StatusCode> {
     state
+        .agent
         .store
         .conversations()
         .get(id)
@@ -287,6 +290,7 @@ async fn delete_conversation(
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, StatusCode> {
     state
+        .agent
         .store
         .conversations()
         .delete(id)
@@ -299,8 +303,8 @@ async fn delete_conversation(
     // archive, channel bindings — goes with it by cascade, so this handler
     // no longer has to know the list. What is left is process state, which
     // the database cannot reach: the recall cache and the todo list.
-    state.recall.purge(id);
-    state.todos.clear(id);
+    state.agent.recall.purge(id);
+    state.agent.todos.clear(id);
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -316,6 +320,7 @@ async fn list_messages(
     Path(id): Path<Uuid>,
 ) -> Result<Json<Vec<ApolloMessage>>, StatusCode> {
     let conv = state
+        .agent
         .store
         .conversations()
         .get(id)
@@ -365,6 +370,7 @@ async fn send_message(
     // save_turn falls back to a full rewrite if the agent compacted
     // history (the persisted prefix no longer matches).
     let mut conv = state
+        .agent
         .store
         .conversations()
         .get(id)
@@ -387,14 +393,14 @@ async fn send_message(
     conv.updated_at = Utc::now();
 
     // Run the full agent pipeline.
-    let assistant_msg =
-        crate::orchestrate::run_agent(&state, &mut conv, &user_content, trace_id).await?;
+    let assistant_msg = crate::run::run_agent(&state, &mut conv, &user_content, trace_id).await?;
 
     // Persist the turn (including intermediate tool call messages):
     // appends the new messages and bumps updated_at, or rewrites the
     // whole conversation if compaction replaced the persisted prefix.
     conv.updated_at = Utc::now();
     state
+        .agent
         .store
         .conversations()
         .save_turn(&conv, &persisted_ids)
@@ -517,6 +523,7 @@ async fn submit_task(
         .unwrap_or_else(|| trace_id.to_string());
 
     let task = state
+        .agent
         .store
         .tasks()
         .enqueue(
@@ -547,7 +554,7 @@ async fn get_task(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<TaskResponse>, StatusCode> {
-    match state.store.tasks().get(&id).await {
+    match state.agent.store.tasks().get(&id).await {
         Ok(Some(task)) => Ok(Json(TaskResponse::from_task(task))),
         Ok(None) => Err(StatusCode::NOT_FOUND),
         Err(e) => {
@@ -560,7 +567,7 @@ async fn get_task(
 /// Recent tasks, newest first. Bounded so a long-lived node cannot
 /// return an unbounded history.
 async fn list_tasks(State(state): State<AppState>) -> Result<Json<Vec<TaskResponse>>, StatusCode> {
-    match state.store.tasks().list(50).await {
+    match state.agent.store.tasks().list(50).await {
         Ok(tasks) => Ok(Json(
             tasks.into_iter().map(TaskResponse::from_task).collect(),
         )),
@@ -579,7 +586,7 @@ async fn cancel_task(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<TaskResponse>, StatusCode> {
-    let previous = state.store.tasks().cancel(&id).await.map_err(|e| {
+    let previous = state.agent.store.tasks().cancel(&id).await.map_err(|e| {
         tracing::error!(error = %e, "could not cancel delegated task");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
@@ -591,7 +598,7 @@ async fn cancel_task(
         tracing::info!(task_id = %id, aborted, "cancelled a running delegated task");
     }
 
-    match state.store.tasks().get(&id).await {
+    match state.agent.store.tasks().get(&id).await {
         Ok(Some(task)) => Ok(Json(TaskResponse::from_task(task))),
         Ok(None) => Err(StatusCode::NOT_FOUND),
         Err(e) => {
@@ -642,6 +649,7 @@ async fn send_message_stream(
     // save_turn append only the new messages (full rewrite if the agent
     // compacted history mid-run).
     let mut conv = state
+        .agent
         .store
         .conversations()
         .get(id)
@@ -713,7 +721,7 @@ async fn send_message_stream(
             }
         });
 
-        let agent_future = crate::orchestrate::run_agent_streaming(
+        let agent_future = crate::run::run_agent_streaming(
             &agent_state,
             &mut conv,
             &user_content,
@@ -738,6 +746,7 @@ async fn send_message_stream(
         // replaced the persisted prefix.
         conv.updated_at = Utc::now();
         if let Err(e) = agent_state
+            .agent
             .store
             .conversations()
             .save_turn(&conv, &persisted_ids)
@@ -941,7 +950,7 @@ struct ListSecretsResponse {
 async fn list_secrets(
     State(state): State<AppState>,
 ) -> Result<Json<ListSecretsResponse>, StatusCode> {
-    let meta = state.store.secrets().metadata().await.map_err(|e| {
+    let meta = state.agent.store.secrets().metadata().await.map_err(|e| {
         tracing::error!(error = %e, "list_secrets failed");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
@@ -975,7 +984,7 @@ async fn set_secret(
 
     match body.dest {
         SecretDest::Store => {
-            let secrets = state.store.secrets();
+            let secrets = state.agent.store.secrets();
             // Create-only by default. Replacing an existing credential is a
             // separate, explicit act — the client must have asked the user
             // first and sent `overwrite: true`.
@@ -1036,6 +1045,7 @@ async fn delete_secret(
     Path(name): Path<String>,
 ) -> Result<StatusCode, StatusCode> {
     state
+        .agent
         .store
         .secrets()
         .delete(
@@ -1092,6 +1102,7 @@ async fn list_credential_requests(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<ChangeRequestResponse>>, StatusCode> {
     let pending = state
+        .agent
         .store
         .credential_requests()
         .pending()
@@ -1162,6 +1173,7 @@ async fn fulfil_credential_request(
         .unwrap_or_else(|| "webchat".to_string());
     let values: Vec<(String, String)> = body.values.into_iter().collect();
     state
+        .agent
         .store
         .credential_requests()
         .fulfil(&id, &values, &decided_by)
@@ -1214,6 +1226,7 @@ async fn pair_device(
     Json(body): Json<PairRequest>,
 ) -> Result<Json<PairResponse>, StatusCode> {
     let (device, token) = state
+        .agent
         .store
         .devices()
         .redeem_pairing_code(&body.code, &body.device_name)
@@ -1244,7 +1257,7 @@ struct DeviceResponse {
 async fn list_devices(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<DeviceResponse>>, StatusCode> {
-    let devices = state.store.devices().list().await.map_err(|e| {
+    let devices = state.agent.store.devices().list().await.map_err(|e| {
         tracing::error!(error = %e, "listing devices failed");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
@@ -1282,6 +1295,7 @@ async fn set_push_token(
         return Err(StatusCode::BAD_REQUEST);
     }
     state
+        .agent
         .store
         .devices()
         .set_push_token(&id, token)
@@ -1304,6 +1318,7 @@ async fn revoke_device(
     Path(id): Path<String>,
 ) -> Result<StatusCode, StatusCode> {
     state
+        .agent
         .store
         .devices()
         .revoke(&id)
@@ -1325,7 +1340,7 @@ async fn decide_credential_request(
     approve: bool,
     principal: Option<rustykrab_store::Principal>,
 ) -> Result<StatusCode, StatusCode> {
-    let requests = state.store.credential_requests();
+    let requests = state.agent.store.credential_requests();
     // Which device decided, for the audit trail.
     let decided_by = principal
         .map(|p| p.describe())

@@ -21,8 +21,9 @@ use tokio::sync::Notify;
 use tokio::task::AbortHandle;
 use uuid::Uuid;
 
-use crate::orchestrate::{run_agent_with_options, RunOptions};
+use crate::run::run_agent_with_options;
 use crate::AppState;
+use rustykrab_runtime::RunOptions;
 
 /// Fallback poll interval. The queue also rings [`TaskQueueSignal`] on
 /// submit, so this only covers a missed notification or a task enqueued
@@ -89,7 +90,7 @@ impl TaskQueueSignal {
 /// Spawned once at startup and held in the CLI's `infra_handles`.
 pub async fn run_task_worker(state: AppState) {
     let signal = state.task_signal.clone();
-    let store = state.store.tasks();
+    let store = state.agent.store.tasks();
 
     // Tasks left `running` belonged to an agent loop that died with the
     // previous process. Nothing will ever complete them, so fail them
@@ -199,7 +200,7 @@ async fn execute(state: AppState, task: DelegatedTask) -> Result<TaskReply, Stri
         .as_deref()
         .and_then(|id| id.parse().ok())
     {
-        Some(id) => match state.store.conversations().get(id).await {
+        Some(id) => match state.agent.store.conversations().get(id).await {
             Ok(conv) => conv,
             Err(_) => {
                 tracing::warn!(
@@ -208,6 +209,7 @@ async fn execute(state: AppState, task: DelegatedTask) -> Result<TaskReply, Stri
                     "delegated task named an unknown conversation; opening a fresh one"
                 );
                 state
+                    .agent
                     .store
                     .conversations()
                     .create()
@@ -216,6 +218,7 @@ async fn execute(state: AppState, task: DelegatedTask) -> Result<TaskReply, Stri
             }
         },
         None => state
+            .agent
             .store
             .conversations()
             .create()
@@ -228,6 +231,7 @@ async fn execute(state: AppState, task: DelegatedTask) -> Result<TaskReply, Stri
         // Record it before the run, not after: a task that dies mid-turn
         // should still tell the peer which thread to resume.
         if let Err(e) = state
+            .agent
             .store
             .tasks()
             .set_conversation(&task.id, &conversation_id)
@@ -266,6 +270,7 @@ async fn execute(state: AppState, task: DelegatedTask) -> Result<TaskReply, Stri
 
     conv.updated_at = Utc::now();
     if let Err(e) = state
+        .agent
         .store
         .conversations()
         .save_turn(&conv, &persisted_ids)
@@ -292,6 +297,7 @@ async fn execute(state: AppState, task: DelegatedTask) -> Result<TaskReply, Stri
 /// against — a denial only means anything for a tool that exists.
 fn available_tool_names(state: &AppState) -> Vec<&str> {
     state
+        .agent
         .tools
         .iter()
         .filter(|t| t.available())

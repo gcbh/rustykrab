@@ -127,7 +127,13 @@ async fn show(
         tracing::warn!("credential page refused: no permitted tailnet identity");
         return refused();
     }
-    let Ok(Some(req)) = state.store.credential_requests().find_by_link(&token).await else {
+    let Ok(Some(req)) = state
+        .agent
+        .store
+        .credential_requests()
+        .find_by_link(&token)
+        .await
+    else {
         return refused();
     };
     Html(form_page(&req, &token, None)).into_response()
@@ -143,7 +149,13 @@ async fn submit(
         tracing::warn!("credential page submit refused: no permitted tailnet identity");
         return refused();
     }
-    let Ok(Some(req)) = state.store.credential_requests().find_by_link(&token).await else {
+    let Ok(Some(req)) = state
+        .agent
+        .store
+        .credential_requests()
+        .find_by_link(&token)
+        .await
+    else {
         return refused();
     };
 
@@ -176,6 +188,7 @@ async fn submit(
         .unwrap_or("credential page");
 
     match state
+        .agent
         .store
         .credential_requests()
         .fulfil(&req.id, &supplied, by)
