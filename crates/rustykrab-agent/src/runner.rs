@@ -873,6 +873,8 @@ pub struct AgentRunner {
     /// Name of the skill driving this run, recorded for attribution. The
     /// runner does not otherwise know about skills.
     active_skill: Option<String>,
+    /// What the active skill declared success to require, if anything.
+    outcome_contract: Option<rustykrab_core::OutcomeContract>,
 }
 
 impl AgentRunner {
@@ -897,6 +899,7 @@ impl AgentRunner {
             outcome_sink: None,
             retrieval_log: None,
             active_skill: None,
+            outcome_contract: None,
         }
     }
 
@@ -919,6 +922,15 @@ impl AgentRunner {
 
     /// Record which skill is driving this run, so its outcomes can be
     /// attributed to that skill.
+    /// Declare what the active skill requires for a run to count as
+    /// successful, so outcomes can be recorded as ground truth rather than
+    /// as behavioural proxy. Without this the run is stamped `Implicit`
+    /// and every mutating stage correctly declines to act on it.
+    pub fn with_outcome_contract(mut self, contract: rustykrab_core::OutcomeContract) -> Self {
+        self.outcome_contract = Some(contract);
+        self
+    }
+
     pub fn with_active_skill(mut self, name: impl Into<String>) -> Self {
         self.active_skill = Some(name.into());
         self
@@ -950,7 +962,24 @@ impl AgentRunner {
             compactions: tracer.compressions(),
         };
 
-        let (verdict, confidence, detail) = classify_run(errored, counters);
+        // A skill that declared what success requires gets checked against
+        // it; that answer is derived from what the run did, so it is
+        // ground truth rather than a proxy. Everything else falls back to
+        // the behavioural signal, which cannot tell a clean run that
+        // produced a wrong answer from one that produced a right one.
+        let contract_verdict = self.outcome_contract.as_ref().and_then(|contract| {
+            rustykrab_core::evaluate_contract(contract, |tool| {
+                stats.get(tool).is_some_and(|s| s.successes > 0)
+            })
+        });
+
+        let (verdict, signal, confidence, detail) = match contract_verdict {
+            Some(v) => (v.verdict, v.signal, v.confidence, v.detail),
+            None => {
+                let (verdict, confidence, detail) = classify_run(errored, counters);
+                (verdict, SignalClass::Implicit, confidence, detail)
+            }
+        };
 
         // Credit assignment: the skill driving the run, the memories that
         // were surfaced into it, and the tools it actually called.
@@ -969,16 +998,11 @@ impl AgentRunner {
             attributions.push(Attribution::tool(name.clone()));
         }
 
-        let record = OutcomeRecord::new(
-            session.conversation_id,
-            session.id,
-            verdict,
-            SignalClass::Implicit,
-        )
-        .with_confidence(confidence)
-        .with_detail(detail)
-        .with_counters(counters)
-        .with_attributions(attributions);
+        let record = OutcomeRecord::new(session.conversation_id, session.id, verdict, signal)
+            .with_confidence(confidence)
+            .with_detail(detail)
+            .with_counters(counters)
+            .with_attributions(attributions);
 
         if let Err(e) = sink.record_outcome(record).await {
             tracing::warn!(error = %e, "failed to record run outcome");
@@ -1269,6 +1293,10 @@ impl AgentRunner {
         let outcome_sink = self.outcome_sink.clone();
         let retrieval_log = self.retrieval_log.clone();
         let active_skill = self.active_skill.clone();
+        // Carried through, or a streaming run would silently record the
+        // weaker implicit signal while the same work non-streamed records
+        // ground truth.
+        let outcome_contract = self.outcome_contract.clone();
 
         // Carry the trace id from the calling task into the spawned agent
         // task so prompt-log rows and agent-loop logs share the same id.
@@ -1290,6 +1318,7 @@ impl AgentRunner {
                 outcome_sink,
                 retrieval_log,
                 active_skill,
+                outcome_contract,
             };
             let body = async move {
                 runner
@@ -5810,6 +5839,126 @@ mod outcome_capture_tests {
         assert_eq!(r.session_id, session.id);
         assert_eq!(r.counters.tool_failures, 0);
         assert!(r.counters.tool_calls >= 1);
+    }
+
+    #[tokio::test]
+    async fn a_declared_outcome_turns_the_record_into_ground_truth() {
+        // The keystone. Until a skill's declaration is checked, every
+        // record is Implicit, the analysis reports proxy_only, and every
+        // mutating stage correctly refuses to act. This is what unblocks
+        // the loop.
+        let sink = Arc::new(RecordingSink::default());
+        let (runner, session, mut conv) = make_runner(false);
+        let runner = runner
+            .with_outcome_sink(sink.clone())
+            .with_active_skill("worker")
+            .with_outcome_contract(rustykrab_core::OutcomeContract::new(
+                "worker",
+                vec!["work".to_string()],
+            ));
+
+        runner.run(&mut conv, &session).await.unwrap();
+
+        let r = &sink.records()[0];
+        assert_eq!(r.verdict, OutcomeVerdict::Success);
+        assert_eq!(r.signal, SignalClass::Verifiable);
+        assert!(
+            r.is_actionable(),
+            "a verified declared outcome is what a later phase may act on"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unmet_declaration_is_a_verified_failure() {
+        // The tool the skill said was required did not succeed. That is a
+        // fact about the run, not a gap in the evidence -- so it is a
+        // Failure on a ground-truth signal, not Ambiguous.
+        let sink = Arc::new(RecordingSink::default());
+        let (runner, session, mut conv) = make_runner(true);
+        let runner = runner
+            .with_outcome_sink(sink.clone())
+            .with_active_skill("worker")
+            .with_outcome_contract(rustykrab_core::OutcomeContract::new(
+                "worker",
+                vec!["work".to_string()],
+            ));
+
+        let _ = runner.run(&mut conv, &session).await;
+
+        let r = &sink.records()[0];
+        assert_eq!(r.verdict, OutcomeVerdict::Failure);
+        assert_eq!(r.signal, SignalClass::Verifiable);
+        assert!(r.detail.as_ref().unwrap().contains("work"));
+    }
+
+    #[tokio::test]
+    async fn a_declaration_naming_nothing_falls_back_to_the_weaker_signal() {
+        // An empty [outcome] block must never be read as confirmation.
+        let sink = Arc::new(RecordingSink::default());
+        let (runner, session, mut conv) = make_runner(false);
+        let runner = runner
+            .with_outcome_sink(sink.clone())
+            .with_outcome_contract(rustykrab_core::OutcomeContract::new("worker", vec![]));
+
+        runner.run(&mut conv, &session).await.unwrap();
+
+        let r = &sink.records()[0];
+        assert_eq!(r.signal, SignalClass::Implicit);
+        assert!(!r.is_actionable());
+    }
+
+    #[tokio::test]
+    async fn a_check_naming_a_tool_the_run_never_called_is_unmet() {
+        // Guards the obvious hole: verification must look at what actually
+        // ran, not merely at whether the run finished.
+        let sink = Arc::new(RecordingSink::default());
+        let (runner, session, mut conv) = make_runner(false);
+        let runner = runner
+            .with_outcome_sink(sink.clone())
+            .with_outcome_contract(rustykrab_core::OutcomeContract::new(
+                "worker",
+                vec!["never_called".to_string()],
+            ));
+
+        runner.run(&mut conv, &session).await.unwrap();
+
+        let r = &sink.records()[0];
+        assert_eq!(
+            r.verdict,
+            OutcomeVerdict::Failure,
+            "a clean run that skipped the declared effect has not succeeded"
+        );
+        assert_eq!(r.signal, SignalClass::Verifiable);
+    }
+
+    #[tokio::test]
+    async fn streaming_records_the_same_signal_as_non_streaming() {
+        // The streaming path rebuilds the runner in a spawned task. If the
+        // contract were not carried across, the same work would record
+        // ground truth one way and a proxy the other.
+        let sink = Arc::new(RecordingSink::default());
+        let (runner, session, mut conv) = make_runner(false);
+        let runner = runner
+            .with_outcome_sink(sink.clone())
+            .with_active_skill("worker")
+            .with_outcome_contract(rustykrab_core::OutcomeContract::new(
+                "worker",
+                vec!["work".to_string()],
+            ));
+
+        let noop = |_: AgentEvent| {};
+        runner
+            .run_streaming(&mut conv, &session, &noop)
+            .await
+            .unwrap();
+
+        let records = sink.records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].signal,
+            SignalClass::Verifiable,
+            "streaming must not silently downgrade the signal"
+        );
     }
 
     #[tokio::test]
