@@ -103,7 +103,8 @@ impl Store {
             );
 
             CREATE TABLE IF NOT EXISTS messages (
-                conversation_id TEXT NOT NULL,
+                conversation_id TEXT NOT NULL
+                    REFERENCES conversations(id) ON DELETE CASCADE,
                 idx             INTEGER NOT NULL,
                 data            TEXT NOT NULL,
                 PRIMARY KEY (conversation_id, idx)
@@ -136,7 +137,8 @@ impl Store {
 
             CREATE TABLE IF NOT EXISTS job_runs (
                 id         TEXT PRIMARY KEY,
-                job_id     TEXT NOT NULL,
+                job_id     TEXT NOT NULL
+                    REFERENCES scheduled_jobs(id) ON DELETE CASCADE,
                 status     TEXT NOT NULL,
                 output     TEXT,
                 started_at TEXT NOT NULL,
@@ -169,7 +171,8 @@ impl Store {
                 ON channel_bindings (conv_id);
 
             CREATE TABLE IF NOT EXISTS recall_archive (
-                conversation_id TEXT PRIMARY KEY,
+                conversation_id TEXT PRIMARY KEY
+                    REFERENCES conversations(id) ON DELETE CASCADE,
                 archive         TEXT NOT NULL,
                 created_at      TEXT NOT NULL,
                 updated_at      TEXT NOT NULL
@@ -236,6 +239,13 @@ impl Store {
             -- Tasks a peer node delegated to this instance. The caller
             -- holds only the id, so the row is the authoritative record of
             -- a delegation's progress and result.
+            -- `conversation_id` here, on `scheduled_jobs` and on
+            -- `credential_requests` is deliberately not a foreign key. Those
+            -- rows outlive the conversation on purpose: a cron job keeps its
+            -- own delivery channel and should keep firing, and a credential
+            -- request is audit-relevant after the conversation that filed it
+            -- is gone. The column records where the row came from, not
+            -- something it depends on.
             CREATE TABLE IF NOT EXISTS delegated_tasks (
                 id              TEXT PRIMARY KEY,
                 message         TEXT NOT NULL,
@@ -459,6 +469,11 @@ impl Store {
         )
         .map_err(|e| Error::Storage(e.to_string()))?;
 
+        // Adopt the foreign keys the fresh-database DDL declares onto
+        // databases created before it did. Runs after the additive column
+        // ALTERs, because the rebuild copies the current column set.
+        adopt_declared_foreign_keys(conn)?;
+
         // Fold the per-channel map tables into `channel_bindings` and drop
         // them. Idempotent — see `channel_binding::migrate_legacy_chat_maps`.
         // Runs before the blob migration so it sees the same `conversations`
@@ -598,6 +613,157 @@ where
 /// `spawn_blocking`, mirroring `SqliteMemoryStorage::with_conn` in
 /// rustykrab-memory. The mutex is locked on the blocking thread so async
 /// workers never park on disk I/O or the connection lock.
+/// Whether `table` already declares at least one foreign key.
+fn has_foreign_key(conn: &rusqlite::Connection, table: &str) -> Result<bool, Error> {
+    let mut stmt = conn
+        .prepare(&format!("PRAGMA foreign_key_list({table})"))
+        .map_err(|e| Error::Storage(e.to_string()))?;
+    let mut rows = stmt.query([]).map_err(|e| Error::Storage(e.to_string()))?;
+    let present = rows
+        .next()
+        .map_err(|e| Error::Storage(e.to_string()))?
+        .is_some();
+    Ok(present)
+}
+
+/// Give an existing table a foreign key it was created without.
+///
+/// SQLite cannot `ALTER TABLE ... ADD CONSTRAINT`, so the only route is the
+/// rebuild the SQLite docs prescribe: create the new shape under a temporary
+/// name, copy the rows, drop the old table, rename, recreate the indexes.
+///
+/// `keep_predicate` selects the rows that satisfy the new constraint. Rows it
+/// excludes are already orphans — they name a parent that does not exist —
+/// and could not be inserted into the new table even if we wanted them. They
+/// are dropped, which is what enforcing the constraint means.
+///
+/// Foreign keys must be off for the duration: with them on, dropping the old
+/// table would cascade into the rows we just copied. The pragma is a no-op
+/// inside a transaction, so it is toggled outside one and restored after.
+/// `PRAGMA foreign_key_check` runs before the commit, so a rebuild that
+/// somehow produced a violation rolls back rather than persisting one.
+fn adopt_foreign_key(
+    conn: &rusqlite::Connection,
+    table: &str,
+    create_new: &str,
+    columns: &str,
+    keep_predicate: &str,
+    indexes: &[&str],
+) -> Result<(), Error> {
+    if has_foreign_key(conn, table)? {
+        return Ok(());
+    }
+
+    let fk_was_on: bool = conn
+        .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+        .map_err(|e| Error::Storage(e.to_string()))?;
+    if fk_was_on {
+        conn.execute_batch("PRAGMA foreign_keys = OFF")
+            .map_err(|e| Error::Storage(e.to_string()))?;
+    }
+
+    let rebuild = || -> Result<(), Error> {
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        let staging = format!("{table}_fk_rebuild");
+        tx.execute_batch(create_new)
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        tx.execute_batch(&format!(
+            "INSERT INTO {staging} ({columns})
+             SELECT {columns} FROM {table} WHERE {keep_predicate};
+             DROP TABLE {table};
+             ALTER TABLE {staging} RENAME TO {table};"
+        ))
+        .map_err(|e| Error::Storage(e.to_string()))?;
+        for index in indexes {
+            tx.execute_batch(index)
+                .map_err(|e| Error::Storage(e.to_string()))?;
+        }
+        let violations: i64 = tx
+            .query_row(
+                &format!("SELECT COUNT(*) FROM pragma_foreign_key_check('{table}')"),
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        if violations > 0 {
+            // Dropping the uncommitted transaction rolls the rebuild back.
+            return Err(Error::Storage(format!(
+                "rebuilding {table} left {violations} foreign-key violations"
+            )));
+        }
+        tx.commit().map_err(|e| Error::Storage(e.to_string()))
+    };
+
+    let outcome = rebuild();
+
+    if fk_was_on {
+        conn.execute_batch("PRAGMA foreign_keys = ON")
+            .map_err(|e| Error::Storage(e.to_string()))?;
+    }
+    outcome
+}
+
+/// Adopt the foreign keys the schema declares for fresh databases onto
+/// databases created before they were declared.
+///
+/// Only the references that are genuinely ownership survive here:
+/// a message, an archived recall window and a job run have no meaning
+/// without their parent. The nullable back-references on `scheduled_jobs`,
+/// `credential_requests` and `delegated_tasks` are left alone on purpose —
+/// see the comment on their DDL.
+fn adopt_declared_foreign_keys(conn: &rusqlite::Connection) -> Result<(), Error> {
+    adopt_foreign_key(
+        conn,
+        "messages",
+        "CREATE TABLE messages_fk_rebuild (
+             conversation_id TEXT NOT NULL
+                 REFERENCES conversations(id) ON DELETE CASCADE,
+             idx             INTEGER NOT NULL,
+             data            TEXT NOT NULL,
+             PRIMARY KEY (conversation_id, idx)
+         )",
+        "conversation_id, idx, data",
+        "conversation_id IN (SELECT id FROM conversations)",
+        &[],
+    )?;
+
+    adopt_foreign_key(
+        conn,
+        "recall_archive",
+        "CREATE TABLE recall_archive_fk_rebuild (
+             conversation_id TEXT PRIMARY KEY
+                 REFERENCES conversations(id) ON DELETE CASCADE,
+             archive         TEXT NOT NULL,
+             created_at      TEXT NOT NULL,
+             updated_at      TEXT NOT NULL
+         )",
+        "conversation_id, archive, created_at, updated_at",
+        "conversation_id IN (SELECT id FROM conversations)",
+        &[],
+    )?;
+
+    adopt_foreign_key(
+        conn,
+        "job_runs",
+        "CREATE TABLE job_runs_fk_rebuild (
+             id         TEXT PRIMARY KEY,
+             job_id     TEXT NOT NULL
+                 REFERENCES scheduled_jobs(id) ON DELETE CASCADE,
+             status     TEXT NOT NULL,
+             output     TEXT,
+             started_at TEXT NOT NULL,
+             finished_at TEXT NOT NULL,
+             rustykrab_version TEXT
+         )",
+        "id, job_id, status, output, started_at, finished_at, rustykrab_version",
+        "job_id IN (SELECT id FROM scheduled_jobs)",
+        &["CREATE INDEX IF NOT EXISTS idx_job_runs_job_id
+               ON job_runs (job_id, finished_at DESC)"],
+    )
+}
+
 pub(crate) async fn with_conn<T, F>(
     conn: &Arc<Mutex<rusqlite::Connection>>,
     f: F,
@@ -628,6 +794,197 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A database created before the foreign keys were declared: no
+    /// constraints, and rows that a constraint would have prevented.
+    fn legacy_db() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE conversations (
+                 id TEXT PRIMARY KEY, data TEXT NOT NULL,
+                 title TEXT, created_at TEXT, updated_at TEXT
+             );
+             CREATE TABLE messages (
+                 conversation_id TEXT NOT NULL, idx INTEGER NOT NULL,
+                 data TEXT NOT NULL, PRIMARY KEY (conversation_id, idx)
+             );
+             CREATE TABLE recall_archive (
+                 conversation_id TEXT PRIMARY KEY, archive TEXT NOT NULL,
+                 created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+             );
+             CREATE TABLE scheduled_jobs (
+                 id TEXT PRIMARY KEY, schedule TEXT NOT NULL, task TEXT NOT NULL,
+                 channel TEXT, chat_id TEXT, thread_id TEXT,
+                 one_shot INTEGER NOT NULL DEFAULT 0, enabled INTEGER NOT NULL DEFAULT 1,
+                 next_run_at TEXT NOT NULL, last_run_at TEXT, created_at TEXT NOT NULL
+             );
+             CREATE TABLE job_runs (
+                 id TEXT PRIMARY KEY, job_id TEXT NOT NULL, status TEXT NOT NULL,
+                 output TEXT, started_at TEXT NOT NULL, finished_at TEXT NOT NULL
+             );
+
+             INSERT INTO conversations (id, data) VALUES ('live', '{}');
+             INSERT INTO messages VALUES ('live', 0, '{}');
+             INSERT INTO messages VALUES ('deleted-conv', 0, '{}');
+             INSERT INTO recall_archive VALUES ('live', '[]', 't', 't');
+             INSERT INTO recall_archive VALUES ('deleted-conv', '[]', 't', 't');
+             INSERT INTO scheduled_jobs (id, schedule, task, next_run_at, created_at)
+                 VALUES ('job', '0 9 * * *', 'task', '2099-01-01T00:00:00+00:00', 't');
+             INSERT INTO job_runs VALUES ('run', 'job', 'ok', 'out', 't', 't');
+             INSERT INTO job_runs VALUES ('orphan-run', 'deleted-job', 'ok', 'out', 't', 't');",
+        )
+        .unwrap();
+        conn
+    }
+
+    fn count(conn: &rusqlite::Connection, sql: &str) -> i64 {
+        conn.query_row(sql, [], |row| row.get(0)).unwrap()
+    }
+
+    #[test]
+    fn migration_adopts_the_foreign_keys_and_drops_the_orphans_they_forbid() {
+        let conn = legacy_db();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+
+        Store::run_migrations(&conn).unwrap();
+
+        for table in ["messages", "recall_archive", "job_runs"] {
+            assert!(
+                has_foreign_key(&conn, table).unwrap(),
+                "{table} must carry its foreign key after migration"
+            );
+        }
+        // Rows naming a parent that does not exist cannot survive the
+        // constraint, and are exactly what the constraint exists to prevent.
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM messages"), 1);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM recall_archive"), 1);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM job_runs"), 1);
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM job_runs WHERE id = 'run'"),
+            1,
+            "the run whose job still exists must be preserved"
+        );
+    }
+
+    #[test]
+    fn adopting_foreign_keys_preserves_the_data_and_the_index() {
+        let conn = legacy_db();
+        Store::run_migrations(&conn).unwrap();
+
+        let data: String = conn
+            .query_row(
+                "SELECT data FROM messages WHERE conversation_id = 'live' AND idx = 0",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(data, "{}");
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'index' AND name = 'idx_job_runs_job_id'"
+            ),
+            1,
+            "the rebuild must put back the index it dropped with the table"
+        );
+        // And the version column the additive ALTERs added is still there.
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM pragma_table_info('job_runs')
+                 WHERE name = 'rustykrab_version'"
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn adopting_foreign_keys_is_idempotent() {
+        let conn = legacy_db();
+        Store::run_migrations(&conn).unwrap();
+        let after_first = count(&conn, "SELECT COUNT(*) FROM messages");
+        Store::run_migrations(&conn).unwrap();
+        Store::run_migrations(&conn).unwrap();
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM messages"), after_first);
+    }
+
+    #[tokio::test]
+    async fn deleting_a_conversation_cascades_to_everything_it_owns() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        Store::run_migrations(&conn).unwrap();
+        let conn = Arc::new(Mutex::new(conn));
+
+        let conv = uuid::Uuid::new_v4();
+        {
+            let guard = conn.lock().unwrap();
+            guard
+                .execute(
+                    "INSERT INTO conversations (id, data, created_at, updated_at)
+                     VALUES (?1, '{}', 't', 't')",
+                    rusqlite::params![conv.to_string()],
+                )
+                .unwrap();
+            guard
+                .execute(
+                    "INSERT INTO messages VALUES (?1, 0, '{}')",
+                    rusqlite::params![conv.to_string()],
+                )
+                .unwrap();
+            guard
+                .execute(
+                    "INSERT INTO recall_archive VALUES (?1, '[]', 't', 't')",
+                    rusqlite::params![conv.to_string()],
+                )
+                .unwrap();
+        }
+
+        ConversationStore::new(Arc::clone(&conn))
+            .delete(conv)
+            .await
+            .unwrap();
+
+        let guard = conn.lock().unwrap();
+        assert_eq!(count(&guard, "SELECT COUNT(*) FROM messages"), 0);
+        assert_eq!(
+            count(&guard, "SELECT COUNT(*) FROM recall_archive"),
+            0,
+            "the archive must go with the conversation, without the caller \
+             having to remember to purge it"
+        );
+    }
+
+    #[tokio::test]
+    async fn deleting_a_job_takes_its_run_history_with_it() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        Store::run_migrations(&conn).unwrap();
+        let conn = Arc::new(Mutex::new(conn));
+        {
+            let guard = conn.lock().unwrap();
+            guard
+                .execute_batch(
+                    "INSERT INTO scheduled_jobs (id, schedule, task, next_run_at, created_at)
+                         VALUES ('job', '0 9 * * *', 'task', '2099-01-01T00:00:00+00:00', 't');
+                     INSERT INTO job_runs (id, job_id, status, started_at, finished_at)
+                         VALUES ('run', 'job', 'ok', 't', 't');",
+                )
+                .unwrap();
+        }
+
+        assert!(JobStore::new(Arc::clone(&conn))
+            .delete_job("job")
+            .await
+            .unwrap());
+
+        let guard = conn.lock().unwrap();
+        assert_eq!(
+            count(&guard, "SELECT COUNT(*) FROM job_runs"),
+            0,
+            "run history must not outlive the job it belongs to"
+        );
+    }
 
     /// A panic while holding the connection lock used to end the process's
     /// ability to touch the database at all: the mutex stayed poisoned and
