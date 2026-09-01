@@ -274,13 +274,49 @@ fn new_snapshot_payload(
     })
 }
 
+/// How long a single CDP element operation may take.
+///
+/// A page whose DOM handle has gone stale -- which happens after it
+/// navigates -- answers `DOM.querySelector` neither quickly nor at all.
+/// Unbounded, the call falls through to the CDP client's own 30s request
+/// timeout, the runner retries the identical call, and one unreachable
+/// input consumed three 60s tool budgets inside a single 600s trial
+/// before it ran out. The page itself was healthy throughout: the
+/// accessibility snapshot kept returning the full form while every
+/// `find_element` against it timed out.
+///
+/// Ten seconds is far longer than a live document needs and far shorter
+/// than a wedged one costs.
+const ELEMENT_OP_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// `find_element` with a bound, and an error the model can act on.
+///
+/// "Request timed out" told the agent nothing, so it reissued the same
+/// call until the trial ended. A fresh snapshot re-reads the document and
+/// yields refs that work, so say that.
+async fn find_element_bounded(page: &Page, selector: &str) -> Result<chromiumoxide::Element> {
+    match tokio::time::timeout(ELEMENT_OP_BUDGET, page.find_element(selector)).await {
+        Ok(Ok(elem)) => Ok(elem),
+        Ok(Err(e)) => Err(Error::ToolExecution(ToolError::not_found(format!(
+            "element not found '{selector}': {e}"
+        )))),
+        Err(_) => Err(Error::ToolExecution(
+            format!(
+                "'{selector}' did not respond within {}s. The page itself is \
+                 reachable -- a snapshot still works -- but the handle used to \
+                 query its DOM is stale, which happens after the page navigates. \
+                 Take a fresh snapshot and use the refs from it; repeating this \
+                 call will fail the same way.",
+                ELEMENT_OP_BUDGET.as_secs()
+            )
+            .into(),
+        )),
+    }
+}
+
 /// Click an element by CSS selector.
 async fn act_click(page: &Page, selector: &str) -> Result<Value> {
-    let elem = page.find_element(selector).await.map_err(|e| {
-        Error::ToolExecution(ToolError::not_found(format!(
-            "element not found '{selector}': {e}"
-        )))
-    })?;
+    let elem = find_element_bounded(page, selector).await?;
     elem.click()
         .await
         .map_err(|e| Error::ToolExecution(format!("click failed on '{selector}': {e}").into()))?;
@@ -289,11 +325,7 @@ async fn act_click(page: &Page, selector: &str) -> Result<Value> {
 
 /// Type text into an element, optionally clearing first.
 async fn act_type(page: &Page, selector: &str, text: &str, clear: bool) -> Result<Value> {
-    let elem = page.find_element(selector).await.map_err(|e| {
-        Error::ToolExecution(ToolError::not_found(format!(
-            "element not found '{selector}': {e}"
-        )))
-    })?;
+    let elem = find_element_bounded(page, selector).await?;
 
     // Focus the element
     elem.click()
