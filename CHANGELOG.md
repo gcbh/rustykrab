@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.2.11] - 2026-09-01
+
+- fix(credentials): ask for a new app password when Google rejects the stored one (#597)
+
 ## [5.2.10] - 2026-09-01
 
 - fix(browser): bound element lookups, and say what went wrong (#581)

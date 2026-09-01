@@ -3453,6 +3453,13 @@ mod retry_policy_tests {
         assert!(!should_retry_unchanged_tool_call(&Error::ToolExecution(
             ToolError::invalid_input("bad command")
         )));
+        // A credential the provider refused. Repeating the call cannot make
+        // a revoked password work, and the tools that raise this file a
+        // credential request as they do — so a retry would ask the user
+        // again for something they are already being asked for.
+        assert!(!should_retry_unchanged_tool_call(&Error::ToolExecution(
+            ToolError::permission_denied("Google rejected the stored app password")
+        )));
         assert!(should_retry_unchanged_tool_call(&Error::Internal(
             "uncategorized execution failure".into()
         )));

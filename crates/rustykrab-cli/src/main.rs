@@ -2191,6 +2191,25 @@ async fn slack_agent_loop(
                     "failed to send Slack reply: {e}"
                 );
             }
+
+            // Then any credential link the turn asked for, as its own
+            // message — same order and same reasoning as the Telegram
+            // loop: the user reads why before being handed the form, and
+            // the link never passed through the model so it cannot have
+            // been truncated. Slack has no app in the loop, so without
+            // this the ask is a dead end here.
+            for link in state.store.pending_links().take(conv_id) {
+                if let Err(e) = sl
+                    .send_text(&inbound.channel_id, &link, Some(&effective_thread_ts))
+                    .await
+                {
+                    tracing::error!(
+                        channel_id = %inbound.channel_id,
+                        thread_ts = %effective_thread_ts,
+                        "failed to send credential link: {e}"
+                    );
+                }
+            }
         });
     }
 
