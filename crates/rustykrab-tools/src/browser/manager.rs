@@ -864,7 +864,7 @@ fn launch_browser_blocking(
     let profile = config.profiles.get(profile_name);
     let driver = profile.map(|p| &p.driver).unwrap_or(&DriverType::Rustykrab);
     let profile_dir_name = if *driver == DriverType::Rustykrab {
-        setup_profile_link(&user_data_dir)
+        setup_profile_link(&user_data_dir, config.isolated_root.is_some())
     } else {
         "Default".to_string()
     };
@@ -1031,15 +1031,21 @@ fn detect_profile_name(chrome_dir: &std::path::Path) -> String {
 
 /// Set up a wrapper data directory that symlinks back to the user's real
 /// Chrome profile, preserving cookies and sessions.
-fn setup_profile_link(user_data_dir: &std::path::Path) -> String {
-    // Borrowing the real profile is the point in normal use -- it carries
-    // the logins. Under an isolated root it is precisely what the caller
-    // asked to avoid, and in an eval it silently invalidates the result:
-    // a trial that inherits a signed-in cookie looks like a successful
-    // sign-in without ever signing in.
-    let isolated = std::env::var("RUSTYKRAB_BROWSER_ISOLATED_ROOT")
-        .map(|v| !v.is_empty())
-        .unwrap_or(false);
+/// Link the account's real Chrome profile into `user_data_dir`, unless
+/// the caller asked for an isolated browser.
+///
+/// Borrowing the real profile is the point in normal use -- it carries
+/// the logins. Under an isolated root it is precisely what the caller
+/// asked to avoid, and in an eval it silently invalidates the result: a
+/// trial that inherits a signed-in cookie looks like a successful
+/// sign-in without ever having signed in.
+///
+/// `isolated` is passed in rather than read from the environment here.
+/// One setting read in one place is easier to reason about than the same
+/// `env::var` in two functions, and it makes this decision testable
+/// without mutating process-global state -- which in this workspace is
+/// shared with every other test in the binary.
+fn setup_profile_link(user_data_dir: &std::path::Path, isolated: bool) -> String {
     let Some(chrome_dir) = chrome_data_dir().filter(|_| !isolated) else {
         write_local_state(user_data_dir, "Default");
         return "Default".to_string();
