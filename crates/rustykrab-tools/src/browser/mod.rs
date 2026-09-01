@@ -3,7 +3,7 @@
 //! Provides a comprehensive browser control surface with:
 //! - Multi-profile browser management (isolated Chrome instances)
 //! - Browser lifecycle (status/start/stop)
-//! - Tab management (tabs/open/close/focus) with targetId addressing
+//! - Tab management (tabs/open/close/focus) addressed by Chrome target ID
 //! - Accessibility-tree snapshots with element refs
 //! - Ref-based actions (click/type/press/hover/select/drag via snapshot refs)
 //! - Screenshot, navigate, evaluate, console, PDF, scroll
@@ -38,7 +38,7 @@ const MAX_CONTENT_BYTES: usize = 50 * 1024; // 50KB cap for page content
 /// Modeled after OpenClaw's browser management architecture:
 /// - Multiple named browser profiles, each an isolated Chrome instance
 /// - Browser lifecycle management (status/start/stop)
-/// - Deterministic tab control (tabs/open/close/focus by targetId)
+/// - Tab control (tabs/open/close/focus) by stable Chrome target ID
 /// - Accessibility-tree snapshots with element refs for actions
 /// - Ref-based interactions (click ref 12, type ref 5 "hello")
 ///
@@ -70,6 +70,21 @@ impl BrowserTool {
         }
     }
 
+    /// Build a tool against an explicit config.
+    ///
+    /// [`Self::new`] loads `~/.rustykrab/browser.json`, which ties it to the
+    /// operator's real Chrome profile and its live sessions. Callers that
+    /// need an isolated browser — tests, embedders driving a throwaway
+    /// profile — supply their own config here.
+    pub fn with_config(config: config::BrowserConfig) -> Self {
+        Self {
+            manager: BrowserManager::new(config),
+            snapshot_store: SnapshotStore::new(),
+            adaptive_store: AdaptiveStore::new(),
+            secrets: None,
+        }
+    }
+
     /// Let the browser type a stored credential without the model ever
     /// holding it.
     pub fn with_secrets(mut self, secrets: rustykrab_store::GuardedSecrets) -> Self {
@@ -90,6 +105,106 @@ impl BrowserTool {
             Some(tid) => format!("{profile}:{tid}"),
             None => format!("{profile}:active"),
         }
+    }
+
+    /// Key for per-conversation browser state.
+    ///
+    /// One Chrome profile is shared by every concurrent run, so the pinned
+    /// tab has to be scoped per conversation or two agents browsing at once
+    /// would steer each other's page. Outside a runner scope (CLI, tests)
+    /// there is one caller and one browser, so a shared key is correct.
+    fn session_key() -> String {
+        rustykrab_core::active_tools::with_session_context(|ctx| ctx.conversation_id.to_string())
+            .unwrap_or_else(|| "global".to_string())
+    }
+
+    /// Actions that operate on a page, and so need one resolved.
+    const PAGE_ACTIONS: &'static [&'static str] = &[
+        "navigate",
+        "snapshot",
+        "act",
+        "fill_credential",
+        "screenshot",
+        "content",
+        "evaluate",
+        "scroll",
+        "console",
+        "cookies",
+        "pdf",
+        "select",
+        "wait_for",
+    ];
+
+    /// Read actions whose whole purpose is to observe page content. Landing
+    /// one of these on a blank tab is a failure, not an empty result.
+    const READ_ACTIONS: &'static [&'static str] =
+        &["snapshot", "content", "evaluate", "screenshot", "pdf"];
+
+    /// Resolve the target this call addresses: explicit `targetId`, else the
+    /// session's pinned tab if it is still live.
+    async fn resolve_target(
+        &self,
+        action: &str,
+        profile: &str,
+        session: &str,
+        args: &Value,
+    ) -> Option<String> {
+        if let Some(tid) = args["targetId"].as_str() {
+            return Some(tid.to_string());
+        }
+        if !Self::PAGE_ACTIONS.contains(&action) {
+            return None;
+        }
+        let pinned = self.manager.sticky_target(session, profile)?;
+        if self.manager.target_is_live(profile, &pinned).await {
+            Some(pinned)
+        } else {
+            // The tab was closed out from under us. Drop the pin rather than
+            // failing every subsequent action on a dead target.
+            self.manager.clear_sticky_target(session, profile);
+            None
+        }
+    }
+
+    /// Resolve the page for a read action, refusing to report a blank tab
+    /// as an empty page.
+    async fn page_for(
+        &self,
+        action: &str,
+        profile: &str,
+        session: &str,
+        target_id: Option<&str>,
+    ) -> Result<chromiumoxide::Page> {
+        let page = self.manager.get_page(profile, target_id).await?;
+        let url = page.url().await.ok().flatten().unwrap_or_default();
+        let navigated = self.manager.sticky_target(session, profile).is_some();
+        Self::reject_blank_read(action, &url, navigated)?;
+        Ok(page)
+    }
+
+    /// Reject a read action that resolved to a blank tab.
+    ///
+    /// Chrome is launched with an `about:blank` startup tab that never goes
+    /// away, so a read can land on it and return a perfectly well-formed
+    /// empty result. That reads to the model as "this page has nothing on
+    /// it" and it stops using the browser, rather than as "you are not
+    /// looking at the page you navigated".
+    fn reject_blank_read(action: &str, url: &str, navigated: bool) -> Result<()> {
+        if !Self::READ_ACTIONS.contains(&action) || !manager::is_blank_url(url) {
+            return Ok(());
+        }
+        let detail = if navigated {
+            "the tab you navigated is no longer available, so this resolved to a blank tab"
+        } else {
+            "no page has been navigated in this session yet"
+        };
+        Err(Error::ToolExecution(
+            format!(
+                "'{action}' resolved to a blank tab ('{url}') — {detail}. \
+                 Call action 'navigate' with the URL you want to read, then retry."
+            )
+            .into(),
+        ))
     }
 }
 
@@ -443,7 +558,16 @@ impl Tool for BrowserTool {
         }
 
         let profile = self.resolve_profile(&args).to_string();
-        let target_id = args["targetId"].as_str();
+        let session = Self::session_key();
+
+        // Decide which page this call addresses once, here: an explicit
+        // `targetId` wins, otherwise the tab this session last navigated,
+        // provided it is still open. Every page action below reads
+        // `target_id`, so this is the single place "which page?" is answered
+        // — previously each one re-resolved it and could land on a different
+        // tab than the call before.
+        let resolved_target = self.resolve_target(action, &profile, &session, &args).await;
+        let target_id = resolved_target.as_deref();
 
         match action {
             // ── Lifecycle ──────────────────────────────────────────
@@ -470,21 +594,33 @@ impl Tool for BrowserTool {
                     .await
                     .map_err(|e| Error::ToolExecution(e.into()))?;
                 let _ = self.manager.get_browser(&profile).await?;
-                self.manager.open_tab(&profile, url).await
+                let opened = self.manager.open_tab(&profile, url).await?;
+                // A freshly opened tab is where this session is now working.
+                if let Some(tid) = opened["targetId"].as_str() {
+                    self.manager.set_sticky_target(&session, &profile, tid);
+                }
+                Ok(opened)
             }
 
             "close" => {
                 let tid = target_id.ok_or_else(|| {
                     Error::ToolExecution("'close' requires 'targetId' parameter".into())
                 })?;
-                self.manager.close_tab(&profile, tid).await
+                let closed = self.manager.close_tab(&profile, tid).await?;
+                if self.manager.sticky_target(&session, &profile).as_deref() == Some(tid) {
+                    self.manager.clear_sticky_target(&session, &profile);
+                }
+                Ok(closed)
             }
 
             "focus" => {
                 let tid = target_id.ok_or_else(|| {
                     Error::ToolExecution("'focus' requires 'targetId' parameter".into())
                 })?;
-                self.manager.focus_tab(&profile, tid).await
+                let focused = self.manager.focus_tab(&profile, tid).await?;
+                // Focusing a tab is a statement about where to work next.
+                self.manager.set_sticky_target(&session, &profile, tid);
+                Ok(focused)
             }
 
             // ── Navigation ─────────────────────────────────────────
@@ -546,10 +682,17 @@ impl Tool for BrowserTool {
                 let title = page.get_title().await.ok().flatten().unwrap_or_default();
                 let current_url = page.url().await.ok().flatten().unwrap_or_default();
 
+                // Pin the tab we just loaded so the snapshot/content call
+                // that follows reads this page and not some other one.
+                let landed_on = page.target_id().inner().clone();
+                self.manager
+                    .set_sticky_target(&session, &profile, &landed_on);
+
                 Ok(json!({
                     "title": title,
                     "url": current_url,
                     "status": "loaded",
+                    "targetId": landed_on,
                     "waits": Value::Object(wait_results),
                     "profile": profile
                 }))
@@ -558,7 +701,7 @@ impl Tool for BrowserTool {
             // ── Snapshot ───────────────────────────────────────────
             "snapshot" => {
                 let _ = self.manager.get_browser(&profile).await?;
-                let page = self.manager.get_page(&profile, target_id).await?;
+                let page = self.page_for(action, &profile, &session, target_id).await?;
 
                 let mode = match args["format"].as_str() {
                     Some("aria") => SnapshotMode::Aria,
@@ -670,7 +813,7 @@ impl Tool for BrowserTool {
             // ── Screenshot ─────────────────────────────────────────
             "screenshot" => {
                 let _ = self.manager.get_browser(&profile).await?;
-                let page = self.manager.get_page(&profile, target_id).await?;
+                let page = self.page_for(action, &profile, &session, target_id).await?;
                 let full_page = args["full_page"].as_bool().unwrap_or(false);
                 let selector = args["selector"].as_str();
 
@@ -709,7 +852,7 @@ impl Tool for BrowserTool {
             // ── Content ────────────────────────────────────────────
             "content" => {
                 let _ = self.manager.get_browser(&profile).await?;
-                let page = self.manager.get_page(&profile, target_id).await?;
+                let page = self.page_for(action, &profile, &session, target_id).await?;
                 let format = args["format"].as_str().unwrap_or("text");
 
                 let content = match format {
@@ -938,7 +1081,7 @@ impl Tool for BrowserTool {
             // ── PDF ────────────────────────────────────────────────
             "pdf" => {
                 let _ = self.manager.get_browser(&profile).await?;
-                let page = self.manager.get_page(&profile, target_id).await?;
+                let page = self.page_for(action, &profile, &session, target_id).await?;
 
                 let pdf_bytes = page.pdf(Default::default()).await.map_err(|e| {
                     Error::ToolExecution(
@@ -1159,5 +1302,170 @@ impl Tool for BrowserTool {
                 .into(),
             )),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_on_a_blank_tab_is_an_error() {
+        // This is the regression: a snapshot that resolved to the startup
+        // tab used to return `count: 0` as a success, which reads as "the
+        // page is empty" rather than "you are on the wrong page".
+        let err = BrowserTool::reject_blank_read("snapshot", "about:blank", true)
+            .expect_err("blank read must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("blank tab"), "{msg}");
+        assert!(msg.contains("navigate"), "{msg}");
+    }
+
+    #[test]
+    fn blank_read_message_distinguishes_never_navigated() {
+        let never = BrowserTool::reject_blank_read("content", "", false)
+            .expect_err("blank read must fail")
+            .to_string();
+        assert!(never.contains("no page has been navigated"), "{never}");
+
+        let lost = BrowserTool::reject_blank_read("content", "", true)
+            .expect_err("blank read must fail")
+            .to_string();
+        assert!(lost.contains("no longer available"), "{lost}");
+    }
+
+    #[test]
+    fn reads_on_a_real_page_pass() {
+        BrowserTool::reject_blank_read("snapshot", "https://www.instagram.com/cutty13/", true)
+            .expect("a real page is readable");
+    }
+
+    #[test]
+    fn non_read_actions_are_not_guarded() {
+        // `navigate` legitimately starts from a blank tab — guarding it
+        // would make the browser unusable from a cold start.
+        BrowserTool::reject_blank_read("navigate", "about:blank", false)
+            .expect("navigate may start blank");
+        BrowserTool::reject_blank_read("act", "about:blank", true).expect("act is not a read");
+    }
+
+    /// End-to-end check of the whole fix against the page that exposed it:
+    /// a real Instagram profile, which serves a login wall to a logged-out
+    /// browser. The old resolution answered this with `about:blank` and an
+    /// empty element list, which read to the model as "this page has nothing
+    /// on it" — so it abandoned the browser and never came back.
+    ///
+    /// Needs the network and launches a real Chrome; ignored by default:
+    ///
+    /// ```sh
+    /// cargo test -p rustykrab-tools --no-default-features \
+    ///   browser::tests::live -- --ignored --nocapture
+    /// ```
+    #[tokio::test]
+    #[ignore = "needs the network and launches a real Chrome"]
+    async fn live_instagram_navigate_then_snapshot_sees_the_page() {
+        const PROFILE_URL: &str = "https://www.instagram.com/secret_sanfrancisco/";
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").expect("free port");
+            l.local_addr().unwrap().port()
+        };
+        let profile = "instagram-live-test";
+
+        let mut cfg = config::BrowserConfig {
+            default_profile: profile.to_string(),
+            ..Default::default()
+        };
+        cfg.profiles.insert(
+            profile.to_string(),
+            config::BrowserProfile {
+                cdp_port: Some(port),
+                user_data_dir: Some(dir.path().display().to_string()),
+                headless: Some(true),
+                ..Default::default()
+            },
+        );
+        let tool = BrowserTool::with_config(cfg);
+
+        let navigated = tool
+            .execute(json!({"action": "navigate", "url": PROFILE_URL, "timeout_ms": 30000}))
+            .await
+            .expect("navigate");
+        eprintln!("navigate -> {navigated}");
+
+        let landed = navigated["url"].as_str().unwrap_or_default();
+        assert!(
+            !manager::is_blank_url(landed),
+            "navigate landed on a blank tab: {navigated}"
+        );
+        let pinned = navigated["targetId"]
+            .as_str()
+            .expect("navigate must report the tab it used")
+            .to_string();
+
+        // The read that follows must observe the page that was navigated —
+        // this is the exact pair that broke.
+        let snapshot = tool
+            .execute(json!({"action": "snapshot"}))
+            .await
+            .expect("snapshot must not fail on a loaded page");
+        eprintln!(
+            "snapshot -> count={} url={}",
+            snapshot["count"], snapshot["url"]
+        );
+        for el in snapshot["elements"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .take(12)
+        {
+            eprintln!("  [{}] {} {}", el["ref"], el["role"], el["name"]);
+        }
+
+        assert!(
+            !manager::is_blank_url(snapshot["url"].as_str().unwrap_or_default()),
+            "snapshot resolved to a blank tab: {snapshot}"
+        );
+        assert!(
+            snapshot["count"].as_u64().unwrap_or(0) > 0,
+            "snapshot saw no elements: {snapshot}"
+        );
+
+        // And it stays on that page across further reads, without the model
+        // having to thread a targetId through.
+        let content = tool
+            .execute(json!({"action": "content", "format": "text"}))
+            .await
+            .expect("content");
+        assert!(
+            !manager::is_blank_url(content["url"].as_str().unwrap_or(landed)),
+            "content resolved to a blank tab: {content}"
+        );
+
+        let tabs = tool.execute(json!({"action": "tabs"})).await.expect("tabs");
+        assert!(
+            tabs["tabs"]
+                .as_array()
+                .expect("tabs array")
+                .iter()
+                .any(|t| t["targetId"].as_str() == Some(pinned.as_str())),
+            "the pinned tab should still be listed: {tabs}"
+        );
+
+        let _ = tool.execute(json!({"action": "stop"})).await;
+    }
+
+    #[test]
+    fn store_key_separates_tabs() {
+        assert_eq!(
+            BrowserTool::store_key("default", Some("TARGET-1")),
+            "default:TARGET-1"
+        );
+        assert_ne!(
+            BrowserTool::store_key("default", Some("TARGET-1")),
+            BrowserTool::store_key("default", Some("TARGET-2"))
+        );
+        assert_eq!(BrowserTool::store_key("default", None), "default:active");
     }
 }
