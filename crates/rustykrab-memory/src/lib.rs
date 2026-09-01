@@ -107,7 +107,6 @@ impl MemorySystem {
     /// - `config`: tuning parameters for chunking, retrieval, and lifecycle.
     /// - `storage`: the backing store (SQLite, PostgreSQL, etc.).
     /// - `embedder`: the text embedding model (fastembed, API-based, etc.).
-    /// Build a memory system.
     ///
     /// Validates the config, because the values it guards are ones nothing
     /// downstream can defend itself against: `rrf_k == 0.0` divides by zero
