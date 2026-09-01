@@ -73,6 +73,38 @@ pub struct BrowserManager {
     sticky: Arc<std::sync::Mutex<HashMap<(String, String), String>>>,
 }
 
+/// How many tabs one profile's browser may hold.
+///
+/// The browser is deliberately long-lived: it keeps the operator's
+/// logged-in profile warm and survives daemon restarts, which is what
+/// gets an agent past bot protection without signing in again. The cost
+/// of that choice is that nothing ever closes a tab -- the agent opens
+/// them and rarely tidies up, so a browser that lives for weeks
+/// accumulates them until it is the largest process on the machine.
+///
+/// A cap keeps reuse constant-cost.
+///
+/// It deliberately does not claim to close the *oldest* tab. There is no
+/// age to sort by: `Browser::pages()` collects from a `HashMap` with
+/// `values_mut()`, and the handler permutes that map on every poll
+/// (`remove_entry` + `insert`, and `swap_remove` on its id list), so the
+/// order is arbitrary and unstable between calls. Chrome's target IDs are
+/// opaque and carry no age either. An earlier version drained the front of
+/// that list and described it as oldest-first; it closed an arbitrary
+/// subset.
+///
+/// So reap by what can actually be known: blank startup tabs first, which
+/// are always safe, and never a tab some session has pinned. One profile
+/// is shared by every concurrent run, so closing a pinned tab would take a
+/// page out from under an agent mid-task -- recoverable, since
+/// `resolve_target` clears a dead pin and falls back, but the agent
+/// silently loses the page it was working on. If every tab is pinned,
+/// exceed the cap rather than break someone's session.
+///
+/// Closing is best-effort: failing to tidy must never fail the navigation
+/// the user actually asked for.
+const MAX_TABS_PER_PROFILE: usize = 8;
+
 impl BrowserManager {
     pub fn new(config: BrowserConfig) -> Self {
         let mgr = Self {
@@ -306,17 +338,99 @@ impl BrowserManager {
 
         let nav_timeout = Duration::from_millis(self.config.remote_cdp_timeout_ms.max(10_000));
 
+        // `new_page` creates the tab *and* navigates, so this budget covers
+        // a page load, not just a CDP round trip. Timing the two phases
+        // separately is the difference between "the browser is wedged" and
+        // "the site is slow", which the old single error could not tell
+        // apart.
+        // Keep reuse bounded before adding to it.
+        // `Page::close` consumes self (CDP `Target.closeTarget`), so the
+        // stale pages are taken by value rather than borrowed -- same
+        // reason `close_tab` uses `swap_remove`.
+        if let Ok(existing) = inst.browser.pages().await {
+            if existing.len() >= MAX_TABS_PER_PROFILE {
+                let wanted = existing.len() + 1 - MAX_TABS_PER_PROFILE;
+                let pinned = self.pinned_targets(profile_name);
+
+                // Rank what may go: blank startup tabs first, then other
+                // unpinned tabs. Pinned tabs are never candidates.
+                let mut blank = Vec::new();
+                let mut other = Vec::new();
+                for page in existing {
+                    if pinned.contains(page.target_id().inner()) {
+                        continue;
+                    }
+                    let url = page.url().await.ok().flatten().unwrap_or_default();
+                    if is_blank_url(&url) {
+                        blank.push(page);
+                    } else {
+                        other.push(page);
+                    }
+                }
+                blank.extend(other);
+
+                let mut closed = 0;
+                for stale in blank.into_iter().take(wanted) {
+                    match stale.close().await {
+                        Ok(()) => closed += 1,
+                        // A tab that will not close is not a reason to
+                        // refuse the navigation the user asked for.
+                        Err(e) => tracing::warn!(error = %e, "could not close a stale tab"),
+                    }
+                }
+                tracing::info!(
+                    closed,
+                    wanted,
+                    pinned = pinned.len(),
+                    cap = MAX_TABS_PER_PROFILE,
+                    "reaped tabs before opening a new one"
+                );
+                if closed < wanted {
+                    // Over the cap because the rest are in use. Say so:
+                    // silently exceeding a documented limit is the kind of
+                    // thing that reads as a leak later.
+                    tracing::debug!(
+                        short_by = wanted - closed,
+                        "kept tabs that sessions are using; over the cap for now"
+                    );
+                }
+            }
+        }
+
+        let open_started = std::time::Instant::now();
         let page = tokio::time::timeout(nav_timeout, inst.browser.new_page(url))
             .await
             .map_err(|_| {
+                tracing::warn!(
+                    url,
+                    budget_ms = nav_timeout.as_millis() as u64,
+                    "new_page timed out — tab creation plus navigation exceeded the budget"
+                );
                 Error::ToolExecution(
-                    format!("open_tab timed out after {}ms", nav_timeout.as_millis()).into(),
+                    format!(
+                        "open_tab timed out after {}ms waiting for the tab to be created \
+                         and '{url}' to load. The browser was reachable (the instance is \
+                         alive); the page did not finish in the budget.",
+                        nav_timeout.as_millis()
+                    )
+                    .into(),
                 )
             })?
             .map_err(|e| Error::ToolExecution(format!("failed to open tab: {e}").into()))?;
+        let open_ms = open_started.elapsed().as_millis() as u64;
 
         // Bound wait_for_navigation so a slow page can't hang the call forever.
-        let _ = tokio::time::timeout(nav_timeout, page.wait_for_navigation()).await;
+        let nav_started = std::time::Instant::now();
+        let settled = tokio::time::timeout(nav_timeout, page.wait_for_navigation())
+            .await
+            .is_ok();
+        tracing::info!(
+            url,
+            open_ms,
+            settle_ms = nav_started.elapsed().as_millis() as u64,
+            settled,
+            "opened tab"
+        );
         let actual_url = page.url().await.ok().flatten().unwrap_or_default();
         let title = page.get_title().await.ok().flatten().unwrap_or_default();
 
@@ -416,6 +530,23 @@ impl BrowserManager {
             Err(p) => p.into_inner(),
         };
         sticky.get(&key).cloned()
+    }
+
+    /// Every target pinned by any session for this profile.
+    ///
+    /// The reap needs "is anyone using this tab", not "is *this* session
+    /// using it": the profile is shared, so another conversation's pinned
+    /// page is exactly what must not be closed.
+    pub fn pinned_targets(&self, profile: &str) -> std::collections::HashSet<String> {
+        let sticky = match self.sticky.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        sticky
+            .iter()
+            .filter(|((_, p), _)| p == profile)
+            .map(|(_, target)| target.clone())
+            .collect()
     }
 
     /// Forget this session's pinned tab — called when it turns out to be
@@ -777,10 +908,37 @@ fn launch_browser_blocking(
         )
     })?;
 
+    // Chrome's own stderr, kept next to its profile.
+    //
+    // It used to go to /dev/null, which meant a browser that failed to
+    // start, crashed, or refused a profile lock said exactly nothing --
+    // the only visible symptom was a tool timeout further up, with no way
+    // to tell "never launched" from "launched and slow". Diagnosing
+    // `open_tab timed out` from outside the process is guesswork without
+    // this.
+    let chrome_log_path = user_data_dir.join("chrome-stderr.log");
+    let chrome_log = std::fs::File::create(&chrome_log_path).ok();
+
     let mut cmd = std::process::Command::new(&exe);
-    cmd.args(&args)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+    cmd.args(&args);
+    match chrome_log {
+        Some(f) => {
+            let dup = f.try_clone().ok();
+            cmd.stdout(std::process::Stdio::from(f));
+            match dup {
+                Some(d) => {
+                    cmd.stderr(std::process::Stdio::from(d));
+                }
+                None => {
+                    cmd.stderr(std::process::Stdio::null());
+                }
+            }
+        }
+        None => {
+            cmd.stdout(std::process::Stdio::null());
+            cmd.stderr(std::process::Stdio::null());
+        }
+    }
 
     // macOS: prevent App Nap from suspending the headed browser's timers.
     // Headed Chrome backgrounded on macOS will throttle its event loop and
@@ -799,6 +957,9 @@ fn launch_browser_blocking(
         profile = profile_name,
         %profile_dir_name,
         pid = child.id(),
+        executable = %exe,
+        user_data_dir = %user_data_dir.display(),
+        stderr_log = %chrome_log_path.display(),
         "launched browser with remote debugging"
     );
     Ok(child)
@@ -1147,5 +1308,31 @@ mod tests {
             mgr.sticky_target("conv-b", "default").as_deref(),
             Some("TARGET-B")
         );
+    }
+
+    /// The reap must not be able to close a tab another session is on.
+    /// One Chrome profile is shared by every concurrent run, so this is
+    /// the difference between tidying and taking a page out from under
+    /// an agent mid-task.
+    #[test]
+    fn pinned_targets_are_gathered_across_sessions_for_one_profile() {
+        let mgr = manager();
+        mgr.set_sticky_target("session-a", "rustykrab", "TARGET-A");
+        mgr.set_sticky_target("session-b", "rustykrab", "TARGET-B");
+        mgr.set_sticky_target("session-c", "other-profile", "TARGET-C");
+
+        let pinned = mgr.pinned_targets("rustykrab");
+        assert_eq!(pinned.len(), 2, "{pinned:?}");
+        assert!(pinned.contains("TARGET-A"));
+        assert!(pinned.contains("TARGET-B"));
+        assert!(
+            !pinned.contains("TARGET-C"),
+            "another profile's pin is not this profile's business: {pinned:?}"
+        );
+    }
+
+    #[test]
+    fn a_profile_with_no_pins_has_nothing_to_protect() {
+        assert!(manager().pinned_targets("rustykrab").is_empty());
     }
 }
