@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.2.16] - 2026-09-01
+
+- fix(context): anchor compaction to actual token usage, and stop the MaxTokens spiral (#599)
+
+- fix(context): anchor compaction to actual token usage, and stop the MaxTokens spiral
+
 ## [5.2.15] - 2026-09-01
 
 - perf(agent): keep the tool block on the compaction call (#600)

@@ -1115,6 +1115,19 @@ impl ModelProvider for OllamaProvider {
         })
     }
 
+    /// The raw pinned window, as distinct from the input budget above.
+    /// Actual usage (`prompt_eval_count` + `eval_count`) is measured
+    /// against this figure — Ollama reports the *full* prompt token count
+    /// even on a prefix-cache hit, so callers can anchor context
+    /// accounting to it.
+    fn total_context_window(&self) -> Option<usize> {
+        self.effective_ctx().map(|w| w as usize)
+    }
+
+    fn output_reserve_tokens(&self) -> usize {
+        clamp_num_predict(self.effective_ctx(), self.config.num_predict).max(0) as usize
+    }
+
     fn supports_vision(&self) -> bool {
         vision_support(&self.model, self.detected_caps)
     }
@@ -1151,17 +1164,22 @@ impl ModelProvider for OllamaProvider {
         let tool_tokens = estimate_tool_tokens(&ollama_tools);
         self.note_tool_block(&ollama_tools, tool_tokens);
 
+        // Same clamp as `chat_at`: an unserveable `num_predict` would both
+        // over-trim history here and reserve more of the window than the
+        // server can honour.
+        let num_predict = clamp_num_predict(self.effective_ctx(), self.config.num_predict);
+
         let ollama_messages = Self::trim_to_budget(
             ollama_messages,
             self.effective_ctx(),
-            self.config.num_predict,
+            num_predict,
             tool_tokens,
         );
 
         let mut options = serde_json::json!({
             "temperature": self.config.temperature,
             "top_p": self.config.top_p,
-            "num_predict": self.config.num_predict,
+            "num_predict": num_predict,
         });
         if let Some(num_ctx) = self.config.num_ctx {
             options["num_ctx"] = serde_json::json!(num_ctx);
