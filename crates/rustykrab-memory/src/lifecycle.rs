@@ -204,6 +204,39 @@ impl LifecycleManager {
         Ok(count)
     }
 
+    /// Promote every Working memory for an agent to Episodic.
+    ///
+    /// For shutdown. [`Self::finalize_session`] promotes one conversation's
+    /// working set, which is right when a conversation ends; at process exit
+    /// every conversation has ended, and nothing will be added to any of
+    /// their working sets again. Waiting for the idle sweep to notice would
+    /// leave them Working until well after the next boot.
+    pub async fn finalize_working_set(&self, agent_id: Uuid) -> rustykrab_core::Result<u32> {
+        let working = self
+            .storage
+            .list_by_stage(agent_id, LifecycleStage::Working)
+            .await?;
+
+        if working.is_empty() {
+            return Ok(0);
+        }
+
+        let promotions: Vec<(Uuid, LifecycleStage)> = working
+            .iter()
+            .map(|m| (m.id, LifecycleStage::Episodic))
+            .collect();
+
+        let count = self.storage.batch_update_stages(&promotions).await?;
+
+        info!(
+            agent_id = %agent_id,
+            promoted = count,
+            "working set finalized: working → episodic"
+        );
+
+        Ok(count)
+    }
+
     /// Detect near-duplicate memories and create links between them.
     ///
     /// Thresholds (from production systems):

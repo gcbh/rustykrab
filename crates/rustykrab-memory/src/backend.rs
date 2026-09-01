@@ -37,7 +37,15 @@ fn fact_to_json(fact: &ExtractedFact) -> Value {
 pub struct HybridMemoryBackend {
     system: Arc<MemorySystem>,
     agent_id: Uuid,
-    session_id: Uuid,
+    /// Scope for writes made outside any conversation — a background task,
+    /// or a caller that constructed the backend directly. Minted once per
+    /// process by the CLI.
+    ///
+    /// It is **not** the scope of a write made while serving a turn. That is
+    /// the conversation, read from the ambient tool context by
+    /// [`Self::write_scope`]. The two were the same field once, and the
+    /// consequences are described there.
+    fallback_scope: Uuid,
     user_id: Option<Uuid>,
     /// Records which memories were handed to the model, so a later outcome
     /// can be attributed to them. See `DREAMING.md`.
@@ -45,14 +53,35 @@ pub struct HybridMemoryBackend {
 }
 
 impl HybridMemoryBackend {
-    pub fn new(system: Arc<MemorySystem>, agent_id: Uuid, session_id: Uuid) -> Self {
+    /// `fallback_scope` is used only for writes made outside a conversation.
+    /// A write made while serving a turn is scoped to that conversation —
+    /// see [`Self::write_scope`].
+    pub fn new(system: Arc<MemorySystem>, agent_id: Uuid, fallback_scope: Uuid) -> Self {
         Self {
             system,
             agent_id,
-            session_id,
+            fallback_scope,
             user_id: None,
             retrieval_log: None,
         }
+    }
+
+    /// The session a write belongs to.
+    ///
+    /// `memories.session_id` is read back as a conversation id: the gateway
+    /// persists every turn under `conversation.id`, and `search` filters on
+    /// a conversation id supplied by the caller. `memory_save` was the one
+    /// writer that used something else — the id minted once per process when
+    /// the backend was constructed — so a fact the agent deliberately saved
+    /// was stamped with a scope no session-scoped search could ever match,
+    /// and only ever surfaced through unscoped search.
+    ///
+    /// The conversation is read from the ambient tool context, which is the
+    /// same source `search` already uses to record retrievals. Outside a
+    /// runner scope there is no conversation, and the construction-time id
+    /// stands in.
+    fn write_scope(&self) -> Uuid {
+        with_session_context(|ctx| ctx.conversation_id).unwrap_or(self.fallback_scope)
     }
 
     /// Set the user ID for scoped retrieval.
@@ -77,9 +106,9 @@ impl HybridMemoryBackend {
         self.agent_id
     }
 
-    /// Get the session ID.
-    pub fn session_id(&self) -> Uuid {
-        self.session_id
+    /// The scope used for writes made outside any conversation.
+    pub fn fallback_scope(&self) -> Uuid {
+        self.fallback_scope
     }
 
     /// Search memories using hybrid retrieval (vector + FTS5 + graph + temporal).
@@ -120,10 +149,18 @@ impl HybridMemoryBackend {
                     .recall_in_session(query, self.agent_id, fetch, sid)
                     .await?;
                 if scoped.is_empty() {
-                    scope_note = Some(
-                        "no matches within this conversation; showing global results \
-                         (explicitly saved facts are stored globally)",
-                    );
+                    // Widening is still worth doing — memories from earlier
+                    // conversations are often what the agent wants — but say
+                    // so, or the model will attribute them to this one.
+                    //
+                    // This note used to add "(explicitly saved facts are
+                    // stored globally)". That was true, and it was the bug:
+                    // `memory_save` stamped facts with a process-wide id
+                    // rather than the conversation, so a scoped search could
+                    // never match one and always landed here. See
+                    // `write_scope`.
+                    scope_note =
+                        Some("no matches within this conversation; showing global results");
                     self.system.recall(query, self.agent_id, fetch).await?
                 } else {
                     scoped
@@ -244,7 +281,7 @@ impl HybridMemoryBackend {
         match self
             .system
             .writer()
-            .save_fact(self.agent_id, self.session_id, fact, tags)
+            .save_fact(self.agent_id, self.write_scope(), fact, tags)
             .await?
         {
             Some(memory_id) => Ok(json!({
@@ -271,15 +308,13 @@ impl HybridMemoryBackend {
         }))
     }
 
-    /// Finalize the current session, promoting all Working memories to Episodic.
+    /// Finalize the current scope, promoting its Working memories to Episodic.
     pub async fn finalize_session(&self) -> rustykrab_core::Result<Value> {
-        let count = self
-            .system
-            .finalize_session(self.agent_id, self.session_id)
-            .await?;
+        let scope = self.write_scope();
+        let count = self.system.finalize_session(self.agent_id, scope).await?;
 
         Ok(json!({
-            "session_id": self.session_id.to_string(),
+            "session_id": scope.to_string(),
             "promoted_to_episodic": count,
             "status": "finalized",
         }))
@@ -333,6 +368,97 @@ mod tests {
             embedder,
         ));
         HybridMemoryBackend::new(system, Uuid::new_v4(), Uuid::new_v4())
+    }
+
+    /// Build the ambient tool context a runner installs around a tool call,
+    /// so a test can exercise the in-a-conversation path.
+    fn session_context(conversation_id: Uuid) -> rustykrab_core::SessionToolContext {
+        rustykrab_core::SessionToolContext {
+            conversation_id,
+            capabilities: Arc::new(rustykrab_core::CapabilitySet::none()),
+            all_tools: Arc::new(Vec::new()),
+            active_tools: Arc::new(rustykrab_core::ActiveToolsRegistry::new()),
+            recall: Arc::new(rustykrab_core::RecallStore::new()),
+            todos: Arc::new(rustykrab_core::TodoStore::new()),
+        }
+    }
+
+    /// The bug: `memory_save` stamped every fact with the id minted when the
+    /// backend was constructed — once per process — while `search` filters on
+    /// a conversation id. No scoped search could ever match one.
+    ///
+    /// It never surfaced as "the fact is missing", because `search` falls
+    /// back to a global sweep when the scoped one comes back empty. It
+    /// surfaced as every scoped search silently widening — and the note
+    /// explaining the widening had been updated to describe the bug as
+    /// intended behaviour.
+    ///
+    /// So the assertion is on the note, not the count: the fact must be found
+    /// *within* the conversation, not by giving up on the scope.
+    #[tokio::test]
+    async fn a_saved_fact_is_found_within_its_own_conversation() {
+        let backend = backend();
+        let conversation = Uuid::new_v4();
+
+        rustykrab_core::SESSION_TOOL_CONTEXT
+            .scope(session_context(conversation), async {
+                backend.save("I prefer dark mode", &[]).await.unwrap();
+            })
+            .await;
+
+        let scoped = backend
+            .search("dark mode", &[], 10, Some(conversation))
+            .await
+            .unwrap();
+
+        assert_eq!(scoped["count"], 1);
+        assert!(
+            scoped.get("session_scope").is_none(),
+            "the fact must be found inside the conversation, not by widening \
+             to a global search: {scoped}"
+        );
+    }
+
+    /// The complement: from another conversation the fact is still reachable,
+    /// but only by widening, and the response says so. Unchanged behaviour —
+    /// pinned here because it is what makes the assertion above meaningful.
+    #[tokio::test]
+    async fn another_conversation_reaches_it_only_by_widening() {
+        let backend = backend();
+        let mine = Uuid::new_v4();
+
+        rustykrab_core::SESSION_TOOL_CONTEXT
+            .scope(session_context(mine), async {
+                backend.save("I prefer dark mode", &[]).await.unwrap();
+            })
+            .await;
+
+        let other = backend
+            .search("dark mode", &[], 10, Some(Uuid::new_v4()))
+            .await
+            .unwrap();
+
+        assert_eq!(other["count"], 1);
+        assert!(
+            other["session_scope"]
+                .as_str()
+                .is_some_and(|n| n.contains("global")),
+            "a cross-conversation hit must be labelled as one: {other}"
+        );
+    }
+
+    /// Outside a runner there is no conversation, and the write still has to
+    /// land somewhere — the construction-time scope stands in.
+    #[tokio::test]
+    async fn a_save_outside_a_conversation_falls_back_to_the_construction_scope() {
+        let backend = backend();
+        backend.save("Deploy on Fridays", &[]).await.unwrap();
+
+        let scoped = backend
+            .search("deploy", &[], 10, Some(backend.fallback_scope()))
+            .await
+            .unwrap();
+        assert_eq!(scoped["count"], 1);
     }
 
     /// The `tags` argument is honored: a tag-scoped search must exclude

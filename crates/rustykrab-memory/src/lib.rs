@@ -206,6 +206,12 @@ impl MemorySystem {
         self.lifecycle.finalize_session(agent_id, session_id).await
     }
 
+    /// Promote every Working memory for an agent to Episodic. For shutdown —
+    /// see [`lifecycle::LifecycleManager::finalize_working_set`].
+    pub async fn finalize_working_set(&self, agent_id: Uuid) -> rustykrab_core::Result<u32> {
+        self.lifecycle.finalize_working_set(agent_id).await
+    }
+
     /// Detect near-duplicate memories and create similarity links.
     pub async fn detect_near_duplicates(&self, agent_id: Uuid) -> rustykrab_core::Result<u32> {
         self.lifecycle.detect_near_duplicates(agent_id).await
