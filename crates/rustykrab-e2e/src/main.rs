@@ -28,7 +28,7 @@ mod surface;
 mod transcript;
 
 use std::process::{Child, Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Serialize;
@@ -284,7 +284,7 @@ impl Ctx {
             .args(args)
             .env_clear()
             .env("PATH", std::env::var("PATH").unwrap_or_default())
-            .env("HOME", std::env::var("HOME").unwrap_or_default())
+            .env("HOME", sandboxed_home(&self.data_dir))
             .env("RUSTYKRAB_DATA_DIR", &self.data_dir)
             .env("RUSTYKRAB_MASTER_KEY", MASTER_KEY_HEX)
             .env("RUSTYKRAB_AUTH_TOKEN", AUTH_TOKEN)
@@ -1072,10 +1072,11 @@ fn spawn_daemon_with(
         // Start from an empty environment: the developer's shell may hold
         // real credentials (which would be written into this throwaway
         // store) and RUSTYKRAB_* settings that would change behaviour and
-        // break determinism. Only PATH and HOME are carried over.
+        // break determinism. Only PATH is carried over; HOME is
+        // redirected into the trial dir -- see `sandboxed_home`.
         .env_clear()
         .env("PATH", std::env::var("PATH").unwrap_or_default())
-        .env("HOME", std::env::var("HOME").unwrap_or_default())
+        .env("HOME", sandboxed_home(data_dir))
         .env("RUSTYKRAB_DATA_DIR", data_dir)
         .env("RUSTYKRAB_PORT", port.to_string())
         .env("RUSTYKRAB_MASTER_KEY", MASTER_KEY_HEX)
@@ -1237,6 +1238,107 @@ fn shared_model_cache() -> std::path::PathBuf {
     dir
 }
 
+/// A `HOME` for a spawned daemon: the trial's own data dir, never the
+/// operator's.
+///
+/// Two things follow from `HOME`, and both must be per-trial.
+///
+/// The browser tool symlinks the *real* Chrome profile
+/// (`$HOME/Library/Application Support/Google/Chrome/<Profile>`) into the
+/// user-data dir it launches with, so the agent inherits the operator's
+/// cookies and sessions. That is deliberate and correct in production --
+/// it is what gets an agent past bot protection -- and it is exactly
+/// wrong here. A suite that inherits it can sign into a live provider as
+/// the operator, and it cannot measure anything: the first trial that
+/// logs in leaves a cookie every later trial rides, which scores as
+/// `SucceededWithoutAsking` and looks like a finding rather than
+/// leakage.
+///
+/// It also decides where `resolve_user_data_dir` puts the profile
+/// (`$HOME/.rustykrab/browser/...`), so pointing `HOME` at the trial dir
+/// isolates trials from each other as well.
+///
+/// Deliberately not a production switch. The linking behaviour is wanted
+/// everywhere except a test, and a test's needs do not belong in the
+/// product's configuration.
+/// Kill any browser launched with a user-data-dir under `data_dir`.
+///
+/// The daemon spawns Chrome and never reaps it, so `shutdown_daemon`
+/// leaves it running. Scoped to the trial's own path on purpose: a
+/// pattern any broader would kill the operator's browser, and this runs
+/// on a developer's machine.
+/// Refuse to start when the model cannot answer.
+///
+/// The README has described this check for some time; it was never
+/// implemented, and its absence costs exactly what the README says it
+/// would. A wedged Ollama -- loaded, holding VRAM, answering `/api/tags`,
+/// but serving nothing -- produced five consecutive `NeverAsked` trials
+/// at 321s each. Every one looked like an agent that declined to ask for
+/// a credential. None of them ever received a token.
+///
+/// One trivial generation distinguishes "the model is there" from "the
+/// model is working", which `/api/tags` cannot. The budget is generous
+/// because a cold load of a 26B model is tens of seconds; it is bounded
+/// because the failure being caught is an unbounded hang.
+async fn preflight_model(ollama_url: &str, model: &str) -> Result<()> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(PREFLIGHT_BUDGET_SECS))
+        .build()?;
+
+    let tags = format!("{}/api/tags", ollama_url.trim_end_matches('/'));
+    client.get(&tags).send().await.with_context(|| {
+        format!("Ollama is not reachable at {ollama_url}. Start it, or pass --ollama-url.")
+    })?;
+
+    let started = Instant::now();
+    let body = serde_json::json!({ "model": model, "prompt": "say ok", "stream": false });
+    let resp = client
+        .post(format!("{}/api/generate", ollama_url.trim_end_matches('/')))
+        .json(&body)
+        .send()
+        .await
+        .with_context(|| {
+            format!(
+                "'{model}' did not answer a one-word prompt within {PREFLIGHT_BUDGET_SECS}s. \
+                 Ollama serves one request at a time per model, so another client holding \
+                 the slot -- a running RustyKrab daemon is the usual culprit -- stops this \
+                 suite rather than slowing it. A wedged server behaves the same way and \
+                 needs a restart. Pull the model with `ollama pull {model}` if it is absent."
+            )
+        })?;
+    if !resp.status().is_success() {
+        bail!(
+            "Ollama answered {} for a trivial generation with '{model}'",
+            resp.status()
+        );
+    }
+    eprintln!(
+        "preflight: {model} answered in {:.1}s",
+        started.elapsed().as_secs_f64()
+    );
+    Ok(())
+}
+
+fn kill_browser_for(data_dir: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        let pattern = format!("user-data-dir={}", data_dir.display());
+        let _ = std::process::Command::new("pkill")
+            .args(["-f", &pattern])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+}
+
+fn sandboxed_home(data_dir: &std::path::Path) -> std::ffi::OsString {
+    let home = data_dir.join("home");
+    let _ = std::fs::create_dir_all(&home);
+    home.into_os_string()
+}
+
+const PREFLIGHT_BUDGET_SECS: u64 = 120;
+
 async fn wait_for_health(base: &str, client: &reqwest::Client, child: &mut Child) -> Result<()> {
     for _ in 0..240 {
         if let Some(status) = child.try_wait()? {
@@ -1304,6 +1406,8 @@ struct Args {
     mode: String,
     reps: usize,
     trials: usize,
+    /// Ceiling on one trial. See `login_suite::DEFAULT_TRIAL_TIMEOUT`.
+    trial_timeout: Duration,
     surfaces: Vec<surface::Surface>,
     resume: bool,
     case_filter: Option<String>,
@@ -1319,6 +1423,7 @@ fn parse_args(argv: &[String]) -> std::result::Result<Args, String> {
         mode: "scripted".to_string(),
         reps: 3,
         trials: 5,
+        trial_timeout: login_suite::DEFAULT_TRIAL_TIMEOUT,
         resume: false,
         // Signal is omitted on purpose: nothing in the daemon reads its
         // inbound queue, so every trial would time out. Requesting it
@@ -1370,6 +1475,17 @@ fn parse_args(argv: &[String]) -> std::result::Result<Args, String> {
             "--case" => {
                 args.case_filter = Some(value(i, "--case")?);
                 i += 1;
+            }
+            "--trial-timeout" => {
+                let v = value(i, "--trial-timeout")?;
+                let secs: u64 = v
+                    .parse()
+                    .map_err(|_| format!("--trial-timeout: not a number of seconds: {v}"))?;
+                if secs == 0 {
+                    return Err("--trial-timeout must be at least 1 second".to_string());
+                }
+                args.trial_timeout = Duration::from_secs(secs);
+                i += 2;
             }
             "--trials" => {
                 let v = value(i, "--trials")?;
@@ -1500,6 +1616,11 @@ async fn main() -> Result<()> {
         judge_name = Some(name);
     }
 
+    // Nothing model-backed is worth starting if the model cannot answer.
+    if matches!(args.mode.as_str(), "model" | "credential" | "login" | "all") {
+        preflight_model(&args.ollama_url, &args.model).await?;
+    }
+
     if args.mode == "credential" || args.mode == "all" {
         let (cells, trial_results) = credential_suite::run(
             &bin,
@@ -1508,7 +1629,7 @@ async fn main() -> Result<()> {
             args.trials,
             &args.surfaces,
             args.case_filter.as_deref(),
-            Duration::from_secs(900),
+            args.trial_timeout,
             args.resume,
         )
         .await?;
@@ -1525,7 +1646,7 @@ async fn main() -> Result<()> {
             &args.ollama_url,
             args.trials,
             args.case_filter.as_deref(),
-            Duration::from_secs(900),
+            args.trial_timeout,
         )
         .await?;
         reports.extend(cells);
