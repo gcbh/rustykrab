@@ -1568,6 +1568,26 @@ const HEARTBEAT_TIMEOUT_SECS: u64 = 1800; // 30 minutes
 /// Telegram's typing indicator expires after ~5 seconds.
 const TYPING_INTERVAL_SECS: u64 = 4;
 
+/// Address of a Telegram chat (or forum topic) for
+/// [`rustykrab_store::ChannelBindingStore`].
+fn telegram_address(chat_id: i64, thread_id: i64) -> rustykrab_store::ChannelAddress {
+    rustykrab_store::ChannelAddress::Telegram { chat_id, thread_id }
+}
+
+/// Address of a Slack channel or thread for
+/// [`rustykrab_store::ChannelBindingStore`].
+fn slack_address(
+    team_id: &str,
+    channel_id: &str,
+    thread_ts: &str,
+) -> rustykrab_store::ChannelAddress {
+    rustykrab_store::ChannelAddress::Slack {
+        team_id: team_id.to_string(),
+        channel_id: channel_id.to_string(),
+        thread_ts: thread_ts.to_string(),
+    }
+}
+
 fn epoch_millis() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1621,8 +1641,13 @@ async fn telegram_agent_loop(
                     }
                     states.remove(&key);
                 }
-                if let Err(e) = state.store.chat_map().remove(chat_id, thread_id).await {
-                    tracing::warn!(chat_id, thread_id, "failed to remove chat map entry: {e}");
+                if let Err(e) = state
+                    .store
+                    .channel_bindings()
+                    .unbind(&telegram_address(chat_id, thread_id))
+                    .await
+                {
+                    tracing::warn!(chat_id, thread_id, "failed to remove channel binding: {e}");
                 }
                 return;
             }
@@ -1672,8 +1697,8 @@ async fn telegram_agent_loop(
                     None => {
                         let db_id = state
                             .store
-                            .chat_map()
-                            .lookup(chat_id, thread_id)
+                            .channel_bindings()
+                            .lookup(&telegram_address(chat_id, thread_id))
                             .await
                             .ok()
                             .flatten();
@@ -1716,13 +1741,16 @@ async fn telegram_agent_loop(
                                             active_handle: None,
                                         },
                                     );
-                                    if let Err(e) =
-                                        state.store.chat_map().upsert(chat_id, thread_id, id).await
+                                    if let Err(e) = state
+                                        .store
+                                        .channel_bindings()
+                                        .bind(&telegram_address(chat_id, thread_id), id)
+                                        .await
                                     {
                                         tracing::warn!(
                                             chat_id,
                                             thread_id,
-                                            "failed to persist chat map: {e}"
+                                            "failed to persist channel binding: {e}"
                                         );
                                     }
                                     tracing::info!(
@@ -2038,15 +2066,19 @@ async fn slack_agent_loop(
                 }
                 if let Err(e) = state
                     .store
-                    .slack_chat_map()
-                    .remove(&inbound.team_id, &inbound.channel_id, &effective_thread_ts)
+                    .channel_bindings()
+                    .unbind(&slack_address(
+                        &inbound.team_id,
+                        &inbound.channel_id,
+                        &effective_thread_ts,
+                    ))
                     .await
                 {
                     tracing::warn!(
                         team_id = %inbound.team_id,
                         channel_id = %inbound.channel_id,
                         thread_ts = %effective_thread_ts,
-                        "failed to remove Slack chat map entry: {e}"
+                        "failed to remove Slack channel binding: {e}"
                     );
                 }
                 return;
@@ -2065,8 +2097,12 @@ async fn slack_agent_loop(
                     None => {
                         let db_id = state
                             .store
-                            .slack_chat_map()
-                            .lookup(&inbound.team_id, &inbound.channel_id, &effective_thread_ts)
+                            .channel_bindings()
+                            .lookup(&slack_address(
+                                &inbound.team_id,
+                                &inbound.channel_id,
+                                &effective_thread_ts,
+                            ))
                             .await
                             .ok()
                             .flatten();
@@ -2110,11 +2146,13 @@ async fn slack_agent_loop(
                                     );
                                     if let Err(e) = state
                                         .store
-                                        .slack_chat_map()
-                                        .upsert(
-                                            &inbound.team_id,
-                                            &inbound.channel_id,
-                                            &effective_thread_ts,
+                                        .channel_bindings()
+                                        .bind(
+                                            &slack_address(
+                                                &inbound.team_id,
+                                                &inbound.channel_id,
+                                                &effective_thread_ts,
+                                            ),
                                             id,
                                         )
                                         .await
@@ -2123,7 +2161,7 @@ async fn slack_agent_loop(
                                             team_id = %inbound.team_id,
                                             channel_id = %inbound.channel_id,
                                             thread_ts = %effective_thread_ts,
-                                            "failed to persist Slack chat map: {e}"
+                                            "failed to persist Slack channel binding: {e}"
                                         );
                                     }
                                     tracing::info!(
