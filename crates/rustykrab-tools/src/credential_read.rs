@@ -131,13 +131,7 @@ impl CredentialReadTool {
                         "why": "This credential is held in the OS secure store. Its value is \
                                 deliberately not returned here so it never enters the \
                                 conversation.",
-                        "how_to_use": format!(
-                            "Do not try to read it again — the answer will not change. \
-                             To sign in with it, take a browser snapshot and call \
-                             browser(action='fill_credential', ref=<ref>, field='username') \
-                             then field='password'. That reads '{name}' directly and types \
-                             it into the page without showing it to you."
-                        ),
+                        "how_to_use": how_to_use(name),
                     })),
                     Ok(value) => Ok(json!({
                         "source": "store",
@@ -256,6 +250,38 @@ impl CredentialReadTool {
                 format!("unknown action '{other}', expected 'get' or 'list'").into(),
             )),
         }
+    }
+}
+
+/// How to use a credential whose value cannot be returned.
+///
+/// This used to prescribe a login: fill `username`, then `password`.
+/// That is a recipe for one situation stated as if it were the only one.
+/// The tool is asked about a single credential, and the roles include
+/// `totp`, `otp`, `email` and `pin` -- for any of those, instructions to
+/// fill a username and a password name two credentials that were not
+/// asked about and omit the one that was. For a stored secret that is
+/// not a web credential at all, "take a browser snapshot" is not merely
+/// incomplete, it points somewhere there is nothing to do.
+///
+/// So: name the field this key actually encodes, and when the key
+/// encodes nothing, say what is true and stop rather than invent a
+/// procedure.
+fn how_to_use(name: &str) -> String {
+    let common = "Do not try to read it again — the answer will not change.";
+    match crate::origin_key::role_of_web_key(name) {
+        Some(role) => format!(
+            "{common} To use it on a page, take a browser snapshot and call \
+             browser(action='fill_credential', ref=<ref>, field='{role}'). That reads \
+             '{name}' directly and types it into the page without showing it to you. \
+             Other fields on the same form are separate credentials with their own \
+             names; fill each one with its own call."
+        ),
+        None => format!(
+            "{common} '{name}' is not a web credential, so there is no field to fill. \
+             Tools that can use it read it from the store themselves; its value is \
+             not available to you here."
+        ),
     }
 }
 
@@ -397,5 +423,44 @@ mod hardware_held_tests {
         assert_eq!(held, vec!["web_example_com_password"]);
         assert_eq!(readable, vec!["plain_token"]);
         assert!(!out.to_string().contains("hunter2"), "leaked: {out}");
+    }
+
+    /// The advice must name the field this key encodes -- not a login
+    /// recipe that happens to be right for two of the six roles.
+    #[test]
+    fn advice_names_the_role_the_key_encodes() {
+        let totp = super::how_to_use("web_example_com_totp");
+        assert!(totp.contains("field='totp'"), "{totp}");
+        assert!(
+            !totp.contains("username") && !totp.contains("password"),
+            "a totp is not a username/password pair: {totp}"
+        );
+
+        let pw = super::how_to_use("web_example_com_password");
+        assert!(pw.contains("field='password'"), "{pw}");
+        assert!(
+            !pw.contains("field='username'"),
+            "only the key asked about: {pw}"
+        );
+    }
+
+    /// A stored secret that is not a web credential has no field to fill,
+    /// and pointing at a browser would send the agent somewhere with
+    /// nothing to do.
+    #[test]
+    fn non_web_secrets_get_no_browser_instructions() {
+        let out = super::how_to_use("stripe_api_key");
+        assert!(!out.contains("fill_credential"), "{out}");
+        assert!(!out.contains("snapshot"), "{out}");
+        assert!(out.contains("not a web credential"), "{out}");
+    }
+
+    /// Every role the key format supports must produce usable advice.
+    #[test]
+    fn every_supported_role_is_named() {
+        for role in ["username", "password", "email", "totp", "otp", "pin"] {
+            let out = super::how_to_use(&format!("web_example_com_{role}"));
+            assert!(out.contains(&format!("field='{role}'")), "{role}: {out}");
+        }
     }
 }
