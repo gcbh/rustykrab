@@ -107,11 +107,32 @@ impl MemorySystem {
     /// - `config`: tuning parameters for chunking, retrieval, and lifecycle.
     /// - `storage`: the backing store (SQLite, PostgreSQL, etc.).
     /// - `embedder`: the text embedding model (fastembed, API-based, etc.).
+    /// Build a memory system.
+    ///
+    /// Validates the config, because the values it guards are ones nothing
+    /// downstream can defend itself against: `rrf_k == 0.0` divides by zero
+    /// inside rank fusion, and `chunk_max_tokens == 0` loops forever. Both
+    /// used to surface as a panic on the first query, arbitrarily far from
+    /// the code that chose the value.
+    ///
+    /// # Panics
+    ///
+    /// If the config is invalid. Use [`Self::try_new`] to handle it.
     pub fn new(
         config: MemoryConfig,
         storage: Arc<dyn MemoryStorage>,
         embedder: Arc<dyn embedding::Embedder>,
     ) -> Self {
+        Self::try_new(config, storage, embedder).expect("invalid MemoryConfig")
+    }
+
+    /// [`Self::new`], returning the validation error instead of panicking.
+    pub fn try_new(
+        config: MemoryConfig,
+        storage: Arc<dyn MemoryStorage>,
+        embedder: Arc<dyn embedding::Embedder>,
+    ) -> std::result::Result<Self, config::ConfigValidationError> {
+        config.validate()?;
         let writer = MemoryWriter::new(Arc::clone(&storage), Arc::clone(&embedder), config.clone());
 
         let retriever =
@@ -120,13 +141,13 @@ impl MemorySystem {
         let lifecycle =
             LifecycleManager::new(Arc::clone(&storage), Arc::clone(&embedder), config.clone());
 
-        Self {
+        Ok(Self {
             writer,
             retriever,
             lifecycle,
             storage,
             config,
-        }
+        })
     }
 
     // ── Write path ──────────────────────────────────────────────
