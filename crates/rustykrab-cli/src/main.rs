@@ -53,50 +53,6 @@ use uuid::Uuid;
 /// Adapter bridging [HybridMemoryBackend] (rustykrab-memory) to the
 /// [MemoryBackend] trait (rustykrab-tools) so the memory tools can use
 /// the hybrid retrieval engine.
-struct MemoryAdapter {
-    inner: HybridMemoryBackend,
-}
-
-#[async_trait::async_trait]
-impl MemoryBackend for MemoryAdapter {
-    async fn search(
-        &self,
-        query: &str,
-        tags: &[String],
-        limit: usize,
-        session_id: Option<&str>,
-    ) -> rustykrab_core::Result<serde_json::Value> {
-        match session_id {
-            Some(raw) => match Uuid::parse_str(raw.trim()) {
-                Ok(sid) => self.inner.search(query, tags, limit, Some(sid)).await,
-                Err(_) => {
-                    // Degrade to a global search, but say so — a silently
-                    // widened scope would let the model attribute other
-                    // conversations' memories to this one.
-                    let mut result = self.inner.search(query, tags, limit, None).await?;
-                    result["session_scope"] = serde_json::json!(
-                        "session_id was not a valid conversation id; results are global"
-                    );
-                    Ok(result)
-                }
-            },
-            None => self.inner.search(query, tags, limit, None).await,
-        }
-    }
-    async fn get(&self, memory_id: &str) -> rustykrab_core::Result<serde_json::Value> {
-        self.inner.get(memory_id).await
-    }
-    async fn save(&self, fact: &str, tags: &[String]) -> rustykrab_core::Result<serde_json::Value> {
-        self.inner.save(fact, tags).await
-    }
-    async fn delete(&self, memory_id: &str) -> rustykrab_core::Result<serde_json::Value> {
-        self.inner.delete(memory_id).await
-    }
-    async fn list(&self) -> rustykrab_core::Result<serde_json::Value> {
-        self.inner.list().await
-    }
-}
-
 /// Adapter bridging [rustykrab_store::JobStore] to the [CronBackend] trait
 /// (rustykrab-tools) so the cron tool can manage scheduled jobs.
 struct CronAdapter {
@@ -753,14 +709,12 @@ async fn main() -> anyhow::Result<()> {
     let retrieval_log = rustykrab_core::retrieval_log::RetrievalLog::new();
     let activity_tracker = rustykrab_core::activity::ActivityTracker::new();
 
-    let memory_backend: Arc<dyn MemoryBackend> = Arc::new(MemoryAdapter {
-        inner: HybridMemoryBackend::new(
-            Arc::clone(&memory_system),
-            agent_id,
-            fallback_memory_scope,
-        )
-        .with_retrieval_log(retrieval_log.clone()),
-    });
+    // `HybridMemoryBackend` implements `MemoryBackend` itself now, so there is
+    // nothing left for the binary to bridge.
+    let memory_backend: Arc<dyn MemoryBackend> = Arc::new(
+        HybridMemoryBackend::new(Arc::clone(&memory_system), agent_id, fallback_memory_scope)
+            .with_retrieval_log(retrieval_log.clone()),
+    );
     tracing::info!(%agent_id, "memory system initialized");
 
     // --- Idle lifecycle sweep ---
