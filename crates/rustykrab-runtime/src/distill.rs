@@ -14,7 +14,23 @@
 //! guard, so it matches "any words + is + any words".
 //!
 //! So this module asks a model instead, once per inbound message, and writes
-//! what comes back at [`LifecycleStage::Semantic`].
+//! what comes back to the tier its kind calls for — see [`FactKind`].
+//!
+//! ## Why two tiers and not one
+//!
+//! Letting use earn persistence is the right default: a preference or a
+//! standing instruction gets exercised, so decay is a reasonable filter, and
+//! `Episodic` is retrievable immediately and promotes to `Semantic` after
+//! three accesses and seven days.
+//!
+//! It is the wrong default for contact details, because there the argument
+//! inverts. `Episodic` decays to `Archival` after 30+ idle days at typical
+//! importance — 30 days at importance 0.5, 72 at 0.9 — and `Archival` is
+//! excluded by `LifecycleStage::is_retrievable`. A phone number is needed
+//! rarely and urgently, so silence is not evidence of irrelevance, and
+//! decaying one would reproduce exactly the failure this module exists to
+//! fix, on a delay. `Semantic` is the only stage the sweep never demotes:
+//! its demotion loop iterates episodic alone.
 //!
 //! ## Two things that are easy to get wrong
 //!
@@ -82,8 +98,55 @@ fn system_prompt() -> &'static str {
      Write each fact as one self-contained sentence naming the user \
      explicitly, e.g. \"The user's phone number is 555-0100.\" — never a \
      pronoun, never a fragment.\n\
+     Tag each fact with a kind: \"identity\" (names, who they are), \
+     \"contact\" (phone, email, address), \"preference\" (what they like), \
+     or \"instruction\" (a standing or recurring request).\n\
      Reply with JSON only, no prose and no code fence: \
-     {\"facts\": [\"...\"]}. If there is nothing durable, reply {\"facts\": []}."
+     {\"facts\": [{\"text\": \"...\", \"kind\": \"...\"}]}. \
+     If there is nothing durable, reply {\"facts\": []}."
+}
+
+/// What kind of durable fact a statement is, which decides where it is kept.
+///
+/// The split is not about importance. It is about whether *not being used*
+/// is evidence of irrelevance. For a preference or a standing instruction it
+/// roughly is — those get exercised, and the lifecycle's decay is a
+/// reasonable filter. For a phone number it is the opposite: contact details
+/// are needed rarely and urgently, so silence means nothing, and letting one
+/// decay would reproduce the failure this module exists to fix, just on a
+/// delay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FactKind {
+    /// Who the user is, and how to reach them.
+    Identity,
+    /// What they like, and what they have asked for on a standing basis.
+    Behavioural,
+}
+
+impl FactKind {
+    /// Parse the classifier's tag. Anything unrecognised is treated as
+    /// behavioural: still retrievable, still promotable on use, and it does
+    /// not silently inflate the tier that never decays.
+    fn from_tag(tag: &str) -> Self {
+        match tag.trim().to_ascii_lowercase().as_str() {
+            "identity" | "contact" => Self::Identity,
+            _ => Self::Behavioural,
+        }
+    }
+
+    /// Where a fact of this kind is written.
+    ///
+    /// `Semantic` is the only stage the lifecycle sweep never demotes — the
+    /// demotion loop iterates episodic alone. `Episodic` is retrievable
+    /// immediately and promotes to semantic after three accesses and seven
+    /// days, but decays to `Archival` — which is *not* retrievable — after
+    /// 30+ idle days at typical importance.
+    pub(crate) fn stage(self) -> LifecycleStage {
+        match self {
+            Self::Identity => LifecycleStage::Semantic,
+            Self::Behavioural => LifecycleStage::Episodic,
+        }
+    }
 }
 
 /// Pull the statement list out of a classifier reply.
@@ -95,7 +158,7 @@ fn system_prompt() -> &'static str {
 /// Tolerates a code fence because local models add one regardless of
 /// instructions; anything beyond that is treated as a failed classification
 /// rather than something to repair by guesswork.
-pub(crate) fn parse_statements(raw: &str) -> Option<Vec<String>> {
+pub(crate) fn parse_statements(raw: &str) -> Option<Vec<(String, FactKind)>> {
     let trimmed = raw.trim();
     // Strip a ```json ... ``` wrapper if present.
     let body = trimmed
@@ -109,15 +172,27 @@ pub(crate) fn parse_statements(raw: &str) -> Option<Vec<String>> {
 
     let mut out = Vec::new();
     for f in facts.iter().take(MAX_STATEMENTS) {
-        let s = f.as_str()?.trim();
-        if s.is_empty() {
+        // A bare string is accepted as well as the tagged object: local
+        // models drop the tag often enough that rejecting the whole reply
+        // over it would throw away facts we did get. An untagged fact is
+        // behavioural, the tier that decays — never the one that does not.
+        let (text, kind) = match f {
+            serde_json::Value::String(s) => (s.as_str(), FactKind::Behavioural),
+            serde_json::Value::Object(_) => (
+                f.get("text")?.as_str()?,
+                FactKind::from_tag(f.get("kind").and_then(|k| k.as_str()).unwrap_or("")),
+            ),
+            _ => return None,
+        };
+        let text = text.trim();
+        if text.is_empty() {
             continue;
         }
-        let mut s = s.to_string();
-        if s.chars().count() > MAX_STATEMENT_CHARS {
-            s = s.chars().take(MAX_STATEMENT_CHARS).collect();
+        let mut text = text.to_string();
+        if text.chars().count() > MAX_STATEMENT_CHARS {
+            text = text.chars().take(MAX_STATEMENT_CHARS).collect();
         }
-        out.push(s);
+        out.push((text, kind));
     }
     Some(out)
 }
@@ -165,7 +240,10 @@ fn text_message(role: Role, text: String) -> Message {
 /// Ask the classifier what is durable in `content`.
 ///
 /// Returns `None` on any failure — transport, refusal, or unparseable reply.
-async fn distil(provider: &Arc<dyn ModelProvider>, content: &str) -> Option<Vec<String>> {
+async fn distil(
+    provider: &Arc<dyn ModelProvider>,
+    content: &str,
+) -> Option<Vec<(String, FactKind)>> {
     let messages = vec![
         text_message(Role::System, system_prompt().to_string()),
         text_message(Role::User, format!("Message: {content:?}")),
@@ -188,7 +266,8 @@ async fn distil(provider: &Arc<dyn ModelProvider>, content: &str) -> Option<Vec<
     parsed
 }
 
-/// Classify `msg` and write any durable statements to semantic memory.
+/// Classify `msg` and write any durable statements, each to the tier its
+/// kind calls for.
 ///
 /// Spawned detached by the caller: there is one local model and agent turns
 /// have been measured taking minutes, so anything on the inbound path must
@@ -207,7 +286,7 @@ pub async fn distil_into_memory(
     if statements.is_empty() {
         return;
     }
-    for (i, statement) in statements.into_iter().enumerate() {
+    for (i, (statement, kind)) in statements.into_iter().enumerate() {
         let turn = ConversationTurn {
             id: Uuid::new_v4(),
             session_id,
@@ -225,11 +304,14 @@ pub async fn distil_into_memory(
                 tags: vec!["distilled".to_string()],
             },
         };
-        match memory
-            .retain_with_stage(turn, agent_id, LifecycleStage::Semantic)
-            .await
-        {
-            Ok(_) => tracing::info!(statement = %statement, "distilled a durable fact"),
+        let stage = kind.stage();
+        match memory.retain_with_stage(turn, agent_id, stage).await {
+            Ok(_) => tracing::info!(
+                statement = %statement,
+                ?kind,
+                ?stage,
+                "distilled a durable fact"
+            ),
             Err(e) => tracing::warn!(error = %e, "failed to store a distilled fact"),
         }
     }
@@ -287,8 +369,13 @@ mod tests {
 
     #[test]
     fn a_plain_reply_parses() {
+        // A bare string is still accepted, and is behavioural: an untagged
+        // fact must never land in the tier that never decays.
         let got = parse_statements(r#"{"facts": ["The user's name is Ada."]}"#).unwrap();
-        assert_eq!(got, vec!["The user's name is Ada.".to_string()]);
+        assert_eq!(
+            got,
+            vec![("The user's name is Ada.".to_string(), FactKind::Behavioural)]
+        );
     }
 
     #[test]
@@ -301,10 +388,13 @@ mod tests {
 
     #[test]
     fn a_code_fence_is_tolerated() {
-        let raw = "```json\n{\"facts\": [\"The user lives in Lisbon.\"]}\n```";
+        let raw = "```json\n{\"facts\": [{\"text\": \"The user lives in Lisbon.\", \"kind\": \"contact\"}]}\n```";
         assert_eq!(
             parse_statements(raw),
-            Some(vec!["The user lives in Lisbon.".to_string()])
+            Some(vec![(
+                "The user lives in Lisbon.".to_string(),
+                FactKind::Identity
+            )])
         );
     }
 
@@ -322,6 +412,63 @@ mod tests {
         }
     }
 
+    /// The whole point of the split, pinned. Contact details must land in
+    /// the one stage the sweep never demotes; everything else earns its keep.
+    #[test]
+    fn identity_and_contact_go_somewhere_that_does_not_decay() {
+        assert_eq!(
+            FactKind::from_tag("identity").stage(),
+            LifecycleStage::Semantic
+        );
+        assert_eq!(
+            FactKind::from_tag("contact").stage(),
+            LifecycleStage::Semantic
+        );
+    }
+
+    #[test]
+    fn preferences_and_instructions_earn_promotion_instead() {
+        for tag in ["preference", "instruction"] {
+            assert_eq!(
+                FactKind::from_tag(tag).stage(),
+                LifecycleStage::Episodic,
+                "{tag} should be allowed to decay if never used"
+            );
+        }
+    }
+
+    /// An unrecognised or missing tag must not be able to place a fact in the
+    /// permanent tier. Erring the other way would let a model typo inflate
+    /// the one stage nothing ever clears.
+    #[test]
+    fn an_unknown_tag_defaults_to_the_decaying_tier() {
+        for tag in ["", "cOnTaCtS", "whatever", "semantic"] {
+            assert_eq!(
+                FactKind::from_tag(tag).stage(),
+                LifecycleStage::Episodic,
+                "unknown tag {tag:?} must not reach Semantic"
+            );
+        }
+    }
+
+    #[test]
+    fn tag_matching_ignores_case_and_padding() {
+        assert_eq!(FactKind::from_tag("  Identity "), FactKind::Identity);
+        assert_eq!(FactKind::from_tag("CONTACT"), FactKind::Identity);
+    }
+
+    #[test]
+    fn a_tagged_reply_routes_each_fact_separately() {
+        let raw = r#"{"facts": [
+            {"text": "The user's phone number is 555-0100.", "kind": "contact"},
+            {"text": "The user prefers aisle seats.", "kind": "preference"}
+        ]}"#;
+        let got = parse_statements(raw).unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].1.stage(), LifecycleStage::Semantic);
+        assert_eq!(got[1].1.stage(), LifecycleStage::Episodic);
+    }
+
     #[test]
     fn a_runaway_list_is_capped() {
         let many: Vec<String> = (0..50).map(|i| format!("Fact {i}")).collect();
@@ -334,7 +481,7 @@ mod tests {
         let long = "x".repeat(MAX_STATEMENT_CHARS + 50);
         let raw = serde_json::json!({ "facts": [long] }).to_string();
         let got = parse_statements(&raw).unwrap();
-        assert_eq!(got[0].chars().count(), MAX_STATEMENT_CHARS);
+        assert_eq!(got[0].0.chars().count(), MAX_STATEMENT_CHARS);
     }
 
     #[test]
