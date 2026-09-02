@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 rustykrab-core.workspace = true
+rustykrab-projects.workspace = true
 async-trait.workspace = true
 rusqlite = { version = "0.34", features = ["bundled"] }
 tokio.workspace = true
