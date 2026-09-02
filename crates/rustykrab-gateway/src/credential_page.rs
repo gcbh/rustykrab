@@ -244,10 +244,14 @@ fn form_page(req: &CredentialRequest, token: &str, error: Option<&str>) -> Strin
 }
 
 fn page(title: &str, body: &str) -> String {
+    // `no-referrer` also serializes the Origin of a form POST as `null` in
+    // WebKit, so the gateway's origin guard rejects the credential before
+    // it reaches `submit`. `same-origin` preserves the real Origin for this
+    // POST while still withholding the one-time token from other origins.
     format!(
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
 <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
-<meta name=\"referrer\" content=\"no-referrer\">\
+<meta name=\"referrer\" content=\"same-origin\">\
 <title>{}</title><style>\
 :root{{color-scheme:light dark}}\
 body{{font:16px/1.5 -apple-system,BlinkMacSystemFont,'SF Pro Text',sans-serif;\
@@ -314,5 +318,12 @@ mod tests {
         let out = page("t", &esc("<script>alert(1)</script>"));
         assert!(!out.contains("<script>alert"));
         assert!(out.contains("&lt;script&gt;"));
+    }
+
+    #[test]
+    fn form_post_keeps_its_origin_without_leaking_the_token_cross_origin() {
+        let out = page("credential", "form");
+        assert!(out.contains("<meta name=\"referrer\" content=\"same-origin\">"));
+        assert!(!out.contains("content=\"no-referrer\""));
     }
 }
