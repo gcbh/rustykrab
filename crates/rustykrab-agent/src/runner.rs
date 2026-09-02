@@ -1441,8 +1441,9 @@ impl AgentRunner {
         // inner loop's many exit paths fired. Still one tracer per run,
         // so there is no cross-session leakage (H8).
         let tracer = ExecutionTracer::new();
+        let discard = |_event: AgentEvent| {};
         let result = SESSION_TOOL_CONTEXT
-            .scope(ctx, self.run_inner(conv, session, &tracer))
+            .scope(ctx, self.run_inner(conv, session, &discard, &tracer))
             .await;
         self.capture_outcome(session, &tracer, result.is_err())
             .await;
@@ -1454,10 +1455,19 @@ impl AgentRunner {
         result
     }
 
+    /// The agent loop. One implementation, parameterised by an event sink.
+    ///
+    /// There were two of these — `run_inner` and `run_streaming_inner` — 81%
+    /// identical, so every behavioural fix had to be made twice, and a fix
+    /// applied to only one changed behaviour on one transport and not the
+    /// other. This is the streaming body, which was the strict superset; the
+    /// non-streaming entry point passes a sink that discards, so all it gives
+    /// up is events it was never going to deliver.
     async fn run_inner(
         &self,
         conv: &mut Conversation,
         session: &Session,
+        on_event: &(dyn Fn(AgentEvent) + Send + Sync),
         tracer: &ExecutionTracer,
     ) -> Result<()> {
         if session.is_expired() {
@@ -1472,22 +1482,12 @@ impl AgentRunner {
 
         let mut consecutive_errors = 0;
         let mut soft_warning_injected = false;
-        // Per-category retry counters (à la OpenClaw incomplete-turn).
         let mut empty_response_retries: usize = 0;
         let mut planning_only_retries: usize = 0;
         let mut empty_tool_use_retries: usize = 0;
         let mut max_tokens_retries: usize = 0;
-        // Cap re-prompts that nudge the model to call `task_complete` after
-        // it stops with text alone mid-task.
         let mut task_complete_retries: usize = 0;
-        // Track whether any side-effect tool has been executed this run,
-        // so we can suppress retries that might duplicate externally-visible actions.
         let mut had_side_effects = false;
-        // Track whether the agent has called any tool this run. Used to
-        // gate the new "must call task_complete to stop" behavior: a
-        // text-only first response (greeting, direct Q&A) still ends the
-        // turn, but once the model has started using tools we expect an
-        // explicit completion signal.
         let mut has_called_any_tool = false;
         // Set when a tool reports the turn is now waiting on someone
         // else. Not reset per iteration: once the agent has asked the
@@ -1526,6 +1526,7 @@ impl AgentRunner {
             // summarize before the next call (RLM paper §3.2).
             if self.needs_compaction(conv) {
                 tracing::info!(iteration, "conversation crossed compaction threshold");
+                on_event(AgentEvent::Compressing);
                 self.compact_history(conv, compaction_tools).await?;
             }
 
@@ -1549,6 +1550,12 @@ impl AgentRunner {
                     },
                 );
             }
+
+            let stream_callback = |event: StreamEvent| {
+                if let StreamEvent::TextDelta(delta) = event {
+                    on_event(AgentEvent::TextDelta(delta));
+                }
+            };
 
             // Already refreshed above, before the compaction check that
             // depends on it.
@@ -1575,7 +1582,7 @@ impl AgentRunner {
                 ..
             } = self
                 .provider
-                .chat_with_choice(&conv.messages, schemas, tool_choice)
+                .chat_stream_with_choice(&conv.messages, schemas, tool_choice, &stream_callback)
                 .await?;
             let llm_elapsed = llm_start.elapsed();
             tracing::info!(
@@ -1627,508 +1634,6 @@ impl AgentRunner {
                 // surface it as the final assistant message after the tool
                 // batch finishes — even if the call vector is moved into
                 // `execute_tools_parallel_traced` below.
-                let task_complete_summary = extract_task_complete_summary(&calls);
-
-                for call in &calls {
-                    tracing::info!(tool = %call.name, call_id = %call.id, "tool call started");
-                }
-
-                let results = self
-                    .execute_tools_parallel_traced(calls, session, tracer, None)
-                    .await;
-
-                // Track side effects: check if any successfully executed tool
-                // can cause external mutations (writes, network, spawning).
-                if !had_side_effects {
-                    for (tool_name, _, result) in &results {
-                        if result.is_ok() {
-                            if let Some(t) = self.tool_index.get(tool_name) {
-                                if t.sandbox_requirements().has_side_effects() {
-                                    had_side_effects = true;
-                                    tracing::debug!(tool = %tool_name, "side-effect tool executed — retry guard active");
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // A tool that succeeded and blocks the turn (e.g. asking
-                // the user for a credential) means the right next move is
-                // one sentence and a stop.
-                if !turn_blocked {
-                    for (tool_name, _, result) in &results {
-                        if result.is_ok() {
-                            if let Some(t) = self.tool_index.get(tool_name) {
-                                if t.blocks_turn() {
-                                    turn_blocked = true;
-                                    tracing::info!(
-                                        tool = %tool_name,
-                                        "turn is blocked on the user — EndTurn will be accepted"
-                                    );
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-
-                let had_errors = results.iter().any(|(_, _, r)| {
-                    if let Ok(tr) = r {
-                        tr.output.get("error").is_some()
-                    } else {
-                        true
-                    }
-                });
-
-                for (tool_name, call_id, result) in results {
-                    let tool_msg = match result {
-                        Ok(tr) => {
-                            tracing::info!(tool = %tool_name, call_id = %call_id, "tool call succeeded");
-                            Message {
-                                id: Uuid::new_v4(),
-                                role: Role::Tool,
-                                content: MessageContent::ToolResult(tr),
-                                created_at: Utc::now(),
-                                agent_version: Message::version_stamp(),
-                            }
-                        }
-                        Err(e) => {
-                            let (output, err_str) = tool_error_output(&e);
-                            tracing::warn!(tool = %tool_name, call_id = %call_id, error = %err_str, kind = e.kind().as_str(), "tool call failed");
-                            Message {
-                                id: Uuid::new_v4(),
-                                role: Role::Tool,
-                                content: MessageContent::ToolResult(ToolResult {
-                                    call_id,
-                                    output,
-                                    is_error: true,
-                                    images: Vec::new(),
-                                }),
-                                created_at: Utc::now(),
-                                agent_version: Message::version_stamp(),
-                            }
-                        }
-                    };
-                    self.push_message(conv, tool_msg);
-                }
-
-                // Reflection on repeated errors.
-                if had_errors {
-                    consecutive_errors += 1;
-                    if consecutive_errors >= self.config.max_consecutive_errors {
-                        tracing::warn!(
-                            consecutive_errors,
-                            "injecting reflection prompt after repeated errors"
-                        );
-                        self.inject_reflection(conv);
-                        consecutive_errors = 0;
-                    }
-                } else {
-                    consecutive_errors = 0;
-                }
-
-                // Explicit completion signal: the model called `task_complete`
-                // with a non-empty summary. Surface the summary as the final
-                // assistant message (so `extract_assistant_message` finds it)
-                // and exit the loop. We only break *after* tool results were
-                // pushed so the conversation history stays well-formed: every
-                // tool_call has a matching tool_result.
-                if let Some(summary) = task_complete_summary {
-                    self.finalize_task_complete(conv, iteration, summary);
-                    return Ok(());
-                }
-
-                continue;
-            }
-
-            match stop_reason {
-                StopReason::MaxTokens => {
-                    max_tokens_retries += 1;
-                    if max_tokens_retries > MAX_TOKENS_RETRY_LIMIT {
-                        tracing::warn!(
-                            iteration,
-                            "max-tokens retries exhausted — accepting the truncated response"
-                        );
-                        return Ok(());
-                    }
-                    // Distinguish the two ways a generation gets cut off.
-                    // `num_predict` exhaustion means a verbose response —
-                    // "Continue." genuinely helps. *Window* exhaustion means
-                    // the prompt ate the model's room, and re-prompting only
-                    // shrinks it further (every retry appends messages), so
-                    // compact first and retry with room to work.
-                    let used = usage.prompt_tokens as usize + usage.completion_tokens as usize;
-                    let window_exhausted = self
-                        .provider
-                        .total_context_window()
-                        .is_some_and(|w| used + MAX_TOKENS_WINDOW_SLACK >= w);
-                    if window_exhausted {
-                        tracing::warn!(
-                            iteration,
-                            used_tokens = used,
-                            "generation cut off by the context window — compacting before retrying"
-                        );
-                        self.compact_history(conv, schemas).await?;
-                    } else {
-                        tracing::warn!(iteration, "model hit max tokens, prompting to continue");
-                    }
-                    self.push_message(
-                        conv,
-                        Message {
-                            id: Uuid::new_v4(),
-                            role: Role::User,
-                            content: MessageContent::Text("Continue.".to_string()),
-                            created_at: Utc::now(),
-                            agent_version: Message::version_stamp(),
-                        },
-                    );
-                    continue;
-                }
-                StopReason::EndTurn => {
-                    let text = message.content.as_text().unwrap_or("");
-                    let classification = classify_response(text, usage.completion_tokens);
-
-                    // If the agent has already called tools this run we no
-                    // longer trust an Ollama-style EndTurn as "task done":
-                    // the provider maps any text-only response to EndTurn
-                    // regardless of intent. Re-prompt the model to either
-                    // call `task_complete` with a final answer or continue
-                    // working. Cap by `TASK_COMPLETE_RETRY_LIMIT` so models
-                    // that never learn the protocol fall through to the
-                    // legacy accept-and-return behavior.
-                    if has_called_any_tool && !turn_blocked {
-                        match self.reprompt_for_task_complete(
-                            conv,
-                            iteration,
-                            &mut task_complete_retries,
-                            &classification,
-                        ) {
-                            CompletionReminderOutcome::Continue => continue,
-                            CompletionReminderOutcome::GiveUp => return Ok(()),
-                        }
-                    }
-
-                    match classification {
-                        ResponseClass::Complete => return Ok(()),
-                        ResponseClass::Empty => {
-                            tracing::warn!(
-                                iteration,
-                                completion_tokens = usage.completion_tokens,
-                                "EndTurn with empty assistant text"
-                            );
-                            if had_side_effects {
-                                tracing::info!(
-                                    "side effects occurred — not retrying empty response"
-                                );
-                                return Ok(());
-                            }
-                            empty_response_retries += 1;
-                            if empty_response_retries > EMPTY_RESPONSE_RETRY_LIMIT {
-                                tracing::warn!("empty response retries exhausted");
-                                return Ok(());
-                            }
-                            self.push_message(
-                                conv,
-                                Message {
-                                    id: Uuid::new_v4(),
-                                    role: Role::User,
-                                    content: MessageContent::Text(
-                                        "Your response was empty. Please provide a substantive answer or take an action.".to_string(),
-                                    ),
-                                    created_at: Utc::now(),
-                                                                    agent_version: Message::version_stamp(),
-                                },
-                            );
-                            continue;
-                        }
-                        ResponseClass::PlanningOnly => {
-                            if had_side_effects {
-                                tracing::info!(
-                                    "side effects occurred — accepting planning-only response"
-                                );
-                                return Ok(());
-                            }
-                            planning_only_retries += 1;
-                            if planning_only_retries > PLANNING_ONLY_RETRY_LIMIT {
-                                tracing::warn!(
-                                    "planning-only retries exhausted — accepting response"
-                                );
-                                return Ok(());
-                            }
-                            tracing::warn!(
-                                retries = planning_only_retries,
-                                "model produced planning-only text without action, re-prompting"
-                            );
-                            self.push_message(
-                                conv,
-                                Message {
-                                    id: Uuid::new_v4(),
-                                    role: Role::User,
-                                    content: MessageContent::Text(
-                                        "Your previous response described or narrated work without actually calling any tools, so nothing happened. Either call the tools now to do the work, or reply with a final answer (including admitting you can't) — do not promise future updates."
-                                            .to_string(),
-                                    ),
-                                    created_at: Utc::now(),
-                                                                    agent_version: Message::version_stamp(),
-                                },
-                            );
-                            continue;
-                        }
-                    }
-                }
-                StopReason::ContentPolicy => {
-                    tracing::error!(iteration, "model refused to respond due to content policy");
-                    return Err(Error::ContentPolicy);
-                }
-                StopReason::ToolUse => {
-                    // stop_reason says ToolUse but no tool calls were found.
-                    // If side-effect tools already ran, don't retry — risk of
-                    // duplicate external actions.
-                    if had_side_effects {
-                        tracing::warn!(
-                            "ToolUse without tool calls after side effects — stopping to avoid duplicates"
-                        );
-                        return Ok(());
-                    }
-                    empty_tool_use_retries += 1;
-                    if empty_tool_use_retries > self.config.max_consecutive_errors {
-                        tracing::error!(
-                            retries = empty_tool_use_retries,
-                            "repeated ToolUse stop reason with no tool calls — aborting"
-                        );
-                        return Err(Error::Internal(
-                            "model repeatedly indicated tool use but provided no tool calls".into(),
-                        ));
-                    }
-                    tracing::warn!(
-                        retries = empty_tool_use_retries,
-                        "stop reason is ToolUse but no tool calls found in response, re-prompting"
-                    );
-                    self.push_message(
-                        conv,
-                        Message {
-                            id: Uuid::new_v4(),
-                            role: Role::User,
-                            content: MessageContent::Text(
-                                "Your previous response indicated a tool call but none was found. Please retry.".to_string(),
-                            ),
-                            created_at: Utc::now(),
-                                                    agent_version: Message::version_stamp(),
-                        },
-                    );
-                    continue;
-                }
-            }
-        }
-
-        // Escalate to user instead of hard-failing.
-        tracing::warn!(
-            max_iterations = self.config.max_iterations,
-            "iteration cap reached — escalating to user"
-        );
-        self.push_message(
-            conv,
-            Message {
-                id: Uuid::new_v4(),
-                role: Role::User,
-                content: MessageContent::Text(format!(
-                    "You have reached the iteration limit ({} iterations). \
-                     Summarize what you accomplished and what remains.",
-                    self.config.max_iterations
-                )),
-                created_at: Utc::now(),
-                agent_version: Message::version_stamp(),
-            },
-        );
-        let final_response = self.provider.chat(&conv.messages, &[]).await?;
-        self.push_message(conv, final_response.message);
-        Ok(())
-    }
-
-    /// Run the agent loop with streaming: text deltas are forwarded through
-    /// the callback as they arrive, and tool lifecycle events are emitted
-    /// so callers can show real-time progress.
-    ///
-    /// Each call creates a fresh ExecutionTracer to prevent cross-session
-    /// information leakage (H8).
-    ///
-    /// The callback must be `Send + Sync` because it may be invoked from
-    /// the provider's streaming internals on a different task.
-    pub async fn run_streaming(
-        &self,
-        conv: &mut Conversation,
-        session: &Session,
-        on_event: &(dyn Fn(AgentEvent) + Send + Sync),
-    ) -> Result<()> {
-        let ctx = self.build_session_context(session);
-        // See `run` — hoisted so outcome capture sees the run's traces.
-        let tracer = ExecutionTracer::new();
-        let result = SESSION_TOOL_CONTEXT
-            .scope(
-                ctx,
-                self.run_streaming_inner(conv, session, on_event, &tracer),
-            )
-            .await;
-        self.capture_outcome(session, &tracer, result.is_err())
-            .await;
-        // See `run` — bound the token-estimate cache to active runs.
-        self.forget_token_estimate(conv.id);
-        self.forget_usage_anchor(conv.id);
-        result
-    }
-
-    async fn run_streaming_inner(
-        &self,
-        conv: &mut Conversation,
-        session: &Session,
-        on_event: &(dyn Fn(AgentEvent) + Send + Sync),
-        tracer: &ExecutionTracer,
-    ) -> Result<()> {
-        if session.is_expired() {
-            return Err(Error::Auth("session has expired".into()));
-        }
-
-        // Repair stored state before the loop: older compactions could
-        // persist summaries that exceed the current cap. See run_inner.
-        self.repair_oversized_summary(conv);
-
-        let mut consecutive_errors = 0;
-        let mut soft_warning_injected = false;
-        let mut empty_response_retries: usize = 0;
-        let mut planning_only_retries: usize = 0;
-        let mut empty_tool_use_retries: usize = 0;
-        let mut max_tokens_retries: usize = 0;
-        let mut task_complete_retries: usize = 0;
-        let mut had_side_effects = false;
-        let mut has_called_any_tool = false;
-        // Set when a tool reports the turn is now waiting on someone
-        // else. Not reset per iteration: once the agent has asked the
-        // user for something, every later EndTurn this run is a stop,
-        // not an early exit.
-        let mut turn_blocked = false;
-        // Per-run schema cache — see run_inner for rationale.
-        let mut schema_cache: Option<(u64, Vec<ToolSchema>)> = None;
-
-        for iteration in 0..self.config.max_iterations {
-            tracer.record_iteration();
-
-            if session.is_expired() {
-                return Err(Error::Auth("session expired during execution".into()));
-            }
-
-            // Refresh the schemas before the compaction check rather than
-            // after: the summarizer call now needs the same tool block the
-            // ordinary turns carry, or it cannot reuse their cached prefix.
-            // The refresh is version-keyed, so this is O(1) unless
-            // `tools_load` actually changed the active set.
-            self.refresh_schema_cache(session, session.conversation_id, &mut schema_cache);
-            let compaction_tools: &[ToolSchema] =
-                schema_cache.as_ref().map_or(&[], |(_, s)| s.as_slice());
-
-            // Compaction: if conversation exceeds threshold, ask the LLM to
-            // summarize before the next call (RLM paper §3.2).
-            if self.needs_compaction(conv) {
-                tracing::info!(iteration, "conversation crossed compaction threshold");
-                on_event(AgentEvent::Compressing);
-                self.compact_history(conv, compaction_tools).await?;
-            }
-
-            // Soft iteration warning.
-            if self.config.soft_iteration_warning > 0
-                && iteration == self.config.soft_iteration_warning
-                && !soft_warning_injected
-            {
-                soft_warning_injected = true;
-                self.push_message(
-                    conv,
-                    Message {
-                        id: Uuid::new_v4(),
-                        role: Role::System,
-                        content: MessageContent::Text(format!(
-                            "[Warning: {iteration}/{} iterations used.]",
-                            self.config.max_iterations
-                        )),
-                        created_at: Utc::now(),
-                        agent_version: Message::version_stamp(),
-                    },
-                );
-            }
-
-            let stream_callback = |event: StreamEvent| {
-                if let StreamEvent::TextDelta(delta) = event {
-                    on_event(AgentEvent::TextDelta(delta));
-                }
-            };
-
-            // Already refreshed above — see run_inner.
-            let schemas: &[ToolSchema] = compaction_tools;
-
-            // Iteration-0 guard: see run_inner for rationale.
-            let tool_choice = if iteration == 0
-                && self.config.force_tool_use_first_iteration
-                && !schemas.is_empty()
-            {
-                ToolChoice::Any
-            } else {
-                ToolChoice::Auto
-            };
-
-            let llm_start = std::time::Instant::now();
-            let ModelResponse {
-                message,
-                usage,
-                stop_reason,
-                ..
-            } = self
-                .provider
-                .chat_stream_with_choice(&conv.messages, schemas, tool_choice, &stream_callback)
-                .await?;
-            let llm_elapsed = llm_start.elapsed();
-            tracing::info!(
-                iteration,
-                duration_ms = llm_elapsed.as_millis() as u64,
-                prompt_tokens = usage.prompt_tokens,
-                completion_tokens = usage.completion_tokens,
-                ?stop_reason,
-                ?tool_choice,
-                "LLM call completed"
-            );
-
-            self.push_message(conv, message);
-            self.record_usage_anchor(conv, &usage);
-            // Re-borrow the just-pushed message — see run_inner.
-            let message = conv
-                .messages
-                .last()
-                .expect("push_message appends the message");
-
-            // Handle tool calls.
-            if message.content.has_tool_calls() {
-                // First tool call this run — reveal `task_complete` in the
-                // schema from here on. See run_inner for rationale.
-                if !has_called_any_tool {
-                    self.active_tools
-                        .activate(session.conversation_id, ["task_complete"]);
-                }
-                has_called_any_tool = true;
-                empty_tool_use_retries = 0;
-                empty_response_retries = 0;
-                planning_only_retries = 0;
-                max_tokens_retries = 0;
-                task_complete_retries = 0;
-                let calls = message.content.tool_calls();
-                let tool_names: Vec<&str> = calls.iter().map(|c| c.name.as_str()).collect();
-                tracing::info!(
-                    iteration,
-                    tool_count = calls.len(),
-                    tools = ?tool_names,
-                    "executing tool calls"
-                );
-
-                // Capture the `task_complete` summary up front so we can
-                // surface it as the final assistant message after this
-                // tool batch finishes — see run_inner for rationale.
                 let task_complete_summary = extract_task_complete_summary(&calls);
 
                 for call in &calls {
@@ -2241,10 +1746,17 @@ impl AgentRunner {
                     consecutive_errors = 0;
                 }
 
-                // Explicit completion signal — see run_inner. The synthesized
-                // final assistant message is also emitted as a TextDelta so
-                // streaming UIs render the deliverable just like a model-
-                // produced final answer.
+                // Explicit completion signal: the model called `task_complete`
+                // with a non-empty summary. Surface the summary as the final
+                // assistant message (so `extract_assistant_message` finds it)
+                // and exit the loop. We only break *after* tool results were
+                // pushed so the conversation history stays well-formed: every
+                // tool_call has a matching tool_result.
+                //
+                // The synthesized message is also emitted as a TextDelta so
+                // streaming callers render the deliverable just like a
+                // model-produced final answer. A non-streaming caller's sink
+                // discards it.
                 if let Some(summary) = task_complete_summary {
                     on_event(AgentEvent::TextDelta(summary.clone()));
                     self.finalize_task_complete(conv, iteration, summary);
@@ -2266,8 +1778,12 @@ impl AgentRunner {
                         on_event(AgentEvent::Done);
                         return Ok(());
                     }
-                    // See run_inner: window exhaustion needs compaction,
-                    // not another "Continue." shrinking the model's room.
+                    // Distinguish the two ways a generation gets cut off.
+                    // `num_predict` exhaustion means a verbose response —
+                    // "Continue." genuinely helps. *Window* exhaustion means
+                    // the prompt ate the model's room, and re-prompting only
+                    // shrinks it further (every retry appends messages), so
+                    // compact first and retry with room to work.
                     let used = usage.prompt_tokens as usize + usage.completion_tokens as usize;
                     let window_exhausted = self
                         .provider
@@ -2300,10 +1816,14 @@ impl AgentRunner {
                     let text = message.content.as_text().unwrap_or("");
                     let classification = classify_response(text, usage.completion_tokens);
 
-                    // Once the agent has called tools this run, an Ollama
-                    // EndTurn no longer terminates: re-prompt the model to
-                    // either call `task_complete` or keep working. See
-                    // run_inner for the full rationale.
+                    // If the agent has already called tools this run we no
+                    // longer trust an Ollama-style EndTurn as "task done":
+                    // the provider maps any text-only response to EndTurn
+                    // regardless of intent. Re-prompt the model to either
+                    // call `task_complete` with a final answer or continue
+                    // working. Cap by `TASK_COMPLETE_RETRY_LIMIT` so models
+                    // that never learn the protocol fall through to the
+                    // legacy accept-and-return behavior.
                     if has_called_any_tool && !turn_blocked {
                         match self.reprompt_for_task_complete(
                             conv,
@@ -2468,6 +1988,35 @@ impl AgentRunner {
         self.push_message(conv, final_response.message);
         on_event(AgentEvent::Done);
         Ok(())
+    }
+
+    /// Run the agent loop with streaming: text deltas are forwarded through
+    /// the callback as they arrive, and tool lifecycle events are emitted
+    /// so callers can show real-time progress.
+    ///
+    /// Each call creates a fresh ExecutionTracer to prevent cross-session
+    /// information leakage (H8).
+    ///
+    /// The callback must be `Send + Sync` because it may be invoked from
+    /// the provider's streaming internals on a different task.
+    pub async fn run_streaming(
+        &self,
+        conv: &mut Conversation,
+        session: &Session,
+        on_event: &(dyn Fn(AgentEvent) + Send + Sync),
+    ) -> Result<()> {
+        let ctx = self.build_session_context(session);
+        // See `run` — hoisted so outcome capture sees the run's traces.
+        let tracer = ExecutionTracer::new();
+        let result = SESSION_TOOL_CONTEXT
+            .scope(ctx, self.run_inner(conv, session, on_event, &tracer))
+            .await;
+        self.capture_outcome(session, &tracer, result.is_err())
+            .await;
+        // See `run` — bound the token-estimate cache to active runs.
+        self.forget_token_estimate(conv.id);
+        self.forget_usage_anchor(conv.id);
+        result
     }
 
     /// Execute multiple tool calls in parallel, recording execution traces.
@@ -5189,6 +4738,26 @@ mod tool_choice_guard_tests {
             self.choices.lock().unwrap().push(choice);
             Ok(canned_response())
         }
+
+        /// The loop calls this one — every run streams now, including the
+        /// non-streaming entry point, which supplies a discarding sink.
+        ///
+        /// Recorded separately rather than delegating to `chat_with_choice`,
+        /// because the point of the double is to observe what the loop
+        /// actually invokes. A double that quietly forwarded would have kept
+        /// passing while the constraint was dropped: the trait's default
+        /// chain is `chat_stream_with_choice -> chat_stream -> chat`, and it
+        /// discards the choice on the way.
+        async fn chat_stream_with_choice(
+            &self,
+            _: &[Message],
+            _: &[ToolSchema],
+            choice: ToolChoice,
+            _on_event: &(dyn Fn(StreamEvent) + Send + Sync),
+        ) -> Result<ModelResponse> {
+            self.choices.lock().unwrap().push(choice);
+            Ok(canned_response())
+        }
     }
 
     fn canned_response() -> ModelResponse {
@@ -5286,6 +4855,63 @@ mod tool_choice_guard_tests {
             choices.first().copied(),
             Some(ToolChoice::Any),
             "iteration 0 must use ToolChoice::Any when flag is set; got {choices:?}"
+        );
+    }
+
+    /// The claim the single loop rests on: `run` and `run_streaming` do the
+    /// same thing to a conversation and differ only in whether the caller
+    /// hears about it.
+    ///
+    /// Before they were merged there were two loop bodies, 81% identical,
+    /// and nothing checked that the shared 81% stayed shared.
+    #[tokio::test]
+    async fn both_entry_points_leave_the_same_conversation_behind() {
+        let quiet = Arc::new(RecordingProvider::new());
+        let (runner, session) = make_runner(quiet.clone(), true);
+        let mut plain = make_conversation();
+        plain.id = session.conversation_id;
+        runner.run(&mut plain, &session).await.unwrap();
+
+        let loud = Arc::new(RecordingProvider::new());
+        let (runner, session) = make_runner(loud.clone(), true);
+        let mut streamed = make_conversation();
+        streamed.id = session.conversation_id;
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = {
+            let seen = Arc::clone(&seen);
+            move |event: AgentEvent| seen.lock().unwrap().push(format!("{event:?}"))
+        };
+        runner
+            .run_streaming(&mut streamed, &session, &sink)
+            .await
+            .unwrap();
+
+        let render = |c: &Conversation| {
+            c.messages
+                .iter()
+                .map(|m| {
+                    format!(
+                        "{:?}:{}",
+                        m.role,
+                        m.content.as_text().unwrap_or("<non-text>")
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            render(&plain),
+            render(&streamed),
+            "the two entry points must produce the same history"
+        );
+        assert_eq!(
+            *quiet.choices.lock().unwrap(),
+            *loud.choices.lock().unwrap(),
+            "and must constrain the model identically"
+        );
+        assert!(
+            !seen.lock().unwrap().is_empty(),
+            "the streaming entry point must actually emit something, or this \
+             test would pass for the wrong reason"
         );
     }
 
