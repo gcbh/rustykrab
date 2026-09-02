@@ -291,13 +291,43 @@ impl OllamaProvider {
         self.config.keep_alive.as_deref()
     }
 
-    /// Whether `think` will be sent, and with what value. An explicit
-    /// `config.think` wins, then `OLLAMA_THINK`, then what Ollama reports
-    /// for the model, and only then the model-tag heuristic.
+    /// Whether the model will be asked to think.
+    ///
+    /// An explicit `config.think` wins, then `OLLAMA_THINK`, then what Ollama
+    /// reports for the model, and only then the model-tag heuristic.
     pub fn resolved_think(&self) -> bool {
         self.config
             .think
             .unwrap_or_else(|| think_support(&self.model, self.detected_caps))
+    }
+
+    /// The value of the `think` field to send with a request, or `None` to
+    /// omit it.
+    ///
+    /// Omitting is not the same as disabling. Ollama defaults a
+    /// thinking-capable model to thinking, so leaving the field out asks for
+    /// thinking; only an explicit `false` turns it off. Sending `false` to a
+    /// model that cannot think is a 400, so it is omitted there — where
+    /// omission genuinely does mean off.
+    ///
+    /// This is why `OLLAMA_THINK=false` used to be silently ineffective: the
+    /// send sites read `if resolved_think() { think = true }`, so "off"
+    /// produced no field at all and the model went on thinking.
+    fn think_field(&self) -> Option<bool> {
+        let wanted = self.resolved_think();
+        if wanted {
+            // `resolved_think` is only true when the model can think, or when
+            // the operator forced it; either way, ask.
+            Some(true)
+        } else if model_can_think(&self.model, self.detected_caps) {
+            // Capable, but told not to. This is the case that has to be
+            // explicit.
+            Some(false)
+        } else {
+            // Incapable: the field would be rejected, and omitting it is
+            // already off.
+            None
+        }
     }
 
     /// Effective context window used for client-side prompt trimming.
@@ -350,9 +380,10 @@ impl OllamaProvider {
             "options": options,
         });
         // `think` is rejected outright by models that don't support it, so
-        // it is only sent when the model (or an explicit override) says yes.
-        if self.resolved_think() {
-            body["think"] = serde_json::json!(true);
+        // the field is omitted there. For a capable model both polarities are
+        // sent explicitly — omitting it would leave thinking on.
+        if let Some(think) = self.think_field() {
+            body["think"] = serde_json::json!(think);
         }
         // Keep the model — and with it the KV cache built from this prompt —
         // resident between turns. Without this Ollama evicts after five idle
@@ -1192,9 +1223,10 @@ impl ModelProvider for OllamaProvider {
             "options": options,
         });
         // `think` is rejected outright by models that don't support it, so
-        // it is only sent when the model (or an explicit override) says yes.
-        if self.resolved_think() {
-            body["think"] = serde_json::json!(true);
+        // the field is omitted there. For a capable model both polarities are
+        // sent explicitly — omitting it would leave thinking on.
+        if let Some(think) = self.think_field() {
+            body["think"] = serde_json::json!(think);
         }
         // Keep the model — and with it the KV cache built from this prompt —
         // resident between turns. Without this Ollama evicts after five idle
@@ -1832,13 +1864,27 @@ fn capability_override(var: &str) -> Option<bool> {
     }
 }
 
+/// Whether the model is *able* to think, ignoring whether we want it to.
+///
+/// Ollama returns a 400 for a `think` field of either polarity against a
+/// model with no thinking capability, so this gates whether the field can be
+/// sent at all. Reported capabilities first, then the tag heuristic.
+///
+/// Deliberately does not consult `OLLAMA_THINK`: that is a preference, not a
+/// capability, and conflating the two is what made the off switch
+/// unreachable — "the operator said no" was indistinguishable from "the model
+/// cannot", and both produced an omitted field.
+fn model_can_think(model: &str, reported: Option<ModelCapabilities>) -> bool {
+    reported
+        .map(|c| c.thinking)
+        .unwrap_or_else(|| model_supports_thinking(model))
+}
+
 /// Decide whether to ask the configured Ollama model to think.
 ///
-/// Ollama returns a 400 for `think: true` against a model that has no
-/// thinking capability, so this cannot be sent unconditionally. Resolved
-/// the same way as vision: `OLLAMA_THINK` first (same `true`/`false`/`auto`
-/// vocabulary as `OLLAMA_VISION`), then Ollama's reported capabilities,
-/// then the tag heuristic.
+/// Resolved the same way as vision: `OLLAMA_THINK` first (same
+/// `true`/`false`/`auto` vocabulary as `OLLAMA_VISION`), then Ollama's
+/// reported capabilities, then the tag heuristic.
 fn think_support(model: &str, reported: Option<ModelCapabilities>) -> bool {
     capability_override("OLLAMA_THINK")
         .or_else(|| reported.map(|c| c.thinking))
@@ -3110,5 +3156,74 @@ mod num_predict_clamp_tests {
         // the clamp must not reinterpret.
         assert_eq!(clamp_num_predict(Some(4096), -1), -1);
         assert_eq!(clamp_num_predict(Some(4096), 0), 0);
+    }
+}
+
+#[cfg(test)]
+mod think_field_tests {
+    use super::*;
+
+    fn provider_with(model: &str, think: Option<bool>) -> OllamaProvider {
+        let config = OllamaConfig {
+            think,
+            ..OllamaConfig::default()
+        };
+        OllamaProvider::new(model).with_config(config)
+    }
+
+    /// The bug: the send sites read `if resolved_think() { think = true }`,
+    /// so asking for no thinking produced a request with no `think` field.
+    /// Ollama defaults a thinking-capable model to thinking, so that request
+    /// still thought — and `OLLAMA_THINK=false` looked like it did nothing.
+    #[test]
+    fn a_capable_model_told_not_to_think_is_told_explicitly() {
+        let p = provider_with("qwen3:8b", Some(false));
+        assert_eq!(
+            p.think_field(),
+            Some(false),
+            "off must be sent, not implied by omission"
+        );
+    }
+
+    #[test]
+    fn a_capable_model_asked_to_think_is_asked() {
+        let p = provider_with("qwen3:8b", Some(true));
+        assert_eq!(p.think_field(), Some(true));
+    }
+
+    /// Ollama 400s on a `think` field of either polarity for a model without
+    /// the capability, and for such a model omission genuinely is off.
+    #[test]
+    fn an_incapable_model_is_sent_no_think_field_at_all() {
+        let p = provider_with("llama3.1:8b", Some(false));
+        assert_eq!(p.think_field(), None);
+        let p = provider_with("llama3.1:8b", None);
+        assert_eq!(p.think_field(), None);
+    }
+
+    /// With no opinion expressed, a capable model still thinks — this change
+    /// is about making "off" reachable, not about changing the default.
+    #[test]
+    fn the_default_for_a_capable_model_is_unchanged() {
+        let p = provider_with("qwen3:8b", None);
+        assert_eq!(p.think_field(), Some(true));
+    }
+
+    /// Capability detection must not consult the preference variable, or the
+    /// two collapse back together and off becomes unreachable again.
+    #[test]
+    fn capability_detection_ignores_the_preference_variable() {
+        let capable = ModelCapabilities {
+            vision: false,
+            thinking: true,
+        };
+        assert!(model_can_think("llama3.1:8b", Some(capable)));
+        assert!(!model_can_think(
+            "qwen3:8b",
+            Some(ModelCapabilities {
+                vision: false,
+                thinking: false,
+            })
+        ));
     }
 }
