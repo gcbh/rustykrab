@@ -34,6 +34,17 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
 
+  docs:
+    name: Architecture Docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Guards the facts in docs/architecture and crates/*/ARCHITECTURE.md:
+      # generated metrics match the tree, every crate is documented, and the
+      # crate count in prose is right. Two structural docs had already
+      # drifted before this existed. Run `--fix` locally to regenerate.
+      - run: python3 scripts/check_architecture_docs.py
+
   fmt:
     name: Format
     runs-on: ubuntu-latest

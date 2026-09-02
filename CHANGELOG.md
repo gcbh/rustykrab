@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.2.21] - 2026-09-02
+
+- docs(architecture): record the structural review, and audit the dead code (#596)
+
 ## [5.2.20] - 2026-09-02
 
 - fix(memory): validate the config at construction, and fix a cap warning that could never fire (#604)
