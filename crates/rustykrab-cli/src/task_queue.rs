@@ -6,6 +6,7 @@ use tokio::sync::{mpsc, Mutex, Semaphore};
 use chrono::Utc;
 use rustykrab_agent::AgentEvent;
 use rustykrab_core::types::{Conversation, Message, MessageContent, Role};
+use rustykrab_core::OutcomeContract;
 use rustykrab_gateway::AppState;
 use rustykrab_skills::SkillRegistry;
 use uuid::Uuid;
@@ -471,6 +472,9 @@ async fn execute_cron_task(
     // and without the body the model would have to make a tool round-trip
     // before doing any real work.
     let resolved_skill = resolve_skill_for_task(&state.agent.skill_registry, task_prompt);
+    let outcome_contract = resolved_skill
+        .as_ref()
+        .and_then(|(name, _)| contract_for_skill(&state.agent.skill_registry, name));
     if let Some((ref name, _)) = resolved_skill {
         tracing::info!(
             job_id = %job_id,
@@ -491,6 +495,7 @@ async fn execute_cron_task(
 
     let run_options = rustykrab_runtime::RunOptions {
         active_skill: resolved_skill,
+        outcome_contract,
         // Cron tasks must call a tool on iteration 0 — a bare "I'm ready"
         // reply is never the deliverable, and the model would otherwise
         // burn the slot.
@@ -686,6 +691,29 @@ fn build_scheduled_prompt(
 /// Operators commonly schedule jobs with natural-language task strings rather
 /// than bare skill names; without substring matching, those tasks never get the
 /// body inlined and the model loops on tool-discovery before giving up.
+/// The checkable claim a skill made about its own effects, if it made one.
+///
+/// Returns `None` unless the skill declared `signal = "verifiable"` *and*
+/// named at least one check: a skill that asked to be judged some other
+/// way must not have its runs promoted to ground truth, and a skill that
+/// named nothing has stated nothing to check. In both cases the run falls
+/// back to the weaker implicit signal rather than inventing evidence.
+fn contract_for_skill(registry: &SkillRegistry, name: &str) -> Option<OutcomeContract> {
+    let md = registry
+        .md_skills()
+        .into_iter()
+        .find(|s| s.frontmatter.name.eq_ignore_ascii_case(name))?;
+    let outcome = md.frontmatter.outcome.as_ref()?;
+    if !outcome.is_verifiable() {
+        return None;
+    }
+    Some(OutcomeContract::new(
+        md.frontmatter.name.clone(),
+        outcome.checks.clone(),
+        outcome.signal_class(),
+    ))
+}
+
 fn resolve_skill_for_task(registry: &SkillRegistry, task_prompt: &str) -> Option<(String, String)> {
     let trimmed = task_prompt.trim();
     if trimmed.is_empty() {
@@ -1181,6 +1209,84 @@ mod tests {
         assert!(conv.channel_source.is_none());
         assert!(conv.channel_id.is_none());
         assert!(conv.channel_thread_id.is_none());
+    }
+
+    fn make_skill_with_outcome(
+        name: &str,
+        checks: &[&str],
+        signal: Option<&str>,
+    ) -> Arc<rustykrab_skills::skill_md::SkillMd> {
+        use rustykrab_skills::skill_md::SkillOutcome;
+        let base = make_skill(name, "body");
+        let mut fm = base.frontmatter.clone();
+        fm.outcome = Some(SkillOutcome {
+            success: "the meeting is booked".to_string(),
+            checks: checks.iter().map(|c| c.to_string()).collect(),
+            signal: signal.map(|s| s.to_string()),
+        });
+        Arc::new(rustykrab_skills::skill_md::SkillMd {
+            path: base.path.clone(),
+            frontmatter: fm,
+            raw_body: base.raw_body.clone(),
+            validation: rustykrab_skills::skill_md::RequirementValidation {
+                missing_env: Vec::new(),
+                missing_bins: Vec::new(),
+            },
+        })
+    }
+
+    #[test]
+    fn a_verifiable_skill_yields_a_contract_the_runner_can_check() {
+        // The derivation that was missing entirely: without it the runner
+        // learns a skill's name but never its claims, so every run it
+        // drives is recorded as proxy evidence and the loop stays shut.
+        let registry = SkillRegistry::new();
+        registry.register_md(make_skill_with_outcome(
+            "calendar-booking",
+            &["calendar.event_created", "email.sent"],
+            Some("verifiable"),
+        ));
+
+        let contract =
+            contract_for_skill(&registry, "calendar-booking").expect("a verifiable skill declares");
+        assert_eq!(contract.skill, "calendar-booking");
+        assert_eq!(contract.checks.len(), 2);
+        assert!(
+            contract.is_checkable(),
+            "a contract that cannot decide anything is no better than none"
+        );
+    }
+
+    #[test]
+    fn a_skill_that_asked_for_another_kind_of_judgement_yields_no_contract() {
+        // Checks alone must not buy ground truth, or the loop could promote
+        // a model's opinion of itself to fact.
+        let registry = SkillRegistry::new();
+        for (name, signal) in [
+            ("judged", Some("judge")),
+            ("implicit", Some("implicit")),
+            ("unstated", None),
+        ] {
+            registry.register_md(make_skill_with_outcome(name, &["did_the_thing"], signal));
+            assert!(
+                contract_for_skill(&registry, name).is_none(),
+                "{name} must not be treated as verifiable"
+            );
+        }
+    }
+
+    #[test]
+    fn a_skill_declaring_no_checks_yields_no_contract() {
+        let registry = SkillRegistry::new();
+        registry.register_md(make_skill_with_outcome("vague", &[], Some("verifiable")));
+        assert!(contract_for_skill(&registry, "vague").is_none());
+    }
+
+    #[test]
+    fn a_skill_with_no_outcome_block_at_all_yields_no_contract() {
+        let registry = SkillRegistry::new();
+        registry.register_md(make_skill("plain", "body"));
+        assert!(contract_for_skill(&registry, "plain").is_none());
     }
 
     fn make_skill(name: &str, body: &str) -> Arc<rustykrab_skills::skill_md::SkillMd> {

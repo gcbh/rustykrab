@@ -265,6 +265,22 @@ signal = "verifiable"
 Skills with no `[outcome]` block are **frozen** -- they run, but the loop never
 edits them.
 
+A check names an effect as a tool: it is satisfied when a tool of that name
+completed successfully during the run. Three properties are load-bearing,
+and each has a test that fails without it:
+
+- **Only `signal = "verifiable"` buys ground truth.** Checks alone do not.
+  A skill asking to be judged by a model must not have its runs promoted to
+  fact, or the loop can launder its own opinion into evidence.
+- **An outstanding check is `Ambiguous`, not `Failure`.** A skill's effects
+  may legitimately span several turns, and from one run there is no way to
+  tell "did not do it" from "has not done it yet". Ambiguous records are
+  kept but excluded from success rates, so a working multi-turn skill is
+  never scored as harmful for being mid-conversation.
+- **Producing every effect and then erroring is not success.** Otherwise a
+  skill that reliably crashes after its side effects accumulates a clean
+  record.
+
 ### Skill improvement as offline learning from logged outcomes
 
 1. Gather execution traces where the skill was used.
@@ -422,6 +438,14 @@ Shipped and opt-in behind `RUSTYKRAB_OUTCOME_CAPTURE` (off by default).
   `signal`. `SkillMd::is_optimizable()` implements the freeze rule; an
   unset or unparseable `signal` degrades to `Implicit` rather than
   something stronger, so an unclear declaration buys no authority.
+- **`OutcomeContract` + `contract_for_skill`** — a skill's `[outcome]`
+  block becomes a checkable claim only when it declared
+  `signal = "verifiable"` *and* named at least one check; anything else
+  yields no contract and the run falls back to the implicit signal.
+  `task_queue.rs` derives it at skill resolution and passes it through
+  `RunOptions::outcome_contract`; `orchestrate.rs` hands it to the runner.
+  Checks are matched against the tracer's *sanitized* tool names, so the
+  dotted form above resolves correctly.
 - **`AgentRunner::capture_outcome`** — the per-run tracer was hoisted from
   `run_inner` to the `run`/`run_streaming` wrappers so capture sees the run's
   traces regardless of which of the inner loop's ~10 exit paths fired.
@@ -435,11 +459,10 @@ Two deliberate deviations from the plan above:
    `SqliteMemoryStorage` has no additive-migration phase to extend. Since
    tallies are *derived* from records rather than incremented in place, the
    column buys nothing until something mutates memory — which is Phase 2.
-2. **Verdicts are `Implicit` only.** Nothing yet checks a post-condition or
-   captures an explicit correction, so every record carries behavioural
-   evidence at low confidence and `is_actionable()` returns false for all of
-   them. That is the honest state: Phase 1 reports can be built on this,
-   Phase 2/3 promotion cannot.
+2. **Explicit corrections are still uncaptured.** A skill's declared
+   `checks` are now verified (see below), so runs it drives carry
+   `Verifiable` evidence; nothing yet notices a user *saying* the run was
+   wrong, so `Explicit` remains unused.
 
 ## What downtime does and does not solve
 
