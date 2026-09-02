@@ -1,13 +1,23 @@
+//! Assemble and run one agent turn.
+//!
+//! This was `rustykrab-gateway::orchestrate`. Nothing in it is about HTTP —
+//! it builds the system prompt, derives the session's capabilities, installs
+//! the memory write-back hook and drives the runner — but living in the Axum
+//! crate meant a Telegram loop had to depend on a web server to run a turn.
+//!
+//! Errors are a plain enum rather than an HTTP status. The gateway maps them
+//! at its own boundary, which is where that decision belongs.
+
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
-use axum::http::StatusCode;
 use chrono::Utc;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
-use crate::AppState;
+use crate::context::AgentContext;
+use crate::error::RuntimeError;
 use rustykrab_agent::{AgentEvent, AgentHandle, AgentRunner, HarnessProfile, OnMessageCallback};
 use rustykrab_core::capability::{Capability, CapabilitySet};
 use rustykrab_core::session::Session;
@@ -55,7 +65,7 @@ pub struct RunOptions {
 /// resolving it once and passing it in avoids a second (potentially
 /// LLM-backed) classification per turn.
 async fn build_and_inject_system_prompt(
-    state: &AppState,
+    ctx: &AgentContext,
     conv: &mut Conversation,
     profile: &HarnessProfile,
     options: &RunOptions,
@@ -72,7 +82,7 @@ async fn build_and_inject_system_prompt(
         .with_security_policy();
 
     // Inject SKILL.md catalog (only satisfied skills).
-    let all_md = state.skill_registry.md_skills();
+    let all_md = ctx.skill_registry.md_skills();
     let (satisfied, unsatisfied): (Vec<_>, Vec<_>) = all_md
         .into_iter()
         .partition(|s| s.validation.is_satisfied());
@@ -226,9 +236,9 @@ fn message_to_turn(msg: &Message, session_id: Uuid, turn_number: u32) -> Convers
 /// infrastructure (agent prompt, warnings) rather than conversation content.
 /// Duplicate content is de-duplicated on the memory side via SHA-256 hash,
 /// so re-firing the callback for an already-persisted message is safe.
-fn build_memory_callback(state: &AppState, conv: &Conversation) -> Option<OnMessageCallback> {
-    let memory: Arc<MemorySystem> = state.memory.clone()?;
-    let agent_id = state.agent_id?;
+fn build_memory_callback(ctx: &AgentContext, conv: &Conversation) -> Option<OnMessageCallback> {
+    let memory: Arc<MemorySystem> = ctx.memory.clone()?;
+    let agent_id = ctx.agent_id?;
     let session_id = conv.id;
     // Start the turn counter from the current message count so turns
     // are numbered consistently across a multi-request conversation.
@@ -259,39 +269,39 @@ fn build_memory_callback(state: &AppState, conv: &Conversation) -> Option<OnMess
 /// `Capability::Subagent` in addition to the per-tool grant, so we only
 /// add it when the gateway has been opted in (see
 /// `AppState::with_subagents_enabled`).
-fn build_session_capabilities(state: &AppState, tool_names: &[&str]) -> CapabilitySet {
+fn build_session_capabilities(ctx: &AgentContext, tool_names: &[&str]) -> CapabilitySet {
     let mut caps = CapabilitySet::for_tools_permissive(tool_names);
-    if state.subagents_enabled {
+    if ctx.subagents_enabled {
         caps.grant(Capability::Subagent);
     }
-    if state.computer_use_enabled {
+    if ctx.computer_use_enabled {
         caps.grant(Capability::ComputerUse);
     }
     caps
 }
 
 async fn prepare_agent(
-    state: &AppState,
+    ctx: &AgentContext,
     conv: &mut Conversation,
     user_content: &str,
     options: &RunOptions,
-) -> Result<(AgentRunner, Session), StatusCode> {
+) -> Result<(AgentRunner, Session), RuntimeError> {
     // Mark the system busy. Every channel reaches the agent through here,
     // so this one call covers Telegram, Slack, WebChat and scheduled runs
     // alike, and keeps the downtime worker from starting mid-turn.
-    if let Some(agent_id) = state.agent_id {
-        state.activity.record(agent_id);
+    if let Some(agent_id) = ctx.agent_id {
+        ctx.activity.record(agent_id);
     }
 
     // Resolve the harness profile once; it drives both the system prompt
     // and the agent config below.
-    let profile = state.profile_for(user_content).await;
+    let profile = ctx.profile_for(user_content).await;
     tracing::info!(profile = %profile.name, "harness profile selected");
 
-    build_and_inject_system_prompt(state, conv, &profile, options).await;
+    build_and_inject_system_prompt(ctx, conv, &profile, options).await;
 
     // Create an ephemeral session with capabilities for available registered tools.
-    let tool_names: Vec<&str> = state
+    let tool_names: Vec<&str> = ctx
         .tools
         .iter()
         .filter(|t| t.available())
@@ -301,10 +311,10 @@ async fn prepare_agent(
     tracing::debug!(
         tool_count = tool_names.len(),
         tools = ?tool_names,
-        subagents_enabled = state.subagents_enabled,
+        subagents_enabled = ctx.subagents_enabled,
         "granting session capabilities for available tools"
     );
-    let caps = build_session_capabilities(state, &tool_names);
+    let caps = build_session_capabilities(ctx, &tool_names);
     let session = Session::with_capabilities(conv.id, caps);
 
     let mut agent_config = profile.to_agent_config();
@@ -313,29 +323,25 @@ async fn prepare_agent(
         agent_config.max_iterations = cap;
     }
 
-    let mut runner = AgentRunner::new(
-        state.provider.clone(),
-        state.tools.clone(),
-        state.sandbox.clone(),
-    )
-    .with_config(agent_config)
-    .with_active_tools(state.active_tools.clone())
-    .with_recall_store(state.recall.clone())
-    .with_todo_store(state.todos.clone())
-    .with_retrieval_log(state.retrieval_log.clone());
+    let mut runner = AgentRunner::new(ctx.provider.clone(), ctx.tools.clone(), ctx.sandbox.clone())
+        .with_config(agent_config)
+        .with_active_tools(ctx.active_tools.clone())
+        .with_recall_store(ctx.recall.clone())
+        .with_todo_store(ctx.todos.clone())
+        .with_retrieval_log(ctx.retrieval_log.clone());
 
     // Outcome instrumentation (see `DREAMING.md`). Observational only: the
     // runner records how the run went and to which artifacts it should be
     // credited. Attributing to the active skill needs its name, which the
     // runner does not otherwise know.
-    if state.outcome_capture_enabled {
-        runner = runner.with_outcome_sink(Arc::new(state.store.outcomes()));
+    if ctx.outcome_capture_enabled {
+        runner = runner.with_outcome_sink(Arc::new(ctx.store.outcomes()));
         if let Some((name, _)) = options.active_skill.as_ref() {
             runner = runner.with_active_skill(name.clone());
         }
     }
 
-    if let Some(cb) = build_memory_callback(state, conv) {
+    if let Some(cb) = build_memory_callback(ctx, conv) {
         // The inbound user message was pushed onto conv.messages by
         // routes.rs before the runner was constructed, so it never goes
         // through push_message. Fire the callback once so the user turn
@@ -352,7 +358,7 @@ async fn prepare_agent(
 }
 
 /// Extract the last assistant text message from a conversation.
-fn extract_assistant_message(conv: &Conversation) -> Result<Message, StatusCode> {
+fn extract_assistant_message(conv: &Conversation) -> Result<Message, RuntimeError> {
     conv.messages
         .iter()
         .rev()
@@ -360,7 +366,7 @@ fn extract_assistant_message(conv: &Conversation) -> Result<Message, StatusCode>
         .cloned()
         .ok_or_else(|| {
             tracing::error!("agent loop completed but no assistant text message found");
-            StatusCode::INTERNAL_SERVER_ERROR
+            RuntimeError::Internal
         })
 }
 
@@ -371,35 +377,35 @@ fn extract_assistant_message(conv: &Conversation) -> Result<Message, StatusCode>
 /// channel/scheduler entry points should mint a fresh one with
 /// [`Uuid::new_v4`].
 pub async fn run_agent(
-    state: &AppState,
+    ctx: &AgentContext,
     conv: &mut Conversation,
     user_content: &str,
     trace_id: Uuid,
-) -> Result<Message, StatusCode> {
-    run_agent_with_options(state, conv, user_content, trace_id, &RunOptions::default()).await
+) -> Result<Message, RuntimeError> {
+    run_agent_with_options(ctx, conv, user_content, trace_id, &RunOptions::default()).await
 }
 
 /// Like [`run_agent`] but accepts caller-supplied [`RunOptions`].
 pub async fn run_agent_with_options(
-    state: &AppState,
+    ctx: &AgentContext,
     conv: &mut Conversation,
     user_content: &str,
     trace_id: Uuid,
     options: &RunOptions,
-) -> Result<Message, StatusCode> {
+) -> Result<Message, RuntimeError> {
     rustykrab_core::prompt_trace::with_trace_id(trace_id, async move {
-        let (runner, session) = prepare_agent(state, conv, user_content, options).await?;
+        let (runner, session) = prepare_agent(ctx, conv, user_content, options).await?;
 
         runner.run(conv, &session).await.map_err(|e| {
             tracing::error!(%trace_id, "agent error: {e}");
-            StatusCode::INTERNAL_SERVER_ERROR
+            RuntimeError::Internal
         })?;
 
         // Mark busy again on the way out. Recording only at the start
         // would leave a long turn looking idle from the moment it began,
         // and the worker could fire while it was still running.
-        if let Some(agent_id) = state.agent_id {
-            state.activity.record(agent_id);
+        if let Some(agent_id) = ctx.agent_id {
+            ctx.activity.record(agent_id);
         }
 
         extract_assistant_message(conv)
@@ -415,7 +421,7 @@ pub async fn run_agent_with_options(
 /// them. The `Receiver<AgentEvent>` streams real-time progress events,
 /// and the `JoinHandle` resolves to the final conversation.
 pub async fn run_agent_interactive(
-    state: &AppState,
+    ctx: &AgentContext,
     mut conv: Conversation,
     user_content: &str,
     trace_id: Uuid,
@@ -425,32 +431,28 @@ pub async fn run_agent_interactive(
         mpsc::Receiver<AgentEvent>,
         JoinHandle<rustykrab_core::Result<Conversation>>,
     ),
-    StatusCode,
+    RuntimeError,
 > {
     rustykrab_core::prompt_trace::with_trace_id(trace_id, async move {
         // Resolve the harness profile once for both the system prompt and
         // the agent config.
-        let profile = state.profile_for(user_content).await;
+        let profile = ctx.profile_for(user_content).await;
         tracing::info!(profile = %profile.name, "harness profile selected");
 
-        build_and_inject_system_prompt(state, &mut conv, &profile, &RunOptions::default()).await;
+        build_and_inject_system_prompt(ctx, &mut conv, &profile, &RunOptions::default()).await;
 
-        let tool_names: Vec<&str> = state
+        let tool_names: Vec<&str> = ctx
             .tools
             .iter()
             .filter(|t| t.available())
             .map(|t| t.name())
             .collect();
-        let caps = build_session_capabilities(state, &tool_names);
+        let caps = build_session_capabilities(ctx, &tool_names);
         let session = Session::with_capabilities(conv.id, caps);
 
-        let runner = AgentRunner::new(
-            state.provider.clone(),
-            state.tools.clone(),
-            state.sandbox.clone(),
-        )
-        .with_config(profile.to_agent_config())
-        .with_todo_store(state.todos.clone());
+        let runner = AgentRunner::new(ctx.provider.clone(), ctx.tools.clone(), ctx.sandbox.clone())
+            .with_config(profile.to_agent_config())
+            .with_todo_store(ctx.todos.clone());
 
         // The agent loop runs in a tokio::spawn'd task inside `start`, so
         // the task-local trace id won't follow it. Re-scope the spawned
@@ -465,14 +467,14 @@ pub async fn run_agent_interactive(
 
 /// Run the agent loop with streaming events.
 pub async fn run_agent_streaming(
-    state: &AppState,
+    ctx: &AgentContext,
     conv: &mut Conversation,
     user_content: &str,
     on_event: &(dyn Fn(AgentEvent) + Send + Sync),
     trace_id: Uuid,
-) -> Result<Message, StatusCode> {
+) -> Result<Message, RuntimeError> {
     run_agent_streaming_with_options(
-        state,
+        ctx,
         conv,
         user_content,
         on_event,
@@ -484,28 +486,28 @@ pub async fn run_agent_streaming(
 
 /// Like [`run_agent_streaming`] but accepts caller-supplied [`RunOptions`].
 pub async fn run_agent_streaming_with_options(
-    state: &AppState,
+    ctx: &AgentContext,
     conv: &mut Conversation,
     user_content: &str,
     on_event: &(dyn Fn(AgentEvent) + Send + Sync),
     trace_id: Uuid,
     options: &RunOptions,
-) -> Result<Message, StatusCode> {
+) -> Result<Message, RuntimeError> {
     rustykrab_core::prompt_trace::with_trace_id(trace_id, async move {
-        let (runner, session) = prepare_agent(state, conv, user_content, options).await?;
+        let (runner, session) = prepare_agent(ctx, conv, user_content, options).await?;
 
         runner
             .run_streaming(conv, &session, on_event)
             .await
             .map_err(|e| {
                 tracing::error!(%trace_id, "agent error: {e}");
-                StatusCode::INTERNAL_SERVER_ERROR
+                RuntimeError::Internal
             })?;
 
         // See `run_agent_with_options` -- a long turn must not read as
         // idle from the moment it started.
-        if let Some(agent_id) = state.agent_id {
-            state.activity.record(agent_id);
+        if let Some(agent_id) = ctx.agent_id {
+            ctx.activity.record(agent_id);
         }
 
         extract_assistant_message(conv)

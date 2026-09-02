@@ -1,0 +1,21 @@
+[package]
+name = "rustykrab-runtime"
+description = "Assembles and runs an agent turn, independent of any transport"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rustykrab-core.workspace = true
+rustykrab-store.workspace = true
+rustykrab-agent.workspace = true
+rustykrab-memory.workspace = true
+rustykrab-skills.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true

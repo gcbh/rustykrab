@@ -63,7 +63,7 @@ pub async fn require_auth(
     let principal = if is_master {
         Some(rustykrab_store::Principal::Master)
     } else if let Some(candidate) = token {
-        match state.store.devices().authenticate(candidate).await {
+        match state.agent.store.devices().authenticate(candidate).await {
             Ok(found) => found,
             Err(e) => {
                 tracing::error!(error = %e, "device token lookup failed");

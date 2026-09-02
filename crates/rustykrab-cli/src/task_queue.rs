@@ -222,7 +222,7 @@ async fn execute_credential_wake(
         return;
     };
 
-    let mut conv = match state.store.conversations().get(uuid).await {
+    let mut conv = match state.agent.store.conversations().get(uuid).await {
         Ok(c) => c,
         Err(e) => {
             // The conversation was deleted between asking and answering.
@@ -247,7 +247,7 @@ async fn execute_credential_wake(
 
     push_scheduled_user_turn(&mut conv, prompt);
 
-    let run_options = rustykrab_gateway::RunOptions {
+    let run_options = rustykrab_runtime::RunOptions {
         active_skill: None,
         // The point of waking is to finish the job, so the first move
         // should be acting rather than announcing that it can now act.
@@ -258,7 +258,7 @@ async fn execute_credential_wake(
         // spends all of it. One observed run reached 96 iterations
         // without ever attempting the login, and would have continued.
         max_iterations: Some(WAKE_MAX_ITERATIONS),
-        ..rustykrab_gateway::RunOptions::default()
+        ..rustykrab_runtime::RunOptions::default()
     };
 
     let trace_id = Uuid::new_v4();
@@ -270,8 +270,8 @@ async fn execute_credential_wake(
     );
 
     let no_op_event = |_event: AgentEvent| {};
-    let response_text = match rustykrab_gateway::run_agent_streaming_with_options(
-        state,
+    let response_text = match rustykrab_runtime::run_agent_streaming_with_options(
+        &state.agent,
         &mut conv,
         prompt,
         &no_op_event,
@@ -298,6 +298,7 @@ async fn execute_credential_wake(
     // on the next turn -- and the resumed turn is exactly the one that
     // did the work they asked for.
     if let Err(e) = state
+        .agent
         .store
         .conversations()
         .save_turn(&conv, &persisted)
@@ -453,7 +454,7 @@ async fn execute_cron_task(
     ) {
         // Metadata-only change — the resumed conversation's messages are
         // untouched here, so skip rewriting them.
-        if let Err(e) = state.store.conversations().save_meta(&conv).await {
+        if let Err(e) = state.agent.store.conversations().save_meta(&conv).await {
             tracing::warn!(
                 job_id = %job_id,
                 "failed to persist channel context onto job conversation: {e}"
@@ -469,7 +470,7 @@ async fn execute_cron_task(
     // content. Operators commonly schedule jobs with `task = "morning-briefing"`,
     // and without the body the model would have to make a tool round-trip
     // before doing any real work.
-    let resolved_skill = resolve_skill_for_task(&state.skill_registry, task_prompt);
+    let resolved_skill = resolve_skill_for_task(&state.agent.skill_registry, task_prompt);
     if let Some((ref name, _)) = resolved_skill {
         tracing::info!(
             job_id = %job_id,
@@ -488,14 +489,14 @@ async fn execute_cron_task(
     // A scheduled run must contribute its own user turn.
     push_scheduled_user_turn(&mut conv, &prompt);
 
-    let run_options = rustykrab_gateway::RunOptions {
+    let run_options = rustykrab_runtime::RunOptions {
         active_skill: resolved_skill,
         // Cron tasks must call a tool on iteration 0 — a bare "I'm ready"
         // reply is never the deliverable, and the model would otherwise
         // burn the slot.
         force_tool_use_first_iteration: true,
         max_iterations: None,
-        ..rustykrab_gateway::RunOptions::default()
+        ..rustykrab_runtime::RunOptions::default()
     };
 
     // Run the agent. Mint a fresh trace id per scheduled run so prompt-log
@@ -510,8 +511,8 @@ async fn execute_cron_task(
         "scheduled task starting"
     );
     let no_op_event = |_event: AgentEvent| {};
-    let result = rustykrab_gateway::run_agent_streaming_with_options(
-        state,
+    let result = rustykrab_runtime::run_agent_streaming_with_options(
+        &state.agent,
         &mut conv,
         &prompt,
         &no_op_event,
@@ -586,7 +587,7 @@ async fn resume_or_create_conversation(
 ) -> Result<Conversation, rustykrab_core::Error> {
     if let Some(cid) = &job.conversation_id {
         if let Ok(uuid) = Uuid::parse_str(cid) {
-            match state.store.conversations().get(uuid).await {
+            match state.agent.store.conversations().get(uuid).await {
                 Ok(c) => return Ok(c),
                 Err(rustykrab_core::Error::NotFound(_)) => {
                     tracing::warn!(
@@ -606,7 +607,7 @@ async fn resume_or_create_conversation(
         }
     }
 
-    let conv = state.store.conversations().create().await?;
+    let conv = state.agent.store.conversations().create().await?;
     store
         .jobs()
         .set_conversation_id(&job.id, &conv.id.to_string())
@@ -877,7 +878,7 @@ async fn deliver_response(
 
     // Each link goes as its own message and never passed through the model,
     // so it cannot have been truncated or paraphrased on the way here.
-    for link in state.store.pending_links().take(conversation_id) {
+    for link in state.agent.store.pending_links().take(conversation_id) {
         deliver_text(target, channel, chat_id, thread_id, &link, state).await;
     }
 }

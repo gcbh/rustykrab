@@ -365,7 +365,10 @@ async fn is_authenticated(state: &crate::AppState, token: Option<&str>) -> bool 
         return true;
     }
 
-    matches!(state.store.devices().authenticate(token).await, Ok(Some(_)))
+    matches!(
+        state.agent.store.devices().authenticate(token).await,
+        Ok(Some(_))
+    )
 }
 
 #[cfg(test)]

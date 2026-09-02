@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/rustykrab-core",
     "crates/rustykrab-store",
+    "crates/rustykrab-runtime",
     "crates/rustykrab-gateway",
     "crates/rustykrab-agent",
     "crates/rustykrab-providers",
@@ -99,6 +100,7 @@ rustls-native-certs = "0.8"
 # Internal crates
 rustykrab-core = { path = "crates/rustykrab-core" }
 rustykrab-store = { path = "crates/rustykrab-store" }
+rustykrab-runtime = { path = "crates/rustykrab-runtime" }
 rustykrab-gateway = { path = "crates/rustykrab-gateway" }
 rustykrab-agent = { path = "crates/rustykrab-agent" }
 rustykrab-providers = { path = "crates/rustykrab-providers" }

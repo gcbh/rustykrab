@@ -167,7 +167,7 @@ impl CronBackend for CronAdapter {
 ///
 /// The `message` tool is registered alongside the other built-in tools, before
 /// any channel is constructed (channels are attached to `AppState` later, and
-/// `state.tools` is captured by-value when state is cloned for spawned agent
+/// `state.agent.tools` is captured by-value when state is cloned for spawned agent
 /// loops). The adapter therefore reads its channels through this shared hub,
 /// which is populated in stages as each channel comes up during startup.
 #[derive(Default)]
@@ -1115,7 +1115,7 @@ async fn main() -> anyhow::Result<()> {
         .with_activity_tracker(activity_tracker.clone())
         .with_outcome_capture(outcome_capture_enabled)
         .with_credential_page_policy(rustykrab_gateway::PageIdentityPolicy::from_env());
-    state.active_tools = active_tools;
+    state.agent.active_tools = active_tools;
 
     // --- Attach video channel to state ---
     if let Some(vc) = video_channel {
@@ -1560,7 +1560,7 @@ async fn load_or_rebind(
     channel_id: Option<String>,
     channel_thread_id: Option<String>,
 ) -> Result<(rustykrab_core::types::Conversation, bool), rustykrab_core::Error> {
-    match state.store.conversations().get(conv_id).await {
+    match state.agent.store.conversations().get(conv_id).await {
         Ok(conv) => Ok((conv, false)),
         Err(rustykrab_core::Error::NotFound(_)) => {
             tracing::warn!(
@@ -1568,12 +1568,13 @@ async fn load_or_rebind(
                 stale_conv_id = %conv_id,
                 "bound conversation no longer exists — starting a new one"
             );
-            let mut conv = state.store.conversations().create().await?;
+            let mut conv = state.agent.store.conversations().create().await?;
             conv.channel_source = Some(channel_source.to_string());
             conv.channel_id = channel_id;
             conv.channel_thread_id = channel_thread_id;
-            state.store.conversations().save_meta(&conv).await?;
+            state.agent.store.conversations().save_meta(&conv).await?;
             state
+                .agent
                 .store
                 .channel_bindings()
                 .bind(address, conv.id)
@@ -1658,6 +1659,7 @@ async fn telegram_agent_loop(
                     states.remove(&key);
                 }
                 if let Err(e) = state
+                    .agent
                     .store
                     .channel_bindings()
                     .unbind(&telegram_address(chat_id, thread_id))
@@ -1712,6 +1714,7 @@ async fn telegram_agent_loop(
                     Some(cs) => cs.conv_id,
                     None => {
                         let db_id = state
+                            .agent
                             .store
                             .channel_bindings()
                             .lookup(&telegram_address(chat_id, thread_id))
@@ -1734,7 +1737,7 @@ async fn telegram_agent_loop(
                                 );
                                 id
                             }
-                            None => match state.store.conversations().create().await {
+                            None => match state.agent.store.conversations().create().await {
                                 Ok(mut conv) => {
                                     conv.channel_source = Some("telegram".to_string());
                                     conv.channel_id = Some(chat_id.to_string());
@@ -1742,7 +1745,7 @@ async fn telegram_agent_loop(
                                         conv.channel_thread_id = Some(thread_id.to_string());
                                     }
                                     if let Err(e) =
-                                        state.store.conversations().save_meta(&conv).await
+                                        state.agent.store.conversations().save_meta(&conv).await
                                     {
                                         tracing::warn!(
                                             chat_id,
@@ -1758,6 +1761,7 @@ async fn telegram_agent_loop(
                                         },
                                     );
                                     if let Err(e) = state
+                                        .agent
                                         .store
                                         .channel_bindings()
                                         .bind(&telegram_address(chat_id, thread_id), id)
@@ -1826,7 +1830,7 @@ async fn telegram_agent_loop(
             // message. It goes after the agent's text so the user reads
             // why before they are handed the form, and it never passed
             // through the model, so it cannot have been truncated.
-            for link in state.store.pending_links().take(conv_id) {
+            for link in state.agent.store.pending_links().take(conv_id) {
                 if let Err(e) = tg.send_text(chat_id, &link, thread_id).await {
                     tracing::error!(chat_id, thread_id, "failed to send credential link: {e}");
                 }
@@ -1922,7 +1926,9 @@ async fn process_telegram_message(
     let trace_id = Uuid::new_v4();
     tracing::info!(%trace_id, chat_id, ?thread_id, "telegram agent run starting");
     let (handle, mut event_rx, join_handle) =
-        match rustykrab_gateway::run_agent_interactive(state, conv, user_text, trace_id).await {
+        match rustykrab_runtime::run_agent_interactive(&state.agent, conv, user_text, trace_id)
+            .await
+        {
             Ok(triple) => triple,
             Err(_status) => {
                 typing_active.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -1990,6 +1996,7 @@ async fn process_telegram_message(
                 // back to a full rewrite if compaction replaced the
                 // persisted prefix.
                 if let Err(e) = state
+                    .agent
                     .store
                     .conversations()
                     .save_turn(&final_conv, &persisted_ids)
@@ -2100,6 +2107,7 @@ async fn slack_agent_loop(
                     states.remove(&key);
                 }
                 if let Err(e) = state
+                    .agent
                     .store
                     .channel_bindings()
                     .unbind(&slack_address(
@@ -2131,6 +2139,7 @@ async fn slack_agent_loop(
                     Some(cs) => cs.conv_id,
                     None => {
                         let db_id = state
+                            .agent
                             .store
                             .channel_bindings()
                             .lookup(&slack_address(
@@ -2160,12 +2169,14 @@ async fn slack_agent_loop(
                                 );
                                 id
                             }
-                            None => match state.store.conversations().create().await {
+                            None => match state.agent.store.conversations().create().await {
                                 Ok(mut conv) => {
                                     conv.channel_source = Some("slack".to_string());
                                     conv.channel_id = Some(inbound.channel_id.clone());
                                     conv.channel_thread_id = Some(effective_thread_ts.clone());
-                                    if let Err(e) = state.store.conversations().save(&conv).await {
+                                    if let Err(e) =
+                                        state.agent.store.conversations().save(&conv).await
+                                    {
                                         tracing::warn!(
                                             channel_id = %inbound.channel_id,
                                             "failed to persist Slack channel metadata: {e}"
@@ -2180,6 +2191,7 @@ async fn slack_agent_loop(
                                         },
                                     );
                                     if let Err(e) = state
+                                        .agent
                                         .store
                                         .channel_bindings()
                                         .bind(
@@ -2276,7 +2288,7 @@ async fn slack_agent_loop(
             // the link never passed through the model so it cannot have
             // been truncated. Slack has no app in the loop, so without
             // this the ask is a dead end here.
-            for link in state.store.pending_links().take(conv_id) {
+            for link in state.agent.store.pending_links().take(conv_id) {
                 if let Err(e) = sl
                     .send_text(&inbound.channel_id, &link, Some(&effective_thread_ts))
                     .await
@@ -2351,8 +2363,13 @@ async fn process_slack_message(
 
     let trace_id = Uuid::new_v4();
     tracing::info!(%trace_id, conv_id = %conv.id, "slack agent run starting");
-    let agent_fut =
-        rustykrab_gateway::run_agent_streaming(state, &mut conv, user_text, &on_event, trace_id);
+    let agent_fut = rustykrab_runtime::run_agent_streaming(
+        &state.agent,
+        &mut conv,
+        user_text,
+        &on_event,
+        trace_id,
+    );
 
     let timeout_millis = HEARTBEAT_TIMEOUT_SECS * 1000;
     let heartbeat_monitor = async {
@@ -2388,6 +2405,7 @@ async fn process_slack_message(
     };
 
     if let Err(e) = state
+        .agent
         .store
         .conversations()
         .save_turn(&conv, &persisted_ids)

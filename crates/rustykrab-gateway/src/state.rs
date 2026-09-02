@@ -1,13 +1,11 @@
-use rustykrab_agent::{HarnessProfile, HarnessRouter, ProcessSandbox, Sandbox};
+use rustykrab_agent::{HarnessProfile, HarnessRouter, Sandbox};
 use rustykrab_channels::{SignalChannel, SlackChannel, TelegramChannel, VideoChannel};
-use rustykrab_core::active_tools::ActiveToolsRegistry;
 use rustykrab_core::activity::ActivityTracker;
 use rustykrab_core::model::ModelProvider;
 use rustykrab_core::orchestration::OrchestrationConfig;
-use rustykrab_core::recall::RecallStore;
 use rustykrab_core::retrieval_log::RetrievalLog;
-use rustykrab_core::todo::TodoStore;
 use rustykrab_memory::MemorySystem;
+use rustykrab_runtime::AgentContext;
 use rustykrab_skills::SkillRegistry;
 use rustykrab_store::Store;
 use std::sync::{Arc, RwLock};
@@ -17,78 +15,35 @@ use crate::origin::OriginPolicy;
 use crate::rate_limit::{RateLimitConfig, RateLimiter};
 
 /// Shared application state threaded through axum handlers.
+///
+/// Two halves, deliberately separated. `agent` is everything a turn needs
+/// and is [`AgentContext`], which lives in `rustykrab-runtime` so a caller
+/// with no HTTP in sight — a Telegram loop, a scheduled job, a test — can
+/// hold one without constructing a web server's state. The rest of this
+/// struct is the web server: auth, rate limiting, origin policy, the
+/// credential page, and the channel handles the webhook routes deliver to.
 #[derive(Clone)]
 pub struct AppState {
-    pub store: Store,
-    pub tools: Vec<Arc<dyn rustykrab_core::Tool>>,
-    pub provider: Arc<dyn ModelProvider>,
+    /// Everything needed to run a turn. See [`AgentContext`].
+    pub agent: AgentContext,
+
+    // --- HTTP-only ---
     pub auth_token: Arc<RwLock<String>>,
     pub rate_limiter: Arc<RateLimiter>,
     pub origin_policy: OriginPolicy,
-    pub telegram: Option<Arc<TelegramChannel>>,
-    pub signal: Option<Arc<SignalChannel>>,
-    pub slack: Option<Arc<SlackChannel>>,
-    /// Video communication channel (hyperframes MCP).
-    pub video: Option<Arc<VideoChannel>>,
-    /// Sandbox for tool execution isolation.
-    pub sandbox: Arc<dyn Sandbox>,
-    /// Base harness profile (used as fallback and template).
-    pub harness_profile: HarnessProfile,
-    /// Auto-router that classifies messages and selects profiles on-the-fly.
-    /// None = static profile mode (uses harness_profile directly).
-    pub harness_router: Option<Arc<HarnessRouter>>,
-    /// Orchestration configuration (used by RLM module).
-    pub orchestration_config: OrchestrationConfig,
-    /// Skill registry for SKILL.md-based skills.
-    pub skill_registry: Arc<SkillRegistry>,
-    /// Hybrid memory system for auto-persisting conversation turns.
-    /// `None` when no memory backend is configured.
-    pub memory: Option<Arc<MemorySystem>>,
-    /// Persistent agent identifier, used as the owner for memory writes.
-    /// `None` when memory is not configured.
-    pub agent_id: Option<Uuid>,
-    /// Shared registry backing the `tools_load` / `tools_list` meta-tools.
-    /// Tracks which tools are "active" per conversation so schemas sent to
-    /// the model stay compact until the agent explicitly loads more.
-    pub active_tools: Arc<ActiveToolsRegistry>,
-    /// Per-conversation archive of compaction-displaced history. Backs
-    /// the `recall_*` tools so the agent can recover detail dropped by
-    /// summarisation.
-    pub recall: Arc<RecallStore>,
-    /// Per-conversation todo list backing the `todo_*` tools. Shared across
-    /// a conversation's requests so the agent's plan persists between turns.
-    /// In-memory only: a todo list is short-horizon working state, not
-    /// durable history like `recall`.
-    pub todos: Arc<TodoStore>,
-    /// Whether sub-agent / session-management tools should be granted to
-    /// sessions created by this gateway. Default `false`. Driven by the
-    /// `RUSTYKRAB_ENABLE_SUBAGENTS` env var at startup; threaded through
-    /// here so `prepare_agent` knows whether to grant `Capability::Subagent`.
-    pub subagents_enabled: bool,
-    /// Whether the computer-use tool should be granted to sessions created by
-    /// this gateway. Default `false`. Driven by `RUSTYKRAB_COMPUTER_USE` at
-    /// startup; threaded through so `prepare_agent` knows whether to grant
-    /// `Capability::ComputerUse`.
-    pub computer_use_enabled: bool,
-    /// When each agent last saw inbound activity. Gates the downtime
-    /// analysis worker, which must run only when nothing else needs the
-    /// machine and must yield the moment it does. See `DREAMING.md`.
-    pub activity: ActivityTracker,
-    /// Records which memories were surfaced into each conversation so a
-    /// completed run's outcome can be attributed to them. Shared with the
-    /// memory backend, which writes it, and the agent runner, which drains
-    /// it. See `DREAMING.md`.
-    pub retrieval_log: RetrievalLog,
-    /// Whether completed runs report their outcome to the store. Off by
-    /// default: instrumentation is opt-in, driven by
-    /// `RUSTYKRAB_OUTCOME_CAPTURE` at startup.
-    pub outcome_capture_enabled: bool,
     /// Who may open the credential page served at `/c/{token}`.
     pub credential_page_policy: crate::PageIdentityPolicy,
     /// Wake-up channel and cancellation registry for the delegated-task
     /// queue. Shared between the `/api/tasks` handlers, which enqueue and
     /// cancel, and the worker, which drains.
     pub task_signal: crate::tasks::TaskQueueSignal,
+
+    // --- Outbound channels, delivered to by the webhook routes ---
+    pub telegram: Option<Arc<TelegramChannel>>,
+    pub signal: Option<Arc<SignalChannel>>,
+    pub slack: Option<Arc<SlackChannel>>,
+    /// Video communication channel (hyperframes MCP).
+    pub video: Option<Arc<VideoChannel>>,
 }
 
 impl AppState {
@@ -98,144 +53,101 @@ impl AppState {
         provider: Arc<dyn ModelProvider>,
         auth_token: String,
     ) -> Self {
-        // Back the recall archive with SQLite so compaction-displaced
-        // history survives process restarts. The in-memory `RecallStore`
-        // acts as a write-through cache, lazily hydrated per conversation.
-        let recall = Arc::new(RecallStore::with_persistence(Arc::new(
-            store.recall_archive(),
-        )));
         Self {
-            store,
-            tools,
-            provider,
+            agent: AgentContext::new(store, tools, provider),
             auth_token: Arc::new(RwLock::new(auth_token)),
             rate_limiter: Arc::new(RateLimiter::new(RateLimitConfig::from_env())),
             origin_policy: OriginPolicy::default(),
+            credential_page_policy: crate::PageIdentityPolicy::default(),
+            task_signal: crate::tasks::TaskQueueSignal::new(),
             telegram: None,
             signal: None,
             slack: None,
             video: None,
-            sandbox: Arc::new(ProcessSandbox::new()),
-            harness_profile: HarnessProfile::default(),
-            harness_router: None,
-            orchestration_config: OrchestrationConfig::default(),
-            skill_registry: Arc::new(SkillRegistry::new()),
-            memory: None,
-            agent_id: None,
-            active_tools: Arc::new(ActiveToolsRegistry::new()),
-            recall,
-            todos: Arc::new(TodoStore::new()),
-            subagents_enabled: false,
-            computer_use_enabled: false,
-            activity: ActivityTracker::new(),
-            retrieval_log: RetrievalLog::new(),
-            outcome_capture_enabled: false,
-            credential_page_policy: crate::PageIdentityPolicy::default(),
-            task_signal: crate::tasks::TaskQueueSignal::new(),
         }
     }
 
-    /// Record how each completed run went, for later offline analysis.
-    ///
-    /// Purely observational — it changes nothing about how the agent
-    /// behaves. Driven by `RUSTYKRAB_OUTCOME_CAPTURE` in the CLI.
+    /// Replace the agent context wholesale, for callers that build one up
+    /// with `AgentContext`'s own builders.
+    pub fn with_agent_context(mut self, agent: AgentContext) -> Self {
+        self.agent = agent;
+        self
+    }
+
+    // --- Delegating builders -------------------------------------------
+    //
+    // Kept so existing wiring reads the same. Each defers to the
+    // `AgentContext` builder of the same name.
+
     pub fn with_outcome_capture(mut self, enabled: bool) -> Self {
-        self.outcome_capture_enabled = enabled;
+        self.agent = self.agent.with_outcome_capture(enabled);
         self
     }
 
-    /// Share the activity tracker with the downtime worker, so the worker
-    /// sees the traffic this gateway serves.
     pub fn with_activity_tracker(mut self, activity: ActivityTracker) -> Self {
-        self.activity = activity;
+        self.agent = self.agent.with_activity_tracker(activity);
         self
     }
 
-    /// Share the retrieval log with the memory backend, which records the
-    /// memories it surfaces so runs can be credited to them.
     pub fn with_retrieval_log(mut self, log: RetrievalLog) -> Self {
-        self.retrieval_log = log;
+        self.agent = self.agent.with_retrieval_log(log);
         self
     }
 
-    /// Enable the sub-agent / session-management tool family for every
-    /// session created by this gateway. Driven by the
-    /// `RUSTYKRAB_ENABLE_SUBAGENTS` env var in the CLI; off by default.
     pub fn with_subagents_enabled(mut self, enabled: bool) -> Self {
-        self.subagents_enabled = enabled;
+        self.agent = self.agent.with_subagents_enabled(enabled);
         self
     }
 
-    /// Grant the computer-use tool to every session created by this gateway.
-    /// Driven by `RUSTYKRAB_COMPUTER_USE` in the CLI; off by default. Only
-    /// meaningful when the tool is actually registered (built with the
-    /// `computer-use` feature).
     pub fn with_computer_use_enabled(mut self, enabled: bool) -> Self {
-        self.computer_use_enabled = enabled;
+        self.agent = self.agent.with_computer_use_enabled(enabled);
         self
     }
 
-    /// Attach the memory system and the agent identifier used for writes.
-    /// When set, the gateway wires an `on_message` hook into the agent
-    /// runner that persists every conversation turn into working memory.
     pub fn with_memory(mut self, memory: Arc<MemorySystem>, agent_id: Uuid) -> Self {
-        self.memory = Some(memory);
-        self.agent_id = Some(agent_id);
+        self.agent = self.agent.with_memory(memory, agent_id);
         self
     }
 
-    /// Override the origin policy.
+    pub fn with_sandbox(mut self, sandbox: Arc<dyn Sandbox>) -> Self {
+        self.agent = self.agent.with_sandbox(sandbox);
+        self
+    }
+
+    pub fn with_harness_profile(mut self, profile: HarnessProfile) -> Self {
+        self.agent = self.agent.with_harness_profile(profile);
+        self
+    }
+
+    pub fn with_harness_router(mut self, router: Arc<HarnessRouter>) -> Self {
+        self.agent = self.agent.with_harness_router(router);
+        self
+    }
+
+    pub fn with_harness_router_opt(mut self, router: Option<Arc<HarnessRouter>>) -> Self {
+        self.agent = self.agent.with_harness_router_opt(router);
+        self
+    }
+
+    pub fn with_skill_registry(mut self, registry: Arc<SkillRegistry>) -> Self {
+        self.agent = self.agent.with_skill_registry(registry);
+        self
+    }
+
+    pub fn with_orchestration_config(mut self, config: OrchestrationConfig) -> Self {
+        self.agent = self.agent.with_orchestration_config(config);
+        self
+    }
+
+    // --- HTTP-only builders ---------------------------------------------
+
     pub fn with_origin_policy(mut self, policy: OriginPolicy) -> Self {
         self.origin_policy = policy;
         self
     }
 
-    /// Override the rate limit configuration.
     pub fn with_rate_limit(mut self, config: RateLimitConfig) -> Self {
         self.rate_limiter = Arc::new(RateLimiter::new(config));
-        self
-    }
-
-    /// Attach a Telegram channel.
-    pub fn with_telegram(mut self, telegram: Arc<TelegramChannel>) -> Self {
-        self.telegram = Some(telegram);
-        self
-    }
-
-    /// Attach a Signal channel.
-    pub fn with_signal(mut self, signal: Arc<SignalChannel>) -> Self {
-        self.signal = Some(signal);
-        self
-    }
-
-    /// Attach a Slack channel.
-    pub fn with_slack(mut self, slack: Arc<SlackChannel>) -> Self {
-        self.slack = Some(slack);
-        self
-    }
-
-    /// Attach a Video communication channel.
-    pub fn with_video(mut self, video: Arc<VideoChannel>) -> Self {
-        self.video = Some(video);
-        self
-    }
-
-    /// Override the sandbox implementation.
-    pub fn with_sandbox(mut self, sandbox: Arc<dyn Sandbox>) -> Self {
-        self.sandbox = sandbox;
-        self
-    }
-
-    /// Set the harness profile.
-    pub fn with_harness_profile(mut self, profile: HarnessProfile) -> Self {
-        self.harness_profile = profile;
-        self
-    }
-
-    /// Enable auto-routing: a cheap model classifies each message and
-    /// selects the right harness profile on-the-fly.
-    pub fn with_harness_router(mut self, router: Arc<HarnessRouter>) -> Self {
-        self.harness_router = Some(router);
         self
     }
 
@@ -245,51 +157,32 @@ impl AppState {
         self
     }
 
-    /// Set the router, or leave static-profile mode in place when `None`.
-    pub fn with_harness_router_opt(mut self, router: Option<Arc<HarnessRouter>>) -> Self {
-        self.harness_router = router;
+    pub fn with_telegram(mut self, telegram: Arc<TelegramChannel>) -> Self {
+        self.telegram = Some(telegram);
         self
     }
 
-    /// Set the skill registry.
-    pub fn with_skill_registry(mut self, registry: Arc<SkillRegistry>) -> Self {
-        self.skill_registry = registry;
+    pub fn with_signal(mut self, signal: Arc<SignalChannel>) -> Self {
+        self.signal = Some(signal);
         self
     }
 
-    /// Set the orchestration configuration (used by RLM module).
-    pub fn with_orchestration_config(mut self, config: OrchestrationConfig) -> Self {
-        self.orchestration_config = config;
+    pub fn with_slack(mut self, slack: Arc<SlackChannel>) -> Self {
+        self.slack = Some(slack);
         self
     }
 
-    /// Rotate the auth token: generates a new random token, stores it,
-    /// and returns the new value. The old token is immediately invalidated.
+    pub fn with_video(mut self, video: Arc<VideoChannel>) -> Self {
+        self.video = Some(video);
+        self
+    }
+
+    /// Rotate the auth token: generates a new random token, stores it, and
+    /// returns the new value. The old token is immediately invalidated.
     pub fn rotate_token(&self) -> String {
         let new_token = crate::auth::generate_token();
         let mut guard = self.auth_token.write().unwrap_or_else(|e| e.into_inner());
         *guard = new_token.clone();
         new_token
-    }
-
-    /// Get the harness profile for a given user message.
-    /// If a router is configured, classifies the message automatically.
-    /// Otherwise, returns the static base profile.
-    pub async fn profile_for(&self, user_message: &str) -> HarnessProfile {
-        if let Some(router) = &self.harness_router {
-            router.route(user_message).await
-        } else {
-            self.harness_profile.clone()
-        }
-    }
-
-    /// Get a harness profile by name.
-    pub fn profile_for_name(&self, name: &str) -> HarnessProfile {
-        match name {
-            "coding" => HarnessProfile::coding(),
-            "research" => HarnessProfile::research(),
-            "creative" => HarnessProfile::creative(),
-            _ => self.harness_profile.clone(),
-        }
     }
 }

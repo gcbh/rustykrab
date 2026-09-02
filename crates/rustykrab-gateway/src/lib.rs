@@ -1,7 +1,6 @@
 pub mod auth;
 mod credential_page;
 pub mod logging;
-mod orchestrate;
 pub mod origin;
 pub mod push;
 pub mod rate_limit;
@@ -13,13 +12,15 @@ mod telegram_webhook;
 mod webchat;
 
 pub use auth::generate_token;
-pub use orchestrate::{
-    run_agent, run_agent_interactive, run_agent_streaming, run_agent_streaming_with_options,
-    run_agent_with_options, RunOptions,
-};
+pub mod run;
 pub use origin::OriginPolicy;
 pub use push::{ApnsClient, ApnsConfig, ApnsEnvironment, PushNotifier};
 pub use rate_limit::RateLimitConfig;
+pub use run::{
+    run_agent, run_agent_interactive, run_agent_streaming, run_agent_streaming_with_options,
+    run_agent_with_options,
+};
+pub use rustykrab_runtime::{AgentContext, RunOptions, RuntimeError};
 pub use state::AppState;
 pub use tasks::{run_task_worker, TaskQueueSignal};
 
