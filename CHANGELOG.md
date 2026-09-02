@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.2.25] - 2026-09-02
+
+- fix(caldav): use the endpoint that accepts an app password (#620)
+
 ## [5.2.24] - 2026-09-02
 
 - Dreaming P0/P1: make the outer loop's measurement readable and honest (#615)

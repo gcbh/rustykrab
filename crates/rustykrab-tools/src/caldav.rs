@@ -1,14 +1,47 @@
 //! Google Calendar integration via the CalDAV protocol.
 //!
-//! This tool talks to Google's CalDAV endpoint
-//! (`https://apidata.googleusercontent.com/caldav/v2/`) using HTTP Basic
+//! This tool talks to Google's CalDAV endpoint using HTTP Basic
 //! authentication. It deliberately **reuses the same credentials as the Gmail
 //! integration** — the `gmail_email` and `gmail_app_password` secrets — so a
-//! single Google app password unlocks both mail and calendar. Google's CalDAV
-//! endpoint accepts app passwords via Basic auth, exactly like IMAP/SMTP.
+//! single Google app password unlocks both mail and calendar.
 //!
-//! Because the host is fixed to Google, there is no arbitrary-URL / SSRF
-//! surface: every request targets `apidata.googleusercontent.com`.
+//! ## Why the legacy host and not `caldav/v2`
+//!
+//! Google publishes two CalDAV hosts, and only one of them accepts a password.
+//!
+//! `apidata.googleusercontent.com/caldav/v2/` is the documented one and it
+//! requires OAuth 2.0 — "Attempting to connect over HTTP or using Basic
+//! Authentication results in an HTTP `401 Unauthorized` status code" — which
+//! is unconditional. Measured 2026-09-02 against a live account: a valid app
+//! password, that same password carrying Google's display spaces, sixteen
+//! arbitrary characters, and an empty string all returned an identical 401
+//! with a GData `loginRequired` body. The endpoint never inspects the
+//! credential at all, so no stored value can ever satisfy it.
+//!
+//! `www.google.com/calendar/dav/` is documented as no longer supported and
+//! answers anyway. The same measurement returned 207 for the principal, for
+//! the events collection, and for a `calendar-query` REPORT carrying real
+//! events — while sixteen arbitrary characters returned 401, so it is
+//! genuinely authenticating rather than waving everything through.
+//!
+//! This is therefore a bridge, not a destination: an endpoint already past
+//! deprecation has no remaining timeline and can stop without notice. The
+//! replacement is OAuth 2.0, against either `caldav/v2` or the Calendar REST
+//! API v3 on the same token. Until that exists, a documented-dead endpoint
+//! that works beats a documented-live one that cannot authenticate — and the
+//! failure mode of guessing wrong here is a 401 the credential flow reads as
+//! "bad password", which asks the user for a replacement that also cannot
+//! work.
+//!
+//! Moving is a two-constant change: [`CALDAV_HOST`] and [`CALDAV_PATH`] are
+//! the only places the host and path are written down, and
+//! `caldav_base_is_host_plus_path` pins [`CALDAV_BASE`] to them.
+//!
+//! Because the host is fixed, the tool's own arguments carry no
+//! arbitrary-URL / SSRF surface: every request targets [`CALDAV_HOST`]. That
+//! host is now `www.google.com` rather than an API-only name, so a
+//! server-supplied href reaches a broader surface than it used to;
+//! [`absolutize`] is the single place such a path becomes a URL.
 
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
@@ -25,10 +58,16 @@ use serde_json::{json, Value};
 // Constants
 // ---------------------------------------------------------------------------
 
-/// Scheme + host for Google's CalDAV API. All requests target this host.
-const CALDAV_HOST: &str = "https://apidata.googleusercontent.com";
-/// Base path for CalDAV v2 collections.
-const CALDAV_BASE: &str = "https://apidata.googleusercontent.com/caldav/v2/";
+/// Scheme + host for Google's CalDAV endpoint. All requests target this host.
+const CALDAV_HOST: &str = "https://www.google.com";
+/// Path prefix for CalDAV collections under [`CALDAV_HOST`].
+///
+/// Server-supplied hrefs carry this prefix, so the parsing below keys off the
+/// constant rather than a literal — otherwise a host move silently stops
+/// matching hrefs while every request still succeeds.
+const CALDAV_PATH: &str = "/calendar/dav/";
+/// Base URL for CalDAV collections: [`CALDAV_HOST`] + [`CALDAV_PATH`].
+const CALDAV_BASE: &str = "https://www.google.com/calendar/dav/";
 
 // The account credential is shared with the Gmail tool so one app password
 // covers both mail and calendar — and so is the code that reads it and asks
@@ -259,8 +298,8 @@ impl CalDavTool {
         // The first href inside the response is the calendar-home-set.
         let home_href = extract_hrefs(&home_xml)
             .into_iter()
-            .find(|h| h.contains("/caldav/v2/"))
-            .unwrap_or_else(|| format!("/caldav/v2/{email}/"));
+            .find(|h| h.contains(CALDAV_PATH))
+            .unwrap_or_else(|| format!("{CALDAV_PATH}{email}/"));
         let home_url = absolutize(&home_href);
 
         // Step 2: enumerate child collections, keeping only calendars.
@@ -575,8 +614,9 @@ impl CalDavTool {
 /// Heuristic: a calendar resourcetype contains a `<...:calendar/>` tag.
 static CALENDAR_TYPE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"<[^>]*:?calendar\s*/?>").expect("static regex"));
-static CALENDAR_ID_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"/caldav/v2/([^/]+)/").expect("static regex"));
+static CALENDAR_ID_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(&format!(r"{}([^/]+)/", regex::escape(CALDAV_PATH))).expect("static regex")
+});
 static RESPONSE_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?si)<[a-z0-9]*:?response[\s>].*?</[a-z0-9]*:?response>").expect("static regex")
 });
@@ -601,7 +641,7 @@ fn absolutize(href: &str) -> String {
     }
 }
 
-/// Extract the calendar id (the segment between `/caldav/v2/` and `/events`)
+/// Extract the calendar id (the segment between [`CALDAV_PATH`] and `/events`)
 /// from an href, percent-decoding `%40` back to `@`.
 fn calendar_id_from_href(href: &str) -> String {
     let id = CALENDAR_ID_RE
@@ -1079,30 +1119,56 @@ mod tests {
         assert!(parse_vevent("BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n").is_none());
     }
 
+    /// The three constants have to agree, because href matching keys off
+    /// [`CALDAV_PATH`] while requests are built from [`CALDAV_BASE`]. Let them
+    /// drift and every request still succeeds while no href ever matches —
+    /// calendar discovery returns nothing and the tool looks empty, not broken.
     #[test]
-    fn absolutize_paths_and_urls() {
-        assert_eq!(
-            absolutize("/caldav/v2/me@gmail.com/events/x.ics"),
-            "https://apidata.googleusercontent.com/caldav/v2/me@gmail.com/events/x.ics"
-        );
-        assert_eq!(
-            absolutize("https://apidata.googleusercontent.com/foo"),
-            "https://apidata.googleusercontent.com/foo"
-        );
-        assert_eq!(
-            absolutize("caldav/v2/x"),
-            "https://apidata.googleusercontent.com/caldav/v2/x"
-        );
+    fn caldav_base_is_host_plus_path() {
+        assert_eq!(CALDAV_BASE, format!("{CALDAV_HOST}{CALDAV_PATH}"));
+    }
+
+    /// Basic auth only works against the legacy host; `caldav/v2` requires
+    /// OAuth and answers 401 to every password, valid or not. See the module
+    /// docs — this pins the endpoint so a "tidy-up" back to the documented
+    /// host cannot land silently.
+    #[test]
+    fn the_endpoint_is_the_one_that_accepts_a_password() {
+        assert_eq!(CALDAV_HOST, "https://www.google.com");
+        assert_eq!(CALDAV_PATH, "/calendar/dav/");
     }
 
     #[test]
+    fn absolutize_paths_and_urls() {
+        assert_eq!(
+            absolutize("/calendar/dav/me@gmail.com/events/x.ics"),
+            "https://www.google.com/calendar/dav/me@gmail.com/events/x.ics"
+        );
+        assert_eq!(
+            absolutize("https://www.google.com/foo"),
+            "https://www.google.com/foo"
+        );
+        assert_eq!(
+            absolutize("calendar/dav/x"),
+            "https://www.google.com/calendar/dav/x"
+        );
+    }
+
+    /// Both spellings observed from the live server on 2026-09-02: the
+    /// principal href leaves `@` bare, the calendar-home-set and event hrefs
+    /// percent-encode it.
+    #[test]
     fn calendar_id_extraction_decodes_at() {
         assert_eq!(
-            calendar_id_from_href("/caldav/v2/me%40gmail.com/events/"),
+            calendar_id_from_href("/calendar/dav/me%40gmail.com/events/"),
             "me@gmail.com"
         );
         assert_eq!(
-            calendar_id_from_href("/caldav/v2/abc123@group.calendar.google.com/events/"),
+            calendar_id_from_href("/calendar/dav/me@gmail.com/user/"),
+            "me@gmail.com"
+        );
+        assert_eq!(
+            calendar_id_from_href("/calendar/dav/abc123@group.calendar.google.com/events/"),
             "abc123@group.calendar.google.com"
         );
     }
@@ -1110,8 +1176,13 @@ mod tests {
     #[test]
     fn uid_from_url_strips_ics() {
         assert_eq!(
-            uid_from_url("https://x/caldav/v2/me/events/the-uid.ics"),
+            uid_from_url("https://x/calendar/dav/me/events/the-uid.ics"),
             "the-uid"
+        );
+        // Google returns UIDs that are themselves addresses.
+        assert_eq!(
+            uid_from_url("/calendar/dav/me%40gmail.com/events/abc%40google.com.ics"),
+            "abc%40google.com"
         );
     }
 
@@ -1133,7 +1204,7 @@ mod tests {
         let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
 <D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
   <D:response>
-    <D:href>/caldav/v2/me@gmail.com/events/evt-1.ics</D:href>
+    <D:href>/calendar/dav/me@gmail.com/events/evt-1.ics</D:href>
     <D:propstat>
       <D:prop>
         <D:getetag>"etag-123"</D:getetag>
@@ -1154,7 +1225,7 @@ END:VCALENDAR&#13;
         let blocks = split_responses(xml);
         assert_eq!(blocks.len(), 1);
         let href = extract_hrefs(&blocks[0]).into_iter().next().unwrap();
-        assert_eq!(href, "/caldav/v2/me@gmail.com/events/evt-1.ics");
+        assert_eq!(href, "/calendar/dav/me@gmail.com/events/evt-1.ics");
         let etag = extract_tag_text(&blocks[0], "getetag").unwrap();
         assert_eq!(etag, "\"etag-123\"");
         let data = extract_tag_text(&blocks[0], "calendar-data").unwrap();
@@ -1172,13 +1243,13 @@ END:VCALENDAR&#13;
         // correct even for calendars whose layout we would guess wrong.
         let url = tool
             .resolve_event_url(
-                &json!({ "href": "/caldav/v2/me@gmail.com/events/x.ics", "uid": "ignored" }),
+                &json!({ "href": "/calendar/dav/me@gmail.com/events/x.ics", "uid": "ignored" }),
                 "me@gmail.com",
             )
             .unwrap();
         assert_eq!(
             url,
-            "https://apidata.googleusercontent.com/caldav/v2/me@gmail.com/events/x.ics"
+            "https://www.google.com/calendar/dav/me@gmail.com/events/x.ics"
         );
     }
 
@@ -1189,18 +1260,18 @@ END:VCALENDAR&#13;
 
         assert_eq!(
             resolve(json!({ "uid": "evt-1" })),
-            "https://apidata.googleusercontent.com/caldav/v2/me@gmail.com/events/evt-1.ics"
+            "https://www.google.com/calendar/dav/me@gmail.com/events/evt-1.ics"
         );
         assert_eq!(
             resolve(json!({ "uid": "evt-1.ics" })),
-            "https://apidata.googleusercontent.com/caldav/v2/me@gmail.com/events/evt-1.ics",
+            "https://www.google.com/calendar/dav/me@gmail.com/events/evt-1.ics",
             "an extension already on the uid must not be doubled"
         );
         // An explicit calendar_id replaces the account's default collection,
         // which is how shared/group calendars are addressed.
         assert_eq!(
             resolve(json!({ "uid": "evt-1", "calendar_id": "team@group.calendar.google.com" })),
-            "https://apidata.googleusercontent.com/caldav/v2/\
+            "https://www.google.com/calendar/dav/\
              team@group.calendar.google.com/events/evt-1.ics"
         );
     }

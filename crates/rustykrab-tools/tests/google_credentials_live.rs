@@ -1,7 +1,8 @@
 //! Live proof that a credential Google *rejects* asks for a new one.
 //!
 //! Ignored by default — needs outbound network to `imap.gmail.com:993` and
-//! `apidata.googleusercontent.com`:
+//! `www.google.com` (see `caldav`'s module docs for why the CalDAV host is
+//! the legacy one):
 //!
 //! ```sh
 //! cargo test -p rustykrab-tools --test google_credentials_live \

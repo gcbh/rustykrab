@@ -257,11 +257,21 @@ pub async fn load(
 /// Remove all whitespace from a Google app password.
 ///
 /// Google displays app passwords as four space-separated groups (`abcd efgh
-/// ijkl mnop`). The spaces are not part of the secret: Gmail's IMAP and SMTP
-/// tolerate them server-side, but a CalDAV `Basic` auth header base64-encodes
-/// them verbatim and Google's DAV endpoint answers 401. Stripping here means
-/// a password stored in the displayed format works everywhere, without asking
-/// the user to type it again.
+/// ijkl mnop`), and the spaces are not part of the secret.
+///
+/// This used to say the spaces were what made CalDAV answer 401. They are
+/// not. Measured 2026-09-02 against a live account, with the two forms
+/// confirmed distinct on the wire by decoding the `Authorization` header:
+/// both authenticate to Gmail IMAP, and both return 207 from
+/// `www.google.com/calendar/dav/`. The 401 that motivated this function came
+/// from `caldav/v2`, which refuses Basic auth outright and returns the same
+/// 401 for the stripped form — so stripping never fixed it, and the comment
+/// claiming it did cost a later investigation a day looking for a password
+/// that would work when no password could.
+///
+/// Kept regardless: normalising at the boundary puts one canonical value in
+/// the store however the user pasted it, so no caller has to remember. That
+/// is hygiene, not a fix, and it should not be cited as one again.
 pub fn normalize_app_password(password: &str) -> String {
     password.replace(char::is_whitespace, "")
 }
