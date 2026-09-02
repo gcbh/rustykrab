@@ -1153,11 +1153,18 @@ impl AgentRunner {
     }
 
     /// Append a message to the conversation, bump `updated_at`, and fire
-    /// `on_message`. This is the single choke point every synthesized or
-    /// model-produced message flows through, so memory auto-persist sees
-    /// every turn — user prompts, assistant responses, tool results,
-    /// reflection injections, and the compaction summary — not just LLM
-    /// responses.
+    /// `on_message`. Every message the runner itself produces or synthesizes
+    /// flows through here — assistant responses, tool results, reflection
+    /// injections, the compaction summary, and the prompts the runner writes
+    /// in the user's voice ("Continue from the summary above").
+    ///
+    /// It is **not** the choke point for inbound messages. Channels append
+    /// those directly to `conv.messages` before a runner exists, so they
+    /// never reach this method or the auto-persist hook behind it. That gap
+    /// meant nothing a user typed was ever written to memory while the
+    /// runner's own synthesized prompts were written repeatedly; the channel
+    /// loops now call `rustykrab_runtime::ingest_inbound` to close it. This
+    /// comment previously claimed the opposite, and the claim cost a day.
     ///
     /// The callback fires on a borrow *before* the message is moved into
     /// the conversation, so no clone is needed — messages can carry large

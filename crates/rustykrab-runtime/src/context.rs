@@ -30,6 +30,21 @@ pub struct AgentContext {
     pub store: Store,
     pub tools: Vec<Arc<dyn rustykrab_core::Tool>>,
     pub provider: Arc<dyn ModelProvider>,
+    /// Model used to decide what an inbound message is worth remembering.
+    ///
+    /// Separate from `provider` because the two want opposite settings: the
+    /// agent wants thinking on, and a one-sentence classification wants it
+    /// off — measured at 0.4–2.6s without it against tens of seconds with.
+    /// `think` is provider-level config in the Ollama client rather than a
+    /// per-call flag, so sharing one handle cannot express both.
+    ///
+    /// Pointing this at the same model and `num_ctx` as `provider` keeps it
+    /// free: no second model resident, and no `num_ctx` switch, which costs
+    /// a reload and a full re-prefill. It is also the seam for moving
+    /// distillation to a bigger model on another node later.
+    ///
+    /// `None` disables distillation; working-memory capture is unaffected.
+    pub distiller: Option<Arc<dyn ModelProvider>>,
     /// Sandbox for tool execution isolation.
     pub sandbox: Arc<dyn Sandbox>,
     /// Base harness profile, used as fallback and as the template a routed
@@ -94,6 +109,7 @@ impl AgentContext {
             harness_router: None,
             orchestration_config: OrchestrationConfig::default(),
             skill_registry: Arc::new(SkillRegistry::new()),
+            distiller: None,
             memory: None,
             agent_id: None,
             active_tools: Arc::new(ActiveToolsRegistry::new()),
@@ -135,6 +151,13 @@ impl AgentContext {
     pub fn with_memory(mut self, memory: Arc<MemorySystem>, agent_id: Uuid) -> Self {
         self.memory = Some(memory);
         self.agent_id = Some(agent_id);
+        self
+    }
+
+    /// Set the model that decides what is worth remembering. See
+    /// [`AgentContext::distiller`].
+    pub fn with_distiller(mut self, distiller: Arc<dyn ModelProvider>) -> Self {
+        self.distiller = Some(distiller);
         self
     }
 

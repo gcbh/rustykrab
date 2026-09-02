@@ -284,6 +284,64 @@ impl MessageBackend for MessageAdapter {
     }
 }
 
+/// Build the model handle used to decide what to remember, or `None` to
+/// leave distillation off.
+///
+/// Same model, same base URL, same `num_ctx` as the agent's own provider —
+/// only `think` differs. That matters twice over: a `num_ctx` switch costs a
+/// model reload and a full re-prefill, and thinking turns a sub-second
+/// classification into a multi-second one. Measured on gemma4:26b with
+/// thinking off: 0.4s for a message carrying nothing, 2.6s for one carrying
+/// two facts.
+///
+/// Only wired for Ollama today. Other providers get `None` rather than a
+/// silently thinking distiller, because there is no per-call way to ask them
+/// for the cheap behaviour and a slow one on the inbound path is worse than
+/// none.
+async fn build_distiller(
+    provider_name: &str,
+) -> Option<std::sync::Arc<dyn rustykrab_core::model::ModelProvider>> {
+    let off = matches!(
+        std::env::var("RUSTYKRAB_DISTILL")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "off" | "0" | "false" | "no"
+    );
+    if off {
+        tracing::info!("memory distillation disabled (RUSTYKRAB_DISTILL)");
+        return None;
+    }
+    if provider_name != "ollama" {
+        tracing::info!(
+            provider = provider_name,
+            "memory distillation off: only the Ollama provider can be asked not to think"
+        );
+        return None;
+    }
+
+    let model = std::env::var("OLLAMA_MODEL").unwrap_or_else(|_| "gemma4:26b".to_string());
+    let base_url =
+        std::env::var("OLLAMA_BASE_URL").unwrap_or_else(|_| "http://localhost:11434".to_string());
+    let config = rustykrab_providers::OllamaConfig {
+        think: Some(false),
+        ..Default::default()
+    };
+    let p = rustykrab_providers::OllamaProvider::new(model.clone())
+        .with_base_url(base_url)
+        .with_config(config)
+        .with_detected_context_window()
+        .await;
+    tracing::info!(
+        %model,
+        num_ctx = ?p.num_ctx(),
+        think = p.resolved_think(),
+        "memory distiller ready"
+    );
+    Some(std::sync::Arc::new(p))
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // --- TLS crypto provider (must be set before any rustls usage) ---
@@ -595,6 +653,11 @@ async fn main() -> anyhow::Result<()> {
         provider = %provider_name,
         "compaction context budget configured"
     );
+
+    // A second handle on the same model, with thinking off, used to decide
+    // what an inbound message is worth remembering. See
+    // `AgentContext::distiller` for why it cannot just be `provider`.
+    let distiller = build_distiller(&provider_name).await;
 
     // --- Skills directory (needed by skill tools and skill loader) ---
     let skills_dir = data_dir.join("skills");
@@ -1112,6 +1175,7 @@ async fn main() -> anyhow::Result<()> {
         .with_orchestration_config(orchestration_config)
         .with_skill_registry(skill_registry)
         .with_memory(Arc::clone(&memory_system), agent_id)
+        .with_distiller_opt(distiller)
         .with_subagents_enabled(subagents_enabled)
         .with_computer_use_enabled(computer_use_enabled)
         .with_retrieval_log(retrieval_log)
@@ -1931,6 +1995,16 @@ async fn process_telegram_message(
     conv.messages.push(message);
     conv.updated_at = Utc::now();
 
+    // Channels append straight onto `conv.messages`, which never passes
+    // through `AgentRunner::push_message` and so never reaches the
+    // auto-persist hook. Without this call nothing the user types ever
+    // reaches memory — measured on the live store, where the runner's own
+    // synthesised prompts are present repeatedly and the user's are absent
+    // entirely. This is also where distillation starts.
+    if let Some(inbound) = conv.messages.last() {
+        rustykrab_runtime::ingest_inbound(&state.agent, &conv, inbound).await;
+    }
+
     // Send initial typing indicator.
     let _ = tg.send_typing(chat_id, thread_id).await;
 
@@ -2380,6 +2454,16 @@ async fn process_slack_message(
 
     conv.messages.push(message);
     conv.updated_at = Utc::now();
+
+    // Channels append straight onto `conv.messages`, which never passes
+    // through `AgentRunner::push_message` and so never reaches the
+    // auto-persist hook. Without this call nothing the user types ever
+    // reaches memory — measured on the live store, where the runner's own
+    // synthesised prompts are present repeatedly and the user's are absent
+    // entirely. This is also where distillation starts.
+    if let Some(inbound) = conv.messages.last() {
+        rustykrab_runtime::ingest_inbound(&state.agent, &conv, inbound).await;
+    }
 
     // Heartbeat-monitored agent run, mirroring the Telegram path.
     let last_heartbeat = Arc::new(AtomicU64::new(epoch_millis()));

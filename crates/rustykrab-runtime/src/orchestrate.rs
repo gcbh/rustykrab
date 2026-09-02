@@ -170,7 +170,11 @@ async fn build_and_inject_system_prompt(
 }
 
 /// Translate an agent `Message` into a memory `ConversationTurn`.
-fn message_to_turn(msg: &Message, session_id: Uuid, turn_number: u32) -> ConversationTurn {
+pub(crate) fn message_to_turn(
+    msg: &Message,
+    session_id: Uuid,
+    turn_number: u32,
+) -> ConversationTurn {
     let speaker = match msg.role {
         Role::System => "system",
         Role::User => "user",
