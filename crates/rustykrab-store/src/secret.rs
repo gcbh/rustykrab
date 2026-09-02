@@ -127,7 +127,7 @@ impl SecretStore {
         let value = Zeroizing::new(value.to_string());
         run_blocking(move || {
             let encrypted = store.encrypt(&name, value.as_bytes())?;
-            let conn = store.conn.lock().unwrap();
+            let conn = store.conn.lock().unwrap_or_else(|p| p.into_inner());
             let now = now_ms();
             let rows = conn
                 .execute(
@@ -168,7 +168,7 @@ impl SecretStore {
         let value = Zeroizing::new(value.to_string());
         run_blocking(move || {
             let encrypted = store.encrypt(&name, value.as_bytes())?;
-            let mut conn = store.conn.lock().unwrap();
+            let mut conn = store.conn.lock().unwrap_or_else(|p| p.into_inner());
             let tx = conn
                 .transaction()
                 .map_err(|e| Error::Storage(e.to_string()))?;
@@ -243,7 +243,7 @@ impl SecretStore {
             // Empty ciphertext: the column is NOT NULL and the row has to
             // exist, but there is no credential to put in it.
             let empty = store.encrypt(&name_owned, b"")?;
-            let mut conn = store.conn.lock().unwrap();
+            let mut conn = store.conn.lock().unwrap_or_else(|p| p.into_inner());
             let tx = conn
                 .transaction()
                 .map_err(|e| Error::Storage(e.to_string()))?;
@@ -314,7 +314,7 @@ impl SecretStore {
         let name = name.to_string();
         run_blocking(move || {
             let encrypted: Vec<u8> = {
-                let conn = store.conn.lock().unwrap();
+                let conn = store.conn.lock().unwrap_or_else(|p| p.into_inner());
                 let mut stmt = conn
                     .prepare("SELECT data FROM secrets WHERE name = ?1")
                     .map_err(|e| Error::Storage(e.to_string()))?;
@@ -346,7 +346,7 @@ impl SecretStore {
         let store = self.clone();
         let name = name.to_string();
         run_blocking(move || {
-            let mut conn = store.conn.lock().unwrap();
+            let mut conn = store.conn.lock().unwrap_or_else(|p| p.into_inner());
             let tx = conn
                 .transaction()
                 .map_err(|e| Error::Storage(e.to_string()))?;

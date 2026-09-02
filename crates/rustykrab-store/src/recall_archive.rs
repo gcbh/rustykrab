@@ -94,7 +94,7 @@ fn delete_row(conn: &rusqlite::Connection, conversation_id: Uuid) -> Result<(), 
 /// `spawn_blocking`).
 impl RecallPersistence for RecallArchiveStore {
     fn load(&self, conversation_id: Uuid) -> Option<String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         match get_row(&conn, conversation_id) {
             Ok(archive) => archive,
             Err(e) => {
@@ -105,14 +105,14 @@ impl RecallPersistence for RecallArchiveStore {
     }
 
     fn upsert(&self, conversation_id: Uuid, archive: &str) {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         if let Err(e) = upsert_row(&conn, conversation_id, archive) {
             tracing::warn!(error = %e, %conversation_id, "failed to persist recall archive");
         }
     }
 
     fn delete(&self, conversation_id: Uuid) {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         if let Err(e) = delete_row(&conn, conversation_id) {
             tracing::warn!(error = %e, %conversation_id, "failed to delete recall archive");
         }
@@ -195,5 +195,47 @@ mod tests {
             .unwrap()
         };
         assert_eq!(created, created_after);
+    }
+}
+
+#[cfg(test)]
+mod poisoning_tests {
+    use super::*;
+
+    /// `with_conn` recovers from a poisoned lock, but this type does not go
+    /// through it — `RecallPersistence` is a synchronous trait, so it locks
+    /// the connection directly. Those direct locks were the half of the
+    /// problem that the `with_conn` fix did not reach: one panic anywhere
+    /// holding the connection and every later recall archive read or write
+    /// panicked with it, for the life of the process.
+    #[test]
+    fn a_poisoned_lock_does_not_disable_the_archive() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::Store::run_migrations(&conn).unwrap();
+        // The archive references its conversation, so one has to exist.
+        let id = Uuid::new_v4();
+        conn.execute(
+            "INSERT INTO conversations (id, data, created_at, updated_at)
+             VALUES (?1, '{}', 't', 't')",
+            rusqlite::params![id.to_string()],
+        )
+        .unwrap();
+        let conn = Arc::new(Mutex::new(conn));
+
+        let poisoner = Arc::clone(&conn);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.lock().unwrap();
+            panic!("simulated panic while holding the connection");
+        })
+        .join();
+        assert!(conn.is_poisoned(), "the test must actually poison the lock");
+
+        // Reads and writes must both still work. These go through the
+        // synchronous `RecallPersistence` impl, which is what locks directly.
+        let store = RecallArchiveStore::new(Arc::clone(&conn));
+        let persistence: &dyn rustykrab_core::recall::RecallPersistence = &store;
+        assert_eq!(persistence.load(Uuid::new_v4()), None);
+        persistence.upsert(id, "[]");
+        assert_eq!(persistence.load(id).as_deref(), Some("[]"));
     }
 }
