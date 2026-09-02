@@ -23,7 +23,7 @@ pub(crate) fn scenarios() -> Vec<(Expected, (&'static str, ScenarioFn))> {
             ),
         ),
         (
-            Expected::XFail,
+            Expected::Pass,
             (
                 "planning/vague-project-begins-without-schema",
                 boxed(vague_project),
@@ -37,14 +37,16 @@ pub(crate) fn scenarios() -> Vec<(Expected, (&'static str, ScenarioFn))> {
             ),
         ),
         (
-            Expected::XFail,
+            // Snapshot reconstruction is distinct from process restart and
+            // model-context compaction; each has its own scenario below.
+            Expected::Pass,
             (
                 "planning/snapshot-reconstructs-linked-state",
                 boxed(snapshot_reconstruction),
             ),
         ),
         (
-            Expected::XFail,
+            Expected::Pass,
             (
                 "planning/daemon-restart-rehydrates-linked-state",
                 boxed(daemon_restart),
@@ -72,7 +74,7 @@ pub(crate) fn scenarios() -> Vec<(Expected, (&'static str, ScenarioFn))> {
             ),
         ),
         (
-            Expected::XFail,
+            Expected::Pass,
             (
                 "planning/projections-share-source-revision",
                 boxed(projection_consistency),
@@ -158,8 +160,9 @@ async fn create_vague_project(ctx: &Ctx) -> Result<(FixtureRepo, Value)> {
 }
 
 async fn vague_project_impl(ctx: &Ctx) -> Result<()> {
-    let (_repo, project) = create_vague_project(ctx).await?;
+    let (repo, project) = create_vague_project(ctx).await?;
     let project_id = require_string(&project, "id")?;
+    let current_revision = require_string(&project, "current_revision")?;
     let brief = get_json(
         ctx,
         &format!("/api/projects/{project_id}/projections/brief"),
@@ -172,6 +175,55 @@ async fn vague_project_impl(ctx: &Ctx) -> Result<()> {
         bail!("ordinary-language opening did not produce a project intent: {brief}");
     }
 
+    // A successful HTTP response is not enough: prove the service committed
+    // its result to the daemon's SQLite store before the scenario can pass.
+    let project_rows = ctx.count(
+        "SELECT COUNT(*) FROM projects WHERE id = ?1 AND current_revision = ?2",
+        &[&project_id, &current_revision],
+    )?;
+    let revision_rows = ctx.count(
+        "SELECT COUNT(*) FROM project_revisions WHERE project_id = ?1 AND id = ?2",
+        &[&project_id, &current_revision],
+    )?;
+    let node_rows = ctx.count(
+        "SELECT COUNT(*) FROM plan_nodes WHERE project_id = ?1 AND revision_id = ?2",
+        &[&project_id, &current_revision],
+    )?;
+    if project_rows != 1 || revision_rows != 1 || node_rows != 2 {
+        bail!(
+            "service response was not durably materialized: projects={project_rows}, \
+             revisions={revision_rows}, nodes={node_rows}"
+        );
+    }
+
+    let evidence = json!({
+        "schema_version": 1,
+        "scenario": "planning/vague-project-begins-without-schema",
+        "result": "verified",
+        "service": {
+            "request": { "method": "POST", "path": "/api/projects" },
+            "response_status": 201,
+            "project_id": project_id,
+            "current_revision": current_revision,
+            "projection_source_revision": brief["source_revision"],
+        },
+        "database": {
+            "engine": "sqlite",
+            "project_rows": project_rows,
+            "revision_rows": revision_rows,
+            "plan_node_rows": node_rows,
+        },
+        "fixture_repository": {
+            "head_revision": repo.head_sha(),
+        },
+        "assertions": {
+            "service_exercised": true,
+            "durable_state_observed": true,
+            "projection_matches_revision": true,
+        },
+    });
+    let evidence_path = ctx.write_evidence("planning/vague-project.json", &evidence)?;
+    eprintln!("planning evidence: {}", evidence_path.display());
     Ok(())
 }
 scenario_fn!(vague_project, vague_project_impl);
@@ -475,7 +527,7 @@ mod tests {
     }
 
     #[test]
-    fn only_fixture_infrastructure_is_promoted_initially() {
+    fn stack_zero_scenarios_are_promoted_and_future_stacks_remain_xfail() {
         let scenarios = scenarios();
         let promoted: Vec<_> = scenarios
             .iter()
@@ -484,14 +536,20 @@ mod tests {
             .collect();
         assert_eq!(
             promoted,
-            vec!["planning/fixture-repository-and-conversation-replay"]
+            vec![
+                "planning/fixture-repository-and-conversation-replay",
+                "planning/vague-project-begins-without-schema",
+                "planning/snapshot-reconstructs-linked-state",
+                "planning/daemon-restart-rehydrates-linked-state",
+                "planning/projections-share-source-revision",
+            ]
         );
         assert_eq!(
             scenarios
                 .iter()
                 .filter(|(expected, _)| *expected == Expected::XFail)
                 .count(),
-            10
+            6
         );
     }
 }
