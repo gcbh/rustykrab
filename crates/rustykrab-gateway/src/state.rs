@@ -84,6 +84,11 @@ impl AppState {
         self
     }
 
+    pub fn with_probes(mut self, probes: std::sync::Arc<rustykrab_core::ProbeRegistry>) -> Self {
+        self.agent = self.agent.with_probes(probes);
+        self
+    }
+
     pub fn with_activity_tracker(mut self, activity: ActivityTracker) -> Self {
         self.agent = self.agent.with_activity_tracker(activity);
         self

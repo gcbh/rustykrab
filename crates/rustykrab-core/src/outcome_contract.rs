@@ -7,18 +7,19 @@
 //!
 //! This is the piece that closes that loop. A check names an effect the
 //! run was supposed to have; verification asks whether that effect
-//! actually occurred. That answer is ground truth in the only sense that
-//! matters here — it is derived from what the system *did*, not from a
-//! model's opinion about whether it went well.
+//! actually occurred, by going and looking — see
+//! [`crate::post_condition`], which explains at length why "the agent
+//! called a tool of that name and it returned Ok" is not an acceptable
+//! answer to that question.
 //!
-//! Deliberately narrow. A check is satisfied when a tool of that name
-//! completed successfully during the run. That covers the honest case —
-//! "the calendar event was created" is verifiable because creating it is
-//! a tool call — and refuses to guess at anything else.
+//! The short version: a check is satisfied when a **probe** observes the
+//! effect appear across the run. Not when the agent reports having done
+//! it.
 
 use serde::{Deserialize, Serialize};
 
 use crate::outcome::{OutcomeVerdict, SignalClass};
+use crate::post_condition::{ProbeRegistry, ProbeWindow};
 
 /// What a run must have done for the skill that drove it to count as
 /// having succeeded.
@@ -26,7 +27,8 @@ use crate::outcome::{OutcomeVerdict, SignalClass};
 pub struct OutcomeContract {
     /// The skill that declared this.
     pub skill: String,
-    /// Effects the run was supposed to produce, named as tools.
+    /// Effects the run was supposed to produce, each naming a registered
+    /// post-condition probe.
     pub checks: Vec<String>,
     /// The evidence class the skill *declared*. Only [`SignalClass::Verifiable`]
     /// buys ground truth: a skill that asked to be judged by a model, or
@@ -46,12 +48,38 @@ impl OutcomeContract {
 
     /// Whether this contract can actually decide anything.
     ///
-    /// Two ways to decide nothing, and both must fall through to the weaker
-    /// signal rather than inventing ground truth: a contract with no checks
-    /// states nothing, and a contract whose skill declared a non-verifiable
-    /// signal has not asked for its effects to be treated as fact.
-    pub fn is_checkable(&self) -> bool {
-        !self.checks.is_empty() && self.signal == SignalClass::Verifiable
+    /// Three ways to decide nothing, and all of them must fall through to
+    /// the weaker signal rather than inventing ground truth:
+    ///
+    /// - A contract with **no checks** states nothing.
+    /// - A contract whose skill declared a **non-verifiable signal** has
+    ///   not asked for its effects to be treated as fact. Checks alone do
+    ///   not buy that, or a skill asking to be judged by a model could
+    ///   launder the model's opinion into evidence.
+    /// - A check naming **no registered probe** cannot be looked at. This
+    ///   is the one that matters most in practice: it is what a typo in a
+    ///   `SKILL.md`, or a check written against a deployment that has no
+    ///   probe for it, actually is. Treating it as unmet would score a
+    ///   working skill as having done nothing, forever, and treating it as
+    ///   met would be pure invention.
+    pub fn is_checkable(&self, probes: &ProbeRegistry) -> bool {
+        !self.checks.is_empty()
+            && self.signal == SignalClass::Verifiable
+            && self.checks.iter().all(|c| probes.contains(c))
+    }
+
+    /// Checks this contract names that nothing knows how to observe.
+    ///
+    /// Worth surfacing rather than silently degrading: a skill declaring
+    /// `signal = "verifiable"` against a probe that does not exist has a
+    /// broken declaration, and the operator is the only one who can fix
+    /// it.
+    pub fn unprobed(&self, probes: &ProbeRegistry) -> Vec<&str> {
+        self.checks
+            .iter()
+            .filter(|c| !probes.contains(c.as_str()))
+            .map(|c| c.as_str())
+            .collect()
     }
 }
 
@@ -68,11 +96,10 @@ pub struct ContractVerdict {
     pub unsatisfied: Vec<String>,
 }
 
-/// Evaluate a contract against what the run actually did.
+/// Evaluate a contract against what the world looks like after the run.
 ///
-/// `succeeded` answers, for a tool name, whether a call to it completed
-/// successfully at least once during the run. `errored` says whether the
-/// run itself terminated abnormally.
+/// `window` holds the probe samples taken either side of the run;
+/// `errored` says whether the run itself terminated abnormally.
 ///
 /// Returns `None` when the contract cannot decide — see
 /// [`OutcomeContract::is_checkable`] — so the caller falls back to the
@@ -90,25 +117,28 @@ pub struct ContractVerdict {
 /// "did not do it" from "has not done it yet" — and manufacturing failures
 /// for a working skill is far more corrosive to the loop than staying
 /// silent.
-pub fn evaluate<F>(
+pub fn evaluate(
     contract: &OutcomeContract,
+    probes: &ProbeRegistry,
+    window: &ProbeWindow,
     errored: bool,
-    mut succeeded: F,
-) -> Option<ContractVerdict>
-where
-    F: FnMut(&str) -> bool,
-{
-    if !contract.is_checkable() {
+) -> Option<ContractVerdict> {
+    if !contract.is_checkable(probes) {
         return None;
     }
 
     let mut satisfied = Vec::new();
     let mut unsatisfied = Vec::new();
     for check in &contract.checks {
-        if succeeded(check) {
-            satisfied.push(check.clone());
-        } else {
-            unsatisfied.push(check.clone());
+        match window.produced(check) {
+            Some(true) => satisfied.push(check.clone()),
+            Some(false) => unsatisfied.push(check.clone()),
+            // Sampled but unanswerable -- a probe that errored on one side
+            // of the window. The contract was checkable when it was built,
+            // so this is a transient fault, not a declaration problem, and
+            // guessing either way would attribute a server outage to the
+            // skill.
+            None => return None,
         }
     }
 
@@ -126,17 +156,17 @@ where
 
     let detail = match (all_met, errored) {
         (true, false) => format!(
-            "all {} declared check(s) satisfied for skill '{}'",
+            "all {} declared effect(s) observed for skill '{}'",
             satisfied.len(),
             contract.skill
         ),
         (true, true) => format!(
-            "all {} declared check(s) satisfied for skill '{}', but the run errored",
+            "all {} declared effect(s) observed for skill '{}', but the run errored",
             satisfied.len(),
             contract.skill
         ),
         (false, _) => format!(
-            "{} of {} declared check(s) outstanding for skill '{}': {}",
+            "{} of {} declared effect(s) not observed for skill '{}': {}",
             unsatisfied.len(),
             contract.checks.len(),
             contract.skill,
@@ -147,8 +177,9 @@ where
     Some(ContractVerdict {
         verdict,
         signal: SignalClass::Verifiable,
-        // High, but never 1.0. The check confirms the effect occurred; it
-        // cannot confirm the effect was the one the user wanted. An
+        // High, but never 1.0. The probe confirms the effect appeared; it
+        // cannot confirm the effect was the one the user wanted -- a
+        // calendar event created on the wrong day still registers. An
         // outstanding check is weaker still: it may only mean the
         // conversation is not finished.
         confidence: if all_met { 0.9 } else { 0.5 },
@@ -161,119 +192,223 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::post_condition::{Observation, PostCondition};
+    use std::sync::Arc;
 
-    fn contract(checks: &[&str]) -> OutcomeContract {
+    /// A probe whose answer the test dictates, so the contract can be
+    /// exercised without a calendar server.
+    struct Fixed {
+        name: &'static str,
+        before: Observation,
+        after: Observation,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Fixed {
+        fn new(name: &'static str, before: Observation, after: Observation) -> Arc<Self> {
+            Arc::new(Self {
+                name,
+                before,
+                after,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl PostCondition for Fixed {
+        fn name(&self) -> &str {
+            self.name
+        }
+        async fn observe(&self) -> crate::Result<Observation> {
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(if n == 0 {
+                self.before.clone()
+            } else {
+                self.after.clone()
+            })
+        }
+    }
+
+    fn contract(checks: &[&str], signal: SignalClass) -> OutcomeContract {
         OutcomeContract::new(
             "calendar-booking",
             checks.iter().map(|s| s.to_string()).collect(),
-            SignalClass::Verifiable,
+            signal,
         )
     }
 
-    #[test]
-    fn a_contract_with_no_checks_decides_nothing() {
-        // The critical case. An empty declaration must fall through to the
-        // weaker signal, never be read as confirmation of success.
-        assert!(evaluate(&contract(&[]), false, |_| true).is_none());
+    /// Registry with one probe that goes from absent to present.
+    fn produced_registry() -> ProbeRegistry {
+        ProbeRegistry::new().with(Fixed::new("event_exists", None, Some("ev-1".into())))
     }
 
-    #[test]
-    fn a_skill_that_did_not_ask_to_be_verified_decides_nothing() {
-        // Checks alone do not buy ground truth. A skill judged by a model
-        // stays a proxy however many effects it happens to name, or the
-        // loop could promote its own opinion to fact.
-        for declared in [
+    /// Registry with one probe whose state never changes.
+    fn unproduced_registry() -> ProbeRegistry {
+        ProbeRegistry::new().with(Fixed::new("event_exists", None, None))
+    }
+
+    async fn window(probes: &ProbeRegistry, checks: &[&str]) -> ProbeWindow {
+        let checks: Vec<String> = checks.iter().map(|s| s.to_string()).collect();
+        ProbeWindow {
+            before: probes.sample(&checks).await,
+            after: probes.sample(&checks).await,
+        }
+    }
+
+    #[tokio::test]
+    async fn an_observed_effect_is_ground_truth_success() {
+        let probes = produced_registry();
+        let w = window(&probes, &["event_exists"]).await;
+        let v = evaluate(
+            &contract(&["event_exists"], SignalClass::Verifiable),
+            &probes,
+            &w,
+            false,
+        )
+        .expect("a probed, verifiable contract decides");
+
+        assert_eq!(v.verdict, OutcomeVerdict::Success);
+        assert_eq!(v.signal, SignalClass::Verifiable);
+        assert!(v.signal.is_ground_truth());
+        assert!(v.confidence < 1.0, "a probe cannot confirm intent");
+    }
+
+    #[tokio::test]
+    async fn an_unobserved_effect_is_ambiguous_not_failure() {
+        // A skill's effects may span turns. From one run there is no way
+        // to tell "did not do it" from "has not done it yet", and
+        // manufacturing failures for a working skill corrupts the analysis
+        // worse than staying quiet.
+        let probes = unproduced_registry();
+        let w = window(&probes, &["event_exists"]).await;
+        let v = evaluate(
+            &contract(&["event_exists"], SignalClass::Verifiable),
+            &probes,
+            &w,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(v.verdict, OutcomeVerdict::Ambiguous);
+        assert_eq!(v.unsatisfied, vec!["event_exists".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn producing_every_effect_then_erroring_is_not_success() {
+        // Otherwise a skill that reliably crashes after its side effects
+        // accumulates a spotless record.
+        let probes = produced_registry();
+        let w = window(&probes, &["event_exists"]).await;
+        let v = evaluate(
+            &contract(&["event_exists"], SignalClass::Verifiable),
+            &probes,
+            &w,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(v.verdict, OutcomeVerdict::Failure);
+        assert_eq!(v.signal, SignalClass::Verifiable);
+    }
+
+    #[tokio::test]
+    async fn a_check_with_no_probe_yields_no_contract() {
+        // The rule that keeps a typo from becoming a permanent verdict.
+        // Neither "satisfied" (invention) nor "unsatisfied" (a working
+        // skill scored as doing nothing forever) is acceptable, so the run
+        // falls back to the implicit signal instead.
+        let probes = produced_registry();
+        let c = contract(&["event_exists", "user_confirmed"], SignalClass::Verifiable);
+
+        assert!(!c.is_checkable(&probes));
+        assert_eq!(c.unprobed(&probes), vec!["user_confirmed"]);
+
+        let w = window(&probes, &["event_exists", "user_confirmed"]).await;
+        assert!(evaluate(&c, &probes, &w, false).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_non_verifiable_signal_never_buys_ground_truth() {
+        // A skill asking to be judged by a model must not have its runs
+        // promoted to fact merely because it also listed some checks --
+        // that is the loop laundering its own opinion into evidence.
+        let probes = produced_registry();
+        for signal in [
             SignalClass::Judge,
             SignalClass::Implicit,
             SignalClass::Explicit,
         ] {
-            let c = OutcomeContract::new("x", vec!["calendar_create".into()], declared);
-            assert!(
-                evaluate(&c, false, |_| true).is_none(),
-                "{declared:?} must not be promoted to Verifiable"
-            );
+            let c = contract(&["event_exists"], signal);
+            assert!(!c.is_checkable(&probes), "{signal:?} must not be checkable");
+            let w = window(&probes, &["event_exists"]).await;
+            assert!(evaluate(&c, &probes, &w, false).is_none());
         }
     }
 
-    #[test]
-    fn a_run_that_did_everything_declared_is_verifiable_success() {
-        let v = evaluate(&contract(&["calendar_create", "email_send"]), false, |_| {
-            true
-        })
+    #[tokio::test]
+    async fn a_contract_with_no_checks_decides_nothing() {
+        let probes = produced_registry();
+        let c = contract(&[], SignalClass::Verifiable);
+        assert!(!c.is_checkable(&probes));
+        assert!(evaluate(&c, &probes, &ProbeWindow::default(), false).is_none());
+    }
+
+    #[tokio::test]
+    async fn an_effect_that_was_already_present_is_not_credited_to_this_run() {
+        // The property that separates a post-condition from a state
+        // assertion, and the reason tool-call matching was not good
+        // enough: a calendar that already held the event says nothing
+        // about the turn that just ran.
+        let probes = ProbeRegistry::new().with(Fixed::new(
+            "event_exists",
+            Some("ev".into()),
+            Some("ev".into()),
+        ));
+        let w = window(&probes, &["event_exists"]).await;
+        let v = evaluate(
+            &contract(&["event_exists"], SignalClass::Verifiable),
+            &probes,
+            &w,
+            false,
+        )
         .unwrap();
-        assert_eq!(v.verdict, OutcomeVerdict::Success);
-        assert_eq!(v.signal, SignalClass::Verifiable);
-        assert!(v.signal.is_ground_truth(), "this is what unblocks mutation");
-        assert!(v.unsatisfied.is_empty());
-    }
 
-    #[test]
-    fn an_outstanding_check_is_ambiguous_not_failure() {
-        // A skill's effects may be spread across turns. From one run we
-        // cannot tell "did not do it" from "has not done it yet", and
-        // manufacturing failures for a working skill would poison the
-        // very analysis this evidence exists to feed.
-        let v = evaluate(&contract(&["calendar_create", "email_send"]), false, |t| {
-            t == "calendar_create"
-        })
-        .unwrap();
-        assert_eq!(v.verdict, OutcomeVerdict::Ambiguous);
-        assert_eq!(v.signal, SignalClass::Verifiable);
-        assert_eq!(v.unsatisfied, vec!["email_send"]);
-        assert!(v.detail.contains("email_send"));
-    }
-
-    #[test]
-    fn an_ambiguous_verdict_cannot_count_against_the_skill() {
-        // The guarantee that makes the choice above safe: outstanding
-        // checks are recorded but excluded from success rates entirely.
-        let mut tally = crate::outcome::OutcomeTally::default();
-        for _ in 0..10 {
-            tally.record(OutcomeVerdict::Ambiguous);
-        }
-        assert_eq!(tally.decisive(), 0, "ambiguity must not read as harm");
-        assert_eq!(tally.success_rate(1), None);
-    }
-
-    #[test]
-    fn producing_every_effect_and_then_dying_is_not_success() {
-        let v = evaluate(&contract(&["calendar_create"]), true, |_| true).unwrap();
         assert_eq!(
             v.verdict,
-            OutcomeVerdict::Failure,
-            "a crashing skill must not accumulate a clean record"
+            OutcomeVerdict::Ambiguous,
+            "a pre-existing effect must not be credited to this run"
         );
-        assert!(v.detail.contains("errored"));
     }
 
-    #[test]
-    fn every_check_must_be_met_not_merely_most() {
-        let v = evaluate(&contract(&["a", "b", "c"]), false, |t| t != "c").unwrap();
-        assert_ne!(
-            v.verdict,
-            OutcomeVerdict::Success,
-            "two out of three is not success"
-        );
-        assert_eq!(v.satisfied.len(), 2);
-    }
+    #[tokio::test]
+    async fn a_probe_that_fails_mid_window_decides_nothing() {
+        // A server outage is not evidence about the skill.
+        struct Flaky(std::sync::atomic::AtomicUsize);
 
-    #[test]
-    fn confidence_stays_below_certainty() {
-        // The check confirms the effect happened; it cannot confirm the
-        // effect was the one the user wanted.
-        let v = evaluate(&contract(&["calendar_create"]), false, |_| true).unwrap();
+        #[async_trait::async_trait]
+        impl PostCondition for Flaky {
+            fn name(&self) -> &str {
+                "event_exists"
+            }
+            async fn observe(&self) -> crate::Result<Observation> {
+                if self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    Ok(None)
+                } else {
+                    Err(crate::Error::Internal("calendar unreachable".into()))
+                }
+            }
+        }
+
+        let probes =
+            ProbeRegistry::new().with(Arc::new(Flaky(std::sync::atomic::AtomicUsize::new(0))));
+        let c = contract(&["event_exists"], SignalClass::Verifiable);
+        assert!(c.is_checkable(&probes), "the probe is registered");
+
+        let w = window(&probes, &["event_exists"]).await;
         assert!(
-            v.confidence < 1.0,
-            "a verified effect is still not proof of intent"
+            evaluate(&c, &probes, &w, false).is_none(),
+            "an unanswerable probe must fall back, not guess"
         );
-        assert!(v.confidence > 0.5);
-    }
-
-    #[test]
-    fn a_verifiable_record_is_actionable_where_an_implicit_one_is_not() {
-        // The whole point: this is the signal that lets a later phase act.
-        let v = evaluate(&contract(&["calendar_create"]), false, |_| true).unwrap();
-        assert!(v.signal.is_ground_truth());
-        assert!(!SignalClass::Implicit.is_ground_truth());
     }
 }
