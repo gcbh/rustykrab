@@ -21,9 +21,11 @@ mod ablation;
 mod assertion;
 mod classify;
 mod credential_suite;
+mod fixture_repo;
 mod judge;
 mod login_suite;
 mod model_suite;
+mod planning_suite;
 mod surface;
 mod transcript;
 
@@ -1403,7 +1405,7 @@ async fn wait_for_health(base: &str, client: &reqwest::Client, child: &mut Child
 
 // ── main ─────────────────────────────────────────────────────────────
 
-type ScenarioFn =
+pub(crate) type ScenarioFn =
     for<'a> fn(&'a Ctx) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + 'a>>;
 
 macro_rules! scenario {
@@ -1648,7 +1650,7 @@ async fn main() -> Result<()> {
     let mut login_trials: Vec<login_suite::LoginTrial> = Vec::new();
 
     if args.mode == "scripted" || args.mode == "all" {
-        reports.extend(run_scripted(&bin).await?);
+        reports.extend(run_scripted(&bin, args.case_filter.as_deref()).await?);
     }
     if args.mode == "model" || args.mode == "all" {
         let (model_reports, name) = model_suite::run(
@@ -1734,7 +1736,7 @@ async fn main() -> Result<()> {
 
 /// The scripted suite shares one daemon across every scenario — they are
 /// deterministic and independent, so a boot each would only add minutes.
-async fn run_scripted(bin: &str) -> Result<Vec<ScenarioReport>> {
+async fn run_scripted(bin: &str, case_filter: Option<&str>) -> Result<Vec<ScenarioReport>> {
     let tmp = tempfile::Builder::new()
         .prefix("rustykrab-e2e-")
         .tempdir()?;
@@ -1742,7 +1744,7 @@ async fn run_scripted(bin: &str) -> Result<Vec<ScenarioReport>> {
     let port = pick_free_port()?;
 
     let mut child = spawn_daemon(bin, &data_dir, port)?;
-    let result = run_suite(bin, &data_dir, port, &mut child).await;
+    let result = run_suite(bin, &data_dir, port, &mut child, case_filter).await;
     shutdown_daemon(child).await;
     keep_or_drop(tmp);
     result
@@ -1874,7 +1876,7 @@ fn log_tail(data_dir: &std::path::Path) -> String {
 
 /// The deterministic plumbing scenarios, in run order.
 fn scripted_scenarios() -> Vec<(Expected, (&'static str, ScenarioFn))> {
-    vec![
+    let mut scenarios = vec![
         // Baseline — implemented today, must pass.
         (Expected::Pass, scenario!(health)),
         (Expected::Pass, scenario!(auth_required)),
@@ -1896,7 +1898,9 @@ fn scripted_scenarios() -> Vec<(Expected, (&'static str, ScenarioFn))> {
         (Expected::Pass, scenario!(deny_preserves_value)),
         (Expected::Pass, scenario!(agent_delete_files_request)),
         (Expected::Pass, scenario!(revoked_device_401)),
-    ]
+    ];
+    scenarios.extend(planning_suite::scenarios());
+    scenarios
 }
 
 async fn run_suite(
@@ -1904,6 +1908,7 @@ async fn run_suite(
     data_dir: &std::path::Path,
     port: u16,
     child: &mut Child,
+    case_filter: Option<&str>,
 ) -> Result<Vec<ScenarioReport>> {
     let base = format!("http://127.0.0.1:{port}");
     // The origin-check middleware requires an Origin header on every
@@ -1928,7 +1933,16 @@ async fn run_suite(
         data_dir: data_dir.to_path_buf(),
     };
 
-    let scenarios = scripted_scenarios();
+    let scenarios: Vec<_> = scripted_scenarios()
+        .into_iter()
+        .filter(|(_, (id, _))| case_filter.is_none_or(|filter| id.contains(filter)))
+        .collect();
+    if scenarios.is_empty() {
+        bail!(
+            "no scripted scenarios matched {}",
+            case_filter.unwrap_or("the requested filter")
+        );
+    }
 
     let mut reports = Vec::new();
     for (expected, (id, f)) in scenarios {
