@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.2.20] - 2026-09-02
+
+- fix(memory): validate the config at construction, and fix a cap warning that could never fire (#604)
+
 ## [5.2.19] - 2026-09-02
 
 - fix(credentials): preserve origin on form submission (#605)

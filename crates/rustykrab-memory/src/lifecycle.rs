@@ -265,7 +265,11 @@ impl LifecycleManager {
             }
         }
 
-        if mem_embeddings.len() > MAX_DEDUP_MEMORIES {
+        // `memories.len()`, not `mem_embeddings.len()`. The latter is built
+        // by `.take(MAX_DEDUP_MEMORIES)` above, so it can never exceed the
+        // cap and this warning could never fire — the one case operators
+        // needed to hear about was the only one it stayed silent for.
+        if memories.len() > MAX_DEDUP_MEMORIES {
             tracing::warn!(
                 agent_id = %agent_id,
                 total = memories.len(),
