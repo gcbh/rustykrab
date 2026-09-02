@@ -1,3 +1,4 @@
+use async_trait::async_trait;
 use std::sync::Arc;
 
 use rustykrab_core::active_tools::with_session_context;
@@ -31,9 +32,11 @@ fn fact_to_json(fact: &ExtractedFact) -> Value {
 /// tool interface (memory_save, memory_search, memory_get, memory_delete)
 /// while transparently using vector search, FTS5, and lifecycle scoring.
 ///
-/// The trait itself is defined in `rustykrab-tools::memory_backend`.
-/// We re-implement it here structurally to avoid a circular dependency;
-/// the gateway wires this into the tool system via a thin wrapper.
+/// Implements `rustykrab_core::MemoryBackend`, so it can be handed to the
+/// `memory_*` tools directly. The trait used to live in `rustykrab-tools`,
+/// which sits above this crate, so it could not be implemented here at all —
+/// this type carried a structurally identical but unrelated method set and
+/// the binary bridged the two with a pass-through adapter.
 pub struct HybridMemoryBackend {
     system: Arc<MemorySystem>,
     agent_id: Uuid,
@@ -348,6 +351,54 @@ impl HybridMemoryBackend {
             "memories": items,
             "count": items.len(),
         }))
+    }
+}
+
+/// The tool-facing surface, implemented directly rather than through an
+/// adapter in the binary.
+///
+/// The trait takes `session_id` as a string because that is how it arrives
+/// from the model. Deciding what an unparseable one means is this crate's
+/// call, not the caller's: a conversation id the model garbled must not
+/// silently become a global search, because the model would then attribute
+/// another conversation's memories to this one. It widens, and says so.
+#[async_trait]
+impl rustykrab_core::MemoryBackend for HybridMemoryBackend {
+    async fn search(
+        &self,
+        query: &str,
+        tags: &[String],
+        limit: usize,
+        session_id: Option<&str>,
+    ) -> rustykrab_core::Result<Value> {
+        let Some(raw) = session_id else {
+            return self.search(query, tags, limit, None).await;
+        };
+        match Uuid::parse_str(raw.trim()) {
+            Ok(sid) => self.search(query, tags, limit, Some(sid)).await,
+            Err(_) => {
+                let mut result = self.search(query, tags, limit, None).await?;
+                result["session_scope"] =
+                    json!("session_id was not a valid conversation id; results are global");
+                Ok(result)
+            }
+        }
+    }
+
+    async fn get(&self, memory_id: &str) -> rustykrab_core::Result<Value> {
+        self.get(memory_id).await
+    }
+
+    async fn save(&self, fact: &str, tags: &[String]) -> rustykrab_core::Result<Value> {
+        self.save(fact, tags).await
+    }
+
+    async fn delete(&self, memory_id: &str) -> rustykrab_core::Result<Value> {
+        self.delete(memory_id).await
+    }
+
+    async fn list(&self) -> rustykrab_core::Result<Value> {
+        self.list().await
     }
 }
 

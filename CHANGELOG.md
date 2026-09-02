@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.2.17] - 2026-09-02
+
+- refactor(core): move MemoryBackend to core, delete the adapter it forced (#592)
+
 ## [5.2.16] - 2026-09-01
 
 - fix(context): anchor compaction to actual token usage, and stop the MaxTokens spiral (#599)

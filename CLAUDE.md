@@ -62,8 +62,8 @@ Workspace with 11 crates under `crates/`:
 ## Key patterns
 
 - **Tool trait** (`rustykrab-core/src/tool.rs`): All agent tools implement `Tool` with `name()`, `description()`, `schema()`, `execute()`.
-- **Backend traits** (`rustykrab-tools/src/*_backend.rs`): Abstract interfaces for pluggable backends (memory, cron, message, gateway). Concrete implementations live in the crate that owns the dependency (e.g. `JobStore` in `rustykrab-store`).
-- **Adapter structs** (`rustykrab-cli/src/main.rs`): Bridge concrete implementations to tool backend traits (e.g. `MemoryAdapter`, `CronAdapter`).
+- **Backend traits**: Abstract interfaces the tools call. A trait whose implementor sits *below* `rustykrab-tools` in the crate graph lives in `rustykrab-core` (`MemoryBackend`), so the crate owning the capability can implement it directly. The rest stay in `rustykrab-tools/src/*_backend.rs`, because their implementors (`rustykrab-cli`, `rustykrab-agent`) already sit above it and a move would buy nothing.
+- **Adapter structs** (`rustykrab-cli/src/main.rs`): Bridge concrete implementations to tool backend traits where the binary genuinely adds something — `CronAdapter` merges the calling conversation's channel context into cron args, `MessageAdapter` routes by channel name. A pure pass-through is a sign the trait is in the wrong crate.
 - **Background tasks**: `tokio::spawn` with handles stored in `infra_handles` for graceful shutdown.
 - **Database**: SQLite with WAL mode via `rusqlite`. Schema created idempotently in `Store::run_migrations()`.
 - **Config**: Environment variables only (no config files). See README.md for the full list.
