@@ -1,8 +1,8 @@
 # Architecture & Reusability Evaluation
 
-A structural review of the RustyKrab workspace. Second pass, against `main` at
-`fd1f1e2` — roughly 84k lines across 13 crates, 921 tests. The first pass ran
-against `d945495`; what it changed is recorded in
+A structural review of the RustyKrab workspace. The second-pass baseline was
+`main` at `fd1f1e2`; the current tree is roughly 85k lines across 13 crates and
+926 tests. The first pass ran against `d945495`; what it changed is recorded in
 [`05-first-pass-outcome.md`](05-first-pass-outcome.md).
 
 The review is deliberately split into **description** and **judgement**, because
