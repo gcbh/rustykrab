@@ -14,6 +14,7 @@ members = [
     "crates/rustykrab-memory",
     "crates/rustykrab-dream",
     "crates/rustykrab-e2e",
+    "crates/rustykrab-projects",
 ]
 
 [workspace.package]
@@ -110,6 +111,7 @@ rustykrab-skills = { path = "crates/rustykrab-skills" }
 rustykrab-cli = { path = "crates/rustykrab-cli" }
 rustykrab-memory = { path = "crates/rustykrab-memory" }
 rustykrab-dream = { path = "crates/rustykrab-dream" }
+rustykrab-projects = { path = "crates/rustykrab-projects" }
 
 [profile.release]
 lto = true
