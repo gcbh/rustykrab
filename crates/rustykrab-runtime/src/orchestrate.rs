@@ -288,7 +288,9 @@ async fn prepare_agent(
 ) -> Result<(AgentRunner, Session), RuntimeError> {
     // Mark the system busy. Every channel reaches the agent through here,
     // so this one call covers Telegram, Slack, WebChat and scheduled runs
-    // alike, and keeps the downtime worker from starting mid-turn.
+    // alike. This advances the "last busy" timestamp; what actually keeps
+    // the downtime worker out for the duration of the turn is the
+    // `RunGuard` the caller holds across the run itself.
     if let Some(agent_id) = ctx.agent_id {
         ctx.activity.record(agent_id);
     }
@@ -396,17 +398,20 @@ pub async fn run_agent_with_options(
     rustykrab_core::prompt_trace::with_trace_id(trace_id, async move {
         let (runner, session) = prepare_agent(ctx, conv, user_content, options).await?;
 
+        // Held for the whole run. Timestamps alone cannot express "busy
+        // right now": a turn that outlasts the idle threshold would read
+        // as quiet while the agent was still working, and a background
+        // pass could start underneath it. Dropping the guard — on the
+        // error path too — also bumps the generation, so any pass that
+        // overlapped this run is preempted rather than returned.
+        let _busy = ctx
+            .agent_id
+            .map(|agent_id| ctx.activity.begin_run(agent_id));
+
         runner.run(conv, &session).await.map_err(|e| {
             tracing::error!(%trace_id, "agent error: {e}");
             RuntimeError::Internal
         })?;
-
-        // Mark busy again on the way out. Recording only at the start
-        // would leave a long turn looking idle from the moment it began,
-        // and the worker could fire while it was still running.
-        if let Some(agent_id) = ctx.agent_id {
-            ctx.activity.record(agent_id);
-        }
 
         extract_assistant_message(conv)
     })
@@ -496,6 +501,12 @@ pub async fn run_agent_streaming_with_options(
     rustykrab_core::prompt_trace::with_trace_id(trace_id, async move {
         let (runner, session) = prepare_agent(ctx, conv, user_content, options).await?;
 
+        // See `run_agent_with_options` -- a long turn must not read as
+        // idle while it is still running.
+        let _busy = ctx
+            .agent_id
+            .map(|agent_id| ctx.activity.begin_run(agent_id));
+
         runner
             .run_streaming(conv, &session, on_event)
             .await
@@ -503,12 +514,6 @@ pub async fn run_agent_streaming_with_options(
                 tracing::error!(%trace_id, "agent error: {e}");
                 RuntimeError::Internal
             })?;
-
-        // See `run_agent_with_options` -- a long turn must not read as
-        // idle from the moment it started.
-        if let Some(agent_id) = ctx.agent_id {
-            ctx.activity.record(agent_id);
-        }
 
         extract_assistant_message(conv)
     })

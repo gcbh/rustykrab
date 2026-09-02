@@ -41,6 +41,33 @@ pub struct ActivityTracker {
     /// Bumped on every recorded activity. Workers compare snapshots of this
     /// to decide whether to yield.
     generation: Arc<AtomicU64>,
+    /// Runs currently in flight, across all agents.
+    ///
+    /// A timestamp alone cannot express "busy right now": activity is
+    /// recorded when a turn starts, so a turn that runs longer than the
+    /// idle threshold reads as idle from the moment the threshold passes,
+    /// while the agent is still working. Counting what is in flight makes
+    /// the busy case a fact rather than an inference from a clock.
+    in_flight: Arc<AtomicU64>,
+}
+
+/// Held for as long as a run is in flight.
+///
+/// Dropping it marks the run finished and bumps the generation, so a
+/// background pass that overlapped the run is preempted. RAII rather than
+/// a matching `end()` call because the agent path has many early returns
+/// and one missed call would leave the system permanently "busy",
+/// silently disabling every background job.
+pub struct RunGuard {
+    generation: Arc<AtomicU64>,
+    in_flight: Arc<AtomicU64>,
+}
+
+impl Drop for RunGuard {
+    fn drop(&mut self) {
+        self.in_flight.fetch_sub(1, Ordering::Release);
+        self.generation.fetch_add(1, Ordering::Release);
+    }
 }
 
 impl ActivityTracker {
@@ -51,7 +78,26 @@ impl ActivityTracker {
                 started_at: Instant::now(),
             })),
             generation: Arc::new(AtomicU64::new(0)),
+            in_flight: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Mark a run as in flight until the returned guard is dropped.
+    ///
+    /// Also records activity for the agent, so the "last busy" timestamp
+    /// still advances for anything reading it directly.
+    pub fn begin_run(&self, agent_id: Uuid) -> RunGuard {
+        self.in_flight.fetch_add(1, Ordering::Release);
+        self.record(agent_id);
+        RunGuard {
+            generation: Arc::clone(&self.generation),
+            in_flight: Arc::clone(&self.in_flight),
+        }
+    }
+
+    /// Runs currently in flight.
+    pub fn runs_in_flight(&self) -> u64 {
+        self.in_flight.load(Ordering::Acquire)
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
@@ -103,8 +149,13 @@ impl ActivityTracker {
     }
 
     /// Whether `agent_id` has been quiet for at least `threshold`.
+    ///
+    /// A run in flight anywhere means not idle, whatever the clock says. A
+    /// turn can outlast the threshold — a long tool chain, a slow model —
+    /// and the elapsed-time test alone would declare the system quiet
+    /// while the agent was still working.
     pub fn is_idle(&self, agent_id: Uuid, threshold: Duration) -> bool {
-        self.idle_for(agent_id) >= threshold
+        self.runs_in_flight() == 0 && self.idle_for(agent_id) >= threshold
     }
 
     /// Current activity generation.
@@ -219,6 +270,74 @@ mod tests {
         tracker.record(Uuid::new_v4());
 
         assert!(tracker.changed_since(snapshot));
+    }
+
+    #[test]
+    fn a_run_in_flight_is_never_idle() {
+        // The bug this guards: activity is recorded when a turn starts, so
+        // a turn lasting longer than the idle threshold used to read as
+        // idle while the agent was still working, and a background pass
+        // could start underneath it.
+        let tracker = ActivityTracker::new();
+        let agent = Uuid::new_v4();
+
+        let guard = tracker.begin_run(agent);
+        assert_eq!(tracker.runs_in_flight(), 1);
+        // Zero threshold is the most permissive question that can be
+        // asked; even that must answer "busy".
+        assert!(!tracker.is_idle(agent, Duration::ZERO));
+
+        drop(guard);
+        assert_eq!(tracker.runs_in_flight(), 0);
+        assert!(tracker.is_idle(agent, Duration::ZERO));
+    }
+
+    #[test]
+    fn finishing_a_run_preempts_an_overlapping_pass() {
+        // A worker snapshots the generation before its work. A run that
+        // began and ended around it must be visible, or the pass would be
+        // returned as though it had never raced anything.
+        let tracker = ActivityTracker::new();
+        let snapshot = tracker.generation();
+
+        drop(tracker.begin_run(Uuid::new_v4()));
+
+        assert!(tracker.changed_since(snapshot));
+    }
+
+    #[test]
+    fn concurrent_runs_are_counted_not_flagged() {
+        // Two channels can be mid-turn at once. A boolean would let the
+        // first to finish declare the system idle while the second ran.
+        let tracker = ActivityTracker::new();
+        let agent = Uuid::new_v4();
+
+        let a = tracker.begin_run(agent);
+        let b = tracker.begin_run(agent);
+        assert_eq!(tracker.runs_in_flight(), 2);
+
+        drop(a);
+        assert!(
+            !tracker.is_idle(agent, Duration::ZERO),
+            "one run finishing must not mark the system idle while another runs"
+        );
+
+        drop(b);
+        assert!(tracker.is_idle(agent, Duration::ZERO));
+    }
+
+    #[test]
+    fn in_flight_state_is_shared_across_clones() {
+        // The worker holds a clone; the run path holds another.
+        let tracker = ActivityTracker::new();
+        let worker_view = tracker.clone();
+        let agent = Uuid::new_v4();
+
+        let guard = tracker.begin_run(agent);
+        assert!(!worker_view.is_idle(agent, Duration::ZERO));
+
+        drop(guard);
+        assert!(worker_view.is_idle(agent, Duration::ZERO));
     }
 
     #[test]

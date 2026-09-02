@@ -21,5 +21,5 @@ pub use report::{
     analyze, AnalysisReport, ArtifactFinding, FindingVerdict, OutcomeSource, Readiness,
     SignalQuality, MIN_OBSERVATIONS, UNDERPERFORMING_BELOW,
 };
-pub use store_source::StoreOutcomeSource;
-pub use worker::{DreamWorker, PassOutcome, WorkerConfig};
+pub use store_source::{StoreOutcomeSource, StoreReportSink};
+pub use worker::{DreamWorker, PassOutcome, ReportSink, WorkerConfig};

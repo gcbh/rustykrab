@@ -353,6 +353,9 @@ async fn main() -> anyhow::Result<()> {
     if args.len() >= 2 && args[1] == "chat" {
         return chat::run(&data_dir, &args[2..]).await;
     }
+    if args.len() >= 2 && args[1] == "dream" {
+        return handle_dream_subcommand(&data_dir, &args[2..]).await;
+    }
     if args.len() >= 2 && args[1] == "pair" {
         return handle_pair_subcommand(&data_dir).await;
     }
@@ -361,7 +364,7 @@ async fn main() -> anyhow::Result<()> {
     // reporting the mistake.
     if let Some(unknown) = args.get(1).filter(|a| !a.starts_with('-')) {
         eprintln!("unknown subcommand '{unknown}'");
-        eprintln!("subcommands: skill, keychain, chat, pair");
+        eprintln!("subcommands: skill, keychain, chat, dream, pair");
         eprintln!("run with no arguments to start the daemon");
         std::process::exit(2);
     }
@@ -1418,13 +1421,37 @@ async fn main() -> anyhow::Result<()> {
     // that produces its input -- with no records to read there is nothing
     // for it to say.
     if outcome_capture_enabled {
+        // Its own read-only connection. The store is a single mutex-guarded
+        // connection, so an analysis pass aggregating the whole outcome
+        // table would otherwise block live traffic for as long as it runs.
+        // WAL readers do not block the writer, so this stops the background
+        // loop competing with the foreground for the shared handle.
+        let outcomes = match store_handle.outcomes_reader() {
+            Ok(reader) => reader,
+            Err(e) => {
+                // Falling back is right: analysis on the shared connection
+                // is worse than analysis on its own, but both beat none,
+                // and the pass only ever runs when the system is quiet.
+                tracing::warn!(
+                    error = %e,
+                    "could not open a dedicated read connection for outcome analysis; \
+                     falling back to the shared one"
+                );
+                store_handle.outcomes()
+            }
+        };
+
         let worker = rustykrab_dream::DreamWorker::new(
-            std::sync::Arc::new(rustykrab_dream::StoreOutcomeSource::new(
-                store_handle.outcomes(),
-            )),
+            std::sync::Arc::new(rustykrab_dream::StoreOutcomeSource::new(outcomes)),
             activity_tracker,
             rustykrab_dream::WorkerConfig::new(agent_id),
-        );
+        )
+        // Passes are kept, so "have the reports shown anything?" is a
+        // question the `dream` subcommand can answer instead of one that
+        // needs a human reading rotated logs.
+        .with_report_sink(std::sync::Arc::new(rustykrab_dream::StoreReportSink::new(
+            store_handle.dream_reports(),
+        )));
         infra_handles.push(tokio::spawn(worker.run()));
     }
 
@@ -2691,6 +2718,67 @@ fn handle_skill_subcommand(data_dir: &std::path::Path, args: &[String]) -> anyho
 /// Prints the code and the QR payload the app scans. Runs against the same
 /// data directory as the daemon; the daemon does not need to be running,
 /// since the code lives in the shared database.
+/// `dream report [N] [--json]` — what the outer loop has been finding.
+///
+/// The phase gate in `DREAMING.md` is "reports show real, actionable
+/// patterns". Without a way to read the passes back, answering that means
+/// grepping rotated daemon logs, so the gate cannot honestly be evaluated
+/// and the loop's most important output is its least accessible one.
+async fn handle_dream_subcommand(
+    data_dir: &std::path::Path,
+    args: &[String],
+) -> anyhow::Result<()> {
+    let json = args.iter().any(|a| a == "--json");
+    let limit: u32 = args
+        .iter()
+        .find(|a| !a.starts_with('-'))
+        .and_then(|a| a.parse().ok())
+        .unwrap_or(1);
+
+    let master_key = match rustykrab_store::keychain::resolve_master_key() {
+        Ok(key) => key,
+        Err(e) => {
+            eprintln!("ERROR: {e}");
+            std::process::exit(1);
+        }
+    };
+    let store = rustykrab_store::Store::open(data_dir.join("db"), master_key)?;
+    let reports = store.dream_reports().recent(limit.max(1)).await?;
+
+    if reports.is_empty() {
+        // Distinguish the two ways this is empty, because they call for
+        // opposite responses: one is "wait", the other is "you have not
+        // turned it on".
+        let capture_on = std::env::var("RUSTYKRAB_OUTCOME_CAPTURE")
+            .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "True"))
+            .unwrap_or(false);
+        if capture_on {
+            println!("no analysis passes recorded yet -- the worker runs only after the system has been quiet");
+        } else {
+            println!("outcome capture is off; set RUSTYKRAB_OUTCOME_CAPTURE=1 to enable it");
+            println!("note: the daemon reads this from its environment, so on macOS it must be");
+            println!("      set in the LaunchAgent plist, not just the shell");
+        }
+        return Ok(());
+    }
+
+    for report in &reports {
+        if json {
+            println!("{}", report.report);
+        } else {
+            println!(
+                "{}  ({} records, {})",
+                report.generated_at.to_rfc3339(),
+                report.total_records,
+                report.readiness
+            );
+            println!("{}", report.summary);
+            println!();
+        }
+    }
+    Ok(())
+}
+
 async fn handle_pair_subcommand(data_dir: &std::path::Path) -> anyhow::Result<()> {
     let master_key = match rustykrab_store::keychain::resolve_master_key() {
         Ok(key) => key,

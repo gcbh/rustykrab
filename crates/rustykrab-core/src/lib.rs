@@ -31,7 +31,7 @@ pub mod types;
 pub use active_tools::{
     with_session_context, ActiveToolsRegistry, SessionToolContext, SESSION_TOOL_CONTEXT,
 };
-pub use activity::ActivityTracker;
+pub use activity::{ActivityTracker, RunGuard};
 pub use agent_def::{AgentDefinition, AgentRegistry};
 pub use capability::{is_subagent_tool, Capability, CapabilitySet, SUBAGENT_TOOL_NAMES};
 pub use error::{Error, Result, ToolError, ToolErrorKind};
