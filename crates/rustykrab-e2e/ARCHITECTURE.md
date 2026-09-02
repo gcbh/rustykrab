@@ -16,13 +16,13 @@ resulting store state. Emit a JSON report and a matching exit code.
 
 | File | Lines | Role |
 |---|---|---|
-| `main.rs` | 1,977 | Daemon lifecycle, scripted scenarios, report assembly |
+| `main.rs` | 2,017 | Daemon lifecycle, scripted scenarios, report and evidence-artifact assembly |
 | `model_suite.rs` | 951 | Scenarios against a real model |
 | `credential_suite.rs` | 716 | Credential-guard scenarios (the Phase 2 exit criteria) |
 | `login_suite.rs` | 677 | Authentication and pairing flows |
 | `ablation.rs` | 578 | Ablation runs — which component change moved the result |
 | `assertion.rs` | 469 | Assertion vocabulary over responses and store rows |
-| `planning_suite.rs` | 415 | Conversational-planning acceptance scenarios and state assertions |
+| `planning_suite.rs` | 473 | Conversational-planning API, projection, restart-shape, and durable-state assertions |
 | `transcript.rs` | 364 | Reads conversation transcripts directly from `store.db` |
 | `fixture_repo.rs` | 262 | Isolated Git repository fixtures for planning and delivery scenarios |
 | `judge.rs` | 261 | LLM-as-judge scoring |
@@ -69,6 +69,12 @@ price of that. Both are loudly logged and clearly documented as harness
 switches, but they are compiled into the release binary rather than gated behind
 a cargo feature. Feature-gating them (`--features eval-harness`) would keep the
 capability and remove it from production builds.
+
+The harness writes its aggregate report and scenario-specific JSON evidence to
+`E2E_ARTIFACT_DIR` (default `target/e2e-artifacts`). Planning scenarios do not
+pass on HTTP shape alone: they query `store.db` for the project, revision, and
+materialized node rows, then persist those counts with the service response and
+fixture-repository revision. Artifact paths reject absolute paths and traversal.
 
 ## Observations
 
