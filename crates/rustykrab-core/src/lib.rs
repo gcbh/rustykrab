@@ -20,6 +20,8 @@ pub mod model;
 pub mod orchestration;
 pub mod outcome;
 pub mod outcome_contract;
+pub mod post_condition;
+pub mod probes;
 pub mod prompt_trace;
 pub mod recall;
 pub mod retrieval_log;
@@ -46,6 +48,8 @@ pub use outcome::{
     OutcomeTally, OutcomeVerdict, SignalClass,
 };
 pub use outcome_contract::{evaluate as evaluate_contract, ContractVerdict, OutcomeContract};
+pub use post_condition::{Observation, PostCondition, ProbeRegistry, ProbeWindow};
+pub use probes::{FilePresence, MemoryWritten};
 pub use recall::RecallStore;
 pub use retrieval_log::RetrievalLog;
 pub use schema_validate::validate_tool_args;

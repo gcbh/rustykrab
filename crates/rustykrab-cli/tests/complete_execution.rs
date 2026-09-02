@@ -46,27 +46,51 @@ use uuid::Uuid;
 
 const SKILL: &str = "calendar-booking";
 
-/// A tool that succeeds and records nothing. The run's *effects* are what
-/// the contract checks, and for this test the effect is simply "a tool of
-/// this name completed successfully".
-struct Effect(&'static str);
+/// A tool that leaves a mark on the world when it succeeds.
+///
+/// The mark, not the call, is what the contract checks. That distinction
+/// is the whole point of the probe layer: an earlier version of this test
+/// treated "a tool of this name completed successfully" as the effect,
+/// which made the evidence a restatement of the agent's own behaviour.
+struct Effect {
+    name: &'static str,
+    mark: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// Observes the mark. Knows nothing about the run that produced it.
+struct MarkProbe {
+    name: String,
+    mark: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl rustykrab_core::PostCondition for MarkProbe {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    async fn observe(&self) -> CoreResult<rustykrab_core::Observation> {
+        let n = self.mark.load(std::sync::atomic::Ordering::SeqCst);
+        Ok(if n == 0 { None } else { Some(n.to_string()) })
+    }
+}
 
 #[async_trait::async_trait]
 impl Tool for Effect {
     fn name(&self) -> &str {
-        self.0
+        self.name
     }
     fn description(&self) -> &str {
         "test effect"
     }
     fn schema(&self) -> ToolSchema {
         ToolSchema {
-            name: self.0.to_string(),
+            name: self.name.to_string(),
             description: "test effect".to_string(),
             parameters: json!({"type": "object", "properties": {}}),
         }
     }
     async fn execute(&self, _args: serde_json::Value) -> CoreResult<serde_json::Value> {
+        self.mark.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(json!({"ok": true}))
     }
 }
@@ -120,21 +144,46 @@ async fn run_turn(
     };
     let provider = Arc::new(ScriptedProvider::new(script));
 
+    // The world the probes look at. Fresh per run, so each turn is judged
+    // on what it changed rather than on what an earlier turn left behind.
+    let booked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let confirmed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
     let tools: Vec<Arc<dyn Tool>> = vec![
-        Arc::new(Effect("calendar_create")),
-        Arc::new(Effect("email_confirm")),
+        Arc::new(Effect {
+            name: "calendar_create",
+            mark: Arc::clone(&booked),
+        }),
+        Arc::new(Effect {
+            name: "email_confirm",
+            mark: Arc::clone(&confirmed),
+        }),
     ];
+
+    let probes = Arc::new(
+        rustykrab_core::ProbeRegistry::new()
+            .with(Arc::new(MarkProbe {
+                name: "event_booked".to_string(),
+                mark: Arc::clone(&booked),
+            }))
+            .with(Arc::new(MarkProbe {
+                name: "confirmation_sent".to_string(),
+                mark: Arc::clone(&confirmed),
+            })),
+    );
 
     let runner = AgentRunner::new(provider, tools, Arc::new(NoSandbox))
         .with_outcome_sink(outcomes)
         .with_active_skill(SKILL)
-        // The declaration under test. This is the line that was missing
-        // from production: without it every record below is `Implicit`.
+        // The declaration under test, and the probes that can check it.
+        // Without either, every record below is `Implicit` and the loop
+        // stays shut.
         .with_outcome_contract(OutcomeContract::new(
             SKILL,
-            vec!["calendar_create".to_string(), "email_confirm".to_string()],
+            vec!["event_booked".to_string(), "confirmation_sent".to_string()],
             SignalClass::Verifiable,
-        ));
+        ))
+        .with_probes(probes);
 
     let caps = CapabilitySet::for_tools_permissive(&["calendar_create", "email_confirm"]);
     let session = Session::with_capabilities(conversation_id, caps);
@@ -385,8 +434,14 @@ async fn without_a_declaration_the_same_runs_change_nothing() {
             }],
         };
         let tools: Vec<Arc<dyn Tool>> = vec![
-            Arc::new(Effect("calendar_create")),
-            Arc::new(Effect("email_confirm")),
+            Arc::new(Effect {
+                name: "calendar_create",
+                mark: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }),
+            Arc::new(Effect {
+                name: "email_confirm",
+                mark: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }),
         ];
         // Same runner, same work -- only the contract is absent.
         let runner = AgentRunner::new(

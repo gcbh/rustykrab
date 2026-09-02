@@ -903,7 +903,12 @@ async fn main() -> anyhow::Result<()> {
     // hybrid memory system so they can be recalled semantically later.
     let wiki_dir = data_dir.join("wiki");
     std::fs::create_dir_all(&wiki_dir)?;
-    tools.extend(rustykrab_tools::wiki_tools(wiki_dir, memory_backend));
+    // Cloned rather than moved: the probe registry below needs the
+    // same backend to observe what a run committed to memory.
+    tools.extend(rustykrab_tools::wiki_tools(
+        wiki_dir,
+        Arc::clone(&memory_backend),
+    ));
     tracing::info!("wiki tool registered");
 
     // --- Message tool (delivers via Telegram/Slack/Signal) ---
@@ -1181,6 +1186,10 @@ async fn main() -> anyhow::Result<()> {
         .with_retrieval_log(retrieval_log)
         .with_activity_tracker(activity_tracker.clone())
         .with_outcome_capture(outcome_capture_enabled)
+        .with_probes(Arc::new(build_probe_registry(
+            &data_dir,
+            Arc::clone(&memory_backend),
+        )))
         .with_credential_page_policy(rustykrab_gateway::PageIdentityPolicy::from_env());
     state.agent.active_tools = active_tools;
 
@@ -2808,6 +2817,36 @@ fn handle_skill_subcommand(data_dir: &std::path::Path, args: &[String]) -> anyho
 /// patterns". Without a way to read the passes back, answering that means
 /// grepping rotated daemon logs, so the gate cannot honestly be evaluated
 /// and the loop's most important output is its least accessible one.
+/// The post-condition probes this deployment can actually run.
+///
+/// Which effects a skill *claims* comes from its `SKILL.md`; which effects
+/// this machine can *observe* comes from here. A check naming nothing in
+/// this registry yields no contract at all, so the run falls back to the
+/// behavioural signal — see `rustykrab_core::post_condition` for why that
+/// is the only safe answer.
+///
+/// Deliberately short. A probe has to observe the effect through a path
+/// independent of the run, which rules out the easy version (ask the
+/// tracer whether the tool was called) and means each one is real work.
+/// These two are the ones that can be written honestly today; a calendar
+/// or mailbox probe belongs with the crate that already owns that client.
+fn build_probe_registry(
+    data_dir: &std::path::Path,
+    memory: Arc<dyn rustykrab_core::MemoryBackend>,
+) -> rustykrab_core::ProbeRegistry {
+    rustykrab_core::ProbeRegistry::new()
+        // "the briefing was written to the vault"
+        .with(Arc::new(rustykrab_core::FilePresence::new(
+            "daily_briefing_written",
+            data_dir.join("briefings").join("latest.md"),
+        )))
+        // "the run committed something to memory"
+        .with(Arc::new(rustykrab_core::MemoryWritten::new(
+            "memory_written",
+            memory,
+        )))
+}
+
 async fn handle_dream_subcommand(
     data_dir: &std::path::Path,
     args: &[String],
