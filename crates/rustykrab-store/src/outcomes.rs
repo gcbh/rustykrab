@@ -34,11 +34,26 @@ const MAX_OUTCOME_RECORDS: u32 = 50_000;
 #[derive(Clone)]
 pub struct OutcomeStore {
     conn: Arc<Mutex<rusqlite::Connection>>,
+    /// Set when this handle owns a `SQLITE_OPEN_READ_ONLY` connection of
+    /// its own. Writes are refused up front rather than left to fail in
+    /// SQLite, so the mistake surfaces as the intended one.
+    read_only: bool,
 }
 
 impl OutcomeStore {
     pub(crate) fn new(conn: Arc<Mutex<rusqlite::Connection>>) -> Self {
-        Self { conn }
+        Self {
+            conn,
+            read_only: false,
+        }
+    }
+
+    /// A handle over a connection that may only read.
+    pub(crate) fn new_read_only(conn: Arc<Mutex<rusqlite::Connection>>) -> Self {
+        Self {
+            conn,
+            read_only: true,
+        }
     }
 
     /// Persist one outcome record and its attributions.
@@ -47,6 +62,11 @@ impl OutcomeStore {
     /// an outcome with no attributions is not actionable, so a partial
     /// write would be worse than no write.
     pub async fn record(&self, record: &OutcomeRecord) -> Result<(), Error> {
+        if self.read_only {
+            return Err(Error::Storage(
+                "outcome store is read-only; this handle exists for analysis, not capture".into(),
+            ));
+        }
         let r = record.clone();
         with_conn(&self.conn, move |conn| {
             let tx = conn
@@ -294,6 +314,50 @@ impl OutcomeStore {
         with_conn(&self.conn, move |conn| {
             conn.query_row("SELECT COUNT(*) FROM outcome_records", [], |row| row.get(0))
                 .map_err(|e| Error::Storage(e.to_string()))
+        })
+        .await
+    }
+
+    /// Verdict totals over the records themselves, counting each record
+    /// once.
+    ///
+    /// Distinct from summing [`Self::tallies_by_kind`], which counts a
+    /// record once per artifact it touched and so cannot describe the
+    /// record population. Describing the *signal* — how much evidence
+    /// there is and how much of it is ground truth — is a question about
+    /// records, not about artifacts, and asking it through the attribution
+    /// join makes the answer depend on how many artifacts happened to be
+    /// in play.
+    pub async fn verdict_totals(&self, ground_truth_only: bool) -> Result<OutcomeTally, Error> {
+        with_conn(&self.conn, move |conn| {
+            let sql = if ground_truth_only {
+                "SELECT verdict, COUNT(*) FROM outcome_records
+                 WHERE signal IN ('verifiable', 'explicit')
+                 GROUP BY verdict"
+            } else {
+                "SELECT verdict, COUNT(*) FROM outcome_records GROUP BY verdict"
+            };
+
+            let mut stmt = conn
+                .prepare(sql)
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?))
+                })
+                .map_err(|e| Error::Storage(e.to_string()))?;
+
+            let mut tally = OutcomeTally::default();
+            for row in rows {
+                let (verdict, count) = row.map_err(|e| Error::Storage(e.to_string()))?;
+                match OutcomeVerdict::parse(&verdict) {
+                    Some(OutcomeVerdict::Success) => tally.helpful += count,
+                    Some(OutcomeVerdict::Failure) => tally.harmful += count,
+                    Some(OutcomeVerdict::Ambiguous) => tally.ambiguous += count,
+                    None => {}
+                }
+            }
+            Ok(tally)
         })
         .await
     }

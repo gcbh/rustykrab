@@ -3,6 +3,7 @@ mod conversation;
 pub mod credential_backend;
 mod credential_request;
 mod device;
+mod dream_reports;
 mod guarded;
 mod jobs;
 pub mod keychain;
@@ -12,7 +13,7 @@ pub mod registry;
 mod secret;
 mod tasks;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use rustykrab_core::Error;
@@ -26,6 +27,7 @@ pub use credential_request::{
     CredentialRequest, CredentialRequestStore, RequestAction, RequestNotifier, RequestedField,
 };
 pub use device::{Device, DeviceStore, Principal};
+pub use dream_reports::{DreamReportStore, StoredReport};
 pub use guarded::{GuardedSecrets, WriteOutcome};
 pub use jobs::{JobRun, JobStore, ScheduledJob};
 pub use outcomes::OutcomeStore;
@@ -50,6 +52,9 @@ pub struct Store {
     /// Credential links minted this turn, waiting to be sent to the user
     /// once the agent has finished speaking. In memory only.
     pending_links: PendingLinks,
+    /// Where the database lives, so a background reader can open its own
+    /// connection instead of queueing behind live traffic on this one.
+    db_path: PathBuf,
 }
 
 impl Store {
@@ -88,6 +93,7 @@ impl Store {
             request_notifier: None,
             credential_backend: credential_backend::default_backend(),
             pending_links: PendingLinks::new(),
+            db_path,
         })
     }
 
@@ -314,6 +320,22 @@ impl Store {
 
             CREATE INDEX IF NOT EXISTS idx_outcome_attributions_target
                 ON outcome_attributions (kind, target_id);
+
+            -- Analysis passes, kept so the phase gate can be read rather
+            -- than inferred. Without this the only record that the outer
+            -- loop ran at all is a log line, and 'reports show real,
+            -- actionable patterns' is not a question anyone can answer.
+            CREATE TABLE IF NOT EXISTS dream_reports (
+                id            TEXT PRIMARY KEY,
+                generated_at  TEXT NOT NULL,
+                readiness     TEXT NOT NULL,
+                total_records INTEGER NOT NULL,
+                summary       TEXT NOT NULL,
+                report        TEXT NOT NULL   -- full AnalysisReport as JSON
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_dream_reports_generated_at
+                ON dream_reports (generated_at DESC);
             ",
         )
         .map_err(|e| Error::Storage(e.to_string()))?;
@@ -566,9 +588,46 @@ impl Store {
         JobStore::new(Arc::clone(&self.conn))
     }
 
+    /// Return a handle for persisted analysis passes (see `DREAMING.md`).
+    pub fn dream_reports(&self) -> DreamReportStore {
+        DreamReportStore::new(Arc::clone(&self.conn))
+    }
+
     /// Return a handle for outcome-record persistence (see `DREAMING.md`).
     pub fn outcomes(&self) -> OutcomeStore {
         OutcomeStore::new(Arc::clone(&self.conn))
+    }
+
+    /// A read-only outcome handle on a connection of its own.
+    ///
+    /// The store is a single `Arc<Mutex<Connection>>`, so even reads
+    /// serialize through it: an analysis pass aggregating tens of
+    /// thousands of rows blocks live traffic for as long as it runs, WAL
+    /// notwithstanding. WAL readers do not block the writer, so the
+    /// background loop gets its own connection and stops competing for the
+    /// shared one.
+    ///
+    /// Opened `SQLITE_OPEN_READ_ONLY`, so this cannot become a second
+    /// writer by accident.
+    pub fn outcomes_reader(&self) -> Result<OutcomeStore, Error> {
+        let conn = rusqlite::Connection::open_with_flags(
+            &self.db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+        )
+        .map_err(|e| Error::Storage(e.to_string()))?;
+
+        // `journal_mode` is a property of the database, not the
+        // connection, and setting it from a read-only handle would fail —
+        // the WAL is already in place from `open`. These are the
+        // per-connection settings that matter to a batch reader.
+        conn.execute_batch(
+            "PRAGMA busy_timeout = 5000;
+             PRAGMA cache_size = -16384;
+             PRAGMA temp_store = MEMORY;",
+        )
+        .map_err(|e| Error::Storage(e.to_string()))?;
+
+        Ok(OutcomeStore::new_read_only(Arc::new(Mutex::new(conn))))
     }
 
     /// Return a handle for channel address → conversation bindings, for

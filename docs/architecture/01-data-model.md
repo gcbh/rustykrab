@@ -4,7 +4,7 @@ Two SQLite databases, opened independently, never joined.
 
 | File | Owner | Tables |
 |---|---|---|
-| `<data_dir>/db/store.db` | `rustykrab-store` | 15 tables + 9 indexes |
+| `<data_dir>/db/store.db` | `rustykrab-store` | 16 tables + 10 indexes |
 | `<data_dir>/memory.db` | `rustykrab-memory` | 4 tables + 1 FTS5 virtual table + 9 indexes |
 
 DDL is idempotent (`CREATE TABLE IF NOT EXISTS`) inside
@@ -162,6 +162,23 @@ outcome_attributions(record_id REFERENCES outcome_records(id) ON DELETE CASCADE,
                      PK(record_id, kind, target_id))
    INDEX (kind, target_id)
 ```
+
+Analysis passes are kept alongside them:
+
+```
+dream_reports(id PK, generated_at, readiness, total_records, summary,
+              report)                       -- full AnalysisReport as JSON
+   INDEX (generated_at DESC)
+```
+
+Two denormalised columns (`readiness`, `total_records`) so "has this ever been
+ready?" is a query rather than a JSON scan; the rest is stored as JSON because
+the shape of an analysis will change and a schema per revision is not worth the
+migrations. Capped at 2000 rows, pruned on insert.
+
+Without this table the only record that the outer loop ran at all was a log
+line, which made the Phase 1 gate — "reports show real, actionable patterns" —
+unanswerable by anything but a human with `grep`.
 
 **Assessment: the most sophisticated modelling in the codebase, and correctly
 normalised.** Write-once event rows; per-artifact tallies derived by
