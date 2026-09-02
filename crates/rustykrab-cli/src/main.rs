@@ -722,7 +722,10 @@ async fn main() -> anyhow::Result<()> {
         id
     };
 
-    let session_id = Uuid::new_v4();
+    // Scope for memory writes made outside any conversation — a background
+    // task, or a tool invoked with no runner context. A write made while
+    // serving a turn is scoped to that conversation instead.
+    let fallback_memory_scope = Uuid::new_v4();
 
     // Rebuild FTS5 index from persisted memories (idempotent). Runs in the
     // background so a large corpus doesn't delay gateway bind; the handle
@@ -751,8 +754,12 @@ async fn main() -> anyhow::Result<()> {
     let activity_tracker = rustykrab_core::activity::ActivityTracker::new();
 
     let memory_backend: Arc<dyn MemoryBackend> = Arc::new(MemoryAdapter {
-        inner: HybridMemoryBackend::new(Arc::clone(&memory_system), agent_id, session_id)
-            .with_retrieval_log(retrieval_log.clone()),
+        inner: HybridMemoryBackend::new(
+            Arc::clone(&memory_system),
+            agent_id,
+            fallback_memory_scope,
+        )
+        .with_retrieval_log(retrieval_log.clone()),
     });
     tracing::info!(%agent_id, "memory system initialized");
 
@@ -1532,11 +1539,17 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // Finalize memory session: Working → Episodic + lifecycle sweep.
+    // Finalize memory: Working → Episodic + lifecycle sweep.
+    //
+    // The whole working set, not one session's. Working memories are scoped
+    // to the conversation that produced them, and at process exit every
+    // conversation has ended — there is no session id here that names any of
+    // them. (This call used to pass the process-boot id, which named a
+    // working set that was always empty.)
     idle_sweep_handle.abort();
-    tracing::info!("finalizing memory session...");
-    if let Err(e) = memory_system.finalize_session(agent_id, session_id).await {
-        tracing::warn!(error = %e, "failed to finalize memory session");
+    tracing::info!("finalizing memory working set...");
+    if let Err(e) = memory_system.finalize_working_set(agent_id).await {
+        tracing::warn!(error = %e, "failed to finalize memory working set");
     }
     if let Err(e) = memory_system.lifecycle_sweep(agent_id).await {
         tracing::warn!(error = %e, "shutdown lifecycle sweep failed");
