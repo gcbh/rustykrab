@@ -267,10 +267,10 @@ mod tests {
         assert_eq!(output["exit_code"], 0);
     }
 
-    #[tokio::test]
-    async fn network_access_blocked() {
-        let tool = CodeExecutionTool::new();
-        let code = r#"
+    /// Reports `BLOCKED: <reason>` when the connection is refused and
+    /// `CONNECTED` when it succeeds.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    const NETWORK_PROBE: &str = r#"
 import socket
 try:
     s = socket.create_connection(("8.8.8.8", 53), timeout=3)
@@ -279,17 +279,53 @@ try:
 except Exception as e:
     print(f"BLOCKED: {e}")
 "#;
-        let result = tool.execute(json!({"code": code})).await;
-        assert!(result.is_ok(), "execution failed: {:?}", result.err());
-        let output = result.unwrap();
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn network_access_blocked() {
+        // Seatbelt's `(deny network*)` needs no privileges, so containment is
+        // unconditional here and the assertion can be strict. It previously
+        // read `BLOCKED || CONNECTED`, which could not fail even if the
+        // sandbox stopped containing anything at all.
+        let tool = CodeExecutionTool::new();
+        let output = tool
+            .execute(json!({ "code": NETWORK_PROBE }))
+            .await
+            .expect("execution failed");
         let stdout = output["stdout"].as_str().unwrap();
-        // Network namespace isolation (CLONE_NEWNET) requires
-        // CAP_SYS_ADMIN. When unavailable (e.g. CI containers), the
-        // sandbox falls back to resource limits only, which don't block
-        // network access. Accept either outcome.
         assert!(
-            stdout.contains("BLOCKED") || stdout.contains("CONNECTED"),
-            "unexpected sandbox output: {stdout}"
+            stdout.contains("BLOCKED"),
+            "seatbelt must deny network access; stdout={stdout:?} stderr={:?}",
+            output["stderr"]
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn network_access_blocked() {
+        // CLONE_NEWNET needs CAP_SYS_ADMIN. Where it is unavailable (CI
+        // containers) the tool degrades to rlimits only and says so on the
+        // child's stderr. Branch on that rather than accepting both outcomes:
+        // when the namespace really was created, blocking is mandatory.
+        let tool = CodeExecutionTool::new();
+        let output = tool
+            .execute(json!({ "code": NETWORK_PROBE }))
+            .await
+            .expect("execution failed");
+        let stdout = output["stdout"].as_str().unwrap();
+        let stderr = output["stderr"].as_str().unwrap_or_default();
+
+        if stderr.contains("namespace isolation unavailable") {
+            eprintln!(
+                "skipping: network namespaces unavailable here, \
+                 sandbox degraded to resource limits only"
+            );
+            return;
+        }
+        assert!(
+            stdout.contains("BLOCKED"),
+            "the network namespace was created, so the connection must fail; \
+             stdout={stdout:?}"
         );
     }
 

@@ -511,3 +511,61 @@ async fn zero_argument_tool_call_yields_empty_object() {
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].arguments, serde_json::json!({}));
 }
+
+#[tokio::test]
+async fn empty_id_and_name_in_later_frames_do_not_clobber_the_first() {
+    // Some servers repeat the `id` and `name` keys on every tool-call frame,
+    // sending empty strings after the first. Taking those at face value would
+    // blank out the call: an empty name is dropped at assembly and an empty id
+    // is replaced by a random UUID, so the tool result could never be matched
+    // back to the call the model made.
+    let server = spawn_mock(Reply::Sse(vec![
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"path\\\"\"}}]}}]}\n\n".into(),
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"\",\"function\":{\"name\":\"\",\"arguments\":\":\\\"/tmp/x\\\"}\"}}]}}]}\n\n".into(),
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n".into(),
+        "data: [DONE]\n\n".into(),
+    ]))
+    .await;
+
+    let resp = OpenAiProvider::new("m")
+        .with_base_url(server.base_url())
+        .chat_stream(&[user("read it")], &[read_tool()], &|_| {})
+        .await
+        .unwrap();
+
+    let calls = resp.message.content.tool_calls();
+    assert_eq!(
+        calls.len(),
+        1,
+        "the empty-id frame must not open a new call"
+    );
+    assert_eq!(calls[0].id, "call_1", "the established id must survive");
+    assert_eq!(calls[0].name, "read", "the established name must survive");
+    assert_eq!(calls[0].arguments, serde_json::json!({"path": "/tmp/x"}));
+}
+
+#[tokio::test]
+async fn a_different_id_at_the_same_index_starts_a_second_call() {
+    // Index is only a hint. When a server reuses index 0 for a genuinely
+    // different call, keying on the index alone would concatenate the two
+    // argument streams into one unparseable blob.
+    let server = spawn_mock(Reply::Sse(vec![
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"/a\\\"}\"}}]}}]}\n\n".into(),
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c2\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"/b\\\"}\"}}]}}]}\n\n".into(),
+        "data: [DONE]\n\n".into(),
+    ]))
+    .await;
+
+    let resp = OpenAiProvider::new("m")
+        .with_base_url(server.base_url())
+        .chat_stream(&[user("read both")], &[read_tool()], &|_| {})
+        .await
+        .unwrap();
+
+    let calls = resp.message.content.tool_calls();
+    assert_eq!(calls.len(), 2, "a new id at the same index is a new call");
+    assert_eq!(calls[0].id, "c1");
+    assert_eq!(calls[0].arguments, serde_json::json!({"path": "/a"}));
+    assert_eq!(calls[1].id, "c2");
+    assert_eq!(calls[1].arguments, serde_json::json!({"path": "/b"}));
+}
