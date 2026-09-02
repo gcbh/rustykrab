@@ -12,7 +12,7 @@ of long-polling channel loops. A message arriving on any surface becomes a
 *turn*: the agent loop calls the model, executes the tools it asks for, and
 repeats until the model signals completion.
 
-**Current tree: 13 crates, ~84,800 lines, 926 tests.**
+**Current tree: 13 crates, ~85,500 lines, 932 tests.**
 
 ## Crate graph
 
