@@ -267,11 +267,16 @@ mod tests {
         assert_eq!(output["exit_code"], 0);
     }
 
-    /// Reports `BLOCKED: <reason>` when the connection is refused and
-    /// `CONNECTED` when it succeeds.
+    /// Prints the sandbox's network-namespace identity as `NETNS:<id>`, then
+    /// `BLOCKED: <reason>` when the connection is refused or `CONNECTED` when
+    /// it succeeds.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     const NETWORK_PROBE: &str = r#"
-import socket
+import os, socket
+try:
+    print("NETNS:" + os.readlink("/proc/self/ns/net"))
+except OSError:
+    print("NETNS:unavailable")
 try:
     s = socket.create_connection(("8.8.8.8", 53), timeout=3)
     s.close()
@@ -303,29 +308,45 @@ except Exception as e:
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn network_access_blocked() {
-        // CLONE_NEWNET needs CAP_SYS_ADMIN. Where it is unavailable (CI
-        // containers) the tool degrades to rlimits only and says so on the
-        // child's stderr. Branch on that rather than accepting both outcomes:
-        // when the namespace really was created, blocking is mandatory.
+        // CLONE_NEWNET needs CAP_SYS_ADMIN, which unprivileged CI runners do
+        // not have; there the tool degrades to rlimits only and cannot contain
+        // the network at all. So decide from what the sandbox actually got:
+        // compare its network namespace against this process's. Asking the
+        // kernel is the whole point — an earlier version of this test keyed off
+        // a log line the tool prints on the fallback path, which never reached
+        // the captured stderr, so the skip silently became a hard assert.
         let tool = CodeExecutionTool::new();
         let output = tool
             .execute(json!({ "code": NETWORK_PROBE }))
             .await
             .expect("execution failed");
         let stdout = output["stdout"].as_str().unwrap();
-        let stderr = output["stderr"].as_str().unwrap_or_default();
 
-        if stderr.contains("namespace isolation unavailable") {
+        let sandbox_netns = stdout
+            .lines()
+            .find_map(|l| l.strip_prefix("NETNS:"))
+            .expect("the probe always reports a namespace line");
+        let host_netns = std::fs::read_link("/proc/self/ns/net")
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| "unavailable".to_string());
+
+        // If either side could not be identified we cannot tell whether
+        // isolation happened, and a test that cannot tell must not assert.
+        if sandbox_netns == "unavailable" || host_netns == "unavailable" {
+            eprintln!("skipping: network namespace identity unavailable on this host");
+            return;
+        }
+        if sandbox_netns == host_netns {
             eprintln!(
-                "skipping: network namespaces unavailable here, \
-                 sandbox degraded to resource limits only"
+                "skipping: no network namespace here (sandbox netns {sandbox_netns} \
+                 matches the host), so the sandbox degraded to resource limits only"
             );
             return;
         }
         assert!(
             stdout.contains("BLOCKED"),
-            "the network namespace was created, so the connection must fail; \
-             stdout={stdout:?}"
+            "the sandbox got its own network namespace ({sandbox_netns} vs host \
+             {host_netns}), so the connection must fail; stdout={stdout:?}"
         );
     }
 
