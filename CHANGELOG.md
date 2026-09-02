@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.2.19] - 2026-09-02
+
+- fix(credentials): preserve origin on form submission (#605)
+
 ## [5.2.18] - 2026-09-02
 
 - refactor(core): one token estimator instead of five copies of the constant (#593)
