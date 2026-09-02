@@ -26,6 +26,15 @@ pub struct RunOptions {
     /// appended to the system prompt so the model has the full recipe
     /// from turn 0 without a `skills`-tool round-trip.
     pub active_skill: Option<(String, String)>,
+    /// What the active skill declared it must actually *do* for the run to
+    /// count as successful, when it declared anything checkable.
+    ///
+    /// Separate from `active_skill` because that pair exists to build the
+    /// prompt: it carries the recipe, not the post-condition. Without this
+    /// the runner knows a skill's name but not its claims, so every run it
+    /// drives is recorded as `Implicit` proxy evidence and no later stage
+    /// is permitted to act on it.
+    pub outcome_contract: Option<rustykrab_core::OutcomeContract>,
     /// When `true`, the runner makes its first LLM call with
     /// `tool_choice = "any"`, forcing the model to invoke a tool. Used
     /// for scheduled tasks so the model can't waste the slot on a
@@ -331,6 +340,12 @@ async fn prepare_agent(
         runner = runner.with_outcome_sink(Arc::new(state.store.outcomes()));
         if let Some((name, _)) = options.active_skill.as_ref() {
             runner = runner.with_active_skill(name.clone());
+        }
+        // Turns the record from proxy into ground truth when the skill
+        // declared a checkable outcome. Absent one, capture still happens
+        // -- it is simply stamped `Implicit`, as before.
+        if let Some(contract) = options.outcome_contract.as_ref() {
+            runner = runner.with_outcome_contract(contract.clone());
         }
     }
 
