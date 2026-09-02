@@ -560,7 +560,7 @@ expectations.
 
 ## Architecture
 
-A Cargo workspace of 13 crates under `crates/`:
+A Cargo workspace of 14 crates under `crates/`:
 
 ```
 rustykrab-cli          Binary entrypoint, daemon management, channel loops
@@ -607,6 +607,8 @@ rustykrab-cli          Binary entrypoint, daemon management, channel loops
   +-- rustykrab-memory     Hybrid retrieval: vector + BM25 + temporal + graph
   |
   +-- rustykrab-skills     SKILL.md loader with ed25519 signature verification
+  |
+  +-- rustykrab-projects   Immutable planning revisions, provenance, graph validation, projections
   |
   +-- rustykrab-core       Shared types, traits, error types
         +-- Tool trait, ModelProvider trait

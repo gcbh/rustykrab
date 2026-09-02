@@ -12,7 +12,7 @@ of long-polling channel loops. A message arriving on any surface becomes a
 *turn*: the agent loop calls the model, executes the tools it asks for, and
 repeats until the model signals completion.
 
-**Current tree: 13 crates, ~85,500 lines, 932 tests.**
+**Current tree: 14 crates, ~88,200 lines, 939 tests.**
 
 ## Crate graph
 
@@ -37,6 +37,9 @@ rustykrab-core        (no internal deps — the contract layer)
         |      +-- rustykrab-gateway  (+ channels)
         |               ^
         +---------------+-- rustykrab-cli
+
+rustykrab-projects    (no internal deps — immutable planning domain;
+                       not wired into the runtime at this stack layer)
 ```
 
 `rustykrab-runtime` is new since the first pass and is the significant change
@@ -50,6 +53,7 @@ no axum in its dependency tree.
 | Layer | Crate(s) | Role |
 |---|---|---|
 | Contracts | `core` | `Tool`, `ModelProvider`, `MemoryBackend`, `Capability`, `Session`, token estimation |
+| Planning domain | `projects` | Immutable revisions, provenance rules, validated planning graph, deterministic projections |
 | Capability providers | `providers`, `store`, `memory`, `skills`, `channels` | Each owns one external dependency |
 | Behaviour | `tools`, `agent` | Tool implementations; the model-call/tool-exec loop |
 | Application service | **`runtime`** | Assemble a turn: prompt, session, capabilities, memory hooks |
