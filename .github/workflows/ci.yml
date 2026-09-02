@@ -5,8 +5,10 @@ on:
     # Feature branches build too, so cloud agents (which can't run the
     # macOS/simulator lane) can iterate by pushing and reading checks.
     branches: [main, 'claude/**']
+  # A stacked PR targets its parent feature branch, not main. Run the same
+  # exact-head checks for every PR base so each layer has independent hosted
+  # evidence instead of inheriting only the bottom PR's checks.
   pull_request:
-    branches: [main]
 
 env:
   CARGO_TERM_COLOR: always
