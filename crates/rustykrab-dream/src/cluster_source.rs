@@ -135,3 +135,245 @@ impl ConsolidationSource for MemoryClusterSource {
         Ok(clusters)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rustykrab_memory::embedding::HashEmbedder;
+    use rustykrab_memory::storage::SqliteMemoryStorage;
+    use rustykrab_memory::types::{
+        ImportanceSource, LifecycleStage, Memory, MemoryLink, MemoryScope,
+    };
+    use rustykrab_memory::MemoryConfig;
+
+    fn live_system() -> Arc<MemorySystem> {
+        Arc::new(MemorySystem::new(
+            MemoryConfig::default(),
+            Arc::new(SqliteMemoryStorage::open_in_memory().unwrap()),
+            Arc::new(HashEmbedder::new(64)),
+        ))
+    }
+
+    async fn seed(system: &MemorySystem, agent: Uuid, content: &str) -> Uuid {
+        let now = chrono::Utc::now();
+        let m = Memory {
+            id: Uuid::new_v4(),
+            agent_id: agent,
+            content: content.to_string(),
+            content_hash: rustykrab_memory::hash_content(content),
+            scope: MemoryScope::User,
+            session_id: None,
+            user_id: None,
+            lifecycle_stage: LifecycleStage::Episodic,
+            importance: 0.6,
+            importance_source: ImportanceSource::Heuristic,
+            decay_rate: 1.0,
+            confidence: 1.0,
+            access_count: 0,
+            last_accessed_at: None,
+            last_relevant_at: None,
+            created_at: now,
+            parent_memory_ids: Vec::new(),
+            consolidation_generation: 0,
+            proof_count: 1,
+            occurred_start: None,
+            occurred_end: None,
+            is_valid: true,
+            invalidated_by: None,
+            invalidated_at: None,
+            tags: Vec::new(),
+            metadata: serde_json::json!({}),
+        };
+        system.storage().upsert_memory(&m).await.unwrap();
+        m.id
+    }
+
+    async fn link(system: &MemorySystem, a: Uuid, b: Uuid, weight: f64) {
+        system
+            .storage()
+            .upsert_link(&MemoryLink {
+                source_id: a,
+                target_id: b,
+                link_type: LinkType::SemanticSimilar,
+                weight,
+                created_at: chrono::Utc::now(),
+            })
+            .await
+            .unwrap();
+    }
+
+    fn ids(clusters: &[Vec<MemoryCandidate>]) -> Vec<std::collections::HashSet<Uuid>> {
+        clusters
+            .iter()
+            .map(|c| c.iter().map(|m| m.id).collect())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_strongly_linked_pair_is_a_cluster() {
+        let system = live_system();
+        let agent = Uuid::new_v4();
+        let a = seed(&system, agent, "the same fact").await;
+        let b = seed(&system, agent, "the same fact, said again").await;
+        link(&system, a, b, 0.97).await;
+
+        let clusters = MemoryClusterSource::new(Arc::clone(&system))
+            .duplicate_clusters(agent)
+            .await
+            .unwrap();
+
+        assert_eq!(ids(&clusters), vec![[a, b].into_iter().collect()]);
+    }
+
+    #[tokio::test]
+    async fn merely_related_memories_are_not_duplicates() {
+        // This is the difference that matters most.
+        //
+        // `detect_near_duplicates` writes a `SemanticSimilar` link at a
+        // threshold chosen for *retrieval* -- related enough to be worth
+        // surfacing together. Consolidation retires memories, so it needs
+        // a much stronger claim: that they say the same thing. A source
+        // that consumed the retrieval threshold directly would merge
+        // distinct facts and call it deduplication.
+        let system = live_system();
+        let agent = Uuid::new_v4();
+        let a = seed(&system, agent, "Geoff's flight is on Tuesday").await;
+        let b = seed(&system, agent, "Geoff's hotel is booked for Tuesday").await;
+        // Comfortably above the link threshold, below the duplicate one.
+        link(&system, a, b, MIN_DUPLICATE_WEIGHT - 0.05).await;
+
+        let clusters = MemoryClusterSource::new(Arc::clone(&system))
+            .duplicate_clusters(agent)
+            .await
+            .unwrap();
+
+        assert!(
+            clusters.is_empty(),
+            "related is not the same as redundant; these are different facts"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_oversized_similarity_component_is_left_alone() {
+        // A component this large means the threshold is finding something
+        // other than duplicates. Consolidating it would collapse
+        // distinctions rather than remove redundancy, so it is skipped and
+        // reported -- not truncated to the cap and merged anyway.
+        let system = live_system();
+        let agent = Uuid::new_v4();
+        let mut all = Vec::new();
+        for i in 0..(MAX_CLUSTER_SIZE + 3) {
+            all.push(seed(&system, agent, &format!("crowded fact {i}")).await);
+        }
+        for i in 0..all.len() {
+            for j in (i + 1)..all.len() {
+                link(&system, all[i], all[j], 0.99).await;
+            }
+        }
+
+        let clusters = MemoryClusterSource::new(Arc::clone(&system))
+            .duplicate_clusters(agent)
+            .await
+            .unwrap();
+
+        assert!(
+            clusters.is_empty(),
+            "an oversized component must be skipped, not truncated and merged"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_component_exactly_at_the_cap_is_still_usable() {
+        // The guard must reject components that are too big, not refuse to
+        // do any work at the boundary.
+        let system = live_system();
+        let agent = Uuid::new_v4();
+        let mut all = Vec::new();
+        for i in 0..MAX_CLUSTER_SIZE {
+            all.push(seed(&system, agent, &format!("same fact {i}")).await);
+        }
+        for i in 0..all.len() {
+            for j in (i + 1)..all.len() {
+                link(&system, all[i], all[j], 0.99).await;
+            }
+        }
+
+        let clusters = MemoryClusterSource::new(Arc::clone(&system))
+            .duplicate_clusters(agent)
+            .await
+            .unwrap();
+
+        assert_eq!(clusters.len(), 1);
+        assert_eq!(clusters[0].len(), MAX_CLUSTER_SIZE);
+    }
+
+    #[tokio::test]
+    async fn a_retired_memory_is_never_a_candidate() {
+        // A cycle must not plan against something an earlier cycle already
+        // retired, or it would retire it a second time against a different
+        // survivor.
+        let system = live_system();
+        let agent = Uuid::new_v4();
+        let a = seed(&system, agent, "fact").await;
+        let b = seed(&system, agent, "fact again").await;
+        let c = seed(&system, agent, "fact once more").await;
+        link(&system, a, b, 0.99).await;
+        link(&system, b, c, 0.99).await;
+
+        system.storage().invalidate(c, Some(a)).await.unwrap();
+
+        let clusters = MemoryClusterSource::new(Arc::clone(&system))
+            .duplicate_clusters(agent)
+            .await
+            .unwrap();
+
+        assert_eq!(ids(&clusters), vec![[a, b].into_iter().collect()]);
+    }
+
+    #[tokio::test]
+    async fn separate_duplicate_groups_stay_separate() {
+        // Two unrelated pairs must produce two clusters, not one merged
+        // component -- otherwise consolidation would retire one pair
+        // against a member of the other.
+        let system = live_system();
+        let agent = Uuid::new_v4();
+        let a1 = seed(&system, agent, "flight fact").await;
+        let a2 = seed(&system, agent, "flight fact copy").await;
+        let b1 = seed(&system, agent, "hotel fact").await;
+        let b2 = seed(&system, agent, "hotel fact copy").await;
+        link(&system, a1, a2, 0.99).await;
+        link(&system, b1, b2, 0.99).await;
+
+        let clusters = MemoryClusterSource::new(Arc::clone(&system))
+            .duplicate_clusters(agent)
+            .await
+            .unwrap();
+
+        let got = ids(&clusters);
+        assert_eq!(got.len(), 2);
+        assert!(got.contains(&[a1, a2].into_iter().collect()));
+        assert!(got.contains(&[b1, b2].into_iter().collect()));
+    }
+
+    #[tokio::test]
+    async fn another_agents_memories_are_never_clustered_in() {
+        // Clustering is per agent. A cluster spanning two agents would
+        // consolidate one agent's memory into another's.
+        let system = live_system();
+        let mine = Uuid::new_v4();
+        let theirs = Uuid::new_v4();
+        let a = seed(&system, mine, "shared-looking fact").await;
+        let b = seed(&system, theirs, "shared-looking fact").await;
+        link(&system, a, b, 0.99).await;
+
+        let clusters = MemoryClusterSource::new(Arc::clone(&system))
+            .duplicate_clusters(mine)
+            .await
+            .unwrap();
+
+        assert!(
+            clusters.is_empty(),
+            "a link across agents must not form a cluster"
+        );
+    }
+}

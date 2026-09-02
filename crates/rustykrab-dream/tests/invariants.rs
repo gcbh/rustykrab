@@ -49,9 +49,12 @@ use rustykrab_dream::engine::CyclePolicy;
 use rustykrab_dream::memory_mutator::MemorySystemMutator;
 use rustykrab_dream::planner::{ConsolidationSource, MemoryCandidate};
 use rustykrab_dream::report::Readiness;
+use rustykrab_dream::MemoryClusterSource;
 use rustykrab_memory::embedding::HashEmbedder;
 use rustykrab_memory::storage::SqliteMemoryStorage;
-use rustykrab_memory::types::{ImportanceSource, LifecycleStage, Memory, MemoryScope};
+use rustykrab_memory::types::{
+    ImportanceSource, LifecycleStage, LinkType, Memory, MemoryLink, MemoryScope,
+};
 use rustykrab_memory::{MemoryConfig, MemorySystem};
 use uuid::Uuid;
 
@@ -468,5 +471,201 @@ async fn any_promoted_cycle_can_be_reversed_to_the_exact_prior_state() {
             before, after,
             "seed {seed}: reversal did not restore the exact retrievable set"
         );
+    }
+}
+
+// ── Invariant 6: the same properties, over the real clustering ──────────
+//
+// The harness above supplies clusters grouped by identical content, which
+// is the right ground truth for checking what the *engine* does with a
+// cluster -- but it means the component that decides what a cluster *is*
+// never runs. That component is the one that can merge two different facts
+// into one, which is the failure the whole design is most afraid of, so
+// checking everything except it leaves the scariest part unproven.
+//
+// This runs the same loop through `MemoryClusterSource`: real
+// `SemanticSimilar` links, real connected components, real size cap. The
+// population deliberately includes the tempting case -- distinct facts
+// linked to each other strongly enough to be worth retrieving together,
+// but not strongly enough to be the same thing.
+
+/// Seeds a population and the similarity links a real deployment would
+/// have: strong links between copies of a fact, weaker cross-links between
+/// different facts.
+async fn generate_linked(rng: &mut Rng, system: Arc<MemorySystem>) -> World {
+    let agent = Uuid::new_v4();
+    let fact_count = 2 + rng.below(4); // 2..=5 distinct facts
+    let mut facts: HashMap<String, Vec<Uuid>> = HashMap::new();
+    let mut per_fact: Vec<Vec<Uuid>> = Vec::new();
+
+    for f in 0..fact_count {
+        let content = format!("fact-{f}");
+        let copies = 1 + rng.below(4);
+        let mut ids = Vec::new();
+        for _ in 0..copies {
+            let accesses = rng.below(10) as u32;
+            let importance = (rng.below(100) as f64) / 100.0;
+            ids.push(
+                seed_memory(&system, agent, &content, accesses, importance)
+                    .await
+                    .id,
+            );
+        }
+        facts.insert(content, ids.clone());
+        per_fact.push(ids);
+    }
+
+    // Copies of one fact are duplicates of each other.
+    for ids in &per_fact {
+        for i in 0..ids.len() {
+            for j in (i + 1)..ids.len() {
+                link(
+                    &system,
+                    ids[i],
+                    ids[j],
+                    0.93 + (rng.below(6) as f64) / 100.0,
+                )
+                .await;
+            }
+        }
+    }
+
+    // Different facts are related but not the same. This is the case that
+    // must never be consolidated, and the reason the duplicate threshold
+    // sits above the threshold that created the link.
+    for a in 0..per_fact.len() {
+        for b in (a + 1)..per_fact.len() {
+            if rng.below(2) == 0 {
+                continue;
+            }
+            let w = 0.70 + (rng.below(21) as f64) / 100.0; // 0.70..=0.90
+            link(&system, per_fact[a][0], per_fact[b][0], w).await;
+        }
+    }
+
+    World {
+        system,
+        agent,
+        facts,
+        clusters: Vec::new(), // unused: the real source derives its own
+    }
+}
+
+async fn link(system: &MemorySystem, a: Uuid, b: Uuid, weight: f64) {
+    system
+        .storage()
+        .upsert_link(&MemoryLink {
+            source_id: a,
+            target_id: b,
+            link_type: LinkType::SemanticSimilar,
+            weight,
+            created_at: chrono::Utc::now(),
+        })
+        .await
+        .unwrap();
+}
+
+/// Invariant 6: distinct facts are never merged into one another.
+///
+/// Stronger than "no fact is lost". A cross-fact merge can leave every
+/// fact represented -- retire one copy of fact-1 against a copy of fact-2
+/// and both contents still exist -- while having silently asserted that
+/// two different things were the same. The tombstone is where the claim
+/// shows up, so that is where it is checked.
+async fn assert_no_fact_was_merged_into_another(world: &World, seed: u64, cycle: usize) {
+    let mut content_of: HashMap<Uuid, String> = HashMap::new();
+    for (content, ids) in &world.facts {
+        for id in ids {
+            content_of.insert(*id, content.clone());
+        }
+    }
+
+    let all: Vec<Uuid> = content_of.keys().copied().collect();
+    for m in world.system.storage().get_memories(&all).await.unwrap() {
+        let Some(successor) = m.invalidated_by else {
+            continue;
+        };
+        let (Some(retired), Some(kept)) = (content_of.get(&m.id), content_of.get(&successor))
+        else {
+            continue;
+        };
+        assert_eq!(
+            retired, kept,
+            "seed {seed}, cycle {cycle}: memory {} ({retired:?}) was retired against {successor} \
+             ({kept:?}) -- consolidation merged two different facts",
+            m.id
+        );
+    }
+}
+
+#[tokio::test]
+async fn real_clustering_never_merges_two_different_facts() {
+    let policy = CyclePolicy::default();
+
+    for seed in 1..=30u64 {
+        let mut rng = Rng::new(seed.wrapping_mul(0xD1B5_4A32_D192_ED03));
+        let system = live_system();
+        let world = generate_linked(&mut rng, Arc::clone(&system)).await;
+        let store = temp_store();
+        let cycles = store.dream_cycles();
+
+        assert_no_information_lost(&world, seed, 0).await;
+        assert_no_fact_was_merged_into_another(&world, seed, 0).await;
+
+        let mut cycle_count = 0usize;
+        loop {
+            cycle_count += 1;
+            assert!(
+                cycle_count <= 25,
+                "seed {seed}: consolidation did not converge within 25 cycles"
+            );
+
+            let source = MemoryClusterSource::new(Arc::clone(&system));
+            let mutator =
+                MemorySystemMutator::new(Arc::clone(&system), world.agent, Uuid::new_v4());
+
+            let outcome = run_consolidation_cycle(
+                &cycles,
+                &source,
+                &mutator,
+                world.agent,
+                Readiness::Ready,
+                &policy,
+            )
+            .await
+            .unwrap();
+
+            // Every cycle, not just the last: an invariant that only holds
+            // at a fixed point is not an invariant.
+            assert_no_information_lost(&world, seed, cycle_count).await;
+            assert_no_fact_was_merged_into_another(&world, seed, cycle_count).await;
+
+            match outcome {
+                CycleOutcome::Promoted { applied, .. } => {
+                    assert!(
+                        applied <= policy.max_changes_per_cycle,
+                        "seed {seed}: a cycle applied {applied} changes, above its budget"
+                    );
+                }
+                CycleOutcome::NothingToDo { .. } => break,
+                CycleOutcome::Refused { reason } => {
+                    panic!("seed {seed}: cycle refused unexpectedly: {reason}")
+                }
+            }
+        }
+
+        // Converged: every distinct fact survives exactly once per
+        // duplicate group the clustering was able to see.
+        let live = system
+            .storage()
+            .list_retrievable(world.agent)
+            .await
+            .unwrap();
+        for content in world.facts.keys() {
+            assert!(
+                live.iter().any(|m| &m.content == content),
+                "seed {seed}: {content:?} did not survive"
+            );
+        }
     }
 }

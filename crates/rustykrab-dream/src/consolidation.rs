@@ -114,6 +114,13 @@ pub async fn run_consolidation_cycle(
 
     match promotion {
         Ok(applied) => {
+            // Which changes actually landed, recorded before the cycle is
+            // marked live. The manifest's whole job is to make a promoted
+            // cycle reversible, and a manifest that records only what was
+            // intended cannot do it: reversal would restore memories
+            // promotion skipped as stale, undoing whatever decision made
+            // them stale in the first place.
+            cycles.mark_applied(cycle.id, &applied.applied).await?;
             cycles.set_status(cycle.id, CycleStatus::Promoted).await?;
             let summary = format!(
                 "{} | applied {}, skipped {} stale",
@@ -309,7 +316,7 @@ mod tests {
         assert!(recorded.promoted_at.is_some());
         assert!(recorded.summary.unwrap().contains("applied 1"));
 
-        let changes = cycles.changes(cycle_id).await.unwrap();
+        let changes = cycles.applied_changes(cycle_id).await.unwrap();
         assert_eq!(changes.len(), 1);
         assert!(matches!(changes[0], StagedChange::InvalidateMemory { .. }));
     }
