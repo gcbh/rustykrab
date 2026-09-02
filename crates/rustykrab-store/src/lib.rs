@@ -3,8 +3,8 @@ mod conversation;
 pub mod credential_backend;
 mod credential_request;
 mod device;
-mod dream_reports;
 mod dream_cycles;
+mod dream_reports;
 mod guarded;
 mod jobs;
 pub mod keychain;
@@ -28,8 +28,8 @@ pub use credential_request::{
     CredentialRequest, CredentialRequestStore, RequestAction, RequestNotifier, RequestedField,
 };
 pub use device::{Device, DeviceStore, Principal};
-pub use dream_reports::{DreamReportStore, StoredReport};
 pub use dream_cycles::DreamCycleStore;
+pub use dream_reports::{DreamReportStore, StoredReport};
 pub use guarded::{GuardedSecrets, WriteOutcome};
 pub use jobs::{JobRun, JobStore, ScheduledJob};
 pub use outcomes::OutcomeStore;
@@ -365,6 +365,12 @@ impl Store {
                 op        TEXT NOT NULL,
                 target_id TEXT NOT NULL,
                 payload   TEXT NOT NULL,
+                -- Whether promotion actually applied this change, as
+                -- opposed to staging it and then skipping it as stale.
+                -- The manifest exists to make a promoted cycle reversible,
+                -- and reversing a change that was never applied restores a
+                -- memory this cycle never retired.
+                applied   INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (cycle_id, seq)
             );
 

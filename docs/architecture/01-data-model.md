@@ -4,7 +4,7 @@ Two SQLite databases, opened independently, never joined.
 
 | File | Owner | Tables |
 |---|---|---|
-| `<data_dir>/db/store.db` | `rustykrab-store` | 16 tables + 10 indexes |
+| `<data_dir>/db/store.db` | `rustykrab-store` | 18 tables + 13 indexes |
 | `<data_dir>/memory.db` | `rustykrab-memory` | 4 tables + 1 FTS5 virtual table + 9 indexes |
 
 DDL is idempotent (`CREATE TABLE IF NOT EXISTS`) inside
@@ -179,6 +179,28 @@ migrations. Capped at 2000 rows, pruned on insert.
 Without this table the only record that the outer loop ran at all was a log
 line, which made the Phase 1 gate — "reports show real, actionable patterns" —
 unanswerable by anything but a human with `grep`.
+
+A mutating cycle records its whole change-set before touching anything, which is
+what makes staged work inert and promoted work reversible:
+
+```
+dream_cycles(id PK, agent_id, kind,
+             status CHECK IN (staged|promoted|rolled_back|aborted),
+             started_at, promoted_at, summary, rustykrab_version)
+   INDEX (agent_id, status, started_at DESC)
+dream_changes(cycle_id REFERENCES dream_cycles(id) ON DELETE CASCADE,
+              seq, op, target_id, payload,
+              applied INTEGER NOT NULL DEFAULT 0,
+              PK(cycle_id, seq))
+   INDEX (target_id)
+```
+
+`applied` is the column the reversal path turns on, and it is not decoration.
+Promotion skips changes whose target moved between planning and promoting; a
+manifest that recorded only what was *staged* would have reversal restore those
+too, resurrecting a memory the cycle never retired and undoing whatever decision
+did retire it. `applied_changes()` is what a reversal walks; `changes()` is the
+intent, useful only for audit.
 
 **Assessment: the most sophisticated modelling in the codebase, and correctly
 normalised.** Write-once event rows; per-artifact tallies derived by

@@ -23,7 +23,7 @@ use rustykrab_core::dream::{CycleStatus, RollbackBlocker, StagedChange};
 use rustykrab_core::{Error, Result};
 use uuid::Uuid;
 
-use crate::mutation::{apply, fact_for, revert, MemoryMutator};
+use crate::mutation::{fact_for, MemoryMutator};
 use crate::report::Readiness;
 
 /// How conservative a mutating cycle is.
@@ -108,19 +108,48 @@ impl Promotion {
 /// is really a retire-and-recreate. The content-hash comparison is kept as
 /// defence-in-depth in case that ever changes, but `is_valid` is the check
 /// that earns its keep today.
-async fn is_still_applicable(mutator: &dyn MemoryMutator, change: &StagedChange) -> Result<bool> {
+async fn is_still_applicable(
+    mutator: &dyn MemoryMutator,
+    change: &StagedChange,
+    creating: &[Uuid],
+) -> Result<bool> {
     match change {
         StagedChange::CreateMemory { .. } => Ok(true),
         StagedChange::InvalidateMemory {
             memory_id,
+            superseded_by,
             expected_content_hash,
-            ..
         } => {
             let Some(facts) = fact_for(mutator, *memory_id).await? else {
                 // Gone entirely; nothing to retire.
                 return Ok(false);
             };
-            Ok(facts.is_valid && &facts.content_hash == expected_content_hash)
+            if !facts.is_valid || &facts.content_hash != expected_content_hash {
+                return Ok(false);
+            }
+
+            // The survivor has to survive.
+            //
+            // Checking only the memory being retired is half the job. A
+            // plan retires a cluster against the one member it keeps, so
+            // if that member is invalidated between planning and promoting
+            // -- by a lifecycle sweep, by the agent, by an earlier cycle --
+            // every duplicate is retired against a dead memory and the
+            // cluster's information is gone entirely. That is the one way
+            // this loop can destroy data, and it is precisely the race
+            // staging exists to catch; it was only being caught on one
+            // side of the change.
+            //
+            // A survivor this same cycle is about to create counts as
+            // live: it does not exist yet by construction, and the apply
+            // order puts the create first.
+            if creating.contains(superseded_by) {
+                return Ok(true);
+            }
+            match fact_for(mutator, *superseded_by).await? {
+                Some(survivor) => Ok(survivor.is_valid),
+                None => Ok(false),
+            }
         }
     }
 }
@@ -153,12 +182,22 @@ pub async fn promote(
         }));
     }
 
+    // Ids this cycle is about to mint, so a retirement pointing at one of
+    // them is not mistaken for pointing at something that does not exist.
+    let creating: Vec<Uuid> = changes
+        .iter()
+        .filter_map(|c| match c {
+            StagedChange::CreateMemory { memory_id, .. } => Some(*memory_id),
+            _ => None,
+        })
+        .collect();
+
     // Staleness reconciliation happens before anything is written, so a
     // cycle never applies half a consolidation.
     let mut applicable = Vec::new();
     let mut skipped_stale = Vec::new();
     for change in changes {
-        if is_still_applicable(mutator, change).await? {
+        if is_still_applicable(mutator, change, &creating).await? {
             applicable.push(change.clone());
         } else {
             skipped_stale.push(change.clone());
@@ -171,23 +210,17 @@ pub async fn promote(
         return Ok(Err(PromotionRefusal::AllChangesStale));
     }
 
-    let mut applied = Vec::new();
-    for change in &applicable {
-        if let Err(e) = apply(mutator, change).await {
-            // Unwind what this promotion already applied so live state does not
-            // keep a partial change-set.
-            for done in applied.iter().rev() {
-                let _ = revert(mutator, done).await;
-            }
-            return Err(Error::Internal(format!(
-                "promotion failed and was unwound: {e}"
-            )));
-        }
-        applied.push(change.clone());
+    // One call, all of it or none of it. Applying change by change and
+    // unwinding on error was a best-effort imitation of a transaction: the
+    // unwind discarded its own failures, and a crash partway through left
+    // live memory holding half a consolidation -- the state staging exists
+    // to make impossible.
+    if let Err(e) = mutator.apply_all(&applicable).await {
+        return Err(Error::Internal(format!("promotion failed: {e}")));
     }
 
     Ok(Ok(Promotion {
-        applied,
+        applied: applicable,
         skipped_stale,
     }))
 }
@@ -208,9 +241,12 @@ pub async fn rollback_blockers(
     }
 
     let mut blockers = Vec::new();
-    if !policy.allow_rollback_after_access {
-        for change in changes {
-            if let StagedChange::CreateMemory { memory_id, .. } = change {
+    for change in changes {
+        match change {
+            StagedChange::CreateMemory { memory_id, .. } => {
+                if policy.allow_rollback_after_access {
+                    continue;
+                }
                 if let Some(facts) = fact_for(mutator, *memory_id).await? {
                     if facts.access_count > 0 {
                         blockers.push(RollbackBlocker::OutputAccessed {
@@ -220,6 +256,37 @@ pub async fn rollback_blockers(
                     }
                 }
             }
+            StagedChange::InvalidateMemory {
+                memory_id,
+                superseded_by,
+                expected_content_hash,
+            } => {
+                // A memory this cycle retired that has since moved.
+                //
+                // Two ways that shows up, and both mean the same thing:
+                // something after this cycle made a decision about that
+                // memory, and restoring it would silently undo that
+                // decision. A tombstone now pointing at a different
+                // survivor was re-retired by someone else; changed content
+                // means the row is no longer the thing that was staged.
+                //
+                // This blocker was declared when the manifest was written
+                // and then never constructed, so reversal would happily
+                // resurrect either case.
+                let Some(facts) = fact_for(mutator, *memory_id).await? else {
+                    blockers.push(RollbackBlocker::ParentModified {
+                        memory_id: *memory_id,
+                    });
+                    continue;
+                };
+                let moved = &facts.content_hash != expected_content_hash
+                    || (!facts.is_valid && facts.invalidated_by != Some(*superseded_by));
+                if moved {
+                    blockers.push(RollbackBlocker::ParentModified {
+                        memory_id: *memory_id,
+                    });
+                }
+            }
         }
     }
     Ok(blockers)
@@ -227,9 +294,14 @@ pub async fn rollback_blockers(
 
 /// Undo a promoted cycle.
 ///
-/// Walks the change-set backwards, so a create/invalidate pair is undone
-/// in the opposite order to the one that applied it. Refuses when the
-/// window has closed, unless the policy says otherwise.
+/// Refuses when the window has closed, unless the policy says otherwise.
+///
+/// `changes` must be the set that was **applied**, not the set that was
+/// staged: promotion skips changes whose target moved, and reversing one
+/// of those would restore a memory this cycle never retired. The manifest
+/// records which is which (`DreamCycleStore::applied_changes`); passing
+/// the staged set instead is the mistake this signature cannot prevent and
+/// the mutator's per-change preconditions are the backstop for.
 pub async fn rollback(
     mutator: &dyn MemoryMutator,
     status: CycleStatus,
@@ -241,12 +313,7 @@ pub async fn rollback(
         return Ok(Err(blockers));
     }
 
-    let mut reverted = 0usize;
-    for change in changes.iter().rev() {
-        revert(mutator, change).await?;
-        reverted += 1;
-    }
-    Ok(Ok(reverted))
+    Ok(Ok(mutator.revert_all(changes).await?))
 }
 
 /// Fresh ids for a consolidation, so a planner never reuses one.
@@ -281,6 +348,7 @@ mod tests {
                     content_hash: hash.to_string(),
                     access_count: accesses,
                     is_valid: true,
+                    invalidated_by: None,
                 },
             );
             self
@@ -311,55 +379,90 @@ mod tests {
             Ok(ids.iter().filter_map(|id| map.get(id).cloned()).collect())
         }
 
-        async fn create(&self, memory_id: Uuid, _content: &str, _parents: &[Uuid]) -> Result<()> {
-            self.calls
-                .lock()
-                .unwrap()
-                .push(format!("create:{memory_id}"));
-            if *self.fail_on.lock().unwrap() == Some(memory_id) {
-                return Err(Error::Storage("disk on fire".into()));
+        /// All of it or none of it, like the real one.
+        ///
+        /// The whole set is validated first and only then written, so a
+        /// failure partway leaves the map untouched — a fake that applied
+        /// as it went could not be used to check the engine's atomicity
+        /// claim, because it would not hold it either.
+        async fn apply_all(&self, changes: &[StagedChange]) -> Result<()> {
+            for change in changes {
+                if let StagedChange::CreateMemory { memory_id, .. } = change {
+                    if *self.fail_on.lock().unwrap() == Some(*memory_id) {
+                        self.calls
+                            .lock()
+                            .unwrap()
+                            .push(format!("failed-apply:{memory_id}"));
+                        return Err(Error::Storage("disk on fire".into()));
+                    }
+                }
             }
-            self.memories.lock().unwrap().insert(
-                memory_id,
-                MemoryFacts {
-                    id: memory_id,
-                    content_hash: "new".into(),
-                    access_count: 0,
-                    is_valid: true,
-                },
-            );
+
+            let mut map = self.memories.lock().unwrap();
+            let mut calls = self.calls.lock().unwrap();
+            for change in changes {
+                match change {
+                    StagedChange::CreateMemory { memory_id, .. } => {
+                        calls.push(format!("create:{memory_id}"));
+                        map.insert(
+                            *memory_id,
+                            MemoryFacts {
+                                id: *memory_id,
+                                content_hash: "new".into(),
+                                access_count: 0,
+                                is_valid: true,
+                                invalidated_by: None,
+                            },
+                        );
+                    }
+                    StagedChange::InvalidateMemory {
+                        memory_id,
+                        superseded_by,
+                        ..
+                    } => {
+                        calls.push(format!("invalidate:{memory_id}"));
+                        if let Some(m) = map.get_mut(memory_id) {
+                            m.is_valid = false;
+                            m.invalidated_by = Some(*superseded_by);
+                        }
+                    }
+                }
+            }
             Ok(())
         }
 
-        async fn invalidate(&self, memory_id: Uuid, _superseded_by: Uuid) -> Result<()> {
-            self.calls
-                .lock()
-                .unwrap()
-                .push(format!("invalidate:{memory_id}"));
-            if let Some(m) = self.memories.lock().unwrap().get_mut(&memory_id) {
-                m.is_valid = false;
+        async fn revert_all(&self, changes: &[StagedChange]) -> Result<usize> {
+            let mut map = self.memories.lock().unwrap();
+            let mut calls = self.calls.lock().unwrap();
+            let mut reverted = 0usize;
+            for change in changes.iter().rev() {
+                match change {
+                    StagedChange::CreateMemory { memory_id, .. } => {
+                        calls.push(format!("discard:{memory_id}"));
+                        if map.remove(memory_id).is_some() {
+                            reverted += 1;
+                        }
+                    }
+                    StagedChange::InvalidateMemory {
+                        memory_id,
+                        superseded_by,
+                        ..
+                    } => {
+                        calls.push(format!("restore:{memory_id}"));
+                        if let Some(m) = map.get_mut(memory_id) {
+                            // Only a tombstone this cycle wrote. One
+                            // pointing elsewhere belongs to whoever wrote
+                            // it, and restoring it would undo their call.
+                            if !m.is_valid && m.invalidated_by == Some(*superseded_by) {
+                                m.is_valid = true;
+                                m.invalidated_by = None;
+                                reverted += 1;
+                            }
+                        }
+                    }
+                }
             }
-            Ok(())
-        }
-
-        async fn restore(&self, memory_id: Uuid) -> Result<()> {
-            self.calls
-                .lock()
-                .unwrap()
-                .push(format!("restore:{memory_id}"));
-            if let Some(m) = self.memories.lock().unwrap().get_mut(&memory_id) {
-                m.is_valid = true;
-            }
-            Ok(())
-        }
-
-        async fn discard(&self, memory_id: Uuid) -> Result<()> {
-            self.calls
-                .lock()
-                .unwrap()
-                .push(format!("discard:{memory_id}"));
-            self.memories.lock().unwrap().remove(&memory_id);
-            Ok(())
+            Ok(reverted)
         }
     }
 
@@ -449,6 +552,190 @@ mod tests {
     }
 
     // ---- Low gain ----
+
+    #[tokio::test]
+    async fn a_retirement_is_skipped_when_its_survivor_has_been_retired() {
+        // The one way this loop can destroy data.
+        //
+        // A plan retires a cluster against the one member it keeps. If
+        // that member is retired between planning and promoting -- by a
+        // lifecycle sweep, by the agent, by an earlier cycle -- then
+        // applying the plan retires every remaining copy against a dead
+        // memory and the fact is gone from the retrievable set entirely.
+        //
+        // Staleness reconciliation was only checking the memories being
+        // retired, never the one being kept.
+        let keeper = Uuid::new_v4();
+        let dup_a = Uuid::new_v4();
+        let dup_b = Uuid::new_v4();
+        let store = FakeStore::default()
+            .with_memory(keeper, "h", 3)
+            .with_memory(dup_a, "h", 0)
+            .with_memory(dup_b, "h", 0);
+
+        // The survivor goes away after the plan was made.
+        store
+            .apply_all(&[StagedChange::InvalidateMemory {
+                memory_id: keeper,
+                superseded_by: Uuid::new_v4(),
+                expected_content_hash: "h".into(),
+            }])
+            .await
+            .unwrap();
+
+        let changes = vec![
+            StagedChange::InvalidateMemory {
+                memory_id: dup_a,
+                superseded_by: keeper,
+                expected_content_hash: "h".into(),
+            },
+            StagedChange::InvalidateMemory {
+                memory_id: dup_b,
+                superseded_by: keeper,
+                expected_content_hash: "h".into(),
+            },
+        ];
+
+        let outcome = promote(
+            &store,
+            CycleStatus::Staged,
+            Readiness::Ready,
+            &changes,
+            &CyclePolicy::default(),
+        )
+        .await
+        .unwrap();
+
+        match outcome {
+            Ok(promotion) => {
+                assert!(
+                    promotion.applied.is_empty(),
+                    "nothing may be retired against a survivor that is gone"
+                );
+                assert_eq!(promotion.skipped_stale.len(), 2);
+            }
+            Err(refusal) => {
+                // Refusing the cycle outright is equally acceptable; what
+                // must not happen is retiring the copies.
+                assert_eq!(refusal, PromotionRefusal::AllChangesStale);
+            }
+        }
+
+        assert_eq!(store.is_valid(dup_a), Some(true), "a copy was destroyed");
+        assert_eq!(store.is_valid(dup_b), Some(true), "a copy was destroyed");
+    }
+
+    #[tokio::test]
+    async fn a_retirement_against_a_survivor_this_cycle_creates_is_applicable() {
+        // The survivor check must not reject a consolidation that mints
+        // its own survivor: the merged memory does not exist yet by
+        // construction, and the apply order puts the create first.
+        let parent = Uuid::new_v4();
+        let merged = new_memory_id();
+        let store = FakeStore::default().with_memory(parent, "h", 0);
+
+        let changes = consolidation(&[(parent, "h")], merged);
+        let promotion = promote(
+            &store,
+            CycleStatus::Staged,
+            Readiness::Ready,
+            &changes,
+            &CyclePolicy::default(),
+        )
+        .await
+        .unwrap()
+        .expect("a self-contained consolidation is applicable");
+
+        assert!(promotion.skipped_stale.is_empty());
+        assert_eq!(store.is_valid(parent), Some(false));
+        assert!(store.exists(merged));
+    }
+
+    #[tokio::test]
+    async fn reversal_is_blocked_when_a_retired_memory_was_retired_again_since() {
+        // `ParentModified` was declared with the manifest and then never
+        // constructed, so reversal would restore a tombstone that now
+        // points at someone else's survivor -- undoing a decision this
+        // cycle never made.
+        let parent = Uuid::new_v4();
+        let ours = Uuid::new_v4();
+        let store = FakeStore::default().with_memory(parent, "h", 0);
+
+        let changes = vec![StagedChange::InvalidateMemory {
+            memory_id: parent,
+            superseded_by: ours,
+            expected_content_hash: "h".into(),
+        }];
+        store.apply_all(&changes).await.unwrap();
+
+        // Something else re-retires it against a different survivor.
+        let theirs = Uuid::new_v4();
+        store
+            .apply_all(&[StagedChange::InvalidateMemory {
+                memory_id: parent,
+                superseded_by: theirs,
+                expected_content_hash: "h".into(),
+            }])
+            .await
+            .unwrap();
+
+        let blockers = rollback(
+            &store,
+            CycleStatus::Promoted,
+            &changes,
+            &CyclePolicy::default(),
+        )
+        .await
+        .unwrap()
+        .expect_err("reversal must be blocked");
+
+        assert_eq!(
+            blockers,
+            vec![RollbackBlocker::ParentModified { memory_id: parent }]
+        );
+        assert_eq!(
+            store.is_valid(parent),
+            Some(false),
+            "the memory must stay retired -- the later decision stands"
+        );
+    }
+
+    #[tokio::test]
+    async fn reversing_a_change_that_was_never_applied_does_nothing() {
+        // The backstop for passing the staged set to `rollback` instead of
+        // the applied one. The manifest records which is which, but a
+        // caller that gets it wrong must not be able to resurrect a memory
+        // this cycle never touched.
+        let ours = Uuid::new_v4();
+        let untouched = Uuid::new_v4();
+        let store = FakeStore::default().with_memory(untouched, "h", 0);
+
+        // Retired by something else entirely, with a different survivor.
+        store
+            .apply_all(&[StagedChange::InvalidateMemory {
+                memory_id: untouched,
+                superseded_by: Uuid::new_v4(),
+                expected_content_hash: "h".into(),
+            }])
+            .await
+            .unwrap();
+
+        // A change this cycle staged but never applied.
+        let never_applied = vec![StagedChange::InvalidateMemory {
+            memory_id: untouched,
+            superseded_by: ours,
+            expected_content_hash: "h".into(),
+        }];
+
+        let reverted = store.revert_all(&never_applied).await.unwrap();
+
+        assert_eq!(reverted, 0, "nothing was this cycle's to revert");
+        assert_eq!(
+            store.is_valid(untouched),
+            Some(false),
+            "a memory this cycle never retired must not be resurrected"
+        );
+    }
 
     #[tokio::test]
     async fn a_cycle_may_not_exceed_the_per_cycle_change_limit() {
@@ -547,8 +834,13 @@ mod tests {
     // ---- Atomicity ----
 
     #[tokio::test]
-    async fn a_failed_promotion_unwinds_what_it_applied() {
-        // Live state must never keep half a change-set.
+    async fn a_failed_promotion_leaves_live_state_untouched() {
+        // Live state must never keep half a change-set. This used to be
+        // achieved by applying change by change and unwinding on error --
+        // a best-effort imitation of a transaction whose unwind discarded
+        // its own failures, and which a crash could interrupt. The
+        // change-set now goes in as one operation, so there is no window
+        // in which half of it is live.
         let parent = Uuid::new_v4();
         let doomed = new_memory_id();
         let store = FakeStore::default()
@@ -581,7 +873,11 @@ mod tests {
         assert_eq!(
             store.is_valid(parent),
             Some(true),
-            "the retired parent must be restored when the promotion unwinds"
+            "a promotion that failed must not have retired anything"
+        );
+        assert!(
+            !store.exists(doomed),
+            "a promotion that failed must not have created anything"
         );
     }
 

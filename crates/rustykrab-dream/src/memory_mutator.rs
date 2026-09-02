@@ -9,8 +9,9 @@
 
 use std::sync::Arc;
 
-use rustykrab_core::dream::MemoryOrigin;
+use rustykrab_core::dream::{MemoryOrigin, StagedChange};
 use rustykrab_core::{Error, Result};
+use rustykrab_memory::storage::ValidityOp;
 use rustykrab_memory::types::{ImportanceSource, LifecycleStage, Memory, MemoryScope};
 use rustykrab_memory::MemorySystem;
 use uuid::Uuid;
@@ -51,10 +52,94 @@ impl MemoryMutator for MemorySystemMutator {
                 content_hash: m.content_hash,
                 access_count: m.access_count,
                 is_valid: m.is_valid,
+                invalidated_by: m.invalidated_by,
             })
             .collect())
     }
 
+    async fn apply_all(&self, changes: &[StagedChange]) -> Result<()> {
+        // Creations first, so a retirement in the same set can point at a
+        // memory that now exists.
+        //
+        // These are not inside the retirement transaction, and the reason
+        // is worth stating rather than hiding: writing a memory goes
+        // through `upsert_memory`, which also maintains the FTS index and
+        // the embedding cache, and reimplementing that as raw SQL to get
+        // it under one transaction would duplicate the most intricate
+        // write path in the system. The exposure is bounded and one-sided
+        // -- a create that lands without its retirements leaves a
+        // `dream`-origin memory that supersedes nothing, which is
+        // redundant rather than wrong, and is discardable by id. A
+        // retirement that lands without its siblings is the harmful case,
+        // and that is the half held under the transaction.
+        //
+        // No planner emits a creation today; the ordering is here so this
+        // stays correct when one does.
+        for change in changes {
+            if let StagedChange::CreateMemory {
+                memory_id,
+                content,
+                parent_ids,
+            } = change
+            {
+                self.create(*memory_id, content, parent_ids).await?;
+            }
+        }
+
+        let ops: Vec<ValidityOp> = changes
+            .iter()
+            .filter_map(|c| match c {
+                StagedChange::InvalidateMemory {
+                    memory_id,
+                    superseded_by,
+                    ..
+                } => Some(ValidityOp::Invalidate {
+                    id: *memory_id,
+                    superseded_by: Some(*superseded_by),
+                }),
+                StagedChange::CreateMemory { .. } => None,
+            })
+            .collect();
+
+        self.system
+            .storage()
+            .apply_validity_batch(&ops)
+            .await
+            .map(|_| ())
+    }
+
+    async fn revert_all(&self, changes: &[StagedChange]) -> Result<usize> {
+        // Backwards, so a create/invalidate pair unwinds in the opposite
+        // order to the one that applied it.
+        let mut reverted = 0usize;
+        let mut ops = Vec::new();
+
+        for change in changes.iter().rev() {
+            match change {
+                StagedChange::InvalidateMemory {
+                    memory_id,
+                    superseded_by,
+                    ..
+                } => ops.push(ValidityOp::Restore {
+                    id: *memory_id,
+                    // Only if the tombstone still names the survivor this
+                    // cycle chose. A row retired by something else since
+                    // is not this cycle's to bring back, and restoring it
+                    // would undo a decision made after the fact.
+                    expect_superseded_by: Some(*superseded_by),
+                }),
+                StagedChange::CreateMemory { memory_id, .. } => {
+                    reverted += usize::from(self.discard(*memory_id).await?);
+                }
+            }
+        }
+
+        reverted += self.system.storage().apply_validity_batch(&ops).await?;
+        Ok(reverted)
+    }
+}
+
+impl MemorySystemMutator {
     async fn create(&self, memory_id: Uuid, content: &str, parent_ids: &[Uuid]) -> Result<()> {
         let now = chrono::Utc::now();
         let content_hash = rustykrab_memory::hash_content(content);
@@ -75,14 +160,46 @@ impl MemoryMutator for MemorySystemMutator {
             .unwrap_or(0)
             .saturating_add(1);
 
+        // A consolidation inherits its parents' addressing, and refuses
+        // when they disagree.
+        //
+        // Writing `scope: User, user_id: None` regardless — as this did —
+        // takes memories that belong to particular people and produces one
+        // that belongs to nobody in particular. Whether that is a leak or
+        // merely an orphan depends on how retrieval filters, which is not
+        // a property this code should be betting on. A cluster that spans
+        // two users is not a duplicate in the first place.
+        // `MemoryScope` is not `Ord`, so this is a linear unique rather
+        // than a sort-and-dedup. Clusters are capped at six members, so
+        // the quadratic cost is not one worth avoiding.
+        let mut scopes: Vec<MemoryScope> = Vec::new();
+        let mut users: Vec<Option<Uuid>> = Vec::new();
+        for p in &parents {
+            if !scopes.contains(&p.scope) {
+                scopes.push(p.scope);
+            }
+            if !users.contains(&p.user_id) {
+                users.push(p.user_id);
+            }
+        }
+        if scopes.len() > 1 || users.len() > 1 {
+            return Err(Error::Internal(format!(
+                "refusing to consolidate memory {memory_id}: parents span                  {} scope(s) and {} user(s)",
+                scopes.len(),
+                users.len()
+            )));
+        }
+        let scope = scopes.first().copied().unwrap_or(MemoryScope::User);
+        let user_id = users.first().copied().flatten();
+
         let memory = Memory {
             id: memory_id,
             agent_id: self.agent_id,
             content: content.to_string(),
             content_hash,
-            scope: MemoryScope::User,
+            scope,
             session_id: None,
-            user_id: None,
+            user_id,
             // Enters as episodic and re-earns promotion through the normal
             // lifecycle; a consolidation does not get to declare itself
             // semantic on arrival.
@@ -113,21 +230,10 @@ impl MemoryMutator for MemorySystemMutator {
         self.system.storage().upsert_memory(&memory).await
     }
 
-    async fn invalidate(&self, memory_id: Uuid, superseded_by: Uuid) -> Result<()> {
-        self.system
-            .storage()
-            .invalidate(memory_id, Some(superseded_by))
-            .await
-    }
-
-    async fn restore(&self, memory_id: Uuid) -> Result<()> {
-        self.system.storage().restore(memory_id).await
-    }
-
-    async fn discard(&self, memory_id: Uuid) -> Result<()> {
-        // A memory the loop created and is now taking back. Retired
-        // without a superseding id, since nothing replaced it -- it simply
-        // should not have existed.
+    /// Retire a memory the loop created and is now taking back.
+    ///
+    /// Returns whether it did anything.
+    async fn discard(&self, memory_id: Uuid) -> Result<bool> {
         let created_here = self
             .system
             .storage()
@@ -151,7 +257,17 @@ impl MemoryMutator for MemorySystemMutator {
             )));
         }
 
-        self.system.storage().invalidate(memory_id, None).await
+        // Retired without a superseding id, since nothing replaced it --
+        // it simply should not have existed.
+        let changed = self
+            .system
+            .storage()
+            .apply_validity_batch(&[ValidityOp::Invalidate {
+                id: memory_id,
+                superseded_by: None,
+            }])
+            .await?;
+        Ok(changed > 0)
     }
 }
 

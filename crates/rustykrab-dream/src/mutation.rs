@@ -2,8 +2,13 @@
 //!
 //! Declared as a trait so the engine can be exercised against fabricated
 //! state, and so this crate does not depend on the memory implementation.
-//! The contract is narrow on purpose: every method here has an inverse,
-//! because a cycle that cannot be undone must not be applied.
+//!
+//! The contract is deliberately coarse: whole change-sets, not individual
+//! operations. A per-operation trait cannot express atomicity, and an
+//! engine that applies a consolidation one row at a time leaves live
+//! memory half-changed if the process dies partway — the exact state
+//! staging exists to prevent. Pushing the batch into the implementation is
+//! what lets the real one wrap it in a transaction.
 
 use rustykrab_core::dream::StagedChange;
 use rustykrab_core::Result;
@@ -19,6 +24,12 @@ pub struct MemoryFacts {
     /// probation window turns on this.
     pub access_count: u32,
     pub is_valid: bool,
+    /// What retired this memory, when it is retired.
+    ///
+    /// The reversal path turns on it: restoring a tombstone that points
+    /// somewhere else would undo a decision this cycle never made, and
+    /// resurrect a memory something else deliberately retired.
+    pub invalidated_by: Option<Uuid>,
 }
 
 /// The durable state a cycle acts on.
@@ -27,50 +38,23 @@ pub trait MemoryMutator: Send + Sync {
     /// Facts about the given memories as they stand right now.
     async fn facts(&self, ids: &[Uuid]) -> Result<Vec<MemoryFacts>>;
 
-    /// Write a new consolidated memory.
-    async fn create(&self, memory_id: Uuid, content: &str, parent_ids: &[Uuid]) -> Result<()>;
-
-    /// Retire a memory, recording what superseded it.
-    async fn invalidate(&self, memory_id: Uuid, superseded_by: Uuid) -> Result<()>;
-
-    /// Undo a retirement, returning the memory to the retrievable set.
-    async fn restore(&self, memory_id: Uuid) -> Result<()>;
-
-    /// Retire a memory the loop itself created, undoing a `create`.
+    /// Apply a whole change-set, all of it or none of it.
     ///
-    /// Distinct from `invalidate` so an implementation can tell "this was
-    /// superseded" from "this should never have existed".
-    async fn discard(&self, memory_id: Uuid) -> Result<()>;
+    /// The implementation is responsible for atomicity. Returning `Err`
+    /// must mean live state is unchanged.
+    async fn apply_all(&self, changes: &[StagedChange]) -> Result<()>;
+
+    /// Undo a change-set, walking it backwards, all of it or none of it.
+    ///
+    /// Returns how many changes were actually reversed. A change whose
+    /// precondition no longer holds — a tombstone that now points
+    /// somewhere else, a created memory that something has since edited —
+    /// is skipped rather than forced, so a reversal cannot clobber a
+    /// decision made after the cycle ran.
+    async fn revert_all(&self, changes: &[StagedChange]) -> Result<usize>;
 }
 
 /// Look up one memory's facts, if it exists.
 pub(crate) async fn fact_for(mutator: &dyn MemoryMutator, id: Uuid) -> Result<Option<MemoryFacts>> {
     Ok(mutator.facts(&[id]).await?.into_iter().find(|f| f.id == id))
-}
-
-/// Apply one change to live state.
-pub(crate) async fn apply(mutator: &dyn MemoryMutator, change: &StagedChange) -> Result<()> {
-    match change {
-        StagedChange::CreateMemory {
-            memory_id,
-            content,
-            parent_ids,
-        } => mutator.create(*memory_id, content, parent_ids).await,
-        StagedChange::InvalidateMemory {
-            memory_id,
-            superseded_by,
-            ..
-        } => mutator.invalidate(*memory_id, *superseded_by).await,
-    }
-}
-
-/// Undo one change.
-///
-/// The inverse of `apply`, and the reason the change vocabulary is closed:
-/// every variant has exactly one way back.
-pub(crate) async fn revert(mutator: &dyn MemoryMutator, change: &StagedChange) -> Result<()> {
-    match change {
-        StagedChange::CreateMemory { memory_id, .. } => mutator.discard(*memory_id).await,
-        StagedChange::InvalidateMemory { memory_id, .. } => mutator.restore(*memory_id).await,
-    }
 }

@@ -177,6 +177,87 @@ impl DreamCycleStore {
         .await
     }
 
+    /// The changes promotion actually applied, in planned order.
+    ///
+    /// This, not [`Self::changes`], is what a reversal must walk.
+    /// Promotion skips changes whose target moved between planning and
+    /// promoting; reversing one of those restores a memory this cycle
+    /// never retired, undoing whatever decision did retire it. The staged
+    /// set is what the cycle intended, which is a different question and
+    /// useful only for audit.
+    pub async fn applied_changes(&self, cycle_id: Uuid) -> Result<Vec<StagedChange>, Error> {
+        let id = cycle_id.to_string();
+        with_conn(&self.conn, move |conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT payload FROM dream_changes
+                     WHERE cycle_id = ?1 AND applied = 1
+                     ORDER BY seq ASC",
+                )
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            let rows = stmt
+                .query_map(params![id], |row| row.get::<_, String>(0))
+                .map_err(|e| Error::Storage(e.to_string()))?;
+
+            let mut out = Vec::new();
+            for row in rows {
+                let payload = row.map_err(|e| Error::Storage(e.to_string()))?;
+                let change: StagedChange = serde_json::from_str(&payload)
+                    .map_err(|e| Error::Storage(format!("cannot decode change: {e}")))?;
+                out.push(change);
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    /// Record which of a cycle's staged changes were applied.
+    ///
+    /// Matched by payload, because that is what uniquely identifies a
+    /// staged row: a cycle can stage two changes against the same target
+    /// only if they differ, and identical payloads are interchangeable for
+    /// reversal purposes.
+    pub async fn mark_applied(
+        &self,
+        cycle_id: Uuid,
+        applied: &[StagedChange],
+    ) -> Result<usize, Error> {
+        if applied.is_empty() {
+            return Ok(0);
+        }
+        let id = cycle_id.to_string();
+        let payloads = applied
+            .iter()
+            .map(|c| {
+                serde_json::to_string(c)
+                    .map_err(|e| Error::Storage(format!("cannot encode change: {e}")))
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+
+        with_conn(&self.conn, move |conn| {
+            let tx = conn
+                .unchecked_transaction()
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            let mut marked = 0usize;
+            {
+                let mut stmt = tx
+                    .prepare(
+                        "UPDATE dream_changes SET applied = 1
+                         WHERE cycle_id = ?1 AND payload = ?2",
+                    )
+                    .map_err(|e| Error::Storage(e.to_string()))?;
+                for payload in &payloads {
+                    marked += stmt
+                        .execute(params![id, payload])
+                        .map_err(|e| Error::Storage(e.to_string()))?;
+                }
+            }
+            tx.commit().map_err(|e| Error::Storage(e.to_string()))?;
+            Ok(marked)
+        })
+        .await
+    }
+
     /// Cycles in a given status, newest first.
     pub async fn list_by_status(
         &self,
