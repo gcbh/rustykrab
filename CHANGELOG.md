@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.2.23] - 2026-09-02
+
+- Replace six tests that could not fail (#612)
+
 ## [5.2.22] - 2026-09-02
 
 - fix(browser): validate action-specific arguments (#611)

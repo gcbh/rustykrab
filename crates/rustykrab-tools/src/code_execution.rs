@@ -267,11 +267,16 @@ mod tests {
         assert_eq!(output["exit_code"], 0);
     }
 
-    #[tokio::test]
-    async fn network_access_blocked() {
-        let tool = CodeExecutionTool::new();
-        let code = r#"
-import socket
+    /// Prints the sandbox's network-namespace identity as `NETNS:<id>`, then
+    /// `BLOCKED: <reason>` when the connection is refused or `CONNECTED` when
+    /// it succeeds.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    const NETWORK_PROBE: &str = r#"
+import os, socket
+try:
+    print("NETNS:" + os.readlink("/proc/self/ns/net"))
+except OSError:
+    print("NETNS:unavailable")
 try:
     s = socket.create_connection(("8.8.8.8", 53), timeout=3)
     s.close()
@@ -279,17 +284,69 @@ try:
 except Exception as e:
     print(f"BLOCKED: {e}")
 "#;
-        let result = tool.execute(json!({"code": code})).await;
-        assert!(result.is_ok(), "execution failed: {:?}", result.err());
-        let output = result.unwrap();
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn network_access_blocked() {
+        // Seatbelt's `(deny network*)` needs no privileges, so containment is
+        // unconditional here and the assertion can be strict. It previously
+        // read `BLOCKED || CONNECTED`, which could not fail even if the
+        // sandbox stopped containing anything at all.
+        let tool = CodeExecutionTool::new();
+        let output = tool
+            .execute(json!({ "code": NETWORK_PROBE }))
+            .await
+            .expect("execution failed");
         let stdout = output["stdout"].as_str().unwrap();
-        // Network namespace isolation (CLONE_NEWNET) requires
-        // CAP_SYS_ADMIN. When unavailable (e.g. CI containers), the
-        // sandbox falls back to resource limits only, which don't block
-        // network access. Accept either outcome.
         assert!(
-            stdout.contains("BLOCKED") || stdout.contains("CONNECTED"),
-            "unexpected sandbox output: {stdout}"
+            stdout.contains("BLOCKED"),
+            "seatbelt must deny network access; stdout={stdout:?} stderr={:?}",
+            output["stderr"]
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn network_access_blocked() {
+        // CLONE_NEWNET needs CAP_SYS_ADMIN, which unprivileged CI runners do
+        // not have; there the tool degrades to rlimits only and cannot contain
+        // the network at all. So decide from what the sandbox actually got:
+        // compare its network namespace against this process's. Asking the
+        // kernel is the whole point — an earlier version of this test keyed off
+        // a log line the tool prints on the fallback path, which never reached
+        // the captured stderr, so the skip silently became a hard assert.
+        let tool = CodeExecutionTool::new();
+        let output = tool
+            .execute(json!({ "code": NETWORK_PROBE }))
+            .await
+            .expect("execution failed");
+        let stdout = output["stdout"].as_str().unwrap();
+
+        let sandbox_netns = stdout
+            .lines()
+            .find_map(|l| l.strip_prefix("NETNS:"))
+            .expect("the probe always reports a namespace line");
+        let host_netns = std::fs::read_link("/proc/self/ns/net")
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| "unavailable".to_string());
+
+        // If either side could not be identified we cannot tell whether
+        // isolation happened, and a test that cannot tell must not assert.
+        if sandbox_netns == "unavailable" || host_netns == "unavailable" {
+            eprintln!("skipping: network namespace identity unavailable on this host");
+            return;
+        }
+        if sandbox_netns == host_netns {
+            eprintln!(
+                "skipping: no network namespace here (sandbox netns {sandbox_netns} \
+                 matches the host), so the sandbox degraded to resource limits only"
+            );
+            return;
+        }
+        assert!(
+            stdout.contains("BLOCKED"),
+            "the sandbox got its own network namespace ({sandbox_netns} vs host \
+             {host_netns}), so the connection must fail; stdout={stdout:?}"
         );
     }
 

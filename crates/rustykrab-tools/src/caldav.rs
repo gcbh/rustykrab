@@ -967,6 +967,16 @@ impl Tool for CalDavTool {
 mod tests {
     use super::*;
 
+    /// `resolve_event_url` never touches the secret store, but constructing
+    /// the tool needs one — a throwaway on-disk store is the cheapest way to
+    /// exercise the real method rather than a reconstruction of it.
+    fn caldav_tool() -> (tempfile::TempDir, CalDavTool) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = rustykrab_store::Store::open(dir.path(), vec![5u8; 32]).expect("open store");
+        let tool = CalDavTool::new(store.guarded_secrets());
+        (dir, tool)
+    }
+
     #[test]
     fn parse_datetime_to_ical_utc() {
         assert_eq!(
@@ -1155,13 +1165,55 @@ END:VCALENDAR&#13;
     }
 
     #[test]
-    fn resolve_event_url_prefers_href() {
-        // Build a tool with a throwaway in-memory secret store is overkill for
-        // this pure check; exercise the URL logic via a standalone reconstruction.
-        // href wins:
+    fn resolve_event_url_prefers_href_over_uid() {
+        let (_dir, tool) = caldav_tool();
+        // Both identifiers present: the href wins. It is the server's own
+        // path for the resource, so it needs no reconstruction and stays
+        // correct even for calendars whose layout we would guess wrong.
+        let url = tool
+            .resolve_event_url(
+                &json!({ "href": "/caldav/v2/me@gmail.com/events/x.ics", "uid": "ignored" }),
+                "me@gmail.com",
+            )
+            .unwrap();
         assert_eq!(
-            absolutize("/caldav/v2/me@gmail.com/events/x.ics"),
+            url,
             "https://apidata.googleusercontent.com/caldav/v2/me@gmail.com/events/x.ics"
         );
+    }
+
+    #[test]
+    fn resolve_event_url_builds_the_canonical_path_from_a_uid() {
+        let (_dir, tool) = caldav_tool();
+        let resolve = |args| tool.resolve_event_url(&args, "me@gmail.com").unwrap();
+
+        assert_eq!(
+            resolve(json!({ "uid": "evt-1" })),
+            "https://apidata.googleusercontent.com/caldav/v2/me@gmail.com/events/evt-1.ics"
+        );
+        assert_eq!(
+            resolve(json!({ "uid": "evt-1.ics" })),
+            "https://apidata.googleusercontent.com/caldav/v2/me@gmail.com/events/evt-1.ics",
+            "an extension already on the uid must not be doubled"
+        );
+        // An explicit calendar_id replaces the account's default collection,
+        // which is how shared/group calendars are addressed.
+        assert_eq!(
+            resolve(json!({ "uid": "evt-1", "calendar_id": "team@group.calendar.google.com" })),
+            "https://apidata.googleusercontent.com/caldav/v2/\
+             team@group.calendar.google.com/events/evt-1.ics"
+        );
+    }
+
+    #[test]
+    fn resolve_event_url_without_an_identifier_names_both_options() {
+        let (_dir, tool) = caldav_tool();
+        let err = tool
+            .resolve_event_url(&json!({}), "me@gmail.com")
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("missing event identifier"), "got: {msg}");
+        // The model has to be told which arguments would fix the call.
+        assert!(msg.contains("href") && msg.contains("uid"), "got: {msg}");
     }
 }

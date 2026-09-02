@@ -1120,6 +1120,22 @@ mod link_tests {
 
     const TTL: Duration = Duration::from_secs(900);
 
+    /// Every byte SQLite has written for this store, as lossy text. Reads the
+    /// `-wal` and `-shm` sidecars too: the database runs in WAL mode, so a
+    /// recently written row may not have reached `store.db` yet and scanning
+    /// only the main file would miss it.
+    fn database_bytes(dir: &std::path::Path) -> String {
+        let mut all = String::new();
+        for entry in std::fs::read_dir(dir).expect("read data dir") {
+            let path = entry.expect("dir entry").path();
+            if path.is_file() {
+                let bytes = std::fs::read(&path).unwrap_or_default();
+                all.push_str(&String::from_utf8_lossy(&bytes));
+            }
+        }
+        all
+    }
+
     #[tokio::test]
     async fn a_link_resolves_to_its_request_and_only_that_one() {
         let (_dir, requests, _secrets) = store();
@@ -1149,7 +1165,7 @@ mod link_tests {
 
     #[tokio::test]
     async fn the_token_itself_is_not_recoverable_from_the_store() {
-        let (_dir, requests, _secrets) = store();
+        let (dir, requests, _secrets) = store();
         let id = requests
             .file_fulfil(
                 "gmail_app_password",
@@ -1161,9 +1177,35 @@ mod link_tests {
             .await
             .expect("file");
         let token = requests.issue_link(&id, TTL).await.expect("issue");
-        // Only the hash is persisted: a dump of the row yields no working link.
-        assert_ne!(hash_token(&token), token);
-        assert_eq!(hash_token(&token).len(), 64);
+
+        // Assert against the database bytes, not against `hash_token`. A
+        // regression that wrote the raw token into the row alongside the hash
+        // would leave the hashing function perfectly correct, so checking
+        // `hash_token(t) != t` would still pass while every issued link sat in
+        // the clear on disk.
+        let on_disk = database_bytes(dir.path());
+
+        // The hash must be present first — otherwise the absence check below
+        // would pass for a database that simply hadn't been written yet.
+        assert!(
+            on_disk.contains(&hash_token(&token)),
+            "expected the token hash on disk; nothing was persisted to assert against"
+        );
+        assert!(
+            !on_disk.contains(&token),
+            "the link token was recoverable from the database file"
+        );
+
+        // And the persisted hash is the right one, so hiding the token did not
+        // cost the link its ability to resolve.
+        assert_eq!(
+            requests
+                .find_by_link(&token)
+                .await
+                .expect("lookup")
+                .map(|r| r.id),
+            Some(id)
+        );
     }
 
     #[tokio::test]

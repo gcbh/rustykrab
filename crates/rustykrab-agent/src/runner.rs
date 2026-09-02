@@ -256,6 +256,29 @@ fn compaction_input_budget_ratio() -> f64 {
     })
 }
 
+/// Input-token budget for a single compaction call against a context
+/// `ceiling`, at the given input-budget `ratio`.
+///
+/// The response reserve is a fixed 4096, which is larger than the whole
+/// ratioed budget once the context limit is modest. Subtracting it flat then
+/// yields 0, and an input budget of 0 does not fail — it sends the recursive
+/// path into chunks of nothing, one model call per fragment. Observed cost: a
+/// compaction that should take seconds ran for 31 minutes.
+///
+/// Cap the reserve at half the budget it is being taken out of, so there is
+/// always room left to actually put history in.
+///
+/// `ratio` is passed in rather than read here so the formula stays pure: the
+/// process-wide `OnceLock` in `compaction_input_budget_ratio` cannot be varied
+/// per test.
+fn compaction_input_budget(ceiling: usize, ratio: f64) -> usize {
+    let ratioed = (ceiling as f64 * ratio) as usize;
+    let reserve = SUMMARIZER_RESPONSE_RESERVE_TOKENS.min(ratioed / 2);
+    ratioed
+        .saturating_sub(reserve)
+        .max(MIN_COMPACTION_INPUT_TOKENS)
+}
+
 /// Maximum recursion depth for chunked summarization. Guards against runaway
 /// loops in the (unlikely) case a model returns summaries that aren't
 /// materially smaller than their inputs.
@@ -2749,20 +2772,7 @@ impl AgentRunner {
             .map(|c| c as usize)
             .unwrap_or_else(|| self.effective_context_limit());
         let ratio = compaction_input_budget_ratio();
-        let ratioed = (ceiling as f64 * ratio) as usize;
-        // The response reserve is a fixed 4096, which is larger than the
-        // whole ratioed budget once the context limit is modest. Subtracting
-        // it flat then yields 0, and an input budget of 0 does not fail —
-        // it sends the recursive path into chunks of nothing, one model call
-        // per fragment. Observed cost: a compaction that should take seconds
-        // ran for 31 minutes.
-        //
-        // Cap the reserve at half the budget it is being taken out of, so
-        // there is always room left to actually put history in.
-        let reserve = SUMMARIZER_RESPONSE_RESERVE_TOKENS.min(ratioed / 2);
-        let input_budget = ratioed
-            .saturating_sub(reserve)
-            .max(MIN_COMPACTION_INPUT_TOKENS);
+        let input_budget = compaction_input_budget(ceiling, ratio);
         let summary_cap_tokens = self.effective_compaction_summary_cap();
         tracing::debug!(
             ceiling,
@@ -6138,15 +6148,9 @@ mod compaction_budget_tests {
         assert_eq!(parse_expand_ctx(None), None);
     }
 
-    /// The budget a compaction call gets, for a given effective context
-    /// limit — mirrors the arithmetic in `compact_history`.
-    fn input_budget_for(ceiling: usize) -> usize {
-        let ratioed = (ceiling as f64 * DEFAULT_COMPACTION_INPUT_BUDGET_RATIO) as usize;
-        let reserve = SUMMARIZER_RESPONSE_RESERVE_TOKENS.min(ratioed / 2);
-        ratioed
-            .saturating_sub(reserve)
-            .max(MIN_COMPACTION_INPUT_TOKENS)
-    }
+    /// The default ratio, named here so the expected values below read as
+    /// arithmetic a person can check rather than as a re-run of the formula.
+    const RATIO: f64 = DEFAULT_COMPACTION_INPUT_BUDGET_RATIO;
 
     #[test]
     fn a_modest_context_limit_still_leaves_room_for_input() {
@@ -6154,7 +6158,7 @@ mod compaction_budget_tests {
         // Subtracting it left 0, and a budget of 0 chunks the history into
         // pieces of nothing — one model call each.
         for ceiling in [1_024, 1_536, 4_096, 8_192] {
-            let budget = input_budget_for(ceiling);
+            let budget = compaction_input_budget(ceiling, RATIO);
             assert!(
                 budget >= MIN_COMPACTION_INPUT_TOKENS,
                 "ceiling {ceiling} produced an unusable budget of {budget}"
@@ -6167,13 +6171,31 @@ mod compaction_budget_tests {
     }
 
     #[test]
-    fn a_large_context_limit_keeps_the_full_response_reserve() {
-        // Where the reserve is affordable, nothing changes.
-        let ceiling = 120_000;
-        let ratioed = (ceiling as f64 * DEFAULT_COMPACTION_INPUT_BUDGET_RATIO) as usize;
+    fn a_modest_context_limit_halves_the_reserve_rather_than_paying_it_flat() {
+        // 4096 * 0.5 = 2048 ratioed; a flat 4096 reserve would underflow to
+        // the 512 floor. Capping the reserve at half the ratioed budget
+        // leaves 2048 - 1024 = 1024 instead.
+        assert_eq!(compaction_input_budget(4_096, RATIO), 1_024);
+        // 1024 * 0.5 = 512 ratioed, minus a 256 reserve = 256, which is
+        // below the floor — so the floor is what comes back.
         assert_eq!(
-            input_budget_for(ceiling),
-            ratioed - SUMMARIZER_RESPONSE_RESERVE_TOKENS
+            compaction_input_budget(1_024, RATIO),
+            MIN_COMPACTION_INPUT_TOKENS
         );
+    }
+
+    #[test]
+    fn a_large_context_limit_keeps_the_full_response_reserve() {
+        // 120_000 * 0.5 = 60_000 ratioed. Half of that is 30_000, well above
+        // the 4096 reserve, so the reserve is paid in full: 60_000 - 4_096.
+        assert_eq!(compaction_input_budget(120_000, RATIO), 55_904);
+    }
+
+    #[test]
+    fn the_ratio_actually_moves_the_budget() {
+        // Guards the wiring rather than the arithmetic: a formula that
+        // ignored its ratio argument would pass every test above.
+        assert_eq!(compaction_input_budget(120_000, 0.25), 30_000 - 4_096);
+        assert_eq!(compaction_input_budget(120_000, 1.0), 120_000 - 4_096);
     }
 }

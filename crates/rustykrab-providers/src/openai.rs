@@ -1134,45 +1134,9 @@ mod tests {
         assert_eq!(resp.message.content.as_text(), Some("partial"));
     }
 
-    #[test]
-    fn streaming_deltas_accumulate_by_index() {
-        let mut partials: Vec<PartialToolCall> = Vec::new();
-
-        let deltas = vec![
-            serde_json::json!({"index": 0, "id": "call_1", "function": {"name": "read", "arguments": "{\"pa"}}),
-            serde_json::json!({"index": 0, "function": {"arguments": "th\":\"/tmp/x\"}"}}),
-            serde_json::json!({"index": 1, "id": "call_2", "function": {"name": "write", "arguments": "{}"}}),
-        ];
-
-        for d in deltas {
-            let delta: OpenAiToolCallDelta = serde_json::from_value(d).unwrap();
-            let slot = OpenAiProvider::slot_for(&mut partials, &delta);
-            if let Some(id) = delta.id {
-                if !id.is_empty() {
-                    slot.id = id;
-                }
-            }
-            if let Some(func) = delta.function {
-                if let Some(name) = func.name {
-                    if !name.is_empty() {
-                        slot.name = name;
-                    }
-                }
-                if let Some(args) = func.arguments {
-                    slot.arguments.push_str(&args);
-                }
-            }
-        }
-
-        assert_eq!(partials.len(), 2);
-        assert_eq!(partials[0].name, "read");
-        assert_eq!(
-            OpenAiProvider::parse_arguments_str(&partials[0].arguments),
-            serde_json::json!({"path": "/tmp/x"})
-        );
-        assert_eq!(partials[1].id, "call_2");
-        assert_eq!(partials[1].name, "write");
-    }
+    // Delta accumulation across streaming frames is covered end-to-end in
+    // `tests/openai_wire.rs`, which drives the real `chat_stream` loop against
+    // a mock server. A unit test here could only re-run a copy of that loop.
 
     #[test]
     fn stream_options_only_sent_when_streaming_and_enabled() {
