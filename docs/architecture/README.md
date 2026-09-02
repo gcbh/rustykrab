@@ -25,6 +25,7 @@ Per-component detail lives next to the code, one file per crate:
 - [`crates/rustykrab-store/ARCHITECTURE.md`](../../crates/rustykrab-store/ARCHITECTURE.md)
 - [`crates/rustykrab-memory/ARCHITECTURE.md`](../../crates/rustykrab-memory/ARCHITECTURE.md)
 - [`crates/rustykrab-agent/ARCHITECTURE.md`](../../crates/rustykrab-agent/ARCHITECTURE.md)
+- [`crates/rustykrab-runtime/ARCHITECTURE.md`](../../crates/rustykrab-runtime/ARCHITECTURE.md)
 - [`crates/rustykrab-providers/ARCHITECTURE.md`](../../crates/rustykrab-providers/ARCHITECTURE.md)
 - [`crates/rustykrab-tools/ARCHITECTURE.md`](../../crates/rustykrab-tools/ARCHITECTURE.md)
 - [`crates/rustykrab-gateway/ARCHITECTURE.md`](../../crates/rustykrab-gateway/ARCHITECTURE.md)

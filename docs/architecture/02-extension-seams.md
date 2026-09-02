@@ -18,16 +18,16 @@ weight. Counts are `impl X for` occurrences including test doubles.
 | `TraceSink` | `core/prompt_trace.rs` | 2 | Fine |
 | `RequestNotifier` | `store/credential_request.rs` | 1 | Fine — breaks store→push dependency |
 | `MemoryBackend` | **`core`** | 2 | **Moved.** The one that was blocked |
-| `CronBackend` | **`tools`** | 2 | Right idea, wrong crate |
-| `MessageBackend` | **`tools`** | 1 | Right idea, wrong crate |
-| `ComputerBackend` | **`tools`** | 2 | Right idea, wrong crate |
-| `VideoBackend` | **`tools`** | 1 | Right idea, wrong crate |
-| `SessionManager` | **`tools`** | 1 | Right idea, wrong crate |
+| `CronBackend` | **`tools`** | 2 | Correctly implemented above the consumer |
+| `MessageBackend` | **`tools`** | 1 | Correctly implemented above the consumer |
+| `ComputerBackend` | **`tools`** | 2 | Correctly implemented above the consumer |
+| `VideoBackend` | **`tools`** | 1 | Fine — implementation is in the same crate |
+| `SessionManager` | **`tools`** | 1 | Correctly implemented above the consumer |
 | `Skill` | `skills/skill.rs` | 1 | Thin — `SkillMd` is the only shape |
 | `Channel` | `channels/channel.rs` | **1** | **Not earning its keep** |
 | `GatewayBackend` | `tools/gateway_backend.rs` | **0** | **Dead** |
 
-## The backend traits are in the wrong crate
+## Backend trait placement is resolved
 
 > **Corrected after implementation.** This section originally said six traits
 > were misplaced. Checking every implementor, only one is: `MemoryBackend`.
@@ -35,37 +35,19 @@ weight. Counts are `impl X for` occurrences including test doubles.
 > `rustykrab-tools` itself — all at or above the tool crate — so none of them
 > is blocked and moving them would be churn. `MemoryBackend` was also the only
 > one that had produced a pass-through adapter, which is the tell. See the
-> table at the end of this section.
+> table below.
 
-One "backend" trait is, and five — `MemoryBackend`, `CronBackend`, `MessageBackend`,
-`ComputerBackend`, `VideoBackend`, `SessionManager` — are defined in
-`rustykrab-tools`, the crate that *consumes* them. The crates that own the real
-capability (`rustykrab-memory`, `rustykrab-store`, `rustykrab-channels`) cannot
-implement them without depending on `rustykrab-tools`, which would create a
-cycle. So they can't, and the CLI writes a pass-through adapter for each one.
-
-`rustykrab-memory` says so out loud:
-
-> ```rust
-> /// The trait itself is defined in `rustykrab-tools::memory_backend`.
-> /// We re-implement it here structurally to avoid a circular dependency;
-> /// the gateway wires this into the tool system via a thin wrapper.
-> ```
-> — `memory/src/backend.rs:34`
-
-The result is `HybridMemoryBackend` (a full implementation with a
-structurally-identical but unrelated method set) wrapped by `MemoryAdapter` in
-`cli/src/main.rs:56` — five methods, four of which are `self.inner.f(args)`.
-
-Moving `MemoryBackend` to `rustykrab-core` (where `Tool` and `ModelProvider`
-already live) deletes the adapter and lets the memory crate implement its own
-contract directly. It is a mechanical change with no behavioural risk.
+`MemoryBackend` has now moved to `rustykrab-core`; `HybridMemoryBackend`
+implements it directly and the pass-through CLI adapter is gone. The other
+five backend traits remain in `rustykrab-tools` because their real implementors
+already sit in that crate or above it in the dependency graph. Moving them
+would remove no cycle and delete no adapter.
 
 Which traits are actually blocked, by where their real implementor lives:
 
 | Trait | Real implementor | Crate | Blocked? |
 |---|---|---|---|
-| `MemoryBackend` | `HybridMemoryBackend` | `rustykrab-memory` | **yes — below `tools`** |
+| `MemoryBackend` | `HybridMemoryBackend` | `rustykrab-memory` | **resolved — trait is now in `core`** |
 | `SessionManager` | `SubagentRunner` | `rustykrab-agent` | no, above |
 | `ComputerBackend` | `EnigoXcapBackend` | `rustykrab-cli` | no, above |
 | `VideoBackend` | `VideoChannelAdapter` | `rustykrab-tools` | no, same crate |
@@ -166,7 +148,7 @@ able to be, for that one reason.
 
 ## Ambient configuration
 
-59 distinct `RUSTYKRAB_*` variables. Reads outside the composition root:
+Direct environment reads outside the composition root and E2E harness:
 
 | Crate | Reads | Examples |
 |---|---|---|
@@ -175,6 +157,8 @@ able to be, for that one reason.
 | `gateway` | 5 | `RUSTYKRAB_ALLOWED_ORIGINS`, `RUSTYKRAB_PUBLIC_URL` |
 | `agent` | 4 | `RUSTYKRAB_COMPACTION_*` |
 | `store` | 3 | `RUSTYKRAB_MASTER_KEY`, `RUSTYKRAB_DISABLE_KEYCHAIN` |
+| `channels` | 1 | `TELEGRAM_API_BASE` |
+| `skills` | 1 | dynamic skill requirements / prompt path |
 
 Each read is individually defensible — it is the escape hatch for an operator
 knob. Collectively they mean a library crate's behaviour depends on process

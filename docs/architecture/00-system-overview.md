@@ -114,12 +114,12 @@ undercounts JSON-heavy history by ~40%, which previously let real prompts
 reach the window while the estimate sat comfortably below the threshold. The
 estimator is now a *delta* estimator, and `core::token_estimate` says so.
 
-**Configuration is still ambient.** 60 distinct `RUSTYKRAB_*` variables, and
-46 reads still sit inside library crates rather than the composition root:
-25 in `tools`, 8 in `providers`, 5 in `gateway`, 4 in `agent`, 3 in `store`.
-Unchanged since the first pass, and the single largest remaining obstacle to
-reusing `tools` or `agent` anywhere else. `memory` and `runtime` both read
-zero, which is why they are the two most portable crates here.
+**Configuration is still ambient.** There are 47 direct environment reads in
+library crates rather than the composition root: 25 in `tools`, 8 in
+`providers`, 5 in `gateway`, 4 in `agent`, 3 in `store`, and one each in
+`channels` and `skills`. This remains the single largest obstacle to reusing
+`tools` or `agent` elsewhere. `memory` and `runtime` both read zero, which is
+why they are the two most portable crates here.
 
 **The turn sequence is still written out at every call site.** Load
 conversation, snapshot persisted ids, append, run with a heartbeat,

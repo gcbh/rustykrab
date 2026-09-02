@@ -97,6 +97,7 @@ def main() -> int:
     fix = "--fix" in sys.argv
     stale: list[str] = []
     missing: list[str] = []
+    missing_guidance: list[str] = []
 
     for crate in workspace_members():
         doc = crate / "ARCHITECTURE.md"
@@ -110,6 +111,17 @@ def main() -> int:
                 doc.write_text(updated)
             else:
                 stale.append(str(doc.relative_to(ROOT)))
+
+    # Both major agent entry points must keep the same-change maintenance rule.
+    # This is intentionally a narrow mechanical check: the prose itself still
+    # requires semantic review.
+    guidance_phrase = "update the affected write-ups in the same PR"
+    for rel in ("AGENTS.md", "CLAUDE.md"):
+        f = ROOT / rel
+        if not f.is_file() or guidance_phrase.lower() not in f.read_text().lower():
+            missing_guidance.append(
+                f"{rel}: must require agents to {guidance_phrase}"
+            )
 
     # The crate count appears in prose in several places; check rather than
     # rewrite, because the surrounding sentence is not ours to regenerate.
@@ -142,7 +154,12 @@ def main() -> int:
         for w in wrong_counts:
             print(f"  {w}", file=sys.stderr)
 
-    if missing or stale or wrong_counts:
+    if missing_guidance:
+        print("Missing architecture-maintenance agent guidance:", file=sys.stderr)
+        for item in missing_guidance:
+            print(f"  {item}", file=sys.stderr)
+
+    if missing or stale or wrong_counts or missing_guidance:
         return 1
     print(f"architecture docs OK — {count} crates, all documented, metrics current")
     return 0

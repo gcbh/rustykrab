@@ -69,6 +69,13 @@ Workspace with 13 crates under `crates/`:
 extension seams, and a dead-code audit. Each crate has its own
 `ARCHITECTURE.md`.
 
+Before planning or editing a structural change, read the system overview and
+the `ARCHITECTURE.md` files for every affected crate from the exact base commit.
+Treat them as versioned evidence: re-check load-bearing claims against the code,
+and correct any stale prose you encounter in the same change.
+Update the affected write-ups in the same PR; architecture documentation is
+part of the implementation, not follow-up cleanup.
+
 **If you change the structure, update these in the same change.** Concretely:
 
 - a new crate needs an `ARCHITECTURE.md` — CI fails without one
@@ -96,7 +103,8 @@ problems the docs have not caught up with yet.
 Everything between the `generated-metrics` markers is generated — files,
 lines, tests, dependencies — so never hand-edit it. The prose is yours to keep
 true; nothing can check that for you, which is exactly why it is called out
-here.
+here. In the PR or handoff evidence, name the architecture documents updated,
+or explicitly state why the change does not affect documented architecture.
 
 ## Key patterns
 
