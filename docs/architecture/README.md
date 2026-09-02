@@ -40,6 +40,28 @@ Per-component detail lives next to the code, one file per crate:
 |---|---|
 | [`OPINION.md`](OPINION.md) | Ranked verdicts on correctness and sensibility, with the reasoning behind each |
 
+## Keeping these true
+
+The numbers here are generated, not written. `scripts/check_architecture_docs.py`
+regenerates the `generated-metrics` block in each crate's `ARCHITECTURE.md`,
+verifies every workspace member has one, and checks the crate count asserted
+in prose. CI runs it on every pull request, so a structural change that
+leaves these documents stale fails the build.
+
+That check exists because the alternative was already demonstrated: before it
+was added, `CLAUDE.md` claimed 11 crates and `README.md` claimed 10, when
+there were 13. Both were written carefully. Nothing verified them.
+
+What it does not check is the prose — a reviewer's reasoning cannot be
+verified mechanically, and pretending otherwise would add false confidence.
+`CLAUDE.md` tells agents to update the argument when they invalidate it; this
+guards the facts.
+
+```sh
+python3 scripts/check_architecture_docs.py --fix   # regenerate
+python3 scripts/check_architecture_docs.py         # verify (what CI runs)
+```
+
 ## Method
 
 Read-only static review: crate graph, module and function inventories, all DDL,
