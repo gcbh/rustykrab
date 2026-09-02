@@ -88,6 +88,11 @@ Run this before committing. It regenerates the counts and fails on drift:
 python3 scripts/check_architecture_docs.py --fix
 ```
 
+For the half a script cannot check — whether the docs' *arguments* are still
+true — invoke the `architecture-review` skill. It re-derives each claim from
+the code instead of trusting the sentence, and at `full` hunts for structural
+problems the docs have not caught up with yet.
+
 Everything between the `generated-metrics` markers is generated — files,
 lines, tests, dependencies — so never hand-edit it. The prose is yours to keep
 true; nothing can check that for you, which is exactly why it is called out

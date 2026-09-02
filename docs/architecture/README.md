@@ -62,6 +62,12 @@ python3 scripts/check_architecture_docs.py --fix   # regenerate
 python3 scripts/check_architecture_docs.py         # verify (what CI runs)
 ```
 
+For the half a script cannot check — whether the *arguments* are still true —
+invoke the `architecture-review` skill (`.claude/skills/architecture-review/`).
+It re-derives each load-bearing claim from the code rather than trusting the
+sentence, and at `full` looks for structural problems the documents do not
+mention yet.
+
 ## Method
 
 Read-only static review: crate graph, module and function inventories, all DDL,
