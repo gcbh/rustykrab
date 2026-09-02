@@ -28,22 +28,30 @@ pub struct OutcomeContract {
     pub skill: String,
     /// Effects the run was supposed to produce, named as tools.
     pub checks: Vec<String>,
+    /// The evidence class the skill *declared*. Only [`SignalClass::Verifiable`]
+    /// buys ground truth: a skill that asked to be judged by a model, or
+    /// said nothing, must not be promoted to fact merely because it also
+    /// happened to list some checks.
+    pub signal: SignalClass,
 }
 
 impl OutcomeContract {
-    pub fn new(skill: impl Into<String>, checks: Vec<String>) -> Self {
+    pub fn new(skill: impl Into<String>, checks: Vec<String>, signal: SignalClass) -> Self {
         Self {
             skill: skill.into(),
             checks,
+            signal,
         }
     }
 
     /// Whether this contract can actually decide anything.
     ///
-    /// A contract with no checks states nothing, and must not be mistaken
-    /// for evidence that the run succeeded.
+    /// Two ways to decide nothing, and both must fall through to the weaker
+    /// signal rather than inventing ground truth: a contract with no checks
+    /// states nothing, and a contract whose skill declared a non-verifiable
+    /// signal has not asked for its effects to be treated as fact.
     pub fn is_checkable(&self) -> bool {
-        !self.checks.is_empty()
+        !self.checks.is_empty() && self.signal == SignalClass::Verifiable
     }
 }
 
@@ -63,12 +71,30 @@ pub struct ContractVerdict {
 /// Evaluate a contract against what the run actually did.
 ///
 /// `succeeded` answers, for a tool name, whether a call to it completed
-/// successfully at least once during the run.
+/// successfully at least once during the run. `errored` says whether the
+/// run itself terminated abnormally.
 ///
-/// Returns `None` when the contract cannot decide — no checks declared —
-/// so the caller falls back to the weaker implicit signal rather than
-/// inventing ground truth from nothing.
-pub fn evaluate<F>(contract: &OutcomeContract, mut succeeded: F) -> Option<ContractVerdict>
+/// Returns `None` when the contract cannot decide — see
+/// [`OutcomeContract::is_checkable`] — so the caller falls back to the
+/// weaker implicit signal rather than inventing ground truth from nothing.
+///
+/// # What an unmet check does and does not mean
+///
+/// A single run is one turn of a conversation, and a skill's declared
+/// effects may legitimately be spread across several. A booking that
+/// clarifies on turn one, creates on turn two and confirms on turn three
+/// leaves the first two turns with checks outstanding while nothing has
+/// gone wrong. So an unmet check yields [`OutcomeVerdict::Ambiguous`]:
+/// observed, recorded, and deliberately excluded from success rates. It is
+/// not evidence of failure, because from one run we cannot distinguish
+/// "did not do it" from "has not done it yet" — and manufacturing failures
+/// for a working skill is far more corrosive to the loop than staying
+/// silent.
+pub fn evaluate<F>(
+    contract: &OutcomeContract,
+    errored: bool,
+    mut succeeded: F,
+) -> Option<ContractVerdict>
 where
     F: FnMut(&str) -> bool,
 {
@@ -87,37 +113,45 @@ where
     }
 
     let all_met = unsatisfied.is_empty();
-    let verdict = if all_met {
-        OutcomeVerdict::Success
-    } else {
-        // Not ambiguous. The skill said what success required and the run
-        // did not do it, which is a fact about the run rather than a gap
-        // in the evidence.
-        OutcomeVerdict::Failure
+
+    // A run that produced every declared effect and then died is not a
+    // success. The effects are real and observed, so this stays ground
+    // truth -- but the run did not complete, and reporting it as success
+    // would let a crashing skill accumulate a clean record.
+    let verdict = match (all_met, errored) {
+        (true, false) => OutcomeVerdict::Success,
+        (true, true) => OutcomeVerdict::Failure,
+        (false, _) => OutcomeVerdict::Ambiguous,
     };
 
-    let detail = if all_met {
-        format!(
+    let detail = match (all_met, errored) {
+        (true, false) => format!(
             "all {} declared check(s) satisfied for skill '{}'",
             satisfied.len(),
             contract.skill
-        )
-    } else {
-        format!(
-            "{} of {} declared check(s) unmet for skill '{}': {}",
+        ),
+        (true, true) => format!(
+            "all {} declared check(s) satisfied for skill '{}', but the run errored",
+            satisfied.len(),
+            contract.skill
+        ),
+        (false, _) => format!(
+            "{} of {} declared check(s) outstanding for skill '{}': {}",
             unsatisfied.len(),
             contract.checks.len(),
             contract.skill,
             unsatisfied.join(", ")
-        )
+        ),
     };
 
     Some(ContractVerdict {
         verdict,
         signal: SignalClass::Verifiable,
         // High, but never 1.0. The check confirms the effect occurred; it
-        // cannot confirm the effect was the one the user wanted.
-        confidence: 0.9,
+        // cannot confirm the effect was the one the user wanted. An
+        // outstanding check is weaker still: it may only mean the
+        // conversation is not finished.
+        confidence: if all_met { 0.9 } else { 0.5 },
         detail,
         satisfied,
         unsatisfied,
@@ -132,6 +166,7 @@ mod tests {
         OutcomeContract::new(
             "calendar-booking",
             checks.iter().map(|s| s.to_string()).collect(),
+            SignalClass::Verifiable,
         )
     }
 
@@ -139,12 +174,33 @@ mod tests {
     fn a_contract_with_no_checks_decides_nothing() {
         // The critical case. An empty declaration must fall through to the
         // weaker signal, never be read as confirmation of success.
-        assert!(evaluate(&contract(&[]), |_| true).is_none());
+        assert!(evaluate(&contract(&[]), false, |_| true).is_none());
+    }
+
+    #[test]
+    fn a_skill_that_did_not_ask_to_be_verified_decides_nothing() {
+        // Checks alone do not buy ground truth. A skill judged by a model
+        // stays a proxy however many effects it happens to name, or the
+        // loop could promote its own opinion to fact.
+        for declared in [
+            SignalClass::Judge,
+            SignalClass::Implicit,
+            SignalClass::Explicit,
+        ] {
+            let c = OutcomeContract::new("x", vec!["calendar_create".into()], declared);
+            assert!(
+                evaluate(&c, false, |_| true).is_none(),
+                "{declared:?} must not be promoted to Verifiable"
+            );
+        }
     }
 
     #[test]
     fn a_run_that_did_everything_declared_is_verifiable_success() {
-        let v = evaluate(&contract(&["calendar_create", "email_send"]), |_| true).unwrap();
+        let v = evaluate(&contract(&["calendar_create", "email_send"]), false, |_| {
+            true
+        })
+        .unwrap();
         assert_eq!(v.verdict, OutcomeVerdict::Success);
         assert_eq!(v.signal, SignalClass::Verifiable);
         assert!(v.signal.is_ground_truth(), "this is what unblocks mutation");
@@ -152,25 +208,50 @@ mod tests {
     }
 
     #[test]
-    fn a_missed_check_is_failure_not_ambiguity() {
-        // The skill said what success required and the run did not do it.
-        // That is a fact about the run, not a gap in the evidence.
-        let v = evaluate(&contract(&["calendar_create", "email_send"]), |t| {
+    fn an_outstanding_check_is_ambiguous_not_failure() {
+        // A skill's effects may be spread across turns. From one run we
+        // cannot tell "did not do it" from "has not done it yet", and
+        // manufacturing failures for a working skill would poison the
+        // very analysis this evidence exists to feed.
+        let v = evaluate(&contract(&["calendar_create", "email_send"]), false, |t| {
             t == "calendar_create"
         })
         .unwrap();
-        assert_eq!(v.verdict, OutcomeVerdict::Failure);
+        assert_eq!(v.verdict, OutcomeVerdict::Ambiguous);
         assert_eq!(v.signal, SignalClass::Verifiable);
         assert_eq!(v.unsatisfied, vec!["email_send"]);
         assert!(v.detail.contains("email_send"));
     }
 
     #[test]
-    fn every_check_must_be_met_not_merely_most() {
-        let v = evaluate(&contract(&["a", "b", "c"]), |t| t != "c").unwrap();
+    fn an_ambiguous_verdict_cannot_count_against_the_skill() {
+        // The guarantee that makes the choice above safe: outstanding
+        // checks are recorded but excluded from success rates entirely.
+        let mut tally = crate::outcome::OutcomeTally::default();
+        for _ in 0..10 {
+            tally.record(OutcomeVerdict::Ambiguous);
+        }
+        assert_eq!(tally.decisive(), 0, "ambiguity must not read as harm");
+        assert_eq!(tally.success_rate(1), None);
+    }
+
+    #[test]
+    fn producing_every_effect_and_then_dying_is_not_success() {
+        let v = evaluate(&contract(&["calendar_create"]), true, |_| true).unwrap();
         assert_eq!(
             v.verdict,
             OutcomeVerdict::Failure,
+            "a crashing skill must not accumulate a clean record"
+        );
+        assert!(v.detail.contains("errored"));
+    }
+
+    #[test]
+    fn every_check_must_be_met_not_merely_most() {
+        let v = evaluate(&contract(&["a", "b", "c"]), false, |t| t != "c").unwrap();
+        assert_ne!(
+            v.verdict,
+            OutcomeVerdict::Success,
             "two out of three is not success"
         );
         assert_eq!(v.satisfied.len(), 2);
@@ -180,7 +261,7 @@ mod tests {
     fn confidence_stays_below_certainty() {
         // The check confirms the effect happened; it cannot confirm the
         // effect was the one the user wanted.
-        let v = evaluate(&contract(&["calendar_create"]), |_| true).unwrap();
+        let v = evaluate(&contract(&["calendar_create"]), false, |_| true).unwrap();
         assert!(
             v.confidence < 1.0,
             "a verified effect is still not proof of intent"
@@ -191,7 +272,7 @@ mod tests {
     #[test]
     fn a_verifiable_record_is_actionable_where_an_implicit_one_is_not() {
         // The whole point: this is the signal that lets a later phase act.
-        let v = evaluate(&contract(&["calendar_create"]), |_| true).unwrap();
+        let v = evaluate(&contract(&["calendar_create"]), false, |_| true).unwrap();
         assert!(v.signal.is_ground_truth());
         assert!(!SignalClass::Implicit.is_ground_truth());
     }

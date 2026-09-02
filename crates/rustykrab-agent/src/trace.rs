@@ -66,7 +66,14 @@ struct TracerInner {
 /// Sanitize a tool name to prevent prompt injection via trace summaries.
 /// Only allows alphanumeric characters, underscores, and hyphens,
 /// and limits length to 64 characters.
-fn sanitize_tool_name(name: &str) -> String {
+///
+/// Public because anything that looks a name up in [`ExecutionTracer::tool_stats`]
+/// must normalise it the same way first. A skill's declared checks are
+/// written by hand and routinely contain dots (`calendar.event_created`),
+/// which are stripped here — comparing a raw check against these keys
+/// would never match, and would report a working skill as never having
+/// done anything.
+pub fn sanitize_tool_name(name: &str) -> String {
     name.chars()
         .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
         .take(64)

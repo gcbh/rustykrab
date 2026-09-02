@@ -975,8 +975,6 @@ impl AgentRunner {
         self
     }
 
-    /// Record which skill is driving this run, so its outcomes can be
-    /// attributed to that skill.
     /// Declare what the active skill requires for a run to count as
     /// successful, so outcomes can be recorded as ground truth rather than
     /// as behavioural proxy. Without this the run is stamped `Implicit`
@@ -986,6 +984,8 @@ impl AgentRunner {
         self
     }
 
+    /// Record which skill is driving this run, so its outcomes can be
+    /// attributed to that skill.
     pub fn with_active_skill(mut self, name: impl Into<String>) -> Self {
         self.active_skill = Some(name.into());
         self
@@ -1023,8 +1023,13 @@ impl AgentRunner {
         // the behavioural signal, which cannot tell a clean run that
         // produced a wrong answer from one that produced a right one.
         let contract_verdict = self.outcome_contract.as_ref().and_then(|contract| {
-            rustykrab_core::evaluate_contract(contract, |tool| {
-                stats.get(tool).is_some_and(|s| s.successes > 0)
+            rustykrab_core::evaluate_contract(contract, errored, |tool| {
+                // `stats` is keyed by sanitized names, so the check has to
+                // be put through the same filter before it can match. A
+                // declared `calendar.event_created` loses its dots here
+                // exactly as the recorded tool name did.
+                let key = crate::trace::sanitize_tool_name(tool);
+                stats.get(&key).is_some_and(|s| s.successes > 0)
             })
         });
 
@@ -6063,6 +6068,7 @@ mod outcome_capture_tests {
             .with_outcome_contract(rustykrab_core::OutcomeContract::new(
                 "worker",
                 vec!["work".to_string()],
+                rustykrab_core::SignalClass::Verifiable,
             ));
 
         runner.run(&mut conv, &session).await.unwrap();
@@ -6077,10 +6083,12 @@ mod outcome_capture_tests {
     }
 
     #[tokio::test]
-    async fn an_unmet_declaration_is_a_verified_failure() {
-        // The tool the skill said was required did not succeed. That is a
-        // fact about the run, not a gap in the evidence -- so it is a
-        // Failure on a ground-truth signal, not Ambiguous.
+    async fn a_run_that_failed_its_declared_tool_is_not_success() {
+        // The declared tool did not succeed, so the record must not read
+        // as success. It is Ambiguous rather than Failure: from one run we
+        // cannot tell "did not do it" from "has not done it yet", and a
+        // skill whose effects span turns must not be scored as harmful for
+        // being mid-conversation.
         let sink = Arc::new(RecordingSink::default());
         let (runner, session, mut conv) = make_runner(true);
         let runner = runner
@@ -6089,12 +6097,13 @@ mod outcome_capture_tests {
             .with_outcome_contract(rustykrab_core::OutcomeContract::new(
                 "worker",
                 vec!["work".to_string()],
+                rustykrab_core::SignalClass::Verifiable,
             ));
 
         let _ = runner.run(&mut conv, &session).await;
 
         let r = &sink.records()[0];
-        assert_eq!(r.verdict, OutcomeVerdict::Failure);
+        assert_ne!(r.verdict, OutcomeVerdict::Success);
         assert_eq!(r.signal, SignalClass::Verifiable);
         assert!(r.detail.as_ref().unwrap().contains("work"));
     }
@@ -6106,7 +6115,11 @@ mod outcome_capture_tests {
         let (runner, session, mut conv) = make_runner(false);
         let runner = runner
             .with_outcome_sink(sink.clone())
-            .with_outcome_contract(rustykrab_core::OutcomeContract::new("worker", vec![]));
+            .with_outcome_contract(rustykrab_core::OutcomeContract::new(
+                "worker",
+                vec![],
+                rustykrab_core::SignalClass::Verifiable,
+            ));
 
         runner.run(&mut conv, &session).await.unwrap();
 
@@ -6126,24 +6139,28 @@ mod outcome_capture_tests {
             .with_outcome_contract(rustykrab_core::OutcomeContract::new(
                 "worker",
                 vec!["never_called".to_string()],
+                rustykrab_core::SignalClass::Verifiable,
             ));
 
         runner.run(&mut conv, &session).await.unwrap();
 
         let r = &sink.records()[0];
-        assert_eq!(
+        assert_ne!(
             r.verdict,
-            OutcomeVerdict::Failure,
+            OutcomeVerdict::Success,
             "a clean run that skipped the declared effect has not succeeded"
         );
         assert_eq!(r.signal, SignalClass::Verifiable);
     }
 
     #[tokio::test]
-    async fn streaming_records_the_same_signal_as_non_streaming() {
-        // The streaming path rebuilds the runner in a spawned task. If the
-        // contract were not carried across, the same work would record
-        // ground truth one way and a proxy the other.
+    async fn a_check_written_the_way_the_docs_describe_it_actually_matches() {
+        // The tracer sanitizes tool names to alphanumerics, `_` and `-`,
+        // but a skill's checks are hand-written and DREAMING.md documents
+        // them dotted: `calendar.event_created`. Comparing the raw check
+        // against sanitized keys never matches, which reported a working
+        // skill as having done nothing -- the earlier tests all used
+        // underscore names and sailed straight past it.
         let sink = Arc::new(RecordingSink::default());
         let (runner, session, mut conv) = make_runner(false);
         let runner = runner
@@ -6151,14 +6168,46 @@ mod outcome_capture_tests {
             .with_active_skill("worker")
             .with_outcome_contract(rustykrab_core::OutcomeContract::new(
                 "worker",
-                vec!["work".to_string()],
+                // The scripted tool is `work`; dots and spaces are stripped
+                // by the same filter that produced the recorded key.
+                vec!["w.o.r.k".to_string()],
+                rustykrab_core::SignalClass::Verifiable,
             ));
 
-        let noop = |_: AgentEvent| {};
-        runner
-            .run_streaming(&mut conv, &session, &noop)
-            .await
-            .unwrap();
+        runner.run(&mut conv, &session).await.unwrap();
+
+        let r = &sink.records()[0];
+        assert_eq!(
+            r.verdict,
+            OutcomeVerdict::Success,
+            "a dotted check must resolve to the tool it names"
+        );
+        assert_eq!(r.signal, SignalClass::Verifiable);
+    }
+
+    #[tokio::test]
+    async fn the_event_loop_records_the_same_signal_as_a_direct_run() {
+        // `start()` does not borrow self -- it copies each field into a
+        // runner rebuilt inside a spawned task. A field left out of that
+        // copy compiles perfectly and silently downgrades every run the
+        // event loop drives, so the rebuild has to be exercised directly:
+        // calling `run_streaming` instead would pass with the contract
+        // dropped from `start()`.
+        let sink = Arc::new(RecordingSink::default());
+        let (runner, session, conv) = make_runner(false);
+        let runner = runner
+            .with_outcome_sink(sink.clone())
+            .with_active_skill("worker")
+            .with_outcome_contract(rustykrab_core::OutcomeContract::new(
+                "worker",
+                vec!["work".to_string()],
+                rustykrab_core::SignalClass::Verifiable,
+            ));
+
+        let (handle, mut events, join) = runner.start(conv, session);
+        while events.recv().await.is_some() {}
+        drop(handle);
+        let _ = join.await;
 
         let records = sink.records();
         assert_eq!(records.len(), 1);
