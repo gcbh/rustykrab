@@ -1,0 +1,123 @@
+# rustykrab-agent — The Loop
+
+14 files, ~10,150 lines, 128 tests. Depends on `core` and `tools`.
+
+## Responsibility
+
+Run a turn: call the model, classify what came back, execute the tools it asked
+for under a sandbox policy, compact history when it grows past budget, and
+decide when the turn is actually over.
+
+## Module map
+
+| Module | Lines | Role |
+|---|---|---|
+| `runner.rs` | 5,988 | `AgentRunner`, `AgentConfig`, `AgentEvent`, both loop bodies, compaction, response classification. ~3,250 lines of code + ~2,700 of inline tests |
+| `recall_tools.rs` | 660 | `recall_*` tools over compaction-displaced history; drives the RLM executor |
+| `sandbox.rs` | 469 | `Sandbox` trait, `SandboxPolicy`, `ProcessSandbox`, `NoSandbox`, per-tool timeouts |
+| `todo_tools.rs` | 432 | `todo_*` planning scratchpad tools |
+| `router.rs` | 383 | `HarnessRouter` — keyword classification into harness profiles |
+| `subagent.rs` | 368 | `SubagentRunner` — nested agent loops behind the `SessionManager` trait |
+| `voting.rs` | 242 | `ConsistencyVoter` — **exported, referenced nowhere** |
+| `trace.rs` | 221 | `ExecutionTracer`, `ToolTrace`, `ToolStats` |
+| `harness.rs` | 96 | `HarnessProfile` presets → `AgentConfig` |
+| `rlm/recursive_call.rs` | 573 | Recursive sub-query execution over context slices |
+| `rlm/repl_tools.rs` | 469 | `peek` / `search` / `sub_query` over externalised context |
+| `rlm/context_manager.rs` | 22 | One token-estimation function |
+
+## The loop
+
+`run_inner` (1368–1831) and `run_streaming_inner` (1854–2322) each implement,
+per iteration:
+
+1. Expiry check; repair an oversized stored summary before the first call.
+2. Compact if `estimate_conversation_tokens > threshold * effective_context_limit`.
+3. Inject a soft warning at `soft_iteration_warning`.
+4. Rebuild the tool schema list only if the active-set version changed.
+5. Call the provider (optionally forcing `ToolChoice::Any` on iteration 0).
+6. Classify the response: empty / planning-only / progress-narration /
+   idle-acknowledgment / complete.
+7. If tool calls: validate args against the schema, enforce the sandbox policy,
+   execute in parallel with per-tool timeouts, fence external output, decide
+   retryability per error kind.
+8. On `EndTurn` after tool use: re-prompt for `task_complete` unless a tool
+   reported `blocks_turn()`.
+9. Track seven independent retry counters, suppressing retries once a
+   side-effecting tool has run.
+
+The design intent throughout is *don't trust the model's stopping signal, and
+don't let a retry duplicate an externally-visible action*. Both are right, and
+both are handled with visible care — `should_retry_unchanged_tool_call` and
+`tool_error_output` each carry their own test modules.
+
+## Compaction
+
+`compact_history` summarises displaced history and archives the originals into
+`RecallStore`, so the agent can recover detail via the `recall_*` tools rather
+than losing it. Oversized inputs are packed into chunks and summarised
+recursively (`summarize_text_recursively`), with a fast single-call path when
+the input fits. `enforce_summary_size_cap` re-summarises and, failing that,
+truncates on a UTF-8 boundary. `repair_oversized_summary` fixes summaries
+persisted by older builds *before* the first model call, so an old database
+can't produce a prompt large enough to trip the provider's HTTP timeout.
+
+This is genuinely good engineering. It is also the most heavily tested area in
+the crate, which is the right place to spend tests.
+
+## The loop was duplicated; it no longer is
+
+`run_inner` and `run_streaming_inner` were 82% identical. They are now one
+`run_inner` parameterised by an event sink, with `run` passing a sink that
+discards.
+
+The merge was worth doing on evidence rather than principle: while it was in
+review, the usage-anchoring and tool-block-on-compaction work landed into
+**both** copies, ~60 lines each. The unification then halved exactly the
+symbols that had been written twice (`max_tokens_retries` 8→4,
+`compact_history(conv, tools)` 2→1) and left the shared ones alone, which is
+how you check that a merge preserved the work rather than resolving over it.
+
+Two things did not transfer mechanically. The per-iteration
+`tracing::info!(iteration, total_messages)` existed only in the non-streaming
+copy. And roughly ten comments in the streaming copy read "see run_inner" —
+pointers to the function being deleted; taking that body verbatim would have
+compiled, passed every test, and left the loop's reasoning pointing at
+nothing.
+
+One consequence, deliberate: every run now calls `chat_stream_with_choice`.
+No provider changes behaviour, but a provider implementing only the
+non-streaming variant would silently lose the iteration-0 tool-choice guard,
+because the trait's default chain drops the constraint.
+
+## Compaction now anchors on measurement
+
+`predicted_prompt_tokens` uses the last response's actual
+`prompt_tokens + completion_tokens` and applies the chars-per-token heuristic
+only to messages appended since. This replaced a pure estimate that
+undercounts JSON-heavy history by ~40%, which had let real prompts reach the
+window while the estimate sat below the threshold. The usage anchor is
+dropped whenever history is rewritten, because an anchor describing messages
+that no longer exist is worse than no anchor.
+
+## Other observations
+
+- **`voting.rs` (242 lines) is dead.** `ConsistencyVoter` is exported from
+  `lib.rs` and referenced from nowhere in the workspace.
+- **`HarnessRouter` holds an unused model provider.** `_classifier:
+  Arc<dyn ModelProvider>` is documented as "kept for potential future use" and
+  never read; routing is keyword matching. Meanwhile
+  `HarnessProfile::research()` is identical to `default()` except its name, and
+  `coding()`/`creative()` differ by two and three integers. The routing
+  machinery is more elaborate than the thing it routes between.
+- **This crate defines 16 tools.** `recall_tools` and `todo_tools` live here
+  because they need runner-adjacent state threaded through
+  `SessionToolContext`. Defensible, but it means "where do tools live" has two
+  answers, and the crate that owns the loop also depends on all of
+  `rustykrab-tools` (browser, Gmail, CalDAV, Notion, chromiumoxide) to compile.
+- **Four env reads** (`RUSTYKRAB_COMPACTION_*`) inside library code, read
+  through `OnceLock` at first use. They should be fields on `AgentConfig`.
+- **`estimate_tokens` now has one definition**, in `rustykrab-core`.
+- **`runner.rs` is now 6,171 lines** — larger than before the unification, because the compaction work added more than the merge removed. Removing the duplicate loop was necessary and not sufficient.
+  Compaction, response classification and tool execution are three coherent
+  modules sharing almost nothing but `&self`, and splitting them is easier
+  now that there is one loop rather than two.

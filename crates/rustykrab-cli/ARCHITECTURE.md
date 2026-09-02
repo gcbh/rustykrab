@@ -1,0 +1,114 @@
+# rustykrab-cli — Composition Root
+
+5 files, ~5,430 lines, 37 tests. Depends on every other crate.
+
+## Responsibility
+
+Read the environment, construct every object in the system, wire them together,
+spawn the background tasks, run the channel loops, and shut down gracefully.
+Also: subcommands (`skill`, `pair`, `keychain`) and the interactive chat REPL.
+
+| File | Lines | Role |
+|---|---|---|
+| `main.rs` | 3,050 | `main()` (~1,240 lines), adapters, channel loops, job executor, subcommands |
+| `task_queue.rs` | 1,336 | In-memory bounded queue for cron and credential-wake work |
+| `chat.rs` | 436 | Interactive terminal REPL |
+| `computer_backend.rs` | 375 | `ComputerBackend` impl (enigo + xcap), feature-gated |
+| `prompt_log.rs` | 69 | `TraceSink` impl writing prompt traces to disk |
+
+## `main()` is ~1,240 lines
+
+Lines 332–1571. In order it: parses subcommands, sets up tracing, resolves the
+data dir, opens the keychain and store, resolves the master key and auth token,
+starts the MCP connector task, builds the model provider, opens the memory
+database, loads or mints the persistent `agent_id`, spawns the FTS index
+rebuild, constructs the memory backend, spawns the idle lifecycle sweep, builds
+the video channel, loads and audits the skill registry, assembles ~65 tools
+across nine factory calls, loads the orchestration config, snapshots tools for
+sub-agents, applies tool stubs, builds `AppState` through ~15 builder calls,
+constructs the task queue, spawns the job executor, the delegated-task worker
+and the dream worker, binds the HTTP server, starts the Telegram/Slack/Signal
+loops, and waits on the shutdown signal.
+
+Every one of those steps is individually reasonable, and the ordering
+constraints between them are real and mostly commented (why the sub-agent tool
+snapshot happens before skill-tools; why stubs are applied last; why the MCP
+task starts before provider setup). But a 1,240-line function with that many
+ordering constraints is held together by comments rather than by types, and it
+is the least testable code in the workspace — 37 tests cover 5,300 lines.
+
+The decomposition is obvious from the comment headers already in the file:
+`build_storage`, `build_memory`, `build_tools`, `build_state`,
+`spawn_infrastructure`, `run_channels`. Each returns a struct; ordering
+constraints become argument dependencies the compiler checks.
+
+## The adapters
+
+`CronAdapter`, `MessageAdapter` and `ChannelHub` bridge concrete
+implementations to the tool-layer backend traits. `MemoryAdapter` is gone —
+`MemoryBackend` moved to `rustykrab-core`, so `rustykrab-memory` implements
+it directly.
+
+`CronAdapter` earns its place: `inherit_channel_for_create` merges the cron
+tool's explicit arguments with the calling conversation's channel context,
+because the model routinely omits `channel`/`chat_id` when scheduling from
+inside a chat and the job then has no delivery target. That is real behaviour,
+correctly located in the adapter layer.
+
+`ChannelHub` is where the missing `Channel` abstraction bites: it dispatches by
+matching on a channel-name string against a set of `Option<Arc<Concrete>>`
+handles.
+
+## The channel loops
+
+`telegram_agent_loop` + `process_telegram_message` (≈380 lines) and
+`slack_agent_loop` + `process_slack_message` (≈300 lines) implement the same
+sequence: resolve conversation (memory map → DB map → create), load, snapshot
+persisted message ids, append the user message, run the agent with a heartbeat
+monitor, persist with `save_turn`, extract the last assistant text, map every
+failure to a user-facing string. Telegram additionally runs a typing task and
+registers the run handle for mid-run message injection; Slack does neither.
+
+There are six copies in total once `gateway`'s two handlers and
+`task_queue.rs`'s two are counted. One shared
+`run_turn(context, conversation, text, hooks)` in `rustykrab-runtime` with
+thin per-surface wrappers would collapse them — and would be the natural home
+for two facts that are currently implicit: that Telegram supports mid-run
+injection and Slack silently does not, and that chat surfaces drain
+`PendingLinks` while app surfaces must not.
+
+That second one is not hypothetical. The drain existed only in the Telegram
+copy, so scheduled jobs minted a credential link and dropped it; the fix added
+it to a second copy. A third copy — the gateway — must *not* have it, because
+Apollo and WebChat render the form from `GET /api/credential-requests` and a
+live capture URL in a persisted transcript is what `pending_links` exists to
+prevent.
+
+## Two queues, two durability guarantees
+
+- `task_queue.rs` — bounded `mpsc` + semaphore, in memory. Carries cron fires
+  and credential-wake resumptions. A restart drops anything queued.
+- `gateway/tasks.rs` over `store::tasks` — durable, backed by `delegated_tasks`,
+  survives restart, supports cancellation.
+
+Cron survives the gap because `scheduled_jobs.next_run_at` is only advanced
+after execution, so a dropped task is re-picked on the next 30-second tick (and
+`dedupe_key` prevents double submission in the meantime). That reasoning is
+correct but implicit — it should be a comment on `TaskQueue`, because it is the
+only thing making the in-memory queue safe.
+
+Longer term these are one mechanism with a durability flag, not two.
+
+## Observations
+
+- **48 `env::var` reads here**, which is exactly right — this is where they
+  belong. The problem is the other 46 scattered through the library crates,
+  a count unchanged since the first pass.
+- `main.rs` mixes the daemon with three unrelated subcommand handlers
+  (`handle_skill_subcommand`, `handle_pair_subcommand`,
+  `handle_keychain_subcommand`, ~600 lines) that share nothing with it but the
+  data directory.
+- `resolve_max_context_tokens`, `load_harness_profile`, `load_orchestration_config`
+  and `credential_backend_from_env` are the configuration layer that the
+  library crates should have been given instead of reading the environment
+  themselves.

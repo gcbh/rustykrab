@@ -1,0 +1,96 @@
+# rustykrab-tools — Capabilities
+
+69 files, ~24,100 lines, 224 tests — the largest crate in the workspace.
+Depends on `core`, `store`, `channels`, `skills`.
+
+## Responsibility
+
+Implement 49 of the system's 65 `Tool` impls, plus the security utilities that
+guard them (SSRF host policy, output sanitisation, origin keying, sandboxed
+subprocess spawning).
+
+## Families
+
+| Family | Files | Notes |
+|---|---|---|
+| Filesystem | `read`, `write`, `edit`, `apply_patch` | |
+| Execution | `exec`, `process`, `code_execution`, `sandboxed_spawn` | |
+| Web | `web_fetch`, `web_search`, `x_search`, `http_request`, `http_session` | |
+| Browser | `browser/` — 9 files, 6,167 lines | CDP via chromiumoxide: manager, actions, selectors, snapshot, stealth, adaptive, fetcher |
+| Integrations | `gmail` (1,121), `caldav` (1,141), `notion` (1,216), `obsidian` (678), `wiki` (1,302), `mcp_connector` (708) | |
+| Memory | `memory_{save,search,get,delete}` + `memory_backend` | |
+| Credentials | `credential_{read,write,request,link}`, `google_credentials`, `origin_key` | |
+| Sessions | `sessions_*`, `subagents`, `agents_list`, `session_manager` | |
+| Meta | `tools_list`, `tools_load`, `task_complete`, `skills` | |
+| Media / UI | `image`, `video`, `canvas`, `computer`, `grid` | |
+| Devices | `nodes` (728) — peer delegation | |
+| Security | `security` (479), `sanitize` (251), `stub` (448) | |
+
+Registration is via grouped factory functions (`builtin_tools`, `memory_tools`,
+`skill_tools`, `wiki_tools`, `message_tools`, `video_tools`, `computer_tools`,
+`session_tools`), which is the right granularity — the composition root opts
+into families, not individual constructors.
+
+## The `tools_load` / `tools_list` pattern
+
+Rather than sending 65 tool schemas on every model call, an
+`ActiveToolsRegistry` (in `core`) tracks a per-conversation active set, and the
+agent expands it by calling the `tools_load` meta-tool. The runner caches
+computed schemas keyed by the active-set version, rebuilding only on change.
+
+This is a good answer to a real problem (schema bloat on small local models)
+and it is implemented in the right place — the registry is in `core`, so
+neither `tools` nor `agent` owns the other's state.
+
+## Backend traits
+
+Six traits are defined here — `MemoryBackend`, `CronBackend`, `MessageBackend`,
+`ComputerBackend`, `VideoBackend`, `SessionManager` — so that tools can depend
+on a contract rather than a concrete store or channel.
+
+The intent is right and the placement is wrong. Because the trait lives in the
+consumer crate, `rustykrab-memory` cannot implement `MemoryBackend` without a
+dependency cycle. It says so in a comment (`memory/src/backend.rs:34`) and
+implements a structurally identical but unrelated method set, which
+`cli/src/main.rs:56` then wraps in a pass-through adapter. Moving these traits
+to `rustykrab-core` deletes the adapters.
+
+`GatewayBackend` + `GatewayTool` + `automation_tools()` have **zero
+implementors and zero callers** — dead.
+
+## The abstraction is not applied uniformly
+
+Twelve files import `rustykrab_store` directly: `credential_read`,
+`credential_write`, `credential_request`, `credential_link`,
+`google_credentials`, `gmail`, `caldav`, `notion`, `obsidian`, `mcp_connector`,
+`browser/mod`, and `lib`. Two import `rustykrab_channels`.
+
+So the crate has two access patterns for external state — trait-mediated for
+six capabilities, direct for the rest — with no stated rule for which applies.
+In practice the split is historical: the trait pattern was applied to what
+existed when it was introduced. The credential path is the one that most wants
+the seam (it is the security-critical one, and the one that most needs to be
+testable in isolation).
+
+## Observations
+
+- **24 direct `env::var` reads.** `BROWSER_HEADLESS`, `CHROME_CDP_URL`,
+  `CHROME_EXECUTABLE`, `X_API_BEARER_TOKEN`, `CANVAS_API_URL`,
+  `RUSTYKRAB_MCP_SERVERS`, `RUSTYKRAB_NODES`, `RUSTYKRAB_SSRF_ALLOW_HOSTS`,
+  `RUSTYKRAB_WORKSPACE`, … This is the single biggest reason the crate cannot be
+  embedded elsewhere, and it has already produced one test race
+  (commit `37c5036`). A `ToolsConfig::from_env()` at the composition root, passed
+  down, fixes it.
+- **`stub.rs` (448 lines) is evaluation scaffolding shipped in the production
+  crate**, activated by `RUSTYKRAB_TOOL_STUBS`. It is well-guarded and loudly
+  logged, and the e2e harness needs it. It still means the release binary
+  contains a switch that replaces the entire tool registry. A cargo feature
+  (`--features eval-stubs`) would make that structural rather than conventional.
+- **`browser/` at 6,167 lines is a subsystem, not a tool.** It has its own
+  config, manager, session lifecycle, selector engine, snapshotting and
+  anti-detection logic. It would be a legitimate crate.
+- **Per-integration credential handling is repeated.** `gmail`, `caldav`,
+  `notion`, `obsidian` and `google_credentials` each resolve credentials, handle
+  the missing case, and shape the "ask the user" flow. `google_credentials`
+  (commit `5085277`, "one Google credential, one way of asking for it") shows the
+  consolidation is already happening for one provider; the pattern generalises.

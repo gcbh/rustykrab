@@ -1,0 +1,65 @@
+# rustykrab-e2e — Black-box Evaluation Harness
+
+13 files, ~6,800 lines, 35 tests. Depends only on `rustykrab-store` (read-only,
+to assert on database state). Not a dependency of anything.
+
+Run with `scripts/e2e.sh`.
+
+## Responsibility
+
+Boot the real daemon binary on a throwaway data directory and an ephemeral port,
+drive scenarios over HTTP, and assert on **both** the responses and the
+resulting store state. Emit a JSON report and a matching exit code.
+
+| File | Lines | Role |
+|---|---|---|
+| `main.rs` | 1,760 | Daemon lifecycle, scenario definitions, report assembly |
+| `model_suite.rs` | 951 | Scenarios against a real model |
+| `credential_suite.rs` | 716 | Credential-guard scenarios (the Phase 2 exit criteria) |
+| `login_suite.rs` | 649 | Authentication and pairing flows |
+| `ablation.rs` | 578 | Ablation runs — which component change moved the result |
+| `assertion.rs` | 469 | Assertion vocabulary over responses and store rows |
+| `transcript.rs` | 364 | Reads conversation transcripts directly from `store.db` |
+| `scripted_suite.rs` | 268 | Deterministic no-model, no-network scenarios |
+| `judge.rs` | 261 | LLM-as-judge scoring |
+| `classify.rs` | 239 | Outcome classification |
+| `report.rs` | 172 | JSON report |
+| `daemon.rs` | 270 | Process supervision |
+| `surface.rs` | 143 | HTTP client surface |
+
+## The xfail mechanism is the good idea here
+
+Scenarios encoding not-yet-built behaviour are marked **xfail**: the suite stays
+green while they fail, and a phase ships by flipping its scenarios to must-pass.
+An unexpected pass (**xpass**) *fails* the suite, forcing the scenario to be
+promoted rather than silently drifting into "passing but not required".
+
+That is a real answer to the usual problem with aspirational tests — they either
+block the build or get ignored. Encoding the exit criteria of a development
+phase as executable, currently-failing scenarios means the plan and the test
+suite cannot diverge.
+
+## Design
+
+Black-box by construction: it drives the built binary over HTTP and asserts on
+the SQLite file the binary wrote. It never links the daemon's internals. That
+makes it a genuine integration test rather than a large unit test, and it is why
+`rustykrab-store` is its only dependency.
+
+The two production affordances it relies on — `RUSTYKRAB_PROVIDER=scripted`
+(`providers/scripted.rs`) and `RUSTYKRAB_TOOL_STUBS` (`tools/stub.rs`) — are the
+price of that. Both are loudly logged and clearly documented as harness
+switches, but they are compiled into the release binary rather than gated behind
+a cargo feature. Feature-gating them (`--features eval-harness`) would keep the
+capability and remove it from production builds.
+
+## Observations
+
+- 6,800 lines of harness against 80,000 lines of system is a healthy ratio, and
+  the presence of an ablation runner and an LLM judge means the harness is
+  measuring quality, not just liveness.
+- Nine env reads, all appropriate for a test driver.
+- The harness has the clearest module boundaries of any crate here — daemon,
+  surface, assertion, transcript, judge, report are each one job. It is worth
+  noting that the code written *to test* the system is better factored than
+  several of the crates it tests.

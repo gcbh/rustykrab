@@ -1,0 +1,58 @@
+# rustykrab-skills — SKILL.md Loading and Trust
+
+6 files, ~1,100 lines, 19 tests. Depends only on `rustykrab-core`.
+
+## Responsibility
+
+Load `SKILL.md` files from disk, validate their declared requirements, verify
+ed25519 signatures on externally-sourced skills, hold them in a hot-reloadable
+registry, and render the catalogue into the system prompt.
+
+| File | Lines | Role |
+|---|---|---|
+| `prompt.rs` | 401 | `SystemPromptBuilder` — assembles the prompt including the skill catalogue |
+| `skill_md.rs` | 384 | Frontmatter parsing, requirement validation, `impl Skill for SkillMd` |
+| `skill.rs` | 111 | `Skill` trait, `SkillManifest`, `SkillRegistry` (RwLock interior mutability) |
+| `loader.rs` | 106 | Directory scan and single-file load |
+| `verify.rs` | 78 | `SkillVerifier` — ed25519 over trusted publisher keys |
+
+## Design
+
+**Requirement validation is startup-visible.** A skill declares
+`requires.env` / `requires.bins`; unmet requirements mark it unsatisfied, it is
+filtered out of every system-prompt catalogue, and the CLI logs a loud per-skill
+audit at boot. This is the right treatment: the failure mode without it is "the
+model never invokes the skill and nobody knows why".
+
+**Signature verification exists and is scoped correctly.** The doc comment names
+the threat (unsigned third-party skills as a supply-chain vector) rather than
+gesturing at "security".
+
+**`SkillOutcome` is the interesting piece.** A skill may declare what success
+means and what evidence establishes it; a skill *without* that declaration is
+frozen — the self-improvement outer loop will never propose edits to it. The
+reasoning is stated in the source: "an undeclared skill can only be mutated
+blindly, which is drift rather than improvement." That is a real design
+position, taken deliberately, and it is what makes `rustykrab-dream` safe to
+build on.
+
+**Skills are also registered as tools.** `skill_md_as_tools` (in
+`rustykrab-tools`) exposes each skill as a native tool whose `execute()` returns
+the body, with collision detection against the real tool set. The rationale in
+the CLI is empirical: small local models reach for native tools far more
+reliably than they consult a prompt catalogue and call a meta-tool. Registering
+the same artifact through two surfaces because one of them is measurably more
+reliable is a pragmatic call, and it is documented as one.
+
+## Observations
+
+- The `Skill` trait has one implementor (`SkillMd`) and one registry lookup
+  path. It is not doing harm, but it is thin — the registry could hold `SkillMd`
+  directly until a second shape exists.
+- `SkillRegistry` uses `RwLock` interior mutability specifically to support
+  hot registration and removal against a shared `Arc` without a restart. Right
+  call for a long-running daemon.
+- One env read.
+- The `extra: HashMap<String, toml::Value>` catch-all on frontmatter is good
+  forward-compatibility hygiene: an old binary reading a newer SKILL.md does not
+  fail, it ignores.

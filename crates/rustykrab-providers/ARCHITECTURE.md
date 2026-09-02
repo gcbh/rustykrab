@@ -1,0 +1,65 @@
+# rustykrab-providers — Model Backends
+
+7 files, ~6,000 lines, 105 tests. Depends only on `rustykrab-core`.
+
+## Responsibility
+
+Implement `ModelProvider` for each supported backend: translate the internal
+`Message` model to and from each vendor's wire format, handle streaming, map
+HTTP failures onto the error taxonomy.
+
+| File | Lines | Backend |
+|---|---|---|
+| `ollama.rs` | 3,096 | Local models; context-window detection, KV geometry, num_ctx sizing |
+| `openai.rs` | 1,195 | OpenAI-compatible chat completions |
+| `anthropic.rs` | 1,153 | Claude Messages API, tool use, streaming, tool_choice |
+| `scripted.rs` | 399 | Deterministic replay provider for the e2e harness |
+| `line_buffer.rs` | 130 | Shared SSE line accumulation across chunk boundaries |
+| `backoff.rs` | 35 | Shared retry backoff |
+
+## Structural pattern
+
+Each provider independently implements the same five internal functions:
+`build_messages`, `build_tools`, `parse_response`, `map_status_error`, and SSE
+delta accumulation.
+
+**This duplication is mostly justified.** The wire formats genuinely differ:
+Anthropic has content blocks and a separate top-level system prompt; OpenAI has
+`tool_calls` with string-encoded arguments accumulated across deltas; Ollama has
+its own message shape plus thinking-tag stripping and a token-budget trimmer.
+Forcing them through a shared translation layer would produce an abstraction
+with more special cases than the three implementations have in common. The parts
+that *are* genuinely shared — line buffering, backoff — have already been
+factored out, which is the correct line to have drawn.
+
+## Ollama is doing something the others are not
+
+`ollama.rs` is 2.7× the size of the next provider because it manages the
+server, not just the request: `detect_context_window` reads `/api/show`,
+`detect_model_shape` derives KV geometry, `log_kv_cache_estimate` reports VRAM
+implications, `trim_to_budget` shrinks prompts to the negotiated window, and
+`chat_with_ctx` re-sizes the window per call (which is what makes compaction's
+"summarise with a much larger window" strategy possible at all).
+
+That is real capability, and it is the reason `ModelProvider::chat_with_ctx` and
+`context_limit` exist as trait methods rather than Ollama-specific hacks. Good
+trait design driven by a real second implementation.
+
+## Observations
+
+- **Eight direct `env::var` reads** — `OLLAMA_NUM_CTX`, `OLLAMA_KEEP_ALIVE`,
+  `OLLAMA_TIMEOUT_SECS`, `ANTHROPIC_CONTEXT_LENGTH` and friends — read inside
+  the provider rather than passed by the caller. `OllamaProvider` already has a
+  full `OllamaConfig` struct and a builder; the env reads bypass both, so a
+  caller that constructs a provider explicitly can still be overridden by
+  ambient process state. That is the wrong precedence order.
+- **`scripted.rs` in the production crate.** Same trade as `tools/stub.rs`:
+  necessary for the e2e harness, but it means the release binary can be pointed
+  at a fake model with `RUSTYKRAB_PROVIDER=scripted`. A cargo feature would make
+  the boundary structural.
+- **`OpenAiProvider` does not override `requires_paired_tool_results`.** It
+  inherits the `true` default, which is correct for OpenAI, but it is worth an
+  explicit override with a comment — the next provider author will not know
+  whether `true` was chosen or inherited.
+- 105 tests, including wire-format tests that survive chunk splits inside
+  multi-byte characters. The right things are being tested.
