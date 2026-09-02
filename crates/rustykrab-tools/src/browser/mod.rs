@@ -23,7 +23,7 @@ use base64::Engine;
 use chromiumoxide::cdp::browser_protocol::network::Cookie;
 use chromiumoxide::page::ScreenshotParams;
 use rustykrab_core::types::ToolSchema;
-use rustykrab_core::{Error, Result, SandboxRequirements, Tool};
+use rustykrab_core::{Error, Result, SandboxRequirements, Tool, ToolError};
 use serde_json::{json, Value};
 
 use crate::security;
@@ -92,7 +92,7 @@ fn schema_parameters() -> serde_json::Value {
                     "fetch", "stealth_fetch", "select", "wait_for",
                     "fill_credential"
                 ],
-                "description": "Action to perform"
+                "description": "Action to perform. Required companion fields: open/navigate/fetch/stealth_fetch -> url; close/focus -> targetId; act -> ref + actAction; fill_credential -> ref; evaluate -> expression. Act sub-actions have additional requirements documented on actAction."
             },
             "field": {
                 "type": "string",
@@ -104,7 +104,7 @@ fn schema_parameters() -> serde_json::Value {
             },
             "url": {
                 "type": "string",
-                "description": "URL to navigate to or open (navigate/open actions)"
+                "description": "Required for open, navigate, fetch, and stealth_fetch"
             },
             "targetId": {
                 "type": "string",
@@ -112,28 +112,28 @@ fn schema_parameters() -> serde_json::Value {
             },
             "ref": {
                 "type": "string",
-                "description": "Element ref from a snapshot (e.g., '12' or 'e12'). Used by 'act' action"
+                "description": "Element ref from a snapshot (e.g., '12' or 'e12'). Required for act and fill_credential"
             },
             "actAction": {
                 "type": "string",
                 "enum": ["click", "type", "fill", "press", "hover", "select", "drag", "wait", "fill_credential"],
-                "description": "Sub-action for 'act' (e.g., click, type, press). Requires 'ref' from snapshot. 'fill_credential' fills a stored credential without its value passing through you — set 'field' to 'username' or 'password'; do not put the secret in 'text'"
+                "description": "Required when action='act'; every act also requires ref. Companion fields: type/fill -> text; press -> key; select -> value; drag -> targetRef. fill_credential uses field='username' or 'password' and never text, so the stored secret does not pass through you."
             },
             "text": {
                 "type": "string",
-                "description": "Text to type (act type/fill action)"
+                "description": "Required for actAction='type' or 'fill'"
             },
             "key": {
                 "type": "string",
-                "description": "Key to press (act press action, e.g., 'Enter', 'Tab', 'Escape')"
+                "description": "Required for actAction='press' (e.g., 'Enter', 'Tab', 'Escape')"
             },
             "value": {
                 "type": "string",
-                "description": "Value to select (act select action)"
+                "description": "Required for actAction='select'"
             },
             "targetRef": {
                 "type": "string",
-                "description": "Target element ref for drag action"
+                "description": "Required target element ref for actAction='drag'"
             },
             "clear": {
                 "type": "boolean",
@@ -145,7 +145,7 @@ fn schema_parameters() -> serde_json::Value {
             },
             "expression": {
                 "type": "string",
-                "description": "JavaScript to evaluate (evaluate action)"
+                "description": "Required when action='evaluate'; JavaScript to evaluate"
             },
             "format": {
                 "type": "string",
@@ -338,7 +338,84 @@ fn schema_parameters() -> serde_json::Value {
                 "description": "wait_for/stealth_fetch: extra delay in ms after other waits resolve"
             }
         },
-        "required": ["action"]
+        "required": ["action"],
+        "allOf": [
+            {
+                "if": {
+                    "properties": { "action": { "enum": ["open", "navigate", "fetch", "stealth_fetch"] } },
+                    "required": ["action"]
+                },
+                "then": { "required": ["url"] }
+            },
+            {
+                "if": {
+                    "properties": { "action": { "enum": ["close", "focus"] } },
+                    "required": ["action"]
+                },
+                "then": { "required": ["targetId"] }
+            },
+            {
+                "if": {
+                    "properties": { "action": { "const": "act" } },
+                    "required": ["action"]
+                },
+                "then": { "required": ["ref", "actAction"] }
+            },
+            {
+                "if": {
+                    "properties": {
+                        "action": { "const": "act" },
+                        "actAction": { "enum": ["type", "fill"] }
+                    },
+                    "required": ["action", "actAction"]
+                },
+                "then": { "required": ["text"] }
+            },
+            {
+                "if": {
+                    "properties": {
+                        "action": { "const": "act" },
+                        "actAction": { "const": "press" }
+                    },
+                    "required": ["action", "actAction"]
+                },
+                "then": { "required": ["key"] }
+            },
+            {
+                "if": {
+                    "properties": {
+                        "action": { "const": "act" },
+                        "actAction": { "const": "select" }
+                    },
+                    "required": ["action", "actAction"]
+                },
+                "then": { "required": ["value"] }
+            },
+            {
+                "if": {
+                    "properties": {
+                        "action": { "const": "act" },
+                        "actAction": { "const": "drag" }
+                    },
+                    "required": ["action", "actAction"]
+                },
+                "then": { "required": ["targetRef"] }
+            },
+            {
+                "if": {
+                    "properties": { "action": { "const": "fill_credential" } },
+                    "required": ["action"]
+                },
+                "then": { "required": ["ref"] }
+            },
+            {
+                "if": {
+                    "properties": { "action": { "const": "evaluate" } },
+                    "required": ["action"]
+                },
+                "then": { "required": ["expression"] }
+            }
+        ]
     })
 }
 
@@ -380,6 +457,73 @@ impl BrowserTool {
     pub fn with_secrets(mut self, secrets: rustykrab_store::GuardedSecrets) -> Self {
         self.secrets = Some(secrets);
         self
+    }
+
+    /// Validate action-specific arguments before touching a browser process.
+    ///
+    /// The schema exposes these requirements to the model and runner. This
+    /// runtime guard also protects direct `Tool::execute` callers and rejects
+    /// empty strings, which JSON Schema's `required` keyword cannot detect.
+    fn validate_action_args(action: &str, args: &Value) -> Result<()> {
+        fn require_non_empty(args: &Value, field: &str, action: &str) -> Result<()> {
+            if args
+                .get(field)
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.trim().is_empty())
+            {
+                return Ok(());
+            }
+            Err(Error::ToolExecution(ToolError::invalid_input(format!(
+                "browser action '{action}' requires non-empty '{field}'"
+            ))))
+        }
+
+        match action {
+            "open" | "navigate" | "fetch" | "stealth_fetch" => {
+                require_non_empty(args, "url", action)?;
+            }
+            "close" | "focus" => require_non_empty(args, "targetId", action)?,
+            "act" => {
+                require_non_empty(args, "ref", action)?;
+                require_non_empty(args, "actAction", action)?;
+                match args["actAction"].as_str().unwrap_or_default() {
+                    "type" => require_non_empty(args, "text", "act/type")?,
+                    "fill" => require_non_empty(args, "text", "act/fill")?,
+                    "press" => require_non_empty(args, "key", "act/press")?,
+                    "select" => require_non_empty(args, "value", "act/select")?,
+                    "drag" => require_non_empty(args, "targetRef", "act/drag")?,
+                    "click" | "hover" | "wait" | "fill_credential" => {}
+                    other => {
+                        return Err(Error::ToolExecution(ToolError::invalid_input(format!(
+                            "unknown act action '{other}'. Available: click, type, fill, press, hover, select, drag, wait, fill_credential"
+                        ))));
+                    }
+                }
+            }
+            "fill_credential" => require_non_empty(args, "ref", action)?,
+            "evaluate" => require_non_empty(args, "expression", action)?,
+            "wait_for" => {
+                let has_condition = args["wait_selector"]
+                    .as_str()
+                    .is_some_and(|value| !value.trim().is_empty())
+                    || args["network_idle"].as_bool().unwrap_or(false)
+                    || args["solve_cloudflare"].as_bool().unwrap_or(false)
+                    || args["delay_ms"].as_u64().is_some();
+                if !has_condition {
+                    return Err(Error::ToolExecution(ToolError::invalid_input(
+                        "browser action 'wait_for' requires at least one of: wait_selector, network_idle, solve_cloudflare, delay_ms",
+                    )));
+                }
+            }
+            "status" | "start" | "stop" | "profiles" | "tabs" | "snapshot" | "screenshot"
+            | "content" | "scroll" | "console" | "cookies" | "pdf" | "select" => {}
+            other => {
+                return Err(Error::ToolExecution(ToolError::invalid_input(format!(
+                    "unknown browser action '{other}'"
+                ))));
+            }
+        }
+        Ok(())
     }
 
     /// Resolve the profile name from args, falling back to the default.
@@ -583,9 +727,11 @@ impl Tool for BrowserTool {
     }
 
     async fn execute(&self, args: Value) -> Result<Value> {
-        let action = args["action"]
-            .as_str()
-            .ok_or_else(|| Error::ToolExecution("missing 'action' parameter".into()))?;
+        let action = args["action"].as_str().ok_or_else(|| {
+            Error::ToolExecution(ToolError::invalid_input("missing 'action' parameter"))
+        })?;
+
+        Self::validate_action_args(action, &args)?;
 
         let action = effective_action(action, &args);
 
@@ -1448,6 +1594,85 @@ impl Tool for BrowserTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn schema_enforces_action_specific_arguments() {
+        let parameters = schema_parameters();
+
+        let act_err = rustykrab_core::validate_tool_args(
+            &parameters,
+            &json!({ "action": "act", "ref": "e12" }),
+        )
+        .expect_err("act without actAction must fail schema validation");
+        assert_eq!(act_err.kind, rustykrab_core::ToolErrorKind::InvalidInput);
+        assert!(act_err.message.contains("'actAction'"), "{act_err}");
+        assert!(act_err.message.contains("'click'"), "{act_err}");
+
+        let evaluate_err =
+            rustykrab_core::validate_tool_args(&parameters, &json!({ "action": "evaluate" }))
+                .expect_err("evaluate without expression must fail schema validation");
+        assert!(
+            evaluate_err.message.contains("'expression'"),
+            "{evaluate_err}"
+        );
+
+        let type_err = rustykrab_core::validate_tool_args(
+            &parameters,
+            &json!({ "action": "act", "ref": "e12", "actAction": "type" }),
+        )
+        .expect_err("act/type without text must fail schema validation");
+        assert!(type_err.message.contains("'text'"), "{type_err}");
+
+        rustykrab_core::validate_tool_args(
+            &parameters,
+            &json!({ "action": "act", "ref": "e12", "actAction": "fill_credential" }),
+        )
+        .expect("fill_credential must not require text");
+        rustykrab_core::validate_tool_args(&parameters, &json!({ "action": "snapshot" }))
+            .expect("actions without conditional arguments must remain valid");
+    }
+
+    #[test]
+    fn schema_describes_companion_arguments_for_the_model() {
+        let parameters = schema_parameters();
+        let act_description = parameters["properties"]["actAction"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(act_description.contains("type/fill -> text"));
+        assert!(act_description.contains("press -> key"));
+        assert!(act_description.contains("drag -> targetRef"));
+
+        let expression_description = parameters["properties"]["expression"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(expression_description.contains("Required when action='evaluate'"));
+    }
+
+    #[tokio::test]
+    async fn malformed_action_arguments_are_typed_invalid_input() {
+        let tool = BrowserTool::with_config(config::BrowserConfig::default());
+        for (args, missing_field) in [
+            (json!({ "action": "act", "ref": "e12" }), "actAction"),
+            (json!({ "action": "evaluate" }), "expression"),
+            (json!({ "action": "navigate" }), "url"),
+        ] {
+            let err = tool
+                .execute(args)
+                .await
+                .expect_err("malformed action must fail before browser I/O");
+            match err {
+                Error::ToolExecution(tool_err) => {
+                    assert_eq!(tool_err.kind, rustykrab_core::ToolErrorKind::InvalidInput);
+                    assert!(
+                        tool_err.message.contains(missing_field),
+                        "{}",
+                        tool_err.message
+                    );
+                }
+                other => panic!("expected ToolExecution, got {other}"),
+            }
+        }
+    }
 
     #[test]
     fn read_on_a_blank_tab_is_an_error() {

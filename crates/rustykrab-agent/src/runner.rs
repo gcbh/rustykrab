@@ -21,7 +21,7 @@ use rustykrab_core::todo::TodoStore;
 use rustykrab_core::types::{
     ContentPart, Conversation, Message, MessageContent, Role, ToolCall, ToolResult, ToolSchema,
 };
-use rustykrab_core::{Error, Result, SandboxRequirements, Tool, ToolErrorKind};
+use rustykrab_core::{Error, Result, SandboxRequirements, Tool};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
@@ -3167,24 +3167,12 @@ async fn execute_with_watchdog(
 
 /// Retry a tool call up to `max_retries` times with exponential backoff.
 ///
-/// Invalid input, permission failures, and timeouts require the model to
-/// change its approach rather than repeating the exact same call. Preserve
-/// the existing retry behavior for other failures, which may be transient.
+/// Retry only errors whose structured kind explicitly says the identical call
+/// can succeed later. Treating the catch-all `Internal` kind as retryable is
+/// especially harmful for malformed calls: the runner repeats a deterministic
+/// failure several times before the model sees it.
 fn should_retry_unchanged_tool_call(error: &Error) -> bool {
-    if matches!(error, Error::Auth(_)) {
-        return false;
-    }
-
-    !matches!(
-        error,
-        Error::ToolExecution(tool_error)
-            if matches!(
-                tool_error.kind,
-                ToolErrorKind::InvalidInput
-                    | ToolErrorKind::PermissionDenied
-                    | ToolErrorKind::Timeout
-            )
-    )
+    error.kind().retryable()
 }
 
 async fn execute_with_retries(
@@ -3225,8 +3213,8 @@ async fn execute_with_retries(
 
 #[cfg(test)]
 mod retry_policy_tests {
-    use super::should_retry_unchanged_tool_call;
-    use rustykrab_core::{Error, ToolError};
+    use super::{should_retry_unchanged_tool_call, tool_error_output};
+    use rustykrab_core::{Error, Tool, ToolError, ToolErrorKind};
 
     #[test]
     fn avoids_retries_that_require_a_changed_call() {
@@ -3249,12 +3237,32 @@ mod retry_policy_tests {
         assert!(!should_retry_unchanged_tool_call(&Error::ToolExecution(
             ToolError::permission_denied("Google rejected the stored app password")
         )));
-        assert!(should_retry_unchanged_tool_call(&Error::Internal(
+        assert!(!should_retry_unchanged_tool_call(&Error::Internal(
             "uncategorized execution failure".into()
+        )));
+        assert!(!should_retry_unchanged_tool_call(&Error::ToolExecution(
+            ToolError::not_found("stale ref")
         )));
         assert!(!should_retry_unchanged_tool_call(&Error::Auth(
             "permission denied".into()
         )));
+    }
+
+    #[tokio::test]
+    async fn malformed_browser_call_is_not_retried() {
+        let browser = rustykrab_tools::BrowserTool::new();
+        let error = browser
+            .execute(serde_json::json!({ "action": "act", "ref": "e12" }))
+            .await
+            .expect_err("act without actAction must fail before browser I/O");
+
+        assert_eq!(error.kind(), ToolErrorKind::InvalidInput);
+        assert!(!should_retry_unchanged_tool_call(&error));
+
+        let (output, _) = tool_error_output(&error);
+        assert_eq!(output["error_kind"], "invalid_input");
+        assert_eq!(output["retryable"], false);
+        assert!(output["error"].as_str().unwrap().contains("actAction"));
     }
 }
 
