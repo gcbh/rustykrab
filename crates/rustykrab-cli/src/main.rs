@@ -111,6 +111,7 @@ impl CronBackend for CronAdapter {
                 ch.as_deref(),
                 cid.as_deref(),
                 tid.as_deref(),
+                rustykrab_core::timezone::configured().name(),
                 allow_duplicate,
             )
             .await?;

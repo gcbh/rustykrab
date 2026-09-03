@@ -141,6 +141,17 @@ hatch for the case that is genuinely two jobs — the same task at 8:00 and
 answers `NotFound` rather than `Ok(false)`, so "deleted it" and "there was
 nothing to delete" are not the same successful call.
 
+`timezone` holds the IANA zone the `schedule` string is written in; every
+timestamp column stays UTC. The split matters because an offset is not a
+timezone: storing `next_run_at` alone is enough to fire a job once, but not to
+advance it, since the offset between 09:00 local and its UTC instant changes at
+each DST transition. Keeping the zone means `mark_executed` re-derives the
+offset from the zone database on every advance, so a job holds its wall-clock
+time year-round. Rows predating the column read back as `UTC`, which is the
+lens they were created under — the migration backfills rather than
+reinterprets, because moving a live job's fire time is not a migration's call
+to make.
+
 The remaining duplication is `(channel, chat_id, thread_id)` on
 `scheduled_jobs`: it repeats addressing information that can also live in
 `channel_bindings`. That is intentional today because a scheduled job retains
