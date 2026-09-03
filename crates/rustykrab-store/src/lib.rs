@@ -1032,10 +1032,10 @@ mod tests {
                 .unwrap();
         }
 
-        assert!(JobStore::new(Arc::clone(&conn))
+        JobStore::new(Arc::clone(&conn))
             .delete_job("job")
             .await
-            .unwrap());
+            .unwrap();
 
         let guard = conn.lock().unwrap();
         assert_eq!(
