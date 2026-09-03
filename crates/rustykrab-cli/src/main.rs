@@ -92,6 +92,8 @@ impl CronBackend for CronAdapter {
         channel: Option<&str>,
         chat_id: Option<&str>,
         thread_id: Option<&str>,
+        timezone: Option<&str>,
+        allow_duplicate: bool,
     ) -> rustykrab_core::Result<serde_json::Value> {
         let session_conv_id =
             rustykrab_core::active_tools::with_session_context(|ctx| ctx.conversation_id);
@@ -101,6 +103,14 @@ impl CronBackend for CronAdapter {
         };
         let (ch, cid, tid) =
             inherit_channel_for_create(channel, chat_id, thread_id, inherited.as_ref());
+        // The model rarely knows what zone the user lives in, so an absent
+        // `timezone` means the operator's configured zone rather than UTC.
+        // Resolving it here — not in the store — keeps the store honest
+        // about interpreting exactly the zone it was handed.
+        let tz = match timezone {
+            Some(name) => rustykrab_core::timezone::parse(name)?,
+            None => rustykrab_core::timezone::configured(),
+        };
         let job = self
             .store
             .jobs()
@@ -110,6 +120,8 @@ impl CronBackend for CronAdapter {
                 ch.as_deref(),
                 cid.as_deref(),
                 tid.as_deref(),
+                tz.name(),
+                allow_duplicate,
             )
             .await?;
         Ok(serde_json::to_value(&job).expect("ScheduledJob is always serializable"))
@@ -122,35 +134,35 @@ impl CronBackend for CronAdapter {
 
     async fn delete_job(&self, job_id: &str) -> rustykrab_core::Result<serde_json::Value> {
         // Grab the conversation id (if any) before the row goes away so we
-        // can reap the associated persistent conversation below. Missing
-        // jobs are fine; delete_job returns `false` without error.
+        // can reap the associated persistent conversation below. A missing
+        // job propagates NotFound from `delete_job`, so the agent learns its
+        // delete matched nothing instead of reading `{"deleted": false}` as
+        // done.
         let conversation_id = match self.store.jobs().get_job(job_id).await {
             Ok(job) => job.conversation_id,
             Err(rustykrab_core::Error::NotFound(_)) => None,
             Err(e) => return Err(e),
         };
 
-        let deleted = self.store.jobs().delete_job(job_id).await?;
+        self.store.jobs().delete_job(job_id).await?;
 
-        if deleted {
-            if let Some(cid) = conversation_id {
-                if let Ok(uuid) = uuid::Uuid::parse_str(&cid) {
-                    // NotFound is fine — the conversation may already be gone.
-                    match self.store.conversations().delete(uuid).await {
-                        Ok(()) | Err(rustykrab_core::Error::NotFound(_)) => {}
-                        Err(e) => {
-                            tracing::warn!(
-                                job_id = %job_id,
-                                conv_id = %cid,
-                                "failed to reap conversation for deleted job: {e}"
-                            );
-                        }
+        if let Some(cid) = conversation_id {
+            if let Ok(uuid) = uuid::Uuid::parse_str(&cid) {
+                // NotFound is fine — the conversation may already be gone.
+                match self.store.conversations().delete(uuid).await {
+                    Ok(()) | Err(rustykrab_core::Error::NotFound(_)) => {}
+                    Err(e) => {
+                        tracing::warn!(
+                            job_id = %job_id,
+                            conv_id = %cid,
+                            "failed to reap conversation for deleted job: {e}"
+                        );
                     }
                 }
             }
         }
 
-        Ok(serde_json::json!({ "deleted": deleted, "job_id": job_id }))
+        Ok(serde_json::json!({ "deleted": true, "job_id": job_id }))
     }
 
     async fn list_runs(

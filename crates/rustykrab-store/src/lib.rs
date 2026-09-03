@@ -134,7 +134,13 @@ impl Store {
                 last_run_at     TEXT,
                 created_at      TEXT NOT NULL,
                 conversation_id TEXT,
-                created_version TEXT
+                created_version TEXT,
+                -- IANA zone the `schedule` string is written in. Every
+                -- timestamp column above stays UTC; this records the lens
+                -- those UTC instants were derived through, so each advance
+                -- of next_run_at re-reads the offset from the zone database
+                -- and the job holds its wall-clock time across DST.
+                timezone        TEXT NOT NULL DEFAULT 'UTC'
             );
 
             CREATE INDEX IF NOT EXISTS idx_scheduled_jobs_due
@@ -365,6 +371,19 @@ impl Store {
         if !existing.iter().any(|c| c == "created_version") {
             conn.execute(
                 "ALTER TABLE scheduled_jobs ADD COLUMN created_version TEXT",
+                [],
+            )
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        }
+        if !existing.iter().any(|c| c == "timezone") {
+            // Backfill 'UTC' rather than the operator's zone. Pre-existing
+            // rows had their cron fields matched against UTC, so UTC is the
+            // lens they were genuinely created under; stamping them with a
+            // local zone would reinterpret them and move every live job's
+            // fire time by the offset. Rewriting a job to local intent is a
+            // decision for whoever owns the job, not for a migration.
+            conn.execute(
+                "ALTER TABLE scheduled_jobs ADD COLUMN timezone TEXT NOT NULL DEFAULT 'UTC'",
                 [],
             )
             .map_err(|e| Error::Storage(e.to_string()))?;
@@ -1032,10 +1051,10 @@ mod tests {
                 .unwrap();
         }
 
-        assert!(JobStore::new(Arc::clone(&conn))
+        JobStore::new(Arc::clone(&conn))
             .delete_job("job")
             .await
-            .unwrap());
+            .unwrap();
 
         let guard = conn.lock().unwrap();
         assert_eq!(

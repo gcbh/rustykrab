@@ -117,7 +117,7 @@ expiry. Nothing to change.
 ```
 scheduled_jobs(id PK, schedule, task, channel, chat_id, thread_id, one_shot,
                enabled, next_run_at, last_run_at, created_at, conversation_id,
-               created_version)
+               created_version, timezone)
    INDEX (next_run_at) WHERE enabled = 1
 job_runs(id PK, job_id, status, output, started_at, finished_at,
          rustykrab_version)
@@ -128,6 +128,27 @@ job_runs(id PK, job_id, status, output, started_at, finished_at,
 separated; the partial index on `next_run_at WHERE enabled = 1` is exactly the
 poller's query. `created_version` / `rustykrab_version` stamping is a nice
 touch for attributing behaviour to a build.
+
+Recurring jobs are deduplicated on `(task, channel, chat_id, thread_id)` at
+insert, under the same lock as the write. The tuple deliberately excludes
+`schedule`: a second job running the same task on a *different* schedule is
+exactly what a failed replace leaves behind, and it is indistinguishable from
+intent afterwards. `JobStore::create_job` takes an `allow_duplicate` escape
+hatch for the case that is genuinely two jobs — the same task at 8:00 and
+17:30 cannot be one expression when the minute fields differ. `delete_job`
+answers `NotFound` rather than `Ok(false)`, so "deleted it" and "there was
+nothing to delete" are not the same successful call.
+
+`timezone` holds the IANA zone the `schedule` string is written in; every
+timestamp column stays UTC. The split matters because an offset is not a
+timezone: storing `next_run_at` alone is enough to fire a job once, but not to
+advance it, since the offset between 09:00 local and its UTC instant changes at
+each DST transition. Keeping the zone means `mark_executed` re-derives the
+offset from the zone database on every advance, so a job holds its wall-clock
+time year-round. Rows predating the column read back as `UTC`, which is the
+lens they were created under — the migration backfills rather than
+reinterprets, because moving a live job's fire time is not a migration's call
+to make.
 
 The gap: `job_runs.job_id` has no FK. `JobStore::delete_job` deletes the job row
 and leaves its runs orphaned forever. `ON DELETE CASCADE` costs one line.
