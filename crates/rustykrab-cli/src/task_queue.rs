@@ -491,6 +491,10 @@ async fn execute_cron_task(
 
     let run_options = rustykrab_runtime::RunOptions {
         active_skill: resolved_skill,
+        // Derived by the runtime from the resolved skill -- see
+        // `contract_for_active_skill`. Supplied here only when a caller
+        // knows something the registry does not.
+        outcome_contract: None,
         // Cron tasks must call a tool on iteration 0 — a bare "I'm ready"
         // reply is never the deliverable, and the model would otherwise
         // burn the slot.
@@ -686,6 +690,13 @@ fn build_scheduled_prompt(
 /// Operators commonly schedule jobs with natural-language task strings rather
 /// than bare skill names; without substring matching, those tasks never get the
 /// body inlined and the model loops on tool-discovery before giving up.
+/// The checkable claim a skill made about its own effects, if it made one.
+///
+/// Returns `None` unless the skill declared `signal = "verifiable"` *and*
+/// named at least one check: a skill that asked to be judged some other
+/// way must not have its runs promoted to ground truth, and a skill that
+/// named nothing has stated nothing to check. In both cases the run falls
+/// back to the weaker implicit signal rather than inventing evidence.
 fn resolve_skill_for_task(registry: &SkillRegistry, task_prompt: &str) -> Option<(String, String)> {
     let trimmed = task_prompt.trim();
     if trimmed.is_empty() {

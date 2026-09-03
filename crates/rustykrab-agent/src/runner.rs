@@ -927,6 +927,12 @@ pub struct AgentRunner {
     /// Name of the skill driving this run, recorded for attribution. The
     /// runner does not otherwise know about skills.
     active_skill: Option<String>,
+    /// What the active skill declared success to require, if anything.
+    outcome_contract: Option<rustykrab_core::OutcomeContract>,
+    /// How to observe the effects a contract names. Without probes a
+    /// contract cannot decide anything and the run falls back to the
+    /// behavioural signal.
+    probes: Option<Arc<rustykrab_core::ProbeRegistry>>,
 }
 
 impl AgentRunner {
@@ -952,6 +958,8 @@ impl AgentRunner {
             outcome_sink: None,
             retrieval_log: None,
             active_skill: None,
+            outcome_contract: None,
+            probes: None,
         }
     }
 
@@ -969,6 +977,27 @@ impl AgentRunner {
     /// so outcomes can be attributed to specific memories.
     pub fn with_retrieval_log(mut self, log: RetrievalLog) -> Self {
         self.retrieval_log = Some(log);
+        self
+    }
+
+    /// Declare what the active skill requires for a run to count as
+    /// successful, so outcomes can be recorded as ground truth rather than
+    /// as behavioural proxy. Without this the run is stamped `Implicit`
+    /// and every mutating stage correctly declines to act on it.
+    pub fn with_outcome_contract(mut self, contract: rustykrab_core::OutcomeContract) -> Self {
+        self.outcome_contract = Some(contract);
+        self
+    }
+
+    /// Supply the post-condition probes that can observe a contract's
+    /// declared effects.
+    ///
+    /// Separate from the contract because the contract comes from a
+    /// `SKILL.md` and the probes come from the deployment: which effects a
+    /// skill claims is a different question from which effects this
+    /// machine is able to look at.
+    pub fn with_probes(mut self, probes: Arc<rustykrab_core::ProbeRegistry>) -> Self {
+        self.probes = Some(probes);
         self
     }
 
@@ -992,7 +1021,48 @@ impl AgentRunner {
     /// a clean run that produced a wrong answer is indistinguishable here,
     /// which is why the record is stamped `Implicit` and carries low
     /// confidence. See `DREAMING.md`.
-    async fn capture_outcome(&self, session: &Session, tracer: &ExecutionTracer, errored: bool) {
+    /// Sample the effects this run's contract declares, before it runs.
+    ///
+    /// The "before" half of the post-condition window. Without it a check
+    /// could only assert that an effect exists, which says nothing about
+    /// the turn that just happened -- a calendar that already held the
+    /// event would credit every subsequent run for work done once.
+    ///
+    /// Returns an empty window when there is nothing to sample, which
+    /// costs nothing on the overwhelmingly common path where no skill is
+    /// driving the run.
+    async fn sample_preconditions(&self) -> rustykrab_core::ProbeWindow {
+        let (Some(contract), Some(probes)) = (&self.outcome_contract, &self.probes) else {
+            return rustykrab_core::ProbeWindow::default();
+        };
+        if !contract.is_checkable(probes) {
+            // Nothing here can decide anything, so do not pay for the
+            // observation. `unprobed` is logged once so a skill declaring
+            // an effect this deployment cannot see is visible to whoever
+            // has to fix the declaration.
+            let unprobed = contract.unprobed(probes);
+            if !unprobed.is_empty() {
+                tracing::debug!(
+                    skill = %contract.skill,
+                    unprobed = ?unprobed,
+                    "skill declares effects no probe can observe; falling back to implicit signal"
+                );
+            }
+            return rustykrab_core::ProbeWindow::default();
+        }
+        rustykrab_core::ProbeWindow {
+            before: probes.sample(&contract.checks).await,
+            after: Default::default(),
+        }
+    }
+
+    async fn capture_outcome(
+        &self,
+        session: &Session,
+        tracer: &ExecutionTracer,
+        errored: bool,
+        mut window: rustykrab_core::ProbeWindow,
+    ) {
         let Some(sink) = self.outcome_sink.as_ref() else {
             return;
         };
@@ -1005,7 +1075,28 @@ impl AgentRunner {
             compactions: tracer.compressions(),
         };
 
-        let (verdict, confidence, detail) = classify_run(errored, counters);
+        // A skill that declared what success requires gets checked against
+        // it; that answer is derived from what the run did, so it is
+        // ground truth rather than a proxy. Everything else falls back to
+        // the behavioural signal, which cannot tell a clean run that
+        // produced a wrong answer from one that produced a right one.
+        // The "after" half of the window. Sampled here, once the run is
+        // over, and compared against what was there before it started.
+        let contract_verdict = match (&self.outcome_contract, &self.probes) {
+            (Some(contract), Some(probes)) if contract.is_checkable(probes) => {
+                window.after = probes.sample(&contract.checks).await;
+                rustykrab_core::evaluate_contract(contract, probes, &window, errored)
+            }
+            _ => None,
+        };
+
+        let (verdict, signal, confidence, detail) = match contract_verdict {
+            Some(v) => (v.verdict, v.signal, v.confidence, v.detail),
+            None => {
+                let (verdict, confidence, detail) = classify_run(errored, counters);
+                (verdict, SignalClass::Implicit, confidence, detail)
+            }
+        };
 
         // Credit assignment: the skill driving the run, the memories that
         // were surfaced into it, and the tools it actually called.
@@ -1024,16 +1115,11 @@ impl AgentRunner {
             attributions.push(Attribution::tool(name.clone()));
         }
 
-        let record = OutcomeRecord::new(
-            session.conversation_id,
-            session.id,
-            verdict,
-            SignalClass::Implicit,
-        )
-        .with_confidence(confidence)
-        .with_detail(detail)
-        .with_counters(counters)
-        .with_attributions(attributions);
+        let record = OutcomeRecord::new(session.conversation_id, session.id, verdict, signal)
+            .with_confidence(confidence)
+            .with_detail(detail)
+            .with_counters(counters)
+            .with_attributions(attributions);
 
         if let Err(e) = sink.record_outcome(record).await {
             tracing::warn!(error = %e, "failed to record run outcome");
@@ -1385,6 +1471,11 @@ impl AgentRunner {
         let outcome_sink = self.outcome_sink.clone();
         let retrieval_log = self.retrieval_log.clone();
         let active_skill = self.active_skill.clone();
+        // Carried through, or a streaming run would silently record the
+        // weaker implicit signal while the same work non-streamed records
+        // ground truth.
+        let outcome_contract = self.outcome_contract.clone();
+        let probes = self.probes.clone();
 
         // Carry the trace id from the calling task into the spawned agent
         // task so prompt-log rows and agent-loop logs share the same id.
@@ -1407,6 +1498,8 @@ impl AgentRunner {
                 outcome_sink,
                 retrieval_log,
                 active_skill,
+                outcome_contract,
+                probes,
             };
             let body = async move {
                 runner
@@ -1471,11 +1564,14 @@ impl AgentRunner {
         // inner loop's many exit paths fired. Still one tracer per run,
         // so there is no cross-session leakage (H8).
         let tracer = ExecutionTracer::new();
+        // Sampled before the run, so the contract can tell an effect this
+        // run produced from one that was already there.
+        let window = self.sample_preconditions().await;
         let discard = |_event: AgentEvent| {};
         let result = SESSION_TOOL_CONTEXT
             .scope(ctx, self.run_inner(conv, session, &discard, &tracer))
             .await;
-        self.capture_outcome(session, &tracer, result.is_err())
+        self.capture_outcome(session, &tracer, result.is_err(), window)
             .await;
         // Release the per-conversation token-estimate and usage-anchor
         // entries so long-lived runners don't accumulate one per
@@ -2038,10 +2134,13 @@ impl AgentRunner {
         let ctx = self.build_session_context(session);
         // See `run` — hoisted so outcome capture sees the run's traces.
         let tracer = ExecutionTracer::new();
+        // Sampled before the run, so the contract can tell an effect this
+        // run produced from one that was already there.
+        let window = self.sample_preconditions().await;
         let result = SESSION_TOOL_CONTEXT
             .scope(ctx, self.run_inner(conv, session, on_event, &tracer))
             .await;
-        self.capture_outcome(session, &tracer, result.is_err())
+        self.capture_outcome(session, &tracer, result.is_err(), window)
             .await;
         // See `run` — bound the token-estimate cache to active runs.
         self.forget_token_estimate(conv.id);
@@ -5908,6 +6007,30 @@ mod outcome_capture_tests {
     struct FlakyTool {
         name: String,
         should_fail: bool,
+        /// The mark this tool leaves on the world when it succeeds.
+        ///
+        /// Stands in for a calendar gaining an event or a file appearing.
+        /// The point is that it is separate from the fact that the tool
+        /// was *called*: a failing call leaves it untouched, so a probe
+        /// reading it is answering a different question from the tracer.
+        effect: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    }
+
+    /// Observes the mark, not the call.
+    struct EffectProbe {
+        name: String,
+        effect: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl rustykrab_core::PostCondition for EffectProbe {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        async fn observe(&self) -> Result<rustykrab_core::Observation> {
+            let n = self.effect.load(std::sync::atomic::Ordering::SeqCst);
+            Ok(if n == 0 { None } else { Some(n.to_string()) })
+        }
     }
 
     #[async_trait]
@@ -5929,6 +6052,9 @@ mod outcome_capture_tests {
             if self.should_fail {
                 Err(Error::Internal("tool blew up".into()))
             } else {
+                if let Some(effect) = &self.effect {
+                    effect.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
                 Ok(serde_json::json!({"ok": true}))
             }
         }
@@ -5976,7 +6102,22 @@ mod outcome_capture_tests {
 
     /// A runner scripted to call `work` once, then `task_complete`.
     fn make_runner(tool_fails: bool) -> (AgentRunner, Session, Conversation) {
+        let (runner, session, conv, _) = make_runner_with_effect(tool_fails);
+        (runner, session, conv)
+    }
+
+    /// As `make_runner`, but also hands back the mark the `work` tool
+    /// leaves when it succeeds — the world a probe would look at.
+    fn make_runner_with_effect(
+        tool_fails: bool,
+    ) -> (
+        AgentRunner,
+        Session,
+        Conversation,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
         use rustykrab_tools::TaskCompleteTool;
+        let effect = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let provider = Arc::new(ScriptedProvider::new(vec![
             tool_use_response("work", serde_json::json!({})),
             tool_use_response("task_complete", serde_json::json!({ "summary": "done" })),
@@ -5986,6 +6127,7 @@ mod outcome_capture_tests {
             Arc::new(FlakyTool {
                 name: "work".into(),
                 should_fail: tool_fails,
+                effect: Some(Arc::clone(&effect)),
             }),
             Arc::new(TaskCompleteTool::new()),
         ];
@@ -5995,7 +6137,29 @@ mod outcome_capture_tests {
         active.activate(conv_id, ["work"]);
         let caps = CapabilitySet::for_tools_permissive(&["work", "task_complete"]);
         let session = Session::with_capabilities(conv_id, caps);
-        (runner, session, make_conv(conv_id))
+        (runner, session, make_conv(conv_id), effect)
+    }
+
+    /// A registry with one probe watching `effect`, under the given check
+    /// name.
+    fn probes_for(
+        check: &str,
+        effect: &Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Arc<rustykrab_core::ProbeRegistry> {
+        Arc::new(
+            rustykrab_core::ProbeRegistry::new().with(Arc::new(EffectProbe {
+                name: check.to_string(),
+                effect: Arc::clone(effect),
+            })),
+        )
+    }
+
+    fn verifiable(checks: &[&str]) -> rustykrab_core::OutcomeContract {
+        rustykrab_core::OutcomeContract::new(
+            "worker",
+            checks.iter().map(|s| s.to_string()).collect(),
+            SignalClass::Verifiable,
+        )
     }
 
     #[tokio::test]
@@ -6111,6 +6275,145 @@ mod outcome_capture_tests {
                 .contains(&Attribution::memory(other_memory)),
             "attribution must not leak across conversations"
         );
+    }
+
+    #[tokio::test]
+    async fn an_observed_effect_turns_the_record_into_ground_truth() {
+        // The probe watched the world change across the run, so this is
+        // evidence about what happened rather than about what the agent
+        // reported doing.
+        let sink = Arc::new(RecordingSink::default());
+        let (runner, session, mut conv, effect) = make_runner_with_effect(false);
+        let runner = runner
+            .with_outcome_sink(sink.clone())
+            .with_active_skill("worker")
+            .with_outcome_contract(verifiable(&["work_done"]))
+            .with_probes(probes_for("work_done", &effect));
+
+        runner.run(&mut conv, &session).await.unwrap();
+
+        let r = &sink.records()[0];
+        assert_eq!(r.verdict, OutcomeVerdict::Success);
+        assert_eq!(r.signal, SignalClass::Verifiable);
+        assert!(r.is_actionable());
+    }
+
+    #[tokio::test]
+    async fn a_run_whose_effect_never_appeared_is_not_success() {
+        // The tool blew up, so the world did not change. Ambiguous rather
+        // than Failure: from one run there is no telling "did not do it"
+        // from "has not done it yet", and a skill whose effects span turns
+        // must not be scored as harmful for being mid-conversation.
+        let sink = Arc::new(RecordingSink::default());
+        let (runner, session, mut conv, effect) = make_runner_with_effect(true);
+        let runner = runner
+            .with_outcome_sink(sink.clone())
+            .with_active_skill("worker")
+            .with_outcome_contract(verifiable(&["work_done"]))
+            .with_probes(probes_for("work_done", &effect));
+
+        let _ = runner.run(&mut conv, &session).await;
+
+        let r = &sink.records()[0];
+        assert_eq!(r.verdict, OutcomeVerdict::Ambiguous);
+        assert_eq!(r.signal, SignalClass::Verifiable);
+        assert!(r.detail.as_ref().unwrap().contains("work_done"));
+    }
+
+    #[tokio::test]
+    async fn an_effect_that_predates_the_run_is_not_credited_to_it() {
+        // The property tool-call matching could not express, and the
+        // reason a probe is sampled twice. The effect is present the whole
+        // time; the run did not produce it.
+        let sink = Arc::new(RecordingSink::default());
+        let (runner, session, mut conv, _) = make_runner_with_effect(true);
+        let preexisting = Arc::new(std::sync::atomic::AtomicUsize::new(1));
+        let runner = runner
+            .with_outcome_sink(sink.clone())
+            .with_active_skill("worker")
+            .with_outcome_contract(verifiable(&["work_done"]))
+            .with_probes(probes_for("work_done", &preexisting));
+
+        let _ = runner.run(&mut conv, &session).await;
+
+        let r = &sink.records()[0];
+        assert_eq!(
+            r.verdict,
+            OutcomeVerdict::Ambiguous,
+            "an effect that was already there is not this run's doing"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_check_no_probe_can_observe_falls_back_to_the_weaker_signal() {
+        // A typo in a SKILL.md, or a check written against a deployment
+        // that has no probe for it. Neither inventing ground truth nor
+        // manufacturing a permanent failure is acceptable, so the run is
+        // recorded on behavioural evidence instead.
+        //
+        // Two layers enforce this and only one of them is being measured
+        // here: `is_checkable` refuses the contract up front, and
+        // `evaluate` refuses again when a check has no observation on
+        // either side of the window. Breaking the first alone leaves this
+        // test green, because the second still catches it. The rule itself
+        // is pinned in `outcome_contract`'s own tests; what this proves is
+        // that the fallback reaches the record.
+        let sink = Arc::new(RecordingSink::default());
+        let (runner, session, mut conv, effect) = make_runner_with_effect(false);
+        let runner = runner
+            .with_outcome_sink(sink.clone())
+            .with_active_skill("worker")
+            .with_outcome_contract(verifiable(&["work_done", "typo_nobody_watches"]))
+            .with_probes(probes_for("work_done", &effect));
+
+        runner.run(&mut conv, &session).await.unwrap();
+
+        let r = &sink.records()[0];
+        assert_eq!(r.signal, SignalClass::Implicit);
+        assert!(!r.is_actionable());
+    }
+
+    #[tokio::test]
+    async fn a_contract_with_no_probes_at_all_falls_back() {
+        // A deployment that has registered nothing can produce no ground
+        // truth. That is the honest state, not a degraded one.
+        let sink = Arc::new(RecordingSink::default());
+        let (runner, session, mut conv) = make_runner(false);
+        let runner = runner
+            .with_outcome_sink(sink.clone())
+            .with_active_skill("worker")
+            .with_outcome_contract(verifiable(&["work_done"]));
+
+        runner.run(&mut conv, &session).await.unwrap();
+
+        assert_eq!(sink.records()[0].signal, SignalClass::Implicit);
+    }
+
+    #[tokio::test]
+    async fn the_event_loop_records_the_same_signal_as_a_direct_run() {
+        // `start()` does not borrow self -- it copies each field into a
+        // runner rebuilt inside a spawned task. A field left out of that
+        // copy compiles perfectly and silently downgrades every run the
+        // event loop drives, so the rebuild has to be exercised directly:
+        // calling `run_streaming` instead would pass with the probes
+        // dropped from `start()`.
+        let sink = Arc::new(RecordingSink::default());
+        let (runner, session, conv, effect) = make_runner_with_effect(false);
+        let runner = runner
+            .with_outcome_sink(sink.clone())
+            .with_active_skill("worker")
+            .with_outcome_contract(verifiable(&["work_done"]))
+            .with_probes(probes_for("work_done", &effect));
+
+        let (handle, mut events, join) = runner.start(conv, session);
+        while events.recv().await.is_some() {}
+        drop(handle);
+        let _ = join.await;
+
+        let records = sink.records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].signal, SignalClass::Verifiable);
+        assert_eq!(records[0].verdict, OutcomeVerdict::Success);
     }
 
     #[tokio::test]

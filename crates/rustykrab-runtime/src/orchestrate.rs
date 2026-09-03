@@ -36,6 +36,15 @@ pub struct RunOptions {
     /// appended to the system prompt so the model has the full recipe
     /// from turn 0 without a `skills`-tool round-trip.
     pub active_skill: Option<(String, String)>,
+    /// What the active skill declared it must actually *do* for the run to
+    /// count as successful, when it declared anything checkable.
+    ///
+    /// Separate from `active_skill` because that pair exists to build the
+    /// prompt: it carries the recipe, not the post-condition. Without this
+    /// the runner knows a skill's name but not its claims, so every run it
+    /// drives is recorded as `Implicit` proxy evidence and no later stage
+    /// is permitted to act on it.
+    pub outcome_contract: Option<rustykrab_core::OutcomeContract>,
     /// When `true`, the runner makes its first LLM call with
     /// `tool_choice = "any"`, forcing the model to invoke a tool. Used
     /// for scheduled tasks so the model can't waste the slot on a
@@ -284,6 +293,32 @@ fn build_session_capabilities(ctx: &AgentContext, tool_names: &[&str]) -> Capabi
     caps
 }
 
+/// The outcome contract declared by whichever skill is driving this turn.
+///
+/// `None` when no skill is active, when the skill declares no `[outcome]`
+/// block, or when it declares a signal other than `verifiable` — in every
+/// one of those cases the run has not asked to be judged as ground truth,
+/// and falls back to the behavioural signal.
+fn contract_for_active_skill(
+    registry: &rustykrab_skills::SkillRegistry,
+    options: &RunOptions,
+) -> Option<rustykrab_core::OutcomeContract> {
+    let (name, _) = options.active_skill.as_ref()?;
+    let md = registry
+        .md_skills()
+        .into_iter()
+        .find(|s| s.frontmatter.name.eq_ignore_ascii_case(name))?;
+    let outcome = md.frontmatter.outcome.as_ref()?;
+    if !outcome.is_verifiable() {
+        return None;
+    }
+    Some(rustykrab_core::OutcomeContract::new(
+        md.frontmatter.name.clone(),
+        outcome.checks.clone(),
+        outcome.signal_class(),
+    ))
+}
+
 async fn prepare_agent(
     ctx: &AgentContext,
     conv: &mut Conversation,
@@ -344,6 +379,26 @@ async fn prepare_agent(
         runner = runner.with_outcome_sink(Arc::new(ctx.store.outcomes()));
         if let Some((name, _)) = options.active_skill.as_ref() {
             runner = runner.with_active_skill(name.clone());
+        }
+        // Turns the record from proxy into ground truth when the skill
+        // declared a checkable outcome. Absent one, capture still happens
+        // -- it is simply stamped `Implicit`, as before.
+        // Derived here, from the skill this turn already resolved, rather
+        // than required from each caller. Passing it in meant only the
+        // cron path ever supplied one: ordinary chat and peer-delegated
+        // tasks ran skills whose declared effects nothing checked, so a
+        // skill's evidence depended on which door the turn came through.
+        // An explicit contract on `RunOptions` still wins, for a caller
+        // that knows better than the registry.
+        let contract = options
+            .outcome_contract
+            .clone()
+            .or_else(|| contract_for_active_skill(&ctx.skill_registry, options));
+        if let Some(contract) = contract {
+            runner = runner.with_outcome_contract(contract);
+        }
+        if let Some(probes) = ctx.probes.as_ref() {
+            runner = runner.with_probes(Arc::clone(probes));
         }
     }
 
@@ -522,4 +577,125 @@ pub async fn run_agent_streaming_with_options(
         extract_assistant_message(conv)
     })
     .await
+}
+
+#[cfg(test)]
+mod outcome_contract_tests {
+    //! Which skills get to be judged as ground truth.
+    //!
+    //! The derivation lives here, rather than at each caller, because a
+    //! skill's claims should not depend on which door the turn came
+    //! through. It used to be wired only into the cron path, so the same
+    //! skill produced verifiable evidence on a schedule and proxy evidence
+    //! in conversation.
+
+    use super::*;
+    use std::sync::Arc;
+
+    fn skill_with_outcome(
+        name: &str,
+        checks: &[&str],
+        signal: Option<&str>,
+    ) -> Arc<rustykrab_skills::skill_md::SkillMd> {
+        use rustykrab_skills::skill_md::{
+            RequirementValidation, SkillMd, SkillMdFrontmatter, SkillOutcome, SkillRequirements,
+        };
+        use std::path::PathBuf;
+
+        Arc::new(SkillMd {
+            path: PathBuf::from(format!("/tmp/{name}/SKILL.md")),
+            frontmatter: SkillMdFrontmatter {
+                name: name.to_string(),
+                description: "test skill".to_string(),
+                version: "1.0".to_string(),
+                requires: SkillRequirements::default(),
+                user_invocable: true,
+                emoji: None,
+                extra: Default::default(),
+                outcome: Some(SkillOutcome {
+                    success: "the meeting is booked".to_string(),
+                    checks: checks.iter().map(|c| c.to_string()).collect(),
+                    signal: signal.map(|s| s.to_string()),
+                }),
+            },
+            raw_body: "body".to_string(),
+            validation: RequirementValidation {
+                missing_env: Vec::new(),
+                missing_bins: Vec::new(),
+            },
+        })
+    }
+
+    fn registry_with(
+        skill: Option<Arc<rustykrab_skills::skill_md::SkillMd>>,
+    ) -> rustykrab_skills::SkillRegistry {
+        let registry = rustykrab_skills::SkillRegistry::new();
+        if let Some(s) = skill {
+            registry.register_md(s);
+        }
+        registry
+    }
+
+    fn options_for(name: &str) -> RunOptions {
+        RunOptions {
+            active_skill: Some((name.to_string(), "body".to_string())),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_verifiable_skill_yields_a_contract() {
+        let registry = registry_with(Some(skill_with_outcome(
+            "calendar-booking",
+            &["calendar_event_created", "email_sent"],
+            Some("verifiable"),
+        )));
+        let contract = contract_for_active_skill(&registry, &options_for("calendar-booking"))
+            .expect("a verifiable skill declares");
+
+        assert_eq!(contract.skill, "calendar-booking");
+        assert_eq!(contract.checks.len(), 2);
+    }
+
+    #[test]
+    fn a_skill_that_asked_for_another_kind_of_judgement_yields_no_contract() {
+        // Checks alone must not buy ground truth, or the loop could promote
+        // a model's opinion of itself to fact.
+        for (name, signal) in [
+            ("judged", Some("judge")),
+            ("implicit", Some("implicit")),
+            ("unstated", None),
+        ] {
+            let registry =
+                registry_with(Some(skill_with_outcome(name, &["did_the_thing"], signal)));
+            assert!(
+                contract_for_active_skill(&registry, &options_for(name)).is_none(),
+                "{name} must not be treated as verifiable"
+            );
+        }
+    }
+
+    #[test]
+    fn a_skill_declaring_no_checks_yields_no_contract() {
+        let registry = registry_with(Some(skill_with_outcome("vague", &[], Some("verifiable"))));
+        assert!(contract_for_active_skill(&registry, &options_for("vague")).is_none());
+    }
+
+    #[test]
+    fn no_active_skill_means_no_contract() {
+        // The overwhelmingly common turn. Nothing declared anything, so
+        // there is nothing to check and nothing to pay for.
+        let registry = registry_with(None);
+        assert!(contract_for_active_skill(&registry, &RunOptions::default()).is_none());
+    }
+
+    #[test]
+    fn an_unknown_skill_name_yields_no_contract() {
+        let registry = registry_with(Some(skill_with_outcome(
+            "known",
+            &["x"],
+            Some("verifiable"),
+        )));
+        assert!(contract_for_active_skill(&registry, &options_for("missing")).is_none());
+    }
 }
