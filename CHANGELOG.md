@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.2.26] - 2026-09-03
+
+- feat(memory): capture what the user says, and distil what is durable (#621)
+
 ## [5.2.25] - 2026-09-02
 
 - fix(caldav): use the endpoint that accepts an app password (#620)

@@ -109,6 +109,23 @@ impl AppState {
         self
     }
 
+    /// Set the model that decides what an inbound message is worth
+    /// remembering. See `AgentContext::distiller`.
+    pub fn with_distiller(mut self, distiller: Arc<dyn ModelProvider>) -> Self {
+        self.agent = self.agent.with_distiller(distiller);
+        self
+    }
+
+    /// Set the distiller, or leave distillation off when `None`. The caller
+    /// decides whether a distiller is available; this keeps that decision
+    /// out of the builder chain.
+    pub fn with_distiller_opt(mut self, distiller: Option<Arc<dyn ModelProvider>>) -> Self {
+        if let Some(d) = distiller {
+            self.agent = self.agent.with_distiller(d);
+        }
+        self
+    }
+
     pub fn with_sandbox(mut self, sandbox: Arc<dyn Sandbox>) -> Self {
         self.agent = self.agent.with_sandbox(sandbox);
         self
