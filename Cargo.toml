@@ -59,7 +59,11 @@ uuid = { version = "1", features = ["v4", "serde"] }
 
 # Time
 chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
 croner = "3"
+# Reads the host's IANA zone so a fresh install schedules in the operator's
+# local time without needing RUSTYKRAB_TIMEZONE set.
+iana-time-zone = "0.1"
 
 # Cryptography
 ed25519-dalek = { version = "2", features = ["rand_core", "serde"] }
