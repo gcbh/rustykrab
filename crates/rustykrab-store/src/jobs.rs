@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, LocalResult, NaiveDateTime, TimeZone, Utc};
 use croner::Cron;
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
@@ -118,7 +118,7 @@ impl JobStore {
         allow_duplicate: bool,
     ) -> Result<ScheduledJob, Error> {
         let now = Utc::now();
-        let (one_shot, next_run_at) = parse_schedule(schedule, now)?;
+        let (one_shot, next_run_at) = parse_schedule(schedule, now, Tz::UTC)?;
 
         let id = Uuid::new_v4().to_string();
         let job = ScheduledJob {
@@ -332,7 +332,7 @@ impl JobStore {
                 .map_err(|e| Error::Storage(e.to_string()))?;
             } else {
                 // Advance next_run_at for recurring jobs.
-                let next = compute_next_cron_run(&schedule, now)
+                let next = compute_next_cron_run(&schedule, now, Tz::UTC)
                     .unwrap_or_else(|_| now + chrono::Duration::hours(1));
                 conn.execute(
                     "UPDATE scheduled_jobs SET last_run_at = ?1, next_run_at = ?2 WHERE id = ?3",
@@ -514,10 +514,48 @@ fn zone_or_utc(name: Option<&str>) -> Tz {
         .unwrap_or(Tz::UTC)
 }
 
+/// Convert a wall-clock time in `tz` to the UTC instant it names.
+///
+/// Both DST edge cases have to resolve to *something*, because a job that
+/// refuses to schedule is worse than one that fires a few minutes off:
+///
+/// - **Ambiguous** (clocks go back; 01:30 happens twice): take the earlier
+///   instant, so the job fires once, on the first pass of that wall clock.
+/// - **Nonexistent** (clocks go forward; 02:30 never occurs): take the
+///   instant the gap ends, which is the first moment that day at or after
+///   the requested wall-clock time.
+fn local_to_utc(naive: NaiveDateTime, tz: Tz) -> DateTime<Utc> {
+    match tz.from_local_datetime(&naive) {
+        LocalResult::Single(dt) => dt.with_timezone(&Utc),
+        LocalResult::Ambiguous(earlier, _) => earlier.with_timezone(&Utc),
+        LocalResult::None => {
+            // Walk forward a minute at a time out of the gap. Real gaps are
+            // 30 or 60 minutes; 180 iterations covers every transition in
+            // the IANA database with room to spare.
+            let mut probe = naive;
+            for _ in 0..180 {
+                probe += chrono::Duration::minutes(1);
+                if let Some(dt) = tz.from_local_datetime(&probe).earliest() {
+                    return dt.with_timezone(&Utc);
+                }
+            }
+            // Unreachable for any real zone, but a scheduler must not panic.
+            probe.and_utc()
+        }
+    }
+}
+
 /// Parse a schedule string, returning `(is_one_shot, next_run_at)`.
-fn parse_schedule(schedule: &str, now: DateTime<Utc>) -> Result<(bool, DateTime<Utc>), Error> {
+///
+/// `tz` is the lens: cron fields and offset-less timestamps are read as
+/// wall-clock times in that zone. The returned instant is always UTC.
+fn parse_schedule(
+    schedule: &str,
+    now: DateTime<Utc>,
+    tz: Tz,
+) -> Result<(bool, DateTime<Utc>), Error> {
     // Try ISO 8601 / RFC 3339 timestamp first (one-shot).
-    if let Some(ts) = try_parse_datetime(schedule) {
+    if let Some(ts) = try_parse_datetime(schedule, tz) {
         if ts <= now {
             return Err(Error::Config(
                 "one-shot schedule must be in the future".to_string(),
@@ -527,33 +565,31 @@ fn parse_schedule(schedule: &str, now: DateTime<Utc>) -> Result<(bool, DateTime<
     }
 
     // Try cron expression (recurring).
-    let next = compute_next_cron_run(schedule, now)?;
+    let next = compute_next_cron_run(schedule, now, tz)?;
     Ok((false, next))
 }
 
 /// Try to parse a datetime string in multiple common formats.
 ///
-/// Accepts RFC 3339 (`2025-04-12T14:30:00Z`), with offset
-/// (`2025-04-12T14:30:00+02:00`), or naive datetime assumed as UTC
-/// (`2025-04-12T14:30:00`, `2025-04-12 14:30:00`).
-fn try_parse_datetime(s: &str) -> Option<DateTime<Utc>> {
+/// Accepts RFC 3339 (`2025-04-12T14:30:00Z`) or an explicit offset
+/// (`2025-04-12T14:30:00+02:00`), both of which already name an instant and
+/// so ignore `tz`. A naive datetime (`2025-04-12T14:30:00`) is read as a
+/// wall-clock time in `tz` — a user who omits the offset means their own
+/// clock, not Greenwich.
+fn try_parse_datetime(s: &str, tz: Tz) -> Option<DateTime<Utc>> {
     // RFC 3339 with timezone
     if let Ok(ts) = DateTime::parse_from_rfc3339(s) {
         return Some(ts.with_timezone(&Utc));
     }
-    // Naive datetime (no timezone) — assume UTC
-    if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S") {
-        return Some(naive.and_utc());
-    }
-    if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
-        return Some(naive.and_utc());
-    }
-    // Date + time without seconds
-    if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M") {
-        return Some(naive.and_utc());
-    }
-    if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M") {
-        return Some(naive.and_utc());
+    for format in [
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M",
+        "%Y-%m-%d %H:%M",
+    ] {
+        if let Ok(naive) = NaiveDateTime::parse_from_str(s, format) {
+            return Some(local_to_utc(naive, tz));
+        }
     }
     None
 }
@@ -562,7 +598,16 @@ fn try_parse_datetime(s: &str) -> Option<DateTime<Utc>> {
 ///
 /// Accepts standard 5-field cron (`minute hour dom month dow`), 6-field
 /// with seconds, or 7-field with seconds and year.
-fn compute_next_cron_run(expression: &str, after: DateTime<Utc>) -> Result<DateTime<Utc>, Error> {
+///
+/// The match runs against `after` rendered in `tz`, so the hour field means
+/// the hour on the operator's clock. Converting the result back to UTC is
+/// what keeps `"0 9 * * *"` at 09:00 local on both sides of a DST change
+/// instead of drifting to 08:00 or 10:00.
+fn compute_next_cron_run(
+    expression: &str,
+    after: DateTime<Utc>,
+    tz: Tz,
+) -> Result<DateTime<Utc>, Error> {
     let cron: Cron = expression
         .parse()
         .map_err(|e| {
@@ -573,7 +618,8 @@ fn compute_next_cron_run(expression: &str, after: DateTime<Utc>) -> Result<DateT
             ))
         })?;
 
-    cron.find_next_occurrence(&after, false)
+    cron.find_next_occurrence(&after.with_timezone(&tz), false)
+        .map(|dt| dt.with_timezone(&Utc))
         .map_err(|_| {
             Error::Config(format!(
                 "cron expression '{expression}' cannot produce a future occurrence. \
@@ -936,10 +982,86 @@ mod tests {
         );
     }
 
+    const LA: Tz = Tz::America__Los_Angeles;
+
+    /// A UTC instant, written the way a test reads best.
+    fn utc(y: i32, m: u32, d: u32, h: u32, min: u32) -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(y, m, d, h, min, 0).unwrap()
+    }
+
+    #[test]
+    fn cron_hour_means_the_operators_hour_not_greenwichs() {
+        // The bug this parameter exists to kill: "0 9 * * *" created by
+        // someone in Los Angeles fired at 09:00 UTC, which is 01:00 for
+        // them. Read through their zone it lands on 16:00 UTC — 9am Pacific.
+        let next = compute_next_cron_run("0 9 * * *", utc(2026, 7, 1, 0, 0), LA).unwrap();
+        assert_eq!(next, utc(2026, 7, 1, 16, 0), "9am PDT is 16:00 UTC");
+    }
+
+    #[test]
+    fn the_same_expression_holds_its_wall_clock_across_dst() {
+        // The reason a *zone* is threaded through and not the offset it
+        // resolved to at creation. One expression, two different UTC
+        // instants, because 9am Pacific is 16:00 UTC in July and 17:00 UTC
+        // in January. A frozen -07:00 would start firing at 8am once the
+        // clocks went back.
+        let summer = compute_next_cron_run("0 9 * * *", utc(2026, 7, 1, 0, 0), LA).unwrap();
+        let winter = compute_next_cron_run("0 9 * * *", utc(2026, 1, 1, 0, 0), LA).unwrap();
+        assert_eq!(summer, utc(2026, 7, 1, 16, 0));
+        assert_eq!(winter, utc(2026, 1, 1, 17, 0));
+    }
+
+    #[test]
+    fn utc_zone_still_reads_cron_fields_as_utc() {
+        // Every caller passes Tz::UTC for now, and existing jobs are stamped
+        // 'UTC', so this is the path that must not move: same expression,
+        // same instant as before.
+        let next = compute_next_cron_run("0 9 * * *", utc(2026, 7, 1, 0, 0), Tz::UTC).unwrap();
+        assert_eq!(next, utc(2026, 7, 1, 9, 0));
+    }
+
+    #[test]
+    fn naive_one_shot_timestamps_are_local() {
+        // Someone typing "2027-07-01T09:00" means nine in the morning where
+        // they are. Reading it as UTC is the same off-by-the-offset bug as
+        // the cron path, just on the one-shot side.
+        let (one_shot, at) = parse_schedule("2027-07-01T09:00", utc(2026, 1, 1, 0, 0), LA).unwrap();
+        assert!(one_shot);
+        assert_eq!(at, utc(2027, 7, 1, 16, 0));
+    }
+
+    #[test]
+    fn an_explicit_offset_overrides_the_zone() {
+        // A trailing Z (or any explicit offset) already names an instant.
+        // Re-interpreting it through the operator's zone would corrupt a
+        // timestamp the caller was precise about.
+        let (_, at) = parse_schedule("2027-07-01T09:00:00Z", utc(2026, 1, 1, 0, 0), LA).unwrap();
+        assert_eq!(at, utc(2027, 7, 1, 9, 0));
+    }
+
+    #[test]
+    fn ambiguous_local_times_take_the_earlier_instant() {
+        // 2026-11-01 01:30 happens twice in Los Angeles. Picking the first
+        // pass means the job fires once, at the first 01:30 — 08:30 UTC.
+        let naive =
+            NaiveDateTime::parse_from_str("2026-11-01T01:30:00", "%Y-%m-%dT%H:%M:%S").unwrap();
+        assert_eq!(local_to_utc(naive, LA), utc(2026, 11, 1, 8, 30));
+    }
+
+    #[test]
+    fn nonexistent_local_times_land_at_the_end_of_the_gap() {
+        // 2026-03-08 02:30 never occurs in Los Angeles — the clock jumps
+        // 02:00 → 03:00. The job has to fire anyway, at the first instant
+        // that exists after the requested one: 03:00 PDT = 10:00 UTC.
+        let naive =
+            NaiveDateTime::parse_from_str("2026-03-08T02:30:00", "%Y-%m-%dT%H:%M:%S").unwrap();
+        assert_eq!(local_to_utc(naive, LA), utc(2026, 3, 8, 10, 0));
+    }
+
     #[test]
     fn compute_next_cron_5_field_expression() {
         let now = Utc::now();
-        let result = compute_next_cron_run("*/5 * * * *", now);
+        let result = compute_next_cron_run("*/5 * * * *", now, Tz::UTC);
         assert!(result.is_ok(), "expected Ok, got: {result:?}");
         assert!(result.unwrap() > now);
     }
@@ -947,7 +1069,7 @@ mod tests {
     #[test]
     fn compute_next_cron_6_field_expression() {
         let now = Utc::now();
-        let result = compute_next_cron_run("0 */5 * * * *", now);
+        let result = compute_next_cron_run("0 */5 * * * *", now, Tz::UTC);
         assert!(result.is_ok(), "expected Ok, got: {result:?}");
         assert!(result.unwrap() > now);
     }
@@ -955,7 +1077,7 @@ mod tests {
     #[test]
     fn compute_next_cron_too_few_fields_gives_actionable_error() {
         let now = Utc::now();
-        let err = compute_next_cron_run("* *", now).unwrap_err();
+        let err = compute_next_cron_run("* *", now, Tz::UTC).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("invalid cron expression"), "got: {msg}");
         assert!(msg.contains("Example:"), "got: {msg}");
@@ -964,7 +1086,7 @@ mod tests {
     #[test]
     fn compute_next_cron_garbage_gives_actionable_error() {
         let now = Utc::now();
-        let err = compute_next_cron_run("not a cron", now).unwrap_err();
+        let err = compute_next_cron_run("not a cron", now, Tz::UTC).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("invalid cron expression"), "got: {msg}");
         assert!(msg.contains("Example:"), "got: {msg}");
@@ -974,7 +1096,7 @@ mod tests {
     fn compute_next_cron_unreachable_gives_actionable_error() {
         let now = Utc::now();
         // February 31st never exists
-        let err = compute_next_cron_run("0 0 31 2 *", now).unwrap_err();
+        let err = compute_next_cron_run("0 0 31 2 *", now, Tz::UTC).unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("cannot produce a future occurrence"),
@@ -986,7 +1108,7 @@ mod tests {
     #[test]
     fn parse_schedule_one_shot_in_past_fails() {
         let now = Utc::now();
-        let err = parse_schedule("2020-01-01T00:00:00Z", now).unwrap_err();
+        let err = parse_schedule("2020-01-01T00:00:00Z", now, Tz::UTC).unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("one-shot schedule must be in the future"),
@@ -998,7 +1120,7 @@ mod tests {
     fn parse_schedule_one_shot_in_future_succeeds() {
         let now = Utc::now();
         let future = (now + chrono::Duration::hours(1)).to_rfc3339();
-        let (one_shot, next_run) = parse_schedule(&future, now).unwrap();
+        let (one_shot, next_run) = parse_schedule(&future, now, Tz::UTC).unwrap();
         assert!(one_shot);
         assert!(next_run > now);
     }
@@ -1006,7 +1128,7 @@ mod tests {
     #[test]
     fn parse_schedule_valid_cron() {
         let now = Utc::now();
-        let (one_shot, next_run) = parse_schedule("0 9 * * *", now).unwrap();
+        let (one_shot, next_run) = parse_schedule("0 9 * * *", now, Tz::UTC).unwrap();
         assert!(!one_shot);
         assert!(next_run > now);
     }
