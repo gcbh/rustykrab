@@ -107,6 +107,20 @@ impl Tool for CronTool {
                         "type": "string",
                         "description": "Optional thread identifier so the result lands in the same thread that scheduled it. Telegram: forum topic thread_id. Slack: thread_ts (e.g. '1700000000.000100'). Omit for top-level."
                     },
+                    "allow_duplicate": {
+                        "type": "boolean",
+                        "description": concat!(
+                            "Optional for create, default false. Creating a second recurring ",
+                            "job with the same task and the same delivery target is refused, ",
+                            "because that is what a failed replace looks like and it silently ",
+                            "doubles how often the user is messaged. If the create fails this ",
+                            "way, do NOT retry with allow_duplicate — call list, and either use ",
+                            "the job that already exists or delete it and recreate. Set this ",
+                            "only when the user genuinely wants the same task on two schedules ",
+                            "that cannot be one expression (e.g. 8:00am and 5:30pm, whose ",
+                            "minute fields differ).",
+                        )
+                    },
                     "job_id": {
                         "type": "string",
                         "description": "Job identifier (required for delete and list_runs)"
@@ -151,10 +165,11 @@ impl Tool for CronTool {
                 let channel = args["channel"].as_str();
                 let chat_id = args["chat_id"].as_str();
                 let thread_id = args["thread_id"].as_str();
+                let allow_duplicate = args["allow_duplicate"].as_bool().unwrap_or(false);
 
                 let result = self
                     .backend
-                    .create_job(schedule, task, channel, chat_id, thread_id)
+                    .create_job(schedule, task, channel, chat_id, thread_id, allow_duplicate)
                     .await
                     .map_err(|e| rustykrab_core::Error::ToolExecution(e.to_string().into()))?;
 
@@ -226,6 +241,7 @@ mod tests {
     /// Stub backend that records whether `create_job` was reached.
     struct SpyBackend {
         called: std::sync::atomic::AtomicBool,
+        allow_duplicate: std::sync::atomic::AtomicBool,
     }
 
     #[async_trait]
@@ -237,8 +253,11 @@ mod tests {
             _channel: Option<&str>,
             _chat_id: Option<&str>,
             _thread_id: Option<&str>,
+            allow_duplicate: bool,
         ) -> Result<Value> {
             self.called.store(true, std::sync::atomic::Ordering::SeqCst);
+            self.allow_duplicate
+                .store(allow_duplicate, std::sync::atomic::Ordering::SeqCst);
             Ok(json!({"ok": true}))
         }
         async fn list_jobs(&self) -> Result<Value> {
@@ -255,6 +274,7 @@ mod tests {
     fn spy() -> (Arc<SpyBackend>, CronTool) {
         let backend = Arc::new(SpyBackend {
             called: std::sync::atomic::AtomicBool::new(false),
+            allow_duplicate: std::sync::atomic::AtomicBool::new(true),
         });
         let tool = CronTool::new(backend.clone());
         (backend, tool)
@@ -361,5 +381,53 @@ mod tests {
             .expect("real task should succeed");
         assert_eq!(result["action"], "create");
         assert!(backend.called.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn create_defaults_allow_duplicate_to_false() {
+        // The default has to be the safe one: an agent that omits the flag
+        // is exactly the agent that does not know a duplicate is possible.
+        let (backend, tool) = spy();
+        tool.execute(json!({
+            "action": "create",
+            "schedule": "0 9 * * *",
+            "task": "Write the daily briefing.",
+        }))
+        .await
+        .unwrap();
+        assert!(
+            !backend
+                .allow_duplicate
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "an omitted allow_duplicate must reach the backend as false"
+        );
+
+        tool.execute(json!({
+            "action": "create",
+            "schedule": "30 17 * * *",
+            "task": "Write the daily briefing.",
+            "allow_duplicate": true,
+        }))
+        .await
+        .unwrap();
+        assert!(backend
+            .allow_duplicate
+            .load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn allow_duplicate_schema_warns_against_using_it_as_a_retry() {
+        // The failure mode this flag invites: create is refused, the model
+        // reads "refused" as "try harder", sets the flag, and writes the
+        // duplicate the check existed to stop.
+        let (_, tool) = spy();
+        let schema = tool.schema();
+        let desc = schema.parameters["properties"]["allow_duplicate"]["description"]
+            .as_str()
+            .expect("allow_duplicate description should be a string");
+        assert!(
+            desc.contains("do NOT retry with allow_duplicate"),
+            "schema must forbid using the flag as a retry: {desc}"
+        );
     }
 }

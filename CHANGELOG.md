@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.2.28] - 2026-09-03
+
+- fix(store): refuse a second recurring job for the same task and target (#624)
+
 ## [5.2.27] - 2026-09-03
 
 - fix(store): distinguish "deleted it" from "nothing to delete" (#623)
