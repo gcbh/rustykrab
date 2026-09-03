@@ -81,6 +81,18 @@ impl JobStore {
     /// `schedule` is either a cron expression (e.g. `"0 9 * * *"`) for
     /// recurring jobs, or an ISO 8601 timestamp (e.g. `"2025-03-15T14:30:00Z"`)
     /// for one-shot jobs.
+    ///
+    /// Recurring jobs are deduplicated on `(task, channel, chat_id,
+    /// thread_id)`: creating a second enabled job that delivers the same
+    /// work to the same place returns [`Error::AlreadyExists`] naming the
+    /// job already doing it. An agent that has lost the memory of scheduling
+    /// something — through compaction, a new session, or a summary that
+    /// misdescribed it — otherwise silently doubles the user's delivery rate,
+    /// and nothing downstream can tell the two apart afterwards.
+    ///
+    /// `allow_duplicate` is the escape hatch for the case that is genuinely
+    /// two jobs: the same briefing at 8am and at 5:30pm cannot be one cron
+    /// expression when the minute fields differ.
     pub async fn create_job(
         &self,
         schedule: &str,
@@ -88,6 +100,7 @@ impl JobStore {
         channel: Option<&str>,
         chat_id: Option<&str>,
         thread_id: Option<&str>,
+        allow_duplicate: bool,
     ) -> Result<ScheduledJob, Error> {
         let now = Utc::now();
         let (one_shot, next_run_at) = parse_schedule(schedule, now)?;
@@ -111,6 +124,18 @@ impl JobStore {
 
         let row = job.clone();
         with_conn(&self.conn, move |conn| {
+            // Checked under the same lock as the insert, so two concurrent
+            // creates cannot both pass the check and both write.
+            if !allow_duplicate && !row.one_shot {
+                if let Some((existing_id, existing_schedule)) = find_duplicate(conn, &row)? {
+                    return Err(Error::AlreadyExists(format!(
+                        "a job already delivers this task here: id {existing_id}, \
+                         schedule '{existing_schedule}'. Delete it first if you meant \
+                         to replace it, or pass allow_duplicate to run both."
+                    )));
+                }
+            }
+
             conn.execute(
                 "INSERT INTO scheduled_jobs (id, schedule, task, channel, chat_id, thread_id, one_shot, enabled, next_run_at, last_run_at, created_at, conversation_id, created_version)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
@@ -419,6 +444,42 @@ fn row_to_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<ScheduledJob> {
     })
 }
 
+/// Find an enabled recurring job already delivering `candidate`'s task to
+/// the same destination, if one exists.
+///
+/// Identity is `(task, channel, chat_id, thread_id)` and deliberately
+/// excludes `schedule`: two jobs running the same task on *different*
+/// schedules is precisely the duplicate worth catching, since that is what a
+/// failed replace leaves behind. `IS` rather than `=` so a NULL channel
+/// matches a NULL channel — SQL equality would let an unaddressed job
+/// duplicate freely.
+///
+/// One-shot jobs are exempt (the caller checks `one_shot` before calling):
+/// two identical reminders at different times are ordinary, not a mistake.
+fn find_duplicate(
+    conn: &rusqlite::Connection,
+    candidate: &ScheduledJob,
+) -> Result<Option<(String, String)>, Error> {
+    conn.query_row(
+        "SELECT id, schedule FROM scheduled_jobs
+          WHERE enabled = 1 AND one_shot = 0
+            AND task = ?1 AND channel IS ?2 AND chat_id IS ?3 AND thread_id IS ?4
+          LIMIT 1",
+        params![
+            candidate.task,
+            candidate.channel,
+            candidate.chat_id,
+            candidate.thread_id
+        ],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .map(Some)
+    .or_else(|e| match e {
+        rusqlite::Error::QueryReturnedNoRows => Ok(None),
+        other => Err(Error::Storage(other.to_string())),
+    })
+}
+
 /// Parse a schedule string, returning `(is_one_shot, next_run_at)`.
 fn parse_schedule(schedule: &str, now: DateTime<Utc>) -> Result<(bool, DateTime<Utc>), Error> {
     // Try ISO 8601 / RFC 3339 timestamp first (one-shot).
@@ -507,7 +568,7 @@ mod tests {
         // before fix X" a query instead of a guess.
         let s = in_memory_jobs();
         let job = s
-            .create_job("0 9 * * *", "Daily briefing.", None, None, None)
+            .create_job("0 9 * * *", "Daily briefing.", None, None, None, false)
             .await
             .unwrap();
         assert_eq!(
@@ -528,7 +589,7 @@ mod tests {
     async fn record_run_stamps_version_and_list_runs_reads_it_back() {
         let s = in_memory_jobs();
         let job = s
-            .create_job("0 9 * * *", "Daily briefing.", None, None, None)
+            .create_job("0 9 * * *", "Daily briefing.", None, None, None, false)
             .await
             .unwrap();
         let now = Utc::now();
@@ -599,13 +660,164 @@ mod tests {
 
         // New writes into the migrated database do get stamped.
         let fresh = s
-            .create_job("0 9 * * *", "new task", None, None, None)
+            .create_job("0 9 * * *", "new task", None, None, None, false)
             .await
             .unwrap();
         assert_eq!(
             fresh.created_version.as_deref(),
             Some(rustykrab_core::VERSION)
         );
+    }
+
+    /// The exact shape of the 2026-06-24 incident: an agent that had lost
+    /// the memory of scheduling the briefing tried to "replace" it, deleted
+    /// nothing, and created a second job delivering the same task to the
+    /// same Telegram thread on a different schedule. Four briefings a day
+    /// followed, and nothing afterwards could tell the two apart.
+    #[tokio::test]
+    async fn create_refuses_a_second_job_for_the_same_task_and_target() {
+        let jobs = in_memory_jobs();
+        let first = jobs
+            .create_job(
+                "30 14,23 * * *",
+                "Execute skill: daily_briefing",
+                Some("telegram"),
+                Some("-1003776932999"),
+                Some("198"),
+                false,
+            )
+            .await
+            .unwrap();
+
+        let err = jobs
+            .create_job(
+                "30 7,16 * * *",
+                "Execute skill: daily_briefing",
+                Some("telegram"),
+                Some("-1003776932999"),
+                Some("198"),
+                false,
+            )
+            .await
+            .expect_err("a duplicate delivery must be refused");
+
+        assert!(
+            matches!(err, Error::AlreadyExists(_)),
+            "expected AlreadyExists, got {err:?}"
+        );
+        let msg = err.to_string();
+        // The caller cannot act on "duplicate" alone — it needs the id to
+        // delete, and the schedule to see whether the existing job is
+        // already what was wanted.
+        assert!(
+            msg.contains(&first.id),
+            "error must name the existing job: {msg}"
+        );
+        assert!(
+            msg.contains("30 14,23 * * *"),
+            "error must name its schedule: {msg}"
+        );
+        assert!(
+            msg.contains("allow_duplicate"),
+            "error must name the escape hatch: {msg}"
+        );
+
+        let listed = jobs.list_jobs().await.unwrap();
+        assert_eq!(listed.len(), 1, "the second job must not have been written");
+    }
+
+    #[tokio::test]
+    async fn allow_duplicate_permits_the_same_task_on_two_schedules() {
+        // 8:00am and 5:30pm cannot be one cron expression — the minute
+        // fields differ — so this genuinely is two jobs, and the check has
+        // to be overridable rather than absolute.
+        let jobs = in_memory_jobs();
+        jobs.create_job(
+            "0 8 * * *",
+            "Execute skill: daily_briefing",
+            Some("telegram"),
+            Some("-1003776932999"),
+            Some("198"),
+            false,
+        )
+        .await
+        .unwrap();
+        jobs.create_job(
+            "30 17 * * *",
+            "Execute skill: daily_briefing",
+            Some("telegram"),
+            Some("-1003776932999"),
+            Some("198"),
+            true,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(jobs.list_jobs().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn the_same_task_to_a_different_destination_is_not_a_duplicate() {
+        // Identity includes the delivery target: the same briefing posted to
+        // a second thread is a different job, not a mistake.
+        let jobs = in_memory_jobs();
+        for thread in ["198", "199"] {
+            jobs.create_job(
+                "0 9 * * *",
+                "Execute skill: daily_briefing",
+                Some("telegram"),
+                Some("-1003776932999"),
+                Some(thread),
+                false,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("thread {thread} should be allowed: {e}"));
+        }
+        assert_eq!(jobs.list_jobs().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn one_shot_jobs_are_exempt_from_the_duplicate_check() {
+        // Two identical reminders at different times are ordinary. Only
+        // recurring jobs compound into a delivery-rate problem.
+        let jobs = in_memory_jobs();
+        for hour in ["2099-01-01T09:00:00Z", "2099-01-01T17:00:00Z"] {
+            jobs.create_job(hour, "Remind me about the thing", None, None, None, false)
+                .await
+                .unwrap_or_else(|e| panic!("{hour} should be allowed: {e}"));
+        }
+        assert_eq!(jobs.list_jobs().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_disabled_job_does_not_block_recreation() {
+        // The executor disables jobs it finds unrunnable. A retired job must
+        // not become a permanent tombstone that prevents scheduling the work
+        // again.
+        let jobs = in_memory_jobs();
+        let first = jobs
+            .create_job(
+                "0 9 * * *",
+                "briefing",
+                Some("telegram"),
+                Some("c"),
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        jobs.set_enabled(&first.id, false).await.unwrap();
+
+        jobs.create_job(
+            "0 9 * * *",
+            "briefing",
+            Some("telegram"),
+            Some("c"),
+            None,
+            false,
+        )
+        .await
+        .expect("a disabled job must not block a fresh one");
     }
 
     #[tokio::test]
@@ -615,7 +827,7 @@ mod tests {
         // proceeded to create a replacement for a job that still existed.
         let jobs = in_memory_jobs();
         let job = jobs
-            .create_job("0 9 * * *", "briefing", None, None, None)
+            .create_job("0 9 * * *", "briefing", None, None, None, false)
             .await
             .unwrap();
 
@@ -733,7 +945,7 @@ mod tests {
     async fn conversation_id_round_trip() {
         let jobs = in_memory_jobs();
         let job = jobs
-            .create_job("*/5 * * * *", "ping", None, None, None)
+            .create_job("*/5 * * * *", "ping", None, None, None, false)
             .await
             .unwrap();
         assert!(
@@ -760,6 +972,7 @@ mod tests {
                 Some("slack"),
                 Some("C012345"),
                 Some("1700000000.000100"),
+                false,
             )
             .await
             .unwrap();
@@ -788,7 +1001,7 @@ mod tests {
     async fn record_run_caps_history_per_job() {
         let jobs = in_memory_jobs();
         let job = jobs
-            .create_job("*/5 * * * *", "ping", None, None, None)
+            .create_job("*/5 * * * *", "ping", None, None, None, false)
             .await
             .unwrap();
 

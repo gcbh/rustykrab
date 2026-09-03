@@ -92,6 +92,7 @@ impl CronBackend for CronAdapter {
         channel: Option<&str>,
         chat_id: Option<&str>,
         thread_id: Option<&str>,
+        allow_duplicate: bool,
     ) -> rustykrab_core::Result<serde_json::Value> {
         let session_conv_id =
             rustykrab_core::active_tools::with_session_context(|ctx| ctx.conversation_id);
@@ -110,6 +111,7 @@ impl CronBackend for CronAdapter {
                 ch.as_deref(),
                 cid.as_deref(),
                 tid.as_deref(),
+                allow_duplicate,
             )
             .await?;
         Ok(serde_json::to_value(&job).expect("ScheduledJob is always serializable"))
