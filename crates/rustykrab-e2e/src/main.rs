@@ -109,11 +109,9 @@ enum Expected {
     /// it fails, and an unexpected pass turns the suite red so the
     /// scenario gets promoted.
     ///
-    /// Currently unconstructed, because every scenario has been promoted —
-    /// which is exactly what "the server is done" looks like. Kept because
-    /// the next phase's targets are written as xfail first; deleting it
-    /// would throw away the convention the moment it had proved itself.
-    #[allow(dead_code)]
+    /// The dreaming loop's targets are written this way first: see the
+    /// `dream_*` scenarios, which stay xfail until the daemon runs the
+    /// loop on its own.
     XFail,
 }
 
@@ -968,6 +966,28 @@ async fn agent_delete_files_request(ctx: &Ctx) -> Result<()> {
 /// Plan §F3 scenario 8 (Phase 2): the lost-phone story — pair a device,
 /// confirm its token works, revoke it, and confirm the same token is
 /// then rejected with 401.
+/// DREAMING.md phase 2: after the daemon has seen enough verifiable
+/// outcomes, a downtime pass consolidates memory through stage-then-
+/// promote, and the manifest records a promoted cycle.
+///
+/// Nothing exposes this over HTTP, deliberately -- the loop is not a
+/// feature the client drives -- so the assertion is on the manifest table
+/// the engine writes. Zero rows is the honest state today: no installed
+/// skill declares an `[outcome]` block, the daemon does not construct a
+/// `ConsolidationContext`, and the scripted turns this suite drives
+/// produce proxy evidence only. Each of those is a step towards turning
+/// this scenario green, and none of them is this suite's to fake.
+async fn dream_promotes_a_consolidation_cycle(ctx: &Ctx) -> Result<()> {
+    let promoted = ctx.count(
+        "SELECT COUNT(*) FROM dream_cycles WHERE status = 'promoted'",
+        &[],
+    )?;
+    if promoted == 0 {
+        bail!("no promoted dream cycle in the manifest: the mutating loop is not wired into the daemon");
+    }
+    Ok(())
+}
+
 async fn revoked_device_401(ctx: &Ctx) -> Result<()> {
     let (device_id, token) = pair_a_device(ctx, "e2e-lost-phone").await?;
 
@@ -1896,6 +1916,15 @@ fn scripted_scenarios() -> Vec<(Expected, (&'static str, ScenarioFn))> {
         (Expected::Pass, scenario!(deny_preserves_value)),
         (Expected::Pass, scenario!(agent_delete_files_request)),
         (Expected::Pass, scenario!(revoked_device_401)),
+        // Dreaming — the outer loop. The engine and the manifest exist
+        // (`rustykrab-dream`), but nothing in the daemon runs a mutating
+        // cycle yet, so the target is written down here as xfail: the day
+        // a promoted cycle appears in this table on its own, the suite
+        // turns red and the scenario gets promoted with it.
+        (
+            Expected::XFail,
+            scenario!(dream_promotes_a_consolidation_cycle),
+        ),
     ]
 }
 

@@ -448,6 +448,18 @@ surface, the skill tier is theater and should be cut from scope honestly.
 Notably **not** required, thanks to staging + soft-delete: a DB snapshot engine,
 a job-state machine for pausing, conversation versioning, or a preemption bus.
 
+### Evals
+
+Each phase's targets are written down as evals before its code meets them
+(`rustykrab_dream::eval`): an eval expected to fail keeps the suite green and
+names what is missing; the day it passes, the suite turns red until it is
+promoted. `crates/rustykrab-dream/tests/evals.rs` and
+`crates/rustykrab-cli/tests/outcome_evals.rs` hold them, the e2e suite carries
+the daemon-level target as an `xfail` scenario, and
+`.github/workflows/dream-evals.yml` runs everything nightly at a seed range a
+pull request cannot afford. The report on that run is the loop's own
+scorecard: what it proves today, and what it still owes.
+
 ## Phase 0 as built
 
 Shipped and opt-in behind `RUSTYKRAB_OUTCOME_CAPTURE` (off by default).
