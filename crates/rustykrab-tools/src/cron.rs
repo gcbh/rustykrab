@@ -1,4 +1,6 @@
 use async_trait::async_trait;
+use chrono::{DateTime, TimeZone, Utc};
+use rustykrab_core::timezone;
 use rustykrab_core::types::ToolSchema;
 use rustykrab_core::{Result, Tool};
 use serde_json::{json, Value};
@@ -214,11 +216,13 @@ impl Tool for CronTool {
                 }))
             }
             "list" => {
-                let jobs = self
+                let mut jobs = self
                     .backend
                     .list_jobs()
                     .await
                     .map_err(|e| rustykrab_core::Error::ToolExecution(e.to_string().into()))?;
+
+                annotate_local_times(&mut jobs);
 
                 Ok(json!({
                     "action": "list",
@@ -269,6 +273,42 @@ impl Tool for CronTool {
     }
 }
 
+/// Add a `next_run_local` field to each listed job, rendered in that job's
+/// own zone.
+///
+/// The stored `next_run_at` is UTC, which is right for the database and
+/// useless in a chat reply: a user who asked for a 9am briefing and is shown
+/// `16:00Z` cannot tell at a glance whether it worked. Rendering it beside
+/// the UTC value — rather than replacing it — keeps the answer checkable in
+/// both directions. Jobs missing or carrying an unparseable zone are left
+/// untouched rather than guessed at.
+fn annotate_local_times(jobs: &mut Value) {
+    let Some(entries) = jobs.as_array_mut() else {
+        return;
+    };
+    for job in entries {
+        let Some(tz) = job["timezone"]
+            .as_str()
+            .and_then(|n| timezone::parse(n).ok())
+        else {
+            continue;
+        };
+        let Some(next) = job["next_run_at"]
+            .as_str()
+            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        else {
+            continue;
+        };
+        let local = tz.from_utc_datetime(&next.with_timezone(&Utc).naive_utc());
+        if let Some(obj) = job.as_object_mut() {
+            obj.insert(
+                "next_run_local".to_string(),
+                json!(local.format("%Y-%m-%d %H:%M %Z").to_string()),
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -300,7 +340,12 @@ mod tests {
             Ok(json!({"ok": true}))
         }
         async fn list_jobs(&self) -> Result<Value> {
-            Ok(json!([]))
+            Ok(json!([{
+                "id": "job-1",
+                "schedule": "0 9 * * *",
+                "timezone": "America/Los_Angeles",
+                "next_run_at": "2026-07-01T16:00:00+00:00",
+            }]))
         }
         async fn delete_job(&self, _job_id: &str) -> Result<Value> {
             Ok(json!({"deleted": false}))
@@ -475,6 +520,24 @@ mod tests {
         assert!(
             desc.contains("Do NOT convert to UTC"),
             "schema must forbid hand-conversion: {desc}"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_renders_next_run_in_the_jobs_own_zone() {
+        // "16:00Z" tells a user who asked for a 9am briefing nothing about
+        // whether they got one. Show both.
+        let (_, tool) = spy();
+        let result = tool.execute(json!({"action": "list"})).await.unwrap();
+        let job = &result["jobs"][0];
+        assert_eq!(
+            job["next_run_local"], "2026-07-01 09:00 PDT",
+            "16:00 UTC is 9am Pacific; got {:?}",
+            job["next_run_local"]
+        );
+        assert_eq!(
+            job["next_run_at"], "2026-07-01T16:00:00+00:00",
+            "the UTC value must survive alongside the rendering"
         );
     }
 
