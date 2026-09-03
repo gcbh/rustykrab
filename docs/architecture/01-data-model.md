@@ -129,8 +129,15 @@ separated; the partial index on `next_run_at WHERE enabled = 1` is exactly the
 poller's query. `created_version` / `rustykrab_version` stamping is a nice
 touch for attributing behaviour to a build.
 
-`delete_job` answers `NotFound` rather than `Ok(false)`, so "deleted it" and
-"there was nothing to delete" are not the same successful call.
+Recurring jobs are deduplicated on `(task, channel, chat_id, thread_id)` at
+insert, under the same lock as the write. The tuple deliberately excludes
+`schedule`: a second job running the same task on a *different* schedule is
+exactly what a failed replace leaves behind, and it is indistinguishable from
+intent afterwards. `JobStore::create_job` takes an `allow_duplicate` escape
+hatch for the case that is genuinely two jobs — the same task at 8:00 and
+17:30 cannot be one expression when the minute fields differ. `delete_job`
+answers `NotFound` rather than `Ok(false)`, so "deleted it" and "there was
+nothing to delete" are not the same successful call.
 
 The gap: `job_runs.job_id` has no FK. `JobStore::delete_job` deletes the job row
 and leaves its runs orphaned forever. `ON DELETE CASCADE` costs one line.
