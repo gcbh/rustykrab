@@ -9,13 +9,17 @@
 //! The two are closed over each other: outer-loop outputs become inner-loop
 //! inputs, and inner-loop traces become the outer loop's measurement.
 //!
-//! See `DREAMING.md` for the full design. This crate currently implements
-//! the **Analyze** stage only: deterministic, read-only reporting over
-//! recorded outcomes. Nothing here calls a model or changes any artifact.
+//! See `DREAMING.md` for the full design. This crate implements the
+//! **Analyze** stage (deterministic, read-only reporting over recorded
+//! outcomes) and the **Plan + Execute** stage for memory: a stage-then-
+//! promote consolidation cycle with a manifest that makes every promoted
+//! change reversible. Nothing here calls a model. The `eval` module is the
+//! protocol the crate's own evals report through.
 
 pub mod cluster_source;
 pub mod consolidation;
 pub mod engine;
+pub mod eval;
 pub mod memory_mutator;
 pub mod mutation;
 pub mod planner;
