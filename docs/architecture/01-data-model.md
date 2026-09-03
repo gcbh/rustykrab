@@ -129,6 +129,9 @@ separated; the partial index on `next_run_at WHERE enabled = 1` is exactly the
 poller's query. `created_version` / `rustykrab_version` stamping is a nice
 touch for attributing behaviour to a build.
 
+`delete_job` answers `NotFound` rather than `Ok(false)`, so "deleted it" and
+"there was nothing to delete" are not the same successful call.
+
 The gap: `job_runs.job_id` has no FK. `JobStore::delete_job` deletes the job row
 and leaves its runs orphaned forever. `ON DELETE CASCADE` costs one line.
 Separately, `(channel, chat_id, thread_id)` on `scheduled_jobs` duplicates the

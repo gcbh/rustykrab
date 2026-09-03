@@ -176,13 +176,31 @@ impl JobStore {
     }
 
     /// Delete a scheduled job by ID.
-    pub async fn delete_job(&self, job_id: &str) -> Result<bool, Error> {
+    ///
+    /// Returns [`Error::NotFound`] if no row matched, mirroring [`get_job`].
+    /// The earlier `Ok(false)` made "I deleted it" and "there was nothing to
+    /// delete" the same successful call, which every caller then had to
+    /// remember to distinguish — and one that forgot mistook a mistyped id
+    /// for a completed replacement and created a second job beside the one
+    /// it meant to remove.
+    ///
+    /// [`get_job`]: JobStore::get_job
+    pub async fn delete_job(&self, job_id: &str) -> Result<(), Error> {
         let job_id = job_id.to_string();
         with_conn(&self.conn, move |conn| {
             let rows = conn
-                .execute("DELETE FROM scheduled_jobs WHERE id = ?1", params![job_id])
+                .execute(
+                    "DELETE FROM scheduled_jobs WHERE id = ?1",
+                    params![job_id.clone()],
+                )
                 .map_err(|e| Error::Storage(e.to_string()))?;
-            Ok(rows > 0)
+            if rows == 0 {
+                return Err(Error::NotFound(format!(
+                    "job {job_id} — nothing was deleted. Call cron list to get \
+                     the current job ids."
+                )));
+            }
+            Ok(())
         })
         .await
     }
@@ -588,6 +606,40 @@ mod tests {
             fresh.created_version.as_deref(),
             Some(rustykrab_core::VERSION)
         );
+    }
+
+    #[tokio::test]
+    async fn delete_reports_not_found_rather_than_a_quiet_no_op() {
+        // The other half of the incident: the delete named an id one
+        // character off from the real one, returned "success", and the agent
+        // proceeded to create a replacement for a job that still existed.
+        let jobs = in_memory_jobs();
+        let job = jobs
+            .create_job("0 9 * * *", "briefing", None, None, None)
+            .await
+            .unwrap();
+
+        let mistyped = job.id.replace(
+            job.id.chars().last().unwrap(),
+            if job.id.ends_with('0') { "1" } else { "0" },
+        );
+        let err = jobs
+            .delete_job(&mistyped)
+            .await
+            .expect_err("deleting an unknown id must not report success");
+        assert!(
+            matches!(err, Error::NotFound(_)),
+            "expected NotFound, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("cron list"),
+            "error should say how to get valid ids: {err}"
+        );
+
+        // The real job is untouched, and deleting it properly succeeds.
+        assert_eq!(jobs.list_jobs().await.unwrap().len(), 1);
+        jobs.delete_job(&job.id).await.unwrap();
+        assert!(jobs.list_jobs().await.unwrap().is_empty());
     }
 
     #[test]
