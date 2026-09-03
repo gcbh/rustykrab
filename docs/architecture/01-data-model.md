@@ -117,7 +117,7 @@ expiry. Nothing to change.
 ```
 scheduled_jobs(id PK, schedule, task, channel, chat_id, thread_id, one_shot,
                enabled, next_run_at, last_run_at, created_at, conversation_id,
-               created_version)
+               created_version, timezone)
    INDEX (next_run_at) WHERE enabled = 1
 job_runs(id PK, job_id, status, output, started_at, finished_at,
          rustykrab_version)
