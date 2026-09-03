@@ -68,6 +68,18 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+/// Canonical content hash for a memory.
+///
+/// Shared rather than inlined per call site: dedup compares these, so two
+/// implementations that drift apart would silently stop recognising
+/// duplicates.
+pub fn hash_content(content: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(content.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
 pub use config::MemoryConfig;
 
 use lifecycle::{LifecycleManager, LifecycleSweepStats};

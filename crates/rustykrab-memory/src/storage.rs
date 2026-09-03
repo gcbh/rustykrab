@@ -9,6 +9,28 @@ use rusqlite::{params, OptionalExtension};
 use rustykrab_core::Result;
 use uuid::Uuid;
 
+/// One change to whether a memory is retrievable.
+///
+/// The unit of [`MemoryStorage::apply_validity_batch`]. Deliberately only
+/// two variants: these are the changes a consolidation makes, they are
+/// exact inverses of each other, and keeping the set closed is what lets
+/// the caller promise that anything it applies it can also take back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValidityOp {
+    /// Retire `id`, recording what superseded it.
+    Invalidate {
+        id: Uuid,
+        superseded_by: Option<Uuid>,
+    },
+    /// Return `id` to the retrievable set, but only if its tombstone still
+    /// names `expect_superseded_by`. A tombstone pointing elsewhere was
+    /// written by someone else and is not this caller's to undo.
+    Restore {
+        id: Uuid,
+        expect_superseded_by: Option<Uuid>,
+    },
+}
+
 use crate::types::{
     ExtractedFact, LifecycleStage, LinkType, Memory, MemoryChunk, MemoryLink, MemoryScope,
 };
@@ -101,6 +123,32 @@ pub trait MemoryStorage: Send + Sync {
 
     /// Soft-delete: mark a memory as invalid.
     async fn invalidate(&self, id: Uuid, invalidated_by: Option<Uuid>) -> Result<()>;
+
+    /// Apply a batch of validity changes in one transaction.
+    ///
+    /// Exists because the caller that needs it — the consolidation loop —
+    /// cannot get atomicity out of `invalidate`/`restore` called in a
+    /// loop, and half a promoted consolidation is exactly the state its
+    /// staging design exists to prevent.
+    ///
+    /// `Restore` carries the tombstone it expects to find. A restore whose
+    /// expectation no longer holds is skipped, not forced: something else
+    /// has since made a decision about that memory, and overriding it
+    /// silently is worse than declining. The return value is how many rows
+    /// actually changed, so a caller can tell a partial reversal from a
+    /// complete one.
+    async fn apply_validity_batch(&self, ops: &[ValidityOp]) -> Result<usize>;
+
+    /// Return a soft-deleted memory to the retrievable set.
+    ///
+    /// The inverse of [`MemoryStorage::invalidate`], and what makes a
+    /// promoted consolidation reversible (see `DREAMING.md`). Restores to
+    /// `episodic` rather than to whatever stage the memory held before:
+    /// the prior stage is not recorded, and episodic is the conservative
+    /// choice -- a restored memory re-earns promotion through the normal
+    /// lifecycle rather than being handed back a status it may no longer
+    /// deserve.
+    async fn restore(&self, id: Uuid) -> Result<()>;
 
     // ── Chunk operations ────────────────────────────────────────
 
@@ -1145,6 +1193,101 @@ impl MemoryStorage for SqliteMemoryStorage {
         .await?;
         // Tombstoned memories are no longer retrievable; drop their embeddings.
         self.embedding_cache.remove_memory(id);
+        Ok(())
+    }
+
+    async fn apply_validity_batch(&self, ops: &[ValidityOp]) -> Result<usize> {
+        if ops.is_empty() {
+            return Ok(0);
+        }
+        let ops_owned = ops.to_vec();
+        let now = Utc::now().to_rfc3339();
+
+        let (changed, dropped) = self
+            .with_conn(move |conn| {
+                let tx = conn.unchecked_transaction().map_err(storage_err)?;
+                let mut changed = 0usize;
+                // Ids whose embeddings are no longer wanted, collected
+                // inside the transaction but acted on only once it commits
+                // — a cache purged for a rolled-back write would be a
+                // side effect the transaction could not take back.
+                let mut dropped = Vec::new();
+
+                for op in &ops_owned {
+                    let n = match op {
+                        ValidityOp::Invalidate { id, superseded_by } => {
+                            let n = tx
+                                .execute(
+                                    "UPDATE memories
+                                     SET is_valid = 0,
+                                         lifecycle_stage = 'tombstone',
+                                         invalidated_by = ?2,
+                                         invalidated_at = ?3
+                                     WHERE id = ?1 AND is_valid = 1",
+                                    params![
+                                        id.to_string(),
+                                        superseded_by.map(|u| u.to_string()),
+                                        now
+                                    ],
+                                )
+                                .map_err(storage_err)?;
+                            if n > 0 {
+                                dropped.push(*id);
+                            }
+                            n
+                        }
+                        ValidityOp::Restore {
+                            id,
+                            expect_superseded_by,
+                        } => tx
+                            .execute(
+                                "UPDATE memories
+                                 SET is_valid = 1,
+                                     lifecycle_stage = 'episodic',
+                                     invalidated_by = NULL,
+                                     invalidated_at = NULL
+                                 WHERE id = ?1
+                                   AND is_valid = 0
+                                   AND invalidated_by IS ?2",
+                                params![
+                                    id.to_string(),
+                                    expect_superseded_by.map(|u| u.to_string())
+                                ],
+                            )
+                            .map_err(storage_err)?,
+                    };
+                    changed += n;
+                }
+
+                tx.commit().map_err(storage_err)?;
+                Ok((changed, dropped))
+            })
+            .await?;
+
+        for id in dropped {
+            self.embedding_cache.remove_memory(id);
+        }
+        Ok(changed)
+    }
+
+    async fn restore(&self, id: Uuid) -> Result<()> {
+        let id_str = id.to_string();
+        self.with_conn(move |conn| {
+            conn.execute(
+                "UPDATE memories
+                 SET is_valid = 1,
+                     lifecycle_stage = 'episodic',
+                     invalidated_by = NULL,
+                     invalidated_at = NULL
+                 WHERE id = ?1",
+                params![id_str],
+            )
+            .map_err(storage_err)?;
+            Ok(())
+        })
+        .await?;
+        // The memory is retrievable again, so its embeddings must be
+        // rebuilt; the cache is dropped for the agent on next write.
         Ok(())
     }
 
