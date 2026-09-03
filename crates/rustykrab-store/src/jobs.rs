@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
 use uuid::Uuid;
 
+use rustykrab_core::timezone::{self, Tz};
 use rustykrab_core::Error;
 
 use crate::with_conn;
@@ -43,6 +44,20 @@ pub struct ScheduledJob {
     /// build makes "which jobs were created before fix X?" a query rather
     /// than a guess. `None` for jobs created before this column existed.
     pub created_version: Option<String>,
+    /// IANA zone the `schedule` field is written in, e.g.
+    /// `America/Los_Angeles`.
+    ///
+    /// `next_run_at` and every other timestamp on this row stay UTC. This
+    /// is only the lens: `"30 7 * * *"` means half past seven *here*, and
+    /// the zone database supplies the offset for each individual fire, so
+    /// the job holds its wall-clock time across the DST boundary instead of
+    /// sliding an hour every spring.
+    ///
+    /// Jobs written before this column existed read back as `UTC`, which is
+    /// exactly the lens they were created under — the migration does not
+    /// reinterpret them, because silently moving a live job's fire time is
+    /// worse than leaving it where the operator last saw it.
+    pub timezone: String,
 }
 
 /// A recorded execution of a scheduled job.
@@ -120,6 +135,10 @@ impl JobStore {
             created_at: now,
             conversation_id: None,
             created_version: Some(rustykrab_core::VERSION.to_string()),
+            // The schedule is still matched against UTC, so UTC is the
+            // honest record of the lens. A `timezone` parameter replaces
+            // this constant once the scheduling path can read a zone.
+            timezone: Tz::UTC.name().to_string(),
         };
 
         let row = job.clone();
@@ -137,8 +156,8 @@ impl JobStore {
             }
 
             conn.execute(
-                "INSERT INTO scheduled_jobs (id, schedule, task, channel, chat_id, thread_id, one_shot, enabled, next_run_at, last_run_at, created_at, conversation_id, created_version)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                "INSERT INTO scheduled_jobs (id, schedule, task, channel, chat_id, thread_id, one_shot, enabled, next_run_at, last_run_at, created_at, conversation_id, created_version, timezone)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
                 params![
                     row.id,
                     row.schedule,
@@ -153,6 +172,7 @@ impl JobStore {
                     row.created_at.to_rfc3339(),
                     row.conversation_id,
                     row.created_version,
+                    row.timezone,
                 ],
             )
             .map_err(|e| Error::Storage(e.to_string()))?;
@@ -423,7 +443,7 @@ impl JobStore {
 /// Column list for `SELECT`s against `scheduled_jobs`. Kept in sync with
 /// [`row_to_job`].
 const JOB_COLUMNS: &str = "id, schedule, task, channel, chat_id, thread_id, one_shot, enabled, \
-     next_run_at, last_run_at, created_at, conversation_id, created_version";
+     next_run_at, last_run_at, created_at, conversation_id, created_version, timezone";
 
 /// Decode a row produced by a `SELECT {JOB_COLUMNS}` into a [`ScheduledJob`].
 fn row_to_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<ScheduledJob> {
@@ -441,6 +461,9 @@ fn row_to_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<ScheduledJob> {
         created_at: parse_stored_timestamp(row.get::<_, String>(10)?),
         conversation_id: row.get::<_, Option<String>>(11)?,
         created_version: row.get::<_, Option<String>>(12)?,
+        timezone: zone_or_utc(row.get::<_, Option<String>>(13)?.as_deref())
+            .name()
+            .to_string(),
     })
 }
 
@@ -478,6 +501,17 @@ fn find_duplicate(
         rusqlite::Error::QueryReturnedNoRows => Ok(None),
         other => Err(Error::Storage(other.to_string())),
     })
+}
+
+/// Resolve a stored zone name, falling back to UTC.
+///
+/// A row written before the `timezone` column existed, or one holding a name
+/// this build's zone database does not know, still has to schedule. UTC is
+/// the only defensible fallback: it is what those rows were already being
+/// interpreted as, so nothing silently moves.
+fn zone_or_utc(name: Option<&str>) -> Tz {
+    name.and_then(|n| timezone::parse(n).ok())
+        .unwrap_or(Tz::UTC)
 }
 
 /// Parse a schedule string, returning `(is_one_shot, next_run_at)`.
@@ -852,6 +886,54 @@ mod tests {
         assert_eq!(jobs.list_jobs().await.unwrap().len(), 1);
         jobs.delete_job(&job.id).await.unwrap();
         assert!(jobs.list_jobs().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn migration_reads_pre_existing_jobs_as_utc() {
+        // Rows written before the column existed had their cron fields
+        // matched against UTC. Stamping them with the operator's local zone
+        // would move every live job by the offset without anyone asking, so
+        // the migration backfills the lens they were actually created under.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE scheduled_jobs (
+                 id TEXT PRIMARY KEY, schedule TEXT NOT NULL, task TEXT NOT NULL,
+                 channel TEXT, chat_id TEXT, thread_id TEXT,
+                 one_shot INTEGER NOT NULL DEFAULT 0, enabled INTEGER NOT NULL DEFAULT 1,
+                 next_run_at TEXT NOT NULL, last_run_at TEXT, created_at TEXT NOT NULL,
+                 conversation_id TEXT
+             );
+             CREATE TABLE job_runs (
+                 id TEXT PRIMARY KEY, job_id TEXT NOT NULL, status TEXT NOT NULL,
+                 output TEXT, started_at TEXT NOT NULL, finished_at TEXT NOT NULL
+             );
+             INSERT INTO scheduled_jobs (id, schedule, task, next_run_at, created_at)
+                 VALUES ('old-job', '0 9 * * *', 'legacy task',
+                         '2099-01-01T00:00:00+00:00', '2020-01-01T00:00:00+00:00');",
+        )
+        .unwrap();
+        crate::Store::run_migrations(&conn).unwrap();
+        let s = JobStore::new(Arc::new(Mutex::new(conn)));
+
+        let job = s.get_job("old-job").await.unwrap();
+        assert_eq!(job.timezone, "UTC");
+
+        // And it keeps firing where it always did.
+        s.mark_executed("old-job").await.unwrap();
+        let advanced = s.get_job("old-job").await.unwrap();
+        assert_eq!(advanced.next_run_at.format("%H:%M").to_string(), "09:00");
+    }
+
+    #[test]
+    fn unknown_stored_zones_fall_back_to_utc_rather_than_failing() {
+        // A row could hold a zone this build's database has dropped. The
+        // scheduler must keep running; UTC is where those rows already were.
+        assert_eq!(zone_or_utc(None), Tz::UTC);
+        assert_eq!(zone_or_utc(Some("Mars/Olympus_Mons")), Tz::UTC);
+        assert_eq!(
+            zone_or_utc(Some("America/Los_Angeles")),
+            Tz::America__Los_Angeles
+        );
     }
 
     #[test]
