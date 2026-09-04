@@ -47,10 +47,15 @@ Node 24-based `actions/create-github-app-token@v3`. GitHub-hosted runners are
 the supported execution environment, so the action majors and runner runtime
 advance together instead of relying on GitHub's temporary Node 20 shim.
 Evidence and release bundles use `actions/upload-artifact@v7`, and publication
-uses `actions/download-artifact@v8` with digest mismatches failing by default.
-Release builds restore Rust caches but set `save-if: false`: the workflow's
-least-privilege token cannot write Actions caches, and a successful release
-must not end with a knowingly unauthorized post-job write attempt.
+uses `actions/download-artifact@v8` with digest mismatches failing by default;
+`softprops/action-gh-release@v3` publishes through its Node 24 runtime. The
+Linux cross-build downloads Zig 0.13.0 directly from Zig's versioned HTTPS
+archive and verifies its pinned SHA-256 digest before adding it to `PATH`. This
+avoids delegating a release toolchain install to an action whose maintained
+versions still declare Node 20. Release builds restore Rust caches but set
+`save-if: false`: the workflow's least-privilege token cannot write Actions
+caches, and a successful release must not end with a knowingly unauthorized
+post-job write attempt.
 
 ## Failure boundaries
 
