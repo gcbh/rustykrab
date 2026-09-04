@@ -92,6 +92,7 @@ impl CronBackend for CronAdapter {
         channel: Option<&str>,
         chat_id: Option<&str>,
         thread_id: Option<&str>,
+        timezone: Option<&str>,
         allow_duplicate: bool,
     ) -> rustykrab_core::Result<serde_json::Value> {
         let session_conv_id =
@@ -102,6 +103,14 @@ impl CronBackend for CronAdapter {
         };
         let (ch, cid, tid) =
             inherit_channel_for_create(channel, chat_id, thread_id, inherited.as_ref());
+        // The model rarely knows what zone the user lives in, so an absent
+        // `timezone` means the operator's configured zone rather than UTC.
+        // Resolving it here — not in the store — keeps the store honest
+        // about interpreting exactly the zone it was handed.
+        let tz = match timezone {
+            Some(name) => rustykrab_core::timezone::parse(name)?,
+            None => rustykrab_core::timezone::configured(),
+        };
         let job = self
             .store
             .jobs()
@@ -111,7 +120,7 @@ impl CronBackend for CronAdapter {
                 ch.as_deref(),
                 cid.as_deref(),
                 tid.as_deref(),
-                rustykrab_core::timezone::configured().name(),
+                tz.name(),
                 allow_duplicate,
             )
             .await?;

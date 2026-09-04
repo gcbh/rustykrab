@@ -44,6 +44,20 @@ impl Tool for CronTool {
                         "description": concat!(
                             "Required for create. Must be ONE of:\n",
                             "\n",
+                            "All times are interpreted in the OPERATOR'S configured timezone — ",
+                            "the zone of the machine running this daemon. That is NOT necessarily ",
+                            "the requester's zone: someone messaging from Telegram or Signal may be ",
+                            "anywhere. If the person asking might not be in the operator's zone — ",
+                            "they mention travelling, name a city, or are reaching you over a remote ",
+                            "channel — ask which zone they mean and pass it as `timezone` rather than ",
+                            "assuming.\n",
+                            "\n",
+                            "Write the hour the user says: if they ask for 9am, that is '0 9 * * *'. ",
+                            "Do NOT convert to UTC yourself — the scheduler stores the zone with the ",
+                            "job and re-derives the offset on every fire, so the job stays at 9am ",
+                            "local across daylight-saving changes. Converting by hand freezes the ",
+                            "offset and the job drifts an hour twice a year.\n",
+                            "\n",
                             "1) Standard 5-field cron expression: minute hour day-of-month month day-of-week\n",
                             "   Fields: minute(0-59) hour(0-23) day(1-31) month(1-12) weekday(0-6, 0=Sun)\n",
                             "   Allowed operators: * (any), */N (every N), N-M (range), N,M (list)\n",
@@ -55,7 +69,8 @@ impl Tool for CronTool {
                             "   - '0 8,12,18 * * *' → daily at 8 AM, noon, and 6 PM\n",
                             "\n",
                             "2) ISO 8601 timestamp for one-shot tasks (must be in the future):\n",
-                            "   - '2025-04-12T14:30:00Z'\n",
+                            "   - '2025-04-12T14:30' or '2025-04-12T14:30:00' → local time\n",
+                            "   - '2025-04-12T14:30:00Z' → explicit UTC (trailing Z), used as-is\n",
                             "\n",
                             "IMPORTANT: Use only the standard 5-field format. Do NOT use non-standard extensions, ",
                             "named months/days (like 'MON'), or 6-field expressions.",
@@ -121,6 +136,17 @@ impl Tool for CronTool {
                             "minute fields differ).",
                         )
                     },
+                    "timezone": {
+                        "type": "string",
+                        "description": concat!(
+                            "Optional IANA timezone name for create, e.g. 'America/Los_Angeles' ",
+                            "or 'Europe/Berlin'. Omit it unless the user explicitly asks for a ",
+                            "schedule in some OTHER zone than their own — omitted means the ",
+                            "operator's configured local zone, which is almost always what is ",
+                            "wanted. Never pass a fixed offset like 'UTC-8'; it does not track ",
+                            "daylight saving.",
+                        )
+                    },
                     "job_id": {
                         "type": "string",
                         "description": "Job identifier (required for delete and list_runs)"
@@ -165,11 +191,20 @@ impl Tool for CronTool {
                 let channel = args["channel"].as_str();
                 let chat_id = args["chat_id"].as_str();
                 let thread_id = args["thread_id"].as_str();
+                let timezone = args["timezone"].as_str();
                 let allow_duplicate = args["allow_duplicate"].as_bool().unwrap_or(false);
 
                 let result = self
                     .backend
-                    .create_job(schedule, task, channel, chat_id, thread_id, allow_duplicate)
+                    .create_job(
+                        schedule,
+                        task,
+                        channel,
+                        chat_id,
+                        thread_id,
+                        timezone,
+                        allow_duplicate,
+                    )
                     .await
                     .map_err(|e| rustykrab_core::Error::ToolExecution(e.to_string().into()))?;
 
@@ -238,9 +273,11 @@ impl Tool for CronTool {
 mod tests {
     use super::*;
 
-    /// Stub backend that records whether `create_job` was reached.
+    /// Stub backend that records whether `create_job` was reached, and
+    /// with which timezone.
     struct SpyBackend {
         called: std::sync::atomic::AtomicBool,
+        timezone: std::sync::Mutex<Option<String>>,
         allow_duplicate: std::sync::atomic::AtomicBool,
     }
 
@@ -253,9 +290,11 @@ mod tests {
             _channel: Option<&str>,
             _chat_id: Option<&str>,
             _thread_id: Option<&str>,
+            timezone: Option<&str>,
             allow_duplicate: bool,
         ) -> Result<Value> {
             self.called.store(true, std::sync::atomic::Ordering::SeqCst);
+            *self.timezone.lock().unwrap() = timezone.map(str::to_string);
             self.allow_duplicate
                 .store(allow_duplicate, std::sync::atomic::Ordering::SeqCst);
             Ok(json!({"ok": true}))
@@ -274,6 +313,7 @@ mod tests {
     fn spy() -> (Arc<SpyBackend>, CronTool) {
         let backend = Arc::new(SpyBackend {
             called: std::sync::atomic::AtomicBool::new(false),
+            timezone: std::sync::Mutex::new(None),
             allow_duplicate: std::sync::atomic::AtomicBool::new(true),
         });
         let tool = CronTool::new(backend.clone());
@@ -381,6 +421,61 @@ mod tests {
             .expect("real task should succeed");
         assert_eq!(result["action"], "create");
         assert!(backend.called.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn create_passes_the_timezone_through_and_omits_it_by_default() {
+        // Omitted means "the operator's zone", which only the CLI adapter
+        // knows how to resolve — the tool must forward the absence rather
+        // than substituting UTC and re-introducing the off-by-the-offset bug.
+        let (backend, tool) = spy();
+        tool.execute(json!({
+            "action": "create",
+            "schedule": "0 9 * * *",
+            "task": "Write the daily briefing.",
+        }))
+        .await
+        .unwrap();
+        assert_eq!(*backend.timezone.lock().unwrap(), None);
+
+        tool.execute(json!({
+            "action": "create",
+            "schedule": "0 9 * * *",
+            "task": "Write the daily briefing.",
+            "timezone": "Europe/Berlin",
+        }))
+        .await
+        .unwrap();
+        assert_eq!(
+            backend.timezone.lock().unwrap().as_deref(),
+            Some("Europe/Berlin"),
+            "an explicit zone must reach the backend unchanged"
+        );
+    }
+
+    #[test]
+    fn schedule_schema_tells_the_model_not_to_convert_to_utc() {
+        // Left to itself the model helpfully converts 9am to 16:00 and
+        // writes '0 16 * * *', which freezes the summer offset and drifts
+        // an hour when the clocks change. The schema has to forbid it.
+        let (_, tool) = spy();
+        let schema = tool.schema();
+        let desc = schema.parameters["properties"]["schedule"]["description"]
+            .as_str()
+            .expect("schedule description should be a string");
+        assert!(
+            desc.contains("OPERATOR'S configured timezone"),
+            "schema must name the lens, and name it accurately: {desc}"
+        );
+        assert!(
+            desc.contains("ask which zone they mean"),
+            "schema must tell the model to ask when the requester may not be \
+             the operator: {desc}"
+        );
+        assert!(
+            desc.contains("Do NOT convert to UTC"),
+            "schema must forbid hand-conversion: {desc}"
+        );
     }
 
     #[tokio::test]

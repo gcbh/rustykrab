@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.2.35] - 2026-09-04
+
+- fix(cron): let the caller name a zone, and stop the model converting by hand (#629)
+
 ## [5.2.34] - 2026-09-04
 
 - fix(store): schedule in the operator's zone, not Greenwich (#628)
