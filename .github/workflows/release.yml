@@ -193,11 +193,22 @@ jobs:
           key: ${{ matrix.target }}
           save-if: false
 
-      - name: Install zig
+      - name: Install Zig
         if: matrix.glibc != ''
-        uses: mlugg/setup-zig@v1
-        with:
-          version: 0.13.0
+        env:
+          ZIG_URL: https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz
+          ZIG_SHA256: d45312e61ebcc48032b77bc4cf7fd6915c11fa16e4aad116b66c9468211230ea
+        run: |
+          set -euxo pipefail
+          ZIG_ARCHIVE="${RUNNER_TEMP}/zig-0.13.0.tar.xz"
+          ZIG_DIR="${RUNNER_TEMP}/zig-0.13.0"
+          curl --proto '=https' --tlsv1.2 -fsSL "$ZIG_URL" -o "$ZIG_ARCHIVE"
+          echo "${ZIG_SHA256}  ${ZIG_ARCHIVE}" | sha256sum --check -
+          mkdir -p "$ZIG_DIR"
+          tar --extract --xz --file "$ZIG_ARCHIVE" \
+            --directory "$ZIG_DIR" --strip-components=1
+          "$ZIG_DIR/zig" version
+          echo "$ZIG_DIR" >> "$GITHUB_PATH"
 
       - name: Install cargo-zigbuild
         if: matrix.glibc != ''
@@ -399,7 +410,7 @@ jobs:
             CHANGELOG.md > release_notes.md
 
       - name: Create release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ needs.bump.outputs.tag }}
           body_path: release_notes.md
