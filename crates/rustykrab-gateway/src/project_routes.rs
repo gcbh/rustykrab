@@ -20,9 +20,11 @@ use uuid::Uuid;
 
 use rustykrab_core::Error;
 use rustykrab_projects::{
-    AssumptionState, AssumptionStatus, CreateProject, JudgmentPolicy, MessageRef, NodeData, NodeId,
-    NodeKind, PlanChange, PlanChangeSet, PlanNodeDraft, ProjectId, ProjectSnapshot, ProjectionKind,
-    Provenance, ProvenanceClassification, ProvenanceSource, RevisionAuthor, RevisionId,
+    AssumptionState, AssumptionStatus, CreateProject, EdgeId, EdgeRelation, JudgmentPolicy,
+    MessageRef, NodeData, NodeId, NodeKind, PlanChange, PlanChangeSet, PlanEdgeDraft,
+    PlanNodeDraft, PlanNodePatch, ProjectId, ProjectPatch, ProjectSnapshot, ProjectStatus,
+    ProjectionKind, Provenance, ProvenanceClassification, ProvenanceSource, RevisionAuthor,
+    RevisionId,
 };
 
 use crate::AppState;
@@ -75,6 +77,79 @@ struct CreateProjectRequest {
     intent: Option<String>,
     #[serde(default)]
     judgment_policy: Option<JudgmentPolicy>,
+}
+
+/// External revision DTO. It deliberately has no author, timestamp, or
+/// provenance-classification fields; those are facts minted by the service.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ApplyRevisionRequest {
+    #[serde(default)]
+    request_id: Option<String>,
+    parent_revision: RevisionId,
+    summary: String,
+    #[serde(default)]
+    source_message: Option<MessageRef>,
+    #[serde(default)]
+    project_patch: Option<ProjectPatchRequest>,
+    #[serde(default)]
+    changes: Vec<PlanChangeRequest>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProjectPatchRequest {
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    status: Option<ProjectStatus>,
+    #[serde(default)]
+    repository_id: Option<String>,
+    #[serde(default)]
+    canonical_conversation_id: Option<String>,
+    #[serde(default)]
+    judgment_policy: Option<JudgmentPolicy>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields, tag = "operation", rename_all = "snake_case")]
+enum PlanChangeRequest {
+    AddNode {
+        node: PlanNodeRequest,
+    },
+    UpdateNode {
+        node_id: NodeId,
+        patch: PlanNodePatch,
+    },
+    SupersedeNode {
+        node_id: NodeId,
+        replacement: PlanNodeRequest,
+    },
+    AddEdge {
+        edge: PlanEdgeRequest,
+    },
+    RemoveEdge {
+        edge_id: EdgeId,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PlanNodeRequest {
+    id: NodeId,
+    kind: NodeKind,
+    title: String,
+    body: String,
+    data: NodeData,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PlanEdgeRequest {
+    id: EdgeId,
+    from: NodeId,
+    relation: EdgeRelation,
+    to: NodeId,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -353,14 +428,25 @@ async fn list_revisions(
 async fn apply_revision(
     State(state): State<AppState>,
     Path(project_id): Path<String>,
-    Json(change_set): Json<PlanChangeSet>,
+    Json(body): Json<ApplyRevisionRequest>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let project_id = parse_project_id(&project_id)?;
-    if change_set.project_id != project_id {
-        return Err(ApiError::bad_request(
-            "change-set project_id does not match the URL",
-        ));
-    }
+    let request_id = body
+        .request_id
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let stored_request = state
+        .agent
+        .store
+        .projects()
+        .get_revision_request(&project_id, &request_id)
+        .await?;
+    let created_at = stored_request
+        .as_ref()
+        .map(|request| request.created_at)
+        .unwrap_or_else(Utc::now);
+    let change_set = apply_revision_command(body, project_id, request_id, created_at);
     let expected_parent = change_set.parent_revision.clone();
     let result = state
         .agent
@@ -375,6 +461,107 @@ async fn apply_revision(
     };
     let response = snapshot_response(&state, &result.snapshot, Some(result.replayed)).await?;
     Ok((status, Json(response)))
+}
+
+fn apply_revision_command(
+    body: ApplyRevisionRequest,
+    project_id: ProjectId,
+    request_id: String,
+    created_at: chrono::DateTime<Utc>,
+) -> PlanChangeSet {
+    let provenance = body
+        .source_message
+        .as_ref()
+        .map(|source| {
+            Provenance::conversation(ProvenanceClassification::UserStated, source, created_at)
+        })
+        .unwrap_or_else(|| Provenance {
+            classification: ProvenanceClassification::UserStated,
+            source: ProvenanceSource::Manual {
+                reference: format!("authenticated-api-request:{request_id}"),
+            },
+            recorded_at: created_at,
+            confidence: None,
+            freshness: None,
+        });
+
+    let changes = body
+        .changes
+        .into_iter()
+        .map(|change| match change {
+            PlanChangeRequest::AddNode { node } => PlanChange::AddNode {
+                node: node.into_domain(provenance.clone()),
+            },
+            PlanChangeRequest::UpdateNode { node_id, patch } => PlanChange::UpdateNode {
+                node_id,
+                patch,
+                provenance: vec![provenance.clone()],
+            },
+            PlanChangeRequest::SupersedeNode {
+                node_id,
+                replacement,
+            } => PlanChange::SupersedeNode {
+                node_id,
+                replacement: replacement.into_domain(provenance.clone()),
+            },
+            PlanChangeRequest::AddEdge { edge } => PlanChange::AddEdge {
+                edge: edge.into_domain(provenance.clone()),
+            },
+            PlanChangeRequest::RemoveEdge { edge_id } => PlanChange::RemoveEdge {
+                edge_id,
+                provenance: vec![provenance.clone()],
+            },
+        })
+        .collect();
+
+    let mut command = PlanChangeSet::new(
+        request_id,
+        project_id,
+        body.parent_revision,
+        body.summary,
+        RevisionAuthor::User,
+        created_at,
+        changes,
+    );
+    if let Some(source_message) = body.source_message {
+        command = command.with_source_message(source_message);
+    }
+    if let Some(patch) = body.project_patch {
+        command = command.with_project_patch(patch.into_domain(provenance));
+    }
+    command
+}
+
+impl PlanNodeRequest {
+    fn into_domain(self, provenance: Provenance) -> PlanNodeDraft {
+        PlanNodeDraft::new(
+            self.id,
+            self.kind,
+            self.title,
+            self.body,
+            self.data,
+            vec![provenance],
+        )
+    }
+}
+
+impl PlanEdgeRequest {
+    fn into_domain(self, provenance: Provenance) -> PlanEdgeDraft {
+        PlanEdgeDraft::new(self.id, self.from, self.relation, self.to, vec![provenance])
+    }
+}
+
+impl ProjectPatchRequest {
+    fn into_domain(self, provenance: Provenance) -> ProjectPatch {
+        ProjectPatch {
+            provenance: vec![provenance],
+            title: self.title,
+            status: self.status,
+            repository_id: self.repository_id.map(Some),
+            canonical_conversation_id: self.canonical_conversation_id.map(Some),
+            judgment_policy: self.judgment_policy,
+        }
+    }
 }
 
 async fn inspect_revision(
@@ -866,6 +1053,96 @@ mod tests {
                 status: AssumptionStatus::Unvalidated,
                 ..
             })
+        ));
+    }
+
+    #[test]
+    fn revision_request_rejects_client_author_time_and_provenance() {
+        let error = serde_json::from_value::<ApplyRevisionRequest>(json!({
+            "request_id": "revision-request-1",
+            "parent_revision": "a".repeat(64),
+            "summary": "Attempt to forge trusted fields",
+            "author": "system",
+            "created_at": "2000-01-01T00:00:00Z",
+            "provenance": [{
+                "classification": "repository_observed",
+                "source": {"type": "repository", "repository": "other/repo"}
+            }],
+            "changes": []
+        }))
+        .unwrap_err();
+
+        assert!(error.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn revision_command_derives_actor_time_and_provenance() {
+        let created_at = chrono::DateTime::parse_from_rfc3339("2026-09-04T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let node_id = NodeId::new();
+        let body: ApplyRevisionRequest = serde_json::from_value(json!({
+            "request_id": "revision-request-1",
+            "parent_revision": "a".repeat(64),
+            "summary": "Add a verified outcome",
+            "source_message": {
+                "conversation_id": "conversation-1",
+                "message_id": "message-2"
+            },
+            "changes": [{
+                "operation": "add_node",
+                "node": {
+                    "id": node_id,
+                    "kind": "outcome",
+                    "title": "Durable planning works",
+                    "body": "The service preserves revisions across restart.",
+                    "data": {
+                        "type": "outcome",
+                        "state": {
+                            "status": "achieved",
+                            "success_measures": ["Distinct process reopened the same revision"]
+                        }
+                    }
+                }
+            }]
+        }))
+        .unwrap();
+        let project_id = ProjectId::new();
+        let first = apply_revision_command(
+            body.clone(),
+            project_id,
+            "revision-request-1".to_owned(),
+            created_at,
+        );
+        let retry = apply_revision_command(
+            body,
+            project_id,
+            "revision-request-1".to_owned(),
+            first.created_at,
+        );
+
+        assert_eq!(first, retry);
+        assert_eq!(first.author, RevisionAuthor::User);
+        assert_eq!(first.created_at, created_at);
+        assert_eq!(
+            first.source_message,
+            Some(MessageRef::new("conversation-1", "message-2").unwrap())
+        );
+        let PlanChange::AddNode { node } = &first.changes[0] else {
+            panic!("request should produce an add-node change");
+        };
+        assert_eq!(node.provenance.len(), 1);
+        assert_eq!(
+            node.provenance[0].classification,
+            ProvenanceClassification::UserStated
+        );
+        assert_eq!(node.provenance[0].recorded_at, created_at);
+        assert!(matches!(
+            &node.provenance[0].source,
+            ProvenanceSource::ConversationMessage {
+                conversation_id,
+                message_id,
+            } if conversation_id == "conversation-1" && message_id == "message-2"
         ));
     }
 

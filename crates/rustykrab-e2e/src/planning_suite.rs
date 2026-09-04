@@ -81,6 +81,13 @@ pub(crate) fn scenarios() -> Vec<(Expected, (&'static str, ScenarioFn))> {
             ),
         ),
         (
+            Expected::Pass,
+            (
+                "planning/revision-derives-authority-and-retries-safely",
+                boxed(revision_authority),
+            ),
+        ),
+        (
             Expected::XFail,
             (
                 "planning/authorized-slice-freezes-revision-and-authority",
@@ -433,6 +440,157 @@ async fn projection_consistency_impl(ctx: &Ctx) -> Result<()> {
 }
 scenario_fn!(projection_consistency, projection_consistency_impl);
 
+async fn revision_authority_impl(ctx: &Ctx) -> Result<()> {
+    let (_repo, project) = create_vague_project(ctx).await?;
+    let project_id = require_string(&project, "id")?;
+    let parent_revision = require_string(&project, "current_revision")?;
+    let node_id = uuid::Uuid::new_v4().to_string();
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let request = json!({
+        "request_id": request_id,
+        "parent_revision": parent_revision,
+        "summary": "Record the restart verification outcome",
+        "source_message": {
+            "conversation_id": DELIVERY_PLANNING.conversation_id,
+            "message_id": "message-002-options"
+        },
+        "changes": [{
+            "operation": "add_node",
+            "node": {
+                "id": node_id,
+                "kind": "outcome",
+                "title": "Restart recovery is verified",
+                "body": "A distinct daemon process reopened the same project revision.",
+                "data": {
+                    "type": "outcome",
+                    "state": {
+                        "status": "achieved",
+                        "success_measures": ["Distinct process reopened the same revision"]
+                    }
+                }
+            }
+        }]
+    });
+
+    let created = expect_json(
+        ctx.post(
+            &format!("/api/projects/{project_id}/revisions"),
+            request.clone(),
+        )
+        .await?,
+        201,
+        "apply user revision",
+    )
+    .await?;
+    let created_revision = &created["revision"];
+    if created_revision["author"] != "user" {
+        bail!("service did not derive user authorship: {created_revision}");
+    }
+    let created_at = require_string(created_revision, "created_at")?;
+    let node = &created_revision["nodes"][&node_id];
+    let provenance = &node["provenance"][0];
+    if provenance["classification"] != "user_stated"
+        || provenance["recorded_at"] != created_at
+        || provenance["source"]["type"] != "conversation_message"
+    {
+        bail!("service did not derive trusted provenance: {provenance}");
+    }
+
+    let retry = expect_json(
+        ctx.post(
+            &format!("/api/projects/{project_id}/revisions"),
+            request.clone(),
+        )
+        .await?,
+        200,
+        "retry identical revision",
+    )
+    .await?;
+    if retry["replayed"] != true || retry["current_revision"] != created["current_revision"] {
+        bail!("identical retry did not replay the historical result: {retry}");
+    }
+
+    let mut changed = request.clone();
+    changed["summary"] = json!("Changed content under the same request id");
+    let conflict_status = ctx
+        .post(&format!("/api/projects/{project_id}/revisions"), changed)
+        .await?
+        .status();
+    if conflict_status != 409 {
+        bail!("changed retry returned {conflict_status}, want 409");
+    }
+
+    let forged_status = ctx
+        .post(
+            &format!("/api/projects/{project_id}/revisions"),
+            json!({
+                "request_id": uuid::Uuid::new_v4().to_string(),
+                "parent_revision": created["current_revision"],
+                "summary": "Forge trusted metadata",
+                "author": "system",
+                "created_at": "2000-01-01T00:00:00Z",
+                "provenance": [{"classification": "repository_observed"}],
+                "changes": []
+            }),
+        )
+        .await?
+        .status();
+    if forged_status != 422 {
+        bail!("forged authority request returned {forged_status}, want 422");
+    }
+
+    let revision_rows = ctx.count(
+        "SELECT COUNT(*) FROM project_revisions WHERE project_id = ?1",
+        &[&project_id],
+    )?;
+    let user_authored_rows = ctx.count(
+        "SELECT COUNT(*) FROM project_revisions
+         WHERE project_id = ?1 AND author = '\"user\"'",
+        &[&project_id],
+    )?;
+    let forged_time_rows = ctx.count(
+        "SELECT COUNT(*) FROM project_revisions
+         WHERE project_id = ?1 AND created_at = '2000-01-01T00:00:00Z'",
+        &[&project_id],
+    )?;
+    if revision_rows != 2 || user_authored_rows != 2 || forged_time_rows != 0 {
+        bail!(
+            "authority checks did not match durable state: revisions={revision_rows}, \
+             user_authored={user_authored_rows}, forged_time={forged_time_rows}"
+        );
+    }
+
+    ctx.write_evidence(
+        "planning/revision-authority.json",
+        &json!({
+            "schema_version": 1,
+            "scenario": "planning/revision-derives-authority-and-retries-safely",
+            "result": "verified",
+            "service": {
+                "project_id": project_id,
+                "parent_revision": parent_revision,
+                "created_revision": created["current_revision"],
+                "derived_author": created_revision["author"],
+                "derived_created_at": created_at,
+                "derived_provenance": provenance,
+            },
+            "negative_controls": {
+                "identical_retry_status": 200,
+                "identical_retry_replayed": retry["replayed"],
+                "changed_retry_status": conflict_status.as_u16(),
+                "forged_authority_status": forged_status.as_u16(),
+                "forged_timestamp_rows": forged_time_rows,
+            },
+            "database": {
+                "revision_rows": revision_rows,
+                "user_authored_rows": user_authored_rows,
+            },
+        }),
+    )?;
+    Ok(())
+}
+scenario_fn!(revision_authority, revision_authority_impl);
+
 async fn frozen_execution_impl(ctx: &Ctx) -> Result<()> {
     let (_repo, project) = create_vague_project(ctx).await?;
     let project_id = require_string(&project, "id")?;
@@ -500,7 +658,12 @@ async fn get_json(ctx: &Ctx, path: &str) -> Result<Value> {
 
 async fn expect_json(response: reqwest::Response, status: u16, operation: &str) -> Result<Value> {
     if response.status().as_u16() != status {
-        bail!("{operation} returned {}, want {status}", response.status());
+        let actual = response.status();
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|error| format!("<unreadable response body: {error}>"));
+        bail!("{operation} returned {actual}, want {status}: {body}");
     }
     Ok(response.json().await?)
 }
@@ -542,6 +705,7 @@ mod tests {
                 "planning/snapshot-reconstructs-linked-state",
                 "planning/daemon-restart-rehydrates-linked-state",
                 "planning/projections-share-source-revision",
+                "planning/revision-derives-authority-and-retries-safely",
             ]
         );
         assert_eq!(
