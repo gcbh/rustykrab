@@ -356,16 +356,16 @@ impl Store {
                 data                      TEXT NOT NULL,
                 created_at                TEXT NOT NULL,
                 updated_at                TEXT NOT NULL,
-                FOREIGN KEY (current_revision)
-                    REFERENCES project_revisions(id)
+                FOREIGN KEY (id, current_revision)
+                    REFERENCES project_revisions(project_id, id)
+                    DEFERRABLE INITIALLY DEFERRED
             );
 
             CREATE TABLE IF NOT EXISTS project_revisions (
                 id                TEXT PRIMARY KEY,
                 project_id        TEXT NOT NULL
                     REFERENCES projects(id) ON DELETE CASCADE,
-                parent_revision   TEXT
-                    REFERENCES project_revisions(id),
+                parent_revision   TEXT,
                 sequence          INTEGER NOT NULL,
                 request_id        TEXT NOT NULL,
                 request_data      TEXT NOT NULL,
@@ -377,7 +377,10 @@ impl Store {
                 data              TEXT NOT NULL,
                 created_at        TEXT NOT NULL,
                 UNIQUE (project_id, sequence),
-                UNIQUE (project_id, request_id)
+                UNIQUE (project_id, request_id),
+                UNIQUE (project_id, id),
+                FOREIGN KEY (project_id, parent_revision)
+                    REFERENCES project_revisions(project_id, id)
             );
 
             CREATE INDEX IF NOT EXISTS idx_project_revisions_project
@@ -388,22 +391,22 @@ impl Store {
             -- provenance and decision/question detail, remains in `data`;
             -- the immutable revision snapshot is the reconstruction source.
             CREATE TABLE IF NOT EXISTS plan_nodes (
-                revision_id TEXT NOT NULL
-                    REFERENCES project_revisions(id) ON DELETE CASCADE,
+                revision_id TEXT NOT NULL,
                 project_id  TEXT NOT NULL
                     REFERENCES projects(id) ON DELETE CASCADE,
                 id          TEXT NOT NULL,
                 kind        TEXT NOT NULL,
                 data        TEXT NOT NULL,
-                PRIMARY KEY (revision_id, id)
+                PRIMARY KEY (revision_id, id),
+                FOREIGN KEY (project_id, revision_id)
+                    REFERENCES project_revisions(project_id, id) ON DELETE CASCADE
             );
 
             CREATE INDEX IF NOT EXISTS idx_plan_nodes_project
                 ON plan_nodes (project_id, id);
 
             CREATE TABLE IF NOT EXISTS plan_edges (
-                revision_id TEXT NOT NULL
-                    REFERENCES project_revisions(id) ON DELETE CASCADE,
+                revision_id TEXT NOT NULL,
                 project_id  TEXT NOT NULL
                     REFERENCES projects(id) ON DELETE CASCADE,
                 id          TEXT NOT NULL,
@@ -411,7 +414,13 @@ impl Store {
                 relation    TEXT NOT NULL,
                 to_node     TEXT NOT NULL,
                 data        TEXT NOT NULL,
-                PRIMARY KEY (revision_id, id)
+                PRIMARY KEY (revision_id, id),
+                FOREIGN KEY (project_id, revision_id)
+                    REFERENCES project_revisions(project_id, id) ON DELETE CASCADE,
+                FOREIGN KEY (revision_id, from_node)
+                    REFERENCES plan_nodes(revision_id, id) ON DELETE CASCADE,
+                FOREIGN KEY (revision_id, to_node)
+                    REFERENCES plan_nodes(revision_id, id) ON DELETE CASCADE
             );
 
             CREATE INDEX IF NOT EXISTS idx_plan_edges_project

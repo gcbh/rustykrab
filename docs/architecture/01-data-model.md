@@ -4,7 +4,7 @@ Two SQLite databases, opened independently, never joined.
 
 | File | Owner | Tables |
 |---|---|---|
-| `<data_dir>/db/store.db` | `rustykrab-store` | 20 tables + 13 indexes |
+| `<data_dir>/db/store.db` | `rustykrab-store` | 20 tables + 14 indexes |
 | `<data_dir>/memory.db` | `rustykrab-memory` | 4 tables + 1 FTS5 virtual table + 9 indexes |
 
 DDL is idempotent (`CREATE TABLE IF NOT EXISTS`) inside
@@ -209,23 +209,29 @@ report a finding against a memory that no longer exists.
 ```
 projects(id PK, create_request_id UNIQUE, repository_id,
          canonical_conversation_id, title, status, judgment_policy,
-         current_revision REFERENCES project_revisions(id), create_request,
+         current_revision, create_request,
          data, created_at, updated_at)
+   FK (id, current_revision) REFERENCES project_revisions(project_id, id)
 project_revisions(id PK,
                   project_id REFERENCES projects(id) ON DELETE CASCADE,
-                  parent_revision REFERENCES project_revisions(id), sequence,
+                  parent_revision, sequence,
                   request_id, request_data, author, conversation_id,
                   source_message_id, summary, project_data, data, created_at,
                   UNIQUE(project_id, sequence),
-                  UNIQUE(project_id, request_id))
+                  UNIQUE(project_id, request_id), UNIQUE(project_id, id))
+   FK (project_id, parent_revision) REFERENCES project_revisions(project_id, id)
    INDEX (project_id, sequence)
-plan_nodes(revision_id REFERENCES project_revisions(id) ON DELETE CASCADE,
-           project_id REFERENCES projects(id) ON DELETE CASCADE,
+plan_nodes(revision_id, project_id REFERENCES projects(id) ON DELETE CASCADE,
            id, kind, data, PK(revision_id, id))
+   FK (project_id, revision_id)
+      REFERENCES project_revisions(project_id, id) ON DELETE CASCADE
    INDEX (project_id, id)
-plan_edges(revision_id REFERENCES project_revisions(id) ON DELETE CASCADE,
-           project_id REFERENCES projects(id) ON DELETE CASCADE,
+plan_edges(revision_id, project_id REFERENCES projects(id) ON DELETE CASCADE,
            id, from_node, relation, to_node, data, PK(revision_id, id))
+   FK (project_id, revision_id)
+      REFERENCES project_revisions(project_id, id) ON DELETE CASCADE
+   FK (revision_id, from_node/to_node)
+      REFERENCES plan_nodes(revision_id, id) ON DELETE CASCADE
    INDEX (project_id, from_node, to_node)
 ```
 
@@ -238,14 +244,12 @@ serialized command before treating a duplicate as success. Conversation and
 message identifiers are provenance references rather than ownership, so they
 are intentionally not foreign keys and can survive conversation deletion.
 
-There is one integrity boundary to keep visible: the foreign keys prove that a
-revision, node, or edge names *an* existing project, but the schema does not use
-composite keys to prove that `projects.current_revision`,
-`project_revisions.parent_revision`, or a materialized row belongs to the same
-project. `ProjectStore` always derives and writes matching identifiers, and the
-domain rejects cross-project application. A future writer that bypasses that
-API could create a cross-project link the database accepts; composite
-`(project_id, revision_id)` references would move that invariant into SQLite.
+Composite foreign keys make project identity a database invariant rather than
+an assumption about `ProjectStore`: current and parent revisions must belong to
+the named project, materialized rows must belong to their revision, and edge
+endpoints must be nodes in that same revision. Direct-SQL negative tests attempt
+each cross-project write and require SQLite to reject it; `foreign_key_check`
+must remain empty afterward.
 
 ## `memory.db`
 
@@ -302,7 +306,7 @@ any conversation. One column, two meanings.
 
 ## Join analysis: enforced, and deliberately not
 
-`store.db` declares fifteen foreign keys, up from one. The ones that are
+`store.db` declares fourteen foreign keys, up from one. The ones that are
 ownership cascade; the ones that record provenance are unenforced *on
 purpose*, and the DDL now says which is which.
 
@@ -314,10 +318,10 @@ purpose*, and the DDL now says which is which.
 | `job_runs.job_id` | **CASCADE** | `delete_job` used to orphan run history forever |
 | `outcome_attributions.record_id` | **CASCADE** | was the only FK before |
 | `project_revisions.project_id` | **CASCADE** | project owns immutable revision history |
-| `projects.current_revision` | **Yes** | same-project identity is enforced by `ProjectStore`, not this scalar FK |
-| `project_revisions.parent_revision` | **Yes** | same-project ancestry is enforced by the domain, not this scalar FK |
-| `plan_nodes.revision_id`, `plan_edges.revision_id` | **CASCADE** | revision owns its materialized graph rows |
-| `plan_nodes.project_id`, `plan_edges.project_id` | **CASCADE** | redundant indexed project key; not composite with revision id |
+| `(projects.id, current_revision)` | **Yes, composite** | current revision must belong to the project |
+| `(project_revisions.project_id, parent_revision)` | **Yes, composite** | parent must belong to the same project |
+| `(plan_nodes/plan_edges.project_id, revision_id)` | **CASCADE, composite** | revision owns materialized rows and must belong to the same project |
+| `plan_edges.(revision_id, from_node/to_node)` | **CASCADE, composite** | endpoints must exist in the same revision |
 | `chunks.memory_id`, `extracted_facts.source_memory_id` | **Yes** | in `memory.db` |
 | `scheduled_jobs.conversation_id` | No, deliberate | a cron job keeps its own delivery channel and should keep firing |
 | `credential_requests.conversation_id` | No, deliberate | audit-relevant after the conversation is gone |

@@ -517,8 +517,10 @@ fn from_json<T: DeserializeOwned>(value: &str) -> Result<T, Error> {
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
+    use rusqlite::params;
     use tempfile::TempDir;
 
+    use rustykrab_core::types::{Message, MessageContent, Role};
     use rustykrab_projects::{
         CreateProject, DecisionMaker, DecisionOwner, DecisionState, DecisionStatus, EdgeId,
         EdgeRelation, JudgmentPolicy, MessageRef, NodeData, NodeId, NodeKind, OutcomeState,
@@ -907,5 +909,134 @@ mod tests {
                 .unwrap(),
             before
         );
+    }
+
+    #[tokio::test]
+    async fn sqlite_rejects_cross_project_revision_and_materialization_links() {
+        let dir = TempDir::new().unwrap();
+        let store = open(&dir);
+        let first = store
+            .projects()
+            .create(create_command("create-first-project"))
+            .await
+            .unwrap()
+            .snapshot;
+        let second = store
+            .projects()
+            .create(create_command("create-second-project"))
+            .await
+            .unwrap()
+            .snapshot;
+
+        let projects = store.projects();
+        let conn = projects.conn.lock().unwrap();
+        let current_revision_error = conn
+            .execute(
+                "UPDATE projects SET current_revision = ?1 WHERE id = ?2",
+                params![second.revision.id.to_string(), first.project.id.to_string()],
+            )
+            .unwrap_err();
+        assert!(current_revision_error.to_string().contains("FOREIGN KEY"));
+
+        let parent_revision_error = conn
+            .execute(
+                "INSERT INTO project_revisions
+                    (id, project_id, parent_revision, sequence, request_id,
+                     request_data, author, summary, project_data, data, created_at)
+                 VALUES (?1, ?2, ?3, 2, ?4, '{}', 'agent', 'forged', '{}', '{}', ?5)",
+                params![
+                    "forged-cross-project-revision",
+                    first.project.id.to_string(),
+                    second.revision.id.to_string(),
+                    "forged-cross-project-request",
+                    Utc::now().to_rfc3339(),
+                ],
+            )
+            .unwrap_err();
+        assert!(parent_revision_error.to_string().contains("FOREIGN KEY"));
+
+        let node_error = conn
+            .execute(
+                "INSERT INTO plan_nodes (revision_id, project_id, id, kind, data)
+                 VALUES (?1, ?2, 'forged-cross-project-node', 'outcome', '{}')",
+                params![first.revision.id.to_string(), second.project.id.to_string()],
+            )
+            .unwrap_err();
+        assert!(node_error.to_string().contains("FOREIGN KEY"));
+
+        let edge_error = conn
+            .execute(
+                "INSERT INTO plan_edges
+                    (revision_id, project_id, id, from_node, relation, to_node, data)
+                 VALUES (?1, ?2, 'forged-cross-project-edge', 'missing-a',
+                         'supports', 'missing-b', '{}')",
+                params![first.revision.id.to_string(), second.project.id.to_string()],
+            )
+            .unwrap_err();
+        assert!(edge_error.to_string().contains("FOREIGN KEY"));
+
+        let violations: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(violations, 0);
+    }
+
+    #[tokio::test]
+    async fn provenance_identifiers_survive_conversation_deletion_without_copying_text() {
+        let dir = TempDir::new().unwrap();
+        let store = open(&dir);
+        let mut conversation = store
+            .conversations()
+            .create_with_title(Some("Planning source".to_owned()))
+            .await
+            .unwrap();
+        let message = Message {
+            id: uuid::Uuid::new_v4(),
+            role: Role::User,
+            content: MessageContent::Text("Keep durable provenance by identifier".to_owned()),
+            created_at: Utc::now(),
+            agent_version: None,
+        };
+        conversation.messages.push(message.clone());
+        store.conversations().save(&conversation).await.unwrap();
+
+        let mut command = create_command("create-with-real-source");
+        command.canonical_conversation_id = Some(conversation.id.to_string());
+        command.source_message =
+            Some(MessageRef::new(conversation.id.to_string(), message.id.to_string()).unwrap());
+        let created = store.projects().create(command).await.unwrap().snapshot;
+
+        store.conversations().delete(conversation.id).await.unwrap();
+        let restored = store
+            .projects()
+            .get(&created.project.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let source = restored.revision.source_message.as_ref().unwrap();
+        assert_eq!(source.conversation_id, conversation.id.to_string());
+        assert_eq!(source.message_id, message.id.to_string());
+
+        let projects = store.projects();
+        let conn = projects.conn.lock().unwrap();
+        let conversation_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM conversations WHERE id = ?1",
+                params![conversation.id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let message_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE conversation_id = ?1",
+                params![conversation.id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!((conversation_rows, message_rows), (0, 0));
+        let revision_json = serde_json::to_string(&restored.revision).unwrap();
+        assert!(!revision_json.contains("Keep durable provenance by identifier"));
     }
 }
