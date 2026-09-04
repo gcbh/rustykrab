@@ -48,6 +48,33 @@ const MAX_FRAME_DEPTH: usize = 5;
 const SNAPSHOT_DEADLINE: Duration = Duration::from_secs(10);
 const PER_FRAME_DEADLINE: Duration = Duration::from_secs(2);
 
+/// Include the viewport plus one nearby screenful. This matches browser-use's
+/// default visibility window: the model sees what it can act on now and what a
+/// small scroll will reveal, instead of every laid-out control on an enormous
+/// virtualized page (Google Flights calendars can expose hundreds of months).
+const VIEWPORT_EXPANSION_PX: usize = 1_000;
+
+/// Match browser-use's prompt boundary for clickable/page-state text. Refs for
+/// all captured elements remain in the snapshot store, but only this much
+/// serialized state is returned to the model. Callers can scope a later
+/// snapshot when the needed element fell beyond the boundary.
+const MAX_SNAPSHOT_OUTPUT_CHARS: usize = 40_000;
+
+fn append_bounded_snapshot_element(
+    output: &mut Vec<serde_json::Value>,
+    output_chars: &mut usize,
+    output_truncated: &mut bool,
+    element: serde_json::Value,
+) {
+    let element_chars = element.to_string().len();
+    if output_chars.saturating_add(element_chars) <= MAX_SNAPSHOT_OUTPUT_CHARS {
+        *output_chars += element_chars;
+        output.push(element);
+    } else {
+        *output_truncated = true;
+    }
+}
+
 /// Marker between segments of a shadow-DOM piercing selector.
 #[allow(dead_code)]
 pub(crate) const SHADOW_SEP: &str = " >>> ";
@@ -306,7 +333,7 @@ impl Default for SnapshotOptions {
 /// array of objects with: tag, role, name, value, selector (possibly chained),
 /// interactive, bounds (x, y, w, h), depth.
 ///
-/// Args: [maxDepth, interactiveOnly, scopeSelector, highlight]
+/// Args: [maxDepth, interactiveOnly, scopeSelector, highlight, viewportExpansion]
 pub(crate) const SNAPSHOT_JS: &str = r#"
 (function() {
     var INTERACTIVE_ROLES = new Set([
@@ -324,6 +351,7 @@ pub(crate) const SNAPSHOT_JS: &str = r#"
     var INTERACTIVE_ONLY = arguments[1] || false;
     var SCOPE_SELECTOR = arguments[2] || null;
     var HIGHLIGHT = arguments[3] || false;
+    var VIEWPORT_EXPANSION = arguments[4];
 
     // Always clear stale highlights from a previous snapshot, even if we are
     // not painting new ones this call.
@@ -500,16 +528,41 @@ pub(crate) const SNAPSHOT_JS: &str = r#"
         return (el.textContent || '').trim().substring(0, 80);
     }
 
-    // Visibility check: layout box, computed style, opacity, viewport overlap,
-    // and a center-point occlusion probe.
+    // Visibility check: layout box, computed style, opacity, and browser-use's
+    // default one-thousand-pixel expansion around the current viewport.
     function isVisible(el) {
         var style = window.getComputedStyle(el);
         if (style.display === 'none' || style.visibility === 'hidden') return false;
+        if (style.contentVisibility === 'hidden') return false;
         if (parseFloat(style.opacity || '1') === 0) return false;
+        if (el.closest && el.closest('[aria-hidden="true"], [inert]')) return false;
         var rect = el.getBoundingClientRect();
         if (rect.width <= 0 || rect.height <= 0) return false;
-        // Off the document entirely (negative side, beyond doc) — keep, the
-        // page may scroll. We only filter purely degenerate cases above.
+        var vw = window.innerWidth || document.documentElement.clientWidth;
+        var vh = window.innerHeight || document.documentElement.clientHeight;
+        var insideViewportWindow = rect.right > -VIEWPORT_EXPANSION &&
+            rect.left < vw + VIEWPORT_EXPANSION &&
+            rect.bottom > -VIEWPORT_EXPANSION &&
+            rect.top < vh + VIEWPORT_EXPANSION;
+        if (!insideViewportWindow) return false;
+
+        // A virtualized menu/calendar often lays out every option inside a
+        // small overflow container. Viewport filtering alone still includes
+        // controls that are clipped by that container. Require an intersection
+        // with each clipping ancestor; scrolling the container and taking a
+        // new snapshot exposes the next set.
+        var parent = el.parentElement;
+        while (parent) {
+            var parentStyle = window.getComputedStyle(parent);
+            var clipsX = /^(auto|scroll|hidden|clip)$/.test(parentStyle.overflowX);
+            var clipsY = /^(auto|scroll|hidden|clip)$/.test(parentStyle.overflowY);
+            if (clipsX || clipsY) {
+                var parentRect = parent.getBoundingClientRect();
+                if (clipsX && (rect.right <= parentRect.left || rect.left >= parentRect.right)) return false;
+                if (clipsY && (rect.bottom <= parentRect.top || rect.top >= parentRect.bottom)) return false;
+            }
+            parent = parent.parentElement;
+        }
         return true;
     }
 
@@ -567,7 +620,9 @@ pub(crate) const SNAPSHOT_JS: &str = r#"
                 tag: node.tagName.toLowerCase(),
                 role: role,
                 name: getName(node),
-                value: fileInput ? null : ((node.tagName === 'INPUT' || node.tagName === 'TEXTAREA' || node.tagName === 'SELECT') ? (node.value || '') : null),
+                value: (fileInput || (node.tagName === 'INPUT' && (node.type || '').toLowerCase() === 'password'))
+                    ? null
+                    : ((node.tagName === 'INPUT' || node.tagName === 'TEXTAREA' || node.tagName === 'SELECT') ? (node.value || '') : null),
                 selector: chainedSelector(node, chain),
                 interactive: interactive,
                 bounds: [Math.round(rect.x), Math.round(rect.y), Math.round(rect.width), Math.round(rect.height)],
@@ -740,7 +795,7 @@ pub async fn take_snapshot(
         .unwrap_or_else(|| "null".to_string());
 
     let eval_js = format!(
-        "({SNAPSHOT_JS})({}, {}, {}, {})",
+        "({SNAPSHOT_JS})({}, {}, {}, {}, {})",
         options.max_depth,
         if options.interactive_only {
             "true"
@@ -749,6 +804,7 @@ pub async fn take_snapshot(
         },
         selector_arg,
         if options.highlight { "true" } else { "false" },
+        VIEWPORT_EXPANSION_PX,
     );
 
     let started = Instant::now();
@@ -897,6 +953,8 @@ pub async fn take_snapshot(
     let generation = store.allocate_generation().await;
     let mut ref_map = HashMap::new();
     let mut output_elements = Vec::new();
+    let mut output_chars = 0usize;
+    let mut output_truncated = false;
     let mut ref_counter = 0usize;
 
     for captured in &elements {
@@ -937,20 +995,31 @@ pub async fn take_snapshot(
                 if let Some(frame_url) = captured.frame_url.as_deref() {
                     line.push_str(&format!(" [frame: {}]", truncate(frame_url, 60)));
                 }
-                output_elements.push(serde_json::Value::String(line));
+                append_bounded_snapshot_element(
+                    &mut output_elements,
+                    &mut output_chars,
+                    &mut output_truncated,
+                    serde_json::Value::String(line),
+                );
             }
         } else {
-            output_elements.push(serde_json::json!({
+            let rendered = serde_json::json!({
                 "ref": ref_id,
                 "role": elem.role,
-                "name": elem.name,
-                "value": elem.value,
+                "name": truncate(&elem.name, 1000),
+                "value": elem.value.as_deref().map(|value| truncate(value, 1000)),
                 "interactive": elem.interactive,
                 "bounds": elem.bounds,
                 "frame_id": captured.frame_id,
                 "frame_url": captured.frame_url,
                 "target_id": captured.target_id,
-            }));
+            });
+            append_bounded_snapshot_element(
+                &mut output_elements,
+                &mut output_chars,
+                &mut output_truncated,
+                rendered,
+            );
         }
     }
 
@@ -960,6 +1029,12 @@ pub async fn take_snapshot(
     let url = page.url().await.ok().flatten().unwrap_or_default();
     let title = page.get_title().await.ok().flatten().unwrap_or_default();
     let captcha = detect_captcha(page).await;
+    let returned_count = output_elements.len();
+    let ref_note = if options.compact {
+        "Use the snapshot identifier shown in brackets with the 'act' action; either s4-12 or [s4-12] is accepted. Refs are valid only for this snapshot."
+    } else {
+        "Use the complete string in each element's ref field with the 'act' action. Refs are valid only for this snapshot."
+    };
 
     Ok(serde_json::json!({
         "url": url,
@@ -967,6 +1042,9 @@ pub async fn take_snapshot(
         "mode": match options.mode { SnapshotMode::Ai => "ai", SnapshotMode::Aria => "aria" },
         "elements": output_elements,
         "count": ref_counter,
+        "returned_count": returned_count,
+        "output_truncated": output_truncated,
+        "output_char_limit": MAX_SNAPSHOT_OUTPUT_CHARS,
         "interactive_count": elements.iter().filter(|e| e.element.interactive).count(),
         "frames_seen": frames_seen,
         "frames_included": frames_included,
@@ -974,7 +1052,7 @@ pub async fn take_snapshot(
         "captcha": captcha,
         "snapshot_generation": generation,
         "highlight": options.highlight,
-        "note": "Use the complete string in each element's ref field with the 'act' action. Refs are valid only for this snapshot."
+        "note": ref_note
     }))
 }
 
@@ -1014,6 +1092,29 @@ mod tests {
         let mut m = HashMap::new();
         m.insert(id.to_string(), mk_ref(id));
         m
+    }
+
+    #[test]
+    fn snapshot_output_boundary_marks_and_omits_overflow() {
+        let mut output = Vec::new();
+        let mut chars = 0;
+        let mut truncated = false;
+        append_bounded_snapshot_element(
+            &mut output,
+            &mut chars,
+            &mut truncated,
+            serde_json::Value::String("x".repeat(MAX_SNAPSHOT_OUTPUT_CHARS - 2)),
+        );
+        append_bounded_snapshot_element(
+            &mut output,
+            &mut chars,
+            &mut truncated,
+            serde_json::Value::String("overflow".into()),
+        );
+
+        assert_eq!(output.len(), 1);
+        assert!(chars <= MAX_SNAPSHOT_OUTPUT_CHARS);
+        assert!(truncated);
     }
 
     #[test]

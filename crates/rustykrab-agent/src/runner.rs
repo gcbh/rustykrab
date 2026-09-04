@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -129,6 +129,97 @@ const EXTERNAL_CONTENT_TOOLS: &[&str] = &[
     "web_search",
     "x_search",
 ];
+
+/// True when a browser result carries a fresh page-state snapshot.
+fn browser_output_has_state(output: &serde_json::Value) -> bool {
+    output
+        .get("elements")
+        .is_some_and(serde_json::Value::is_array)
+        || output
+            .get("page_state")
+            .and_then(|state| state.get("elements"))
+            .is_some_and(serde_json::Value::is_array)
+        || output
+            .get("snapshot")
+            .and_then(|state| state.get("elements"))
+            .is_some_and(serde_json::Value::is_array)
+}
+
+/// Reduce a stale browser snapshot to provenance and size metadata.
+///
+/// The action call and its outcome remain in the conversation. Only the
+/// obsolete DOM-like payload is removed; the newest state is retained in full
+/// so the model always has current refs. This mirrors browser-use's single
+/// replaceable browser-state message instead of accumulating one state per
+/// step.
+fn superseded_browser_snapshot(snapshot: &serde_json::Value) -> serde_json::Value {
+    let mut summary = serde_json::Map::new();
+    summary.insert("state_superseded".into(), serde_json::Value::Bool(true));
+    for key in [
+        "url",
+        "title",
+        "mode",
+        "count",
+        "interactive_count",
+        "frames_seen",
+        "frames_included",
+        "snapshot_generation",
+    ] {
+        if let Some(value) = snapshot.get(key) {
+            summary.insert(key.into(), value.clone());
+        }
+    }
+    summary.insert(
+        "note".into(),
+        serde_json::Value::String(
+            "Superseded by a newer browser state; use refs from the newest state only.".into(),
+        ),
+    );
+    serde_json::Value::Object(summary)
+}
+
+/// Elide detailed state from all prior browser results. Returns the number of
+/// snapshots replaced. Call only when a newer browser result contains state.
+fn elide_superseded_browser_states(messages: &mut [Message]) -> usize {
+    let browser_call_ids: HashSet<String> = messages
+        .iter()
+        .flat_map(|message| message.content.tool_calls())
+        .filter(|call| call.name == "browser")
+        .map(|call| call.id.clone())
+        .collect();
+    let mut elided = 0;
+
+    for message in messages {
+        let MessageContent::ToolResult(result) = &mut message.content else {
+            continue;
+        };
+        if !browser_call_ids.contains(&result.call_id) {
+            continue;
+        }
+
+        if result
+            .output
+            .get("elements")
+            .is_some_and(serde_json::Value::is_array)
+        {
+            result.output = superseded_browser_snapshot(&result.output);
+            elided += 1;
+            continue;
+        }
+
+        let Some(object) = result.output.as_object_mut() else {
+            continue;
+        };
+        for key in ["page_state", "snapshot"] {
+            if object.get(key).is_some_and(serde_json::Value::is_object) {
+                let summary = superseded_browser_snapshot(&object[key]);
+                object.insert(key.into(), summary);
+                elided += 1;
+            }
+        }
+    }
+    elided
+}
 
 /// Maximum retries for an empty response (model returned no text).
 const EMPTY_RESPONSE_RETRY_LIMIT: usize = 1;
@@ -1724,6 +1815,16 @@ impl AgentRunner {
                 for (tool_name, call_id, result) in results {
                     let (tool_msg, success, error_message) = match result {
                         Ok(tr) => {
+                            if tool_name == "browser" && browser_output_has_state(&tr.output) {
+                                let elided = elide_superseded_browser_states(&mut conv.messages);
+                                if elided > 0 {
+                                    // History changed in place, invalidating both incremental
+                                    // accounting mechanisms just like compaction does.
+                                    self.forget_token_estimate(conv.id);
+                                    self.forget_usage_anchor(conv.id);
+                                    tracing::debug!(elided, "superseded prior browser page state");
+                                }
+                            }
                             tracing::info!(tool = %tool_name, call_id = %call_id, "tool call succeeded");
                             let msg = Message {
                                 id: Uuid::new_v4(),
@@ -3500,6 +3601,111 @@ fn drain_inbound_to_conv(
             }
             InboundEvent::Cancel => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod browser_state_history_tests {
+    use super::*;
+
+    fn message(role: Role, content: MessageContent) -> Message {
+        Message {
+            id: Uuid::new_v4(),
+            role,
+            content,
+            created_at: Utc::now(),
+            agent_version: None,
+        }
+    }
+
+    fn call(id: &str, name: &str) -> Message {
+        message(
+            Role::Assistant,
+            MessageContent::ToolCall(ToolCall {
+                id: id.into(),
+                name: name.into(),
+                arguments: serde_json::json!({"action": "snapshot"}),
+            }),
+        )
+    }
+
+    fn result(id: &str, output: serde_json::Value) -> Message {
+        message(
+            Role::Tool,
+            MessageContent::ToolResult(ToolResult {
+                call_id: id.into(),
+                output,
+                is_error: false,
+                images: Vec::new(),
+            }),
+        )
+    }
+
+    #[test]
+    fn a_new_browser_state_elides_only_prior_browser_snapshots() {
+        let mut messages = vec![
+            call("browser-snapshot", "browser"),
+            result(
+                "browser-snapshot",
+                serde_json::json!({
+                    "url": "https://example.com",
+                    "title": "Example",
+                    "elements": [{"ref": "s1-1", "name": "large old tree"}],
+                    "count": 1,
+                    "snapshot_generation": 1
+                }),
+            ),
+            call("browser-action", "browser"),
+            result(
+                "browser-action",
+                serde_json::json!({
+                    "outcome": "applied",
+                    "page_state": {
+                        "url": "https://example.com/next",
+                        "elements": ["[s2-1] button: Next"],
+                        "count": 1,
+                        "snapshot_generation": 2
+                    }
+                }),
+            ),
+            call("search", "web_search"),
+            result(
+                "search",
+                serde_json::json!({"elements": ["not browser state"]}),
+            ),
+        ];
+
+        assert_eq!(elide_superseded_browser_states(&mut messages), 2);
+        let MessageContent::ToolResult(first) = &messages[1].content else {
+            panic!("expected first browser result")
+        };
+        assert_eq!(first.output["state_superseded"], true);
+        assert!(first.output.get("elements").is_none());
+
+        let MessageContent::ToolResult(action) = &messages[3].content else {
+            panic!("expected browser action result")
+        };
+        assert_eq!(action.output["outcome"], "applied");
+        assert_eq!(action.output["page_state"]["state_superseded"], true);
+        assert!(action.output["page_state"].get("elements").is_none());
+
+        let MessageContent::ToolResult(search) = &messages[5].content else {
+            panic!("expected search result")
+        };
+        assert_eq!(search.output["elements"][0], "not browser state");
+    }
+
+    #[test]
+    fn browser_state_detection_ignores_metadata_only_results() {
+        assert!(browser_output_has_state(
+            &serde_json::json!({"page_state": {"elements": []}})
+        ));
+        assert!(!browser_output_has_state(
+            &serde_json::json!({"outcome": "applied", "url": "https://example.com"})
+        ));
+        assert!(!browser_output_has_state(
+            &serde_json::json!({"outcome": "unknown", "page_state": {}})
+        ));
     }
 }
 

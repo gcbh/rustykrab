@@ -1540,7 +1540,8 @@ fn launch_browser_blocking(
 }
 
 fn should_borrow_system_profile(config: &BrowserConfig, profile_name: &str) -> bool {
-    config.isolated_root.is_none()
+    config.borrow_system_profile
+        && config.isolated_root.is_none()
         && config
             .profiles
             .get(profile_name)
@@ -1612,16 +1613,15 @@ fn detect_profile_name(chrome_dir: &std::path::Path) -> String {
     "Default".to_string()
 }
 
-/// Set up a wrapper data directory that symlinks back to the user's real
-/// Chrome profile, preserving cookies and sessions.
-/// Link the account's real Chrome profile into `user_data_dir`, unless
-/// the caller asked for an isolated browser.
+/// Set up a wrapper data directory that can symlink back to the user's real
+/// Chrome profile, preserving cookies and sessions when explicitly enabled.
 ///
-/// Borrowing the real profile is the point in normal use -- it carries
-/// the logins. Under an isolated root it is precisely what the caller
-/// asked to avoid, and in an eval it silently invalidates the result: a
-/// trial that inherits a signed-in cookie looks like a successful
-/// sign-in without ever having signed in.
+/// A dedicated persistent profile is the default. Borrowing the real profile
+/// can carry logins, but opening its SQLite databases while the user's Chrome
+/// owns them can prevent CDP startup or corrupt profile state. Under an
+/// isolated root it is precisely what the caller asked to avoid, and in an
+/// eval it silently invalidates the result: a trial that inherits a signed-in
+/// cookie looks like a successful sign-in without ever having signed in.
 ///
 /// An explicit per-profile user-data directory is also isolated: the caller
 /// named the exact data root, so silently linking the account profile into it
@@ -1878,11 +1878,17 @@ mod tests {
     }
 
     #[test]
-    fn only_the_implicit_default_data_root_borrows_the_system_profile() {
+    fn system_profile_borrowing_requires_explicit_opt_in_and_default_data_root() {
         let default = BrowserConfig::default();
-        assert!(should_borrow_system_profile(&default, "rustykrab"));
+        assert!(!should_borrow_system_profile(&default, "rustykrab"));
 
-        let mut explicit = BrowserConfig::default();
+        let opted_in = BrowserConfig {
+            borrow_system_profile: true,
+            ..BrowserConfig::default()
+        };
+        assert!(should_borrow_system_profile(&opted_in, "rustykrab"));
+
+        let mut explicit = opted_in.clone();
         explicit
             .profiles
             .get_mut("rustykrab")
@@ -1891,6 +1897,7 @@ mod tests {
         assert!(!should_borrow_system_profile(&explicit, "rustykrab"));
 
         let isolated = BrowserConfig {
+            borrow_system_profile: true,
             isolated_root: Some("/tmp/isolated-browser-root".into()),
             ..BrowserConfig::default()
         };
