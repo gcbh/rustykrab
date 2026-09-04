@@ -50,6 +50,18 @@ The RustyKrab agent and tool registry replace browser-use's controller/agent
 layer. Copying that Python orchestration would create two competing planning
 loops and would not improve CDP execution reliability.
 
+That replacement is not yet throughput-equivalent. Browser-use asks its model
+for up to five ordered actions in one step and executes them sequentially,
+aborting the remainder when the URL or focused target changes. RustyKrab's
+generic runner accepts several tool calls in one model response, but schedules
+them as a parallel tool batch; the browser profile lease then serializes them
+in acquisition order rather than declared order. Browser prompts therefore do
+not encourage parallel calls, and dependent browser work usually costs one
+model round trip per action. A local-model Google Flights evaluation applied
+ten browser operations correctly but exhausted a 480-second journey budget
+after seventeen model calls. This is an orchestration latency discontinuity,
+not a CDP action failure.
+
 ## Intentional discontinuities
 
 ### Persistent profiles instead of exported storage-state JSON
@@ -135,6 +147,22 @@ mutations include a 100ms renderer-settle interval, matching browser-use's
 default gap, so the returned observation is less likely to race a queued event
 handler; that interval is a small fixed latency cost on each mutation.
 
+### No ordered multi-action browser step
+
+Browser-use's `max_actions_per_step` defaults to five and its `multi_act`
+routine preserves order, freezes the originating selector map, and stops the
+sequence on errors, terminal actions, URL changes, or target-focus changes.
+RustyKrab does not yet expose an equivalent ordered browser sequence. Reusing
+the generic parallel tool batch would be unsafe because several actions could
+race one page, and merely serializing the profile lock does not guarantee the
+model's declared order. The current one-action-per-dependent-step behavior is
+safe and independently observable, but it makes slow local-model inference the
+dominant cost on multi-field forms and date pickers. An implementation should
+be a bounded browser-owned sequence (maximum five), resolve all refs against
+one frozen snapshot, enforce policy and page-change guards after every action,
+abort rather than re-target stale remaining actions, and return one final
+snapshot plus per-action outcomes.
+
 ### Attached-browser side effects
 
 Popup focus, permission grants, and download configuration can affect tabs that
@@ -147,15 +175,18 @@ convenience for a smaller blast radius.
 
 1. Add a persistent CDP event router or request interceptor so navigation policy
    is enforced continuously and per-target crash events are retained.
-2. Add redacted, bounded diagnostic trace artifacts for failures; keep HAR and
+2. Add a bounded, ordered browser action sequence with frozen refs and
+   browser-use-compatible abort-on-page-change behavior; do not route it through
+   the generic parallel tool executor.
+3. Add redacted, bounded diagnostic trace artifacts for failures; keep HAR and
    video opt-in because they can contain credentials and personal data.
-3. Define a remote artifact protocol before advertising remote uploads or
+4. Define a remote artifact protocol before advertising remote uploads or
    downloads.
-4. Expand the OOPIF bridge only where real fixtures prove a gap: nested OOPIFs,
+5. Expand the OOPIF bridge only where real fixtures prove a gap: nested OOPIFs,
    modifier shortcuts, and cross-target drag are the known cases.
-5. Add explicit origin-scoped permission operations if a target workflow needs
+6. Add explicit origin-scoped permission operations if a target workflow needs
    them; do not adopt blanket permission grants.
-6. Integrate an external CAPTCHA solver only as a separately authorized service,
+7. Integrate an external CAPTCHA solver only as a separately authorized service,
    not as an implied local browser capability.
 
 ## Verification contract

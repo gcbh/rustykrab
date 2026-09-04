@@ -7,6 +7,7 @@ make e2e            # deterministic plumbing scenarios — no model, seconds
 make eval           # gemma4:26b behaviour scenarios, 3 repetitions each
 make eval-cred      # the credential-ask measurement, per surface
 make eval-login     # live-network login flows (opt-in; skips unless RK_LOGIN_* set)
+make eval-browser   # real CDP + production-site journeys (opt-in)
 make eval-list      # list every scenario
 ```
 
@@ -18,7 +19,7 @@ Flags pass through: `make eval ARGS="--case compaction"`, or call
 ```mermaid
 flowchart TB
     subgraph HARNESS["rustykrab-e2e (one binary, one report, one exit code)"]
-        MODES["--mode scripted | model | credential | ablation"]
+        MODES["--mode scripted | model | credential | ablation | browser"]
         JUDGE["LLM judge<br/>claude-sonnet-5, or the model<br/>under test (report says which)"]
         ASSERT["assertions + transcript<br/>read from the daemon's SQLite,<br/>not the REST API"]
         ABL["ablation driver<br/>speed probes · suite per window ·<br/>compaction cost A/B"]
@@ -81,7 +82,7 @@ above 65,536 change nothing about compaction; and the expansion switch is
 what lets everyday turns run small and hot while summarization sees far
 more history per call.
 
-## Three modes, and why they are not one number
+## Five modes, and why they are not one number
 
 | mode | provider | scored by | gates CI |
 |---|---|---|---|
@@ -89,8 +90,9 @@ more history per call.
 | `model` | real model, stubbed tools | boolean assertions + LLM judge | yes — must pass a **majority** of repetitions |
 | `credential` | real model, real tools, empty credential store | outcome **distribution** | no — reports a rate |
 | `login` | real model, real tools, **the real internet** | outcome distribution | no — xfail, and opt-in |
+| `browser` | real model, real Chrome/CDP, **production websites** | transcript + runtime evidence | no — opt-in, must pass when configured |
 
-The four answer different questions and the report never merges them.
+The five answer different questions and the report never merges them.
 
 **scripted** answers *"does the server still do what it says"*: auth, the
 origin allowlist, conversation CRUD, SSE framing, secrets, the credential
@@ -115,13 +117,36 @@ whether the agent then signs in and finishes the job. Two scenarios,
 deliberately separate — signing in and using what is inside fail
 independently, and one scenario covering both cannot say which broke.
 
-This is the only mode that leaves the machine, so it is opt-in
+This is a live-network mode, so it is opt-in
 (`RK_LOGIN_URL`/`RK_LOGIN_USER`/`RK_LOGIN_PASS`), excluded from `--mode all`,
 and `Expected::XFail` until the capability lands. A fixture would not do:
 pointed at a local one, the agent read the password out of the fixture's own
 source with its filesystem tools and "signed in" without asking. Anything the
 harness can reach on this machine, so can the agent under test. Use a
 throwaway account.
+
+**browser** answers *"can a complete browser-use journey cross every real
+boundary"*: gateway, agent, model, browser tool, CDP, isolated Chrome, live
+site, persisted transcript, and (for login cases) the credential-request and
+`fill_credential` path. The initial cases cover Google Flights search/result
+selection, Instagram login, and United login/search/result selection. They
+stop before booking, purchase, or any Instagram account action.
+
+This mode is also excluded from `--mode all`. Set
+`RK_BROWSER_DEPART_DATE=YYYY-MM-DD`; Instagram and United additionally require
+their documented `RK_*_USER`, `RK_*_PASS`, and `RK_*_EXPECT` values. `EXPECT`
+must be account text visible only after authentication; the evaluator requires
+it in a browser observation after both secure fills and a submit click.
+Once browser mode is selected, missing configuration is a failure rather than a
+skip, so an unconfigured login cannot masquerade as a green evaluation.
+Every trial has a fresh browser profile and CDP port, so an inherited login
+cannot create a false pass. Flight cases also require a price and departure
+time in browser output after the route/date actions and minimum result-click
+boundary; encoding the itinerary directly into a navigation URL does not
+satisfy the route-input boundary. Reports store action counts, observed route/date evidence,
+latency/context peaks, and a redacted reply—never usernames or passwords.
+Timeouts retain process-log evidence even when the interrupted turn never
+reached SQLite.
 
 ### Why `Measure` exists
 
@@ -245,8 +270,14 @@ never silently inherits an old one's trials.
 
 ## Prerequisites
 
-`scripted` needs nothing but a build. `model` and `credential` need Ollama
+`scripted` needs nothing but a build. `model`, `credential`, and `browser` need Ollama
 running with the model pulled (`ollama pull gemma4:26b`).
+
+`browser` also needs a locally installed Chrome-family browser and network
+access to the selected sites. Usernames and passwords are redacted from the
+JSON report. Use throwaway login accounts: Instagram and
+United can challenge, rate-limit, or suspend automated sessions independently
+of RustyKrab correctness.
 
 Preflight checks that up front, including one trivial generation: Ollama
 serves one request at a time per model, so another client holding the slot
@@ -268,3 +299,5 @@ scenario twenty minutes in.
 - `E2E_DAEMON_LOG` sets the daemon's `RUST_LOG`. The spawn clears the
   environment, which clears `RUST_LOG` with it, so a misbehaving scenario
   otherwise leaves a log with nothing in it to explain why.
+- Production websites and anti-bot controls are nondeterministic. Browser-mode
+  failures are release evidence to investigate, not a hermetic CI signal.

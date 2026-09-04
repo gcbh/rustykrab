@@ -21,7 +21,7 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::time::Duration;
 
-use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
+use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, ORIGIN};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use uuid::Uuid;
@@ -40,6 +40,7 @@ pub async fn run(data_dir: &Path, _args: &[String]) -> anyhow::Result<()> {
         HeaderValue::from_str(&format!("Bearer {token}"))
             .map_err(|e| anyhow::anyhow!("invalid auth token: {e}"))?,
     );
+    auth_headers.insert(ORIGIN, gateway_origin(&gateway_url)?);
 
     let client = reqwest::Client::builder()
         .default_headers(auth_headers)
@@ -86,6 +87,23 @@ pub async fn run(data_dir: &Path, _args: &[String]) -> anyhow::Result<()> {
             Err(e) => eprintln!("  error: {e}\n"),
         }
     }
+}
+
+/// Return the HTTP origin expected by the gateway's CSRF boundary.
+///
+/// The gateway deliberately requires `Origin` on sensitive `/api` routes,
+/// including requests from non-browser clients.  Supplying the configured
+/// gateway's own origin preserves that boundary while allowing this trusted
+/// loopback client to use the API.
+fn gateway_origin(base: &str) -> anyhow::Result<HeaderValue> {
+    let url = reqwest::Url::parse(base)
+        .map_err(|e| anyhow::anyhow!("invalid RUSTYKRAB_GATEWAY_URL `{base}`: {e}"))?;
+    if !matches!(url.scheme(), "http" | "https") || url.host().is_none() {
+        anyhow::bail!("RUSTYKRAB_GATEWAY_URL must be an http(s) URL with a host");
+    }
+
+    HeaderValue::from_str(&url.origin().ascii_serialization())
+        .map_err(|e| anyhow::anyhow!("invalid gateway origin: {e}"))
 }
 
 enum ControlFlow {
@@ -432,5 +450,33 @@ mod tests {
     fn render_content_handles_plain_string() {
         let v = serde_json::json!("hello");
         assert_eq!(render_content(&v), "hello");
+    }
+
+    #[test]
+    fn gateway_origin_uses_only_scheme_authority_and_port() {
+        assert_eq!(
+            gateway_origin("https://Example.COM:8443/a/path")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "https://example.com:8443"
+        );
+    }
+
+    #[test]
+    fn gateway_origin_accepts_the_default_loopback_url() {
+        assert_eq!(
+            gateway_origin(DEFAULT_GATEWAY_URL)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            DEFAULT_GATEWAY_URL
+        );
+    }
+
+    #[test]
+    fn gateway_origin_rejects_non_http_urls() {
+        let error = gateway_origin("file:///tmp/rustykrab.sock").unwrap_err();
+        assert!(error.to_string().contains("must be an http(s) URL"));
     }
 }

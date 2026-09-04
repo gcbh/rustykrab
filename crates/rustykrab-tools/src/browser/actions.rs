@@ -129,10 +129,18 @@ pub async fn execute_act(
     if let Value::Object(ref mut object) = value {
         object.insert("navigation_guard".into(), navigation_guard);
     }
-    Ok(match dialog_watchdog {
+    let value = match dialog_watchdog {
         Some(watchdog) => watchdog.finish(value).await,
         None => value,
-    })
+    };
+    tracing::debug!(
+        action,
+        ref_id,
+        outcome = value["outcome"].as_str().unwrap_or("missing"),
+        stage = value["stage"].as_str().unwrap_or("missing"),
+        "browser action completed"
+    );
+    Ok(value)
 }
 
 /// Click viewport coordinates from a native-resolution screenshot using the
@@ -846,6 +854,23 @@ async fn current_url(page: &Page) -> Option<String> {
     page.url().await.ok().flatten()
 }
 
+/// Browser-use carries the current page state forward but does not retain a
+/// verbose accessibility object for every action.  Keep all visible text and
+/// refs here, while using the compact line representation to avoid making each
+/// model turn progressively slower on dense application pages.
+fn action_snapshot_options() -> SnapshotOptions {
+    SnapshotOptions {
+        // Preserve visible outcome text such as validation errors, login
+        // failures, live-region updates, and confirmation messages. Keeping
+        // only controls makes the next model turn cheaper, but can hide the
+        // only evidence that the preceding action succeeded or failed. The
+        // compact representation and snapshot output cap bound the cost.
+        interactive_only: false,
+        compact: true,
+        ..SnapshotOptions::default()
+    }
+}
+
 /// A stale-ref action failed. Re-snapshot, then either silently re-resolve the
 /// same logical element (unique role+name match, same page) and retry once, or
 /// escalate a fresh snapshot back to the model.
@@ -862,7 +887,7 @@ async fn heal_or_escalate(
 ) -> Result<Value> {
     // Re-snapshot first: this refreshes the store (so find_by_identity sees the
     // current DOM) and gives us a payload to embed if we escalate.
-    let snapshot = take_snapshot(page, &SnapshotOptions::default(), store, store_key)
+    let snapshot = take_snapshot(page, &action_snapshot_options(), store, store_key)
         .await
         .ok();
     let url_after = current_url(page).await;
@@ -951,7 +976,7 @@ async fn attach_post_action_state(
 
     let state = tokio::time::timeout(
         Duration::from_secs(5),
-        take_snapshot(page, &SnapshotOptions::default(), store, store_key),
+        take_snapshot(page, &action_snapshot_options(), store, store_key),
     )
     .await;
 
@@ -1023,7 +1048,7 @@ async fn escalate(
     ref_id: &str,
     reason: &str,
 ) -> Value {
-    let snapshot = take_snapshot(page, &SnapshotOptions::default(), store, store_key)
+    let snapshot = take_snapshot(page, &action_snapshot_options(), store, store_key)
         .await
         .ok();
     let url = current_url(page).await;
