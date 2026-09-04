@@ -1757,6 +1757,12 @@ async fn main() -> Result<()> {
     // go green again.
     let ok = fail == 0 && xpass == 0;
     let report = json!({
+        "source_revision": source_revision(),
+        "verification_environment": {
+            "daemon": "real rustykrab-cli process",
+            "database": "real SQLite store.db",
+            "mode": args.mode,
+        },
         "scenarios": reports,
         // Every trial, verbatim, so any rate in the summary can be audited
         // back to the reply that produced it.
@@ -1924,6 +1930,10 @@ fn artifact_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("target/e2e-artifacts"))
 }
 
+fn source_revision() -> String {
+    std::env::var("RUSTYKRAB_E2E_SOURCE_REVISION").unwrap_or_else(|_| "unrecorded".to_owned())
+}
+
 fn write_json_artifact(root: &Path, relative_path: &str, value: &Value) -> Result<PathBuf> {
     let relative = Path::new(relative_path);
     if relative.is_absolute()
@@ -1939,7 +1949,14 @@ fn write_json_artifact(root: &Path, relative_path: &str, value: &Value) -> Resul
         .ok_or_else(|| anyhow!("artifact path has no parent: {}", path.display()))?;
     std::fs::create_dir_all(parent)
         .with_context(|| format!("create artifact directory {}", parent.display()))?;
-    std::fs::write(&path, serde_json::to_vec_pretty(value)?)
+    let mut evidence = value.clone();
+    if let Value::Object(object) = &mut evidence {
+        object.insert(
+            "source_revision".to_owned(),
+            Value::String(source_revision()),
+        );
+    }
+    std::fs::write(&path, serde_json::to_vec_pretty(&evidence)?)
         .with_context(|| format!("write evidence artifact {}", path.display()))?;
     Ok(path)
 }
