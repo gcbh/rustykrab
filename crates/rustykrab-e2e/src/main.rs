@@ -9,6 +9,7 @@
 //! the suite — it means a scenario must be promoted.
 //!
 //! Output is a JSON report on stdout plus a matching exit code (0 = green),
+//! and durable evidence is written under `target/e2e-artifacts` by default,
 //! so agents and CI can assert mechanically. Run via `scripts/e2e.sh`, or
 //! directly:
 //!
@@ -326,7 +327,6 @@ impl Ctx {
             .and_then(|(_, port)| port.parse().ok())
             .ok_or_else(|| anyhow!("invalid harness base URL: {}", self.base))
     }
-
     /// Run a daemon CLI subcommand with the harness environment.
     fn cli(&self, args: &[&str]) -> Result<std::process::Output> {
         Ok(Command::new(&self.bin)
@@ -1497,6 +1497,8 @@ ENVIRONMENT:
                         the report says so.
     E2E_KEEP_TMP        Keep the throwaway data dir for post-mortems (logs
                         only; the Chrome profile is shed to save disk).
+    E2E_ARTIFACT_DIR    Durable report/evidence directory
+                        (default: target/e2e-artifacts).
 ";
 
 struct Args {
@@ -1956,7 +1958,9 @@ fn write_json_artifact(root: &Path, relative_path: &str, value: &Value) -> Resul
             Value::String(source_revision()),
         );
     }
-    std::fs::write(&path, serde_json::to_vec_pretty(&evidence)?)
+    let mut encoded = serde_json::to_vec_pretty(&evidence)?;
+    encoded.push(b'\n');
+    std::fs::write(&path, encoded)
         .with_context(|| format!("write evidence artifact {}", path.display()))?;
     Ok(path)
 }
