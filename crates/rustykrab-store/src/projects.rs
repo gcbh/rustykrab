@@ -155,6 +155,34 @@ impl ProjectStore {
         .await
     }
 
+    /// Load the original revision command for an idempotency key.
+    ///
+    /// Transport adapters use this to reuse server-derived values such as the
+    /// author and timestamp when reconstructing an exact retry. The command
+    /// must still be passed to [`Self::apply`], which compares its complete
+    /// serialization and rejects changed caller input under the same key.
+    pub async fn get_revision_request(
+        &self,
+        project_id: &ProjectId,
+        request_id: &str,
+    ) -> Result<Option<PlanChangeSet>, Error> {
+        let project_id = *project_id;
+        let request_id = request_id.to_owned();
+        with_conn(&self.conn, move |conn| {
+            let request = conn
+                .query_row(
+                    "SELECT request_data FROM project_revisions
+                     WHERE project_id = ?1 AND request_id = ?2",
+                    params![project_id.to_string(), request_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(storage_error)?;
+            request.map(|request| from_json(&request)).transpose()
+        })
+        .await
+    }
+
     /// Load the exact project snapshot produced by a historical revision.
     pub async fn get_revision(
         &self,
@@ -791,6 +819,20 @@ mod tests {
             .unwrap();
         assert!(repeated.replayed);
         assert_eq!(repeated.snapshot, applied.snapshot);
+        assert_eq!(
+            store
+                .projects()
+                .get_revision_request(&first.snapshot.project.id, "apply-replay")
+                .await
+                .unwrap(),
+            Some(change_set.clone())
+        );
+        assert!(store
+            .projects()
+            .get_revision_request(&first.snapshot.project.id, "missing-request")
+            .await
+            .unwrap()
+            .is_none());
 
         let create_replay = store.projects().create(command).await.unwrap();
         assert!(create_replay.replayed);
