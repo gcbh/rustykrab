@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.2.30] - 2026-09-04
+
+- fix(release): keep lockfile reproducible after version bump (#635)
+
 ## [5.2.29] - 2026-09-04
 
 - feat(gateway): expose durable project planning (#609)
