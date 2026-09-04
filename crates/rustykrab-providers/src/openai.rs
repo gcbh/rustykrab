@@ -502,6 +502,10 @@ impl ModelProvider for OpenAiProvider {
         &self.provider_name
     }
 
+    fn model_id(&self) -> &str {
+        &self.model
+    }
+
     fn supports_vision(&self) -> bool {
         self.vision
     }

@@ -23,5 +23,5 @@ pub use sandbox::{
 };
 pub use subagent::SubagentRunner;
 pub use todo_tools::todo_tools;
-pub use trace::{ExecutionTracer, ToolStats, ToolTrace};
+pub use trace::{CaptchaTrace, ExecutionTracer, ToolStats, ToolTrace};
 pub use voting::ConsistencyVoter;

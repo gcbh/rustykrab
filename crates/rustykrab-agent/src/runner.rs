@@ -108,7 +108,7 @@ const DEFAULT_ACTIVE_TOOLS: &[&str] = &[
 ];
 
 use crate::sandbox::{tool_timeout_secs, Sandbox, SandboxPolicy, DEFAULT_NET_TOOL_TIMEOUT_SECS};
-use crate::trace::{ExecutionTracer, ToolTrace};
+use crate::trace::{CaptchaTrace, ExecutionTracer, ToolTrace};
 
 /// Tool names whose output comes from external/untrusted sources (web pages,
 /// search results, etc.). Their output is wrapped with adversarial-content
@@ -1023,7 +1023,15 @@ impl AgentRunner {
         for name in stats.keys() {
             attributions.push(Attribution::tool(name.clone()));
         }
-
+        let model_attribution = format!(
+            "model:{}",
+            self.provider
+                .model_id()
+                .chars()
+                .filter(|character| !character.is_control())
+                .take(128)
+                .collect::<String>()
+        );
         let record = OutcomeRecord::new(
             session.conversation_id,
             session.id,
@@ -1037,6 +1045,60 @@ impl AgentRunner {
 
         if let Err(e) = sink.record_outcome(record).await {
             tracing::warn!(error = %e, "failed to record run outcome");
+        }
+
+        // CAPTCHA interaction records are separate from the turn outcome.
+        // `cleared` is a useful independently repeated DOM observation, but
+        // not proof that the target server accepted the challenge, so these
+        // remain implicit evidence and can be joined to the normal run record
+        // by session id when evaluating downstream task success.
+        for attempt in tracer.captcha_traces() {
+            let (verdict, confidence) = match attempt.result.as_str() {
+                "cleared" => (rustykrab_core::OutcomeVerdict::Success, 0.65),
+                "action_failed" | "budget_exhausted" => {
+                    (rustykrab_core::OutcomeVerdict::Failure, 0.65)
+                }
+                _ => (rustykrab_core::OutcomeVerdict::Ambiguous, 0.5),
+            };
+            let failed = u32::from(matches!(
+                attempt.result.as_str(),
+                "action_failed" | "budget_exhausted"
+            ));
+            let detail = serde_json::json!({
+                "kind": "captcha_model_attempt",
+                "challenge_id": attempt.challenge_id,
+                "origin": attempt.origin,
+                "providers": attempt.providers,
+                "attempt": attempt.attempt,
+                "action": attempt.action,
+                "result": attempt.result,
+                "action_outcome": attempt.action_outcome,
+                "elapsed_ms": attempt.elapsed_ms,
+                "clearance_confirmations": attempt.clearance_confirmations,
+                "max_attempts": attempt.max_attempts,
+            })
+            .to_string();
+            let record = OutcomeRecord::new(
+                session.conversation_id,
+                session.id,
+                verdict,
+                SignalClass::Implicit,
+            )
+            .with_confidence(confidence)
+            .with_detail(detail)
+            .with_counters(ExecutionCounters {
+                tool_calls: 1,
+                tool_failures: failed,
+                iterations: 0,
+                compactions: 0,
+            })
+            .with_attributions(vec![
+                Attribution::tool("browser:captcha:model-assisted"),
+                Attribution::tool(model_attribution.clone()),
+            ]);
+            if let Err(error) = sink.record_outcome(record).await {
+                tracing::warn!(error = %error, "failed to record model CAPTCHA outcome");
+            }
         }
     }
 
@@ -2119,12 +2181,18 @@ impl AgentRunner {
                 )
                 .await
             };
+            let result = annotate_image_transport(
+                result,
+                self.provider.model_id(),
+                self.provider.supports_vision(),
+            );
             tracer.record(ToolTrace {
                 tool_name: call.name.clone(),
                 success: result.is_ok(),
                 duration: start.elapsed(),
                 error: result.as_ref().err().map(|e| e.to_string()),
             });
+            record_captcha_result(tracer, &result);
             return vec![(call.name.clone(), call.id.clone(), result)];
         }
 
@@ -2219,6 +2287,12 @@ impl AgentRunner {
             };
             match joined {
                 Ok((result, name, call_id, duration)) => {
+                    let result = annotate_image_transport(
+                        result,
+                        self.provider.model_id(),
+                        self.provider.supports_vision(),
+                    );
+                    record_captcha_result(tracer, &result);
                     tracer.record(ToolTrace {
                         tool_name: name.clone(),
                         success: result.is_ok(),
@@ -3144,6 +3218,172 @@ mod error_output_tests {
         let clamped = sanitize_error(&huge);
         assert!(clamped.chars().count() < huge.chars().count());
         assert!(clamped.ends_with("[truncated]"));
+    }
+}
+
+/// Report whether attached tool images are eligible to cross the next model
+/// boundary. Provider request-shaping tests remain the independent evidence
+/// that eligible images are serialized on the wire.
+fn annotate_image_transport(
+    result: Result<ToolResult>,
+    model_id: &str,
+    supports_vision: bool,
+) -> Result<ToolResult> {
+    result.map(|mut tool_result| {
+        if !tool_result.images.is_empty() {
+            if let Some(object) = tool_result.output.as_object_mut() {
+                object.insert(
+                    "image_transport".to_string(),
+                    serde_json::json!({
+                        "attached_images": tool_result.images.len(),
+                        "model": model_id
+                            .chars()
+                            .filter(|character| !character.is_control())
+                            .take(128)
+                            .collect::<String>(),
+                        "model_accepts_images": supports_vision,
+                        "status": if supports_vision {
+                            "eligible_for_next_model_request"
+                        } else {
+                            "dropped_for_text_only_model"
+                        },
+                    }),
+                );
+            }
+        }
+        tool_result
+    })
+}
+
+/// Pull privacy-safe model-attempt evidence from a browser result into this
+/// run's trace. Missing or malformed telemetry never changes tool execution.
+fn record_captcha_result(tracer: &ExecutionTracer, result: &Result<ToolResult>) {
+    let Ok(tool_result) = result else {
+        return;
+    };
+    let value = &tool_result.output["captcha_attempt"];
+    let Some(challenge_id) = value["challenge_id"].as_str() else {
+        return;
+    };
+    let Some(result) = value["result"].as_str() else {
+        return;
+    };
+    tracer.record_captcha(CaptchaTrace {
+        challenge_id: challenge_id.to_string(),
+        origin: value["origin"].as_str().unwrap_or("unknown").to_string(),
+        providers: value["providers"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_str)
+            .take(8)
+            .map(ToOwned::to_owned)
+            .collect(),
+        attempt: value["attempt"]
+            .as_u64()
+            .unwrap_or_default()
+            .min(u32::MAX as u64) as u32,
+        action: value["action"].as_str().unwrap_or("unknown").to_string(),
+        result: result.to_string(),
+        action_outcome: value["action_outcome"]
+            .as_str()
+            .unwrap_or("unknown")
+            .to_string(),
+        elapsed_ms: value["elapsed_ms"].as_u64().unwrap_or_default(),
+        clearance_confirmations: value["clearance_confirmations"]
+            .as_u64()
+            .unwrap_or_default()
+            .min(u8::MAX as u64) as u8,
+        max_attempts: value["max_attempts"]
+            .as_u64()
+            .unwrap_or_default()
+            .min(u32::MAX as u64) as u32,
+    });
+}
+
+#[cfg(test)]
+mod captcha_observability_tests {
+    use super::*;
+    use rustykrab_core::types::ContentBlock;
+
+    fn screenshot_result() -> Result<ToolResult> {
+        Ok(ToolResult {
+            call_id: "screenshot-1".to_string(),
+            output: serde_json::json!({"screenshot":"attached_to_multimodal_result"}),
+            is_error: false,
+            images: vec![ContentBlock::Image {
+                media_type: "image/png".to_string(),
+                data: vec![0x89, b'P', b'N', b'G'],
+            }],
+        })
+    }
+
+    #[test]
+    fn screenshot_transport_names_the_concrete_vision_model() {
+        let result = annotate_image_transport(screenshot_result(), "gemma4:26b", true)
+            .expect("annotated result");
+        assert_eq!(result.output["image_transport"]["attached_images"], 1);
+        assert_eq!(result.output["image_transport"]["model"], "gemma4:26b");
+        assert_eq!(
+            result.output["image_transport"]["status"],
+            "eligible_for_next_model_request"
+        );
+    }
+
+    #[test]
+    fn screenshot_transport_reports_when_a_model_cannot_see_the_image() {
+        let result = annotate_image_transport(screenshot_result(), "text-only", false)
+            .expect("annotated result");
+        assert_eq!(
+            result.output["image_transport"]["status"],
+            "dropped_for_text_only_model"
+        );
+        assert_eq!(
+            result.output["image_transport"]["model_accepts_images"],
+            false
+        );
+    }
+
+    #[test]
+    fn browser_attempt_metadata_is_copied_into_the_privacy_safe_trace() {
+        let tracer = ExecutionTracer::new();
+        let result = Ok(ToolResult {
+            call_id: "captcha-1".to_string(),
+            output: serde_json::json!({
+                "captcha_attempt": {
+                    "challenge_id": "challenge-123",
+                    "origin": "https://example.com",
+                    "providers": ["cloudflare-turnstile"],
+                    "attempt": 2,
+                    "action": "act/click",
+                    "result": "cleared",
+                    "action_outcome": "applied",
+                    "elapsed_ms": 925,
+                    "clearance_confirmations": 2,
+                    "max_attempts": 4
+                }
+            }),
+            is_error: false,
+            images: Vec::new(),
+        });
+
+        record_captcha_result(&tracer, &result);
+
+        assert_eq!(
+            tracer.captcha_traces(),
+            vec![CaptchaTrace {
+                challenge_id: "challenge-123".to_string(),
+                origin: "https://example.com".to_string(),
+                providers: vec!["cloudflare-turnstile".to_string()],
+                attempt: 2,
+                action: "act/click".to_string(),
+                result: "cleared".to_string(),
+                action_outcome: "applied".to_string(),
+                elapsed_ms: 925,
+                clearance_confirmations: 2,
+                max_attempts: 4,
+            }]
+        );
     }
 }
 
@@ -5891,6 +6131,9 @@ mod outcome_capture_tests {
         fn name(&self) -> &str {
             "scripted-mock"
         }
+        fn model_id(&self) -> &str {
+            "gemma4:26b"
+        }
         async fn chat(&self, _: &[Message], _: &[ToolSchema]) -> Result<ModelResponse> {
             Ok(self.next())
         }
@@ -6059,6 +6302,47 @@ mod outcome_capture_tests {
                 .any(|a| a.kind == AttributionKind::Tool && a.id == "work"),
             "tools actually called must be credited, got {attributions:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn captcha_attempts_are_separate_model_attributed_outcomes() {
+        let sink = Arc::new(RecordingSink::default());
+        let (runner, session, _conv) = make_runner(false);
+        let runner = runner.with_outcome_sink(sink.clone());
+        let tracer = ExecutionTracer::new();
+        tracer.record_captcha(CaptchaTrace {
+            challenge_id: "challenge-123".to_string(),
+            origin: "https://example.com".to_string(),
+            providers: vec!["cloudflare-turnstile".to_string()],
+            attempt: 2,
+            action: "act/click".to_string(),
+            result: "cleared".to_string(),
+            action_outcome: "applied".to_string(),
+            elapsed_ms: 925,
+            clearance_confirmations: 2,
+            max_attempts: 4,
+        });
+
+        runner.capture_outcome(&session, &tracer, false).await;
+
+        let records = sink.records();
+        assert_eq!(records.len(), 2, "one run record plus one attempt record");
+        let attempt = &records[1];
+        assert_eq!(attempt.verdict, OutcomeVerdict::Success);
+        assert_eq!(attempt.signal, SignalClass::Implicit);
+        assert_eq!(attempt.session_id, session.id);
+        assert!(attempt
+            .attributions
+            .contains(&Attribution::tool("browser:captcha:model-assisted")));
+        assert!(attempt
+            .attributions
+            .contains(&Attribution::tool("model:gemma4:26b")));
+        let detail: serde_json::Value =
+            serde_json::from_str(attempt.detail.as_deref().expect("attempt detail"))
+                .expect("valid detail json");
+        assert_eq!(detail["kind"], "captcha_model_attempt");
+        assert_eq!(detail["result"], "cleared");
+        assert_eq!(detail["clearance_confirmations"], 2);
     }
 
     #[tokio::test]

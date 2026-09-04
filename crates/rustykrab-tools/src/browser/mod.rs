@@ -11,6 +11,7 @@
 
 pub mod actions;
 pub mod adaptive;
+mod captcha;
 pub mod config;
 pub mod downloads;
 pub mod fetcher;
@@ -31,8 +32,10 @@ use chromiumoxide::page::ScreenshotParams;
 use rustykrab_core::types::ToolSchema;
 use rustykrab_core::{Error, Result, SandboxRequirements, Tool, ToolError};
 use serde_json::{json, Value};
-use std::collections::HashSet;
-use std::time::Duration;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::sync::Mutex;
 
 use adaptive::AdaptiveStore;
 use manager::BrowserManager;
@@ -48,6 +51,36 @@ struct NavigationObservation {
     browser_degraded: bool,
     elapsed_ms: u64,
     reason: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ScreenshotGeometry {
+    image_width: f64,
+    image_height: f64,
+    viewport_width: f64,
+    viewport_height: f64,
+    page_url: String,
+    captured_at: Instant,
+}
+
+fn scale_screenshot_point(x: f64, y: f64, geometry: &ScreenshotGeometry) -> Result<(f64, f64)> {
+    if x < 0.0
+        || y < 0.0
+        || x > geometry.image_width
+        || y > geometry.image_height
+        || geometry.image_width <= 0.0
+        || geometry.image_height <= 0.0
+        || geometry.viewport_width <= 0.0
+        || geometry.viewport_height <= 0.0
+    {
+        return Err(Error::ToolExecution(ToolError::invalid_input(
+            "click coordinates fall outside the latest compatible screenshot",
+        )));
+    }
+    Ok((
+        x * geometry.viewport_width / geometry.image_width,
+        y * geometry.viewport_height / geometry.image_height,
+    ))
 }
 
 /// Issue `Page.navigate` and observe document readiness under one absolute
@@ -331,6 +364,8 @@ pub struct BrowserTool {
     manager: BrowserManager,
     snapshot_store: SnapshotStore,
     adaptive_store: AdaptiveStore,
+    captcha_monitor: captcha::CaptchaMonitor,
+    screenshot_geometry: Arc<Mutex<HashMap<String, ScreenshotGeometry>>>,
     /// Read access to stored credentials, for `fill_credential`.
     ///
     /// Optional so a browser built without a store still works for
@@ -407,12 +442,12 @@ fn schema_parameters() -> serde_json::Value {
             "x": {
                 "type": "number",
                 "minimum": 0,
-                "description": "Viewport x coordinate for click_coordinates, measured in the native screenshot coordinate space."
+                "description": "Viewport x coordinate for click_coordinates. Use coordinates only from a screenshot whose coordinate_actions_compatible field is true."
             },
             "y": {
                 "type": "number",
                 "minimum": 0,
-                "description": "Viewport y coordinate for click_coordinates, measured in the native screenshot coordinate space."
+                "description": "Viewport y coordinate for click_coordinates. Use coordinates only from a screenshot whose coordinate_actions_compatible field is true."
             },
             "key": {
                 "type": "string",
@@ -443,6 +478,10 @@ fn schema_parameters() -> serde_json::Value {
             "clear": {
                 "type": "boolean",
                 "description": "Clear field before typing (default: true for fill, false for type)"
+            },
+            "captchaAttempt": {
+                "type": "boolean",
+                "description": "Mark this act/click_coordinates/send_keys call as one model-assisted CAPTCHA interaction. Valid only while a CAPTCHA is independently detected and modelCaptchaSolver is enabled. This opt-in activates bounded attempt monitoring; never mark ordinary page actions."
             },
             "expect_download": {
                 "type": "boolean",
@@ -755,6 +794,8 @@ impl BrowserTool {
             manager: BrowserManager::from_config(),
             snapshot_store: SnapshotStore::new(),
             adaptive_store: AdaptiveStore::new(),
+            captcha_monitor: captcha::CaptchaMonitor::default(),
+            screenshot_geometry: Arc::new(Mutex::new(HashMap::new())),
             secrets: None,
         }
     }
@@ -770,6 +811,8 @@ impl BrowserTool {
             manager: BrowserManager::new(config),
             snapshot_store: SnapshotStore::new(),
             adaptive_store: AdaptiveStore::new(),
+            captcha_monitor: captcha::CaptchaMonitor::default(),
+            screenshot_geometry: Arc::new(Mutex::new(HashMap::new())),
             secrets: None,
         }
     }
@@ -798,6 +841,20 @@ impl BrowserTool {
             Err(Error::ToolExecution(ToolError::invalid_input(format!(
                 "browser action '{action}' requires non-empty '{field}'"
             ))))
+        }
+
+        if args["captchaAttempt"].as_bool() == Some(true) {
+            let supported = matches!(action, "click_coordinates" | "send_keys")
+                || (action == "act"
+                    && matches!(
+                        args["actAction"].as_str(),
+                        Some("click" | "type" | "fill" | "press" | "select")
+                    ));
+            if !supported {
+                return Err(Error::ToolExecution(ToolError::invalid_input(
+                    "captchaAttempt=true is limited to act/click, act/type, act/fill, act/press, act/select, click_coordinates, and send_keys",
+                )));
+            }
         }
 
         match action {
@@ -1030,6 +1087,159 @@ impl BrowserTool {
             .map_err(|error| Error::ToolExecution(error.into()))
     }
 
+    async fn observe_captcha(&self, key: &str, page_url: &str, captcha_state: &Value) -> Value {
+        let config = self.manager.config();
+        self.captcha_monitor
+            .observe(
+                key,
+                &captcha::safe_origin(page_url),
+                captcha_state,
+                config.model_captcha_solver,
+                config.effective_captcha_max_attempts(),
+                config.effective_captcha_timeout(),
+            )
+            .await
+    }
+
+    async fn begin_captcha_attempt(
+        &self,
+        args: &Value,
+        key: &str,
+        page: &chromiumoxide::Page,
+    ) -> Result<Option<captcha::AttemptStart>> {
+        if args["captchaAttempt"].as_bool() != Some(true) {
+            return Ok(None);
+        }
+        let config = self.manager.config();
+        if !config.model_captcha_solver {
+            return Err(Error::ToolExecution(ToolError::permission_denied(
+                "model-assisted CAPTCHA interaction is disabled; set modelCaptchaSolver=true in browser.json to enable bounded, monitored attempts",
+            )));
+        }
+        let page_url = manager::probe_page_url_once(page).await.unwrap_or_default();
+        let captcha_state = snapshot::detect_captcha(page).await;
+        Ok(Some(
+            self.captcha_monitor
+                .begin_attempt(
+                    key,
+                    &captcha::safe_origin(&page_url),
+                    &captcha_state,
+                    config.effective_captcha_max_attempts(),
+                    config.effective_captcha_timeout(),
+                )
+                .await,
+        ))
+    }
+
+    fn captcha_rejection(action: &str, mut metadata: Value) -> Value {
+        if let Value::Object(object) = &mut metadata {
+            object.insert("action".into(), Value::String(action.to_string()));
+            object.insert(
+                "action_outcome".into(),
+                Value::String("not_applied".to_string()),
+            );
+            object.entry("elapsed_ms").or_insert(json!(0));
+            object.entry("clearance_confirmations").or_insert(json!(0));
+        }
+        json!({
+            "status": "captcha_attempt_rejected",
+            "outcome": "not_applied",
+            "retry_safe": metadata["retry_safe"],
+            "browser_degraded": false,
+            "action": action,
+            "captcha_attempt": metadata,
+        })
+    }
+
+    async fn finish_captcha_attempt(
+        &self,
+        ticket: Option<captcha::AttemptTicket>,
+        action: &str,
+        page: &chromiumoxide::Page,
+        outcome: &mut Value,
+    ) {
+        let Some(ticket) = ticket else {
+            return;
+        };
+        let post_state = outcome["page_state"]["captcha"].clone();
+        let action_outcome = outcome["outcome"].as_str().unwrap_or("unknown").to_string();
+        let confirmation = if action_outcome == "applied" {
+            tokio::time::sleep(Duration::from_millis(350)).await;
+            snapshot::detect_captcha(page).await
+        } else {
+            json!({"detected":false,"providers":[],"status":"unverified"})
+        };
+        let attempt = self
+            .captcha_monitor
+            .finish_attempt(ticket, action, &action_outcome, &post_state, &confirmation)
+            .await;
+        if let Value::Object(object) = outcome {
+            object.insert("captcha_attempt".into(), attempt);
+        }
+    }
+
+    async fn map_screenshot_coordinates(
+        &self,
+        key: &str,
+        page: &chromiumoxide::Page,
+        x: f64,
+        y: f64,
+        require_fresh_screenshot: bool,
+    ) -> Result<(f64, f64, Value)> {
+        let geometry = self.screenshot_geometry.lock().await.get(key).cloned();
+        let page_url = manager::probe_page_url_once(page).await.unwrap_or_default();
+        let usable = geometry.filter(|geometry| {
+            geometry.page_url == page_url
+                && geometry.captured_at.elapsed() <= Duration::from_secs(60)
+        });
+        let Some(geometry) = usable else {
+            if require_fresh_screenshot {
+                return Err(Error::ToolExecution(ToolError::invalid_input(
+                    "captcha coordinate actions require a compatible viewport screenshot from the current page within the last 60 seconds",
+                )));
+            }
+            return Ok((
+                x,
+                y,
+                json!({
+                    "status": "unavailable",
+                    "input_space": "css_viewport_fallback",
+                    "dispatched_x": x,
+                    "dispatched_y": y,
+                }),
+            ));
+        };
+        let (mapped_x, mapped_y) = scale_screenshot_point(x, y, &geometry)?;
+        Ok((
+            mapped_x,
+            mapped_y,
+            json!({
+                "status": "scaled_from_recent_screenshot",
+                "input_x": x,
+                "input_y": y,
+                "image_width": geometry.image_width,
+                "image_height": geometry.image_height,
+                "viewport_width": geometry.viewport_width,
+                "viewport_height": geometry.viewport_height,
+                "dispatched_x": mapped_x,
+                "dispatched_y": mapped_y,
+            }),
+        ))
+    }
+
+    fn captcha_action_error(action: &str, error: Error) -> Value {
+        json!({
+            "status": "captcha_action_failed",
+            "outcome": "not_applied",
+            "retry_safe": true,
+            "browser_degraded": false,
+            "action": action,
+            "error": error.to_string(),
+            "page_state": null,
+            "page_state_status": "failed",
+        })
+    }
+
     fn validated_upload_paths(args: &Value) -> Result<Vec<String>> {
         let mut requested = Vec::new();
         if let Some(path) = args["path"].as_str() {
@@ -1236,6 +1446,16 @@ fn truncate_utf8(s: &str, max_bytes: usize) -> (&str, bool) {
     (&s[..end], true)
 }
 
+fn png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
+    if bytes.len() < 24 || &bytes[..8] != PNG_SIGNATURE || &bytes[12..16] != b"IHDR" {
+        return None;
+    }
+    let width = u32::from_be_bytes(bytes[16..20].try_into().ok()?);
+    let height = u32::from_be_bytes(bytes[20..24].try_into().ok()?);
+    (width > 0 && height > 0).then_some((width, height))
+}
+
 /// Mask a cookie value for security: hide the entire value to prevent
 /// exposure of predictable session token prefixes.
 fn mask_cookie_value(value: &str) -> String {
@@ -1274,7 +1494,8 @@ impl Tool for BrowserTool {
          have the value, and typing a placeholder or the credential's own name just \
          fails the login. If nothing is stored yet the error names the exact key — \
          ask for it with credential_request under that name, then retry; \
-         screenshot/content/evaluate/scroll/console/cookies/pdf. Snapshots report likely CAPTCHA providers but do not claim to solve them. \
+         screenshot/content/evaluate/scroll/console/cookies/pdf. Screenshots are delivered through the model's multimodal image channel. Use screenshot coordinates only when coordinate_actions_compatible=true; element and full-page screenshots are not viewport coordinate maps. \
+         Snapshots report likely CAPTCHA providers. When captcha_monitor says model_solver_enabled=true, inspect a screenshot and mark only challenge-specific act/click_coordinates/send_keys calls with captchaAttempt=true. RustyKrab bounds and records those interactions; stop on cleared, budget_exhausted, not_detected, or unknown. After action_failed, inspect state and continue only with a materially corrected action while budget remains. This is visible interaction, not token injection or a bypass API. \
          Cookies persist across calls. Use snapshot + act for reliable element interaction. \
          Each act returns its outcome plus page_state; clicks also return the current tabs \
          and any JavaScript dialogs they accepted. Set expect_download=true on a download \
@@ -1359,7 +1580,28 @@ impl Tool for BrowserTool {
 
         match action {
             // ── Lifecycle ──────────────────────────────────────────
-            "status" => Ok(self.manager.status(&profile).await),
+            "status" => {
+                let mut status = self.manager.status(&profile).await;
+                let status_target = args["targetId"]
+                    .as_str()
+                    .map(ToOwned::to_owned)
+                    .or_else(|| self.manager.sticky_target(&session, &profile));
+                let key = Self::store_key(&session, &profile, status_target.as_deref());
+                let config = self.manager.config();
+                let captcha_status = self
+                    .captcha_monitor
+                    .status(
+                        &key,
+                        config.model_captcha_solver,
+                        config.effective_captcha_max_attempts(),
+                        config.effective_captcha_timeout(),
+                    )
+                    .await;
+                if let Value::Object(object) = &mut status {
+                    object.insert("captcha_monitor".into(), captcha_status);
+                }
+                Ok(status)
+            }
 
             "start" => self.manager.start(&profile).await,
 
@@ -1669,6 +1911,17 @@ impl Tool for BrowserTool {
                     object.insert("navigation_guard".into(), guard);
                 }
 
+                let captcha_monitor = self
+                    .observe_captcha(
+                        &key,
+                        snap["url"].as_str().unwrap_or_default(),
+                        &snap["captcha"],
+                    )
+                    .await;
+                if let Value::Object(ref mut object) = snap {
+                    object.insert("captcha_monitor".into(), captcha_monitor);
+                }
+
                 // How much of the page the agent actually received.
                 //
                 // When an agent reports only a page's heading, two very
@@ -1717,6 +1970,16 @@ impl Tool for BrowserTool {
                 }
                 let page = self.page_for(action, &profile, &session, target_id).await?;
                 let key = Self::store_key(&session, &profile, target_id);
+                let captcha_ticket = match self.begin_captcha_attempt(&args, &key, &page).await? {
+                    Some(captcha::AttemptStart::Ready(ticket)) => Some(ticket),
+                    Some(captcha::AttemptStart::Rejected(metadata)) => {
+                        return Ok(Self::captcha_rejection(
+                            &format!("act/{act_action}"),
+                            metadata,
+                        ));
+                    }
+                    None => None,
+                };
                 let targets_before =
                     tokio::time::timeout(Duration::from_secs(3), self.manager.target_ids(&profile))
                         .await
@@ -1728,7 +1991,7 @@ impl Tool for BrowserTool {
                     None
                 };
 
-                let mut outcome = actions::execute_act(
+                let action_result = actions::execute_act(
                     &page,
                     &self.snapshot_store,
                     &key,
@@ -1740,7 +2003,14 @@ impl Tool for BrowserTool {
                         navigation: &self.manager.config().ssrf_policy,
                     },
                 )
-                .await?;
+                .await;
+                let mut outcome = match action_result {
+                    Ok(outcome) => outcome,
+                    Err(error) if captcha_ticket.is_some() => {
+                        Self::captcha_action_error(&format!("act/{act_action}"), error)
+                    }
+                    Err(error) => return Err(error),
+                };
 
                 if let Some(since) = download_since {
                     let expect_download = args["expect_download"].as_bool().unwrap_or(false);
@@ -1813,6 +2083,13 @@ impl Tool for BrowserTool {
                         object.insert("tabs".into(), tabs);
                     }
                 }
+                self.finish_captcha_attempt(
+                    captcha_ticket,
+                    &format!("act/{act_action}"),
+                    &page,
+                    &mut outcome,
+                )
+                .await;
                 Ok(outcome)
             }
 
@@ -1822,12 +2099,28 @@ impl Tool for BrowserTool {
                 let _ = self.manager.get_browser(&profile).await?;
                 let page = self.page_for(action, &profile, &session, target_id).await?;
                 let key = Self::store_key(&session, &profile, target_id);
+                let (x, y, coordinate_mapping) = self
+                    .map_screenshot_coordinates(
+                        &key,
+                        &page,
+                        x,
+                        y,
+                        args["captchaAttempt"].as_bool() == Some(true),
+                    )
+                    .await?;
+                let captcha_ticket = match self.begin_captcha_attempt(&args, &key, &page).await? {
+                    Some(captcha::AttemptStart::Ready(ticket)) => Some(ticket),
+                    Some(captcha::AttemptStart::Rejected(metadata)) => {
+                        return Ok(Self::captcha_rejection(action, metadata));
+                    }
+                    None => None,
+                };
                 let targets_before =
                     tokio::time::timeout(Duration::from_secs(3), self.manager.target_ids(&profile))
                         .await
                         .ok()
                         .and_then(std::result::Result::ok);
-                let mut outcome = actions::execute_coordinate_click(
+                let action_result = actions::execute_coordinate_click(
                     &page,
                     &self.snapshot_store,
                     &key,
@@ -1836,7 +2129,17 @@ impl Tool for BrowserTool {
                     self.manager.config().dialog_policy,
                     &self.manager.config().ssrf_policy,
                 )
-                .await?;
+                .await;
+                let mut outcome = match action_result {
+                    Ok(outcome) => outcome,
+                    Err(error) if captcha_ticket.is_some() => {
+                        Self::captcha_action_error(action, error)
+                    }
+                    Err(error) => return Err(error),
+                };
+                if let Value::Object(object) = &mut outcome {
+                    object.insert("coordinate_mapping".into(), coordinate_mapping);
+                }
                 let action_degraded = outcome["browser_degraded"].as_bool().unwrap_or(false);
                 if !action_degraded {
                     let popup_guard = self
@@ -1851,6 +2154,8 @@ impl Tool for BrowserTool {
                         object.insert("recovery".into(), recovery);
                     }
                 }
+                self.finish_captcha_attempt(captcha_ticket, action, &page, &mut outcome)
+                    .await;
                 Ok(outcome)
             }
 
@@ -1859,12 +2164,20 @@ impl Tool for BrowserTool {
                 let _ = self.manager.get_browser(&profile).await?;
                 let page = self.page_for(action, &profile, &session, target_id).await?;
                 let store_key = Self::store_key(&session, &profile, target_id);
+                let captcha_ticket =
+                    match self.begin_captcha_attempt(&args, &store_key, &page).await? {
+                        Some(captcha::AttemptStart::Ready(ticket)) => Some(ticket),
+                        Some(captcha::AttemptStart::Rejected(metadata)) => {
+                            return Ok(Self::captcha_rejection(action, metadata));
+                        }
+                        None => None,
+                    };
                 let targets_before =
                     tokio::time::timeout(Duration::from_secs(3), self.manager.target_ids(&profile))
                         .await
                         .ok()
                         .and_then(std::result::Result::ok);
-                let mut outcome = actions::execute_send_keys(
+                let action_result = actions::execute_send_keys(
                     &page,
                     &self.snapshot_store,
                     &store_key,
@@ -1872,7 +2185,14 @@ impl Tool for BrowserTool {
                     self.manager.config().dialog_policy,
                     &self.manager.config().ssrf_policy,
                 )
-                .await?;
+                .await;
+                let mut outcome = match action_result {
+                    Ok(outcome) => outcome,
+                    Err(error) if captcha_ticket.is_some() => {
+                        Self::captcha_action_error(action, error)
+                    }
+                    Err(error) => return Err(error),
+                };
                 let action_degraded = outcome["browser_degraded"].as_bool().unwrap_or(false);
                 if !action_degraded {
                     let popup_guard = self
@@ -1887,6 +2207,8 @@ impl Tool for BrowserTool {
                         object.insert("recovery".into(), recovery);
                     }
                 }
+                self.finish_captcha_attempt(captcha_ticket, action, &page, &mut outcome)
+                    .await;
                 Ok(outcome)
             }
             // Type a stored credential into a field without the value
@@ -2041,19 +2363,77 @@ impl Tool for BrowserTool {
                 };
 
                 let size_bytes = png_bytes.len();
+                let dimensions = png_dimensions(&png_bytes);
                 let b64 = base64::engine::general_purpose::STANDARD.encode(&png_bytes);
                 let navigation_guard = self
                     .guard_page_output(action, &session, &profile, target_id, &page)
                     .await?;
+                let page_url = manager::probe_page_url_once(&page)
+                    .await
+                    .unwrap_or_default();
+                let captcha_state = snapshot::detect_captcha(&page).await;
+                let key = Self::store_key(&session, &profile, target_id);
+                let captcha_monitor = self.observe_captcha(&key, &page_url, &captcha_state).await;
+                let viewport = tokio::time::timeout(Duration::from_secs(2), page.layout_metrics())
+                    .await
+                    .ok()
+                    .and_then(std::result::Result::ok)
+                    .map(|metrics| {
+                        (
+                            metrics.css_visual_viewport.client_width,
+                            metrics.css_visual_viewport.client_height,
+                        )
+                    });
+                let coordinate_actions_compatible =
+                    selector.is_none() && !full_page && dimensions.is_some() && viewport.is_some();
+                if coordinate_actions_compatible {
+                    let (image_width, image_height) = dimensions.expect("checked above");
+                    let (viewport_width, viewport_height) = viewport.expect("checked above");
+                    self.screenshot_geometry.lock().await.insert(
+                        key,
+                        ScreenshotGeometry {
+                            image_width: f64::from(image_width),
+                            image_height: f64::from(image_height),
+                            viewport_width,
+                            viewport_height,
+                            page_url: page_url.clone(),
+                            captured_at: Instant::now(),
+                        },
+                    );
+                } else {
+                    self.screenshot_geometry.lock().await.remove(&key);
+                }
 
-                Ok(json!({
-                    "screenshot": b64,
+                let mut output = json!({
+                    "screenshot": "attached_to_multimodal_result",
                     "size_bytes": size_bytes,
+                    "image_width": dimensions.map(|(width, _)| width),
+                    "image_height": dimensions.map(|(_, height)| height),
+                    "viewport_width": viewport.map(|(width, _)| width),
+                    "viewport_height": viewport.map(|(_, height)| height),
+                    "coordinate_space": if selector.is_some() {
+                        "element_pixels_not_viewport"
+                    } else if full_page {
+                        "full_page_pixels_not_current_viewport"
+                    } else {
+                        "viewport_screenshot_pixels"
+                    },
+                    "coordinate_actions_compatible": coordinate_actions_compatible,
                     "format": "png",
-                    "encoding": "base64",
                     "profile": profile,
                     "navigation_guard": navigation_guard,
-                }))
+                    "captcha": captcha_state,
+                    "captcha_monitor": captcha_monitor,
+                    "_images": [{
+                        "media_type": "image/png",
+                        "data": b64.clone(),
+                    }],
+                });
+                if args["includeBase64"].as_bool() == Some(true) {
+                    output["screenshot"] = Value::String(b64);
+                    output["encoding"] = Value::String("base64".to_string());
+                }
+                Ok(output)
             }
 
             // ── Content ────────────────────────────────────────────
@@ -2719,6 +3099,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn png_dimensions_reads_the_ihdr_without_decoding_the_image() {
+        let mut header = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR".to_vec();
+        header.extend_from_slice(&640u32.to_be_bytes());
+        header.extend_from_slice(&400u32.to_be_bytes());
+        assert_eq!(png_dimensions(&header), Some((640, 400)));
+        assert_eq!(png_dimensions(b"not a png"), None);
+    }
+
+    #[test]
+    fn screenshot_coordinates_scale_back_to_the_css_viewport() {
+        let geometry = ScreenshotGeometry {
+            image_width: 1280.0,
+            image_height: 720.0,
+            viewport_width: 640.0,
+            viewport_height: 360.0,
+            page_url: "https://example.com".into(),
+            captured_at: Instant::now(),
+        };
+        assert_eq!(
+            scale_screenshot_point(320.0, 180.0, &geometry).expect("point in bounds"),
+            (160.0, 90.0)
+        );
+        assert!(scale_screenshot_point(1281.0, 1.0, &geometry).is_err());
+    }
+
+    #[test]
     fn schema_enforces_action_specific_arguments() {
         let parameters = schema_parameters();
 
@@ -2769,6 +3175,28 @@ mod tests {
             .as_str()
             .unwrap();
         assert!(expression_description.contains("Required when action='evaluate'"));
+    }
+
+    #[test]
+    fn captcha_attempt_marker_is_limited_to_visible_interactions() {
+        for args in [
+            json!({"action":"act","actAction":"click","ref":"s1-1","captchaAttempt":true}),
+            json!({"action":"click_coordinates","x":10,"y":20,"captchaAttempt":true}),
+            json!({"action":"send_keys","keys":"Space","captchaAttempt":true}),
+        ] {
+            BrowserTool::validate_action_args(args["action"].as_str().unwrap(), &args)
+                .expect("visible challenge action must accept the marker");
+        }
+
+        for args in [
+            json!({"action":"navigate","url":"https://example.com","captchaAttempt":true}),
+            json!({"action":"evaluate","expression":"true","captchaAttempt":true}),
+            json!({"action":"act","actAction":"upload","ref":"s1-1","path":"x","captchaAttempt":true}),
+        ] {
+            let error = BrowserTool::validate_action_args(args["action"].as_str().unwrap(), &args)
+                .expect_err("non-challenge or privilege-expanding action must reject marker");
+            assert_eq!(error.kind(), rustykrab_core::ToolErrorKind::InvalidInput);
+        }
     }
 
     #[tokio::test]
@@ -3040,6 +3468,13 @@ mod tests {
     }
 
     fn isolated_live_tool(profile: &str) -> (BrowserTool, tempfile::TempDir) {
+        isolated_live_tool_with(profile, |_| {})
+    }
+
+    fn isolated_live_tool_with(
+        profile: &str,
+        configure: impl FnOnce(&mut config::BrowserConfig),
+    ) -> (BrowserTool, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
         let port = {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("free port");
@@ -3056,6 +3491,7 @@ mod tests {
             .ssrf_policy
             .hostname_allowlist
             .push("localhost".to_string());
+        configure(&mut config);
         config.profiles.insert(
             profile.to_string(),
             config::BrowserProfile {
@@ -3066,6 +3502,179 @@ mod tests {
             },
         );
         (BrowserTool::with_config(config), dir)
+    }
+
+    /// Exercise the complete monitored CAPTCHA interaction boundary in a
+    /// real Chrome process. The fixture intentionally behaves like a visible
+    /// two-step challenge without imitating or bypassing a third-party
+    /// service: the first trusted click leaves the marker present, the second
+    /// removes it. This proves detection, screenshot image transport, attempt
+    /// accounting, and double-confirmed clearance independently of a model's
+    /// reasoning quality.
+    #[tokio::test]
+    #[ignore = "launches a real Chrome"]
+    async fn live_model_captcha_attempts_are_bounded_observed_and_multimodal() {
+        let profile = "captcha-observability-live-test";
+        let (tool, _dir) = isolated_live_tool_with(profile, |config| {
+            config.model_captcha_solver = true;
+            config.captcha_max_attempts = 3;
+            config.captcha_timeout_ms = 30_000;
+        });
+        tool.manager
+            .get_browser(profile)
+            .await
+            .expect("start browser");
+        let page = tool
+            .manager
+            .get_page(profile, None)
+            .await
+            .expect("blank page");
+        let html = r#"<!doctype html><html><body>
+            <h1>Local challenge fixture</h1>
+            <div class="cf-turnstile">
+              <button id="challenge" aria-label="Verify challenge" onclick="
+                window.challengeAttempts = (window.challengeAttempts || 0) + 1;
+                document.getElementById('attempt-status').textContent =
+                  'attempt:' + window.challengeAttempts + ':trusted:' + event.isTrusted;
+                if (window.challengeAttempts === 2) this.parentElement.remove();
+              ">Verify challenge</button>
+            </div>
+            <div id="attempt-status" role="status">attempt:0</div>
+        </body></html>"#;
+        let data_url = format!(
+            "data:text/html;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(html)
+        );
+        page.execute(chromiumoxide::cdp::browser_protocol::page::NavigateParams::new(data_url))
+            .await
+            .expect("navigate fixture");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let target_id = page.target_id().inner().clone();
+
+        let snapshot = tool
+            .execute(json!({
+                "action":"snapshot", "profile":profile, "targetId":target_id,
+                "interactive":false,
+            }))
+            .await
+            .expect("initial snapshot");
+        assert_eq!(snapshot["captcha"]["detected"], true, "{snapshot}");
+        assert_eq!(
+            snapshot["captcha_monitor"]["model_solver_enabled"], true,
+            "{snapshot}"
+        );
+        assert_eq!(snapshot["captcha_monitor"]["attempts"], 0, "{snapshot}");
+
+        let screenshot = tool
+            .execute(json!({
+                "action":"screenshot", "profile":profile, "targetId":target_id,
+            }))
+            .await
+            .expect("fixture screenshot");
+        let (screenshot_text, images) = rustykrab_core::types::split_tool_result_images(screenshot);
+        assert!(screenshot_text.get("_images").is_none());
+        assert_eq!(
+            screenshot_text["screenshot"],
+            "attached_to_multimodal_result"
+        );
+        assert!(screenshot_text["image_width"].as_u64().unwrap_or(0) > 0);
+        assert!(screenshot_text["image_height"].as_u64().unwrap_or(0) > 0);
+        assert_eq!(
+            images.len(),
+            1,
+            "one PNG must cross the multimodal boundary"
+        );
+        assert!(matches!(
+            &images[0],
+            rustykrab_core::types::ContentBlock::Image { media_type, data }
+                if media_type == "image/png" && !data.is_empty()
+        ));
+
+        let center: Vec<f64> = page
+            .evaluate(
+                "(function(){ const r=document.getElementById('challenge').getBoundingClientRect(); return [r.left+r.width/2,r.top+r.height/2]; })()",
+            )
+            .await
+            .expect("read challenge center")
+            .into_value()
+            .expect("challenge center coordinates");
+        let screenshot_x = center[0]
+            * screenshot_text["image_width"]
+                .as_f64()
+                .expect("image width")
+            / screenshot_text["viewport_width"]
+                .as_f64()
+                .expect("viewport width");
+        let screenshot_y = center[1]
+            * screenshot_text["image_height"]
+                .as_f64()
+                .expect("image height")
+            / screenshot_text["viewport_height"]
+                .as_f64()
+                .expect("viewport height");
+
+        let first = tool
+            .execute(json!({
+                "action":"click_coordinates", "x":screenshot_x, "y":screenshot_y,
+                "profile":profile, "targetId":target_id,
+                "captchaAttempt":true,
+            }))
+            .await
+            .expect("first challenge interaction");
+        assert_eq!(first["outcome"], "applied", "{first}");
+        assert_eq!(first["captcha_attempt"]["result"], "in_progress", "{first}");
+        assert_eq!(first["captcha_attempt"]["attempt"], 1, "{first}");
+        assert!(
+            (first["coordinate_mapping"]["dispatched_x"]
+                .as_f64()
+                .expect("dispatched x")
+                - center[0])
+                .abs()
+                < 0.5,
+            "{first}"
+        );
+
+        let second = tool
+            .execute(json!({
+                "action":"click_coordinates", "x":screenshot_x, "y":screenshot_y,
+                "profile":profile, "targetId":target_id,
+                "captchaAttempt":true,
+            }))
+            .await
+            .expect("second challenge interaction");
+        assert_eq!(second["outcome"], "applied", "{second}");
+        assert_eq!(second["captcha_attempt"]["result"], "cleared", "{second}");
+        assert_eq!(second["captcha_attempt"]["attempt"], 2, "{second}");
+        assert_eq!(
+            second["captcha_attempt"]["clearance_confirmations"], 2,
+            "{second}"
+        );
+
+        let trusted: String = page
+            .evaluate("document.getElementById('attempt-status').textContent")
+            .await
+            .expect("read fixture result")
+            .into_value()
+            .expect("fixture result string");
+        assert_eq!(trusted, "attempt:2:trusted:true");
+
+        let status = tool
+            .execute(json!({
+                "action":"status", "profile":profile, "targetId":target_id,
+            }))
+            .await
+            .expect("monitor status");
+        assert_eq!(status["captcha_monitor"]["totals"]["attempts"], 2);
+        assert_eq!(status["captcha_monitor"]["totals"]["challenges_cleared"], 1);
+        assert_eq!(
+            status["captcha_monitor"]["recent_attempts"]
+                .as_array()
+                .expect("recent attempts")
+                .len(),
+            2
+        );
+
+        let _ = tool.manager.stop(profile).await;
     }
 
     /// Wix-style pages reuse `data-testid="linkElement"` for every link. The

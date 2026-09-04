@@ -23,6 +23,23 @@ pub struct ToolStats {
     pub total_duration: Duration,
 }
 
+/// Privacy-safe evidence from one explicitly tagged model CAPTCHA
+/// interaction. It contains no screenshot, token, cookie, DOM text, path, or
+/// query string; the browser tool reduces the page identity to its origin.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CaptchaTrace {
+    pub challenge_id: String,
+    pub origin: String,
+    pub providers: Vec<String>,
+    pub attempt: u32,
+    pub action: String,
+    pub result: String,
+    pub action_outcome: String,
+    pub elapsed_ms: u64,
+    pub clearance_confirmations: u8,
+    pub max_attempts: u32,
+}
+
 impl ToolStats {
     pub fn success_rate(&self) -> f64 {
         if self.calls == 0 {
@@ -57,6 +74,7 @@ pub struct ExecutionTracer {
 struct TracerInner {
     traces: Vec<ToolTrace>,
     stats: HashMap<String, ToolStats>,
+    captcha_traces: Vec<CaptchaTrace>,
     /// Total iterations the agent has completed.
     iterations: u32,
     /// How many times compression was triggered.
@@ -70,6 +88,14 @@ fn sanitize_tool_name(name: &str) -> String {
     name.chars()
         .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
         .take(64)
+        .collect()
+}
+
+fn sanitize_label(value: &str, max: usize) -> String {
+    value
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(max)
         .collect()
 }
 
@@ -116,6 +142,25 @@ impl ExecutionTracer {
         self.lock_inner().iterations += 1;
     }
 
+    /// Record a model-assisted CAPTCHA interaction without retaining the
+    /// image or page content that prompted it.
+    pub fn record_captcha(&self, trace: CaptchaTrace) {
+        let sanitized = CaptchaTrace {
+            challenge_id: sanitize_label(&trace.challenge_id, 64),
+            origin: sanitize_label(&trace.origin, 256),
+            providers: trace
+                .providers
+                .iter()
+                .map(|provider| sanitize_label(provider, 48))
+                .collect(),
+            action: sanitize_label(&trace.action, 64),
+            result: sanitize_label(&trace.result, 32),
+            action_outcome: sanitize_label(&trace.action_outcome, 32),
+            ..trace
+        };
+        self.lock_inner().captcha_traces.push(sanitized);
+    }
+
     /// Increment the compression counter.
     pub fn record_compression(&self) {
         self.lock_inner().compressions += 1;
@@ -139,6 +184,10 @@ impl ExecutionTracer {
     /// Get the full trace log.
     pub fn traces(&self) -> Vec<ToolTrace> {
         self.lock_inner().traces.clone()
+    }
+
+    pub fn captcha_traces(&self) -> Vec<CaptchaTrace> {
+        self.lock_inner().captcha_traces.clone()
     }
 
     /// Get tools with a failure rate above the given threshold (0.0–1.0).

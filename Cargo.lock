@@ -4233,6 +4233,8 @@ version = "5.2.37"
 dependencies = [
  "anyhow",
  "axum",
+ "base64 0.22.1",
+ "image",
  "regex",
  "reqwest 0.13.3",
  "rusqlite",

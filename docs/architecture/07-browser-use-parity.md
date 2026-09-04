@@ -34,6 +34,7 @@ model.
 | CDP browser/profile lifecycle | Managed, attached, and remote CDP profiles; per-profile serialization and recovery |
 | Stable page identity | Chrome target ids plus per-session sticky target affinity |
 | DOM observation | Bounded DOM-derived snapshots with generation-scoped refs, open shadow roots, same-process frames, and OOPIFs |
+| Screenshot observation | PNG bytes use the multimodal tool-result channel; viewport screenshots report image/CSS dimensions and recent coordinate clicks scale back to the CDP viewport |
 | Element actions | Native click, hover, keyboard input, coordinate click, upload, select/options, same-target drag, and bounded wait |
 | Navigation actions | Navigate, back, forward, refresh, scroll, scroll-to-text, and wait-for |
 | Post-action state | Explicit `applied`/`not_applied`/`unknown` outcome separated from observation status; fresh snapshot returned |
@@ -43,7 +44,7 @@ model.
 | About-blank/empty DOM recovery | Bounded wait, reload, and re-observation before treating the page as empty |
 | Navigation restrictions | Pre-request validation and post-render validation across redirects, reads, actions, OOPIFs, and popups |
 | Authentication state | Persistent Chrome profile directories and credential-safe field filling |
-| CAPTCHA awareness | Provider heuristics in page state; detection only |
+| CAPTCHA awareness | Provider heuristics plus opt-in, budgeted model interaction through ordinary visible CDP actions; no token injection or external solver |
 | Driver drift visibility | Protocol decoder counters, offending method summary, browser product/protocol, and handler health in status |
 
 The RustyKrab agent and tool registry replace browser-use's controller/agent
@@ -98,12 +99,39 @@ the risk of persisting credentials, tokens, and personal page content. It also
 makes intermittent production failures harder to reconstruct. A redacted,
 bounded trace artifact is preferable to enabling these globally.
 
-### CAPTCHA detection, not solving
+### Local model assistance instead of a cloud solver
 
-Browser-use's solver is coupled to its cloud browser service. RustyKrab reports
-likely reCAPTCHA, hCaptcha, and Cloudflare Turnstile challenges but does not
-claim to solve them. Local automated solving would require an external service,
-additional policy, cost controls, and an explicit decision about site terms.
+Browser-use's `CaptchaWatchdog` does not solve a local challenge itself. It
+observes solver-started/solver-finished events supplied by browser-use's cloud
+browser proxy and pauses the agent while that external service works. RustyKrab
+has no equivalent cloud event source.
+
+RustyKrab instead offers an opt-in `modelCaptchaSolver` experiment. Detection
+creates a challenge episode, the vision-capable model receives a screenshot
+through the tool-result image channel, and only interactions explicitly marked
+`captchaAttempt=true` consume the episode's action and wall-clock budgets. The
+interaction remains an ordinary visible CDP click, keyboard action, ref action,
+or coordinate click. There is no token extraction/injection, protocol bypass,
+or third-party solver API.
+
+This approach can handle simple visual or interactive challenges the model can
+understand, and it keeps the execution and policy boundaries uniform. It cannot
+match the specialized service's challenge coverage or externally reported
+solver state. A `cleared` result requires the challenge marker to be absent in
+both the post-action page state and a delayed independent detector probe, but it
+still proves only DOM disappearance—not that the origin server accepted the
+challenge or that the user's larger task succeeded.
+
+The monitor exposes current challenge state, aggregate counts, and the ten most
+recent attempts in browser status. Each attempt emits a structured log with
+challenge id, URL origin (never path/query), provider, action, result, elapsed
+time, and counters. With `RUSTYKRAB_OUTCOME_CAPTURE=1`, the agent also persists a
+separate implicit outcome per attempt, attributable to
+`browser:captcha:model-assisted` and the concrete `model:<id>`. The common
+session id joins those records to the ordinary turn outcome for downstream
+task-success analysis. Using a namespaced tool attribution for the model is a
+compatibility compromise with the existing three-kind outcome schema; a future
+schema revision should give model identity its own first-class dimension.
 
 ### Local artifact truth
 
@@ -155,8 +183,10 @@ convenience for a smaller blast radius.
    modifier shortcuts, and cross-target drag are the known cases.
 5. Add explicit origin-scoped permission operations if a target workflow needs
    them; do not adopt blanket permission grants.
-6. Integrate an external CAPTCHA solver only as a separately authorized service,
-   not as an implied local browser capability.
+6. Accumulate per-origin, per-provider model-assistance results and compare them
+   with downstream task outcomes before deciding whether an external CAPTCHA
+   solver is justified. Any external solver must remain separately authorized,
+   cost-bounded, and explicit rather than becoming an implied browser ability.
 
 ## Verification contract
 
@@ -169,11 +199,32 @@ The relevant live tests launch Chrome and cross real process/network boundaries:
 - `live_native_forms_upload_coordinates_and_send_keys` proves trusted keyboard
   input, dropdown inspection/selection, workspace-contained file upload,
   coordinate clicking, and scroll-to-text against a real renderer.
+- `live_model_captcha_attempts_are_bounded_observed_and_multimodal` launches a
+  real Chrome process against a local two-step challenge fixture. It proves that
+  the screenshot becomes a non-empty image block, trusted actions share one
+  challenge id, attempts are counted, and clearance requires two observations.
+- The black-box model scenario `model-grounds-a-monitored-captcha-action` boots
+  the real daemon against Ollama, sends Gemma a deterministic 640×400 browser
+  image with distractors, and requires the screenshot call, a coordinate in the
+  target range, `captchaAttempt=true`, and a final cleared report. It is
+  repeatable with `--reps`; the report is the model-quality evidence rather than
+  the deterministic browser fixture.
 - The existing dialog, hanging-action, download, browser-recovery, and public
   Instagram tests exercise their named external boundaries and remain ignored
   in the default unit suite because they launch Chrome or require the network.
 
-These tests verify the browser execution layer. They do not prove an
+These tests verify the browser execution layer and one controlled Gemma visual-
+grounding task. They do not prove a real third-party CAPTCHA solve, an
 authenticated Instagram submission, a remote-CDP artifact flow, every nested
 OOPIF topology, or continuous policy enforcement between tool calls. Those
-must remain explicit uncertainty rather than being inferred from unit coverage.
+must remain explicit uncertainty rather than being inferred from controlled
+coverage.
+
+The model scenario deliberately stubs the browser result so model scoring is
+deterministic, while the live fixture drives real Chrome with deterministic
+actions so browser failures are attributable. No current test joins sampled
+Gemma output and a real Chrome CAPTCHA fixture in one loop. The two tests cover
+both sides of that boundary independently, but emergent failures at their exact
+integration remain unverified. Likewise, the detector recognizes visible
+reCAPTCHA, hCaptcha, and Turnstile markers; generic or custom anti-bot pages can
+remain undetected until their providers are added from observed evidence.

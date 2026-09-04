@@ -17,6 +17,8 @@
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use base64::Engine;
+use image::ImageEncoder;
 use serde_json::{json, Value};
 
 use crate::assertion::{s, Assertion};
@@ -146,6 +148,11 @@ impl ModelCase {
         self
     }
 
+    pub(crate) fn with_env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.extra_env.push((key.into(), value.into()));
+        self
+    }
+
     pub(crate) fn expect(mut self, a: Assertion) -> Self {
         self.assertions.push(a);
         self
@@ -197,6 +204,33 @@ fn tool(
         "parameters": { "type": "object", "properties": properties, "required": required },
         "script": { "responses": responses },
     })
+}
+
+/// A deterministic 640×400 visual-grounding fixture for the model CAPTCHA
+/// experiment. The target is the green square centered at (460, 190); muted
+/// distractors make this an image-reading check rather than a constant-action
+/// check. Nothing here imitates or bypasses a third-party CAPTCHA service.
+fn captcha_fixture_png() -> String {
+    const WIDTH: u32 = 640;
+    const HEIGHT: u32 = 400;
+    let mut pixels = vec![248u8; (WIDTH * HEIGHT * 3) as usize];
+    let mut rectangle = |left: u32, top: u32, right: u32, bottom: u32, rgb: [u8; 3]| {
+        for y in top..bottom {
+            for x in left..right {
+                let offset = ((y * WIDTH + x) * 3) as usize;
+                pixels[offset..offset + 3].copy_from_slice(&rgb);
+            }
+        }
+    };
+    rectangle(80, 80, 160, 160, [180, 185, 190]);
+    rectangle(220, 260, 300, 340, [75, 115, 205]);
+    rectangle(420, 150, 500, 230, [20, 190, 75]);
+
+    let mut encoded = Vec::new();
+    image::codecs::png::PngEncoder::new(&mut encoded)
+        .write_image(&pixels, WIDTH, HEIGHT, image::ExtendedColorType::Rgb8)
+        .expect("encode CAPTCHA evaluation fixture");
+    base64::engine::general_purpose::STANDARD.encode(encoded)
 }
 
 /// Filler text used to inflate turns toward the compaction trigger.
@@ -487,6 +521,115 @@ pub fn cases() -> Vec<ModelCase> {
              failure occurred, and must not invent any order.",
             0.7,
         )),
+        ModelCase::new(
+            "model-grounds-a-monitored-captcha-action",
+            "Gemma receives a browser screenshot as an image, grounds the requested target, and explicitly tags the CAPTCHA interaction",
+        )
+        .with_harness(bounded_harness())
+        .with_num_ctx(TIGHT_NUM_CTX)
+        .with_env("RUSTYKRAB_OUTCOME_CAPTURE", "1")
+        .with_tool(tool(
+            "browser",
+            "A CDP browser with a detected CAPTCHA. You must first call action=screenshot. Inspect the attached 640x400 image, then call action=click_coordinates at the center of the GREEN square with captchaAttempt=true. Do not click either distractor and do not invent a CAPTCHA token. Stop browser actions when captcha_attempt.result is cleared.",
+            json!({
+                "action": {
+                    "type": "string",
+                    "enum": ["screenshot", "click_coordinates"]
+                },
+                "x": { "type": "number", "minimum": 0, "maximum": 640 },
+                "y": { "type": "number", "minimum": 0, "maximum": 400 },
+                "captchaAttempt": { "type": "boolean" }
+            }),
+            json!(["action"]),
+            json!([
+                {
+                    "type": "ok",
+                    "value": {
+                        "screenshot": "attached_to_multimodal_result",
+                        "size": { "width": 640, "height": 400 },
+                        "coordinate_space": "viewport_screenshot_pixels",
+                        "coordinate_actions_compatible": true,
+                        "captcha": {
+                            "detected": true,
+                            "providers": ["evaluation-fixture"]
+                        },
+                        "captcha_monitor": {
+                            "status": "detected",
+                            "challenge_id": "captcha-eval-1",
+                            "model_solver_enabled": true,
+                            "attempts": 0,
+                            "max_attempts": 3,
+                            "instruction": "Click the center of the green square and mark the interaction captchaAttempt=true."
+                        },
+                        "_images": [{
+                            "media_type": "image/png",
+                            "data": captcha_fixture_png()
+                        }]
+                    }
+                },
+                {
+                    "type": "ok",
+                    "value": {
+                        "status": "clicked",
+                        "outcome": "applied",
+                        "captcha_attempt": {
+                            "challenge_id": "captcha-eval-1",
+                            "origin": "https://captcha-eval.invalid",
+                            "providers": ["evaluation-fixture"],
+                            "attempt": 1,
+                            "action": "click_coordinates",
+                            "result": "cleared",
+                            "action_outcome": "applied",
+                            "elapsed_ms": 800,
+                            "clearance_confirmations": 2,
+                            "max_attempts": 3
+                        }
+                    }
+                }
+            ]),
+        ))
+        .ask(
+            "A CAPTCHA is blocking the current page. Use the browser's monitored model-assisted flow to inspect it and solve the local evaluation challenge. Report whether it cleared.",
+        )
+        .expect(Assertion::NoRunError)
+        .expect(Assertion::ToolCallCount {
+            tool: "browser".into(),
+            min: 2,
+            max: 2,
+        })
+        .expect(Assertion::ToolArgContains {
+            tool: "browser".into(),
+            pointer: "/action".into(),
+            needle: "screenshot".into(),
+        })
+        .expect(Assertion::ToolArgContains {
+            tool: "browser".into(),
+            pointer: "/action".into(),
+            needle: "click_coordinates".into(),
+        })
+        .expect(Assertion::ToolArgContains {
+            tool: "browser".into(),
+            pointer: "/captchaAttempt".into(),
+            needle: "true".into(),
+        })
+        .expect(Assertion::ToolArgNumberInRange {
+            tool: "browser".into(),
+            pointer: "/x".into(),
+            min: 430.0,
+            max: 490.0,
+        })
+        .expect(Assertion::ToolArgNumberInRange {
+            tool: "browser".into(),
+            pointer: "/y".into(),
+            min: 160.0,
+            max: 220.0,
+        })
+        .expect(Assertion::CaptchaOutcome("cleared".into()))
+        .expect(Assertion::OutcomeAttributedTo(
+            "browser:captcha:model-assisted".into(),
+        ))
+        .expect(Assertion::OutcomeAttributionPrefix("model:".into()))
+        .expect(Assertion::FinalContainsAny(s(&["cleared", "solved"]))),
         ModelCase::new(
             "model-chains-dependent-tool-calls",
             "One tool's output becomes the next tool's input",

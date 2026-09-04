@@ -681,11 +681,16 @@ async fn evaluate_document_snapshot(
         .map_err(|e| Error::ToolExecution(format!("invalid snapshot result: {e}").into()))
 }
 
-async fn detect_captcha(page: &Page) -> serde_json::Value {
+pub(crate) async fn detect_captcha(page: &Page) -> serde_json::Value {
     let script = r#"(function() {
         var providers = new Set();
         var nodes = document.querySelectorAll('iframe[src], iframe[title], [data-sitekey], .g-recaptcha, .h-captcha, .cf-turnstile');
         for (var i = 0; i < nodes.length; i++) {
+            var style = window.getComputedStyle(nodes[i]);
+            var rect = nodes[i].getBoundingClientRect();
+            var visible = style.display !== 'none' && style.visibility !== 'hidden' &&
+                Number(style.opacity || 1) > 0 && rect.width > 2 && rect.height > 2;
+            if (!visible) continue;
             var value = ((nodes[i].getAttribute('src') || '') + ' ' +
                 (nodes[i].getAttribute('title') || '') + ' ' +
                 (nodes[i].className || '')).toLowerCase();

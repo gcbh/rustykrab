@@ -24,3 +24,5 @@ tempfile = "3"
 # credential_requests) and not just on what the REST API reveals.
 rusqlite = { version = "0.34", features = ["bundled"] }
 uuid.workspace = true
+base64.workspace = true
+image = { version = "0.25", default-features = false, features = ["png"] }

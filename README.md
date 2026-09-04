@@ -226,6 +226,30 @@ All configuration is via environment variables. No plaintext config files.
 | `RUSTYKRAB_TAILNET_USERS` | unset | Comma-separated tailnet logins allowed to open a credential page. Empty means any authenticated tailnet user. Requires `tailscale serve` in front to inject `Tailscale-User-Login` |
 | | | When enabled, this also starts a **downtime analysis worker**: read-only, it aggregates recorded outcomes and logs a digest once the system has been quiet for 10 minutes, abandoning a pass if activity arrives mid-flight. It never writes and never calls a model |
 
+### Model-assisted CAPTCHA experiment
+
+The browser can let a vision-capable model attempt a detected CAPTCHA through
+the same visible CDP actions used for ordinary browsing. This is disabled by
+default and is not a token injector, bypass API, or external solver. Enable and
+bound it in `~/.rustykrab/browser.json`:
+
+```json
+{
+  "modelCaptchaSolver": true,
+  "captchaMaxAttempts": 12,
+  "captchaTimeoutMs": 120000
+}
+```
+
+Only actions explicitly marked `captchaAttempt=true` consume the challenge
+budget. Browser status exposes current and recent attempt metrics, and every
+attempt emits a privacy-safe structured log. Set
+`RUSTYKRAB_OUTCOME_CAPTURE=1` to persist attempt outcomes attributed to the
+concrete model (for example `model:gemma4:26b`) and join them by session id to
+the larger task outcome. A reported `cleared` challenge means two independent
+DOM checks no longer detected it; it does not by itself prove that the website
+accepted the challenge or that the task succeeded.
+
 ### Persisting credentials
 
 To avoid setting env vars every launch:

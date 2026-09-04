@@ -52,7 +52,8 @@ fn execution_capabilities() -> serde_json::Value {
         "native_mouse_keyboard_upload": true,
         "redirect_and_popup_policy": "tool-boundary-guarded",
         "persistent_storage": "chrome-profile",
-        "captcha": "detect-only",
+        "captcha": "detect-and-model-assist",
+        "captcha_bypass_or_token_injection": false,
         "har_recording": false,
         "video_recording": false,
         "cloud_captcha_solver": false,
@@ -392,6 +393,9 @@ impl BrowserManager {
                 "site_isolation_disabled": self.config.disable_site_isolation,
                 "dialog_policy": self.config.dialog_policy,
                 "auto_focus_new_tabs": self.config.auto_focus_new_tabs,
+                "model_captcha_solver": self.config.model_captcha_solver,
+                "captcha_max_attempts": self.config.effective_captcha_max_attempts(),
+                "captcha_timeout_ms": self.config.effective_captcha_timeout().as_millis() as u64,
                 "execution_capabilities": execution_capabilities(),
                 "tabs": page_count
             })
@@ -404,6 +408,9 @@ impl BrowserManager {
                 "profile": profile_name,
                 "cdp_url": cdp_url,
                 "launched_by_us": false,
+                "model_captcha_solver": self.config.model_captcha_solver,
+                "captcha_max_attempts": self.config.effective_captcha_max_attempts(),
+                "captcha_timeout_ms": self.config.effective_captcha_timeout().as_millis() as u64,
                 "execution_capabilities": execution_capabilities(),
                 "tabs": 0
             })
