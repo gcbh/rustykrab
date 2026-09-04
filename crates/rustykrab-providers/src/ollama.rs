@@ -1101,6 +1101,10 @@ impl ModelProvider for OllamaProvider {
         "ollama"
     }
 
+    fn model_id(&self) -> &str {
+        &self.model
+    }
+
     /// Reports the usable *input* budget rather than the raw window.
     ///
     /// The trait documents this as the single source of truth for downstream

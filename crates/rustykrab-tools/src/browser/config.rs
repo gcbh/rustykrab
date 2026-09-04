@@ -110,6 +110,21 @@ pub struct BrowserConfig {
     #[serde(default)]
     pub disable_site_isolation: bool,
 
+    /// Permit the active model to mark visible browser interactions as
+    /// CAPTCHA-solving attempts. The model receives no bypass API: it uses
+    /// the same screenshot, ref, coordinate, and keyboard actions as any
+    /// other page interaction, under the budgets below.
+    #[serde(default)]
+    pub model_captcha_solver: bool,
+
+    /// Maximum explicitly tagged model interactions in one challenge episode.
+    #[serde(default = "default_captcha_max_attempts")]
+    pub captcha_max_attempts: u32,
+
+    /// Wall-clock budget for one challenge episode.
+    #[serde(default = "default_captcha_timeout_ms")]
+    pub captcha_timeout_ms: u64,
+
     /// Extra arguments to pass to the browser on launch.
     #[serde(default)]
     pub extra_args: Vec<String>,
@@ -244,6 +259,9 @@ impl Default for BrowserConfig {
             auto_focus_new_tabs: true,
             allow_attached_downloads: false,
             disable_site_isolation: false,
+            model_captcha_solver: false,
+            captcha_max_attempts: default_captcha_max_attempts(),
+            captcha_timeout_ms: default_captcha_timeout_ms(),
             extra_args: Vec::new(),
         }
     }
@@ -419,6 +437,14 @@ impl BrowserConfig {
         )
     }
 
+    pub fn effective_captcha_max_attempts(&self) -> u32 {
+        self.captcha_max_attempts.clamp(1, 50)
+    }
+
+    pub fn effective_captcha_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.captcha_timeout_ms.clamp(5_000, 300_000))
+    }
+
     /// Resolve the executable path for a profile.
     pub fn resolve_executable(&self, profile_name: &str) -> Option<String> {
         self.profiles
@@ -446,6 +472,14 @@ fn default_remote_cdp_timeout() -> u64 {
 
 fn default_cdp_request_timeout() -> u64 {
     10_000
+}
+
+fn default_captcha_max_attempts() -> u32 {
+    12
+}
+
+fn default_captcha_timeout_ms() -> u64 {
+    120_000
 }
 
 fn default_color() -> String {
@@ -566,5 +600,34 @@ mod isolated_root_tests {
         assert!(config.auto_focus_new_tabs);
         assert!(!config.allow_attached_downloads);
         assert!(!config.disable_site_isolation);
+        assert!(!config.model_captcha_solver);
+        assert_eq!(config.effective_captcha_max_attempts(), 12);
+        assert_eq!(
+            config.effective_captcha_timeout(),
+            std::time::Duration::from_secs(120)
+        );
+    }
+
+    #[test]
+    fn captcha_experiment_config_is_camel_case_and_clamped() {
+        let low: BrowserConfig = serde_json::from_str(
+            r#"{"modelCaptchaSolver":true,"captchaMaxAttempts":0,"captchaTimeoutMs":1}"#,
+        )
+        .expect("browser config");
+        assert!(low.model_captcha_solver);
+        assert_eq!(low.effective_captcha_max_attempts(), 1);
+        assert_eq!(
+            low.effective_captcha_timeout(),
+            std::time::Duration::from_secs(5)
+        );
+
+        let high: BrowserConfig =
+            serde_json::from_str(r#"{"captchaMaxAttempts":500,"captchaTimeoutMs":9999999}"#)
+                .expect("browser config");
+        assert_eq!(high.effective_captcha_max_attempts(), 50);
+        assert_eq!(
+            high.effective_captcha_timeout(),
+            std::time::Duration::from_secs(300)
+        );
     }
 }

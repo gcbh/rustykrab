@@ -41,6 +41,13 @@ pub enum Assertion {
         pointer: String,
         needle: String,
     },
+    /// Some call to `tool` had a numeric argument within an inclusive range.
+    ToolArgNumberInRange {
+        tool: String,
+        pointer: String,
+        min: f64,
+        max: f64,
+    },
     /// These tools were called in this relative order (other calls may be
     /// interleaved).
     ToolCallOrder(Vec<String>),
@@ -57,6 +64,12 @@ pub enum Assertion {
     /// The agent called a failing tool no more than `max` times before
     /// moving on. Catches the infinite-retry failure mode.
     RetriesAtMost { tool: String, max: usize },
+    /// A durable CAPTCHA experiment record has the requested result.
+    CaptchaOutcome(String),
+    /// A durable outcome carries this attribution id.
+    OutcomeAttributedTo(String),
+    /// A durable outcome carries an attribution with this prefix.
+    OutcomeAttributionPrefix(String),
     /// Compaction did (or didn't) run.
     Compacted(bool),
 
@@ -93,12 +106,27 @@ impl Assertion {
                 pointer,
                 needle,
             } => format!("{tool}{pointer} contains {needle:?}"),
+            Assertion::ToolArgNumberInRange {
+                tool,
+                pointer,
+                min,
+                max,
+            } => format!("{tool}{pointer} is within {min}..={max}"),
             Assertion::ToolCallOrder(v) => format!("call order {v:?}"),
             Assertion::ToolOutputContainsAny { tool, needles } => {
                 format!("{tool} returned any {needles:?}")
             }
             Assertion::RecoveredFrom { tool, .. } => format!("recovered from {tool} failure"),
             Assertion::RetriesAtMost { tool, max } => format!("{tool} called at most {max}x"),
+            Assertion::CaptchaOutcome(result) => {
+                format!("persisted CAPTCHA outcome is {result:?}")
+            }
+            Assertion::OutcomeAttributedTo(target) => {
+                format!("outcome attributed to {target:?}")
+            }
+            Assertion::OutcomeAttributionPrefix(prefix) => {
+                format!("outcome attribution starts with {prefix:?}")
+            }
             Assertion::Compacted(b) => format!("compacted == {b}"),
 
             Assertion::SummaryContainsAny(v) => format!("summary contains any {v:?}"),
@@ -204,6 +232,32 @@ impl Assertion {
                 }
             }
 
+            Assertion::ToolArgNumberInRange {
+                tool,
+                pointer,
+                min,
+                max,
+            } => {
+                let seen: Vec<String> = t
+                    .calls_to(tool)
+                    .iter()
+                    .filter_map(|call| call.args.pointer(pointer).map(render))
+                    .collect();
+                let matched = t.calls_to(tool).iter().any(|call| {
+                    call.args
+                        .pointer(pointer)
+                        .and_then(Value::as_f64)
+                        .is_some_and(|value| value >= *min && value <= *max)
+                });
+                if matched {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "no {tool} call had a number within {min}..={max} at {pointer}; saw {seen:?}"
+                    ))
+                }
+            }
+
             Assertion::ToolCallOrder(expected) => {
                 let mut remaining = expected.iter();
                 let mut want = remaining.next();
@@ -251,6 +305,46 @@ impl Assertion {
                     Ok(())
                 } else {
                     Err(format!("{tool} called {n}x, more than the {max} allowed"))
+                }
+            }
+
+            Assertion::CaptchaOutcome(result) => {
+                let seen: Vec<&str> = t
+                    .captcha_outcomes
+                    .iter()
+                    .filter_map(|detail| detail["result"].as_str())
+                    .collect();
+                if seen.iter().any(|seen| *seen == result) {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "no persisted CAPTCHA outcome was {result:?}; saw {seen:?}"
+                    ))
+                }
+            }
+
+            Assertion::OutcomeAttributedTo(target) => {
+                if t.outcome_attributions.contains(target) {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "no outcome attribution matched {target:?}; saw {:?}",
+                        t.outcome_attributions
+                    ))
+                }
+            }
+
+            Assertion::OutcomeAttributionPrefix(prefix) => {
+                if t.outcome_attributions
+                    .iter()
+                    .any(|target| target.starts_with(prefix))
+                {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "no outcome attribution started with {prefix:?}; saw {:?}",
+                        t.outcome_attributions
+                    ))
                 }
             }
 
@@ -436,6 +530,51 @@ mod tests {
         }
         .check(&t)
         .is_ok());
+    }
+
+    #[test]
+    fn tool_arg_number_range_reads_json_pointers() {
+        let t = with_calls(vec![call("browser", json!({ "x": 461.5 }), false)]);
+        assert!(Assertion::ToolArgNumberInRange {
+            tool: "browser".into(),
+            pointer: "/x".into(),
+            min: 430.0,
+            max: 490.0,
+        }
+        .check(&t)
+        .is_ok());
+        assert!(Assertion::ToolArgNumberInRange {
+            tool: "browser".into(),
+            pointer: "/x".into(),
+            min: 10.0,
+            max: 20.0,
+        }
+        .check(&t)
+        .is_err());
+    }
+
+    #[test]
+    fn captcha_outcome_assertions_require_durable_evidence() {
+        let t = Transcript {
+            captcha_outcomes: vec![json!({
+                "kind": "captcha_model_attempt",
+                "result": "cleared"
+            })],
+            outcome_attributions: vec!["model:gemma4:26b".into()],
+            ..Default::default()
+        };
+        assert!(Assertion::CaptchaOutcome("cleared".into())
+            .check(&t)
+            .is_ok());
+        assert!(Assertion::OutcomeAttributedTo("model:gemma4:26b".into())
+            .check(&t)
+            .is_ok());
+        assert!(Assertion::OutcomeAttributionPrefix("model:".into())
+            .check(&t)
+            .is_ok());
+        assert!(Assertion::CaptchaOutcome("budget_exhausted".into())
+            .check(&t)
+            .is_err());
     }
 
     #[test]

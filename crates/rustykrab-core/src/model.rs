@@ -69,6 +69,14 @@ pub trait ModelProvider: Send + Sync {
     /// Human-readable name of the provider.
     fn name(&self) -> &str;
 
+    /// Concrete model identifier used for observational attribution.
+    ///
+    /// Providers serving one fixed model should override this. The default
+    /// preserves compatibility for adapters that expose only a provider name.
+    fn model_id(&self) -> &str {
+        self.name()
+    }
+
     /// Model's context window in tokens, when known.
     ///
     /// Serves as the single source of truth for downstream budgets —

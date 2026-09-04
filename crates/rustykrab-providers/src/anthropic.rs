@@ -475,6 +475,10 @@ impl ModelProvider for AnthropicProvider {
         "anthropic"
     }
 
+    fn model_id(&self) -> &str {
+        &self.model
+    }
+
     fn context_limit(&self) -> Option<usize> {
         Some(self.context_limit)
     }

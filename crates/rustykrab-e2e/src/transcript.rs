@@ -34,6 +34,10 @@ pub struct Transcript {
     /// Every assistant text turn, oldest first.
     pub assistant_texts: Vec<String>,
     pub calls: Vec<ToolInvocation>,
+    /// Structured CAPTCHA experiment records persisted by the outcome sink.
+    pub captcha_outcomes: Vec<Value>,
+    /// Distinct attribution ids attached to this conversation's outcomes.
+    pub outcome_attributions: Vec<String>,
     /// True once a compaction has run. Detected from the continuation
     /// turn the runner injects, which is the one unambiguous marker: the
     /// summary itself is model-written and could say anything.
@@ -89,6 +93,26 @@ impl Transcript {
                 |row| row.get::<_, i64>(0),
             )
             .unwrap_or(0) as usize;
+        let mut outcome_stmt = conn.prepare(
+            "SELECT detail FROM outcome_records \
+             WHERE conversation_id = ?1 AND detail IS NOT NULL",
+        )?;
+        transcript.captcha_outcomes = outcome_stmt
+            .query_map([conv_id], |row| row.get::<_, String>(0))?
+            .filter_map(|row| row.ok())
+            .filter_map(|detail| serde_json::from_str::<Value>(&detail).ok())
+            .filter(|detail| detail["kind"] == "captcha_model_attempt")
+            .collect();
+        let mut attribution_stmt = conn.prepare(
+            "SELECT DISTINCT a.target_id \
+             FROM outcome_attributions a \
+             JOIN outcome_records r ON r.id = a.record_id \
+             WHERE r.conversation_id = ?1 ORDER BY a.target_id",
+        )?;
+        transcript.outcome_attributions = attribution_stmt
+            .query_map([conv_id], |row| row.get::<_, String>(0))?
+            .filter_map(|row| row.ok())
+            .collect();
         Ok(transcript)
     }
 
@@ -172,6 +196,8 @@ impl Transcript {
             final_text: assistant_texts.last().cloned().unwrap_or_default(),
             assistant_texts,
             calls,
+            captcha_outcomes: Vec::new(),
+            outcome_attributions: Vec::new(),
             compacted: summary.is_some(),
             summary,
             archived_chars: 0,
