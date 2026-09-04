@@ -42,6 +42,12 @@ pub struct BrowserConfig {
     #[serde(default)]
     pub isolated_root: Option<PathBuf>,
 
+    /// Optional root for browser downloads. Each profile receives its own
+    /// subdirectory. When omitted, downloads live under that profile's
+    /// RustyKrab user-data directory.
+    #[serde(default)]
+    pub download_root: Option<PathBuf>,
+
     /// Run browsers in headless mode.
     #[serde(default)]
     pub headless: bool,
@@ -65,6 +71,15 @@ pub struct BrowserConfig {
     /// Timeout for remote CDP connections (ms).
     #[serde(default = "default_remote_cdp_timeout")]
     pub remote_cdp_timeout_ms: u64,
+
+    /// Maximum time for one Chrome DevTools Protocol request (ms), clamped to
+    /// 500..=10,000 by the driver.
+    ///
+    /// This is deliberately below the browser tool and action deadlines. A
+    /// single missing response must surface with its CDP method/stage while
+    /// there is still time to reconnect the browser session.
+    #[serde(default = "default_cdp_request_timeout")]
+    pub cdp_request_timeout_ms: u64,
 
     /// Named browser profiles.
     #[serde(default)]
@@ -171,12 +186,14 @@ impl Default for BrowserConfig {
             // Unset by default: normal use borrows the real Chrome
             // profile, which is where the logins are.
             isolated_root: None,
+            download_root: None,
             headless: false,
             no_sandbox: false,
             attach_only: false,
             executable_path: None,
             cdp_port_range_start: 18800,
             remote_cdp_timeout_ms: 5000,
+            cdp_request_timeout_ms: 10_000,
             profiles,
             ssrf_policy: SsrfPolicy::default(),
             extra_args: Vec::new(),
@@ -231,6 +248,11 @@ impl BrowserConfig {
         if let Ok(root) = std::env::var("RUSTYKRAB_BROWSER_ISOLATED_ROOT") {
             if !root.is_empty() {
                 config.isolated_root = Some(PathBuf::from(root));
+            }
+        }
+        if let Ok(root) = std::env::var("RUSTYKRAB_BROWSER_DOWNLOAD_ROOT") {
+            if !root.is_empty() {
+                config.download_root = Some(PathBuf::from(root));
             }
         }
         if std::env::var("BROWSER_HEADLESS").as_deref() == Ok("1") {
@@ -291,6 +313,28 @@ impl BrowserConfig {
             .join("user-data")
     }
 
+    /// Resolve the only directory from which completed downloads may be
+    /// reported back to the agent.
+    pub fn resolve_download_dir(&self, profile_name: &str) -> PathBuf {
+        self.download_root
+            .as_ref()
+            .map(|root| root.join(profile_name))
+            .unwrap_or_else(|| self.resolve_user_data_dir(profile_name).join("downloads"))
+    }
+
+    /// Whether the browser filesystem is on another host. CDP reports a
+    /// download path in that browser's filesystem; without an artifact
+    /// transfer channel RustyKrab cannot validate or expose it as a local
+    /// path.
+    pub fn is_remote_profile(&self, profile_name: &str) -> bool {
+        matches!(
+            self.profiles
+                .get(profile_name)
+                .map(|profile| &profile.driver),
+            Some(DriverType::Remote)
+        )
+    }
+
     /// Whether a profile should use headless mode.
     pub fn is_headless(&self, profile_name: &str) -> bool {
         self.profiles
@@ -338,6 +382,10 @@ fn default_cdp_port_start() -> u16 {
 
 fn default_remote_cdp_timeout() -> u64 {
     5000
+}
+
+fn default_cdp_request_timeout() -> u64 {
+    10_000
 }
 
 fn default_color() -> String {
@@ -393,5 +441,59 @@ mod isolated_root_tests {
             config.resolve_user_data_dir("rustykrab"),
             PathBuf::from("/explicit/path")
         );
+    }
+
+    #[test]
+    fn cdp_request_timeout_has_a_backward_compatible_json_default() {
+        let config: BrowserConfig = serde_json::from_str("{}").expect("browser config");
+        assert_eq!(config.cdp_request_timeout_ms, 10_000);
+
+        let configured: BrowserConfig =
+            serde_json::from_str(r#"{"cdpRequestTimeoutMs":2500}"#).expect("browser config");
+        assert_eq!(configured.cdp_request_timeout_ms, 2_500);
+    }
+
+    #[test]
+    fn downloads_are_profile_scoped_and_configurable() {
+        let default = BrowserConfig {
+            isolated_root: Some(PathBuf::from("/tmp/browser-isolation")),
+            ..Default::default()
+        };
+        assert_eq!(
+            default.resolve_download_dir("agent"),
+            PathBuf::from("/tmp/browser-isolation/agent/user-data/downloads")
+        );
+
+        let configured = BrowserConfig {
+            download_root: Some(PathBuf::from("/tmp/agent-downloads")),
+            ..Default::default()
+        };
+        assert_eq!(
+            configured.resolve_download_dir("agent"),
+            PathBuf::from("/tmp/agent-downloads/agent")
+        );
+    }
+
+    #[test]
+    fn remote_profile_is_distinguished_from_local_attach() {
+        let mut config = BrowserConfig::default();
+        config.profiles.insert(
+            "remote".to_string(),
+            BrowserProfile {
+                driver: DriverType::Remote,
+                ..Default::default()
+            },
+        );
+        config.profiles.insert(
+            "attached".to_string(),
+            BrowserProfile {
+                driver: DriverType::ExistingSession,
+                ..Default::default()
+            },
+        );
+
+        assert!(config.is_remote_profile("remote"));
+        assert!(!config.is_remote_profile("attached"));
+        assert!(!config.is_remote_profile("missing"));
     }
 }

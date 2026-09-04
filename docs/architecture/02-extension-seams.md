@@ -152,7 +152,7 @@ Direct environment reads outside the composition root and E2E harness:
 
 | Crate | Reads | Examples |
 |---|---|---|
-| `tools` | 25 | `BROWSER_HEADLESS`, `CHROME_CDP_URL`, `X_API_BEARER_TOKEN`, `RUSTYKRAB_MCP_SERVERS`, `RUSTYKRAB_NODES` |
+| `tools` | 26 | `BROWSER_HEADLESS`, `CHROME_CDP_URL`, `RUSTYKRAB_BROWSER_DOWNLOAD_ROOT`, `X_API_BEARER_TOKEN`, `RUSTYKRAB_MCP_SERVERS`, `RUSTYKRAB_NODES` |
 | `providers` | 8 | `OLLAMA_NUM_CTX`, `OLLAMA_KEEP_ALIVE`, `ANTHROPIC_CONTEXT_LENGTH` |
 | `gateway` | 5 | `RUSTYKRAB_ALLOWED_ORIGINS`, `RUSTYKRAB_PUBLIC_URL` |
 | `agent` | 4 | `RUSTYKRAB_COMPACTION_*` |
