@@ -61,8 +61,8 @@ likely thing to be "fixed" by someone tidying up.
 
 ### 2. Ambient configuration — **structural, measured, unchanged**
 
-There are 47 direct environment reads inside library crates rather than the
-composition root: 25 `tools`, 8 `providers`, 5 `gateway`, 4 `agent`, 3 `store`,
+There are 48 direct environment reads inside library crates rather than the
+composition root: 26 `tools`, 8 `providers`, 5 `gateway`, 4 `agent`, 3 `store`,
 and one each in `channels` and `skills`.
 
 Each read is individually defensible. Collectively they mean a library's

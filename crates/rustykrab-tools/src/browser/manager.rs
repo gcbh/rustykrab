@@ -10,14 +10,18 @@
 //! - Health checks before reuse so dead browsers are auto-replaced
 //! - Best-effort kill of all spawned children on Drop
 
+use chromiumoxide::cdp::browser_protocol::network::EventRequestWillBeSentExtraInfo;
+use chromiumoxide::handler::HandlerConfig;
 use chromiumoxide::Browser;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio_stream::StreamExt;
 
 use super::config::{BrowserConfig, DriverType};
+use super::downloads::DownloadTracker;
 use rustykrab_core::{Error, Result};
 
 /// How long to wait for a launched Chrome to start serving CDP before giving
@@ -63,6 +67,106 @@ pub struct ProfileInstance {
     pub profile_name: String,
     pub cdp_url: String,
     pub launched_by_us: bool,
+    protocol_health: Arc<ProtocolHealth>,
+    pub download_tracker: Option<DownloadTracker>,
+    pub _download_task: Option<tokio::task::JoinHandle<()>>,
+    pub download_setup_error: Option<String>,
+}
+
+impl ProfileInstance {
+    fn abort_background_tasks(&self) {
+        self._handler_task.abort();
+        if let Some(task) = &self._download_task {
+            task.abort();
+        }
+    }
+}
+
+/// Observable health of the long-lived CDP event stream.
+///
+/// Chromiumoxide normally swallows events it cannot decode and emits a log
+/// line with neither the CDP method nor a counter. Surfacing them lets status
+/// and incident logs distinguish an alive Chrome process from a protocol
+/// client that is steadily losing browser state.
+#[derive(Debug, Default)]
+struct ProtocolHealth {
+    invalid_messages: AtomicU64,
+    tolerated_messages: AtomicU64,
+    handler_exited: AtomicBool,
+    invalid_methods: std::sync::Mutex<HashMap<String, u64>>,
+    tolerated_methods: std::sync::Mutex<HashMap<String, u64>>,
+    last_invalid_error: std::sync::Mutex<Option<String>>,
+    last_tolerated_reason: std::sync::Mutex<Option<String>>,
+}
+
+impl ProtocolHealth {
+    fn record_invalid_method(&self, method: String, error: String) -> u64 {
+        let count = self.invalid_messages.fetch_add(1, Ordering::Relaxed) + 1;
+        let mut methods = match self.invalid_methods.lock() {
+            Ok(methods) => methods,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *methods.entry(method).or_default() += 1;
+        let mut last_error = match self.last_invalid_error.lock() {
+            Ok(error) => error,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *last_error = Some(error);
+        count
+    }
+
+    fn last_invalid_error(&self) -> Option<String> {
+        match self.last_invalid_error.lock() {
+            Ok(error) => error.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    fn invalid_method_summary(&self) -> Vec<serde_json::Value> {
+        method_summary(&self.invalid_methods)
+    }
+
+    fn record_tolerated_method(&self, method: String, reason: String) -> u64 {
+        let count = self.tolerated_messages.fetch_add(1, Ordering::Relaxed) + 1;
+        let mut methods = match self.tolerated_methods.lock() {
+            Ok(methods) => methods,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *methods.entry(method).or_default() += 1;
+        let mut last_reason = match self.last_tolerated_reason.lock() {
+            Ok(reason) => reason,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *last_reason = Some(reason);
+        count
+    }
+
+    fn tolerated_method_summary(&self) -> Vec<serde_json::Value> {
+        method_summary(&self.tolerated_methods)
+    }
+
+    fn last_tolerated_reason(&self) -> Option<String> {
+        match self.last_tolerated_reason.lock() {
+            Ok(reason) => reason.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+}
+
+fn method_summary(methods: &std::sync::Mutex<HashMap<String, u64>>) -> Vec<serde_json::Value> {
+    let methods = match methods.lock() {
+        Ok(methods) => methods,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let mut entries: Vec<_> = methods.iter().collect();
+    entries.sort_by(|(method_a, count_a), (method_b, count_b)| {
+        count_b.cmp(count_a).then_with(|| method_a.cmp(method_b))
+    });
+    entries
+        .into_iter()
+        .take(16)
+        .map(|(method, count)| serde_json::json!({ "method": method, "count": count }))
+        .collect()
 }
 
 /// Manages multiple browser profiles, each an isolated Chrome instance.
@@ -82,6 +186,10 @@ pub struct BrowserManager {
     /// concurrent run. Pinning the navigated tab is what keeps a `navigate`
     /// and the `snapshot` after it on the same page.
     sticky: Arc<std::sync::Mutex<HashMap<(String, String), String>>>,
+    /// One browser profile is one mutable Chrome process. Serialize tool calls
+    /// that address it so a recovery, navigation, or tab mutation cannot race
+    /// another conversation using the same profile.
+    action_leases: Arc<std::sync::Mutex<HashMap<String, Arc<Mutex<()>>>>>,
 }
 
 /// How many tabs one profile's browser may hold.
@@ -123,6 +231,7 @@ impl BrowserManager {
             instances: Arc::new(Mutex::new(HashMap::new())),
             children: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sticky: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            action_leases: Arc::new(std::sync::Mutex::new(HashMap::new())),
         };
         if std::env::var("RUSTYKRAB_BROWSER_SWEEP").as_deref() == Ok("1") {
             sweep_stale_processes();
@@ -137,6 +246,25 @@ impl BrowserManager {
 
     pub fn config(&self) -> &BrowserConfig {
         &self.config
+    }
+
+    /// Acquire exclusive access to one mutable browser profile for a tool call.
+    pub async fn acquire_profile_lease(
+        &self,
+        profile_name: &str,
+    ) -> tokio::sync::OwnedMutexGuard<()> {
+        let lease = {
+            let mut leases = match self.action_leases.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            Arc::clone(
+                leases
+                    .entry(profile_name.to_string())
+                    .or_insert_with(|| Arc::new(Mutex::new(()))),
+            )
+        };
+        lease.lock_owned().await
     }
 
     /// Get or create a browser instance for the given profile.
@@ -161,7 +289,7 @@ impl BrowserManager {
                     profile = profile_name,
                     "browser instance failed health check — relaunching"
                 );
-                dead._handler_task.abort();
+                dead.abort_background_tasks();
                 self.kill_child(profile_name);
                 drop(dead.browser);
             }
@@ -179,11 +307,56 @@ impl BrowserManager {
         if let Some(inst) = instances.get(profile_name) {
             let alive = is_instance_alive(inst).await;
             let page_count = inst.browser.pages().await.map(|p| p.len()).unwrap_or(0);
+            let invalid_messages = inst
+                .protocol_health
+                .invalid_messages
+                .load(Ordering::Relaxed);
+            let tolerated_messages = inst
+                .protocol_health
+                .tolerated_messages
+                .load(Ordering::Relaxed);
+            let handler_running = !inst.protocol_health.handler_exited.load(Ordering::Acquire);
+            let browser_version = tokio::time::timeout(
+                Duration::from_millis(HEALTH_PROBE_TIMEOUT_MS),
+                inst.browser.version(),
+            )
+            .await
+            .ok()
+            .and_then(std::result::Result::ok);
+            let protocol_invalid_methods = inst.protocol_health.invalid_method_summary();
+            let protocol_last_invalid_error = inst.protocol_health.last_invalid_error();
+            let protocol_tolerated_methods = inst.protocol_health.tolerated_method_summary();
+            let protocol_last_tolerated_reason = inst.protocol_health.last_tolerated_reason();
+            let download_dir = inst
+                .download_tracker
+                .as_ref()
+                .map(|tracker| tracker.root().display().to_string());
             serde_json::json!({
                 "status": if alive { "running" } else { "unresponsive" },
                 "profile": profile_name,
                 "cdp_url": inst.cdp_url,
                 "launched_by_us": inst.launched_by_us,
+                "protocol_status": if !handler_running {
+                    "disconnected"
+                } else if invalid_messages > 0 {
+                    "compatibility_warning"
+                } else if tolerated_messages > 0 {
+                    "healthy_with_tolerated_drift"
+                } else {
+                    "healthy"
+                },
+                "protocol_invalid_messages": invalid_messages,
+                "protocol_invalid_methods": protocol_invalid_methods,
+                "protocol_last_invalid_error": protocol_last_invalid_error,
+                "protocol_tolerated_messages": tolerated_messages,
+                "protocol_tolerated_methods": protocol_tolerated_methods,
+                "protocol_last_tolerated_reason": protocol_last_tolerated_reason,
+                "protocol_handler_running": handler_running,
+                "browser_product": browser_version.as_ref().map(|version| version.product.clone()),
+                "browser_protocol_version": browser_version.as_ref().map(|version| version.protocol_version.clone()),
+                "downloads_status": if inst.download_tracker.is_some() { "ready" } else { "unavailable" },
+                "download_dir": download_dir,
+                "download_setup_error": inst.download_setup_error,
                 "tabs": page_count
             })
         } else {
@@ -198,6 +371,56 @@ impl BrowserManager {
                 "tabs": 0
             })
         }
+    }
+
+    /// Sequence marker used to correlate a click with browser-level download
+    /// events that begin after it.
+    pub async fn download_sequence(&self, profile_name: &str) -> Option<u64> {
+        let tracker = {
+            let instances = self.instances.lock().await;
+            instances
+                .get(profile_name)
+                .and_then(|instance| instance.download_tracker.clone())
+        };
+        match tracker {
+            Some(tracker) => Some(tracker.sequence().await),
+            None => None,
+        }
+    }
+
+    pub async fn list_downloads(&self, profile_name: &str) -> Result<serde_json::Value> {
+        let tracker = {
+            let instances = self.instances.lock().await;
+            instances
+                .get(profile_name)
+                .and_then(|instance| instance.download_tracker.clone())
+        }
+        .ok_or_else(|| {
+            Error::ToolExecution(
+                format!("download observation is unavailable for profile '{profile_name}'").into(),
+            )
+        })?;
+        Ok(serde_json::json!({
+            "status": "ok",
+            "profile": profile_name,
+            "download_dir": tracker.root().display().to_string(),
+            "downloads": tracker.list().await,
+        }))
+    }
+
+    pub async fn observe_downloads(
+        &self,
+        profile_name: &str,
+        since: u64,
+        budget: Duration,
+    ) -> Option<serde_json::Value> {
+        let tracker = {
+            let instances = self.instances.lock().await;
+            instances
+                .get(profile_name)
+                .and_then(|instance| instance.download_tracker.clone())
+        }?;
+        Some(tracker.observe_since(since, budget).await)
     }
 
     /// Start a browser for the given profile (if not already running).
@@ -216,7 +439,7 @@ impl BrowserManager {
                 "existing browser entry is unresponsive — replacing"
             );
             if let Some(dead) = instances.remove(profile_name) {
-                dead._handler_task.abort();
+                dead.abort_background_tasks();
                 drop(dead.browser);
             }
             self.kill_child(profile_name);
@@ -237,7 +460,7 @@ impl BrowserManager {
     pub async fn stop(&self, profile_name: &str) -> Result<serde_json::Value> {
         let mut instances = self.instances.lock().await;
         if let Some(inst) = instances.remove(profile_name) {
-            inst._handler_task.abort();
+            inst.abort_background_tasks();
             drop(inst.browser);
             let killed = self.kill_child(profile_name);
             Ok(serde_json::json!({
@@ -251,6 +474,45 @@ impl BrowserManager {
                 "profile": profile_name
             }))
         }
+    }
+
+    /// Drop a degraded CDP client and establish a fresh one.
+    ///
+    /// Managed Chrome is restarted because a target/renderer timeout can leave
+    /// the process responsive at `Browser.getVersion` while its page session is
+    /// unusable. Attach-only/remote profiles are never killed; only their CDP
+    /// client and target sessions are rebuilt.
+    pub async fn recover_profile(&self, profile_name: &str) -> Result<serde_json::Value> {
+        let mut instances = self.instances.lock().await;
+        let old = instances.remove(profile_name);
+        let was_running = old.is_some();
+        if let Some(old) = old {
+            old.abort_background_tasks();
+            drop(old.browser);
+        }
+
+        let process_restarted = self.kill_child(profile_name);
+        self.clear_profile_sticky_targets(profile_name);
+
+        tracing::warn!(
+            profile = profile_name,
+            was_running,
+            process_restarted,
+            "recovering degraded browser profile"
+        );
+
+        let replacement = self.connect_or_launch(profile_name).await?;
+        let cdp_url = replacement.cdp_url.clone();
+        let launched_by_us = replacement.launched_by_us;
+        instances.insert(profile_name.to_string(), replacement);
+
+        Ok(serde_json::json!({
+            "status": "recovered",
+            "profile": profile_name,
+            "cdp_url": cdp_url,
+            "process_restarted": process_restarted,
+            "launched_by_us": launched_by_us
+        }))
     }
 
     /// Stop every running profile. Best-effort; errors are logged.
@@ -351,6 +613,7 @@ impl BrowserManager {
         })?;
 
         let nav_timeout = Duration::from_millis(self.config.remote_cdp_timeout_ms.max(10_000));
+        let open_deadline = tokio::time::Instant::now() + nav_timeout;
 
         // `new_page` creates the tab *and* navigates, so this budget covers
         // a page load, not just a CDP round trip. Timing the two phases
@@ -423,7 +686,7 @@ impl BrowserManager {
         }
 
         let open_started = std::time::Instant::now();
-        let page = tokio::time::timeout(nav_timeout, inst.browser.new_page(url))
+        let page = tokio::time::timeout_at(open_deadline, inst.browser.new_page(url))
             .await
             .map_err(|_| {
                 tracing::warn!(
@@ -444,11 +707,17 @@ impl BrowserManager {
             .map_err(|e| Error::ToolExecution(format!("failed to open tab: {e}").into()))?;
         let open_ms = open_started.elapsed().as_millis() as u64;
 
-        // Bound wait_for_navigation so a slow page can't hang the call forever.
+        // Tab creation and settling share one absolute deadline. Two separate
+        // full-size timeouts made a slow open cost twice what the caller asked
+        // for and could collide with the runner's outer tool timeout.
         let nav_started = std::time::Instant::now();
-        let settled = tokio::time::timeout(nav_timeout, page.wait_for_navigation())
-            .await
-            .is_ok();
+        let settled = if tokio::time::Instant::now() < open_deadline {
+            tokio::time::timeout_at(open_deadline, page.wait_for_navigation())
+                .await
+                .is_ok()
+        } else {
+            false
+        };
         tracing::info!(
             url,
             open_ms,
@@ -456,7 +725,7 @@ impl BrowserManager {
             settled,
             "opened tab"
         );
-        let actual_url = page.url().await.ok().flatten().unwrap_or_default();
+        let actual_url = probe_page_url_once(&page).await.unwrap_or_default();
         let title = probe_page_title_once(&page).await.unwrap_or_default();
 
         Ok(serde_json::json!({
@@ -524,7 +793,7 @@ impl BrowserManager {
             .await
             .map_err(|e| Error::ToolExecution(format!("failed to focus tab: {e}").into()))?;
 
-        let url = page.url().await.ok().flatten().unwrap_or_default();
+        let url = probe_page_url_once(page).await.unwrap_or_default();
         let title = probe_page_title_once(page).await.unwrap_or_default();
 
         Ok(serde_json::json!({
@@ -584,6 +853,14 @@ impl BrowserManager {
             Err(p) => p.into_inner(),
         };
         sticky.remove(&key);
+    }
+
+    fn clear_profile_sticky_targets(&self, profile: &str) {
+        let mut sticky = match self.sticky.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        sticky.retain(|(_, pinned_profile), _| pinned_profile != profile);
     }
 
     /// Whether `target_id` still names a live tab in this profile.
@@ -679,15 +956,22 @@ impl BrowserManager {
         let connect_timeout = Duration::from_millis(self.config.remote_cdp_timeout_ms);
 
         // Try connecting to an existing instance first
-        match tokio::time::timeout(connect_timeout, Browser::connect(&cdp_url)).await {
+        match tokio::time::timeout(connect_timeout, self.connect_browser(&cdp_url)).await {
             Ok(Ok((browser, handler))) => {
-                let handler_task = spawn_handler_task(handler, profile_name.to_string());
+                let (handler_task, protocol_health) =
+                    spawn_handler_task(handler, profile_name.to_string());
+                let (download_tracker, download_task, download_setup_error) =
+                    self.setup_download_tracker(&browser, profile_name).await;
                 return Ok(ProfileInstance {
                     browser,
                     _handler_task: handler_task,
                     profile_name: profile_name.to_string(),
                     cdp_url,
                     launched_by_us: false,
+                    protocol_health,
+                    download_tracker,
+                    _download_task: download_task,
+                    download_setup_error,
                 });
             }
             Ok(Err(e)) => {
@@ -766,7 +1050,7 @@ impl BrowserManager {
         }
 
         let (browser, handler) =
-            match tokio::time::timeout(connect_timeout, Browser::connect(&cdp_url)).await {
+            match tokio::time::timeout(connect_timeout, self.connect_browser(&cdp_url)).await {
                 Ok(Ok(pair)) => pair,
                 Ok(Err(e)) => {
                     self.kill_child(profile_name);
@@ -794,7 +1078,9 @@ impl BrowserManager {
                 }
             };
 
-        let handler_task = spawn_handler_task(handler, profile_name.to_string());
+        let (handler_task, protocol_health) = spawn_handler_task(handler, profile_name.to_string());
+        let (download_tracker, download_task, download_setup_error) =
+            self.setup_download_tracker(&browser, profile_name).await;
 
         Ok(ProfileInstance {
             browser,
@@ -802,13 +1088,60 @@ impl BrowserManager {
             profile_name: profile_name.to_string(),
             cdp_url,
             launched_by_us: true,
+            protocol_health,
+            download_tracker,
+            _download_task: download_task,
+            download_setup_error,
         })
+    }
+
+    async fn connect_browser(
+        &self,
+        cdp_url: &str,
+    ) -> chromiumoxide::Result<(Browser, chromiumoxide::Handler)> {
+        let config = HandlerConfig {
+            // Surface rejected events to our handler task. It records only the
+            // method name and parse error, never the event payload.
+            ignore_invalid_messages: false,
+            request_timeout: Duration::from_millis(
+                self.config.cdp_request_timeout_ms.clamp(500, 10_000),
+            ),
+            ..HandlerConfig::default()
+        };
+        Browser::connect_with_config(cdp_url, config).await
     }
 
     fn health_probe_timeout_ms(&self) -> u64 {
         self.config
             .remote_cdp_timeout_ms
             .min(HEALTH_PROBE_TIMEOUT_MS)
+    }
+
+    async fn setup_download_tracker(
+        &self,
+        browser: &Browser,
+        profile_name: &str,
+    ) -> (
+        Option<DownloadTracker>,
+        Option<tokio::task::JoinHandle<()>>,
+        Option<String>,
+    ) {
+        if self.config.is_remote_profile(profile_name) {
+            return (
+                None,
+                None,
+                Some(
+                    "remote downloads require an artifact-transfer channel; local path verification is disabled"
+                        .to_string(),
+                ),
+            );
+        }
+        setup_download_tracker(
+            browser,
+            self.config.resolve_download_dir(profile_name),
+            profile_name,
+        )
+        .await
     }
 
     /// Kill the stored Child for the given profile. Returns true if a
@@ -869,21 +1202,142 @@ impl Drop for BrowserManager {
 fn spawn_handler_task(
     mut handler: chromiumoxide::Handler,
     profile_name: String,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+) -> (tokio::task::JoinHandle<()>, Arc<ProtocolHealth>) {
+    let health = Arc::new(ProtocolHealth::default());
+    let task_health = Arc::clone(&health);
+    let task = tokio::spawn(async move {
         while let Some(event) = handler.next().await {
-            if let Err(e) = event {
-                tracing::debug!(profile = %profile_name, error = %e, "CDP handler event error");
+            match event {
+                Err(chromiumoxide::error::CdpError::InvalidMessage(raw, error)) => {
+                    let parsed = serde_json::from_str::<serde_json::Value>(&raw).ok();
+                    let method = parsed
+                        .as_ref()
+                        .and_then(|message| message["method"].as_str().map(str::to_string))
+                        .unwrap_or_else(|| "unknown".to_string());
+                    let diagnostic = if method == EventRequestWillBeSentExtraInfo::IDENTIFIER {
+                        parsed
+                            .as_ref()
+                            .and_then(|message| message.get("params").cloned())
+                            .and_then(|params| {
+                                serde_json::from_value::<EventRequestWillBeSentExtraInfo>(params)
+                                    .err()
+                                    .map(|parse_error| parse_error.to_string())
+                            })
+                            .unwrap_or_else(|| error.to_string())
+                    } else {
+                        error.to_string()
+                    };
+                    if let Some(reason) = known_tolerated_protocol_drift(&method, parsed.as_ref()) {
+                        let count =
+                            task_health.record_tolerated_method(method.clone(), reason.to_string());
+                        if count <= 3 || count.is_power_of_two() {
+                            tracing::debug!(
+                                profile = %profile_name,
+                                method,
+                                count,
+                                reason,
+                                "tolerated known CDP schema drift for an unconsumed event"
+                            );
+                        }
+                        continue;
+                    }
+                    let count = task_health.record_invalid_method(method.clone(), diagnostic);
+                    // Avoid reproducing chromiumoxide's warning flood. The first
+                    // few events and powers of two preserve timing and scale.
+                    if count <= 3 || count.is_power_of_two() {
+                        tracing::warn!(
+                            profile = %profile_name,
+                            method,
+                            count,
+                            error = %error,
+                            "CDP event rejected by protocol decoder"
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(profile = %profile_name, error = %e, "CDP handler event error");
+                }
+                Ok(_) => {}
             }
         }
+        task_health.handler_exited.store(true, Ordering::Release);
         tracing::info!(profile = %profile_name, "browser CDP handler task exited");
-    })
+    });
+    (task, health)
+}
+
+/// Chromiumoxide 0.9.1 is generated from a Chrome 142-era protocol and eagerly
+/// deserializes every event, even those RustyKrab never subscribes to. Chrome
+/// 152 renamed one required field in `ClientSecurityState`; rejecting this
+/// request metadata does not affect navigation, DOM, action, or download state.
+/// Keep this exception exact so any other protocol drift remains an alert.
+fn known_tolerated_protocol_drift(
+    method: &str,
+    message: Option<&serde_json::Value>,
+) -> Option<&'static str> {
+    if method != EventRequestWillBeSentExtraInfo::IDENTIFIER {
+        return None;
+    }
+    let security_state = message?
+        .get("params")?
+        .get("clientSecurityState")?
+        .as_object()?;
+    if security_state.contains_key("localNetworkAccessRequestPolicy")
+        && !security_state.contains_key("privateNetworkRequestPolicy")
+    {
+        Some(
+            "Chrome 152 renamed ClientSecurityState.privateNetworkRequestPolicy to localNetworkAccessRequestPolicy; this unconsumed request metadata event was dropped",
+        )
+    } else {
+        None
+    }
+}
+
+async fn setup_download_tracker(
+    browser: &Browser,
+    root: std::path::PathBuf,
+    profile_name: &str,
+) -> (
+    Option<DownloadTracker>,
+    Option<tokio::task::JoinHandle<()>>,
+    Option<String>,
+) {
+    match tokio::time::timeout(
+        Duration::from_secs(4),
+        DownloadTracker::attach(browser, root),
+    )
+    .await
+    {
+        Ok(Ok((tracker, task))) => (Some(tracker), Some(task), None),
+        Ok(Err(error)) => {
+            let message = error.to_string();
+            tracing::warn!(
+                profile = profile_name,
+                error = %message,
+                "browser connected without download observation"
+            );
+            (None, None, Some(message))
+        }
+        Err(_) => {
+            let message = "download observer setup timed out after 4s".to_string();
+            tracing::warn!(
+                profile = profile_name,
+                "browser connected without download observation: {message}"
+            );
+            (None, None, Some(message))
+        }
+    }
 }
 
 /// Health check for a cached `ProfileInstance`. We do a cheap CDP
 /// round-trip (`Browser.getVersion`) with a short timeout. A failure
 /// (timeout or CDP error) means the browser has gone away.
 async fn is_instance_alive(inst: &ProfileInstance) -> bool {
+    if inst._handler_task.is_finished()
+        || inst.protocol_health.handler_exited.load(Ordering::Acquire)
+    {
+        return false;
+    }
     let probe_timeout = Duration::from_millis(HEALTH_PROBE_TIMEOUT_MS);
     matches!(
         tokio::time::timeout(probe_timeout, inst.browser.version()).await,
@@ -912,7 +1366,10 @@ fn launch_browser_blocking(
     let profile = config.profiles.get(profile_name);
     let driver = profile.map(|p| &p.driver).unwrap_or(&DriverType::Rustykrab);
     let profile_dir_name = if *driver == DriverType::Rustykrab {
-        setup_profile_link(&user_data_dir, config.isolated_root.is_some())
+        setup_profile_link(
+            &user_data_dir,
+            !should_borrow_system_profile(config, profile_name),
+        )
     } else {
         "Default".to_string()
     };
@@ -1013,6 +1470,15 @@ fn launch_browser_blocking(
     Ok(child)
 }
 
+fn should_borrow_system_profile(config: &BrowserConfig, profile_name: &str) -> bool {
+    config.isolated_root.is_none()
+        && config
+            .profiles
+            .get(profile_name)
+            .and_then(|profile| profile.user_data_dir.as_ref())
+            .is_none()
+}
+
 /// Best-effort kill of any Chromium-like process whose user-data-dir lives
 /// under `~/.rustykrab/browser/`. Opt-in via `RUSTYKRAB_BROWSER_SWEEP=1` —
 /// we won't touch unrelated browser processes, but startup sweeps are still
@@ -1087,6 +1553,10 @@ fn detect_profile_name(chrome_dir: &std::path::Path) -> String {
 /// asked to avoid, and in an eval it silently invalidates the result: a
 /// trial that inherits a signed-in cookie looks like a successful
 /// sign-in without ever having signed in.
+///
+/// An explicit per-profile user-data directory is also isolated: the caller
+/// named the exact data root, so silently linking the account profile into it
+/// would violate that boundary (and made live tests mutate the real profile).
 ///
 /// `isolated` is passed in rather than read from the environment here.
 /// One setting read in one place is easier to reason about than the same
@@ -1292,6 +1762,70 @@ mod tests {
         assert!(!is_blank_url("https://www.instagram.com/cutty13/"));
         // Not blank just because the host is unusual.
         assert!(!is_blank_url("about:config"));
+    }
+
+    #[test]
+    fn protocol_health_summarizes_rejected_methods_without_payloads() {
+        let health = ProtocolHealth::default();
+        health.record_invalid_method("Page.frameNavigated".to_string(), "first".to_string());
+        health.record_invalid_method("Page.frameNavigated".to_string(), "second".to_string());
+        health.record_invalid_method("Runtime.consoleAPICalled".to_string(), "latest".to_string());
+        assert_eq!(health.invalid_messages.load(Ordering::Relaxed), 3);
+        let summary = health.invalid_method_summary();
+        assert_eq!(summary[0]["method"], "Page.frameNavigated");
+        assert_eq!(summary[0]["count"], 2);
+        assert_eq!(summary[1]["method"], "Runtime.consoleAPICalled");
+        assert_eq!(health.last_invalid_error().as_deref(), Some("latest"));
+    }
+
+    #[test]
+    fn only_the_known_chrome_152_policy_rename_is_tolerated() {
+        let renamed = serde_json::json!({
+            "method": "Network.requestWillBeSentExtraInfo",
+            "params": {
+                "clientSecurityState": {
+                    "initiatorIsSecureContext": true,
+                    "initiatorIPAddressSpace": "Public",
+                    "localNetworkAccessRequestPolicy": "Allow"
+                }
+            }
+        });
+        assert!(known_tolerated_protocol_drift(
+            "Network.requestWillBeSentExtraInfo",
+            Some(&renamed)
+        )
+        .is_some());
+
+        let unknown = serde_json::json!({
+            "method": "Network.requestWillBeSentExtraInfo",
+            "params": { "clientSecurityState": { "futureField": true } }
+        });
+        assert!(known_tolerated_protocol_drift(
+            "Network.requestWillBeSentExtraInfo",
+            Some(&unknown)
+        )
+        .is_none());
+        assert!(known_tolerated_protocol_drift("Page.futureEvent", Some(&renamed)).is_none());
+    }
+
+    #[test]
+    fn only_the_implicit_default_data_root_borrows_the_system_profile() {
+        let default = BrowserConfig::default();
+        assert!(should_borrow_system_profile(&default, "rustykrab"));
+
+        let mut explicit = BrowserConfig::default();
+        explicit
+            .profiles
+            .get_mut("rustykrab")
+            .unwrap()
+            .user_data_dir = Some("/tmp/dedicated-browser-profile".into());
+        assert!(!should_borrow_system_profile(&explicit, "rustykrab"));
+
+        let isolated = BrowserConfig {
+            isolated_root: Some("/tmp/isolated-browser-root".into()),
+            ..BrowserConfig::default()
+        };
+        assert!(!should_borrow_system_profile(&isolated, "rustykrab"));
     }
 
     #[test]

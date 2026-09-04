@@ -1,28 +1,34 @@
 //! Accessibility-tree snapshot system modeled after OpenClaw's snapshot/ref pattern,
 //! with browser-use-inspired enhancements.
 //!
-//! Takes a snapshot of the page's accessibility tree, assigns stable numeric
+//! Takes a snapshot of the page's accessibility tree, assigns snapshot-scoped
 //! refs to interactive elements, and returns a structured representation that
-//! the agent can use for targeted actions (click ref 12, type ref 23 "hello").
+//! the agent can use for targeted actions (click ref s4-12, type ref s4-23
+//! "hello").
 //!
 //! Two snapshot modes:
-//! - **ai**: Compact text summary with numeric refs (default)
-//! - **aria**: Full accessibility tree with `e`-prefixed refs (e.g., e12)
+//! - **ai**: Compact text summary with snapshot-scoped refs (default)
+//! - **aria**: Full accessibility tree with `e`-marked refs (e.g., s4-e12)
 //!
 //! Enhancements over the baseline AX-tree extractor:
 //! - Pierces open shadow roots (Web Components, Angular Material, etc.).
-//! - Pierces same-origin iframes.
+//! - Captures each reachable frame in its own execution context, including
+//!   cross-origin frames when Chrome exposes that context through this target.
 //! - Filters out occluded / zero-size / fully transparent elements.
-//! - Prefers stable selectors (`data-testid`, `aria-label`, `name`) over
-//!   fragile nth-of-type chains.
+//! - Uses a preferred attribute selector only when it uniquely identifies the
+//!   element in its document/shadow root; duplicated framework attributes fall
+//!   back to an exact structural path.
 //! - Optional numbered highlight overlay for screenshots.
 
+use chromiumoxide::cdp::browser_protocol::page::FrameId;
+use chromiumoxide::cdp::js_protocol::runtime::{EvaluateParams, ExecutionContextId};
 use chromiumoxide::Page;
 use rustykrab_core::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use tokio::time::{timeout, Duration, Instant};
 
 /// Maximum depth for accessibility tree traversal.
 ///
@@ -34,6 +40,14 @@ use tokio::sync::Mutex;
 /// is cheap. Callers can still override via the `depth` snapshot parameter.
 const DEFAULT_MAX_DEPTH: usize = 50;
 
+/// Frame traversal is deliberately bounded. Ad-heavy pages can create hundreds
+/// of short-lived frames; a snapshot must remain useful even when some are
+/// detached or unresponsive.
+const MAX_SNAPSHOT_FRAMES: usize = 100;
+const MAX_FRAME_DEPTH: usize = 5;
+const SNAPSHOT_DEADLINE: Duration = Duration::from_secs(10);
+const PER_FRAME_DEADLINE: Duration = Duration::from_secs(2);
+
 /// Marker between segments of a shadow-DOM piercing selector.
 #[allow(dead_code)]
 pub(crate) const SHADOW_SEP: &str = " >>> ";
@@ -44,10 +58,17 @@ pub(crate) const IFRAME_SEP: &str = " ||| ";
 /// A single element ref from a snapshot.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ElementRef {
-    /// The ref identifier (numeric for ai mode, e-prefixed for aria mode).
+    /// The ref identifier, including the snapshot generation that produced it.
     pub ref_id: String,
     /// Primary selector, possibly chained via `>>>` (shadow) or `|||` (iframe).
     pub selector: String,
+    /// CDP frame identifier when the element belongs to a child frame. Refs
+    /// remain snapshot-scoped because frame identifiers can change on reload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame_id: Option<String>,
+    /// Frame URL captured for diagnostics and conservative stale-ref healing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame_url: Option<String>,
     /// Element role (button, link, textbox, etc.).
     pub role: String,
     /// Human-readable name/label.
@@ -79,6 +100,10 @@ struct SnapshotInner {
     refs: HashMap<String, HashMap<String, ElementRef>>,
     /// Recency order: front = least-recently-used, back = most-recent.
     order: VecDeque<String>,
+    /// Monotonic snapshot generation. Including this in every ref prevents an
+    /// old numeric ref from silently selecting a different element after a
+    /// later snapshot replaces the map for the same tab.
+    next_generation: u64,
 }
 
 impl SnapshotInner {
@@ -107,8 +132,17 @@ impl SnapshotStore {
             inner: Arc::new(Mutex::new(SnapshotInner {
                 refs: HashMap::new(),
                 order: VecDeque::new(),
+                next_generation: 1,
             })),
         }
+    }
+
+    /// Allocate a generation for one snapshot.
+    async fn allocate_generation(&self) -> u64 {
+        let mut g = self.inner.lock().await;
+        let generation = g.next_generation;
+        g.next_generation = g.next_generation.saturating_add(1);
+        generation
     }
 
     /// Store refs from a snapshot.
@@ -135,13 +169,23 @@ impl SnapshotStore {
     /// look for the *same logical element* by role+name (ref ids are positional
     /// and change between snapshots, so they can't be reused). The caller heals
     /// only on a unique match and escalates on none or several.
-    pub async fn find_by_identity(&self, key: &str, role: &str, name: &str) -> Vec<ElementRef> {
+    pub async fn find_by_identity(
+        &self,
+        key: &str,
+        role: &str,
+        name: &str,
+        frame_url: Option<&str>,
+    ) -> Vec<ElementRef> {
         let g = self.inner.lock().await;
         g.refs
             .get(key)
             .map(|m| {
                 m.values()
-                    .filter(|r| r.role == role && r.name == name)
+                    .filter(|r| {
+                        r.role == role
+                            && r.name == name
+                            && frame_url.is_none_or(|url| r.frame_url.as_deref() == Some(url))
+                    })
                     .cloned()
                     .collect()
             })
@@ -157,14 +201,32 @@ impl SnapshotStore {
             g.order.remove(pos);
         }
     }
+
+    /// Clear every snapshot associated with a browser profile.
+    ///
+    /// Recovering a profile replaces its CDP connection and, for managed
+    /// browsers, the Chrome process itself. Refs held by *other* conversations
+    /// are just as stale as the ref that detected the failure, so invalidating
+    /// only the initiating tab would leave cross-session capabilities pointing
+    /// into a browser that no longer exists.
+    pub async fn clear_profile(&self, profile: &str) {
+        let belongs_to_profile = |key: &str| {
+            key.split_once(':')
+                .and_then(|(_, rest)| rest.split_once(':'))
+                .is_some_and(|(key_profile, _)| key_profile == profile)
+        };
+        let mut g = self.inner.lock().await;
+        g.refs.retain(|key, _| !belongs_to_profile(key));
+        g.order.retain(|key| !belongs_to_profile(key));
+    }
 }
 
 /// Snapshot mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SnapshotMode {
-    /// Compact AI-friendly format with numeric refs.
+    /// Compact AI-friendly format with snapshot-scoped refs.
     Ai,
-    /// Full accessibility tree with e-prefixed refs.
+    /// Full accessibility tree with e-marked snapshot-scoped refs.
     Aria,
 }
 
@@ -201,7 +263,9 @@ impl Default for SnapshotOptions {
 
 /// JavaScript that extracts the accessibility tree from a page.
 ///
-/// Walks the document, open shadow roots, and same-origin iframes. Returns an
+/// Walks one document and its open shadow roots. Rust invokes this once per
+/// reachable frame execution context, which avoids the browser same-origin
+/// restriction on `iframe.contentDocument`. Returns an
 /// array of objects with: tag, role, name, value, selector (possibly chained),
 /// interactive, bounds (x, y, w, h), depth.
 ///
@@ -218,7 +282,6 @@ const SNAPSHOT_JS: &str = r#"
         'A', 'BUTTON', 'INPUT', 'SELECT', 'TEXTAREA', 'DETAILS', 'SUMMARY'
     ]);
     var SHADOW_SEP = ' >>> ';
-    var IFRAME_SEP = ' ||| ';
 
     var MAX_DEPTH = arguments[0] || 50;
     var INTERACTIVE_ONLY = arguments[1] || false;
@@ -236,21 +299,47 @@ const SNAPSHOT_JS: &str = r#"
         return String(s).replace(/[^a-zA-Z0-9_-]/g, function(c) { return '\\' + c; });
     }
 
+    // A selector is useful only if it names this element and no other one in
+    // its local root. Component frameworks such as Wix deliberately reuse
+    // data-testid="linkElement" across a page; accepting that as an identity
+    // made several different refs click the first link in the document.
+    function uniqueInLocalRoot(el, selector) {
+        try {
+            var root = el.getRootNode ? el.getRootNode() : document;
+            if (!root || !root.querySelectorAll) return false;
+            var matches = root.querySelectorAll(selector);
+            return matches.length === 1 && matches[0] === el;
+        } catch (e) {
+            return false;
+        }
+    }
+
     // Build a CSS selector for an element, scoped to its owner Document or
-    // ShadowRoot. Prefers stable attributes.
+    // ShadowRoot. Stable attributes are preferred only when unique.
     function localSelector(el) {
-        if (el.id && !/^[0-9]/.test(el.id)) return '#' + csqEscape(el.id);
+        if (el.id && !/^[0-9]/.test(el.id)) {
+            var idSelector = '#' + csqEscape(el.id);
+            if (uniqueInLocalRoot(el, idSelector)) return idSelector;
+        }
         var tid = el.getAttribute && el.getAttribute('data-testid');
-        if (tid) return el.tagName.toLowerCase() + '[data-testid="' + cssAttrEscape(tid) + '"]';
+        if (tid) {
+            var testSelector = el.tagName.toLowerCase() + '[data-testid="' + cssAttrEscape(tid) + '"]';
+            if (uniqueInLocalRoot(el, testSelector)) return testSelector;
+        }
         var dataQa = el.getAttribute && el.getAttribute('data-qa');
-        if (dataQa) return el.tagName.toLowerCase() + '[data-qa="' + cssAttrEscape(dataQa) + '"]';
+        if (dataQa) {
+            var qaSelector = el.tagName.toLowerCase() + '[data-qa="' + cssAttrEscape(dataQa) + '"]';
+            if (uniqueInLocalRoot(el, qaSelector)) return qaSelector;
+        }
         var name = el.getAttribute && el.getAttribute('name');
         if (name && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT' || el.tagName === 'BUTTON')) {
-            return el.tagName.toLowerCase() + '[name="' + cssAttrEscape(name) + '"]';
+            var nameSelector = el.tagName.toLowerCase() + '[name="' + cssAttrEscape(name) + '"]';
+            if (uniqueInLocalRoot(el, nameSelector)) return nameSelector;
         }
         var aria = el.getAttribute && el.getAttribute('aria-label');
         if (aria && aria.length < 100) {
-            return el.tagName.toLowerCase() + '[aria-label="' + cssAttrEscape(aria) + '"]';
+            var ariaSelector = el.tagName.toLowerCase() + '[aria-label="' + cssAttrEscape(aria) + '"]';
+            if (uniqueInLocalRoot(el, ariaSelector)) return ariaSelector;
         }
         // Fallback: structural path within the local root.
         return structuralPath(el);
@@ -286,8 +375,8 @@ const SNAPSHOT_JS: &str = r#"
         return parts.join(' > ') || el.tagName.toLowerCase();
     }
 
-    // Compose a chained selector that pierces shadow/iframe boundaries.
-    // chain is an array like [{kind:'doc', el:host}, {kind:'shadow', host:host}, {kind:'iframe', host:iframe}]
+    // Compose a chained selector that pierces shadow boundaries.
+    // Iframes are captured independently by their CDP execution context.
     // Each segment contributes a localSelector(el) plus an appropriate separator.
     function chainedSelector(el, chain) {
         var localPart = localSelector(el);
@@ -299,11 +388,10 @@ const SNAPSHOT_JS: &str = r#"
             if (i === 0) {
                 s = hostSel;
             } else {
-                s = s + (chain[i - 1].kind === 'shadow' ? SHADOW_SEP : IFRAME_SEP) + hostSel;
+                s = s + SHADOW_SEP + hostSel;
             }
         }
-        var lastBoundary = chain[chain.length - 1].kind === 'shadow' ? SHADOW_SEP : IFRAME_SEP;
-        return s + lastBoundary + localPart;
+        return s + SHADOW_SEP + localPart;
     }
 
     function isInteractive(el) {
@@ -453,19 +541,6 @@ const SNAPSHOT_JS: &str = r#"
             }
         }
 
-        // Descend into same-origin iframe contentDocument.
-        if (node.tagName === 'IFRAME') {
-            try {
-                var doc = node.contentDocument;
-                if (doc && doc.body) {
-                    var ic = doc.body.children;
-                    for (var j = 0; j < ic.length; j++) {
-                        walk(ic[j], depth + 1, chain.concat([{ kind: 'iframe', host: node }]));
-                    }
-                }
-            } catch (e) { /* cross-origin: cannot pierce */ }
-        }
-
         // Light DOM children.
         var lc = node.children;
         for (var k = 0; k < lc.length; k++) {
@@ -534,6 +609,53 @@ struct RawElement {
     depth: usize,
 }
 
+struct CapturedElement {
+    element: RawElement,
+    frame_id: Option<String>,
+    frame_url: Option<String>,
+}
+
+async fn evaluate_document_snapshot(
+    page: &Page,
+    eval_js: &str,
+    context_id: Option<ExecutionContextId>,
+) -> Result<Vec<RawElement>> {
+    let mut params = EvaluateParams::builder()
+        .expression(eval_js)
+        .return_by_value(true);
+    if let Some(context_id) = context_id {
+        params = params.context_id(context_id);
+    }
+    let params = params
+        .build()
+        .map_err(|e| Error::ToolExecution(format!("invalid snapshot evaluation: {e}").into()))?;
+    let result = page
+        .evaluate_expression(params)
+        .await
+        .map_err(|e| Error::ToolExecution(format!("snapshot evaluation failed: {e}").into()))?;
+    let raw_json: String = result.into_value().unwrap_or_else(|_| "[]".to_string());
+    serde_json::from_str(&raw_json)
+        .map_err(|e| Error::ToolExecution(format!("invalid snapshot result: {e}").into()))
+}
+
+async fn frame_depth(page: &Page, frame: &FrameId, main: &FrameId) -> Option<usize> {
+    let mut current = frame.clone();
+    for depth in 1..=(MAX_FRAME_DEPTH + 1) {
+        let parent = timeout(
+            Duration::from_millis(250),
+            page.frame_parent(current.clone()),
+        )
+        .await
+        .ok()?
+        .ok()??;
+        if &parent == main {
+            return Some(depth);
+        }
+        current = parent;
+    }
+    Some(MAX_FRAME_DEPTH + 1)
+}
+
 /// Take a snapshot of the page's accessibility tree.
 pub async fn take_snapshot(
     page: &Page,
@@ -559,29 +681,111 @@ pub async fn take_snapshot(
         if options.highlight { "true" } else { "false" },
     );
 
-    let result = page
-        .evaluate(eval_js)
+    let started = Instant::now();
+    let main_elements = timeout(
+        PER_FRAME_DEADLINE,
+        evaluate_document_snapshot(page, &eval_js, None),
+    )
+    .await
+    .map_err(|_| Error::ToolExecution("main-frame snapshot timed out".into()))??;
+    let mut elements: Vec<CapturedElement> = main_elements
+        .into_iter()
+        .map(|element| CapturedElement {
+            element,
+            frame_id: None,
+            frame_url: None,
+        })
+        .collect();
+
+    let main_frame = timeout(Duration::from_secs(1), page.mainframe())
         .await
-        .map_err(|e| Error::ToolExecution(format!("snapshot failed: {e}").into()))?;
+        .ok()
+        .and_then(std::result::Result::ok)
+        .flatten();
+    let frames = timeout(Duration::from_secs(1), page.frames())
+        .await
+        .ok()
+        .and_then(std::result::Result::ok)
+        .unwrap_or_default();
+    let frames_seen = frames
+        .len()
+        .saturating_sub(usize::from(main_frame.is_some()));
+    let mut frames_included = 0usize;
+    let mut frames_skipped = Vec::new();
 
-    let raw_json: String = result.into_value().unwrap_or_else(|_| "[]".to_string());
-    let elements: Vec<RawElement> = serde_json::from_str(&raw_json).unwrap_or_default();
+    if let Some(main_frame) = main_frame {
+        for frame in frames
+            .into_iter()
+            .filter(|frame| frame != &main_frame)
+            .take(MAX_SNAPSHOT_FRAMES)
+        {
+            if started.elapsed() >= SNAPSHOT_DEADLINE {
+                frames_skipped.push("snapshot deadline reached".to_string());
+                break;
+            }
+            let frame_id = frame.as_ref().to_string();
+            let depth = frame_depth(page, &frame, &main_frame).await;
+            if depth.is_none_or(|depth| depth > MAX_FRAME_DEPTH) {
+                frames_skipped.push(format!("{frame_id}: frame depth unavailable or too deep"));
+                continue;
+            }
+            let context_id = match timeout(
+                Duration::from_millis(750),
+                page.frame_execution_context(frame.clone()),
+            )
+            .await
+            {
+                Ok(Ok(Some(context_id))) => context_id,
+                _ => {
+                    frames_skipped.push(format!("{frame_id}: execution context unavailable"));
+                    continue;
+                }
+            };
+            let frame_url = timeout(Duration::from_millis(500), page.frame_url(frame.clone()))
+                .await
+                .ok()
+                .and_then(std::result::Result::ok)
+                .flatten();
+            match timeout(
+                PER_FRAME_DEADLINE.min(SNAPSHOT_DEADLINE.saturating_sub(started.elapsed())),
+                evaluate_document_snapshot(page, &eval_js, Some(context_id)),
+            )
+            .await
+            {
+                Ok(Ok(frame_elements)) => {
+                    frames_included += 1;
+                    elements.extend(frame_elements.into_iter().map(|element| CapturedElement {
+                        element,
+                        frame_id: Some(frame_id.clone()),
+                        frame_url: frame_url.clone(),
+                    }));
+                }
+                Ok(Err(error)) => frames_skipped.push(format!("{frame_id}: {error}")),
+                Err(_) => frames_skipped.push(format!("{frame_id}: snapshot timed out")),
+            }
+        }
+    }
 
-    // Assign refs and build the output
+    // Assign refs and build the output. Ref ids carry a generation so a ref
+    // from an earlier snapshot cannot collide with one from this snapshot.
+    let generation = store.allocate_generation().await;
     let mut ref_map = HashMap::new();
     let mut output_elements = Vec::new();
     let mut ref_counter = 0usize;
 
-    for elem in &elements {
+    for captured in &elements {
+        let elem = &captured.element;
         ref_counter += 1;
         let ref_id = match options.mode {
-            SnapshotMode::Ai => format!("{ref_counter}"),
-            SnapshotMode::Aria => format!("e{ref_counter}"),
+            SnapshotMode::Ai => format!("s{generation}-{ref_counter}"),
+            SnapshotMode::Aria => format!("s{generation}-e{ref_counter}"),
         };
 
         let element_ref = ElementRef {
             ref_id: ref_id.clone(),
             selector: elem.selector.clone(),
+            frame_id: captured.frame_id.clone(),
+            frame_url: captured.frame_url.clone(),
             role: elem.role.clone(),
             name: elem.name.clone(),
             value: elem.value.clone(),
@@ -603,6 +807,9 @@ pub async fn take_snapshot(
                         line.push_str(&format!(" = \"{}\"", truncate(val, 40)));
                     }
                 }
+                if let Some(frame_url) = captured.frame_url.as_deref() {
+                    line.push_str(&format!(" [frame: {}]", truncate(frame_url, 60)));
+                }
                 output_elements.push(serde_json::Value::String(line));
             }
         } else {
@@ -613,6 +820,8 @@ pub async fn take_snapshot(
                 "value": elem.value,
                 "interactive": elem.interactive,
                 "bounds": elem.bounds,
+                "frame_id": captured.frame_id,
+                "frame_url": captured.frame_url,
             }));
         }
     }
@@ -629,12 +838,13 @@ pub async fn take_snapshot(
         "mode": match options.mode { SnapshotMode::Ai => "ai", SnapshotMode::Aria => "aria" },
         "elements": output_elements,
         "count": ref_counter,
-        "interactive_count": elements.iter().filter(|e| e.interactive).count(),
+        "interactive_count": elements.iter().filter(|e| e.element.interactive).count(),
+        "frames_seen": frames_seen,
+        "frames_included": frames_included,
+        "frames_skipped": frames_skipped,
+        "snapshot_generation": generation,
         "highlight": options.highlight,
-        "note": format!(
-            "Use ref numbers with 'act' action to interact with elements (e.g., act click {}1)",
-            if options.mode == SnapshotMode::Aria { "e" } else { "" }
-        )
+        "note": "Use the complete string in each element's ref field with the 'act' action. Refs are valid only for this snapshot."
     }))
 }
 
@@ -659,6 +869,8 @@ mod tests {
         ElementRef {
             ref_id: id.to_string(),
             selector: "body > a".to_string(),
+            frame_id: None,
+            frame_url: None,
             role: "link".to_string(),
             name: "x".to_string(),
             value: None,
@@ -731,6 +943,8 @@ mod tests {
                 ElementRef {
                     ref_id: id.into(),
                     selector: sel.into(),
+                    frame_id: None,
+                    frame_url: None,
                     role: role.into(),
                     name: name.into(),
                     value: None,
@@ -742,17 +956,26 @@ mod tests {
         store.store("k", refs).await;
 
         // Unique match heals; ambiguous and absent both escalate.
-        assert_eq!(store.find_by_identity("k", "link", "Home").await.len(), 1);
         assert_eq!(
-            store.find_by_identity("k", "button", "Submit").await.len(),
+            store
+                .find_by_identity("k", "link", "Home", None)
+                .await
+                .len(),
+            1
+        );
+        assert_eq!(
+            store
+                .find_by_identity("k", "button", "Submit", None)
+                .await
+                .len(),
             2
         );
         assert!(store
-            .find_by_identity("k", "button", "Cancel")
+            .find_by_identity("k", "button", "Cancel", None)
             .await
             .is_empty());
         assert!(store
-            .find_by_identity("missing", "link", "Home")
+            .find_by_identity("missing", "link", "Home", None)
             .await
             .is_empty());
     }
@@ -765,5 +988,41 @@ mod tests {
         let inner = store.inner.lock().await;
         assert!(!inner.refs.contains_key("a"));
         assert!(!inner.order.iter().any(|k| k == "a"));
+    }
+
+    #[tokio::test]
+    async fn snapshot_generations_are_monotonic() {
+        let store = SnapshotStore::new();
+        assert_eq!(store.allocate_generation().await, 1);
+        assert_eq!(store.allocate_generation().await, 2);
+    }
+
+    #[tokio::test]
+    async fn profile_recovery_invalidates_every_sessions_refs() {
+        let store = SnapshotStore::new();
+        store
+            .store("conversation-a:shared:target-1", mk_refs("s1-1"))
+            .await;
+        store
+            .store("conversation-b:shared:target-2", mk_refs("s2-1"))
+            .await;
+        store
+            .store("conversation-c:other:target-3", mk_refs("s3-1"))
+            .await;
+
+        store.clear_profile("shared").await;
+
+        assert!(store
+            .get_ref("conversation-a:shared:target-1", "s1-1")
+            .await
+            .is_none());
+        assert!(store
+            .get_ref("conversation-b:shared:target-2", "s2-1")
+            .await
+            .is_none());
+        assert!(store
+            .get_ref("conversation-c:other:target-3", "s3-1")
+            .await
+            .is_some());
     }
 }
