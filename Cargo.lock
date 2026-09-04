@@ -4344,6 +4344,7 @@ dependencies = [
  "rand 0.9.4",
  "rusqlite",
  "rustykrab-core",
+ "rustykrab-projects",
  "security-framework",
  "serde",
  "serde_json",

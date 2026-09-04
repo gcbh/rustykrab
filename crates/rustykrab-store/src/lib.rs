@@ -8,6 +8,7 @@ mod guarded;
 mod jobs;
 pub mod keychain;
 mod outcomes;
+mod projects;
 mod recall_archive;
 pub mod registry;
 mod secret;
@@ -32,6 +33,7 @@ pub use guarded::{GuardedSecrets, WriteOutcome};
 pub use jobs::{JobRun, JobStore, ScheduledJob};
 pub use outcomes::OutcomeStore;
 pub use pending_links::PendingLinks;
+pub use projects::{ApplyRevisionResult, ProjectStore};
 pub use recall_archive::RecallArchiveStore;
 pub use secret::{SecretMeta, SecretStore, WriteAuthority};
 pub use tasks::{DelegatedTask, TaskStatus, TaskStore};
@@ -336,6 +338,93 @@ impl Store {
 
             CREATE INDEX IF NOT EXISTS idx_dream_reports_generated_at
                 ON dream_reports (generated_at DESC);
+
+            -- Conversational project planning. Revisions are immutable,
+            -- content-addressed snapshots; the project row points at the
+            -- current one. Request ids make both project creation and plan
+            -- changes safe to retry after an interrupted response.
+            CREATE TABLE IF NOT EXISTS projects (
+                id                        TEXT PRIMARY KEY,
+                create_request_id         TEXT NOT NULL UNIQUE,
+                repository_id             TEXT,
+                canonical_conversation_id TEXT,
+                title                     TEXT NOT NULL,
+                status                    TEXT NOT NULL,
+                judgment_policy           TEXT NOT NULL,
+                current_revision          TEXT,
+                create_request            TEXT NOT NULL,
+                data                      TEXT NOT NULL,
+                created_at                TEXT NOT NULL,
+                updated_at                TEXT NOT NULL,
+                FOREIGN KEY (id, current_revision)
+                    REFERENCES project_revisions(project_id, id)
+                    DEFERRABLE INITIALLY DEFERRED
+            );
+
+            CREATE TABLE IF NOT EXISTS project_revisions (
+                id                TEXT PRIMARY KEY,
+                project_id        TEXT NOT NULL
+                    REFERENCES projects(id) ON DELETE CASCADE,
+                parent_revision   TEXT,
+                sequence          INTEGER NOT NULL,
+                request_id        TEXT NOT NULL,
+                request_data      TEXT NOT NULL,
+                author            TEXT NOT NULL,
+                conversation_id   TEXT,
+                source_message_id TEXT,
+                summary           TEXT NOT NULL,
+                project_data      TEXT NOT NULL,
+                data              TEXT NOT NULL,
+                created_at        TEXT NOT NULL,
+                UNIQUE (project_id, sequence),
+                UNIQUE (project_id, request_id),
+                UNIQUE (project_id, id),
+                FOREIGN KEY (project_id, parent_revision)
+                    REFERENCES project_revisions(project_id, id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_project_revisions_project
+                ON project_revisions (project_id, sequence);
+
+            -- Nodes and edges are materialized per revision for indexed
+            -- inspection. Their complete typed representation, including
+            -- provenance and decision/question detail, remains in `data`;
+            -- the immutable revision snapshot is the reconstruction source.
+            CREATE TABLE IF NOT EXISTS plan_nodes (
+                revision_id TEXT NOT NULL,
+                project_id  TEXT NOT NULL
+                    REFERENCES projects(id) ON DELETE CASCADE,
+                id          TEXT NOT NULL,
+                kind        TEXT NOT NULL,
+                data        TEXT NOT NULL,
+                PRIMARY KEY (revision_id, id),
+                FOREIGN KEY (project_id, revision_id)
+                    REFERENCES project_revisions(project_id, id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_plan_nodes_project
+                ON plan_nodes (project_id, id);
+
+            CREATE TABLE IF NOT EXISTS plan_edges (
+                revision_id TEXT NOT NULL,
+                project_id  TEXT NOT NULL
+                    REFERENCES projects(id) ON DELETE CASCADE,
+                id          TEXT NOT NULL,
+                from_node   TEXT NOT NULL,
+                relation    TEXT NOT NULL,
+                to_node     TEXT NOT NULL,
+                data        TEXT NOT NULL,
+                PRIMARY KEY (revision_id, id),
+                FOREIGN KEY (project_id, revision_id)
+                    REFERENCES project_revisions(project_id, id) ON DELETE CASCADE,
+                FOREIGN KEY (revision_id, from_node)
+                    REFERENCES plan_nodes(revision_id, id) ON DELETE CASCADE,
+                FOREIGN KEY (revision_id, to_node)
+                    REFERENCES plan_nodes(revision_id, id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_plan_edges_project
+                ON plan_edges (project_id, from_node, to_node);
             ",
         )
         .map_err(|e| Error::Storage(e.to_string()))?;
@@ -628,6 +717,11 @@ impl Store {
         .map_err(|e| Error::Storage(e.to_string()))?;
 
         Ok(OutcomeStore::new_read_only(Arc::new(Mutex::new(conn))))
+    }
+
+    /// Return a handle for durable conversational-project planning.
+    pub fn projects(&self) -> ProjectStore {
+        ProjectStore::new(Arc::clone(&self.conn))
     }
 
     /// Return a handle for channel address → conversation bindings, for

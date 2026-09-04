@@ -4,7 +4,7 @@ Two SQLite databases, opened independently, never joined.
 
 | File | Owner | Tables |
 |---|---|---|
-| `<data_dir>/db/store.db` | `rustykrab-store` | 16 tables + 10 indexes |
+| `<data_dir>/db/store.db` | `rustykrab-store` | 20 tables + 14 indexes |
 | `<data_dir>/memory.db` | `rustykrab-memory` | 4 tables + 1 FTS5 virtual table + 9 indexes |
 
 DDL is idempotent (`CREATE TABLE IF NOT EXISTS`) inside
@@ -124,10 +124,12 @@ job_runs(id PK, job_id, status, output, started_at, finished_at,
    INDEX (job_id, finished_at DESC)
 ```
 
-**Assessment: right shape, one gap.** Job definition and job history correctly
+**Assessment: right shape.** Job definition and job history are correctly
 separated; the partial index on `next_run_at WHERE enabled = 1` is exactly the
-poller's query. `created_version` / `rustykrab_version` stamping is a nice
-touch for attributing behaviour to a build.
+poller's query. `job_runs.job_id` now cascades from `scheduled_jobs`, including
+for existing databases through FK adoption, so deleting a job cannot orphan
+its run history. `created_version` / `rustykrab_version` stamping is a useful
+way to attribute behaviour to a build.
 
 Recurring jobs are deduplicated on `(task, channel, chat_id, thread_id)` at
 insert, under the same lock as the write. The tuple deliberately excludes
@@ -139,11 +141,10 @@ hatch for the case that is genuinely two jobs — the same task at 8:00 and
 answers `NotFound` rather than `Ok(false)`, so "deleted it" and "there was
 nothing to delete" are not the same successful call.
 
-The gap: `job_runs.job_id` has no FK. `JobStore::delete_job` deletes the job row
-and leaves its runs orphaned forever. `ON DELETE CASCADE` costs one line.
-Separately, `(channel, chat_id, thread_id)` on `scheduled_jobs` duplicates the
-addressing information that would live in `channel_bindings`; with a binding
-table the job would only need `conversation_id`.
+The remaining duplication is `(channel, chat_id, thread_id)` on
+`scheduled_jobs`: it repeats addressing information that can also live in
+`channel_bindings`. That is intentional today because a scheduled job retains
+its own delivery target after its originating conversation is deleted.
 
 ### Delegated tasks
 
@@ -203,6 +204,53 @@ foreign key, cannot be joined, and deleting a memory silently orphans every
 attribution naming it. `rustykrab-dream` analyses these tallies by id and would
 report a finding against a memory that no longer exists.
 
+### Conversational project planning
+
+```
+projects(id PK, create_request_id UNIQUE, repository_id,
+         canonical_conversation_id, title, status, judgment_policy,
+         current_revision, create_request,
+         data, created_at, updated_at)
+   FK (id, current_revision) REFERENCES project_revisions(project_id, id)
+project_revisions(id PK,
+                  project_id REFERENCES projects(id) ON DELETE CASCADE,
+                  parent_revision, sequence,
+                  request_id, request_data, author, conversation_id,
+                  source_message_id, summary, project_data, data, created_at,
+                  UNIQUE(project_id, sequence),
+                  UNIQUE(project_id, request_id), UNIQUE(project_id, id))
+   FK (project_id, parent_revision) REFERENCES project_revisions(project_id, id)
+   INDEX (project_id, sequence)
+plan_nodes(revision_id, project_id REFERENCES projects(id) ON DELETE CASCADE,
+           id, kind, data, PK(revision_id, id))
+   FK (project_id, revision_id)
+      REFERENCES project_revisions(project_id, id) ON DELETE CASCADE
+   INDEX (project_id, id)
+plan_edges(revision_id, project_id REFERENCES projects(id) ON DELETE CASCADE,
+           id, from_node, relation, to_node, data, PK(revision_id, id))
+   FK (project_id, revision_id)
+      REFERENCES project_revisions(project_id, id) ON DELETE CASCADE
+   FK (revision_id, from_node/to_node)
+      REFERENCES plan_nodes(revision_id, id) ON DELETE CASCADE
+   INDEX (project_id, from_node, to_node)
+```
+
+**Assessment: sound event history with deliberately redundant read indexes.**
+`project_revisions.data` is the immutable reconstruction source. The project
+row is the current pointer; `plan_nodes` and `plan_edges` materialize each
+revision for indexed inspection and are inserted atomically with it. Request
+ids make create and apply safe to replay, and the store compares the complete
+serialized command before treating a duplicate as success. Conversation and
+message identifiers are provenance references rather than ownership, so they
+are intentionally not foreign keys and can survive conversation deletion.
+
+Composite foreign keys make project identity a database invariant rather than
+an assumption about `ProjectStore`: current and parent revisions must belong to
+the named project, materialized rows must belong to their revision, and edge
+endpoints must be nodes in that same revision. Direct-SQL negative tests attempt
+each cross-project write and require SQLite to reject it; `foreign_key_check`
+must remain empty afterward.
+
 ## `memory.db`
 
 ```
@@ -258,7 +306,7 @@ any conversation. One column, two meanings.
 
 ## Join analysis: enforced, and deliberately not
 
-`store.db` declares eight foreign keys, up from one. The ones that are
+`store.db` declares fourteen foreign keys, up from one. The ones that are
 ownership cascade; the ones that record provenance are unenforced *on
 purpose*, and the DDL now says which is which.
 
@@ -269,6 +317,11 @@ purpose*, and the DDL now says which is which.
 | `channel_bindings.conv_id` | **CASCADE** | closed the live bug above |
 | `job_runs.job_id` | **CASCADE** | `delete_job` used to orphan run history forever |
 | `outcome_attributions.record_id` | **CASCADE** | was the only FK before |
+| `project_revisions.project_id` | **CASCADE** | project owns immutable revision history |
+| `(projects.id, current_revision)` | **Yes, composite** | current revision must belong to the project |
+| `(project_revisions.project_id, parent_revision)` | **Yes, composite** | parent must belong to the same project |
+| `(plan_nodes/plan_edges.project_id, revision_id)` | **CASCADE, composite** | revision owns materialized rows and must belong to the same project |
+| `plan_edges.(revision_id, from_node/to_node)` | **CASCADE, composite** | endpoints must exist in the same revision |
 | `chunks.memory_id`, `extracted_facts.source_memory_id` | **Yes** | in `memory.db` |
 | `scheduled_jobs.conversation_id` | No, deliberate | a cron job keeps its own delivery channel and should keep firing |
 | `credential_requests.conversation_id` | No, deliberate | audit-relevant after the conversation is gone |
