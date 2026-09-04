@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.2.31] - 2026-09-04
+
+- ci(actions): move workflow runtime to Node 24 (#636)
+
 ## [5.2.30] - 2026-09-04
 
 - fix(release): keep lockfile reproducible after version bump (#635)

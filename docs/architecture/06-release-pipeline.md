@@ -41,6 +41,17 @@ The script uses `awk` plus same-directory temporary files for version and
 changelog edits. That keeps the documented local path portable between GNU and
 BSD/macOS userlands; GNU-only `sed -i` semantics are not part of the contract.
 
+Workflow repository access uses the Node 24-based `actions/checkout@v7`; the
+release writer obtains its short-lived installation credential through the
+Node 24-based `actions/create-github-app-token@v3`. GitHub-hosted runners are
+the supported execution environment, so the action majors and runner runtime
+advance together instead of relying on GitHub's temporary Node 20 shim.
+Evidence and release bundles use `actions/upload-artifact@v7`, and publication
+uses `actions/download-artifact@v8` with digest mismatches failing by default.
+Release builds restore Rust caches but set `save-if: false`: the workflow's
+least-privilege token cannot write Actions caches, and a successful release
+must not end with a knowingly unauthorized post-job write attempt.
+
 ## Failure boundaries
 
 - A dependency-resolution failure stops before commit or tag creation.
