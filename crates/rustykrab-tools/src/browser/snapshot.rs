@@ -25,7 +25,7 @@ use chromiumoxide::cdp::js_protocol::runtime::{EvaluateParams, ExecutionContextI
 use chromiumoxide::Page;
 use rustykrab_core::{Error, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::time::{timeout, Duration, Instant};
@@ -69,6 +69,10 @@ pub struct ElementRef {
     /// Frame URL captured for diagnostics and conservative stale-ref healing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frame_url: Option<String>,
+    /// OOPIF target that owns this element. Absent for the top-level document
+    /// and in-process frames handled by chromiumoxide directly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_id: Option<String>,
     /// Element role (button, link, textbox, etc.).
     pub role: String,
     /// Human-readable name/label.
@@ -104,6 +108,15 @@ struct SnapshotInner {
     /// old numeric ref from silently selecting a different element after a
     /// later snapshot replaces the map for the same tab.
     next_generation: u64,
+    /// Raw-CDP context for live page snapshots. Standalone tests and helpers
+    /// intentionally remain valid without it.
+    oopif_contexts: HashMap<String, OopifContext>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct OopifContext {
+    pub websocket_url: String,
+    pub policy: super::config::SsrfPolicy,
 }
 
 impl SnapshotInner {
@@ -119,6 +132,7 @@ impl SnapshotInner {
             match self.order.pop_front() {
                 Some(oldest) => {
                     self.refs.remove(&oldest);
+                    self.oopif_contexts.remove(&oldest);
                 }
                 None => break,
             }
@@ -133,8 +147,29 @@ impl SnapshotStore {
                 refs: HashMap::new(),
                 order: VecDeque::new(),
                 next_generation: 1,
+                oopif_contexts: HashMap::new(),
             })),
         }
+    }
+
+    pub(crate) async fn register_oopif_context(
+        &self,
+        key: &str,
+        websocket_url: String,
+        policy: super::config::SsrfPolicy,
+    ) {
+        let mut g = self.inner.lock().await;
+        g.oopif_contexts.insert(
+            key.to_string(),
+            OopifContext {
+                websocket_url,
+                policy,
+            },
+        );
+    }
+
+    pub(crate) async fn oopif_context(&self, key: &str) -> Option<OopifContext> {
+        self.inner.lock().await.oopif_contexts.get(key).cloned()
     }
 
     /// Allocate a generation for one snapshot.
@@ -197,6 +232,7 @@ impl SnapshotStore {
     pub async fn clear(&self, key: &str) {
         let mut g = self.inner.lock().await;
         g.refs.remove(key);
+        g.oopif_contexts.remove(key);
         if let Some(pos) = g.order.iter().position(|k| k == key) {
             g.order.remove(pos);
         }
@@ -217,6 +253,7 @@ impl SnapshotStore {
         };
         let mut g = self.inner.lock().await;
         g.refs.retain(|key, _| !belongs_to_profile(key));
+        g.oopif_contexts.retain(|key, _| !belongs_to_profile(key));
         g.order.retain(|key| !belongs_to_profile(key));
     }
 }
@@ -270,7 +307,7 @@ impl Default for SnapshotOptions {
 /// interactive, bounds (x, y, w, h), depth.
 ///
 /// Args: [maxDepth, interactiveOnly, scopeSelector, highlight]
-const SNAPSHOT_JS: &str = r#"
+pub(crate) const SNAPSHOT_JS: &str = r#"
 (function() {
     var INTERACTIVE_ROLES = new Set([
         'button', 'link', 'textbox', 'checkbox', 'radio', 'combobox',
@@ -416,6 +453,7 @@ const SNAPSHOT_JS: &str = r#"
             var type = (el.type || 'text').toLowerCase();
             if (type === 'checkbox') return 'checkbox';
             if (type === 'radio') return 'radio';
+            if (type === 'file') return 'filechooser';
             if (type === 'submit' || type === 'button') return 'button';
             return 'textbox';
         }
@@ -507,10 +545,14 @@ const SNAPSHOT_JS: &str = r#"
         // Element-like node.
         if (node.nodeType !== 1) return;
 
-        if (!isVisible(node)) return;
+        var fileInput = node.tagName === 'INPUT' && (node.type || '').toLowerCase() === 'file';
+        // Hidden file inputs are intentionally retained. Upload controls often
+        // hide the native input behind a styled button, while CDP can still set
+        // files on the input safely without opening the native chooser.
+        if (!fileInput && !isVisible(node)) return;
         // Skip occluded interactive candidates; non-interactive structural nodes
         // we still descend into (their children may be visible).
-        var occluded = isOccluded(node);
+        var occluded = fileInput ? false : isOccluded(node);
 
         var interactive = isInteractive(node);
         var role = getRole(node);
@@ -525,7 +567,7 @@ const SNAPSHOT_JS: &str = r#"
                 tag: node.tagName.toLowerCase(),
                 role: role,
                 name: getName(node),
-                value: (node.tagName === 'INPUT' || node.tagName === 'TEXTAREA' || node.tagName === 'SELECT') ? (node.value || '') : null,
+                value: fileInput ? null : ((node.tagName === 'INPUT' || node.tagName === 'TEXTAREA' || node.tagName === 'SELECT') ? (node.value || '') : null),
                 selector: chainedSelector(node, chain),
                 interactive: interactive,
                 bounds: [Math.round(rect.x), Math.round(rect.y), Math.round(rect.width), Math.round(rect.height)],
@@ -596,23 +638,24 @@ const SNAPSHOT_JS: &str = r#"
 
 /// Raw element data from the JS snapshot.
 #[derive(Debug, Deserialize)]
-struct RawElement {
+pub(crate) struct RawElement {
     #[allow(dead_code)]
-    tag: String,
-    role: String,
-    name: String,
-    value: Option<String>,
-    selector: String,
-    interactive: bool,
-    bounds: Option<[f64; 4]>,
+    pub(crate) tag: String,
+    pub(crate) role: String,
+    pub(crate) name: String,
+    pub(crate) value: Option<String>,
+    pub(crate) selector: String,
+    pub(crate) interactive: bool,
+    pub(crate) bounds: Option<[f64; 4]>,
     #[allow(dead_code)]
-    depth: usize,
+    pub(crate) depth: usize,
 }
 
 struct CapturedElement {
     element: RawElement,
     frame_id: Option<String>,
     frame_url: Option<String>,
+    target_id: Option<String>,
 }
 
 async fn evaluate_document_snapshot(
@@ -636,6 +679,33 @@ async fn evaluate_document_snapshot(
     let raw_json: String = result.into_value().unwrap_or_else(|_| "[]".to_string());
     serde_json::from_str(&raw_json)
         .map_err(|e| Error::ToolExecution(format!("invalid snapshot result: {e}").into()))
+}
+
+async fn detect_captcha(page: &Page) -> serde_json::Value {
+    let script = r#"(function() {
+        var providers = new Set();
+        var nodes = document.querySelectorAll('iframe[src], iframe[title], [data-sitekey], .g-recaptcha, .h-captcha, .cf-turnstile');
+        for (var i = 0; i < nodes.length; i++) {
+            var value = ((nodes[i].getAttribute('src') || '') + ' ' +
+                (nodes[i].getAttribute('title') || '') + ' ' +
+                (nodes[i].className || '')).toLowerCase();
+            if (value.includes('recaptcha') || nodes[i].classList.contains('g-recaptcha')) providers.add('recaptcha');
+            if (value.includes('hcaptcha') || nodes[i].classList.contains('h-captcha')) providers.add('hcaptcha');
+            if (value.includes('turnstile') || nodes[i].classList.contains('cf-turnstile')) providers.add('cloudflare-turnstile');
+            if (nodes[i].hasAttribute('data-sitekey') && providers.size === 0) providers.add('unknown');
+        }
+        return {detected: providers.size > 0, providers: Array.from(providers)};
+    })()"#;
+    match timeout(Duration::from_secs(1), page.evaluate(script)).await {
+        Ok(Ok(result)) => result.into_value::<serde_json::Value>().unwrap_or_else(
+            |_| serde_json::json!({"detected":false,"providers":[],"status":"unverified"}),
+        ),
+        _ => serde_json::json!({
+            "detected": false,
+            "providers": [],
+            "status": "unverified",
+        }),
+    }
 }
 
 async fn frame_depth(page: &Page, frame: &FrameId, main: &FrameId) -> Option<usize> {
@@ -694,6 +764,7 @@ pub async fn take_snapshot(
             element,
             frame_id: None,
             frame_url: None,
+            target_id: None,
         })
         .collect();
 
@@ -707,11 +778,17 @@ pub async fn take_snapshot(
         .ok()
         .and_then(std::result::Result::ok)
         .unwrap_or_default();
-    let frames_seen = frames
+    let mut page_frame_ids: HashSet<String> = frames
+        .iter()
+        .map(|frame| frame.as_ref().to_string())
+        .collect();
+    page_frame_ids.insert(page.target_id().inner().clone());
+    let mut frames_seen = frames
         .len()
         .saturating_sub(usize::from(main_frame.is_some()));
     let mut frames_included = 0usize;
     let mut frames_skipped = Vec::new();
+    let mut included_frame_ids = HashSet::new();
 
     if let Some(main_frame) = main_frame {
         for frame in frames
@@ -754,10 +831,12 @@ pub async fn take_snapshot(
             {
                 Ok(Ok(frame_elements)) => {
                     frames_included += 1;
+                    included_frame_ids.insert(frame_id.clone());
                     elements.extend(frame_elements.into_iter().map(|element| CapturedElement {
                         element,
                         frame_id: Some(frame_id.clone()),
                         frame_url: frame_url.clone(),
+                        target_id: None,
                     }));
                 }
                 Ok(Err(error)) => frames_skipped.push(format!("{frame_id}: {error}")),
@@ -765,6 +844,53 @@ pub async fn take_snapshot(
             }
         }
     }
+
+    // Site-isolated cross-origin frames have no execution context on the
+    // top-level chromiumoxide Page. Its current target poller ignores `iframe`
+    // targets entirely, so collect those documents through a bounded secondary
+    // CDP session and retain their owning target for subsequent actions.
+    if started.elapsed() < SNAPSHOT_DEADLINE {
+        if let Some(context) = store.oopif_context(store_key).await {
+            let remaining = SNAPSHOT_DEADLINE.saturating_sub(started.elapsed());
+            match timeout(
+                remaining,
+                super::oopif::capture(
+                    &context.websocket_url,
+                    &page_frame_ids,
+                    &eval_js,
+                    &context.policy,
+                ),
+            )
+            .await
+            {
+                Ok(oopif) => {
+                    frames_seen = frames_seen.max(oopif.frames_seen);
+                    frames_skipped.extend(oopif.frames_skipped);
+                    for frame in oopif.frames {
+                        if included_frame_ids.contains(&frame.frame_id) {
+                            continue;
+                        }
+                        frames_included += 1;
+                        included_frame_ids.insert(frame.frame_id.clone());
+                        elements.extend(frame.elements.into_iter().map(|element| {
+                            CapturedElement {
+                                element,
+                                frame_id: Some(frame.frame_id.clone()),
+                                frame_url: Some(frame.frame_url.clone()),
+                                target_id: Some(frame.target_id.clone()),
+                            }
+                        }));
+                    }
+                }
+                Err(_) => frames_skipped.push("OOPIF snapshot deadline reached".to_string()),
+            }
+        }
+    }
+    frames_skipped.retain(|message| {
+        !included_frame_ids
+            .iter()
+            .any(|frame_id| message.starts_with(&format!("{frame_id}:")))
+    });
 
     // Assign refs and build the output. Ref ids carry a generation so a ref
     // from an earlier snapshot cannot collide with one from this snapshot.
@@ -786,6 +912,7 @@ pub async fn take_snapshot(
             selector: elem.selector.clone(),
             frame_id: captured.frame_id.clone(),
             frame_url: captured.frame_url.clone(),
+            target_id: captured.target_id.clone(),
             role: elem.role.clone(),
             name: elem.name.clone(),
             value: elem.value.clone(),
@@ -822,6 +949,7 @@ pub async fn take_snapshot(
                 "bounds": elem.bounds,
                 "frame_id": captured.frame_id,
                 "frame_url": captured.frame_url,
+                "target_id": captured.target_id,
             }));
         }
     }
@@ -831,6 +959,7 @@ pub async fn take_snapshot(
 
     let url = page.url().await.ok().flatten().unwrap_or_default();
     let title = page.get_title().await.ok().flatten().unwrap_or_default();
+    let captcha = detect_captcha(page).await;
 
     Ok(serde_json::json!({
         "url": url,
@@ -842,6 +971,7 @@ pub async fn take_snapshot(
         "frames_seen": frames_seen,
         "frames_included": frames_included,
         "frames_skipped": frames_skipped,
+        "captcha": captcha,
         "snapshot_generation": generation,
         "highlight": options.highlight,
         "note": "Use the complete string in each element's ref field with the 'act' action. Refs are valid only for this snapshot."
@@ -871,6 +1001,7 @@ mod tests {
             selector: "body > a".to_string(),
             frame_id: None,
             frame_url: None,
+            target_id: None,
             role: "link".to_string(),
             name: "x".to_string(),
             value: None,
@@ -945,6 +1076,7 @@ mod tests {
                     selector: sel.into(),
                     frame_id: None,
                     frame_url: None,
+                    target_id: None,
                     role: role.into(),
                     name: name.into(),
                     value: None,

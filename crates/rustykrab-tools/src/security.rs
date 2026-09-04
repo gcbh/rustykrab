@@ -213,9 +213,9 @@ fn host_matches(allowed: &[String], host_lower: &str) -> bool {
 /// - URLs without a host
 ///
 /// Hosts named in `RUSTYKRAB_SSRF_ALLOW_HOSTS` are exempt from the
-/// private-address checks. The cloud metadata endpoint never is, and
-/// neither is `localhost`: those are the canonical SSRF targets, and an
-/// operator who wants the local machine can name it by hostname.
+/// private-address checks. The cloud metadata endpoint never is. `localhost`
+/// requires an exact explicit allowlist entry; the broad private-network flag
+/// alone does not permit it.
 ///
 /// Returns resolved socket addresses to prevent DNS rebinding (TOCTOU)
 /// attacks. Callers should use the returned addresses to pin connections
@@ -227,6 +227,27 @@ pub async fn validate_url(url: &str) -> Result<ValidatedUrl, String> {
     validate_url_with_allowlist(url, &ssrf_allowed_hosts()).await
 }
 
+/// [`validate_url`] with browser-specific policy overrides.
+///
+/// Browser profiles may explicitly permit named private-network hosts, or all
+/// private-network destinations, without weakening the process-wide policy for
+/// HTTP tools. Cloud metadata remains blocked in every mode; localhost requires
+/// an exact hostname allowlist entry.
+pub(crate) async fn validate_url_with_overrides(
+    url: &str,
+    additional_allowed_hosts: &[String],
+    allow_private_network: bool,
+) -> Result<ValidatedUrl, String> {
+    let mut allowed = ssrf_allowed_hosts();
+    for host in additional_allowed_hosts {
+        let host = host.trim().to_ascii_lowercase();
+        if !host.is_empty() && !allowed.contains(&host) {
+            allowed.push(host);
+        }
+    }
+    validate_url_with_policy(url, &allowed, allow_private_network).await
+}
+
 /// [`validate_url`] against an explicit allowlist.
 ///
 /// Exists so the guard can be tested without setting an environment
@@ -234,6 +255,14 @@ pub async fn validate_url(url: &str) -> Result<ValidatedUrl, String> {
 pub(crate) async fn validate_url_with_allowlist(
     url: &str,
     allowed: &[String],
+) -> Result<ValidatedUrl, String> {
+    validate_url_with_policy(url, allowed, false).await
+}
+
+async fn validate_url_with_policy(
+    url: &str,
+    allowed: &[String],
+    allow_private_network: bool,
 ) -> Result<ValidatedUrl, String> {
     let parsed = url::Url::parse(url).map_err(|e| format!("invalid URL: {e}"))?;
 
@@ -253,7 +282,10 @@ pub(crate) async fn validate_url_with_allowlist(
     if let Ok(ip) = host.parse::<IpAddr>() {
         // An allowlisted literal IP is checked further down, once
         // `host_lower` exists; here we only reject when it is not.
-        if is_private_ip(&ip) && !host_matches(allowed, &host.to_lowercase()) {
+        if is_private_ip(&ip)
+            && !allow_private_network
+            && !host_matches(allowed, &host.to_lowercase())
+        {
             return Err(format!(
                 "requests to private/internal IP addresses ({ip}) are blocked (SSRF protection)"
             ));
@@ -261,11 +293,7 @@ pub(crate) async fn validate_url_with_allowlist(
     }
 
     // Block known internal hostnames
-    let blocked_hosts = [
-        "localhost",
-        "metadata.google.internal",
-        "metadata.google.com",
-    ];
+    let blocked_hosts = ["metadata.google.internal", "metadata.google.com"];
     let host_lower = host.to_lowercase();
     // Decided before any address check so both the literal-IP and the
     // resolved-address paths honour the same answer.
@@ -277,6 +305,11 @@ pub(crate) async fn validate_url_with_allowlist(
                 "requests to '{host}' are blocked (SSRF protection)"
             ));
         }
+    }
+    if host_lower == "localhost" && !allowlisted {
+        return Err(format!(
+            "requests to '{host}' are blocked (SSRF protection); add an exact hostnameAllowlist entry to opt in"
+        ));
     }
 
     // Block 169.254.169.254 (AWS/GCP metadata) even as hostname
@@ -310,6 +343,14 @@ pub(crate) async fn validate_url_with_allowlist(
             return Err("requests to cloud metadata endpoint are blocked (SSRF protection)".into());
         }
         if is_private_ip(&ip) {
+            if allow_private_network {
+                tracing::debug!(
+                    host = %host,
+                    %ip,
+                    "browser profile permits private-network navigation"
+                );
+                continue;
+            }
             if allowlisted {
                 tracing::debug!(
                     host = %host,
@@ -470,10 +511,14 @@ mod ssrf_allowlist_tests {
     }
 
     #[tokio::test]
-    async fn localhost_is_blocked_even_when_named() {
-        let err = validate_url_with_allowlist("http://localhost:8099/", &list(&["localhost"]))
+    async fn localhost_requires_an_exact_allowlist_entry() {
+        let err = validate_url_with_allowlist("http://localhost:8099/", &[])
             .await
             .unwrap_err();
         assert!(err.contains("blocked"), "{err}");
+
+        let allowed =
+            validate_url_with_allowlist("http://localhost:8099/", &list(&["localhost"])).await;
+        assert!(allowed.is_ok(), "{allowed:?}");
     }
 }

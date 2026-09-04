@@ -23,6 +23,7 @@ uuid.workspace = true
 chrono.workspace = true
 chromiumoxide.workspace = true
 tokio-stream.workspace = true
+tokio-tungstenite.workspace = true
 url = "2"
 regex.workspace = true
 scraper = { version = "0.26", default-features = false }

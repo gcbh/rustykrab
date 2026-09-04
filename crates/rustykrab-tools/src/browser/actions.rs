@@ -1,14 +1,15 @@
-//! Ref-based action system modeled after OpenClaw's `act` command.
+//! CDP-native, ref-based action system informed by browser-use's action model.
 //!
 //! Actions use element refs from snapshots instead of raw CSS selectors.
-//! Supported actions: click, type, press, hover, select, fill, scroll,
-//! wait, evaluate.
+//! Supported actions include click, type/fill, press, hover, select/options,
+//! upload, drag, and wait.
 
 use chromiumoxide::cdp::browser_protocol::dom::{
-    BackendNodeId, DescribeNodeParams, GetContentQuadsParams,
+    BackendNodeId, DescribeNodeParams, GetContentQuadsParams, SetFileInputFilesParams,
 };
 use chromiumoxide::cdp::browser_protocol::input::{
-    DispatchMouseEventParams, DispatchMouseEventType, InsertTextParams, MouseButton,
+    DispatchKeyEventParams, DispatchKeyEventType, DispatchMouseEventParams, DispatchMouseEventType,
+    InsertTextParams, MouseButton,
 };
 use chromiumoxide::cdp::browser_protocol::page::{
     EventJavascriptDialogOpening, FrameId, HandleJavaScriptDialogParams,
@@ -27,6 +28,19 @@ use tokio_stream::StreamExt;
 use super::snapshot::{
     take_snapshot, ElementRef, SnapshotOptions, SnapshotStore, IFRAME_SEP, SHADOW_SEP,
 };
+use super::{config::DialogPolicy, config::SsrfPolicy, policy};
+
+/// Allow renderer event handlers queued by an acknowledged input command to
+/// run before policy checks and the post-action snapshot. Browser-use applies a
+/// 100ms default gap between actions for the same reason. Without this barrier,
+/// a fast CDP response can race the click/input handler and return stale state.
+const POST_ACTION_SETTLE: Duration = Duration::from_millis(100);
+
+#[derive(Clone, Copy)]
+pub(crate) struct ActionPolicies<'a> {
+    pub dialog: DialogPolicy,
+    pub navigation: &'a SsrfPolicy,
+}
 
 /// Encode a string as a safe JavaScript string literal (including quotes).
 /// Uses serde_json serialization which properly escapes backslashes, quotes,
@@ -60,8 +74,9 @@ pub async fn execute_act(
     action: &str,
     ref_id: &str,
     args: &Value,
+    policies: ActionPolicies<'_>,
 ) -> Result<Value> {
-    let dialog_watchdog = DialogWatchdog::start(page).await;
+    let dialog_watchdog = DialogWatchdog::start(page, policies.dialog).await;
     let budget = action_budget(action, args);
     let result = tokio::time::timeout(
         budget,
@@ -88,11 +103,438 @@ pub async fn execute_act(
         }
     };
 
-    let value = attach_post_action_state(page, store, store_key, value).await?;
+    if value["outcome"] == "applied" && !matches!(action, "options" | "wait") {
+        tokio::time::sleep(POST_ACTION_SETTLE).await;
+    }
+
+    // Enforce policy before taking the post-action snapshot. Otherwise a form
+    // submit or click redirected to an internal service could return that
+    // service's DOM before the caller had a chance to inspect the final URL.
+    let navigation_guard = policy::enforce_page(page, policies.navigation).await;
+    let mut value = if navigation_guard["status"] == "blocked" {
+        store.clear(store_key).await;
+        let mut value = value;
+        if let Value::Object(ref mut object) = value {
+            object.insert("page_state".into(), Value::Null);
+            object.insert("snapshot".into(), Value::Null);
+            object.insert(
+                "page_state_status".into(),
+                Value::String("policy_blocked".into()),
+            );
+        }
+        value
+    } else {
+        attach_post_action_state(page, store, store_key, value).await?
+    };
+    if let Value::Object(ref mut object) = value {
+        object.insert("navigation_guard".into(), navigation_guard);
+    }
     Ok(match dialog_watchdog {
         Some(watchdog) => watchdog.finish(value).await,
         None => value,
     })
+}
+
+/// Click viewport coordinates from a native-resolution screenshot using the
+/// same side-effect and post-state contract as ref-based clicks.
+pub async fn execute_coordinate_click(
+    page: &Page,
+    store: &SnapshotStore,
+    store_key: &str,
+    x: f64,
+    y: f64,
+    dialog_policy: DialogPolicy,
+    navigation_policy: &SsrfPolicy,
+) -> Result<Value> {
+    let dialog_watchdog = DialogWatchdog::start(page, dialog_policy).await;
+    let point = Point::new(x, y);
+    let mut value = match tokio::time::timeout(CLICK_MOUSE_BUDGET, page.move_mouse(point)).await {
+        Ok(Ok(_)) => {
+            let pressed = DispatchMouseEventParams::builder()
+                .r#type(DispatchMouseEventType::MousePressed)
+                .x(x)
+                .y(y)
+                .button(MouseButton::Left)
+                .click_count(1)
+                .build()
+                .expect("complete coordinate mouse-press parameters");
+            match tokio::time::timeout(CLICK_PRESS_BUDGET, page.execute(pressed)).await {
+                Ok(Ok(_)) => {
+                    let released = DispatchMouseEventParams::builder()
+                        .r#type(DispatchMouseEventType::MouseReleased)
+                        .x(x)
+                        .y(y)
+                        .button(MouseButton::Left)
+                        .click_count(1)
+                        .build()
+                        .expect("complete coordinate mouse-release parameters");
+                    match tokio::time::timeout(CLICK_RELEASE_BUDGET, page.execute(released)).await {
+                        Ok(Ok(_)) => json!({
+                            "status": "clicked",
+                            "outcome": "applied",
+                            "action": "click_coordinates",
+                            "method": "cdp_mouse",
+                            "x": x,
+                            "y": y,
+                            "retry_safe": false,
+                            "browser_degraded": false,
+                        }),
+                        Ok(Err(error)) => unknown_outcome(
+                            "click_coordinates",
+                            &format!("{x},{y}"),
+                            "mouse_released",
+                            error.to_string(),
+                            true,
+                        ),
+                        Err(_) => unknown_outcome(
+                            "click_coordinates",
+                            &format!("{x},{y}"),
+                            "mouse_released",
+                            "mouse-release response timed out".to_string(),
+                            true,
+                        ),
+                    }
+                }
+                Ok(Err(error)) => unknown_outcome(
+                    "click_coordinates",
+                    &format!("{x},{y}"),
+                    "mouse_pressed",
+                    error.to_string(),
+                    true,
+                ),
+                Err(_) => unknown_outcome(
+                    "click_coordinates",
+                    &format!("{x},{y}"),
+                    "mouse_pressed",
+                    "mouse-press response timed out".to_string(),
+                    true,
+                ),
+            }
+        }
+        Ok(Err(error)) => json!({
+            "status": "failed",
+            "outcome": "not_applied",
+            "action": "click_coordinates",
+            "stage": "mouse_move",
+            "reason": error.to_string(),
+            "x": x,
+            "y": y,
+            "retry_safe": true,
+            "browser_degraded": false,
+        }),
+        Err(_) => json!({
+            "status": "failed",
+            "outcome": "not_applied",
+            "action": "click_coordinates",
+            "stage": "mouse_move",
+            "reason": "mouse-move response timed out",
+            "x": x,
+            "y": y,
+            "retry_safe": true,
+            "browser_degraded": true,
+        }),
+    };
+
+    if value["outcome"] == "applied" {
+        tokio::time::sleep(POST_ACTION_SETTLE).await;
+    }
+    let navigation_guard = policy::enforce_page(page, navigation_policy).await;
+    value = if navigation_guard["status"] == "blocked" {
+        store.clear(store_key).await;
+        if let Value::Object(ref mut object) = value {
+            object.insert("page_state".into(), Value::Null);
+            object.insert("snapshot".into(), Value::Null);
+            object.insert(
+                "page_state_status".into(),
+                Value::String("policy_blocked".into()),
+            );
+        }
+        value
+    } else {
+        attach_post_action_state(page, store, store_key, value).await?
+    };
+    if let Value::Object(ref mut object) = value {
+        object.insert("navigation_guard".into(), navigation_guard);
+    }
+    Ok(match dialog_watchdog {
+        Some(watchdog) => watchdog.finish(value).await,
+        None => value,
+    })
+}
+
+/// Send physical CDP keyboard input to the currently focused element.
+///
+/// browser-use exposes this independently of indexed/ref-based element
+/// actions because it is also needed for native shortcuts and controls that
+/// retain focus after a click. Keep it on the same outcome, dialog, policy,
+/// and post-state contract as the other side-effecting actions.
+pub async fn execute_send_keys(
+    page: &Page,
+    store: &SnapshotStore,
+    store_key: &str,
+    keys: &str,
+    dialog_policy: DialogPolicy,
+    navigation_policy: &SsrfPolicy,
+) -> Result<Value> {
+    let dialog_watchdog = DialogWatchdog::start(page, dialog_policy).await;
+    let result = tokio::time::timeout(Duration::from_secs(12), send_keys_inner(page, keys)).await;
+    let mut value = match result {
+        Ok(Ok(())) => json!({
+            "status": "sent",
+            "outcome": "applied",
+            "action": "send_keys",
+            "keys": keys,
+            "method": "cdp_keyboard",
+            "retry_safe": false,
+            "browser_degraded": false,
+        }),
+        Ok(Err(error)) if is_invalid_input(&error) => return Err(error),
+        Ok(Err(error)) => unknown_outcome(
+            "send_keys",
+            "active_element",
+            "key_dispatch",
+            error.to_string(),
+            true,
+        ),
+        Err(_) => unknown_outcome(
+            "send_keys",
+            "active_element",
+            "action_deadline",
+            "the complete send-keys action exceeded its 12000ms deadline".into(),
+            true,
+        ),
+    };
+
+    if value["outcome"] == "applied" {
+        tokio::time::sleep(POST_ACTION_SETTLE).await;
+    }
+    let navigation_guard = policy::enforce_page(page, navigation_policy).await;
+    value = if navigation_guard["status"] == "blocked" {
+        store.clear(store_key).await;
+        if let Value::Object(ref mut object) = value {
+            object.insert("page_state".into(), Value::Null);
+            object.insert("snapshot".into(), Value::Null);
+            object.insert(
+                "page_state_status".into(),
+                Value::String("policy_blocked".into()),
+            );
+        }
+        value
+    } else {
+        attach_post_action_state(page, store, store_key, value).await?
+    };
+    if let Value::Object(ref mut object) = value {
+        object.insert("navigation_guard".into(), navigation_guard);
+    }
+    Ok(match dialog_watchdog {
+        Some(watchdog) => watchdog.finish(value).await,
+        None => value,
+    })
+}
+
+fn normalize_key_alias(key: &str) -> String {
+    match key.trim().to_ascii_lowercase().as_str() {
+        "ctrl" | "control" => "Control".into(),
+        "alt" | "option" => "Alt".into(),
+        "meta" | "cmd" | "command" => "Meta".into(),
+        "shift" => "Shift".into(),
+        "enter" | "return" => "Enter".into(),
+        "tab" => "Tab".into(),
+        "delete" => "Delete".into(),
+        "backspace" => "Backspace".into(),
+        "escape" | "esc" => "Escape".into(),
+        "space" => " ".into(),
+        "up" => "ArrowUp".into(),
+        "down" => "ArrowDown".into(),
+        "left" => "ArrowLeft".into(),
+        "right" => "ArrowRight".into(),
+        "pageup" => "PageUp".into(),
+        "pagedown" => "PageDown".into(),
+        "home" => "Home".into(),
+        "end" => "End".into(),
+        _ => key.to_string(),
+    }
+}
+
+fn modifier_mask(key: &str) -> Option<i64> {
+    match key {
+        "Alt" => Some(1),
+        "Control" => Some(2),
+        "Meta" => Some(4),
+        "Shift" => Some(8),
+        _ => None,
+    }
+}
+
+async fn dispatch_key_event(
+    page: &Page,
+    event_type: DispatchKeyEventType,
+    key: &str,
+    modifiers: i64,
+) -> Result<()> {
+    let definition = chromiumoxide::keys::get_key_definition(key).ok_or_else(|| {
+        Error::ToolExecution(ToolError::invalid_input(format!(
+            "unsupported physical key '{key}'"
+        )))
+    })?;
+    let mut params = DispatchKeyEventParams::builder()
+        .r#type(event_type)
+        .key(definition.key)
+        .code(definition.code)
+        .windows_virtual_key_code(definition.key_code)
+        .native_virtual_key_code(definition.key_code);
+    if modifiers != 0 {
+        params = params.modifiers(modifiers);
+    }
+    page.execute(params.build().expect("complete key-event parameters"))
+        .await
+        .map_err(|error| {
+            Error::ToolExecution(format!("physical key dispatch failed: {error}").into())
+        })?;
+    Ok(())
+}
+
+async fn press_physical_key(page: &Page, key: &str) -> Result<()> {
+    let definition = chromiumoxide::keys::get_key_definition(key).ok_or_else(|| {
+        Error::ToolExecution(ToolError::invalid_input(format!(
+            "unsupported physical key '{key}'"
+        )))
+    })?;
+    let text = definition
+        .text
+        .map(str::to_string)
+        .or_else(|| (definition.key.chars().count() == 1).then(|| definition.key.to_string()));
+    let event_type = if text.is_some() {
+        DispatchKeyEventType::KeyDown
+    } else {
+        DispatchKeyEventType::RawKeyDown
+    };
+    let mut down = DispatchKeyEventParams::builder()
+        .r#type(event_type)
+        .key(definition.key)
+        .code(definition.code)
+        .windows_virtual_key_code(definition.key_code)
+        .native_virtual_key_code(definition.key_code);
+    if let Some(text) = text {
+        down = down.text(text);
+    }
+    page.execute(down.build().expect("complete key-down parameters"))
+        .await
+        .map_err(|error| {
+            Error::ToolExecution(format!("physical key-down failed: {error}").into())
+        })?;
+    dispatch_key_event(page, DispatchKeyEventType::KeyUp, key, 0).await
+}
+
+async fn send_keys_inner(page: &Page, keys: &str) -> Result<()> {
+    if keys.is_empty() {
+        return Err(Error::ToolExecution(ToolError::invalid_input(
+            "'send_keys' requires non-empty 'keys'",
+        )));
+    }
+
+    // Treat plus as a shortcut delimiter only when every prefix component is
+    // a modifier. This preserves literal text such as `a+b` and supports the
+    // browser-use spelling `Control++` for Control + plus.
+    let shortcut = if let Some(prefix) = keys.strip_suffix("++") {
+        let modifiers: Vec<String> = prefix.split('+').map(normalize_key_alias).collect();
+        if !modifiers.is_empty() && modifiers.iter().all(|key| modifier_mask(key).is_some()) {
+            Some((modifiers, "+".to_string()))
+        } else {
+            None
+        }
+    } else if let Some((prefix, main)) = keys.rsplit_once('+') {
+        let modifiers: Vec<String> = prefix.split('+').map(normalize_key_alias).collect();
+        if !main.trim().is_empty()
+            && !modifiers.is_empty()
+            && modifiers.iter().all(|key| modifier_mask(key).is_some())
+        {
+            Some((modifiers, normalize_key_alias(main)))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    if let Some((modifiers, main)) = shortcut {
+        let mask = modifiers
+            .iter()
+            .filter_map(|key| modifier_mask(key))
+            .fold(0, |combined, value| combined | value);
+        for modifier in &modifiers {
+            dispatch_key_event(page, DispatchKeyEventType::RawKeyDown, modifier, 0).await?;
+        }
+        dispatch_key_event(page, DispatchKeyEventType::RawKeyDown, &main, mask).await?;
+        dispatch_key_event(page, DispatchKeyEventType::KeyUp, &main, mask).await?;
+        for modifier in modifiers.iter().rev() {
+            dispatch_key_event(page, DispatchKeyEventType::KeyUp, modifier, 0).await?;
+        }
+        return Ok(());
+    }
+
+    let normalized = normalize_key_alias(keys);
+    let is_special = matches!(
+        normalized.as_str(),
+        "Enter"
+            | "Tab"
+            | "Delete"
+            | "Backspace"
+            | "Escape"
+            | "ArrowUp"
+            | "ArrowDown"
+            | "ArrowLeft"
+            | "ArrowRight"
+            | "PageUp"
+            | "PageDown"
+            | "Home"
+            | "End"
+            | "Control"
+            | "Alt"
+            | "Meta"
+            | "Shift"
+            | "F1"
+            | "F2"
+            | "F3"
+            | "F4"
+            | "F5"
+            | "F6"
+            | "F7"
+            | "F8"
+            | "F9"
+            | "F10"
+            | "F11"
+            | "F12"
+    );
+    if is_special {
+        press_physical_key(page, &normalized).await?;
+    } else {
+        for part in normalized.split_inclusive(['\n', '\r']) {
+            let text = part.trim_end_matches(['\n', '\r']);
+            if !text.is_empty() {
+                for character in text.chars() {
+                    let key = character.to_string();
+                    if chromiumoxide::keys::get_key_definition(&key).is_some() {
+                        press_physical_key(page, &key).await?;
+                    } else {
+                        // CDP's text insertion path covers Unicode characters
+                        // not represented in chromiumoxide's US keyboard map.
+                        page.execute(InsertTextParams::new(key))
+                            .await
+                            .map_err(|error| {
+                                Error::ToolExecution(
+                                    format!("Unicode text dispatch failed: {error}").into(),
+                                )
+                            })?;
+                    }
+                }
+            }
+            if part.ends_with(['\n', '\r']) {
+                press_physical_key(page, "Enter").await?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Watch native JavaScript dialogs while an action is in flight. A modal
@@ -105,7 +547,7 @@ struct DialogWatchdog {
 }
 
 impl DialogWatchdog {
-    async fn start(page: &Page) -> Option<Self> {
+    async fn start(page: &Page, policy: DialogPolicy) -> Option<Self> {
         let mut events = tokio::time::timeout(
             Duration::from_millis(500),
             page.event_listener::<EventJavascriptDialogOpening>(),
@@ -120,10 +562,17 @@ impl DialogWatchdog {
             while let Some(event) = events.next().await {
                 let dialog_type = event.r#type.as_ref().to_string();
                 let message = event.message.clone();
+                let accept = match policy {
+                    DialogPolicy::Accept => true,
+                    DialogPolicy::Dismiss => false,
+                    DialogPolicy::Auto => {
+                        matches!(dialog_type.as_str(), "alert" | "confirm" | "beforeunload")
+                    }
+                };
                 let handled = matches!(
                     tokio::time::timeout(
                         Duration::from_secs(2),
-                        page.execute(HandleJavaScriptDialogParams::new(true)),
+                        page.execute(HandleJavaScriptDialogParams::new(accept)),
                     )
                     .await,
                     Ok(Ok(_))
@@ -136,7 +585,9 @@ impl DialogWatchdog {
                 task_observations.lock().await.push(json!({
                     "type": dialog_type,
                     "message": message,
-                    "accepted": handled,
+                    "accepted": handled && accept,
+                    "dismissed": handled && !accept,
+                    "handled": handled,
                 }));
             }
         });
@@ -154,14 +605,17 @@ impl DialogWatchdog {
         }
 
         if let Value::Object(ref mut object) = value {
-            // An accepted dialog opened during this click is independent
+            // A handled dialog opened during this click is independent
             // evidence that the click handler ran. A missing mouse-release
             // response is no longer ambiguous in that case.
-            let dialog_proves_click = object.get("action").and_then(Value::as_str) == Some("click")
-                && object.get("outcome").and_then(Value::as_str) == Some("unknown")
+            let dialog_proves_click = matches!(
+                object.get("action").and_then(Value::as_str),
+                Some("click" | "click_coordinates")
+            ) && object.get("outcome").and_then(Value::as_str)
+                == Some("unknown")
                 && observations
                     .iter()
-                    .any(|dialog| dialog["accepted"].as_bool() == Some(true));
+                    .any(|dialog| dialog["handled"].as_bool() == Some(true));
             if dialog_proves_click {
                 object.insert("status".into(), Value::String("clicked".into()));
                 object.insert("outcome".into(), Value::String("applied".into()));
@@ -273,6 +727,36 @@ async fn dispatch_act(
     element_ref: &ElementRef,
     args: &Value,
 ) -> Result<Value> {
+    if element_ref.target_id.is_some() {
+        let context = store.oopif_context(store_key).await.ok_or_else(|| {
+            Error::ToolExecution(
+                "site-isolated iframe action is unavailable because its CDP context expired; take a new snapshot"
+                    .into(),
+            )
+        })?;
+        let target = if action == "drag" {
+            let target_ref = args["targetRef"].as_str().ok_or_else(|| {
+                Error::ToolExecution(ToolError::invalid_input("drag requires targetRef"))
+            })?;
+            Some(store.get_ref(store_key, target_ref).await.ok_or_else(|| {
+                Error::ToolExecution(ToolError::not_found(format!(
+                    "target ref '{target_ref}' not found"
+                )))
+            })?)
+        } else {
+            None
+        };
+        return super::oopif::execute_action(
+            &context.websocket_url,
+            action,
+            element_ref,
+            target.as_ref(),
+            args,
+            &context.policy,
+        )
+        .await;
+    }
+
     match action {
         "click" => act_click(page, ref_id, element_ref).await,
         "type" | "fill" => {
@@ -314,12 +798,32 @@ async fn dispatch_act(
             })?;
             act_drag(page, element_ref, &target).await
         }
+        "upload" => {
+            let paths = args["paths"]
+                .as_array()
+                .ok_or_else(|| {
+                    Error::ToolExecution(ToolError::invalid_input(
+                        "'upload' requires a non-empty 'paths' array",
+                    ))
+                })?
+                .iter()
+                .filter_map(Value::as_str)
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>();
+            if paths.is_empty() {
+                return Err(Error::ToolExecution(ToolError::invalid_input(
+                    "'upload' requires a non-empty 'paths' array",
+                )));
+            }
+            act_upload(page, element_ref, &paths).await
+        }
+        "options" => act_dropdown_options(page, element_ref).await,
         "wait" => {
             let timeout_ms = args["timeout_ms"].as_u64().unwrap_or(10_000).min(30_000);
             act_wait_for_element(page, element_ref, timeout_ms).await
         }
         _ => Err(Error::ToolExecution(ToolError::invalid_input(format!(
-            "unknown act action '{action}'. Available: click, type, fill, press, hover, select, drag, wait"
+            "unknown act action '{action}'. Available: click, type, fill, press, hover, select, drag, upload, options, wait"
         )))),
     }
 }
@@ -1271,62 +1775,32 @@ async fn act_type(page: &Page, element_ref: &ElementRef, text: &str, clear: bool
 /// Press a key on an element (e.g., "Enter", "Tab", "Escape").
 async fn act_press(page: &Page, element_ref: &ElementRef, key: &str) -> Result<Value> {
     let selector = &element_ref.selector;
-    let sel_lit = js_string_literal(selector);
-    let key_lit = js_string_literal(key);
-    let js = if requires_document_resolver(element_ref) {
-        element_expression(
-            selector,
-            &format!(
-                r#"
-            el.focus();
-            var event = new KeyboardEvent('keydown', {{
-                key: {key_lit},
-                code: {key_lit},
-                bubbles: true,
-                cancelable: true
-            }});
-            el.dispatchEvent(event);
-            var up = new KeyboardEvent('keyup', {{
-                key: {key_lit},
-                code: {key_lit},
-                bubbles: true,
-                cancelable: true
-            }});
-            el.dispatchEvent(up);
-            return 'pressed';"#
-            ),
+    if requires_document_resolver(element_ref) {
+        let resolved = resolve_element(page, element_ref).await?;
+        tokio::time::timeout(
+            CLICK_GEOMETRY_BUDGET,
+            call_on_element(page, &resolved, "function() { this.focus(); return true; }"),
         )
+        .await
+        .map_err(|_| Error::ToolExecution("focus timed out".into()))?
+        .map_err(|error| Error::ToolExecution(format!("focus failed: {error}").into()))?;
     } else {
-        format!(
-            r#"(function() {{
-                var el = document.querySelector({sel_lit});
-                if (!el) return 'element_not_found';
-                el.focus();
-                var event = new KeyboardEvent('keydown', {{ key: {key_lit}, code: {key_lit}, bubbles: true, cancelable: true }});
-                el.dispatchEvent(event);
-                var up = new KeyboardEvent('keyup', {{ key: {key_lit}, code: {key_lit}, bubbles: true, cancelable: true }});
-                el.dispatchEvent(up);
-                return 'pressed';
-            }})()"#
-        )
-    };
-
-    let status: String = if requires_document_resolver(element_ref) {
-        evaluate_in_element_context(page, element_ref, js).await?
-    } else {
-        page.evaluate(js)
+        let elem = find_element_bounded(page, selector).await?;
+        tokio::time::timeout(CLICK_GEOMETRY_BUDGET, elem.focus())
             .await
-            .map_err(|e| Error::ToolExecution(format!("press failed: {e}").into()))?
-            .into_value()
-            .unwrap_or_else(|_| "unknown".into())
-    };
-    if status == "element_not_found" {
-        return Err(Error::ToolExecution(ToolError::not_found(format!(
-            "element not found: '{selector}'"
-        ))));
+            .map_err(|_| Error::ToolExecution(format!("focus timed out on '{selector}'").into()))?
+            .map_err(|error| {
+                Error::ToolExecution(format!("failed to focus '{selector}': {error}").into())
+            })?;
     }
+    send_keys_inner(page, key).await?;
 
-    Ok(json!({ "status": "pressed", "key": key, "selector": selector }))
+    Ok(json!({
+        "status": "pressed",
+        "key": key,
+        "selector": selector,
+        "method": "cdp_keyboard",
+    }))
 }
 
 /// Hover over an element.
@@ -1433,6 +1907,93 @@ async fn act_select(page: &Page, element_ref: &ElementRef, value: &str) -> Resul
     }
 
     Ok(json!({ "status": "selected", "selector": selector, "value": value }))
+}
+
+/// Upload local, pre-validated files through CDP's native file-input command.
+/// This works for hidden inputs and does not need to synthesize a chooser UI.
+async fn act_upload(page: &Page, element_ref: &ElementRef, paths: &[String]) -> Result<Value> {
+    let resolved = resolve_element(page, element_ref).await?;
+    let is_file_input = tokio::time::timeout(
+        ELEMENT_OP_BUDGET,
+        call_on_element(
+            page,
+            &resolved,
+            "function() { return this.tagName === 'INPUT' && String(this.type).toLowerCase() === 'file'; }",
+        ),
+    )
+    .await
+    .map_err(|_| Error::ToolExecution("file-input verification timed out".into()))?
+    .map_err(|error| {
+        Error::ToolExecution(format!("file-input verification failed: {error}").into())
+    })?
+    .as_bool()
+    .unwrap_or(false);
+    if !is_file_input {
+        return Err(Error::ToolExecution(ToolError::invalid_input(
+            "upload requires a live <input type='file'> ref",
+        )));
+    }
+    let params = SetFileInputFilesParams::builder()
+        .files(paths.iter().cloned())
+        .backend_node_id(resolved.backend_node_id)
+        .build()
+        .map_err(|error| Error::ToolExecution(format!("invalid upload request: {error}").into()))?;
+    tokio::time::timeout(Duration::from_secs(10), page.execute(params))
+        .await
+        .map_err(|_| Error::ToolExecution("file upload timed out".into()))?
+        .map_err(|error| Error::ToolExecution(format!("file upload failed: {error}").into()))?;
+    Ok(json!({
+        "status": "uploaded",
+        "selector": element_ref.selector,
+        "file_count": paths.len(),
+        "files": paths,
+    }))
+}
+
+/// Return the actual options available in a native `<select>` element.
+async fn act_dropdown_options(page: &Page, element_ref: &ElementRef) -> Result<Value> {
+    let result: Value = evaluate_in_element_context(
+        page,
+        element_ref,
+        element_expression(
+            &element_ref.selector,
+            r#"
+            if (el.tagName !== 'SELECT') return {status:'not_select'};
+            return {
+                status: 'ok',
+                multiple: Boolean(el.multiple),
+                disabled: Boolean(el.disabled),
+                options: Array.from(el.options).map(function(option, index) {
+                    return {
+                        index: index,
+                        text: (option.textContent || '').trim(),
+                        value: option.value,
+                        selected: option.selected,
+                        disabled: option.disabled
+                    };
+                })
+            };"#,
+        ),
+    )
+    .await?;
+    if result["status"] == "element_not_found" {
+        return Err(Error::ToolExecution(ToolError::not_found(format!(
+            "element not found: '{}'",
+            element_ref.selector
+        ))));
+    }
+    if result["status"] == "not_select" {
+        return Err(Error::ToolExecution(ToolError::invalid_input(
+            "dropdown options require a native <select> element",
+        )));
+    }
+    Ok(json!({
+        "status": "options",
+        "selector": element_ref.selector,
+        "multiple": result["multiple"],
+        "disabled": result["disabled"],
+        "options": result["options"],
+    }))
 }
 
 /// Drag one element to another.

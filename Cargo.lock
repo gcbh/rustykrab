@@ -4421,6 +4421,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tokio-stream",
+ "tokio-tungstenite",
  "tracing",
  "url",
  "uuid",

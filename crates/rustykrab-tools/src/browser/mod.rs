@@ -1,11 +1,11 @@
-//! Browser automation tool modeled after OpenClaw's browser management.
+//! CDP-native browser execution inspired by browser-use's reliability model.
 //!
 //! Provides a comprehensive browser control surface with:
 //! - Multi-profile browser management (isolated Chrome instances)
 //! - Browser lifecycle (status/start/stop)
 //! - Tab management (tabs/open/close/focus) addressed by Chrome target ID
-//! - Accessibility-tree snapshots with element refs
-//! - Ref-based actions (click/type/press/hover/select/drag via snapshot refs)
+//! - DOM snapshots with generation-scoped element refs, including OOPIFs
+//! - Native CDP actions (click/type/press/hover/select/drag/upload)
 //! - Screenshot, navigate, evaluate, console, PDF, scroll
 //! - SSRF protection and cookie security
 
@@ -15,6 +15,8 @@ pub mod config;
 pub mod downloads;
 pub mod fetcher;
 pub mod manager;
+mod oopif;
+mod policy;
 pub mod selectors;
 pub mod snapshot;
 pub mod stealth;
@@ -22,13 +24,16 @@ pub mod stealth;
 use async_trait::async_trait;
 use base64::Engine;
 use chromiumoxide::cdp::browser_protocol::network::Cookie;
+use chromiumoxide::cdp::browser_protocol::page::{
+    GetNavigationHistoryParams, NavigateToHistoryEntryParams,
+};
 use chromiumoxide::page::ScreenshotParams;
 use rustykrab_core::types::ToolSchema;
 use rustykrab_core::{Error, Result, SandboxRequirements, Tool, ToolError};
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use std::time::Duration;
 
-use crate::security;
 use adaptive::AdaptiveStore;
 use manager::BrowserManager;
 use snapshot::{SnapshotMode, SnapshotOptions, SnapshotStore};
@@ -134,6 +139,170 @@ async fn navigate_with_deadline(
     })
 }
 
+async fn navigate_history_entry(
+    page: &chromiumoxide::Page,
+    delta: i64,
+    navigation_policy: &config::SsrfPolicy,
+) -> Result<Value> {
+    let history = tokio::time::timeout(
+        Duration::from_secs(3),
+        page.execute(GetNavigationHistoryParams::default()),
+    )
+    .await
+    .map_err(|_| Error::ToolExecution("navigation-history lookup timed out".into()))?
+    .map_err(|error| {
+        Error::ToolExecution(format!("failed to read navigation history: {error}").into())
+    })?;
+    let wanted = history.current_index + delta;
+    let Some(entry) = history.entries.get(wanted.max(0) as usize) else {
+        return Ok(json!({
+            "status": "no_history_entry",
+            "outcome": "not_applied",
+            "direction": if delta < 0 { "back" } else { "forward" },
+            "retry_safe": true,
+        }));
+    };
+    policy::validate_requested(&entry.url, navigation_policy)
+        .await
+        .map_err(|error| Error::ToolExecution(error.into()))?;
+    let target_url = entry.url.clone();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        page.execute(NavigateToHistoryEntryParams::new(entry.id)),
+    )
+    .await
+    .map_err(|_| Error::ToolExecution("history navigation timed out".into()))?
+    .map_err(|error| Error::ToolExecution(format!("history navigation failed: {error}").into()))?;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    while tokio::time::Instant::now() < deadline {
+        let ready = tokio::time::timeout(
+            Duration::from_millis(750),
+            page.evaluate("document.readyState"),
+        )
+        .await
+        .ok()
+        .and_then(std::result::Result::ok)
+        .and_then(|value| value.into_value::<String>().ok())
+        .is_some_and(|state| state == "interactive" || state == "complete");
+        if ready {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let guard = policy::enforce_page(page, navigation_policy).await;
+    if guard["status"] == "blocked" {
+        return Ok(json!({
+            "status": "blocked",
+            "outcome": "not_applied",
+            "direction": if delta < 0 { "back" } else { "forward" },
+            "target_url": target_url,
+            "navigation_guard": guard,
+            "retry_safe": false,
+        }));
+    }
+    Ok(json!({
+        "status": "navigated",
+        "outcome": "applied",
+        "direction": if delta < 0 { "back" } else { "forward" },
+        "url": manager::probe_page_url_once(page).await.unwrap_or(target_url),
+        "title": manager::probe_page_title_once(page).await.unwrap_or_default(),
+        "navigation_guard": guard,
+        "retry_safe": false,
+    }))
+}
+
+async fn page_has_agent_content(page: &chromiumoxide::Page) -> Option<bool> {
+    tokio::time::timeout(
+        Duration::from_millis(750),
+        page.evaluate(
+            r#"Boolean(document.body && (
+                document.body.innerText.trim().length > 0 ||
+                document.body.querySelector('input,button,a,select,textarea,canvas,svg,img,video,[role],[onclick]')
+            ))"#,
+        ),
+    )
+    .await
+    .ok()
+    .and_then(std::result::Result::ok)
+    .and_then(|value| value.into_value::<bool>().ok())
+}
+
+async fn wait_for_agent_content(page: &chromiumoxide::Page, budget: Duration) -> Option<bool> {
+    let deadline = tokio::time::Instant::now() + budget;
+    loop {
+        match page_has_agent_content(page).await {
+            Some(true) => return Some(true),
+            None => return None,
+            Some(false) if tokio::time::Instant::now() >= deadline => return Some(false),
+            Some(false) => tokio::time::sleep(Duration::from_millis(250)).await,
+        }
+    }
+}
+
+/// browser-use retries pages whose HTTP navigation succeeds but yields no
+/// agent-visible DOM. Preserve that behavior under an explicit bounded report
+/// so a legitimate empty document is not silently mistaken for a driver bug.
+async fn recover_empty_page(page: &chromiumoxide::Page) -> Value {
+    match page_has_agent_content(page).await {
+        Some(true) => return json!({ "status": "not_empty", "reloaded": false }),
+        None => {
+            return json!({
+                "status": "unverified",
+                "reloaded": false,
+                "reason": "the renderer did not answer the content probe"
+            })
+        }
+        Some(false) => {}
+    }
+
+    match wait_for_agent_content(page, Duration::from_secs(3)).await {
+        Some(true) => return json!({ "status": "recovered_after_wait", "reloaded": false }),
+        None => {
+            return json!({
+                "status": "unverified",
+                "reloaded": false,
+                "reason": "the renderer stopped answering while waiting for content"
+            })
+        }
+        Some(false) => {}
+    }
+
+    let reload = tokio::time::timeout(Duration::from_secs(5), page.reload()).await;
+    match reload {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => {
+            return json!({
+                "status": "reload_failed",
+                "reloaded": false,
+                "reason": error.to_string(),
+            })
+        }
+        Err(_) => {
+            return json!({
+                "status": "reload_timed_out",
+                "reloaded": false,
+                "reason": "empty-page reload exceeded 5 seconds",
+            })
+        }
+    }
+
+    match wait_for_agent_content(page, Duration::from_secs(5)).await {
+        Some(true) => json!({ "status": "recovered_after_reload", "reloaded": true }),
+        Some(false) => json!({
+            "status": "empty_after_reload",
+            "reloaded": true,
+            "reason": "the HTTP page still has no text or actionable DOM after one reload"
+        }),
+        None => json!({
+            "status": "unverified_after_reload",
+            "reloaded": true,
+            "reason": "the renderer did not answer the post-reload content probe"
+        }),
+    }
+}
+
 fn remaining_millis(deadline: tokio::time::Instant) -> u64 {
     deadline
         .saturating_duration_since(tokio::time::Instant::now())
@@ -143,12 +312,14 @@ fn remaining_millis(deadline: tokio::time::Instant) -> u64 {
 
 /// Browser automation tool using Chrome DevTools Protocol.
 ///
-/// Modeled after OpenClaw's browser management architecture:
+/// CDP-native browser execution with browser-use-compatible action semantics:
 /// - Multiple named browser profiles, each an isolated Chrome instance
 /// - Browser lifecycle management (status/start/stop)
 /// - Tab control (tabs/open/close/focus) by stable Chrome target ID
 /// - Accessibility-tree snapshots with element refs for actions
 /// - Snapshot-scoped interactions (click ref s4-12, type ref s4-5 "hello")
+/// - Native CDP mouse/keyboard/file-input actions, redirect guards, popup
+///   handling, dialog handling, and bounded renderer recovery
 ///
 /// Configure via `~/.rustykrab/browser.json` or environment variables:
 /// - `CHROME_CDP_URL`: Override default CDP URL
@@ -195,8 +366,9 @@ fn schema_parameters() -> serde_json::Value {
                     "status", "start", "stop", "profiles",
                     "downloads",
                     "tabs", "open", "close", "focus",
-                    "navigate", "snapshot", "act", "screenshot",
+                    "navigate", "back", "forward", "refresh", "snapshot", "act", "click_coordinates", "send_keys", "screenshot",
                     "content", "evaluate", "scroll",
+                    "scroll_to_text",
                     "console", "cookies", "pdf",
                     "fetch", "stealth_fetch", "select", "wait_for",
                     "fill_credential"
@@ -225,16 +397,30 @@ fn schema_parameters() -> serde_json::Value {
             },
             "actAction": {
                 "type": "string",
-                "enum": ["click", "type", "fill", "press", "hover", "select", "drag", "wait", "fill_credential"],
-                "description": "Required when action='act'; every act also requires ref. Companion fields: type/fill -> text; press -> key; select -> value; drag -> targetRef. fill_credential uses field='username' or 'password' and never text, so the stored secret does not pass through you."
+                "enum": ["click", "type", "fill", "press", "hover", "select", "drag", "upload", "options", "wait", "fill_credential"],
+                "description": "Required when action='act'; every act also requires ref. Companion fields: type/fill -> text; press -> key; select -> value; drag -> targetRef; upload -> path or paths. options inspects a native select. fill_credential uses field='username' or 'password' and never text, so the stored secret does not pass through you."
             },
             "text": {
                 "type": "string",
                 "description": "Required for actAction='type' or 'fill'"
             },
+            "x": {
+                "type": "number",
+                "minimum": 0,
+                "description": "Viewport x coordinate for click_coordinates, measured in the native screenshot coordinate space."
+            },
+            "y": {
+                "type": "number",
+                "minimum": 0,
+                "description": "Viewport y coordinate for click_coordinates, measured in the native screenshot coordinate space."
+            },
             "key": {
                 "type": "string",
                 "description": "Required for actAction='press' (e.g., 'Enter', 'Tab', 'Escape')"
+            },
+            "keys": {
+                "type": "string",
+                "description": "Required for send_keys. Sends trusted CDP keyboard input to the focused element; supports text, special keys, and combinations such as Control+A or Meta+Enter."
             },
             "value": {
                 "type": "string",
@@ -243,6 +429,16 @@ fn schema_parameters() -> serde_json::Value {
             "targetRef": {
                 "type": "string",
                 "description": "Required target element ref for actAction='drag'"
+            },
+            "path": {
+                "type": "string",
+                "description": "For actAction='upload': one existing non-empty file inside the configured RustyKrab workspace."
+            },
+            "paths": {
+                "type": "array",
+                "items": {"type": "string"},
+                "minItems": 1,
+                "description": "For actAction='upload': existing non-empty files inside the configured RustyKrab workspace."
             },
             "clear": {
                 "type": "boolean",
@@ -529,6 +725,13 @@ fn schema_parameters() -> serde_json::Value {
             },
             {
                 "if": {
+                    "properties": { "action": { "const": "send_keys" } },
+                    "required": ["action"]
+                },
+                "then": { "required": ["keys"] }
+            },
+            {
+                "if": {
                     "properties": { "action": { "const": "evaluate" } },
                     "required": ["action"]
                 },
@@ -611,15 +814,44 @@ impl BrowserTool {
                     "press" => require_non_empty(args, "key", "act/press")?,
                     "select" => require_non_empty(args, "value", "act/select")?,
                     "drag" => require_non_empty(args, "targetRef", "act/drag")?,
-                    "click" | "hover" | "wait" | "fill_credential" => {}
+                    "upload" => {
+                        let has_path = args["path"]
+                            .as_str()
+                            .is_some_and(|value| !value.trim().is_empty());
+                        let has_paths = args["paths"]
+                            .as_array()
+                            .is_some_and(|values| !values.is_empty());
+                        if !has_path && !has_paths {
+                            return Err(Error::ToolExecution(ToolError::invalid_input(
+                                "act/upload requires 'path' or a non-empty 'paths' array",
+                            )));
+                        }
+                    }
+                    "click" | "hover" | "options" | "wait" | "fill_credential" => {}
                     other => {
                         return Err(Error::ToolExecution(ToolError::invalid_input(format!(
-                            "unknown act action '{other}'. Available: click, type, fill, press, hover, select, drag, wait, fill_credential"
+                            "unknown act action '{other}'. Available: click, type, fill, press, hover, select, drag, upload, options, wait, fill_credential"
                         ))));
                     }
                 }
             }
             "fill_credential" => require_non_empty(args, "ref", action)?,
+            "click_coordinates" => {
+                if args["x"].as_f64().is_none() || args["y"].as_f64().is_none() {
+                    return Err(Error::ToolExecution(ToolError::invalid_input(
+                        "click_coordinates requires numeric 'x' and 'y'",
+                    )));
+                }
+                if args["x"].as_f64().unwrap_or(-1.0) < 0.0
+                    || args["y"].as_f64().unwrap_or(-1.0) < 0.0
+                {
+                    return Err(Error::ToolExecution(ToolError::invalid_input(
+                        "click_coordinates requires non-negative coordinates",
+                    )));
+                }
+            }
+            "scroll_to_text" => require_non_empty(args, "text", action)?,
+            "send_keys" => require_non_empty(args, "keys", action)?,
             "evaluate" => require_non_empty(args, "expression", action)?,
             "wait_for" => {
                 let has_condition = args["wait_selector"]
@@ -635,7 +867,8 @@ impl BrowserTool {
                 }
             }
             "status" | "start" | "stop" | "profiles" | "downloads" | "tabs" | "snapshot"
-            | "screenshot" | "content" | "scroll" | "console" | "cookies" | "pdf" | "select" => {}
+            | "screenshot" | "content" | "scroll" | "console" | "cookies" | "pdf" | "select"
+            | "back" | "forward" | "refresh" => {}
             other => {
                 return Err(Error::ToolExecution(ToolError::invalid_input(format!(
                     "unknown browser action '{other}'"
@@ -678,13 +911,19 @@ impl BrowserTool {
     /// Actions that operate on a page, and so need one resolved.
     const PAGE_ACTIONS: &'static [&'static str] = &[
         "navigate",
+        "back",
+        "forward",
+        "refresh",
         "snapshot",
         "act",
+        "click_coordinates",
+        "send_keys",
         "fill_credential",
         "screenshot",
         "content",
         "evaluate",
         "scroll",
+        "scroll_to_text",
         "console",
         "cookies",
         "pdf",
@@ -743,7 +982,197 @@ impl BrowserTool {
             let navigated = self.manager.sticky_target(session, profile).is_some();
             Self::reject_blank_read(action, &url, navigated)?;
         }
+        let guard = policy::enforce_page(&page, &self.manager.config().ssrf_policy).await;
+        if guard["status"] == "blocked" {
+            return Err(Error::ToolExecution(
+                format!(
+                    "browser navigation policy blocked '{}' before '{action}': {}",
+                    guard["url"].as_str().unwrap_or("unknown URL"),
+                    guard["reason"].as_str().unwrap_or("policy rejected URL")
+                )
+                .into(),
+            ));
+        }
         Ok(page)
+    }
+
+    /// Re-check the URL after a page operation and before returning any data.
+    /// A page can navigate itself while a read is in flight, so preflight
+    /// validation alone is not a sufficient confidentiality boundary.
+    async fn guard_page_output(
+        &self,
+        action: &str,
+        session: &str,
+        profile: &str,
+        target_id: Option<&str>,
+        page: &chromiumoxide::Page,
+    ) -> Result<Value> {
+        let guard = policy::enforce_page(page, &self.manager.config().ssrf_policy).await;
+        if guard["status"] == "blocked" {
+            self.snapshot_store
+                .clear(&Self::store_key(session, profile, target_id))
+                .await;
+            return Err(Error::ToolExecution(
+                format!(
+                    "browser navigation policy blocked '{}' after '{action}': {}",
+                    guard["url"].as_str().unwrap_or("unknown URL"),
+                    guard["reason"].as_str().unwrap_or("policy rejected URL")
+                )
+                .into(),
+            ));
+        }
+        Ok(guard)
+    }
+
+    async fn validate_requested_url(&self, url: &str) -> Result<()> {
+        policy::validate_requested(url, &self.manager.config().ssrf_policy)
+            .await
+            .map_err(|error| Error::ToolExecution(error.into()))
+    }
+
+    fn validated_upload_paths(args: &Value) -> Result<Vec<String>> {
+        let mut requested = Vec::new();
+        if let Some(path) = args["path"].as_str() {
+            if !path.trim().is_empty() {
+                requested.push(path.to_string());
+            }
+        }
+        if let Some(paths) = args["paths"].as_array() {
+            for path in paths {
+                let path = path.as_str().ok_or_else(|| {
+                    Error::ToolExecution(ToolError::invalid_input(
+                        "every upload path must be a string",
+                    ))
+                })?;
+                if path.trim().is_empty() {
+                    return Err(Error::ToolExecution(ToolError::invalid_input(
+                        "upload paths cannot be empty",
+                    )));
+                }
+                requested.push(path.to_string());
+            }
+        }
+        requested.sort();
+        requested.dedup();
+        if requested.is_empty() {
+            return Err(Error::ToolExecution(ToolError::invalid_input(
+                "act/upload requires at least one file",
+            )));
+        }
+
+        requested
+            .into_iter()
+            .map(|path| {
+                let canonical = crate::security::validate_path(&path)
+                    .map_err(|error| Error::ToolExecution(error.into()))?;
+                let metadata = std::fs::metadata(&canonical).map_err(|error| {
+                    Error::ToolExecution(
+                        format!("cannot inspect upload file '{path}': {error}").into(),
+                    )
+                })?;
+                if !metadata.is_file() {
+                    return Err(Error::ToolExecution(ToolError::invalid_input(format!(
+                        "upload path is not a regular file: '{path}'"
+                    ))));
+                }
+                if metadata.len() == 0 {
+                    return Err(Error::ToolExecution(ToolError::invalid_input(format!(
+                        "upload file is empty: '{path}'"
+                    ))));
+                }
+                Ok(canonical.display().to_string())
+            })
+            .collect()
+    }
+
+    /// Enforce policy on tabs created by one browser action and optionally
+    /// focus the sole allowed popup, matching browser-use without guessing
+    /// when several tabs appear together.
+    async fn guard_new_tabs(
+        &self,
+        profile: &str,
+        session: &str,
+        before: Option<HashSet<String>>,
+    ) -> Value {
+        let Some(before) = before else {
+            return json!({
+                "status": "unverified",
+                "reason": "could not capture the pre-action target set"
+            });
+        };
+        // Let Target.attachedToTarget propagate through chromiumoxide.
+        tokio::time::sleep(Duration::from_millis(75)).await;
+        let after =
+            match tokio::time::timeout(Duration::from_secs(3), self.manager.target_ids(profile))
+                .await
+            {
+                Ok(Ok(ids)) => ids,
+                Ok(Err(error)) => {
+                    return json!({ "status": "unverified", "reason": error.to_string() })
+                }
+                Err(_) => {
+                    return json!({
+                        "status": "unverified",
+                        "reason": "post-action target listing timed out"
+                    })
+                }
+            };
+        let mut new_targets: Vec<String> = after.difference(&before).cloned().collect();
+        new_targets.sort();
+        let mut allowed = Vec::new();
+        let mut blocked = Vec::new();
+        let mut unverified = Vec::new();
+
+        for target in new_targets {
+            let page = match self.manager.get_page(profile, Some(&target)).await {
+                Ok(page) => page,
+                Err(error) => {
+                    unverified.push(json!({ "targetId": target, "reason": error.to_string() }));
+                    continue;
+                }
+            };
+            let guard = policy::enforce_page(&page, &self.manager.config().ssrf_policy).await;
+            match guard["status"].as_str() {
+                Some("allowed") => allowed.push(target),
+                Some("blocked") => {
+                    self.snapshot_store
+                        .clear(&Self::store_key(session, profile, Some(&target)))
+                        .await;
+                    let closed = self.manager.close_tab(profile, &target).await.is_ok();
+                    blocked.push(json!({
+                        "targetId": target,
+                        "url": guard["url"],
+                        "reason": guard["reason"],
+                        "closed": closed,
+                    }));
+                }
+                _ => unverified.push(guard),
+            }
+        }
+
+        let focused_target = if self.manager.config().auto_focus_new_tabs && allowed.len() == 1 {
+            let target = &allowed[0];
+            if self.manager.focus_tab(profile, target).await.is_ok() {
+                self.manager.set_sticky_target(session, profile, target);
+                Some(target.clone())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        json!({
+            "status": if allowed.is_empty() && blocked.is_empty() && unverified.is_empty() {
+                "no_new_tabs"
+            } else {
+                "processed"
+            },
+            "allowed_targets": allowed,
+            "blocked_targets": blocked,
+            "unverified_targets": unverified,
+            "focused_target": focused_target,
+        })
     }
 
     /// Reject a read action that resolved to a blank tab.
@@ -824,7 +1253,7 @@ impl Tool for BrowserTool {
 
     fn description(&self) -> &str {
         "Browse and scrape the web. Three fetch modes plus interactive control of \
-         Chrome via DevTools Protocol. \
+         Chrome via DevTools Protocol (CDP only; no Playwright). \
          Fetch modes: \
          fetch — pure HTTP request with browser-like header packs (impersonate=chrome|firefox|safari|edge), stealthy_headers, custom user-agent, proxy, retries, redirects; \
          stealth_fetch — full browser navigation with anti-bot patches (block_webrtc, hide_canvas, disable_resources), wait_selector, network_idle, solve_cloudflare, and returns rendered body; \
@@ -834,17 +1263,18 @@ impl Tool for BrowserTool {
          profiles — list profiles; \
          downloads — list browser-observed download records and validated local paths; \
          tabs/open/close/focus — tab management; \
-         navigate — go to URL (supports wait_selector, wait_selector_state, network_idle, solve_cloudflare); \
+         navigate/back/forward/refresh — navigation and history (navigate supports wait_selector, wait_selector_state, network_idle, solve_cloudflare); \
          wait_for — wait for selector / network idle / fixed delay; \
-         snapshot — accessibility-tree with element refs; \
-         act — interact by ref (click/type/press/hover/select/drag); \
+         snapshot — DOM-derived interaction state with element refs, including site-isolated cross-origin frames; \
+         act — interact by ref (click/type/fill/press/hover/select/drag/upload/options/wait); \
+         click_coordinates — click native screenshot coordinates; send_keys — send trusted CDP keyboard input to the focused element; scroll_to_text — find and reveal visible text; \
          fill_credential — type a STORED credential into a field by ref, without \
          ever seeing its value: pass 'ref' and 'field' ('username' or 'password'). \
          Always sign in with this. Never use act/type for a password: you do not \
          have the value, and typing a placeholder or the credential's own name just \
          fails the login. If nothing is stored yet the error names the exact key — \
          ask for it with credential_request under that name, then retry; \
-         screenshot/content/evaluate/scroll/console/cookies/pdf. \
+         screenshot/content/evaluate/scroll/console/cookies/pdf. Snapshots report likely CAPTCHA providers but do not claim to solve them. \
          Cookies persist across calls. Use snapshot + act for reliable element interaction. \
          Each act returns its outcome plus page_state; clicks also return the current tabs \
          and any JavaScript dialogs they accepted. Set expect_download=true on a download \
@@ -909,6 +1339,24 @@ impl Tool for BrowserTool {
         let resolved_target = self.resolve_target(action, &profile, &session, &args).await;
         let target_id = resolved_target.as_deref();
 
+        // Register the raw-CDP endpoint used only for site-isolated iframe
+        // targets. Keeping it with the snapshot state lets automatic
+        // post-action snapshots use the bridge without coupling actions to the
+        // browser manager.
+        let needs_live_page = Self::PAGE_ACTIONS.contains(&action)
+            && !(action == "select" && args["html"].as_str().is_some());
+        if needs_live_page {
+            let _ = self.manager.get_browser(&profile).await?;
+            let websocket_url = self.manager.websocket_address(&profile).await?;
+            self.snapshot_store
+                .register_oopif_context(
+                    &Self::store_key(&session, &profile, target_id),
+                    websocket_url,
+                    self.manager.config().ssrf_policy.clone(),
+                )
+                .await;
+        }
+
         match action {
             // ── Lifecycle ──────────────────────────────────────────
             "status" => Ok(self.manager.status(&profile).await),
@@ -935,11 +1383,26 @@ impl Tool for BrowserTool {
                 let url = args["url"].as_str().ok_or_else(|| {
                     Error::ToolExecution("'open' requires 'url' parameter".into())
                 })?;
-                security::validate_url(url)
-                    .await
-                    .map_err(|e| Error::ToolExecution(e.into()))?;
+                self.validate_requested_url(url).await?;
                 let _ = self.manager.get_browser(&profile).await?;
                 let opened = self.manager.open_tab(&profile, url).await?;
+                if let Some(tid) = opened["targetId"].as_str() {
+                    let page = self.manager.get_page(&profile, Some(tid)).await?;
+                    let guard =
+                        policy::enforce_page(&page, &self.manager.config().ssrf_policy).await;
+                    if guard["status"] == "blocked" {
+                        let closed = self.manager.close_tab(&profile, tid).await.is_ok();
+                        return Ok(json!({
+                            "status": "blocked",
+                            "outcome": "not_applied",
+                            "targetId": tid,
+                            "navigation_guard": guard,
+                            "closed": closed,
+                            "retry_safe": false,
+                            "profile": profile,
+                        }));
+                    }
+                }
                 // A freshly opened tab is where this session is now working.
                 if let Some(tid) = opened["targetId"].as_str() {
                     self.manager.set_sticky_target(&session, &profile, tid);
@@ -973,9 +1436,7 @@ impl Tool for BrowserTool {
                 let url = args["url"].as_str().ok_or_else(|| {
                     Error::ToolExecution("'navigate' requires 'url' parameter".into())
                 })?;
-                security::validate_url(url)
-                    .await
-                    .map_err(|e| Error::ToolExecution(e.into()))?;
+                self.validate_requested_url(url).await?;
 
                 let _ = self.manager.get_browser(&profile).await?;
                 let page = self.manager.get_page(&profile, target_id).await?;
@@ -1019,6 +1480,25 @@ impl Tool for BrowserTool {
                         "browser_degraded": false,
                         "retry_safe": true,
                         "profile": profile
+                    }));
+                }
+
+                let mut navigation_guard =
+                    policy::enforce_page(&page, &self.manager.config().ssrf_policy).await;
+                if navigation_guard["status"] == "blocked" {
+                    self.snapshot_store
+                        .clear(&Self::store_key(&session, &profile, target_id))
+                        .await;
+                    return Ok(json!({
+                        "status": "blocked",
+                        "outcome": "not_applied",
+                        "navigation_outcome": navigation.outcome,
+                        "readiness": navigation.readiness,
+                        "elapsed_ms": navigation.elapsed_ms,
+                        "browser_degraded": false,
+                        "retry_safe": false,
+                        "navigation_guard": navigation_guard,
+                        "profile": profile,
                     }));
                 }
 
@@ -1068,6 +1548,29 @@ impl Tool for BrowserTool {
                     .await;
                 }
 
+                let empty_page_recovery = recover_empty_page(&page).await;
+                if empty_page_recovery["reloaded"].as_bool() == Some(true) {
+                    self.snapshot_store
+                        .clear(&Self::store_key(&session, &profile, target_id))
+                        .await;
+                    navigation_guard =
+                        policy::enforce_page(&page, &self.manager.config().ssrf_policy).await;
+                    if navigation_guard["status"] == "blocked" {
+                        return Ok(json!({
+                            "status": "blocked",
+                            "outcome": "not_applied",
+                            "navigation_outcome": navigation.outcome,
+                            "readiness": navigation.readiness,
+                            "elapsed_ms": navigation.elapsed_ms,
+                            "browser_degraded": false,
+                            "retry_safe": false,
+                            "empty_page_recovery": empty_page_recovery,
+                            "navigation_guard": navigation_guard,
+                            "profile": profile,
+                        }));
+                    }
+                }
+
                 let title = manager::probe_page_title_once(&page)
                     .await
                     .unwrap_or_default();
@@ -1092,7 +1595,48 @@ impl Tool for BrowserTool {
                     "browser_degraded": false,
                     "targetId": landed_on,
                     "waits": Value::Object(wait_results),
+                    "waits_preceded_reload": empty_page_recovery["reloaded"].as_bool() == Some(true),
+                    "empty_page_recovery": empty_page_recovery,
+                    "navigation_guard": navigation_guard,
                     "profile": profile
+                }))
+            }
+
+            "back" | "forward" => {
+                let _ = self.manager.get_browser(&profile).await?;
+                let page = self.page_for(action, &profile, &session, target_id).await?;
+                let result = navigate_history_entry(
+                    &page,
+                    if action == "back" { -1 } else { 1 },
+                    &self.manager.config().ssrf_policy,
+                )
+                .await?;
+                self.snapshot_store
+                    .clear(&Self::store_key(&session, &profile, target_id))
+                    .await;
+                Ok(result)
+            }
+
+            "refresh" => {
+                let _ = self.manager.get_browser(&profile).await?;
+                let page = self.page_for(action, &profile, &session, target_id).await?;
+                tokio::time::timeout(Duration::from_secs(10), page.reload())
+                    .await
+                    .map_err(|_| Error::ToolExecution("page refresh timed out".into()))?
+                    .map_err(|error| {
+                        Error::ToolExecution(format!("page refresh failed: {error}").into())
+                    })?;
+                let guard = policy::enforce_page(&page, &self.manager.config().ssrf_policy).await;
+                self.snapshot_store
+                    .clear(&Self::store_key(&session, &profile, target_id))
+                    .await;
+                Ok(json!({
+                    "status": if guard["status"] == "blocked" { "blocked" } else { "refreshed" },
+                    "outcome": if guard["status"] == "blocked" { "not_applied" } else { "applied" },
+                    "url": manager::probe_page_url_once(&page).await.unwrap_or_default(),
+                    "navigation_guard": guard,
+                    "retry_safe": false,
+                    "profile": profile,
                 }))
             }
 
@@ -1116,8 +1660,14 @@ impl Tool for BrowserTool {
                 };
 
                 let key = Self::store_key(&session, &profile, target_id);
-                let snap =
-                    snapshot::take_snapshot(&page, &options, &self.snapshot_store, &key).await;
+                let mut snap =
+                    snapshot::take_snapshot(&page, &options, &self.snapshot_store, &key).await?;
+                let guard = self
+                    .guard_page_output(action, &session, &profile, target_id, &page)
+                    .await?;
+                if let Value::Object(ref mut object) = snap {
+                    object.insert("navigation_guard".into(), guard);
+                }
 
                 // How much of the page the agent actually received.
                 //
@@ -1129,18 +1679,16 @@ impl Tool for BrowserTool {
                 // apart. Sizes settle it; the page's text is deliberately
                 // not logged, because a snapshot can contain anything the
                 // page contains.
-                if let Ok(ref v) = snap {
-                    let url = manager::probe_page_url_once(&page)
-                        .await
-                        .unwrap_or_default();
-                    tracing::debug!(
-                        url = %url,
-                        chars = v.to_string().len(),
-                        nodes = v["elements"].as_array().map(|a| a.len()).unwrap_or(0),
-                        "took page snapshot"
-                    );
-                }
-                snap
+                let url = manager::probe_page_url_once(&page)
+                    .await
+                    .unwrap_or_default();
+                tracing::debug!(
+                    url = %url,
+                    chars = snap.to_string().len(),
+                    nodes = snap["elements"].as_array().map(|a| a.len()).unwrap_or(0),
+                    "took page snapshot"
+                );
+                Ok(snap)
             }
 
             // ── Act (ref-based actions) ────────────────────────────
@@ -1153,12 +1701,27 @@ impl Tool for BrowserTool {
                 let act_action = args["actAction"]
                     .as_str()
                     .ok_or_else(|| Error::ToolExecution(
-                        "'act' requires 'actAction' parameter (click, type, press, hover, select, drag, wait)".into(),
+                        "'act' requires 'actAction' parameter (click, type, fill, press, hover, select, drag, upload, options, wait, fill_credential)".into(),
                     ))?;
 
                 let _ = self.manager.get_browser(&profile).await?;
-                let page = self.manager.get_page(&profile, target_id).await?;
+                let mut action_args = args.clone();
+                if act_action == "upload" {
+                    if self.manager.config().is_remote_profile(&profile) {
+                        return Err(Error::ToolExecution(ToolError::invalid_input(
+                            "file upload to a remote CDP browser requires an artifact-transfer channel, which is not configured",
+                        )));
+                    }
+                    let paths = Self::validated_upload_paths(&args)?;
+                    action_args["paths"] = json!(paths);
+                }
+                let page = self.page_for(action, &profile, &session, target_id).await?;
                 let key = Self::store_key(&session, &profile, target_id);
+                let targets_before =
+                    tokio::time::timeout(Duration::from_secs(3), self.manager.target_ids(&profile))
+                        .await
+                        .ok()
+                        .and_then(std::result::Result::ok);
                 let download_since = if act_action == "click" {
                     self.manager.download_sequence(&profile).await
                 } else {
@@ -1171,7 +1734,11 @@ impl Tool for BrowserTool {
                     &key,
                     act_action,
                     ref_id,
-                    &args,
+                    &action_args,
+                    actions::ActionPolicies {
+                        dialog: self.manager.config().dialog_policy,
+                        navigation: &self.manager.config().ssrf_policy,
+                    },
                 )
                 .await?;
 
@@ -1214,7 +1781,17 @@ impl Tool for BrowserTool {
                 // action against the same session. Rebuild the driver/session
                 // now, clear all refs for this tab, and report the recovery
                 // without retrying the potentially-applied side effect.
-                if outcome["browser_degraded"].as_bool().unwrap_or(false) {
+                let action_degraded = outcome["browser_degraded"].as_bool().unwrap_or(false);
+                if !action_degraded {
+                    let popup_guard = self
+                        .guard_new_tabs(&profile, &session, targets_before)
+                        .await;
+                    if let Value::Object(ref mut object) = outcome {
+                        object.insert("popup_guard".into(), popup_guard);
+                    }
+                }
+
+                if action_degraded {
                     let recovery_value = self.recover_degraded_profile(&profile).await;
                     if let Value::Object(ref mut object) = outcome {
                         object.insert("recovery".into(), recovery_value);
@@ -1234,6 +1811,80 @@ impl Tool for BrowserTool {
                             .unwrap_or(Value::Null);
                     if let Value::Object(ref mut object) = outcome {
                         object.insert("tabs".into(), tabs);
+                    }
+                }
+                Ok(outcome)
+            }
+
+            "click_coordinates" => {
+                let x = args["x"].as_f64().expect("validated x coordinate");
+                let y = args["y"].as_f64().expect("validated y coordinate");
+                let _ = self.manager.get_browser(&profile).await?;
+                let page = self.page_for(action, &profile, &session, target_id).await?;
+                let key = Self::store_key(&session, &profile, target_id);
+                let targets_before =
+                    tokio::time::timeout(Duration::from_secs(3), self.manager.target_ids(&profile))
+                        .await
+                        .ok()
+                        .and_then(std::result::Result::ok);
+                let mut outcome = actions::execute_coordinate_click(
+                    &page,
+                    &self.snapshot_store,
+                    &key,
+                    x,
+                    y,
+                    self.manager.config().dialog_policy,
+                    &self.manager.config().ssrf_policy,
+                )
+                .await?;
+                let action_degraded = outcome["browser_degraded"].as_bool().unwrap_or(false);
+                if !action_degraded {
+                    let popup_guard = self
+                        .guard_new_tabs(&profile, &session, targets_before)
+                        .await;
+                    if let Value::Object(ref mut object) = outcome {
+                        object.insert("popup_guard".into(), popup_guard);
+                    }
+                } else {
+                    let recovery = self.recover_degraded_profile(&profile).await;
+                    if let Value::Object(ref mut object) = outcome {
+                        object.insert("recovery".into(), recovery);
+                    }
+                }
+                Ok(outcome)
+            }
+
+            "send_keys" => {
+                let keys = args["keys"].as_str().expect("validated keys");
+                let _ = self.manager.get_browser(&profile).await?;
+                let page = self.page_for(action, &profile, &session, target_id).await?;
+                let store_key = Self::store_key(&session, &profile, target_id);
+                let targets_before =
+                    tokio::time::timeout(Duration::from_secs(3), self.manager.target_ids(&profile))
+                        .await
+                        .ok()
+                        .and_then(std::result::Result::ok);
+                let mut outcome = actions::execute_send_keys(
+                    &page,
+                    &self.snapshot_store,
+                    &store_key,
+                    keys,
+                    self.manager.config().dialog_policy,
+                    &self.manager.config().ssrf_policy,
+                )
+                .await?;
+                let action_degraded = outcome["browser_degraded"].as_bool().unwrap_or(false);
+                if !action_degraded {
+                    let popup_guard = self
+                        .guard_new_tabs(&profile, &session, targets_before)
+                        .await;
+                    if let Value::Object(ref mut object) = outcome {
+                        object.insert("popup_guard".into(), popup_guard);
+                    }
+                } else {
+                    let recovery = self.recover_degraded_profile(&profile).await;
+                    if let Value::Object(ref mut object) = outcome {
+                        object.insert("recovery".into(), recovery);
                     }
                 }
                 Ok(outcome)
@@ -1263,7 +1914,7 @@ impl Tool for BrowserTool {
                 })?;
 
                 let _ = self.manager.get_browser(&profile).await?;
-                let page = self.manager.get_page(&profile, target_id).await?;
+                let page = self.page_for(action, &profile, &session, target_id).await?;
 
                 // The page's own URL, so the key matches wherever the
                 // agent actually is rather than where it meant to be.
@@ -1318,6 +1969,10 @@ impl Tool for BrowserTool {
                     "fill",
                     ref_id,
                     &fill_args,
+                    actions::ActionPolicies {
+                        dialog: self.manager.config().dialog_policy,
+                        navigation: &self.manager.config().ssrf_policy,
+                    },
                 )
                 .await?;
 
@@ -1387,13 +2042,17 @@ impl Tool for BrowserTool {
 
                 let size_bytes = png_bytes.len();
                 let b64 = base64::engine::general_purpose::STANDARD.encode(&png_bytes);
+                let navigation_guard = self
+                    .guard_page_output(action, &session, &profile, target_id, &page)
+                    .await?;
 
                 Ok(json!({
                     "screenshot": b64,
                     "size_bytes": size_bytes,
                     "format": "png",
                     "encoding": "base64",
-                    "profile": profile
+                    "profile": profile,
+                    "navigation_guard": navigation_guard,
                 }))
             }
 
@@ -1427,6 +2086,9 @@ impl Tool for BrowserTool {
                 let current_url = manager::probe_page_url_once(&page)
                     .await
                     .unwrap_or_default();
+                let navigation_guard = self
+                    .guard_page_output(action, &session, &profile, target_id, &page)
+                    .await?;
 
                 Ok(json!({
                     "content": truncated_content,
@@ -1434,7 +2096,8 @@ impl Tool for BrowserTool {
                     "title": title,
                     "format": format,
                     "truncated": was_truncated,
-                    "profile": profile
+                    "profile": profile,
+                    "navigation_guard": navigation_guard,
                 }))
             }
 
@@ -1488,16 +2151,20 @@ impl Tool for BrowserTool {
                 }
 
                 let _ = self.manager.get_browser(&profile).await?;
-                let page = self.manager.get_page(&profile, target_id).await?;
+                let page = self.page_for(action, &profile, &session, target_id).await?;
                 let result = page.evaluate(expression).await.map_err(|e| {
                     Error::ToolExecution(format!("JS evaluation failed: {e}").into())
                 })?;
 
                 let value: Value = result.into_value().unwrap_or(Value::Null);
+                let navigation_guard = self
+                    .guard_page_output(action, &session, &profile, target_id, &page)
+                    .await?;
 
                 Ok(json!({
                     "result": value,
-                    "profile": profile
+                    "profile": profile,
+                    "navigation_guard": navigation_guard,
                 }))
             }
 
@@ -1507,7 +2174,7 @@ impl Tool for BrowserTool {
                 let amount = args["amount"].as_i64().unwrap_or(500);
 
                 let _ = self.manager.get_browser(&profile).await?;
-                let page = self.manager.get_page(&profile, target_id).await?;
+                let page = self.page_for(action, &profile, &session, target_id).await?;
 
                 let js = match direction {
                     "down" => format!("window.scrollBy(0, {amount}); window.scrollY"),
@@ -1532,19 +2199,81 @@ impl Tool for BrowserTool {
                     .map_err(|e| Error::ToolExecution(format!("scroll failed: {e}").into()))?;
 
                 let scroll_y: f64 = result.into_value().unwrap_or(0.0);
+                let navigation_guard = self
+                    .guard_page_output(action, &session, &profile, target_id, &page)
+                    .await?;
 
                 Ok(json!({
                     "status": "scrolled",
                     "direction": direction,
                     "scroll_y": scroll_y as i64,
-                    "profile": profile
+                    "profile": profile,
+                    "navigation_guard": navigation_guard,
+                }))
+            }
+
+            "scroll_to_text" => {
+                let text = args["text"].as_str().expect("validated scroll text");
+                let _ = self.manager.get_browser(&profile).await?;
+                let page = self.page_for(action, &profile, &session, target_id).await?;
+                let needle = serde_json::to_string(text).map_err(|error| {
+                    Error::ToolExecution(format!("invalid scroll text: {error}").into())
+                })?;
+                let script = format!(
+                    r#"(function() {{
+                        var needle = String({needle}).toLocaleLowerCase();
+                        var roots = [document];
+                        var seen = new Set();
+                        while (roots.length) {{
+                            var root = roots.shift();
+                            if (!root || seen.has(root)) continue;
+                            seen.add(root);
+                            var walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+                            var node;
+                            while ((node = walker.nextNode())) {{
+                                var value = (node.nodeValue || '').trim();
+                                if (value && value.toLocaleLowerCase().includes(needle)) {{
+                                    var element = node.parentElement;
+                                    if (!element) continue;
+                                    element.scrollIntoView({{block:'center', inline:'nearest', behavior:'instant'}});
+                                    var rect = element.getBoundingClientRect();
+                                    return {{found:true, text:value.substring(0,200), bounds:[rect.x,rect.y,rect.width,rect.height]}};
+                                }}
+                            }}
+                            var elements = root.querySelectorAll ? root.querySelectorAll('*') : [];
+                            for (var i = 0; i < elements.length; i++) {{
+                                if (elements[i].shadowRoot) roots.push(elements[i].shadowRoot);
+                            }}
+                        }}
+                        return {{found:false}};
+                    }})()"#
+                );
+                let result = tokio::time::timeout(Duration::from_secs(5), page.evaluate(script))
+                    .await
+                    .map_err(|_| Error::ToolExecution("scroll-to-text timed out".into()))?
+                    .map_err(|error| {
+                        Error::ToolExecution(format!("scroll-to-text failed: {error}").into())
+                    })?
+                    .into_value::<Value>()
+                    .unwrap_or_else(|_| json!({ "found": false }));
+                let navigation_guard = self
+                    .guard_page_output(action, &session, &profile, target_id, &page)
+                    .await?;
+                Ok(json!({
+                    "status": if result["found"] == true { "scrolled" } else { "not_found" },
+                    "outcome": if result["found"] == true { "applied" } else { "not_applied" },
+                    "query": text,
+                    "match": result,
+                    "retry_safe": result["found"] != true,
+                    "profile": profile,
+                    "navigation_guard": navigation_guard,
                 }))
             }
 
             // ── Console ────────────────────────────────────────────
             "console" => {
                 let _ = self.manager.get_browser(&profile).await?;
-                let page = self.manager.get_page(&profile, target_id).await?;
+                let page = self.page_for(action, &profile, &session, target_id).await?;
 
                 // Retrieve console messages via JS — collects last N entries
                 let js = r#"
@@ -1586,18 +2315,22 @@ impl Tool for BrowserTool {
 
                 let raw: String = result.into_value().unwrap_or_else(|_| "[]".to_string());
                 let entries: Value = serde_json::from_str(&raw).unwrap_or(json!([]));
+                let navigation_guard = self
+                    .guard_page_output(action, &session, &profile, target_id, &page)
+                    .await?;
 
                 Ok(json!({
                     "console": entries,
                     "note": "Console interception is installed on first call. Earlier messages are not captured.",
-                    "profile": profile
+                    "profile": profile,
+                    "navigation_guard": navigation_guard,
                 }))
             }
 
             // ── Cookies ────────────────────────────────────────────
             "cookies" => {
                 let _ = self.manager.get_browser(&profile).await?;
-                let page = self.manager.get_page(&profile, target_id).await?;
+                let page = self.page_for(action, &profile, &session, target_id).await?;
                 let domain_filter = args["domain"].as_str();
 
                 let cookies: Vec<Cookie> = page.get_cookies().await.map_err(|e| {
@@ -1622,11 +2355,15 @@ impl Tool for BrowserTool {
                         })
                     })
                     .collect();
+                let navigation_guard = self
+                    .guard_page_output(action, &session, &profile, target_id, &page)
+                    .await?;
 
                 Ok(json!({
                     "cookies": filtered,
                     "count": filtered.len(),
-                    "profile": profile
+                    "profile": profile,
+                    "navigation_guard": navigation_guard,
                 }))
             }
 
@@ -1651,6 +2388,9 @@ impl Tool for BrowserTool {
                 let title = manager::probe_page_title_once(&page)
                     .await
                     .unwrap_or_default();
+                let navigation_guard = self
+                    .guard_page_output(action, &session, &profile, target_id, &page)
+                    .await?;
 
                 Ok(json!({
                     "pdf": b64,
@@ -1658,7 +2398,8 @@ impl Tool for BrowserTool {
                     "encoding": "base64",
                     "url": url,
                     "title": title,
-                    "profile": profile
+                    "profile": profile,
+                    "navigation_guard": navigation_guard,
                 }))
             }
 
@@ -1673,9 +2414,7 @@ impl Tool for BrowserTool {
                 let url = args["url"].as_str().ok_or_else(|| {
                     Error::ToolExecution("'stealth_fetch' requires 'url' parameter".into())
                 })?;
-                security::validate_url(url)
-                    .await
-                    .map_err(|e| Error::ToolExecution(e.into()))?;
+                self.validate_requested_url(url).await?;
 
                 let _ = self.manager.get_browser(&profile).await?;
                 let page = self.manager.get_page(&profile, target_id).await?;
@@ -1713,6 +2452,25 @@ impl Tool for BrowserTool {
                         "browser_degraded": false,
                         "retry_safe": true,
                         "profile": profile
+                    }));
+                }
+
+                let mut navigation_guard =
+                    policy::enforce_page(&page, &self.manager.config().ssrf_policy).await;
+                if navigation_guard["status"] == "blocked" {
+                    self.snapshot_store
+                        .clear(&Self::store_key(&session, &profile, target_id))
+                        .await;
+                    return Ok(json!({
+                        "status": "blocked",
+                        "outcome": "not_applied",
+                        "navigation_outcome": navigation.outcome,
+                        "readiness": navigation.readiness,
+                        "elapsed_ms": navigation.elapsed_ms,
+                        "browser_degraded": false,
+                        "retry_safe": false,
+                        "navigation_guard": navigation_guard,
+                        "profile": profile,
                     }));
                 }
 
@@ -1761,6 +2519,29 @@ impl Tool for BrowserTool {
                     .await;
                 }
 
+                let empty_page_recovery = recover_empty_page(&page).await;
+                if empty_page_recovery["reloaded"].as_bool() == Some(true) {
+                    self.snapshot_store
+                        .clear(&Self::store_key(&session, &profile, target_id))
+                        .await;
+                    navigation_guard =
+                        policy::enforce_page(&page, &self.manager.config().ssrf_policy).await;
+                    if navigation_guard["status"] == "blocked" {
+                        return Ok(json!({
+                            "status": "blocked",
+                            "outcome": "not_applied",
+                            "navigation_outcome": navigation.outcome,
+                            "readiness": navigation.readiness,
+                            "elapsed_ms": navigation.elapsed_ms,
+                            "browser_degraded": false,
+                            "retry_safe": false,
+                            "empty_page_recovery": empty_page_recovery,
+                            "navigation_guard": navigation_guard,
+                            "profile": profile,
+                        }));
+                    }
+                }
+
                 let final_url = manager::probe_page_url_once(&page)
                     .await
                     .unwrap_or_default();
@@ -1800,6 +2581,9 @@ impl Tool for BrowserTool {
                     "body_truncated": html_truncated,
                     "cookies": cookie_map,
                     "waits": Value::Object(wait_results),
+                    "waits_preceded_reload": empty_page_recovery["reloaded"].as_bool() == Some(true),
+                    "empty_page_recovery": empty_page_recovery,
+                    "navigation_guard": navigation_guard,
                     "profile": profile,
                 }))
             }
@@ -1807,13 +2591,18 @@ impl Tool for BrowserTool {
             // ── Scrapling.Selector ─────────────────────────────────
             "select" => {
                 let params = selectors::SelectParams::from_args(&args);
+                let live_page = if params.html.is_none() {
+                    let _ = self.manager.get_browser(&profile).await?;
+                    Some(self.page_for(action, &profile, &session, target_id).await?)
+                } else {
+                    None
+                };
 
                 let mut matches = if let Some(html) = &params.html {
                     selectors::select_static(html, &params)?
                 } else {
-                    let _ = self.manager.get_browser(&profile).await?;
-                    let page = self.manager.get_page(&profile, target_id).await?;
-                    selectors::select_live(&page, &params).await?
+                    let page = live_page.as_ref().expect("live page was resolved");
+                    selectors::select_live(page, &params).await?
                 };
 
                 let mut adaptive_used = false;
@@ -1828,8 +2617,8 @@ impl Tool for BrowserTool {
                         let candidates = if let Some(html) = &params.html {
                             selectors::select_static(html, &pool_params).unwrap_or_default()
                         } else {
-                            let page = self.manager.get_page(&profile, target_id).await?;
-                            selectors::select_live(&page, &pool_params)
+                            let page = live_page.as_ref().expect("live page was resolved");
+                            selectors::select_live(page, &pool_params)
                                 .await
                                 .unwrap_or_default()
                         };
@@ -1854,6 +2643,12 @@ impl Tool for BrowserTool {
                 let mut value = selectors::matches_to_json(&matches);
                 if let Value::Object(ref mut o) = value {
                     o.insert("adaptive_used".into(), Value::Bool(adaptive_used));
+                    if let Some(page) = &live_page {
+                        let guard = self
+                            .guard_page_output(action, &session, &profile, target_id, page)
+                            .await?;
+                        o.insert("navigation_guard".into(), guard);
+                    }
                 }
                 Ok(value)
             }
@@ -1861,7 +2656,7 @@ impl Tool for BrowserTool {
             // ── Wait helper ────────────────────────────────────────
             "wait_for" => {
                 let _ = self.manager.get_browser(&profile).await?;
-                let page = self.manager.get_page(&profile, target_id).await?;
+                let page = self.page_for(action, &profile, &session, target_id).await?;
                 let timeout_ms = args["timeout_ms"].as_u64().unwrap_or(10_000);
 
                 let mut results = serde_json::Map::new();
@@ -1898,6 +2693,10 @@ impl Tool for BrowserTool {
                     ));
                 }
 
+                let guard = self
+                    .guard_page_output(action, &session, &profile, target_id, &page)
+                    .await?;
+                results.insert("navigation_guard".into(), guard);
                 Ok(Value::Object(results))
             }
 
@@ -1905,8 +2704,9 @@ impl Tool for BrowserTool {
                 format!(
                     "unknown browser action: '{action}'. Available: \
                      status, start, stop, profiles, tabs, open, close, focus, \
-                     navigate, snapshot, act, screenshot, content, evaluate, \
-                     scroll, console, cookies, pdf, fetch, stealth_fetch, select, wait_for"
+                     navigate, back, forward, refresh, snapshot, act, click_coordinates, \
+                     send_keys, screenshot, content, evaluate, scroll, scroll_to_text, \
+                     console, cookies, pdf, fetch, stealth_fetch, select, wait_for"
                 )
                 .into(),
             )),
@@ -2251,6 +3051,11 @@ mod tests {
             cdp_request_timeout_ms: 5_000,
             ..Default::default()
         };
+        config.ssrf_policy.allow_private_network = true;
+        config
+            .ssrf_policy
+            .hostname_allowlist
+            .push("localhost".to_string());
         config.profiles.insert(
             profile.to_string(),
             config::BrowserProfile {
@@ -2331,6 +3136,10 @@ mod tests {
             "click",
             &second_ref,
             &json!({}),
+            actions::ActionPolicies {
+                dialog: config::DialogPolicy::Auto,
+                navigation: &tool.manager.config().ssrf_policy,
+            },
         )
         .await
         .expect("click outcome");
@@ -2341,7 +3150,190 @@ mod tests {
             .expect("read click marker")
             .into_value()
             .expect("click marker string");
-        assert_eq!(clicked, "second");
+        assert_eq!(
+            clicked, "second",
+            "selector={} outcome={outcome}",
+            second.selector
+        );
+
+        let _ = tool.manager.stop(profile).await;
+    }
+
+    /// Exercises the browser-use-compatible native action surface across the
+    /// real BrowserTool boundary, including the automatic post-action state
+    /// that supplies the next snapshot generation.
+    #[tokio::test]
+    #[ignore = "launches a real Chrome"]
+    async fn live_native_forms_upload_coordinates_and_send_keys() {
+        fn element<'a>(state: &'a Value, name: &str) -> &'a Value {
+            state["elements"]
+                .as_array()
+                .expect("snapshot elements")
+                .iter()
+                .find(|element| element["name"] == name)
+                .unwrap_or_else(|| panic!("element '{name}' missing from {state}"))
+        }
+
+        let profile = "native-actions-live-test";
+        let (tool, _dir) = isolated_live_tool(profile);
+        tool.manager
+            .get_browser(profile)
+            .await
+            .expect("start browser");
+        let page = tool
+            .manager
+            .get_page(profile, None)
+            .await
+            .expect("blank page");
+        let html = r#"<!doctype html><html><body>
+                <label>Message <input id="message" aria-label="Message"></label>
+                <div id="key-status" role="status">No key</div>
+                <label>Choice <select id="choice" aria-label="Choice">
+                    <option value="a">Alpha</option><option value="b">Beta</option>
+                </select></label>
+                <input id="upload" type="file" aria-label="Upload fixture" hidden>
+                <div id="upload-status" role="status">No upload</div>
+                <button id="coordinate" onclick="this.textContent='Coordinate clicked'">Coordinate target</button>
+                <div style="height:1600px"></div><h2>Late marker text</h2>
+                <script>
+                    message.addEventListener('keydown', function(e) {
+                        document.getElementById('key-status').textContent = 'trusted:' + e.isTrusted + ':key:' + e.key;
+                    });
+                    upload.addEventListener('change', function() {
+                        document.getElementById('upload-status').textContent = this.files.length ? 'Uploaded ' + this.files[0].name : 'No upload';
+                    });
+                </script>
+            </body></html>"#;
+        let data_url = format!(
+            "data:text/html;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(html)
+        );
+        page.execute(chromiumoxide::cdp::browser_protocol::page::NavigateParams::new(data_url))
+            .await
+            .expect("navigate test page");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let target_id = page.target_id().inner().clone();
+
+        let snapshot = tool
+            .execute(json!({
+                "action":"snapshot", "profile":profile, "targetId":target_id,
+                "interactive":false,
+            }))
+            .await
+            .expect("initial snapshot");
+        let message_ref = element(&snapshot, "Message")["ref"]
+            .as_str()
+            .expect("message ref");
+        let focused = tool
+            .execute(json!({
+                "action":"act", "actAction":"click", "ref":message_ref,
+                "profile":profile, "targetId":target_id,
+            }))
+            .await
+            .expect("focus input");
+        assert_eq!(focused["outcome"], "applied", "{focused}");
+
+        let typed = tool
+            .execute(json!({
+                "action":"send_keys", "keys":"Hello", "profile":profile,
+                "targetId":target_id,
+            }))
+            .await
+            .expect("send trusted text");
+        assert_eq!(typed["outcome"], "applied", "{typed}");
+        assert_eq!(
+            element(&typed["page_state"], "Message")["value"],
+            "Hello",
+            "{typed}"
+        );
+        assert!(
+            typed["page_state"]["elements"]
+                .as_array()
+                .expect("post-key elements")
+                .iter()
+                .any(|element| element["name"]
+                    .as_str()
+                    .is_some_and(|name| name.starts_with("trusted:true:key:"))),
+            "the DOM did not observe trusted CDP keyboard events: {typed}"
+        );
+
+        let choice_ref = element(&typed["page_state"], "Choice")["ref"]
+            .as_str()
+            .expect("choice ref");
+        let options = tool
+            .execute(json!({
+                "action":"act", "actAction":"options", "ref":choice_ref,
+                "profile":profile, "targetId":target_id,
+            }))
+            .await
+            .expect("inspect options");
+        assert_eq!(
+            options["options"].as_array().map(Vec::len),
+            Some(2),
+            "{options}"
+        );
+        let choice_ref = element(&options["page_state"], "Choice")["ref"]
+            .as_str()
+            .expect("refreshed choice ref");
+        let selected = tool
+            .execute(json!({
+                "action":"act", "actAction":"select", "ref":choice_ref, "value":"b",
+                "profile":profile, "targetId":target_id,
+            }))
+            .await
+            .expect("select option");
+        assert_eq!(element(&selected["page_state"], "Choice")["value"], "b");
+
+        let upload_ref = element(&selected["page_state"], "Upload fixture")["ref"]
+            .as_str()
+            .expect("upload ref");
+        let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+        let uploaded = tool
+            .execute(json!({
+                "action":"act", "actAction":"upload", "ref":upload_ref,
+                "path":fixture.display().to_string(), "profile":profile,
+                "targetId":target_id,
+            }))
+            .await
+            .expect("upload fixture");
+        assert!(
+            uploaded["page_state"]["elements"]
+                .as_array()
+                .expect("post-upload elements")
+                .iter()
+                .any(|element| element["name"] == "Uploaded Cargo.toml"),
+            "upload change was not independently observed: {uploaded}"
+        );
+
+        let coordinate = element(&uploaded["page_state"], "Coordinate target");
+        let bounds = coordinate["bounds"].as_array().expect("coordinate bounds");
+        let x = bounds[0].as_f64().unwrap() + bounds[2].as_f64().unwrap() / 2.0;
+        let y = bounds[1].as_f64().unwrap() + bounds[3].as_f64().unwrap() / 2.0;
+        let clicked = tool
+            .execute(json!({
+                "action":"click_coordinates", "x":x, "y":y,
+                "profile":profile, "targetId":target_id,
+            }))
+            .await
+            .expect("coordinate click");
+        assert_eq!(clicked["outcome"], "applied", "{clicked}");
+        assert!(
+            clicked["page_state"]["elements"]
+                .as_array()
+                .expect("post-coordinate elements")
+                .iter()
+                .any(|element| element["name"] == "Coordinate clicked"),
+            "coordinate click was not independently observed: {clicked}"
+        );
+
+        let scrolled = tool
+            .execute(json!({
+                "action":"scroll_to_text", "text":"Late marker text",
+                "profile":profile, "targetId":target_id,
+            }))
+            .await
+            .expect("scroll to text");
+        assert_eq!(scrolled["outcome"], "applied", "{scrolled}");
 
         let _ = tool.manager.stop(profile).await;
     }
@@ -2352,11 +3344,23 @@ mod tests {
     /// frame DOM. Two loopback hostnames make the documents different origins.
     #[tokio::test]
     #[ignore = "launches a real Chrome"]
-    async fn live_cross_origin_iframe_snapshot_and_click() {
+    async fn live_cross_origin_iframe_snapshot_and_native_actions() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        async fn serve(body: String) -> (String, tokio::task::JoinHandle<()>) {
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        fn frame_element<'a>(state: &'a Value, name: &str) -> &'a Value {
+            state["elements"]
+                .as_array()
+                .expect("snapshot elements")
+                .iter()
+                .find(|element| element["name"] == name)
+                .unwrap_or_else(|| panic!("frame element '{name}' missing from {state}"))
+        }
+
+        async fn serve(
+            body: String,
+            advertised_host: &str,
+        ) -> (String, tokio::task::JoinHandle<()>) {
+            let listener = tokio::net::TcpListener::bind("0.0.0.0:0")
                 .await
                 .expect("bind test server");
             let port = listener.local_addr().expect("server address").port();
@@ -2375,15 +3379,24 @@ mod tests {
                     let _ = socket.shutdown().await;
                 }
             });
-            (format!("http://127.0.0.1:{port}"), task)
+            (format!("http://{advertised_host}:{port}"), task)
         }
 
-        let child_body = r#"<!doctype html><html><body><button id="inside" onclick="this.textContent='Clicked inside frame'">Click inside frame</button></body></html>"#.to_string();
-        let (child_url, child_server) = serve(child_body).await;
+        let child_body = r#"<!doctype html><html><body>
+            <button id="inside" onclick="this.textContent='Clicked inside frame'">Click inside frame</button>
+            <input id="frame-input" aria-label="Frame input" onkeydown="if(event.key==='Enter'){document.getElementById('key-status').textContent=event.isTrusted?'Trusted frame key':'Synthetic frame key'}">
+            <p id="key-status" role="status"></p>
+            <select id="frame-choice" aria-label="Frame choice">
+                <option value="alpha">Alpha</option><option value="beta">Beta</option>
+            </select>
+            <input id="frame-upload" type="file" aria-label="Frame upload" hidden onchange="document.getElementById('upload-status').textContent='Uploaded '+this.files[0].name">
+            <p id="upload-status" role="status"></p>
+        </body></html>"#.to_string();
+        let (child_url, child_server) = serve(child_body, "127.0.0.1").await;
         let parent_body = format!(
             r#"<!doctype html><html><body><h1>Parent</h1><iframe src="{child_url}"></iframe></body></html>"#
         );
-        let (parent_url, parent_server) = serve(parent_body).await;
+        let (parent_url, parent_server) = serve(parent_body, "localhost").await;
 
         let profile = "cross-origin-frame-live-test";
         let (tool, _dir) = isolated_live_tool(profile);
@@ -2396,11 +3409,16 @@ mod tests {
             .get_page(profile, None)
             .await
             .expect("blank page");
-        tokio::time::timeout(Duration::from_secs(15), page.goto(&parent_url))
-            .await
-            .expect("navigation deadline")
-            .expect("navigate parent");
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            page.execute(
+                chromiumoxide::cdp::browser_protocol::page::NavigateParams::new(&parent_url),
+            ),
+        )
+        .await
+        .expect("navigation deadline")
+        .expect("navigate parent");
+        tokio::time::sleep(Duration::from_secs(2)).await;
 
         let parent_can_read_child: bool = page
             .evaluate(
@@ -2413,18 +3431,15 @@ mod tests {
         assert!(!parent_can_read_child, "fixture must be cross-origin");
 
         let target_id = page.target_id().inner().clone();
-        let key = BrowserTool::store_key("global", profile, Some(&target_id));
-        let snapshot = snapshot::take_snapshot(
-            &page,
-            &SnapshotOptions {
-                interactive_only: true,
-                ..Default::default()
-            },
-            &tool.snapshot_store,
-            &key,
-        )
-        .await
-        .expect("frame-aware snapshot");
+        let snapshot = tool
+            .execute(json!({
+                "action": "snapshot",
+                "profile": profile,
+                "targetId": target_id,
+                "interactive": true,
+            }))
+            .await
+            .expect("frame-aware snapshot");
         let frame_button = snapshot["elements"]
             .as_array()
             .expect("snapshot elements")
@@ -2432,18 +3447,22 @@ mod tests {
             .find(|element| element["name"] == "Click inside frame")
             .unwrap_or_else(|| panic!("button inside cross-origin frame: {snapshot}"));
         assert!(frame_button["frame_id"].is_string(), "{frame_button}");
+        assert!(
+            frame_button["target_id"].is_string(),
+            "the fixture must be captured through a real OOPIF target: {frame_button}"
+        );
         let frame_ref = frame_button["ref"].as_str().expect("frame ref");
 
-        let outcome = actions::execute_act(
-            &page,
-            &tool.snapshot_store,
-            &key,
-            "click",
-            frame_ref,
-            &json!({}),
-        )
-        .await
-        .expect("cross-origin click outcome");
+        let outcome = tool
+            .execute(json!({
+                "action": "act",
+                "actAction": "click",
+                "profile": profile,
+                "targetId": target_id,
+                "ref": frame_ref,
+            }))
+            .await
+            .expect("cross-origin click outcome");
         assert_eq!(outcome["outcome"], "applied", "{outcome}");
         assert_eq!(outcome["page_state_status"], "captured", "{outcome}");
         let post_elements = outcome["page_state"]["elements"]
@@ -2454,6 +3473,98 @@ mod tests {
                 .iter()
                 .any(|element| element["name"] == "Clicked inside frame"),
             "post-action snapshot did not independently observe the click: {outcome}"
+        );
+
+        let input_ref = frame_element(&outcome["page_state"], "Frame input")["ref"]
+            .as_str()
+            .expect("OOPIF input ref")
+            .to_string();
+        let typed = tool
+            .execute(json!({
+                "action":"act", "actAction":"fill", "text":"OOPIF text",
+                "profile":profile, "targetId":target_id, "ref":input_ref,
+            }))
+            .await
+            .expect("cross-origin fill outcome");
+        assert_eq!(typed["outcome"], "applied", "{typed}");
+        assert_eq!(
+            frame_element(&typed["page_state"], "Frame input")["value"],
+            "OOPIF text",
+            "{typed}"
+        );
+
+        let input_ref = frame_element(&typed["page_state"], "Frame input")["ref"]
+            .as_str()
+            .expect("refreshed OOPIF input ref");
+        let pressed = tool
+            .execute(json!({
+                "action":"act", "actAction":"press", "key":"Enter",
+                "profile":profile, "targetId":target_id, "ref":input_ref,
+            }))
+            .await
+            .expect("cross-origin key outcome");
+        assert_eq!(pressed["outcome"], "applied", "{pressed}");
+        assert!(
+            pressed["page_state"]["elements"]
+                .as_array()
+                .expect("post-key snapshot")
+                .iter()
+                .any(|element| element["name"] == "Trusted frame key"),
+            "OOPIF key event was not independently observed as trusted: {pressed}"
+        );
+
+        let choice_ref = frame_element(&pressed["page_state"], "Frame choice")["ref"]
+            .as_str()
+            .expect("OOPIF choice ref");
+        let options = tool
+            .execute(json!({
+                "action":"act", "actAction":"options",
+                "profile":profile, "targetId":target_id, "ref":choice_ref,
+            }))
+            .await
+            .expect("cross-origin options outcome");
+        assert_eq!(
+            options["options"].as_array().map(Vec::len),
+            Some(2),
+            "{options}"
+        );
+        let choice_ref = frame_element(&options["page_state"], "Frame choice")["ref"]
+            .as_str()
+            .expect("refreshed OOPIF choice ref");
+        let selected = tool
+            .execute(json!({
+                "action":"act", "actAction":"select", "value":"beta",
+                "profile":profile, "targetId":target_id, "ref":choice_ref,
+            }))
+            .await
+            .expect("cross-origin select outcome");
+        assert_eq!(selected["outcome"], "applied", "{selected}");
+        assert_eq!(
+            frame_element(&selected["page_state"], "Frame choice")["value"],
+            "beta",
+            "{selected}"
+        );
+
+        let upload_ref = frame_element(&selected["page_state"], "Frame upload")["ref"]
+            .as_str()
+            .expect("OOPIF upload ref");
+        let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+        let uploaded = tool
+            .execute(json!({
+                "action":"act", "actAction":"upload",
+                "path":fixture.display().to_string(),
+                "profile":profile, "targetId":target_id, "ref":upload_ref,
+            }))
+            .await
+            .expect("cross-origin upload outcome");
+        assert_eq!(uploaded["outcome"], "applied", "{uploaded}");
+        assert!(
+            uploaded["page_state"]["elements"]
+                .as_array()
+                .expect("post-upload snapshot")
+                .iter()
+                .any(|element| element["name"] == "Uploaded Cargo.toml"),
+            "OOPIF upload was not independently observed: {uploaded}"
         );
 
         let _ = tool.manager.stop(profile).await;
@@ -2623,6 +3734,10 @@ mod tests {
             "click",
             ref_id,
             &json!({}),
+            actions::ActionPolicies {
+                dialog: config::DialogPolicy::Auto,
+                navigation: &config::SsrfPolicy::default(),
+            },
         )
         .await
         .expect("dialog click outcome");

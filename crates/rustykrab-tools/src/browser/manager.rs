@@ -42,13 +42,29 @@ const PAGE_PROBE_TIMEOUT_MS: u64 = 2_000;
 /// multiply the per-probe budget by the number of tabs.
 const RESOLVE_PROBE_BUDGET_MS: u64 = 5_000;
 
+fn execution_capabilities() -> serde_json::Value {
+    serde_json::json!({
+        "transport": "chrome-devtools-protocol",
+        "primary_driver": "chromiumoxide",
+        "oopif_driver": "raw-cdp-target-sessions",
+        "uses_playwright": false,
+        "site_isolated_iframes": true,
+        "native_mouse_keyboard_upload": true,
+        "redirect_and_popup_policy": "tool-boundary-guarded",
+        "persistent_storage": "chrome-profile",
+        "captcha": "detect-only",
+        "har_recording": false,
+        "video_recording": false,
+        "cloud_captcha_solver": false,
+    })
+}
+
 /// Stealth-oriented Chrome launch flags. These reduce the most obvious
 /// "this is a headed automation browser" signals — automation banner,
 /// `navigator.webdriver`, and the timer throttling that causes the macOS
 /// "Chrome went to sleep" pattern.
 const STEALTH_LAUNCH_ARGS: &[&str] = &[
     "--disable-blink-features=AutomationControlled",
-    "--disable-features=IsolateOrigins,site-per-process",
     "--window-size=1920,1080",
     "--lang=en-US",
     "--disable-background-timer-throttling",
@@ -301,6 +317,21 @@ impl BrowserManager {
         Ok(Arc::clone(&self.instances))
     }
 
+    /// Browser-level DevTools websocket used by the narrow OOPIF bridge.
+    /// chromiumoxide remains the primary driver; this endpoint is exposed
+    /// only because it does not surface attached iframe sessions as pages.
+    pub async fn websocket_address(&self, profile_name: &str) -> Result<String> {
+        let instances = self.instances.lock().await;
+        instances
+            .get(profile_name)
+            .map(|instance| instance.browser.websocket_address().clone())
+            .ok_or_else(|| {
+                Error::ToolExecution(
+                    format!("browser profile '{profile_name}' is not running").into(),
+                )
+            })
+    }
+
     /// Check the status of a profile's browser.
     pub async fn status(&self, profile_name: &str) -> serde_json::Value {
         let instances = self.instances.lock().await;
@@ -357,6 +388,11 @@ impl BrowserManager {
                 "downloads_status": if inst.download_tracker.is_some() { "ready" } else { "unavailable" },
                 "download_dir": download_dir,
                 "download_setup_error": inst.download_setup_error,
+                "attached_downloads_enabled": self.config.allow_attached_downloads,
+                "site_isolation_disabled": self.config.disable_site_isolation,
+                "dialog_policy": self.config.dialog_policy,
+                "auto_focus_new_tabs": self.config.auto_focus_new_tabs,
+                "execution_capabilities": execution_capabilities(),
                 "tabs": page_count
             })
         } else {
@@ -368,6 +404,7 @@ impl BrowserManager {
                 "profile": profile_name,
                 "cdp_url": cdp_url,
                 "launched_by_us": false,
+                "execution_capabilities": execution_capabilities(),
                 "tabs": 0
             })
         }
@@ -603,6 +640,25 @@ impl BrowserManager {
             "count": tabs.len(),
             "profile": profile_name
         }))
+    }
+
+    /// Snapshot current top-level page target ids without probing page state.
+    /// Used to attribute popup tabs to one action.
+    pub async fn target_ids(
+        &self,
+        profile_name: &str,
+    ) -> Result<std::collections::HashSet<String>> {
+        let instances = self.instances.lock().await;
+        let inst = instances.get(profile_name).ok_or_else(|| {
+            Error::ToolExecution(format!("browser not running for profile '{profile_name}'").into())
+        })?;
+        let pages = inst.browser.pages().await.map_err(|error| {
+            Error::ToolExecution(format!("failed to list tabs: {error}").into())
+        })?;
+        Ok(pages
+            .into_iter()
+            .map(|page| page.target_id().inner().clone())
+            .collect())
     }
 
     /// Open a new tab with the given URL.
@@ -1136,6 +1192,16 @@ impl BrowserManager {
                 ),
             );
         }
+        if !self.config.is_managed_profile(profile_name) && !self.config.allow_attached_downloads {
+            return (
+                None,
+                None,
+                Some(
+                    "download observation is disabled for attached Chrome because Browser.setDownloadBehavior is browser-wide; set allowAttachedDownloads=true to opt in"
+                        .to_string(),
+                ),
+            );
+        }
         setup_download_tracker(
             browser,
             self.config.resolve_download_dir(profile_name),
@@ -1393,6 +1459,9 @@ fn launch_browser_blocking(
     // extra_args so explicit overrides win.
     for flag in STEALTH_LAUNCH_ARGS {
         args.push((*flag).to_string());
+    }
+    if config.disable_site_isolation {
+        args.push("--disable-features=IsolateOrigins,site-per-process".to_string());
     }
 
     // Extra args from config

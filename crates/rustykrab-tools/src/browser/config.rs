@@ -89,6 +89,27 @@ pub struct BrowserConfig {
     #[serde(default)]
     pub ssrf_policy: SsrfPolicy,
 
+    /// How JavaScript dialogs opened by browser actions are handled.
+    #[serde(default)]
+    pub dialog_policy: DialogPolicy,
+
+    /// Automatically focus the only new, policy-approved tab opened by an
+    /// action. Multiple simultaneous popups are reported but not guessed at.
+    #[serde(default = "default_true")]
+    pub auto_focus_new_tabs: bool,
+
+    /// Allow RustyKrab to change browser-wide download behavior when attached
+    /// to a Chrome process it did not launch. Off by default because Chrome's
+    /// Browser.setDownloadBehavior affects the operator's own tabs too.
+    #[serde(default)]
+    pub allow_attached_downloads: bool,
+
+    /// Disable Chrome site isolation as an opt-in compatibility escape hatch.
+    /// The default remains secure: the OOPIF bridge handles cross-origin frames
+    /// without weakening Chromium's process boundary.
+    #[serde(default)]
+    pub disable_site_isolation: bool,
+
     /// Extra arguments to pass to the browser on launch.
     #[serde(default)]
     pub extra_args: Vec<String>,
@@ -160,6 +181,29 @@ pub struct SsrfPolicy {
     /// Hostnames explicitly allowed regardless of SSRF rules.
     #[serde(default)]
     pub hostname_allowlist: Vec<String>,
+
+    /// If non-empty, navigation is limited to these exact hosts or explicit
+    /// `*.example.com` suffix patterns. Deny rules are still applied first.
+    #[serde(default)]
+    pub allowed_domains: Vec<String>,
+
+    /// Exact hosts or explicit `*.example.com` suffix patterns that navigation
+    /// must never reach, including through redirects and page-opened tabs.
+    #[serde(default)]
+    pub prohibited_domains: Vec<String>,
+}
+
+/// JavaScript dialog handling policy.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum DialogPolicy {
+    /// Match browser-use: accept alert/confirm/beforeunload, dismiss prompt.
+    #[default]
+    Auto,
+    /// Accept every dialog, including prompts with an empty response.
+    Accept,
+    /// Dismiss every dialog.
+    Dismiss,
 }
 
 impl Default for BrowserConfig {
@@ -196,6 +240,10 @@ impl Default for BrowserConfig {
             cdp_request_timeout_ms: 10_000,
             profiles,
             ssrf_policy: SsrfPolicy::default(),
+            dialog_policy: DialogPolicy::default(),
+            auto_focus_new_tabs: true,
+            allow_attached_downloads: false,
+            disable_site_isolation: false,
             extra_args: Vec::new(),
         }
     }
@@ -359,6 +407,18 @@ impl BrowserConfig {
             .unwrap_or(self.attach_only)
     }
 
+    /// Whether the profile is RustyKrab-owned rather than an operator or
+    /// remote browser. Browser-wide settings are safe only for owned profiles
+    /// unless the operator opts in explicitly.
+    pub fn is_managed_profile(&self, profile_name: &str) -> bool {
+        matches!(
+            self.profiles
+                .get(profile_name)
+                .map(|profile| &profile.driver),
+            Some(DriverType::Rustykrab) | None
+        )
+    }
+
     /// Resolve the executable path for a profile.
     pub fn resolve_executable(&self, profile_name: &str) -> Option<String> {
         self.profiles
@@ -495,5 +555,16 @@ mod isolated_root_tests {
         assert!(config.is_remote_profile("remote"));
         assert!(!config.is_remote_profile("attached"));
         assert!(!config.is_remote_profile("missing"));
+        assert!(config.is_managed_profile("missing"));
+        assert!(!config.is_managed_profile("attached"));
+    }
+
+    #[test]
+    fn browser_use_compatibility_policies_have_explicit_defaults() {
+        let config: BrowserConfig = serde_json::from_str("{}").expect("browser config");
+        assert_eq!(config.dialog_policy, DialogPolicy::Auto);
+        assert!(config.auto_focus_new_tabs);
+        assert!(!config.allow_attached_downloads);
+        assert!(!config.disable_site_isolation);
     }
 }
