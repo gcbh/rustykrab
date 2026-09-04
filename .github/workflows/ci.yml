@@ -84,12 +84,16 @@ jobs:
       # scripted agent. Green = implemented scenarios pass and no Phase 2
       # target scenario passes unexpectedly.
       - run: scripts/e2e.sh
-      - name: Upload scenario report
+        env:
+          E2E_ARTIFACT_DIR: e2e-artifacts
+      - name: Upload scenario evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: e2e-report
-          path: e2e-report.json
+          path: |
+            e2e-report.json
+            e2e-artifacts/
           if-no-files-found: ignore
 
   # Gate job: add this as a required status check in branch protection

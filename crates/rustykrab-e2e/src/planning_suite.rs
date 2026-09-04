@@ -39,8 +39,22 @@ pub(crate) fn scenarios() -> Vec<(Expected, (&'static str, ScenarioFn))> {
         (
             Expected::XFail,
             (
-                "planning/restart-compaction-rehydrates-linked-state",
-                boxed(restart_compaction),
+                "planning/snapshot-reconstructs-linked-state",
+                boxed(snapshot_reconstruction),
+            ),
+        ),
+        (
+            Expected::XFail,
+            (
+                "planning/daemon-restart-rehydrates-linked-state",
+                boxed(daemon_restart),
+            ),
+        ),
+        (
+            Expected::XFail,
+            (
+                "planning/compaction-rehydrates-linked-state",
+                boxed(compaction_reconstruction),
             ),
         ),
         (
@@ -195,7 +209,7 @@ async fn material_question_impl(ctx: &Ctx) -> Result<()> {
 }
 scenario_fn!(material_question, material_question_impl);
 
-async fn restart_compaction_impl(ctx: &Ctx) -> Result<()> {
+async fn snapshot_reconstruction_impl(ctx: &Ctx) -> Result<()> {
     let (_repo, project) = create_vague_project(ctx).await?;
     let project_id = require_string(&project, "id")?;
     let snapshot = get_json(ctx, &format!("/api/projects/{project_id}/snapshot")).await?;
@@ -221,7 +235,75 @@ async fn restart_compaction_impl(ctx: &Ctx) -> Result<()> {
     }
     Ok(())
 }
-scenario_fn!(restart_compaction, restart_compaction_impl);
+scenario_fn!(snapshot_reconstruction, snapshot_reconstruction_impl);
+
+async fn daemon_restart_impl(ctx: &Ctx) -> Result<()> {
+    let (_repo, project) = create_vague_project(ctx).await?;
+    let project_id = require_string(&project, "id")?;
+    let revision_id = require_string(&project, "current_revision")?;
+
+    let (previous_pid, replacement_pid) = ctx.restart_daemon().await?;
+    let snapshot = get_json(ctx, &format!("/api/projects/{project_id}/snapshot")).await?;
+    if snapshot["current_revision"] != revision_id {
+        bail!("daemon restart changed the current revision: {snapshot}");
+    }
+    let project_rows = ctx.count(
+        "SELECT COUNT(*) FROM projects WHERE id = ?1 AND current_revision = ?2",
+        &[&project_id, &revision_id],
+    )?;
+    let revision_rows = ctx.count(
+        "SELECT COUNT(*) FROM project_revisions WHERE project_id = ?1 AND id = ?2",
+        &[&project_id, &revision_id],
+    )?;
+    if project_rows != 1 || revision_rows != 1 {
+        bail!(
+            "restarted daemon did not reopen the same state: projects={project_rows}, \
+             revisions={revision_rows}"
+        );
+    }
+
+    ctx.write_evidence(
+        "planning/daemon-restart.json",
+        &json!({
+            "schema_version": 1,
+            "scenario": "planning/daemon-restart-rehydrates-linked-state",
+            "result": "verified",
+            "process": {
+                "previous_pid": previous_pid,
+                "replacement_pid": replacement_pid,
+                "distinct_processes": previous_pid != replacement_pid,
+            },
+            "service": {
+                "project_id": project_id,
+                "current_revision": revision_id,
+                "snapshot_revision": snapshot["current_revision"],
+            },
+            "database": {
+                "project_rows": project_rows,
+                "revision_rows": revision_rows,
+            },
+        }),
+    )?;
+    Ok(())
+}
+scenario_fn!(daemon_restart, daemon_restart_impl);
+
+async fn compaction_reconstruction_impl(ctx: &Ctx) -> Result<()> {
+    let (_repo, project) = create_vague_project(ctx).await?;
+    let project_id = require_string(&project, "id")?;
+    let response = ctx
+        .post(
+            &format!("/api/projects/{project_id}/planning/compact"),
+            json!({"retain_after_message_id": "message-003-decision"}),
+        )
+        .await?;
+    let snapshot = expect_json(response, 200, "compact planning conversation").await?;
+    if snapshot["current_revision"] != project["current_revision"] {
+        bail!("compaction changed the project revision: {snapshot}");
+    }
+    Ok(())
+}
+scenario_fn!(compaction_reconstruction, compaction_reconstruction_impl);
 
 async fn decision_correction_impl(ctx: &Ctx) -> Result<()> {
     let (_repo, project) = create_vague_project(ctx).await?;
@@ -409,7 +491,7 @@ mod tests {
                 .iter()
                 .filter(|(expected, _)| *expected == Expected::XFail)
                 .count(),
-            8
+            10
         );
     }
 }

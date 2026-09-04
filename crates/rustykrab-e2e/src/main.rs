@@ -29,7 +29,9 @@ mod planning_suite;
 mod surface;
 mod transcript;
 
+use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -255,6 +257,9 @@ struct Ctx {
     bin: String,
     /// The daemon's data dir — CLI subcommands must see the same store.
     data_dir: std::path::PathBuf,
+    /// Owns the disposable daemon so scenarios can prove restart recovery
+    /// against the same port and data directory.
+    daemon: Arc<tokio::sync::Mutex<Option<Child>>>,
 }
 
 impl Ctx {
@@ -278,6 +283,48 @@ impl Ctx {
             Err(e) if e.to_string().contains("no such table") => Ok(0),
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// Persist machine-readable proof outside the throwaway daemon directory.
+    fn write_evidence(&self, relative_path: &str, evidence: &Value) -> Result<PathBuf> {
+        write_json_artifact(&artifact_dir(), relative_path, evidence)
+    }
+
+    /// Stop the live daemon, prove the port went dark, and boot a distinct
+    /// process against the same durable state.
+    async fn restart_daemon(&self) -> Result<(u32, u32)> {
+        let mut daemon = self.daemon.lock().await;
+        let previous = daemon
+            .take()
+            .ok_or_else(|| anyhow!("daemon is not running"))?;
+        let previous_pid = previous.id();
+        shutdown_daemon(previous).await;
+
+        if self
+            .client
+            .get(self.url("/api/health"))
+            .send()
+            .await
+            .is_ok()
+        {
+            bail!("daemon still answered after shutdown");
+        }
+
+        let mut replacement = spawn_daemon(&self.bin, &self.data_dir, self.port()?)?;
+        let replacement_pid = replacement.id();
+        if replacement_pid == previous_pid {
+            bail!("replacement daemon reused pid {previous_pid}");
+        }
+        wait_for_health(&self.base, &self.client, &mut replacement).await?;
+        *daemon = Some(replacement);
+        Ok((previous_pid, replacement_pid))
+    }
+
+    fn port(&self) -> Result<u16> {
+        self.base
+            .rsplit_once(':')
+            .and_then(|(_, port)| port.parse().ok())
+            .ok_or_else(|| anyhow!("invalid harness base URL: {}", self.base))
     }
 
     /// Run a daemon CLI subcommand with the harness environment.
@@ -1727,7 +1774,10 @@ async fn main() -> Result<()> {
         },
     });
 
-    println!("{}", serde_json::to_string_pretty(&report)?);
+    let report_text = serde_json::to_string_pretty(&report)?;
+    let report_path = write_json_artifact(&artifact_dir(), "e2e-report.json", &report)?;
+    println!("{report_text}");
+    eprintln!("evidence report: {}", report_path.display());
     if !ok {
         std::process::exit(1);
     }
@@ -1743,9 +1793,13 @@ async fn run_scripted(bin: &str, case_filter: Option<&str>) -> Result<Vec<Scenar
     let data_dir = tmp.path().to_path_buf();
     let port = pick_free_port()?;
 
-    let mut child = spawn_daemon(bin, &data_dir, port)?;
-    let result = run_suite(bin, &data_dir, port, &mut child, case_filter).await;
-    shutdown_daemon(child).await;
+    let daemon = Arc::new(tokio::sync::Mutex::new(Some(spawn_daemon(
+        bin, &data_dir, port,
+    )?)));
+    let result = run_suite(bin, &data_dir, port, Arc::clone(&daemon), case_filter).await;
+    if let Some(child) = daemon.lock().await.take() {
+        shutdown_daemon(child).await;
+    }
     keep_or_drop(tmp);
     result
 }
@@ -1864,6 +1918,32 @@ fn keep_or_drop(tmp: tempfile::TempDir) {
     }
 }
 
+fn artifact_dir() -> PathBuf {
+    std::env::var_os("E2E_ARTIFACT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("target/e2e-artifacts"))
+}
+
+fn write_json_artifact(root: &Path, relative_path: &str, value: &Value) -> Result<PathBuf> {
+    let relative = Path::new(relative_path);
+    if relative.is_absolute()
+        || relative
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        bail!("artifact path must contain only normal relative components: {relative_path}");
+    }
+    let path = root.join(relative);
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("artifact path has no parent: {}", path.display()))?;
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("create artifact directory {}", parent.display()))?;
+    std::fs::write(&path, serde_json::to_vec_pretty(value)?)
+        .with_context(|| format!("write evidence artifact {}", path.display()))?;
+    Ok(path)
+}
+
 /// The last few lines of the daemon log — a startup failure is otherwise
 /// reported as a bare exit status, which says nothing about the cause.
 fn log_tail(data_dir: &std::path::Path) -> String {
@@ -1907,7 +1987,7 @@ async fn run_suite(
     bin: &str,
     data_dir: &std::path::Path,
     port: u16,
-    child: &mut Child,
+    daemon: Arc<tokio::sync::Mutex<Option<Child>>>,
     case_filter: Option<&str>,
 ) -> Result<Vec<ScenarioReport>> {
     let base = format!("http://127.0.0.1:{port}");
@@ -1919,7 +1999,17 @@ async fn run_suite(
         .default_headers(headers)
         .timeout(Duration::from_secs(120))
         .build()?;
-    wait_for_health(&base, &client, child).await?;
+    {
+        let mut child = daemon.lock().await;
+        wait_for_health(
+            &base,
+            &client,
+            child
+                .as_mut()
+                .ok_or_else(|| anyhow!("daemon is not running"))?,
+        )
+        .await?;
+    }
 
     // Open the store only after the daemon is healthy — it owns the
     // database and its migrations; this is a read handle for assertions.
@@ -1931,6 +2021,7 @@ async fn run_suite(
         db_path: data_dir.join("db").join("store.db"),
         bin: bin.to_string(),
         data_dir: data_dir.to_path_buf(),
+        daemon,
     };
 
     let scenarios: Vec<_> = scripted_scenarios()
