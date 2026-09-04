@@ -843,6 +843,9 @@ async fn run_once(
             db_path: data_dir.join("db").join("store.db"),
             bin: bin.to_string(),
             data_dir: data_dir.clone(),
+            // Model scenarios already own their one-shot daemon directly;
+            // only the scripted planning suite exercises in-scenario restarts.
+            daemon: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
         };
 
         let started = Instant::now();

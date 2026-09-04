@@ -28,6 +28,11 @@ for arg in "$@"; do
   fi
 done
 
+# Bind every machine-readable evidence artifact to the exact checkout that
+# built the daemon and runner. Callers may override this for packaged sources
+# that do not include Git metadata.
+E2E_SOURCE_REVISION="${RUSTYKRAB_E2E_SOURCE_REVISION:-$(git rev-parse HEAD)}"
+
 echo "building daemon (--no-default-features)..." >&2
 cargo build -p rustykrab-cli --no-default-features "${CARGO_FLAGS[@]+"${CARGO_FLAGS[@]}"}"
 echo "building e2e runner..." >&2
@@ -36,7 +41,8 @@ cargo build -p rustykrab-e2e "${CARGO_FLAGS[@]+"${CARGO_FLAGS[@]}"}"
 # Report goes to stdout and to e2e-report.json (CI uploads it as an
 # artifact); the exit code is the runner's.
 set +e
-RUSTYKRAB_BIN="target/$PROFILE/rustykrab-cli" "target/$PROFILE/rustykrab-e2e" \
+RUSTYKRAB_E2E_SOURCE_REVISION="$E2E_SOURCE_REVISION" \
+  RUSTYKRAB_BIN="target/$PROFILE/rustykrab-cli" "target/$PROFILE/rustykrab-e2e" \
   "${RUNNER_ARGS[@]+"${RUNNER_ARGS[@]}"}" | tee e2e-report.json
 status=${PIPESTATUS[0]}
 exit "$status"
