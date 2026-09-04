@@ -1,8 +1,8 @@
 # Architecture & Reusability Evaluation
 
 A structural review of the RustyKrab workspace. The second-pass baseline was
-`main` at `fd1f1e2`; the current tree is roughly 85k lines across 13 crates and
-932 tests. The first pass ran against `d945495`; what it changed is recorded in
+`main` at `fd1f1e2`; the current tree is roughly 88k lines across 14 crates and
+939 tests. The first pass ran against `d945495`; what it changed is recorded in
 [`05-first-pass-outcome.md`](05-first-pass-outcome.md).
 
 The review is deliberately split into **description** and **judgement**, because
@@ -34,6 +34,7 @@ Per-component detail lives next to the code, one file per crate:
 - [`crates/rustykrab-dream/ARCHITECTURE.md`](../../crates/rustykrab-dream/ARCHITECTURE.md)
 - [`crates/rustykrab-cli/ARCHITECTURE.md`](../../crates/rustykrab-cli/ARCHITECTURE.md)
 - [`crates/rustykrab-e2e/ARCHITECTURE.md`](../../crates/rustykrab-e2e/ARCHITECTURE.md)
+- [`crates/rustykrab-projects/ARCHITECTURE.md`](../../crates/rustykrab-projects/ARCHITECTURE.md)
 
 ## Judgement (whether it is right and sensible)
 

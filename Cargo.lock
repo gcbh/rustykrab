@@ -4265,6 +4265,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustykrab-projects"
+version = "5.2.28"
+dependencies = [
+ "chrono",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
+ "uuid",
+]
+
+[[package]]
 name = "rustykrab-providers"
 version = "5.2.28"
 dependencies = [
