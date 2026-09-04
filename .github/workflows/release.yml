@@ -31,6 +31,7 @@ jobs:
       github.event.pull_request.merged == true
     runs-on: ubuntu-latest
     outputs:
+      should_release: ${{ steps.release-owner.outputs.should_release }}
       version: ${{ steps.bump.outputs.version }}
       tag: ${{ steps.bump.outputs.tag }}
     steps:
@@ -46,13 +47,35 @@ jobs:
           fetch-depth: 0
           token: ${{ steps.app-token.outputs.token }}
 
+      - name: Select release owner
+        id: release-owner
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha || '' }}
+        run: |
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git fetch origin main
+          MAIN_TIP=$(git rev-parse origin/main)
+          if [ "$MAIN_TIP" = "$MERGE_SHA" ]; then
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Skipping release for a non-tip member of an atomic PR stack merge."
+          fi
+
       - name: Configure git
+        if: steps.release-owner.outputs.should_release == 'true'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
       - name: Determine bump type
         id: bump-type
+        if: steps.release-owner.outputs.should_release == 'true'
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "bump=${{ inputs.bump }}" >> "$GITHUB_OUTPUT"
@@ -69,6 +92,7 @@ jobs:
 
       - name: Bump version
         id: bump
+        if: steps.release-owner.outputs.should_release == 'true'
         env:
           PR_TITLE: ${{ github.event.pull_request.title || 'Manual release' }}
           PR_NUMBER: ${{ github.event.pull_request.number || '0' }}
@@ -89,7 +113,14 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
 
+      - name: Verify reproducible lockfile
+        if: steps.release-owner.outputs.should_release == 'true'
+        run: |
+          cargo metadata --format-version 1 >/dev/null
+          git diff --exit-code -- Cargo.lock
+
       - name: Push version commit and tag
+        if: steps.release-owner.outputs.should_release == 'true'
         env:
           APP_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
@@ -105,6 +136,7 @@ jobs:
   build:
     name: Build (${{ matrix.target }})
     needs: bump
+    if: needs.bump.outputs.should_release == 'true'
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
@@ -347,6 +379,7 @@ jobs:
   release:
     name: Create GitHub Release
     needs: [bump, build]
+    if: needs.bump.outputs.should_release == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
