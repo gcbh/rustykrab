@@ -19,6 +19,7 @@ of the code holds; the judgement is one reviewer's opinion at one point in time.
 | [`03-dead-code-audit.md`](03-dead-code-audit.md) | The unreferenced items, what each is for, and whether to wire or delete it |
 | [`05-first-pass-outcome.md`](05-first-pass-outcome.md) | Which first-pass findings were acted on, and which were wrong |
 | [`06-release-pipeline.md`](06-release-pipeline.md) | Merge-triggered versioning, stack ownership, reproducibility, build, signing, and publication |
+| [`07-browser-use-parity.md`](07-browser-use-parity.md) | Rust browser execution parity with browser-use, verification evidence, and deliberate discontinuities |
 
 Per-component detail lives next to the code, one file per crate:
 

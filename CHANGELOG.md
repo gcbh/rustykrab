@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.2.37] - 2026-09-04
+
+- feat(browser): add CDP-native browser-use parity (#639)
+
 ## [5.2.36] - 2026-09-04
 
 - feat(cron): show each job's next run in its own zone (#630)
