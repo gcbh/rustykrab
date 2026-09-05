@@ -40,6 +40,18 @@ use snapshot::{SnapshotMode, SnapshotOptions, SnapshotStore};
 
 const MAX_CONTENT_BYTES: usize = 50 * 1024; // 50KB cap for page content
 
+/// Compact snapshots display refs in square brackets (`[s4-12]`). Models
+/// commonly copy that visible token verbatim even though the structured form
+/// contains `s4-12`. Accept both spellings at the tool boundary.
+fn normalize_snapshot_ref(value: &str) -> &str {
+    let trimmed = value.trim();
+    trimmed
+        .strip_prefix('[')
+        .and_then(|inner| inner.strip_suffix(']'))
+        .unwrap_or(trimmed)
+        .trim()
+}
+
 #[derive(Debug)]
 struct NavigationObservation {
     status: &'static str,
@@ -393,7 +405,7 @@ fn schema_parameters() -> serde_json::Value {
             },
             "ref": {
                 "type": "string",
-                "description": "Complete snapshot-scoped element ref (e.g., 's4-12' or 's4-e12'). Required for act and fill_credential; never reuse a ref after receiving newer page_state/snapshot output."
+                "description": "Complete snapshot-scoped element ref (e.g., 's4-12', '[s4-12]', or 's4-e12'). Required for act and fill_credential; square brackets copied from compact snapshot lines are accepted. Never reuse a ref after receiving newer page_state/snapshot output."
             },
             "actAction": {
                 "type": "string",
@@ -494,7 +506,7 @@ fn schema_parameters() -> serde_json::Value {
             },
             "compact": {
                 "type": "boolean",
-                "description": "Snapshot: compact output format (default: false)"
+                "description": "Snapshot: compact output format (default: false). Prefer true for routine control to keep repeated model turns fast."
             },
             "depth": {
                 "type": "integer",
@@ -1276,7 +1288,12 @@ impl Tool for BrowserTool {
          ask for it with credential_request under that name, then retry; \
          screenshot/content/evaluate/scroll/console/cookies/pdf. Snapshots report likely CAPTCHA providers but do not claim to solve them. \
          Cookies persist across calls. Use snapshot + act for reliable element interaction. \
-         Each act returns its outcome plus page_state; clicks also return the current tabs \
+         Prefer compact=true and interactive=true for routine control; request \
+         interactive=false only when surrounding visible text is needed. Each act returns \
+         its outcome plus compact page_state. Use refs from that returned page_state \
+         directly; do not request another snapshot after every action or repeat an \
+         unchanged snapshot. If the needed control is absent, scroll once and then take \
+         a fresh snapshot. Clicks also return the current tabs \
          and any JavaScript dialogs they accepted. Set expect_download=true on a download \
          click to wait for Chrome's completion event; a click alone is not download proof. \
          If outcome is \"unknown\", the browser \
@@ -1693,11 +1710,14 @@ impl Tool for BrowserTool {
 
             // ── Act (ref-based actions) ────────────────────────────
             "act" => {
-                let ref_id = args["ref"].as_str().ok_or_else(|| {
-                    Error::ToolExecution(
-                        "'act' requires 'ref' parameter from a previous snapshot".into(),
-                    )
-                })?;
+                let ref_id = args["ref"]
+                    .as_str()
+                    .map(normalize_snapshot_ref)
+                    .ok_or_else(|| {
+                        Error::ToolExecution(
+                            "'act' requires 'ref' parameter from a previous snapshot".into(),
+                        )
+                    })?;
                 let act_action = args["actAction"]
                     .as_str()
                     .ok_or_else(|| Error::ToolExecution(
@@ -1706,6 +1726,10 @@ impl Tool for BrowserTool {
 
                 let _ = self.manager.get_browser(&profile).await?;
                 let mut action_args = args.clone();
+                if let Some(target_ref) = args["targetRef"].as_str() {
+                    action_args["targetRef"] =
+                        Value::String(normalize_snapshot_ref(target_ref).to_string());
+                }
                 if act_action == "upload" {
                     if self.manager.config().is_remote_profile(&profile) {
                         return Err(Error::ToolExecution(ToolError::invalid_input(
@@ -1900,11 +1924,14 @@ impl Tool for BrowserTool {
             // fill action that undoes that on the way back in would make
             // the rest of this pointless.
             "fill_credential" => {
-                let ref_id = args["ref"].as_str().ok_or_else(|| {
-                    Error::ToolExecution(
-                        "'fill_credential' requires 'ref' from a previous snapshot".into(),
-                    )
-                })?;
+                let ref_id = args["ref"]
+                    .as_str()
+                    .map(normalize_snapshot_ref)
+                    .ok_or_else(|| {
+                        Error::ToolExecution(
+                            "'fill_credential' requires 'ref' from a previous snapshot".into(),
+                        )
+                    })?;
                 let field = args["field"].as_str().unwrap_or(crate::PASSWORD);
                 let secrets = self.secrets.as_ref().ok_or_else(|| {
                     Error::ToolExecution(
@@ -1926,38 +1953,47 @@ impl Tool for BrowserTool {
                 };
                 let cred_key = crate::origin_credential_key(&url, field)?;
 
-                let value = secrets.get(&cred_key).await.map_err(|_| {
-                    // Names the key so the agent can ask for exactly it.
-                    Error::ToolExecution(
-                        format!(
-                            "no credential stored under '{cred_key}'. Ask the user for it with \
-                             credential_request using that exact name, then try again."
-                        )
-                        .into(),
-                    )
-                })?;
-
-                // What is about to be typed, without saying it.
-                //
-                // `status: "filled"` was returned whether or not the right
-                // string reached the field, so a wrong fill and a right
-                // one were indistinguishable from outside -- the same
-                // shape of defect as a read that returns "" and calls it
-                // success. Length plus a short digest is enough to tell
-                // "the value arrived" from "something else did" when
-                // reading a failed run, and neither reveals the secret.
-                let digest = {
-                    use sha2::{Digest, Sha256};
-                    let mut h = Sha256::new();
-                    h.update(value.as_bytes());
-                    hex::encode(&h.finalize()[..4])
+                let value = match secrets.get(&cred_key).await {
+                    Ok(value) => value,
+                    Err(Error::NotFound(_)) => {
+                        match crate::origin_key::legacy_browser_credential_key(&url, field) {
+                            Some(legacy_key) => secrets.get(legacy_key).await.map_err(|error| {
+                                if matches!(error, Error::NotFound(_)) {
+                                    // Names only the canonical key so new requests converge on
+                                    // the origin-scoped namespace.
+                                    Error::ToolExecution(
+                                        format!(
+                                            "no credential stored under '{cred_key}'. Ask the user \
+                                             for it with credential_request using that exact name, \
+                                             then try again."
+                                        )
+                                        .into(),
+                                    )
+                                } else {
+                                    error
+                                }
+                            })?,
+                            None => {
+                                return Err(Error::ToolExecution(
+                                    format!(
+                                        "no credential stored under '{cred_key}'. Ask the user for \
+                                         it with credential_request using that exact name, then try \
+                                         again."
+                                    )
+                                    .into(),
+                                ));
+                            }
+                        }
+                    }
+                    Err(error) => return Err(error),
                 };
+
+                // Record the control boundary without logging the credential,
+                // its length, or a reusable fingerprint of it.
                 tracing::debug!(
                     key = %cred_key,
                     field,
-                    value_len = value.len(),
-                    value_sha256_prefix = %digest,
-                    "filling a credential field"
+                    "credential fill started"
                 );
 
                 let store_key = Self::store_key(&session, &profile, target_id);
@@ -1975,6 +2011,12 @@ impl Tool for BrowserTool {
                     },
                 )
                 .await?;
+                tracing::debug!(
+                    field,
+                    outcome = fill_outcome["outcome"].as_str().unwrap_or("missing"),
+                    stage = fill_outcome["stage"].as_str().unwrap_or("missing"),
+                    "browser credential fill completed"
+                );
 
                 if fill_outcome["outcome"] != "applied" {
                     let recovery = if fill_outcome["browser_degraded"].as_bool().unwrap_or(false) {
@@ -1999,18 +2041,14 @@ impl Tool for BrowserTool {
                     }));
                 }
 
-                // A fresh result rather than the fill's own. Nothing
-                // derived from the value travels back to the model — not
-                // its length, which for a password is worth guessing with.
-                // The length is reported so a caller can tell an empty
-                // or placeholder fill from a real one. The value is not.
+                // A fresh result rather than the fill's own. Nothing derived
+                // from the value travels back to the model.
                 Ok(json!({
                     "status": "filled",
                     "outcome": "applied",
                     "field": field,
                     "credentialKey": cred_key,
                     "ref": ref_id,
-                    "value_len": value.len(),
                     "page_state": fill_outcome["page_state"],
                 }))
             }
@@ -2765,10 +2803,24 @@ mod tests {
         assert!(act_description.contains("press -> key"));
         assert!(act_description.contains("drag -> targetRef"));
 
+        let ref_description = parameters["properties"]["ref"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(ref_description.contains("[s4-12]"));
+        assert!(ref_description.contains("square brackets"));
+
         let expression_description = parameters["properties"]["expression"]["description"]
             .as_str()
             .unwrap();
         assert!(expression_description.contains("Required when action='evaluate'"));
+    }
+
+    #[test]
+    fn compact_snapshot_refs_accept_their_displayed_brackets() {
+        assert_eq!(normalize_snapshot_ref("s4-12"), "s4-12");
+        assert_eq!(normalize_snapshot_ref("[s4-12]"), "s4-12");
+        assert_eq!(normalize_snapshot_ref("  [s4-e12]  "), "s4-e12");
+        assert_eq!(normalize_snapshot_ref("[]"), "");
     }
 
     #[tokio::test]
@@ -3068,6 +3120,75 @@ mod tests {
         (BrowserTool::with_config(config), dir)
     }
 
+    /// The secure fill boundary extends through serialization: a password may
+    /// exist in the DOM, but no snapshot sent to the model may contain it. The
+    /// same real-Chrome check proves that controls outside a scroll container's
+    /// clipping rectangle are omitted until the container is scrolled.
+    #[tokio::test]
+    #[ignore = "launches a real Chrome"]
+    async fn live_snapshot_hides_password_values_and_clipped_controls() {
+        let profile = "snapshot-privacy-live-test";
+        let (tool, _dir) = isolated_live_tool(profile);
+        tool.manager
+            .get_browser(profile)
+            .await
+            .expect("start browser");
+        let page = tool
+            .manager
+            .get_page(profile, None)
+            .await
+            .expect("blank page");
+        page.set_content(
+            r#"<html><body>
+                <input id="password" type="password" value="snapshot-must-not-leak">
+                <div style="height:100px;overflow:auto">
+                  <button id="visible">Visible choice</button>
+                  <div style="height:2500px"></div>
+                  <button id="clipped">Clipped choice</button>
+                </div>
+            </body></html>"#,
+        )
+        .await
+        .expect("set content");
+
+        let snapshot = snapshot::take_snapshot(
+            &page,
+            &SnapshotOptions {
+                interactive_only: true,
+                ..Default::default()
+            },
+            &tool.snapshot_store,
+            "test:snapshot-privacy",
+        )
+        .await
+        .expect("snapshot");
+        let elements = snapshot["elements"].as_array().expect("elements");
+        let password = elements
+            .iter()
+            .find(|element| {
+                element["ref"]
+                    .as_str()
+                    .is_some_and(|_| element["role"] == "textbox" && element["name"] == "")
+            })
+            .expect("password field");
+        assert_eq!(password["value"], serde_json::Value::Null, "{snapshot}");
+        assert!(
+            elements
+                .iter()
+                .any(|element| element["name"] == "Visible choice"),
+            "{snapshot}"
+        );
+        assert!(
+            !elements
+                .iter()
+                .any(|element| element["name"] == "Clipped choice"),
+            "{snapshot}"
+        );
+        assert!(!snapshot.to_string().contains("snapshot-must-not-leak"));
+
+        let _ = tool.manager.stop(profile).await;
+    }
+
     /// Wix-style pages reuse `data-testid="linkElement"` for every link. The
     /// snapshot must retain exact identity and the action must click the chosen
     /// link, not the first match in document order.
@@ -3165,13 +3286,32 @@ mod tests {
     #[tokio::test]
     #[ignore = "launches a real Chrome"]
     async fn live_native_forms_upload_coordinates_and_send_keys() {
-        fn element<'a>(state: &'a Value, name: &str) -> &'a Value {
+        fn structured_element<'a>(state: &'a Value, name: &str) -> &'a Value {
             state["elements"]
                 .as_array()
                 .expect("snapshot elements")
                 .iter()
                 .find(|element| element["name"] == name)
                 .unwrap_or_else(|| panic!("element '{name}' missing from {state}"))
+        }
+
+        fn compact_line<'a>(state: &'a Value, name: &str) -> &'a str {
+            let quoted_name = format!("\"{name}\"");
+            state["elements"]
+                .as_array()
+                .expect("snapshot elements")
+                .iter()
+                .filter_map(Value::as_str)
+                .find(|line| line.contains(&quoted_name))
+                .unwrap_or_else(|| panic!("compact element '{name}' missing from {state}"))
+        }
+
+        fn compact_ref(state: &Value, name: &str) -> String {
+            compact_line(state, name)
+                .strip_prefix('[')
+                .and_then(|line| line.split_once(']'))
+                .map(|(reference, _)| reference.to_string())
+                .unwrap_or_else(|| panic!("ref for compact element '{name}' missing from {state}"))
         }
 
         let profile = "native-actions-live-test";
@@ -3221,12 +3361,19 @@ mod tests {
             }))
             .await
             .expect("initial snapshot");
-        let message_ref = element(&snapshot, "Message")["ref"]
+        let message_ref = structured_element(&snapshot, "Message")["ref"]
             .as_str()
-            .expect("message ref");
+            .expect("message ref")
+            .to_string();
+        let coordinate = structured_element(&snapshot, "Coordinate target");
+        let bounds = coordinate["bounds"].as_array().expect("coordinate bounds");
+        let coordinate_x = bounds[0].as_f64().unwrap() + bounds[2].as_f64().unwrap() / 2.0;
+        let coordinate_y = bounds[1].as_f64().unwrap() + bounds[3].as_f64().unwrap() / 2.0;
         let focused = tool
             .execute(json!({
-                "action":"act", "actAction":"click", "ref":message_ref,
+                // Use the token exactly as a model copies it from a compact
+                // snapshot line. The action boundary accepts the brackets.
+                "action":"act", "actAction":"click", "ref":format!("[{message_ref}]"),
                 "profile":profile, "targetId":target_id,
             }))
             .await
@@ -3241,9 +3388,8 @@ mod tests {
             .await
             .expect("send trusted text");
         assert_eq!(typed["outcome"], "applied", "{typed}");
-        assert_eq!(
-            element(&typed["page_state"], "Message")["value"],
-            "Hello",
+        assert!(
+            compact_line(&typed["page_state"], "Message").contains("= \"Hello\""),
             "{typed}"
         );
         assert!(
@@ -3251,15 +3397,12 @@ mod tests {
                 .as_array()
                 .expect("post-key elements")
                 .iter()
-                .any(|element| element["name"]
-                    .as_str()
-                    .is_some_and(|name| name.starts_with("trusted:true:key:"))),
+                .filter_map(Value::as_str)
+                .any(|line| line.contains("trusted:true:key:")),
             "the DOM did not observe trusted CDP keyboard events: {typed}"
         );
 
-        let choice_ref = element(&typed["page_state"], "Choice")["ref"]
-            .as_str()
-            .expect("choice ref");
+        let choice_ref = compact_ref(&typed["page_state"], "Choice");
         let options = tool
             .execute(json!({
                 "action":"act", "actAction":"options", "ref":choice_ref,
@@ -3272,9 +3415,7 @@ mod tests {
             Some(2),
             "{options}"
         );
-        let choice_ref = element(&options["page_state"], "Choice")["ref"]
-            .as_str()
-            .expect("refreshed choice ref");
+        let choice_ref = compact_ref(&options["page_state"], "Choice");
         let selected = tool
             .execute(json!({
                 "action":"act", "actAction":"select", "ref":choice_ref, "value":"b",
@@ -3282,11 +3423,12 @@ mod tests {
             }))
             .await
             .expect("select option");
-        assert_eq!(element(&selected["page_state"], "Choice")["value"], "b");
+        assert!(
+            compact_line(&selected["page_state"], "Choice").contains("= \"b\""),
+            "{selected}"
+        );
 
-        let upload_ref = element(&selected["page_state"], "Upload fixture")["ref"]
-            .as_str()
-            .expect("upload ref");
+        let upload_ref = compact_ref(&selected["page_state"], "Upload fixture");
         let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
         let uploaded = tool
             .execute(json!({
@@ -3301,17 +3443,14 @@ mod tests {
                 .as_array()
                 .expect("post-upload elements")
                 .iter()
-                .any(|element| element["name"] == "Uploaded Cargo.toml"),
+                .filter_map(Value::as_str)
+                .any(|line| line.contains("Uploaded Cargo.toml")),
             "upload change was not independently observed: {uploaded}"
         );
 
-        let coordinate = element(&uploaded["page_state"], "Coordinate target");
-        let bounds = coordinate["bounds"].as_array().expect("coordinate bounds");
-        let x = bounds[0].as_f64().unwrap() + bounds[2].as_f64().unwrap() / 2.0;
-        let y = bounds[1].as_f64().unwrap() + bounds[3].as_f64().unwrap() / 2.0;
         let clicked = tool
             .execute(json!({
-                "action":"click_coordinates", "x":x, "y":y,
+                "action":"click_coordinates", "x":coordinate_x, "y":coordinate_y,
                 "profile":profile, "targetId":target_id,
             }))
             .await
@@ -3322,7 +3461,8 @@ mod tests {
                 .as_array()
                 .expect("post-coordinate elements")
                 .iter()
-                .any(|element| element["name"] == "Coordinate clicked"),
+                .filter_map(Value::as_str)
+                .any(|line| line.contains("Coordinate clicked")),
             "coordinate click was not independently observed: {clicked}"
         );
 
@@ -3347,13 +3487,25 @@ mod tests {
     async fn live_cross_origin_iframe_snapshot_and_native_actions() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        fn frame_element<'a>(state: &'a Value, name: &str) -> &'a Value {
+        fn compact_frame_line<'a>(state: &'a Value, name: &str) -> &'a str {
+            let quoted_name = format!("\"{name}\"");
             state["elements"]
                 .as_array()
                 .expect("snapshot elements")
                 .iter()
-                .find(|element| element["name"] == name)
-                .unwrap_or_else(|| panic!("frame element '{name}' missing from {state}"))
+                .filter_map(Value::as_str)
+                .find(|line| line.contains(&quoted_name))
+                .unwrap_or_else(|| panic!("compact frame element '{name}' missing from {state}"))
+        }
+
+        fn compact_frame_ref(state: &Value, name: &str) -> String {
+            compact_frame_line(state, name)
+                .strip_prefix('[')
+                .and_then(|line| line.split_once(']'))
+                .map(|(reference, _)| reference.to_string())
+                .unwrap_or_else(|| {
+                    panic!("ref for compact frame element '{name}' missing from {state}")
+                })
         }
 
         async fn serve(
@@ -3471,14 +3623,12 @@ mod tests {
         assert!(
             post_elements
                 .iter()
-                .any(|element| element["name"] == "Clicked inside frame"),
+                .filter_map(Value::as_str)
+                .any(|line| line.contains("Clicked inside frame")),
             "post-action snapshot did not independently observe the click: {outcome}"
         );
 
-        let input_ref = frame_element(&outcome["page_state"], "Frame input")["ref"]
-            .as_str()
-            .expect("OOPIF input ref")
-            .to_string();
+        let input_ref = compact_frame_ref(&outcome["page_state"], "Frame input");
         let typed = tool
             .execute(json!({
                 "action":"act", "actAction":"fill", "text":"OOPIF text",
@@ -3487,15 +3637,12 @@ mod tests {
             .await
             .expect("cross-origin fill outcome");
         assert_eq!(typed["outcome"], "applied", "{typed}");
-        assert_eq!(
-            frame_element(&typed["page_state"], "Frame input")["value"],
-            "OOPIF text",
+        assert!(
+            compact_frame_line(&typed["page_state"], "Frame input").contains("= \"OOPIF text\""),
             "{typed}"
         );
 
-        let input_ref = frame_element(&typed["page_state"], "Frame input")["ref"]
-            .as_str()
-            .expect("refreshed OOPIF input ref");
+        let input_ref = compact_frame_ref(&typed["page_state"], "Frame input");
         let pressed = tool
             .execute(json!({
                 "action":"act", "actAction":"press", "key":"Enter",
@@ -3509,13 +3656,12 @@ mod tests {
                 .as_array()
                 .expect("post-key snapshot")
                 .iter()
-                .any(|element| element["name"] == "Trusted frame key"),
+                .filter_map(Value::as_str)
+                .any(|line| line.contains("Trusted frame key")),
             "OOPIF key event was not independently observed as trusted: {pressed}"
         );
 
-        let choice_ref = frame_element(&pressed["page_state"], "Frame choice")["ref"]
-            .as_str()
-            .expect("OOPIF choice ref");
+        let choice_ref = compact_frame_ref(&pressed["page_state"], "Frame choice");
         let options = tool
             .execute(json!({
                 "action":"act", "actAction":"options",
@@ -3528,9 +3674,7 @@ mod tests {
             Some(2),
             "{options}"
         );
-        let choice_ref = frame_element(&options["page_state"], "Frame choice")["ref"]
-            .as_str()
-            .expect("refreshed OOPIF choice ref");
+        let choice_ref = compact_frame_ref(&options["page_state"], "Frame choice");
         let selected = tool
             .execute(json!({
                 "action":"act", "actAction":"select", "value":"beta",
@@ -3539,15 +3683,12 @@ mod tests {
             .await
             .expect("cross-origin select outcome");
         assert_eq!(selected["outcome"], "applied", "{selected}");
-        assert_eq!(
-            frame_element(&selected["page_state"], "Frame choice")["value"],
-            "beta",
+        assert!(
+            compact_frame_line(&selected["page_state"], "Frame choice").contains("= \"beta\""),
             "{selected}"
         );
 
-        let upload_ref = frame_element(&selected["page_state"], "Frame upload")["ref"]
-            .as_str()
-            .expect("OOPIF upload ref");
+        let upload_ref = compact_frame_ref(&selected["page_state"], "Frame upload");
         let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
         let uploaded = tool
             .execute(json!({
@@ -3563,7 +3704,8 @@ mod tests {
                 .as_array()
                 .expect("post-upload snapshot")
                 .iter()
-                .any(|element| element["name"] == "Uploaded Cargo.toml"),
+                .filter_map(Value::as_str)
+                .any(|line| line.contains("Uploaded Cargo.toml")),
             "OOPIF upload was not independently observed: {uploaded}"
         );
 

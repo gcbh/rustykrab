@@ -29,11 +29,9 @@ pub struct BrowserConfig {
     /// Root for browser profile data, when the caller wants a browser of
     /// its own rather than the account's.
     ///
-    /// Set it and two things follow: profile data lives under this root
-    /// instead of `~/.rustykrab/browser`, and the symlink to the real
-    /// Chrome profile is suppressed. Unset -- the normal case -- nothing
-    /// changes, and the real profile is borrowed because that is where
-    /// the logins are.
+    /// Set it and profile data lives under this root instead of
+    /// `~/.rustykrab/browser`. It also suppresses the optional system-profile
+    /// link even when `borrow_system_profile` is enabled.
     ///
     /// The obvious way to get an isolated browser is to point HOME at a
     /// scratch directory. That does not work: Chrome wedges its renderer
@@ -41,6 +39,17 @@ pub struct BrowserConfig {
     /// document never arrives. Isolate this one directory instead.
     #[serde(default)]
     pub isolated_root: Option<PathBuf>,
+
+    /// Opt in to symlinking the account's active system-Chrome profile into
+    /// RustyKrab's user-data directory.
+    ///
+    /// This can reuse existing website sessions, but Chrome profile databases
+    /// are not safe to open from two browser processes concurrently. The
+    /// reliable default is a dedicated persistent RustyKrab profile; secure
+    /// stored credentials can establish its sessions once and they then
+    /// persist normally.
+    #[serde(default)]
+    pub borrow_system_profile: bool,
 
     /// Optional root for browser downloads. Each profile receives its own
     /// subdirectory. When omitted, downloads live under that profile's
@@ -227,9 +236,8 @@ impl Default for BrowserConfig {
             enabled: true,
             evaluate_enabled: false,
             default_profile: "rustykrab".to_string(),
-            // Unset by default: normal use borrows the real Chrome
-            // profile, which is where the logins are.
             isolated_root: None,
+            borrow_system_profile: false,
             download_root: None,
             headless: false,
             no_sandbox: false,
@@ -297,6 +305,9 @@ impl BrowserConfig {
             if !root.is_empty() {
                 config.isolated_root = Some(PathBuf::from(root));
             }
+        }
+        if std::env::var("RUSTYKRAB_BROWSER_BORROW_SYSTEM_PROFILE").as_deref() == Ok("1") {
+            config.borrow_system_profile = true;
         }
         if let Ok(root) = std::env::var("RUSTYKRAB_BROWSER_DOWNLOAD_ROOT") {
             if !root.is_empty() {
@@ -478,11 +489,10 @@ mod isolated_root_tests {
         assert!(shown.contains(".rustykrab/browser/rustykrab"), "{shown}");
     }
 
-    /// Normal use must keep borrowing the real Chrome profile; that is
-    /// where the logins are.
     #[test]
-    fn isolation_is_off_by_default() {
+    fn dedicated_persistent_profile_is_the_default() {
         assert!(BrowserConfig::default().isolated_root.is_none());
+        assert!(!BrowserConfig::default().borrow_system_profile);
     }
 
     /// A per-profile override still wins, as it did before.

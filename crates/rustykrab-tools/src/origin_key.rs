@@ -62,6 +62,23 @@ pub fn origin_credential_key(url: &str, field: &str) -> Result<String> {
     Ok(key)
 }
 
+/// Pre-origin-key credential names retained by a small number of built-in
+/// login flows.
+///
+/// Only exact, known hosts are eligible. This is deliberately not a generic
+/// "try every similarly named secret" fallback: credentials must never cross
+/// an origin boundary just because two services have similar names.
+pub(crate) fn legacy_browser_credential_key(url: &str, field: &str) -> Option<&'static str> {
+    let parsed = url::Url::parse(url).ok()?;
+    let raw_host = parsed.host_str()?;
+    let host = raw_host.strip_prefix("www.").unwrap_or(raw_host);
+    match (host, field.trim()) {
+        ("instagram.com", USERNAME) => Some("instagram_username"),
+        ("instagram.com", PASSWORD) => Some("instagram_password"),
+        _ => None,
+    }
+}
+
 /// Lowercase ASCII alphanumerics survive; everything else becomes `_`.
 ///
 /// Deliberately lossy and deliberately not reversible. The key only has
@@ -155,6 +172,26 @@ mod tests {
     #[test]
     fn an_empty_field_is_refused() {
         assert!(origin_credential_key("https://example.com", "  ").is_err());
+    }
+
+    #[test]
+    fn instagram_legacy_keys_are_scoped_to_the_exact_origin() {
+        assert_eq!(
+            legacy_browser_credential_key("https://www.instagram.com/accounts/login/", USERNAME),
+            Some("instagram_username")
+        );
+        assert_eq!(
+            legacy_browser_credential_key("https://instagram.com/", PASSWORD),
+            Some("instagram_password")
+        );
+        assert_eq!(
+            legacy_browser_credential_key("https://support.instagram.com/", PASSWORD),
+            None
+        );
+        assert_eq!(
+            legacy_browser_credential_key("https://instagram.example/", PASSWORD),
+            None
+        );
     }
 }
 

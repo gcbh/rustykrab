@@ -20,6 +20,7 @@
 
 mod ablation;
 mod assertion;
+mod browser_suite;
 mod classify;
 mod credential_suite;
 mod fixture_repo;
@@ -1466,20 +1467,26 @@ const USAGE: &str = "\
 rustykrab-e2e — end-to-end evaluation harness
 
 USAGE:
-    cargo run -p rustykrab-e2e -- [FLAGS]
+    scripts/e2e.sh [FLAGS]
+
+    The wrapper builds both the daemon and evaluator and binds reports to the
+    checkout revision. Direct cargo invocation is intended only for --help and
+    --list unless RUSTYKRAB_BIN and RUSTYKRAB_E2E_SOURCE_REVISION are set.
 
 FLAGS:
     --mode SUITE                scripted | model | credential | login |
-                                ablation | all (default: scripted). `login`
-                                reaches the real internet with real
-                                credentials and is never included in `all`;
-                                it skips unless RK_LOGIN_URL/USER/PASS are set.
+                                browser | ablation | all (default: scripted).
+                                `login` and `browser` reach the real internet,
+                                may use real credentials, and are never included
+                                in `all`. Explicit browser cases fail when their
+                                required live configuration is missing.
     --ctx-list A,B,C            Windows for --mode ablation (default:
                                 4096,8192,16384,32768,65536,131072,262144)
     --surfaces LIST             Surfaces for --mode credential
                                 (default: gateway,telegram; signal has no
                                 agent loop reading it and will error)
     --trials N                  Trials per credential cell (default: 5)
+    --trial-timeout SECONDS     Hard ceiling for each login/browser trial
     --resume                    Reuse trials already in the sidecar rather
                                 than paying for them twice
     --reps N                    Repetitions per model scenario (default: 3)
@@ -1499,6 +1506,14 @@ ENVIRONMENT:
                         only; the Chrome profile is shed to save disk).
     E2E_ARTIFACT_DIR    Durable report/evidence directory
                         (default: target/e2e-artifacts).
+    RK_BROWSER_DEPART_DATE
+                        ISO date required by Google Flights and United cases.
+                        Origin/destination default to SFO/LAX and can be changed
+                        with RK_BROWSER_ORIGIN/RK_BROWSER_DESTINATION.
+    RK_INSTAGRAM_USER / RK_INSTAGRAM_PASS / RK_INSTAGRAM_EXPECT
+                        Opt in to the Instagram login journey.
+    RK_UNITED_USER / RK_UNITED_PASS / RK_UNITED_EXPECT
+                        Opt in to the United login-and-flight journey.
 ";
 
 struct Args {
@@ -1552,10 +1567,10 @@ fn parse_args(argv: &[String]) -> std::result::Result<Args, String> {
                 args.mode = value(i, "--mode")?.to_lowercase();
                 if !matches!(
                     args.mode.as_str(),
-                    "scripted" | "model" | "credential" | "login" | "ablation" | "all"
+                    "scripted" | "model" | "credential" | "login" | "browser" | "ablation" | "all"
                 ) {
                     return Err(format!(
-                        "--mode: expected scripted|model|credential|login|ablation|all, got {}",
+                        "--mode: expected scripted|model|credential|login|browser|ablation|all, got {}",
                         args.mode
                     ));
                 }
@@ -1584,7 +1599,7 @@ fn parse_args(argv: &[String]) -> std::result::Result<Args, String> {
                     return Err("--trial-timeout must be at least 1 second".to_string());
                 }
                 args.trial_timeout = Duration::from_secs(secs);
-                i += 2;
+                i += 1;
             }
             "--trials" => {
                 let v = value(i, "--trials")?;
@@ -1664,7 +1679,19 @@ async fn main() -> Result<()> {
         for sc in login_suite::SCENARIOS {
             eprintln!("  {:<42}\n      {}", sc.id, sc.description);
         }
+        eprintln!("\n── browser (live network, opt-in) ──");
+        for sc in browser_suite::SCENARIOS {
+            eprintln!("  {:<42}\n      {}", sc.id, sc.description);
+        }
         return Ok(());
+    }
+
+    if matches!(args.mode.as_str(), "login" | "browser") && source_revision() == "unrecorded" {
+        bail!(
+            "live {} evidence needs an exact source revision and a freshly built daemon; run scripts/e2e.sh --mode {} (recommended), or set both RUSTYKRAB_BIN and RUSTYKRAB_E2E_SOURCE_REVISION explicitly",
+            args.mode,
+            args.mode
+        );
     }
 
     let bin =
@@ -1697,6 +1724,7 @@ async fn main() -> Result<()> {
     let mut judge_name: Option<String> = None;
     let mut trials: Vec<credential_suite::TrialResult> = Vec::new();
     let mut login_trials: Vec<login_suite::LoginTrial> = Vec::new();
+    let mut browser_trials: Vec<browser_suite::BrowserJourneyTrial> = Vec::new();
 
     if args.mode == "scripted" || args.mode == "all" {
         reports.extend(run_scripted(&bin, args.case_filter.as_deref()).await?);
@@ -1716,7 +1744,10 @@ async fn main() -> Result<()> {
     }
 
     // Nothing model-backed is worth starting if the model cannot answer.
-    if matches!(args.mode.as_str(), "model" | "credential" | "login" | "all") {
+    if matches!(
+        args.mode.as_str(),
+        "model" | "credential" | "login" | "browser" | "all"
+    ) {
         preflight_model(&args.ollama_url, &args.model).await?;
     }
 
@@ -1751,6 +1782,22 @@ async fn main() -> Result<()> {
         reports.extend(cells);
         login_trials = login_results;
     }
+    // Also excluded from `all`: every case drives a public third-party site,
+    // and two cases consume real credentials. An operator must ask for this
+    // suite by name and configure each site independently.
+    if args.mode == "browser" {
+        let (cells, journey_results) = browser_suite::run(
+            &bin,
+            &args.model,
+            &args.ollama_url,
+            args.trials,
+            args.case_filter.as_deref(),
+            args.trial_timeout,
+        )
+        .await?;
+        reports.extend(cells);
+        browser_trials = journey_results;
+    }
 
     let count = |o: &str| reports.iter().filter(|r| r.outcome == o).count();
     let (pass, fail, xfail, xpass) = (count("pass"), count("fail"), count("xfail"), count("xpass"));
@@ -1770,6 +1817,7 @@ async fn main() -> Result<()> {
         // back to the reply that produced it.
         "credential_trials": trials,
         "login_trials": login_trials,
+        "browser_trials": browser_trials,
         "summary": {
             "pass": pass,
             "fail": fail,
@@ -2086,4 +2134,22 @@ fn hex_decode(s: &str) -> Result<Vec<u8>> {
         .step_by(2)
         .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(Into::into))
         .collect()
+}
+
+#[cfg(test)]
+mod argument_tests {
+    use super::*;
+
+    #[test]
+    fn trial_timeout_does_not_skip_the_following_flag() {
+        let args = parse_args(&[
+            "--trial-timeout".into(),
+            "90".into(),
+            "--case".into(),
+            "instagram".into(),
+        ])
+        .expect("arguments");
+        assert_eq!(args.trial_timeout, Duration::from_secs(90));
+        assert_eq!(args.case_filter.as_deref(), Some("instagram"));
+    }
 }
