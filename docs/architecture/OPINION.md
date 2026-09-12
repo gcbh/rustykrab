@@ -38,6 +38,11 @@ from the first pass.
 
 ### 1. The turn sequence is written out six times — **structural, measured**
 
+Follow-up against `0b565fd`: shared interactive setup, Telegram/Slack admission
+journaling and reset generations, and partial HTTP/SSE persistence now address
+specific lifecycle defects; see [outcome history](05-first-pass-outcome.md#interactive-continuity-follow-up).
+The broader six-copy finding remains open: the channel transaction is not unified.
+
 Load conversation → snapshot persisted ids → append user message → run with a
 heartbeat → `save_turn` → extract the reply → map failure to a user string.
 It appears in `process_telegram_message`, `process_slack_message`,
@@ -78,13 +83,12 @@ precedence order regardless of the wider refactor.
 `memory` and `runtime` read zero and are the two most portable crates here.
 That is not a coincidence.
 
-### 3. `rustykrab-runtime` has no tests — **my own change, flagged**
+### 3. Runtime turn assembly still needs direct coverage
 
-746 lines holding the application service layer, 0 tests. It is exercised
-indirectly through `gateway` (45) and the e2e suite, and the extraction was
-behaviour-preserving, so this is a gap rather than a risk. But the crate now
-owns prompt assembly and capability derivation, and it is the natural place
-for the turn sequence to land — at which point untested becomes untenable.
+The original zero-test finding is retired in the [outcome history](05-first-pass-outcome.md#interactive-continuity-follow-up):
+base `0b565fd` already had 14 distillation tests, and this follow-up adds three
+channel lifecycle tests. Prompt assembly and capability derivation still rely
+on indirect gateway/evaluation coverage. That narrower gap remains open.
 
 ### 4. `memory_links` has no foreign keys — **minor, unchanged**
 
