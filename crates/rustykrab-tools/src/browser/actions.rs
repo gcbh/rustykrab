@@ -1127,6 +1127,107 @@ struct ResolvedElement {
     backend_node_id: BackendNodeId,
 }
 
+/// A credential target is resolved once, before consulting the vault. Unlike
+/// ordinary text input it is never healed to a different node or sent to the
+/// currently focused element. Origin and field checks run again atomically
+/// with assignment, so a navigation/type mutation cannot redirect the value.
+pub(crate) struct CredentialTarget {
+    resolved: ResolvedElement,
+    origin: String,
+    field: String,
+}
+
+const CREDENTIAL_TARGET_CHECK: &str = r#"
+    if (!this.isConnected || !this.ownerDocument || !this.ownerDocument.defaultView) return 'detached';
+    var view = this.ownerDocument.defaultView;
+    try {
+        if (view.location.origin !== expectedOrigin || view.top.location.origin !== expectedOrigin) return 'origin_mismatch';
+    } catch (_) { return 'origin_mismatch'; }
+    if (this.tagName !== 'INPUT' || this.disabled || this.readOnly) return 'unsupported_field';
+    var kind = (this.type || '').toLowerCase();
+    var identity = [this.id, this.name, this.getAttribute('autocomplete'), this.getAttribute('aria-label')].join(' ').toLowerCase();
+    if (/cc-|card[\s_-]*(number|no|security|verification)|credit[\s_-]*card|\bcvv2?\b|\bcvc2?\b|\bcsc\b|security[\s_-]*code/.test(identity)) return 'payment_field';
+    if (field === 'password' ? kind !== 'password' : !['text', 'email', 'tel'].includes(kind)) return 'unsupported_field';
+"#;
+
+pub(crate) async fn prepare_credential_target(
+    page: &Page,
+    store: &SnapshotStore,
+    store_key: &str,
+    ref_id: &str,
+    origin: &str,
+    field: &str,
+) -> Result<CredentialTarget> {
+    let element_ref = store.get_ref(store_key, ref_id).await.ok_or_else(|| {
+        Error::ToolExecution(ToolError::not_found(
+            "credential ref expired; take a fresh snapshot",
+        ))
+    })?;
+    // OOPIFs are cross-origin by definition here. Ordinary same-origin child
+    // frames use the page's execution contexts and pass the live check below.
+    // Hosted sign-in/payment frames require a separate explicit consent model.
+    if element_ref.target_id.is_some() {
+        return Err(Error::ToolExecution(ToolError::permission_denied(
+            "credential fill into a site-isolated frame is not authorized",
+        )));
+    }
+    let resolved = resolve_element(page, &element_ref).await?;
+    let function = format!(
+        "function() {{ var expectedOrigin = {}; var field = {}; {CREDENTIAL_TARGET_CHECK} return 'ready'; }}",
+        js_string_literal(origin), js_string_literal(field)
+    );
+    let check = tokio::time::timeout(
+        ELEMENT_OP_BUDGET,
+        call_on_element(page, &resolved, &function),
+    )
+    .await
+    .map_err(|_| Error::ToolExecution("credential target verification timed out".into()))?
+    .map_err(|_| Error::ToolExecution("credential target verification failed".into()))?;
+    if check != "ready" {
+        return Err(Error::ToolExecution(ToolError::permission_denied(
+            "credential target must be an enabled login input in the live top-level origin; passwords require type=password",
+        )));
+    }
+    Ok(CredentialTarget {
+        resolved,
+        origin: origin.to_string(),
+        field: field.to_string(),
+    })
+}
+
+pub(crate) async fn fill_credential_target(
+    page: &Page,
+    target: &CredentialTarget,
+    value: &str,
+) -> Result<Value> {
+    // Setter is object-bound, not focus-bound. Do not use Input.insertText here:
+    // onfocus handlers can redirect focus to an unrelated or cross-origin box.
+    // Only constant status strings return across CDP; exception details may
+    // contain a value echoed by page code, so they are deliberately discarded.
+    let function = format!(
+        "function() {{ var expectedOrigin = {}; var field = {}; {CREDENTIAL_TARGET_CHECK} var value = {}; var setter = Object.getOwnPropertyDescriptor(view.HTMLInputElement.prototype, 'value').set; setter.call(this, value); this.dispatchEvent(new view.Event('input', {{bubbles:true}})); this.dispatchEvent(new view.Event('change', {{bubbles:true}})); return 'filled'; }}",
+        js_string_literal(&target.origin), js_string_literal(&target.field), js_string_literal(value)
+    );
+    match tokio::time::timeout(
+        ELEMENT_OP_BUDGET,
+        call_on_element(page, &target.resolved, &function),
+    )
+    .await
+    {
+        Ok(Ok(result)) if result == "filled" => {
+            Ok(json!({"status":"filled", "outcome":"applied", "retry_safe":false}))
+        }
+        Ok(Ok(_)) => Ok(
+            json!({"status":"blocked", "outcome":"not_applied", "retry_safe":true,
+            "reason":"credential target changed after verification; take a fresh snapshot"}),
+        ),
+        _ => Ok(
+            json!({"status":"unknown", "outcome":"unknown", "retry_safe":false,
+            "reason":"credential assignment was interrupted; inspect state without repeating it blindly"}),
+        ),
+    }
+}
+
 fn requires_document_resolver(element_ref: &ElementRef) -> bool {
     element_ref.frame_id.is_some()
         || element_ref.selector.contains(SHADOW_SEP)

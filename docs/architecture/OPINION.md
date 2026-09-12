@@ -38,6 +38,11 @@ from the first pass.
 
 ### 1. The turn sequence is written out six times — **structural, measured**
 
+Follow-up against `0b565fd`: shared interactive setup, Telegram/Slack admission
+journaling and reset generations, and partial HTTP/SSE persistence now address
+specific lifecycle defects; see [outcome history](05-first-pass-outcome.md#interactive-continuity-follow-up).
+The broader six-copy finding remains open: the channel transaction is not unified.
+
 Load conversation → snapshot persisted ids → append user message → run with a
 heartbeat → `save_turn` → extract the reply → map failure to a user string.
 It appears in `process_telegram_message`, `process_slack_message`,

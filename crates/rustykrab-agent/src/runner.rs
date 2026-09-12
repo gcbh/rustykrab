@@ -6,6 +6,7 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
+use futures::FutureExt;
 use rustykrab_core::active_tools::{ActiveToolsRegistry, SessionToolContext, SESSION_TOOL_CONTEXT};
 use rustykrab_core::capability::Capability;
 use rustykrab_core::model::{
@@ -22,7 +23,7 @@ use rustykrab_core::types::{
     ContentPart, Conversation, Message, MessageContent, Role, ToolCall, ToolResult, ToolSchema,
 };
 use rustykrab_core::{Error, Result, SandboxRequirements, Tool};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
@@ -107,6 +108,7 @@ const DEFAULT_ACTIVE_TOOLS: &[&str] = &[
     "credential_request",
 ];
 
+use crate::compaction::CompactionStrategy;
 use crate::sandbox::{tool_timeout_secs, Sandbox, SandboxPolicy, DEFAULT_NET_TOOL_TIMEOUT_SECS};
 use crate::trace::{ExecutionTracer, ToolTrace};
 
@@ -782,6 +784,9 @@ pub enum AgentEvent {
 /// Events that flow INTO a running agent loop.
 #[derive(Debug)]
 pub enum InboundEvent {
+    /// Already journaled user input. Preserve its identity across admission,
+    /// execution, and partial-history persistence.
+    Message(Message),
     /// A new user message (possibly multi-modal) arrived while the agent is running.
     UserMessage {
         parts: Vec<ContentPart>,
@@ -796,20 +801,35 @@ pub enum InboundEvent {
 #[derive(Clone)]
 pub struct AgentHandle {
     inbound_tx: mpsc::Sender<InboundEvent>,
+    cancel_tx: watch::Sender<bool>,
     alive: Arc<AtomicBool>,
 }
 
 impl AgentHandle {
+    pub async fn send_message_record(&self, message: Message) -> Result<()> {
+        if message.role != Role::User {
+            return Err(Error::Internal(
+                "agent inbox only accepts user messages".into(),
+            ));
+        }
+        self.inbound_tx
+            .try_send(InboundEvent::Message(message))
+            .map_err(|_| {
+                Error::Internal("agent inbox is closed or full; message was not accepted".into())
+            })
+    }
+
     /// Submit a new user message to the running agent.
     pub async fn send_message(&self, parts: Vec<ContentPart>) -> Result<()> {
         self.inbound_tx
-            .send(InboundEvent::UserMessage {
+            .try_send(InboundEvent::UserMessage {
                 parts,
                 channel: None,
                 channel_msg_id: None,
             })
-            .await
-            .map_err(|_| Error::Internal("agent loop has terminated".into()))
+            .map_err(|_| {
+                Error::Internal("agent inbox is closed or full; message was not accepted".into())
+            })
     }
 
     /// Submit a new user message with channel metadata.
@@ -820,26 +840,44 @@ impl AgentHandle {
         channel_msg_id: Option<String>,
     ) -> Result<()> {
         self.inbound_tx
-            .send(InboundEvent::UserMessage {
+            .try_send(InboundEvent::UserMessage {
                 parts,
                 channel: Some(channel),
                 channel_msg_id,
             })
-            .await
-            .map_err(|_| Error::Internal("agent loop has terminated".into()))
+            .map_err(|_| {
+                Error::Internal("agent inbox is closed or full; message was not accepted".into())
+            })
     }
 
     /// Request cancellation of the current agent run.
     pub async fn cancel(&self) -> Result<()> {
-        self.inbound_tx
-            .send(InboundEvent::Cancel)
-            .await
+        self.cancel_tx
+            .send(true)
             .map_err(|_| Error::Internal("agent loop has terminated".into()))
     }
 
     /// Check whether the agent loop is still running.
     pub fn is_alive(&self) -> bool {
         self.alive.load(AtomicOrdering::Acquire)
+    }
+}
+
+/// An interactive run always returns its history, including on provider
+/// errors and cancellation. A failed run is not an empty conversation.
+pub struct AgentRunCompletion {
+    pub conversation: Conversation,
+    pub result: Result<()>,
+}
+
+/// Dropping a run must not detach its parallel tool tasks. Abort stops local
+/// futures, not effects already committed in a browser or remote service.
+struct AbortToolTasks(Vec<tokio::task::AbortHandle>);
+impl Drop for AbortToolTasks {
+    fn drop(&mut self) {
+        for task in &self.0 {
+            task.abort();
+        }
     }
 }
 
@@ -874,6 +912,12 @@ pub struct AgentConfig {
     /// Following the RLM paper (Zhang, Kraska, Khattab — arXiv 2512.24601),
     /// default is 0.85 (85%).  Set to 0.0 to disable compaction.
     pub compaction_threshold_pct: f64,
+    /// Explicit policy, shared with the ablation harness. Legacy remains the
+    /// default until the measured comparison supports promoting a candidate.
+    pub compaction_strategy: CompactionStrategy,
+    /// Optional total compacted message budget (not just summary size).
+    /// Mandatory user anchors that cannot fit cause an explicit refusal.
+    pub compaction_target_tokens: Option<usize>,
     /// Strategy for when to call the LLM after tool results start arriving.
     pub llm_trigger_strategy: LlmTriggerStrategy,
     /// When `true`, the first LLM call of the run is made with
@@ -895,6 +939,8 @@ impl Default for AgentConfig {
             max_tool_retries: 2,
             max_context_tokens: 128_000,
             compaction_threshold_pct: 0.85,
+            compaction_strategy: CompactionStrategy::default(),
+            compaction_target_tokens: None,
             llm_trigger_strategy: LlmTriggerStrategy::Debounce(Duration::from_secs(2)),
             force_tool_use_first_iteration: false,
             tool_heartbeat_interval_secs: 30,
@@ -1433,7 +1479,7 @@ impl AgentRunner {
             conv,
             Message {
                 id: Uuid::new_v4(),
-                role: Role::User,
+                role: Role::System,
                 content: MessageContent::Text(TASK_COMPLETE_REMINDER.to_string()),
                 created_at: Utc::now(),
                 agent_version: Message::version_stamp(),
@@ -1457,9 +1503,10 @@ impl AgentRunner {
     ) -> (
         AgentHandle,
         mpsc::Receiver<AgentEvent>,
-        JoinHandle<Result<Conversation>>,
+        JoinHandle<AgentRunCompletion>,
     ) {
         let (inbound_tx, inbound_rx) = mpsc::channel::<InboundEvent>(64);
+        let (cancel_tx, cancel_rx) = watch::channel(false);
         let (outbound_tx, outbound_rx) = mpsc::channel::<AgentEvent>(128);
         let alive = Arc::new(AtomicBool::new(true));
         let alive_clone = alive.clone();
@@ -1501,7 +1548,7 @@ impl AgentRunner {
             };
             let body = async move {
                 runner
-                    .run_event_loop(conv, &session, inbound_rx, outbound_tx)
+                    .run_event_loop(conv, &session, inbound_rx, cancel_rx, outbound_tx)
                     .await
             };
             let result = match trace_id {
@@ -1512,7 +1559,11 @@ impl AgentRunner {
             result
         });
 
-        let handle = AgentHandle { inbound_tx, alive };
+        let handle = AgentHandle {
+            inbound_tx,
+            cancel_tx,
+            alive,
+        };
         (handle, outbound_rx, join_handle)
     }
 
@@ -1524,31 +1575,102 @@ impl AgentRunner {
         mut conv: Conversation,
         session: &Session,
         mut inbound_rx: mpsc::Receiver<InboundEvent>,
+        mut cancel_rx: watch::Receiver<bool>,
         outbound_tx: mpsc::Sender<AgentEvent>,
-    ) -> Result<Conversation> {
-        let supports_vision = self.provider.supports_vision();
-
-        let on_event = move |event: AgentEvent| {
-            let _ = outbound_tx.try_send(event);
+    ) -> AgentRunCompletion {
+        let on_event = |event: AgentEvent| {
+            if !matches!(event, AgentEvent::Done) {
+                let _ = outbound_tx.try_send(event);
+            }
         };
-
-        // Before each LLM call, drain inbound user messages.
-        // We wrap the streaming call with a pre-iteration hook.
-        // For the initial release, we use a simpler design: drain
-        // inbound messages before running the streaming loop, and
-        // let the existing run_streaming handle the core logic.
-        // Messages that arrive mid-run are queued and appended on
-        // the next invocation.
-
-        // Drain any messages that arrived before the loop started.
-        drain_inbound_to_conv(&mut inbound_rx, &mut conv, supports_vision, &on_event);
-
-        self.run_streaming(&mut conv, session, &on_event).await?;
-
-        // Final drain after the loop completes.
-        drain_inbound_to_conv(&mut inbound_rx, &mut conv, supports_vision, &on_event);
-
-        Ok(conv)
+        let tracer = ExecutionTracer::new();
+        // A follow-up received at EndTurn gets another dispatch, but never
+        // a fresh iteration allowance. This bounds even a continuously fed inbox.
+        let mut iterations = 0;
+        let body = async {
+            loop {
+                self.drain_inbound(&mut inbound_rx, &mut conv, &on_event)?;
+                self.run_inner(
+                    &mut conv,
+                    session,
+                    &on_event,
+                    &tracer,
+                    &mut Some(&mut inbound_rx),
+                    &mut iterations,
+                )
+                .await?;
+                let mut pending = self.drain_inbound(&mut inbound_rx, &mut conv, &on_event)?;
+                if pending == 0 {
+                    // Seal admission before the final drain: successful sends
+                    // cannot land in the gap between this check and task exit.
+                    inbound_rx.close();
+                    pending = self.drain_inbound(&mut inbound_rx, &mut conv, &on_event)?;
+                }
+                if pending == 0 {
+                    return Ok(());
+                }
+                if iterations >= self.config.max_iterations {
+                    return Err(Error::Internal(
+                        "iteration limit reached with pending user messages; history retained"
+                            .into(),
+                    ));
+                }
+            }
+        };
+        let result = {
+            let scoped = SESSION_TOOL_CONTEXT.scope(self.build_session_context(session), body);
+            let caught = std::panic::AssertUnwindSafe(scoped).catch_unwind();
+            tokio::select! {
+                result = caught => result.unwrap_or_else(|_| Err(Error::Internal("agent task panicked; partial history retained".into()))),
+                _ = async {
+                    while !*cancel_rx.borrow_and_update() {
+                        if cancel_rx.changed().await.is_err() {
+                            std::future::pending::<()>().await;
+                        }
+                    }
+                } => Err(Error::Internal("agent run cancelled; in-flight tool effects may be unknown".into())),
+            }
+        };
+        inbound_rx.close();
+        if result.is_err() {
+            // A cancelled tool may already have affected the outside world.
+            // Record uncertainty, not a retryable failure or invented success.
+            let completed: HashSet<String> = conv
+                .messages
+                .iter()
+                .filter_map(|m| {
+                    if let MessageContent::ToolResult(r) = &m.content {
+                        Some(r.call_id.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            let unfinished: Vec<_> = conv
+                .messages
+                .iter()
+                .flat_map(|m| m.content.tool_calls())
+                .filter(|c| !completed.contains(&c.id))
+                .map(|c| c.id.clone())
+                .collect();
+            for call_id in unfinished {
+                self.push_message(&mut conv, Message::stamped(Role::Tool, MessageContent::ToolResult(ToolResult {
+                    call_id,
+                    output: serde_json::json!({"error": "run interrupted", "outcome": "unknown", "next_step": "Inspect external state before retrying; the action may already have happened."}),
+                    is_error: true, images: Vec::new(),
+                })));
+            }
+        }
+        let _ = self.drain_inbound(&mut inbound_rx, &mut conv, &on_event);
+        self.capture_outcome(session, &tracer, result.is_err())
+            .await;
+        self.forget_token_estimate(conv.id);
+        self.forget_usage_anchor(conv.id);
+        let _ = outbound_tx.try_send(AgentEvent::Done);
+        AgentRunCompletion {
+            conversation: conv,
+            result,
+        }
     }
 
     /// Run the agent loop on a conversation within a session's capability scope.
@@ -1564,7 +1686,10 @@ impl AgentRunner {
         let tracer = ExecutionTracer::new();
         let discard = |_event: AgentEvent| {};
         let result = SESSION_TOOL_CONTEXT
-            .scope(ctx, self.run_inner(conv, session, &discard, &tracer))
+            .scope(
+                ctx,
+                self.run_inner(conv, session, &discard, &tracer, &mut None, &mut 0),
+            )
             .await;
         self.capture_outcome(session, &tracer, result.is_err())
             .await;
@@ -1590,6 +1715,8 @@ impl AgentRunner {
         session: &Session,
         on_event: &(dyn Fn(AgentEvent) + Send + Sync),
         tracer: &ExecutionTracer,
+        inbound: &mut Option<&mut mpsc::Receiver<InboundEvent>>,
+        iterations: &mut usize,
     ) -> Result<()> {
         if session.is_expired() {
             return Err(Error::Auth("session has expired".into()));
@@ -1621,7 +1748,25 @@ impl AgentRunner {
         // call without rebuilding every tool's JSON schema each iteration.
         let mut schema_cache: Option<(u64, Vec<ToolSchema>)> = None;
 
-        for iteration in 0..self.config.max_iterations {
+        let mut latest_user = conv
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::User)
+            .cloned();
+        while *iterations < self.config.max_iterations {
+            let iteration = *iterations;
+            *iterations += 1;
+            if let Some(rx) = inbound.as_deref_mut() {
+                if self.drain_inbound(rx, conv, on_event)? > 0 {
+                    latest_user = conv
+                        .messages
+                        .iter()
+                        .rev()
+                        .find(|m| m.role == Role::User)
+                        .cloned();
+                }
+            }
             tracer.record_iteration();
 
             if session.is_expired() {
@@ -1645,10 +1790,16 @@ impl AgentRunner {
 
             // Compaction: if conversation exceeds threshold, ask the LLM to
             // summarize before the next call (RLM paper §3.2).
-            if self.needs_compaction(conv) {
+            let schema_threshold = (self.request_context_limit(compaction_tools) as f64
+                * self.config.compaction_threshold_pct) as usize;
+            if self.needs_compaction(conv)
+                || (self.config.compaction_threshold_pct > 0.0
+                    && self.cached_conversation_tokens(conv) >= schema_threshold)
+            {
                 tracing::info!(iteration, "conversation crossed compaction threshold");
                 on_event(AgentEvent::Compressing);
-                self.compact_history(conv, compaction_tools).await?;
+                self.compact_history_preserving(conv, compaction_tools, latest_user.as_ref())
+                    .await?;
             }
 
             // Soft iteration warning.
@@ -1696,15 +1847,38 @@ impl AgentRunner {
             };
 
             let llm_start = std::time::Instant::now();
+            let mut response = self
+                .provider
+                .chat_stream_with_choice(&conv.messages, schemas, tool_choice, &stream_callback)
+                .await;
+            if matches!(&response, Err(Error::ContextBudgetExceeded { .. }))
+                && self.config.compaction_threshold_pct > 0.0
+            {
+                // The adapter refused before dispatch. One runner-owned
+                // compaction/retry is allowed, never silent trimming or an
+                // unbounded loop. On failure the complete trail is returned.
+                let before = Self::estimate_conversation_tokens(&conv.messages);
+                on_event(AgentEvent::Compressing);
+                self.compact_history_preserving(conv, schemas, latest_user.as_ref())
+                    .await?;
+                if Self::estimate_conversation_tokens(&conv.messages) < before {
+                    response = self
+                        .provider
+                        .chat_stream_with_choice(
+                            &conv.messages,
+                            schemas,
+                            tool_choice,
+                            &stream_callback,
+                        )
+                        .await;
+                }
+            }
             let ModelResponse {
                 message,
                 usage,
                 stop_reason,
                 ..
-            } = self
-                .provider
-                .chat_stream_with_choice(&conv.messages, schemas, tool_choice, &stream_callback)
-                .await?;
+            } = response?;
             let llm_elapsed = llm_start.elapsed();
             tracing::info!(
                 iteration,
@@ -1927,7 +2101,8 @@ impl AgentRunner {
                             "generation cut off by the context window — compacting before retrying"
                         );
                         on_event(AgentEvent::Compressing);
-                        self.compact_history(conv, schemas).await?;
+                        self.compact_history_preserving(conv, schemas, latest_user.as_ref())
+                            .await?;
                     } else {
                         tracing::warn!(iteration, "model hit max tokens, prompting to continue");
                     }
@@ -1935,7 +2110,7 @@ impl AgentRunner {
                         conv,
                         Message {
                             id: Uuid::new_v4(),
-                            role: Role::User,
+                            role: Role::System,
                             content: MessageContent::Text("Continue.".to_string()),
                             created_at: Utc::now(),
                             agent_version: Message::version_stamp(),
@@ -1998,7 +2173,7 @@ impl AgentRunner {
                                 conv,
                                 Message {
                                     id: Uuid::new_v4(),
-                                    role: Role::User,
+                                    role: Role::System,
                                     content: MessageContent::Text(
                                         "Your response was empty. Please provide a substantive answer or take an action.".to_string(),
                                     ),
@@ -2032,7 +2207,7 @@ impl AgentRunner {
                                 conv,
                                 Message {
                                     id: Uuid::new_v4(),
-                                    role: Role::User,
+                                    role: Role::System,
                                     content: MessageContent::Text(
                                         "Your previous response described or narrated work without actually calling any tools, so nothing happened. Either call the tools now to do the work, or reply with a final answer (including admitting you can't) — do not promise future updates."
                                             .to_string(),
@@ -2075,7 +2250,7 @@ impl AgentRunner {
                         conv,
                         Message {
                             id: Uuid::new_v4(),
-                            role: Role::User,
+                            role: Role::System,
                             content: MessageContent::Text(
                                 "Your previous response indicated a tool call but none was found. Please retry.".to_string(),
                             ),
@@ -2097,7 +2272,7 @@ impl AgentRunner {
             conv,
             Message {
                 id: Uuid::new_v4(),
-                role: Role::User,
+                role: Role::System,
                 content: MessageContent::Text(format!(
                     "You have reached the iteration limit ({} iterations). \
                      Summarize what you accomplished and what remains.",
@@ -2140,7 +2315,10 @@ impl AgentRunner {
         // See `run` — hoisted so outcome capture sees the run's traces.
         let tracer = ExecutionTracer::new();
         let result = SESSION_TOOL_CONTEXT
-            .scope(ctx, self.run_inner(conv, session, on_event, &tracer))
+            .scope(
+                ctx,
+                self.run_inner(conv, session, on_event, &tracer, &mut None, &mut 0),
+            )
             .await;
         self.capture_outcome(session, &tracer, result.is_err())
             .await;
@@ -2239,6 +2417,7 @@ impl AgentRunner {
         // tasks don't need a Send + 'static handle to `on_event`.
         let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_TOOL_CALLS));
         let mut handles = Vec::with_capacity(calls.len());
+        let mut abort_on_drop = AbortToolTasks(Vec::with_capacity(calls.len()));
         let call_meta: Vec<(String, String)> = calls
             .iter()
             .map(|c| (c.name.clone(), c.id.clone()))
@@ -2256,7 +2435,7 @@ impl AgentRunner {
             let hb_tx = hb_tx.clone();
             let interval = heartbeat_interval;
 
-            handles.push(tokio::spawn(async move {
+            let task = tokio::spawn(async move {
                 let _permit = sem.acquire().await.expect("semaphore closed");
                 let start = Instant::now();
                 let result = if interval == 0 {
@@ -2293,7 +2472,9 @@ impl AgentRunner {
                     .await
                 };
                 (result, call.name.clone(), call.id.clone(), start.elapsed())
-            }));
+            });
+            abort_on_drop.0.push(task.abort_handle());
+            handles.push(task);
         }
         // Drop the orchestrator's sender so the receiver closes once
         // every spawned task finishes.
@@ -2432,6 +2613,13 @@ impl AgentRunner {
         let env_cap = compaction_summary_max_tokens();
         let quarter_cap = (self.config.max_context_tokens / 4).max(1);
         env_cap.min(quarter_cap)
+    }
+
+    fn request_context_limit(&self, tools: &[ToolSchema]) -> usize {
+        self.provider
+            .context_limit_for_tools(tools)
+            .unwrap_or(self.config.max_context_tokens)
+            .min(compaction_context_ceiling())
     }
 
     /// Truncate a previously-stored compaction summary that exceeds the
@@ -2577,15 +2765,30 @@ impl AgentRunner {
         rustykrab_core::estimate_text_tokens(text)
     }
 
-    /// Pack text fragments into chunks whose token estimates each fit the
-    /// budget. Preserves fragment order. A single fragment larger than the
-    /// budget becomes its own chunk (the summarizer will truncate or the
-    /// provider will error — unavoidable at this layer).
+    /// Pack text fragments within budget, splitting oversized fragments at
+    /// UTF-8 boundaries. No fragment is silently truncated or oversized.
     fn pack_into_chunks(inputs: &[String], budget_tokens: usize) -> Vec<String> {
         let mut chunks = Vec::new();
         let mut current = String::new();
         let mut current_tokens = 0usize;
-        for text in inputs {
+        let max_bytes =
+            rustykrab_core::max_bytes_for_tokens(budget_tokens.saturating_sub(2)).max(4);
+        let mut fragments = Vec::new();
+        for input in inputs {
+            let mut rest = input.as_str();
+            while rest.len() > max_bytes {
+                let mut end = max_bytes;
+                while !rest.is_char_boundary(end) {
+                    end -= 1;
+                }
+                fragments.push(&rest[..end]);
+                rest = &rest[end..];
+            }
+            if !rest.is_empty() {
+                fragments.push(rest);
+            }
+        }
+        for text in fragments {
             let t = Self::estimate_text_tokens(text);
             if current_tokens != 0 && current_tokens + t > budget_tokens {
                 chunks.push(std::mem::take(&mut current));
@@ -2628,8 +2831,9 @@ impl AgentRunner {
         // Token → word conversion uses ~1.5 tokens/word as a conservative
         // estimate so the word budget leaves headroom under the token cap.
         let max_words = (max_output_tokens as f64 / 1.5).floor().max(128.0) as usize;
-        let system_prompt = format!(
-            "You are compressing {scope} so a downstream agent can continue the work \
+        let system_prompt = if self.config.compaction_strategy == CompactionStrategy::Legacy {
+            format!(
+                "You are compressing {scope} so a downstream agent can continue the work \
              without re-reading it. Preserve: concrete intermediate results (values, file \
              paths, IDs, URLs), decisions, constraints and preferences, named entities, \
              open questions, and the agent's current plan. Drop: pleasantries, superseded \
@@ -2637,7 +2841,12 @@ impl AgentRunner {
              points only — no preamble, no meta-commentary. HARD LIMIT: keep the summary \
              under {max_words} words — shorter is better. If you cannot fit everything, \
              prioritise the most recent decisions and open work."
-        );
+            )
+        } else {
+            self.config
+                .compaction_strategy
+                .summary_prompt(max_words, partial)
+        };
         let messages = vec![
             Message {
                 id: Uuid::new_v4(),
@@ -2660,6 +2869,12 @@ impl AgentRunner {
             Some(ctx) => self.provider.chat_with_ctx(&messages, &[], ctx).await?,
             None => self.provider.chat(&messages, &[]).await?,
         };
+        if response.stop_reason == StopReason::MaxTokens {
+            return Err(Error::ModelProvider(
+                "compaction summary hit its generation limit; original history was not replaced"
+                    .into(),
+            ));
+        }
         let text = response.message.content.as_text().unwrap_or("").to_string();
         // One line per summarizer call, so a slow compaction can be
         // attributed rather than guessed at: how many calls, how big each
@@ -2711,9 +2926,8 @@ impl AgentRunner {
         // Fast path: the whole batch fits in one summarizer call.
         if total_tokens <= input_budget_tokens {
             let joined = inputs.join("\n\n");
-            let partial = depth > 0;
             let summary = self
-                .summarize_text_once(&joined, partial, max_output_tokens)
+                .summarize_text_once(&joined, false, max_output_tokens)
                 .await?;
 
             // If the model ignored the budget, recurse on its own output so
@@ -2791,13 +3005,23 @@ impl AgentRunner {
     /// large enough to defeat the whole point of compaction. This method
     /// re-summarizes the summary itself until it fits, then truncates as
     /// a last resort.
+    #[cfg(test)]
     async fn enforce_summary_size_cap(
         &self,
-        mut summary: String,
+        summary: String,
         input_budget: usize,
     ) -> Result<String> {
         let cap_tokens = self.effective_compaction_summary_cap();
+        self.enforce_summary_cap(summary, input_budget, cap_tokens)
+            .await
+    }
 
+    async fn enforce_summary_cap(
+        &self,
+        mut summary: String,
+        input_budget: usize,
+        cap_tokens: usize,
+    ) -> Result<String> {
         for attempt in 0..MAX_SUMMARY_CAP_RESUMMARIZE_ATTEMPTS {
             let tokens = Self::estimate_text_tokens(&summary);
             if tokens <= cap_tokens {
@@ -2856,9 +3080,174 @@ impl AgentRunner {
     ///
     /// Measured on gemma4:26b (Q4_K_M, M1 Max) over an 8.6k-token history:
     /// 20.14s of prompt evaluation without the tool block, 3.55s with it.
+    #[cfg(test)]
     async fn compact_history(&self, conv: &mut Conversation, tools: &[ToolSchema]) -> Result<()> {
+        let latest = conv
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::User)
+            .cloned();
+        self.compact_history_preserving(conv, tools, latest.as_ref())
+            .await
+    }
+
+    /// Runs the production compaction path without executing an agent action.
+    /// Intended for controlled evaluations and explicit maintenance tooling.
+    pub async fn compact_for_evaluation(
+        &self,
+        conv: &mut Conversation,
+        tools: &[ToolSchema],
+    ) -> Result<()> {
+        let latest = conv
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::User)
+            .cloned();
+        self.compact_history_preserving(conv, tools, latest.as_ref())
+            .await
+    }
+
+    async fn compact_history_preserving(
+        &self,
+        conv: &mut Conversation,
+        tools: &[ToolSchema],
+        latest_user: Option<&Message>,
+    ) -> Result<()> {
         let before_len = conv.messages.len();
         let before_tokens = self.cached_conversation_tokens(conv);
+
+        let strategy = self.config.compaction_strategy;
+        let request_budget = self.request_context_limit(tools);
+        let target = self
+            .config
+            .compaction_target_tokens
+            .unwrap_or(request_budget / 2)
+            .min(request_budget);
+        let mut preserved_ids = HashSet::new();
+        let mut head = Vec::new();
+        for message in conv.messages.iter().take_while(|m| m.role == Role::System) {
+            preserved_ids.insert(message.id);
+            head.push(message.clone());
+        }
+        if let Some(first) = conv.messages.iter().find(|m| m.role == Role::User) {
+            preserved_ids.insert(first.id);
+            head.push(first.clone());
+        }
+        if let Some(latest) = latest_user {
+            preserved_ids.insert(latest.id);
+        }
+        let mandatory_tokens = Self::estimate_conversation_tokens(&head)
+            + latest_user
+                .filter(|m| !head.iter().any(|h| h.id == m.id))
+                .map_or(0, Self::estimate_message_tokens);
+        // Reserve explicit room for framing/recall hints and the verbatim todo
+        // ledger. Mandatory input is never clipped to make a request fit.
+        let todo_text = self.todos.render(conv.id);
+        let metadata_tokens = 256
+            + todo_text
+                .as_ref()
+                .map_or(0, |t| Self::estimate_text_tokens(t));
+        if mandatory_tokens.saturating_add(metadata_tokens) >= target {
+            return Err(Error::ContextBudgetExceeded {
+                estimated_input_tokens: mandatory_tokens.saturating_add(metadata_tokens),
+                input_budget_tokens: target,
+            });
+        }
+        let available = target - mandatory_tokens - metadata_tokens;
+        let tail_budget = match strategy {
+            CompactionStrategy::StructuredTail | CompactionStrategy::StructuredMessageTail => {
+                available / 2
+            }
+            CompactionStrategy::Extractive => available,
+            _ => 0,
+        };
+        let mut tail_tokens = 0;
+        if strategy == CompactionStrategy::StructuredMessageTail {
+            // A whole user turn can contain megabytes of browser observations.
+            // Keep recent dialogue at finer boundaries. An oversized tool
+            // exchange may be archived as a whole without crowding out the
+            // nearby short user/assistant context. Never split call/results.
+            let mut groups = Vec::new();
+            let mut start = 0;
+            while start < conv.messages.len() {
+                let mut end = start + 1;
+                let mut pending: HashSet<String> = conv.messages[start]
+                    .content
+                    .tool_calls()
+                    .iter()
+                    .map(|c| c.id.clone())
+                    .collect();
+                while !pending.is_empty() && end < conv.messages.len() {
+                    if let MessageContent::ToolResult(result) = &conv.messages[end].content {
+                        pending.remove(&result.call_id);
+                    }
+                    end += 1;
+                }
+                groups.push(start..end);
+                start = end;
+            }
+            let mut users = 0;
+            for range in groups.into_iter().rev() {
+                let group = &conv.messages[range];
+                users += group.iter().filter(|m| m.role == Role::User).count();
+                if users > 3 {
+                    break;
+                }
+                let extra: usize = group
+                    .iter()
+                    .filter(|m| !preserved_ids.contains(&m.id))
+                    .map(Self::estimate_message_tokens)
+                    .sum();
+                if tail_tokens + extra > tail_budget {
+                    if !group[0].content.tool_calls().is_empty()
+                        && group.iter().all(|m| m.role != Role::User)
+                    {
+                        continue;
+                    }
+                    break;
+                }
+                tail_tokens += extra;
+                preserved_ids.extend(group.iter().map(|m| m.id));
+            }
+        } else if tail_budget > 0 {
+            // Whole user-turn groups preserve call/result pairing. Choose a
+            // contiguous recent suffix, never isolated orphan tool results.
+            let starts: Vec<usize> = conv
+                .messages
+                .iter()
+                .enumerate()
+                .filter(|(_, m)| m.role == Role::User)
+                .map(|(i, _)| i)
+                .collect();
+            let max_turns = if strategy == CompactionStrategy::Extractive {
+                usize::MAX
+            } else {
+                3
+            };
+            let mut end = conv.messages.len();
+            for start in starts.into_iter().rev().take(max_turns) {
+                let group = &conv.messages[start..end];
+                let extra: usize = group
+                    .iter()
+                    .filter(|m| !preserved_ids.contains(&m.id))
+                    .map(Self::estimate_message_tokens)
+                    .sum();
+                if tail_tokens + extra > tail_budget {
+                    break;
+                }
+                tail_tokens += extra;
+                preserved_ids.extend(group.iter().map(|m| m.id));
+                end = start;
+            }
+        }
+        let tail: Vec<Message> = conv
+            .messages
+            .iter()
+            .filter(|m| preserved_ids.contains(&m.id) && !head.iter().any(|h| h.id == m.id))
+            .cloned()
+            .collect();
 
         tracing::info!(
             before_messages = before_len,
@@ -2878,10 +3267,19 @@ impl AgentRunner {
         // or no chunks.
         let ceiling = compaction_expand_ctx()
             .map(|c| c as usize)
-            .unwrap_or_else(|| self.effective_context_limit());
+            .unwrap_or_else(|| self.request_context_limit(&[]));
         let ratio = compaction_input_budget_ratio();
-        let input_budget = compaction_input_budget(ceiling, ratio);
-        let summary_cap_tokens = self.effective_compaction_summary_cap();
+        let input_budget =
+            compaction_input_budget(ceiling, ratio).min(ceiling.saturating_sub(1024));
+        if input_budget < 64 {
+            return Err(Error::ContextBudgetExceeded {
+                estimated_input_tokens: 64,
+                input_budget_tokens: input_budget,
+            });
+        }
+        let summary_cap_tokens = self
+            .effective_compaction_summary_cap()
+            .min(available.saturating_sub(tail_tokens));
         tracing::debug!(
             ceiling,
             ratio,
@@ -2894,46 +3292,50 @@ impl AgentRunner {
         // model call. Preserves the existing first-person summarization
         // semantics (the model sees its own history and is asked to
         // summarize its progress).
-        let summary = if before_tokens <= input_budget {
+        let summary = if strategy == CompactionStrategy::Extractive {
+            "No model-generated summary. Recent verbatim turns follow; earlier details are in the recall archive. Inspect that archive before assuming an omitted fact is unknown or completed.".to_string()
+        } else if before_tokens.saturating_add(1024) <= input_budget
+            && before_tokens.saturating_add(1024) <= request_budget
+        {
             // Derive a word budget from the token cap so the model's own
             // output targets the same size as the recursive path. ~1.5
             // tokens per word leaves headroom under the token cap.
             let max_words = (summary_cap_tokens as f64 / 1.5).floor().max(128.0) as usize;
             let compaction_prompt = Message {
                 id: Uuid::new_v4(),
-                role: Role::User,
-                content: MessageContent::Text(format!(
-                    "Your conversation history is getting long and needs to be compressed. \
-                     Summarize your progress so far in a concise message. Include:\n\
-                     1. What you have already completed (concrete results, values, file paths, etc.)\n\
-                     2. What remains to be done\n\
-                     3. Your current plan / next step\n\n\
-                     Be specific — include variable names, numbers, tool outputs, and any \
-                     intermediate results needed to continue without repeating work. \
-                     HARD LIMIT: keep the summary under {max_words} words."
-                )),
+                role: Role::System,
+                content: MessageContent::Text(strategy.summary_prompt(max_words, false)),
                 created_at: Utc::now(),
-                            agent_version: Message::version_stamp(),
+                agent_version: Message::version_stamp(),
             };
 
-            // Append the prompt in place for the summarizer call, then pop
-            // it back off — this avoids deep-cloning the entire history at
-            // the exact moment it is at its largest.
-            conv.messages.push(compaction_prompt);
+            // Keep the live history unchanged even if the summarizer future
+            // is cancelled. This costs one deep clone at the high-water mark.
+            let mut summary_messages = conv.messages.clone();
+            summary_messages.push(compaction_prompt);
             // Must follow the expanded window when one is set: the expanded
             // input budget is what routed this history to the fast path, and
-            // a plain chat() would trim it back to the everyday window — the
-            // model would summarize a truncated fragment while this code
-            // believes it saw everything.
+            // a plain chat() would validate against the everyday window and
+            // reject a history that fits the intended expanded request.
             let response = match compaction_expand_ctx() {
                 Some(ctx) => {
                     self.provider
-                        .chat_with_ctx(&conv.messages, tools, ctx)
+                        .chat_with_ctx(&summary_messages, tools, ctx)
                         .await
                 }
-                None => self.provider.chat(&conv.messages, tools).await,
+                None => self.provider.chat(&summary_messages, tools).await,
             };
-            let response = response?;
+            let response = match response {
+                Ok(response) => response,
+                Err(error) => {
+                    return Err(error);
+                }
+            };
+            if response.stop_reason == StopReason::MaxTokens {
+                return Err(Error::ModelProvider(
+                    "compaction summary hit its generation limit; original history was not replaced".into(),
+                ));
+            }
             let text = response.message.content.as_text().unwrap_or("").to_string();
 
             // Offering the tool block is what keeps the cache warm, but it
@@ -2949,13 +3351,15 @@ impl AgentRunner {
                      retrying without the tool block"
                 );
                 let retry = match compaction_expand_ctx() {
-                    Some(ctx) => self.provider.chat_with_ctx(&conv.messages, &[], ctx).await,
-                    None => self.provider.chat(&conv.messages, &[]).await,
+                    Some(ctx) => {
+                        self.provider
+                            .chat_with_ctx(&summary_messages, &[], ctx)
+                            .await
+                    }
+                    None => self.provider.chat(&summary_messages, &[]).await,
                 };
-                conv.messages.pop();
                 retry?.message.content.as_text().unwrap_or("").to_string()
             } else {
-                conv.messages.pop();
                 text
             }
         } else {
@@ -2983,31 +3387,24 @@ impl AgentRunner {
         // intermediates without further compression — both can produce
         // summaries that exceed the compaction threshold themselves,
         // defeating compaction. Re-summarize or truncate until it fits.
-        let summary = self.enforce_summary_size_cap(summary, input_budget).await?;
+        let summary = if strategy == CompactionStrategy::Extractive {
+            summary
+        } else {
+            self.enforce_summary_cap(summary, input_budget, summary_cap_tokens)
+                .await?
+        };
 
         if summary.is_empty() {
-            tracing::warn!("compaction produced empty summary, skipping");
-            return Ok(());
+            return Err(Error::Internal(
+                "compaction produced no usable summary; original history retained".into(),
+            ));
         }
 
         // Figure out which messages survive the swap (leading system
-        // messages + the first user message). Everything else is
+        // messages + first and latest actual user messages). Everything else is
         // "displaced" — its detail lives only in the summary unless we
         // archive it for recall.
-        let mut new_messages: Vec<Message> = Vec::new();
-        let mut preserved_ids: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
-        for msg in &conv.messages {
-            if msg.role == Role::System {
-                preserved_ids.insert(msg.id);
-                new_messages.push(msg.clone());
-            } else {
-                break;
-            }
-        }
-        if let Some(first_user) = conv.messages.iter().find(|m| m.role == Role::User) {
-            preserved_ids.insert(first_user.id);
-            new_messages.push(first_user.clone());
-        }
+        let mut new_messages = head;
 
         // Archive the displaced messages into the per-conversation
         // recall store so the agent can recover specific detail via the
@@ -3021,15 +3418,6 @@ impl AgentRunner {
             .map(Self::render_message_for_summary)
             .collect();
         let archived_chars: usize = displaced.iter().map(|s| s.len()).sum();
-        if !displaced.is_empty() {
-            self.recall.append(conv.id, &displaced.join("\n\n"));
-            tracing::info!(
-                conversation_id = %conv.id,
-                displaced_messages = displaced.len(),
-                archived_chars,
-                "compaction: archived displaced history for recall"
-            );
-        }
 
         // Append a recall hint so the model knows specific detail is
         // recoverable when the bullet summary glosses over something.
@@ -3052,7 +3440,7 @@ impl AgentRunner {
         // (which truncates from the end) can never clip it. The model keeps
         // it current with `todo_write`; the store, not this text, is the
         // source of truth, so a later edit supersedes what's frozen here.
-        let summary_with_hint = match self.todos.render(conv.id) {
+        let summary_with_hint = match todo_text {
             Some(todos) => format!(
                 "Current task list (maintained via todo_write — update statuses as you \
                  work):\n{todos}\n\n{summary_with_hint}"
@@ -3073,17 +3461,37 @@ impl AgentRunner {
         };
         let continuation_msg = Message {
             id: Uuid::new_v4(),
-            role: Role::User,
-            content: MessageContent::Text(
-                "Continue from the summary above. Do not repeat already-completed work."
-                    .to_string(),
-            ),
+            role: Role::System,
+            content: MessageContent::Text(if strategy == CompactionStrategy::Legacy {
+                "Continue from the summary above. Do not repeat already-completed work.".to_string()
+            } else {
+                let mut text = "Continue the current user task using the handoff and verbatim turns. Later user corrections and explicit task switches override earlier goals or summary claims. Resolve short follow-ups in context. A summary is lossy: verify uncertain details via recall, and never treat attempted or failed actions as completed. Refresh browser state before using element refs.".to_string();
+                if strategy == CompactionStrategy::StructuredMessageTail {
+                    text.push_str(" Within the same task, apply corrections only to the fields changed; retain other preferences and constraints unless explicitly withdrawn or contradicted. A newer summary omitting an older requirement does not cancel it. Check verbatim context before choosing the next action. Do not transfer unrelated constraints across an explicit task switch.");
+                }
+                text
+            }),
             created_at: Utc::now(),
             agent_version: Message::version_stamp(),
         };
 
         new_messages.push(summary_msg.clone());
         new_messages.push(continuation_msg.clone());
+        new_messages.extend(tail);
+
+        let after_tokens = Self::estimate_conversation_tokens(&new_messages);
+        if after_tokens > target {
+            return Err(Error::ContextBudgetExceeded {
+                estimated_input_tokens: after_tokens,
+                input_budget_tokens: target,
+            });
+        }
+        // Commit the archive and history replacement only after validation.
+        if !displaced.is_empty() {
+            self.recall.append(conv.id, &displaced.join("\n\n"));
+            tracing::info!(conversation_id = %conv.id, displaced_messages = displaced.len(), archived_chars,
+                "compaction: archived displaced history for recall");
+        }
 
         conv.messages = new_messages;
         conv.summary = Some(summary_with_hint);
@@ -3099,7 +3507,6 @@ impl AgentRunner {
             cb(&continuation_msg);
         }
 
-        let after_tokens = Self::estimate_conversation_tokens(&conv.messages);
         // Compaction replaced the history wholesale; reset the incremental
         // estimate to the fresh count so `needs_compaction` stays O(1),
         // and drop the usage anchor — it measured messages that no longer
@@ -3146,7 +3553,7 @@ impl AgentRunner {
             conv,
             Message {
                 id: Uuid::new_v4(),
-                role: Role::User,
+                role: Role::Assistant,
                 content: MessageContent::Text(text),
                 created_at: Utc::now(),
                 agent_version: Message::version_stamp(),
@@ -3577,30 +3984,320 @@ fn enforce_sandbox_policy(
 }
 
 /// Drain all immediately-available inbound events and append user messages
-/// to the conversation.
-fn drain_inbound_to_conv(
-    inbound_rx: &mut mpsc::Receiver<InboundEvent>,
-    conv: &mut Conversation,
-    supports_vision: bool,
-    on_event: &dyn Fn(AgentEvent),
-) {
-    while let Ok(event) = inbound_rx.try_recv() {
-        match event {
-            InboundEvent::UserMessage { parts, .. } => {
-                let content = MessageContent::from_parts(&parts, supports_vision);
-                let msg = Message {
-                    id: Uuid::new_v4(),
-                    role: Role::User,
-                    content,
-                    created_at: Utc::now(),
-                    agent_version: None,
-                };
-                on_event(AgentEvent::UserMessageQueued { message_id: msg.id });
-                conv.messages.push(msg);
-                conv.updated_at = Utc::now();
+/// to the conversation. Runner-owned hooks also observe injected messages.
+impl AgentRunner {
+    fn drain_inbound(
+        &self,
+        inbound_rx: &mut mpsc::Receiver<InboundEvent>,
+        conv: &mut Conversation,
+        on_event: &dyn Fn(AgentEvent),
+    ) -> Result<usize> {
+        let mut count = 0;
+        let mut cancelled = false;
+        while let Ok(event) = inbound_rx.try_recv() {
+            match event {
+                InboundEvent::Message(msg) => {
+                    if msg.role != Role::User {
+                        return Err(Error::Internal(
+                            "agent inbox only accepts user messages".into(),
+                        ));
+                    }
+                    if !conv.messages.iter().any(|existing| existing.id == msg.id) {
+                        on_event(AgentEvent::UserMessageQueued { message_id: msg.id });
+                        self.push_message(conv, msg);
+                        count += 1;
+                    }
+                }
+                InboundEvent::UserMessage { parts, .. } => {
+                    let content =
+                        MessageContent::from_parts(&parts, self.provider.supports_vision());
+                    let msg = Message {
+                        id: Uuid::new_v4(),
+                        role: Role::User,
+                        content,
+                        created_at: Utc::now(),
+                        agent_version: None,
+                    };
+                    on_event(AgentEvent::UserMessageQueued { message_id: msg.id });
+                    self.push_message(conv, msg);
+                    count += 1;
+                }
+                InboundEvent::Cancel => {
+                    cancelled = true;
+                }
             }
-            InboundEvent::Cancel => {}
         }
+        if cancelled {
+            return Err(Error::Internal("agent run cancelled".into()));
+        }
+        Ok(count)
+    }
+}
+
+#[cfg(test)]
+mod interactive_regression_tests {
+    use super::*;
+    use crate::sandbox::NoSandbox;
+    use async_trait::async_trait;
+
+    struct PausedProvider {
+        seen: Mutex<Vec<Vec<Message>>>,
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+        failure: bool,
+        response: Mutex<Option<MessageContent>>,
+    }
+    #[async_trait]
+    impl ModelProvider for PausedProvider {
+        fn name(&self) -> &str {
+            "paused-regression-fixture"
+        }
+        async fn chat(&self, messages: &[Message], _: &[ToolSchema]) -> Result<ModelResponse> {
+            let first = {
+                let mut seen = self.seen.lock().unwrap();
+                seen.push(messages.to_vec());
+                seen.len() == 1
+            };
+            if first {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+            if self.failure {
+                return Err(Error::Internal("injected provider stream failure".into()));
+            }
+            Ok(ModelResponse {
+                message: Message::stamped(
+                    Role::Assistant,
+                    self.response.lock().unwrap().take().unwrap_or_else(|| {
+                        MessageContent::Text("The observed result is complete.".into())
+                    }),
+                ),
+                usage: Usage::default(),
+                stop_reason: StopReason::EndTurn,
+                text: None,
+            })
+        }
+    }
+    fn setup(
+        failure: bool,
+        cap: usize,
+    ) -> (Arc<PausedProvider>, AgentRunner, Conversation, Session) {
+        let provider = Arc::new(PausedProvider {
+            seen: Mutex::new(Vec::new()),
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+            failure,
+            response: Mutex::new(None),
+        });
+        let runner = AgentRunner::new(provider.clone(), Vec::new(), Arc::new(NoSandbox))
+            .with_config(AgentConfig {
+                max_iterations: cap,
+                ..Default::default()
+            });
+        let mut conv = Conversation {
+            id: Uuid::new_v4(),
+            messages: Vec::new(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            title: None,
+            summary: None,
+            detected_profile: None,
+            channel_source: None,
+            channel_id: None,
+            channel_thread_id: None,
+        };
+        conv.messages.push(Message::stamped(
+            Role::User,
+            MessageContent::Text("Find Broadway dates.".into()),
+        ));
+        let session = Session::with_capabilities(
+            conv.id,
+            rustykrab_core::capability::CapabilitySet::for_tools_permissive(&[]),
+        );
+        (provider, runner, conv, session)
+    }
+    async fn inject(handle: &AgentHandle) {
+        handle
+            .send_message(vec![ContentPart::Text {
+                text: "Use September 18-20 instead.".into(),
+            }])
+            .await
+            .unwrap();
+    }
+    fn has_correction(messages: &[Message]) -> bool {
+        messages.iter().any(|m| {
+            m.role == Role::User && m.content.as_text() == Some("Use September 18-20 instead.")
+        })
+    }
+
+    #[tokio::test]
+    async fn end_turn_injection_reaches_another_dispatch_and_memory_hook() {
+        let (p, runner, conv, session) = setup(false, 4);
+        let retained = Arc::new(Mutex::new(Vec::new()));
+        let out = retained.clone();
+        let runner = runner.with_on_message(Arc::new(move |m| out.lock().unwrap().push(m.clone())));
+        let (handle, _events, task) = runner.start(conv, session);
+        p.entered.notified().await;
+        inject(&handle).await;
+        p.release.notify_one();
+        let completion = tokio::time::timeout(Duration::from_secs(3), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(completion.result.is_ok());
+        {
+            let seen = p.seen.lock().unwrap();
+            assert_eq!(seen.len(), 2);
+            assert!(!has_correction(&seen[0]));
+            assert!(has_correction(&seen[1]));
+        }
+        assert!(has_correction(&retained.lock().unwrap()));
+        assert!(!handle.is_alive());
+        assert!(handle.send_message(Vec::new()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn provider_error_returns_partial_history_and_pending_input() {
+        let (p, runner, mut conv, session) = setup(true, 4);
+        let trail = Message::stamped(
+            Role::Tool,
+            MessageContent::Text("Prior Hyannis browser timeout evidence".into()),
+        );
+        let trail_id = trail.id;
+        conv.messages.push(trail);
+        let (handle, _events, task) = runner.start(conv, session);
+        p.entered.notified().await;
+        inject(&handle).await;
+        p.release.notify_one();
+        let completion = task.await.unwrap();
+        assert!(completion.result.is_err());
+        assert!(has_correction(&completion.conversation.messages));
+        assert!(completion
+            .conversation
+            .messages
+            .iter()
+            .any(|m| m.id == trail_id));
+        assert_eq!(p.seen.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn cancellation_interrupts_a_stuck_provider_and_retains_input() {
+        let (p, runner, conv, session) = setup(false, 4);
+        let (handle, _events, task) = runner.start(conv, session);
+        p.entered.notified().await;
+        inject(&handle).await;
+        handle.cancel().await.unwrap();
+        let completion = tokio::time::timeout(Duration::from_secs(3), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(completion
+            .result
+            .unwrap_err()
+            .to_string()
+            .contains("cancelled"));
+        assert!(has_correction(&completion.conversation.messages));
+    }
+
+    #[tokio::test]
+    async fn queued_followups_cannot_reset_the_iteration_budget() {
+        let (p, runner, conv, session) = setup(false, 1);
+        let (handle, _events, task) = runner.start(conv, session);
+        p.entered.notified().await;
+        inject(&handle).await;
+        p.release.notify_one();
+        let completion = task.await.unwrap();
+        assert!(completion
+            .result
+            .unwrap_err()
+            .to_string()
+            .contains("iteration limit"));
+        assert!(has_correction(&completion.conversation.messages));
+        assert_eq!(p.seen.lock().unwrap().len(), 1);
+    }
+
+    struct DropNotice(Arc<tokio::sync::Semaphore>);
+    impl Drop for DropNotice {
+        fn drop(&mut self) {
+            self.0.add_permits(1);
+        }
+    }
+    struct HangingTool {
+        started: Arc<tokio::sync::Semaphore>,
+        dropped: Arc<tokio::sync::Semaphore>,
+    }
+    #[async_trait]
+    impl Tool for HangingTool {
+        fn name(&self) -> &str {
+            "hang_fixture"
+        }
+        fn description(&self) -> &str {
+            "A cancellable local test future"
+        }
+        fn schema(&self) -> ToolSchema {
+            ToolSchema {
+                name: self.name().into(),
+                description: self.description().into(),
+                parameters: serde_json::json!({"type":"object"}),
+            }
+        }
+        async fn execute(&self, _: serde_json::Value) -> Result<serde_json::Value> {
+            let _drop = DropNotice(self.dropped.clone());
+            self.started.add_permits(1);
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_aborts_parallel_tools_and_records_unknown_outcomes() {
+        let (p, _, conv, _) = setup(false, 4);
+        *p.response.lock().unwrap() = Some(MessageContent::MultiToolCall(
+            (0..2)
+                .map(|i| ToolCall {
+                    id: format!("interrupted-{i}"),
+                    name: "hang_fixture".into(),
+                    arguments: serde_json::json!({}),
+                })
+                .collect(),
+        ));
+        let started = Arc::new(tokio::sync::Semaphore::new(0));
+        let dropped = Arc::new(tokio::sync::Semaphore::new(0));
+        let runner = AgentRunner::new(
+            p.clone(),
+            vec![Arc::new(HangingTool {
+                started: started.clone(),
+                dropped: dropped.clone(),
+            })],
+            Arc::new(NoSandbox),
+        );
+        let session = Session::with_capabilities(
+            conv.id,
+            rustykrab_core::capability::CapabilitySet::for_tools_permissive(&["hang_fixture"]),
+        );
+        let (handle, _events, task) = runner.start(conv, session);
+        p.entered.notified().await;
+        p.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(3), started.acquire_many(2))
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        handle.cancel().await.unwrap();
+        let completion = tokio::time::timeout(Duration::from_secs(3), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(completion.result.is_err());
+        tokio::time::timeout(Duration::from_secs(3), dropped.acquire_many(2))
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        let unknown = completion.conversation.messages.iter().filter(|m| {
+            matches!(&m.content, MessageContent::ToolResult(r) if r.output["outcome"] == "unknown")
+        }).count();
+        assert_eq!(unknown, 2);
+        assert_eq!(p.seen.lock().unwrap().len(), 1, "no automatic retry");
     }
 }
 
@@ -3719,6 +4416,311 @@ mod compaction_tests {
     use std::sync::Mutex;
 
     use crate::sandbox::NoSandbox;
+
+    fn study_message(role: Role, text: &str) -> Message {
+        Message {
+            id: Uuid::new_v4(),
+            role,
+            content: MessageContent::Text(text.into()),
+            created_at: Utc::now(),
+            agent_version: None,
+        }
+    }
+
+    fn study_conversation(messages: Vec<Message>) -> Conversation {
+        Conversation {
+            id: Uuid::new_v4(),
+            messages,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            title: None,
+            summary: None,
+            detected_profile: None,
+            channel_source: None,
+            channel_id: None,
+            channel_thread_id: None,
+        }
+    }
+
+    #[test]
+    fn oversized_unicode_fragments_are_split_without_loss() {
+        let input = "日程は変更されました。".repeat(700);
+        let chunks = AgentRunner::pack_into_chunks(std::slice::from_ref(&input), 128);
+        assert!(chunks.len() > 2);
+        assert_eq!(chunks.concat(), input);
+        assert!(chunks
+            .iter()
+            .all(|c| AgentRunner::estimate_text_tokens(c) <= 128));
+    }
+
+    #[tokio::test]
+    async fn structured_tail_pins_intermediate_correction_and_complete_tool_pair() {
+        let provider = Arc::new(CountingProvider::new(Some(16_000)));
+        let runner = build_runner(provider).with_config(AgentConfig {
+            compaction_strategy: CompactionStrategy::StructuredTail,
+            compaction_target_tokens: Some(3_072),
+            ..Default::default()
+        });
+        let correction = study_message(
+            Role::User,
+            "Use September 18-20 instead of September 14-16.",
+        );
+        let latest = study_message(Role::User, "Continue with those dates.");
+        let mut call = study_message(Role::Assistant, "");
+        call.content = MessageContent::ToolCall(ToolCall {
+            id: "pair-1".into(),
+            name: "browser".into(),
+            arguments: serde_json::json!({"action":"snapshot"}),
+        });
+        let mut result = study_message(Role::Tool, "");
+        result.content = MessageContent::ToolResult(ToolResult {
+            call_id: "pair-1".into(),
+            output: serde_json::json!({"error":"timeout","outcome":"unknown"}),
+            is_error: true,
+            images: Vec::new(),
+        });
+        let mut conv = study_conversation(vec![
+            study_message(Role::System, "Agent instructions"),
+            study_message(Role::User, "Find Broadway shows September 14-16."),
+            study_message(Role::Assistant, &"irrelevant old tool detail ".repeat(700)),
+            correction.clone(),
+            study_message(Role::Assistant, "Next: inspect evening performances."),
+            latest.clone(),
+            call.clone(),
+            result.clone(),
+        ]);
+        runner.compact_for_evaluation(&mut conv, &[]).await.unwrap();
+        for pinned in [&correction, &latest, &call, &result] {
+            assert_eq!(
+                conv.messages.iter().filter(|m| m.id == pinned.id).count(),
+                1
+            );
+        }
+        assert!(AgentRunner::estimate_conversation_tokens(&conv.messages) <= 3_072);
+        assert!(runner
+            .recall
+            .get(conv.id)
+            .unwrap()
+            .contains("irrelevant old tool detail"));
+        runner.compact_for_evaluation(&mut conv, &[]).await.unwrap();
+        assert_eq!(
+            conv.messages
+                .iter()
+                .filter(|m| m.id == correction.id)
+                .count(),
+            1
+        );
+        assert_eq!(
+            conv.messages.iter().filter(|m| m.id == latest.id).count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn extractive_compaction_never_calls_model_and_archives_displaced_text() {
+        let provider = Arc::new(CountingProvider::new(Some(16_000)));
+        let runner = build_runner(provider.clone()).with_config(AgentConfig {
+            compaction_strategy: CompactionStrategy::Extractive,
+            compaction_target_tokens: Some(1_024),
+            ..Default::default()
+        });
+        let latest = study_message(Role::User, "Use the second option. Do not book.");
+        let mut conv = study_conversation(vec![
+            study_message(Role::System, "Agent instructions"),
+            study_message(Role::User, "Compare flights to Hyannis."),
+            study_message(Role::Assistant, &"old-result-marker ".repeat(900)),
+            latest.clone(),
+        ]);
+        runner.compact_for_evaluation(&mut conv, &[]).await.unwrap();
+        assert_eq!(*provider.call_count.lock().unwrap(), 0);
+        assert!(conv.messages.iter().any(|m| m.id == latest.id));
+        assert!(runner
+            .recall
+            .get(conv.id)
+            .unwrap()
+            .contains("old-result-marker"));
+        assert!(AgentRunner::estimate_conversation_tokens(&conv.messages) <= 1_024);
+    }
+
+    #[tokio::test]
+    async fn message_tail_keeps_recent_antecedent_after_an_oversized_tool_group() {
+        let provider = Arc::new(CountingProvider::new(Some(16_000)));
+        let runner = build_runner(provider).with_config(AgentConfig {
+            compaction_strategy: CompactionStrategy::StructuredMessageTail,
+            compaction_target_tokens: Some(3_072),
+            ..Default::default()
+        });
+        let prior = study_message(
+            Role::Assistant,
+            "The candidates are Hamilton and Wicked; next inspect their show calendars.",
+        );
+        let latest = study_message(
+            Role::User,
+            "Use the browser to fetch the time and date info.",
+        );
+        let mut conv = study_conversation(vec![
+            study_message(Role::System, "Agent instructions"),
+            study_message(Role::User, "Find Broadway shows September 14-16."),
+            study_message(Role::Assistant, &"obsolete page details ".repeat(900)),
+            prior.clone(),
+            latest.clone(),
+        ]);
+        runner.compact_for_evaluation(&mut conv, &[]).await.unwrap();
+        assert!(conv.messages.iter().any(|m| m.id == prior.id));
+        assert!(conv.messages.iter().any(|m| m.id == latest.id));
+        assert!(AgentRunner::estimate_conversation_tokens(&conv.messages) <= 3_072);
+    }
+
+    #[tokio::test]
+    async fn mandatory_input_over_target_refuses_without_mutation_or_provider_call() {
+        let provider = Arc::new(CountingProvider::new(Some(16_000)));
+        let runner = build_runner(provider.clone()).with_config(AgentConfig {
+            compaction_target_tokens: Some(512),
+            ..Default::default()
+        });
+        let mut conv = study_conversation(vec![study_message(
+            Role::User,
+            &"retain me exactly ".repeat(300),
+        )]);
+        let before = serde_json::to_value(&conv).unwrap();
+        let error = runner
+            .compact_for_evaluation(&mut conv, &[])
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::ContextBudgetExceeded { .. }));
+        assert_eq!(serde_json::to_value(&conv).unwrap(), before);
+        assert_eq!(*provider.call_count.lock().unwrap(), 0);
+        assert!(runner.recall.get(conv.id).is_none());
+    }
+
+    #[tokio::test]
+    async fn message_tail_archives_large_tool_pair_without_losing_nearby_constraints() {
+        let runner =
+            build_runner(Arc::new(CountingProvider::new(Some(16_000)))).with_config(AgentConfig {
+                compaction_strategy: CompactionStrategy::StructuredMessageTail,
+                compaction_target_tokens: Some(3_072),
+                ..Default::default()
+            });
+        let constraints = study_message(
+            Role::Assistant,
+            "Preferences: nonstop and carry-on included.",
+        );
+        let mut call = study_message(Role::Assistant, "");
+        call.content = MessageContent::ToolCall(ToolCall {
+            id: "large-page".into(),
+            name: "browser".into(),
+            arguments: serde_json::json!({"action":"snapshot"}),
+        });
+        let mut result = study_message(Role::Tool, "");
+        result.content = MessageContent::ToolResult(ToolResult {
+            call_id: "large-page".into(),
+            output: serde_json::json!({"page":"irrelevant-navigation ".repeat(2_000)}),
+            is_error: false,
+            images: Vec::new(),
+        });
+        let mut conv = study_conversation(vec![
+            study_message(Role::System, "Agent instructions"),
+            study_message(
+                Role::User,
+                "Compare Seattle to Chicago flights. No booking.",
+            ),
+            constraints.clone(),
+            call.clone(),
+            result.clone(),
+            study_message(Role::Assistant, "Next: inspect fare conditions."),
+            study_message(Role::User, "Use December 2-5, 2026."),
+        ]);
+        runner.compact_for_evaluation(&mut conv, &[]).await.unwrap();
+        assert!(conv.messages.iter().any(|m| m.id == constraints.id));
+        assert!(!conv
+            .messages
+            .iter()
+            .any(|m| m.id == call.id || m.id == result.id));
+        assert!(runner
+            .recall
+            .get(conv.id)
+            .unwrap()
+            .contains("irrelevant-navigation"));
+        conv.messages.push(study_message(
+            Role::User,
+            "Actually December 3-6, and prefer afternoon.",
+        ));
+        runner.compact_for_evaluation(&mut conv, &[]).await.unwrap();
+        assert!(conv.messages.iter().any(|m| m.id == constraints.id));
+        assert!(AgentRunner::estimate_conversation_tokens(&conv.messages) <= 3_072);
+    }
+
+    struct FailingSummary;
+    #[async_trait]
+    impl ModelProvider for FailingSummary {
+        fn name(&self) -> &str {
+            "failing-summary"
+        }
+        async fn chat(&self, _: &[Message], _: &[ToolSchema]) -> Result<ModelResponse> {
+            Err(Error::ModelProvider("synthetic summary failure".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn summary_failure_does_not_leave_a_synthetic_prompt_in_history() {
+        let runner = AgentRunner::new(Arc::new(FailingSummary), Vec::new(), Arc::new(NoSandbox));
+        let mut conv = study_conversation(vec![study_message(
+            Role::User,
+            "Review FBAR records, do not submit.",
+        )]);
+        let before = serde_json::to_value(&conv).unwrap();
+        assert!(runner.compact_for_evaluation(&mut conv, &[]).await.is_err());
+        assert_eq!(serde_json::to_value(&conv).unwrap(), before);
+        assert!(runner.recall.get(conv.id).is_none());
+    }
+
+    struct TruncatedSummary;
+    #[async_trait]
+    impl ModelProvider for TruncatedSummary {
+        fn name(&self) -> &str {
+            "truncated-summary"
+        }
+        async fn chat(&self, _: &[Message], _: &[ToolSchema]) -> Result<ModelResponse> {
+            Ok(ModelResponse {
+                message: study_message(
+                    Role::Assistant,
+                    "INTENT: compare flights\nCONSTRAINTS: return date",
+                ),
+                usage: Usage::default(),
+                stop_reason: StopReason::MaxTokens,
+                text: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn generation_limited_summary_cannot_replace_history_or_feed_recursive_reduction() {
+        let runner = AgentRunner::new(Arc::new(TruncatedSummary), Vec::new(), Arc::new(NoSandbox));
+        let mut conv = study_conversation(vec![
+            study_message(
+                Role::User,
+                "Compare flights. Nonstop, carry-on included. Do not book.",
+            ),
+            study_message(
+                Role::User,
+                "Change the dates, retaining the other requirements.",
+            ),
+        ]);
+        let before = serde_json::to_value(&conv).unwrap();
+        let error = runner
+            .compact_for_evaluation(&mut conv, &[])
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("summary hit its generation limit"));
+        assert_eq!(serde_json::to_value(&conv).unwrap(), before);
+        assert!(runner.recall.get(conv.id).is_none());
+        assert!(runner
+            .summarize_text_once("synthetic history", false, 512)
+            .await
+            .is_err());
+    }
 
     /// Mock provider that records chat-call count + prompt sizes and returns
     /// a canned summary for each call.
@@ -3984,10 +4986,10 @@ mod compaction_tests {
             .expect("compaction should succeed");
 
         // Compacted history should be: all leading system msgs + first user
-        // msg + summary + continuation prompt = 4 messages in this setup.
+        // msg + summary + continuation + latest user = 5 messages.
         assert_eq!(
             conv.messages.len(),
-            4,
+            5,
             "expected compacted layout, got {} messages",
             conv.messages.len()
         );
@@ -4297,8 +5299,12 @@ mod compaction_tests {
             .await
             .expect("compaction should succeed");
 
-        // System message + first user message + summary + continuation = 4.
-        assert_eq!(conv.messages.len(), 4);
+        // The newest real correction survives even when the summary omits it.
+        assert_eq!(conv.messages.len(), 5);
+        assert_eq!(
+            conv.messages.last().unwrap().content.as_text(),
+            Some("UNIQUE_DETAIL_BRAVO")
+        );
 
         // The compacted summary should mention the recall tools so the
         // model knows the displaced detail is recoverable.
@@ -4314,7 +5320,7 @@ mod compaction_tests {
             .get(conv_id)
             .expect("recall archive should be populated");
         assert!(archived.contains("UNIQUE_DETAIL_ALPHA"));
-        assert!(archived.contains("UNIQUE_DETAIL_BRAVO"));
+        assert!(!archived.contains("UNIQUE_DETAIL_BRAVO"));
         assert!(archived.contains("UNIQUE_DETAIL_CHARLIE"));
         assert!(
             !archived.contains("agent identity"),
@@ -5408,7 +6414,7 @@ mod task_complete_tests {
         let continues = conv
             .messages
             .iter()
-            .filter(|m| m.role == Role::User && m.content.as_text() == Some("Continue."))
+            .filter(|m| m.role == Role::System && m.content.as_text() == Some("Continue."))
             .count();
         assert_eq!(continues, 3, "only the first three truncations re-prompt");
     }
@@ -5589,7 +6595,7 @@ mod task_complete_tests {
 
         // The reminder must have been injected as a user-role message.
         assert!(
-            conv.messages.iter().any(|m| m.role == Role::User
+            conv.messages.iter().any(|m| m.role == Role::System
                 && m.content
                     .as_text()
                     .map(|t| t.contains("task_complete"))
@@ -5802,7 +6808,7 @@ mod task_complete_tests {
             .messages
             .iter()
             .filter(|m| {
-                m.role == Role::User
+                m.role == Role::System
                     && m.content
                         .as_text()
                         .map(|t| t.contains("did not call `task_complete`"))

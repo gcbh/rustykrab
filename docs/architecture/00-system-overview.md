@@ -12,7 +12,9 @@ of long-polling channel loops. A message arriving on any surface becomes a
 *turn*: the agent loop calls the model, executes the tools it asks for, and
 repeats until the model signals completion.
 
-**Current tree: 14 crates, ~90,200 lines, 949 tests.**
+**Second-pass snapshot: 14 crates, ~90,200 lines, 949 tests.** Current mechanical
+counts live in the generated crate summaries; the continuity follow-up below
+is derived against base `0b565fd` plus its recorded working-tree changes.
 
 ## Crate graph
 
@@ -43,6 +45,9 @@ rustykrab-projects    (no internal deps — immutable planning domain)
    +-- rustykrab-store    +-- rustykrab-gateway
        revision storage      planning HTTP surface
        (also uses core)      (also uses runtime/store/channels)
+
+rustykrab-e2e         (core, store, tools, agent, providers)
+                     daemon boundary tests + direct production-compactor ablation
 ```
 
 `rustykrab-runtime` is new since the first pass and is the significant change
@@ -62,7 +67,11 @@ no axum in its dependency tree.
 | Application service | **`runtime`** | Assemble a turn: prompt, session, capabilities, memory hooks |
 | Transport | `gateway`, channel loops in `cli` | HTTP/SSE, Telegram polling, Slack events |
 | Composition | `cli` | Read env, build everything, spawn background tasks |
-| Verification | `e2e`, `dream` | Black-box scenarios; offline outcome analysis |
+| Verification | `e2e`, `dream` | Black-box scenarios, direct compactor ablation; offline outcome analysis |
+
+The context evaluator also links `core` and `tools` to reuse production tool
+schemas and argument validation for inert replacements. Turn execution still
+crosses the real daemon process boundary; it does not call the runner directly.
 
 The spine is now complete — the application-service row is a real crate
 rather than a module inside the transport. That was the first pass's
@@ -99,14 +108,19 @@ still implicit and is the only thing making the in-memory queue safe.
    `channel_bindings`, then by creating one.
 2. `process_telegram_message` loads the conversation — healing a binding that
    outlived it — snapshots persisted message ids, appends the user message,
-   starts a typing task.
-3. `rustykrab_runtime::run_agent_interactive` → `prepare_agent`: system
-   prompt, capability set, `Session`, memory write-back callback, `AgentRunner`.
+   saves that inbound turn, and starts a typing task.
+3. `rustykrab_runtime::run_agent_interactive` now uses shared `prepare_agent`
+   for the system prompt, capabilities, session, active tools, durable recall,
+   memory callback, retrieval log and optional outcome sink. A task-owned
+   activity guard lasts through completion. The omitted wiring found against
+   base `0b565fd` is repaired and covered by captured-wire regression trials.
 4. `AgentRunner::run_inner` — **one loop now**, parameterised by an event
    sink — compacts if over budget, calls the provider, classifies the
    response, executes tools in parallel under the sandbox policy.
 5. The caller drains `AgentEvent`s as a heartbeat.
-6. `save_turn(&conv, &persisted_ids)` appends this turn's messages.
+6. `save_turn(&conv, &persisted_ids)` appends this turn's messages, including
+   partial history returned on error/cancellation. An interrupted action's
+   outcome may be unknown; persistence is not proof of task completion.
 7. Optionally an `OutcomeRecord` plus attributions are written.
 8. Any `PendingLinks` minted this turn are delivered as a separate message —
    on chat surfaces only.

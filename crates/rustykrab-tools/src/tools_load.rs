@@ -102,6 +102,13 @@ impl Tool for ToolsLoadTool {
                     .active_tools
                     .active_for(ctx.conversation_id)
                     .into_iter()
+                    .filter(|name| {
+                        caps.can_use_tool(name)
+                            && ctx
+                                .all_tools
+                                .iter()
+                                .any(|tool| tool.name() == name && tool.available())
+                    })
                     .collect();
                 v.sort();
                 v
@@ -119,5 +126,72 @@ impl Tool for ToolsLoadTool {
         })?;
 
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rustykrab_core::active_tools::{
+        ActiveToolsRegistry, SessionToolContext, SESSION_TOOL_CONTEXT,
+    };
+    use rustykrab_core::{capability::CapabilitySet, recall::RecallStore, todo::TodoStore};
+    use std::sync::Arc;
+
+    struct FixtureTool(&'static str, bool);
+    #[async_trait]
+    impl Tool for FixtureTool {
+        fn name(&self) -> &str {
+            self.0
+        }
+        fn description(&self) -> &str {
+            "inert availability fixture"
+        }
+        fn available(&self) -> bool {
+            self.1
+        }
+        fn schema(&self) -> ToolSchema {
+            ToolSchema {
+                name: self.0.into(),
+                description: self.description().into(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        async fn execute(&self, _: Value) -> Result<Value> {
+            Ok(Value::Null)
+        }
+    }
+
+    #[tokio::test]
+    async fn active_report_excludes_missing_unavailable_and_forbidden_seed_names() {
+        let ctx = SessionToolContext {
+            conversation_id: uuid::Uuid::new_v4(),
+            capabilities: Arc::new(CapabilitySet::for_tools(&["browser", "unavailable"])),
+            all_tools: Arc::new(vec![
+                Arc::new(FixtureTool("browser", true)),
+                Arc::new(FixtureTool("unavailable", false)),
+                Arc::new(FixtureTool("forbidden", true)),
+            ]),
+            active_tools: Arc::new(ActiveToolsRegistry::with_seed([
+                "memory_search",
+                "unavailable",
+                "forbidden",
+            ])),
+            recall: Arc::new(RecallStore::new()),
+            todos: Arc::new(TodoStore::new()),
+        };
+        let result = SESSION_TOOL_CONTEXT
+            .scope(
+                ctx,
+                ToolsLoadTool::new().execute(
+                    json!({"names":["browser","memory_search","unavailable","forbidden"]}),
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["active"], json!(["browser"]));
+        assert_eq!(result["loaded"], json!(["browser"]));
+        assert_eq!(result["unknown"], json!(["memory_search", "unavailable"]));
+        assert_eq!(result["forbidden"], json!(["forbidden"]));
     }
 }

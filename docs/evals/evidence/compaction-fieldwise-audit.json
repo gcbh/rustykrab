@@ -1,0 +1,355 @@
+{
+  "runs": [
+    {
+      "root": "target/e2e-artifacts/compaction-study-598d3b77-3b6e-432a-9ef9-901af7a31de1",
+      "complete": true,
+      "manifest_sha256": "d599e72df4eda4358291e91019338d5a1a7604a75c29c375e28914941740ca76",
+      "source_revision": "0b565fdbe80095668a402cdc6b5d410efecc867b+fieldwise-v2-dirty",
+      "summaries": [
+        {
+          "strategy": "structured-message-tail",
+          "trials": 2,
+          "raw_all_passed": 2,
+          "morphology_only_all_passed": 2,
+          "schema_valid_readouts": 2,
+          "raw_dimensions_on_valid_readouts": {
+            "intent_preserved": {
+              "passed": 2,
+              "scorable": 2
+            },
+            "direction_preserved": {
+              "passed": 2,
+              "scorable": 2
+            },
+            "relevant_facts_preserved": {
+              "passed": 2,
+              "scorable": 2
+            },
+            "current_constraints_preserved": {
+              "passed": 2,
+              "scorable": 2
+            },
+            "safe_next_action": {
+              "passed": 2,
+              "scorable": 2
+            },
+            "no_false_completion": {
+              "passed": 2,
+              "scorable": 2
+            }
+          },
+          "median_actual_probe_prompt_tokens": 1291.0,
+          "wire_integrity_failures": 0
+        }
+      ],
+      "trials": [
+        {
+          "case": "repeated-correction",
+          "elapsed_ms": 64595,
+          "error": null,
+          "probe_prompt_tokens": 1314,
+          "repetition": 0,
+          "score": {
+            "all_passed": true,
+            "current_constraints_preserved": true,
+            "direction_preserved": true,
+            "fact_checks": [
+              {
+                "criterion": "2026-12-03",
+                "present": true
+              },
+              {
+                "criterion": "2026-12-06",
+                "present": true
+              },
+              {
+                "criterion": "nonstop",
+                "present": true
+              },
+              {
+                "criterion": "carry-on",
+                "present": true
+              }
+            ],
+            "intent_preserved": true,
+            "no_false_completion": true,
+            "relevant_facts_preserved": true,
+            "safe_next_action": true,
+            "schema_valid": true
+          },
+          "strategy": "structured-message-tail",
+          "summary_elapsed_ms": 48431,
+          "wire_calls": 3,
+          "evidence_path": "target/e2e-artifacts/compaction-study-598d3b77-3b6e-432a-9ef9-901af7a31de1/repeated-correction-structured-message-tail-0.json",
+          "evidence_sha256": "9852c8194928545edf454052621e01836e4b5734323d5ba80a4b1cb462900eb7",
+          "wire_integrity_passed": true,
+          "wire_count": 3,
+          "checkpoint_present": true,
+          "schema_valid_readout": true,
+          "semantic_dimensions_scorable": true,
+          "direction_morphology_false_negative": false,
+          "morphology_only_all_passed": true,
+          "probe_done_reason": "stop",
+          "probe_generated_tokens": 596,
+          "summary_done_reasons": [
+            "stop",
+            "stop"
+          ],
+          "fact_diagnostics": [
+            {
+              "criterion": "2026-12-03",
+              "present": true,
+              "literal_in_final_context": false,
+              "literal_in_each_compacted_round": [
+                false,
+                false
+              ],
+              "note": "literal match only; not a semantic loss verdict"
+            },
+            {
+              "criterion": "2026-12-06",
+              "present": true,
+              "literal_in_final_context": false,
+              "literal_in_each_compacted_round": [
+                false,
+                false
+              ],
+              "note": "literal match only; not a semantic loss verdict"
+            },
+            {
+              "criterion": "nonstop",
+              "present": true,
+              "literal_in_final_context": true,
+              "literal_in_each_compacted_round": [
+                true,
+                true
+              ],
+              "note": "literal match only; not a semantic loss verdict"
+            },
+            {
+              "criterion": "carry-on",
+              "present": true,
+              "literal_in_final_context": true,
+              "literal_in_each_compacted_round": [
+                true,
+                true
+              ],
+              "note": "literal match only; not a semantic loss verdict"
+            }
+          ]
+        },
+        {
+          "case": "repeated-correction",
+          "elapsed_ms": 67995,
+          "error": null,
+          "probe_prompt_tokens": 1268,
+          "repetition": 1,
+          "score": {
+            "all_passed": true,
+            "current_constraints_preserved": true,
+            "direction_preserved": true,
+            "fact_checks": [
+              {
+                "criterion": "2026-12-03",
+                "present": true
+              },
+              {
+                "criterion": "2026-12-06",
+                "present": true
+              },
+              {
+                "criterion": "nonstop",
+                "present": true
+              },
+              {
+                "criterion": "carry-on",
+                "present": true
+              }
+            ],
+            "intent_preserved": true,
+            "no_false_completion": true,
+            "relevant_facts_preserved": true,
+            "safe_next_action": true,
+            "schema_valid": true
+          },
+          "strategy": "structured-message-tail",
+          "summary_elapsed_ms": 53103,
+          "wire_calls": 3,
+          "evidence_path": "target/e2e-artifacts/compaction-study-598d3b77-3b6e-432a-9ef9-901af7a31de1/repeated-correction-structured-message-tail-1.json",
+          "evidence_sha256": "6298c6c7a31d4428aa464f2c8ef24ff5c7a0b7c4fd107c313426e6a9dacf2c0f",
+          "wire_integrity_passed": true,
+          "wire_count": 3,
+          "checkpoint_present": true,
+          "schema_valid_readout": true,
+          "semantic_dimensions_scorable": true,
+          "direction_morphology_false_negative": false,
+          "morphology_only_all_passed": true,
+          "probe_done_reason": "stop",
+          "probe_generated_tokens": 535,
+          "summary_done_reasons": [
+            "stop",
+            "stop"
+          ],
+          "fact_diagnostics": [
+            {
+              "criterion": "2026-12-03",
+              "present": true,
+              "literal_in_final_context": false,
+              "literal_in_each_compacted_round": [
+                false,
+                false
+              ],
+              "note": "literal match only; not a semantic loss verdict"
+            },
+            {
+              "criterion": "2026-12-06",
+              "present": true,
+              "literal_in_final_context": false,
+              "literal_in_each_compacted_round": [
+                false,
+                false
+              ],
+              "note": "literal match only; not a semantic loss verdict"
+            },
+            {
+              "criterion": "nonstop",
+              "present": true,
+              "literal_in_final_context": true,
+              "literal_in_each_compacted_round": [
+                true,
+                true
+              ],
+              "note": "literal match only; not a semantic loss verdict"
+            },
+            {
+              "criterion": "carry-on",
+              "present": true,
+              "literal_in_final_context": true,
+              "literal_in_each_compacted_round": [
+                true,
+                true
+              ],
+              "note": "literal match only; not a semantic loss verdict"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "root": "target/e2e-artifacts/compaction-study-e5ba6860-62f4-4737-9708-3bd6ff37b134",
+      "complete": true,
+      "manifest_sha256": "a0943b87eba84e6d80174b37dcaedfcc4f482b64f7c8ece06423d0207e8b6f59",
+      "source_revision": "0b565fdbe80095668a402cdc6b5d410efecc867b+fieldwise-v2-dirty",
+      "summaries": [
+        {
+          "strategy": "structured-message-tail",
+          "trials": 1,
+          "raw_all_passed": 0,
+          "morphology_only_all_passed": 0,
+          "schema_valid_readouts": 0,
+          "raw_dimensions_on_valid_readouts": {
+            "intent_preserved": {
+              "passed": 0,
+              "scorable": 0
+            },
+            "direction_preserved": {
+              "passed": 0,
+              "scorable": 0
+            },
+            "relevant_facts_preserved": {
+              "passed": 0,
+              "scorable": 0
+            },
+            "current_constraints_preserved": {
+              "passed": 0,
+              "scorable": 0
+            },
+            "safe_next_action": {
+              "passed": 0,
+              "scorable": 0
+            },
+            "no_false_completion": {
+              "passed": 0,
+              "scorable": 0
+            }
+          },
+          "median_actual_probe_prompt_tokens": 752,
+          "wire_integrity_failures": 0
+        }
+      ],
+      "trials": [
+        {
+          "case": "explicit-task-switch",
+          "elapsed_ms": 57096,
+          "error": "model did not emit exactly one session_checkpoint",
+          "probe_prompt_tokens": 752,
+          "repetition": 0,
+          "score": {
+            "all_passed": false,
+            "current_constraints_preserved": true,
+            "direction_preserved": false,
+            "fact_checks": [
+              {
+                "criterion": "mutex",
+                "present": false
+              },
+              {
+                "criterion": "rwlock",
+                "present": false
+              }
+            ],
+            "intent_preserved": false,
+            "no_false_completion": true,
+            "relevant_facts_preserved": false,
+            "safe_next_action": true,
+            "schema_valid": false
+          },
+          "strategy": "structured-message-tail",
+          "summary_elapsed_ms": 36368,
+          "wire_calls": 2,
+          "evidence_path": "target/e2e-artifacts/compaction-study-e5ba6860-62f4-4737-9708-3bd6ff37b134/explicit-task-switch-structured-message-tail-0.json",
+          "evidence_sha256": "cff6d8d20e06bf546bef1c52027b594e84630df2f7b323a1ab1c8445ecd5c869",
+          "wire_integrity_passed": true,
+          "wire_count": 2,
+          "checkpoint_present": false,
+          "schema_valid_readout": false,
+          "semantic_dimensions_scorable": false,
+          "direction_morphology_false_negative": false,
+          "morphology_only_all_passed": false,
+          "probe_done_reason": "stop",
+          "probe_generated_tokens": 859,
+          "summary_done_reasons": [
+            "stop"
+          ],
+          "fact_diagnostics": [
+            {
+              "criterion": "mutex",
+              "present": false,
+              "literal_in_final_context": true,
+              "literal_in_each_compacted_round": [
+                true
+              ],
+              "note": "literal match only; not a semantic loss verdict"
+            },
+            {
+              "criterion": "rwlock",
+              "present": false,
+              "literal_in_final_context": true,
+              "literal_in_each_compacted_round": [
+                true
+              ],
+              "note": "literal match only; not a semantic loss verdict"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "analyzer_sha256": "12144bb6db4aeff219be9191337fbdf770b130e1a6e2daaa608cf80a3f556c34",
+  "limits": [
+    "Raw keyword grades are unchanged; inspect false negatives separately.",
+    "Invalid readouts are probe failures, not automatic semantic amnesia.",
+    "Literal fact matching cannot resolve paraphrases, negation or natural dates.",
+    "Not domain-action E2E or a production reliability estimate."
+  ]
+}

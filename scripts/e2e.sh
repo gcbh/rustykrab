@@ -11,6 +11,9 @@
 #   scripts/e2e.sh                      # scripted plumbing suite (fast, CI)
 #   scripts/e2e.sh --mode model         # gemma4 behaviour suite (slow)
 #   scripts/e2e.sh --mode browser       # opt-in live browser journeys
+#   scripts/e2e.sh --mode context       # task-context wire contracts (no model)
+#   scripts/e2e.sh --mode context-model --quick --reps 3  # local model, inert tools
+#   scripts/e2e.sh --mode compaction-study --reps 2       # local model, no domain actions
 #   scripts/e2e.sh --mode all --release
 #
 # Any flag other than --release is passed through to the runner.

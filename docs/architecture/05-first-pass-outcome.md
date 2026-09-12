@@ -52,6 +52,41 @@ written twice (`max_tokens_retries` 8→4, `compact_history(conv, tools)` 2→1)
 while leaving the shared ones untouched, which is the check that the merge
 preserved the work rather than resolving over it.
 
+## Interactive continuity follow-up
+
+Against base `0b565fd`, deterministic wire capture exposed Telegram's separate
+runner setup, and code inspection found lossy latest-user compaction, failed-run
+history loss and queued-but-undispatched follow-ups. This follow-up shares runner
+setup, pins the current inbound instruction, returns partial history with errors,
+and processes accepted input at iteration/completion boundaries under a shared cap.
+Telegram persists before setup and after failure, and serializes admission fallback.
+These are targeted repairs to finding 1, not removal of all six turn sequences.
+Hard process death, reset races and asynchronous memory-write completion remain
+outside the proven contract. See `docs/evals/payment-and-runtime-contract.md`.
+
+The subsequent ablation follow-up adds request-schema-aware input budgets and
+refuses oversized Ollama requests without silently dropping history. Compaction
+now checks mandatory anchors, preserves tool pairing, bounds oversized summary
+fragments and supports controlled prompt/tail alternatives. Production behavior
+and proposed policies are distinguished in the study evidence.
+
+Telegram and Slack now journal user UUIDs before admission and use reset
+generations to cancel obsolete work and suppress later obsolete delivery.
+HTTP persists inbound and partial-error history; SSE owns cancellation through
+completion rather than dropping the running future. These remain targeted
+repairs: upstream acknowledgement gaps, exactly-once external effects,
+asynchronous memory durability, concurrent HTTP turns and full recovery UX are
+not resolved. Earlier evidence does not retroactively prove these new paths.
+
+The live synthetic daemon follow-up exposed a separate context-contract defect:
+`tools_load.active` echoed default-seeded names missing from the real catalog,
+while the soul unconditionally instructed memory lookup. The corrected report
+filters registered, available and permitted tools; runtime guidance makes
+generic tool references conditional on offered schemas. HTTP/Telegram wire
+fixtures join the real report to the next schema set. This closes the observed
+static-catalog mismatch, not dynamic availability cache invalidation or all
+model task-selection failures. Existing custom soul files are preserved.
+
 ## Method note
 
 Three findings were wrong, and all three were caught by *implementing* them

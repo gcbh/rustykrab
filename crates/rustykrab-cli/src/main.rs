@@ -23,15 +23,13 @@ const BUILD_DATE: &str = env!("RUSTYKRAB_BUILD_DATE");
 fn version_string() -> String {
     format!("{VERSION} ({GIT_HASH}{GIT_DIRTY}, {BUILD_DATE})")
 }
-use rustykrab_agent::{
-    AgentEvent, AgentHandle, HarnessProfile, HarnessRouter, ProcessSandbox, SubagentRunner,
-};
+use rustykrab_agent::{AgentHandle, HarnessProfile, HarnessRouter, ProcessSandbox, SubagentRunner};
 use rustykrab_channels::slack::SlackInboundMessage;
 use rustykrab_channels::telegram::ChannelMessage;
 use rustykrab_channels::{SignalChannel, SlackChannel, TelegramChannel, VideoChannel, VideoConfig};
 use rustykrab_core::model::ModelProvider;
 use rustykrab_core::orchestration::OrchestrationConfig;
-use rustykrab_core::types::{ContentPart, MessageContent};
+use rustykrab_core::types::{MessageContent, Role};
 use rustykrab_core::AgentRegistry;
 use rustykrab_gateway::AppState;
 use rustykrab_memory::backend::HybridMemoryBackend;
@@ -42,6 +40,7 @@ use rustykrab_memory::embedding::LazyFastEmbedder;
 use rustykrab_memory::storage::SqliteMemoryStorage;
 use rustykrab_memory::{MemoryConfig, MemorySystem};
 use rustykrab_skills::SkillRegistry;
+use rustykrab_store::Store;
 use rustykrab_tools::{CronBackend, MemoryBackend, MessageBackend};
 use tokio::sync::mpsc;
 use tracing_subscriber::fmt;
@@ -1708,22 +1707,132 @@ fn slack_address(
     }
 }
 
-fn epoch_millis() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
-
 /// Per-chat (or per-thread in forum groups) state for tracking conversations
 /// and active agent loops. Keyed by `(chat_id, thread_id)` where
 /// `thread_id == 0` means a non-forum chat or the implicit "General" topic.
 struct ChatState {
     conv_id: Uuid,
-    /// Handle to the currently-running agent loop, if any.
-    /// Messages arriving while a loop is active are injected via this handle
-    /// instead of being dropped.
-    active_handle: Option<AgentHandle>,
+}
+
+/// One lifecycle per channel address, independent of the conversation binding.
+/// Reset invalidates the generation at receive time, before any spawned task
+/// can race it. The barrier prevents post-reset turns from overtaking unbind;
+/// the gate keeps the old turn's final save ahead of the replacement turn.
+struct ChannelTurnControl {
+    generation: AtomicU64,
+    reset_completed: tokio::sync::watch::Sender<u64>,
+    gate: tokio::sync::Mutex<()>,
+    active: tokio::sync::Mutex<Option<(u64, Uuid, AgentHandle)>>,
+    admitted: std::sync::Mutex<Vec<Uuid>>,
+}
+
+impl Default for ChannelTurnControl {
+    fn default() -> Self {
+        Self {
+            generation: AtomicU64::new(0),
+            reset_completed: tokio::sync::watch::channel(0).0,
+            gate: tokio::sync::Mutex::new(()),
+            active: tokio::sync::Mutex::new(None),
+            admitted: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+}
+
+impl ChannelTurnControl {
+    fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    fn begin_reset(&self) -> u64 {
+        self.generation.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    fn is_current(&self, generation: u64) -> bool {
+        self.generation() == generation
+    }
+
+    fn finish_reset(&self, generation: u64) {
+        self.reset_completed.send_modify(|completed| {
+            *completed = (*completed).max(generation);
+        });
+    }
+
+    async fn enter(&self, generation: u64) -> Option<tokio::sync::MutexGuard<'_, ()>> {
+        let mut completed = self.reset_completed.subscribe();
+        while *completed.borrow_and_update() < generation {
+            if !self.is_current(generation) || completed.changed().await.is_err() {
+                return None;
+            }
+        }
+        let guard = self.gate.lock().await;
+        self.is_current(generation).then_some(guard)
+    }
+
+    fn take_admitted(&self) -> Vec<Uuid> {
+        std::mem::take(&mut *self.admitted.lock().unwrap_or_else(|p| p.into_inner()))
+    }
+
+    fn admit(&self, id: Uuid) {
+        self.admitted
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(id);
+    }
+
+    fn forget(&self, ids: &[Uuid]) {
+        self.admitted
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|id| !ids.contains(id));
+    }
+
+    async fn register(&self, generation: u64, conv_id: Uuid, handle: AgentHandle) {
+        let mut active = self.active.lock().await;
+        if self.is_current(generation) {
+            *active = Some((generation, conv_id, handle));
+        } else {
+            // Reset may arrive during model/profile setup, before there was a
+            // handle to cancel. Registration closes that cancellation race.
+            let _ = handle.cancel().await;
+        }
+    }
+
+    async fn cancel_before(&self, generation: u64) {
+        let handle = self.active.lock().await.clone();
+        if let Some((_, _, handle)) =
+            handle.filter(|(active_generation, _, _)| *active_generation < generation)
+        {
+            let _ = handle.cancel().await;
+        }
+    }
+
+    async fn inject(
+        &self,
+        generation: u64,
+        message: &rustykrab_core::types::Message,
+        store: &Store,
+    ) -> bool {
+        if !self.is_current(generation) || *self.reset_completed.borrow() < generation {
+            return false;
+        }
+        let handle = self.active.lock().await.clone();
+        if let Some((active_generation, conv_id, handle)) = handle.filter(|(_, _, h)| h.is_alive())
+        {
+            if active_generation != generation {
+                return false;
+            }
+            if let Err(error) = store.inbound().assign(message.id, conv_id).await {
+                tracing::error!("cannot assign durable inbound before injection: {error}");
+                return false;
+            }
+            let accepted = handle.send_message_record(message.clone()).await.is_ok();
+            if accepted {
+                tracing::info!(message_id=%message.id, "injected user message into running agent loop");
+            }
+            return accepted;
+        }
+        false
+    }
 }
 
 /// Background task: consume inbound Telegram messages and run the agent.
@@ -1740,6 +1849,9 @@ async fn telegram_agent_loop(
 ) {
     let chat_states: Arc<tokio::sync::Mutex<HashMap<(i64, i64), ChatState>>> =
         Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    // A closed inbox falls back to a new turn only after the previous turn
+    // has saved its history. Also serializes messages arriving during setup.
+    let mut controls = HashMap::<(i64, i64), Arc<ChannelTurnControl>>::new();
 
     while let Some(channel_msg) = rx.recv().await {
         let chat_id = channel_msg.chat_id;
@@ -1748,17 +1860,63 @@ async fn telegram_agent_loop(
         let tg = tg.clone();
         let state = state.clone();
         let chat_states = chat_states.clone();
+        let first_seen = !controls.contains_key(&key);
+        let control = controls.entry(key).or_default().clone();
+        let generation = if channel_msg.reset {
+            control.begin_reset()
+        } else {
+            control.generation()
+        };
+        let reset_ids = if channel_msg.reset {
+            control.take_admitted()
+        } else {
+            Vec::new()
+        };
+        if !channel_msg.reset {
+            let address = telegram_address(chat_id, thread_id);
+            if first_seen
+                && state
+                    .agent
+                    .store
+                    .inbound()
+                    .pending_count(&address)
+                    .await
+                    .unwrap_or(0)
+                    > 0
+            {
+                let _ = tg.send_text(chat_id, "An earlier input was saved but its final checkpoint is missing. I will not replay its actions automatically; please check the previous result before retrying.", thread_id).await;
+            }
+            match state
+                .agent
+                .store
+                .inbound()
+                .accept(&address, &channel_msg.message)
+                .await
+            {
+                Ok(true) => control.admit(channel_msg.message.id),
+                Ok(false) => continue,
+                Err(error) => {
+                    tracing::error!("Telegram inbound journal failed: {error}");
+                    let _ = tg.send_text(chat_id, "I could not save your message, so I have not started acting on it. Please try again.", thread_id).await;
+                    continue;
+                }
+            }
+        }
 
         tokio::spawn(async move {
             // Handle conversation reset via structured flag.
             if channel_msg.reset {
+                control.cancel_before(generation).await;
+                if let Err(error) = state.agent.store.inbound().cancel(&reset_ids).await {
+                    tracing::error!("could not checkpoint cancelled Telegram inputs: {error}");
+                }
+                let _turn = control.gate.lock().await;
+                if !control.is_current(generation) {
+                    control.finish_reset(generation);
+                    return;
+                }
                 {
                     let mut states = chat_states.lock().await;
-                    if let Some(cs) = states.get(&key) {
-                        if let Some(ref handle) = cs.active_handle {
-                            let _ = handle.cancel().await;
-                        }
-                    }
                     states.remove(&key);
                 }
                 if let Err(e) = state
@@ -1770,6 +1928,7 @@ async fn telegram_agent_loop(
                 {
                     tracing::warn!(chat_id, thread_id, "failed to remove channel binding: {e}");
                 }
+                control.finish_reset(generation);
                 return;
             }
 
@@ -1780,34 +1939,24 @@ async fn telegram_agent_loop(
 
             // If an agent loop is already running for this chat/thread,
             // inject the new message instead of dropping it.
+            if control
+                .inject(generation, &channel_msg.message, &state.agent.store)
+                .await
             {
-                let states = chat_states.lock().await;
-                if let Some(cs) = states.get(&key) {
-                    if let Some(ref handle) = cs.active_handle {
-                        if handle.is_alive() {
-                            let parts = vec![ContentPart::Text { text: user_text }];
-                            if let Err(e) = handle
-                                .send_channel_message(parts, "telegram".to_string(), None)
-                                .await
-                            {
-                                tracing::warn!(
-                                    chat_id,
-                                    thread_id,
-                                    "failed to inject message into running loop: {e}"
-                                );
-                            } else {
-                                tracing::info!(
-                                    chat_id,
-                                    thread_id,
-                                    "injected user message into running agent loop"
-                                );
-                                let _ = tg.send_typing(chat_id, thread_id).await;
-                            }
-                            return;
-                        }
-                    }
-                }
+                let _ = tg.send_typing(chat_id, thread_id).await;
+                return;
             }
+
+            let Some(_turn) = control.enter(generation).await else {
+                // A reset deliberately cancels queued work from the old branch.
+                let _ = state
+                    .agent
+                    .store
+                    .inbound()
+                    .cancel(&[channel_msg.message.id])
+                    .await;
+                return;
+            };
 
             // Get or create conversation. Check in-memory first, then DB,
             // then create a brand new one.
@@ -1827,13 +1976,7 @@ async fn telegram_agent_loop(
 
                         match db_id {
                             Some(id) => {
-                                states.insert(
-                                    key,
-                                    ChatState {
-                                        conv_id: id,
-                                        active_handle: None,
-                                    },
-                                );
+                                states.insert(key, ChatState { conv_id: id });
                                 tracing::info!(
                                     chat_id, thread_id, conv_id = %id,
                                     "restored conversation from database"
@@ -1856,13 +1999,7 @@ async fn telegram_agent_loop(
                                         );
                                     }
                                     let id = conv.id;
-                                    states.insert(
-                                        key,
-                                        ChatState {
-                                            conv_id: id,
-                                            active_handle: None,
-                                        },
-                                    );
+                                    states.insert(key, ChatState { conv_id: id });
                                     if let Err(e) = state
                                         .agent
                                         .store
@@ -1913,15 +2050,17 @@ async fn telegram_agent_loop(
                 &user_text,
                 &chat_states,
                 key,
+                &control,
+                generation,
             )
             .await;
 
             // Clear the active handle.
-            {
-                let mut states = chat_states.lock().await;
-                if let Some(cs) = states.get_mut(&key) {
-                    cs.active_handle = None;
-                }
+            *control.active.lock().await = None;
+            if !control.is_current(generation) {
+                // Old history was saved, but reset must not be followed by an
+                // obsolete response or a credential link from the retired run.
+                return;
             }
 
             // Send response back to Telegram (in the correct thread).
@@ -1933,7 +2072,13 @@ async fn telegram_agent_loop(
             // message. It goes after the agent's text so the user reads
             // why before they are handed the form, and it never passed
             // through the model, so it cannot have been truncated.
+            if !control.is_current(generation) {
+                return;
+            }
             for link in state.agent.store.pending_links().take(conv_id) {
+                if !control.is_current(generation) {
+                    break;
+                }
                 if let Err(e) = tg.send_text(chat_id, &link, thread_id).await {
                     tracing::error!(chat_id, thread_id, "failed to send credential link: {e}");
                 }
@@ -1958,6 +2103,8 @@ async fn process_telegram_message(
     user_text: &str,
     chat_states: &Arc<tokio::sync::Mutex<HashMap<(i64, i64), ChatState>>>,
     key: (i64, i64),
+    control: &ChannelTurnControl,
+    generation: u64,
 ) -> String {
     // Load the conversation. `persisted_ids` lets the post-run save
     // append only this turn's messages (full rewrite if the agent
@@ -1982,13 +2129,23 @@ async fn process_telegram_message(
     // The cached id is the one that just failed to load; leaving it in place
     // would send the next message down the same dead path.
     let conv_id = conv.id;
+    if let Err(error) = state
+        .agent
+        .store
+        .inbound()
+        .assign(message.id, conv_id)
+        .await
+    {
+        tracing::error!("could not associate Telegram inbound with conversation: {error}");
+        return "Your message is in the recovery journal, but I could not attach it to this conversation. I have not started acting on it.".into();
+    }
     if rebound {
         let mut states = chat_states.lock().await;
         if let Some(cs) = states.get_mut(&key) {
             cs.conv_id = conv_id;
         }
     }
-    let persisted_ids: Vec<Uuid> = conv.messages.iter().map(|m| m.id).collect();
+    let mut persisted_ids: Vec<Uuid> = conv.messages.iter().map(|m| m.id).collect();
 
     // Ensure channel metadata is present (backfills conversations created
     // before this field was populated).
@@ -2006,6 +2163,19 @@ async fn process_telegram_message(
     // Append user message.
     conv.messages.push(message);
     conv.updated_at = Utc::now();
+
+    // Make the initial inbound turn durable before provider/setup failures.
+    if let Err(e) = state
+        .agent
+        .store
+        .conversations()
+        .save_turn(&conv, &persisted_ids)
+        .await
+    {
+        tracing::error!(chat_id, %conv_id, "failed to persist inbound conversation: {e}");
+        return "I couldn't save your message, so I haven't started acting on it. Please try again.".into();
+    }
+    persisted_ids = conv.messages.iter().map(|m| m.id).collect();
 
     // Channels append straight onto `conv.messages`, which never passes
     // through `AgentRunner::push_message` and so never reaches the
@@ -2038,7 +2208,7 @@ async fn process_telegram_message(
     // Telegram message so the prompt log can be matched against this run.
     let trace_id = Uuid::new_v4();
     tracing::info!(%trace_id, chat_id, ?thread_id, "telegram agent run starting");
-    let (handle, mut event_rx, join_handle) =
+    let (handle, event_rx, join_handle) =
         match rustykrab_runtime::run_agent_interactive(&state.agent, conv, user_text, trace_id)
             .await
         {
@@ -2052,95 +2222,66 @@ async fn process_telegram_message(
 
     // Store the handle so concurrent messages for this chat/thread
     // can be injected into the running loop.
+    control.register(generation, conv_id, handle.clone()).await;
+
+    // Cancellation completes the runner too: always retrieve and save the
+    // partial conversation instead of abandoning the owned history.
+    let reply = match rustykrab_runtime::await_interactive_run(
+        &handle,
+        event_rx,
+        join_handle,
+        std::time::Duration::from_secs(HEARTBEAT_TIMEOUT_SECS),
+    )
+    .await
     {
-        let mut states = chat_states.lock().await;
-        if let Some(cs) = states.get_mut(&key) {
-            cs.active_handle = Some(handle);
+        Ok((completion, timed_out)) => {
+            let final_conv = completion.conversation;
+            // Persist the turn: appends the new messages, or falls
+            // back to a full rewrite if compaction replaced the
+            // persisted prefix.
+            if let Err(e) = state
+                .agent
+                .store
+                .conversations()
+                .save_turn(&final_conv, &persisted_ids)
+                .await
+            {
+                tracing::error!(chat_id, %conv_id, "failed to persist conversation: {e}");
+                typing_active.store(false, std::sync::atomic::Ordering::Relaxed);
+                typing_task.abort();
+                return "The run ended, but I couldn't save its full history. Please inspect the result before retrying any action.".into();
+            }
+            if let Err(e) = completion.result {
+                checkpoint_channel_input(state, &final_conv, control).await;
+                tracing::error!(chat_id, %conv_id, "agent error (partial history saved): {e}");
+                typing_active.store(false, std::sync::atomic::Ordering::Relaxed);
+                typing_task.abort();
+                return if timed_out {
+                    "The agent stalled. I saved the partial history; any interrupted external action needs checking before retrying.".into()
+                } else {
+                    "I encountered an error. I saved the partial history, including pending messages; the task is not complete.".into()
+                };
+            }
+            // Extract last assistant text.
+            checkpoint_channel_input(state, &final_conv, control).await;
+            final_conv
+                .messages
+                .iter()
+                .rev()
+                .find_map(|m| {
+                    if m.role == rustykrab_core::types::Role::Assistant {
+                        m.content.as_text().map(|t| t.to_string())
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_else(|| {
+                    "I processed your message but have no text response.".to_string()
+                })
         }
-    }
-
-    // Heartbeat-based timeout: track activity from agent events.
-    let last_heartbeat = Arc::new(AtomicU64::new(epoch_millis()));
-    let hb = last_heartbeat.clone();
-    let timeout_millis = HEARTBEAT_TIMEOUT_SECS * 1000;
-
-    // Drain events, updating heartbeat on each one.
-    let event_drain = async {
-        while let Some(_event) = event_rx.recv().await {
-            hb.store(epoch_millis(), Ordering::Relaxed);
-        }
-    };
-
-    let heartbeat_monitor = async {
-        loop {
-            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-            let last = last_heartbeat.load(Ordering::Relaxed);
-            if epoch_millis() - last > timeout_millis {
-                break;
-            }
-        }
-    };
-
-    let timed_out = tokio::select! {
-        _ = event_drain => false,
-        _ = heartbeat_monitor => true,
-    };
-
-    let reply = if timed_out {
-        tracing::error!(
-            chat_id, %conv_id,
-            "agent stalled — no activity for {HEARTBEAT_TIMEOUT_SECS}s"
-        );
-        // Cancel the running loop.
-        {
-            let states = chat_states.lock().await;
-            if let Some(cs) = states.get(&key) {
-                if let Some(ref h) = cs.active_handle {
-                    let _ = h.cancel().await;
-                }
-            }
-        }
-        "Sorry, the agent appears to have stalled. Please try again.".to_string()
-    } else {
-        // Await the join handle to get the final conversation.
-        match join_handle.await {
-            Ok(Ok(final_conv)) => {
-                // Persist the turn: appends the new messages, or falls
-                // back to a full rewrite if compaction replaced the
-                // persisted prefix.
-                if let Err(e) = state
-                    .agent
-                    .store
-                    .conversations()
-                    .save_turn(&final_conv, &persisted_ids)
-                    .await
-                {
-                    tracing::error!(chat_id, %conv_id, "failed to persist conversation: {e}");
-                }
-                // Extract last assistant text.
-                final_conv
-                    .messages
-                    .iter()
-                    .rev()
-                    .find_map(|m| {
-                        if m.role == rustykrab_core::types::Role::Assistant {
-                            m.content.as_text().map(|t| t.to_string())
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or_else(|| {
-                        "I processed your message but have no text response.".to_string()
-                    })
-            }
-            Ok(Err(e)) => {
-                tracing::error!(chat_id, %conv_id, "agent error: {e}");
-                "Sorry, I encountered an error processing your message.".to_string()
-            }
-            Err(e) => {
-                tracing::error!(chat_id, %conv_id, "agent task panicked: {e}");
-                "Sorry, I encountered an internal error.".to_string()
-            }
+        Err(e) => {
+            tracing::error!(chat_id, %conv_id, "agent task panicked: {e}");
+            "Sorry, I encountered an internal error.".to_string()
         }
     };
 
@@ -2157,7 +2298,6 @@ async fn process_telegram_message(
 /// user's message timestamp so the conversation key is the user's `ts`.
 struct SlackChatState {
     conv_id: Uuid,
-    busy: bool,
 }
 
 /// `(team_id, channel_id, effective_thread_ts)` → per-thread state. The
@@ -2179,6 +2319,7 @@ async fn slack_agent_loop(
 ) {
     let chat_states: Arc<tokio::sync::Mutex<SlackChatStateMap>> =
         Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let mut controls = HashMap::<(String, String, String), Arc<ChannelTurnControl>>::new();
 
     while let Some(inbound) = rx.recv().await {
         // Auto-thread: top-level mentions reply in a new thread off the
@@ -2195,26 +2336,62 @@ async fn slack_agent_loop(
         let sl = sl.clone();
         let state = state.clone();
         let chat_states = chat_states.clone();
-
-        tokio::spawn(async move {
-            // Concurrency guard: serialize within a single thread.
+        let first_seen = !controls.contains_key(&key);
+        let control = controls.entry(key.clone()).or_default().clone();
+        let generation = if inbound.reset {
+            control.begin_reset()
+        } else {
+            control.generation()
+        };
+        let reset_ids = if inbound.reset {
+            control.take_admitted()
+        } else {
+            Vec::new()
+        };
+        if !inbound.reset {
+            let address =
+                slack_address(&inbound.team_id, &inbound.channel_id, &effective_thread_ts);
+            if first_seen
+                && state
+                    .agent
+                    .store
+                    .inbound()
+                    .pending_count(&address)
+                    .await
+                    .unwrap_or(0)
+                    > 0
             {
-                let states = chat_states.lock().await;
-                if let Some(cs) = states.get(&key) {
-                    if cs.busy {
-                        let _ = sl
-                            .send_text(
-                                &inbound.channel_id,
-                                "I'm still working on your previous message. Please wait.",
-                                Some(&effective_thread_ts),
-                            )
-                            .await;
-                        return;
-                    }
+                tracing::warn!(channel_id=%inbound.channel_id, "recovery needed: prior Slack input lacks a final checkpoint; automatic replay disabled");
+                let _ = sl.send_text(&inbound.channel_id, "An earlier input was saved but its final checkpoint is missing. I will not replay its actions automatically; please check the previous result before retrying.", Some(&effective_thread_ts)).await;
+            }
+            match state
+                .agent
+                .store
+                .inbound()
+                .accept(&address, &inbound.message)
+                .await
+            {
+                Ok(true) => control.admit(inbound.message.id),
+                Ok(false) => continue,
+                Err(error) => {
+                    tracing::error!("Slack inbound journal failed; input not dispatched: {error}");
+                    let _ = sl.send_text(&inbound.channel_id, "I could not save your message, so I have not started acting on it. Please try again.", Some(&effective_thread_ts)).await;
+                    continue;
                 }
             }
+        }
 
+        tokio::spawn(async move {
             if inbound.reset {
+                control.cancel_before(generation).await;
+                if let Err(error) = state.agent.store.inbound().cancel(&reset_ids).await {
+                    tracing::error!("could not checkpoint cancelled Slack inputs: {error}");
+                }
+                let _turn = control.gate.lock().await;
+                if !control.is_current(generation) {
+                    control.finish_reset(generation);
+                    return;
+                }
                 {
                     let mut states = chat_states.lock().await;
                     states.remove(&key);
@@ -2237,12 +2414,29 @@ async fn slack_agent_loop(
                         "failed to remove Slack channel binding: {e}"
                     );
                 }
+                control.finish_reset(generation);
                 return;
             }
 
             let user_text = match &inbound.message.content {
                 MessageContent::Text(t) => t.clone(),
                 _ => return,
+            };
+
+            if control
+                .inject(generation, &inbound.message, &state.agent.store)
+                .await
+            {
+                return;
+            }
+            let Some(_turn) = control.enter(generation).await else {
+                let _ = state
+                    .agent
+                    .store
+                    .inbound()
+                    .cancel(&[inbound.message.id])
+                    .await;
+                return;
             };
 
             // Resolve / create the conversation.
@@ -2266,13 +2460,7 @@ async fn slack_agent_loop(
 
                         match db_id {
                             Some(id) => {
-                                states.insert(
-                                    key.clone(),
-                                    SlackChatState {
-                                        conv_id: id,
-                                        busy: false,
-                                    },
-                                );
+                                states.insert(key.clone(), SlackChatState { conv_id: id });
                                 tracing::info!(
                                     team_id = %inbound.team_id,
                                     channel_id = %inbound.channel_id,
@@ -2296,13 +2484,7 @@ async fn slack_agent_loop(
                                         );
                                     }
                                     let id = conv.id;
-                                    states.insert(
-                                        key.clone(),
-                                        SlackChatState {
-                                            conv_id: id,
-                                            busy: false,
-                                        },
-                                    );
+                                    states.insert(key.clone(), SlackChatState { conv_id: id });
                                     if let Err(e) = state
                                         .agent
                                         .store
@@ -2353,14 +2535,6 @@ async fn slack_agent_loop(
                 }
             };
 
-            // Mark busy.
-            {
-                let mut states = chat_states.lock().await;
-                if let Some(cs) = states.get_mut(&key) {
-                    cs.busy = true;
-                }
-            }
-
             let (used_conv_id, reply) = process_slack_message(
                 &state,
                 conv_id,
@@ -2369,19 +2543,24 @@ async fn slack_agent_loop(
                 &effective_thread_ts,
                 inbound.message,
                 &user_text,
+                &control,
+                generation,
             )
             .await;
 
-            // Clear busy, and adopt the conversation actually used: it
+            // Adopt the conversation actually used: it
             // differs when the cached id had outlived its conversation and
             // a new one was started. Leaving the dead id cached would send
             // the next message down the same path.
             {
                 let mut states = chat_states.lock().await;
                 if let Some(cs) = states.get_mut(&key) {
-                    cs.busy = false;
                     cs.conv_id = used_conv_id;
                 }
+            }
+            *control.active.lock().await = None;
+            if !control.is_current(generation) {
+                return;
             }
 
             if let Err(e) = sl
@@ -2401,7 +2580,13 @@ async fn slack_agent_loop(
             // the link never passed through the model so it cannot have
             // been truncated. Slack has no app in the loop, so without
             // this the ask is a dead end here.
-            for link in state.agent.store.pending_links().take(conv_id) {
+            if !control.is_current(generation) {
+                return;
+            }
+            for link in state.agent.store.pending_links().take(used_conv_id) {
+                if !control.is_current(generation) {
+                    break;
+                }
                 if let Err(e) = sl
                     .send_text(&inbound.channel_id, &link, Some(&effective_thread_ts))
                     .await
@@ -2423,6 +2608,7 @@ async fn slack_agent_loop(
 /// Returns the conversation id actually used alongside the reply: it differs
 /// from the one passed in when the binding had outlived its conversation and
 /// [`load_or_rebind`] started a new one.
+#[allow(clippy::too_many_arguments)]
 async fn process_slack_message(
     state: &AppState,
     conv_id: Uuid,
@@ -2431,6 +2617,8 @@ async fn process_slack_message(
     thread_ts: &str,
     message: rustykrab_core::types::Message,
     user_text: &str,
+    control: &ChannelTurnControl,
+    generation: u64,
 ) -> (Uuid, String) {
     let address = slack_address(team_id, channel_id, thread_ts);
     let (mut conv, _rebound) = match load_or_rebind(
@@ -2453,7 +2641,7 @@ async fn process_slack_message(
     // Ids of the already-persisted messages: the post-run save appends
     // only this turn's tail (full rewrite if the agent compacted
     // history mid-run).
-    let persisted_ids: Vec<Uuid> = conv.messages.iter().map(|m| m.id).collect();
+    let mut persisted_ids: Vec<Uuid> = conv.messages.iter().map(|m| m.id).collect();
 
     if conv.channel_source.is_none() {
         conv.channel_source = Some("slack".to_string());
@@ -2464,8 +2652,34 @@ async fn process_slack_message(
         conv.channel_thread_id = Some(thread_ts.to_string());
     }
 
+    if let Err(error) = state
+        .agent
+        .store
+        .inbound()
+        .assign(message.id, conv_id)
+        .await
+    {
+        tracing::error!("could not associate Slack inbound with conversation: {error}");
+        return (conv_id, "Your message is in the recovery journal, but I could not attach it to this conversation. I have not started acting on it.".into());
+    }
     conv.messages.push(message);
     conv.updated_at = Utc::now();
+
+    if let Err(e) = state
+        .agent
+        .store
+        .conversations()
+        .save_turn(&conv, &persisted_ids)
+        .await
+    {
+        tracing::error!(channel_id, %conv_id, "failed to persist Slack inbound conversation: {e}");
+        return (
+            conv_id,
+            "I couldn't save your message, so I haven't started acting on it. Please try again."
+                .into(),
+        );
+    }
+    persisted_ids = conv.messages.iter().map(|m| m.id).collect();
 
     // Channels append straight onto `conv.messages`, which never passes
     // through `AgentRunner::push_message` and so never reaches the
@@ -2477,67 +2691,89 @@ async fn process_slack_message(
         rustykrab_runtime::ingest_inbound(&state.agent, &conv, inbound).await;
     }
 
-    // Heartbeat-monitored agent run, mirroring the Telegram path.
-    let last_heartbeat = Arc::new(AtomicU64::new(epoch_millis()));
-    let hb = last_heartbeat.clone();
-    let on_event = move |_event: AgentEvent| {
-        hb.store(epoch_millis(), Ordering::Relaxed);
-    };
-
     let trace_id = Uuid::new_v4();
     tracing::info!(%trace_id, conv_id = %conv.id, "slack agent run starting");
-    let agent_fut = rustykrab_runtime::run_agent_streaming(
-        &state.agent,
-        &mut conv,
-        user_text,
-        &on_event,
-        trace_id,
-    );
-
-    let timeout_millis = HEARTBEAT_TIMEOUT_SECS * 1000;
-    let heartbeat_monitor = async {
-        loop {
-            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-            let last = last_heartbeat.load(Ordering::Relaxed);
-            if epoch_millis() - last > timeout_millis {
-                break;
+    let (handle, events, task) =
+        match rustykrab_runtime::run_agent_interactive(&state.agent, conv, user_text, trace_id)
+            .await
+        {
+            Ok(started) => started,
+            Err(_) => {
+                return (
+                    conv_id,
+                    "I encountered an error before starting. Your message was saved.".into(),
+                )
             }
-        }
-    };
-
-    let reply = tokio::select! {
-        result = agent_fut => {
-            match result {
-                Ok(assistant_msg) => match &assistant_msg.content {
-                    MessageContent::Text(t) => t.clone(),
-                    _ => "I processed your message but have no text response.".to_string(),
-                },
-                Err(_status) => {
-                    tracing::error!(channel_id, %conv_id, "Slack agent returned error");
-                    "Sorry, I encountered an error processing your message.".to_string()
-                }
-            }
-        }
-        _ = heartbeat_monitor => {
-            tracing::error!(
-                channel_id, %conv_id,
-                "Slack agent stalled — no activity for {HEARTBEAT_TIMEOUT_SECS}s"
-            );
-            "Sorry, the agent appears to have stalled. Please try again.".to_string()
-        }
-    };
-
-    if let Err(e) = state
-        .agent
-        .store
-        .conversations()
-        .save_turn(&conv, &persisted_ids)
-        .await
+        };
+    control.register(generation, conv_id, handle.clone()).await;
+    match rustykrab_runtime::await_interactive_run(
+        &handle,
+        events,
+        task,
+        std::time::Duration::from_secs(HEARTBEAT_TIMEOUT_SECS),
+    )
+    .await
     {
-        tracing::error!(channel_id, %conv_id, "failed to persist Slack conversation: {e}");
+        Ok((completion, stalled)) => {
+            if let Err(e) = state
+                .agent
+                .store
+                .conversations()
+                .save_turn(&completion.conversation, &persisted_ids)
+                .await
+            {
+                tracing::error!(channel_id, %conv_id, "failed to persist Slack conversation: {e}");
+                return (conv_id, "The run ended, but I couldn't save its full history. Please inspect the result before retrying any action.".into());
+            }
+            checkpoint_channel_input(state, &completion.conversation, control).await;
+            let reply = match completion.result {
+                Err(e) => {
+                    tracing::error!(channel_id, %conv_id, "Slack agent failed (partial history saved): {e}");
+                    if stalled {
+                        "The agent stalled. I saved the partial history; any interrupted external action needs checking before retrying.".into()
+                    } else {
+                        "I encountered an error. I saved the partial history, including pending messages; the task is not complete.".into()
+                    }
+                }
+                Ok(()) => completion
+                    .conversation
+                    .messages
+                    .iter()
+                    .rev()
+                    .find_map(|message| {
+                        (message.role == rustykrab_core::types::Role::Assistant)
+                            .then(|| message.content.as_text())
+                            .flatten()
+                            .map(str::to_owned)
+                    })
+                    .unwrap_or_else(|| {
+                        "I processed your message but have no text response.".into()
+                    }),
+            };
+            (conv_id, reply)
+        }
+        Err(e) => {
+            tracing::error!(channel_id, %conv_id, "Slack agent task failed: {e}");
+            (conv_id, "I encountered an internal error. Your initial message is saved; check any external action before retrying.".into())
+        }
     }
+}
 
-    (conv_id, reply)
+async fn checkpoint_channel_input(
+    state: &AppState,
+    conv: &rustykrab_core::types::Conversation,
+    control: &ChannelTurnControl,
+) {
+    let ids: Vec<Uuid> = conv
+        .messages
+        .iter()
+        .filter(|m| m.role == Role::User)
+        .map(|m| m.id)
+        .collect();
+    match state.agent.store.inbound().retained(conv.id, &ids).await {
+        Ok(()) => control.forget(&ids),
+        Err(error) => tracing::error!("conversation saved but inbound checkpoint failed; recovery remains conservative: {error}"),
+    }
 }
 
 async fn shutdown_signal() {
@@ -2545,6 +2781,44 @@ async fn shutdown_signal() {
         .await
         .expect("failed to listen for ctrl+c");
     tracing::info!("shutdown signal received");
+}
+
+#[cfg(test)]
+mod channel_control_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn post_reset_turn_waits_for_its_own_barrier() {
+        let control = ChannelTurnControl::default();
+        let old = control.generation();
+        let first = control.begin_reset();
+        let second = control.begin_reset();
+        assert!(!control.is_current(old));
+        control.finish_reset(first);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), control.enter(second))
+                .await
+                .is_err()
+        );
+        control.finish_reset(second);
+        assert!(control.enter(second).await.is_some());
+        assert!(control.enter(first).await.is_none());
+    }
+
+    #[test]
+    fn reset_cancellation_uses_receive_time_ids_not_later_admissions() {
+        let control = ChannelTurnControl::default();
+        let before = Uuid::new_v4();
+        let after = Uuid::new_v4();
+        control.admit(before);
+        control.begin_reset();
+        let retired = control.take_admitted();
+        control.admit(after);
+        assert_eq!(retired, vec![before]);
+        control.forget(&[before]);
+        assert_eq!(control.take_admitted(), vec![after]);
+    }
 }
 
 /// Background task: poll for due scheduled jobs and submit them to

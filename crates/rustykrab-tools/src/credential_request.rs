@@ -83,7 +83,11 @@ impl Tool for CredentialRequestTool {
          field='username'|'password') — it types the value straight into the \
          page. Never read a password back with credential_read to type it \
          yourself: that puts it in this conversation, which is the one thing \
-         this whole flow exists to avoid."
+         this whole flow exists to avoid.\n\n\
+         Payment cards are NOT supported by this login-credential flow. If a \
+         checkout requests a card, stop and ask the user to enter payment \
+         details directly on the merchant's trusted page. Never request card \
+         numbers or CVV in chat or claim that a reusable wallet is available."
     }
 
     /// Once the request is filed there is nothing further the agent can

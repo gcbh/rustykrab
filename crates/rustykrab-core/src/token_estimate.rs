@@ -26,13 +26,12 @@
 //! `rustykrab-providers` estimates differently on purpose — Ollama uses
 //! `CHARS_PER_TOKEN = 4` for its own budget accounting. The gap is not an
 //! oversight. The runner compacts against a budget derived from the
-//! provider's reported window, and the provider then trims history against
-//! its own; collapsing the two removes headroom between those thresholds,
-//! and when the trim budget falls below the compaction threshold, trimming
-//! fires first and *deletes* the oldest turns where compaction would have
-//! summarised them.
+//! provider's tool-aware input budget. Ollama now refuses oversized input
+//! before dispatch rather than deleting messages; the runner alone owns
+//! compaction, archival, and bounded retry. The distinct estimators remain
+//! heuristic safety margins, not native tokenizer guarantees.
 //!
-//! `ModelProvider::context_limit_with_tools` addresses that properly by
+//! `ModelProvider::context_limit_for_tools` addresses that by
 //! letting a provider report the budget for the tool set actually loaded.
 //! Until you have confirmed that path covers every provider in use, treat
 //! the two estimators as separate on purpose.

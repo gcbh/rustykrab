@@ -1,0 +1,1298 @@
+{
+  "runs": [
+    {
+      "root": "target/e2e-artifacts/compaction-study-6ee6e739-b75b-4f6c-bdd8-5187f1d21a38",
+      "complete": true,
+      "manifest_sha256": "b8bc9fb6f46f60708ad468fd6cae17d6650cc824b22c4248c769e8b8485d7360",
+      "source_revision": "0b565fdbe80095668a402cdc6b5d410efecc867b+message-tail-followup-dirty",
+      "summaries": [
+        {
+          "strategy": "structured-message-tail",
+          "trials": 16,
+          "raw_all_passed": 11,
+          "morphology_only_all_passed": 12,
+          "schema_valid_readouts": 15,
+          "raw_dimensions_on_valid_readouts": {
+            "intent_preserved": {
+              "passed": 13,
+              "scorable": 15
+            },
+            "direction_preserved": {
+              "passed": 14,
+              "scorable": 15
+            },
+            "relevant_facts_preserved": {
+              "passed": 14,
+              "scorable": 15
+            },
+            "current_constraints_preserved": {
+              "passed": 15,
+              "scorable": 15
+            },
+            "safe_next_action": {
+              "passed": 15,
+              "scorable": 15
+            },
+            "no_false_completion": {
+              "passed": 15,
+              "scorable": 15
+            }
+          },
+          "median_actual_probe_prompt_tokens": 813.5,
+          "wire_integrity_failures": 0
+        }
+      ],
+      "trials": [
+        {
+          "case": "broadway-ambiguous",
+          "elapsed_ms": 41651,
+          "error": null,
+          "probe_prompt_tokens": 777,
+          "repetition": 0,
+          "score": {
+            "all_passed": true,
+            "current_constraints_preserved": true,
+            "direction_preserved": true,
+            "fact_checks": [
+              {
+                "criterion": "2026-09-14",
+                "present": true
+              },
+              {
+                "criterion": "2026-09-16",
+                "present": true
+              },
+              {
+                "criterion": "hamilton",
+                "present": true
+              },
+              {
+                "criterion": "wicked",
+                "present": true
+              }
+            ],
+            "intent_preserved": true,
+            "no_false_completion": true,
+            "relevant_facts_preserved": true,
+            "safe_next_action": true,
+            "schema_valid": true
+          },
+          "strategy": "structured-message-tail",
+          "summary_elapsed_ms": 31542,
+          "wire_calls": 2,
+          "evidence_path": "target/e2e-artifacts/compaction-study-6ee6e739-b75b-4f6c-bdd8-5187f1d21a38/broadway-ambiguous-structured-message-tail-0.json",
+          "evidence_sha256": "1dbcdc2a52399e2c15b351250402bae08ff6154eaa96ee8fa633bd54b14c0517",
+          "wire_integrity_passed": true,
+          "wire_count": 2,
+          "checkpoint_present": true,
+          "schema_valid_readout": true,
+          "semantic_dimensions_scorable": true,
+          "direction_morphology_false_negative": false,
+          "morphology_only_all_passed": true,
+          "probe_done_reason": "stop",
+          "probe_generated_tokens": 383,
+          "summary_done_reasons": [
+            "stop"
+          ],
+          "fact_diagnostics": [
+            {
+              "criterion": "2026-09-14",
+              "present": true,
+              "literal_in_final_context": false,
+              "literal_in_each_compacted_round": [
+                false
+              ],
+              "note": "literal match only; not a semantic loss verdict"
+            },
+            {
+              "criterion": "2026-09-16",
+              "present": true,
+              "literal_in_final_context": false,
+              "literal_in_each_compacted_round": [
+                false
+              ],
+              "note": "literal match only; not a semantic loss verdict"
+            },
+            {
+              "criterion": "hamilton",
+              "present": true,
+              "literal_in_final_context": true,
+              "literal_in_each_compacted_round": [
+                true
+              ],
+              "note": "literal match only; not a semantic loss verdict"
+            },
+            {
+              "criterion": "wicked",
+              "present": true,
+              "literal_in_final_context": true,
+              "literal_in_each_compacted_round": [
+                true
+              ],
+              "note": "literal match only; not a semantic loss verdict"
+            }
+          ]
+        },
+        {
+          "case": "broadway-correction",
+          "elapsed_ms": 42331,
+          "error": null,
+          "probe_prompt_tokens": 805,
+          "repetition": 0,
+          "score": {
+            "all_passed": true,
+            "current_constraints_preserved": true,
+            "direction_preserved": true,
+            "fact_checks": [
+              {
+                "criterion": "2026-09-18",
+                "present": true
+              },
+              {
+                "criterion": "2026-09-20",
+                "present": true
+              }
+            ],
+            "intent_preserved": true,
+            "no_false_completion": true,
+            "relevant_facts_preserved": true,
+            "safe_next_action": true,
+            "schema_valid": true
+          },
+          "strategy": "structured-message-tail",
+          "summary_elapsed_ms": 27196,
+          "wire_calls": 2,
+          "evidence_path": "target/e2e-artifacts/compaction-study-6ee6e739-b75b-4f6c-bdd8-5187f1d21a38/broadway-correction-structured-message-tail-0.json",
+          "evidence_sha256": "cb08e1b0406243072a11dbfb5daeb3b17544db8425777736a0987d0700578b02",
+          "wire_integrity_passed": true,
+          "wire_count": 2,
+          "checkpoint_present": true,
+          "schema_valid_readout": true,
+          "semantic_dimensions_scorable": true,
+          "direction_morphology_false_negative": false,
+          "morphology_only_all_passed": true,
+          "probe_done_reason": "stop",
+          "probe_generated_tokens": 607,
+          "summary_done_reasons": [
+            "stop"
+          ],
+          "fact_diagnostics": [
+            {
+              "criterion": "2026-09-18",
+              "present": true,
+              "literal_in_final_context": false,
+              "literal_in_each_compacted_round": [
+                false
+              ],
+              "note": "literal match only; not a semantic loss verdict"
+            },
+            {
+              "criterion": "2026-09-20",
+              "present": true,
+              "literal_in_final_context": false,
+              "literal_in_each_compacted_round": [
+                false
+              ],
+              "note": "literal match only; not a semantic loss verdict"
+            }
+          ]
+        },
+        {
+          "case": "explicit-task-switch",
+          "elapsed_ms": 54296,
+          "error": null,
+          "probe_prompt_tokens": 701,
+          "repetition": 0,
+          "score": {
+            "all_passed": false,
+            "current_constraints_preserved": true,
+            "direction_preserved": false,
+            "fact_checks": [
+              {
+                "criterion": "mutex",
+                "present": true
+              },
+              {
+                "criterion": "rwlock",
+                "present": true
+              }
+            ],
+            "intent_preserved": true,
+            "no_false_completion": true,
+            "relevant_facts_preserved": true,
+            "safe_next_action": true,
+            "schema_valid": true
+          },
+          "strategy": "structured-message-tail",
+          "summary_elapsed_ms": 29076,
+          "wire_calls": 2,
+          "evidence_path": "target/e2e-artifacts/compaction-study-6ee6e739-b75b-4f6c-bdd8-5187f1d21a38/explicit-task-switch-structured-message-tail-0.json",
+          "evidence_sha256": "48fe92f39d71236ad0d5f7242a3b672ac944f72d3a70c36fdf3ebcbcb7b0ee7b",
+          "wire_integrity_passed": true,
+          "wire_count": 2,
+          "checkpoint_present": true,
+          "schema_valid_readout": true,
+          "semantic_dimensions_scorable": true,
+          "direction_morphology_false_negative": true,
+          "morphology_only_all_passed": true,
+          "probe_done_reason": "stop",
+          "probe_generated_tokens": 996,
+          "summary_done_reasons": [
+            "stop"
+          ],
+          "fact_diagnostics": [
+            {
+              "criterion": "mutex",
+              "present": true,
+              "literal_in_final_context": true,
+              "literal_in_each_compacted_round": [
+                true
+              ],
+              "note": "literal match only; not a semantic loss verdict"
+            },
+            {
+              "criterion": "rwlock",
+              "present": true,
+              "literal_in_final_context": true,
+              "literal_in_each_compacted_round": [
+                true
+              ],
+              "note": "literal match only; not a semantic loss verdict"
+            }
+          ]
+        },
+        {
+          "case": "hyannis-direction",
+          "elapsed_ms": 49371,
+          "error": null,
+          "probe_prompt_tokens": 834,
+          "repetition": 0,
+          "score": {
+            "all_passed": true,
+            "current_constraints_preserved": true,
+            "direction_preserved": true,
+            "fact_checks": [
+              {
+                "criterion": "2026-10-02",
+                "present": true
+              },
+              {
+                "criterion": "15:00|3 pm|3pm",
+                "present": true
+              },
+              {
+                "criterion": "180",
+                "present": true
+              }
+            ],
+            "intent_preserved": true,
+            "no_false_completion": true,
+            "relevant_facts_preserved": true,
+            "safe_next_action": true,
+            "schema_valid": true
+          },
+          "strategy": "structured-message-tail",
+          "summary_elapsed_ms": 33998,
+          "wire_calls": 2,
+          "evidence_path": "target/e2e-artifacts/compaction-study-6ee6e739-b75b-4f6c-bdd8-5187f1d21a38/hyannis-direction-structured-message-tail-0.json",
+          "evidence_sha256": "5e7d459e61422b422e3a7b42aa83ce7f63c8f4cd4e79c64f99961b0e293954ed",
+          "wire_integrity_passed": true,
+          "wire_count": 2,
+          "checkpoint_present": true,
+          "schema_valid_readout": true,
+          "semantic_dimensions_scorable": true,
+          "direction_morphology_false_negative": false,
+          "morphology_only_all_passed": true,
+          "probe_done_reason": "stop",
+          "probe_generated_tokens": 610,
+          "summary_done_reasons": [
+            "stop"
+          ],
+          "fact_diagnostics": [
+            {
+              "criterion": "2026-10-02",
+              "present": true,
+              "literal_in_final_context": false,
+              "literal_in_each_compacted_round": [
+                false
+              ],
+              "note": "literal match only; not a semantic loss verdict"
+            },
+            {
+              "criterion": "15:00|3 pm|3pm",
+              "present": true,
+              "literal_in_final_context": true,
+              "literal_in_each_compacted_round": [
+                true
+              ],
+              "note": "literal match only; not a semantic loss verdict"
+            },
+            {
+              "criterion": "180",
+              "present": true,
+              "literal_in_final_context": true,
+              "literal_in_each_compacted_round": [
+                true
+              ],
+              "note": "literal match only; not a semantic loss verdict"
+            }
+          ]
+        },
+        {
+          "case": "fbar-older-fact",
+          "elapsed_ms": 45453,
+          "error": null,
+          "probe_prompt_tokens": 823,
+          "repetition": 0,
+          "score": {
+            "all_passed": false,
+            "current_constraints_preserved": true,
+            "direction_preserved": true,
+            "fact_checks": [
+              {
+                "criterion": "/fixtures/accounts/cedar-2025.pdf",
+                "present": true
+              },
+              {
+                "criterion": "cedar-731",
+                "present": true
+              },
+              {
+                "criterion": "address",
+                "present": true
+              }
+            ],
+            "intent_preserved": false,
+            "no_false_completion": true,
+            "relevant_facts_preserved": true,
+            "safe_next_action": true,
+            "schema_valid": true
+          },
+          "strategy": "structured-message-tail",
+          "summary_elapsed_ms": 33115,
+          "wire_calls": 2,
+          "evidence_path": "target/e2e-artifacts/compaction-study-6ee6e739-b75b-4f6c-bdd8-5187f1d21a38/fbar-older-fact-structured-message-tail-0.json",
+          "evidence_sha256": "9db8a2cc5d8e936a8346b34e6bc7b412f7fd6e88045c97ed3c6edf3ed548009f",
+          "wire_integrity_passed": true,
+          "wire_count": 2,
+          "checkpoint_present": true,
+          "schema_valid_readout": true,
+          "semantic_dimensions_scorable": true,
+          "direction_morphology_false_negative": false,
+          "morphology_only_all_passed": false,
+          "probe_done_reason": "stop",
+          "probe_generated_tokens": 476,
+          "summary_done_reasons": [
+            "stop"
+          ],
+          "fact_diagnostics": [
+            {
+              "criterion": "/fixtures/accounts/cedar-2025.pdf",
+              "present": true,
+              "literal_in_final_context": true,
+              "literal_in_each_compacted_round": [
+                true
+              ],
+              "note": "literal match only; not a semantic loss verdict"
+            },
+            {
+              "criterion": "cedar-731",
+              "present": true,
+              "literal_in_final_context": true,
+              "literal_in_each_compacted_round": [
+                true
+              ],
+              "note": "literal match only; not a semantic loss verdict"
+            },
+            {
+              "criterion": "address",
+              "present": true,
+              "literal_in_final_context": true,
+              "literal_in_each_compacted_round": [
+                true
+              ],
+              "note": "literal match only; not a semantic loss verdict"
+            }
+          ]
+        },
+        {
+          "case": "unknown-external-effect",
+          "elapsed_ms": 46691,
+          "error": null,
+          "probe_prompt_tokens": 825,
+          "repetition": 0,
+          "score": {
+            "all_passed": true,
+            "current_constraints_preserved": true,
+            "direction_preserved": true,
+            "fact_checks": [
+              {
+                "criterion": "draft-942",
+                "present": true
+              },
+              {
+                "criterion": "unknown",
+                "present": true
+              }
+            ],
+            "intent_preserved": true,
+            "no_false_completion": true,
+            "relevant_facts_preserved": true,
+            "safe_next_action": true,
+            "schema_valid": true
+          },
+          "strategy": "structured-message-tail",
+          "summary_elapsed_ms": 32972,
+          "wire_calls": 2,
+          "evidence_path": "target/e2e-artifacts/compaction-study-6ee6e739-b75b-4f6c-bdd8-5187f1d21a38/unknown-external-effect-structured-message-tail-0.json",
+          "evidence_sha256": "b344a8ac4054e488e23c870f815497f2423ac0a1b68a0bea6fa3a66d7c408f7e",
+          "wire_integrity_passed": true,
+          "wire_count": 2,
+          "checkpoint_present": true,
+          "schema_valid_readout": true,
+          "semantic_dimensions_scorable": true,
+          "direction_morphology_false_negative": false,
+          "morphology_only_all_passed": true,
+          "probe_done_reason": "stop",
+          "probe_generated_tokens": 537,
+          "summary_done_reasons": [
+            "stop"
+          ],
+          "fact_diagnostics": [
+            {
+              "criterion": "draft-942",
+              "present": true,
+              "literal_in_final_context": true,
+              "literal_in_each_compacted_round": [
+                true
+              ],
+              "note": "literal match only; not a semantic loss verdict"
+            },
+            {
+              "criterion": "unknown",
+              "present": true,
+              "literal_in_final_context": true,
+              "literal_in_each_compacted_round": [
+                true
+              ],
+              "note": "literal match only; not a semantic loss verdict"
+            }
+          ]
+        },
+        {
+          "case": "cross-topic-return",
+          "elapsed_ms": 42248,
+          "error": null,
+          "probe_prompt_tokens": 809,
+          "repetition": 0,
+          "score": {
+            "all_passed": true,
+            "current_constraints_preserved": true,
+            "direction_preserved": true,
+            "fact_checks": [
+              {
+                "criterion": "cedar inn",
+                "present": true
+              },
+              {
+                "criterion": "step-free|accessible",
+                "present": true
+              },
+              {
+                "criterion": "2026-11-03",
+                "present": true
+              },
+              {
+                "criterion": "2026-11-06",
+                "present": true
+              }
+            ],
+            "intent_preserved": true,
+            "no_false_completion": true,
+            "relevant_facts_preserved": true,
+            "safe_next_action": true,
+            "schema_valid": true
+          },
+          "strategy": "structured-message-tail",
+          "summary_elapsed_ms": 27759,
+          "wire_calls": 2,
+          "evidence_path": "target/e2e-artifacts/compaction-study-6ee6e739-b75b-4f6c-bdd8-5187f1d21a38/cross-topic-return-structured-message-tail-0.json",
+          "evidence_sha256": "40daa0c9c82fae3f80b5be818b47d91fa5fa9a38e07f02ead70c9a0fe94f48f5",
+          "wire_integrity_passed": true,
+          "wire_count": 2,
+          "checkpoint_present": true,
+          "schema_valid_readout": true,
+          "semantic_dimensions_scorable": true,
+          "direction_morphology_false_negative": false,
+          "morphology_only_all_passed": true,
+          "probe_done_reason": "stop",
+          "probe_generated_tokens": 566,
+          "summary_done_reasons": [
+            "stop"
+          ],
+          "fact_diagnostics": [
+            {
+              "criterion": "cedar inn",
+              "present": true,
+              "literal_in_final_context": true,
+              "literal_in_each_compacted_round": [
+                true
+              ],
+              "note": "literal match only; not a semantic loss verdict"
+            },
+            {
+              "criterion": "step-free|accessible",
+              "present": true,
+              "literal_in_final_context": true,
+              "literal_in_each_compacted_round": [
+                true
+              ],
+              "note": "literal match only; not a semantic loss verdict"
+            },
+            {
+              "criterion": "2026-11-03",
+              "present": true,
+              "literal_in_final_context": false,
+              "literal_in_each_compacted_round": [
+                false
+              ],
+              "note": "literal match only; not a semantic loss verdict"
+            },
+            {
+              "criterion": "2026-11-06",
+              "present": true,
+              "literal_in_final_context": false,
+              "literal_in_each_compacted_round": [
+                false
+              ],
+              "note": "literal match only; not a semantic loss verdict"
+            }
+          ]
+        },
+        {
+          "case": "repeated-correction",
+          "elapsed_ms": 79335,
+          "error": null,
+          "probe_prompt_tokens": 1156,
+          "repetition": 0,
+          "score": {
+            "all_passed": false,
+            "current_constraints_preserved": true,
+            "direction_preserved": true,
+            "fact_checks": [
+              {
+                "criterion": "2026-12-03",
+                "present": true
+              },
+              {
+                "criterion": "2026-12-06",
+                "present": true
+              },
+              {
+                "criterion": "nonstop",
+                "present": false
+              },
+              {
+                "criterion": "carry-on",
+                "present": false
+              }
+            ],
+            "intent_preserved": true,
+            "no_false_completion": true,
+            "relevant_facts_preserved": false,
+            "safe_next_action": true,
+            "schema_valid": true
+          },
+          "strategy": "structured-message-tail",
+          "summary_elapsed_ms": 61304,
+          "wire_calls": 3,
+          "evidence_path": "target/e2e-artifacts/compaction-study-6ee6e739-b75b-4f6c-bdd8-5187f1d21a38/repeated-correction-structured-message-tail-0.json",
+          "evidence_sha256": "2d9697b837a3a29f7960bb92fee490d39b4ef97432f9c99f57ca1c8ad4081eda",
+          "wire_integrity_passed": true,
+          "wire_count": 3,
+          "checkpoint_present": true,
+          "schema_valid_readout": true,
+          "semantic_dimensions_scorable": true,
+          "direction_morphology_false_negative": false,
+          "morphology_only_all_passed": false,
+          "probe_done_reason": "stop",
+          "probe_generated_tokens": 688,
+          "summary_done_reasons": [
+            "stop",
+            "stop"
+          ],
+          "fact_diagnostics": [
+            {
+              "criterion": "2026-12-03",
+              "present": true,
+              "literal_in_final_context": false,
+              "literal_in_each_compacted_round": [
+                false,
+                false
+              ],
+              "note": "literal match only; not a semantic loss verdict"
+            },
+            {
+              "criterion": "2026-12-06",
+              "present": true,
+              "literal_in_final_context": false,
+              "literal_in_each_compacted_round": [
+                false,
+                false
+              ],
+              "note": "literal match only; not a semantic loss verdict"
+            },
+            {
+              "criterion": "nonstop",
+              "present": false,
+              "literal_in_final_context": true,
+              "literal_in_each_compacted_round": [
+                true,
+                true
+              ],
+              "note": "literal match only; not a semantic loss verdict"
+            },
+            {
+              "criterion": "carry-on",
+              "present": false,
+              "literal_in_final_context": true,
+              "literal_in_each_compacted_round": [
+                true,
+                true
+              ],
+              "note": "literal match only; not a semantic loss verdict"
+            }
+          ]
+        },
+        {
+          "case": "broadway-ambiguous",
+          "elapsed_ms": 40695,
+          "error": null,
+          "probe_prompt_tokens": 808,
+          "repetition": 1,
+          "score": {
+            "all_passed": true,
+            "current_constraints_preserved": true,
+            "direction_preserved": true,
+            "fact_checks": [
+              {
+                "criterion": "2026-09-14",
+                "present": true
+              },
+              {
+                "criterion": "2026-09-16",
+                "present": true
+              },
+              {
+                "criterion": "hamilton",
+                "present": true
+              },
+              {
+                "criterion": "wicked",
+                "present": true
+              }
+            ],
+            "intent_preserved": true,
+            "no_false_completion": true,
+            "relevant_facts_preserved": true,
+            "safe_next_action": true,
+            "schema_valid": true
+          },
+          "strategy": "structured-message-tail",
+          "summary_elapsed_ms": 29091,
+          "wire_calls": 2,
+          "evidence_path": "target/e2e-artifacts/compaction-study-6ee6e739-b75b-4f6c-bdd8-5187f1d21a38/broadway-ambiguous-structured-message-tail-1.json",
+          "evidence_sha256": "a8a03952dfa4683b05a34eb9580de3e2e2a53ea51282ea83a4c72c8aab56e35a",
+          "wire_integrity_passed": true,
+          "wire_count": 2,
+          "checkpoint_present": true,
+          "schema_valid_readout": true,
+          "semantic_dimensions_scorable": true,
+          "direction_morphology_false_negative": false,
+          "morphology_only_all_passed": true,
+          "probe_done_reason": "stop",
+          "probe_generated_tokens": 448,
+          "summary_done_reasons": [
+            "stop"
+          ],
+          "fact_diagnostics": [
+            {
+              "criterion": "2026-09-14",
+              "present": true,
+              "literal_in_final_context": false,
+              "literal_in_each_compacted_round": [
+                false
+              ],
+              "note": "literal match only; not a semantic loss verdict"
+            },
+            {
+              "criterion": "2026-09-16",
+              "present": true,
+              "literal_in_final_context": false,
+              "literal_in_each_compacted_round": [
+                false
+              ],
+              "note": "literal match only; not a semantic loss verdict"
+            },
+            {
+              "criterion": "hamilton",
+              "present": true,
+              "literal_in_final_context": true,
+              "literal_in_each_compacted_round": [
+                true
+              ],
+              "note": "literal match only; not a semantic loss verdict"
+            },
+            {
+              "criterion": "wicked",
+              "present": true,
+              "literal_in_final_context": true,
+              "literal_in_each_compacted_round": [
+                true
+              ],
+              "note": "literal match only; not a semantic loss verdict"
+            }
+          ]
+        },
+        {
+          "case": "broadway-correction",
+          "elapsed_ms": 75944,
+          "error": null,
+          "probe_prompt_tokens": 858,
+          "repetition": 1,
+          "score": {
+            "all_passed": true,
+            "current_constraints_preserved": true,
+            "direction_preserved": true,
+            "fact_checks": [
+              {
+                "criterion": "2026-09-18",
+                "present": true
+              },
+              {
+                "criterion": "2026-09-20",
+                "present": true
+              }
+            ],
+            "intent_preserved": true,
+            "no_false_completion": true,
+            "relevant_facts_preserved": true,
+            "safe_next_action": true,
+            "schema_valid": true
+          },
+          "strategy": "structured-message-tail",
+          "summary_elapsed_ms": 30180,
+          "wire_calls": 2,
+          "evidence_path": "target/e2e-artifacts/compaction-study-6ee6e739-b75b-4f6c-bdd8-5187f1d21a38/broadway-correction-structured-message-tail-1.json",
+          "evidence_sha256": "fd1927615777f28aff95e93931357fca007474bd0dacce6a2983c25986105693",
+          "wire_integrity_passed": true,
+          "wire_count": 2,
+          "checkpoint_present": true,
+          "schema_valid_readout": true,
+          "semantic_dimensions_scorable": true,
+          "direction_morphology_false_negative": false,
+          "morphology_only_all_passed": true,
+          "probe_done_reason": "stop",
+          "probe_generated_tokens": 1939,
+          "summary_done_reasons": [
+            "stop"
+          ],
+          "fact_diagnostics": [
+            {
+              "criterion": "2026-09-18",
+              "present": true,
+              "literal_in_final_context": false,
+              "literal_in_each_compacted_round": [
+                false
+              ],
+              "note": "literal match only; not a semantic loss verdict"
+            },
+            {
+              "criterion": "2026-09-20",
+              "present": true,
+              "literal_in_final_context": false,
+              "literal_in_each_compacted_round": [
+                false
+              ],
+              "note": "literal match only; not a semantic loss verdict"
+            }
+          ]
+        },
+        {
+          "case": "explicit-task-switch",
+          "elapsed_ms": 54990,
+          "error": "model did not emit exactly one session_checkpoint",
+          "probe_prompt_tokens": 706,
+          "repetition": 1,
+          "score": {
+            "all_passed": false,
+            "current_constraints_preserved": true,
+            "direction_preserved": false,
+            "fact_checks": [
+              {
+                "criterion": "mutex",
+                "present": false
+              },
+              {
+                "criterion": "rwlock",
+                "present": false
+              }
+            ],
+            "intent_preserved": false,
+            "no_false_completion": true,
+            "relevant_facts_preserved": false,
+            "safe_next_action": true,
+            "schema_valid": false
+          },
+          "strategy": "structured-message-tail",
+          "summary_elapsed_ms": 34302,
+          "wire_calls": 2,
+          "evidence_path": "target/e2e-artifacts/compaction-study-6ee6e739-b75b-4f6c-bdd8-5187f1d21a38/explicit-task-switch-structured-message-tail-1.json",
+          "evidence_sha256": "509cb9c21985a5924883e395f322634edad55938a25ba49f9227c98504ffe745",
+          "wire_integrity_passed": true,
+          "wire_count": 2,
+          "checkpoint_present": false,
+          "schema_valid_readout": false,
+          "semantic_dimensions_scorable": false,
+          "direction_morphology_false_negative": false,
+          "morphology_only_all_passed": false,
+          "probe_done_reason": "stop",
+          "probe_generated_tokens": 816,
+          "summary_done_reasons": [
+            "stop"
+          ],
+          "fact_diagnostics": [
+            {
+              "criterion": "mutex",
+              "present": false,
+              "literal_in_final_context": true,
+              "literal_in_each_compacted_round": [
+                true
+              ],
+              "note": "literal match only; not a semantic loss verdict"
+            },
+            {
+              "criterion": "rwlock",
+              "present": false,
+              "literal_in_final_context": true,
+              "literal_in_each_compacted_round": [
+                true
+              ],
+              "note": "literal match only; not a semantic loss verdict"
+            }
+          ]
+        },
+        {
+          "case": "hyannis-direction",
+          "elapsed_ms": 42417,
+          "error": null,
+          "probe_prompt_tokens": 818,
+          "repetition": 1,
+          "score": {
+            "all_passed": true,
+            "current_constraints_preserved": true,
+            "direction_preserved": true,
+            "fact_checks": [
+              {
+                "criterion": "2026-10-02",
+                "present": true
+              },
+              {
+                "criterion": "15:00|3 pm|3pm",
+                "present": true
+              },
+              {
+                "criterion": "180",
+                "present": true
+              }
+            ],
+            "intent_preserved": true,
+            "no_false_completion": true,
+            "relevant_facts_preserved": true,
+            "safe_next_action": true,
+            "schema_valid": true
+          },
+          "strategy": "structured-message-tail",
+          "summary_elapsed_ms": 26174,
+          "wire_calls": 2,
+          "evidence_path": "target/e2e-artifacts/compaction-study-6ee6e739-b75b-4f6c-bdd8-5187f1d21a38/hyannis-direction-structured-message-tail-1.json",
+          "evidence_sha256": "5f201e9203151c5a2c76e838b17dfbc9224b741370ceb7fbbf22adc03be8a62e",
+          "wire_integrity_passed": true,
+          "wire_count": 2,
+          "checkpoint_present": true,
+          "schema_valid_readout": true,
+          "semantic_dimensions_scorable": true,
+          "direction_morphology_false_negative": false,
+          "morphology_only_all_passed": true,
+          "probe_done_reason": "stop",
+          "probe_generated_tokens": 640,
+          "summary_done_reasons": [
+            "stop"
+          ],
+          "fact_diagnostics": [
+            {
+              "criterion": "2026-10-02",
+              "present": true,
+              "literal_in_final_context": false,
+              "literal_in_each_compacted_round": [
+                false
+              ],
+              "note": "literal match only; not a semantic loss verdict"
+            },
+            {
+              "criterion": "15:00|3 pm|3pm",
+              "present": true,
+              "literal_in_final_context": true,
+              "literal_in_each_compacted_round": [
+                true
+              ],
+              "note": "literal match only; not a semantic loss verdict"
+            },
+            {
+              "criterion": "180",
+              "present": true,
+              "literal_in_final_context": true,
+              "literal_in_each_compacted_round": [
+                true
+              ],
+              "note": "literal match only; not a semantic loss verdict"
+            }
+          ]
+        },
+        {
+          "case": "fbar-older-fact",
+          "elapsed_ms": 49086,
+          "error": null,
+          "probe_prompt_tokens": 803,
+          "repetition": 1,
+          "score": {
+            "all_passed": false,
+            "current_constraints_preserved": true,
+            "direction_preserved": true,
+            "fact_checks": [
+              {
+                "criterion": "/fixtures/accounts/cedar-2025.pdf",
+                "present": true
+              },
+              {
+                "criterion": "cedar-731",
+                "present": true
+              },
+              {
+                "criterion": "address",
+                "present": true
+              }
+            ],
+            "intent_preserved": false,
+            "no_false_completion": true,
+            "relevant_facts_preserved": true,
+            "safe_next_action": true,
+            "schema_valid": true
+          },
+          "strategy": "structured-message-tail",
+          "summary_elapsed_ms": 30750,
+          "wire_calls": 2,
+          "evidence_path": "target/e2e-artifacts/compaction-study-6ee6e739-b75b-4f6c-bdd8-5187f1d21a38/fbar-older-fact-structured-message-tail-1.json",
+          "evidence_sha256": "f720c468d8ba140c15af1d8a376a4fe1f54cf325e73e546f4dfbe91854e0a993",
+          "wire_integrity_passed": true,
+          "wire_count": 2,
+          "checkpoint_present": true,
+          "schema_valid_readout": true,
+          "semantic_dimensions_scorable": true,
+          "direction_morphology_false_negative": false,
+          "morphology_only_all_passed": false,
+          "probe_done_reason": "stop",
+          "probe_generated_tokens": 745,
+          "summary_done_reasons": [
+            "stop"
+          ],
+          "fact_diagnostics": [
+            {
+              "criterion": "/fixtures/accounts/cedar-2025.pdf",
+              "present": true,
+              "literal_in_final_context": true,
+              "literal_in_each_compacted_round": [
+                true
+              ],
+              "note": "literal match only; not a semantic loss verdict"
+            },
+            {
+              "criterion": "cedar-731",
+              "present": true,
+              "literal_in_final_context": true,
+              "literal_in_each_compacted_round": [
+                true
+              ],
+              "note": "literal match only; not a semantic loss verdict"
+            },
+            {
+              "criterion": "address",
+              "present": true,
+              "literal_in_final_context": true,
+              "literal_in_each_compacted_round": [
+                true
+              ],
+              "note": "literal match only; not a semantic loss verdict"
+            }
+          ]
+        },
+        {
+          "case": "unknown-external-effect",
+          "elapsed_ms": 42443,
+          "error": null,
+          "probe_prompt_tokens": 821,
+          "repetition": 1,
+          "score": {
+            "all_passed": true,
+            "current_constraints_preserved": true,
+            "direction_preserved": true,
+            "fact_checks": [
+              {
+                "criterion": "draft-942",
+                "present": true
+              },
+              {
+                "criterion": "unknown",
+                "present": true
+              }
+            ],
+            "intent_preserved": true,
+            "no_false_completion": true,
+            "relevant_facts_preserved": true,
+            "safe_next_action": true,
+            "schema_valid": true
+          },
+          "strategy": "structured-message-tail",
+          "summary_elapsed_ms": 30984,
+          "wire_calls": 2,
+          "evidence_path": "target/e2e-artifacts/compaction-study-6ee6e739-b75b-4f6c-bdd8-5187f1d21a38/unknown-external-effect-structured-message-tail-1.json",
+          "evidence_sha256": "4e788304eef6271e5364b32dd4a7e82b756e2a5a2d2609d1a55bdf7d219fdd35",
+          "wire_integrity_passed": true,
+          "wire_count": 2,
+          "checkpoint_present": true,
+          "schema_valid_readout": true,
+          "semantic_dimensions_scorable": true,
+          "direction_morphology_false_negative": false,
+          "morphology_only_all_passed": true,
+          "probe_done_reason": "stop",
+          "probe_generated_tokens": 422,
+          "summary_done_reasons": [
+            "stop"
+          ],
+          "fact_diagnostics": [
+            {
+              "criterion": "draft-942",
+              "present": true,
+              "literal_in_final_context": true,
+              "literal_in_each_compacted_round": [
+                true
+              ],
+              "note": "literal match only; not a semantic loss verdict"
+            },
+            {
+              "criterion": "unknown",
+              "present": true,
+              "literal_in_final_context": true,
+              "literal_in_each_compacted_round": [
+                true
+              ],
+              "note": "literal match only; not a semantic loss verdict"
+            }
+          ]
+        },
+        {
+          "case": "cross-topic-return",
+          "elapsed_ms": 45118,
+          "error": null,
+          "probe_prompt_tokens": 792,
+          "repetition": 1,
+          "score": {
+            "all_passed": true,
+            "current_constraints_preserved": true,
+            "direction_preserved": true,
+            "fact_checks": [
+              {
+                "criterion": "cedar inn",
+                "present": true
+              },
+              {
+                "criterion": "step-free|accessible",
+                "present": true
+              },
+              {
+                "criterion": "2026-11-03",
+                "present": true
+              },
+              {
+                "criterion": "2026-11-06",
+                "present": true
+              }
+            ],
+            "intent_preserved": true,
+            "no_false_completion": true,
+            "relevant_facts_preserved": true,
+            "safe_next_action": true,
+            "schema_valid": true
+          },
+          "strategy": "structured-message-tail",
+          "summary_elapsed_ms": 31251,
+          "wire_calls": 2,
+          "evidence_path": "target/e2e-artifacts/compaction-study-6ee6e739-b75b-4f6c-bdd8-5187f1d21a38/cross-topic-return-structured-message-tail-1.json",
+          "evidence_sha256": "4c683818e83b3df5e123b7f3c57eefabf0e4f3244957bfd289ebc2131ab31091",
+          "wire_integrity_passed": true,
+          "wire_count": 2,
+          "checkpoint_present": true,
+          "schema_valid_readout": true,
+          "semantic_dimensions_scorable": true,
+          "direction_morphology_false_negative": false,
+          "morphology_only_all_passed": true,
+          "probe_done_reason": "stop",
+          "probe_generated_tokens": 545,
+          "summary_done_reasons": [
+            "stop"
+          ],
+          "fact_diagnostics": [
+            {
+              "criterion": "cedar inn",
+              "present": true,
+              "literal_in_final_context": true,
+              "literal_in_each_compacted_round": [
+                true
+              ],
+              "note": "literal match only; not a semantic loss verdict"
+            },
+            {
+              "criterion": "step-free|accessible",
+              "present": true,
+              "literal_in_final_context": true,
+              "literal_in_each_compacted_round": [
+                true
+              ],
+              "note": "literal match only; not a semantic loss verdict"
+            },
+            {
+              "criterion": "2026-11-03",
+              "present": true,
+              "literal_in_final_context": false,
+              "literal_in_each_compacted_round": [
+                false
+              ],
+              "note": "literal match only; not a semantic loss verdict"
+            },
+            {
+              "criterion": "2026-11-06",
+              "present": true,
+              "literal_in_final_context": false,
+              "literal_in_each_compacted_round": [
+                false
+              ],
+              "note": "literal match only; not a semantic loss verdict"
+            }
+          ]
+        },
+        {
+          "case": "repeated-correction",
+          "elapsed_ms": 89033,
+          "error": null,
+          "probe_prompt_tokens": 1191,
+          "repetition": 1,
+          "score": {
+            "all_passed": true,
+            "current_constraints_preserved": true,
+            "direction_preserved": true,
+            "fact_checks": [
+              {
+                "criterion": "2026-12-03",
+                "present": true
+              },
+              {
+                "criterion": "2026-12-06",
+                "present": true
+              },
+              {
+                "criterion": "nonstop",
+                "present": true
+              },
+              {
+                "criterion": "carry-on",
+                "present": true
+              }
+            ],
+            "intent_preserved": true,
+            "no_false_completion": true,
+            "relevant_facts_preserved": true,
+            "safe_next_action": true,
+            "schema_valid": true
+          },
+          "strategy": "structured-message-tail",
+          "summary_elapsed_ms": 73327,
+          "wire_calls": 3,
+          "evidence_path": "target/e2e-artifacts/compaction-study-6ee6e739-b75b-4f6c-bdd8-5187f1d21a38/repeated-correction-structured-message-tail-1.json",
+          "evidence_sha256": "2c70ff5002fde150fbf1f37af0b83c4f716490447aabd7913b6937d27194e7f2",
+          "wire_integrity_passed": true,
+          "wire_count": 3,
+          "checkpoint_present": true,
+          "schema_valid_readout": true,
+          "semantic_dimensions_scorable": true,
+          "direction_morphology_false_negative": false,
+          "morphology_only_all_passed": true,
+          "probe_done_reason": "stop",
+          "probe_generated_tokens": 589,
+          "summary_done_reasons": [
+            "stop",
+            "stop"
+          ],
+          "fact_diagnostics": [
+            {
+              "criterion": "2026-12-03",
+              "present": true,
+              "literal_in_final_context": false,
+              "literal_in_each_compacted_round": [
+                false,
+                false
+              ],
+              "note": "literal match only; not a semantic loss verdict"
+            },
+            {
+              "criterion": "2026-12-06",
+              "present": true,
+              "literal_in_final_context": false,
+              "literal_in_each_compacted_round": [
+                false,
+                false
+              ],
+              "note": "literal match only; not a semantic loss verdict"
+            },
+            {
+              "criterion": "nonstop",
+              "present": true,
+              "literal_in_final_context": true,
+              "literal_in_each_compacted_round": [
+                true,
+                true
+              ],
+              "note": "literal match only; not a semantic loss verdict"
+            },
+            {
+              "criterion": "carry-on",
+              "present": true,
+              "literal_in_final_context": true,
+              "literal_in_each_compacted_round": [
+                true,
+                true
+              ],
+              "note": "literal match only; not a semantic loss verdict"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "analyzer_sha256": "12144bb6db4aeff219be9191337fbdf770b130e1a6e2daaa608cf80a3f556c34",
+  "limits": [
+    "Raw keyword grades are unchanged; inspect false negatives separately.",
+    "Invalid readouts are probe failures, not automatic semantic amnesia.",
+    "Literal fact matching cannot resolve paraphrases, negation or natural dates.",
+    "Not domain-action E2E or a production reliability estimate."
+  ]
+}
