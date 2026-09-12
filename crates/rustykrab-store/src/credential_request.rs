@@ -24,6 +24,38 @@ use crate::secret::{SecretStore, WriteAuthority};
 /// How long a pending request survives before it is swept.
 pub const REQUEST_TTL_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 
+/// Defense in depth, not a classifier for arbitrary secret values. The generic
+/// login form has no payment-specific retention/observation policy and must not
+/// advertise enrollment of an explicitly named card or security code.
+fn reject_payment_fields(fields: &[RequestedField]) -> Result<(), Error> {
+    for field in fields {
+        let identity = format!("{} {}", field.key, field.label).to_ascii_lowercase();
+        let words = identity
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>();
+        let compact = words.join("");
+        if words
+            .iter()
+            .any(|w| matches!(*w, "cvv" | "cvv2" | "cvc" | "cvc2" | "csc" | "pan"))
+            || [
+                "cardnumber",
+                "creditcard",
+                "debitcard",
+                "securitycode",
+                "cardverification",
+                "cccsc",
+                "ccnumber",
+            ]
+            .iter()
+            .any(|s| compact.contains(s))
+        {
+            return Err(Error::Storage("Payment details cannot be saved through generic credential capture. Ask the user to enter them directly on the merchant's trusted checkout; do not request card numbers or security codes in chat. Reusable card storage is not implemented.".into()));
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequestAction {
     Update,
@@ -234,6 +266,7 @@ impl CredentialRequestStore {
                 "a fulfil request must name at least one field".into(),
             ));
         }
+        reject_payment_fields(&fields)?;
         let id = Uuid::new_v4().to_string();
         self.insert_full(
             id.clone(),
@@ -280,6 +313,8 @@ impl CredentialRequestStore {
         }
 
         let asked: Vec<RequestedField> = row.fields;
+        // Also block old requests filed before this policy existed.
+        reject_payment_fields(&asked)?;
         for (key, _) in values {
             if !asked.iter().any(|f| &f.key == key) {
                 return Err(Error::Storage(format!(
@@ -812,6 +847,51 @@ mod fulfil_tests {
                 crate::credential_backend::MemoryBackend::new(),
             ));
         (dir, store.credential_requests(), store.secrets())
+    }
+
+    #[tokio::test]
+    async fn payment_fields_are_rejected_before_filing_or_fulfilling_legacy_requests() {
+        let (_dir, requests, secrets) = store();
+        for key in ["card_number", "cc-number", "cvv", "cvc2", "payment_pan"] {
+            let fields = vec![RequestedField {
+                key: key.into(),
+                label: key.into(),
+                secret: true,
+                hint: None,
+            }];
+            assert!(requests
+                .file_fulfil("test_payment", None, fields.clone(), None, None)
+                .await
+                .is_err());
+            assert!(requests.pending().await.unwrap().is_empty());
+            // Reconstruct an old pending request to test the second guard,
+            // not only the tool's new-request path.
+            let id = Uuid::new_v4().to_string();
+            requests
+                .insert_full(
+                    id.clone(),
+                    "test_payment",
+                    RequestAction::Fulfil,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(fields),
+                )
+                .await
+                .unwrap();
+            assert!(requests
+                .fulfil(
+                    &id,
+                    &[(key.into(), "synthetic-not-a-real-card".into())],
+                    "fixture"
+                )
+                .await
+                .is_err());
+            assert!(secrets.list_names().await.unwrap().is_empty());
+            requests.deny(&id, "fixture").await.unwrap();
+        }
     }
 
     #[tokio::test]

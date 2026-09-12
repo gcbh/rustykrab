@@ -510,6 +510,13 @@ pub(crate) const SNAPSHOT_JS: &str = r#"
             if (label) return (label.textContent || '').trim().substring(0, 100);
         }
         if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT') {
+            // Native labels covers both explicit for= and implicit wrapping
+            // labels, including controls inside an open shadow root.
+            if (el.labels && el.labels.length) {
+                return Array.from(el.labels).map(function(label) {
+                    return (label.textContent || '').trim();
+                }).join(' ').substring(0, 100);
+            }
             var id = el.id;
             if (id) {
                 var root = el.getRootNode ? el.getRootNode() : document;
@@ -589,6 +596,17 @@ pub(crate) const SNAPSHOT_JS: &str = r#"
     var results = [];
     var refCounter = 0;
 
+    function sensitiveValue(el) {
+        if (!['INPUT', 'TEXTAREA', 'SELECT'].includes(el.tagName)) return false;
+        if ((el.type || '').toLowerCase() === 'password') return true;
+        // autocomplete is tokenized: section/billing qualifiers may precede
+        // cc-number, cc-exp, cc-csc, etc. Unknown card fields fail closed.
+        var autocomplete = (el.getAttribute('autocomplete') || '').toLowerCase();
+        if (autocomplete.split(/\s+/).some(function(t) { return t.startsWith('cc-'); })) return true;
+        var identity = [el.id, el.name, el.getAttribute('aria-label'), getName(el)].join(' ').toLowerCase();
+        return /(?:card[\s_-]*(?:number|no|security|verification)|credit[\s_-]*card|\bcvv2?\b|\bcvc2?\b|\bcsc\b|security[\s_-]*code)/.test(identity);
+    }
+
     var rootDoc = SCOPE_SELECTOR ? document.querySelector(SCOPE_SELECTOR) : document.body;
     if (!rootDoc) return JSON.stringify({ elements: [], note: 'scope selector did not match' });
 
@@ -620,7 +638,7 @@ pub(crate) const SNAPSHOT_JS: &str = r#"
                 tag: node.tagName.toLowerCase(),
                 role: role,
                 name: getName(node),
-                value: (fileInput || (node.tagName === 'INPUT' && (node.type || '').toLowerCase() === 'password'))
+                value: (fileInput || sensitiveValue(node))
                     ? null
                     : ((node.tagName === 'INPUT' || node.tagName === 'TEXTAREA' || node.tagName === 'SELECT') ? (node.value || '') : null),
                 selector: chainedSelector(node, chain),
