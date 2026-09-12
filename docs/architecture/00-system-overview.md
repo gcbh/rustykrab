@@ -12,7 +12,9 @@ of long-polling channel loops. A message arriving on any surface becomes a
 *turn*: the agent loop calls the model, executes the tools it asks for, and
 repeats until the model signals completion.
 
-**Current tree: 14 crates, ~90,200 lines, 949 tests.**
+**Second-pass snapshot: 14 crates, ~90,200 lines, 949 tests.** Current mechanical
+counts live in the generated crate summaries; the continuity follow-up below
+is derived against base `0b565fd` plus its recorded working-tree changes.
 
 ## Crate graph
 
@@ -99,14 +101,19 @@ still implicit and is the only thing making the in-memory queue safe.
    `channel_bindings`, then by creating one.
 2. `process_telegram_message` loads the conversation — healing a binding that
    outlived it — snapshots persisted message ids, appends the user message,
-   starts a typing task.
-3. `rustykrab_runtime::run_agent_interactive` → `prepare_agent`: system
-   prompt, capability set, `Session`, memory write-back callback, `AgentRunner`.
+   saves that inbound turn, and starts a typing task.
+3. `rustykrab_runtime::run_agent_interactive` now uses shared `prepare_agent`
+   for the system prompt, capabilities, session, active tools, durable recall,
+   memory callback, retrieval log and optional outcome sink. A task-owned
+   activity guard lasts through completion. The omitted wiring found against
+   base `0b565fd` is repaired and covered by captured-wire regression trials.
 4. `AgentRunner::run_inner` — **one loop now**, parameterised by an event
    sink — compacts if over budget, calls the provider, classifies the
    response, executes tools in parallel under the sandbox policy.
 5. The caller drains `AgentEvent`s as a heartbeat.
-6. `save_turn(&conv, &persisted_ids)` appends this turn's messages.
+6. `save_turn(&conv, &persisted_ids)` appends this turn's messages, including
+   partial history returned on error/cancellation. An interrupted action's
+   outcome may be unknown; persistence is not proof of task completion.
 7. Optionally an `OutcomeRecord` plus attributions are written.
 8. Any `PendingLinks` minted this turn are delivered as a separate message —
    on chat surfaces only.

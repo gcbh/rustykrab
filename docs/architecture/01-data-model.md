@@ -75,6 +75,30 @@ that is still there.
 lives in two shapes with nothing reconciling them. Low-severity — nothing
 queries the blob copy — but it is the residue of the old design.
 
+### Channel inbound admission journal
+
+```
+channel_inbound(message_id TEXT PRIMARY KEY, channel, external_key, data,
+                conversation_id REFERENCES conversations(id) ON DELETE CASCADE,
+                status CHECK(status IN ('accepted','retained','cancelled')),
+                created_at DEFAULT CURRENT_TIMESTAMP)
+   INDEX (channel, external_key) WHERE status = 'accepted'
+```
+
+`InboundStore` journals the exact user `Message` UUID and JSON before Telegram
+or Slack launches or injects a turn. Assignment is nullable until the binding
+resolves. Only a successful conversation save can mark matching history IDs
+`retained`; this means durable history, not successful execution or delivery.
+Reset cancels the exact captured admission IDs, leaving later arrivals intact.
+An independent SQLite reopen test checks identity, idempotence and cascade.
+
+This is not an exactly-once upstream queue: channel-generated UUIDs do not
+deduplicate transport replays, and the pre-admission transport gap remains.
+After restart pending entries generate a warning, not automatic replay of
+possibly applied external actions. Compacted-away IDs can remain pending.
+Conversation deletion cascades bound entries; unassigned entries have no TTL
+or recovery UI yet. Data has the same plaintext-at-rest exposure as chat rows.
+
 ### Secrets and the credential guard
 
 ```
@@ -317,7 +341,7 @@ any conversation. One column, two meanings.
 
 ## Join analysis: enforced, and deliberately not
 
-`store.db` declares fourteen foreign keys, up from one. The ones that are
+`store.db` declares fifteen foreign keys, up from one. The ones that are
 ownership cascade; the ones that record provenance are unenforced *on
 purpose*, and the DDL now says which is which.
 
@@ -326,6 +350,7 @@ purpose*, and the DDL now says which is which.
 | `messages.conversation_id` | **CASCADE** | |
 | `recall_archive.conversation_id` | **CASCADE** | |
 | `channel_bindings.conv_id` | **CASCADE** | closed the live bug above |
+| `channel_inbound.conversation_id` | **CASCADE** | nullable until admission is assigned; preserves conversation deletion semantics |
 | `job_runs.job_id` | **CASCADE** | `delete_job` used to orphan run history forever |
 | `outcome_attributions.record_id` | **CASCADE** | was the only FK before |
 | `project_revisions.project_id` | **CASCADE** | project owns immutable revision history |

@@ -20,6 +20,6 @@ pub use context::AgentContext;
 pub use distill::{distil_into_memory, ingest_inbound};
 pub use error::RuntimeError;
 pub use orchestrate::{
-    run_agent, run_agent_interactive, run_agent_streaming, run_agent_streaming_with_options,
-    run_agent_with_options, RunOptions,
+    await_interactive_run, run_agent, run_agent_interactive, run_agent_streaming,
+    run_agent_streaming_with_options, run_agent_with_options, RunOptions,
 };

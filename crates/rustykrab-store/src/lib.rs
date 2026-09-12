@@ -5,6 +5,7 @@ mod credential_request;
 mod device;
 mod dream_reports;
 mod guarded;
+mod inbound;
 mod jobs;
 pub mod keychain;
 mod outcomes;
@@ -30,6 +31,7 @@ pub use credential_request::{
 pub use device::{Device, DeviceStore, Principal};
 pub use dream_reports::{DreamReportStore, StoredReport};
 pub use guarded::{GuardedSecrets, WriteOutcome};
+pub use inbound::InboundStore;
 pub use jobs::{JobRun, JobStore, ScheduledJob};
 pub use outcomes::OutcomeStore;
 pub use pending_links::PendingLinks;
@@ -122,6 +124,18 @@ impl Store {
                 name TEXT PRIMARY KEY,
                 data BLOB NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS channel_inbound (
+                message_id TEXT PRIMARY KEY,
+                channel TEXT NOT NULL,
+                external_key TEXT NOT NULL,
+                data TEXT NOT NULL,
+                conversation_id TEXT REFERENCES conversations(id) ON DELETE CASCADE,
+                status TEXT NOT NULL CHECK(status IN ('accepted','retained','cancelled')),
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_channel_inbound_pending
+                ON channel_inbound(channel,external_key) WHERE status='accepted';
 
             CREATE TABLE IF NOT EXISTS scheduled_jobs (
                 id              TEXT PRIMARY KEY,
@@ -749,6 +763,10 @@ impl Store {
     /// hand-built key.
     pub fn channel_bindings(&self) -> ChannelBindingStore {
         ChannelBindingStore::new(Arc::clone(&self.conn))
+    }
+
+    pub fn inbound(&self) -> InboundStore {
+        InboundStore::new(Arc::clone(&self.conn))
     }
 
     /// Return a handle for the durable recall archive (compaction-displaced

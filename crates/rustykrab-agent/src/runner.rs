@@ -6,6 +6,7 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
+use futures::FutureExt;
 use rustykrab_core::active_tools::{ActiveToolsRegistry, SessionToolContext, SESSION_TOOL_CONTEXT};
 use rustykrab_core::capability::Capability;
 use rustykrab_core::model::{
@@ -22,7 +23,7 @@ use rustykrab_core::types::{
     ContentPart, Conversation, Message, MessageContent, Role, ToolCall, ToolResult, ToolSchema,
 };
 use rustykrab_core::{Error, Result, SandboxRequirements, Tool};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
@@ -782,6 +783,9 @@ pub enum AgentEvent {
 /// Events that flow INTO a running agent loop.
 #[derive(Debug)]
 pub enum InboundEvent {
+    /// Already journaled user input. Preserve its identity across admission,
+    /// execution, and partial-history persistence.
+    Message(Message),
     /// A new user message (possibly multi-modal) arrived while the agent is running.
     UserMessage {
         parts: Vec<ContentPart>,
@@ -796,20 +800,35 @@ pub enum InboundEvent {
 #[derive(Clone)]
 pub struct AgentHandle {
     inbound_tx: mpsc::Sender<InboundEvent>,
+    cancel_tx: watch::Sender<bool>,
     alive: Arc<AtomicBool>,
 }
 
 impl AgentHandle {
+    pub async fn send_message_record(&self, message: Message) -> Result<()> {
+        if message.role != Role::User {
+            return Err(Error::Internal(
+                "agent inbox only accepts user messages".into(),
+            ));
+        }
+        self.inbound_tx
+            .try_send(InboundEvent::Message(message))
+            .map_err(|_| {
+                Error::Internal("agent inbox is closed or full; message was not accepted".into())
+            })
+    }
+
     /// Submit a new user message to the running agent.
     pub async fn send_message(&self, parts: Vec<ContentPart>) -> Result<()> {
         self.inbound_tx
-            .send(InboundEvent::UserMessage {
+            .try_send(InboundEvent::UserMessage {
                 parts,
                 channel: None,
                 channel_msg_id: None,
             })
-            .await
-            .map_err(|_| Error::Internal("agent loop has terminated".into()))
+            .map_err(|_| {
+                Error::Internal("agent inbox is closed or full; message was not accepted".into())
+            })
     }
 
     /// Submit a new user message with channel metadata.
@@ -820,26 +839,44 @@ impl AgentHandle {
         channel_msg_id: Option<String>,
     ) -> Result<()> {
         self.inbound_tx
-            .send(InboundEvent::UserMessage {
+            .try_send(InboundEvent::UserMessage {
                 parts,
                 channel: Some(channel),
                 channel_msg_id,
             })
-            .await
-            .map_err(|_| Error::Internal("agent loop has terminated".into()))
+            .map_err(|_| {
+                Error::Internal("agent inbox is closed or full; message was not accepted".into())
+            })
     }
 
     /// Request cancellation of the current agent run.
     pub async fn cancel(&self) -> Result<()> {
-        self.inbound_tx
-            .send(InboundEvent::Cancel)
-            .await
+        self.cancel_tx
+            .send(true)
             .map_err(|_| Error::Internal("agent loop has terminated".into()))
     }
 
     /// Check whether the agent loop is still running.
     pub fn is_alive(&self) -> bool {
         self.alive.load(AtomicOrdering::Acquire)
+    }
+}
+
+/// An interactive run always returns its history, including on provider
+/// errors and cancellation. A failed run is not an empty conversation.
+pub struct AgentRunCompletion {
+    pub conversation: Conversation,
+    pub result: Result<()>,
+}
+
+/// Dropping a run must not detach its parallel tool tasks. Abort stops local
+/// futures, not effects already committed in a browser or remote service.
+struct AbortToolTasks(Vec<tokio::task::AbortHandle>);
+impl Drop for AbortToolTasks {
+    fn drop(&mut self) {
+        for task in &self.0 {
+            task.abort();
+        }
     }
 }
 
@@ -1457,9 +1494,10 @@ impl AgentRunner {
     ) -> (
         AgentHandle,
         mpsc::Receiver<AgentEvent>,
-        JoinHandle<Result<Conversation>>,
+        JoinHandle<AgentRunCompletion>,
     ) {
         let (inbound_tx, inbound_rx) = mpsc::channel::<InboundEvent>(64);
+        let (cancel_tx, cancel_rx) = watch::channel(false);
         let (outbound_tx, outbound_rx) = mpsc::channel::<AgentEvent>(128);
         let alive = Arc::new(AtomicBool::new(true));
         let alive_clone = alive.clone();
@@ -1501,7 +1539,7 @@ impl AgentRunner {
             };
             let body = async move {
                 runner
-                    .run_event_loop(conv, &session, inbound_rx, outbound_tx)
+                    .run_event_loop(conv, &session, inbound_rx, cancel_rx, outbound_tx)
                     .await
             };
             let result = match trace_id {
@@ -1512,7 +1550,11 @@ impl AgentRunner {
             result
         });
 
-        let handle = AgentHandle { inbound_tx, alive };
+        let handle = AgentHandle {
+            inbound_tx,
+            cancel_tx,
+            alive,
+        };
         (handle, outbound_rx, join_handle)
     }
 
@@ -1524,31 +1566,102 @@ impl AgentRunner {
         mut conv: Conversation,
         session: &Session,
         mut inbound_rx: mpsc::Receiver<InboundEvent>,
+        mut cancel_rx: watch::Receiver<bool>,
         outbound_tx: mpsc::Sender<AgentEvent>,
-    ) -> Result<Conversation> {
-        let supports_vision = self.provider.supports_vision();
-
-        let on_event = move |event: AgentEvent| {
-            let _ = outbound_tx.try_send(event);
+    ) -> AgentRunCompletion {
+        let on_event = |event: AgentEvent| {
+            if !matches!(event, AgentEvent::Done) {
+                let _ = outbound_tx.try_send(event);
+            }
         };
-
-        // Before each LLM call, drain inbound user messages.
-        // We wrap the streaming call with a pre-iteration hook.
-        // For the initial release, we use a simpler design: drain
-        // inbound messages before running the streaming loop, and
-        // let the existing run_streaming handle the core logic.
-        // Messages that arrive mid-run are queued and appended on
-        // the next invocation.
-
-        // Drain any messages that arrived before the loop started.
-        drain_inbound_to_conv(&mut inbound_rx, &mut conv, supports_vision, &on_event);
-
-        self.run_streaming(&mut conv, session, &on_event).await?;
-
-        // Final drain after the loop completes.
-        drain_inbound_to_conv(&mut inbound_rx, &mut conv, supports_vision, &on_event);
-
-        Ok(conv)
+        let tracer = ExecutionTracer::new();
+        // A follow-up received at EndTurn gets another dispatch, but never
+        // a fresh iteration allowance. This bounds even a continuously fed inbox.
+        let mut iterations = 0;
+        let body = async {
+            loop {
+                self.drain_inbound(&mut inbound_rx, &mut conv, &on_event)?;
+                self.run_inner(
+                    &mut conv,
+                    session,
+                    &on_event,
+                    &tracer,
+                    &mut Some(&mut inbound_rx),
+                    &mut iterations,
+                )
+                .await?;
+                let mut pending = self.drain_inbound(&mut inbound_rx, &mut conv, &on_event)?;
+                if pending == 0 {
+                    // Seal admission before the final drain: successful sends
+                    // cannot land in the gap between this check and task exit.
+                    inbound_rx.close();
+                    pending = self.drain_inbound(&mut inbound_rx, &mut conv, &on_event)?;
+                }
+                if pending == 0 {
+                    return Ok(());
+                }
+                if iterations >= self.config.max_iterations {
+                    return Err(Error::Internal(
+                        "iteration limit reached with pending user messages; history retained"
+                            .into(),
+                    ));
+                }
+            }
+        };
+        let result = {
+            let scoped = SESSION_TOOL_CONTEXT.scope(self.build_session_context(session), body);
+            let caught = std::panic::AssertUnwindSafe(scoped).catch_unwind();
+            tokio::select! {
+                result = caught => result.unwrap_or_else(|_| Err(Error::Internal("agent task panicked; partial history retained".into()))),
+                _ = async {
+                    while !*cancel_rx.borrow_and_update() {
+                        if cancel_rx.changed().await.is_err() {
+                            std::future::pending::<()>().await;
+                        }
+                    }
+                } => Err(Error::Internal("agent run cancelled; in-flight tool effects may be unknown".into())),
+            }
+        };
+        inbound_rx.close();
+        if result.is_err() {
+            // A cancelled tool may already have affected the outside world.
+            // Record uncertainty, not a retryable failure or invented success.
+            let completed: HashSet<String> = conv
+                .messages
+                .iter()
+                .filter_map(|m| {
+                    if let MessageContent::ToolResult(r) = &m.content {
+                        Some(r.call_id.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            let unfinished: Vec<_> = conv
+                .messages
+                .iter()
+                .flat_map(|m| m.content.tool_calls())
+                .filter(|c| !completed.contains(&c.id))
+                .map(|c| c.id.clone())
+                .collect();
+            for call_id in unfinished {
+                self.push_message(&mut conv, Message::stamped(Role::Tool, MessageContent::ToolResult(ToolResult {
+                    call_id,
+                    output: serde_json::json!({"error": "run interrupted", "outcome": "unknown", "next_step": "Inspect external state before retrying; the action may already have happened."}),
+                    is_error: true, images: Vec::new(),
+                })));
+            }
+        }
+        let _ = self.drain_inbound(&mut inbound_rx, &mut conv, &on_event);
+        self.capture_outcome(session, &tracer, result.is_err())
+            .await;
+        self.forget_token_estimate(conv.id);
+        self.forget_usage_anchor(conv.id);
+        let _ = outbound_tx.try_send(AgentEvent::Done);
+        AgentRunCompletion {
+            conversation: conv,
+            result,
+        }
     }
 
     /// Run the agent loop on a conversation within a session's capability scope.
@@ -1564,7 +1677,10 @@ impl AgentRunner {
         let tracer = ExecutionTracer::new();
         let discard = |_event: AgentEvent| {};
         let result = SESSION_TOOL_CONTEXT
-            .scope(ctx, self.run_inner(conv, session, &discard, &tracer))
+            .scope(
+                ctx,
+                self.run_inner(conv, session, &discard, &tracer, &mut None, &mut 0),
+            )
             .await;
         self.capture_outcome(session, &tracer, result.is_err())
             .await;
@@ -1590,6 +1706,8 @@ impl AgentRunner {
         session: &Session,
         on_event: &(dyn Fn(AgentEvent) + Send + Sync),
         tracer: &ExecutionTracer,
+        inbound: &mut Option<&mut mpsc::Receiver<InboundEvent>>,
+        iterations: &mut usize,
     ) -> Result<()> {
         if session.is_expired() {
             return Err(Error::Auth("session has expired".into()));
@@ -1621,7 +1739,12 @@ impl AgentRunner {
         // call without rebuilding every tool's JSON schema each iteration.
         let mut schema_cache: Option<(u64, Vec<ToolSchema>)> = None;
 
-        for iteration in 0..self.config.max_iterations {
+        while *iterations < self.config.max_iterations {
+            let iteration = *iterations;
+            *iterations += 1;
+            if let Some(rx) = inbound.as_deref_mut() {
+                self.drain_inbound(rx, conv, on_event)?;
+            }
             tracer.record_iteration();
 
             if session.is_expired() {
@@ -2140,7 +2263,10 @@ impl AgentRunner {
         // See `run` — hoisted so outcome capture sees the run's traces.
         let tracer = ExecutionTracer::new();
         let result = SESSION_TOOL_CONTEXT
-            .scope(ctx, self.run_inner(conv, session, on_event, &tracer))
+            .scope(
+                ctx,
+                self.run_inner(conv, session, on_event, &tracer, &mut None, &mut 0),
+            )
             .await;
         self.capture_outcome(session, &tracer, result.is_err())
             .await;
@@ -2239,6 +2365,7 @@ impl AgentRunner {
         // tasks don't need a Send + 'static handle to `on_event`.
         let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_TOOL_CALLS));
         let mut handles = Vec::with_capacity(calls.len());
+        let mut abort_on_drop = AbortToolTasks(Vec::with_capacity(calls.len()));
         let call_meta: Vec<(String, String)> = calls
             .iter()
             .map(|c| (c.name.clone(), c.id.clone()))
@@ -2256,7 +2383,7 @@ impl AgentRunner {
             let hb_tx = hb_tx.clone();
             let interval = heartbeat_interval;
 
-            handles.push(tokio::spawn(async move {
+            let task = tokio::spawn(async move {
                 let _permit = sem.acquire().await.expect("semaphore closed");
                 let start = Instant::now();
                 let result = if interval == 0 {
@@ -2293,7 +2420,9 @@ impl AgentRunner {
                     .await
                 };
                 (result, call.name.clone(), call.id.clone(), start.elapsed())
-            }));
+            });
+            abort_on_drop.0.push(task.abort_handle());
+            handles.push(task);
         }
         // Drop the orchestrator's sender so the receiver closes once
         // every spawned task finishes.
@@ -3577,30 +3706,320 @@ fn enforce_sandbox_policy(
 }
 
 /// Drain all immediately-available inbound events and append user messages
-/// to the conversation.
-fn drain_inbound_to_conv(
-    inbound_rx: &mut mpsc::Receiver<InboundEvent>,
-    conv: &mut Conversation,
-    supports_vision: bool,
-    on_event: &dyn Fn(AgentEvent),
-) {
-    while let Ok(event) = inbound_rx.try_recv() {
-        match event {
-            InboundEvent::UserMessage { parts, .. } => {
-                let content = MessageContent::from_parts(&parts, supports_vision);
-                let msg = Message {
-                    id: Uuid::new_v4(),
-                    role: Role::User,
-                    content,
-                    created_at: Utc::now(),
-                    agent_version: None,
-                };
-                on_event(AgentEvent::UserMessageQueued { message_id: msg.id });
-                conv.messages.push(msg);
-                conv.updated_at = Utc::now();
+/// to the conversation. Runner-owned hooks also observe injected messages.
+impl AgentRunner {
+    fn drain_inbound(
+        &self,
+        inbound_rx: &mut mpsc::Receiver<InboundEvent>,
+        conv: &mut Conversation,
+        on_event: &dyn Fn(AgentEvent),
+    ) -> Result<usize> {
+        let mut count = 0;
+        let mut cancelled = false;
+        while let Ok(event) = inbound_rx.try_recv() {
+            match event {
+                InboundEvent::Message(msg) => {
+                    if msg.role != Role::User {
+                        return Err(Error::Internal(
+                            "agent inbox only accepts user messages".into(),
+                        ));
+                    }
+                    if !conv.messages.iter().any(|existing| existing.id == msg.id) {
+                        on_event(AgentEvent::UserMessageQueued { message_id: msg.id });
+                        self.push_message(conv, msg);
+                        count += 1;
+                    }
+                }
+                InboundEvent::UserMessage { parts, .. } => {
+                    let content =
+                        MessageContent::from_parts(&parts, self.provider.supports_vision());
+                    let msg = Message {
+                        id: Uuid::new_v4(),
+                        role: Role::User,
+                        content,
+                        created_at: Utc::now(),
+                        agent_version: None,
+                    };
+                    on_event(AgentEvent::UserMessageQueued { message_id: msg.id });
+                    self.push_message(conv, msg);
+                    count += 1;
+                }
+                InboundEvent::Cancel => {
+                    cancelled = true;
+                }
             }
-            InboundEvent::Cancel => {}
         }
+        if cancelled {
+            return Err(Error::Internal("agent run cancelled".into()));
+        }
+        Ok(count)
+    }
+}
+
+#[cfg(test)]
+mod interactive_regression_tests {
+    use super::*;
+    use crate::sandbox::NoSandbox;
+    use async_trait::async_trait;
+
+    struct PausedProvider {
+        seen: Mutex<Vec<Vec<Message>>>,
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+        failure: bool,
+        response: Mutex<Option<MessageContent>>,
+    }
+    #[async_trait]
+    impl ModelProvider for PausedProvider {
+        fn name(&self) -> &str {
+            "paused-regression-fixture"
+        }
+        async fn chat(&self, messages: &[Message], _: &[ToolSchema]) -> Result<ModelResponse> {
+            let first = {
+                let mut seen = self.seen.lock().unwrap();
+                seen.push(messages.to_vec());
+                seen.len() == 1
+            };
+            if first {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+            if self.failure {
+                return Err(Error::Internal("injected provider stream failure".into()));
+            }
+            Ok(ModelResponse {
+                message: Message::stamped(
+                    Role::Assistant,
+                    self.response.lock().unwrap().take().unwrap_or_else(|| {
+                        MessageContent::Text("The observed result is complete.".into())
+                    }),
+                ),
+                usage: Usage::default(),
+                stop_reason: StopReason::EndTurn,
+                text: None,
+            })
+        }
+    }
+    fn setup(
+        failure: bool,
+        cap: usize,
+    ) -> (Arc<PausedProvider>, AgentRunner, Conversation, Session) {
+        let provider = Arc::new(PausedProvider {
+            seen: Mutex::new(Vec::new()),
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+            failure,
+            response: Mutex::new(None),
+        });
+        let runner = AgentRunner::new(provider.clone(), Vec::new(), Arc::new(NoSandbox))
+            .with_config(AgentConfig {
+                max_iterations: cap,
+                ..Default::default()
+            });
+        let mut conv = Conversation {
+            id: Uuid::new_v4(),
+            messages: Vec::new(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            title: None,
+            summary: None,
+            detected_profile: None,
+            channel_source: None,
+            channel_id: None,
+            channel_thread_id: None,
+        };
+        conv.messages.push(Message::stamped(
+            Role::User,
+            MessageContent::Text("Find Broadway dates.".into()),
+        ));
+        let session = Session::with_capabilities(
+            conv.id,
+            rustykrab_core::capability::CapabilitySet::for_tools_permissive(&[]),
+        );
+        (provider, runner, conv, session)
+    }
+    async fn inject(handle: &AgentHandle) {
+        handle
+            .send_message(vec![ContentPart::Text {
+                text: "Use September 18-20 instead.".into(),
+            }])
+            .await
+            .unwrap();
+    }
+    fn has_correction(messages: &[Message]) -> bool {
+        messages.iter().any(|m| {
+            m.role == Role::User && m.content.as_text() == Some("Use September 18-20 instead.")
+        })
+    }
+
+    #[tokio::test]
+    async fn end_turn_injection_reaches_another_dispatch_and_memory_hook() {
+        let (p, runner, conv, session) = setup(false, 4);
+        let retained = Arc::new(Mutex::new(Vec::new()));
+        let out = retained.clone();
+        let runner = runner.with_on_message(Arc::new(move |m| out.lock().unwrap().push(m.clone())));
+        let (handle, _events, task) = runner.start(conv, session);
+        p.entered.notified().await;
+        inject(&handle).await;
+        p.release.notify_one();
+        let completion = tokio::time::timeout(Duration::from_secs(3), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(completion.result.is_ok());
+        {
+            let seen = p.seen.lock().unwrap();
+            assert_eq!(seen.len(), 2);
+            assert!(!has_correction(&seen[0]));
+            assert!(has_correction(&seen[1]));
+        }
+        assert!(has_correction(&retained.lock().unwrap()));
+        assert!(!handle.is_alive());
+        assert!(handle.send_message(Vec::new()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn provider_error_returns_partial_history_and_pending_input() {
+        let (p, runner, mut conv, session) = setup(true, 4);
+        let trail = Message::stamped(
+            Role::Tool,
+            MessageContent::Text("Prior Hyannis browser timeout evidence".into()),
+        );
+        let trail_id = trail.id;
+        conv.messages.push(trail);
+        let (handle, _events, task) = runner.start(conv, session);
+        p.entered.notified().await;
+        inject(&handle).await;
+        p.release.notify_one();
+        let completion = task.await.unwrap();
+        assert!(completion.result.is_err());
+        assert!(has_correction(&completion.conversation.messages));
+        assert!(completion
+            .conversation
+            .messages
+            .iter()
+            .any(|m| m.id == trail_id));
+        assert_eq!(p.seen.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn cancellation_interrupts_a_stuck_provider_and_retains_input() {
+        let (p, runner, conv, session) = setup(false, 4);
+        let (handle, _events, task) = runner.start(conv, session);
+        p.entered.notified().await;
+        inject(&handle).await;
+        handle.cancel().await.unwrap();
+        let completion = tokio::time::timeout(Duration::from_secs(3), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(completion
+            .result
+            .unwrap_err()
+            .to_string()
+            .contains("cancelled"));
+        assert!(has_correction(&completion.conversation.messages));
+    }
+
+    #[tokio::test]
+    async fn queued_followups_cannot_reset_the_iteration_budget() {
+        let (p, runner, conv, session) = setup(false, 1);
+        let (handle, _events, task) = runner.start(conv, session);
+        p.entered.notified().await;
+        inject(&handle).await;
+        p.release.notify_one();
+        let completion = task.await.unwrap();
+        assert!(completion
+            .result
+            .unwrap_err()
+            .to_string()
+            .contains("iteration limit"));
+        assert!(has_correction(&completion.conversation.messages));
+        assert_eq!(p.seen.lock().unwrap().len(), 1);
+    }
+
+    struct DropNotice(Arc<tokio::sync::Semaphore>);
+    impl Drop for DropNotice {
+        fn drop(&mut self) {
+            self.0.add_permits(1);
+        }
+    }
+    struct HangingTool {
+        started: Arc<tokio::sync::Semaphore>,
+        dropped: Arc<tokio::sync::Semaphore>,
+    }
+    #[async_trait]
+    impl Tool for HangingTool {
+        fn name(&self) -> &str {
+            "hang_fixture"
+        }
+        fn description(&self) -> &str {
+            "A cancellable local test future"
+        }
+        fn schema(&self) -> ToolSchema {
+            ToolSchema {
+                name: self.name().into(),
+                description: self.description().into(),
+                parameters: serde_json::json!({"type":"object"}),
+            }
+        }
+        async fn execute(&self, _: serde_json::Value) -> Result<serde_json::Value> {
+            let _drop = DropNotice(self.dropped.clone());
+            self.started.add_permits(1);
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_aborts_parallel_tools_and_records_unknown_outcomes() {
+        let (p, _, conv, _) = setup(false, 4);
+        *p.response.lock().unwrap() = Some(MessageContent::MultiToolCall(
+            (0..2)
+                .map(|i| ToolCall {
+                    id: format!("interrupted-{i}"),
+                    name: "hang_fixture".into(),
+                    arguments: serde_json::json!({}),
+                })
+                .collect(),
+        ));
+        let started = Arc::new(tokio::sync::Semaphore::new(0));
+        let dropped = Arc::new(tokio::sync::Semaphore::new(0));
+        let runner = AgentRunner::new(
+            p.clone(),
+            vec![Arc::new(HangingTool {
+                started: started.clone(),
+                dropped: dropped.clone(),
+            })],
+            Arc::new(NoSandbox),
+        );
+        let session = Session::with_capabilities(
+            conv.id,
+            rustykrab_core::capability::CapabilitySet::for_tools_permissive(&["hang_fixture"]),
+        );
+        let (handle, _events, task) = runner.start(conv, session);
+        p.entered.notified().await;
+        p.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(3), started.acquire_many(2))
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        handle.cancel().await.unwrap();
+        let completion = tokio::time::timeout(Duration::from_secs(3), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(completion.result.is_err());
+        tokio::time::timeout(Duration::from_secs(3), dropped.acquire_many(2))
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        let unknown = completion.conversation.messages.iter().filter(|m| {
+            matches!(&m.content, MessageContent::ToolResult(r) if r.output["outcome"] == "unknown")
+        }).count();
+        assert_eq!(unknown, 2);
+        assert_eq!(p.seen.lock().unwrap().len(), 1, "no automatic retry");
     }
 }
 
