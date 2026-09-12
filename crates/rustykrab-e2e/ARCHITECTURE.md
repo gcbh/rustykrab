@@ -22,8 +22,9 @@ follow-up injected while the first model request is blocked at a fixture barrier
 It joins native prompt logs, exact Ollama wire bodies, final SQLite messages and
 channel replies. The adversarial compaction case is a retention regression now,
 not a passing expectation of data loss. `context-model` excludes deterministic
-Telegram fault fixtures. Credential/payment-boundary hardening and its real
-Chrome regression coverage are isolated in the following PR.
+Telegram fault fixtures. Credential/payment-boundary hardening is isolated in
+the final stack layer; real Chrome regressions live beside BrowserTool and
+write synthetic-only evidence to an explicitly selected artifact directory.
 
 Boot the real daemon binary on a throwaway data directory and an ephemeral port,
 drive scenarios over HTTP, and assert on **both** the responses and the

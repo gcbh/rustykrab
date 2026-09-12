@@ -389,7 +389,8 @@ fn schema_parameters() -> serde_json::Value {
             },
             "field": {
                 "type": "string",
-                "description": "Which part of the login to fill (fill_credential action): 'username' or 'password'. Defaults to 'password'."
+                "enum": ["username", "password"],
+                "description": "Login field for fill_credential. Passwords require a type=password input; fields must belong to the live top-level origin. Defaults to password."
             },
             "profile": {
                 "type": "string",
@@ -885,6 +886,21 @@ impl BrowserTool {
                 return Err(Error::ToolExecution(ToolError::invalid_input(format!(
                     "unknown browser action '{other}'"
                 ))));
+            }
+        }
+        if effective_action(action, args) == "fill_credential" {
+            if args.get("url").is_some() || args.get("text").is_some() {
+                return Err(Error::ToolExecution(ToolError::invalid_input(
+                    "fill_credential does not accept url or text; authority comes only from the live page origin",
+                )));
+            }
+            if !matches!(
+                args["field"].as_str().unwrap_or(crate::PASSWORD),
+                crate::USERNAME | crate::PASSWORD
+            ) {
+                return Err(Error::ToolExecution(ToolError::invalid_input(
+                    "fill_credential supports only username or password",
+                )));
             }
         }
         Ok(())
@@ -1943,47 +1959,41 @@ impl Tool for BrowserTool {
                 let _ = self.manager.get_browser(&profile).await?;
                 let page = self.page_for(action, &profile, &session, target_id).await?;
 
-                // The page's own URL, so the key matches wherever the
-                // agent actually is rather than where it meant to be.
-                let url = match args["url"].as_str() {
-                    Some(u) => u.to_string(),
-                    None => manager::probe_page_url_once(&page)
-                        .await
-                        .unwrap_or_default(),
-                };
+                // Neither a model URL nor a snapshot's old frame URL is
+                // authority to release a secret. Read the live page, enforce
+                // secure transport, then inspect the actual target node.
+                let url = manager::probe_page_url_once(&page)
+                    .await
+                    .unwrap_or_default();
+                let origin = crate::origin_key::canonical_credential_origin(&url)?;
+                let parsed = url::Url::parse(&origin).expect("validated origin");
+                let loopback = parsed.host_str().is_some_and(|host| {
+                    host == "localhost" || host == "127.0.0.1" || host == "[::1]"
+                });
+                if parsed.scheme() != "https"
+                    && !(loopback && self.manager.config().ssrf_policy.allow_private_network)
+                {
+                    return Err(Error::ToolExecution(ToolError::permission_denied(
+                        "credential fill requires HTTPS (HTTP loopback requires explicit private-network test policy)",
+                    )));
+                }
                 let cred_key = crate::origin_credential_key(&url, field)?;
-
+                let store_key = Self::store_key(&session, &profile, target_id);
+                let target = actions::prepare_credential_target(
+                    &page,
+                    &self.snapshot_store,
+                    &store_key,
+                    ref_id,
+                    &origin,
+                    field,
+                )
+                .await?;
                 let value = match secrets.get(&cred_key).await {
                     Ok(value) => value,
                     Err(Error::NotFound(_)) => {
-                        match crate::origin_key::legacy_browser_credential_key(&url, field) {
-                            Some(legacy_key) => secrets.get(legacy_key).await.map_err(|error| {
-                                if matches!(error, Error::NotFound(_)) {
-                                    // Names only the canonical key so new requests converge on
-                                    // the origin-scoped namespace.
-                                    Error::ToolExecution(
-                                        format!(
-                                            "no credential stored under '{cred_key}'. Ask the user \
-                                             for it with credential_request using that exact name, \
-                                             then try again."
-                                        )
-                                        .into(),
-                                    )
-                                } else {
-                                    error
-                                }
-                            })?,
-                            None => {
-                                return Err(Error::ToolExecution(
-                                    format!(
-                                        "no credential stored under '{cred_key}'. Ask the user for \
-                                         it with credential_request using that exact name, then try \
-                                         again."
-                                    )
-                                    .into(),
-                                ));
-                            }
-                        }
+                        return Err(Error::ToolExecution(format!(
+                            "No credential enrolled for exact origin '{origin}' under '{cred_key}'. Ask via credential_request with url='{origin}' and that exact field key. Legacy credentials are preserved but cannot be safely auto-migrated; re-enrollment is required. Do not request the value in chat."
+                        ).into()));
                     }
                     Err(error) => return Err(error),
                 };
@@ -1996,21 +2006,7 @@ impl Tool for BrowserTool {
                     "credential fill started"
                 );
 
-                let store_key = Self::store_key(&session, &profile, target_id);
-                let fill_args = json!({ "text": value, "clear": true });
-                let fill_outcome = actions::execute_act(
-                    &page,
-                    &self.snapshot_store,
-                    &store_key,
-                    "fill",
-                    ref_id,
-                    &fill_args,
-                    actions::ActionPolicies {
-                        dialog: self.manager.config().dialog_policy,
-                        navigation: &self.manager.config().ssrf_policy,
-                    },
-                )
-                .await?;
+                let fill_outcome = actions::fill_credential_target(&page, &target, &value).await?;
                 tracing::debug!(
                     field,
                     outcome = fill_outcome["outcome"].as_str().unwrap_or("missing"),
@@ -2049,7 +2045,9 @@ impl Tool for BrowserTool {
                     "field": field,
                     "credentialKey": cred_key,
                     "ref": ref_id,
-                    "page_state": fill_outcome["page_state"],
+                    "page_state": Value::Null,
+                    "page_state_status": "withheld_after_credential_fill",
+                    "next_step": "The credential was assigned without submitting. Take a fresh snapshot to inspect the next control; never repeat an uncertain fill blindly.",
                 }))
             }
 
@@ -2757,6 +2755,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn credential_fill_rejects_model_authority_overrides_before_browser_access() {
+        for extra in [
+            json!({"url":"https://other.example"}),
+            json!({"text":"not allowed"}),
+            json!({"field":"card_number"}),
+        ] {
+            let mut args = json!({"action":"fill_credential","ref":"e1"});
+            args.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            assert!(BrowserTool::validate_action_args("fill_credential", &args).is_err());
+        }
+    }
+
+    #[test]
     fn schema_enforces_action_specific_arguments() {
         let parameters = schema_parameters();
 
@@ -3118,6 +3131,315 @@ mod tests {
             },
         );
         (BrowserTool::with_config(config), dir)
+    }
+
+    #[tokio::test]
+    #[ignore = "real Chrome and loopback servers; synthetic credentials only"]
+    async fn live_credentials_are_bound_to_verified_origin_and_input_object() {
+        use rustykrab_store::credential_backend::CredentialBackend;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        struct FixtureSecrets {
+            key: String,
+            reads: AtomicUsize,
+        }
+        impl CredentialBackend for FixtureSecrets {
+            fn name(&self) -> &str {
+                "synthetic credential boundary fixture"
+            }
+            fn available(&self) -> bool {
+                true
+            }
+            fn get(&self, key: &str) -> Result<Option<String>> {
+                self.reads.fetch_add(1, Ordering::SeqCst);
+                Ok((key == self.key).then(|| "synthetic-login-secret".into()))
+            }
+            fn set(&self, _: &str, _: &str) -> Result<()> {
+                panic!("test must not write credentials")
+            }
+            fn delete(&self, _: &str) -> Result<()> {
+                panic!("test must not delete credentials")
+            }
+        }
+        async fn serve(listener: tokio::net::TcpListener, html: String) {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut buffer = [0; 4096];
+                let _ = stream.read(&mut buffer).await;
+                let response=format!("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",html.len(),html);
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        }
+        let child = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let child_url = format!(
+            "http://localhost:{}/frame",
+            child.local_addr().unwrap().port()
+        );
+        let child_server = tokio::spawn(serve(
+            child,
+            "<label>Frame password<input id='framepw' type='password'></label>".into(),
+        ));
+        let parent = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let parent_url = format!(
+            "http://localhost:{}/login",
+            parent.local_addr().unwrap().port()
+        );
+        let html = format!(
+            r#"<!doctype html><meta charset="utf-8"><title>Synthetic login boundary</title>
+            <form onsubmit="event.preventDefault();window.submissions++">
+            <label>Password<input id="pw" type="password" onfocus="document.getElementById('trap').focus()"></label>
+            <label>Plain text<input id="plain" type="text"></label>
+            <label>Focus trap<input id="trap" type="text"></label>
+            <label>Card number<input id="card" autocomplete="cc-number"></label>
+            <button>Sign in</button></form><iframe src="{child_url}"></iframe><script>window.submissions=0</script>"#
+        );
+        let parent_server = tokio::spawn(serve(parent, html));
+        let profile = "credential-boundary-live-test";
+        let (tool, profile_dir) = isolated_live_tool(profile);
+        let backend = Arc::new(FixtureSecrets {
+            key: rustykrab_store::registry::keychain_account_for(
+                &crate::origin_credential_key(&parent_url, crate::PASSWORD).unwrap(),
+            ),
+            reads: AtomicUsize::new(0),
+        });
+        let store =
+            rustykrab_store::Store::open(profile_dir.path().join("fixture-store"), vec![7; 32])
+                .unwrap()
+                .with_credential_backend(backend.clone());
+        let tool = tool.with_secrets(store.guarded_secrets());
+        let opened = tool
+            .execute(json!({"action":"open","url":parent_url}))
+            .await
+            .unwrap();
+        let target_id = opened["targetId"].as_str().unwrap();
+        let page = tool
+            .manager
+            .get_page(profile, Some(target_id))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let snap = tool
+            .execute(json!({"action":"snapshot","targetId":target_id,"interactive":true}))
+            .await
+            .unwrap();
+        let get_ref = |name: &str| {
+            snap["elements"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["name"] == name)
+                .unwrap_or_else(|| panic!("fixture control not observed: {name}"))["ref"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        let pw = get_ref("Password");
+        let mut rejected = Vec::new();
+        for (label, args) in [
+            (
+                "model_url_override",
+                json!({"action":"fill_credential","targetId":target_id,"ref":pw,"url":"https://other.example"}),
+            ),
+            (
+                "password_to_plain_text",
+                json!({"action":"fill_credential","targetId":target_id,"ref":get_ref("Plain text"),"field":"password"}),
+            ),
+            (
+                "cross_origin_frame",
+                json!({"action":"fill_credential","targetId":target_id,"ref":get_ref("Frame password"),"field":"password"}),
+            ),
+            (
+                "payment_field",
+                json!({"action":"fill_credential","targetId":target_id,"ref":get_ref("Card number"),"field":"username"}),
+            ),
+        ] {
+            let blocked = tool.execute(args).await.is_err();
+            rejected.push(json!({"case":label,"blocked":blocked,"vault_reads":backend.reads.load(Ordering::SeqCst)}));
+        }
+        let fill=tool.execute(json!({"action":"fill_credential","targetId":target_id,"ref":pw,"field":"password"})).await.unwrap();
+        let dom_ok:bool=page.evaluate("document.getElementById('pw').value === 'synthetic-login-secret' && document.getElementById('trap').value === '' && window.submissions === 0").await.unwrap().into_value().unwrap();
+        let after = tool
+            .execute(json!({"action":"snapshot","targetId":target_id,"interactive":true}))
+            .await
+            .unwrap();
+        let fresh_ref = after["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["name"] == "Password")
+            .unwrap()["ref"]
+            .as_str()
+            .unwrap();
+        let key = BrowserTool::store_key(&BrowserTool::session_key(), profile, Some(target_id));
+        let origin = crate::origin_key::canonical_credential_origin(&parent_url).unwrap();
+        let prepared = actions::prepare_credential_target(
+            &page,
+            &tool.snapshot_store,
+            &key,
+            fresh_ref,
+            &origin,
+            "password",
+        )
+        .await
+        .unwrap();
+        page.evaluate(
+            "document.getElementById('pw').value='';document.getElementById('pw').type='text'",
+        )
+        .await
+        .unwrap();
+        let mutated = actions::fill_credential_target(&page, &prepared, "synthetic-login-secret")
+            .await
+            .unwrap();
+        let changed_target_blocked = mutated["outcome"] == "not_applied";
+        let values_hidden = !after.to_string().contains("synthetic-login-secret")
+            && !fill.to_string().contains("synthetic-login-secret");
+        let passed = rejected
+            .iter()
+            .all(|r| r["blocked"] == true && r["vault_reads"] == 0)
+            && fill["outcome"] == "applied"
+            && dom_ok
+            && values_hidden
+            && changed_target_blocked
+            && backend.reads.load(Ordering::SeqCst) == 1;
+        let report = json!({"passed":passed,"negative_cases":rejected,"vault_reads":backend.reads.load(Ordering::SeqCst),
+            "object_bound_fill_applied":dom_ok,"password_absent_from_snapshot_and_result":values_hidden,"mutation_rechecked":changed_target_blocked,
+            "submit_count":0,"fixture":"real Chrome, two loopback origins, synthetic in-memory secret backend",
+            "limits":["HTTP loopback exception explicitly enabled for test","not real merchant login","arbitrary page reflection/evaluate/screenshots are not isolated from secrets","no reusable payment vault"]});
+        if let Some(root) = std::env::var_os("RK_PAYMENT_EVIDENCE_DIR") {
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(
+                std::path::Path::new(&root).join("credential-boundary-result.json"),
+                serde_json::to_vec_pretty(&report).unwrap(),
+            )
+            .unwrap();
+        }
+        let _ = tool.manager.stop(profile).await;
+        parent_server.abort();
+        child_server.abort();
+        assert!(passed, "{report}");
+    }
+
+    /// Controlled checkout, no payment processor and no real card. The test
+    /// enters public synthetic fixture values directly (not through a model),
+    /// then inspects real CDP snapshots and an independent submit counter.
+    #[tokio::test]
+    #[ignore = "launches real Chrome; writes evidence when RK_PAYMENT_EVIDENCE_DIR is set"]
+    async fn live_payment_screen_stops_without_saving_or_leaking_card_data() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "http://localhost:{}/checkout",
+            listener.local_addr().unwrap().port()
+        );
+        let html = r#"<!doctype html><html><head><meta charset="utf-8"><title>Controlled checkout — TEST ONLY</title>
+          <style>body{font:18px system-ui;max-width:620px;margin:64px auto}label{display:block;margin:20px 0}input{display:block;padding:10px;width:90%}button{padding:14px}aside{background:#fff1ca;padding:16px}</style></head><body>
+          <h1>Checkout · TEST ONLY</h1><p>Fixture reservation · USD 12.00</p>
+          <aside>Payment required. Do not enter real card details. No payment processor is connected.</aside>
+          <form onsubmit="event.preventDefault();window.submissions++;">
+          <label>Card number<input id="number" autocomplete="cc-number" inputmode="numeric"></label>
+          <label>Expiry<input id="expiry" autocomplete="cc-exp"></label>
+          <label>Security code<input id="cvv" name="cvv" autocomplete="cc-csc"></label>
+          <button id="pay">Pay USD 12.00</button></form><script>window.submissions=0</script></body></html>"#;
+        let server = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut request = [0u8; 4096];
+                let _ = socket.read(&mut request).await;
+                let response = format!("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{html}", html.len());
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+        let profile = "payment-boundary-live-test";
+        let (tool, _dir) = isolated_live_tool(profile);
+        let opened = tool
+            .execute(json!({"action":"open","url":url}))
+            .await
+            .unwrap();
+        let page = tool
+            .manager
+            .get_page(profile, opened["targetId"].as_str())
+            .await
+            .unwrap();
+        let before = tool
+            .execute(json!({"action":"snapshot","interactive":true}))
+            .await
+            .unwrap();
+        let before_text = before.to_string();
+        let fields_identified =
+            before_text.contains("Card number") && before_text.contains("Pay USD 12.00");
+        let evidence_root =
+            std::env::var_os("RK_PAYMENT_EVIDENCE_DIR").map(std::path::PathBuf::from);
+        if let Some(root) = &evidence_root {
+            std::fs::create_dir_all(root).unwrap();
+            let png = page
+                .screenshot(ScreenshotParams::builder().full_page(false).build())
+                .await
+                .unwrap();
+            std::fs::write(root.join("checkout-screen.png"), png).unwrap();
+            std::fs::write(root.join("checkout-screen.html"), html).unwrap();
+            std::fs::write(
+                root.join("checkout-before.json"),
+                serde_json::to_vec_pretty(&before).unwrap(),
+            )
+            .unwrap();
+        }
+        // Public synthetic test card only; no real account and no submission.
+        page.evaluate("document.getElementById('number').value='4242424242424242';document.getElementById('expiry').value='12/34';document.getElementById('cvv').value='987';true").await.unwrap();
+        let after = tool
+            .execute(json!({"action":"snapshot","interactive":true}))
+            .await
+            .unwrap();
+        let serialized = after.to_string();
+        let pan_hidden = !serialized.contains("4242424242424242");
+        let cvv_hidden = !serialized.contains("987");
+        let expiry_hidden = !serialized.contains("12/34");
+        let submissions: u64 = page
+            .evaluate("window.submissions")
+            .await
+            .unwrap()
+            .into_value()
+            .unwrap();
+        let data_dir = tempfile::tempdir().unwrap();
+        let store = rustykrab_store::Store::open(data_dir.path(), vec![7; 32])
+            .unwrap()
+            .with_credential_backend(std::sync::Arc::new(
+                rustykrab_store::credential_backend::MemoryBackend::new(),
+            ));
+        let request = crate::CredentialRequestTool::new(store.credential_requests());
+        let ask = request
+            .execute(
+                json!({"name":"checkout_card","service":"Controlled checkout", "fields":[
+            {"key":"card_number","label":"Card number"},{"key":"cvv","label":"Security code"}]}),
+            )
+            .await;
+        let request_blocked = ask.is_err();
+        let pending = store.credential_requests().pending().await.unwrap().len();
+        let stored = store.secrets().list_names().await.unwrap().len();
+        let passed = fields_identified
+            && pan_hidden
+            && cvv_hidden
+            && expiry_hidden
+            && submissions == 0
+            && request_blocked
+            && pending == 0
+            && stored == 0;
+        let report = json!({"passed":passed,"base_revision":"0b565fdbe80095668a402cdc6b5d410efecc867b", "checked_at":chrono::Utc::now(),
+            "fixture":"loopback checkout, public synthetic values", "real_browser":true,"real_model":false,
+            "fields_identified":fields_identified,"pan_hidden":pan_hidden,"cvv_hidden":cvv_hidden,"expiry_hidden":expiry_hidden,
+            "submit_count":submissions,"credential_request_blocked":request_blocked,"pending_requests":pending,"stored_secret_names":stored,
+            "request_result":ask.err().map(|e|e.to_string()),
+            "wallet_enrollment":"not implemented", "cross_site_card_reuse":"not implemented",
+            "limits":["No model-decision evaluation", "No real payment processor", "Snapshots only: arbitrary evaluate, screenshots and mirrored page text are not secret-isolated", "Named-field guard is not comprehensive payment-data detection"]});
+        if let Some(root) = evidence_root {
+            let suffix = if passed { "after" } else { "before" };
+            std::fs::write(
+                root.join(format!("payment-result-{suffix}.json")),
+                serde_json::to_vec_pretty(&report).unwrap(),
+            )
+            .unwrap();
+        }
+        let _ = tool.manager.stop(profile).await;
+        server.abort();
+        assert!(passed, "{report}");
     }
 
     /// The secure fill boundary extends through serialization: a password may
