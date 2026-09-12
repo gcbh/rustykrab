@@ -63,11 +63,12 @@ impl HarnessRouter {
         };
         // Preserve user customizations from the base profile.
         //
-        // These three are unconditional: they describe the deployment, not
+        // These are unconditional: they describe the deployment, not
         // the task.
         profile.agent_name = self.base.agent_name.clone();
         profile.max_context_tokens = self.base.max_context_tokens;
         profile.compaction_threshold_pct = self.base.compaction_threshold_pct;
+        profile.compaction_strategy = self.base.compaction_strategy;
 
         // The loop parameters are the preset's to choose — that is what a
         // preset is for — *unless* the operator named them. "Named" rather
@@ -347,6 +348,21 @@ mod base_preservation_tests {
 
         assert_eq!(routed.max_tool_retries, 1, "the operator's value must win");
         assert_eq!(routed.max_iterations, 20);
+    }
+
+    #[tokio::test]
+    async fn compaction_policy_survives_task_routing() {
+        let base = HarnessProfile {
+            compaction_strategy: crate::CompactionStrategy::StructuredMessageTail,
+            ..HarnessProfile::default()
+        };
+        let routed = router_with_base(base)
+            .route("please write some code for me")
+            .await;
+        assert_eq!(
+            routed.compaction_strategy,
+            crate::CompactionStrategy::StructuredMessageTail
+        );
     }
 
     #[tokio::test]

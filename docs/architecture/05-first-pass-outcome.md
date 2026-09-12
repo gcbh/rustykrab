@@ -68,6 +68,19 @@ The old runtime "no tests" finding was already stale at base `0b565fd`,
 which had 14 distillation tests. This slice adds three lifecycle helper tests.
 Direct turn-assembly coverage remains a separate gap; zero-test wording is retired.
 
+## Context and compaction follow-up
+
+The second split pins real user anchors, corrects generated-message roles,
+rejects incomplete summaries and gives the runner sole authority to compact.
+Ollama's schema-aware budget guard refuses overflow instead of silently
+discarding messages. Explicit harness policies and the production-compactor
+ablation evaluate alternatives without silently changing the Legacy default.
+Captured context tests also found absent default-seeded tools in
+`tools_load.active`; filtering the report and conditional memory guidance
+repair that static-catalog contradiction. Dynamic schema invalidation,
+task-switch readout failures and recall-after-restart coverage remain open.
+See [study summary](../evals/compaction-study-validation.md).
+
 ## Method note
 
 Three findings were wrong, and all three were caught by *implementing* them
