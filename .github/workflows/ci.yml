@@ -86,6 +86,14 @@ jobs:
       - run: scripts/e2e.sh
         env:
           E2E_ARTIFACT_DIR: e2e-artifacts
+      # Uses the real channel/runtime/Ollama adapter, with a loopback
+      # response fixture and inert tools. No model service or accounts.
+      - run: scripts/e2e.sh --mode context --trial-timeout 30
+        env:
+          E2E_ARTIFACT_DIR: e2e-artifacts/context
+          # Exercise the opt-in retention candidate; production still defaults
+          # to legacy. The adversarial summary deliberately omits recent facts.
+          RUSTYKRAB_CONTEXT_COMPACTION_STRATEGY: structured-message-tail
       - name: Upload scenario evidence
         if: always()
         uses: actions/upload-artifact@v7

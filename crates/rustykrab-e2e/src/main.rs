@@ -22,6 +22,8 @@ mod ablation;
 mod assertion;
 mod browser_suite;
 mod classify;
+mod compaction_study;
+mod context_suite;
 mod credential_suite;
 mod fixture_repo;
 mod judge;
@@ -1475,7 +1477,13 @@ USAGE:
 
 FLAGS:
     --mode SUITE                scripted | model | credential | login |
-                                browser | ablation | all (default: scripted).
+                                browser | context | context-model | compaction-study | ablation | all (default: scripted).
+                                `context` captures real Ollama wire requests with
+                                a local response fixture. `context-model` uses a
+                                local model with inert tools. Neither is in all.
+                                `compaction-study` compares the production Rust
+                                compactor with a local model and inert readout;
+                                it does not boot a daemon or execute domain tools.
                                 `login` and `browser` reach the real internet,
                                 may use real credentials, and are never included
                                 in `all`. Explicit browser cases fail when their
@@ -1506,6 +1514,17 @@ ENVIRONMENT:
                         only; the Chrome profile is shed to save disk).
     E2E_ARTIFACT_DIR    Durable report/evidence directory
                         (default: target/e2e-artifacts).
+    RUSTYKRAB_COMPACTION_STUDY_ARM
+                        `message-tail` selects the exploratory message-group
+                        retention arm; unset runs the four-method comparison
+                        plus the full-history reference.
+    RUSTYKRAB_CONTEXT_COMPACTION_STRATEGY
+                        Explicit harness policy for context/context-model
+                        daemon trials; recorded in the evidence manifest.
+    RUSTYKRAB_CONTEXT_BROWSER_READY
+                        `1` makes the inert browser's first response a neutral
+                        readiness signal; later calls still fail. Default is
+                        unavailable throughout. Recorded as a separate fixture.
     RK_BROWSER_DEPART_DATE
                         ISO date required by Google Flights and United cases.
                         Origin/destination default to SFO/LAX and can be changed
@@ -1567,10 +1586,19 @@ fn parse_args(argv: &[String]) -> std::result::Result<Args, String> {
                 args.mode = value(i, "--mode")?.to_lowercase();
                 if !matches!(
                     args.mode.as_str(),
-                    "scripted" | "model" | "credential" | "login" | "browser" | "ablation" | "all"
+                    "scripted"
+                        | "model"
+                        | "credential"
+                        | "login"
+                        | "browser"
+                        | "context"
+                        | "context-model"
+                        | "compaction-study"
+                        | "ablation"
+                        | "all"
                 ) {
                     return Err(format!(
-                        "--mode: expected scripted|model|credential|login|browser|ablation|all, got {}",
+                        "--mode: expected scripted|model|credential|login|browser|context|context-model|compaction-study|ablation|all, got {}",
                         args.mode
                     ));
                 }
@@ -1683,10 +1711,18 @@ async fn main() -> Result<()> {
         for sc in browser_suite::SCENARIOS {
             eprintln!("  {:<42}\n      {}", sc.id, sc.description);
         }
+        eprintln!("\n── context / context-model (inert tools, captured wire) ──");
+        for id in context_suite::CASES {
+            eprintln!("  {id}");
+        }
         return Ok(());
     }
 
-    if matches!(args.mode.as_str(), "login" | "browser") && source_revision() == "unrecorded" {
+    if matches!(
+        args.mode.as_str(),
+        "login" | "browser" | "context" | "context-model"
+    ) && source_revision() == "unrecorded"
+    {
         bail!(
             "live {} evidence needs an exact source revision and a freshly built daemon; run scripts/e2e.sh --mode {} (recommended), or set both RUSTYKRAB_BIN and RUSTYKRAB_E2E_SOURCE_REVISION explicitly",
             args.mode,
@@ -1694,10 +1730,23 @@ async fn main() -> Result<()> {
         );
     }
 
+    if args.mode == "compaction-study" {
+        compaction_study::run(&args).await?;
+        return Ok(());
+    }
+
     let bin =
         std::env::var("RUSTYKRAB_BIN").unwrap_or_else(|_| "target/debug/rustykrab-cli".to_string());
     if !std::path::Path::new(&bin).exists() {
         bail!("daemon binary not found at {bin} — build it first or set RUSTYKRAB_BIN");
+    }
+
+    if matches!(args.mode.as_str(), "context" | "context-model") {
+        let ok = context_suite::run(&bin, &args).await?;
+        if !ok {
+            std::process::exit(1);
+        }
+        return Ok(());
     }
 
     if args.mode == "ablation" {

@@ -45,6 +45,9 @@ rustykrab-projects    (no internal deps — immutable planning domain)
    +-- rustykrab-store    +-- rustykrab-gateway
        revision storage      planning HTTP surface
        (also uses core)      (also uses runtime/store/channels)
+
+rustykrab-e2e         (core, store, tools, agent, providers)
+                     daemon boundary tests + direct production-compactor ablation
 ```
 
 `rustykrab-runtime` is new since the first pass and is the significant change
@@ -64,7 +67,11 @@ no axum in its dependency tree.
 | Application service | **`runtime`** | Assemble a turn: prompt, session, capabilities, memory hooks |
 | Transport | `gateway`, channel loops in `cli` | HTTP/SSE, Telegram polling, Slack events |
 | Composition | `cli` | Read env, build everything, spawn background tasks |
-| Verification | `e2e`, `dream` | Black-box scenarios; offline outcome analysis |
+| Verification | `e2e`, `dream` | Black-box scenarios, direct compactor ablation; offline outcome analysis |
+
+The context evaluator also links `core` and `tools` to reuse production tool
+schemas and argument validation for inert replacements. Turn execution still
+crosses the real daemon process boundary; it does not call the runner directly.
 
 The spine is now complete — the application-service row is a real crate
 rather than a module inside the transport. That was the first pass's

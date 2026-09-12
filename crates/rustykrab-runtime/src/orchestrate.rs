@@ -128,6 +128,28 @@ async fn build_and_inject_system_prompt(
     }
 
     let mut system_prompt = builder.build();
+    system_prompt.push_str(
+        "\n\n## Task continuity\n\
+         Interpret a short follow-up using the active user goal, the most recent \
+         relevant exchange, and any later corrections. Resolve references before \
+         choosing a tool; a familiar phrase by itself is not a new task. Explicit \
+         user task switches override the old goal. Preserve current dates, entities, \
+         constraints and authorization boundaries. Within the same task, a correction \
+         changes only the specified fields; other requirements remain unless withdrawn \
+         or contradicted. Do not transfer unrelated constraints across a task switch. \
+         If the referent is materially \
+         ambiguous, ask a focused question. Your first useful action should advance \
+         that current request. Failed or timed-out actions are not verified results; \
+         inspect current external state before retrying a potentially applied effect.",
+    );
+    // Custom soul files are user-owned and may still name absent tools. The
+    // session's actual schema is authoritative regardless of that wording.
+    system_prompt.push_str(
+        "\n\n## Tool availability\nInvoke only tools whose schemas are currently offered. \
+         References to tool names in general guidance are conditional on availability. \
+         Discover and load other available tools before invoking them; if discovery \
+         says a tool is unknown or forbidden, do not invent a call to it.",
+    );
 
     // Append channel context so the agent knows where this conversation lives.
     if let Some(ref source) = conv.channel_source {

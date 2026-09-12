@@ -1,3 +1,4 @@
+pub mod compaction;
 pub mod harness;
 pub mod recall_tools;
 pub mod rlm;
@@ -9,6 +10,7 @@ pub mod todo_tools;
 pub mod trace;
 pub mod voting;
 
+pub use compaction::CompactionStrategy;
 pub use harness::HarnessProfile;
 pub use recall_tools::recall_tools;
 pub use rlm::RecursiveExecutor;
