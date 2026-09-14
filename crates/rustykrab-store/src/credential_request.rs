@@ -164,6 +164,14 @@ pub trait RequestNotifier: Send + Sync + std::fmt::Debug {
         _service: Option<&str>,
     ) {
     }
+
+    /// The user approved a purchase and supplied the card for it.
+    ///
+    /// Same loop as [`Self::request_fulfilled`], for a payment rather than
+    /// a credential: whatever filed the request can now go and pay.
+    /// Defaulted and fire-and-forget for the same reasons.
+    fn payment_authorized(&self, _conversation_id: Option<&str>, _request: &crate::PaymentRequest) {
+    }
 }
 
 #[derive(Clone)]
@@ -1187,7 +1195,7 @@ mod fulfil_tests {
 /// SHA-256 without a salt is right here and a salt would be wrong: the
 /// token is 32 bytes of CSPRNG output, so there is no dictionary to attack,
 /// and lookup is by hash — a per-row salt would make that impossible.
-fn hash_token(token: &str) -> String {
+pub(crate) fn hash_token(token: &str) -> String {
     let mut h = Sha256::new();
     h.update(token.as_bytes());
     hex::encode(h.finalize())
