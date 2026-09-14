@@ -4,7 +4,7 @@ Two SQLite databases, opened independently, never joined.
 
 | File | Owner | Tables |
 |---|---|---|
-| `<data_dir>/db/store.db` | `rustykrab-store` | 20 tables + 14 indexes |
+| `<data_dir>/db/store.db` | `rustykrab-store` | 22 tables + 16 indexes |
 | `<data_dir>/memory.db` | `rustykrab-memory` | 4 tables + 1 FTS5 virtual table + 9 indexes |
 
 DDL is idempotent (`CREATE TABLE IF NOT EXISTS`) inside
@@ -123,6 +123,33 @@ The partial index `idx_credential_requests_pending ON (name) WHERE status =
 Two notes: `secret_versions` has no FK to `secrets` — deliberately, since a
 deleted secret must stay recoverable, and that should be a comment on the
 table. And `credential_requests.conversation_id` is an unenforced reference.
+
+### Payment approvals
+
+```
+payment_requests(id PK, conversation_id, merchant, origin, amount_minor,
+                 currency, description, status, created_at, decided_at,
+                 decided_by, card_last4, used_at, link_token_hash,
+                 link_expires_at)
+```
+
+One purchase the agent asked the user to approve: the merchant, the exact
+origin a card may be entered on, and the most it may pay, in integer minor
+units. **The card is not in this table or anywhere else on disk** — it lives in
+`CardVault`, an in-memory map keyed by request id, until the agent presses pay,
+15 minutes pass, a newer request in the same conversation supersedes it, or the
+daemon restarts. The row is the approval and its audit trail; `card_last4` is
+the only card-derived value kept. Like credential links, only the hash of the
+one-time approval link is stored.
+
+Status runs `pending → authorized → used`, with `declined`, `expired` and
+`superseded` as the other terminal states. An `authorized` row whose card is
+no longer in the vault is marked `expired` the next time anything asks, so the
+record never claims an approval nothing can act on. The partial index
+`idx_payment_requests_live ON (conversation_id) WHERE status IN ('pending',
+'authorized')` serves the one-purchase-per-conversation supersede and the
+browser's "may this conversation pay here" lookup. `conversation_id` is an
+unenforced reference, for the same audit reason as on `credential_requests`.
 
 ### Devices and pairing
 
@@ -361,6 +388,7 @@ purpose*, and the DDL now says which is which.
 | `chunks.memory_id`, `extracted_facts.source_memory_id` | **Yes** | in `memory.db` |
 | `scheduled_jobs.conversation_id` | No, deliberate | a cron job keeps its own delivery channel and should keep firing |
 | `credential_requests.conversation_id` | No, deliberate | audit-relevant after the conversation is gone |
+| `payment_requests.conversation_id` | No, deliberate | what the agent paid for stays answerable after the conversation is gone |
 | `delegated_tasks.conversation_id` | No, deliberate | the row records where work came from |
 | `outcome_records.conversation_id` | No, deliberate | evidence outlives the conversation |
 | `outcome_attributions.target_id` (memory) | **Impossible** | other database |
