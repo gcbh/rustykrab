@@ -1228,6 +1228,179 @@ pub(crate) async fn fill_credential_target(
     }
 }
 
+/// Enter one part of an approved card into the field behind `ref_id`.
+///
+/// The field is checked and filled in one page-side call
+/// ([`super::payment::FILL_PAYMENT_FIELD`]), so the origin, frame chain and
+/// field identity that were verified are the ones the value lands in. Card
+/// fields usually sit in a payment provider's site-isolated frame, so OOPIF
+/// refs go through the raw-CDP bridge rather than being refused as they are
+/// for login credentials.
+///
+/// Returns the script's status string. A CDP failure or page exception
+/// becomes `"interrupted"`: exception details can carry a value echoed by
+/// page code, so none of them travel back.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn fill_payment_field(
+    page: &Page,
+    store: &SnapshotStore,
+    store_key: &str,
+    ref_id: &str,
+    merchant_origin: &str,
+    provider_origins: &[String],
+    field: super::payment::PaymentField,
+    value_json: &str,
+) -> Result<String> {
+    let element_ref = store.get_ref(store_key, ref_id).await.ok_or_else(|| {
+        Error::ToolExecution(ToolError::not_found(
+            "payment field ref expired; take a fresh snapshot",
+        ))
+    })?;
+    let call = format!(
+        "return ({})(el, {}, {}, {}, {});",
+        super::payment::FILL_PAYMENT_FIELD,
+        js_string_literal(merchant_origin),
+        super::payment::origins_literal(provider_origins),
+        js_string_literal(field.as_str()),
+        value_json
+    );
+
+    let result = if element_ref.target_id.is_some() {
+        let context = store.oopif_context(store_key).await.ok_or_else(|| {
+            Error::ToolExecution(ToolError::not_found(
+                "the payment frame's CDP context expired; take a fresh snapshot",
+            ))
+        })?;
+        super::oopif::run_on_element(&context.websocket_url, &element_ref, &call, &context.policy)
+            .await
+            .map_err(|_| ())
+    } else {
+        let resolved = resolve_element(page, &element_ref).await?;
+        let function = format!("function() {{ var el = this; {call} }}");
+        match tokio::time::timeout(
+            ELEMENT_OP_BUDGET,
+            call_on_element(page, &resolved, &function),
+        )
+        .await
+        {
+            Ok(Ok(value)) => Ok(value),
+            _ => Err(()),
+        }
+    };
+    Ok(match result {
+        Ok(Value::String(status)) => status,
+        // The OOPIF bridge reports a missing element as `{ok: false}`.
+        Ok(value) if value["ok"] == false => "detached".to_string(),
+        _ => "interrupted".to_string(),
+    })
+}
+
+/// A pay control that has been checked to sit on the merchant's own page,
+/// with what pressing it would agree to.
+pub(crate) struct PayTarget {
+    element_ref: ElementRef,
+    /// The control's own label, e.g. "Pay $46.00".
+    pub label: String,
+    /// The top document's visible text, for the total check. Never returned
+    /// to the model.
+    pub text: String,
+}
+
+/// Resolve and verify the control the agent wants to press as pay.
+///
+/// `Ok(Err(status))` is a refusal with a constant reason; `Err` is a stale
+/// ref. Pay buttons in cross-site frames are refused: the total check reads
+/// the merchant's page, and a button elsewhere is not provably its button.
+pub(crate) async fn prepare_pay(
+    page: &Page,
+    store: &SnapshotStore,
+    store_key: &str,
+    ref_id: &str,
+    merchant_origin: &str,
+) -> Result<std::result::Result<PayTarget, &'static str>> {
+    let element_ref = store.get_ref(store_key, ref_id).await.ok_or_else(|| {
+        Error::ToolExecution(ToolError::not_found(
+            "pay ref expired; take a fresh snapshot",
+        ))
+    })?;
+    if element_ref.target_id.is_some() {
+        return Ok(Err("site_isolated_frame"));
+    }
+    let resolved = resolve_element(page, &element_ref).await?;
+    let function = format!(
+        "function() {{ return ({}).call(this, {}); }}",
+        super::payment::PAY_TARGET,
+        js_string_literal(merchant_origin)
+    );
+    let checked = tokio::time::timeout(
+        ELEMENT_OP_BUDGET,
+        call_on_element(page, &resolved, &function),
+    )
+    .await;
+    let Ok(Ok(checked)) = checked else {
+        return Ok(Err("detached"));
+    };
+    match checked["status"].as_str() {
+        Some("ready") => Ok(Ok(PayTarget {
+            element_ref,
+            label: checked["label"].as_str().unwrap_or_default().to_string(),
+            text: checked["text"].as_str().unwrap_or_default().to_string(),
+        })),
+        Some("origin_mismatch") => Ok(Err("origin_mismatch")),
+        Some("disabled") => Ok(Err("disabled")),
+        _ => Ok(Err("detached")),
+    }
+}
+
+/// Press a verified pay control with a trusted click.
+///
+/// Not routed through `execute_act`: its stale-ref healing may re-resolve
+/// to a different element by role and name, and the element pressed here
+/// must be the one whose page total was just checked.
+pub(crate) async fn press_pay(page: &Page, ref_id: &str, target: &PayTarget) -> Result<Value> {
+    act_click(page, ref_id, &target.element_ref)
+        .await
+        .map(normalize_outcome)
+}
+
+/// Whether an error from [`press_pay`] happened before any input reached
+/// the page, so the approval is not yet spent.
+pub(crate) fn failed_before_press(error: &Error) -> bool {
+    is_stale_element(error)
+}
+
+/// Whether the control behind `ref_id` would plausibly submit a checkout.
+/// Controls in site-isolated frames are not judged and read as `false`.
+pub(crate) async fn is_submit_like(
+    page: &Page,
+    store: &SnapshotStore,
+    store_key: &str,
+    ref_id: &str,
+) -> Result<bool> {
+    let element_ref = store.get_ref(store_key, ref_id).await.ok_or_else(|| {
+        Error::ToolExecution(ToolError::not_found("ref expired; take a fresh snapshot"))
+    })?;
+    if element_ref.target_id.is_some() {
+        return Ok(false);
+    }
+    let resolved = resolve_element(page, &element_ref).await?;
+    let function = format!(
+        "function() {{ return ({}).call(this); }}",
+        super::payment::SUBMIT_LIKE
+    );
+    match tokio::time::timeout(
+        ELEMENT_OP_BUDGET,
+        call_on_element(page, &resolved, &function),
+    )
+    .await
+    {
+        Ok(Ok(Value::Bool(submits))) => Ok(submits),
+        // Undecidable is treated as submitting: the cost is one refused
+        // click the agent can route through `pay`.
+        _ => Ok(true),
+    }
+}
+
 fn requires_document_resolver(element_ref: &ElementRef) -> bool {
     element_ref.frame_id.is_some()
         || element_ref.selector.contains(SHADOW_SEP)

@@ -16,6 +16,7 @@ pub mod downloads;
 pub mod fetcher;
 pub mod manager;
 mod oopif;
+mod payment;
 mod policy;
 pub mod selectors;
 pub mod snapshot;
@@ -31,7 +32,8 @@ use chromiumoxide::page::ScreenshotParams;
 use rustykrab_core::types::ToolSchema;
 use rustykrab_core::{Error, Result, SandboxRequirements, Tool, ToolError};
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use adaptive::AdaptiveStore;
@@ -349,6 +351,17 @@ pub struct BrowserTool {
     /// everything else; the action reports itself unavailable rather than
     /// the tool disappearing.
     secrets: Option<rustykrab_store::GuardedSecrets>,
+    /// Approved purchases and their cards, for `fill_payment` and `pay`.
+    /// Optional for the same reason as `secrets`.
+    payments: Option<rustykrab_store::PaymentRequestStore>,
+    /// Frame origins, besides the merchant's own, that may receive card
+    /// fields. [`payment::PAYMENT_FRAME_ORIGINS`] outside tests.
+    payment_frame_origins: Vec<String>,
+    /// Pages with a card entered, keyed `session:target`, valued by the
+    /// payment request it was entered for. While a page is here, anything
+    /// that could submit it or show the card is routed through `pay` or
+    /// refused.
+    payment_armed: Arc<Mutex<HashMap<String, String>>>,
 }
 
 /// Resolve the action the caller meant.
@@ -383,14 +396,14 @@ fn schema_parameters() -> serde_json::Value {
                     "scroll_to_text",
                     "console", "cookies", "pdf",
                     "fetch", "stealth_fetch", "select", "wait_for",
-                    "fill_credential"
+                    "fill_credential", "fill_payment", "pay"
                 ],
-                "description": "Action to perform. Required companion fields: open/navigate/fetch/stealth_fetch -> url; close/focus -> targetId; act -> ref + actAction; fill_credential -> ref; evaluate -> expression. Act sub-actions have additional requirements documented on actAction."
+                "description": "Action to perform. Required companion fields: open/navigate/fetch/stealth_fetch -> url; close/focus -> targetId; act -> ref + actAction; fill_credential -> ref; fill_payment -> ref + field; pay -> ref; evaluate -> expression. Act sub-actions have additional requirements documented on actAction."
             },
             "field": {
                 "type": "string",
-                "enum": ["username", "password"],
-                "description": "Login field for fill_credential. Passwords require a type=password input; fields must belong to the live top-level origin. Defaults to password."
+                "enum": ["username", "password", "number", "expiry", "exp_month", "exp_year", "cvc", "name", "postal_code"],
+                "description": "fill_credential: 'username' or 'password' (default password; passwords require a type=password input). fill_payment: which part of the approved card the field takes — 'number', 'expiry' (month and year in one box), 'exp_month' and 'exp_year' (separate boxes or selects), 'cvc', 'name' (name on card) or 'postal_code'."
             },
             "profile": {
                 "type": "string",
@@ -406,7 +419,7 @@ fn schema_parameters() -> serde_json::Value {
             },
             "ref": {
                 "type": "string",
-                "description": "Complete snapshot-scoped element ref (e.g., 's4-12', '[s4-12]', or 's4-e12'). Required for act and fill_credential; square brackets copied from compact snapshot lines are accepted. Never reuse a ref after receiving newer page_state/snapshot output."
+                "description": "Complete snapshot-scoped element ref (e.g., 's4-12', '[s4-12]', or 's4-e12'). Required for act, fill_credential, fill_payment and pay; square brackets copied from compact snapshot lines are accepted. Never reuse a ref after receiving newer page_state/snapshot output."
             },
             "actAction": {
                 "type": "string",
@@ -738,6 +751,20 @@ fn schema_parameters() -> serde_json::Value {
             },
             {
                 "if": {
+                    "properties": { "action": { "const": "fill_payment" } },
+                    "required": ["action"]
+                },
+                "then": { "required": ["ref", "field"] }
+            },
+            {
+                "if": {
+                    "properties": { "action": { "const": "pay" } },
+                    "required": ["action"]
+                },
+                "then": { "required": ["ref"] }
+            },
+            {
+                "if": {
                     "properties": { "action": { "const": "send_keys" } },
                     "required": ["action"]
                 },
@@ -755,10 +782,16 @@ fn schema_parameters() -> serde_json::Value {
 }
 
 fn effective_action<'a>(action: &'a str, args: &serde_json::Value) -> &'a str {
-    if action == "act" && args["actAction"] == "fill_credential" {
-        "fill_credential"
-    } else {
-        action
+    if action != "act" {
+        return action;
+    }
+    // Same reasoning as `fill_credential` above: a model holding a ref
+    // reaches for `act`, so accept the spelling it already uses.
+    match args["actAction"].as_str() {
+        Some("fill_credential") => "fill_credential",
+        Some("fill_payment") => "fill_payment",
+        Some("pay") => "pay",
+        _ => action,
     }
 }
 
@@ -769,7 +802,17 @@ impl BrowserTool {
             snapshot_store: SnapshotStore::new(),
             adaptive_store: AdaptiveStore::new(),
             secrets: None,
+            payments: None,
+            payment_frame_origins: Self::default_payment_frame_origins(),
+            payment_armed: Arc::default(),
         }
+    }
+
+    fn default_payment_frame_origins() -> Vec<String> {
+        payment::PAYMENT_FRAME_ORIGINS
+            .iter()
+            .map(|o| o.to_string())
+            .collect()
     }
 
     /// Build a tool against an explicit config.
@@ -784,6 +827,9 @@ impl BrowserTool {
             snapshot_store: SnapshotStore::new(),
             adaptive_store: AdaptiveStore::new(),
             secrets: None,
+            payments: None,
+            payment_frame_origins: Self::default_payment_frame_origins(),
+            payment_armed: Arc::default(),
         }
     }
 
@@ -791,6 +837,21 @@ impl BrowserTool {
     /// holding it.
     pub fn with_secrets(mut self, secrets: rustykrab_store::GuardedSecrets) -> Self {
         self.secrets = Some(secrets);
+        self
+    }
+
+    /// Let the browser enter a card the user approved for one purchase, and
+    /// press pay once the page total checks out.
+    pub fn with_payments(mut self, payments: rustykrab_store::PaymentRequestStore) -> Self {
+        self.payments = Some(payments);
+        self
+    }
+
+    /// Test fixtures serve "provider" frames from loopback origins that the
+    /// production list rightly does not contain.
+    #[cfg(test)]
+    fn with_payment_frame_origins(mut self, origins: &[&str]) -> Self {
+        self.payment_frame_origins = origins.iter().map(|o| o.to_string()).collect();
         self
     }
 
@@ -840,7 +901,8 @@ impl BrowserTool {
                             )));
                         }
                     }
-                    "click" | "hover" | "options" | "wait" | "fill_credential" => {}
+                    "click" | "hover" | "options" | "wait" | "fill_credential" | "fill_payment"
+                    | "pay" => {}
                     other => {
                         return Err(Error::ToolExecution(ToolError::invalid_input(format!(
                             "unknown act action '{other}'. Available: click, type, fill, press, hover, select, drag, upload, options, wait, fill_credential"
@@ -848,7 +910,7 @@ impl BrowserTool {
                     }
                 }
             }
-            "fill_credential" => require_non_empty(args, "ref", action)?,
+            "fill_credential" | "fill_payment" | "pay" => require_non_empty(args, "ref", action)?,
             "click_coordinates" => {
                 if args["x"].as_f64().is_none() || args["y"].as_f64().is_none() {
                     return Err(Error::ToolExecution(ToolError::invalid_input(
@@ -903,7 +965,200 @@ impl BrowserTool {
                 )));
             }
         }
+        if matches!(effective_action(action, args), "fill_payment" | "pay") {
+            // The card comes from the approval and the page, never from the
+            // call. A `text` or `value` here is the model trying to supply
+            // one, which it does not have.
+            if ["url", "text", "value", "keys"]
+                .iter()
+                .any(|k| args.get(*k).is_some())
+            {
+                return Err(Error::ToolExecution(ToolError::invalid_input(
+                    "fill_payment and pay take no url, text, value or keys; the card comes from the user's approval and the site from the live page",
+                )));
+            }
+        }
+        if effective_action(action, args) == "fill_payment"
+            && !args["field"]
+                .as_str()
+                .is_some_and(|f| payment::PaymentField::parse(f).is_some())
+        {
+            return Err(Error::ToolExecution(ToolError::invalid_input(format!(
+                "fill_payment requires 'field', one of: {}",
+                payment::PaymentField::ALL.join(", ")
+            ))));
+        }
         Ok(())
+    }
+
+    /// The live page's origin, provided it is safe to release a secret to.
+    ///
+    /// Neither a model-supplied URL nor a snapshot's old frame URL is
+    /// authority: this reads the page as it is now and requires HTTPS, with
+    /// HTTP loopback allowed only under the explicit private-network test
+    /// policy. Returns the URL and its canonical origin.
+    async fn secure_live_origin(
+        &self,
+        page: &chromiumoxide::Page,
+        what: &str,
+    ) -> Result<(String, String)> {
+        let url = manager::probe_page_url_once(page).await.unwrap_or_default();
+        let origin = crate::origin_key::canonical_credential_origin(&url)?;
+        let parsed = url::Url::parse(&origin).expect("validated origin");
+        let loopback = parsed
+            .host_str()
+            .is_some_and(|host| host == "localhost" || host == "127.0.0.1" || host == "[::1]");
+        if parsed.scheme() != "https"
+            && !(loopback && self.manager.config().ssrf_policy.allow_private_network)
+        {
+            return Err(Error::ToolExecution(ToolError::permission_denied(format!(
+                "{what} requires HTTPS (HTTP loopback requires explicit private-network test policy)"
+            ))));
+        }
+        Ok((url, origin))
+    }
+
+    /// The payment this conversation may make on `origin`, with its card.
+    ///
+    /// Every refusal says what to do next, because the model's next move
+    /// after "no" is otherwise to try typing a card it does not have.
+    async fn approved_payment(
+        &self,
+        origin: &str,
+    ) -> Result<(
+        rustykrab_store::PaymentRequest,
+        rustykrab_store::CardDetails,
+    )> {
+        let payments = self.payments.as_ref().ok_or_else(|| {
+            Error::ToolExecution(
+                "payments are unavailable: this browser has no payment store".into(),
+            )
+        })?;
+        let conversation =
+            rustykrab_core::active_tools::with_session_context(|c| c.conversation_id).ok_or_else(
+                || {
+                    Error::ToolExecution(ToolError::permission_denied(
+                        "a payment can only be made from the conversation the user approved it in",
+                    ))
+                },
+            )?;
+        match payments.authorized_for(conversation, origin).await? {
+            rustykrab_store::AuthorizedPayment::Ready { request, card } => Ok((*request, card)),
+            rustykrab_store::AuthorizedPayment::OriginMismatch { approved_origin } => {
+                Err(Error::ToolExecution(ToolError::permission_denied(format!(
+                    "The user approved paying on {approved_origin}, not {origin}. Do not enter the card here. If the checkout really is on this site, file a new payment_request with this page's url and stop until the user approves."
+                ))))
+            }
+            rustykrab_store::AuthorizedPayment::None => {
+                Err(Error::ToolExecution(ToolError::permission_denied(format!(
+                    "No approved payment for {origin} in this conversation (none was filed, the user has not approved yet, or the 15-minute approval ran out). Call payment_request with this checkout's url, the merchant and the total, tell the user in one sentence, and stop until they approve. Never ask for card details in chat."
+                ))))
+            }
+        }
+    }
+
+    fn armed_key(session: &str, page: &chromiumoxide::Page) -> String {
+        format!("{session}:{}", page.target_id().inner())
+    }
+
+    fn disarm_payment(&self, key: &str) {
+        self.payment_armed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(key);
+    }
+
+    /// Refuse what could submit or reveal a page that has a card entered.
+    ///
+    /// Filling the card is safe on its own; the two dangers after it are a
+    /// submit that skips the total check and output that shows the number
+    /// to the model. So while a page is armed: `pay` is the only way to
+    /// press a submit-like control or Enter, and screenshots, PDFs, HTML
+    /// content and `evaluate` are off. Typing into other fields, ticking a
+    /// terms box and snapshots (which omit card values) still work.
+    async fn enforce_payment_lock(
+        &self,
+        action: &str,
+        args: &Value,
+        profile: &str,
+        session: &str,
+        target_id: Option<&str>,
+    ) -> Result<()> {
+        const GUARDED: &[&str] = &[
+            "act",
+            "click_coordinates",
+            "send_keys",
+            "evaluate",
+            "screenshot",
+            "pdf",
+            "content",
+        ];
+        if !GUARDED.contains(&action) {
+            return Ok(());
+        }
+        let prefix = format!("{session}:");
+        let any_armed = self
+            .payment_armed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .any(|k| k.starts_with(&prefix));
+        if !any_armed {
+            return Ok(());
+        }
+        let page = self.manager.get_page(profile, target_id).await?;
+        let armed = self
+            .payment_armed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&Self::armed_key(session, &page));
+        if !armed {
+            return Ok(());
+        }
+
+        let refuse = |why: &str| -> Result<()> {
+            Err(Error::ToolExecution(ToolError::permission_denied(format!(
+                "A card is entered on this page, so {why}. To submit the payment use browser(action='pay', ref=<pay button>), which checks the total first; navigating away clears this."
+            ))))
+        };
+        let is_enter = |key: &str| {
+            let key = key.to_ascii_lowercase();
+            key.contains("enter") || key.contains("return") || key.contains('\n')
+        };
+        match action {
+            "evaluate" => refuse("evaluate is disabled until the payment is submitted"),
+            "screenshot" | "pdf" => {
+                refuse("screenshots and PDFs are disabled because they would show the card")
+            }
+            "content" if args["format"] == "html" => refuse("HTML content is disabled"),
+            "click_coordinates" => {
+                refuse("coordinate clicks are disabled because their target cannot be checked")
+            }
+            "send_keys" if is_enter(args["keys"].as_str().unwrap_or_default()) => {
+                refuse("Enter is disabled because it could submit the payment")
+            }
+            "act" => match args["actAction"].as_str() {
+                Some("press") if is_enter(args["key"].as_str().unwrap_or_default()) => {
+                    refuse("Enter is disabled because it could submit the payment")
+                }
+                Some("click") => {
+                    let ref_id = args["ref"]
+                        .as_str()
+                        .map(normalize_snapshot_ref)
+                        .unwrap_or_default();
+                    let store_key = Self::store_key(session, profile, target_id);
+                    if actions::is_submit_like(&page, &self.snapshot_store, &store_key, ref_id)
+                        .await?
+                    {
+                        refuse("that control looks like it submits the payment")
+                    } else {
+                        Ok(())
+                    }
+                }
+                _ => Ok(()),
+            },
+            _ => Ok(()),
+        }
     }
 
     /// Resolve the profile name from args, falling back to the default.
@@ -947,6 +1202,8 @@ impl BrowserTool {
         "click_coordinates",
         "send_keys",
         "fill_credential",
+        "fill_payment",
+        "pay",
         "screenshot",
         "content",
         "evaluate",
@@ -1302,6 +1559,16 @@ impl Tool for BrowserTool {
          have the value, and typing a placeholder or the credential's own name just \
          fails the login. If nothing is stored yet the error names the exact key — \
          ask for it with credential_request under that name, then retry; \
+         fill_payment — enter the card the user approved for this checkout into one \
+         card field by ref, with field='number', 'expiry', 'exp_month', 'exp_year', \
+         'cvc', 'name' or 'postal_code'. You never see the card. It only works on the \
+         site the user approved (and its payment provider's card frames) — if nothing \
+         is approved, ask with payment_request and stop; \
+         pay — press the checkout's pay / place-order button by ref after the card is \
+         entered. It reads the page total first and refuses if it is above the \
+         approved amount; pressing spends the approval, so never press pay twice for \
+         one purchase. While a card is entered, screenshot, pdf, evaluate, coordinate \
+         clicks, Enter, and clicking a submit button any other way are blocked; \
          screenshot/content/evaluate/scroll/console/cookies/pdf. Snapshots report likely CAPTCHA providers but do not claim to solve them. \
          Cookies persist across calls. Use snapshot + act for reliable element interaction. \
          Prefer compact=true and interactive=true for routine control; request \
@@ -1390,6 +1657,9 @@ impl Tool for BrowserTool {
                 .await;
         }
 
+        self.enforce_payment_lock(action, &args, &profile, &session, target_id)
+            .await?;
+
         match action {
             // ── Lifecycle ──────────────────────────────────────────
             "status" => Ok(self.manager.status(&profile).await),
@@ -1448,6 +1718,7 @@ impl Tool for BrowserTool {
                     Error::ToolExecution("'close' requires 'targetId' parameter".into())
                 })?;
                 let closed = self.manager.close_tab(&profile, tid).await?;
+                self.disarm_payment(&format!("{session}:{tid}"));
                 if self.manager.sticky_target(&session, &profile).as_deref() == Some(tid) {
                     self.manager.clear_sticky_target(&session, &profile);
                 }
@@ -1616,6 +1887,9 @@ impl Tool for BrowserTool {
                 let landed_on = page.target_id().inner().clone();
                 self.manager
                     .set_sticky_target(&session, &profile, &landed_on);
+                // A new document: whatever card was typed into the last one
+                // went with it.
+                self.disarm_payment(&format!("{session}:{landed_on}"));
 
                 Ok(json!({
                     "title": title,
@@ -1962,21 +2236,7 @@ impl Tool for BrowserTool {
                 // Neither a model URL nor a snapshot's old frame URL is
                 // authority to release a secret. Read the live page, enforce
                 // secure transport, then inspect the actual target node.
-                let url = manager::probe_page_url_once(&page)
-                    .await
-                    .unwrap_or_default();
-                let origin = crate::origin_key::canonical_credential_origin(&url)?;
-                let parsed = url::Url::parse(&origin).expect("validated origin");
-                let loopback = parsed.host_str().is_some_and(|host| {
-                    host == "localhost" || host == "127.0.0.1" || host == "[::1]"
-                });
-                if parsed.scheme() != "https"
-                    && !(loopback && self.manager.config().ssrf_policy.allow_private_network)
-                {
-                    return Err(Error::ToolExecution(ToolError::permission_denied(
-                        "credential fill requires HTTPS (HTTP loopback requires explicit private-network test policy)",
-                    )));
-                }
+                let (url, origin) = self.secure_live_origin(&page, "credential fill").await?;
                 let cred_key = crate::origin_credential_key(&url, field)?;
                 let store_key = Self::store_key(&session, &profile, target_id);
                 let target = actions::prepare_credential_target(
@@ -2049,6 +2309,198 @@ impl Tool for BrowserTool {
                     "page_state_status": "withheld_after_credential_fill",
                     "next_step": "The credential was assigned without submitting. Take a fresh snapshot to inspect the next control; never repeat an uncertain fill blindly.",
                 }))
+            }
+
+            // ── Payment ────────────────────────────────────────────
+            //
+            // The card is the user's approval of one purchase, not a stored
+            // credential: it is looked up by conversation and live origin,
+            // entered one field at a time without passing through the
+            // model, and spent by `pay`.
+            "fill_payment" => {
+                let ref_id = args["ref"]
+                    .as_str()
+                    .map(normalize_snapshot_ref)
+                    .expect("validated ref");
+                let field = args["field"]
+                    .as_str()
+                    .and_then(payment::PaymentField::parse)
+                    .expect("validated field");
+                let _ = self.manager.get_browser(&profile).await?;
+                let page = self.page_for(action, &profile, &session, target_id).await?;
+                let (_, origin) = self.secure_live_origin(&page, "payment fill").await?;
+                let (request, card) = self.approved_payment(&origin).await?;
+                let value = field.page_value(&card).ok_or_else(|| {
+                    Error::ToolExecution(
+                        "the user left the postal code blank on the approval form, so there is none to enter; skip this field, or tell the user the checkout needs it"
+                            .into(),
+                    )
+                })?;
+                drop(card);
+
+                let store_key = Self::store_key(&session, &profile, target_id);
+                let status = actions::fill_payment_field(
+                    &page,
+                    &self.snapshot_store,
+                    &store_key,
+                    ref_id,
+                    &origin,
+                    &self.payment_frame_origins,
+                    field,
+                    &value,
+                )
+                .await?;
+                drop(value);
+                tracing::debug!(
+                    field = field.as_str(),
+                    status = %status,
+                    "payment field fill completed"
+                );
+
+                if status == "filled" || payment::fill_refusal(&status).is_none() {
+                    // Filled, or interrupted mid-assignment: either way the
+                    // card may now be in the page.
+                    self.payment_armed
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(Self::armed_key(&session, &page), request.id.clone());
+                }
+                if status == "filled" {
+                    return Ok(json!({
+                        "status": "filled",
+                        "outcome": "applied",
+                        "field": field.as_str(),
+                        "ref": ref_id,
+                        "retry_safe": false,
+                        "page_state": Value::Null,
+                        "page_state_status": "withheld_after_payment_fill",
+                        "next_step": "Fill the other card fields the same way, then press the checkout's pay button with browser(action='pay', ref=<button ref>). Do not click it any other way.",
+                    }));
+                }
+                Ok(match payment::fill_refusal(&status) {
+                    Some(reason) => json!({
+                        "status": "blocked",
+                        "outcome": "not_applied",
+                        "field": field.as_str(),
+                        "ref": ref_id,
+                        "retry_safe": true,
+                        "reason": reason,
+                    }),
+                    None => json!({
+                        "status": "unknown",
+                        "outcome": "unknown",
+                        "field": field.as_str(),
+                        "ref": ref_id,
+                        "retry_safe": false,
+                        "reason": "the card field assignment was interrupted; take a fresh snapshot and check the field before trying again",
+                    }),
+                })
+            }
+
+            "pay" => {
+                let ref_id = args["ref"]
+                    .as_str()
+                    .map(normalize_snapshot_ref)
+                    .expect("validated ref");
+                let _ = self.manager.get_browser(&profile).await?;
+                let page = self.page_for(action, &profile, &session, target_id).await?;
+                let (_, origin) = self.secure_live_origin(&page, "pay").await?;
+                let (request, card) = self.approved_payment(&origin).await?;
+                drop(card);
+                let payments = self.payments.as_ref().expect("approved_payment checked");
+
+                let store_key = Self::store_key(&session, &profile, target_id);
+                let target = match actions::prepare_pay(
+                    &page,
+                    &self.snapshot_store,
+                    &store_key,
+                    ref_id,
+                    &origin,
+                )
+                .await?
+                {
+                    Ok(target) => target,
+                    Err(status) => {
+                        let reason = match status {
+                            "origin_mismatch" => "that control is not on the approved merchant's page",
+                            "disabled" => "that control is disabled; a required field may still be empty — take a snapshot and check",
+                            "site_isolated_frame" => "pay buttons inside a cross-site frame are not supported; tell the user this checkout needs them to finish paying",
+                            _ => "that element is no longer on the page; take a fresh snapshot",
+                        };
+                        return Ok(json!({
+                            "status": "blocked",
+                            "outcome": "not_applied",
+                            "ref": ref_id,
+                            "retry_safe": true,
+                            "reason": reason,
+                        }));
+                    }
+                };
+
+                let checked =
+                    match payment::check_total(&target.label, &target.text, &request.amount) {
+                        Ok(checked) => checked,
+                        Err(refusal) => {
+                            tracing::info!(
+                                request = %request.id,
+                                approved = %request.amount,
+                                refusal = ?refusal,
+                                "pay refused: the page total did not verify"
+                            );
+                            return Ok(json!({
+                                "status": "blocked",
+                                "outcome": "not_applied",
+                                "ref": ref_id,
+                                "retry_safe": false,
+                                "approved": request.amount.to_string(),
+                                "reason": refusal.explain(&request.amount),
+                            }));
+                        }
+                    };
+
+                let armed_key = Self::armed_key(&session, &page);
+                let pressed = actions::press_pay(&page, ref_id, &target).await;
+                let spent = match &pressed {
+                    Ok(outcome) => {
+                        !(outcome["outcome"] == "not_applied" && outcome["retry_safe"] == true)
+                    }
+                    Err(error) => !actions::failed_before_press(error),
+                };
+                if spent {
+                    // Spent whatever the checkout does next. A second press
+                    // after an uncertain outcome could charge twice; the user
+                    // can approve again.
+                    payments.mark_used(&request.id).await?;
+                    self.disarm_payment(&armed_key);
+                }
+                tracing::info!(
+                    request = %request.id,
+                    checked_total = %checked,
+                    approved = %request.amount,
+                    spent,
+                    "pay pressed"
+                );
+                let mut outcome = pressed?;
+                if let Value::Object(ref mut object) = outcome {
+                    object.insert(
+                        "payment".into(),
+                        json!({
+                            "merchant": request.merchant,
+                            "approved": request.amount.to_string(),
+                            "checked_total": checked.to_string(),
+                            "approval_spent": spent,
+                        }),
+                    );
+                    object.insert(
+                        "next_step".into(),
+                        Value::String(if spent {
+                            "The pay button was pressed and the approval is spent. Take a snapshot to read the result. Do not press pay again for this purchase: if it failed or needs another step you cannot complete, tell the user.".into()
+                        } else {
+                            "The press did not reach the page. Take a fresh snapshot and call pay again with the new ref.".into()
+                        }),
+                    );
+                }
+                Ok(outcome)
             }
 
             // ── Screenshot ─────────────────────────────────────────
@@ -3440,6 +3892,344 @@ mod tests {
         let _ = tool.manager.stop(profile).await;
         server.abort();
         assert!(passed, "{report}");
+    }
+
+    /// The approved-card path end to end in a real Chrome: a merchant page
+    /// on one loopback origin, its "payment provider" card frame on another
+    /// (site-isolated), and the same provider frame nested inside a third
+    /// "ad" origin. Public synthetic card values only; the checkout's submit
+    /// is an in-page counter, never a processor.
+    ///
+    /// Proves, in order: nothing is filled without an approval or outside
+    /// the approving conversation; a wrong field and a provider frame under a
+    /// foreign ancestor are refused; every card part lands in the right box
+    /// on both the merchant page and the provider frame; nothing card-shaped
+    /// reaches a tool result or snapshot; screenshot, evaluate, Enter and a
+    /// plain click on pay are blocked while the card is on the page; pay
+    /// refuses a total above the approval without submitting; pay at the
+    /// approved total submits exactly once and spends the approval.
+    #[tokio::test]
+    #[ignore = "launches real Chrome; synthetic card values and loopback origins only"]
+    async fn live_approved_card_is_entered_only_where_approved_and_paid_within_the_total() {
+        use rustykrab_core::active_tools::{SessionToolContext, SESSION_TOOL_CONTEXT};
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        async fn serve(listener: tokio::net::TcpListener, html: String) {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut buffer = [0; 4096];
+                let _ = stream.read(&mut buffer).await;
+                let response = format!("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", html.len(), html);
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        }
+        let bind = || async { tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap() };
+
+        let provider = bind().await;
+        let provider_origin = format!("http://127.0.0.1:{}", provider.local_addr().unwrap().port());
+        let card_frame = r#"<!doctype html><meta charset="utf-8"><body>
+            <label>Card number<input id="n" autocomplete="cc-number" inputmode="numeric"></label>
+            <label>Expiry<input id="e" autocomplete="cc-exp" placeholder="MM / YY"></label>
+            <label>Security code<input id="c" autocomplete="cc-csc"></label>
+            <script>['n','e','c'].forEach(function(id){document.getElementById(id).addEventListener('change',function(ev){
+              parent.postMessage({id:id,value:ev.target.value,nested:location.search.indexOf('nested')>=0},'*');});});</script>"#;
+        let provider_server = tokio::spawn(serve(provider, card_frame.to_string()));
+
+        let ad = bind().await;
+        let ad_url = format!("http://localhost:{}/ad", ad.local_addr().unwrap().port());
+        let ad_server = tokio::spawn(serve(
+            ad,
+            format!(
+                r#"<!doctype html><p>Advert</p><iframe src="{provider_origin}/card?nested=1" width="360" height="160"></iframe>"#
+            ),
+        ));
+
+        let merchant = bind().await;
+        let merchant_url = format!(
+            "http://localhost:{}/checkout",
+            merchant.local_addr().unwrap().port()
+        );
+        let months: String = (1..=12)
+            .map(|m| format!(r#"<option value="{m:02}">{m:02}</option>"#))
+            .collect();
+        let checkout = format!(
+            r#"<!doctype html><meta charset="utf-8"><title>Checkout — TEST ONLY</title>
+            <h1>Checkout · TEST ONLY</h1><p>2 passengers, Hyannis to Nantucket</p>
+            <form id="f" onsubmit="event.preventDefault();window.submissions++">
+            <label>Name on card<input id="holder" autocomplete="cc-name"></label>
+            <label>Notes<input id="notes"></label>
+            <label>Expiry month<select id="mm" autocomplete="cc-exp-month"><option value="">Month</option>{months}</select></label>
+            <label>Expiry year<select id="yy" autocomplete="cc-exp-year"><option value="">Year</option><option value="2030">2030</option><option value="2031">2031</option></select></label>
+            <label>I agree to the terms<input id="terms" type="checkbox"></label>
+            <iframe src="{provider_origin}/card" width="360" height="160"></iframe>
+            <iframe src="{ad_url}" width="400" height="220"></iframe>
+            <p>Subtotal $42.00</p><p id="total">Total $46.00</p>
+            <button id="pay">Pay now</button></form>
+            <script>window.submissions=0;window.seen={{}};addEventListener('message',function(m){{if(m.data&&m.data.id&&!m.data.nested)window.seen[m.data.id]=m.data.value;}});</script>"#
+        );
+        let merchant_server = tokio::spawn(serve(merchant, checkout));
+
+        let profile = "payment-fill-live-test";
+        let (tool, profile_dir) = isolated_live_tool(profile);
+        let store =
+            rustykrab_store::Store::open(profile_dir.path().join("fixture-store"), vec![7; 32])
+                .unwrap()
+                .with_credential_backend(Arc::new(
+                    rustykrab_store::credential_backend::MemoryBackend::new(),
+                ));
+        let payments = store.payment_requests();
+        let tool = tool
+            .with_payments(payments.clone())
+            .with_payment_frame_origins(&[provider_origin.as_str()]);
+
+        let conversation = uuid::Uuid::new_v4();
+        let scope = || SessionToolContext {
+            conversation_id: conversation,
+            capabilities: Arc::new(rustykrab_core::CapabilitySet::none()),
+            all_tools: Arc::new(Vec::new()),
+            active_tools: Arc::new(Default::default()),
+            recall: Arc::new(Default::default()),
+            todos: Arc::new(Default::default()),
+        };
+        macro_rules! call {
+            ($args:expr) => {
+                SESSION_TOOL_CONTEXT
+                    .scope(scope(), tool.execute($args))
+                    .await
+            };
+        }
+
+        let opened = call!(json!({"action":"open","url":merchant_url})).unwrap();
+        let tid = opened["targetId"].as_str().unwrap().to_string();
+        let page = tool.manager.get_page(profile, Some(&tid)).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let snap = call!(json!({"action":"snapshot","targetId":tid,"interactive":true})).unwrap();
+        let find = |name: &str, nested: Option<bool>| {
+            snap["elements"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|e| {
+                    e["name"].as_str().is_some_and(|n| n.starts_with(name))
+                        // `Some(_)` means a provider-frame field: in a frame,
+                        // nested under the ad or not.
+                        && nested.is_none_or(|n| {
+                            e["frame_url"]
+                                .as_str()
+                                .is_some_and(|url| url.contains("nested") == n)
+                        })
+                })
+                .unwrap_or_else(|| {
+                    panic!("fixture control not observed: {name} nested={nested:?}\n{snap}")
+                })["ref"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        let number_ref = find("Card number", Some(false));
+        let site_isolated = snap["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["ref"] == number_ref.as_str() && !e["target_id"].is_null());
+        let fill = |ref_id: &str, field: &str| json!({"action":"fill_payment","targetId":tid,"ref":ref_id,"field":field});
+
+        let mut checks = serde_json::Map::new();
+        let mut results = Vec::new();
+
+        // Nothing without an approval, or outside the approving conversation.
+        let unapproved = call!(fill(&number_ref, "number"));
+        checks.insert(
+            "refused_without_approval".into(),
+            json!(unapproved
+                .as_ref()
+                .is_err_and(|e| e.to_string().contains("No approved payment"))),
+        );
+
+        let merchant_origin =
+            crate::origin_key::canonical_credential_origin(&merchant_url).unwrap();
+        let id = payments
+            .file(
+                rustykrab_store::PaymentTerms {
+                    merchant: "Test ferry".into(),
+                    origin: merchant_origin.clone(),
+                    amount: rustykrab_store::Money::parse("46.00", "USD").unwrap(),
+                    description: None,
+                },
+                Some(conversation),
+            )
+            .await
+            .unwrap();
+        let card = rustykrab_store::CardDetails::new(
+            "4242 4242 4242 4242",
+            "12/31",
+            "987",
+            "Ada Lovelace",
+            Some("02554"),
+        )
+        .unwrap();
+        payments.authorize(&id, card, "fixture").await.unwrap();
+
+        let outside = tool.execute(fill(&number_ref, "number")).await;
+        checks.insert(
+            "refused_outside_conversation".into(),
+            json!(outside.is_err()),
+        );
+        let with_text = call!(
+            json!({"action":"fill_payment","targetId":tid,"ref":number_ref,"field":"number","text":"4242"})
+        );
+        checks.insert(
+            "refused_model_supplied_value".into(),
+            json!(with_text.is_err()),
+        );
+
+        // Wrong box, and the provider frame under a foreign ancestor.
+        let wrong_box = call!(fill(&find("Notes", None), "number")).unwrap();
+        checks.insert(
+            "refused_wrong_field".into(),
+            json!(wrong_box["status"] == "blocked"),
+        );
+        let nested = call!(fill(&find("Card number", Some(true)), "number")).unwrap();
+        checks.insert(
+            "refused_provider_under_foreign_frame".into(),
+            json!(
+                nested["status"] == "blocked"
+                    && nested["reason"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains("neither the merchant")
+            ),
+        );
+
+        // Every part, on the merchant page and in the provider frame.
+        for (name, field) in [
+            ("Name on card", "name"),
+            ("Card number", "number"),
+            ("Expiry", "expiry"),
+            ("Security code", "cvc"),
+            ("Expiry month", "exp_month"),
+            ("Expiry year", "exp_year"),
+        ] {
+            let nested =
+                (["Card number", "Expiry", "Security code"].contains(&name)).then_some(false);
+            let result = call!(fill(&find(name, nested), field)).unwrap();
+            results.push(result.clone());
+            checks.insert(
+                format!("filled_{field}"),
+                json!(result["status"] == "filled"),
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let landed: Value = page.evaluate("({holder:document.getElementById('holder').value, notes:document.getElementById('notes').value, mm:document.getElementById('mm').value, yy:document.getElementById('yy').value, seen:window.seen, submissions:window.submissions})").await.unwrap().into_value().unwrap();
+        checks.insert(
+            "values_landed_in_the_right_boxes".into(),
+            json!(
+                landed["holder"] == "Ada Lovelace"
+                    && landed["notes"] == ""
+                    && landed["mm"] == "12"
+                    && landed["yy"] == "2031"
+                    && landed["seen"]["n"] == "4242424242424242"
+                    && landed["seen"]["e"] == "12/31"
+                    && landed["seen"]["c"] == "987"
+                    && landed["submissions"] == 0
+            ),
+        );
+
+        // While the card is on the page.
+        checks.insert(
+            "screenshot_blocked".into(),
+            json!(call!(json!({"action":"screenshot","targetId":tid})).is_err()),
+        );
+        checks.insert(
+            "evaluate_blocked".into(),
+            json!(call!(json!({"action":"evaluate","targetId":tid,"expression":"1"})).is_err()),
+        );
+        checks.insert("enter_blocked".into(), json!(call!(json!({"action":"act","targetId":tid,"ref":find("Notes", None),"actAction":"press","key":"Enter"})).is_err()));
+        checks.insert("plain_click_on_pay_blocked".into(), json!(call!(json!({"action":"act","targetId":tid,"ref":find("Pay now", None),"actAction":"click"})).is_err()));
+        checks.insert("terms_checkbox_still_clickable".into(), json!(call!(json!({"action":"act","targetId":tid,"ref":find("I agree to the terms", None),"actAction":"click"})).is_ok()));
+
+        let after = call!(json!({"action":"snapshot","targetId":tid,"interactive":true})).unwrap();
+        let pay_ref = after["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["name"] == "Pay now")
+            .unwrap()["ref"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let exposed = format!("{after}{}", serde_json::to_string(&results).unwrap());
+        checks.insert(
+            "card_absent_from_results_and_snapshot".into(),
+            json!(
+                !exposed.contains("4242424242424242")
+                    && !exposed.contains("987")
+                    && !exposed.contains("12/31")
+            ),
+        );
+
+        // Pay refuses a higher total, then pays the approved one once.
+        page.evaluate("document.getElementById('total').textContent='Total $52.00'")
+            .await
+            .unwrap();
+        let too_much = call!(json!({"action":"pay","targetId":tid,"ref":pay_ref})).unwrap();
+        let submissions: u64 = page
+            .evaluate("window.submissions")
+            .await
+            .unwrap()
+            .into_value()
+            .unwrap();
+        checks.insert(
+            "pay_refused_above_approval".into(),
+            json!(too_much["status"] == "blocked" && submissions == 0),
+        );
+
+        page.evaluate("document.getElementById('total').textContent='Total $46.00'")
+            .await
+            .unwrap();
+        let paid = call!(json!({"action":"pay","targetId":tid,"ref":pay_ref})).unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let submissions: u64 = page
+            .evaluate("window.submissions")
+            .await
+            .unwrap()
+            .into_value()
+            .unwrap();
+        let status = payments.get(&id).await.unwrap().status;
+        checks.insert(
+            "paid_once_within_approval".into(),
+            json!(
+                paid["payment"]["approval_spent"] == true
+                    && paid["payment"]["checked_total"] == "USD 46.00"
+                    && submissions == 1
+                    && status == rustykrab_store::PaymentStatus::Used
+            ),
+        );
+        let again = call!(json!({"action":"pay","targetId":tid,"ref":pay_ref}));
+        checks.insert("second_pay_refused".into(), json!(again.is_err()));
+        checks.insert(
+            "lock_released_after_pay".into(),
+            json!(call!(json!({"action":"screenshot","targetId":tid})).is_ok()),
+        );
+
+        let passed = checks.values().all(|v| v == true);
+        let report = json!({"passed": passed, "checks": checks, "provider_frame_site_isolated": site_isolated,
+            "refusals": {"wrong_box": wrong_box, "nested": nested, "too_much": too_much},
+            "fixture": "real Chrome; merchant, provider and ad on separate loopback origins; public synthetic card; in-page submit counter",
+            "limits": ["loopback HTTP allowed by test policy", "provider allowlist replaced by the fixture origin", "no real processor or merchant", "no model in the loop"]});
+        if let Some(root) = std::env::var_os("RK_PAYMENT_EVIDENCE_DIR") {
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(
+                std::path::Path::new(&root).join("approved-card-result.json"),
+                serde_json::to_vec_pretty(&report).unwrap(),
+            )
+            .unwrap();
+        }
+        let _ = tool.manager.stop(profile).await;
+        provider_server.abort();
+        ad_server.abort();
+        merchant_server.abort();
+        assert!(passed, "{report:#}");
     }
 
     /// The secure fill boundary extends through serialization: a password may
