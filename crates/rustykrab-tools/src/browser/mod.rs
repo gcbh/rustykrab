@@ -423,8 +423,8 @@ fn schema_parameters() -> serde_json::Value {
             },
             "actAction": {
                 "type": "string",
-                "enum": ["click", "type", "fill", "press", "hover", "select", "drag", "upload", "options", "wait", "fill_credential"],
-                "description": "Required when action='act'; every act also requires ref. Companion fields: type/fill -> text; press -> key; select -> value; drag -> targetRef; upload -> path or paths. options inspects a native select. fill_credential uses field='username' or 'password' and never text, so the stored secret does not pass through you."
+                "enum": ["click", "type", "fill", "press", "hover", "select", "drag", "upload", "options", "wait", "fill_credential", "fill_payment", "pay"],
+                "description": "Required when action='act'; every act also requires ref. Companion fields: type/fill -> text; press -> key; select -> value; drag -> targetRef; upload -> path or paths. options inspects a native select. fill_credential uses field='username' or 'password' and never text, so the stored secret does not pass through you. fill_payment uses field (number/expiry/exp_month/exp_year/cvc/name/postal_code) and never text; pay presses a checkout button after checking the total."
             },
             "text": {
                 "type": "string",
@@ -5182,5 +5182,33 @@ mod act_action_tests {
             variants.contains(&"fill_credential"),
             "actAction enum: {variants:?}"
         );
+        // Observed with gemma4:26b on the payment eval: the model reached for
+        // act + actAction 'fill_payment', schema validation rejected it five
+        // times before the tool could route it, and in between the model
+        // typed the field's label into the name box. Accepting a spelling in
+        // `effective_action` is worthless if the schema refuses it first.
+        for sub_action in ["fill_payment", "pay"] {
+            assert!(
+                variants.contains(&sub_action),
+                "actAction enum must admit {sub_action}: {variants:?}"
+            );
+        }
+    }
+
+    /// The exact calls gemma4:26b made in the payment eval, run through the
+    /// same validator the agent runner applies before a tool executes.
+    #[test]
+    fn the_payment_sub_action_calls_the_model_made_pass_runner_validation() {
+        let params = super::schema_parameters();
+        for args in [
+            json!({"action": "act", "actAction": "fill_payment", "field": "number", "ref": "s6-5"}),
+            json!({"action": "act", "actAction": "pay", "ref": "s6-9"}),
+            json!({"action": "fill_payment", "field": "cvc", "ref": "s6-7"}),
+        ] {
+            rustykrab_core::validate_tool_args(&params, &args)
+                .unwrap_or_else(|e| panic!("{args} rejected before reaching the tool: {e:?}"));
+            super::BrowserTool::validate_action_args(args["action"].as_str().unwrap(), &args)
+                .unwrap_or_else(|e| panic!("{args} rejected by the tool: {e}"));
+        }
     }
 }
