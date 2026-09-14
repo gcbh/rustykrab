@@ -96,7 +96,7 @@ main()
 ```
 
 Two task queues still coexist with different durability guarantees — the
-in-memory one for cron and credential wakes, the durable one for peer
+in-memory one for cron, credential and payment-approval wakes, the durable one for peer
 delegation. Cron survives the gap because `scheduled_jobs.next_run_at` only
 advances after execution, so a dropped task is re-picked. That reasoning is
 still implicit and is the only thing making the in-memory queue safe.

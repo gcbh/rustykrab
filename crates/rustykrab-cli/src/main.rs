@@ -901,6 +901,7 @@ async fn main() -> anyhow::Result<()> {
         store.secrets(),
         store.guarded_secrets(),
         store.credential_requests(),
+        store.payment_requests(),
         store.pending_links(),
     );
     tools.extend(rustykrab_tools::memory_tools(memory_backend.clone()));
@@ -3498,6 +3499,28 @@ impl std::fmt::Debug for CredentialNotifier {
     }
 }
 
+impl CredentialNotifier {
+    /// Queue a resume of `conversation_id`. Detached for the reason given in
+    /// `request_fulfilled`: the store write that triggered it must not wait.
+    fn wake(&self, conversation_id: &str, what: &str, request: task_queue::TaskRequest) {
+        let Some(queue) = self.queue.get() else {
+            tracing::warn!(
+                what,
+                conversation_id,
+                "answer arrived before the task queue was ready — not resuming"
+            );
+            return;
+        };
+        let queue = queue.clone();
+        let what = what.to_string();
+        tokio::spawn(async move {
+            if let Err(e) = queue.submit(request).await {
+                tracing::error!(what = %what, "could not queue wake: {e}");
+            }
+        });
+    }
+}
+
 impl rustykrab_store::RequestNotifier for CredentialNotifier {
     fn request_filed(&self, credential_name: &str, action: &str) {
         if let Some(push) = &self.push {
@@ -3550,6 +3573,36 @@ impl rustykrab_store::RequestNotifier for CredentialNotifier {
                 tracing::error!(credential = %name, "could not queue credential wake: {e}");
             }
         });
+    }
+
+    fn payment_authorized(
+        &self,
+        conversation_id: Option<&str>,
+        request: &rustykrab_store::PaymentRequest,
+    ) {
+        let Some(conversation_id) = conversation_id else {
+            tracing::debug!(
+                request = %request.id,
+                "payment approved, but the request recorded no conversation — nothing to wake"
+            );
+            return;
+        };
+        let task = task_queue::TaskRequest {
+            prompt: task_queue::payment_wake_prompt(
+                &request.merchant,
+                &request.amount.to_string(),
+                &request.origin,
+            ),
+            source: task_queue::TaskSource::PaymentAuthorized {
+                conversation_id: conversation_id.to_string(),
+                request_id: request.id.clone(),
+            },
+            // Shares the credential wake's key: either kind of answer
+            // resumes the same stalled turn, and two runs over one
+            // conversation's history must never start together.
+            dedupe_key: Some(format!("credential-wake:{conversation_id}")),
+        };
+        self.wake(conversation_id, "payment approval", task);
     }
 }
 
