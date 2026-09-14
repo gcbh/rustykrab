@@ -29,6 +29,7 @@ mod fixture_repo;
 mod judge;
 mod login_suite;
 mod model_suite;
+mod payment_suite;
 mod planning_suite;
 mod surface;
 mod transcript;
@@ -97,6 +98,26 @@ const AGENT_SCRIPT: &str = r#"{
                                           "name": "e2e_delete_token" } } ] },
         { "toolCalls": [ { "name": "task_complete",
                            "arguments": { "summary": "Attempted delete of e2e_delete_token." } } ] }
+      ]
+    },
+    {
+      "trigger": "e2e: pay for the ferry",
+      "steps": [
+        { "toolCalls": [ { "name": "payment_request",
+                           "arguments": { "url": "http://localhost:9/checkout",
+                                          "merchant": "E2E Ferry",
+                                          "amount": "46.00",
+                                          "currency": "USD",
+                                          "description": "2 passenger tickets" } } ] },
+        { "text": "I have asked you to approve paying E2E Ferry up to USD 46.00." }
+      ]
+    },
+    {
+      "trigger": "the user approved paying e2e ferry",
+      "steps": [
+        { "toolCalls": [ { "name": "todo_read", "arguments": {} } ] },
+        { "toolCalls": [ { "name": "task_complete",
+                           "arguments": { "summary": "e2e: resumed after payment approval." } } ] }
       ]
     }
   ]
@@ -2097,6 +2118,7 @@ fn scripted_scenarios() -> Vec<(Expected, (&'static str, ScenarioFn))> {
         (Expected::Pass, scenario!(agent_delete_files_request)),
         (Expected::Pass, scenario!(revoked_device_401)),
     ];
+    scenarios.extend(payment_suite::scenarios());
     scenarios.extend(planning_suite::scenarios());
     scenarios
 }
