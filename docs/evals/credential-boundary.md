@@ -29,7 +29,34 @@ filing and fulfilment of older pending forms.
 - A same-origin page can read or mirror its input. Arbitrary evaluate,
   screenshots and reflected-page content are not isolated secret channels.
 - Payment detection is conservative naming/autocomplete logic, not universal
-  PAN detection. No reusable payment vault or CVV retention is enabled.
+  PAN detection. Generic credential capture still refuses card fields; cards
+  use the separate one-purchase payment path below. No reusable payment vault
+  or CVV retention is enabled.
+
+## Payment path (added after this split)
+
+A card is consent to one purchase, so it does not go through credential
+capture. The user approves the terms (merchant, exact origin, maximum amount)
+on a one-time `/p/{token}` page; the card is held in memory only and erased on
+pay, after 15 minutes, on supersede, or on restart. `browser` `fill_payment`
+enters one part per call into a field whose top origin is the approved merchant
+and whose frame chain is the merchant or a fixed payment-provider allowlist.
+`pay` refuses unless the page shows a total in the approved currency at or below
+the approval, and spends the approval when pressed. While a card is on the page,
+evaluate, screenshots, PDF, HTML content, coordinate clicks, Enter, and plain
+clicks on submit-like controls are refused.
+
+Evidence: `live_approved_card_is_entered_only_where_approved_and_paid_within_the_total`
+(real Chrome, merchant/provider/ad on separate loopback origins with the provider
+frame site-isolated, public synthetic card). 22 checks passed, covering refusal
+without approval, outside the conversation, with a model-supplied value, into
+the wrong field, and into a provider frame nested under a foreign origin; correct
+landing of all six parts across the merchant page and provider frame; no card
+value in results or snapshots; the armed-page refusals; refusal of a total above
+the approval with zero submissions; exactly one submission at the approved
+total; and refusal of a second pay. Limits: loopback HTTP and a fixture provider
+origin replace HTTPS and the production allowlist; no real merchant, processor
+or model; total and submit detection are heuristics that fail closed.
 
 ## Evidence
 
