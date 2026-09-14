@@ -106,6 +106,12 @@ const DEFAULT_ACTIVE_TOOLS: &[&str] = &[
     // Making the tool visible moved `other_mail_provider` and
     // `website_login_generic` from 0/5 to 5/5 each.
     "credential_request",
+    // The same lesson for money. With only `credential_request` visible, and
+    // its description saying cards were unsupported, a local model asked to
+    // "book the 2:25pm ferry for two" replied that it could not pay and
+    // offered to stop at the payment screen. The approval path has to be in
+    // the schema before the model reaches a checkout, not discoverable after.
+    "payment_request",
 ];
 
 use crate::compaction::CompactionStrategy;
