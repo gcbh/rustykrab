@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.2.40] - 2026-09-15
+
+- fix(compaction): stop one opaque tool result from wedging a conversation (#654)
+
 ## [5.2.39] - 2026-09-12
 
 - fix(browser): bind credential fills to verified origins and inputs (#645)

@@ -31,3 +31,4 @@ tempfile = "3"
 rusqlite = { version = "0.34", features = ["bundled"] }
 uuid.workspace = true
 sha2.workspace = true
+base64.workspace = true

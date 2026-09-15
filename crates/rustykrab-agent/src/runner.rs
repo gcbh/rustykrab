@@ -407,6 +407,43 @@ fn truncate_summary_to_tokens(s: &str, max_tokens: usize) -> String {
     out
 }
 
+/// Largest single tool output rendered verbatim into a summarizer chunk.
+///
+/// The chunker budgets in estimated tokens (~4 chars each), which holds for
+/// prose and fails badly for base64: a `browser` `pdf` result tokenizes at
+/// roughly 1.4 chars/token, so a chunk budgeted at 26k tokens arrived as 64k
+/// real ones and filled a 64k window. With ~1300 tokens left to generate, the
+/// model spent them all reasoning about what the blob was, returned no text,
+/// and Ollama reported `done_reason: "length"` — a `MaxTokens` stop that
+/// aborts compaction, and with it the whole run, before the user gets a reply.
+///
+/// Capping the *rendered* output fixes both halves: an opaque blob has nothing
+/// to summarize, and no single tool result can dominate a chunk however it
+/// tokenizes. The message itself is untouched — the full output still reaches
+/// the recall archive, which is where the summary already points the agent.
+const MAX_SUMMARIZED_TOOL_OUTPUT_BYTES: usize = 8 * 1024;
+
+/// Render a tool result's output for a summarizer chunk, eliding anything past
+/// [`MAX_SUMMARIZED_TOOL_OUTPUT_BYTES`]. Cuts on a UTF-8 boundary and says how
+/// much was dropped, so the summarizer records that a large result exists
+/// rather than inventing its contents.
+fn render_tool_output_for_summary(output: &serde_json::Value) -> String {
+    let text = output.to_string();
+    if text.len() <= MAX_SUMMARIZED_TOOL_OUTPUT_BYTES {
+        return text;
+    }
+    let mut end = MAX_SUMMARIZED_TOOL_OUTPUT_BYTES;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let elided = text.len() - end;
+    format!(
+        "{} [{elided} more bytes of tool output elided from this summary; \
+         the full result is in the recall archive]",
+        &text[..end]
+    )
+}
+
 /// Read the env-configurable compaction summary cap once. Treats
 /// non-positive values as unset and falls back to the default. This is
 /// the *upper* bound from configuration; the effective cap used at
@@ -2723,8 +2760,19 @@ impl AgentRunner {
     }
 
     /// Render a single message as plain text for inclusion in a summarizer
-    /// prompt. Used by the recursive/chunked compaction path.
+    /// prompt. Used by the recursive/chunked compaction path. Oversized tool
+    /// outputs are elided (see [`MAX_SUMMARIZED_TOOL_OUTPUT_BYTES`]).
     fn render_message_for_summary(msg: &Message) -> String {
+        Self::render_message_text(msg, true)
+    }
+
+    /// Render a single message in full for the recall archive. Never elides:
+    /// the archive is where the summarizer's elision notice points.
+    fn render_message_for_archive(msg: &Message) -> String {
+        Self::render_message_text(msg, false)
+    }
+
+    fn render_message_text(msg: &Message, elide_tool_output: bool) -> String {
         let role = match msg.role {
             Role::System => "system",
             Role::User => "user",
@@ -2736,7 +2784,12 @@ impl AgentRunner {
             MessageContent::ToolCall(tc) => format!("tool_call {}: {}", tc.name, tc.arguments),
             MessageContent::ToolResult(tr) => {
                 let marker = if tr.is_error { " (error)" } else { "" };
-                format!("tool_result{} {}: {}", marker, tr.call_id, tr.output)
+                let output = if elide_tool_output {
+                    render_tool_output_for_summary(&tr.output)
+                } else {
+                    tr.output.to_string()
+                };
+                format!("tool_result{} {}: {}", marker, tr.call_id, output)
             }
             MessageContent::MultiToolCall(tcs) => {
                 let names: Vec<&str> = tcs.iter().map(|c| c.name.as_str()).collect();
@@ -3415,7 +3468,7 @@ impl AgentRunner {
             .messages
             .iter()
             .filter(|m| !preserved_ids.contains(&m.id))
-            .map(Self::render_message_for_summary)
+            .map(Self::render_message_for_archive)
             .collect();
         let archived_chars: usize = displaced.iter().map(|s| s.len()).sum();
 
@@ -4720,6 +4773,95 @@ mod compaction_tests {
             .summarize_text_once("synthetic history", false, 512)
             .await
             .is_err());
+    }
+
+    /// Stands in for Ollama against a fixed context window: a prompt that
+    /// leaves no room to generate comes back with no text and
+    /// `done_reason: "length"`, which the provider maps to `MaxTokens`.
+    /// Deterministic — the size of the prompt decides, not the model.
+    struct WindowBoundSummarizer {
+        window_chars: usize,
+    }
+
+    #[async_trait]
+    impl ModelProvider for WindowBoundSummarizer {
+        fn name(&self) -> &str {
+            "window-bound-summarizer"
+        }
+        async fn chat(&self, messages: &[Message], _: &[ToolSchema]) -> Result<ModelResponse> {
+            let prompt_chars: usize = messages
+                .iter()
+                .map(|m| m.content.as_text().unwrap_or("").len())
+                .sum();
+            let (text, stop_reason) = if prompt_chars > self.window_chars {
+                ("", StopReason::MaxTokens)
+            } else {
+                (
+                    "- fetched the Steamship Authority schedule PDF",
+                    StopReason::EndTurn,
+                )
+            };
+            Ok(ModelResponse {
+                message: study_message(Role::Assistant, text),
+                usage: Usage::default(),
+                stop_reason,
+                text: None,
+            })
+        }
+    }
+
+    /// One opaque tool result must not be able to abort compaction.
+    ///
+    /// A `browser` `pdf` action returned 587KB of base64 — 82% of a live
+    /// conversation. Rendered verbatim, every chunk it produced overran the
+    /// model's window, and the empty `MaxTokens` response failed the run: the
+    /// user's message got no reply, twice, and the conversation could not
+    /// recover because compaction ran again on the same blob every turn.
+    #[tokio::test]
+    async fn an_oversized_tool_result_does_not_abort_compaction() {
+        let recall = Arc::new(RecallStore::new());
+        let runner = AgentRunner::new(
+            Arc::new(WindowBoundSummarizer {
+                window_chars: 40_000,
+            }),
+            Vec::new(),
+            Arc::new(NoSandbox),
+        )
+        .with_recall_store(recall.clone());
+        // Base64 of a PDF: no summarizable content, and far denser per
+        // character than the chars/4 budget the chunker packs against.
+        let pdf = "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVowMTIzNDU2Nzg5Ky8=".repeat(12_000);
+        let mut conv = study_conversation(vec![
+            study_message(Role::User, "Book the Hyannis–Nantucket ferry for two."),
+            study_message(Role::Assistant, "Checking the schedule."),
+            Message {
+                id: Uuid::new_v4(),
+                role: Role::Tool,
+                content: MessageContent::ToolResult(ToolResult {
+                    call_id: "pdf-1".into(),
+                    output: serde_json::json!({ "encoding": "base64", "data": pdf }),
+                    is_error: false,
+                    images: Vec::new(),
+                }),
+                created_at: Utc::now(),
+                agent_version: None,
+            },
+            study_message(Role::User, "Could you find the high speed ferry?"),
+        ]);
+
+        runner
+            .compact_for_evaluation(&mut conv, &[])
+            .await
+            .expect("compaction must survive an opaque tool result");
+        assert!(conv.summary.is_some());
+
+        // Elision is for the summarizer only: the recall archive the notice
+        // points to must still hold the whole result.
+        let archived = recall.get(conv.id).expect("displaced history archived");
+        assert!(
+            archived.contains(&pdf),
+            "recall archive must keep the full tool output"
+        );
     }
 
     /// Mock provider that records chat-call count + prompt sizes and returns

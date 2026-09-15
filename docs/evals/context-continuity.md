@@ -60,6 +60,7 @@ candidate's green result must not be reported as a changed production default.
 | `missing-history-control` | No previous messages | Confirm Broadway history is absent; behavior unscored |
 | `compaction-loss-control` | Real compaction with a deliberately lossy scripted summary | Latest instruction must survive verbatim despite summary omission; scripted mode only |
 | `compaction-generation-limit` | Provider returns a partial summary with native length stop | Refuse replacement, retain the exact original/latest input, and dispatch no actor step; scripted mode only |
+| `compaction-opaque-tool-output` | Ferry history dominated by a ~587KB base64 `browser` `pdf` result; scripted summarizer enforces a 65,536-token window at base64 token density | Compaction completes with no summarizer length stop and the follow-up gets a persisted reply; also runnable live with `--case compaction-opaque` (behavior unscored) |
 | `tool-availability-contract` | Force real `tools_load` with a missing default-seeded memory tool | Every active/loaded name must appear in the next actor request; absent tool reported unknown; scripted mode only |
 | `provider-trim-control` | Small provider window, runner compaction disabled | Require explicit pre-dispatch refusal, zero model requests, and intact durable initial/latest input; scripted mode only |
 | `telegram-provider-failure` | Provider fails after a controlled tool timeout | Initial user and partial tool trail remain in SQLite; error reply acknowledges incomplete task |
