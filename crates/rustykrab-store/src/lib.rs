@@ -37,9 +37,9 @@ pub use inbound::InboundStore;
 pub use jobs::{JobRun, JobStore, ScheduledJob};
 pub use outcomes::OutcomeStore;
 pub use payment_request::{
-    AuthorizedPayment, CardDetails, CardError, ClaimedCard, Money, PayClaim, PayRefusal,
-    PaymentRequest, PaymentRequestStore, PaymentStatus, PaymentTerms, CARD_TTL,
-    DEFAULT_PAY_COOLDOWN, PENDING_TTL_MS, STALE_CLAIM_MS,
+    stamp_utc, AuthorizedPayment, CardDetails, CardError, ClaimedCard, Filed, Money, PayClaim,
+    PayRefusal, PaymentRequest, PaymentRequestStore, PaymentStatus, PaymentTerms, CARD_TTL,
+    DEFAULT_DUPLICATE_WINDOW_MS, DEFAULT_PAY_COOLDOWN, PENDING_TTL_MS, STALE_CLAIM_MS,
 };
 pub use pending_links::PendingLinks;
 pub use projects::{ApplyRevisionResult, ProjectStore};
@@ -71,6 +71,10 @@ pub struct Store {
     /// conversation. Operator-tunable because "how fast is too fast" is a
     /// property of the household, not of the code.
     pay_cooldown: std::time::Duration,
+    /// How far back a payment counts as a duplicate of a new one.
+    /// Operator-tunable for the same reason as the cooldown; `0` turns the
+    /// duplicate hold off entirely.
+    duplicate_window_ms: i64,
     /// Where the database lives, so a background reader can open its own
     /// connection instead of queueing behind live traffic on this one.
     db_path: PathBuf,
@@ -114,6 +118,7 @@ impl Store {
             pending_links: PendingLinks::new(),
             card_vault: payment_request::CardVault::default(),
             pay_cooldown: payment_request::DEFAULT_PAY_COOLDOWN,
+            duplicate_window_ms: payment_request::DEFAULT_DUPLICATE_WINDOW_MS,
             db_path,
         })
     }
@@ -122,6 +127,13 @@ impl Store {
     /// disables the throttle.
     pub fn with_pay_cooldown(mut self, cooldown: std::time::Duration) -> Self {
         self.pay_cooldown = cooldown;
+        self
+    }
+
+    /// How far back a payment counts as a duplicate of a new one. `0`
+    /// disables the duplicate hold and the duplicate refusal at pay time.
+    pub fn with_duplicate_window_ms(mut self, window_ms: i64) -> Self {
+        self.duplicate_window_ms = window_ms;
         self
     }
 
@@ -278,15 +290,37 @@ impl Store {
                 -- the single-spend lock: one row may be 'paying' at a time,
                 -- and a claim older than STALE_CLAIM_MS is swept to 'used'
                 -- rather than released, because the press may have landed.
-                claimed_at      INTEGER
+                claimed_at      INTEGER,
+                -- The earlier request this one repeats, on a row filed
+                -- 'held' and on the confirmed re-ask that follows a hold.
+                -- Always names a payment, never the hold in between.
+                duplicate_of    TEXT,
+                -- The user was shown the hold and asked to pay anyway. The
+                -- only thing that lets a press past the duplicate check in
+                -- claim_for_pay, and the store sets it only when a 'held'
+                -- row already exists in the same conversation -- so the
+                -- model cannot pre-set it to skip the check.
+                duplicate_confirmed INTEGER NOT NULL DEFAULT 0
             );
 
             -- One purchase in flight per conversation, and the lookups that
             -- enforce it only ever ask about live rows. A 'paying' row is
-            -- live: it is the press the global lock is held for.
+            -- live: it is the press the global lock is held for. A 'held'
+            -- row is not: it was stopped before the user was ever asked,
+            -- and it must not supersede or be superseded by the live one.
             CREATE INDEX IF NOT EXISTS idx_payment_requests_live
                 ON payment_requests (conversation_id)
                 WHERE status IN ('pending', 'authorized', 'paying');
+
+            -- Has this site already been paid this amount today? That is the
+            -- duplicate key, asked once when a request is filed and again
+            -- when a press is claimed. Partial, because the answer only
+            -- ever concerns rows that are live or spent; the terminal
+            -- 'declined'/'expired'/'superseded' rows are the bulk of an old
+            -- table and never match.
+            CREATE INDEX IF NOT EXISTS idx_payment_requests_dup
+                ON payment_requests (origin, amount_minor, currency, created_at)
+                WHERE status IN ('pending', 'authorized', 'paying', 'used', 'held');
 
             -- Superseded values, kept encrypted, so an approved change or a
             -- mistaken delete is recoverable.
@@ -647,12 +681,34 @@ impl Store {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| Error::Storage(e.to_string()))?;
         drop(stmt);
-        if !existing.iter().any(|c| c == "claimed_at") {
-            conn.execute(
+        //
+        // `duplicate_of` and `duplicate_confirmed` arrived with the
+        // duplicate hold. Both default to "not a duplicate", which is the
+        // honest reading of a row filed before anything looked: the check
+        // never ran on it, and back-filling would be inventing a judgement.
+        // `idx_payment_requests_dup` needs no rebuild clause — it is new,
+        // so `CREATE INDEX IF NOT EXISTS` above creates it on upgraded and
+        // fresh databases alike, and it indexes only columns that existed
+        // before this change.
+        for (column, ddl) in [
+            (
+                "claimed_at",
                 "ALTER TABLE payment_requests ADD COLUMN claimed_at INTEGER",
-                [],
-            )
-            .map_err(|e| Error::Storage(e.to_string()))?;
+            ),
+            (
+                "duplicate_of",
+                "ALTER TABLE payment_requests ADD COLUMN duplicate_of TEXT",
+            ),
+            (
+                "duplicate_confirmed",
+                "ALTER TABLE payment_requests
+                     ADD COLUMN duplicate_confirmed INTEGER NOT NULL DEFAULT 0",
+            ),
+        ] {
+            if !existing.iter().any(|c| c == column) {
+                conn.execute(ddl, [])
+                    .map_err(|e| Error::Storage(e.to_string()))?;
+            }
         }
         let live_index: Option<String> = conn
             .query_row(
@@ -796,7 +852,8 @@ impl Store {
     /// cards approved for them.
     pub fn payment_requests(&self) -> PaymentRequestStore {
         let payments = PaymentRequestStore::new(Arc::clone(&self.conn), self.card_vault.clone())
-            .with_pay_cooldown(self.pay_cooldown);
+            .with_pay_cooldown(self.pay_cooldown)
+            .with_duplicate_window_ms(self.duplicate_window_ms);
         match &self.request_notifier {
             Some(notifier) => payments.with_notifier(Arc::clone(notifier)),
             None => payments,
@@ -1266,6 +1323,40 @@ mod tests {
             count(&conn, "SELECT COUNT(*) FROM payment_requests"),
             1,
             "and the audit trail survives the rebuild"
+        );
+
+        // The duplicate hold's columns and its index. The index needs no
+        // rebuild clause of its own — it is new, so it is simply created —
+        // but an upgraded database must end up with it, or every duplicate
+        // lookup falls back to a scan of the whole payment history.
+        for column in ["duplicate_of", "duplicate_confirmed"] {
+            assert_eq!(
+                count(
+                    &conn,
+                    &format!(
+                        "SELECT COUNT(*) FROM pragma_table_info('payment_requests')
+                          WHERE name = '{column}'"
+                    )
+                ),
+                1,
+                "{column}"
+            );
+        }
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM sqlite_master
+                  WHERE type = 'index' AND name = 'idx_payment_requests_dup'"
+            ),
+            1
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM payment_requests WHERE duplicate_confirmed = 0"
+            ),
+            1,
+            "a row filed before the check existed was never judged a duplicate"
         );
 
         // Idempotent: a second open must not drop and rebuild the index it

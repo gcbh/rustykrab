@@ -21,12 +21,19 @@
 //! - **Declining is a first-class answer**, not closing the tab: it tells
 //!   the agent not to pay rather than leaving the turn waiting.
 //! - **Responses are `no-store`**, so a card page never sits in a cache.
+//! - **A confirmed duplicate says so, above the form.** A request the user
+//!   asked for after being told it repeats an earlier payment reaches this
+//!   page looking exactly like a first purchase. The one thing that
+//!   distinguishes it is on the row (`duplicate_confirmed`), so the page
+//!   says it out loud: the approval given here is a *second* charge. A
+//!   `held` request, by contrast, never reaches this page at all — it is
+//!   issued no link, and `find_by_link` only returns `pending` rows.
 
 use axum::extract::{Form, Path, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use rustykrab_core::Error;
-use rustykrab_store::{CardDetails, PaymentRequest, CARD_TTL};
+use rustykrab_store::{CardDetails, PaymentRequest, PaymentStatus, CARD_TTL};
 use std::collections::HashMap;
 
 use crate::credential_page::{esc, page, tailnet_login};
@@ -72,7 +79,34 @@ async fn show(
     else {
         return refused();
     };
-    no_store(StatusCode::OK, form_page(&request, &token, None))
+    let earlier = earlier_payment(&state, &request).await;
+    no_store(
+        StatusCode::OK,
+        form_page(&request, &token, None, earlier.as_deref()),
+    )
+}
+
+/// The payment a `duplicate_confirmed` request is about to repeat.
+///
+/// `None` for an ordinary request, and also when the earlier row cannot be
+/// read: a lookup failure must not stop the user approving a purchase they
+/// asked for, so the page falls back to its usual shape rather than to an
+/// error.
+async fn earlier_payment(
+    state: &AppState,
+    request: &PaymentRequest,
+) -> Option<Box<PaymentRequest>> {
+    if !request.duplicate_confirmed {
+        return None;
+    }
+    let id = request.duplicate_of.as_deref()?;
+    match state.agent.store.payment_requests().get(id).await {
+        Ok(earlier) => Some(Box::new(earlier)),
+        Err(e) => {
+            tracing::warn!(error = %e, %id, "the payment this one repeats could not be read");
+            None
+        }
+    }
 }
 
 /// What the user asked for when they pressed a button.
@@ -134,19 +168,25 @@ async fn submit(
         // Re-render with the reason and nothing the user typed: a card
         // number echoed into `value=""` would sit in the page source.
         Decision::Approve(Err(reason)) => {
-            no_store(StatusCode::OK, form_page(&request, &token, Some(reason)))
+            let earlier = earlier_payment(&state, &request).await;
+            no_store(
+                StatusCode::OK,
+                form_page(&request, &token, Some(reason), earlier.as_deref()),
+            )
         }
         Decision::Approve(Ok(card)) => match payments.authorize(&request.id, card, &by).await {
             Ok(()) => no_store(StatusCode::OK, approved_page(&request)),
             Err(Error::AlreadyExists(_)) => refused(),
             Err(e) => {
                 tracing::error!(error = %e, "payment page could not record the approval");
+                let earlier = earlier_payment(&state, &request).await;
                 no_store(
                     StatusCode::OK,
                     form_page(
                         &request,
                         &token,
                         Some("That could not be saved. Try once more."),
+                        earlier.as_deref(),
                     ),
                 )
             }
@@ -154,10 +194,34 @@ async fn submit(
     }
 }
 
-fn form_page(request: &PaymentRequest, token: &str, error: Option<&str>) -> String {
+fn form_page(
+    request: &PaymentRequest,
+    token: &str,
+    error: Option<&str>,
+    earlier: Option<&PaymentRequest>,
+) -> String {
     let amount = request.amount.to_string();
     let mut body = String::new();
     body.push_str("<h1>Approve a payment</h1>");
+    // Above everything else, because it changes what the rest of the page
+    // means. The user asked for this second payment, but they asked for it
+    // in a chat message some minutes ago, and the page they are now looking
+    // at is indistinguishable from the one they approved the first time.
+    if let Some(earlier) = earlier {
+        body.push_str(&format!(
+            "<div class=\"warn\"><b>This is a second payment.</b> You already {} {} to {} \
+             on {}. Approving here pays it again.</div>",
+            match earlier.status {
+                PaymentStatus::Used | PaymentStatus::Paying => "paid",
+                _ => "approved",
+            },
+            esc(&earlier.amount.to_string()),
+            esc(&earlier.merchant),
+            esc(&rustykrab_store::stamp_utc(
+                earlier.used_at.unwrap_or(earlier.created_at)
+            )),
+        ));
+    }
     body.push_str(&format!(
         "<p class=\"amount\">{}</p><p class=\"merchant\">to <b>{}</b></p>",
         esc(&amount),
@@ -249,7 +313,7 @@ fn approved_page(request: &PaymentRequest) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustykrab_store::{Money, PaymentStatus};
+    use rustykrab_store::Money;
 
     fn request() -> PaymentRequest {
         PaymentRequest {
@@ -262,6 +326,9 @@ mod tests {
             status: PaymentStatus::Pending,
             created_at: 0,
             card_last4: None,
+            used_at: None,
+            duplicate_of: None,
+            duplicate_confirmed: false,
         }
     }
 
@@ -274,7 +341,7 @@ mod tests {
 
     #[test]
     fn the_terms_are_shown_and_escaped() {
-        let html = form_page(&request(), "tok", None);
+        let html = form_page(&request(), "tok", None, None);
         assert!(html.contains("USD 46.00"));
         assert!(html.contains("Pay up to USD 46.00"));
         assert!(html.contains("<code>https://www.steamshipauthority.com</code>"));
@@ -287,7 +354,7 @@ mod tests {
     /// types sixteen digits on a phone keyboard.
     #[test]
     fn inputs_carry_card_autofill_tokens() {
-        let html = form_page(&request(), "tok", None);
+        let html = form_page(&request(), "tok", None, None);
         for token in ["cc-name", "cc-number", "cc-exp", "cc-csc", "postal-code"] {
             assert!(
                 html.contains(&format!("autocomplete=\"{token}\"")),
@@ -326,11 +393,43 @@ mod tests {
         }
     }
 
+    /// A second payment the user asked for looks exactly like a first one.
+    /// The row knows the difference, so the page has to say it.
+    #[test]
+    fn a_confirmed_duplicate_warns_that_this_pays_twice() {
+        let mut second = request();
+        second.duplicate_confirmed = true;
+        second.duplicate_of = Some("r0".into());
+        let mut earlier = request();
+        earlier.id = "r0".into();
+        earlier.status = PaymentStatus::Used;
+        // 2026-09-11 16:03 UTC.
+        earlier.used_at = Some(1_789_142_580_000);
+
+        let html = form_page(&second, "tok", None, Some(&earlier));
+        assert!(html.contains("This is a second payment"), "{html}");
+        assert!(html.contains("You already paid USD 46.00"), "{html}");
+        assert!(html.contains("2026-09-11 16:03 UTC"), "{html}");
+        assert!(
+            html.contains("Steamship &lt;Authority&gt;") && !html.contains("<Authority>"),
+            "the earlier merchant is escaped too"
+        );
+        assert!(
+            html.find("second payment").unwrap() < html.find("<form").unwrap(),
+            "the warning has to come before the fields"
+        );
+
+        assert!(
+            !form_page(&request(), "tok", None, None).contains("second payment"),
+            "an ordinary request must not cry wolf"
+        );
+    }
+
     /// A rejected form is re-rendered from the request alone, so nothing
     /// the user typed can be in it.
     #[test]
     fn an_error_rerender_never_echoes_the_card() {
-        let html = form_page(&request(), "tok", Some("That card has expired."));
+        let html = form_page(&request(), "tok", Some("That card has expired."), None);
         assert!(html.contains("That card has expired."));
         let inputs: Vec<&str> = html
             .split("<input")

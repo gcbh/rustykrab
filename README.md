@@ -225,6 +225,7 @@ All configuration is via environment variables. No plaintext config files.
 | `RUSTYKRAB_PUBLIC_URL` | unset | Base URL the agent puts in a credential or payment-approval link, e.g. `https://mac.tailnet.ts.net`. Unset, the agent falls back to telling the user a prompt is waiting in the app — so a link is never minted and the failure is silent |
 | `RUSTYKRAB_TAILNET_USERS` | unset | Comma-separated tailnet logins allowed to open a credential or payment-approval page. Empty means any authenticated tailnet user. Requires `tailscale serve` in front to inject `Tailscale-User-Login` |
 | `RUSTYKRAB_PAYMENT_COOLDOWN_SECS` | `30` | Seconds after one payment is pressed before another may be claimed, across every conversation. Not a limit on what the user may buy — each purchase is approved separately — but on how fast the agent can act on approvals it already holds, so a retry loop is caught by a human before it can run. `0` disables the throttle; a value that is not a whole number of seconds is ignored with a warning and the default kept. Independent of the single-spend lock, which is unconditional: one payment may be in flight at a time and each approval is spendable exactly once |
+| `RUSTYKRAB_PAYMENT_DUPLICATE_WINDOW_HOURS` | `24` | Hours back over which a payment counts as a repeat of one being filed now. The same site, amount and currency inside the window is held rather than sent to the user for approval: nothing is paid, the user is told, and the agent is told to stop. `0` disables the hold; a value that is not a whole number of hours is ignored with a warning and the default kept. The key is deliberately the origin, amount and currency — not the merchant name or the description, both of which the model writes and could reword its way past |
 | | | When enabled, this also starts a **downtime analysis worker**: read-only, it aggregates recorded outcomes and logs a digest once the system has been quiet for 10 minutes, abandoning a pass if activity arrives mid-flight. It never writes and never calls a model |
 
 ### Persisting credentials
@@ -305,6 +306,28 @@ export RUSTYKRAB_ALLOWED_ORIGINS=https://<mac>.<tailnet>.ts.net
 
 `RUSTYKRAB_ALLOWED_ORIGINS` matters: the form posts back from that origin,
 and the origin check rejects a POST it does not recognise.
+
+### Paying twice for the same thing
+
+Each approval is spendable exactly once, and one payment may be in flight at
+a time. Neither stops the agent buying the *same thing* twice: a turn resumed
+from a stale summary, a cron re-run, or the user asking again because no
+confirmation arrived, and it files a fresh request for a purchase already
+made. The user then sees a perfectly plausible approval page.
+
+So a request that repeats an earlier one — the same origin, amount and
+currency within `RUSTYKRAB_PAYMENT_DUPLICATE_WINDOW_HOURS` (24 h) of a
+payment that is live or already made — is **held**. No approval link is
+minted, nothing is paid, and the user is sent a message saying what was
+stopped and what it looked like a repeat of. The same check runs again at the
+pay button, for a twin paid in between, and refuses the press.
+
+Only the user can override it. If they reply asking to pay a second time, the
+agent files the request again with `confirm_duplicate`, which the store
+honours *only* when a held request for the same purchase already exists in
+that conversation — so the agent cannot set the flag pre-emptively and skip
+the check. The resulting approval page carries a warning that this is a
+second payment, naming the first.
 
 Without `tailscale serve` in front there is no `Tailscale-User-Login`
 header, so the page refuses every request — which is the intended failure.

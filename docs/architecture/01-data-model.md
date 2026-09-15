@@ -130,7 +130,8 @@ table. And `credential_requests.conversation_id` is an unenforced reference.
 payment_requests(id PK, conversation_id, merchant, origin, amount_minor,
                  currency, description, status, created_at, decided_at,
                  decided_by, card_last4, used_at, link_token_hash,
-                 link_expires_at, claimed_at)
+                 link_expires_at, claimed_at, duplicate_of,
+                 duplicate_confirmed)
 ```
 
 One purchase the agent asked the user to approve: the merchant, the exact
@@ -142,14 +143,15 @@ daemon restarts. The row is the approval and its audit trail; `card_last4` is
 the only card-derived value kept. Like credential links, only the hash of the
 one-time approval link is stored.
 
-Status runs `pending → authorized → paying → used`, with `declined`, `expired`
-and `superseded` as the other terminal states. An `authorized` row whose card
-is no longer in the vault is marked `expired` the next time anything asks, so
-the record never claims an approval nothing can act on. The partial index
+Status runs `pending → authorized → paying → used`, with `declined`, `expired`,
+`superseded` and `held` as the other terminal states. An `authorized` row whose
+card is no longer in the vault is marked `expired` the next time anything asks,
+so the record never claims an approval nothing can act on. The partial index
 `idx_payment_requests_live ON (conversation_id) WHERE status IN ('pending',
 'authorized', 'paying')` serves the one-purchase-per-conversation supersede and
 the browser's "may this conversation pay here" lookup; a `paying` row is live,
-because it is a press in flight. `conversation_id` is an unenforced reference,
+because it is a press in flight, and a `held` row is not, because it was stopped
+before the user was ever asked. `conversation_id` is an unenforced reference,
 for the same audit reason as on `credential_requests`.
 
 **`paying` is the single-spend lock, and the row is where it lives.** Tool
@@ -195,6 +197,74 @@ the press would have happened and keeps a long-stuck lock from imposing a fresh
 cooldown the moment it clears. The sweep runs in `sweep_expired` and at the head
 of `claim_for_pay` and `authorized_for`, so a crash cannot wedge the global lock
 until someone notices.
+
+**`held` stops the same purchase being made twice.** Everything above protects
+one *approval* from being spent twice; none of it stops the agent buying the
+same thing twice. An agent that has lost track of a booking it already made —
+a turn resumed from a stale summary, a cron re-run, the user asking again
+because no confirmation email arrived — files a fresh request, the user sees a
+plausible approval page for a purchase they do want, and pays for the ferry
+twice. Each half is correct in isolation, which is why nothing caught it.
+
+The **duplicate key** is `(origin, amount_minor, currency)` within
+`DEFAULT_DUPLICATE_WINDOW_MS` (24 h, `Store::with_duplicate_window_ms` from
+`RUSTYKRAB_PAYMENT_DUPLICATE_WINDOW_HOURS`; `0` disables). `description` and
+`merchant` are deliberately *not* in the key: both are model-authored, and a key
+the model can reword its way past is not a key. The origin is canonicalised from
+the checkout URL and is what the card is actually bound to. A day is the shape
+of the mistake — the same site and amount a week later is more likely a standing
+order.
+
+`file` looks for an earlier request matching the key whose status is live or
+spent — `pending`, `authorized`, `paying`, `used`, `held` — with one exclusion:
+within the *same* conversation a `pending` or `authorized` prior is the ordinary
+re-file (the cart total changed) and is handled by the supersede path, so it
+does not count. A `used` or `paying` prior in the same conversation does count,
+and across conversations everything in that list counts. `declined`, `expired`
+and `superseded` never count: each is a request that demonstrably produced no
+charge. On a match the new row is inserted `status = 'held'` with `duplicate_of`
+naming the earlier *payment*, no approval link is minted, and — importantly —
+nothing is superseded, because a hold must not kill a live approval the user
+already gave.
+
+**The model cannot opt out.** `PaymentTerms::confirm_duplicate` is honoured only
+when a `held` row with the same key already exists **in the same conversation**,
+i.e. the agent was stopped and the user answered. Then the new row is filed
+`pending` with `duplicate_confirmed = 1`, `duplicate_of` pointing at the payment
+(not at the hold), and the held row is marked `superseded`. Set on a first
+attempt, where no held row exists, the flag is ignored entirely and the request
+is judged as if it were absent — otherwise the whole check would be one JSON
+field away from being switched off by the party it exists to restrain.
+
+The check runs a second time in `claim_for_pay`, because a twin can be approved
+and paid in the minutes between filing and the browser reaching the pay button,
+and by then a hold is no longer available. The clause added to the same
+conditional `UPDATE`:
+
+```sql
+   AND (duplicate_confirmed = 1 OR ?window_ms = 0
+        OR NOT EXISTS (SELECT 1 FROM payment_requests AS twin
+                        WHERE twin.id <> ?id
+                          AND twin.status IN ('used', 'paying')
+                          AND twin.origin = payment_requests.origin
+                          AND twin.amount_minor = payment_requests.amount_minor
+                          AND twin.currency = payment_requests.currency
+                          AND ABS(twin.created_at
+                                  - payment_requests.created_at) < ?window_ms))
+```
+
+The window is measured between the two rows rather than from now, so it says the
+same thing the key at filing says whichever row came first. The refusal is
+`PayRefusal::Duplicate { earlier }`, carrying the earlier payment so the model
+can say *what* it nearly paid twice; `retry_safe()` is false, and the diagnosis
+checks it **before** `AnotherPaymentInFlight` and `Cooldown` even though all
+three may hold at once — those two say "wait and press again", which here is a
+loop ending in the second charge.
+
+The partial index `idx_payment_requests_dup ON (origin, amount_minor, currency,
+created_at) WHERE status IN ('pending', 'authorized', 'paying', 'used', 'held')`
+serves both lookups, and excludes the terminal rows that make up the bulk of an
+old table and can never match.
 
 ### Devices and pairing
 
