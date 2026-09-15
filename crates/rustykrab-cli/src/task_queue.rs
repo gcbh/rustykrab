@@ -36,6 +36,15 @@ pub enum TaskSource {
         /// Store key of the credential, for logs and deduplication.
         credential_name: String,
     },
+    /// The user approved a purchase and supplied its card; the turn that
+    /// stopped at checkout can go and pay. Resumed exactly like a credential
+    /// wake, with its own prompt.
+    PaymentAuthorized {
+        /// The conversation that filed the payment request.
+        conversation_id: String,
+        /// The payment request, for logs.
+        request_id: String,
+    },
 }
 
 /// How many iterations a resumed turn may take before it is cut off.
@@ -68,6 +77,27 @@ pub fn credential_wake_prompt(credential_name: &str, service: Option<&str>) -> S
          anything you type will be wrong.\n\n\
          Do not ask for the credential again, and do not repeat any value back \
          to me."
+    )
+}
+
+/// The turn appended when the user approves a purchase.
+///
+/// Names the two browser actions and says the agent holds no card, for the
+/// reasons `credential_wake_prompt` spells out: left unsaid, a resumed model
+/// improvises, and one improvisation at a checkout is typing a made-up card.
+pub fn payment_wake_prompt(merchant: &str, amount: &str, origin: &str) -> String {
+    format!(
+        "The user approved paying {merchant} up to {amount} on {origin}, and the card is \
+         ready. Carry on from where you stopped.\n\n\
+         Take a fresh browser snapshot of the checkout (go back to it on {origin} if you \
+         left). Fill each card field with browser(action='fill_payment', ref=<ref>, \
+         field=...) using field='number', 'expiry' (or 'exp_month' and 'exp_year' for \
+         separate boxes), 'cvc', 'name' and, if asked, 'postal_code'. Then press the \
+         checkout's pay button with browser(action='pay', ref=<ref>). The browser supplies \
+         the card — you do not have it and must not type one. Pay checks the page total \
+         against the approval and can only be pressed once; the approval lasts 15 minutes.\n\n\
+         When it is done, tell me what the confirmation page says. Do not repeat any card \
+         detail back to me."
     )
 }
 
@@ -196,6 +226,13 @@ async fn execute_task(task: &TaskRequest, state: &AppState, store: &rustykrab_st
             credential_name,
         } => {
             execute_credential_wake(conversation_id, credential_name, &task.prompt, state).await;
+        }
+        TaskSource::PaymentAuthorized {
+            conversation_id,
+            request_id,
+        } => {
+            let label = format!("payment {request_id}");
+            execute_credential_wake(conversation_id, &label, &task.prompt, state).await;
         }
     }
 }
@@ -961,6 +998,27 @@ async fn deliver_text(
 #[cfg(test)]
 mod wake_prompt_tests {
     use super::*;
+
+    #[test]
+    fn the_payment_wake_names_both_actions_and_holds_no_card() {
+        let p = payment_wake_prompt(
+            "Steamship Authority",
+            "USD 46.00",
+            "https://www.steamshipauthority.com",
+        );
+        for needed in [
+            "fill_payment",
+            "action='pay'",
+            "snapshot",
+            "USD 46.00",
+            "Steamship Authority",
+            "you do not have it and must not type one",
+            "only be pressed once",
+            "Do not repeat any card detail",
+        ] {
+            assert!(p.contains(needed), "missing {needed:?}: {p}");
+        }
+    }
 
     /// The prompt used to say "retry the tool that failed". Nothing had
     /// failed — the agent hit a login wall, which is not a tool error —
