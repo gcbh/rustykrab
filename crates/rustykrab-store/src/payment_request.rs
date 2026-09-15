@@ -13,7 +13,7 @@
 //! the approval page goes into [`CardVault`], an in-memory map keyed by the
 //! request it pays for, and is gone the moment any of these happen:
 //!
-//! - the agent presses pay ([`PaymentRequestStore::mark_used`]),
+//! - the agent claims the press ([`PaymentRequestStore::claim_for_pay`]),
 //! - [`CARD_TTL`] passes,
 //! - the conversation files a newer payment request (superseded),
 //! - the daemon restarts.
@@ -26,6 +26,41 @@
 //! separate. A card the user typed this minute is one source for the vault
 //! slot; a saved card chosen from a wallet could be another, without the
 //! approval record changing shape.
+//!
+//! ## Why pressing pay is a claim, not a read
+//!
+//! An audit of the concurrent path found a silent double charge. Tool calls
+//! in one model turn run concurrently (`MAX_CONCURRENT_TOOL_CALLS`), and the
+//! old `pay` read the card with [`PaymentRequestStore::authorized_for`],
+//! which hands back a *clone*: two `pay` calls on the same approved request
+//! both got a card, both pressed, and the second `mark_used` updated zero
+//! rows and discarded the count. Nothing in the store stood between the user
+//! and two charges — only the model's habit of calling `pay` once a turn.
+//!
+//! So the press is now *claimed* before it happens.
+//! [`PaymentRequestStore::claim_for_pay`] moves the row
+//! `authorized → paying` in one conditional `UPDATE` whose rows-affected
+//! count must be exactly 1, and only the winner of that row is handed the
+//! card — taken out of the vault, not copied. Three things ride on that one
+//! statement:
+//!
+//! - **Single spend.** A second claim on the same request sees a row that is
+//!   no longer `authorized`.
+//! - **A global lock.** The statement also refuses if *any* row is `paying`.
+//!   One press is in flight at a time across the whole daemon; a checkout is
+//!   a serial act and two at once is far more likely a runaway loop than two
+//!   genuine purchases.
+//! - **A throttle.** It refuses while any row was marked `used` inside the
+//!   cooldown ([`DEFAULT_PAY_COOLDOWN`], operator-tunable), so a model that
+//!   retries across turns cannot spend approval after approval in seconds.
+//!
+//! `paying` is not a state anything may sit in forever: a daemon killed
+//! mid-press would otherwise hold the global lock for good. A claim older
+//! than [`STALE_CLAIM_MS`] is swept to `used` — never back to `authorized`,
+//! because the press may well have reached the merchant and the card is the
+//! user's, not ours to spend on a guess. The one route back to `authorized`
+//! is [`PaymentRequestStore::release_claim`], for a press the browser can
+//! prove never left the process (`failed_before_press`).
 
 use std::collections::HashMap;
 use std::fmt;
@@ -52,6 +87,25 @@ pub const CARD_TTL: Duration = Duration::from_secs(15 * 60);
 /// A checkout session rarely outlives an hour, so an approval arriving
 /// later than that would authorise a cart that no longer exists.
 pub const PENDING_TTL_MS: i64 = 60 * 60 * 1000;
+
+/// How long a claimed press may stand before it is assumed abandoned.
+///
+/// Generous next to a click — a slow checkout, a page that hangs on submit,
+/// a browser restart — and short enough that a daemon killed mid-press does
+/// not hold the global pay lock until someone notices. A claim this old is
+/// swept to `used`, never back to `authorized`: whatever happened, it may
+/// have been a charge.
+pub const STALE_CLAIM_MS: i64 = 2 * 60 * 1000;
+
+/// How long after one press the next claim is refused, across every
+/// conversation.
+///
+/// Not a limit on what the user may buy — each purchase is separately
+/// approved — but on how fast an agent can act on approvals it already
+/// holds. Long enough that a retry loop is caught by a human before it can
+/// run, short enough not to obstruct someone paying for two things in a row.
+/// `Duration::ZERO` disables it.
+pub const DEFAULT_PAY_COOLDOWN: Duration = Duration::from_secs(30);
 
 fn now_ms() -> i64 {
     Utc::now().timestamp_millis()
@@ -420,6 +474,28 @@ impl CardVault {
         }
     }
 
+    /// The card for a request, removed on the way out, with the deadline it
+    /// was holding.
+    ///
+    /// The taking is the point: a claimed press is the one press, so the
+    /// winner of the row gets the only copy and nothing is left for a
+    /// concurrent caller to find. The deadline comes back so a press that
+    /// provably never happened can put the card back on its *original*
+    /// clock ([`PaymentRequestStore::release_claim`]) — restoring a fresh
+    /// [`CARD_TTL`] would let a loop of claim-and-release keep a card in
+    /// memory indefinitely.
+    fn take(&self, request_id: &str) -> Option<(CardDetails, Instant)> {
+        match self.lock().remove(request_id) {
+            Some(held) if held.expires > Instant::now() => Some((held.card, held.expires)),
+            _ => None,
+        }
+    }
+
+    fn put_until(&self, request_id: &str, card: CardDetails, expires: Instant) {
+        self.lock()
+            .insert(request_id.to_string(), Held { card, expires });
+    }
+
     fn remove(&self, request_id: &str) {
         self.lock().remove(request_id);
     }
@@ -436,8 +512,15 @@ pub enum PaymentStatus {
     /// Filed; the user has not answered.
     Pending,
     /// The user supplied a card and approved the terms. The card is in the
-    /// vault until used or expired.
+    /// vault until claimed or expired.
     Authorized,
+    /// A press is claimed and in flight. The card has left the vault, and
+    /// no other request may be claimed while this one stands. Reached only
+    /// through [`PaymentRequestStore::claim_for_pay`], and left only for
+    /// `used` (pressed, or the claim went stale) or back to `authorized`
+    /// through [`PaymentRequestStore::release_claim`], for a press that
+    /// provably never reached the page.
+    Paying,
     /// The agent pressed pay. Terminal, and the card is gone.
     Used,
     /// The user said no.
@@ -452,6 +535,7 @@ impl PaymentStatus {
         match self {
             PaymentStatus::Pending => "pending",
             PaymentStatus::Authorized => "authorized",
+            PaymentStatus::Paying => "paying",
             PaymentStatus::Used => "used",
             PaymentStatus::Declined => "declined",
             PaymentStatus::Expired => "expired",
@@ -463,6 +547,7 @@ impl PaymentStatus {
         Ok(match raw {
             "pending" => PaymentStatus::Pending,
             "authorized" => PaymentStatus::Authorized,
+            "paying" => PaymentStatus::Paying,
             "used" => PaymentStatus::Used,
             "declined" => PaymentStatus::Declined,
             "expired" => PaymentStatus::Expired,
@@ -516,11 +601,149 @@ pub enum AuthorizedPayment {
     },
 }
 
+// ── claiming a press ─────────────────────────────────────────────────
+
+/// The card, out of the vault, on the clock it was already keeping.
+///
+/// Holding one is holding the only copy: [`CardVault::take`] removed it.
+/// Dropping it erases the card (every field is `Zeroizing`) and the
+/// approval is never usable again — which is the right outcome for a press
+/// whose result is unknown. Handing it back to
+/// [`PaymentRequestStore::release_claim`] is the only way to undo that, and
+/// only a caller who can prove the press never happened may do it.
+pub struct ClaimedCard {
+    card: CardDetails,
+    /// The vault deadline this card was under, so a release restores its
+    /// remaining life rather than a fresh [`CARD_TTL`].
+    expires: Instant,
+}
+
+impl fmt::Debug for ClaimedCard {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ClaimedCard")
+            .field("card", &self.card)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ClaimedCard {
+    pub fn card(&self) -> &CardDetails {
+        &self.card
+    }
+}
+
+/// A won claim: the row is `paying`, and this is the card it may press with.
+#[derive(Debug)]
+pub struct PayClaim {
+    pub request: Box<PaymentRequest>,
+    pub card: ClaimedCard,
+}
+
+/// Why a press was not claimed.
+///
+/// Typed rather than a string, because the browser turns each kind into a
+/// different `retry_safe` and the model is told a different thing to do
+/// next. Every message is written for the model: it says what happened and
+/// what its next move is, since "no" on its own is an invitation to press
+/// something else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PayRefusal {
+    /// The row is not `authorized`. `Used` and `Paying` are the interesting
+    /// cases — this approval is already spent or already claimed — and
+    /// `Expired` is what a claim whose card had left the vault becomes.
+    NotAuthorized { status: PaymentStatus },
+    /// Some *other* request is mid-press. One checkout at a time.
+    AnotherPaymentInFlight,
+    /// Something was paid too recently.
+    Cooldown { remaining: Duration },
+}
+
+impl PayRefusal {
+    /// What to tell the model. Never suggests a way around the refusal.
+    pub fn message(&self) -> String {
+        match self {
+            PayRefusal::NotAuthorized {
+                status: PaymentStatus::Used,
+            } => "This purchase has already been paid for. Do not press pay again and do not \
+                  press any other button on this checkout — a second press could charge the \
+                  user twice. Take a snapshot to read what the page says, and tell the user \
+                  what happened."
+                .into(),
+            PayRefusal::NotAuthorized {
+                status: PaymentStatus::Paying,
+            } => "A press for this same purchase is already in flight. Do not press pay again \
+                  and do not press any other button. Wait 5 seconds, then call pay once more; \
+                  if it is refused again, take a snapshot and tell the user what the page shows."
+                .into(),
+            PayRefusal::NotAuthorized {
+                status: PaymentStatus::Expired,
+            } => "The user's approval for this purchase has run out, so there is no card to \
+                  pay with. Do not press pay or any other button. File a new payment_request \
+                  with this checkout's url, merchant and total, tell the user in one sentence, \
+                  and stop until they approve."
+                .into(),
+            PayRefusal::NotAuthorized { status } => format!(
+                "This purchase is '{}', not approved, so it cannot be paid. Do not press pay \
+                 or any other button on this checkout. Tell the user, and file a new \
+                 payment_request only if they still want it.",
+                status.as_str()
+            ),
+            PayRefusal::AnotherPaymentInFlight => {
+                "Another purchase is being paid for right now, and only one payment may be in \
+                 flight at a time. Do not press pay again and do not press any other button. \
+                 Wait 5 seconds, then call pay once more; if it is refused again, stop and tell \
+                 the user."
+                    .into()
+            }
+            PayRefusal::Cooldown { remaining } => format!(
+                "Something was paid too recently: payments are throttled, and this one is \
+                 refused for another {} seconds. Do not press pay again and do not press any \
+                 other button. Wait {} seconds, then call pay once more; if it is refused \
+                 again, stop and tell the user.",
+                remaining.as_secs() + 1,
+                remaining.as_secs() + 1,
+            ),
+        }
+    }
+
+    /// Whether calling `pay` again could succeed without another approval.
+    ///
+    /// False for anything that needs the user: a spent, expired or declined
+    /// approval is not coming back on a retry.
+    pub fn retry_safe(&self) -> bool {
+        match self {
+            PayRefusal::NotAuthorized {
+                status: PaymentStatus::Paying,
+            } => true,
+            PayRefusal::NotAuthorized { .. } => false,
+            PayRefusal::AnotherPaymentInFlight | PayRefusal::Cooldown { .. } => true,
+        }
+    }
+
+    /// A short tag for logs and tool output.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            PayRefusal::NotAuthorized { .. } => "not_authorized",
+            PayRefusal::AnotherPaymentInFlight => "another_payment_in_flight",
+            PayRefusal::Cooldown { .. } => "cooldown",
+        }
+    }
+}
+
+impl fmt::Display for PayRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message())
+    }
+}
+
 #[derive(Clone)]
 pub struct PaymentRequestStore {
     conn: Arc<Mutex<rusqlite::Connection>>,
     vault: CardVault,
     notifier: Option<Arc<dyn RequestNotifier>>,
+    /// How long after one press the next claim is refused. See
+    /// [`DEFAULT_PAY_COOLDOWN`].
+    pay_cooldown: Duration,
 }
 
 const COLUMNS: &str = "id, conversation_id, merchant, origin, amount_minor, currency, \
@@ -590,12 +813,20 @@ impl PaymentRequestStore {
             conn,
             vault,
             notifier: None,
+            pay_cooldown: DEFAULT_PAY_COOLDOWN,
         }
     }
 
     /// Attach whatever resumes the conversation once a payment is approved.
     pub fn with_notifier(mut self, notifier: Arc<dyn RequestNotifier>) -> Self {
         self.notifier = Some(notifier);
+        self
+    }
+
+    /// How long after one press the next claim is refused.
+    /// `Duration::ZERO` disables the throttle.
+    pub fn with_pay_cooldown(mut self, cooldown: Duration) -> Self {
+        self.pay_cooldown = cooldown;
         self
     }
 
@@ -863,11 +1094,19 @@ impl PaymentRequestStore {
     /// An authorised row whose card is no longer in the vault — a restart,
     /// or [`CARD_TTL`] passing — is marked expired here, so the answer and
     /// the record agree.
+    ///
+    /// Only `authorized` rows are considered, so a request whose press is
+    /// already claimed (`paying`) or spent (`used`) answers "nothing here"
+    /// — which is what stops `fill_payment` typing a card into a checkout
+    /// that is already being paid for.
     pub async fn authorized_for(
         &self,
         conversation_id: Uuid,
         origin: &str,
     ) -> Result<AuthorizedPayment, Error> {
+        // A claim abandoned by a crashed daemon would otherwise leave its
+        // row `paying` for good, hiding an approval that is in fact spent.
+        self.sweep_stale_claims().await?;
         let conv = conversation_id.to_string();
         let rows = crate::with_conn(&self.conn, move |conn| {
             let mut stmt = conn
@@ -908,22 +1147,203 @@ impl PaymentRequestStore {
         })
     }
 
-    /// The agent pressed pay. The approval is spent and the card erased,
-    /// whatever the checkout then does: a second press after an uncertain
-    /// outcome could charge twice, and the user can approve again.
-    pub async fn mark_used(&self, id: &str) -> Result<(), Error> {
-        self.vault.remove(id);
+    /// Claim the one press this approval allows.
+    ///
+    /// The whole single-spend guarantee is the rows-affected count of one
+    /// `UPDATE`. It moves `authorized → paying` only if this row is still
+    /// `authorized`, no *other* row is mid-press, and nothing was paid
+    /// inside the cooldown — so two concurrent callers cannot both leave
+    /// with a card, and the loser is told which of the three it lost to.
+    /// See the module docs for the double charge that put it here.
+    ///
+    /// The card is *taken* out of the vault, not copied: whoever wins the
+    /// row gets the only copy, and the loser gets neither row nor card.
+    /// A won row with no card left (the [`CARD_TTL`] ran out, or the daemon
+    /// restarted since the approval) is marked `expired` rather than handed
+    /// back — the approval is unusable, and leaving it `paying` would hold
+    /// the global lock for a press that can never happen.
+    ///
+    /// `Err` is a database failure. A refusal is an ordinary answer.
+    pub async fn claim_for_pay(&self, id: &str) -> Result<Result<PayClaim, PayRefusal>, Error> {
+        // Before judging "another payment is in flight", make sure the
+        // in-flight one is real and not a crash from ten minutes ago.
+        self.sweep_stale_claims().await?;
+
         let row_id = id.to_string();
-        crate::with_conn(&self.conn, move |conn| {
+        let now = now_ms();
+        let cooldown_ms = i64::try_from(self.pay_cooldown.as_millis()).unwrap_or(i64::MAX);
+        let claimed = crate::with_conn(&self.conn, move |conn| {
+            // One statement, one connection, one lock: the diagnosis below
+            // runs against the same state the UPDATE just saw.
+            let rows = conn
+                .execute(
+                    "UPDATE payment_requests
+                        SET status = 'paying', claimed_at = ?2
+                      WHERE id = ?1 AND status = 'authorized'
+                        AND NOT EXISTS (SELECT 1 FROM payment_requests
+                                         WHERE status = 'paying' AND id <> ?1)
+                        AND NOT EXISTS (SELECT 1 FROM payment_requests
+                                         WHERE status = 'used' AND used_at > ?2 - ?3)",
+                    params![row_id, now, cooldown_ms],
+                )
+                .map_err(storage)?;
+            match rows {
+                1 => {
+                    let (row, status) = conn
+                        .query_row(
+                            &format!("SELECT {COLUMNS} FROM payment_requests WHERE id = ?1"),
+                            params![row_id],
+                            row_to_request,
+                        )
+                        .map_err(storage)?;
+                    Ok(Ok(row.into_request(&status)?))
+                }
+                0 => Ok(Err(diagnose_refusal(conn, &row_id, now, cooldown_ms)?)),
+                other => Err(Error::Storage(format!(
+                    "claiming payment request {row_id} touched {other} rows; id is the \
+                     primary key, so the schema is not the one this code was written for"
+                ))),
+            }
+        })
+        .await?;
+
+        let request = match claimed {
+            Ok(request) => request,
+            Err(refusal) => return Ok(Err(refusal)),
+        };
+        match self.vault.take(id) {
+            Some((card, expires)) => Ok(Ok(PayClaim {
+                request: Box::new(request),
+                card: ClaimedCard { card, expires },
+            })),
+            None => {
+                tracing::info!(
+                    request = %id,
+                    "pay claim won a row whose card had already left the vault; expiring it"
+                );
+                self.expire(id).await?;
+                Ok(Err(PayRefusal::NotAuthorized {
+                    status: PaymentStatus::Expired,
+                }))
+            }
+        }
+    }
+
+    /// The claimed press happened. The approval is spent whatever the
+    /// checkout then does: a second press after an uncertain outcome could
+    /// charge twice, and the user can approve again.
+    ///
+    /// Only a `paying` row may be marked used, so this cannot quietly spend
+    /// an approval nobody claimed — the zero-rows case the audit found is
+    /// now an error rather than a shrug.
+    pub async fn mark_used(&self, id: &str) -> Result<(), Error> {
+        let row_id = id.to_string();
+        let updated = crate::with_conn(&self.conn, move |conn| {
             conn.execute(
                 "UPDATE payment_requests SET status = 'used', used_at = ?2
-                  WHERE id = ?1 AND status = 'authorized'",
+                  WHERE id = ?1 AND status = 'paying'",
                 params![row_id, now_ms()],
             )
-            .map_err(storage)?;
-            Ok(())
+            .map_err(storage)
         })
-        .await
+        .await?;
+        if updated == 0 {
+            // Deliberately before touching the vault: a refused mark_used
+            // must leave the approval exactly as it found it, card
+            // included, or a stray call would quietly disarm a live one.
+            return Err(Error::AlreadyExists(format!(
+                "payment request {id} is not mid-press, so it cannot be recorded as paid \
+                 (claim it with claim_for_pay first)"
+            )));
+        }
+        // The claim already took the card; this is belt and braces for a
+        // caller that reached `paying` another way.
+        self.vault.remove(id);
+        Ok(())
+    }
+
+    /// Give back a claim for a press that provably never reached the page.
+    ///
+    /// The only route from `paying` back to `authorized`, and it exists for
+    /// exactly one case: the browser knows the click failed before any
+    /// input left the process (`actions::failed_before_press`). Anything
+    /// less certain must stay spent.
+    ///
+    /// The card goes back on the clock it was already keeping, not a fresh
+    /// [`CARD_TTL`] — otherwise a claim/release loop would keep a card in
+    /// memory long past the fifteen minutes the user agreed to.
+    pub async fn release_claim(&self, id: &str, card: ClaimedCard) -> Result<(), Error> {
+        let row_id = id.to_string();
+        let released = crate::with_conn(&self.conn, move |conn| {
+            conn.execute(
+                "UPDATE payment_requests SET status = 'authorized', claimed_at = NULL
+                  WHERE id = ?1 AND status = 'paying'",
+                params![row_id],
+            )
+            .map_err(storage)
+        })
+        .await?;
+        if released == 0 {
+            // `card` drops here, and with it the only copy: a row that is
+            // not `paying` must not get its card back.
+            return Err(Error::AlreadyExists(format!(
+                "payment request {id} is not mid-press, so there is no claim to release"
+            )));
+        }
+        self.vault.put_until(id, card.card, card.expires);
+        Ok(())
+    }
+
+    /// Retire claims older than [`STALE_CLAIM_MS`].
+    ///
+    /// To `used`, never back to `authorized`. A claim this old means the
+    /// daemon died between the claim and the press, and from here there is
+    /// no way to know whether the merchant was charged — so the approval is
+    /// treated as spent and the user asked again if they still want it. The
+    /// alternative, releasing it, risks the second charge this whole
+    /// mechanism exists to prevent.
+    ///
+    /// `used_at` is set to the claim time rather than now: that is when the
+    /// press, if there was one, happened, and it keeps a lock stuck for an
+    /// hour from imposing a fresh cooldown the moment it is cleared.
+    async fn sweep_stale_claims(&self) -> Result<usize, Error> {
+        let cutoff = now_ms() - STALE_CLAIM_MS;
+        let stale = crate::with_conn(&self.conn, move |conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id FROM payment_requests
+                      WHERE status = 'paying' AND COALESCE(claimed_at, 0) <= ?1",
+                )
+                .map_err(storage)?;
+            let ids: Vec<String> = stmt
+                .query_map(params![cutoff], |row| row.get::<_, String>(0))
+                .map_err(storage)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(storage)?;
+            drop(stmt);
+            if !ids.is_empty() {
+                conn.execute(
+                    "UPDATE payment_requests
+                        SET status = 'used', used_at = COALESCE(used_at, claimed_at, ?2)
+                      WHERE status = 'paying' AND COALESCE(claimed_at, 0) <= ?1",
+                    params![cutoff, now_ms()],
+                )
+                .map_err(storage)?;
+            }
+            Ok(ids)
+        })
+        .await?;
+        for id in &stale {
+            self.vault.remove(id);
+        }
+        if !stale.is_empty() {
+            tracing::warn!(
+                count = stale.len(),
+                "payment claims were abandoned mid-press and are recorded as spent; \
+                 the daemon may have stopped between claiming and pressing"
+            );
+        }
+        Ok(stale.len())
     }
 
     async fn expire(&self, id: &str) -> Result<(), Error> {
@@ -933,8 +1353,9 @@ impl PaymentRequestStore {
             conn.execute(
                 "UPDATE payment_requests
                     SET status = 'expired', decided_at = COALESCE(decided_at, ?2),
+                        claimed_at = NULL,
                         link_token_hash = NULL, link_expires_at = NULL
-                  WHERE id = ?1 AND status IN ('pending', 'authorized')",
+                  WHERE id = ?1 AND status IN ('pending', 'authorized', 'paying')",
                 params![row_id, now_ms()],
             )
             .map_err(storage)?;
@@ -943,9 +1364,11 @@ impl PaymentRequestStore {
         .await
     }
 
-    /// Mark unanswered requests past [`PENDING_TTL_MS`] expired.
+    /// Mark unanswered requests past [`PENDING_TTL_MS`] expired, and retire
+    /// claims past [`STALE_CLAIM_MS`]. Returns how many rows moved.
     pub async fn sweep_expired(&self) -> Result<usize, Error> {
-        crate::with_conn(&self.conn, |conn| {
+        let stale = self.sweep_stale_claims().await?;
+        let expired = crate::with_conn(&self.conn, |conn| {
             conn.execute(
                 "UPDATE payment_requests
                     SET status = 'expired', decided_at = ?2,
@@ -955,8 +1378,71 @@ impl PaymentRequestStore {
             )
             .map_err(storage)
         })
-        .await
+        .await?;
+        Ok(stale + expired)
     }
+}
+
+/// Why a claim that touched no rows was refused, read from the same
+/// connection the `UPDATE` ran on.
+///
+/// The order matters: the row's own status is the most specific answer, and
+/// only once it is `authorized` — so this request itself is fine — is the
+/// refusal about something else on the machine.
+fn diagnose_refusal(
+    conn: &rusqlite::Connection,
+    id: &str,
+    now: i64,
+    cooldown_ms: i64,
+) -> Result<PayRefusal, Error> {
+    let status: String = conn
+        .query_row(
+            "SELECT status FROM payment_requests WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        )
+        .map_err(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => {
+                Error::NotFound(format!("payment request '{id}'"))
+            }
+            other => storage(other),
+        })?;
+    let status = PaymentStatus::parse(&status)?;
+    if status != PaymentStatus::Authorized {
+        return Ok(PayRefusal::NotAuthorized { status });
+    }
+
+    let in_flight: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM payment_requests
+                            WHERE status = 'paying' AND id <> ?1)",
+            params![id],
+            |row| row.get(0),
+        )
+        .map_err(storage)?;
+    if in_flight {
+        return Ok(PayRefusal::AnotherPaymentInFlight);
+    }
+
+    let last_used: Option<i64> = conn
+        .query_row(
+            "SELECT MAX(used_at) FROM payment_requests WHERE status = 'used'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(storage)?;
+    if let Some(used_at) = last_used.filter(|used_at| *used_at > now - cooldown_ms) {
+        let remaining = (used_at + cooldown_ms - now).max(0);
+        return Ok(PayRefusal::Cooldown {
+            remaining: Duration::from_millis(remaining as u64),
+        });
+    }
+
+    // The row is authorised and nothing blocks it now, so the claim lost a
+    // race to something that has since resolved — another claim that was
+    // released, or a sweep. Retryable, and "wait, then try once" is the
+    // right instruction for it.
+    Ok(PayRefusal::AnotherPaymentInFlight)
 }
 
 #[cfg(test)]
@@ -1118,6 +1604,19 @@ mod tests {
         let id = payments.file(terms(ORIGIN), Some(conv)).await.unwrap();
         payments.authorize(&id, card(), "me").await.unwrap();
 
+        let claim = payments.claim_for_pay(&id).await.unwrap().expect("claimed");
+        assert_eq!(claim.request.id, id);
+        assert_eq!(claim.card.card().security_code(), "123");
+        assert_eq!(
+            payments.get(&id).await.unwrap().status,
+            PaymentStatus::Paying,
+            "the row is the lock while the press is in flight"
+        );
+        assert!(
+            store.card_vault.get(&id).is_none(),
+            "the claim takes the card rather than copying it"
+        );
+
         payments.mark_used(&id).await.unwrap();
 
         assert!(matches!(
@@ -1126,6 +1625,351 @@ mod tests {
         ));
         assert!(store.card_vault.get(&id).is_none());
         assert_eq!(payments.get(&id).await.unwrap().status, PaymentStatus::Used);
+    }
+
+    /// The defect this whole mechanism exists for: two `pay` tool calls in
+    /// one model turn, running concurrently, both getting a card and both
+    /// pressing. Exactly one may leave with a card.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn two_concurrent_claims_on_one_approval_produce_exactly_one_press() {
+        let (_dir, store) = store();
+        let payments = store.payment_requests();
+        let conv = Uuid::new_v4();
+        let id = payments.file(terms(ORIGIN), Some(conv)).await.unwrap();
+        payments.authorize(&id, card(), "me").await.unwrap();
+
+        let (left, right) = {
+            let (a, b) = (payments.clone(), payments.clone());
+            let (id_a, id_b) = (id.clone(), id.clone());
+            tokio::join!(
+                tokio::spawn(async move { a.claim_for_pay(&id_a).await.unwrap() }),
+                tokio::spawn(async move { b.claim_for_pay(&id_b).await.unwrap() }),
+            )
+        };
+        let outcomes = [left.unwrap(), right.unwrap()];
+        let won: Vec<_> = outcomes.iter().filter(|o| o.is_ok()).collect();
+        assert_eq!(won.len(), 1, "exactly one claim may win: {outcomes:?}");
+        assert_eq!(
+            won[0].as_ref().map(|c| c.card.card().last4()).unwrap(),
+            "4242"
+        );
+
+        let refusal = outcomes
+            .iter()
+            .find_map(|o| o.as_ref().err())
+            .expect("one refusal");
+        assert!(
+            matches!(
+                refusal,
+                PayRefusal::AnotherPaymentInFlight
+                    | PayRefusal::NotAuthorized {
+                        status: PaymentStatus::Paying
+                    }
+            ),
+            "the loser must be told why: {refusal:?}"
+        );
+        assert!(
+            store.card_vault.get(&id).is_none(),
+            "the loser must not leave a card behind either"
+        );
+        assert_eq!(
+            payments.get(&id).await.unwrap().status,
+            PaymentStatus::Paying
+        );
+    }
+
+    #[tokio::test]
+    async fn only_a_claimed_press_can_be_recorded_as_paid() {
+        let (_dir, store) = store();
+        let payments = store.payment_requests();
+        let id = payments
+            .file(terms(ORIGIN), Some(Uuid::new_v4()))
+            .await
+            .unwrap();
+        payments.authorize(&id, card(), "me").await.unwrap();
+
+        assert!(
+            payments.mark_used(&id).await.is_err(),
+            "an approval nobody claimed was never pressed"
+        );
+        assert_eq!(
+            payments.get(&id).await.unwrap().status,
+            PaymentStatus::Authorized,
+            "and the refused mark_used must not have moved it"
+        );
+
+        let _claim = payments.claim_for_pay(&id).await.unwrap().expect("claimed");
+        payments.mark_used(&id).await.unwrap();
+        assert!(
+            payments.mark_used(&id).await.is_err(),
+            "the second press is the double charge; it must not pass silently"
+        );
+    }
+
+    /// Two approvals, two conversations. The throttle is global: it is
+    /// about how fast the agent is spending, not about one purchase.
+    #[tokio::test]
+    async fn a_second_purchase_waits_out_the_cooldown() {
+        let (_dir, store) = store();
+        let payments = store.payment_requests();
+        let first = payments
+            .file(terms(ORIGIN), Some(Uuid::new_v4()))
+            .await
+            .unwrap();
+        let second = payments
+            .file(terms(ORIGIN), Some(Uuid::new_v4()))
+            .await
+            .unwrap();
+        payments.authorize(&first, card(), "me").await.unwrap();
+        payments.authorize(&second, card(), "me").await.unwrap();
+
+        let _claim = payments
+            .claim_for_pay(&first)
+            .await
+            .unwrap()
+            .expect("claimed");
+        payments.mark_used(&first).await.unwrap();
+
+        match payments.claim_for_pay(&second).await.unwrap() {
+            Err(PayRefusal::Cooldown { remaining }) => {
+                assert!(
+                    remaining <= DEFAULT_PAY_COOLDOWN && remaining > Duration::from_secs(25),
+                    "{remaining:?}"
+                );
+            }
+            other => panic!("expected a cooldown refusal, got {other:?}"),
+        }
+        assert_eq!(
+            payments.get(&second).await.unwrap().status,
+            PaymentStatus::Authorized,
+            "a refused claim leaves the approval alone"
+        );
+
+        let unthrottled = payments.clone().with_pay_cooldown(Duration::ZERO);
+        assert!(
+            unthrottled.claim_for_pay(&second).await.unwrap().is_ok(),
+            "zero disables the throttle"
+        );
+    }
+
+    /// A daemon killed between claiming and pressing must not hold the
+    /// global lock for the rest of the day.
+    #[tokio::test]
+    async fn an_abandoned_claim_is_recorded_as_spent_and_stops_blocking() {
+        let (_dir, store) = store();
+        let payments = store.payment_requests();
+        let abandoned = payments
+            .file(terms(ORIGIN), Some(Uuid::new_v4()))
+            .await
+            .unwrap();
+        let next = payments
+            .file(terms(ORIGIN), Some(Uuid::new_v4()))
+            .await
+            .unwrap();
+        payments.authorize(&abandoned, card(), "me").await.unwrap();
+        payments.authorize(&next, card(), "me").await.unwrap();
+        let claim = payments
+            .claim_for_pay(&abandoned)
+            .await
+            .unwrap()
+            .expect("claimed");
+
+        assert!(
+            matches!(
+                payments.claim_for_pay(&next).await.unwrap(),
+                Err(PayRefusal::AnotherPaymentInFlight)
+            ),
+            "one press at a time while the claim is fresh"
+        );
+
+        // Three minutes ago, past STALE_CLAIM_MS.
+        let stale_id = abandoned.clone();
+        crate::with_conn(&store.conn, move |conn| {
+            conn.execute(
+                "UPDATE payment_requests SET claimed_at = ?1 WHERE id = ?2",
+                params![now_ms() - 3 * 60 * 1000, stale_id],
+            )
+            .map_err(storage)
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(payments.sweep_expired().await.unwrap(), 1);
+        assert_eq!(
+            payments.get(&abandoned).await.unwrap().status,
+            PaymentStatus::Used,
+            "never back to authorized: the press may have reached the merchant"
+        );
+        assert!(store.card_vault.get(&abandoned).is_none());
+        assert!(
+            payments
+                .release_claim(&abandoned, claim.card)
+                .await
+                .is_err(),
+            "the swept claim is no longer releasable"
+        );
+        assert!(
+            payments.claim_for_pay(&next).await.unwrap().is_ok(),
+            "and the lock is free again"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_press_that_never_reached_the_page_gives_the_approval_back() {
+        let (_dir, store) = store();
+        let payments = store.payment_requests();
+        let conv = Uuid::new_v4();
+        let id = payments.file(terms(ORIGIN), Some(conv)).await.unwrap();
+        payments
+            .authorize_for(&id, card(), "me", Duration::from_secs(120))
+            .await
+            .unwrap();
+
+        let claim = payments.claim_for_pay(&id).await.unwrap().expect("claimed");
+        let deadline = claim.card.expires;
+        payments.release_claim(&id, claim.card).await.unwrap();
+
+        assert_eq!(
+            payments.get(&id).await.unwrap().status,
+            PaymentStatus::Authorized
+        );
+        assert!(matches!(
+            payments.authorized_for(conv, ORIGIN).await.unwrap(),
+            AuthorizedPayment::Ready { .. }
+        ));
+        let (_, restored) = store.card_vault.take(&id).expect("card is back");
+        assert_eq!(
+            restored, deadline,
+            "the card keeps its own clock; a release must not extend the TTL"
+        );
+        store
+            .card_vault
+            .put_until(&id, card(), restored.max(Instant::now()));
+
+        let claim = payments.claim_for_pay(&id).await.unwrap().expect("claimed");
+        payments.mark_used(&id).await.unwrap();
+        assert!(
+            payments.release_claim(&id, claim.card).await.is_err(),
+            "a spent approval cannot be released back to authorized"
+        );
+        assert!(store.card_vault.get(&id).is_none());
+    }
+
+    /// A card whose TTL ran out between approval and press. The row must
+    /// not sit in `paying` holding the global lock for a press that can
+    /// never happen.
+    #[tokio::test]
+    async fn a_claim_with_no_card_left_expires_the_approval_instead_of_holding_the_lock() {
+        let (_dir, store) = store();
+        let payments = store.payment_requests();
+        let id = payments
+            .file(terms(ORIGIN), Some(Uuid::new_v4()))
+            .await
+            .unwrap();
+        payments
+            .authorize_for(&id, card(), "me", Duration::from_millis(1))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        match payments.claim_for_pay(&id).await.unwrap() {
+            Err(refusal @ PayRefusal::NotAuthorized { status }) => {
+                assert_eq!(status, PaymentStatus::Expired);
+                assert!(!refusal.retry_safe());
+            }
+            other => panic!("expected an expired refusal, got {other:?}"),
+        }
+        assert_eq!(
+            payments.get(&id).await.unwrap().status,
+            PaymentStatus::Expired
+        );
+
+        let other = payments
+            .file(terms(ORIGIN), Some(Uuid::new_v4()))
+            .await
+            .unwrap();
+        payments.authorize(&other, card(), "me").await.unwrap();
+        assert!(
+            payments.claim_for_pay(&other).await.unwrap().is_ok(),
+            "nothing is left holding the lock"
+        );
+    }
+
+    /// `fill_payment` asks this question before typing anything into a
+    /// checkout, so "claimed or spent" must read as "nothing to fill here".
+    /// Once a press is claimed the card has left the vault; a lookup that
+    /// still answered `Ready` would be offering a card that is gone.
+    #[tokio::test]
+    async fn a_claimed_or_spent_request_offers_nothing_to_fill() {
+        let (_dir, store) = store();
+        let payments = store.payment_requests();
+        let conv = Uuid::new_v4();
+        let id = payments.file(terms(ORIGIN), Some(conv)).await.unwrap();
+        payments.authorize(&id, card(), "me").await.unwrap();
+
+        let claim = payments.claim_for_pay(&id).await.unwrap().expect("claimed");
+        assert_eq!(
+            payments.get(&id).await.unwrap().status,
+            PaymentStatus::Paying
+        );
+        assert!(
+            matches!(
+                payments.authorized_for(conv, ORIGIN).await.unwrap(),
+                AuthorizedPayment::None
+            ),
+            "a press in flight is not something to fill a card for"
+        );
+
+        drop(claim);
+        payments.mark_used(&id).await.unwrap();
+        assert!(matches!(
+            payments.authorized_for(conv, ORIGIN).await.unwrap(),
+            AuthorizedPayment::None
+        ));
+    }
+
+    /// Every refusal has to tell the model what to do next; "no" alone is
+    /// an invitation to press something else on the checkout.
+    #[test]
+    fn every_refusal_says_what_to_do_next() {
+        for refusal in [
+            PayRefusal::NotAuthorized {
+                status: PaymentStatus::Used,
+            },
+            PayRefusal::NotAuthorized {
+                status: PaymentStatus::Paying,
+            },
+            PayRefusal::NotAuthorized {
+                status: PaymentStatus::Expired,
+            },
+            PayRefusal::NotAuthorized {
+                status: PaymentStatus::Declined,
+            },
+            PayRefusal::AnotherPaymentInFlight,
+            PayRefusal::Cooldown {
+                remaining: Duration::from_secs(12),
+            },
+        ] {
+            let message = refusal.message();
+            assert!(
+                message.contains("other button"),
+                "{:?} must forbid pressing something else: {message}",
+                refusal
+            );
+            assert!(
+                message.contains("Wait")
+                    || message.contains("Tell the user")
+                    || message.contains("tell the user"),
+                "{:?} must say what comes next: {message}",
+                refusal
+            );
+            assert!(!refusal.kind().is_empty());
+        }
+        assert!(PayRefusal::AnotherPaymentInFlight.retry_safe());
+        assert!(!PayRefusal::NotAuthorized {
+            status: PaymentStatus::Used
+        }
+        .retry_safe());
     }
 
     #[tokio::test]
@@ -1309,6 +2153,12 @@ mod tests {
         let conv = Uuid::new_v4();
         let id = payments.file(terms(ORIGIN), Some(conv)).await.unwrap();
         payments.authorize(&id, card(), "me").await.unwrap();
+        // Through the whole press, not just the approval: claiming and
+        // marking used both write the row, and neither may carry the card
+        // along with them.
+        let claim = payments.claim_for_pay(&id).await.unwrap().expect("claimed");
+        payments.mark_used(&id).await.unwrap();
+        drop(claim);
 
         let mut on_disk = String::new();
         for entry in std::fs::read_dir(dir.path()).unwrap() {
