@@ -289,6 +289,8 @@ button.secondary{{margin-top:.6rem;background:transparent;color:#0a84ff}}\
 .merchant{{margin:0 0 .25rem}}\
 .site{{color:#666;font-size:.85rem;margin:.25rem 0 1.25rem}}\
 code{{font:.85em ui-monospace,Menlo,monospace;word-break:break-all}}\
+.warn{{background:#fff4e5;border:1px solid #e8a33d;border-radius:.5rem;\
+padding:.75rem .85rem;margin:0 0 1rem;font-size:.9rem;line-height:1.4}}\
 </style></head><body>{}</body></html>",
         esc(title),
         body
