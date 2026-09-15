@@ -42,17 +42,27 @@ pay, after 15 minutes, on supersede, or on restart. `browser` `fill_payment`
 enters one part per call into a field whose top origin is the approved merchant
 and whose frame chain is the merchant or a fixed payment-provider allowlist.
 `pay` refuses unless the page shows a total in the approved currency at or below
-the approval, and spends the approval when pressed. While a card is on the page,
+the approval, and spends the approval when pressed. It also refuses before
+claiming anything unless the page is armed by an earlier `fill_payment` for the
+approval that currently stands, so an approval is never spent pressing a
+checkout with no card in it. While a card is on the page,
 evaluate, screenshots, PDF, HTML content, coordinate clicks, Enter, and plain
-clicks on submit-like controls are refused.
+clicks on submit-like controls are refused — including controls inside a
+site-isolated frame, which `pay` cannot total-check either, so that checkout is
+handed back to the user. The model-facing text of these refusals travels under
+a `guidance` key that the agent runner exempts from its external-content fence;
+everything page-derived stays fenced.
 
 Evidence: `live_approved_card_is_entered_only_where_approved_and_paid_within_the_total`
 (real Chrome, merchant/provider/ad on separate loopback origins with the provider
-frame site-isolated, public synthetic card). 22 checks passed, covering refusal
+frame site-isolated, public synthetic card). 28 checks passed, covering refusal
 without approval, outside the conversation, with a model-supplied value, into
 the wrong field, and into a provider frame nested under a foreign origin; correct
 landing of all six parts across the merchant page and provider frame; no card
-value in results or snapshots; the armed-page refusals; refusal of a total above
+value in results or snapshots; the armed-page refusals, including a click on and
+a `pay` at the provider frame's own submit button; refusal of a `pay` before any
+card was entered and of one whose fill a newer approval superseded, each with the
+request left `authorized` and zero submissions; refusal of a total above
 the approval with zero submissions; exactly one submission at the approved
 total; and refusal of a second pay. Limits: loopback HTTP and a fixture provider
 origin replace HTTPS and the production allowlist; no real merchant, processor

@@ -774,6 +774,7 @@ fn collect(data_dir: &std::path::Path, result: &mut PaymentTrial) {
                                 "status": out["status"], "outcome": out["outcome"],
                                 "error": out["error"].as_str().map(|e| e.chars().take(200).collect::<String>()),
                                 "reason": out["reason"].as_str().map(|e| e.chars().take(200).collect::<String>()),
+                                "guidance": out["guidance"].as_str().map(|e| e.chars().take(200).collect::<String>()),
                                 "payment": out["payment"],
                             }),
                         );

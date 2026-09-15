@@ -1091,6 +1091,10 @@ impl BrowserTool {
     /// press a submit-like control or Enter, and screenshots, PDFs, HTML
     /// content and `evaluate` are off. Typing into other fields, ticking a
     /// terms box and snapshots (which omit card values) still work.
+    ///
+    /// A control in a site-isolated frame is refused outright rather than
+    /// pointed at `pay`, which cannot check a total there either
+    /// ([`actions::SubmitVerdict::SiteIsolated`]).
     async fn enforce_payment_lock(
         &self,
         action: &str,
@@ -1162,12 +1166,24 @@ impl BrowserTool {
                         .map(normalize_snapshot_ref)
                         .unwrap_or_default();
                     let store_key = Self::store_key(session, profile, target_id);
-                    if actions::is_submit_like(&page, &self.snapshot_store, &store_key, ref_id)
+                    match actions::is_submit_like(&page, &self.snapshot_store, &store_key, ref_id)
                         .await?
                     {
-                        refuse("that control looks like it submits the payment")
-                    } else {
-                        Ok(())
+                        actions::SubmitVerdict::Other => Ok(()),
+                        actions::SubmitVerdict::Submits => {
+                            refuse("that control looks like it submits the payment")
+                        }
+                        // `pay` is no answer here: it reads the total from the
+                        // merchant's top document, and a control in someone
+                        // else's frame is not provably that page's pay button.
+                        // So this checkout is one the user finishes themselves.
+                        actions::SubmitVerdict::SiteIsolated => {
+                            Err(Error::ToolExecution(ToolError::permission_denied(
+                                "A card is entered on this page and that control is inside a cross-site frame, \
+                                 where the page total cannot be checked and pay is not available. Do not click it; \
+                                 tell the user this checkout needs them to finish paying. Navigating away clears this.",
+                            )))
+                        }
                     }
                 }
                 _ => Ok(()),
@@ -2380,6 +2396,9 @@ impl Tool for BrowserTool {
                         .unwrap_or_else(|e| e.into_inner())
                         .insert(Self::armed_key(&session, &page), request.id.clone());
                 }
+                // Model-facing text goes under `guidance`, the one result key
+                // the runner does not wrap in its external-content fence: it
+                // is ours, not the page's. See `fence_external_output`.
                 if status == "filled" {
                     return Ok(json!({
                         "status": "filled",
@@ -2389,7 +2408,7 @@ impl Tool for BrowserTool {
                         "retry_safe": false,
                         "page_state": Value::Null,
                         "page_state_status": "withheld_after_payment_fill",
-                        "next_step": "Fill the other card fields the same way, then press the checkout's pay button with browser(action='pay', ref=<button ref>). Do not click it any other way.",
+                        "guidance": "Fill the other card fields the same way, then press the checkout's pay button with browser(action='pay', ref=<button ref>). Do not click it any other way.",
                     }));
                 }
                 Ok(match payment::fill_refusal(&status) {
@@ -2399,7 +2418,7 @@ impl Tool for BrowserTool {
                         "field": field.as_str(),
                         "ref": ref_id,
                         "retry_safe": true,
-                        "reason": reason,
+                        "guidance": reason,
                     }),
                     None => json!({
                         "status": "unknown",
@@ -2407,7 +2426,7 @@ impl Tool for BrowserTool {
                         "field": field.as_str(),
                         "ref": ref_id,
                         "retry_safe": false,
-                        "reason": "the card field assignment was interrupted; take a fresh snapshot and check the field before trying again",
+                        "guidance": "the card field assignment was interrupted; take a fresh snapshot and check the field before trying again",
                     }),
                 })
             }
@@ -2427,6 +2446,43 @@ impl Tool for BrowserTool {
                 let (request, card) = self.approved_payment(&origin).await?;
                 drop(card);
                 let payments = self.payments.as_ref().expect("approved_payment checked");
+
+                // The lock and the spend have to be one thing. A `pay` on a
+                // page no `fill_payment` armed presses a submit with no card
+                // in it and still claims the approval, spending the user's
+                // one purchase on nothing — so the armed entry is checked
+                // here, before `claim_for_pay`, and its request id must be
+                // the approval the card was actually filled for.
+                let armed_key = Self::armed_key(&session, &page);
+                let armed_request = self
+                    .payment_armed
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(&armed_key)
+                    .cloned();
+                let guidance = match armed_request {
+                    None => Some(
+                        "no card has been entered on this page yet; fill the card fields with fill_payment first"
+                            .to_string(),
+                    ),
+                    Some(armed) if armed != request.id => Some(format!(
+                        "the card on this page was entered for an earlier approval ({armed}), which a newer one has since superseded; take a fresh snapshot and fill the card fields again before paying"
+                    )),
+                    Some(_) => None,
+                };
+                if let Some(guidance) = guidance {
+                    tracing::info!(
+                        request = %request.id,
+                        "pay refused: the page is not armed for this approval"
+                    );
+                    return Ok(json!({
+                        "status": "blocked",
+                        "outcome": "not_applied",
+                        "ref": ref_id,
+                        "retry_safe": true,
+                        "guidance": guidance,
+                    }));
+                }
 
                 let store_key = Self::store_key(&session, &profile, target_id);
                 let target = match actions::prepare_pay(
@@ -2451,7 +2507,8 @@ impl Tool for BrowserTool {
                             "outcome": "not_applied",
                             "ref": ref_id,
                             "retry_safe": true,
-                            "reason": reason,
+                            "refusal": status,
+                            "guidance": reason,
                         }));
                     }
                 };
@@ -2472,7 +2529,7 @@ impl Tool for BrowserTool {
                                 "ref": ref_id,
                                 "retry_safe": false,
                                 "approved": request.amount.to_string(),
-                                "reason": refusal.explain(&request.amount),
+                                "guidance": refusal.explain(&request.amount),
                             }));
                         }
                     };
@@ -2495,7 +2552,8 @@ impl Tool for BrowserTool {
                             "outcome": "not_applied",
                             "ref": ref_id,
                             "retry_safe": refusal.retry_safe(),
-                            "reason": refusal.message(),
+                            "refusal": refusal.kind(),
+                            "guidance": refusal.message(),
                         });
                         // A duplicate is the one refusal the user has to
                         // hear about: the agent is at a checkout for
@@ -2533,7 +2591,6 @@ impl Tool for BrowserTool {
                 // back — every other path drops it, which erases it.
                 let claimed_card = claim.card;
 
-                let armed_key = Self::armed_key(&session, &page);
                 let pressed = actions::press_pay(&page, ref_id, &target).await;
                 let spent = match &pressed {
                     Ok(outcome) => {
@@ -2576,7 +2633,7 @@ impl Tool for BrowserTool {
                         }),
                     );
                     object.insert(
-                        "next_step".into(),
+                        "guidance".into(),
                         Value::String(if spent {
                             "The pay button was pressed and the approval is spent. Take a snapshot to read the result. Do not press pay again for this purchase: if it failed or needs another step you cannot complete, tell the user.".into()
                         } else {
@@ -3989,9 +4046,12 @@ mod tests {
     /// foreign ancestor are refused; every card part lands in the right box
     /// on both the merchant page and the provider frame; nothing card-shaped
     /// reaches a tool result or snapshot; screenshot, evaluate, Enter and a
-    /// plain click on pay are blocked while the card is on the page; pay
-    /// refuses a total above the approval without submitting; pay at the
-    /// approved total submits exactly once and spends the approval.
+    /// plain click on pay are blocked while the card is on the page; the
+    /// provider frame's own submit is refused by both the click guard and
+    /// `pay`; pay before any card is entered, and pay for a fill a newer
+    /// approval superseded, are refused without spending either approval;
+    /// pay refuses a total above the approval without submitting;
+    /// pay at the approved total submits exactly once and spends the approval.
     #[tokio::test]
     #[ignore = "launches real Chrome; synthetic card values and loopback origins only"]
     async fn live_approved_card_is_entered_only_where_approved_and_paid_within_the_total() {
@@ -4015,6 +4075,7 @@ mod tests {
             <label>Card number<input id="n" autocomplete="cc-number" inputmode="numeric"></label>
             <label>Expiry<input id="e" autocomplete="cc-exp" placeholder="MM / YY"></label>
             <label>Security code<input id="c" autocomplete="cc-csc"></label>
+            <button id="p">Pay in frame</button>
             <script>['n','e','c'].forEach(function(id){document.getElementById(id).addEventListener('change',function(ev){
               parent.postMessage({id:id,value:ev.target.value,nested:location.search.indexOf('nested')>=0},'*');});});</script>"#;
         let provider_server = tokio::spawn(serve(provider, card_frame.to_string()));
@@ -4169,6 +4230,31 @@ mod tests {
             json!(with_text.is_err()),
         );
 
+        // An approval exists but no card has been entered: pressing pay would
+        // submit an empty checkout and burn the approval on nothing. Refused
+        // before the claim, so the request is still `authorized` after.
+        let unarmed =
+            call!(json!({"action":"pay","targetId":tid,"ref":find("Pay now", None)})).unwrap();
+        let submissions: u64 = page
+            .evaluate("window.submissions")
+            .await
+            .unwrap()
+            .into_value()
+            .unwrap();
+        checks.insert(
+            "pay_refused_before_any_card_was_entered".into(),
+            json!(
+                unarmed["status"] == "blocked"
+                    && unarmed["guidance"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains("no card has been entered")
+                    && submissions == 0
+                    && payments.get(&id).await.unwrap().status
+                        == rustykrab_store::PaymentStatus::Authorized
+            ),
+        );
+
         // Wrong box, and the provider frame under a foreign ancestor.
         let wrong_box = call!(fill(&find("Notes", None), "number")).unwrap();
         checks.insert(
@@ -4180,7 +4266,7 @@ mod tests {
             "refused_provider_under_foreign_frame".into(),
             json!(
                 nested["status"] == "blocked"
-                    && nested["reason"]
+                    && nested["guidance"]
                         .as_str()
                         .unwrap_or_default()
                         .contains("neither the merchant")
@@ -4221,6 +4307,67 @@ mod tests {
             ),
         );
 
+        // A newer approval supersedes the one these fields were filled for.
+        // The armed page still names the old request, so pay must refuse and
+        // ask for a fresh fill rather than spend the new approval on fields
+        // entered for something else.
+        let fresh_card = || {
+            rustykrab_store::CardDetails::new(
+                "4242 4242 4242 4242",
+                "12/31",
+                "987",
+                "Ada Lovelace",
+                Some("02554"),
+            )
+            .unwrap()
+        };
+        let superseding = payments
+            .file(
+                rustykrab_store::PaymentTerms {
+                    merchant: "Test ferry".into(),
+                    origin: merchant_origin.clone(),
+                    amount: rustykrab_store::Money::parse("46.00", "USD").unwrap(),
+                    description: None,
+                    confirm_duplicate: false,
+                },
+                Some(conversation),
+            )
+            .await
+            .unwrap()
+            .id;
+        payments
+            .authorize(&superseding, fresh_card(), "fixture")
+            .await
+            .unwrap();
+        let stale =
+            call!(json!({"action":"pay","targetId":tid,"ref":find("Pay now", None)})).unwrap();
+        let submissions: u64 = page
+            .evaluate("window.submissions")
+            .await
+            .unwrap()
+            .into_value()
+            .unwrap();
+        checks.insert(
+            "pay_refused_when_a_newer_approval_superseded_the_fill".into(),
+            json!(
+                stale["status"] == "blocked"
+                    && stale["guidance"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains("superseded")
+                    && submissions == 0
+                    && payments.get(&id).await.unwrap().status
+                        == rustykrab_store::PaymentStatus::Superseded
+                    && payments.get(&superseding).await.unwrap().status
+                        == rustykrab_store::PaymentStatus::Authorized
+            ),
+        );
+        // Re-arm for the approval that now stands, as the refusal instructs.
+        checks.insert(
+            "refill_arms_the_page_for_the_new_approval".into(),
+            json!(call!(fill(&number_ref, "number")).unwrap()["status"] == "filled"),
+        );
+
         // While the card is on the page.
         checks.insert(
             "screenshot_blocked".into(),
@@ -4244,6 +4391,44 @@ mod tests {
             .as_str()
             .unwrap()
             .to_string();
+
+        // The provider's own submit, in its site-isolated frame. `pay` cannot
+        // check a total through it, so a plain click must not be the way
+        // around that: both doors are shut and the user is told to finish.
+        // Refs come from `after`, because the successful terms click above
+        // refreshed the snapshot the earlier ones belong to.
+        let in_frame_pay = after["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| {
+                e["name"].as_str().is_some_and(|n| n == "Pay in frame")
+                    && e["frame_url"]
+                        .as_str()
+                        .is_some_and(|u| !u.contains("nested"))
+            })
+            .unwrap_or_else(|| panic!("in-frame pay button not observed\n{after}"))["ref"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let in_frame_click =
+            call!(json!({"action":"act","targetId":tid,"ref":in_frame_pay,"actAction":"click"}));
+        checks.insert(
+            "in_frame_submit_click_blocked".into(),
+            json!(in_frame_click
+                .as_ref()
+                .is_err_and(|e| e.to_string().contains("finish paying"))),
+        );
+        // Neither refusal presses anything, so `pay_ref` is still live below.
+        let in_frame_pay_result =
+            call!(json!({"action":"pay","targetId":tid,"ref":in_frame_pay})).unwrap();
+        checks.insert(
+            "in_frame_pay_refused".into(),
+            json!(
+                in_frame_pay_result["status"] == "blocked"
+                    && in_frame_pay_result["refusal"] == "site_isolated_frame"
+            ),
+        );
         let exposed = format!("{after}{}", serde_json::to_string(&results).unwrap());
         checks.insert(
             "card_absent_from_results_and_snapshot".into(),
@@ -4281,7 +4466,9 @@ mod tests {
             .unwrap()
             .into_value()
             .unwrap();
-        let status = payments.get(&id).await.unwrap().status;
+        // `superseding` is the approval that stands, and the one the refill
+        // armed the page for.
+        let status = payments.get(&superseding).await.unwrap().status;
         checks.insert(
             "paid_once_within_approval".into(),
             json!(
@@ -4307,7 +4494,8 @@ mod tests {
 
         let passed = checks.values().all(|v| v == true);
         let report = json!({"passed": passed, "checks": checks, "provider_frame_site_isolated": site_isolated,
-            "refusals": {"wrong_box": wrong_box, "nested": nested, "too_much": too_much},
+            "refusals": {"wrong_box": wrong_box, "nested": nested, "too_much": too_much,
+                "unarmed": unarmed, "in_frame_pay": in_frame_pay_result},
             "fixture": "real Chrome; merchant, provider and ad on separate loopback origins; public synthetic card; in-page submit counter",
             "limits": ["loopback HTTP allowed by test policy", "provider allowlist replaced by the fixture origin", "no real processor or merchant", "no model in the loop"]});
         if let Some(root) = std::env::var_os("RK_PAYMENT_EVIDENCE_DIR") {
