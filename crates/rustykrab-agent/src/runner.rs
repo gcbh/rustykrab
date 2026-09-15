@@ -2760,8 +2760,19 @@ impl AgentRunner {
     }
 
     /// Render a single message as plain text for inclusion in a summarizer
-    /// prompt. Used by the recursive/chunked compaction path.
+    /// prompt. Used by the recursive/chunked compaction path. Oversized tool
+    /// outputs are elided (see [`MAX_SUMMARIZED_TOOL_OUTPUT_BYTES`]).
     fn render_message_for_summary(msg: &Message) -> String {
+        Self::render_message_text(msg, true)
+    }
+
+    /// Render a single message in full for the recall archive. Never elides:
+    /// the archive is where the summarizer's elision notice points.
+    fn render_message_for_archive(msg: &Message) -> String {
+        Self::render_message_text(msg, false)
+    }
+
+    fn render_message_text(msg: &Message, elide_tool_output: bool) -> String {
         let role = match msg.role {
             Role::System => "system",
             Role::User => "user",
@@ -2773,12 +2784,12 @@ impl AgentRunner {
             MessageContent::ToolCall(tc) => format!("tool_call {}: {}", tc.name, tc.arguments),
             MessageContent::ToolResult(tr) => {
                 let marker = if tr.is_error { " (error)" } else { "" };
-                format!(
-                    "tool_result{} {}: {}",
-                    marker,
-                    tr.call_id,
+                let output = if elide_tool_output {
                     render_tool_output_for_summary(&tr.output)
-                )
+                } else {
+                    tr.output.to_string()
+                };
+                format!("tool_result{} {}: {}", marker, tr.call_id, output)
             }
             MessageContent::MultiToolCall(tcs) => {
                 let names: Vec<&str> = tcs.iter().map(|c| c.name.as_str()).collect();
@@ -3457,7 +3468,7 @@ impl AgentRunner {
             .messages
             .iter()
             .filter(|m| !preserved_ids.contains(&m.id))
-            .map(Self::render_message_for_summary)
+            .map(Self::render_message_for_archive)
             .collect();
         let archived_chars: usize = displaced.iter().map(|s| s.len()).sum();
 
@@ -4808,13 +4819,15 @@ mod compaction_tests {
     /// recover because compaction ran again on the same blob every turn.
     #[tokio::test]
     async fn an_oversized_tool_result_does_not_abort_compaction() {
+        let recall = Arc::new(RecallStore::new());
         let runner = AgentRunner::new(
             Arc::new(WindowBoundSummarizer {
                 window_chars: 40_000,
             }),
             Vec::new(),
             Arc::new(NoSandbox),
-        );
+        )
+        .with_recall_store(recall.clone());
         // Base64 of a PDF: no summarizable content, and far denser per
         // character than the chars/4 budget the chunker packs against.
         let pdf = "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVowMTIzNDU2Nzg5Ky8=".repeat(12_000);
@@ -4841,6 +4854,14 @@ mod compaction_tests {
             .await
             .expect("compaction must survive an opaque tool result");
         assert!(conv.summary.is_some());
+
+        // Elision is for the summarizer only: the recall archive the notice
+        // points to must still hold the whole result.
+        let archived = recall.get(conv.id).expect("displaced history archived");
+        assert!(
+            archived.contains(&pdf),
+            "recall archive must keep the full tool output"
+        );
     }
 
     /// Mock provider that records chat-call count + prompt sizes and returns
