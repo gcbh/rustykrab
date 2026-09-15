@@ -19,6 +19,7 @@ mod tasks;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use rusqlite::OptionalExtension;
 use rustykrab_core::Error;
 use std::sync::Mutex;
 use zeroize::Zeroizing;
@@ -36,8 +37,9 @@ pub use inbound::InboundStore;
 pub use jobs::{JobRun, JobStore, ScheduledJob};
 pub use outcomes::OutcomeStore;
 pub use payment_request::{
-    AuthorizedPayment, CardDetails, CardError, Money, PaymentRequest, PaymentRequestStore,
-    PaymentStatus, PaymentTerms, CARD_TTL, PENDING_TTL_MS,
+    AuthorizedPayment, CardDetails, CardError, ClaimedCard, Money, PayClaim, PayRefusal,
+    PaymentRequest, PaymentRequestStore, PaymentStatus, PaymentTerms, CARD_TTL,
+    DEFAULT_PAY_COOLDOWN, PENDING_TTL_MS, STALE_CLAIM_MS,
 };
 pub use pending_links::PendingLinks;
 pub use projects::{ApplyRevisionResult, ProjectStore};
@@ -65,6 +67,10 @@ pub struct Store {
     /// every clone of this handle so the page that receives a card and the
     /// browser that spends it see the same entry.
     card_vault: payment_request::CardVault,
+    /// How long after one press the next one is refused, across every
+    /// conversation. Operator-tunable because "how fast is too fast" is a
+    /// property of the household, not of the code.
+    pay_cooldown: std::time::Duration,
     /// Where the database lives, so a background reader can open its own
     /// connection instead of queueing behind live traffic on this one.
     db_path: PathBuf,
@@ -107,8 +113,16 @@ impl Store {
             credential_backend: credential_backend::default_backend(),
             pending_links: PendingLinks::new(),
             card_vault: payment_request::CardVault::default(),
+            pay_cooldown: payment_request::DEFAULT_PAY_COOLDOWN,
             db_path,
         })
+    }
+
+    /// How long after one press the next claim is refused. `Duration::ZERO`
+    /// disables the throttle.
+    pub fn with_pay_cooldown(mut self, cooldown: std::time::Duration) -> Self {
+        self.pay_cooldown = cooldown;
+        self
     }
 
     pub(crate) fn run_migrations(conn: &rusqlite::Connection) -> Result<(), Error> {
@@ -259,14 +273,20 @@ impl Store {
                 card_last4      TEXT,
                 used_at         INTEGER,
                 link_token_hash TEXT,
-                link_expires_at INTEGER
+                link_expires_at INTEGER,
+                -- When a press was claimed (status 'paying'). The claim is
+                -- the single-spend lock: one row may be 'paying' at a time,
+                -- and a claim older than STALE_CLAIM_MS is swept to 'used'
+                -- rather than released, because the press may have landed.
+                claimed_at      INTEGER
             );
 
             -- One purchase in flight per conversation, and the lookups that
-            -- enforce it only ever ask about live rows.
+            -- enforce it only ever ask about live rows. A 'paying' row is
+            -- live: it is the press the global lock is held for.
             CREATE INDEX IF NOT EXISTS idx_payment_requests_live
                 ON payment_requests (conversation_id)
-                WHERE status IN ('pending', 'authorized');
+                WHERE status IN ('pending', 'authorized', 'paying');
 
             -- Superseded values, kept encrypted, so an approved change or a
             -- mistaken delete is recoverable.
@@ -608,6 +628,51 @@ impl Store {
             }
         }
 
+        // `payment_requests.claimed_at` arrived with the atomic pay claim.
+        // Rows predating it were never claimed — the press was taken
+        // straight from 'authorized' — so NULL is the honest value and
+        // there is nothing to back-fill. `CREATE INDEX IF NOT EXISTS`
+        // leaves an existing `idx_payment_requests_live` alone, so a
+        // database created before 'paying' existed keeps the old predicate
+        // and drops 'paying' rows out of the index that the
+        // one-purchase-per-conversation lookups ride on. Rebuild it only
+        // when the stored DDL is the old one, rather than dropping and
+        // recreating on every open.
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(payment_requests)")
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        let existing: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|e| Error::Storage(e.to_string()))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        drop(stmt);
+        if !existing.iter().any(|c| c == "claimed_at") {
+            conn.execute(
+                "ALTER TABLE payment_requests ADD COLUMN claimed_at INTEGER",
+                [],
+            )
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        }
+        let live_index: Option<String> = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master
+                  WHERE type = 'index' AND name = 'idx_payment_requests_live'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        if live_index.is_some_and(|sql| !sql.contains("'paying'")) {
+            conn.execute_batch(
+                "DROP INDEX idx_payment_requests_live;
+                 CREATE INDEX idx_payment_requests_live
+                     ON payment_requests (conversation_id)
+                     WHERE status IN ('pending', 'authorized', 'paying');",
+            )
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        }
+
         // `job_runs.rustykrab_version` records which build executed each run.
         // Rows written before this column existed stay NULL rather than being
         // back-filled with the current version, which would misattribute them.
@@ -730,7 +795,8 @@ impl Store {
     /// Handle for purchases the agent asks the user to approve, and the
     /// cards approved for them.
     pub fn payment_requests(&self) -> PaymentRequestStore {
-        let payments = PaymentRequestStore::new(Arc::clone(&self.conn), self.card_vault.clone());
+        let payments = PaymentRequestStore::new(Arc::clone(&self.conn), self.card_vault.clone())
+            .with_pay_cooldown(self.pay_cooldown);
         match &self.request_notifier {
             Some(notifier) => payments.with_notifier(Arc::clone(notifier)),
             None => payments,
@@ -1138,6 +1204,75 @@ mod tests {
             ),
             1
         );
+    }
+
+    /// A database created before `paying` existed keeps the index SQLite
+    /// wrote for it, because `CREATE INDEX IF NOT EXISTS` will not replace
+    /// one. Left alone, the live-request index would stop covering rows
+    /// that are mid-press — the ones the supersede and "may this
+    /// conversation pay here" lookups most need to see.
+    #[test]
+    fn upgrading_teaches_the_live_payment_index_about_a_press_in_flight() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE payment_requests (
+                 id              TEXT PRIMARY KEY,
+                 conversation_id TEXT,
+                 merchant        TEXT NOT NULL,
+                 origin          TEXT NOT NULL,
+                 amount_minor    INTEGER NOT NULL,
+                 currency        TEXT NOT NULL,
+                 description     TEXT,
+                 status          TEXT NOT NULL DEFAULT 'pending',
+                 created_at      INTEGER NOT NULL,
+                 decided_at      INTEGER,
+                 decided_by      TEXT,
+                 card_last4      TEXT,
+                 used_at         INTEGER,
+                 link_token_hash TEXT,
+                 link_expires_at INTEGER
+             );
+             CREATE INDEX idx_payment_requests_live
+                 ON payment_requests (conversation_id)
+                 WHERE status IN ('pending', 'authorized');
+             INSERT INTO payment_requests
+                 (id, merchant, origin, amount_minor, currency, created_at)
+             VALUES ('old', 'Steamship Authority', 'https://example.com',
+                     4600, 'USD', 1);",
+        )
+        .unwrap();
+
+        Store::run_migrations(&conn).unwrap();
+
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM pragma_table_info('payment_requests')
+                 WHERE name = 'claimed_at'"
+            ),
+            1,
+            "the claim needs somewhere to record when it was taken"
+        );
+        let index: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master
+                  WHERE type = 'index' AND name = 'idx_payment_requests_live'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(index.contains("'paying'"), "{index}");
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM payment_requests"),
+            1,
+            "and the audit trail survives the rebuild"
+        );
+
+        // Idempotent: a second open must not drop and rebuild the index it
+        // has already corrected.
+        Store::run_migrations(&conn).unwrap();
+        Store::run_migrations(&conn).unwrap();
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM payment_requests"), 1);
     }
 
     #[test]

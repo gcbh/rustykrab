@@ -130,7 +130,7 @@ table. And `credential_requests.conversation_id` is an unenforced reference.
 payment_requests(id PK, conversation_id, merchant, origin, amount_minor,
                  currency, description, status, created_at, decided_at,
                  decided_by, card_last4, used_at, link_token_hash,
-                 link_expires_at)
+                 link_expires_at, claimed_at)
 ```
 
 One purchase the agent asked the user to approve: the merchant, the exact
@@ -142,14 +142,59 @@ daemon restarts. The row is the approval and its audit trail; `card_last4` is
 the only card-derived value kept. Like credential links, only the hash of the
 one-time approval link is stored.
 
-Status runs `pending → authorized → used`, with `declined`, `expired` and
-`superseded` as the other terminal states. An `authorized` row whose card is
-no longer in the vault is marked `expired` the next time anything asks, so the
-record never claims an approval nothing can act on. The partial index
+Status runs `pending → authorized → paying → used`, with `declined`, `expired`
+and `superseded` as the other terminal states. An `authorized` row whose card
+is no longer in the vault is marked `expired` the next time anything asks, so
+the record never claims an approval nothing can act on. The partial index
 `idx_payment_requests_live ON (conversation_id) WHERE status IN ('pending',
-'authorized')` serves the one-purchase-per-conversation supersede and the
-browser's "may this conversation pay here" lookup. `conversation_id` is an
-unenforced reference, for the same audit reason as on `credential_requests`.
+'authorized', 'paying')` serves the one-purchase-per-conversation supersede and
+the browser's "may this conversation pay here" lookup; a `paying` row is live,
+because it is a press in flight. `conversation_id` is an unenforced reference,
+for the same audit reason as on `credential_requests`.
+
+**`paying` is the single-spend lock, and the row is where it lives.** Tool
+calls in one model turn run concurrently, and the earlier design read the card
+with `authorized_for`, which returns a *clone*: two `pay` calls on one approval
+both got a card, both pressed, and the second `mark_used` updated zero rows and
+discarded the count. The press is now claimed first. `claim_for_pay` runs one
+conditional `UPDATE` whose rows-affected count must be exactly 1:
+
+```sql
+UPDATE payment_requests SET status = 'paying', claimed_at = ?now
+ WHERE id = ?id AND status = 'authorized'
+   AND NOT EXISTS (SELECT 1 FROM payment_requests
+                    WHERE status = 'paying' AND id <> ?id)
+   AND NOT EXISTS (SELECT 1 FROM payment_requests
+                    WHERE status = 'used' AND used_at > ?now - ?cooldown_ms)
+```
+
+Three guarantees ride on that statement. **Single spend**: a second claim on the
+same request finds a row that is no longer `authorized`. **A global lock**: the
+second `NOT EXISTS` clause means at most one row is `paying` across the whole
+daemon — a checkout is a serial act, and two at once is far more likely a
+runaway loop than two purchases. **A throttle**: the third clause refuses while
+anything was marked `used` inside the cooldown (default 30 s,
+`RUSTYKRAB_PAYMENT_COOLDOWN_SECS`, `0` disables). Only the winner of the row is
+handed the card, and it is *taken* out of the vault rather than copied, so the
+loser gets neither. A won row whose card had already left the vault is marked
+`expired` instead, so it cannot hold the lock for a press that can never happen.
+A claim that touches no rows is diagnosed against the same connection into a
+typed refusal — `NotAuthorized { status }`, `AnotherPaymentInFlight`,
+`Cooldown { remaining }` — each carrying a message that tells the model what to
+do next.
+
+`mark_used` moves `paying → used` and errors on zero rows rather than shrugging.
+The one route back to `authorized` is `release_claim`, for a press the browser
+can prove never left the process; it restores the card on its *original* vault
+deadline, so a claim/release loop cannot extend `CARD_TTL`. **Stale claims**:
+a `paying` row whose `claimed_at` is older than `STALE_CLAIM_MS` (2 minutes) is
+swept to `used`, never back to `authorized` — a daemon that died mid-press may
+well have charged the merchant, and guessing otherwise risks the second charge
+the lock exists to prevent. Its `used_at` is set to `claimed_at`, which is when
+the press would have happened and keeps a long-stuck lock from imposing a fresh
+cooldown the moment it clears. The sweep runs in `sweep_expired` and at the head
+of `claim_for_pay` and `authorized_for`, so a crash cannot wedge the global lock
+until someone notices.
 
 ### Devices and pairing
 

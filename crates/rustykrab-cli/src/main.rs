@@ -461,8 +461,35 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    // How long after one press the next payment claim is refused, across
+    // every conversation. "How fast is too fast to be spending" belongs to
+    // the household, not to the code; `0` turns the throttle off. An
+    // unparseable value keeps the default rather than failing startup — the
+    // safe direction, since the default is the stricter one.
+    let pay_cooldown = match std::env::var("RUSTYKRAB_PAYMENT_COOLDOWN_SECS") {
+        Ok(raw) => match raw.trim().parse::<u64>() {
+            Ok(secs) => std::time::Duration::from_secs(secs),
+            Err(_) => {
+                tracing::warn!(
+                    value = %raw,
+                    "RUSTYKRAB_PAYMENT_COOLDOWN_SECS is not a whole number of seconds; \
+                     keeping the default payment cooldown"
+                );
+                rustykrab_store::DEFAULT_PAY_COOLDOWN
+            }
+        },
+        Err(_) => rustykrab_store::DEFAULT_PAY_COOLDOWN,
+    };
+    if pay_cooldown.is_zero() {
+        tracing::warn!(
+            "payment cooldown disabled (RUSTYKRAB_PAYMENT_COOLDOWN_SECS=0) — \
+             approvals can be spent back to back"
+        );
+    }
+
     let store = rustykrab_store::Store::open(data_dir.join("db"), master_key)?
-        .with_credential_backend(credential_backend_from_env());
+        .with_credential_backend(credential_backend_from_env())
+        .with_pay_cooldown(pay_cooldown);
 
     // --- Validate required secrets (central registry) ---
     // Every credential the app needs is declared in `registry::REGISTRY`.
