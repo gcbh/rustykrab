@@ -718,6 +718,60 @@ async fn perform_action(
     }
 }
 
+/// Evaluate `body` against one element inside a site-isolated frame and
+/// return its value.
+///
+/// `body` runs with the element bound to `el` and must `return` the result.
+/// Used where the caller needs a verdict computed next to the element — the
+/// payment fill checks origin, frame chain and field identity in the same
+/// call that assigns the value. Script errors are reported without their
+/// exception details, which can echo page or argument contents.
+pub(crate) async fn run_on_element(
+    websocket_url: &str,
+    element: &ElementRef,
+    body: &str,
+    navigation_policy: &SsrfPolicy,
+) -> Result<Value> {
+    let target_id = element.target_id.as_deref().ok_or_else(|| {
+        Error::ToolExecution("OOPIF call received a ref with no target ID".into())
+    })?;
+    let mut client = RawCdp::connect(websocket_url).await?;
+    let targets = client.command("Target.getTargets", json!({}), None).await?;
+    let target_info = targets["targetInfos"]
+        .as_array()
+        .and_then(|targets| {
+            targets
+                .iter()
+                .find(|target| target["targetId"] == target_id)
+        })
+        .cloned()
+        .ok_or_else(|| Error::ToolExecution(ToolError::not_found("OOPIF target is stale")))?;
+    let session_id = client.attach(target_id).await?;
+    let _ = client
+        .command(
+            "Runtime.runIfWaitingForDebugger",
+            json!({}),
+            Some(&session_id),
+        )
+        .await;
+    let (_, frame_url) = frame_identity(&mut client, &session_id, &target_info).await?;
+    if let Err(reason) = policy::validate_observed(&frame_url, navigation_policy).await {
+        client.detach(&session_id).await;
+        return Err(Error::ToolExecution(
+            format!("OOPIF navigation policy blocked '{frame_url}': {reason}").into(),
+        ));
+    }
+    let result = evaluate(
+        &mut client,
+        &session_id,
+        element_expression(&element.selector, body),
+    )
+    .await
+    .map_err(|_| Error::ToolExecution("OOPIF element call failed".into()));
+    client.detach(&session_id).await;
+    result
+}
+
 pub(crate) async fn execute_action(
     websocket_url: &str,
     action: &str,
