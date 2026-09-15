@@ -34,6 +34,7 @@ pub const CASES: &[&str] = &[
     "missing-history-control",
     "compaction-loss-control",
     "compaction-generation-limit",
+    "compaction-opaque-tool-output",
     "tool-availability-contract",
     "provider-trim-control",
     "telegram-provider-failure",
@@ -46,6 +47,18 @@ const PRIOR: &str = "I found Broadway listings including Hamilton and Wicked, bu
 const CORRECTION: &str = "Use the browser for Broadway show times and available seats on September 18-20, 2026 instead of September 14-16.";
 const CLOCK: &str = "New task: ignore the Broadway request. Use the browser to find the current date and time in UTC.";
 const DATE: &str = "2026-09-10T07:00:00Z";
+const OPAQUE_CASE: &str = "compaction-opaque-tool-output";
+const FERRY_ORIGINAL: &str = "Find the Hyannis to Nantucket ferry schedule for Saturday.";
+const FERRY_PRIOR: &str = "The traditional ferry leaves Hyannis for Nantucket at 6:15, 9:15, 13:15 and 18:15 on Saturday.";
+const FERRY_ASK: &str = "What about the high speed?";
+const FERRY_FOLLOWUP: &str = "Could you find the high speed ferry?";
+/// Raw PDF bytes behind the synthetic `browser` `pdf` result. Base64 makes
+/// it ~587KB, the size of the result that wedged a live conversation.
+const OPAQUE_PDF_BYTES: usize = 440_000;
+/// The window the scripted summarizer enforces, matching the eval daemon's
+/// `num_ctx`, and the reserve below which it can no longer emit text.
+const SCRIPTED_WINDOW_TOKENS: usize = 65_536;
+const SCRIPTED_MIN_GENERATION_TOKENS: usize = 2_048;
 const THREAD: i64 = 2533;
 
 fn message(role: &str, kind: &str, data: Value) -> Value {
@@ -61,6 +74,7 @@ fn followup(case: &str) -> &'static str {
     match case {
         "explicit-clock-switch" => CLOCK,
         "broadway-date-correction" | "compaction-loss-control" | "compaction-generation-limit" => CORRECTION,
+        OPAQUE_CASE => FERRY_FOLLOWUP,
         "broadway-explicit-reminder" | "broadway-retained-explicit" => "Continue the Broadway task: use the browser to fetch show times and seating availability for September 14-16, 2026.",
         _ => FOLLOWUP,
     }
@@ -73,13 +87,87 @@ fn noisy(case: &str) -> bool {
             | "broadway-explicit-reminder"
             | "compaction-loss-control"
             | "compaction-generation-limit"
+            | "compaction-opaque-tool-output"
             | "provider-trim-control"
     )
+}
+
+/// Deterministic incompressible bytes, base64-encoded like a real `browser`
+/// `pdf` result. A repeated pattern would tokenize unrealistically well.
+fn opaque_pdf_base64() -> String {
+    use base64::Engine as _;
+    let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+    let bytes: Vec<u8> = (0..OPAQUE_PDF_BYTES)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 24) as u8
+        })
+        .collect();
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+/// A ferry conversation whose one `browser` `pdf` result dominates history.
+fn opaque_fixture() -> Vec<Value> {
+    let pdf = opaque_pdf_base64();
+    vec![
+        text("user", FERRY_ORIGINAL),
+        message(
+            "assistant",
+            "tool_call",
+            json!({"id":"historical-pdf-0","name":"browser","arguments":{"action":"pdf"}}),
+        ),
+        message(
+            "tool",
+            "tool_result",
+            json!({"call_id":"historical-pdf-0","is_error":false,"output":{
+                "pdf":pdf,"size_bytes":OPAQUE_PDF_BYTES,"encoding":"base64",
+                "url":"https://ferry.example/schedules/hyannis-nantucket.pdf",
+                "title":"Hyannis - Nantucket schedule"}}),
+        ),
+        text("assistant", FERRY_PRIOR),
+        text("user", FERRY_ASK),
+        text("assistant", "Checking the high-speed schedule next."),
+    ]
+}
+
+/// Emulate a real tokenizer closely enough to reproduce a window overrun:
+/// long base64 runs cost ~1 token per 1.4 chars, everything else ~1 per 4.
+fn emulated_prompt_tokens(body: &Value) -> usize {
+    let mut tokens = 0;
+    for message in body["messages"].as_array().into_iter().flatten() {
+        let content = message["content"].as_str().unwrap_or("");
+        let (mut dense, mut run, mut other) = (0usize, 0usize, 0usize);
+        for c in content.chars() {
+            if c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '=') {
+                run += 1;
+                continue;
+            }
+            if run >= 200 {
+                dense += run;
+            } else {
+                other += run;
+            }
+            run = 0;
+            other += c.len_utf8();
+        }
+        if run >= 200 {
+            dense += run;
+        } else {
+            other += run;
+        }
+        tokens += dense * 10 / 14 + other / 4;
+    }
+    tokens
 }
 
 fn fixture(case: &str) -> Vec<Value> {
     if case == "missing-history-control" {
         return vec![];
+    }
+    if case == OPAQUE_CASE {
+        return opaque_fixture();
     }
     let mut messages = vec![];
     if case != "broadway-summary-only" {
@@ -301,6 +389,18 @@ async fn handle_request(
             400,
             json!({"error":"controlled provider failure after browser timeout"}).to_string(),
         ))
+    } else if state.case == OPAQUE_CASE && body["stream"] == false {
+        // A prompt that leaves no generation room gets what Ollama returns
+        // there: no text and a native length stop.
+        let mut response = fixture_response(&body);
+        let tokens = emulated_prompt_tokens(&body);
+        response["prompt_eval_count"] = json!(tokens.min(SCRIPTED_WINDOW_TOKENS));
+        if tokens + SCRIPTED_MIN_GENERATION_TOKENS > SCRIPTED_WINDOW_TOKENS {
+            response["done_reason"] = json!("length");
+            response["message"]["content"] = json!("");
+            response["eval_count"] = json!(SCRIPTED_WINDOW_TOKENS.saturating_sub(tokens));
+        }
+        Ok((200, format!("{response}\n")))
     } else if state.case == "compaction-generation-limit" && body["stream"] == false {
         let mut response = fixture_response(&body);
         response["done_reason"] = json!("length");
@@ -612,7 +712,10 @@ fn behavior(case: &str, records: &[Value]) -> Value {
     }
     let unscored = matches!(
         case,
-        "missing-history-control" | "compaction-loss-control" | "provider-trim-control"
+        "missing-history-control"
+            | "compaction-loss-control"
+            | "compaction-opaque-tool-output"
+            | "provider-trim-control"
     );
     let on_task = if case == "explicit-clock-switch" {
         clock && !broadway
@@ -913,6 +1016,7 @@ async fn trial(
     }
     let budget_guard = case == "provider-trim-control";
     let summary_guard = case == "compaction-generation-limit";
+    let opaque_guard = case == OPAQUE_CASE;
     let summary_refused = daemon_log.contains("compaction summary hit its generation limit");
     let refusal_observed = daemon_log
         .contains("refusing oversized Ollama request without dropping history")
@@ -986,6 +1090,27 @@ async fn trial(
             "pre_dispatch_refusal":refusal_observed,"wire_requests":records.len(),
             "original_trail_retained":original_trail_retained,"latest_user_retained":latest_retained,
             "negative_control":false,"compaction_calls":0})
+    } else if opaque_guard {
+        let summaries: Vec<_> = records
+            .iter()
+            .filter(|r| r["wire_request"]["stream"] == false)
+            .collect();
+        let length_stops = summaries
+            .iter()
+            .filter(|r| r["response"]["terminal"]["done_reason"] == "length")
+            .count();
+        let agent_steps = records.len() - summaries.len();
+        let replied = final_messages
+            .iter()
+            .any(|m| m["role"] == "assistant" && !initial.iter().any(|old| old["id"] == m["id"]));
+        json!({"passed":!summaries.is_empty() && length_stops == 0 && !summary_refused
+                && agent_steps > 0 && replied && latest_retained,
+            "compaction_calls":summaries.len(),"summarizer_length_stops":length_stops,
+            "summary_generation_refused":summary_refused,"agent_steps_after_compaction":agent_steps,
+            "assistant_reply_persisted":replied,"latest_user_retained":latest_retained,
+            "max_summarizer_prompt_tokens":summaries.iter()
+                .filter_map(|r| r["response"]["terminal"]["prompt_eval_count"].as_u64()).max(),
+            "negative_control":false})
     } else if summary_guard {
         json!({"passed":summary_refused && records.len() == 1
                 && records[0]["wire_request"]["stream"] == false
@@ -1099,6 +1224,7 @@ pub async fn run(bin: &str, args: &Args) -> Result<bool> {
                     *id,
                     "compaction-loss-control"
                         | "compaction-generation-limit"
+                        | "compaction-opaque-tool-output"
                         | "provider-trim-control"
                 )
         })

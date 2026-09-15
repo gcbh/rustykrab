@@ -4233,6 +4233,7 @@ version = "5.2.39"
 dependencies = [
  "anyhow",
  "axum",
+ "base64 0.22.1",
  "chrono",
  "regex",
  "reqwest 0.13.3",
