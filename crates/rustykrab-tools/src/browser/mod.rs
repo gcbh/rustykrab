@@ -2405,6 +2405,10 @@ impl Tool for BrowserTool {
                 let _ = self.manager.get_browser(&profile).await?;
                 let page = self.page_for(action, &profile, &session, target_id).await?;
                 let (_, origin) = self.secure_live_origin(&page, "pay").await?;
+                // Still the origin, conversation and terms check — but the
+                // card it hands back is a *clone*, and two concurrent
+                // presses both getting one is the double charge this arm
+                // now claims against. Drop it: nothing here fills a field.
                 let (request, card) = self.approved_payment(&origin).await?;
                 drop(card);
                 let payments = self.payments.as_ref().expect("approved_payment checked");
@@ -2458,6 +2462,34 @@ impl Tool for BrowserTool {
                         }
                     };
 
+                // Claim the press before making it. The row moving
+                // `authorized -> paying` in one conditional UPDATE is what
+                // makes this the only press: a concurrent `pay` in the same
+                // turn loses the row and is refused here rather than
+                // pressing a second time.
+                let claim = match payments.claim_for_pay(&request.id).await? {
+                    Ok(claim) => claim,
+                    Err(refusal) => {
+                        tracing::info!(
+                            request = %request.id,
+                            refusal = refusal.kind(),
+                            "pay refused: the press was not claimed"
+                        );
+                        return Ok(json!({
+                            "status": "blocked",
+                            "outcome": "not_applied",
+                            "ref": ref_id,
+                            "retry_safe": refusal.retry_safe(),
+                            "reason": refusal.message(),
+                        }));
+                    }
+                };
+                // The claim took the card out of the vault; pressing a
+                // button needs no card. It is held here unread, and only so
+                // a press that provably never left this process can hand it
+                // back — every other path drops it, which erases it.
+                let claimed_card = claim.card;
+
                 let armed_key = Self::armed_key(&session, &page);
                 let pressed = actions::press_pay(&page, ref_id, &target).await;
                 let spent = match &pressed {
@@ -2470,13 +2502,22 @@ impl Tool for BrowserTool {
                     // Spent whatever the checkout does next. A second press
                     // after an uncertain outcome could charge twice; the user
                     // can approve again.
+                    drop(claimed_card);
                     payments.mark_used(&request.id).await?;
                     self.disarm_payment(&armed_key);
+                } else {
+                    // The click never reached the page, so nothing was
+                    // charged and the approval goes back — card, remaining
+                    // TTL and all — for the retry the model is told to make.
+                    payments.release_claim(&request.id, claimed_card).await?;
                 }
                 tracing::info!(
                     request = %request.id,
                     checked_total = %checked,
                     approved = %request.amount,
+                    // Always true past the claim gate above; logged so a
+                    // pressed line is visibly one that went through it.
+                    claimed = true,
                     spent,
                     "pay pressed"
                 );
@@ -4205,8 +4246,15 @@ mod tests {
                     && status == rustykrab_store::PaymentStatus::Used
             ),
         );
+        // Refused by the claim, not merely by the mark: the row is no
+        // longer `authorized`, so there is neither an approval to claim nor
+        // a card left in the vault to press with.
         let again = call!(json!({"action":"pay","targetId":tid,"ref":pay_ref}));
         checks.insert("second_pay_refused".into(), json!(again.is_err()));
+        checks.insert(
+            "fill_refused_after_the_press_was_claimed".into(),
+            json!(call!(fill(&number_ref, "number")).is_err()),
+        );
         checks.insert(
             "lock_released_after_pay".into(),
             json!(call!(json!({"action":"screenshot","targetId":tid})).is_ok()),
@@ -5197,6 +5245,12 @@ mod act_action_tests {
 
     /// The exact calls gemma4:26b made in the payment eval, run through the
     /// same validator the agent runner applies before a tool executes.
+    ///
+    /// Also the guard on the pay claim: claiming happens entirely inside
+    /// the tool, so the call the model writes is unchanged. If a schema
+    /// edit ever crept in with a store change, the model's existing pay
+    /// calls would start being rejected before the tool could route them —
+    /// exactly the failure this test was written for.
     #[test]
     fn the_payment_sub_action_calls_the_model_made_pass_runner_validation() {
         let params = super::schema_parameters();
