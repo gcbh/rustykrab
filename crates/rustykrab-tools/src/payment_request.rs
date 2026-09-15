@@ -2,7 +2,9 @@ use async_trait::async_trait;
 use rustykrab_core::active_tools::with_session_context;
 use rustykrab_core::types::ToolSchema;
 use rustykrab_core::{Error, Result, Tool};
-use rustykrab_store::{Money, PaymentRequestStore, PaymentTerms, CARD_TTL};
+use rustykrab_store::{
+    Money, PaymentRequest, PaymentRequestStore, PaymentStatus, PaymentTerms, CARD_TTL,
+};
 use serde_json::{json, Value};
 
 /// Asks the user to approve one purchase and supply the card for it.
@@ -48,6 +50,37 @@ impl PaymentRequestTool {
     }
 }
 
+/// What the user is told when a payment is held as a probable duplicate.
+///
+/// Queued through `PendingLinks`, the same out-of-band path an approval
+/// link takes, and for a stronger version of the same reason. A hold is the
+/// one moment in this flow where the model is *wrong about what it is
+/// doing* — it believes it is buying something — so making it the messenger
+/// is asking the party that just made the mistake to report it. This string
+/// reaches the user whatever the model then says.
+///
+/// It names the amount, the merchant, the site and the time, because "this
+/// looks like a duplicate" is unanswerable on its own: only the user knows
+/// whether the ferry they booked this morning is the ferry the agent is
+/// trying to book now. It never carries a card, a link or a request id.
+pub(crate) fn duplicate_alert(prior: &PaymentRequest) -> String {
+    let when = rustykrab_store::stamp_utc(prior.used_at.unwrap_or(prior.created_at));
+    let state = match prior.status {
+        PaymentStatus::Used => "already paid",
+        PaymentStatus::Paying => "being paid right now",
+        PaymentStatus::Authorized => "already approved and waiting to be paid",
+        PaymentStatus::Pending => "already waiting for your approval",
+        // A third attempt: the second one is still sitting held.
+        _ => "already held as a duplicate",
+    };
+    format!(
+        "⚠️ Payment stopped. This looks like a repeat of {} to {} at {}, which was {} \
+         ({when}). Nothing has been paid and no approval link was sent. If you do want to \
+         pay a second time, reply and say so.",
+        prior.amount, prior.merchant, prior.origin, state,
+    )
+}
+
 /// Wording for the model's next turn. Never contains the link: it is
 /// delivered separately, for the reasons in `pending_links.rs`.
 fn next_step(queued: bool, merchant: &str, amount: &Money, origin: &str) -> String {
@@ -90,6 +123,11 @@ impl Tool for PaymentRequestTool {
          ISO code, e.g. \"USD\". 'description' says what is being bought, in words the \
          user will recognise. A new request replaces any earlier one in this \
          conversation, so re-file if the total changes.\n\n\
+         If this site has already been paid this amount today, the request is \
+         held instead: nothing is sent to the user for approval, they are told \
+         it was stopped, and you must stop the task rather than trying again. \
+         Only if the user then explicitly asks to pay a second time, call this \
+         again with confirm_duplicate: true.\n\n\
          Example:\n\
          {\"url\": \"https://www.steamshipauthority.com/reservations/checkout\", \
          \"merchant\": \"Steamship Authority\", \"amount\": \"46.00\", \"currency\": \
@@ -128,6 +166,10 @@ impl Tool for PaymentRequestTool {
                     "description": {
                         "type": "string",
                         "description": "What is being bought, e.g. '2 passenger tickets, Hyannis to Nantucket, Sep 17 2:25pm'."
+                    },
+                    "confirm_duplicate": {
+                        "type": "boolean",
+                        "description": "Only after the user has been told a payment looks like a duplicate and has explicitly asked to pay again. Setting it any other time has no effect."
                     }
                 },
                 "required": ["url", "merchant", "amount", "currency"]
@@ -172,7 +214,7 @@ impl Tool for PaymentRequestTool {
 
         let conversation_id = with_session_context(|c| c.conversation_id);
         let description = args["description"].as_str().map(str::to_string);
-        let id = self
+        let filed = self
             .payments
             .file(
                 PaymentTerms {
@@ -180,6 +222,7 @@ impl Tool for PaymentRequestTool {
                     origin: origin.clone(),
                     amount: amount.clone(),
                     description,
+                    confirm_duplicate: args["confirm_duplicate"].as_bool().unwrap_or(false),
                 },
                 conversation_id,
             )
@@ -187,6 +230,45 @@ impl Tool for PaymentRequestTool {
             .map_err(|e| {
                 Error::ToolExecution(format!("could not file the payment request: {e}").into())
             })?;
+        let id = filed.id;
+
+        // A held request has no link and must not get one: the user is not
+        // being asked to approve anything, they are being told the agent
+        // was stopped. Minting one anyway would put a live approval page
+        // for a purchase already made on the user's phone, which is the
+        // outcome the hold exists to prevent.
+        if let Some(prior) = filed.held_as_duplicate_of {
+            let alerted = match (&self.pending_links, conversation_id) {
+                (Some(pending), Some(conv)) => {
+                    pending.push(conv, duplicate_alert(&prior));
+                    true
+                }
+                _ => false,
+            };
+            return Ok(json!({
+                "status": "held",
+                "request_id": id,
+                "duplicate_of": {
+                    "merchant": prior.merchant,
+                    "amount": prior.amount.to_string(),
+                    "site": prior.origin,
+                    "status": prior.status.as_str(),
+                    "when": rustykrab_store::stamp_utc(
+                        prior.used_at.unwrap_or(prior.created_at)
+                    ),
+                },
+                "user_alerted": alerted,
+                "next_step": format!(
+                    "Nothing was paid and no approval link was sent. Tell the user, in one \
+                     or two sentences, that you stopped the payment because it looks like a \
+                     repeat of {} to {} that was already made. Do not file this request \
+                     again and do not try to pay another way. Stop this task now. If the \
+                     user replies that they do want to pay a second time, call \
+                     payment_request again with confirm_duplicate: true.",
+                    prior.amount, prior.merchant,
+                ),
+            }));
+        }
 
         let base = self
             .public_base
@@ -305,6 +387,113 @@ mod tests {
             .unwrap();
         assert_eq!(out["link_sent_separately"], false);
         assert!(out["next_step"].as_str().unwrap().contains("finish paying"));
+    }
+
+    /// The hold's whole point is that the user hears about it. The model is
+    /// being told to stop, so the message cannot depend on the model.
+    #[tokio::test]
+    async fn a_held_duplicate_alerts_the_user_and_mints_no_link() {
+        let (_dir, store) = store();
+        let links = PendingLinks::new();
+        let tool = PaymentRequestTool::new(store.payment_requests())
+            .with_pending_links(links.clone())
+            .with_public_base("https://mac.example.ts.net");
+        let payments = store.payment_requests();
+
+        // Bought once, in an earlier conversation.
+        let bought = Uuid::new_v4();
+        let first = in_conversation(bought, tool.execute(ferry()))
+            .await
+            .unwrap()["request_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(links.take(bought).len(), 1, "the first ask sends a link");
+        payments
+            .authorize(
+                &first,
+                rustykrab_store::CardDetails::new("4242424242424242", "12/40", "987", "Ada", None)
+                    .unwrap(),
+                "me",
+            )
+            .await
+            .unwrap();
+        let claim = payments
+            .claim_for_pay(&first)
+            .await
+            .unwrap()
+            .expect("claim");
+        drop(claim);
+        payments.mark_used(&first).await.unwrap();
+
+        // And asked for again, elsewhere.
+        let asked_again = Uuid::new_v4();
+        let out = in_conversation(asked_again, tool.execute(ferry()))
+            .await
+            .unwrap();
+
+        assert_eq!(out["status"], "held");
+        assert_eq!(out["duplicate_of"]["merchant"], "Steamship Authority");
+        assert_eq!(out["duplicate_of"]["amount"], "USD 46.00");
+        assert_eq!(out["duplicate_of"]["status"], "used");
+        assert_eq!(out["user_alerted"], true);
+        assert!(out["next_step"]
+            .as_str()
+            .unwrap()
+            .contains("Stop this task"));
+        assert!(
+            out.get("link_sent_separately").is_none(),
+            "a held request is not an ask, so nothing was sent to approve"
+        );
+        assert_eq!(
+            payments
+                .get(out["request_id"].as_str().unwrap())
+                .await
+                .unwrap()
+                .status,
+            PaymentStatus::Held
+        );
+
+        let queued = links.take(asked_again);
+        assert_eq!(queued.len(), 1, "exactly one alert, and it is not a link");
+        let alert = &queued[0];
+        assert!(!alert.contains("/p/"), "{alert}");
+        assert!(alert.contains("USD 46.00"), "{alert}");
+        assert!(alert.contains("Steamship Authority"), "{alert}");
+        assert!(alert.contains("already paid"), "{alert}");
+        for leaked in ["4242", "987", &first] {
+            assert!(
+                !alert.contains(leaked),
+                "'{leaked}' reached the user: {alert}"
+            );
+        }
+    }
+
+    /// The override the user gives after a hold. The store decides whether
+    /// it means anything; the tool has to carry it.
+    #[tokio::test]
+    async fn the_confirm_duplicate_argument_reaches_the_store() {
+        let (_dir, store) = store();
+        let tool = PaymentRequestTool::new(store.payment_requests())
+            .with_pending_links(PendingLinks::new());
+        let conv = Uuid::new_v4();
+
+        let mut args = ferry();
+        args["confirm_duplicate"] = json!(true);
+        // Nothing has been held here, so the flag is inert and this is an
+        // ordinary first ask — which is exactly the protection.
+        let out = in_conversation(conv, tool.execute(args)).await.unwrap();
+        assert_eq!(out["status"], "requested");
+        let filed = store
+            .payment_requests()
+            .get(out["request_id"].as_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(filed.status, PaymentStatus::Pending);
+        assert!(
+            !filed.duplicate_confirmed,
+            "a model may not confirm a duplicate nobody stopped it for"
+        );
     }
 
     #[tokio::test]

@@ -39,12 +39,30 @@ pub(crate) fn scenarios() -> Vec<(Expected, (&'static str, ScenarioFn))> {
                 Box::pin(payment_decline_is_recorded(ctx))
             }),
         ),
+        (
+            Expected::Pass,
+            ("payment_duplicate_is_held_and_user_alerted", |ctx| {
+                Box::pin(payment_duplicate_is_held_and_user_alerted(ctx))
+            }),
+        ),
     ]
 }
 
-/// Start a conversation, send the scripted checkout message, and return the
-/// conversation id and the payment request it filed.
-async fn file_payment(ctx: &Ctx) -> Result<(String, String)> {
+/// Start a conversation, send `trigger`, and return the conversation id and
+/// the one payment request it filed — checking the terms and the status the
+/// scenario expects it to have been filed with.
+///
+/// Every scenario here shares one daemon and one database, so each takes a
+/// trigger of its own rather than all filing the same terms: since the
+/// duplicate hold landed, two scenarios asking to pay the same site the
+/// same amount would have the second one held, and the test would be
+/// measuring the scenarios' interference rather than the daemon.
+async fn file_payment(
+    ctx: &Ctx,
+    trigger: &str,
+    minor: i64,
+    expect_status: &str,
+) -> Result<(String, String)> {
     let conv: Value = ctx
         .post("/api/conversations", json!({}))
         .await?
@@ -57,7 +75,7 @@ async fn file_payment(ctx: &Ctx) -> Result<(String, String)> {
     let resp = ctx
         .post(
             &format!("/api/conversations/{conv_id}/messages"),
-            json!({"content": "e2e: pay for the ferry"}),
+            json!({"content": trigger}),
         )
         .await?;
     if resp.status() != 200 {
@@ -77,10 +95,13 @@ async fn file_payment(ctx: &Ctx) -> Result<(String, String)> {
             Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
         })?
         .collect::<std::result::Result<_, _>>()?;
-    let [(id, status, origin, minor, currency)] = rows.as_slice() else {
+    let [(id, status, origin, amount, currency)] = rows.as_slice() else {
         bail!("want exactly one payment request for the conversation, got {rows:?}");
     };
-    if status != "pending" || origin != "http://localhost:9" || *minor != 4600 || currency != "USD"
+    if status != expect_status
+        || origin != "http://localhost:9"
+        || *amount != minor
+        || currency != "USD"
     {
         bail!("payment request recorded the wrong terms: {rows:?}");
     }
@@ -151,7 +172,8 @@ fn status_of(ctx: &Ctx, request_id: &str) -> Result<(String, Option<String>, Opt
 }
 
 async fn payment_approval_resumes_the_turn(ctx: &Ctx) -> Result<()> {
-    let (conv_id, request_id) = file_payment(ctx).await?;
+    let (conv_id, request_id) =
+        file_payment(ctx, "e2e: pay for the ferry", 4600, "pending").await?;
     let token = issue_link(ctx, &request_id).await?;
 
     // The page is not an oracle, and not open to anyone off the tailnet.
@@ -276,7 +298,8 @@ async fn payment_approval_resumes_the_turn(ctx: &Ctx) -> Result<()> {
 }
 
 async fn payment_decline_is_recorded(ctx: &Ctx) -> Result<()> {
-    let (_conv_id, request_id) = file_payment(ctx).await?;
+    let (_conv_id, request_id) =
+        file_payment(ctx, "e2e: pay for the parking", 1200, "pending").await?;
     let token = issue_link(ctx, &request_id).await?;
     // No card fields at all: declining must not demand one.
     let declined = submit(ctx, &token, &[("decision", "decline")]).await?;
@@ -291,4 +314,107 @@ async fn payment_decline_is_recorded(ctx: &Ctx) -> Result<()> {
         bail!("the link still works after it was declined");
     }
     Ok(())
+}
+
+/// The agent buys the mooring, forgets, and asks again in a fresh
+/// conversation. Nothing should reach the user's phone the second time
+/// except the news that it was stopped.
+///
+/// The load-bearing assertions are the database ones: the row is `held`, it
+/// names what it repeats, it has no link and cannot be given one. The
+/// assistant's reply is scripted here — a no-model agent cannot react to a
+/// tool result — so it proves the turn finished and spoke, not that a model
+/// would say the right thing. The alert itself is delivered through
+/// `PendingLinks`, which lives in the daemon's memory and is drained by the
+/// Telegram and Slack loops; the HTTP surface this harness drives does not
+/// drain it, and a second process cannot read it. `PaymentRequestTool`'s
+/// unit test is what holds that half down.
+async fn payment_duplicate_is_held_and_user_alerted(ctx: &Ctx) -> Result<()> {
+    let (_paid_conv, paid) = file_payment(ctx, "e2e: pay for the harbour", 3300, "pending").await?;
+    let token = issue_link(ctx, &paid).await?;
+    let approved = submit(
+        ctx,
+        &token,
+        &[
+            ("decision", "approve"),
+            ("holder", HOLDER),
+            ("number", TEST_CARD),
+            ("expiry", "12/40"),
+            ("security_code", "987"),
+        ],
+    )
+    .await?;
+    if approved.status() != 200 || !approved.text().await?.contains("Approved") {
+        bail!("approving the first payment did not succeed");
+    }
+
+    // Pressing pay needs Chrome and a card that lives in the daemon's
+    // memory, neither of which this harness has, so the press is recorded
+    // rather than made. The row is the whole of what the duplicate check
+    // reads, so a written row is a faithful stand-in for a pressed one.
+    {
+        let conn = rusqlite::Connection::open(&ctx.db_path)?;
+        conn.busy_timeout(Duration::from_secs(5))?;
+        let moved = conn.execute(
+            "UPDATE payment_requests SET status = 'used', used_at = ?2 WHERE id = ?1",
+            rusqlite::params![&paid, chrono::Utc::now().timestamp_millis()],
+        )?;
+        if moved != 1 {
+            bail!("could not record the first payment as made");
+        }
+    }
+
+    let (conv_id, held) = file_payment(ctx, "e2e: pay for the harbour again", 3300, "held").await?;
+
+    let conn = rusqlite::Connection::open_with_flags(
+        &ctx.db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?;
+    let (duplicate_of, confirmed, has_link): (Option<String>, i64, bool) = conn.query_row(
+        "SELECT duplicate_of, duplicate_confirmed, link_token_hash IS NOT NULL
+           FROM payment_requests WHERE id = ?1",
+        [&held],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )?;
+    if duplicate_of.as_deref() != Some(paid.as_str()) {
+        bail!("the held request does not name what it repeats: {duplicate_of:?}");
+    }
+    if confirmed != 0 {
+        bail!("a held request was somehow marked as a confirmed second payment");
+    }
+    if has_link {
+        bail!("a held request was given an approval link");
+    }
+    if issue_link(ctx, &held).await.is_ok() {
+        bail!("a held request could be given a link after the fact");
+    }
+    if status_of(ctx, &paid)?.0 != "used" {
+        bail!("the payment it repeats was disturbed");
+    }
+
+    // And the turn ended rather than stalling on an approval that is never
+    // coming.
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let messages: Value = ctx
+            .get(&format!("/api/conversations/{conv_id}/messages"))
+            .await?
+            .json()
+            .await?;
+        let spoke = messages.as_array().is_some_and(|all| {
+            all.iter().any(|m| {
+                m["role"] == "assistant"
+                    && m["content"]
+                        .as_str()
+                        .is_some_and(|c| c.contains("stopped that payment") && c.contains("repeat"))
+            })
+        });
+        if spoke {
+            return Ok(());
+        }
+        if std::time::Instant::now() > deadline {
+            bail!("the held payment was never reported back to the user: {messages}");
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
 }

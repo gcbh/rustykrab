@@ -257,7 +257,10 @@ pub fn builtin_tools(
         std::sync::Arc::new(
             BrowserTool::new()
                 .with_secrets(guarded.clone())
-                .with_payments(payments.clone()),
+                .with_payments(payments.clone())
+                // So a payment refused at the pay button as a duplicate
+                // reaches the user even if the model says nothing useful.
+                .with_pending_links(pending_links.clone()),
         ),
         std::sync::Arc::new(CanvasTool::new()),
         // Devices
