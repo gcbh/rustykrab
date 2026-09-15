@@ -2,6 +2,7 @@ pub mod auth;
 mod credential_page;
 pub mod logging;
 pub mod origin;
+mod payment_page;
 mod project_routes;
 pub mod push;
 pub mod rate_limit;
@@ -68,6 +69,7 @@ pub fn router(state: AppState) -> Router {
         .merge(telegram_webhook::telegram_routes())
         .merge(signal_webhook::signal_routes())
         .merge(credential_page::routes())
+        .merge(payment_page::routes())
         .merge(webchat::static_routes())
         .layer(middleware::from_fn_with_state(
             state.clone(),
