@@ -50,7 +50,7 @@ fn reject_payment_fields(fields: &[RequestedField]) -> Result<(), Error> {
             .iter()
             .any(|s| compact.contains(s))
         {
-            return Err(Error::Storage("Payment details cannot be saved through generic credential capture. Ask the user to enter them directly on the merchant's trusted checkout; do not request card numbers or security codes in chat. Reusable card storage is not implemented.".into()));
+            return Err(Error::Storage("Payment cards cannot be saved through generic credential capture. To pay at a checkout, use payment_request, which asks the user to approve that one purchase; never request card numbers or security codes in chat.".into()));
         }
     }
     Ok(())

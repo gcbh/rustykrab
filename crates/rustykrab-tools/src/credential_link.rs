@@ -9,7 +9,7 @@
 
 use std::time::Duration;
 
-use rustykrab_store::CredentialRequestStore;
+use rustykrab_store::{CredentialRequestStore, PaymentRequestStore};
 
 /// How long a credential link stays good.
 ///
@@ -25,15 +25,38 @@ pub const LINK_TTL: Duration = Duration::from_secs(15 * 60);
 /// not failure to ask — the request is already filed and answerable in
 /// the app, so this logs and returns `None` rather than propagating.
 pub async fn mint_link(requests: &CredentialRequestStore, request_id: &str) -> Option<String> {
-    let base = std::env::var("RUSTYKRAB_PUBLIC_URL")
-        .ok()
-        .map(|u| u.trim_end_matches('/').to_string())
-        .filter(|u| !u.is_empty())?;
+    let base = public_base()?;
 
     match requests.issue_link(request_id, LINK_TTL).await {
         Ok(token) => Some(format!("{base}/c/{token}")),
         Err(e) => {
             tracing::warn!(error = %e, "could not mint a credential link");
+            None
+        }
+    }
+}
+
+/// The configured public base URL, without a trailing slash.
+pub fn public_base() -> Option<String> {
+    std::env::var("RUSTYKRAB_PUBLIC_URL")
+        .ok()
+        .map(|u| u.trim_end_matches('/').to_string())
+        .filter(|u| !u.is_empty())
+}
+
+/// A one-time URL for a payment approval, or `None` when there is no base
+/// URL or the token could not be minted. Same shape and lifetime as a
+/// credential link; the page lives at `/p/` rather than `/c/`.
+pub async fn mint_payment_link(
+    payments: &PaymentRequestStore,
+    request_id: &str,
+    base: Option<String>,
+) -> Option<String> {
+    let base = base?;
+    match payments.issue_link(request_id, LINK_TTL).await {
+        Ok(token) => Some(format!("{base}/p/{token}")),
+        Err(e) => {
+            tracing::warn!(error = %e, "could not mint a payment approval link");
             None
         }
     }

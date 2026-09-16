@@ -97,6 +97,7 @@ mod wiki;
 mod credential_read;
 mod credential_request;
 mod credential_write;
+mod payment_request;
 
 // Skill tools
 mod skills;
@@ -200,6 +201,7 @@ pub use credential_write::CredentialWriteTool;
 pub use origin_key::{
     canonical_web_key, origin_credential_key, origin_from_service, PASSWORD, USERNAME,
 };
+pub use payment_request::PaymentRequestTool;
 
 // Skills
 pub use self::skills::{SkillTool, SkillsTool};
@@ -223,6 +225,7 @@ pub fn builtin_tools(
     secrets: rustykrab_store::SecretStore,
     guarded: rustykrab_store::GuardedSecrets,
     requests: rustykrab_store::CredentialRequestStore,
+    payments: rustykrab_store::PaymentRequestStore,
     pending_links: rustykrab_store::PendingLinks,
 ) -> Vec<std::sync::Arc<dyn rustykrab_core::Tool>> {
     vec![
@@ -251,7 +254,11 @@ pub fn builtin_tools(
         // Media
         std::sync::Arc::new(ImageTool::new()),
         // UI
-        std::sync::Arc::new(BrowserTool::new().with_secrets(guarded.clone())),
+        std::sync::Arc::new(
+            BrowserTool::new()
+                .with_secrets(guarded.clone())
+                .with_payments(payments.clone()),
+        ),
         std::sync::Arc::new(CanvasTool::new()),
         // Devices
         std::sync::Arc::new(NodesTool::new()),
@@ -281,7 +288,12 @@ pub fn builtin_tools(
         std::sync::Arc::new(CredentialWriteTool::new(guarded)),
         // Asking for a credential nobody has stored yet — the only one of
         // the three that produces a prompt on the user's phone.
-        std::sync::Arc::new(CredentialRequestTool::new(requests).with_pending_links(pending_links)),
+        std::sync::Arc::new(
+            CredentialRequestTool::new(requests).with_pending_links(pending_links.clone()),
+        ),
+        // Asking the user to approve a purchase and supply its card. The
+        // browser enters and spends it; this only asks.
+        std::sync::Arc::new(PaymentRequestTool::new(payments).with_pending_links(pending_links)),
     ]
 }
 
