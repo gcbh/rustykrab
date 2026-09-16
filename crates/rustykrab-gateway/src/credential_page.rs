@@ -83,18 +83,24 @@ impl PageIdentityPolicy {
     ///
     /// Fails closed: an absent header is a refusal unless anonymous access
     /// was turned on deliberately.
-    fn permits(&self, headers: &HeaderMap) -> bool {
-        let login = headers
-            .get(TAILNET_USER_HEADER)
-            .and_then(|v| v.to_str().ok())
-            .map(|v| v.trim().to_ascii_lowercase())
-            .filter(|v| !v.is_empty());
-
-        match login {
+    pub(crate) fn permits(&self, headers: &HeaderMap) -> bool {
+        match tailnet_login(headers) {
             Some(login) => self.allowed_logins.is_empty() || self.allowed_logins.contains(&login),
             None => self.allow_anonymous,
         }
     }
+}
+
+/// The authenticated tailnet user `tailscale serve` vouched for, if any.
+///
+/// Normalised the way the allowlist is, so the identity that passed the
+/// policy is the identity recorded as having decided.
+pub(crate) fn tailnet_login(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(TAILNET_USER_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.trim().to_ascii_lowercase())
+        .filter(|v| !v.is_empty())
 }
 
 pub fn routes() -> axum::Router<AppState> {
@@ -214,7 +220,7 @@ async fn submit(
     }
 }
 
-fn esc(s: &str) -> String {
+pub(crate) fn esc(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
@@ -256,7 +262,7 @@ fn form_page(req: &CredentialRequest, token: &str, error: Option<&str>) -> Strin
     page(&format!("{service} credential"), &body)
 }
 
-fn page(title: &str, body: &str) -> String {
+pub(crate) fn page(title: &str, body: &str) -> String {
     // `no-referrer` also serializes the Origin of a form POST as `null` in
     // WebKit, so the gateway's origin guard rejects the credential before
     // it reaches `submit`. `same-origin` preserves the real Origin for this
@@ -278,6 +284,11 @@ input{{display:block;width:100%;margin-top:.3rem;padding:.65rem .7rem;\
 font-size:1rem;border:1px solid #bbb;border-radius:.5rem;box-sizing:border-box}}\
 button{{width:100%;padding:.7rem;font-size:1rem;border:0;border-radius:.5rem;\
 background:#0a84ff;color:#fff;font-weight:600}}\
+button.secondary{{margin-top:.6rem;background:transparent;color:#0a84ff}}\
+.amount{{font-size:2rem;font-weight:700;margin:.5rem 0 0}}\
+.merchant{{margin:0 0 .25rem}}\
+.site{{color:#666;font-size:.85rem;margin:.25rem 0 1.25rem}}\
+code{{font:.85em ui-monospace,Menlo,monospace;word-break:break-all}}\
 </style></head><body>{}</body></html>",
         esc(title),
         body

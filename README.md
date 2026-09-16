@@ -222,8 +222,8 @@ All configuration is via environment variables. No plaintext config files.
 | `RUST_LOG` | `info` | Log level (`info`, `debug`, `rustykrab_gateway=debug`) |
 | `RUSTYKRAB_LOG_STDOUT` | auto | Force stdout logging on (`1`) or off (`0`). Default: enabled only when stdout is a terminal. The rolling log file under the data directory is always written |
 | `RUSTYKRAB_OUTCOME_CAPTURE` | `0` | Record how each completed run went, and which skill, memories, and tools were in play, into the `outcome_records` table. Observational only — it changes nothing about how the agent behaves. Groundwork for the self-improvement outer loop; see `DREAMING.md` |
-| `RUSTYKRAB_PUBLIC_URL` | unset | Base URL the agent puts in a credential link, e.g. `https://mac.tailnet.ts.net`. Unset, the agent falls back to telling the user a prompt is waiting in the app — so a link is never minted and the failure is silent |
-| `RUSTYKRAB_TAILNET_USERS` | unset | Comma-separated tailnet logins allowed to open a credential page. Empty means any authenticated tailnet user. Requires `tailscale serve` in front to inject `Tailscale-User-Login` |
+| `RUSTYKRAB_PUBLIC_URL` | unset | Base URL the agent puts in a credential or payment-approval link, e.g. `https://mac.tailnet.ts.net`. Unset, the agent falls back to telling the user a prompt is waiting in the app — so a link is never minted and the failure is silent |
+| `RUSTYKRAB_TAILNET_USERS` | unset | Comma-separated tailnet logins allowed to open a credential or payment-approval page. Empty means any authenticated tailnet user. Requires `tailscale serve` in front to inject `Tailscale-User-Login` |
 | | | When enabled, this also starts a **downtime analysis worker**: read-only, it aggregates recorded outcomes and logs a digest once the system has been quiet for 10 minutes, abandoning a pass if activity arrives mid-flight. It never writes and never calls a model |
 
 ### Persisting credentials
@@ -284,7 +284,9 @@ The `rustykrab-cli keychain` subcommand is macOS-only; on Linux/Docker use env v
 
 The gateway binds loopback. `tailscale serve` fronts it with a real
 Let's Encrypt certificate so a phone on the tailnet can open the secure
-form the agent links to.
+form the agent links to — a credential form at `/c/…`, or a payment
+approval at `/p/…`, which shows the merchant, site and amount and takes
+the card for that one purchase.
 
 ```sh
 # 1. Enable HTTPS certificates for the tailnet, once, in the admin console:
