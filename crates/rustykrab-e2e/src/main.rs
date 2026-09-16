@@ -29,6 +29,7 @@ mod fixture_repo;
 mod judge;
 mod login_suite;
 mod model_suite;
+mod payment_eval;
 mod payment_suite;
 mod planning_suite;
 mod surface;
@@ -1616,10 +1617,11 @@ fn parse_args(argv: &[String]) -> std::result::Result<Args, String> {
                         | "context-model"
                         | "compaction-study"
                         | "ablation"
+                        | "payment"
                         | "all"
                 ) {
                     return Err(format!(
-                        "--mode: expected scripted|model|credential|login|browser|context|context-model|compaction-study|ablation|all, got {}",
+                        "--mode: expected scripted|model|credential|login|browser|context|context-model|compaction-study|ablation|payment|all, got {}",
                         args.mode
                     ));
                 }
@@ -1728,6 +1730,10 @@ async fn main() -> Result<()> {
         for sc in login_suite::SCENARIOS {
             eprintln!("  {:<42}\n      {}", sc.id, sc.description);
         }
+        eprintln!("\n── payment (local model + Chrome + merchant fixture, opt-in) ──");
+        for sc in payment_eval::SCENARIOS {
+            eprintln!("  {:<42}\n      {}", sc.id, sc.description);
+        }
         eprintln!("\n── browser (live network, opt-in) ──");
         for sc in browser_suite::SCENARIOS {
             eprintln!("  {:<42}\n      {}", sc.id, sc.description);
@@ -1816,7 +1822,7 @@ async fn main() -> Result<()> {
     // Nothing model-backed is worth starting if the model cannot answer.
     if matches!(
         args.mode.as_str(),
-        "model" | "credential" | "login" | "browser" | "all"
+        "model" | "credential" | "login" | "browser" | "payment" | "all"
     ) {
         preflight_model(&args.ollama_url, &args.model).await?;
     }
@@ -1855,6 +1861,27 @@ async fn main() -> Result<()> {
     // Also excluded from `all`: every case drives a public third-party site,
     // and two cases consume real credentials. An operator must ask for this
     // suite by name and configure each site independently.
+    // Opt-in: a real model, a real Chrome and a local merchant fixture, for
+    // tens of minutes per trial.
+    let mut payment_trials: Vec<payment_eval::PaymentTrial> = Vec::new();
+    if args.mode == "payment" {
+        let timeout = if args.trial_timeout == login_suite::DEFAULT_TRIAL_TIMEOUT {
+            payment_eval::DEFAULT_TRIAL_TIMEOUT
+        } else {
+            args.trial_timeout
+        };
+        let (cells, results) = payment_eval::run(
+            &bin,
+            &args.model,
+            &args.ollama_url,
+            args.trials,
+            args.case_filter.as_deref(),
+            timeout,
+        )
+        .await?;
+        reports.extend(cells);
+        payment_trials = results;
+    }
     if args.mode == "browser" {
         let (cells, journey_results) = browser_suite::run(
             &bin,
@@ -1888,6 +1915,7 @@ async fn main() -> Result<()> {
         "credential_trials": trials,
         "login_trials": login_trials,
         "browser_trials": browser_trials,
+        "payment_trials": payment_trials,
         "summary": {
             "pass": pass,
             "fail": fail,
@@ -1994,7 +2022,13 @@ fn find_user_data_dirs(root: &std::path::Path) -> Vec<std::path::PathBuf> {
         };
         for entry in entries.flatten() {
             let path = entry.path();
-            if !path.is_dir() {
+            // `file_type` does not follow symlinks; `Path::is_dir` does. A
+            // trial directory holding a link to somewhere real — the payment
+            // eval links the operator's `~/Library` into a substitute HOME —
+            // must not turn this walk into a search of the operator's disk
+            // for directories to delete. Observed: an hour spent walking
+            // `~/Library` through that link before this.
+            if !entry.file_type().is_ok_and(|t| t.is_dir()) {
                 continue;
             }
             if path.file_name().is_some_and(|n| n == "user-data") {
@@ -2205,6 +2239,30 @@ fn hex_decode(s: &str) -> Result<Vec<u8>> {
         .step_by(2)
         .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(Into::into))
         .collect()
+}
+
+#[cfg(test)]
+mod shed_tests {
+    /// A link out of the trial directory must not be followed: shedding
+    /// deletes every `user-data` it finds, so following a link would turn a
+    /// cleanup into deleting directories anywhere the link leads.
+    #[cfg(unix)]
+    #[test]
+    fn shedding_never_follows_a_symlink_out_of_the_trial() {
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(outside.path().join("app/user-data")).unwrap();
+        let trial = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(trial.path().join("browser/p/user-data")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), trial.path().join("home-link")).unwrap();
+
+        let found = super::find_user_data_dirs(trial.path());
+        assert_eq!(found, vec![trial.path().join("browser/p/user-data")]);
+        super::shed_browser_profile(trial.path());
+        assert!(
+            outside.path().join("app/user-data").exists(),
+            "a user-data directory behind a symlink was deleted"
+        );
+    }
 }
 
 #[cfg(test)]
