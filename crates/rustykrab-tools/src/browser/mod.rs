@@ -362,6 +362,12 @@ pub struct BrowserTool {
     /// that could submit it or show the card is routed through `pay` or
     /// refused.
     payment_armed: Arc<Mutex<HashMap<String, String>>>,
+    /// Where a message to the user goes when the model must not be the one
+    /// carrying it. Only `pay` uses it, and only to report a payment
+    /// refused as a duplicate: the model is being told to stop, and a turn
+    /// that is being stopped is not a reliable messenger. Optional for the
+    /// same reason as `payments`.
+    pending_links: Option<rustykrab_store::PendingLinks>,
 }
 
 /// Resolve the action the caller meant.
@@ -805,6 +811,7 @@ impl BrowserTool {
             payments: None,
             payment_frame_origins: Self::default_payment_frame_origins(),
             payment_armed: Arc::default(),
+            pending_links: None,
         }
     }
 
@@ -830,6 +837,7 @@ impl BrowserTool {
             payments: None,
             payment_frame_origins: Self::default_payment_frame_origins(),
             payment_armed: Arc::default(),
+            pending_links: None,
         }
     }
 
@@ -844,6 +852,13 @@ impl BrowserTool {
     /// press pay once the page total checks out.
     pub fn with_payments(mut self, payments: rustykrab_store::PaymentRequestStore) -> Self {
         self.payments = Some(payments);
+        self
+    }
+
+    /// Where to put a message the user must get whatever the model does
+    /// next. See the field.
+    pub fn with_pending_links(mut self, links: rustykrab_store::PendingLinks) -> Self {
+        self.pending_links = Some(links);
         self
     }
 
@@ -2475,13 +2490,41 @@ impl Tool for BrowserTool {
                             refusal = refusal.kind(),
                             "pay refused: the press was not claimed"
                         );
-                        return Ok(json!({
+                        let mut blocked = json!({
                             "status": "blocked",
                             "outcome": "not_applied",
                             "ref": ref_id,
                             "retry_safe": refusal.retry_safe(),
                             "reason": refusal.message(),
-                        }));
+                        });
+                        // A duplicate is the one refusal the user has to
+                        // hear about: the agent is at a checkout for
+                        // something already bought, and what happens next
+                        // is a decision only they can make. Told out of
+                        // band as well as through the tool result, because
+                        // the model is being instructed to stop and a
+                        // stopping turn is not a dependable messenger.
+                        if let rustykrab_store::PayRefusal::Duplicate { earlier } = &refusal {
+                            if let (Some(pending), Some(conv)) = (
+                                &self.pending_links,
+                                rustykrab_core::active_tools::with_session_context(|c| {
+                                    c.conversation_id
+                                }),
+                            ) {
+                                pending
+                                    .push(conv, crate::payment_request::duplicate_alert(earlier));
+                            }
+                            blocked["duplicate_of"] = json!({
+                                "merchant": earlier.merchant,
+                                "amount": earlier.amount.to_string(),
+                                "site": earlier.origin,
+                                "status": earlier.status.as_str(),
+                                "when": rustykrab_store::stamp_utc(
+                                    earlier.used_at.unwrap_or(earlier.created_at)
+                                ),
+                            });
+                        }
+                        return Ok(blocked);
                     }
                 };
                 // The claim took the card out of the vault; pressing a
@@ -4096,11 +4139,13 @@ mod tests {
                     origin: merchant_origin.clone(),
                     amount: rustykrab_store::Money::parse("46.00", "USD").unwrap(),
                     description: None,
+                    confirm_duplicate: false,
                 },
                 Some(conversation),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .id;
         let card = rustykrab_store::CardDetails::new(
             "4242 4242 4242 4242",
             "12/31",

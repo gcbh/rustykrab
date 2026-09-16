@@ -487,9 +487,36 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
+    // How far back a payment counts as a repeat of one being filed now.
+    // Read in hours because that is the unit the decision is made in — "the
+    // same thing twice in a day is a mistake" — and, like the cooldown, an
+    // unparseable value keeps the stricter default rather than failing
+    // startup. `0` turns the duplicate hold off entirely.
+    let duplicate_window_ms = match std::env::var("RUSTYKRAB_PAYMENT_DUPLICATE_WINDOW_HOURS") {
+        Ok(raw) => match raw.trim().parse::<i64>() {
+            Ok(hours) if hours >= 0 => hours.saturating_mul(60 * 60 * 1000),
+            _ => {
+                tracing::warn!(
+                    value = %raw,
+                    "RUSTYKRAB_PAYMENT_DUPLICATE_WINDOW_HOURS is not a whole number of hours; \
+                     keeping the default duplicate window"
+                );
+                rustykrab_store::DEFAULT_DUPLICATE_WINDOW_MS
+            }
+        },
+        Err(_) => rustykrab_store::DEFAULT_DUPLICATE_WINDOW_MS,
+    };
+    if duplicate_window_ms == 0 {
+        tracing::warn!(
+            "duplicate payment hold disabled (RUSTYKRAB_PAYMENT_DUPLICATE_WINDOW_HOURS=0) — \
+             the agent can pay the same site the same amount twice without being stopped"
+        );
+    }
+
     let store = rustykrab_store::Store::open(data_dir.join("db"), master_key)?
         .with_credential_backend(credential_backend_from_env())
-        .with_pay_cooldown(pay_cooldown);
+        .with_pay_cooldown(pay_cooldown)
+        .with_duplicate_window_ms(duplicate_window_ms);
 
     // --- Validate required secrets (central registry) ---
     // Every credential the app needs is declared in `registry::REGISTRY`.

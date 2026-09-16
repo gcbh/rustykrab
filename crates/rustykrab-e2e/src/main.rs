@@ -114,6 +114,42 @@ const AGENT_SCRIPT: &str = r#"{
       ]
     },
     {
+      "trigger": "e2e: pay for the parking",
+      "steps": [
+        { "toolCalls": [ { "name": "payment_request",
+                           "arguments": { "url": "http://localhost:9/checkout",
+                                          "merchant": "E2E Parking",
+                                          "amount": "12.00",
+                                          "currency": "USD",
+                                          "description": "all-day parking" } } ] },
+        { "text": "I have asked you to approve paying E2E Parking up to USD 12.00." }
+      ]
+    },
+    {
+      "trigger": "e2e: pay for the harbour",
+      "steps": [
+        { "toolCalls": [ { "name": "payment_request",
+                           "arguments": { "url": "http://localhost:9/checkout",
+                                          "merchant": "E2E Harbour",
+                                          "amount": "33.00",
+                                          "currency": "USD",
+                                          "description": "mooring fee" } } ] },
+        { "text": "I have asked you to approve paying E2E Harbour up to USD 33.00." }
+      ]
+    },
+    {
+      "trigger": "e2e: pay for the harbour again",
+      "steps": [
+        { "toolCalls": [ { "name": "payment_request",
+                           "arguments": { "url": "http://localhost:9/checkout",
+                                          "merchant": "E2E Harbour",
+                                          "amount": "33.00",
+                                          "currency": "USD",
+                                          "description": "mooring fee" } } ] },
+        { "text": "I stopped that payment: it looks like a repeat of one already made." }
+      ]
+    },
+    {
       "trigger": "the user approved paying e2e ferry",
       "steps": [
         { "toolCalls": [ { "name": "todo_read", "arguments": {} } ] },
