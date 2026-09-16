@@ -9,6 +9,7 @@ mod inbound;
 mod jobs;
 pub mod keychain;
 mod outcomes;
+mod payment_request;
 mod projects;
 mod recall_archive;
 pub mod registry;
@@ -34,6 +35,10 @@ pub use guarded::{GuardedSecrets, WriteOutcome};
 pub use inbound::InboundStore;
 pub use jobs::{JobRun, JobStore, ScheduledJob};
 pub use outcomes::OutcomeStore;
+pub use payment_request::{
+    AuthorizedPayment, CardDetails, CardError, Money, PaymentRequest, PaymentRequestStore,
+    PaymentStatus, PaymentTerms, CARD_TTL, PENDING_TTL_MS,
+};
 pub use pending_links::PendingLinks;
 pub use projects::{ApplyRevisionResult, ProjectStore};
 pub use recall_archive::RecallArchiveStore;
@@ -56,6 +61,10 @@ pub struct Store {
     /// Credential links minted this turn, waiting to be sent to the user
     /// once the agent has finished speaking. In memory only.
     pending_links: PendingLinks,
+    /// Cards approved for one purchase each. In memory only, shared by
+    /// every clone of this handle so the page that receives a card and the
+    /// browser that spends it see the same entry.
+    card_vault: payment_request::CardVault,
     /// Where the database lives, so a background reader can open its own
     /// connection instead of queueing behind live traffic on this one.
     db_path: PathBuf,
@@ -97,6 +106,7 @@ impl Store {
             request_notifier: None,
             credential_backend: credential_backend::default_backend(),
             pending_links: PendingLinks::new(),
+            card_vault: payment_request::CardVault::default(),
             db_path,
         })
     }
@@ -227,6 +237,36 @@ impl Store {
 
             CREATE INDEX IF NOT EXISTS idx_credential_requests_pending
                 ON credential_requests (name) WHERE status = 'pending';
+
+            -- One purchase the agent may pay for (payment_request.rs). The
+            -- card itself is never here: it lives in an in-memory vault
+            -- until used or expired. The row is the approval and its audit
+            -- trail -- terms, who approved, when, and the last four digits.
+            -- `conversation_id` is unenforced for the same reason as on
+            -- `credential_requests`.
+            CREATE TABLE IF NOT EXISTS payment_requests (
+                id              TEXT PRIMARY KEY,
+                conversation_id TEXT,
+                merchant        TEXT NOT NULL,
+                origin          TEXT NOT NULL,
+                amount_minor    INTEGER NOT NULL,
+                currency        TEXT NOT NULL,
+                description     TEXT,
+                status          TEXT NOT NULL DEFAULT 'pending',
+                created_at      INTEGER NOT NULL,
+                decided_at      INTEGER,
+                decided_by      TEXT,
+                card_last4      TEXT,
+                used_at         INTEGER,
+                link_token_hash TEXT,
+                link_expires_at INTEGER
+            );
+
+            -- One purchase in flight per conversation, and the lookups that
+            -- enforce it only ever ask about live rows.
+            CREATE INDEX IF NOT EXISTS idx_payment_requests_live
+                ON payment_requests (conversation_id)
+                WHERE status IN ('pending', 'authorized');
 
             -- Superseded values, kept encrypted, so an approved change or a
             -- mistaken delete is recoverable.
@@ -684,6 +724,16 @@ impl Store {
         match &self.request_notifier {
             Some(notifier) => requests.with_notifier(Arc::clone(notifier)),
             None => requests,
+        }
+    }
+
+    /// Handle for purchases the agent asks the user to approve, and the
+    /// cards approved for them.
+    pub fn payment_requests(&self) -> PaymentRequestStore {
+        let payments = PaymentRequestStore::new(Arc::clone(&self.conn), self.card_vault.clone());
+        match &self.request_notifier {
+            Some(notifier) => payments.with_notifier(Arc::clone(notifier)),
+            None => payments,
         }
     }
 
