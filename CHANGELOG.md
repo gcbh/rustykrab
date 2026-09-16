@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.3.0] - 2026-09-16
+
+- fix(browser): close three bypasses in the browser payment path [9/9] (#657)
+
 ## [5.2.40] - 2026-09-15
 
 - fix(compaction): stop one opaque tool result from wedging a conversation (#654)

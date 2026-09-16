@@ -1369,19 +1369,51 @@ pub(crate) fn failed_before_press(error: &Error) -> bool {
     is_stale_element(error)
 }
 
+/// What clicking a control would mean on a page that has a card entered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SubmitVerdict {
+    /// Not a submit — a terms checkbox, a coupon field, a "show details"
+    /// toggle. The click goes through.
+    Other,
+    /// Submits the checkout, or could not be judged in the merchant's own
+    /// document. Routed through `pay`, which checks the total first.
+    Submits,
+    /// The control is in a site-isolated frame, where neither this check nor
+    /// `pay`'s total check can reach it.
+    SiteIsolated,
+}
+
+impl SubmitVerdict {
+    /// The verdict a ref's own frame settles, before the page is asked.
+    ///
+    /// A ref carrying a `target_id` lives in a site-isolated frame (an
+    /// OOPIF). The page-side [`super::payment::SUBMIT_LIKE`] check runs in
+    /// the merchant's document and cannot see it, and `prepare_pay` refuses
+    /// such refs outright, so reading it as "not a submit" would leave a
+    /// checkout whose pay button sits in the provider's frame with no total
+    /// check at all: `pay` unavailable and a plain click unguarded. It is
+    /// therefore treated as submitting — the same conservative default the
+    /// undecidable case already takes.
+    pub(crate) fn from_frame(element_ref: &ElementRef) -> Option<Self> {
+        element_ref
+            .target_id
+            .is_some()
+            .then_some(Self::SiteIsolated)
+    }
+}
+
 /// Whether the control behind `ref_id` would plausibly submit a checkout.
-/// Controls in site-isolated frames are not judged and read as `false`.
 pub(crate) async fn is_submit_like(
     page: &Page,
     store: &SnapshotStore,
     store_key: &str,
     ref_id: &str,
-) -> Result<bool> {
+) -> Result<SubmitVerdict> {
     let element_ref = store.get_ref(store_key, ref_id).await.ok_or_else(|| {
         Error::ToolExecution(ToolError::not_found("ref expired; take a fresh snapshot"))
     })?;
-    if element_ref.target_id.is_some() {
-        return Ok(false);
+    if let Some(verdict) = SubmitVerdict::from_frame(&element_ref) {
+        return Ok(verdict);
     }
     let resolved = resolve_element(page, &element_ref).await?;
     let function = format!(
@@ -1394,10 +1426,11 @@ pub(crate) async fn is_submit_like(
     )
     .await
     {
-        Ok(Ok(Value::Bool(submits))) => Ok(submits),
+        Ok(Ok(Value::Bool(false))) => Ok(SubmitVerdict::Other),
+        Ok(Ok(Value::Bool(true))) => Ok(SubmitVerdict::Submits),
         // Undecidable is treated as submitting: the cost is one refused
         // click the agent can route through `pay`.
-        _ => Ok(true),
+        _ => Ok(SubmitVerdict::Submits),
     }
 }
 
@@ -2478,5 +2511,39 @@ mod tests {
         assert_eq!(value["outcome"], "not_applied");
         assert_eq!(value["browser_degraded"], true);
         assert_eq!(value["retry_safe"], true);
+    }
+
+    fn button_ref(target_id: Option<&str>) -> ElementRef {
+        ElementRef {
+            ref_id: "s1-7".into(),
+            selector: "#pay".into(),
+            frame_id: None,
+            frame_url: None,
+            target_id: target_id.map(str::to_string),
+            role: "button".into(),
+            name: "Pay in frame".into(),
+            value: None,
+            interactive: true,
+            bounds: None,
+        }
+    }
+
+    #[test]
+    fn a_control_in_a_site_isolated_frame_counts_as_submitting() {
+        // The bypass this closes: `pay` refuses an OOPIF ref, so reading the
+        // same ref as "not a submit" left the in-frame pay button clickable
+        // with no total check anywhere.
+        // `Other` is the only verdict `enforce_payment_lock` lets through,
+        // and its match over this enum is exhaustive, so a ref in a frame
+        // cannot quietly become clickable again.
+        assert_eq!(
+            SubmitVerdict::from_frame(&button_ref(Some("F00F"))),
+            Some(SubmitVerdict::SiteIsolated)
+        );
+        assert_eq!(
+            SubmitVerdict::from_frame(&button_ref(None)),
+            None,
+            "a ref in the merchant's own document is decided by the page"
+        );
     }
 }
