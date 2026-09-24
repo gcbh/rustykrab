@@ -1,0 +1,74 @@
+name: Dream Evals
+
+# The outer loop's evals, run wider than a pull request can afford and on
+# a schedule rather than a change. A PR run proves the properties on a
+# handful of seeds; this run proves them on hundreds, so a fault the
+# generator reaches rarely is found within days rather than never. The
+# report is uploaded as an artifact and summarised on the run page, which
+# is what makes the evals something to build on: an eval marked expected-
+# to-fail shows up here as `xfail` until the code meets it, and as `xpass`
+# (failing the run) the day it does, so it gets promoted.
+
+on:
+  schedule:
+    # 04:17 UTC daily. Off the hour so it does not queue behind every other
+    # nightly on the runner pool.
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+    inputs:
+      seeds:
+        description: "Seeds per randomized eval"
+        required: false
+        default: "300"
+
+env:
+  CARGO_TERM_COLOR: always
+  DREAM_EVAL_SEEDS: ${{ github.event.inputs.seeds || '300' }}
+  DREAM_EVAL_REPORT: ${{ github.workspace }}/dream-evals.jsonl
+
+jobs:
+  evals:
+    name: Consolidation and outcome evals
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run the evals
+        # Each file is one suite. `--no-fail-fast` so a failing suite does
+        # not hide the others' results from the report.
+        run: |
+          cargo test --no-fail-fast \
+            -p rustykrab-dream --test invariants --test evals \
+            -p rustykrab-cli --test outcome_evals \
+            -- --nocapture
+
+      - name: Summarise
+        if: always()
+        run: |
+          if [[ ! -f "$DREAM_EVAL_REPORT" ]]; then
+            echo "no report written -- the evals did not run" | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          {
+            echo "## Dream evals ($DREAM_EVAL_SEEDS seeds)"
+            echo
+            echo "| outcome | count |"
+            echo "|---|---|"
+            jq -r '.outcome' "$DREAM_EVAL_REPORT" | sort | uniq -c | awk '{printf "| %s | %s |\n", $2, $1}'
+            echo
+            echo "| eval | outcome | seeds | ms | detail |"
+            echo "|---|---|---|---|---|"
+            jq -r '[.name, .outcome, .seeds, .elapsed_ms, (.detail // .xfail_reason // "")] | @tsv' "$DREAM_EVAL_REPORT" \
+              | awk -F'\t' '{gsub(/\|/, "\\|", $5); printf "| %s | %s | %s | %s | %s |\n", $1, $2, $3, $4, substr($5, 1, 160)}'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dream-evals-${{ github.run_id }}
+          path: ${{ env.DREAM_EVAL_REPORT }}
+          if-no-files-found: error

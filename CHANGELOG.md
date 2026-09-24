@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.3.1] - 2026-09-24
+
+- Dreaming evals: say what the loop still owes, and prove it nightly (#633)
+
 ## [5.3.0] - 2026-09-16
 
 - fix(browser): close three bypasses in the browser payment path [9/9] (#657)
