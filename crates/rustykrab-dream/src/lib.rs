@@ -13,10 +13,22 @@
 //! the **Analyze** stage only: deterministic, read-only reporting over
 //! recorded outcomes. Nothing here calls a model or changes any artifact.
 
+pub mod cluster_source;
+pub mod consolidation;
+pub mod engine;
+pub mod memory_mutator;
+pub mod mutation;
+pub mod planner;
 pub mod report;
 pub mod store_source;
 pub mod worker;
 
+pub use cluster_source::MemoryClusterSource;
+pub use consolidation::{run_consolidation_cycle, ConsolidationContext, CycleOutcome};
+pub use engine::{promote, rollback, rollback_blockers, CyclePolicy, Promotion, PromotionRefusal};
+pub use memory_mutator::MemorySystemMutator;
+pub use mutation::{MemoryFacts, MemoryMutator};
+pub use planner::{plan_consolidation, ConsolidationPlan, ConsolidationSource, MemoryCandidate};
 pub use report::{
     analyze, AnalysisReport, ArtifactFinding, FindingVerdict, OutcomeSource, Readiness,
     SignalQuality, MIN_OBSERVATIONS, UNDERPERFORMING_BELOW,
