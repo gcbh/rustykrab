@@ -7,6 +7,12 @@ license.workspace = true
 
 [dependencies]
 rustykrab-store.workspace = true
+# Reuse production tool schemas and argument validation, never tool execution.
+rustykrab-core.workspace = true
+rustykrab-agent.workspace = true
+rustykrab-providers.workspace = true
+rustykrab-tools.workspace = true
+chrono.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
 reqwest = { workspace = true, features = ["stream"] }
@@ -24,3 +30,5 @@ tempfile = "3"
 # credential_requests) and not just on what the REST API reveals.
 rusqlite = { version = "0.34", features = ["bundled"] }
 uuid.workspace = true
+sha2.workspace = true
+base64.workspace = true

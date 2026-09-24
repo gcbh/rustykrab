@@ -24,6 +24,38 @@ use crate::secret::{SecretStore, WriteAuthority};
 /// How long a pending request survives before it is swept.
 pub const REQUEST_TTL_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 
+/// Defense in depth, not a classifier for arbitrary secret values. The generic
+/// login form has no payment-specific retention/observation policy and must not
+/// advertise enrollment of an explicitly named card or security code.
+fn reject_payment_fields(fields: &[RequestedField]) -> Result<(), Error> {
+    for field in fields {
+        let identity = format!("{} {}", field.key, field.label).to_ascii_lowercase();
+        let words = identity
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>();
+        let compact = words.join("");
+        if words
+            .iter()
+            .any(|w| matches!(*w, "cvv" | "cvv2" | "cvc" | "cvc2" | "csc" | "pan"))
+            || [
+                "cardnumber",
+                "creditcard",
+                "debitcard",
+                "securitycode",
+                "cardverification",
+                "cccsc",
+                "ccnumber",
+            ]
+            .iter()
+            .any(|s| compact.contains(s))
+        {
+            return Err(Error::Storage("Payment cards cannot be saved through generic credential capture. To pay at a checkout, use payment_request, which asks the user to approve that one purchase; never request card numbers or security codes in chat.".into()));
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequestAction {
     Update,
@@ -132,6 +164,14 @@ pub trait RequestNotifier: Send + Sync + std::fmt::Debug {
         _service: Option<&str>,
     ) {
     }
+
+    /// The user approved a purchase and supplied the card for it.
+    ///
+    /// Same loop as [`Self::request_fulfilled`], for a payment rather than
+    /// a credential: whatever filed the request can now go and pay.
+    /// Defaulted and fire-and-forget for the same reasons.
+    fn payment_authorized(&self, _conversation_id: Option<&str>, _request: &crate::PaymentRequest) {
+    }
 }
 
 #[derive(Clone)]
@@ -234,6 +274,7 @@ impl CredentialRequestStore {
                 "a fulfil request must name at least one field".into(),
             ));
         }
+        reject_payment_fields(&fields)?;
         let id = Uuid::new_v4().to_string();
         self.insert_full(
             id.clone(),
@@ -280,6 +321,8 @@ impl CredentialRequestStore {
         }
 
         let asked: Vec<RequestedField> = row.fields;
+        // Also block old requests filed before this policy existed.
+        reject_payment_fields(&asked)?;
         for (key, _) in values {
             if !asked.iter().any(|f| &f.key == key) {
                 return Err(Error::Storage(format!(
@@ -815,6 +858,51 @@ mod fulfil_tests {
     }
 
     #[tokio::test]
+    async fn payment_fields_are_rejected_before_filing_or_fulfilling_legacy_requests() {
+        let (_dir, requests, secrets) = store();
+        for key in ["card_number", "cc-number", "cvv", "cvc2", "payment_pan"] {
+            let fields = vec![RequestedField {
+                key: key.into(),
+                label: key.into(),
+                secret: true,
+                hint: None,
+            }];
+            assert!(requests
+                .file_fulfil("test_payment", None, fields.clone(), None, None)
+                .await
+                .is_err());
+            assert!(requests.pending().await.unwrap().is_empty());
+            // Reconstruct an old pending request to test the second guard,
+            // not only the tool's new-request path.
+            let id = Uuid::new_v4().to_string();
+            requests
+                .insert_full(
+                    id.clone(),
+                    "test_payment",
+                    RequestAction::Fulfil,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(fields),
+                )
+                .await
+                .unwrap();
+            assert!(requests
+                .fulfil(
+                    &id,
+                    &[(key.into(), "synthetic-not-a-real-card".into())],
+                    "fixture"
+                )
+                .await
+                .is_err());
+            assert!(secrets.list_names().await.unwrap().is_empty());
+            requests.deny(&id, "fixture").await.unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn a_live_link_suppresses_a_second_ask_and_an_expired_one_does_not() {
         let (_dir, requests, _secrets) = store();
         let id = requests
@@ -1107,7 +1195,7 @@ mod fulfil_tests {
 /// SHA-256 without a salt is right here and a salt would be wrong: the
 /// token is 32 bytes of CSPRNG output, so there is no dictionary to attack,
 /// and lookup is by hash — a per-row salt would make that impossible.
-fn hash_token(token: &str) -> String {
+pub(crate) fn hash_token(token: &str) -> String {
     let mut h = Sha256::new();
     h.update(token.as_bytes());
     hex::encode(h.finalize())

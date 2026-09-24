@@ -31,7 +31,8 @@ pub struct AppState {
     pub auth_token: Arc<RwLock<String>>,
     pub rate_limiter: Arc<RateLimiter>,
     pub origin_policy: OriginPolicy,
-    /// Who may open the credential page served at `/c/{token}`.
+    /// Who may open the link pages: credentials at `/c/{token}`, payment
+    /// approvals at `/p/{token}`.
     pub credential_page_policy: crate::PageIdentityPolicy,
     /// Wake-up channel and cancellation registry for the delegated-task
     /// queue. Shared between the `/api/tasks` handlers, which enqueue and

@@ -12,6 +12,7 @@
 //! mapping.
 
 use rustykrab_core::{Error, Result};
+use sha2::{Digest, Sha256};
 
 /// The value a person types into the first box.
 pub const USERNAME: &str = "username";
@@ -20,62 +21,41 @@ pub const PASSWORD: &str = "password";
 
 /// Store key for one field of a website login.
 ///
-/// Keyed on host alone — not scheme, not port. A site reached over http
-/// once and https thereafter, or on an explicit port, is the same login
-/// to the person typing it; splitting the key would ask them for it
-/// twice. `www.` is stripped for the same reason.
-///
-/// ```text
-/// https://portal.example.com/login  + password -> web_portal_example_com_password
-/// https://www.portal.example.com/   + username -> web_portal_example_com_username
-/// ```
-///
-/// The result is restricted to the character set `SecretStore::validate_name`
-/// accepts, so a host with a hyphen or an internationalised name cannot
-/// produce a key the store will refuse.
+/// Version 2 hashes the canonical URL origin (scheme, exact host, effective
+/// port), preserving browser security boundaries. Paths are not identity.
+/// Old `web_host_with_underscores_*` keys and Instagram's named legacy keys
+/// are intentionally not fallback candidates: their original origin cannot
+/// be reconstructed without guessing. They remain stored; users re-enroll
+/// through an origin-labelled secure form. No data is deleted or auto-migrated.
 pub fn origin_credential_key(url: &str, field: &str) -> Result<String> {
-    let parsed = url::Url::parse(url).map_err(|e| {
-        Error::ToolExecution(format!("cannot derive a credential key from '{url}': {e}").into())
-    })?;
-    let host = parsed.host_str().ok_or_else(|| {
-        Error::ToolExecution(format!("'{url}' has no host, so there is no login to key on").into())
-    })?;
-    let host = host.strip_prefix("www.").unwrap_or(host);
-    if host.is_empty() {
-        return Err(Error::ToolExecution(
-            format!("'{url}' has an empty host").into(),
-        ));
-    }
-
+    let origin = canonical_credential_origin(url)?;
     let field = field.trim();
-    if field.is_empty() {
+    if !WEB_KEY_ROLES.contains(&field) {
         return Err(Error::ToolExecution(
-            "a credential key needs a field name, e.g. 'username' or 'password'".into(),
+            "a website credential key needs a supported login field, e.g. 'username' or 'password'"
+                .into(),
         ));
     }
-
-    let mut key = String::with_capacity(4 + host.len() + 1 + field.len());
-    key.push_str("web_");
-    push_sanitised(&mut key, host);
-    key.push('_');
-    push_sanitised(&mut key, field);
-    Ok(key)
+    Ok(format!(
+        "web_v2_{}_{field}",
+        hex::encode(Sha256::digest(origin.as_bytes()))
+    ))
 }
 
-/// Lowercase ASCII alphanumerics survive; everything else becomes `_`.
-///
-/// Deliberately lossy and deliberately not reversible. The key only has
-/// to be stable and legal, and collapsing punctuation means a host cannot
-/// smuggle a character the store rejects — or, worse, one that reads as a
-/// different key.
-fn push_sanitised(out: &mut String, raw: &str) {
-    for ch in raw.chars() {
-        if ch.is_ascii_alphanumeric() {
-            out.push(ch.to_ascii_lowercase());
-        } else {
-            out.push('_');
-        }
+pub(crate) fn canonical_credential_origin(raw: &str) -> Result<String> {
+    let parsed = url::Url::parse(raw).map_err(|_| {
+        Error::ToolExecution("credential origin must be an absolute HTTP(S) URL".into())
+    })?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+    {
+        return Err(Error::ToolExecution(
+            "credential origin must be an HTTP(S) URL without embedded credentials".into(),
+        ));
     }
+    Ok(parsed.origin().ascii_serialization())
 }
 
 #[cfg(test)]
@@ -84,18 +64,18 @@ mod tests {
 
     #[test]
     fn the_same_site_always_yields_the_same_key() {
-        // Different paths, different schemes, one login.
+        // Paths and an explicit default port are equivalent; schemes are not.
         let a = origin_credential_key("https://portal.example.com/login", PASSWORD).unwrap();
         let b = origin_credential_key("https://portal.example.com/account/2", PASSWORD).unwrap();
-        let c = origin_credential_key("http://portal.example.com", PASSWORD).unwrap();
-        assert_eq!(a, "web_portal_example_com_password");
+        let c = origin_credential_key("https://portal.example.com:443", PASSWORD).unwrap();
+        assert!(a.starts_with("web_v2_"));
         assert_eq!(a, b);
-        assert_eq!(a, c, "scheme is not part of the identity of a login");
+        assert_eq!(a, c);
     }
 
     #[test]
-    fn www_is_not_a_different_site() {
-        assert_eq!(
+    fn www_is_a_different_origin() {
+        assert_ne!(
             origin_credential_key("https://www.example.com/", USERNAME).unwrap(),
             origin_credential_key("https://example.com/", USERNAME).unwrap()
         );
@@ -106,13 +86,13 @@ mod tests {
         let u = origin_credential_key("https://example.com", USERNAME).unwrap();
         let p = origin_credential_key("https://example.com", PASSWORD).unwrap();
         assert_ne!(u, p);
-        assert_eq!(u, "web_example_com_username");
-        assert_eq!(p, "web_example_com_password");
+        assert!(u.ends_with("_username"));
+        assert!(p.ends_with("_password"));
     }
 
     #[test]
-    fn a_port_does_not_split_the_login() {
-        assert_eq!(
+    fn a_nondefault_port_is_a_different_origin() {
+        assert_ne!(
             origin_credential_key("https://example.com:8443/login", PASSWORD).unwrap(),
             origin_credential_key("https://example.com/login", PASSWORD).unwrap()
         );
@@ -155,6 +135,23 @@ mod tests {
     #[test]
     fn an_empty_field_is_refused() {
         assert!(origin_credential_key("https://example.com", "  ").is_err());
+    }
+
+    #[test]
+    fn legacy_collisions_and_schemes_are_isolated() {
+        let origins = [
+            "https://a-b.example.com",
+            "https://a.b.example.com",
+            "http://a.b.example.com",
+            "https://a_b.example.com",
+            "https://www.a.b.example.com",
+        ];
+        let keys: std::collections::HashSet<_> = origins
+            .into_iter()
+            .map(|origin| origin_credential_key(origin, PASSWORD).unwrap())
+            .collect();
+        assert_eq!(keys.len(), origins.len());
+        assert!(!keys.contains("web_a_b_example_com_password"));
     }
 }
 
@@ -212,6 +209,9 @@ pub fn canonical_web_key(origin: &str, key: &str) -> Option<String> {
 /// "portal.example.com/login" — so it is only usable here when it looks
 /// like a host. Anything without a dot is a product name, not an origin.
 pub fn origin_from_service(service: &str) -> Option<String> {
+    if service.trim().starts_with("https://") || service.trim().starts_with("http://") {
+        return canonical_credential_origin(service.trim()).ok();
+    }
     let s = service
         .trim()
         .trim_start_matches("https://")
@@ -232,8 +232,8 @@ mod canonical_tests {
             "web_m1_max_64_gb_tail84017e_ts_net_password",
         );
         assert_eq!(
-            got.as_deref(),
-            Some("web_m1_max_64gb_tail84017e_ts_net_password")
+            got,
+            Some(origin_credential_key("https://m1-max-64gb.tail84017e.ts.net", PASSWORD).unwrap())
         );
     }
 
@@ -242,7 +242,7 @@ mod canonical_tests {
         assert_eq!(
             canonical_web_key(
                 "https://m1-max-64gb.tail84017e.ts.net/demo/",
-                "web_m1_max_64gb_tail84017e_ts_net_username"
+                &origin_credential_key("https://m1-max-64gb.tail84017e.ts.net", USERNAME).unwrap()
             ),
             None
         );

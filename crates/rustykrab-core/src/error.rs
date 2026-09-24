@@ -139,6 +139,13 @@ pub enum Error {
     #[error("model provider bad request: {0}")]
     ModelBadRequest(String),
 
+    /// Refused before dispatch; no messages have been silently removed.
+    #[error("model input requires approximately {estimated_input_tokens} tokens but only {input_budget_tokens} are available; compact history or reduce the active tool schemas")]
+    ContextBudgetExceeded {
+        estimated_input_tokens: usize,
+        input_budget_tokens: usize,
+    },
+
     #[error("model provider overloaded: {0}")]
     ModelOverloaded(String),
 
@@ -195,7 +202,9 @@ impl Error {
             Error::ToolExecution(te) => te.kind,
             Error::ModelRateLimit(_) | Error::ModelOverloaded(_) => ToolErrorKind::RateLimited,
             Error::ModelAuthError(_) | Error::Auth(_) => ToolErrorKind::PermissionDenied,
-            Error::ModelBadRequest(_) => ToolErrorKind::InvalidInput,
+            Error::ModelBadRequest(_) | Error::ContextBudgetExceeded { .. } => {
+                ToolErrorKind::InvalidInput
+            }
             Error::NotFound(_) => ToolErrorKind::NotFound,
             Error::AlreadyExists(_) => ToolErrorKind::InvalidInput,
             // The agent asked for something it isn't allowed to do
@@ -208,5 +217,22 @@ impl Error {
             | Error::ContentPolicy
             | Error::Internal(_) => ToolErrorKind::Internal,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn context_budget_refusal_requires_a_changed_request() {
+        let error = Error::ContextBudgetExceeded {
+            estimated_input_tokens: 9_000,
+            input_budget_tokens: 4_096,
+        };
+        assert_eq!(error.kind(), ToolErrorKind::InvalidInput);
+        assert!(!error.kind().retryable());
+        assert!(error.to_string().contains("9000"));
+        assert!(error.to_string().contains("4096"));
     }
 }

@@ -80,6 +80,13 @@ pub trait ModelProvider: Send + Sync {
         None
     }
 
+    /// Usable message budget for the actual tool schemas on this request.
+    /// Providers must not silently delete messages to fit this budget: the
+    /// runner owns semantic compaction and preservation of the original trail.
+    fn context_limit_for_tools(&self, _tools: &[ToolSchema]) -> Option<usize> {
+        self.context_limit()
+    }
+
     /// Total raw context window in tokens (input + output), when known.
     ///
     /// Distinct from [`Self::context_limit`], which may report a *usable

@@ -20,7 +20,8 @@
 #   2. Computes the next version (or uses the one you gave)
 #   3. Updates workspace version in Cargo.toml
 #   4. Moves "Unreleased" entries in CHANGELOG.md under a new version heading
-#   5. Runs `cargo check` to regenerate Cargo.lock (skipped in --ci mode)
+#   5. Resolves workspace metadata to regenerate Cargo.lock without compiling
+#      native dependencies (local releases also run a best-effort cargo check)
 #   6. Commits (or amends HEAD with --amend) and tags as v<version>
 #
 # After running locally, push with:
@@ -80,7 +81,15 @@ NEXT="${MAJOR}.${MINOR}.${PATCH}"
 echo "Bumping version: $CURRENT -> $NEXT"
 
 # --- Update Cargo.toml workspace version ---
-sed -i "s/^version = \"$CURRENT\"/version = \"$NEXT\"/" "$CARGO_TOML"
+awk -v current="$CURRENT" -v next_version="$NEXT" '
+    $0 == "version = \"" current "\"" && !updated {
+        print "version = \"" next_version "\""
+        updated = 1
+        next
+    }
+    { print }
+    END { if (!updated) exit 1 }
+' "$CARGO_TOML" > "${CARGO_TOML}.tmp" && mv "${CARGO_TOML}.tmp" "$CARGO_TOML"
 echo "  Updated $CARGO_TOML"
 
 # --- Update CHANGELOG.md ---
@@ -111,14 +120,28 @@ if [ "$CI_MODE" = true ] && [ -n "$PR_TITLE" ]; then
     ' "$CHANGELOG" > "${CHANGELOG}.tmp" && mv "${CHANGELOG}.tmp" "$CHANGELOG"
 else
     # Local: just promote the [Unreleased] section to the new version heading
-    sed -i "s/^## \[Unreleased\]/## [Unreleased]\n\n## [$NEXT] - $DATE/" "$CHANGELOG"
+    awk -v ver="$NEXT" -v date="$DATE" '
+        /^## \[Unreleased\]/ {
+            print
+            print ""
+            printf "## [%s] - %s\n", ver, date
+            next
+        }
+        { print }
+    ' "$CHANGELOG" > "${CHANGELOG}.tmp" && mv "${CHANGELOG}.tmp" "$CHANGELOG"
 fi
 echo "  Updated $CHANGELOG"
 
-# --- Regenerate Cargo.lock (local only — CI may not have all native deps) ---
+# --- Regenerate Cargo.lock without compiling native dependencies ---
+# Workspace package versions are recorded in Cargo.lock. This must run in CI
+# too; otherwise the merge-time version bump leaves the first subsequent Cargo
+# command with a dirty worktree. `cargo metadata` resolves the lockfile but does
+# not build dependencies that may require unavailable native libraries.
+(cd "$REPO_ROOT" && cargo metadata --format-version 1 >/dev/null)
+echo "  Cargo.lock updated"
+
 if [ "$CI_MODE" = false ]; then
     (cd "$REPO_ROOT" && cargo check --quiet 2>/dev/null) || true
-    echo "  Cargo.lock updated"
 fi
 
 # --- Commit and tag ---
