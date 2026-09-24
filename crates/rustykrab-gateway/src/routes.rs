@@ -392,8 +392,17 @@ async fn send_message(
     conv.messages.push(user_msg);
     conv.updated_at = Utc::now();
 
-    // Run the full agent pipeline.
-    let assistant_msg = crate::run::run_agent(&state, &mut conv, &user_content, trace_id).await?;
+    // Persist admission before model/profile setup; an error is not an empty
+    // turn. Save the partial trail below before propagating the HTTP status.
+    state
+        .agent
+        .store
+        .conversations()
+        .save_turn(&conv, &persisted_ids)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let persisted_ids: Vec<Uuid> = conv.messages.iter().map(|m| m.id).collect();
+    let result = crate::run::run_agent(&state, &mut conv, &user_content, trace_id).await;
 
     // Persist the turn (including intermediate tool call messages):
     // appends the new messages and bumps updated_at, or rewrites the
@@ -407,6 +416,7 @@ async fn send_message(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
+    let assistant_msg = result?;
     let apollo_msg = ApolloMessage::from_message(conv.id, &assistant_msg);
     let apps = extract_apps_from_text(&assistant_msg);
     let response = if apps.is_empty() {
@@ -671,6 +681,17 @@ async fn send_message_stream(
     conv.messages.push(user_msg);
     conv.updated_at = Utc::now();
 
+    // Durable before spawning: even setup failure or client disconnect must
+    // not erase the incoming message.
+    state
+        .agent
+        .store
+        .conversations()
+        .save_turn(&conv, &persisted_ids)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let persisted_ids: Vec<Uuid> = conv.messages.iter().map(|m| m.id).collect();
+
     // Channel for streaming events from the agent task to the SSE response.
     let (tx, rx) = tokio::sync::mpsc::channel::<SsePayload>(128);
 
@@ -685,74 +706,73 @@ async fn send_message_stream(
     let agent_state = state.clone();
     let panic_tx = tx.clone();
     let agent_handle = tokio::spawn(async move {
-        // Heartbeat bookkeeping uses a monotonic Instant origin; the atomic
-        // stores milliseconds elapsed since `start` (cheaper and steadier
-        // than a SystemTime/UNIX_EPOCH read per streamed event).
-        let start = std::time::Instant::now();
-        let heartbeat = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-
-        let hb = heartbeat.clone();
-        let event_tx = tx.clone();
-        let on_event = move |event: AgentEvent| {
-            // Reset heartbeat on every event.
-            hb.store(
-                start.elapsed().as_millis() as u64,
-                std::sync::atomic::Ordering::Relaxed,
-            );
-            if let Err(e) = event_tx.try_send(SsePayload::Event(event)) {
-                tracing::warn!("SSE event dropped (channel full): {e}");
-            }
-        };
-
-        // Heartbeat monitor: checks every 30s if we've gone 5 minutes without an event.
-        let hb_monitor = heartbeat.clone();
-        let timeout_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let tf = timeout_flag.clone();
-        let mut monitor = tokio::spawn(async move {
-            const HEARTBEAT_TIMEOUT_MS: u64 = 300_000; // 5 minutes
-            loop {
-                tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
-                let last = hb_monitor.load(std::sync::atomic::Ordering::Relaxed);
-                let now = start.elapsed().as_millis() as u64;
-                if now.saturating_sub(last) > HEARTBEAT_TIMEOUT_MS {
-                    tf.store(true, std::sync::atomic::Ordering::Relaxed);
+        // Use the owned interactive completion contract. A timeout cancels
+        // and then awaits the runner, so partial history and unknown tool
+        // outcomes survive instead of dropping a borrowed future.
+        let (handle, mut events, task) =
+            match crate::run::run_agent_interactive(&agent_state, conv, &user_content, trace_id)
+                .await
+            {
+                Ok(started) => started,
+                Err(status) => {
+                    let _ = tx.send(SsePayload::Done(Err(status))).await;
+                    return;
+                }
+            };
+        let mut stalled = false;
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_secs(300), events.recv()).await {
+                Ok(Some(event)) => {
+                    if let Err(error) = tx.try_send(SsePayload::Event(event)) {
+                        tracing::warn!("SSE event dropped: {error}");
+                    }
+                }
+                Ok(None) => break,
+                Err(_) => {
+                    stalled = true;
+                    let _ = handle.cancel().await;
                     break;
                 }
             }
-        });
-
-        let agent_future = crate::run::run_agent_streaming(
-            &agent_state,
-            &mut conv,
-            &user_content,
-            &on_event,
-            trace_id,
-        );
-
-        let result = tokio::select! {
-            r = agent_future => r,
-            _ = &mut monitor => {
-                tracing::warn!("streaming agent timed out (no activity for 5 minutes)");
-                Err(StatusCode::REQUEST_TIMEOUT)
+        }
+        let completion = match task.await {
+            Ok(completion) => completion,
+            Err(error) => {
+                tracing::error!("SSE completion task failed: {error}");
+                let _ = tx
+                    .send(SsePayload::Done(Err(StatusCode::INTERNAL_SERVER_ERROR)))
+                    .await;
+                return;
             }
         };
-
-        // Abort the monitor task to prevent it from leaking for up to
-        // 5 minutes after the agent completes normally.
-        monitor.abort();
-
-        // Persist the turn regardless of outcome to preserve the user
-        // message. Appends the new tail; full rewrite when compaction
-        // replaced the persisted prefix.
+        let mut conv = completion.conversation;
         conv.updated_at = Utc::now();
-        if let Err(e) = agent_state
+        let mut result = match completion.result {
+            Ok(()) => conv
+                .messages
+                .iter()
+                .rev()
+                .find(|m| m.role == Role::Assistant && m.content.as_text().is_some())
+                .cloned()
+                .ok_or(StatusCode::INTERNAL_SERVER_ERROR),
+            Err(error) => {
+                tracing::warn!("SSE agent failed; retaining partial history: {error}");
+                Err(if stalled {
+                    StatusCode::REQUEST_TIMEOUT
+                } else {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })
+            }
+        };
+        if let Err(error) = agent_state
             .agent
             .store
             .conversations()
             .save_turn(&conv, &persisted_ids)
             .await
         {
-            tracing::error!("failed to save conversation: {e}");
+            tracing::error!("failed to save SSE conversation: {error}");
+            result = Err(StatusCode::INTERNAL_SERVER_ERROR);
         }
 
         let _ = tx.send(SsePayload::Done(result)).await;

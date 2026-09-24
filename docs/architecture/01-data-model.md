@@ -4,7 +4,7 @@ Two SQLite databases, opened independently, never joined.
 
 | File | Owner | Tables |
 |---|---|---|
-| `<data_dir>/db/store.db` | `rustykrab-store` | 18 tables + 13 indexes |
+| `<data_dir>/db/store.db` | `rustykrab-store` | 24 tables + 19 indexes |
 | `<data_dir>/memory.db` | `rustykrab-memory` | 4 tables + 1 FTS5 virtual table + 9 indexes |
 
 DDL is idempotent (`CREATE TABLE IF NOT EXISTS`) inside
@@ -75,6 +75,30 @@ that is still there.
 lives in two shapes with nothing reconciling them. Low-severity — nothing
 queries the blob copy — but it is the residue of the old design.
 
+### Channel inbound admission journal
+
+```
+channel_inbound(message_id TEXT PRIMARY KEY, channel, external_key, data,
+                conversation_id REFERENCES conversations(id) ON DELETE CASCADE,
+                status CHECK(status IN ('accepted','retained','cancelled')),
+                created_at DEFAULT CURRENT_TIMESTAMP)
+   INDEX (channel, external_key) WHERE status = 'accepted'
+```
+
+`InboundStore` journals the exact user `Message` UUID and JSON before Telegram
+or Slack launches or injects a turn. Assignment is nullable until the binding
+resolves. Only a successful conversation save can mark matching history IDs
+`retained`; this means durable history, not successful execution or delivery.
+Reset cancels the exact captured admission IDs, leaving later arrivals intact.
+An independent SQLite reopen test checks identity, idempotence and cascade.
+
+This is not an exactly-once upstream queue: channel-generated UUIDs do not
+deduplicate transport replays, and the pre-admission transport gap remains.
+After restart pending entries generate a warning, not automatic replay of
+possibly applied external actions. Compacted-away IDs can remain pending.
+Conversation deletion cascades bound entries; unassigned entries have no TTL
+or recovery UI yet. Data has the same plaintext-at-rest exposure as chat rows.
+
 ### Secrets and the credential guard
 
 ```
@@ -100,6 +124,148 @@ Two notes: `secret_versions` has no FK to `secrets` — deliberately, since a
 deleted secret must stay recoverable, and that should be a comment on the
 table. And `credential_requests.conversation_id` is an unenforced reference.
 
+### Payment approvals
+
+```
+payment_requests(id PK, conversation_id, merchant, origin, amount_minor,
+                 currency, description, status, created_at, decided_at,
+                 decided_by, card_last4, used_at, link_token_hash,
+                 link_expires_at, claimed_at, duplicate_of,
+                 duplicate_confirmed)
+```
+
+One purchase the agent asked the user to approve: the merchant, the exact
+origin a card may be entered on, and the most it may pay, in integer minor
+units. **The card is not in this table or anywhere else on disk** — it lives in
+`CardVault`, an in-memory map keyed by request id, until the agent presses pay,
+15 minutes pass, a newer request in the same conversation supersedes it, or the
+daemon restarts. The row is the approval and its audit trail; `card_last4` is
+the only card-derived value kept. Like credential links, only the hash of the
+one-time approval link is stored.
+
+Status runs `pending → authorized → paying → used`, with `declined`, `expired`,
+`superseded` and `held` as the other terminal states. An `authorized` row whose
+card is no longer in the vault is marked `expired` the next time anything asks,
+so the record never claims an approval nothing can act on. The partial index
+`idx_payment_requests_live ON (conversation_id) WHERE status IN ('pending',
+'authorized', 'paying')` serves the one-purchase-per-conversation supersede and
+the browser's "may this conversation pay here" lookup; a `paying` row is live,
+because it is a press in flight, and a `held` row is not, because it was stopped
+before the user was ever asked. `conversation_id` is an unenforced reference,
+for the same audit reason as on `credential_requests`.
+
+**`paying` is the single-spend lock, and the row is where it lives.** Tool
+calls in one model turn run concurrently, and the earlier design read the card
+with `authorized_for`, which returns a *clone*: two `pay` calls on one approval
+both got a card, both pressed, and the second `mark_used` updated zero rows and
+discarded the count. The press is now claimed first. `claim_for_pay` runs one
+conditional `UPDATE` whose rows-affected count must be exactly 1:
+
+```sql
+UPDATE payment_requests SET status = 'paying', claimed_at = ?now
+ WHERE id = ?id AND status = 'authorized'
+   AND NOT EXISTS (SELECT 1 FROM payment_requests
+                    WHERE status = 'paying' AND id <> ?id)
+   AND NOT EXISTS (SELECT 1 FROM payment_requests
+                    WHERE status = 'used' AND used_at > ?now - ?cooldown_ms)
+```
+
+Three guarantees ride on that statement. **Single spend**: a second claim on the
+same request finds a row that is no longer `authorized`. **A global lock**: the
+second `NOT EXISTS` clause means at most one row is `paying` across the whole
+daemon — a checkout is a serial act, and two at once is far more likely a
+runaway loop than two purchases. **A throttle**: the third clause refuses while
+anything was marked `used` inside the cooldown (default 30 s,
+`RUSTYKRAB_PAYMENT_COOLDOWN_SECS`, `0` disables). Only the winner of the row is
+handed the card, and it is *taken* out of the vault rather than copied, so the
+loser gets neither. A won row whose card had already left the vault is marked
+`expired` instead, so it cannot hold the lock for a press that can never happen.
+A claim that touches no rows is diagnosed against the same connection into a
+typed refusal — `NotAuthorized { status }`, `AnotherPaymentInFlight`,
+`Cooldown { remaining }` — each carrying a message that tells the model what to
+do next.
+
+`mark_used` moves `paying → used` and errors on zero rows rather than shrugging.
+The one route back to `authorized` is `release_claim`, for a press the browser
+can prove never left the process; it restores the card on its *original* vault
+deadline, so a claim/release loop cannot extend `CARD_TTL`. **Stale claims**:
+a `paying` row whose `claimed_at` is older than `STALE_CLAIM_MS` (2 minutes) is
+swept to `used`, never back to `authorized` — a daemon that died mid-press may
+well have charged the merchant, and guessing otherwise risks the second charge
+the lock exists to prevent. Its `used_at` is set to `claimed_at`, which is when
+the press would have happened and keeps a long-stuck lock from imposing a fresh
+cooldown the moment it clears. The sweep runs in `sweep_expired` and at the head
+of `claim_for_pay` and `authorized_for`, so a crash cannot wedge the global lock
+until someone notices.
+
+**`held` stops the same purchase being made twice.** Everything above protects
+one *approval* from being spent twice; none of it stops the agent buying the
+same thing twice. An agent that has lost track of a booking it already made —
+a turn resumed from a stale summary, a cron re-run, the user asking again
+because no confirmation email arrived — files a fresh request, the user sees a
+plausible approval page for a purchase they do want, and pays for the ferry
+twice. Each half is correct in isolation, which is why nothing caught it.
+
+The **duplicate key** is `(origin, amount_minor, currency)` within
+`DEFAULT_DUPLICATE_WINDOW_MS` (24 h, `Store::with_duplicate_window_ms` from
+`RUSTYKRAB_PAYMENT_DUPLICATE_WINDOW_HOURS`; `0` disables). `description` and
+`merchant` are deliberately *not* in the key: both are model-authored, and a key
+the model can reword its way past is not a key. The origin is canonicalised from
+the checkout URL and is what the card is actually bound to. A day is the shape
+of the mistake — the same site and amount a week later is more likely a standing
+order.
+
+`file` looks for an earlier request matching the key whose status is live or
+spent — `pending`, `authorized`, `paying`, `used`, `held` — with one exclusion:
+within the *same* conversation a `pending` or `authorized` prior is the ordinary
+re-file (the cart total changed) and is handled by the supersede path, so it
+does not count. A `used` or `paying` prior in the same conversation does count,
+and across conversations everything in that list counts. `declined`, `expired`
+and `superseded` never count: each is a request that demonstrably produced no
+charge. On a match the new row is inserted `status = 'held'` with `duplicate_of`
+naming the earlier *payment*, no approval link is minted, and — importantly —
+nothing is superseded, because a hold must not kill a live approval the user
+already gave.
+
+**The model cannot opt out.** `PaymentTerms::confirm_duplicate` is honoured only
+when a `held` row with the same key already exists **in the same conversation**,
+i.e. the agent was stopped and the user answered. Then the new row is filed
+`pending` with `duplicate_confirmed = 1`, `duplicate_of` pointing at the payment
+(not at the hold), and the held row is marked `superseded`. Set on a first
+attempt, where no held row exists, the flag is ignored entirely and the request
+is judged as if it were absent — otherwise the whole check would be one JSON
+field away from being switched off by the party it exists to restrain.
+
+The check runs a second time in `claim_for_pay`, because a twin can be approved
+and paid in the minutes between filing and the browser reaching the pay button,
+and by then a hold is no longer available. The clause added to the same
+conditional `UPDATE`:
+
+```sql
+   AND (duplicate_confirmed = 1 OR ?window_ms = 0
+        OR NOT EXISTS (SELECT 1 FROM payment_requests AS twin
+                        WHERE twin.id <> ?id
+                          AND twin.status IN ('used', 'paying')
+                          AND twin.origin = payment_requests.origin
+                          AND twin.amount_minor = payment_requests.amount_minor
+                          AND twin.currency = payment_requests.currency
+                          AND ABS(twin.created_at
+                                  - payment_requests.created_at) < ?window_ms))
+```
+
+The window is measured between the two rows rather than from now, so it says the
+same thing the key at filing says whichever row came first. The refusal is
+`PayRefusal::Duplicate { earlier }`, carrying the earlier payment so the model
+can say *what* it nearly paid twice; `retry_safe()` is false, and the diagnosis
+checks it **before** `AnotherPaymentInFlight` and `Cooldown` even though all
+three may hold at once — those two say "wait and press again", which here is a
+loop ending in the second charge.
+
+The partial index `idx_payment_requests_dup ON (origin, amount_minor, currency,
+created_at) WHERE status IN ('pending', 'authorized', 'paying', 'used', 'held')`
+serves both lookups, and excludes the terminal rows that make up the bulk of an
+old table and can never match.
+
 ### Devices and pairing
 
 ```
@@ -117,23 +283,45 @@ expiry. Nothing to change.
 ```
 scheduled_jobs(id PK, schedule, task, channel, chat_id, thread_id, one_shot,
                enabled, next_run_at, last_run_at, created_at, conversation_id,
-               created_version)
+               created_version, timezone)
    INDEX (next_run_at) WHERE enabled = 1
 job_runs(id PK, job_id, status, output, started_at, finished_at,
          rustykrab_version)
    INDEX (job_id, finished_at DESC)
 ```
 
-**Assessment: right shape, one gap.** Job definition and job history correctly
+**Assessment: right shape.** Job definition and job history are correctly
 separated; the partial index on `next_run_at WHERE enabled = 1` is exactly the
-poller's query. `created_version` / `rustykrab_version` stamping is a nice
-touch for attributing behaviour to a build.
+poller's query. `job_runs.job_id` now cascades from `scheduled_jobs`, including
+for existing databases through FK adoption, so deleting a job cannot orphan
+its run history. `created_version` / `rustykrab_version` stamping is a useful
+way to attribute behaviour to a build.
 
-The gap: `job_runs.job_id` has no FK. `JobStore::delete_job` deletes the job row
-and leaves its runs orphaned forever. `ON DELETE CASCADE` costs one line.
-Separately, `(channel, chat_id, thread_id)` on `scheduled_jobs` duplicates the
-addressing information that would live in `channel_bindings`; with a binding
-table the job would only need `conversation_id`.
+Recurring jobs are deduplicated on `(task, channel, chat_id, thread_id)` at
+insert, under the same lock as the write. The tuple deliberately excludes
+`schedule`: a second job running the same task on a *different* schedule is
+exactly what a failed replace leaves behind, and it is indistinguishable from
+intent afterwards. `JobStore::create_job` takes an `allow_duplicate` escape
+hatch for the case that is genuinely two jobs — the same task at 8:00 and
+17:30 cannot be one expression when the minute fields differ. `delete_job`
+answers `NotFound` rather than `Ok(false)`, so "deleted it" and "there was
+nothing to delete" are not the same successful call.
+
+`timezone` holds the IANA zone the `schedule` string is written in; every
+timestamp column stays UTC. The split matters because an offset is not a
+timezone: storing `next_run_at` alone is enough to fire a job once, but not to
+advance it, since the offset between 09:00 local and its UTC instant changes at
+each DST transition. Keeping the zone means `mark_executed` re-derives the
+offset from the zone database on every advance, so a job holds its wall-clock
+time year-round. Rows predating the column read back as `UTC`, which is the
+lens they were created under — the migration backfills rather than
+reinterprets, because moving a live job's fire time is not a migration's call
+to make.
+
+The remaining duplication is `(channel, chat_id, thread_id)` on
+`scheduled_jobs`: it repeats addressing information that can also live in
+`channel_bindings`. That is intentional today because a scheduled job retains
+its own delivery target after its originating conversation is deleted.
 
 ### Delegated tasks
 
@@ -215,6 +403,53 @@ foreign key, cannot be joined, and deleting a memory silently orphans every
 attribution naming it. `rustykrab-dream` analyses these tallies by id and would
 report a finding against a memory that no longer exists.
 
+### Conversational project planning
+
+```
+projects(id PK, create_request_id UNIQUE, repository_id,
+         canonical_conversation_id, title, status, judgment_policy,
+         current_revision, create_request,
+         data, created_at, updated_at)
+   FK (id, current_revision) REFERENCES project_revisions(project_id, id)
+project_revisions(id PK,
+                  project_id REFERENCES projects(id) ON DELETE CASCADE,
+                  parent_revision, sequence,
+                  request_id, request_data, author, conversation_id,
+                  source_message_id, summary, project_data, data, created_at,
+                  UNIQUE(project_id, sequence),
+                  UNIQUE(project_id, request_id), UNIQUE(project_id, id))
+   FK (project_id, parent_revision) REFERENCES project_revisions(project_id, id)
+   INDEX (project_id, sequence)
+plan_nodes(revision_id, project_id REFERENCES projects(id) ON DELETE CASCADE,
+           id, kind, data, PK(revision_id, id))
+   FK (project_id, revision_id)
+      REFERENCES project_revisions(project_id, id) ON DELETE CASCADE
+   INDEX (project_id, id)
+plan_edges(revision_id, project_id REFERENCES projects(id) ON DELETE CASCADE,
+           id, from_node, relation, to_node, data, PK(revision_id, id))
+   FK (project_id, revision_id)
+      REFERENCES project_revisions(project_id, id) ON DELETE CASCADE
+   FK (revision_id, from_node/to_node)
+      REFERENCES plan_nodes(revision_id, id) ON DELETE CASCADE
+   INDEX (project_id, from_node, to_node)
+```
+
+**Assessment: sound event history with deliberately redundant read indexes.**
+`project_revisions.data` is the immutable reconstruction source. The project
+row is the current pointer; `plan_nodes` and `plan_edges` materialize each
+revision for indexed inspection and are inserted atomically with it. Request
+ids make create and apply safe to replay, and the store compares the complete
+serialized command before treating a duplicate as success. Conversation and
+message identifiers are provenance references rather than ownership, so they
+are intentionally not foreign keys and can survive conversation deletion.
+
+Composite foreign keys make project identity a database invariant rather than
+an assumption about `ProjectStore`: current and parent revisions must belong to
+the named project, materialized rows must belong to their revision, and edge
+endpoints must be nodes in that same revision. Direct-SQL negative tests attempt
+each cross-project write and require SQLite to reject it; `foreign_key_check`
+must remain empty afterward.
+
 ## `memory.db`
 
 ```
@@ -270,7 +505,7 @@ any conversation. One column, two meanings.
 
 ## Join analysis: enforced, and deliberately not
 
-`store.db` declares eight foreign keys, up from one. The ones that are
+`store.db` declares fifteen foreign keys, up from one. The ones that are
 ownership cascade; the ones that record provenance are unenforced *on
 purpose*, and the DDL now says which is which.
 
@@ -279,11 +514,18 @@ purpose*, and the DDL now says which is which.
 | `messages.conversation_id` | **CASCADE** | |
 | `recall_archive.conversation_id` | **CASCADE** | |
 | `channel_bindings.conv_id` | **CASCADE** | closed the live bug above |
+| `channel_inbound.conversation_id` | **CASCADE** | nullable until admission is assigned; preserves conversation deletion semantics |
 | `job_runs.job_id` | **CASCADE** | `delete_job` used to orphan run history forever |
 | `outcome_attributions.record_id` | **CASCADE** | was the only FK before |
+| `project_revisions.project_id` | **CASCADE** | project owns immutable revision history |
+| `(projects.id, current_revision)` | **Yes, composite** | current revision must belong to the project |
+| `(project_revisions.project_id, parent_revision)` | **Yes, composite** | parent must belong to the same project |
+| `(plan_nodes/plan_edges.project_id, revision_id)` | **CASCADE, composite** | revision owns materialized rows and must belong to the same project |
+| `plan_edges.(revision_id, from_node/to_node)` | **CASCADE, composite** | endpoints must exist in the same revision |
 | `chunks.memory_id`, `extracted_facts.source_memory_id` | **Yes** | in `memory.db` |
 | `scheduled_jobs.conversation_id` | No, deliberate | a cron job keeps its own delivery channel and should keep firing |
 | `credential_requests.conversation_id` | No, deliberate | audit-relevant after the conversation is gone |
+| `payment_requests.conversation_id` | No, deliberate | what the agent paid for stays answerable after the conversation is gone |
 | `delegated_tasks.conversation_id` | No, deliberate | the row records where work came from |
 | `outcome_records.conversation_id` | No, deliberate | evidence outlives the conversation |
 | `outcome_attributions.target_id` (memory) | **Impossible** | other database |

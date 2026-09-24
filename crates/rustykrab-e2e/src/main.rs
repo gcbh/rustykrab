@@ -9,6 +9,7 @@
 //! the suite — it means a scenario must be promoted.
 //!
 //! Output is a JSON report on stdout plus a matching exit code (0 = green),
+//! and durable evidence is written under `target/e2e-artifacts` by default,
 //! so agents and CI can assert mechanically. Run via `scripts/e2e.sh`, or
 //! directly:
 //!
@@ -19,15 +20,24 @@
 
 mod ablation;
 mod assertion;
+mod browser_suite;
 mod classify;
+mod compaction_study;
+mod context_suite;
 mod credential_suite;
+mod fixture_repo;
 mod judge;
 mod login_suite;
 mod model_suite;
+mod payment_eval;
+mod payment_suite;
+mod planning_suite;
 mod surface;
 mod transcript;
 
+use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -89,6 +99,62 @@ const AGENT_SCRIPT: &str = r#"{
                                           "name": "e2e_delete_token" } } ] },
         { "toolCalls": [ { "name": "task_complete",
                            "arguments": { "summary": "Attempted delete of e2e_delete_token." } } ] }
+      ]
+    },
+    {
+      "trigger": "e2e: pay for the ferry",
+      "steps": [
+        { "toolCalls": [ { "name": "payment_request",
+                           "arguments": { "url": "http://localhost:9/checkout",
+                                          "merchant": "E2E Ferry",
+                                          "amount": "46.00",
+                                          "currency": "USD",
+                                          "description": "2 passenger tickets" } } ] },
+        { "text": "I have asked you to approve paying E2E Ferry up to USD 46.00." }
+      ]
+    },
+    {
+      "trigger": "e2e: pay for the parking",
+      "steps": [
+        { "toolCalls": [ { "name": "payment_request",
+                           "arguments": { "url": "http://localhost:9/checkout",
+                                          "merchant": "E2E Parking",
+                                          "amount": "12.00",
+                                          "currency": "USD",
+                                          "description": "all-day parking" } } ] },
+        { "text": "I have asked you to approve paying E2E Parking up to USD 12.00." }
+      ]
+    },
+    {
+      "trigger": "e2e: pay for the harbour",
+      "steps": [
+        { "toolCalls": [ { "name": "payment_request",
+                           "arguments": { "url": "http://localhost:9/checkout",
+                                          "merchant": "E2E Harbour",
+                                          "amount": "33.00",
+                                          "currency": "USD",
+                                          "description": "mooring fee" } } ] },
+        { "text": "I have asked you to approve paying E2E Harbour up to USD 33.00." }
+      ]
+    },
+    {
+      "trigger": "e2e: pay for the harbour again",
+      "steps": [
+        { "toolCalls": [ { "name": "payment_request",
+                           "arguments": { "url": "http://localhost:9/checkout",
+                                          "merchant": "E2E Harbour",
+                                          "amount": "33.00",
+                                          "currency": "USD",
+                                          "description": "mooring fee" } } ] },
+        { "text": "I stopped that payment: it looks like a repeat of one already made." }
+      ]
+    },
+    {
+      "trigger": "the user approved paying e2e ferry",
+      "steps": [
+        { "toolCalls": [ { "name": "todo_read", "arguments": {} } ] },
+        { "toolCalls": [ { "name": "task_complete",
+                           "arguments": { "summary": "e2e: resumed after payment approval." } } ] }
       ]
     }
   ]
@@ -251,6 +317,9 @@ struct Ctx {
     bin: String,
     /// The daemon's data dir — CLI subcommands must see the same store.
     data_dir: std::path::PathBuf,
+    /// Owns the disposable daemon so scenarios can prove restart recovery
+    /// against the same port and data directory.
+    daemon: Arc<tokio::sync::Mutex<Option<Child>>>,
 }
 
 impl Ctx {
@@ -276,6 +345,47 @@ impl Ctx {
         }
     }
 
+    /// Persist machine-readable proof outside the throwaway daemon directory.
+    fn write_evidence(&self, relative_path: &str, evidence: &Value) -> Result<PathBuf> {
+        write_json_artifact(&artifact_dir(), relative_path, evidence)
+    }
+
+    /// Stop the live daemon, prove the port went dark, and boot a distinct
+    /// process against the same durable state.
+    async fn restart_daemon(&self) -> Result<(u32, u32)> {
+        let mut daemon = self.daemon.lock().await;
+        let previous = daemon
+            .take()
+            .ok_or_else(|| anyhow!("daemon is not running"))?;
+        let previous_pid = previous.id();
+        shutdown_daemon(previous).await;
+
+        if self
+            .client
+            .get(self.url("/api/health"))
+            .send()
+            .await
+            .is_ok()
+        {
+            bail!("daemon still answered after shutdown");
+        }
+
+        let mut replacement = spawn_daemon(&self.bin, &self.data_dir, self.port()?)?;
+        let replacement_pid = replacement.id();
+        if replacement_pid == previous_pid {
+            bail!("replacement daemon reused pid {previous_pid}");
+        }
+        wait_for_health(&self.base, &self.client, &mut replacement).await?;
+        *daemon = Some(replacement);
+        Ok((previous_pid, replacement_pid))
+    }
+
+    fn port(&self) -> Result<u16> {
+        self.base
+            .rsplit_once(':')
+            .and_then(|(_, port)| port.parse().ok())
+            .ok_or_else(|| anyhow!("invalid harness base URL: {}", self.base))
+    }
     /// Run a daemon CLI subcommand with the harness environment.
     fn cli(&self, args: &[&str]) -> Result<std::process::Output> {
         Ok(Command::new(&self.bin)
@@ -1423,7 +1533,7 @@ async fn wait_for_health(base: &str, client: &reqwest::Client, child: &mut Child
 
 // ── main ─────────────────────────────────────────────────────────────
 
-type ScenarioFn =
+pub(crate) type ScenarioFn =
     for<'a> fn(&'a Ctx) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + 'a>>;
 
 macro_rules! scenario {
@@ -1437,20 +1547,32 @@ const USAGE: &str = "\
 rustykrab-e2e — end-to-end evaluation harness
 
 USAGE:
-    cargo run -p rustykrab-e2e -- [FLAGS]
+    scripts/e2e.sh [FLAGS]
+
+    The wrapper builds both the daemon and evaluator and binds reports to the
+    checkout revision. Direct cargo invocation is intended only for --help and
+    --list unless RUSTYKRAB_BIN and RUSTYKRAB_E2E_SOURCE_REVISION are set.
 
 FLAGS:
     --mode SUITE                scripted | model | credential | login |
-                                ablation | all (default: scripted). `login`
-                                reaches the real internet with real
-                                credentials and is never included in `all`;
-                                it skips unless RK_LOGIN_URL/USER/PASS are set.
+                                browser | context | context-model | compaction-study | ablation | all (default: scripted).
+                                `context` captures real Ollama wire requests with
+                                a local response fixture. `context-model` uses a
+                                local model with inert tools. Neither is in all.
+                                `compaction-study` compares the production Rust
+                                compactor with a local model and inert readout;
+                                it does not boot a daemon or execute domain tools.
+                                `login` and `browser` reach the real internet,
+                                may use real credentials, and are never included
+                                in `all`. Explicit browser cases fail when their
+                                required live configuration is missing.
     --ctx-list A,B,C            Windows for --mode ablation (default:
                                 4096,8192,16384,32768,65536,131072,262144)
     --surfaces LIST             Surfaces for --mode credential
                                 (default: gateway,telegram; signal has no
                                 agent loop reading it and will error)
     --trials N                  Trials per credential cell (default: 5)
+    --trial-timeout SECONDS     Hard ceiling for each login/browser trial
     --resume                    Reuse trials already in the sidecar rather
                                 than paying for them twice
     --reps N                    Repetitions per model scenario (default: 3)
@@ -1468,6 +1590,27 @@ ENVIRONMENT:
                         the report says so.
     E2E_KEEP_TMP        Keep the throwaway data dir for post-mortems (logs
                         only; the Chrome profile is shed to save disk).
+    E2E_ARTIFACT_DIR    Durable report/evidence directory
+                        (default: target/e2e-artifacts).
+    RUSTYKRAB_COMPACTION_STUDY_ARM
+                        `message-tail` selects the exploratory message-group
+                        retention arm; unset runs the four-method comparison
+                        plus the full-history reference.
+    RUSTYKRAB_CONTEXT_COMPACTION_STRATEGY
+                        Explicit harness policy for context/context-model
+                        daemon trials; recorded in the evidence manifest.
+    RUSTYKRAB_CONTEXT_BROWSER_READY
+                        `1` makes the inert browser's first response a neutral
+                        readiness signal; later calls still fail. Default is
+                        unavailable throughout. Recorded as a separate fixture.
+    RK_BROWSER_DEPART_DATE
+                        ISO date required by Google Flights and United cases.
+                        Origin/destination default to SFO/LAX and can be changed
+                        with RK_BROWSER_ORIGIN/RK_BROWSER_DESTINATION.
+    RK_INSTAGRAM_USER / RK_INSTAGRAM_PASS / RK_INSTAGRAM_EXPECT
+                        Opt in to the Instagram login journey.
+    RK_UNITED_USER / RK_UNITED_PASS / RK_UNITED_EXPECT
+                        Opt in to the United login-and-flight journey.
 ";
 
 struct Args {
@@ -1521,10 +1664,20 @@ fn parse_args(argv: &[String]) -> std::result::Result<Args, String> {
                 args.mode = value(i, "--mode")?.to_lowercase();
                 if !matches!(
                     args.mode.as_str(),
-                    "scripted" | "model" | "credential" | "login" | "ablation" | "all"
+                    "scripted"
+                        | "model"
+                        | "credential"
+                        | "login"
+                        | "browser"
+                        | "context"
+                        | "context-model"
+                        | "compaction-study"
+                        | "ablation"
+                        | "payment"
+                        | "all"
                 ) {
                     return Err(format!(
-                        "--mode: expected scripted|model|credential|login|ablation|all, got {}",
+                        "--mode: expected scripted|model|credential|login|browser|context|context-model|compaction-study|ablation|payment|all, got {}",
                         args.mode
                     ));
                 }
@@ -1553,7 +1706,7 @@ fn parse_args(argv: &[String]) -> std::result::Result<Args, String> {
                     return Err("--trial-timeout must be at least 1 second".to_string());
                 }
                 args.trial_timeout = Duration::from_secs(secs);
-                i += 2;
+                i += 1;
             }
             "--trials" => {
                 let v = value(i, "--trials")?;
@@ -1633,6 +1786,35 @@ async fn main() -> Result<()> {
         for sc in login_suite::SCENARIOS {
             eprintln!("  {:<42}\n      {}", sc.id, sc.description);
         }
+        eprintln!("\n── payment (local model + Chrome + merchant fixture, opt-in) ──");
+        for sc in payment_eval::SCENARIOS {
+            eprintln!("  {:<42}\n      {}", sc.id, sc.description);
+        }
+        eprintln!("\n── browser (live network, opt-in) ──");
+        for sc in browser_suite::SCENARIOS {
+            eprintln!("  {:<42}\n      {}", sc.id, sc.description);
+        }
+        eprintln!("\n── context / context-model (inert tools, captured wire) ──");
+        for id in context_suite::CASES {
+            eprintln!("  {id}");
+        }
+        return Ok(());
+    }
+
+    if matches!(
+        args.mode.as_str(),
+        "login" | "browser" | "context" | "context-model"
+    ) && source_revision() == "unrecorded"
+    {
+        bail!(
+            "live {} evidence needs an exact source revision and a freshly built daemon; run scripts/e2e.sh --mode {} (recommended), or set both RUSTYKRAB_BIN and RUSTYKRAB_E2E_SOURCE_REVISION explicitly",
+            args.mode,
+            args.mode
+        );
+    }
+
+    if args.mode == "compaction-study" {
+        compaction_study::run(&args).await?;
         return Ok(());
     }
 
@@ -1640,6 +1822,14 @@ async fn main() -> Result<()> {
         std::env::var("RUSTYKRAB_BIN").unwrap_or_else(|_| "target/debug/rustykrab-cli".to_string());
     if !std::path::Path::new(&bin).exists() {
         bail!("daemon binary not found at {bin} — build it first or set RUSTYKRAB_BIN");
+    }
+
+    if matches!(args.mode.as_str(), "context" | "context-model") {
+        let ok = context_suite::run(&bin, &args).await?;
+        if !ok {
+            std::process::exit(1);
+        }
+        return Ok(());
     }
 
     if args.mode == "ablation" {
@@ -1666,9 +1856,10 @@ async fn main() -> Result<()> {
     let mut judge_name: Option<String> = None;
     let mut trials: Vec<credential_suite::TrialResult> = Vec::new();
     let mut login_trials: Vec<login_suite::LoginTrial> = Vec::new();
+    let mut browser_trials: Vec<browser_suite::BrowserJourneyTrial> = Vec::new();
 
     if args.mode == "scripted" || args.mode == "all" {
-        reports.extend(run_scripted(&bin).await?);
+        reports.extend(run_scripted(&bin, args.case_filter.as_deref()).await?);
     }
     if args.mode == "model" || args.mode == "all" {
         let (model_reports, name) = model_suite::run(
@@ -1685,7 +1876,10 @@ async fn main() -> Result<()> {
     }
 
     // Nothing model-backed is worth starting if the model cannot answer.
-    if matches!(args.mode.as_str(), "model" | "credential" | "login" | "all") {
+    if matches!(
+        args.mode.as_str(),
+        "model" | "credential" | "login" | "browser" | "payment" | "all"
+    ) {
         preflight_model(&args.ollama_url, &args.model).await?;
     }
 
@@ -1720,6 +1914,43 @@ async fn main() -> Result<()> {
         reports.extend(cells);
         login_trials = login_results;
     }
+    // Also excluded from `all`: every case drives a public third-party site,
+    // and two cases consume real credentials. An operator must ask for this
+    // suite by name and configure each site independently.
+    // Opt-in: a real model, a real Chrome and a local merchant fixture, for
+    // tens of minutes per trial.
+    let mut payment_trials: Vec<payment_eval::PaymentTrial> = Vec::new();
+    if args.mode == "payment" {
+        let timeout = if args.trial_timeout == login_suite::DEFAULT_TRIAL_TIMEOUT {
+            payment_eval::DEFAULT_TRIAL_TIMEOUT
+        } else {
+            args.trial_timeout
+        };
+        let (cells, results) = payment_eval::run(
+            &bin,
+            &args.model,
+            &args.ollama_url,
+            args.trials,
+            args.case_filter.as_deref(),
+            timeout,
+        )
+        .await?;
+        reports.extend(cells);
+        payment_trials = results;
+    }
+    if args.mode == "browser" {
+        let (cells, journey_results) = browser_suite::run(
+            &bin,
+            &args.model,
+            &args.ollama_url,
+            args.trials,
+            args.case_filter.as_deref(),
+            args.trial_timeout,
+        )
+        .await?;
+        reports.extend(cells);
+        browser_trials = journey_results;
+    }
 
     let count = |o: &str| reports.iter().filter(|r| r.outcome == o).count();
     let (pass, fail, xfail, xpass) = (count("pass"), count("fail"), count("xfail"), count("xpass"));
@@ -1728,11 +1959,19 @@ async fn main() -> Result<()> {
     // go green again.
     let ok = fail == 0 && xpass == 0;
     let report = json!({
+        "source_revision": source_revision(),
+        "verification_environment": {
+            "daemon": "real rustykrab-cli process",
+            "database": "real SQLite store.db",
+            "mode": args.mode,
+        },
         "scenarios": reports,
         // Every trial, verbatim, so any rate in the summary can be audited
         // back to the reply that produced it.
         "credential_trials": trials,
         "login_trials": login_trials,
+        "browser_trials": browser_trials,
+        "payment_trials": payment_trials,
         "summary": {
             "pass": pass,
             "fail": fail,
@@ -1745,7 +1984,10 @@ async fn main() -> Result<()> {
         },
     });
 
-    println!("{}", serde_json::to_string_pretty(&report)?);
+    let report_text = serde_json::to_string_pretty(&report)?;
+    let report_path = write_json_artifact(&artifact_dir(), "e2e-report.json", &report)?;
+    println!("{report_text}");
+    eprintln!("evidence report: {}", report_path.display());
     if !ok {
         std::process::exit(1);
     }
@@ -1754,16 +1996,20 @@ async fn main() -> Result<()> {
 
 /// The scripted suite shares one daemon across every scenario — they are
 /// deterministic and independent, so a boot each would only add minutes.
-async fn run_scripted(bin: &str) -> Result<Vec<ScenarioReport>> {
+async fn run_scripted(bin: &str, case_filter: Option<&str>) -> Result<Vec<ScenarioReport>> {
     let tmp = tempfile::Builder::new()
         .prefix("rustykrab-e2e-")
         .tempdir()?;
     let data_dir = tmp.path().to_path_buf();
     let port = pick_free_port()?;
 
-    let mut child = spawn_daemon(bin, &data_dir, port)?;
-    let result = run_suite(bin, &data_dir, port, &mut child).await;
-    shutdown_daemon(child).await;
+    let daemon = Arc::new(tokio::sync::Mutex::new(Some(spawn_daemon(
+        bin, &data_dir, port,
+    )?)));
+    let result = run_suite(bin, &data_dir, port, Arc::clone(&daemon), case_filter).await;
+    if let Some(child) = daemon.lock().await.take() {
+        shutdown_daemon(child).await;
+    }
     keep_or_drop(tmp);
     result
 }
@@ -1832,7 +2078,13 @@ fn find_user_data_dirs(root: &std::path::Path) -> Vec<std::path::PathBuf> {
         };
         for entry in entries.flatten() {
             let path = entry.path();
-            if !path.is_dir() {
+            // `file_type` does not follow symlinks; `Path::is_dir` does. A
+            // trial directory holding a link to somewhere real — the payment
+            // eval links the operator's `~/Library` into a substitute HOME —
+            // must not turn this walk into a search of the operator's disk
+            // for directories to delete. Observed: an hour spent walking
+            // `~/Library` through that link before this.
+            if !entry.file_type().is_ok_and(|t| t.is_dir()) {
                 continue;
             }
             if path.file_name().is_some_and(|n| n == "user-data") {
@@ -1882,6 +2134,45 @@ fn keep_or_drop(tmp: tempfile::TempDir) {
     }
 }
 
+fn artifact_dir() -> PathBuf {
+    std::env::var_os("E2E_ARTIFACT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("target/e2e-artifacts"))
+}
+
+fn source_revision() -> String {
+    std::env::var("RUSTYKRAB_E2E_SOURCE_REVISION").unwrap_or_else(|_| "unrecorded".to_owned())
+}
+
+fn write_json_artifact(root: &Path, relative_path: &str, value: &Value) -> Result<PathBuf> {
+    let relative = Path::new(relative_path);
+    if relative.is_absolute()
+        || relative
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        bail!("artifact path must contain only normal relative components: {relative_path}");
+    }
+    let path = root.join(relative);
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("artifact path has no parent: {}", path.display()))?;
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("create artifact directory {}", parent.display()))?;
+    let mut evidence = value.clone();
+    if let Value::Object(object) = &mut evidence {
+        object.insert(
+            "source_revision".to_owned(),
+            Value::String(source_revision()),
+        );
+    }
+    let mut encoded = serde_json::to_vec_pretty(&evidence)?;
+    encoded.push(b'\n');
+    std::fs::write(&path, encoded)
+        .with_context(|| format!("write evidence artifact {}", path.display()))?;
+    Ok(path)
+}
+
 /// The last few lines of the daemon log — a startup failure is otherwise
 /// reported as a bare exit status, which says nothing about the cause.
 fn log_tail(data_dir: &std::path::Path) -> String {
@@ -1894,7 +2185,7 @@ fn log_tail(data_dir: &std::path::Path) -> String {
 
 /// The deterministic plumbing scenarios, in run order.
 fn scripted_scenarios() -> Vec<(Expected, (&'static str, ScenarioFn))> {
-    vec![
+    let mut scenarios = vec![
         // Baseline — implemented today, must pass.
         (Expected::Pass, scenario!(health)),
         (Expected::Pass, scenario!(auth_required)),
@@ -1925,14 +2216,18 @@ fn scripted_scenarios() -> Vec<(Expected, (&'static str, ScenarioFn))> {
             Expected::XFail,
             scenario!(dream_promotes_a_consolidation_cycle),
         ),
-    ]
+    ];
+    scenarios.extend(payment_suite::scenarios());
+    scenarios.extend(planning_suite::scenarios());
+    scenarios
 }
 
 async fn run_suite(
     bin: &str,
     data_dir: &std::path::Path,
     port: u16,
-    child: &mut Child,
+    daemon: Arc<tokio::sync::Mutex<Option<Child>>>,
+    case_filter: Option<&str>,
 ) -> Result<Vec<ScenarioReport>> {
     let base = format!("http://127.0.0.1:{port}");
     // The origin-check middleware requires an Origin header on every
@@ -1943,7 +2238,17 @@ async fn run_suite(
         .default_headers(headers)
         .timeout(Duration::from_secs(120))
         .build()?;
-    wait_for_health(&base, &client, child).await?;
+    {
+        let mut child = daemon.lock().await;
+        wait_for_health(
+            &base,
+            &client,
+            child
+                .as_mut()
+                .ok_or_else(|| anyhow!("daemon is not running"))?,
+        )
+        .await?;
+    }
 
     // Open the store only after the daemon is healthy — it owns the
     // database and its migrations; this is a read handle for assertions.
@@ -1955,9 +2260,19 @@ async fn run_suite(
         db_path: data_dir.join("db").join("store.db"),
         bin: bin.to_string(),
         data_dir: data_dir.to_path_buf(),
+        daemon,
     };
 
-    let scenarios = scripted_scenarios();
+    let scenarios: Vec<_> = scripted_scenarios()
+        .into_iter()
+        .filter(|(_, (id, _))| case_filter.is_none_or(|filter| id.contains(filter)))
+        .collect();
+    if scenarios.is_empty() {
+        bail!(
+            "no scripted scenarios matched {}",
+            case_filter.unwrap_or("the requested filter")
+        );
+    }
 
     let mut reports = Vec::new();
     for (expected, (id, f)) in scenarios {
@@ -1989,4 +2304,46 @@ fn hex_decode(s: &str) -> Result<Vec<u8>> {
         .step_by(2)
         .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(Into::into))
         .collect()
+}
+
+#[cfg(test)]
+mod shed_tests {
+    /// A link out of the trial directory must not be followed: shedding
+    /// deletes every `user-data` it finds, so following a link would turn a
+    /// cleanup into deleting directories anywhere the link leads.
+    #[cfg(unix)]
+    #[test]
+    fn shedding_never_follows_a_symlink_out_of_the_trial() {
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(outside.path().join("app/user-data")).unwrap();
+        let trial = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(trial.path().join("browser/p/user-data")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), trial.path().join("home-link")).unwrap();
+
+        let found = super::find_user_data_dirs(trial.path());
+        assert_eq!(found, vec![trial.path().join("browser/p/user-data")]);
+        super::shed_browser_profile(trial.path());
+        assert!(
+            outside.path().join("app/user-data").exists(),
+            "a user-data directory behind a symlink was deleted"
+        );
+    }
+}
+
+#[cfg(test)]
+mod argument_tests {
+    use super::*;
+
+    #[test]
+    fn trial_timeout_does_not_skip_the_following_flag() {
+        let args = parse_args(&[
+            "--trial-timeout".into(),
+            "90".into(),
+            "--case".into(),
+            "instagram".into(),
+        ])
+        .expect("arguments");
+        assert_eq!(args.trial_timeout, Duration::from_secs(90));
+        assert_eq!(args.case_filter.as_deref(), Some("instagram"));
+    }
 }

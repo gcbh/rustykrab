@@ -7,6 +7,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.3.0] - 2026-09-16
+
+- fix(browser): close three bypasses in the browser payment path [9/9] (#657)
+
+## [5.2.40] - 2026-09-15
+
+- fix(compaction): stop one opaque tool result from wedging a conversation (#654)
+
+## [5.2.39] - 2026-09-12
+
+- fix(browser): bind credential fills to verified origins and inputs (#645)
+
+## [5.2.38] - 2026-09-05
+
+- test(browser): add production journey evaluations (#640)
+
+## [5.2.37] - 2026-09-04
+
+- feat(browser): add CDP-native browser-use parity (#639)
+
+## [5.2.36] - 2026-09-04
+
+- feat(cron): show each job's next run in its own zone (#630)
+
+## [5.2.35] - 2026-09-04
+
+- fix(cron): let the caller name a zone, and stop the model converting by hand (#629)
+
+## [5.2.34] - 2026-09-04
+
+- fix(store): schedule in the operator's zone, not Greenwich (#628)
+
+## [5.2.33] - 2026-09-04
+
+- feat(browser): harden interactive browser workflows (#638)
+
+## [5.2.32] - 2026-09-04
+
+- ci(release): remove remaining Node 20 actions (#637)
+
+## [5.2.31] - 2026-09-04
+
+- ci(actions): move workflow runtime to Node 24 (#636)
+
+## [5.2.30] - 2026-09-04
+
+- fix(release): keep lockfile reproducible after version bump (#635)
+
+## [5.2.29] - 2026-09-04
+
+- feat(gateway): expose durable project planning (#609)
+
+## [5.2.28] - 2026-09-03
+
+- fix(store): refuse a second recurring job for the same task and target (#624)
+
+## [5.2.27] - 2026-09-03
+
+- fix(store): distinguish "deleted it" from "nothing to delete" (#623)
+
 ## [5.2.26] - 2026-09-03
 
 - feat(memory): capture what the user says, and distil what is durable (#621)

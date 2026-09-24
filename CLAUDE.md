@@ -46,10 +46,11 @@ the scenario gets promoted. See
 
 ## Project structure
 
-Workspace with 13 crates under `crates/`:
+Workspace with 14 crates under `crates/`:
 
 - **rustykrab-cli** — Binary entrypoint, daemon management, channel loops
 - **rustykrab-core** — Shared traits (`Tool`, `ModelProvider`), error types
+- **rustykrab-projects** — Immutable conversational-planning domain and deterministic projections
 - **rustykrab-store** — SQLite persistence (conversations, secrets, scheduled jobs)
 - **rustykrab-gateway** — Axum HTTP server, REST API, SSE streaming, security middleware
 - **rustykrab-agent** — Agent loop, harness profiles, orchestration pipeline

@@ -1,19 +1,23 @@
-//! Browser automation tool modeled after OpenClaw's browser management.
+//! CDP-native browser execution inspired by browser-use's reliability model.
 //!
 //! Provides a comprehensive browser control surface with:
 //! - Multi-profile browser management (isolated Chrome instances)
 //! - Browser lifecycle (status/start/stop)
 //! - Tab management (tabs/open/close/focus) addressed by Chrome target ID
-//! - Accessibility-tree snapshots with element refs
-//! - Ref-based actions (click/type/press/hover/select/drag via snapshot refs)
+//! - DOM snapshots with generation-scoped element refs, including OOPIFs
+//! - Native CDP actions (click/type/press/hover/select/drag/upload)
 //! - Screenshot, navigate, evaluate, console, PDF, scroll
 //! - SSRF protection and cookie security
 
 pub mod actions;
 pub mod adaptive;
 pub mod config;
+pub mod downloads;
 pub mod fetcher;
 pub mod manager;
+mod oopif;
+mod payment;
+mod policy;
 pub mod selectors;
 pub mod snapshot;
 pub mod stealth;
@@ -21,26 +25,315 @@ pub mod stealth;
 use async_trait::async_trait;
 use base64::Engine;
 use chromiumoxide::cdp::browser_protocol::network::Cookie;
+use chromiumoxide::cdp::browser_protocol::page::{
+    GetNavigationHistoryParams, NavigateToHistoryEntryParams,
+};
 use chromiumoxide::page::ScreenshotParams;
 use rustykrab_core::types::ToolSchema;
 use rustykrab_core::{Error, Result, SandboxRequirements, Tool, ToolError};
 use serde_json::{json, Value};
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-use crate::security;
 use adaptive::AdaptiveStore;
 use manager::BrowserManager;
 use snapshot::{SnapshotMode, SnapshotOptions, SnapshotStore};
 
 const MAX_CONTENT_BYTES: usize = 50 * 1024; // 50KB cap for page content
 
+/// Compact snapshots display refs in square brackets (`[s4-12]`). Models
+/// commonly copy that visible token verbatim even though the structured form
+/// contains `s4-12`. Accept both spellings at the tool boundary.
+fn normalize_snapshot_ref(value: &str) -> &str {
+    let trimmed = value.trim();
+    trimmed
+        .strip_prefix('[')
+        .and_then(|inner| inner.strip_suffix(']'))
+        .unwrap_or(trimmed)
+        .trim()
+}
+
+#[derive(Debug)]
+struct NavigationObservation {
+    status: &'static str,
+    outcome: &'static str,
+    readiness: &'static str,
+    browser_degraded: bool,
+    elapsed_ms: u64,
+    reason: Option<String>,
+}
+
+/// Issue `Page.navigate` and observe document readiness under one absolute
+/// deadline. A committed but slow page is different from a target session that
+/// cannot answer even `document.readyState`; callers use that distinction to
+/// decide whether to preserve or rebuild the CDP session.
+async fn navigate_with_deadline(
+    page: &chromiumoxide::Page,
+    url: &str,
+    deadline: tokio::time::Instant,
+) -> Result<NavigationObservation> {
+    let started = std::time::Instant::now();
+    match tokio::time::timeout_at(deadline, page.goto(url)).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => {
+            let browser_degraded = !matches!(
+                e,
+                chromiumoxide::error::CdpError::ChromeMessage(_)
+                    | chromiumoxide::error::CdpError::Url(_)
+            );
+            return Ok(NavigationObservation {
+                status: "failed",
+                outcome: if browser_degraded {
+                    "unknown"
+                } else {
+                    "not_applied"
+                },
+                readiness: "navigate_error",
+                browser_degraded,
+                elapsed_ms: started.elapsed().as_millis() as u64,
+                reason: Some(format!("Page.navigate failed for '{url}': {e}")),
+            });
+        }
+        Err(_) => {
+            return Ok(NavigationObservation {
+                status: "unknown",
+                outcome: "unknown",
+                readiness: "navigate_response_timeout",
+                browser_degraded: true,
+                elapsed_ms: started.elapsed().as_millis() as u64,
+                reason: Some(
+                    "Page.navigate did not return before the navigation deadline; the target session may be unresponsive"
+                        .to_string(),
+                ),
+            })
+        }
+    }
+
+    let mut renderer_responded = false;
+    while tokio::time::Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let probe_budget = remaining.min(Duration::from_millis(750));
+        if let Ok(Ok(result)) =
+            tokio::time::timeout(probe_budget, page.evaluate("document.readyState")).await
+        {
+            renderer_responded = true;
+            let ready: String = result.into_value().unwrap_or_default();
+            if ready == "interactive" || ready == "complete" {
+                return Ok(NavigationObservation {
+                    status: "loaded",
+                    outcome: "applied",
+                    readiness: if ready == "complete" {
+                        "complete"
+                    } else {
+                        "interactive"
+                    },
+                    browser_degraded: false,
+                    elapsed_ms: started.elapsed().as_millis() as u64,
+                    reason: None,
+                });
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(75)).await;
+    }
+
+    Ok(NavigationObservation {
+        status: "committed",
+        outcome: "applied",
+        readiness: "deadline_exceeded",
+        browser_degraded: !renderer_responded,
+        elapsed_ms: started.elapsed().as_millis() as u64,
+        reason: Some(if renderer_responded {
+            "navigation committed, but the document did not become interactive before the deadline"
+                .to_string()
+        } else {
+            "navigation committed, but the target renderer did not answer readiness probes"
+                .to_string()
+        }),
+    })
+}
+
+async fn navigate_history_entry(
+    page: &chromiumoxide::Page,
+    delta: i64,
+    navigation_policy: &config::SsrfPolicy,
+) -> Result<Value> {
+    let history = tokio::time::timeout(
+        Duration::from_secs(3),
+        page.execute(GetNavigationHistoryParams::default()),
+    )
+    .await
+    .map_err(|_| Error::ToolExecution("navigation-history lookup timed out".into()))?
+    .map_err(|error| {
+        Error::ToolExecution(format!("failed to read navigation history: {error}").into())
+    })?;
+    let wanted = history.current_index + delta;
+    let Some(entry) = history.entries.get(wanted.max(0) as usize) else {
+        return Ok(json!({
+            "status": "no_history_entry",
+            "outcome": "not_applied",
+            "direction": if delta < 0 { "back" } else { "forward" },
+            "retry_safe": true,
+        }));
+    };
+    policy::validate_requested(&entry.url, navigation_policy)
+        .await
+        .map_err(|error| Error::ToolExecution(error.into()))?;
+    let target_url = entry.url.clone();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        page.execute(NavigateToHistoryEntryParams::new(entry.id)),
+    )
+    .await
+    .map_err(|_| Error::ToolExecution("history navigation timed out".into()))?
+    .map_err(|error| Error::ToolExecution(format!("history navigation failed: {error}").into()))?;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    while tokio::time::Instant::now() < deadline {
+        let ready = tokio::time::timeout(
+            Duration::from_millis(750),
+            page.evaluate("document.readyState"),
+        )
+        .await
+        .ok()
+        .and_then(std::result::Result::ok)
+        .and_then(|value| value.into_value::<String>().ok())
+        .is_some_and(|state| state == "interactive" || state == "complete");
+        if ready {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let guard = policy::enforce_page(page, navigation_policy).await;
+    if guard["status"] == "blocked" {
+        return Ok(json!({
+            "status": "blocked",
+            "outcome": "not_applied",
+            "direction": if delta < 0 { "back" } else { "forward" },
+            "target_url": target_url,
+            "navigation_guard": guard,
+            "retry_safe": false,
+        }));
+    }
+    Ok(json!({
+        "status": "navigated",
+        "outcome": "applied",
+        "direction": if delta < 0 { "back" } else { "forward" },
+        "url": manager::probe_page_url_once(page).await.unwrap_or(target_url),
+        "title": manager::probe_page_title_once(page).await.unwrap_or_default(),
+        "navigation_guard": guard,
+        "retry_safe": false,
+    }))
+}
+
+async fn page_has_agent_content(page: &chromiumoxide::Page) -> Option<bool> {
+    tokio::time::timeout(
+        Duration::from_millis(750),
+        page.evaluate(
+            r#"Boolean(document.body && (
+                document.body.innerText.trim().length > 0 ||
+                document.body.querySelector('input,button,a,select,textarea,canvas,svg,img,video,[role],[onclick]')
+            ))"#,
+        ),
+    )
+    .await
+    .ok()
+    .and_then(std::result::Result::ok)
+    .and_then(|value| value.into_value::<bool>().ok())
+}
+
+async fn wait_for_agent_content(page: &chromiumoxide::Page, budget: Duration) -> Option<bool> {
+    let deadline = tokio::time::Instant::now() + budget;
+    loop {
+        match page_has_agent_content(page).await {
+            Some(true) => return Some(true),
+            None => return None,
+            Some(false) if tokio::time::Instant::now() >= deadline => return Some(false),
+            Some(false) => tokio::time::sleep(Duration::from_millis(250)).await,
+        }
+    }
+}
+
+/// browser-use retries pages whose HTTP navigation succeeds but yields no
+/// agent-visible DOM. Preserve that behavior under an explicit bounded report
+/// so a legitimate empty document is not silently mistaken for a driver bug.
+async fn recover_empty_page(page: &chromiumoxide::Page) -> Value {
+    match page_has_agent_content(page).await {
+        Some(true) => return json!({ "status": "not_empty", "reloaded": false }),
+        None => {
+            return json!({
+                "status": "unverified",
+                "reloaded": false,
+                "reason": "the renderer did not answer the content probe"
+            })
+        }
+        Some(false) => {}
+    }
+
+    match wait_for_agent_content(page, Duration::from_secs(3)).await {
+        Some(true) => return json!({ "status": "recovered_after_wait", "reloaded": false }),
+        None => {
+            return json!({
+                "status": "unverified",
+                "reloaded": false,
+                "reason": "the renderer stopped answering while waiting for content"
+            })
+        }
+        Some(false) => {}
+    }
+
+    let reload = tokio::time::timeout(Duration::from_secs(5), page.reload()).await;
+    match reload {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => {
+            return json!({
+                "status": "reload_failed",
+                "reloaded": false,
+                "reason": error.to_string(),
+            })
+        }
+        Err(_) => {
+            return json!({
+                "status": "reload_timed_out",
+                "reloaded": false,
+                "reason": "empty-page reload exceeded 5 seconds",
+            })
+        }
+    }
+
+    match wait_for_agent_content(page, Duration::from_secs(5)).await {
+        Some(true) => json!({ "status": "recovered_after_reload", "reloaded": true }),
+        Some(false) => json!({
+            "status": "empty_after_reload",
+            "reloaded": true,
+            "reason": "the HTTP page still has no text or actionable DOM after one reload"
+        }),
+        None => json!({
+            "status": "unverified_after_reload",
+            "reloaded": true,
+            "reason": "the renderer did not answer the post-reload content probe"
+        }),
+    }
+}
+
+fn remaining_millis(deadline: tokio::time::Instant) -> u64 {
+    deadline
+        .saturating_duration_since(tokio::time::Instant::now())
+        .as_millis()
+        .min(u64::MAX as u128) as u64
+}
+
 /// Browser automation tool using Chrome DevTools Protocol.
 ///
-/// Modeled after OpenClaw's browser management architecture:
+/// CDP-native browser execution with browser-use-compatible action semantics:
 /// - Multiple named browser profiles, each an isolated Chrome instance
 /// - Browser lifecycle management (status/start/stop)
 /// - Tab control (tabs/open/close/focus) by stable Chrome target ID
 /// - Accessibility-tree snapshots with element refs for actions
-/// - Ref-based interactions (click ref 12, type ref 5 "hello")
+/// - Snapshot-scoped interactions (click ref s4-12, type ref s4-5 "hello")
+/// - Native CDP mouse/keyboard/file-input actions, redirect guards, popup
+///   handling, dialog handling, and bounded renderer recovery
 ///
 /// Configure via `~/.rustykrab/browser.json` or environment variables:
 /// - `CHROME_CDP_URL`: Override default CDP URL
@@ -58,6 +351,23 @@ pub struct BrowserTool {
     /// everything else; the action reports itself unavailable rather than
     /// the tool disappearing.
     secrets: Option<rustykrab_store::GuardedSecrets>,
+    /// Approved purchases and their cards, for `fill_payment` and `pay`.
+    /// Optional for the same reason as `secrets`.
+    payments: Option<rustykrab_store::PaymentRequestStore>,
+    /// Frame origins, besides the merchant's own, that may receive card
+    /// fields. [`payment::PAYMENT_FRAME_ORIGINS`] outside tests.
+    payment_frame_origins: Vec<String>,
+    /// Pages with a card entered, keyed `session:target`, valued by the
+    /// payment request it was entered for. While a page is here, anything
+    /// that could submit it or show the card is routed through `pay` or
+    /// refused.
+    payment_armed: Arc<Mutex<HashMap<String, String>>>,
+    /// Where a message to the user goes when the model must not be the one
+    /// carrying it. Only `pay` uses it, and only to report a payment
+    /// refused as a duplicate: the model is being told to stop, and a turn
+    /// that is being stopped is not a reliable messenger. Optional for the
+    /// same reason as `payments`.
+    pending_links: Option<rustykrab_store::PendingLinks>,
 }
 
 /// Resolve the action the caller meant.
@@ -85,18 +395,21 @@ fn schema_parameters() -> serde_json::Value {
                 "type": "string",
                 "enum": [
                     "status", "start", "stop", "profiles",
+                    "downloads",
                     "tabs", "open", "close", "focus",
-                    "navigate", "snapshot", "act", "screenshot",
+                    "navigate", "back", "forward", "refresh", "snapshot", "act", "click_coordinates", "send_keys", "screenshot",
                     "content", "evaluate", "scroll",
+                    "scroll_to_text",
                     "console", "cookies", "pdf",
                     "fetch", "stealth_fetch", "select", "wait_for",
-                    "fill_credential"
+                    "fill_credential", "fill_payment", "pay"
                 ],
-                "description": "Action to perform. Required companion fields: open/navigate/fetch/stealth_fetch -> url; close/focus -> targetId; act -> ref + actAction; fill_credential -> ref; evaluate -> expression. Act sub-actions have additional requirements documented on actAction."
+                "description": "Action to perform. Required companion fields: open/navigate/fetch/stealth_fetch -> url; close/focus -> targetId; act -> ref + actAction; fill_credential -> ref; fill_payment -> ref + field; pay -> ref; evaluate -> expression. Act sub-actions have additional requirements documented on actAction."
             },
             "field": {
                 "type": "string",
-                "description": "Which part of the login to fill (fill_credential action): 'username' or 'password'. Defaults to 'password'."
+                "enum": ["username", "password", "number", "expiry", "exp_month", "exp_year", "cvc", "name", "postal_code"],
+                "description": "fill_credential: 'username' or 'password' (default password; passwords require a type=password input). fill_payment: which part of the approved card the field takes — 'number', 'expiry' (month and year in one box), 'exp_month' and 'exp_year' (separate boxes or selects), 'cvc', 'name' (name on card) or 'postal_code'."
             },
             "profile": {
                 "type": "string",
@@ -108,24 +421,38 @@ fn schema_parameters() -> serde_json::Value {
             },
             "targetId": {
                 "type": "string",
-                "description": "Tab identifier from 'tabs' action (e.g., 'tab_0'). Used by close/focus/navigate/snapshot/act/screenshot/content/evaluate"
+                "description": "Opaque Chrome target identifier from the 'tabs' or click result. Used by close/focus/navigate/snapshot/act/screenshot/content/evaluate; never infer it from tab order."
             },
             "ref": {
                 "type": "string",
-                "description": "Element ref from a snapshot (e.g., '12' or 'e12'). Required for act and fill_credential"
+                "description": "Complete snapshot-scoped element ref (e.g., 's4-12', '[s4-12]', or 's4-e12'). Required for act, fill_credential, fill_payment and pay; square brackets copied from compact snapshot lines are accepted. Never reuse a ref after receiving newer page_state/snapshot output."
             },
             "actAction": {
                 "type": "string",
-                "enum": ["click", "type", "fill", "press", "hover", "select", "drag", "wait", "fill_credential"],
-                "description": "Required when action='act'; every act also requires ref. Companion fields: type/fill -> text; press -> key; select -> value; drag -> targetRef. fill_credential uses field='username' or 'password' and never text, so the stored secret does not pass through you."
+                "enum": ["click", "type", "fill", "press", "hover", "select", "drag", "upload", "options", "wait", "fill_credential", "fill_payment", "pay"],
+                "description": "Required when action='act'; every act also requires ref. Companion fields: type/fill -> text; press -> key; select -> value; drag -> targetRef; upload -> path or paths. options inspects a native select. fill_credential uses field='username' or 'password' and never text, so the stored secret does not pass through you. fill_payment uses field (number/expiry/exp_month/exp_year/cvc/name/postal_code) and never text; pay presses a checkout button after checking the total."
             },
             "text": {
                 "type": "string",
                 "description": "Required for actAction='type' or 'fill'"
             },
+            "x": {
+                "type": "number",
+                "minimum": 0,
+                "description": "Viewport x coordinate for click_coordinates, measured in the native screenshot coordinate space."
+            },
+            "y": {
+                "type": "number",
+                "minimum": 0,
+                "description": "Viewport y coordinate for click_coordinates, measured in the native screenshot coordinate space."
+            },
             "key": {
                 "type": "string",
                 "description": "Required for actAction='press' (e.g., 'Enter', 'Tab', 'Escape')"
+            },
+            "keys": {
+                "type": "string",
+                "description": "Required for send_keys. Sends trusted CDP keyboard input to the focused element; supports text, special keys, and combinations such as Control+A or Meta+Enter."
             },
             "value": {
                 "type": "string",
@@ -135,9 +462,29 @@ fn schema_parameters() -> serde_json::Value {
                 "type": "string",
                 "description": "Required target element ref for actAction='drag'"
             },
+            "path": {
+                "type": "string",
+                "description": "For actAction='upload': one existing non-empty file inside the configured RustyKrab workspace."
+            },
+            "paths": {
+                "type": "array",
+                "items": {"type": "string"},
+                "minItems": 1,
+                "description": "For actAction='upload': existing non-empty files inside the configured RustyKrab workspace."
+            },
             "clear": {
                 "type": "boolean",
                 "description": "Clear field before typing (default: true for fill, false for type)"
+            },
+            "expect_download": {
+                "type": "boolean",
+                "description": "For actAction='click': wait for and report a browser download lifecycle event (default: false)."
+            },
+            "download_timeout_ms": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 30000,
+                "description": "Maximum time to wait for an expected download to finish (default: 10000, maximum: 30000)."
             },
             "selector": {
                 "type": "string",
@@ -179,7 +526,7 @@ fn schema_parameters() -> serde_json::Value {
             },
             "compact": {
                 "type": "boolean",
-                "description": "Snapshot: compact output format (default: false)"
+                "description": "Snapshot: compact output format (default: false). Prefer true for routine control to keep repeated model turns fast."
             },
             "depth": {
                 "type": "integer",
@@ -410,6 +757,27 @@ fn schema_parameters() -> serde_json::Value {
             },
             {
                 "if": {
+                    "properties": { "action": { "const": "fill_payment" } },
+                    "required": ["action"]
+                },
+                "then": { "required": ["ref", "field"] }
+            },
+            {
+                "if": {
+                    "properties": { "action": { "const": "pay" } },
+                    "required": ["action"]
+                },
+                "then": { "required": ["ref"] }
+            },
+            {
+                "if": {
+                    "properties": { "action": { "const": "send_keys" } },
+                    "required": ["action"]
+                },
+                "then": { "required": ["keys"] }
+            },
+            {
+                "if": {
                     "properties": { "action": { "const": "evaluate" } },
                     "required": ["action"]
                 },
@@ -420,10 +788,16 @@ fn schema_parameters() -> serde_json::Value {
 }
 
 fn effective_action<'a>(action: &'a str, args: &serde_json::Value) -> &'a str {
-    if action == "act" && args["actAction"] == "fill_credential" {
-        "fill_credential"
-    } else {
-        action
+    if action != "act" {
+        return action;
+    }
+    // Same reasoning as `fill_credential` above: a model holding a ref
+    // reaches for `act`, so accept the spelling it already uses.
+    match args["actAction"].as_str() {
+        Some("fill_credential") => "fill_credential",
+        Some("fill_payment") => "fill_payment",
+        Some("pay") => "pay",
+        _ => action,
     }
 }
 
@@ -434,7 +808,18 @@ impl BrowserTool {
             snapshot_store: SnapshotStore::new(),
             adaptive_store: AdaptiveStore::new(),
             secrets: None,
+            payments: None,
+            payment_frame_origins: Self::default_payment_frame_origins(),
+            payment_armed: Arc::default(),
+            pending_links: None,
         }
+    }
+
+    fn default_payment_frame_origins() -> Vec<String> {
+        payment::PAYMENT_FRAME_ORIGINS
+            .iter()
+            .map(|o| o.to_string())
+            .collect()
     }
 
     /// Build a tool against an explicit config.
@@ -449,6 +834,10 @@ impl BrowserTool {
             snapshot_store: SnapshotStore::new(),
             adaptive_store: AdaptiveStore::new(),
             secrets: None,
+            payments: None,
+            payment_frame_origins: Self::default_payment_frame_origins(),
+            payment_armed: Arc::default(),
+            pending_links: None,
         }
     }
 
@@ -456,6 +845,28 @@ impl BrowserTool {
     /// holding it.
     pub fn with_secrets(mut self, secrets: rustykrab_store::GuardedSecrets) -> Self {
         self.secrets = Some(secrets);
+        self
+    }
+
+    /// Let the browser enter a card the user approved for one purchase, and
+    /// press pay once the page total checks out.
+    pub fn with_payments(mut self, payments: rustykrab_store::PaymentRequestStore) -> Self {
+        self.payments = Some(payments);
+        self
+    }
+
+    /// Where to put a message the user must get whatever the model does
+    /// next. See the field.
+    pub fn with_pending_links(mut self, links: rustykrab_store::PendingLinks) -> Self {
+        self.pending_links = Some(links);
+        self
+    }
+
+    /// Test fixtures serve "provider" frames from loopback origins that the
+    /// production list rightly does not contain.
+    #[cfg(test)]
+    fn with_payment_frame_origins(mut self, origins: &[&str]) -> Self {
+        self.payment_frame_origins = origins.iter().map(|o| o.to_string()).collect();
         self
     }
 
@@ -492,15 +903,45 @@ impl BrowserTool {
                     "press" => require_non_empty(args, "key", "act/press")?,
                     "select" => require_non_empty(args, "value", "act/select")?,
                     "drag" => require_non_empty(args, "targetRef", "act/drag")?,
-                    "click" | "hover" | "wait" | "fill_credential" => {}
+                    "upload" => {
+                        let has_path = args["path"]
+                            .as_str()
+                            .is_some_and(|value| !value.trim().is_empty());
+                        let has_paths = args["paths"]
+                            .as_array()
+                            .is_some_and(|values| !values.is_empty());
+                        if !has_path && !has_paths {
+                            return Err(Error::ToolExecution(ToolError::invalid_input(
+                                "act/upload requires 'path' or a non-empty 'paths' array",
+                            )));
+                        }
+                    }
+                    "click" | "hover" | "options" | "wait" | "fill_credential" | "fill_payment"
+                    | "pay" => {}
                     other => {
                         return Err(Error::ToolExecution(ToolError::invalid_input(format!(
-                            "unknown act action '{other}'. Available: click, type, fill, press, hover, select, drag, wait, fill_credential"
+                            "unknown act action '{other}'. Available: click, type, fill, press, hover, select, drag, upload, options, wait, fill_credential"
                         ))));
                     }
                 }
             }
-            "fill_credential" => require_non_empty(args, "ref", action)?,
+            "fill_credential" | "fill_payment" | "pay" => require_non_empty(args, "ref", action)?,
+            "click_coordinates" => {
+                if args["x"].as_f64().is_none() || args["y"].as_f64().is_none() {
+                    return Err(Error::ToolExecution(ToolError::invalid_input(
+                        "click_coordinates requires numeric 'x' and 'y'",
+                    )));
+                }
+                if args["x"].as_f64().unwrap_or(-1.0) < 0.0
+                    || args["y"].as_f64().unwrap_or(-1.0) < 0.0
+                {
+                    return Err(Error::ToolExecution(ToolError::invalid_input(
+                        "click_coordinates requires non-negative coordinates",
+                    )));
+                }
+            }
+            "scroll_to_text" => require_non_empty(args, "text", action)?,
+            "send_keys" => require_non_empty(args, "keys", action)?,
             "evaluate" => require_non_empty(args, "expression", action)?,
             "wait_for" => {
                 let has_condition = args["wait_selector"]
@@ -515,15 +956,240 @@ impl BrowserTool {
                     )));
                 }
             }
-            "status" | "start" | "stop" | "profiles" | "tabs" | "snapshot" | "screenshot"
-            | "content" | "scroll" | "console" | "cookies" | "pdf" | "select" => {}
+            "status" | "start" | "stop" | "profiles" | "downloads" | "tabs" | "snapshot"
+            | "screenshot" | "content" | "scroll" | "console" | "cookies" | "pdf" | "select"
+            | "back" | "forward" | "refresh" => {}
             other => {
                 return Err(Error::ToolExecution(ToolError::invalid_input(format!(
                     "unknown browser action '{other}'"
                 ))));
             }
         }
+        if effective_action(action, args) == "fill_credential" {
+            if args.get("url").is_some() || args.get("text").is_some() {
+                return Err(Error::ToolExecution(ToolError::invalid_input(
+                    "fill_credential does not accept url or text; authority comes only from the live page origin",
+                )));
+            }
+            if !matches!(
+                args["field"].as_str().unwrap_or(crate::PASSWORD),
+                crate::USERNAME | crate::PASSWORD
+            ) {
+                return Err(Error::ToolExecution(ToolError::invalid_input(
+                    "fill_credential supports only username or password",
+                )));
+            }
+        }
+        if matches!(effective_action(action, args), "fill_payment" | "pay") {
+            // The card comes from the approval and the page, never from the
+            // call. A `text` or `value` here is the model trying to supply
+            // one, which it does not have.
+            if ["url", "text", "value", "keys"]
+                .iter()
+                .any(|k| args.get(*k).is_some())
+            {
+                return Err(Error::ToolExecution(ToolError::invalid_input(
+                    "fill_payment and pay take no url, text, value or keys; the card comes from the user's approval and the site from the live page",
+                )));
+            }
+        }
+        if effective_action(action, args) == "fill_payment"
+            && !args["field"]
+                .as_str()
+                .is_some_and(|f| payment::PaymentField::parse(f).is_some())
+        {
+            return Err(Error::ToolExecution(ToolError::invalid_input(format!(
+                "fill_payment requires 'field', one of: {}",
+                payment::PaymentField::ALL.join(", ")
+            ))));
+        }
         Ok(())
+    }
+
+    /// The live page's origin, provided it is safe to release a secret to.
+    ///
+    /// Neither a model-supplied URL nor a snapshot's old frame URL is
+    /// authority: this reads the page as it is now and requires HTTPS, with
+    /// HTTP loopback allowed only under the explicit private-network test
+    /// policy. Returns the URL and its canonical origin.
+    async fn secure_live_origin(
+        &self,
+        page: &chromiumoxide::Page,
+        what: &str,
+    ) -> Result<(String, String)> {
+        let url = manager::probe_page_url_once(page).await.unwrap_or_default();
+        let origin = crate::origin_key::canonical_credential_origin(&url)?;
+        let parsed = url::Url::parse(&origin).expect("validated origin");
+        let loopback = parsed
+            .host_str()
+            .is_some_and(|host| host == "localhost" || host == "127.0.0.1" || host == "[::1]");
+        if parsed.scheme() != "https"
+            && !(loopback && self.manager.config().ssrf_policy.allow_private_network)
+        {
+            return Err(Error::ToolExecution(ToolError::permission_denied(format!(
+                "{what} requires HTTPS (HTTP loopback requires explicit private-network test policy)"
+            ))));
+        }
+        Ok((url, origin))
+    }
+
+    /// The payment this conversation may make on `origin`, with its card.
+    ///
+    /// Every refusal says what to do next, because the model's next move
+    /// after "no" is otherwise to try typing a card it does not have.
+    async fn approved_payment(
+        &self,
+        origin: &str,
+    ) -> Result<(
+        rustykrab_store::PaymentRequest,
+        rustykrab_store::CardDetails,
+    )> {
+        let payments = self.payments.as_ref().ok_or_else(|| {
+            Error::ToolExecution(
+                "payments are unavailable: this browser has no payment store".into(),
+            )
+        })?;
+        let conversation =
+            rustykrab_core::active_tools::with_session_context(|c| c.conversation_id).ok_or_else(
+                || {
+                    Error::ToolExecution(ToolError::permission_denied(
+                        "a payment can only be made from the conversation the user approved it in",
+                    ))
+                },
+            )?;
+        match payments.authorized_for(conversation, origin).await? {
+            rustykrab_store::AuthorizedPayment::Ready { request, card } => Ok((*request, card)),
+            rustykrab_store::AuthorizedPayment::OriginMismatch { approved_origin } => {
+                Err(Error::ToolExecution(ToolError::permission_denied(format!(
+                    "The user approved paying on {approved_origin}, not {origin}. Do not enter the card here. If the checkout really is on this site, file a new payment_request with this page's url and stop until the user approves."
+                ))))
+            }
+            rustykrab_store::AuthorizedPayment::None => {
+                Err(Error::ToolExecution(ToolError::permission_denied(format!(
+                    "No approved payment for {origin} in this conversation (none was filed, the user has not approved yet, or the 15-minute approval ran out). Call payment_request with this checkout's url, the merchant and the total, tell the user in one sentence, and stop until they approve. Never ask for card details in chat."
+                ))))
+            }
+        }
+    }
+
+    fn armed_key(session: &str, page: &chromiumoxide::Page) -> String {
+        format!("{session}:{}", page.target_id().inner())
+    }
+
+    fn disarm_payment(&self, key: &str) {
+        self.payment_armed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(key);
+    }
+
+    /// Refuse what could submit or reveal a page that has a card entered.
+    ///
+    /// Filling the card is safe on its own; the two dangers after it are a
+    /// submit that skips the total check and output that shows the number
+    /// to the model. So while a page is armed: `pay` is the only way to
+    /// press a submit-like control or Enter, and screenshots, PDFs, HTML
+    /// content and `evaluate` are off. Typing into other fields, ticking a
+    /// terms box and snapshots (which omit card values) still work.
+    ///
+    /// A control in a site-isolated frame is refused outright rather than
+    /// pointed at `pay`, which cannot check a total there either
+    /// ([`actions::SubmitVerdict::SiteIsolated`]).
+    async fn enforce_payment_lock(
+        &self,
+        action: &str,
+        args: &Value,
+        profile: &str,
+        session: &str,
+        target_id: Option<&str>,
+    ) -> Result<()> {
+        const GUARDED: &[&str] = &[
+            "act",
+            "click_coordinates",
+            "send_keys",
+            "evaluate",
+            "screenshot",
+            "pdf",
+            "content",
+        ];
+        if !GUARDED.contains(&action) {
+            return Ok(());
+        }
+        let prefix = format!("{session}:");
+        let any_armed = self
+            .payment_armed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .any(|k| k.starts_with(&prefix));
+        if !any_armed {
+            return Ok(());
+        }
+        let page = self.manager.get_page(profile, target_id).await?;
+        let armed = self
+            .payment_armed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&Self::armed_key(session, &page));
+        if !armed {
+            return Ok(());
+        }
+
+        let refuse = |why: &str| -> Result<()> {
+            Err(Error::ToolExecution(ToolError::permission_denied(format!(
+                "A card is entered on this page, so {why}. To submit the payment use browser(action='pay', ref=<pay button>), which checks the total first; navigating away clears this."
+            ))))
+        };
+        let is_enter = |key: &str| {
+            let key = key.to_ascii_lowercase();
+            key.contains("enter") || key.contains("return") || key.contains('\n')
+        };
+        match action {
+            "evaluate" => refuse("evaluate is disabled until the payment is submitted"),
+            "screenshot" | "pdf" => {
+                refuse("screenshots and PDFs are disabled because they would show the card")
+            }
+            "content" if args["format"] == "html" => refuse("HTML content is disabled"),
+            "click_coordinates" => {
+                refuse("coordinate clicks are disabled because their target cannot be checked")
+            }
+            "send_keys" if is_enter(args["keys"].as_str().unwrap_or_default()) => {
+                refuse("Enter is disabled because it could submit the payment")
+            }
+            "act" => match args["actAction"].as_str() {
+                Some("press") if is_enter(args["key"].as_str().unwrap_or_default()) => {
+                    refuse("Enter is disabled because it could submit the payment")
+                }
+                Some("click") => {
+                    let ref_id = args["ref"]
+                        .as_str()
+                        .map(normalize_snapshot_ref)
+                        .unwrap_or_default();
+                    let store_key = Self::store_key(session, profile, target_id);
+                    match actions::is_submit_like(&page, &self.snapshot_store, &store_key, ref_id)
+                        .await?
+                    {
+                        actions::SubmitVerdict::Other => Ok(()),
+                        actions::SubmitVerdict::Submits => {
+                            refuse("that control looks like it submits the payment")
+                        }
+                        // `pay` is no answer here: it reads the total from the
+                        // merchant's top document, and a control in someone
+                        // else's frame is not provably that page's pay button.
+                        // So this checkout is one the user finishes themselves.
+                        actions::SubmitVerdict::SiteIsolated => {
+                            Err(Error::ToolExecution(ToolError::permission_denied(
+                                "A card is entered on this page and that control is inside a cross-site frame, \
+                                 where the page total cannot be checked and pay is not available. Do not click it; \
+                                 tell the user this checkout needs them to finish paying. Navigating away clears this.",
+                            )))
+                        }
+                    }
+                }
+                _ => Ok(()),
+            },
+            _ => Ok(()),
+        }
     }
 
     /// Resolve the profile name from args, falling back to the default.
@@ -533,11 +1199,15 @@ impl BrowserTool {
             .unwrap_or(&self.manager.config().default_profile)
     }
 
-    /// Build a snapshot store key from profile + target.
-    fn store_key(profile: &str, target_id: Option<&str>) -> String {
+    /// Build a snapshot store key from conversation + profile + target.
+    ///
+    /// Refs are capabilities over a page element. Keeping them conversation-
+    /// scoped prevents one concurrent agent from acting on another agent's
+    /// most recent snapshot merely because both share a Chrome profile/tab.
+    fn store_key(session: &str, profile: &str, target_id: Option<&str>) -> String {
         match target_id {
-            Some(tid) => format!("{profile}:{tid}"),
-            None => format!("{profile}:active"),
+            Some(tid) => format!("{session}:{profile}:{tid}"),
+            None => format!("{session}:{profile}:active"),
         }
     }
 
@@ -555,13 +1225,21 @@ impl BrowserTool {
     /// Actions that operate on a page, and so need one resolved.
     const PAGE_ACTIONS: &'static [&'static str] = &[
         "navigate",
+        "back",
+        "forward",
+        "refresh",
         "snapshot",
         "act",
+        "click_coordinates",
+        "send_keys",
         "fill_credential",
+        "fill_payment",
+        "pay",
         "screenshot",
         "content",
         "evaluate",
         "scroll",
+        "scroll_to_text",
         "console",
         "cookies",
         "pdf",
@@ -620,7 +1298,197 @@ impl BrowserTool {
             let navigated = self.manager.sticky_target(session, profile).is_some();
             Self::reject_blank_read(action, &url, navigated)?;
         }
+        let guard = policy::enforce_page(&page, &self.manager.config().ssrf_policy).await;
+        if guard["status"] == "blocked" {
+            return Err(Error::ToolExecution(
+                format!(
+                    "browser navigation policy blocked '{}' before '{action}': {}",
+                    guard["url"].as_str().unwrap_or("unknown URL"),
+                    guard["reason"].as_str().unwrap_or("policy rejected URL")
+                )
+                .into(),
+            ));
+        }
         Ok(page)
+    }
+
+    /// Re-check the URL after a page operation and before returning any data.
+    /// A page can navigate itself while a read is in flight, so preflight
+    /// validation alone is not a sufficient confidentiality boundary.
+    async fn guard_page_output(
+        &self,
+        action: &str,
+        session: &str,
+        profile: &str,
+        target_id: Option<&str>,
+        page: &chromiumoxide::Page,
+    ) -> Result<Value> {
+        let guard = policy::enforce_page(page, &self.manager.config().ssrf_policy).await;
+        if guard["status"] == "blocked" {
+            self.snapshot_store
+                .clear(&Self::store_key(session, profile, target_id))
+                .await;
+            return Err(Error::ToolExecution(
+                format!(
+                    "browser navigation policy blocked '{}' after '{action}': {}",
+                    guard["url"].as_str().unwrap_or("unknown URL"),
+                    guard["reason"].as_str().unwrap_or("policy rejected URL")
+                )
+                .into(),
+            ));
+        }
+        Ok(guard)
+    }
+
+    async fn validate_requested_url(&self, url: &str) -> Result<()> {
+        policy::validate_requested(url, &self.manager.config().ssrf_policy)
+            .await
+            .map_err(|error| Error::ToolExecution(error.into()))
+    }
+
+    fn validated_upload_paths(args: &Value) -> Result<Vec<String>> {
+        let mut requested = Vec::new();
+        if let Some(path) = args["path"].as_str() {
+            if !path.trim().is_empty() {
+                requested.push(path.to_string());
+            }
+        }
+        if let Some(paths) = args["paths"].as_array() {
+            for path in paths {
+                let path = path.as_str().ok_or_else(|| {
+                    Error::ToolExecution(ToolError::invalid_input(
+                        "every upload path must be a string",
+                    ))
+                })?;
+                if path.trim().is_empty() {
+                    return Err(Error::ToolExecution(ToolError::invalid_input(
+                        "upload paths cannot be empty",
+                    )));
+                }
+                requested.push(path.to_string());
+            }
+        }
+        requested.sort();
+        requested.dedup();
+        if requested.is_empty() {
+            return Err(Error::ToolExecution(ToolError::invalid_input(
+                "act/upload requires at least one file",
+            )));
+        }
+
+        requested
+            .into_iter()
+            .map(|path| {
+                let canonical = crate::security::validate_path(&path)
+                    .map_err(|error| Error::ToolExecution(error.into()))?;
+                let metadata = std::fs::metadata(&canonical).map_err(|error| {
+                    Error::ToolExecution(
+                        format!("cannot inspect upload file '{path}': {error}").into(),
+                    )
+                })?;
+                if !metadata.is_file() {
+                    return Err(Error::ToolExecution(ToolError::invalid_input(format!(
+                        "upload path is not a regular file: '{path}'"
+                    ))));
+                }
+                if metadata.len() == 0 {
+                    return Err(Error::ToolExecution(ToolError::invalid_input(format!(
+                        "upload file is empty: '{path}'"
+                    ))));
+                }
+                Ok(canonical.display().to_string())
+            })
+            .collect()
+    }
+
+    /// Enforce policy on tabs created by one browser action and optionally
+    /// focus the sole allowed popup, matching browser-use without guessing
+    /// when several tabs appear together.
+    async fn guard_new_tabs(
+        &self,
+        profile: &str,
+        session: &str,
+        before: Option<HashSet<String>>,
+    ) -> Value {
+        let Some(before) = before else {
+            return json!({
+                "status": "unverified",
+                "reason": "could not capture the pre-action target set"
+            });
+        };
+        // Let Target.attachedToTarget propagate through chromiumoxide.
+        tokio::time::sleep(Duration::from_millis(75)).await;
+        let after =
+            match tokio::time::timeout(Duration::from_secs(3), self.manager.target_ids(profile))
+                .await
+            {
+                Ok(Ok(ids)) => ids,
+                Ok(Err(error)) => {
+                    return json!({ "status": "unverified", "reason": error.to_string() })
+                }
+                Err(_) => {
+                    return json!({
+                        "status": "unverified",
+                        "reason": "post-action target listing timed out"
+                    })
+                }
+            };
+        let mut new_targets: Vec<String> = after.difference(&before).cloned().collect();
+        new_targets.sort();
+        let mut allowed = Vec::new();
+        let mut blocked = Vec::new();
+        let mut unverified = Vec::new();
+
+        for target in new_targets {
+            let page = match self.manager.get_page(profile, Some(&target)).await {
+                Ok(page) => page,
+                Err(error) => {
+                    unverified.push(json!({ "targetId": target, "reason": error.to_string() }));
+                    continue;
+                }
+            };
+            let guard = policy::enforce_page(&page, &self.manager.config().ssrf_policy).await;
+            match guard["status"].as_str() {
+                Some("allowed") => allowed.push(target),
+                Some("blocked") => {
+                    self.snapshot_store
+                        .clear(&Self::store_key(session, profile, Some(&target)))
+                        .await;
+                    let closed = self.manager.close_tab(profile, &target).await.is_ok();
+                    blocked.push(json!({
+                        "targetId": target,
+                        "url": guard["url"],
+                        "reason": guard["reason"],
+                        "closed": closed,
+                    }));
+                }
+                _ => unverified.push(guard),
+            }
+        }
+
+        let focused_target = if self.manager.config().auto_focus_new_tabs && allowed.len() == 1 {
+            let target = &allowed[0];
+            if self.manager.focus_tab(profile, target).await.is_ok() {
+                self.manager.set_sticky_target(session, profile, target);
+                Some(target.clone())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        json!({
+            "status": if allowed.is_empty() && blocked.is_empty() && unverified.is_empty() {
+                "no_new_tabs"
+            } else {
+                "processed"
+            },
+            "allowed_targets": allowed,
+            "blocked_targets": blocked,
+            "unverified_targets": unverified,
+            "focused_target": focused_target,
+        })
     }
 
     /// Reject a read action that resolved to a blank tab.
@@ -646,6 +1514,23 @@ impl BrowserTool {
             )
             .into(),
         ))
+    }
+
+    /// Rebuild a degraded browser connection and invalidate every capability
+    /// minted by the old profile instance. The profile lease held by
+    /// `execute` makes this atomic with respect to other browser tool calls.
+    async fn recover_degraded_profile(&self, profile: &str) -> Value {
+        self.snapshot_store.clear_profile(profile).await;
+        match tokio::time::timeout(
+            Duration::from_secs(25),
+            self.manager.recover_profile(profile),
+        )
+        .await
+        {
+            Ok(Ok(value)) => value,
+            Ok(Err(e)) => json!({ "status": "failed", "error": e.to_string() }),
+            Err(_) => json!({ "status": "failed", "error": "browser recovery exceeded 25s" }),
+        }
     }
 }
 
@@ -684,7 +1569,7 @@ impl Tool for BrowserTool {
 
     fn description(&self) -> &str {
         "Browse and scrape the web. Three fetch modes plus interactive control of \
-         Chrome via DevTools Protocol. \
+         Chrome via DevTools Protocol (CDP only; no Playwright). \
          Fetch modes: \
          fetch — pure HTTP request with browser-like header packs (impersonate=chrome|firefox|safari|edge), stealthy_headers, custom user-agent, proxy, retries, redirects; \
          stealth_fetch — full browser navigation with anti-bot patches (block_webrtc, hide_canvas, disable_resources), wait_selector, network_idle, solve_cloudflare, and returns rendered body; \
@@ -692,19 +1577,42 @@ impl Tool for BrowserTool {
          Browser control: \
          status/start/stop — lifecycle; \
          profiles — list profiles; \
+         downloads — list browser-observed download records and validated local paths; \
          tabs/open/close/focus — tab management; \
-         navigate — go to URL (supports wait_selector, wait_selector_state, network_idle, solve_cloudflare); \
+         navigate/back/forward/refresh — navigation and history (navigate supports wait_selector, wait_selector_state, network_idle, solve_cloudflare); \
          wait_for — wait for selector / network idle / fixed delay; \
-         snapshot — accessibility-tree with element refs; \
-         act — interact by ref (click/type/press/hover/select/drag); \
+         snapshot — DOM-derived interaction state with element refs, including site-isolated cross-origin frames; \
+         act — interact by ref (click/type/fill/press/hover/select/drag/upload/options/wait); \
+         click_coordinates — click native screenshot coordinates; send_keys — send trusted CDP keyboard input to the focused element; scroll_to_text — find and reveal visible text; \
          fill_credential — type a STORED credential into a field by ref, without \
          ever seeing its value: pass 'ref' and 'field' ('username' or 'password'). \
          Always sign in with this. Never use act/type for a password: you do not \
          have the value, and typing a placeholder or the credential's own name just \
          fails the login. If nothing is stored yet the error names the exact key — \
          ask for it with credential_request under that name, then retry; \
-         screenshot/content/evaluate/scroll/console/cookies/pdf. \
+         fill_payment — enter the card the user approved for this checkout into one \
+         card field by ref, with field='number', 'expiry', 'exp_month', 'exp_year', \
+         'cvc', 'name' or 'postal_code'. You never see the card. It only works on the \
+         site the user approved (and its payment provider's card frames) — if nothing \
+         is approved, ask with payment_request and stop; \
+         pay — press the checkout's pay / place-order button by ref after the card is \
+         entered. It reads the page total first and refuses if it is above the \
+         approved amount; pressing spends the approval, so never press pay twice for \
+         one purchase. While a card is entered, screenshot, pdf, evaluate, coordinate \
+         clicks, Enter, and clicking a submit button any other way are blocked; \
+         screenshot/content/evaluate/scroll/console/cookies/pdf. Snapshots report likely CAPTCHA providers but do not claim to solve them. \
          Cookies persist across calls. Use snapshot + act for reliable element interaction. \
+         Prefer compact=true and interactive=true for routine control; request \
+         interactive=false only when surrounding visible text is needed. Each act returns \
+         its outcome plus compact page_state. Use refs from that returned page_state \
+         directly; do not request another snapshot after every action or repeat an \
+         unchanged snapshot. If the needed control is absent, scroll once and then take \
+         a fresh snapshot. Clicks also return the current tabs \
+         and any JavaScript dialogs they accepted. Set expect_download=true on a download \
+         click to wait for Chrome's completion event; a click alone is not download proof. \
+         If outcome is \"unknown\", the browser \
+         was recovered but the action may already have happened — inspect the new state \
+         and never repeat the action blindly. \
          If act returns status \"new_snapshot\", the page state moved on: the response \
          contains the current snapshot under \"snapshot\" — pick a ref from it and call \
          act with that ref. The previous_ref in the response is no longer valid. \
@@ -744,6 +1652,15 @@ impl Tool for BrowserTool {
         let profile = self.resolve_profile(&args).to_string();
         let session = Self::session_key();
 
+        // The manager intentionally shares a long-lived authenticated Chrome
+        // profile. Serialize its tool calls so navigation/recovery cannot race
+        // another conversation that is using the same process.
+        let _profile_lease = if action == "fetch" {
+            None
+        } else {
+            Some(self.manager.acquire_profile_lease(&profile).await)
+        };
+
         // Decide which page this call addresses once, here: an explicit
         // `targetId` wins, otherwise the tab this session last navigated,
         // provided it is still open. Every page action below reads
@@ -752,6 +1669,27 @@ impl Tool for BrowserTool {
         // tab than the call before.
         let resolved_target = self.resolve_target(action, &profile, &session, &args).await;
         let target_id = resolved_target.as_deref();
+
+        // Register the raw-CDP endpoint used only for site-isolated iframe
+        // targets. Keeping it with the snapshot state lets automatic
+        // post-action snapshots use the bridge without coupling actions to the
+        // browser manager.
+        let needs_live_page = Self::PAGE_ACTIONS.contains(&action)
+            && !(action == "select" && args["html"].as_str().is_some());
+        if needs_live_page {
+            let _ = self.manager.get_browser(&profile).await?;
+            let websocket_url = self.manager.websocket_address(&profile).await?;
+            self.snapshot_store
+                .register_oopif_context(
+                    &Self::store_key(&session, &profile, target_id),
+                    websocket_url,
+                    self.manager.config().ssrf_policy.clone(),
+                )
+                .await;
+        }
+
+        self.enforce_payment_lock(action, &args, &profile, &session, target_id)
+            .await?;
 
         match action {
             // ── Lifecycle ──────────────────────────────────────────
@@ -762,6 +1700,11 @@ impl Tool for BrowserTool {
             "stop" => self.manager.stop(&profile).await,
 
             "profiles" => Ok(self.manager.profiles().await),
+
+            "downloads" => {
+                let _ = self.manager.get_browser(&profile).await?;
+                self.manager.list_downloads(&profile).await
+            }
 
             // ── Tab management ─────────────────────────────────────
             "tabs" => {
@@ -774,11 +1717,26 @@ impl Tool for BrowserTool {
                 let url = args["url"].as_str().ok_or_else(|| {
                     Error::ToolExecution("'open' requires 'url' parameter".into())
                 })?;
-                security::validate_url(url)
-                    .await
-                    .map_err(|e| Error::ToolExecution(e.into()))?;
+                self.validate_requested_url(url).await?;
                 let _ = self.manager.get_browser(&profile).await?;
                 let opened = self.manager.open_tab(&profile, url).await?;
+                if let Some(tid) = opened["targetId"].as_str() {
+                    let page = self.manager.get_page(&profile, Some(tid)).await?;
+                    let guard =
+                        policy::enforce_page(&page, &self.manager.config().ssrf_policy).await;
+                    if guard["status"] == "blocked" {
+                        let closed = self.manager.close_tab(&profile, tid).await.is_ok();
+                        return Ok(json!({
+                            "status": "blocked",
+                            "outcome": "not_applied",
+                            "targetId": tid,
+                            "navigation_guard": guard,
+                            "closed": closed,
+                            "retry_safe": false,
+                            "profile": profile,
+                        }));
+                    }
+                }
                 // A freshly opened tab is where this session is now working.
                 if let Some(tid) = opened["targetId"].as_str() {
                     self.manager.set_sticky_target(&session, &profile, tid);
@@ -791,6 +1749,7 @@ impl Tool for BrowserTool {
                     Error::ToolExecution("'close' requires 'targetId' parameter".into())
                 })?;
                 let closed = self.manager.close_tab(&profile, tid).await?;
+                self.disarm_payment(&format!("{session}:{tid}"));
                 if self.manager.sticky_target(&session, &profile).as_deref() == Some(tid) {
                     self.manager.clear_sticky_target(&session, &profile);
                 }
@@ -812,9 +1771,7 @@ impl Tool for BrowserTool {
                 let url = args["url"].as_str().ok_or_else(|| {
                     Error::ToolExecution("'navigate' requires 'url' parameter".into())
                 })?;
-                security::validate_url(url)
-                    .await
-                    .map_err(|e| Error::ToolExecution(e.into()))?;
+                self.validate_requested_url(url).await?;
 
                 let _ = self.manager.get_browser(&profile).await?;
                 let page = self.manager.get_page(&profile, target_id).await?;
@@ -829,82 +1786,195 @@ impl Tool for BrowserTool {
                 // `navigator.webdriver` from frameworks that read it on load.
                 let _ = stealth::install_stealth_on_new_document(&page, &stealth_opts).await;
 
-                // `goto` gets the caller's budget too, not just the settle
-                // wait below. Unbounded, it falls through to the CDP client's
-                // own request timeout, so `timeout_ms` silently did not bound
-                // the navigation it names -- a server that accepts the
-                // connection and never answers cost 30s per attempt, and the
-                // runner then retried it.
                 let timeout_ms = args["timeout_ms"].as_u64().unwrap_or(10_000);
-                match tokio::time::timeout(
-                    std::time::Duration::from_millis(timeout_ms),
-                    page.goto(url),
-                )
-                .await
-                {
-                    Ok(r) => r.map_err(|e| {
-                        Error::ToolExecution(format!("navigation failed: {e}").into())
-                    })?,
-                    Err(_) => {
-                        return Err(Error::ToolExecution(
-                            format!(
-                                "navigation to '{url}' did not complete within {timeout_ms}ms. \
-                                 The browser is alive and accepted the request, so this is the \
-                                 page or the server it talks to, not the browser: a server that \
-                                 accepts the connection and never responds looks exactly like \
-                                 this. Retrying the same URL will usually fail the same way."
-                            )
-                            .into(),
-                        ));
-                    }
-                };
-                let _ = tokio::time::timeout(
-                    std::time::Duration::from_millis(timeout_ms),
-                    page.wait_for_navigation(),
-                )
-                .await;
+                let deadline =
+                    tokio::time::Instant::now() + Duration::from_millis(timeout_ms.max(1));
+                let navigation = navigate_with_deadline(&page, url, deadline).await?;
+
+                if navigation.browser_degraded {
+                    let recovery = self.recover_degraded_profile(&profile).await;
+                    return Ok(json!({
+                        "status": navigation.status,
+                        "outcome": navigation.outcome,
+                        "readiness": navigation.readiness,
+                        "reason": navigation.reason,
+                        "elapsed_ms": navigation.elapsed_ms,
+                        "browser_degraded": true,
+                        "retry_safe": false,
+                        "recovery": recovery,
+                        "profile": profile
+                    }));
+                }
+                if navigation.outcome == "not_applied" {
+                    return Ok(json!({
+                        "status": navigation.status,
+                        "outcome": navigation.outcome,
+                        "readiness": navigation.readiness,
+                        "reason": navigation.reason,
+                        "elapsed_ms": navigation.elapsed_ms,
+                        "browser_degraded": false,
+                        "retry_safe": true,
+                        "profile": profile
+                    }));
+                }
+
+                let mut navigation_guard =
+                    policy::enforce_page(&page, &self.manager.config().ssrf_policy).await;
+                if navigation_guard["status"] == "blocked" {
+                    self.snapshot_store
+                        .clear(&Self::store_key(&session, &profile, target_id))
+                        .await;
+                    return Ok(json!({
+                        "status": "blocked",
+                        "outcome": "not_applied",
+                        "navigation_outcome": navigation.outcome,
+                        "readiness": navigation.readiness,
+                        "elapsed_ms": navigation.elapsed_ms,
+                        "browser_degraded": false,
+                        "retry_safe": false,
+                        "navigation_guard": navigation_guard,
+                        "profile": profile,
+                    }));
+                }
 
                 // Apply DOM-level stealth patches (post-navigation).
-                let _ = stealth::apply_stealth(&page, &stealth_opts).await;
+                if remaining_millis(deadline) > 0 {
+                    let _ = tokio::time::timeout_at(
+                        deadline,
+                        stealth::apply_stealth(&page, &stealth_opts),
+                    )
+                    .await;
+                }
 
                 let mut wait_results = serde_json::Map::new();
                 if let Some(sel) = args["wait_selector"].as_str() {
                     let state = stealth::WaitState::parse(
                         args["wait_selector_state"].as_str().unwrap_or("visible"),
                     );
-                    let ok = stealth::wait_for_selector(&page, sel, state, timeout_ms).await?;
+                    let ok = if remaining_millis(deadline) == 0 {
+                        false
+                    } else {
+                        stealth::wait_for_selector(&page, sel, state, remaining_millis(deadline))
+                            .await?
+                    };
                     wait_results.insert("wait_selector".into(), Value::Bool(ok));
                 }
                 if args["network_idle"].as_bool().unwrap_or(false) {
-                    let ok = stealth::wait_for_network_idle(&page, 500, timeout_ms).await?;
+                    let ok = if remaining_millis(deadline) == 0 {
+                        false
+                    } else {
+                        stealth::wait_for_network_idle(&page, 500, remaining_millis(deadline))
+                            .await?
+                    };
                     wait_results.insert("network_idle".into(), Value::Bool(ok));
                 }
                 if args["solve_cloudflare"].as_bool().unwrap_or(false) {
-                    let ok = stealth::solve_cloudflare(&page, timeout_ms).await?;
+                    let ok = if remaining_millis(deadline) == 0 {
+                        false
+                    } else {
+                        stealth::solve_cloudflare(&page, remaining_millis(deadline)).await?
+                    };
                     wait_results.insert("cloudflare_clear".into(), Value::Bool(ok));
                 }
                 if let Some(delay) = args["delay_ms"].as_u64() {
-                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                    tokio::time::sleep(Duration::from_millis(
+                        delay.min(remaining_millis(deadline)),
+                    ))
+                    .await;
+                }
+
+                let empty_page_recovery = recover_empty_page(&page).await;
+                if empty_page_recovery["reloaded"].as_bool() == Some(true) {
+                    self.snapshot_store
+                        .clear(&Self::store_key(&session, &profile, target_id))
+                        .await;
+                    navigation_guard =
+                        policy::enforce_page(&page, &self.manager.config().ssrf_policy).await;
+                    if navigation_guard["status"] == "blocked" {
+                        return Ok(json!({
+                            "status": "blocked",
+                            "outcome": "not_applied",
+                            "navigation_outcome": navigation.outcome,
+                            "readiness": navigation.readiness,
+                            "elapsed_ms": navigation.elapsed_ms,
+                            "browser_degraded": false,
+                            "retry_safe": false,
+                            "empty_page_recovery": empty_page_recovery,
+                            "navigation_guard": navigation_guard,
+                            "profile": profile,
+                        }));
+                    }
                 }
 
                 let title = manager::probe_page_title_once(&page)
                     .await
                     .unwrap_or_default();
-                let current_url = page.url().await.ok().flatten().unwrap_or_default();
+                let current_url = manager::probe_page_url_once(&page)
+                    .await
+                    .unwrap_or_default();
 
                 // Pin the tab we just loaded so the snapshot/content call
                 // that follows reads this page and not some other one.
                 let landed_on = page.target_id().inner().clone();
                 self.manager
                     .set_sticky_target(&session, &profile, &landed_on);
+                // A new document: whatever card was typed into the last one
+                // went with it.
+                self.disarm_payment(&format!("{session}:{landed_on}"));
 
                 Ok(json!({
                     "title": title,
                     "url": current_url,
-                    "status": "loaded",
+                    "status": navigation.status,
+                    "outcome": navigation.outcome,
+                    "readiness": navigation.readiness,
+                    "reason": navigation.reason,
+                    "elapsed_ms": navigation.elapsed_ms,
+                    "browser_degraded": false,
                     "targetId": landed_on,
                     "waits": Value::Object(wait_results),
+                    "waits_preceded_reload": empty_page_recovery["reloaded"].as_bool() == Some(true),
+                    "empty_page_recovery": empty_page_recovery,
+                    "navigation_guard": navigation_guard,
                     "profile": profile
+                }))
+            }
+
+            "back" | "forward" => {
+                let _ = self.manager.get_browser(&profile).await?;
+                let page = self.page_for(action, &profile, &session, target_id).await?;
+                let result = navigate_history_entry(
+                    &page,
+                    if action == "back" { -1 } else { 1 },
+                    &self.manager.config().ssrf_policy,
+                )
+                .await?;
+                self.snapshot_store
+                    .clear(&Self::store_key(&session, &profile, target_id))
+                    .await;
+                Ok(result)
+            }
+
+            "refresh" => {
+                let _ = self.manager.get_browser(&profile).await?;
+                let page = self.page_for(action, &profile, &session, target_id).await?;
+                tokio::time::timeout(Duration::from_secs(10), page.reload())
+                    .await
+                    .map_err(|_| Error::ToolExecution("page refresh timed out".into()))?
+                    .map_err(|error| {
+                        Error::ToolExecution(format!("page refresh failed: {error}").into())
+                    })?;
+                let guard = policy::enforce_page(&page, &self.manager.config().ssrf_policy).await;
+                self.snapshot_store
+                    .clear(&Self::store_key(&session, &profile, target_id))
+                    .await;
+                Ok(json!({
+                    "status": if guard["status"] == "blocked" { "blocked" } else { "refreshed" },
+                    "outcome": if guard["status"] == "blocked" { "not_applied" } else { "applied" },
+                    "url": manager::probe_page_url_once(&page).await.unwrap_or_default(),
+                    "navigation_guard": guard,
+                    "retry_safe": false,
+                    "profile": profile,
                 }))
             }
 
@@ -927,9 +1997,15 @@ impl Tool for BrowserTool {
                     highlight: args["highlight"].as_bool().unwrap_or(false),
                 };
 
-                let key = Self::store_key(&profile, target_id);
-                let snap =
-                    snapshot::take_snapshot(&page, &options, &self.snapshot_store, &key).await;
+                let key = Self::store_key(&session, &profile, target_id);
+                let mut snap =
+                    snapshot::take_snapshot(&page, &options, &self.snapshot_store, &key).await?;
+                let guard = self
+                    .guard_page_output(action, &session, &profile, target_id, &page)
+                    .await?;
+                if let Value::Object(ref mut object) = snap {
+                    object.insert("navigation_guard".into(), guard);
+                }
 
                 // How much of the page the agent actually received.
                 //
@@ -941,37 +2017,222 @@ impl Tool for BrowserTool {
                 // apart. Sizes settle it; the page's text is deliberately
                 // not logged, because a snapshot can contain anything the
                 // page contains.
-                if let Ok(ref v) = snap {
-                    let url = page.url().await.ok().flatten().unwrap_or_default();
-                    tracing::debug!(
-                        url = %url,
-                        chars = v.to_string().len(),
-                        nodes = v["elements"].as_array().map(|a| a.len()).unwrap_or(0),
-                        "took page snapshot"
-                    );
-                }
-                snap
+                let url = manager::probe_page_url_once(&page)
+                    .await
+                    .unwrap_or_default();
+                tracing::debug!(
+                    url = %url,
+                    chars = snap.to_string().len(),
+                    nodes = snap["elements"].as_array().map(|a| a.len()).unwrap_or(0),
+                    "took page snapshot"
+                );
+                Ok(snap)
             }
 
             // ── Act (ref-based actions) ────────────────────────────
             "act" => {
-                let ref_id = args["ref"].as_str().ok_or_else(|| {
-                    Error::ToolExecution(
-                        "'act' requires 'ref' parameter from a previous snapshot".into(),
-                    )
-                })?;
+                let ref_id = args["ref"]
+                    .as_str()
+                    .map(normalize_snapshot_ref)
+                    .ok_or_else(|| {
+                        Error::ToolExecution(
+                            "'act' requires 'ref' parameter from a previous snapshot".into(),
+                        )
+                    })?;
                 let act_action = args["actAction"]
                     .as_str()
                     .ok_or_else(|| Error::ToolExecution(
-                        "'act' requires 'actAction' parameter (click, type, press, hover, select, drag, wait)".into(),
+                        "'act' requires 'actAction' parameter (click, type, fill, press, hover, select, drag, upload, options, wait, fill_credential)".into(),
                     ))?;
 
                 let _ = self.manager.get_browser(&profile).await?;
-                let page = self.manager.get_page(&profile, target_id).await?;
-                let key = Self::store_key(&profile, target_id);
+                let mut action_args = args.clone();
+                if let Some(target_ref) = args["targetRef"].as_str() {
+                    action_args["targetRef"] =
+                        Value::String(normalize_snapshot_ref(target_ref).to_string());
+                }
+                if act_action == "upload" {
+                    if self.manager.config().is_remote_profile(&profile) {
+                        return Err(Error::ToolExecution(ToolError::invalid_input(
+                            "file upload to a remote CDP browser requires an artifact-transfer channel, which is not configured",
+                        )));
+                    }
+                    let paths = Self::validated_upload_paths(&args)?;
+                    action_args["paths"] = json!(paths);
+                }
+                let page = self.page_for(action, &profile, &session, target_id).await?;
+                let key = Self::store_key(&session, &profile, target_id);
+                let targets_before =
+                    tokio::time::timeout(Duration::from_secs(3), self.manager.target_ids(&profile))
+                        .await
+                        .ok()
+                        .and_then(std::result::Result::ok);
+                let download_since = if act_action == "click" {
+                    self.manager.download_sequence(&profile).await
+                } else {
+                    None
+                };
 
-                actions::execute_act(&page, &self.snapshot_store, &key, act_action, ref_id, &args)
-                    .await
+                let mut outcome = actions::execute_act(
+                    &page,
+                    &self.snapshot_store,
+                    &key,
+                    act_action,
+                    ref_id,
+                    &action_args,
+                    actions::ActionPolicies {
+                        dialog: self.manager.config().dialog_policy,
+                        navigation: &self.manager.config().ssrf_policy,
+                    },
+                )
+                .await?;
+
+                if let Some(since) = download_since {
+                    let expect_download = args["expect_download"].as_bool().unwrap_or(false);
+                    let action_degraded = outcome["browser_degraded"].as_bool().unwrap_or(false);
+                    let wait = if expect_download && !action_degraded {
+                        Duration::from_millis(
+                            args["download_timeout_ms"]
+                                .as_u64()
+                                .unwrap_or(10_000)
+                                .min(30_000),
+                        )
+                    } else {
+                        Duration::ZERO
+                    };
+                    if let Some(observation) =
+                        self.manager.observe_downloads(&profile, since, wait).await
+                    {
+                        if expect_download || observation["status"] != "not_observed" {
+                            if let Value::Object(ref mut object) = outcome {
+                                object.insert("download_observation".into(), observation);
+                            }
+                        }
+                    } else if expect_download {
+                        if let Value::Object(ref mut object) = outcome {
+                            object.insert(
+                                "download_observation".into(),
+                                json!({
+                                    "status": "unavailable",
+                                    "downloads": [],
+                                    "message": "The click outcome does not prove whether a download completed because browser-level download observation is unavailable."
+                                }),
+                            );
+                        }
+                    }
+                }
+
+                // A timed-out CDP stage is not repaired by repeating the same
+                // action against the same session. Rebuild the driver/session
+                // now, clear all refs for this tab, and report the recovery
+                // without retrying the potentially-applied side effect.
+                let action_degraded = outcome["browser_degraded"].as_bool().unwrap_or(false);
+                if !action_degraded {
+                    let popup_guard = self
+                        .guard_new_tabs(&profile, &session, targets_before)
+                        .await;
+                    if let Value::Object(ref mut object) = outcome {
+                        object.insert("popup_guard".into(), popup_guard);
+                    }
+                }
+
+                if action_degraded {
+                    let recovery_value = self.recover_degraded_profile(&profile).await;
+                    if let Value::Object(ref mut object) = outcome {
+                        object.insert("recovery".into(), recovery_value);
+                    }
+                }
+
+                // A click may create a popup/new tab even when the originating
+                // page does not navigate. Return the current target set with
+                // the action so the agent can focus the new tab instead of
+                // clicking the same control again.
+                if act_action == "click" {
+                    let tabs =
+                        tokio::time::timeout(Duration::from_secs(5), self.manager.tabs(&profile))
+                            .await
+                            .ok()
+                            .and_then(std::result::Result::ok)
+                            .unwrap_or(Value::Null);
+                    if let Value::Object(ref mut object) = outcome {
+                        object.insert("tabs".into(), tabs);
+                    }
+                }
+                Ok(outcome)
+            }
+
+            "click_coordinates" => {
+                let x = args["x"].as_f64().expect("validated x coordinate");
+                let y = args["y"].as_f64().expect("validated y coordinate");
+                let _ = self.manager.get_browser(&profile).await?;
+                let page = self.page_for(action, &profile, &session, target_id).await?;
+                let key = Self::store_key(&session, &profile, target_id);
+                let targets_before =
+                    tokio::time::timeout(Duration::from_secs(3), self.manager.target_ids(&profile))
+                        .await
+                        .ok()
+                        .and_then(std::result::Result::ok);
+                let mut outcome = actions::execute_coordinate_click(
+                    &page,
+                    &self.snapshot_store,
+                    &key,
+                    x,
+                    y,
+                    self.manager.config().dialog_policy,
+                    &self.manager.config().ssrf_policy,
+                )
+                .await?;
+                let action_degraded = outcome["browser_degraded"].as_bool().unwrap_or(false);
+                if !action_degraded {
+                    let popup_guard = self
+                        .guard_new_tabs(&profile, &session, targets_before)
+                        .await;
+                    if let Value::Object(ref mut object) = outcome {
+                        object.insert("popup_guard".into(), popup_guard);
+                    }
+                } else {
+                    let recovery = self.recover_degraded_profile(&profile).await;
+                    if let Value::Object(ref mut object) = outcome {
+                        object.insert("recovery".into(), recovery);
+                    }
+                }
+                Ok(outcome)
+            }
+
+            "send_keys" => {
+                let keys = args["keys"].as_str().expect("validated keys");
+                let _ = self.manager.get_browser(&profile).await?;
+                let page = self.page_for(action, &profile, &session, target_id).await?;
+                let store_key = Self::store_key(&session, &profile, target_id);
+                let targets_before =
+                    tokio::time::timeout(Duration::from_secs(3), self.manager.target_ids(&profile))
+                        .await
+                        .ok()
+                        .and_then(std::result::Result::ok);
+                let mut outcome = actions::execute_send_keys(
+                    &page,
+                    &self.snapshot_store,
+                    &store_key,
+                    keys,
+                    self.manager.config().dialog_policy,
+                    &self.manager.config().ssrf_policy,
+                )
+                .await?;
+                let action_degraded = outcome["browser_degraded"].as_bool().unwrap_or(false);
+                if !action_degraded {
+                    let popup_guard = self
+                        .guard_new_tabs(&profile, &session, targets_before)
+                        .await;
+                    if let Value::Object(ref mut object) = outcome {
+                        object.insert("popup_guard".into(), popup_guard);
+                    }
+                } else {
+                    let recovery = self.recover_degraded_profile(&profile).await;
+                    if let Value::Object(ref mut object) = outcome {
+                        object.insert("recovery".into(), recovery);
+                    }
+                }
+                Ok(outcome)
             }
             // Type a stored credential into a field without the value
             // passing through the model.
@@ -984,11 +2245,14 @@ impl Tool for BrowserTool {
             // fill action that undoes that on the way back in would make
             // the rest of this pointless.
             "fill_credential" => {
-                let ref_id = args["ref"].as_str().ok_or_else(|| {
-                    Error::ToolExecution(
-                        "'fill_credential' requires 'ref' from a previous snapshot".into(),
-                    )
-                })?;
+                let ref_id = args["ref"]
+                    .as_str()
+                    .map(normalize_snapshot_ref)
+                    .ok_or_else(|| {
+                        Error::ToolExecution(
+                            "'fill_credential' requires 'ref' from a previous snapshot".into(),
+                        )
+                    })?;
                 let field = args["field"].as_str().unwrap_or(crate::PASSWORD);
                 let secrets = self.secrets.as_ref().ok_or_else(|| {
                     Error::ToolExecution(
@@ -998,74 +2262,386 @@ impl Tool for BrowserTool {
                 })?;
 
                 let _ = self.manager.get_browser(&profile).await?;
-                let page = self.manager.get_page(&profile, target_id).await?;
+                let page = self.page_for(action, &profile, &session, target_id).await?;
 
-                // The page's own URL, so the key matches wherever the
-                // agent actually is rather than where it meant to be.
-                let url = match args["url"].as_str() {
-                    Some(u) => u.to_string(),
-                    None => page.url().await.ok().flatten().unwrap_or_default(),
-                };
+                // Neither a model URL nor a snapshot's old frame URL is
+                // authority to release a secret. Read the live page, enforce
+                // secure transport, then inspect the actual target node.
+                let (url, origin) = self.secure_live_origin(&page, "credential fill").await?;
                 let cred_key = crate::origin_credential_key(&url, field)?;
-
-                let value = secrets.get(&cred_key).await.map_err(|_| {
-                    // Names the key so the agent can ask for exactly it.
-                    Error::ToolExecution(
-                        format!(
-                            "no credential stored under '{cred_key}'. Ask the user for it with \
-                             credential_request using that exact name, then try again."
-                        )
-                        .into(),
-                    )
-                })?;
-
-                // What is about to be typed, without saying it.
-                //
-                // `status: "filled"` was returned whether or not the right
-                // string reached the field, so a wrong fill and a right
-                // one were indistinguishable from outside -- the same
-                // shape of defect as a read that returns "" and calls it
-                // success. Length plus a short digest is enough to tell
-                // "the value arrived" from "something else did" when
-                // reading a failed run, and neither reveals the secret.
-                let digest = {
-                    use sha2::{Digest, Sha256};
-                    let mut h = Sha256::new();
-                    h.update(value.as_bytes());
-                    hex::encode(&h.finalize()[..4])
-                };
-                tracing::debug!(
-                    key = %cred_key,
-                    field,
-                    value_len = value.len(),
-                    value_sha256_prefix = %digest,
-                    "filling a credential field"
-                );
-
-                let store_key = Self::store_key(&profile, target_id);
-                let fill_args = json!({ "text": value, "clear": true });
-                actions::execute_act(
+                let store_key = Self::store_key(&session, &profile, target_id);
+                let target = actions::prepare_credential_target(
                     &page,
                     &self.snapshot_store,
                     &store_key,
-                    "fill",
                     ref_id,
-                    &fill_args,
+                    &origin,
+                    field,
                 )
                 .await?;
+                let value = match secrets.get(&cred_key).await {
+                    Ok(value) => value,
+                    Err(Error::NotFound(_)) => {
+                        return Err(Error::ToolExecution(format!(
+                            "No credential enrolled for exact origin '{origin}' under '{cred_key}'. Ask via credential_request with url='{origin}' and that exact field key. Legacy credentials are preserved but cannot be safely auto-migrated; re-enrollment is required. Do not request the value in chat."
+                        ).into()));
+                    }
+                    Err(error) => return Err(error),
+                };
 
-                // A fresh result rather than the fill's own. Nothing
-                // derived from the value travels back to the model — not
-                // its length, which for a password is worth guessing with.
-                // The length is reported so a caller can tell an empty
-                // or placeholder fill from a real one. The value is not.
+                // Record the control boundary without logging the credential,
+                // its length, or a reusable fingerprint of it.
+                tracing::debug!(
+                    key = %cred_key,
+                    field,
+                    "credential fill started"
+                );
+
+                let fill_outcome = actions::fill_credential_target(&page, &target, &value).await?;
+                tracing::debug!(
+                    field,
+                    outcome = fill_outcome["outcome"].as_str().unwrap_or("missing"),
+                    stage = fill_outcome["stage"].as_str().unwrap_or("missing"),
+                    "browser credential fill completed"
+                );
+
+                if fill_outcome["outcome"] != "applied" {
+                    let recovery = if fill_outcome["browser_degraded"].as_bool().unwrap_or(false) {
+                        self.recover_degraded_profile(&profile).await
+                    } else {
+                        Value::Null
+                    };
+                    return Ok(json!({
+                        "status": fill_outcome["status"],
+                        "outcome": fill_outcome["outcome"],
+                        "field": field,
+                        "credentialKey": cred_key,
+                        "ref": ref_id,
+                        "reason": fill_outcome["reason"],
+                        "stage": fill_outcome["stage"],
+                        "retry_safe": fill_outcome["retry_safe"],
+                        "browser_degraded": fill_outcome["browser_degraded"],
+                        "page_state": fill_outcome["page_state"],
+                        "snapshot": fill_outcome["snapshot"],
+                        "message": fill_outcome["message"],
+                        "recovery": recovery,
+                    }));
+                }
+
+                // A fresh result rather than the fill's own. Nothing derived
+                // from the value travels back to the model.
                 Ok(json!({
                     "status": "filled",
+                    "outcome": "applied",
                     "field": field,
                     "credentialKey": cred_key,
                     "ref": ref_id,
-                    "value_len": value.len(),
+                    "page_state": Value::Null,
+                    "page_state_status": "withheld_after_credential_fill",
+                    "next_step": "The credential was assigned without submitting. Take a fresh snapshot to inspect the next control; never repeat an uncertain fill blindly.",
                 }))
+            }
+
+            // ── Payment ────────────────────────────────────────────
+            //
+            // The card is the user's approval of one purchase, not a stored
+            // credential: it is looked up by conversation and live origin,
+            // entered one field at a time without passing through the
+            // model, and spent by `pay`.
+            "fill_payment" => {
+                let ref_id = args["ref"]
+                    .as_str()
+                    .map(normalize_snapshot_ref)
+                    .expect("validated ref");
+                let field = args["field"]
+                    .as_str()
+                    .and_then(payment::PaymentField::parse)
+                    .expect("validated field");
+                let _ = self.manager.get_browser(&profile).await?;
+                let page = self.page_for(action, &profile, &session, target_id).await?;
+                let (_, origin) = self.secure_live_origin(&page, "payment fill").await?;
+                let (request, card) = self.approved_payment(&origin).await?;
+                let value = field.page_value(&card).ok_or_else(|| {
+                    Error::ToolExecution(
+                        "the user left the postal code blank on the approval form, so there is none to enter; skip this field, or tell the user the checkout needs it"
+                            .into(),
+                    )
+                })?;
+                drop(card);
+
+                let store_key = Self::store_key(&session, &profile, target_id);
+                let status = actions::fill_payment_field(
+                    &page,
+                    &self.snapshot_store,
+                    &store_key,
+                    ref_id,
+                    &origin,
+                    &self.payment_frame_origins,
+                    field,
+                    &value,
+                )
+                .await?;
+                drop(value);
+                tracing::debug!(
+                    field = field.as_str(),
+                    status = %status,
+                    "payment field fill completed"
+                );
+
+                if status == "filled" || payment::fill_refusal(&status).is_none() {
+                    // Filled, or interrupted mid-assignment: either way the
+                    // card may now be in the page.
+                    self.payment_armed
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(Self::armed_key(&session, &page), request.id.clone());
+                }
+                // Model-facing text goes under `guidance`, the one result key
+                // the runner does not wrap in its external-content fence: it
+                // is ours, not the page's. See `fence_external_output`.
+                if status == "filled" {
+                    return Ok(json!({
+                        "status": "filled",
+                        "outcome": "applied",
+                        "field": field.as_str(),
+                        "ref": ref_id,
+                        "retry_safe": false,
+                        "page_state": Value::Null,
+                        "page_state_status": "withheld_after_payment_fill",
+                        "guidance": "Fill the other card fields the same way, then press the checkout's pay button with browser(action='pay', ref=<button ref>). Do not click it any other way.",
+                    }));
+                }
+                Ok(match payment::fill_refusal(&status) {
+                    Some(reason) => json!({
+                        "status": "blocked",
+                        "outcome": "not_applied",
+                        "field": field.as_str(),
+                        "ref": ref_id,
+                        "retry_safe": true,
+                        "guidance": reason,
+                    }),
+                    None => json!({
+                        "status": "unknown",
+                        "outcome": "unknown",
+                        "field": field.as_str(),
+                        "ref": ref_id,
+                        "retry_safe": false,
+                        "guidance": "the card field assignment was interrupted; take a fresh snapshot and check the field before trying again",
+                    }),
+                })
+            }
+
+            "pay" => {
+                let ref_id = args["ref"]
+                    .as_str()
+                    .map(normalize_snapshot_ref)
+                    .expect("validated ref");
+                let _ = self.manager.get_browser(&profile).await?;
+                let page = self.page_for(action, &profile, &session, target_id).await?;
+                let (_, origin) = self.secure_live_origin(&page, "pay").await?;
+                // Still the origin, conversation and terms check — but the
+                // card it hands back is a *clone*, and two concurrent
+                // presses both getting one is the double charge this arm
+                // now claims against. Drop it: nothing here fills a field.
+                let (request, card) = self.approved_payment(&origin).await?;
+                drop(card);
+                let payments = self.payments.as_ref().expect("approved_payment checked");
+
+                // The lock and the spend have to be one thing. A `pay` on a
+                // page no `fill_payment` armed presses a submit with no card
+                // in it and still claims the approval, spending the user's
+                // one purchase on nothing — so the armed entry is checked
+                // here, before `claim_for_pay`, and its request id must be
+                // the approval the card was actually filled for.
+                let armed_key = Self::armed_key(&session, &page);
+                let armed_request = self
+                    .payment_armed
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(&armed_key)
+                    .cloned();
+                let guidance = match armed_request {
+                    None => Some(
+                        "no card has been entered on this page yet; fill the card fields with fill_payment first"
+                            .to_string(),
+                    ),
+                    Some(armed) if armed != request.id => Some(format!(
+                        "the card on this page was entered for an earlier approval ({armed}), which a newer one has since superseded; take a fresh snapshot and fill the card fields again before paying"
+                    )),
+                    Some(_) => None,
+                };
+                if let Some(guidance) = guidance {
+                    tracing::info!(
+                        request = %request.id,
+                        "pay refused: the page is not armed for this approval"
+                    );
+                    return Ok(json!({
+                        "status": "blocked",
+                        "outcome": "not_applied",
+                        "ref": ref_id,
+                        "retry_safe": true,
+                        "guidance": guidance,
+                    }));
+                }
+
+                let store_key = Self::store_key(&session, &profile, target_id);
+                let target = match actions::prepare_pay(
+                    &page,
+                    &self.snapshot_store,
+                    &store_key,
+                    ref_id,
+                    &origin,
+                )
+                .await?
+                {
+                    Ok(target) => target,
+                    Err(status) => {
+                        let reason = match status {
+                            "origin_mismatch" => "that control is not on the approved merchant's page",
+                            "disabled" => "that control is disabled; a required field may still be empty — take a snapshot and check",
+                            "site_isolated_frame" => "pay buttons inside a cross-site frame are not supported; tell the user this checkout needs them to finish paying",
+                            _ => "that element is no longer on the page; take a fresh snapshot",
+                        };
+                        return Ok(json!({
+                            "status": "blocked",
+                            "outcome": "not_applied",
+                            "ref": ref_id,
+                            "retry_safe": true,
+                            "refusal": status,
+                            "guidance": reason,
+                        }));
+                    }
+                };
+
+                let checked =
+                    match payment::check_total(&target.label, &target.text, &request.amount) {
+                        Ok(checked) => checked,
+                        Err(refusal) => {
+                            tracing::info!(
+                                request = %request.id,
+                                approved = %request.amount,
+                                refusal = ?refusal,
+                                "pay refused: the page total did not verify"
+                            );
+                            return Ok(json!({
+                                "status": "blocked",
+                                "outcome": "not_applied",
+                                "ref": ref_id,
+                                "retry_safe": false,
+                                "approved": request.amount.to_string(),
+                                "guidance": refusal.explain(&request.amount),
+                            }));
+                        }
+                    };
+
+                // Claim the press before making it. The row moving
+                // `authorized -> paying` in one conditional UPDATE is what
+                // makes this the only press: a concurrent `pay` in the same
+                // turn loses the row and is refused here rather than
+                // pressing a second time.
+                let claim = match payments.claim_for_pay(&request.id).await? {
+                    Ok(claim) => claim,
+                    Err(refusal) => {
+                        tracing::info!(
+                            request = %request.id,
+                            refusal = refusal.kind(),
+                            "pay refused: the press was not claimed"
+                        );
+                        let mut blocked = json!({
+                            "status": "blocked",
+                            "outcome": "not_applied",
+                            "ref": ref_id,
+                            "retry_safe": refusal.retry_safe(),
+                            "refusal": refusal.kind(),
+                            "guidance": refusal.message(),
+                        });
+                        // A duplicate is the one refusal the user has to
+                        // hear about: the agent is at a checkout for
+                        // something already bought, and what happens next
+                        // is a decision only they can make. Told out of
+                        // band as well as through the tool result, because
+                        // the model is being instructed to stop and a
+                        // stopping turn is not a dependable messenger.
+                        if let rustykrab_store::PayRefusal::Duplicate { earlier } = &refusal {
+                            if let (Some(pending), Some(conv)) = (
+                                &self.pending_links,
+                                rustykrab_core::active_tools::with_session_context(|c| {
+                                    c.conversation_id
+                                }),
+                            ) {
+                                pending
+                                    .push(conv, crate::payment_request::duplicate_alert(earlier));
+                            }
+                            blocked["duplicate_of"] = json!({
+                                "merchant": earlier.merchant,
+                                "amount": earlier.amount.to_string(),
+                                "site": earlier.origin,
+                                "status": earlier.status.as_str(),
+                                "when": rustykrab_store::stamp_utc(
+                                    earlier.used_at.unwrap_or(earlier.created_at)
+                                ),
+                            });
+                        }
+                        return Ok(blocked);
+                    }
+                };
+                // The claim took the card out of the vault; pressing a
+                // button needs no card. It is held here unread, and only so
+                // a press that provably never left this process can hand it
+                // back — every other path drops it, which erases it.
+                let claimed_card = claim.card;
+
+                let pressed = actions::press_pay(&page, ref_id, &target).await;
+                let spent = match &pressed {
+                    Ok(outcome) => {
+                        !(outcome["outcome"] == "not_applied" && outcome["retry_safe"] == true)
+                    }
+                    Err(error) => !actions::failed_before_press(error),
+                };
+                if spent {
+                    // Spent whatever the checkout does next. A second press
+                    // after an uncertain outcome could charge twice; the user
+                    // can approve again.
+                    drop(claimed_card);
+                    payments.mark_used(&request.id).await?;
+                    self.disarm_payment(&armed_key);
+                } else {
+                    // The click never reached the page, so nothing was
+                    // charged and the approval goes back — card, remaining
+                    // TTL and all — for the retry the model is told to make.
+                    payments.release_claim(&request.id, claimed_card).await?;
+                }
+                tracing::info!(
+                    request = %request.id,
+                    checked_total = %checked,
+                    approved = %request.amount,
+                    // Always true past the claim gate above; logged so a
+                    // pressed line is visibly one that went through it.
+                    claimed = true,
+                    spent,
+                    "pay pressed"
+                );
+                let mut outcome = pressed?;
+                if let Value::Object(ref mut object) = outcome {
+                    object.insert(
+                        "payment".into(),
+                        json!({
+                            "merchant": request.merchant,
+                            "approved": request.amount.to_string(),
+                            "checked_total": checked.to_string(),
+                            "approval_spent": spent,
+                        }),
+                    );
+                    object.insert(
+                        "guidance".into(),
+                        Value::String(if spent {
+                            "The pay button was pressed and the approval is spent. Take a snapshot to read the result. Do not press pay again for this purchase: if it failed or needs another step you cannot complete, tell the user.".into()
+                        } else {
+                            "The press did not reach the page. Take a fresh snapshot and call pay again with the new ref.".into()
+                        }),
+                    );
+                }
+                Ok(outcome)
             }
 
             // ── Screenshot ─────────────────────────────────────────
@@ -1095,13 +2671,17 @@ impl Tool for BrowserTool {
 
                 let size_bytes = png_bytes.len();
                 let b64 = base64::engine::general_purpose::STANDARD.encode(&png_bytes);
+                let navigation_guard = self
+                    .guard_page_output(action, &session, &profile, target_id, &page)
+                    .await?;
 
                 Ok(json!({
                     "screenshot": b64,
                     "size_bytes": size_bytes,
                     "format": "png",
                     "encoding": "base64",
-                    "profile": profile
+                    "profile": profile,
+                    "navigation_guard": navigation_guard,
                 }))
             }
 
@@ -1132,7 +2712,12 @@ impl Tool for BrowserTool {
                 let title = manager::probe_page_title_once(&page)
                     .await
                     .unwrap_or_default();
-                let current_url = page.url().await.ok().flatten().unwrap_or_default();
+                let current_url = manager::probe_page_url_once(&page)
+                    .await
+                    .unwrap_or_default();
+                let navigation_guard = self
+                    .guard_page_output(action, &session, &profile, target_id, &page)
+                    .await?;
 
                 Ok(json!({
                     "content": truncated_content,
@@ -1140,7 +2725,8 @@ impl Tool for BrowserTool {
                     "title": title,
                     "format": format,
                     "truncated": was_truncated,
-                    "profile": profile
+                    "profile": profile,
+                    "navigation_guard": navigation_guard,
                 }))
             }
 
@@ -1194,16 +2780,20 @@ impl Tool for BrowserTool {
                 }
 
                 let _ = self.manager.get_browser(&profile).await?;
-                let page = self.manager.get_page(&profile, target_id).await?;
+                let page = self.page_for(action, &profile, &session, target_id).await?;
                 let result = page.evaluate(expression).await.map_err(|e| {
                     Error::ToolExecution(format!("JS evaluation failed: {e}").into())
                 })?;
 
                 let value: Value = result.into_value().unwrap_or(Value::Null);
+                let navigation_guard = self
+                    .guard_page_output(action, &session, &profile, target_id, &page)
+                    .await?;
 
                 Ok(json!({
                     "result": value,
-                    "profile": profile
+                    "profile": profile,
+                    "navigation_guard": navigation_guard,
                 }))
             }
 
@@ -1213,7 +2803,7 @@ impl Tool for BrowserTool {
                 let amount = args["amount"].as_i64().unwrap_or(500);
 
                 let _ = self.manager.get_browser(&profile).await?;
-                let page = self.manager.get_page(&profile, target_id).await?;
+                let page = self.page_for(action, &profile, &session, target_id).await?;
 
                 let js = match direction {
                     "down" => format!("window.scrollBy(0, {amount}); window.scrollY"),
@@ -1238,19 +2828,81 @@ impl Tool for BrowserTool {
                     .map_err(|e| Error::ToolExecution(format!("scroll failed: {e}").into()))?;
 
                 let scroll_y: f64 = result.into_value().unwrap_or(0.0);
+                let navigation_guard = self
+                    .guard_page_output(action, &session, &profile, target_id, &page)
+                    .await?;
 
                 Ok(json!({
                     "status": "scrolled",
                     "direction": direction,
                     "scroll_y": scroll_y as i64,
-                    "profile": profile
+                    "profile": profile,
+                    "navigation_guard": navigation_guard,
+                }))
+            }
+
+            "scroll_to_text" => {
+                let text = args["text"].as_str().expect("validated scroll text");
+                let _ = self.manager.get_browser(&profile).await?;
+                let page = self.page_for(action, &profile, &session, target_id).await?;
+                let needle = serde_json::to_string(text).map_err(|error| {
+                    Error::ToolExecution(format!("invalid scroll text: {error}").into())
+                })?;
+                let script = format!(
+                    r#"(function() {{
+                        var needle = String({needle}).toLocaleLowerCase();
+                        var roots = [document];
+                        var seen = new Set();
+                        while (roots.length) {{
+                            var root = roots.shift();
+                            if (!root || seen.has(root)) continue;
+                            seen.add(root);
+                            var walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+                            var node;
+                            while ((node = walker.nextNode())) {{
+                                var value = (node.nodeValue || '').trim();
+                                if (value && value.toLocaleLowerCase().includes(needle)) {{
+                                    var element = node.parentElement;
+                                    if (!element) continue;
+                                    element.scrollIntoView({{block:'center', inline:'nearest', behavior:'instant'}});
+                                    var rect = element.getBoundingClientRect();
+                                    return {{found:true, text:value.substring(0,200), bounds:[rect.x,rect.y,rect.width,rect.height]}};
+                                }}
+                            }}
+                            var elements = root.querySelectorAll ? root.querySelectorAll('*') : [];
+                            for (var i = 0; i < elements.length; i++) {{
+                                if (elements[i].shadowRoot) roots.push(elements[i].shadowRoot);
+                            }}
+                        }}
+                        return {{found:false}};
+                    }})()"#
+                );
+                let result = tokio::time::timeout(Duration::from_secs(5), page.evaluate(script))
+                    .await
+                    .map_err(|_| Error::ToolExecution("scroll-to-text timed out".into()))?
+                    .map_err(|error| {
+                        Error::ToolExecution(format!("scroll-to-text failed: {error}").into())
+                    })?
+                    .into_value::<Value>()
+                    .unwrap_or_else(|_| json!({ "found": false }));
+                let navigation_guard = self
+                    .guard_page_output(action, &session, &profile, target_id, &page)
+                    .await?;
+                Ok(json!({
+                    "status": if result["found"] == true { "scrolled" } else { "not_found" },
+                    "outcome": if result["found"] == true { "applied" } else { "not_applied" },
+                    "query": text,
+                    "match": result,
+                    "retry_safe": result["found"] != true,
+                    "profile": profile,
+                    "navigation_guard": navigation_guard,
                 }))
             }
 
             // ── Console ────────────────────────────────────────────
             "console" => {
                 let _ = self.manager.get_browser(&profile).await?;
-                let page = self.manager.get_page(&profile, target_id).await?;
+                let page = self.page_for(action, &profile, &session, target_id).await?;
 
                 // Retrieve console messages via JS — collects last N entries
                 let js = r#"
@@ -1292,18 +2944,22 @@ impl Tool for BrowserTool {
 
                 let raw: String = result.into_value().unwrap_or_else(|_| "[]".to_string());
                 let entries: Value = serde_json::from_str(&raw).unwrap_or(json!([]));
+                let navigation_guard = self
+                    .guard_page_output(action, &session, &profile, target_id, &page)
+                    .await?;
 
                 Ok(json!({
                     "console": entries,
                     "note": "Console interception is installed on first call. Earlier messages are not captured.",
-                    "profile": profile
+                    "profile": profile,
+                    "navigation_guard": navigation_guard,
                 }))
             }
 
             // ── Cookies ────────────────────────────────────────────
             "cookies" => {
                 let _ = self.manager.get_browser(&profile).await?;
-                let page = self.manager.get_page(&profile, target_id).await?;
+                let page = self.page_for(action, &profile, &session, target_id).await?;
                 let domain_filter = args["domain"].as_str();
 
                 let cookies: Vec<Cookie> = page.get_cookies().await.map_err(|e| {
@@ -1328,11 +2984,15 @@ impl Tool for BrowserTool {
                         })
                     })
                     .collect();
+                let navigation_guard = self
+                    .guard_page_output(action, &session, &profile, target_id, &page)
+                    .await?;
 
                 Ok(json!({
                     "cookies": filtered,
                     "count": filtered.len(),
-                    "profile": profile
+                    "profile": profile,
+                    "navigation_guard": navigation_guard,
                 }))
             }
 
@@ -1351,10 +3011,15 @@ impl Tool for BrowserTool {
                 let size_bytes = pdf_bytes.len();
                 let b64 = base64::engine::general_purpose::STANDARD.encode(&pdf_bytes);
 
-                let url = page.url().await.ok().flatten().unwrap_or_default();
+                let url = manager::probe_page_url_once(&page)
+                    .await
+                    .unwrap_or_default();
                 let title = manager::probe_page_title_once(&page)
                     .await
                     .unwrap_or_default();
+                let navigation_guard = self
+                    .guard_page_output(action, &session, &profile, target_id, &page)
+                    .await?;
 
                 Ok(json!({
                     "pdf": b64,
@@ -1362,7 +3027,8 @@ impl Tool for BrowserTool {
                     "encoding": "base64",
                     "url": url,
                     "title": title,
-                    "profile": profile
+                    "profile": profile,
+                    "navigation_guard": navigation_guard,
                 }))
             }
 
@@ -1377,9 +3043,7 @@ impl Tool for BrowserTool {
                 let url = args["url"].as_str().ok_or_else(|| {
                     Error::ToolExecution("'stealth_fetch' requires 'url' parameter".into())
                 })?;
-                security::validate_url(url)
-                    .await
-                    .map_err(|e| Error::ToolExecution(e.into()))?;
+                self.validate_requested_url(url).await?;
 
                 let _ = self.manager.get_browser(&profile).await?;
                 let page = self.manager.get_page(&profile, target_id).await?;
@@ -1388,64 +3052,128 @@ impl Tool for BrowserTool {
                 let _ = stealth::apply_network_overrides(&page, &stealth_opts).await;
                 let _ = stealth::install_stealth_on_new_document(&page, &stealth_opts).await;
 
-                // `goto` gets the caller's budget too, not just the settle
-                // wait below. Unbounded, it falls through to the CDP client's
-                // own request timeout, so `timeout_ms` silently did not bound
-                // the navigation it names -- a server that accepts the
-                // connection and never answers cost 30s per attempt, and the
-                // runner then retried it.
                 let timeout_ms = args["timeout_ms"].as_u64().unwrap_or(30_000);
-                match tokio::time::timeout(
-                    std::time::Duration::from_millis(timeout_ms),
-                    page.goto(url),
-                )
-                .await
-                {
-                    Ok(r) => r.map_err(|e| {
-                        Error::ToolExecution(format!("navigation failed: {e}").into())
-                    })?,
-                    Err(_) => {
-                        return Err(Error::ToolExecution(
-                            format!(
-                                "navigation to '{url}' did not complete within {timeout_ms}ms. \
-                                 The browser is alive and accepted the request, so this is the \
-                                 page or the server it talks to, not the browser: a server that \
-                                 accepts the connection and never responds looks exactly like \
-                                 this. Retrying the same URL will usually fail the same way."
-                            )
-                            .into(),
-                        ));
-                    }
-                };
-                let _ = tokio::time::timeout(
-                    std::time::Duration::from_millis(timeout_ms),
-                    page.wait_for_navigation(),
-                )
-                .await;
+                let deadline =
+                    tokio::time::Instant::now() + Duration::from_millis(timeout_ms.max(1));
+                let navigation = navigate_with_deadline(&page, url, deadline).await?;
 
-                let _ = stealth::apply_stealth(&page, &stealth_opts).await;
+                if navigation.browser_degraded {
+                    let recovery = self.recover_degraded_profile(&profile).await;
+                    return Ok(json!({
+                        "status": navigation.status,
+                        "outcome": navigation.outcome,
+                        "readiness": navigation.readiness,
+                        "reason": navigation.reason,
+                        "elapsed_ms": navigation.elapsed_ms,
+                        "browser_degraded": true,
+                        "retry_safe": false,
+                        "recovery": recovery,
+                        "profile": profile
+                    }));
+                }
+                if navigation.outcome == "not_applied" {
+                    return Ok(json!({
+                        "status": navigation.status,
+                        "outcome": navigation.outcome,
+                        "readiness": navigation.readiness,
+                        "reason": navigation.reason,
+                        "elapsed_ms": navigation.elapsed_ms,
+                        "browser_degraded": false,
+                        "retry_safe": true,
+                        "profile": profile
+                    }));
+                }
+
+                let mut navigation_guard =
+                    policy::enforce_page(&page, &self.manager.config().ssrf_policy).await;
+                if navigation_guard["status"] == "blocked" {
+                    self.snapshot_store
+                        .clear(&Self::store_key(&session, &profile, target_id))
+                        .await;
+                    return Ok(json!({
+                        "status": "blocked",
+                        "outcome": "not_applied",
+                        "navigation_outcome": navigation.outcome,
+                        "readiness": navigation.readiness,
+                        "elapsed_ms": navigation.elapsed_ms,
+                        "browser_degraded": false,
+                        "retry_safe": false,
+                        "navigation_guard": navigation_guard,
+                        "profile": profile,
+                    }));
+                }
+
+                if remaining_millis(deadline) > 0 {
+                    let _ = tokio::time::timeout_at(
+                        deadline,
+                        stealth::apply_stealth(&page, &stealth_opts),
+                    )
+                    .await;
+                }
 
                 let mut wait_results = serde_json::Map::new();
                 if let Some(sel) = args["wait_selector"].as_str() {
                     let state = stealth::WaitState::parse(
                         args["wait_selector_state"].as_str().unwrap_or("visible"),
                     );
-                    let ok = stealth::wait_for_selector(&page, sel, state, timeout_ms).await?;
+                    let ok = if remaining_millis(deadline) == 0 {
+                        false
+                    } else {
+                        stealth::wait_for_selector(&page, sel, state, remaining_millis(deadline))
+                            .await?
+                    };
                     wait_results.insert("wait_selector".into(), Value::Bool(ok));
                 }
                 if args["network_idle"].as_bool().unwrap_or(true) {
-                    let ok = stealth::wait_for_network_idle(&page, 500, timeout_ms).await?;
+                    let ok = if remaining_millis(deadline) == 0 {
+                        false
+                    } else {
+                        stealth::wait_for_network_idle(&page, 500, remaining_millis(deadline))
+                            .await?
+                    };
                     wait_results.insert("network_idle".into(), Value::Bool(ok));
                 }
                 if args["solve_cloudflare"].as_bool().unwrap_or(false) {
-                    let ok = stealth::solve_cloudflare(&page, timeout_ms).await?;
+                    let ok = if remaining_millis(deadline) == 0 {
+                        false
+                    } else {
+                        stealth::solve_cloudflare(&page, remaining_millis(deadline)).await?
+                    };
                     wait_results.insert("cloudflare_clear".into(), Value::Bool(ok));
                 }
                 if let Some(delay) = args["delay_ms"].as_u64() {
-                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                    tokio::time::sleep(Duration::from_millis(
+                        delay.min(remaining_millis(deadline)),
+                    ))
+                    .await;
                 }
 
-                let final_url = page.url().await.ok().flatten().unwrap_or_default();
+                let empty_page_recovery = recover_empty_page(&page).await;
+                if empty_page_recovery["reloaded"].as_bool() == Some(true) {
+                    self.snapshot_store
+                        .clear(&Self::store_key(&session, &profile, target_id))
+                        .await;
+                    navigation_guard =
+                        policy::enforce_page(&page, &self.manager.config().ssrf_policy).await;
+                    if navigation_guard["status"] == "blocked" {
+                        return Ok(json!({
+                            "status": "blocked",
+                            "outcome": "not_applied",
+                            "navigation_outcome": navigation.outcome,
+                            "readiness": navigation.readiness,
+                            "elapsed_ms": navigation.elapsed_ms,
+                            "browser_degraded": false,
+                            "retry_safe": false,
+                            "empty_page_recovery": empty_page_recovery,
+                            "navigation_guard": navigation_guard,
+                            "profile": profile,
+                        }));
+                    }
+                }
+
+                let final_url = manager::probe_page_url_once(&page)
+                    .await
+                    .unwrap_or_default();
                 let title = manager::probe_page_title_once(&page)
                     .await
                     .unwrap_or_default();
@@ -1471,12 +3199,20 @@ impl Tool for BrowserTool {
                     "title": title,
                     "status": 200,
                     "ok": true,
+                    "outcome": navigation.outcome,
+                    "navigation_status": navigation.status,
+                    "readiness": navigation.readiness,
+                    "navigation_reason": navigation.reason,
+                    "elapsed_ms": navigation.elapsed_ms,
                     "text": truncated_text,
                     "text_truncated": text_truncated,
                     "body": truncated_html,
                     "body_truncated": html_truncated,
                     "cookies": cookie_map,
                     "waits": Value::Object(wait_results),
+                    "waits_preceded_reload": empty_page_recovery["reloaded"].as_bool() == Some(true),
+                    "empty_page_recovery": empty_page_recovery,
+                    "navigation_guard": navigation_guard,
                     "profile": profile,
                 }))
             }
@@ -1484,13 +3220,18 @@ impl Tool for BrowserTool {
             // ── Scrapling.Selector ─────────────────────────────────
             "select" => {
                 let params = selectors::SelectParams::from_args(&args);
+                let live_page = if params.html.is_none() {
+                    let _ = self.manager.get_browser(&profile).await?;
+                    Some(self.page_for(action, &profile, &session, target_id).await?)
+                } else {
+                    None
+                };
 
                 let mut matches = if let Some(html) = &params.html {
                     selectors::select_static(html, &params)?
                 } else {
-                    let _ = self.manager.get_browser(&profile).await?;
-                    let page = self.manager.get_page(&profile, target_id).await?;
-                    selectors::select_live(&page, &params).await?
+                    let page = live_page.as_ref().expect("live page was resolved");
+                    selectors::select_live(page, &params).await?
                 };
 
                 let mut adaptive_used = false;
@@ -1505,8 +3246,8 @@ impl Tool for BrowserTool {
                         let candidates = if let Some(html) = &params.html {
                             selectors::select_static(html, &pool_params).unwrap_or_default()
                         } else {
-                            let page = self.manager.get_page(&profile, target_id).await?;
-                            selectors::select_live(&page, &pool_params)
+                            let page = live_page.as_ref().expect("live page was resolved");
+                            selectors::select_live(page, &pool_params)
                                 .await
                                 .unwrap_or_default()
                         };
@@ -1531,6 +3272,12 @@ impl Tool for BrowserTool {
                 let mut value = selectors::matches_to_json(&matches);
                 if let Value::Object(ref mut o) = value {
                     o.insert("adaptive_used".into(), Value::Bool(adaptive_used));
+                    if let Some(page) = &live_page {
+                        let guard = self
+                            .guard_page_output(action, &session, &profile, target_id, page)
+                            .await?;
+                        o.insert("navigation_guard".into(), guard);
+                    }
                 }
                 Ok(value)
             }
@@ -1538,7 +3285,7 @@ impl Tool for BrowserTool {
             // ── Wait helper ────────────────────────────────────────
             "wait_for" => {
                 let _ = self.manager.get_browser(&profile).await?;
-                let page = self.manager.get_page(&profile, target_id).await?;
+                let page = self.page_for(action, &profile, &session, target_id).await?;
                 let timeout_ms = args["timeout_ms"].as_u64().unwrap_or(10_000);
 
                 let mut results = serde_json::Map::new();
@@ -1575,6 +3322,10 @@ impl Tool for BrowserTool {
                     ));
                 }
 
+                let guard = self
+                    .guard_page_output(action, &session, &profile, target_id, &page)
+                    .await?;
+                results.insert("navigation_guard".into(), guard);
                 Ok(Value::Object(results))
             }
 
@@ -1582,8 +3333,9 @@ impl Tool for BrowserTool {
                 format!(
                     "unknown browser action: '{action}'. Available: \
                      status, start, stop, profiles, tabs, open, close, focus, \
-                     navigate, snapshot, act, screenshot, content, evaluate, \
-                     scroll, console, cookies, pdf, fetch, stealth_fetch, select, wait_for"
+                     navigate, back, forward, refresh, snapshot, act, click_coordinates, \
+                     send_keys, screenshot, content, evaluate, scroll, scroll_to_text, \
+                     console, cookies, pdf, fetch, stealth_fetch, select, wait_for"
                 )
                 .into(),
             )),
@@ -1594,6 +3346,21 @@ impl Tool for BrowserTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn credential_fill_rejects_model_authority_overrides_before_browser_access() {
+        for extra in [
+            json!({"url":"https://other.example"}),
+            json!({"text":"not allowed"}),
+            json!({"field":"card_number"}),
+        ] {
+            let mut args = json!({"action":"fill_credential","ref":"e1"});
+            args.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            assert!(BrowserTool::validate_action_args("fill_credential", &args).is_err());
+        }
+    }
 
     #[test]
     fn schema_enforces_action_specific_arguments() {
@@ -1642,10 +3409,24 @@ mod tests {
         assert!(act_description.contains("press -> key"));
         assert!(act_description.contains("drag -> targetRef"));
 
+        let ref_description = parameters["properties"]["ref"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(ref_description.contains("[s4-12]"));
+        assert!(ref_description.contains("square brackets"));
+
         let expression_description = parameters["properties"]["expression"]["description"]
             .as_str()
             .unwrap();
         assert!(expression_description.contains("Required when action='evaluate'"));
+    }
+
+    #[test]
+    fn compact_snapshot_refs_accept_their_displayed_brackets() {
+        assert_eq!(normalize_snapshot_ref("s4-12"), "s4-12");
+        assert_eq!(normalize_snapshot_ref("[s4-12]"), "s4-12");
+        assert_eq!(normalize_snapshot_ref("  [s4-e12]  "), "s4-e12");
+        assert_eq!(normalize_snapshot_ref("[]"), "");
     }
 
     #[tokio::test]
@@ -1821,17 +3602,1805 @@ mod tests {
         let _ = tool.execute(json!({"action": "stop"})).await;
     }
 
+    /// Repeat production BrowserTool navigation/snapshot/action/status calls
+    /// against a stable public interactive page. This is intentionally ignored
+    /// in the default suite because it requires network and Chrome, but it is a
+    /// reproducible protocol soak for release verification.
+    #[tokio::test]
+    #[ignore = "needs the network and launches a real Chrome"]
+    async fn live_public_w3c_accordion_protocol_soak() {
+        const URL: &str = "https://www.w3.org/WAI/ARIA/apg/patterns/accordion/examples/accordion/";
+        const ROUNDS: usize = 12;
+
+        let profile = "w3c-protocol-soak";
+        let (tool, _dir) = isolated_live_tool(profile);
+        let navigation = tool
+            .execute(json!({
+                "action": "navigate",
+                "profile": profile,
+                "url": URL,
+                "timeout_ms": 20_000,
+            }))
+            .await
+            .expect("navigate public W3C fixture");
+        assert_eq!(navigation["outcome"], "applied", "{navigation}");
+
+        let target_id = navigation["targetId"]
+            .as_str()
+            .expect("navigated target id")
+            .to_string();
+        let mut slowest = Duration::ZERO;
+        for round in 0..ROUNDS {
+            let started = std::time::Instant::now();
+            let snapshot = tool
+                .execute(json!({
+                    "action": "snapshot",
+                    "profile": profile,
+                    "targetId": target_id,
+                    "interactive": true,
+                }))
+                .await
+                .unwrap_or_else(|error| panic!("round {round} snapshot failed: {error}"));
+            let button_ref = snapshot["elements"]
+                .as_array()
+                .expect("snapshot elements")
+                .iter()
+                .find(|element| {
+                    element["role"] == "button"
+                        && [
+                            "Personal Information",
+                            "Billing Address",
+                            "Shipping Address",
+                        ]
+                        .contains(&element["name"].as_str().unwrap_or_default())
+                })
+                .and_then(|element| element["ref"].as_str())
+                .unwrap_or_else(|| panic!("round {round} accordion button missing: {snapshot}"));
+            let outcome = tool
+                .execute(json!({
+                    "action": "act",
+                    "actAction": "click",
+                    "ref": button_ref,
+                    "profile": profile,
+                    "targetId": target_id,
+                }))
+                .await
+                .unwrap_or_else(|error| panic!("round {round} click failed: {error}"));
+            assert_eq!(outcome["outcome"], "applied", "round {round}: {outcome}");
+            assert_eq!(
+                outcome["page_state_status"], "captured",
+                "round {round}: post-action observation was not explicit: {outcome}"
+            );
+            assert!(
+                outcome["page_state"]["count"].as_u64().unwrap_or(0) > 0,
+                "round {round}: missing post-action state: {outcome}"
+            );
+            slowest = slowest.max(started.elapsed());
+            assert!(
+                started.elapsed() < Duration::from_secs(20),
+                "round {round} exceeded action bound: {:?}",
+                started.elapsed()
+            );
+        }
+
+        let status = tool
+            .execute(json!({"action": "status", "profile": profile}))
+            .await
+            .expect("post-soak browser status");
+        assert_eq!(status["status"], "running", "{status}");
+        assert_eq!(status["protocol_handler_running"], true, "{status}");
+        assert_eq!(status["protocol_invalid_messages"], 0, "{status}");
+        assert!(status["browser_product"].is_string(), "{status}");
+        assert!(status["browser_protocol_version"].is_string(), "{status}");
+        eprintln!("protocol_soak slowest_round={slowest:?} status={status}");
+
+        let _ = tool.manager.stop(profile).await;
+    }
+
+    fn isolated_live_tool(profile: &str) -> (BrowserTool, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("free port");
+            listener.local_addr().unwrap().port()
+        };
+        let mut config = config::BrowserConfig {
+            default_profile: profile.to_string(),
+            headless: true,
+            cdp_request_timeout_ms: 5_000,
+            ..Default::default()
+        };
+        config.ssrf_policy.allow_private_network = true;
+        config
+            .ssrf_policy
+            .hostname_allowlist
+            .push("localhost".to_string());
+        config.profiles.insert(
+            profile.to_string(),
+            config::BrowserProfile {
+                cdp_port: Some(port),
+                user_data_dir: Some(dir.path().display().to_string()),
+                headless: Some(true),
+                ..Default::default()
+            },
+        );
+        (BrowserTool::with_config(config), dir)
+    }
+
+    #[tokio::test]
+    #[ignore = "real Chrome and loopback servers; synthetic credentials only"]
+    async fn live_credentials_are_bound_to_verified_origin_and_input_object() {
+        use rustykrab_store::credential_backend::CredentialBackend;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        struct FixtureSecrets {
+            key: String,
+            reads: AtomicUsize,
+        }
+        impl CredentialBackend for FixtureSecrets {
+            fn name(&self) -> &str {
+                "synthetic credential boundary fixture"
+            }
+            fn available(&self) -> bool {
+                true
+            }
+            fn get(&self, key: &str) -> Result<Option<String>> {
+                self.reads.fetch_add(1, Ordering::SeqCst);
+                Ok((key == self.key).then(|| "synthetic-login-secret".into()))
+            }
+            fn set(&self, _: &str, _: &str) -> Result<()> {
+                panic!("test must not write credentials")
+            }
+            fn delete(&self, _: &str) -> Result<()> {
+                panic!("test must not delete credentials")
+            }
+        }
+        async fn serve(listener: tokio::net::TcpListener, html: String) {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut buffer = [0; 4096];
+                let _ = stream.read(&mut buffer).await;
+                let response=format!("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",html.len(),html);
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        }
+        let child = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let child_url = format!(
+            "http://localhost:{}/frame",
+            child.local_addr().unwrap().port()
+        );
+        let child_server = tokio::spawn(serve(
+            child,
+            "<label>Frame password<input id='framepw' type='password'></label>".into(),
+        ));
+        let parent = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let parent_url = format!(
+            "http://localhost:{}/login",
+            parent.local_addr().unwrap().port()
+        );
+        let html = format!(
+            r#"<!doctype html><meta charset="utf-8"><title>Synthetic login boundary</title>
+            <form onsubmit="event.preventDefault();window.submissions++">
+            <label>Password<input id="pw" type="password" onfocus="document.getElementById('trap').focus()"></label>
+            <label>Plain text<input id="plain" type="text"></label>
+            <label>Focus trap<input id="trap" type="text"></label>
+            <label>Card number<input id="card" autocomplete="cc-number"></label>
+            <button>Sign in</button></form><iframe src="{child_url}"></iframe><script>window.submissions=0</script>"#
+        );
+        let parent_server = tokio::spawn(serve(parent, html));
+        let profile = "credential-boundary-live-test";
+        let (tool, profile_dir) = isolated_live_tool(profile);
+        let backend = Arc::new(FixtureSecrets {
+            key: rustykrab_store::registry::keychain_account_for(
+                &crate::origin_credential_key(&parent_url, crate::PASSWORD).unwrap(),
+            ),
+            reads: AtomicUsize::new(0),
+        });
+        let store =
+            rustykrab_store::Store::open(profile_dir.path().join("fixture-store"), vec![7; 32])
+                .unwrap()
+                .with_credential_backend(backend.clone());
+        let tool = tool.with_secrets(store.guarded_secrets());
+        let opened = tool
+            .execute(json!({"action":"open","url":parent_url}))
+            .await
+            .unwrap();
+        let target_id = opened["targetId"].as_str().unwrap();
+        let page = tool
+            .manager
+            .get_page(profile, Some(target_id))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let snap = tool
+            .execute(json!({"action":"snapshot","targetId":target_id,"interactive":true}))
+            .await
+            .unwrap();
+        let get_ref = |name: &str| {
+            snap["elements"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["name"] == name)
+                .unwrap_or_else(|| panic!("fixture control not observed: {name}"))["ref"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        let pw = get_ref("Password");
+        let mut rejected = Vec::new();
+        for (label, args) in [
+            (
+                "model_url_override",
+                json!({"action":"fill_credential","targetId":target_id,"ref":pw,"url":"https://other.example"}),
+            ),
+            (
+                "password_to_plain_text",
+                json!({"action":"fill_credential","targetId":target_id,"ref":get_ref("Plain text"),"field":"password"}),
+            ),
+            (
+                "cross_origin_frame",
+                json!({"action":"fill_credential","targetId":target_id,"ref":get_ref("Frame password"),"field":"password"}),
+            ),
+            (
+                "payment_field",
+                json!({"action":"fill_credential","targetId":target_id,"ref":get_ref("Card number"),"field":"username"}),
+            ),
+        ] {
+            let blocked = tool.execute(args).await.is_err();
+            rejected.push(json!({"case":label,"blocked":blocked,"vault_reads":backend.reads.load(Ordering::SeqCst)}));
+        }
+        let fill=tool.execute(json!({"action":"fill_credential","targetId":target_id,"ref":pw,"field":"password"})).await.unwrap();
+        let dom_ok:bool=page.evaluate("document.getElementById('pw').value === 'synthetic-login-secret' && document.getElementById('trap').value === '' && window.submissions === 0").await.unwrap().into_value().unwrap();
+        let after = tool
+            .execute(json!({"action":"snapshot","targetId":target_id,"interactive":true}))
+            .await
+            .unwrap();
+        let fresh_ref = after["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["name"] == "Password")
+            .unwrap()["ref"]
+            .as_str()
+            .unwrap();
+        let key = BrowserTool::store_key(&BrowserTool::session_key(), profile, Some(target_id));
+        let origin = crate::origin_key::canonical_credential_origin(&parent_url).unwrap();
+        let prepared = actions::prepare_credential_target(
+            &page,
+            &tool.snapshot_store,
+            &key,
+            fresh_ref,
+            &origin,
+            "password",
+        )
+        .await
+        .unwrap();
+        page.evaluate(
+            "document.getElementById('pw').value='';document.getElementById('pw').type='text'",
+        )
+        .await
+        .unwrap();
+        let mutated = actions::fill_credential_target(&page, &prepared, "synthetic-login-secret")
+            .await
+            .unwrap();
+        let changed_target_blocked = mutated["outcome"] == "not_applied";
+        let values_hidden = !after.to_string().contains("synthetic-login-secret")
+            && !fill.to_string().contains("synthetic-login-secret");
+        let passed = rejected
+            .iter()
+            .all(|r| r["blocked"] == true && r["vault_reads"] == 0)
+            && fill["outcome"] == "applied"
+            && dom_ok
+            && values_hidden
+            && changed_target_blocked
+            && backend.reads.load(Ordering::SeqCst) == 1;
+        let report = json!({"passed":passed,"negative_cases":rejected,"vault_reads":backend.reads.load(Ordering::SeqCst),
+            "object_bound_fill_applied":dom_ok,"password_absent_from_snapshot_and_result":values_hidden,"mutation_rechecked":changed_target_blocked,
+            "submit_count":0,"fixture":"real Chrome, two loopback origins, synthetic in-memory secret backend",
+            "limits":["HTTP loopback exception explicitly enabled for test","not real merchant login","arbitrary page reflection/evaluate/screenshots are not isolated from secrets","no reusable payment vault"]});
+        if let Some(root) = std::env::var_os("RK_PAYMENT_EVIDENCE_DIR") {
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(
+                std::path::Path::new(&root).join("credential-boundary-result.json"),
+                serde_json::to_vec_pretty(&report).unwrap(),
+            )
+            .unwrap();
+        }
+        let _ = tool.manager.stop(profile).await;
+        parent_server.abort();
+        child_server.abort();
+        assert!(passed, "{report}");
+    }
+
+    /// Controlled checkout, no payment processor and no real card. The test
+    /// enters public synthetic fixture values directly (not through a model),
+    /// then inspects real CDP snapshots and an independent submit counter.
+    #[tokio::test]
+    #[ignore = "launches real Chrome; writes evidence when RK_PAYMENT_EVIDENCE_DIR is set"]
+    async fn live_payment_screen_stops_without_saving_or_leaking_card_data() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "http://localhost:{}/checkout",
+            listener.local_addr().unwrap().port()
+        );
+        let html = r#"<!doctype html><html><head><meta charset="utf-8"><title>Controlled checkout — TEST ONLY</title>
+          <style>body{font:18px system-ui;max-width:620px;margin:64px auto}label{display:block;margin:20px 0}input{display:block;padding:10px;width:90%}button{padding:14px}aside{background:#fff1ca;padding:16px}</style></head><body>
+          <h1>Checkout · TEST ONLY</h1><p>Fixture reservation · USD 12.00</p>
+          <aside>Payment required. Do not enter real card details. No payment processor is connected.</aside>
+          <form onsubmit="event.preventDefault();window.submissions++;">
+          <label>Card number<input id="number" autocomplete="cc-number" inputmode="numeric"></label>
+          <label>Expiry<input id="expiry" autocomplete="cc-exp"></label>
+          <label>Security code<input id="cvv" name="cvv" autocomplete="cc-csc"></label>
+          <button id="pay">Pay USD 12.00</button></form><script>window.submissions=0</script></body></html>"#;
+        let server = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut request = [0u8; 4096];
+                let _ = socket.read(&mut request).await;
+                let response = format!("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{html}", html.len());
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+        let profile = "payment-boundary-live-test";
+        let (tool, _dir) = isolated_live_tool(profile);
+        let opened = tool
+            .execute(json!({"action":"open","url":url}))
+            .await
+            .unwrap();
+        let page = tool
+            .manager
+            .get_page(profile, opened["targetId"].as_str())
+            .await
+            .unwrap();
+        let before = tool
+            .execute(json!({"action":"snapshot","interactive":true}))
+            .await
+            .unwrap();
+        let before_text = before.to_string();
+        let fields_identified =
+            before_text.contains("Card number") && before_text.contains("Pay USD 12.00");
+        let evidence_root =
+            std::env::var_os("RK_PAYMENT_EVIDENCE_DIR").map(std::path::PathBuf::from);
+        if let Some(root) = &evidence_root {
+            std::fs::create_dir_all(root).unwrap();
+            let png = page
+                .screenshot(ScreenshotParams::builder().full_page(false).build())
+                .await
+                .unwrap();
+            std::fs::write(root.join("checkout-screen.png"), png).unwrap();
+            std::fs::write(root.join("checkout-screen.html"), html).unwrap();
+            std::fs::write(
+                root.join("checkout-before.json"),
+                serde_json::to_vec_pretty(&before).unwrap(),
+            )
+            .unwrap();
+        }
+        // Public synthetic test card only; no real account and no submission.
+        page.evaluate("document.getElementById('number').value='4242424242424242';document.getElementById('expiry').value='12/34';document.getElementById('cvv').value='987';true").await.unwrap();
+        let after = tool
+            .execute(json!({"action":"snapshot","interactive":true}))
+            .await
+            .unwrap();
+        let serialized = after.to_string();
+        let pan_hidden = !serialized.contains("4242424242424242");
+        let cvv_hidden = !serialized.contains("987");
+        let expiry_hidden = !serialized.contains("12/34");
+        let submissions: u64 = page
+            .evaluate("window.submissions")
+            .await
+            .unwrap()
+            .into_value()
+            .unwrap();
+        let data_dir = tempfile::tempdir().unwrap();
+        let store = rustykrab_store::Store::open(data_dir.path(), vec![7; 32])
+            .unwrap()
+            .with_credential_backend(std::sync::Arc::new(
+                rustykrab_store::credential_backend::MemoryBackend::new(),
+            ));
+        let request = crate::CredentialRequestTool::new(store.credential_requests());
+        let ask = request
+            .execute(
+                json!({"name":"checkout_card","service":"Controlled checkout", "fields":[
+            {"key":"card_number","label":"Card number"},{"key":"cvv","label":"Security code"}]}),
+            )
+            .await;
+        let request_blocked = ask.is_err();
+        let pending = store.credential_requests().pending().await.unwrap().len();
+        let stored = store.secrets().list_names().await.unwrap().len();
+        let passed = fields_identified
+            && pan_hidden
+            && cvv_hidden
+            && expiry_hidden
+            && submissions == 0
+            && request_blocked
+            && pending == 0
+            && stored == 0;
+        let report = json!({"passed":passed,"base_revision":"0b565fdbe80095668a402cdc6b5d410efecc867b", "checked_at":chrono::Utc::now(),
+            "fixture":"loopback checkout, public synthetic values", "real_browser":true,"real_model":false,
+            "fields_identified":fields_identified,"pan_hidden":pan_hidden,"cvv_hidden":cvv_hidden,"expiry_hidden":expiry_hidden,
+            "submit_count":submissions,"credential_request_blocked":request_blocked,"pending_requests":pending,"stored_secret_names":stored,
+            "request_result":ask.err().map(|e|e.to_string()),
+            "wallet_enrollment":"not implemented", "cross_site_card_reuse":"not implemented",
+            "limits":["No model-decision evaluation", "No real payment processor", "Snapshots only: arbitrary evaluate, screenshots and mirrored page text are not secret-isolated", "Named-field guard is not comprehensive payment-data detection"]});
+        if let Some(root) = evidence_root {
+            let suffix = if passed { "after" } else { "before" };
+            std::fs::write(
+                root.join(format!("payment-result-{suffix}.json")),
+                serde_json::to_vec_pretty(&report).unwrap(),
+            )
+            .unwrap();
+        }
+        let _ = tool.manager.stop(profile).await;
+        server.abort();
+        assert!(passed, "{report}");
+    }
+
+    /// The approved-card path end to end in a real Chrome: a merchant page
+    /// on one loopback origin, its "payment provider" card frame on another
+    /// (site-isolated), and the same provider frame nested inside a third
+    /// "ad" origin. Public synthetic card values only; the checkout's submit
+    /// is an in-page counter, never a processor.
+    ///
+    /// Proves, in order: nothing is filled without an approval or outside
+    /// the approving conversation; a wrong field and a provider frame under a
+    /// foreign ancestor are refused; every card part lands in the right box
+    /// on both the merchant page and the provider frame; nothing card-shaped
+    /// reaches a tool result or snapshot; screenshot, evaluate, Enter and a
+    /// plain click on pay are blocked while the card is on the page; the
+    /// provider frame's own submit is refused by both the click guard and
+    /// `pay`; pay before any card is entered, and pay for a fill a newer
+    /// approval superseded, are refused without spending either approval;
+    /// pay refuses a total above the approval without submitting;
+    /// pay at the approved total submits exactly once and spends the approval.
+    #[tokio::test]
+    #[ignore = "launches real Chrome; synthetic card values and loopback origins only"]
+    async fn live_approved_card_is_entered_only_where_approved_and_paid_within_the_total() {
+        use rustykrab_core::active_tools::{SessionToolContext, SESSION_TOOL_CONTEXT};
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        async fn serve(listener: tokio::net::TcpListener, html: String) {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut buffer = [0; 4096];
+                let _ = stream.read(&mut buffer).await;
+                let response = format!("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", html.len(), html);
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        }
+        let bind = || async { tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap() };
+
+        let provider = bind().await;
+        let provider_origin = format!("http://127.0.0.1:{}", provider.local_addr().unwrap().port());
+        let card_frame = r#"<!doctype html><meta charset="utf-8"><body>
+            <label>Card number<input id="n" autocomplete="cc-number" inputmode="numeric"></label>
+            <label>Expiry<input id="e" autocomplete="cc-exp" placeholder="MM / YY"></label>
+            <label>Security code<input id="c" autocomplete="cc-csc"></label>
+            <button id="p">Pay in frame</button>
+            <script>['n','e','c'].forEach(function(id){document.getElementById(id).addEventListener('change',function(ev){
+              parent.postMessage({id:id,value:ev.target.value,nested:location.search.indexOf('nested')>=0},'*');});});</script>"#;
+        let provider_server = tokio::spawn(serve(provider, card_frame.to_string()));
+
+        let ad = bind().await;
+        let ad_url = format!("http://localhost:{}/ad", ad.local_addr().unwrap().port());
+        let ad_server = tokio::spawn(serve(
+            ad,
+            format!(
+                r#"<!doctype html><p>Advert</p><iframe src="{provider_origin}/card?nested=1" width="360" height="160"></iframe>"#
+            ),
+        ));
+
+        let merchant = bind().await;
+        let merchant_url = format!(
+            "http://localhost:{}/checkout",
+            merchant.local_addr().unwrap().port()
+        );
+        let months: String = (1..=12)
+            .map(|m| format!(r#"<option value="{m:02}">{m:02}</option>"#))
+            .collect();
+        let checkout = format!(
+            r#"<!doctype html><meta charset="utf-8"><title>Checkout — TEST ONLY</title>
+            <h1>Checkout · TEST ONLY</h1><p>2 passengers, Hyannis to Nantucket</p>
+            <form id="f" onsubmit="event.preventDefault();window.submissions++">
+            <label>Name on card<input id="holder" autocomplete="cc-name"></label>
+            <label>Notes<input id="notes"></label>
+            <label>Expiry month<select id="mm" autocomplete="cc-exp-month"><option value="">Month</option>{months}</select></label>
+            <label>Expiry year<select id="yy" autocomplete="cc-exp-year"><option value="">Year</option><option value="2030">2030</option><option value="2031">2031</option></select></label>
+            <label>I agree to the terms<input id="terms" type="checkbox"></label>
+            <iframe src="{provider_origin}/card" width="360" height="160"></iframe>
+            <iframe src="{ad_url}" width="400" height="220"></iframe>
+            <p>Subtotal $42.00</p><p id="total">Total $46.00</p>
+            <button id="pay">Pay now</button></form>
+            <script>window.submissions=0;window.seen={{}};addEventListener('message',function(m){{if(m.data&&m.data.id&&!m.data.nested)window.seen[m.data.id]=m.data.value;}});</script>"#
+        );
+        let merchant_server = tokio::spawn(serve(merchant, checkout));
+
+        let profile = "payment-fill-live-test";
+        let (tool, profile_dir) = isolated_live_tool(profile);
+        let store =
+            rustykrab_store::Store::open(profile_dir.path().join("fixture-store"), vec![7; 32])
+                .unwrap()
+                .with_credential_backend(Arc::new(
+                    rustykrab_store::credential_backend::MemoryBackend::new(),
+                ));
+        let payments = store.payment_requests();
+        let tool = tool
+            .with_payments(payments.clone())
+            .with_payment_frame_origins(&[provider_origin.as_str()]);
+
+        let conversation = uuid::Uuid::new_v4();
+        let scope = || SessionToolContext {
+            conversation_id: conversation,
+            capabilities: Arc::new(rustykrab_core::CapabilitySet::none()),
+            all_tools: Arc::new(Vec::new()),
+            active_tools: Arc::new(Default::default()),
+            recall: Arc::new(Default::default()),
+            todos: Arc::new(Default::default()),
+        };
+        macro_rules! call {
+            ($args:expr) => {
+                SESSION_TOOL_CONTEXT
+                    .scope(scope(), tool.execute($args))
+                    .await
+            };
+        }
+
+        let opened = call!(json!({"action":"open","url":merchant_url})).unwrap();
+        let tid = opened["targetId"].as_str().unwrap().to_string();
+        let page = tool.manager.get_page(profile, Some(&tid)).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let snap = call!(json!({"action":"snapshot","targetId":tid,"interactive":true})).unwrap();
+        let find = |name: &str, nested: Option<bool>| {
+            snap["elements"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|e| {
+                    e["name"].as_str().is_some_and(|n| n.starts_with(name))
+                        // `Some(_)` means a provider-frame field: in a frame,
+                        // nested under the ad or not.
+                        && nested.is_none_or(|n| {
+                            e["frame_url"]
+                                .as_str()
+                                .is_some_and(|url| url.contains("nested") == n)
+                        })
+                })
+                .unwrap_or_else(|| {
+                    panic!("fixture control not observed: {name} nested={nested:?}\n{snap}")
+                })["ref"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        let number_ref = find("Card number", Some(false));
+        let site_isolated = snap["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["ref"] == number_ref.as_str() && !e["target_id"].is_null());
+        let fill = |ref_id: &str, field: &str| json!({"action":"fill_payment","targetId":tid,"ref":ref_id,"field":field});
+
+        let mut checks = serde_json::Map::new();
+        let mut results = Vec::new();
+
+        // Nothing without an approval, or outside the approving conversation.
+        let unapproved = call!(fill(&number_ref, "number"));
+        checks.insert(
+            "refused_without_approval".into(),
+            json!(unapproved
+                .as_ref()
+                .is_err_and(|e| e.to_string().contains("No approved payment"))),
+        );
+
+        let merchant_origin =
+            crate::origin_key::canonical_credential_origin(&merchant_url).unwrap();
+        let id = payments
+            .file(
+                rustykrab_store::PaymentTerms {
+                    merchant: "Test ferry".into(),
+                    origin: merchant_origin.clone(),
+                    amount: rustykrab_store::Money::parse("46.00", "USD").unwrap(),
+                    description: None,
+                    confirm_duplicate: false,
+                },
+                Some(conversation),
+            )
+            .await
+            .unwrap()
+            .id;
+        let card = rustykrab_store::CardDetails::new(
+            "4242 4242 4242 4242",
+            "12/31",
+            "987",
+            "Ada Lovelace",
+            Some("02554"),
+        )
+        .unwrap();
+        payments.authorize(&id, card, "fixture").await.unwrap();
+
+        let outside = tool.execute(fill(&number_ref, "number")).await;
+        checks.insert(
+            "refused_outside_conversation".into(),
+            json!(outside.is_err()),
+        );
+        let with_text = call!(
+            json!({"action":"fill_payment","targetId":tid,"ref":number_ref,"field":"number","text":"4242"})
+        );
+        checks.insert(
+            "refused_model_supplied_value".into(),
+            json!(with_text.is_err()),
+        );
+
+        // An approval exists but no card has been entered: pressing pay would
+        // submit an empty checkout and burn the approval on nothing. Refused
+        // before the claim, so the request is still `authorized` after.
+        let unarmed =
+            call!(json!({"action":"pay","targetId":tid,"ref":find("Pay now", None)})).unwrap();
+        let submissions: u64 = page
+            .evaluate("window.submissions")
+            .await
+            .unwrap()
+            .into_value()
+            .unwrap();
+        checks.insert(
+            "pay_refused_before_any_card_was_entered".into(),
+            json!(
+                unarmed["status"] == "blocked"
+                    && unarmed["guidance"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains("no card has been entered")
+                    && submissions == 0
+                    && payments.get(&id).await.unwrap().status
+                        == rustykrab_store::PaymentStatus::Authorized
+            ),
+        );
+
+        // Wrong box, and the provider frame under a foreign ancestor.
+        let wrong_box = call!(fill(&find("Notes", None), "number")).unwrap();
+        checks.insert(
+            "refused_wrong_field".into(),
+            json!(wrong_box["status"] == "blocked"),
+        );
+        let nested = call!(fill(&find("Card number", Some(true)), "number")).unwrap();
+        checks.insert(
+            "refused_provider_under_foreign_frame".into(),
+            json!(
+                nested["status"] == "blocked"
+                    && nested["guidance"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains("neither the merchant")
+            ),
+        );
+
+        // Every part, on the merchant page and in the provider frame.
+        for (name, field) in [
+            ("Name on card", "name"),
+            ("Card number", "number"),
+            ("Expiry", "expiry"),
+            ("Security code", "cvc"),
+            ("Expiry month", "exp_month"),
+            ("Expiry year", "exp_year"),
+        ] {
+            let nested =
+                (["Card number", "Expiry", "Security code"].contains(&name)).then_some(false);
+            let result = call!(fill(&find(name, nested), field)).unwrap();
+            results.push(result.clone());
+            checks.insert(
+                format!("filled_{field}"),
+                json!(result["status"] == "filled"),
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let landed: Value = page.evaluate("({holder:document.getElementById('holder').value, notes:document.getElementById('notes').value, mm:document.getElementById('mm').value, yy:document.getElementById('yy').value, seen:window.seen, submissions:window.submissions})").await.unwrap().into_value().unwrap();
+        checks.insert(
+            "values_landed_in_the_right_boxes".into(),
+            json!(
+                landed["holder"] == "Ada Lovelace"
+                    && landed["notes"] == ""
+                    && landed["mm"] == "12"
+                    && landed["yy"] == "2031"
+                    && landed["seen"]["n"] == "4242424242424242"
+                    && landed["seen"]["e"] == "12/31"
+                    && landed["seen"]["c"] == "987"
+                    && landed["submissions"] == 0
+            ),
+        );
+
+        // A newer approval supersedes the one these fields were filled for.
+        // The armed page still names the old request, so pay must refuse and
+        // ask for a fresh fill rather than spend the new approval on fields
+        // entered for something else.
+        let fresh_card = || {
+            rustykrab_store::CardDetails::new(
+                "4242 4242 4242 4242",
+                "12/31",
+                "987",
+                "Ada Lovelace",
+                Some("02554"),
+            )
+            .unwrap()
+        };
+        let superseding = payments
+            .file(
+                rustykrab_store::PaymentTerms {
+                    merchant: "Test ferry".into(),
+                    origin: merchant_origin.clone(),
+                    amount: rustykrab_store::Money::parse("46.00", "USD").unwrap(),
+                    description: None,
+                    confirm_duplicate: false,
+                },
+                Some(conversation),
+            )
+            .await
+            .unwrap()
+            .id;
+        payments
+            .authorize(&superseding, fresh_card(), "fixture")
+            .await
+            .unwrap();
+        let stale =
+            call!(json!({"action":"pay","targetId":tid,"ref":find("Pay now", None)})).unwrap();
+        let submissions: u64 = page
+            .evaluate("window.submissions")
+            .await
+            .unwrap()
+            .into_value()
+            .unwrap();
+        checks.insert(
+            "pay_refused_when_a_newer_approval_superseded_the_fill".into(),
+            json!(
+                stale["status"] == "blocked"
+                    && stale["guidance"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains("superseded")
+                    && submissions == 0
+                    && payments.get(&id).await.unwrap().status
+                        == rustykrab_store::PaymentStatus::Superseded
+                    && payments.get(&superseding).await.unwrap().status
+                        == rustykrab_store::PaymentStatus::Authorized
+            ),
+        );
+        // Re-arm for the approval that now stands, as the refusal instructs.
+        checks.insert(
+            "refill_arms_the_page_for_the_new_approval".into(),
+            json!(call!(fill(&number_ref, "number")).unwrap()["status"] == "filled"),
+        );
+
+        // While the card is on the page.
+        checks.insert(
+            "screenshot_blocked".into(),
+            json!(call!(json!({"action":"screenshot","targetId":tid})).is_err()),
+        );
+        checks.insert(
+            "evaluate_blocked".into(),
+            json!(call!(json!({"action":"evaluate","targetId":tid,"expression":"1"})).is_err()),
+        );
+        checks.insert("enter_blocked".into(), json!(call!(json!({"action":"act","targetId":tid,"ref":find("Notes", None),"actAction":"press","key":"Enter"})).is_err()));
+        checks.insert("plain_click_on_pay_blocked".into(), json!(call!(json!({"action":"act","targetId":tid,"ref":find("Pay now", None),"actAction":"click"})).is_err()));
+        checks.insert("terms_checkbox_still_clickable".into(), json!(call!(json!({"action":"act","targetId":tid,"ref":find("I agree to the terms", None),"actAction":"click"})).is_ok()));
+
+        let after = call!(json!({"action":"snapshot","targetId":tid,"interactive":true})).unwrap();
+        let pay_ref = after["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["name"] == "Pay now")
+            .unwrap()["ref"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // The provider's own submit, in its site-isolated frame. `pay` cannot
+        // check a total through it, so a plain click must not be the way
+        // around that: both doors are shut and the user is told to finish.
+        // Refs come from `after`, because the successful terms click above
+        // refreshed the snapshot the earlier ones belong to.
+        let in_frame_pay = after["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| {
+                e["name"].as_str().is_some_and(|n| n == "Pay in frame")
+                    && e["frame_url"]
+                        .as_str()
+                        .is_some_and(|u| !u.contains("nested"))
+            })
+            .unwrap_or_else(|| panic!("in-frame pay button not observed\n{after}"))["ref"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let in_frame_click =
+            call!(json!({"action":"act","targetId":tid,"ref":in_frame_pay,"actAction":"click"}));
+        checks.insert(
+            "in_frame_submit_click_blocked".into(),
+            json!(in_frame_click
+                .as_ref()
+                .is_err_and(|e| e.to_string().contains("finish paying"))),
+        );
+        // Neither refusal presses anything, so `pay_ref` is still live below.
+        let in_frame_pay_result =
+            call!(json!({"action":"pay","targetId":tid,"ref":in_frame_pay})).unwrap();
+        checks.insert(
+            "in_frame_pay_refused".into(),
+            json!(
+                in_frame_pay_result["status"] == "blocked"
+                    && in_frame_pay_result["refusal"] == "site_isolated_frame"
+            ),
+        );
+        let exposed = format!("{after}{}", serde_json::to_string(&results).unwrap());
+        checks.insert(
+            "card_absent_from_results_and_snapshot".into(),
+            json!(
+                !exposed.contains("4242424242424242")
+                    && !exposed.contains("987")
+                    && !exposed.contains("12/31")
+            ),
+        );
+
+        // Pay refuses a higher total, then pays the approved one once.
+        page.evaluate("document.getElementById('total').textContent='Total $52.00'")
+            .await
+            .unwrap();
+        let too_much = call!(json!({"action":"pay","targetId":tid,"ref":pay_ref})).unwrap();
+        let submissions: u64 = page
+            .evaluate("window.submissions")
+            .await
+            .unwrap()
+            .into_value()
+            .unwrap();
+        checks.insert(
+            "pay_refused_above_approval".into(),
+            json!(too_much["status"] == "blocked" && submissions == 0),
+        );
+
+        page.evaluate("document.getElementById('total').textContent='Total $46.00'")
+            .await
+            .unwrap();
+        let paid = call!(json!({"action":"pay","targetId":tid,"ref":pay_ref})).unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let submissions: u64 = page
+            .evaluate("window.submissions")
+            .await
+            .unwrap()
+            .into_value()
+            .unwrap();
+        // `superseding` is the approval that stands, and the one the refill
+        // armed the page for.
+        let status = payments.get(&superseding).await.unwrap().status;
+        checks.insert(
+            "paid_once_within_approval".into(),
+            json!(
+                paid["payment"]["approval_spent"] == true
+                    && paid["payment"]["checked_total"] == "USD 46.00"
+                    && submissions == 1
+                    && status == rustykrab_store::PaymentStatus::Used
+            ),
+        );
+        // Refused by the claim, not merely by the mark: the row is no
+        // longer `authorized`, so there is neither an approval to claim nor
+        // a card left in the vault to press with.
+        let again = call!(json!({"action":"pay","targetId":tid,"ref":pay_ref}));
+        checks.insert("second_pay_refused".into(), json!(again.is_err()));
+        checks.insert(
+            "fill_refused_after_the_press_was_claimed".into(),
+            json!(call!(fill(&number_ref, "number")).is_err()),
+        );
+        checks.insert(
+            "lock_released_after_pay".into(),
+            json!(call!(json!({"action":"screenshot","targetId":tid})).is_ok()),
+        );
+
+        let passed = checks.values().all(|v| v == true);
+        let report = json!({"passed": passed, "checks": checks, "provider_frame_site_isolated": site_isolated,
+            "refusals": {"wrong_box": wrong_box, "nested": nested, "too_much": too_much,
+                "unarmed": unarmed, "in_frame_pay": in_frame_pay_result},
+            "fixture": "real Chrome; merchant, provider and ad on separate loopback origins; public synthetic card; in-page submit counter",
+            "limits": ["loopback HTTP allowed by test policy", "provider allowlist replaced by the fixture origin", "no real processor or merchant", "no model in the loop"]});
+        if let Some(root) = std::env::var_os("RK_PAYMENT_EVIDENCE_DIR") {
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(
+                std::path::Path::new(&root).join("approved-card-result.json"),
+                serde_json::to_vec_pretty(&report).unwrap(),
+            )
+            .unwrap();
+        }
+        let _ = tool.manager.stop(profile).await;
+        provider_server.abort();
+        ad_server.abort();
+        merchant_server.abort();
+        assert!(passed, "{report:#}");
+    }
+
+    /// The secure fill boundary extends through serialization: a password may
+    /// exist in the DOM, but no snapshot sent to the model may contain it. The
+    /// same real-Chrome check proves that controls outside a scroll container's
+    /// clipping rectangle are omitted until the container is scrolled.
+    #[tokio::test]
+    #[ignore = "launches a real Chrome"]
+    async fn live_snapshot_hides_password_values_and_clipped_controls() {
+        let profile = "snapshot-privacy-live-test";
+        let (tool, _dir) = isolated_live_tool(profile);
+        tool.manager
+            .get_browser(profile)
+            .await
+            .expect("start browser");
+        let page = tool
+            .manager
+            .get_page(profile, None)
+            .await
+            .expect("blank page");
+        page.set_content(
+            r#"<html><body>
+                <input id="password" type="password" value="snapshot-must-not-leak">
+                <div style="height:100px;overflow:auto">
+                  <button id="visible">Visible choice</button>
+                  <div style="height:2500px"></div>
+                  <button id="clipped">Clipped choice</button>
+                </div>
+            </body></html>"#,
+        )
+        .await
+        .expect("set content");
+
+        let snapshot = snapshot::take_snapshot(
+            &page,
+            &SnapshotOptions {
+                interactive_only: true,
+                ..Default::default()
+            },
+            &tool.snapshot_store,
+            "test:snapshot-privacy",
+        )
+        .await
+        .expect("snapshot");
+        let elements = snapshot["elements"].as_array().expect("elements");
+        let password = elements
+            .iter()
+            .find(|element| {
+                element["ref"]
+                    .as_str()
+                    .is_some_and(|_| element["role"] == "textbox" && element["name"] == "")
+            })
+            .expect("password field");
+        assert_eq!(password["value"], serde_json::Value::Null, "{snapshot}");
+        assert!(
+            elements
+                .iter()
+                .any(|element| element["name"] == "Visible choice"),
+            "{snapshot}"
+        );
+        assert!(
+            !elements
+                .iter()
+                .any(|element| element["name"] == "Clipped choice"),
+            "{snapshot}"
+        );
+        assert!(!snapshot.to_string().contains("snapshot-must-not-leak"));
+
+        let _ = tool.manager.stop(profile).await;
+    }
+
+    /// Wix-style pages reuse `data-testid="linkElement"` for every link. The
+    /// snapshot must retain exact identity and the action must click the chosen
+    /// link, not the first match in document order.
+    #[tokio::test]
+    #[ignore = "launches a real Chrome"]
+    async fn live_duplicate_testids_keep_distinct_click_identity() {
+        let profile = "duplicate-selector-live-test";
+        let (tool, _dir) = isolated_live_tool(profile);
+        tool.manager
+            .get_browser(profile)
+            .await
+            .expect("start browser");
+        let page = tool
+            .manager
+            .get_page(profile, None)
+            .await
+            .expect("blank page");
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            page.set_content(
+                r##"<html><body>
+                    <a data-testid="linkElement" href="#first" onclick="document.body.dataset.clicked='first'">First choice</a>
+                    <a data-testid="linkElement" href="#second" onclick="document.body.dataset.clicked='second'">Second choice</a>
+                </body></html>"##,
+            ),
+        )
+        .await
+        .expect("set_content deadline")
+        .expect("set_content");
+
+        let key = "test:duplicate-selector";
+        let snapshot = snapshot::take_snapshot(
+            &page,
+            &SnapshotOptions {
+                interactive_only: true,
+                ..Default::default()
+            },
+            &tool.snapshot_store,
+            key,
+        )
+        .await
+        .expect("snapshot");
+        let second_ref = snapshot["elements"]
+            .as_array()
+            .expect("elements")
+            .iter()
+            .find(|element| element["name"] == "Second choice")
+            .and_then(|element| element["ref"].as_str())
+            .expect("second link ref")
+            .to_string();
+        let second = tool
+            .snapshot_store
+            .get_ref(key, &second_ref)
+            .await
+            .expect("stored second ref");
+        assert!(
+            !second.selector.contains("[data-testid=\"linkElement\"]"),
+            "a duplicated test id must not be accepted as identity: {}",
+            second.selector
+        );
+
+        let outcome = actions::execute_act(
+            &page,
+            &tool.snapshot_store,
+            key,
+            "click",
+            &second_ref,
+            &json!({}),
+            actions::ActionPolicies {
+                dialog: config::DialogPolicy::Auto,
+                navigation: &tool.manager.config().ssrf_policy,
+            },
+        )
+        .await
+        .expect("click outcome");
+        assert_eq!(outcome["outcome"], "applied", "{outcome}");
+        let clicked: String = page
+            .evaluate("document.body.dataset.clicked || ''")
+            .await
+            .expect("read click marker")
+            .into_value()
+            .expect("click marker string");
+        assert_eq!(
+            clicked, "second",
+            "selector={} outcome={outcome}",
+            second.selector
+        );
+
+        let _ = tool.manager.stop(profile).await;
+    }
+
+    /// Exercises the browser-use-compatible native action surface across the
+    /// real BrowserTool boundary, including the automatic post-action state
+    /// that supplies the next snapshot generation.
+    #[tokio::test]
+    #[ignore = "launches a real Chrome"]
+    async fn live_native_forms_upload_coordinates_and_send_keys() {
+        fn structured_element<'a>(state: &'a Value, name: &str) -> &'a Value {
+            state["elements"]
+                .as_array()
+                .expect("snapshot elements")
+                .iter()
+                .find(|element| element["name"] == name)
+                .unwrap_or_else(|| panic!("element '{name}' missing from {state}"))
+        }
+
+        fn compact_line<'a>(state: &'a Value, name: &str) -> &'a str {
+            let quoted_name = format!("\"{name}\"");
+            state["elements"]
+                .as_array()
+                .expect("snapshot elements")
+                .iter()
+                .filter_map(Value::as_str)
+                .find(|line| line.contains(&quoted_name))
+                .unwrap_or_else(|| panic!("compact element '{name}' missing from {state}"))
+        }
+
+        fn compact_ref(state: &Value, name: &str) -> String {
+            compact_line(state, name)
+                .strip_prefix('[')
+                .and_then(|line| line.split_once(']'))
+                .map(|(reference, _)| reference.to_string())
+                .unwrap_or_else(|| panic!("ref for compact element '{name}' missing from {state}"))
+        }
+
+        let profile = "native-actions-live-test";
+        let (tool, _dir) = isolated_live_tool(profile);
+        tool.manager
+            .get_browser(profile)
+            .await
+            .expect("start browser");
+        let page = tool
+            .manager
+            .get_page(profile, None)
+            .await
+            .expect("blank page");
+        let html = r#"<!doctype html><html><body>
+                <label>Message <input id="message" aria-label="Message"></label>
+                <div id="key-status" role="status">No key</div>
+                <label>Choice <select id="choice" aria-label="Choice">
+                    <option value="a">Alpha</option><option value="b">Beta</option>
+                </select></label>
+                <input id="upload" type="file" aria-label="Upload fixture" hidden>
+                <div id="upload-status" role="status">No upload</div>
+                <button id="coordinate" onclick="this.textContent='Coordinate clicked'">Coordinate target</button>
+                <div style="height:1600px"></div><h2>Late marker text</h2>
+                <script>
+                    message.addEventListener('keydown', function(e) {
+                        document.getElementById('key-status').textContent = 'trusted:' + e.isTrusted + ':key:' + e.key;
+                    });
+                    upload.addEventListener('change', function() {
+                        document.getElementById('upload-status').textContent = this.files.length ? 'Uploaded ' + this.files[0].name : 'No upload';
+                    });
+                </script>
+            </body></html>"#;
+        let data_url = format!(
+            "data:text/html;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(html)
+        );
+        page.execute(chromiumoxide::cdp::browser_protocol::page::NavigateParams::new(data_url))
+            .await
+            .expect("navigate test page");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let target_id = page.target_id().inner().clone();
+
+        let snapshot = tool
+            .execute(json!({
+                "action":"snapshot", "profile":profile, "targetId":target_id,
+                "interactive":false,
+            }))
+            .await
+            .expect("initial snapshot");
+        let message_ref = structured_element(&snapshot, "Message")["ref"]
+            .as_str()
+            .expect("message ref")
+            .to_string();
+        let coordinate = structured_element(&snapshot, "Coordinate target");
+        let bounds = coordinate["bounds"].as_array().expect("coordinate bounds");
+        let coordinate_x = bounds[0].as_f64().unwrap() + bounds[2].as_f64().unwrap() / 2.0;
+        let coordinate_y = bounds[1].as_f64().unwrap() + bounds[3].as_f64().unwrap() / 2.0;
+        let focused = tool
+            .execute(json!({
+                // Use the token exactly as a model copies it from a compact
+                // snapshot line. The action boundary accepts the brackets.
+                "action":"act", "actAction":"click", "ref":format!("[{message_ref}]"),
+                "profile":profile, "targetId":target_id,
+            }))
+            .await
+            .expect("focus input");
+        assert_eq!(focused["outcome"], "applied", "{focused}");
+
+        let typed = tool
+            .execute(json!({
+                "action":"send_keys", "keys":"Hello", "profile":profile,
+                "targetId":target_id,
+            }))
+            .await
+            .expect("send trusted text");
+        assert_eq!(typed["outcome"], "applied", "{typed}");
+        assert!(
+            compact_line(&typed["page_state"], "Message").contains("= \"Hello\""),
+            "{typed}"
+        );
+        assert!(
+            typed["page_state"]["elements"]
+                .as_array()
+                .expect("post-key elements")
+                .iter()
+                .filter_map(Value::as_str)
+                .any(|line| line.contains("trusted:true:key:")),
+            "the DOM did not observe trusted CDP keyboard events: {typed}"
+        );
+
+        let choice_ref = compact_ref(&typed["page_state"], "Choice");
+        let options = tool
+            .execute(json!({
+                "action":"act", "actAction":"options", "ref":choice_ref,
+                "profile":profile, "targetId":target_id,
+            }))
+            .await
+            .expect("inspect options");
+        assert_eq!(
+            options["options"].as_array().map(Vec::len),
+            Some(2),
+            "{options}"
+        );
+        let choice_ref = compact_ref(&options["page_state"], "Choice");
+        let selected = tool
+            .execute(json!({
+                "action":"act", "actAction":"select", "ref":choice_ref, "value":"b",
+                "profile":profile, "targetId":target_id,
+            }))
+            .await
+            .expect("select option");
+        assert!(
+            compact_line(&selected["page_state"], "Choice").contains("= \"b\""),
+            "{selected}"
+        );
+
+        let upload_ref = compact_ref(&selected["page_state"], "Upload fixture");
+        let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+        let uploaded = tool
+            .execute(json!({
+                "action":"act", "actAction":"upload", "ref":upload_ref,
+                "path":fixture.display().to_string(), "profile":profile,
+                "targetId":target_id,
+            }))
+            .await
+            .expect("upload fixture");
+        assert!(
+            uploaded["page_state"]["elements"]
+                .as_array()
+                .expect("post-upload elements")
+                .iter()
+                .filter_map(Value::as_str)
+                .any(|line| line.contains("Uploaded Cargo.toml")),
+            "upload change was not independently observed: {uploaded}"
+        );
+
+        let clicked = tool
+            .execute(json!({
+                "action":"click_coordinates", "x":coordinate_x, "y":coordinate_y,
+                "profile":profile, "targetId":target_id,
+            }))
+            .await
+            .expect("coordinate click");
+        assert_eq!(clicked["outcome"], "applied", "{clicked}");
+        assert!(
+            clicked["page_state"]["elements"]
+                .as_array()
+                .expect("post-coordinate elements")
+                .iter()
+                .filter_map(Value::as_str)
+                .any(|line| line.contains("Coordinate clicked")),
+            "coordinate click was not independently observed: {clicked}"
+        );
+
+        let scrolled = tool
+            .execute(json!({
+                "action":"scroll_to_text", "text":"Late marker text",
+                "profile":profile, "targetId":target_id,
+            }))
+            .await
+            .expect("scroll to text");
+        assert_eq!(scrolled["outcome"], "applied", "{scrolled}");
+
+        let _ = tool.manager.stop(profile).await;
+    }
+
+    /// Proves the full ref path across the browser's same-origin boundary:
+    /// discover an element in a child frame, preserve its frame identity, and
+    /// apply a real mouse click without the parent document accessing the
+    /// frame DOM. Two loopback hostnames make the documents different origins.
+    #[tokio::test]
+    #[ignore = "launches a real Chrome"]
+    async fn live_cross_origin_iframe_snapshot_and_native_actions() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        fn compact_frame_line<'a>(state: &'a Value, name: &str) -> &'a str {
+            let quoted_name = format!("\"{name}\"");
+            state["elements"]
+                .as_array()
+                .expect("snapshot elements")
+                .iter()
+                .filter_map(Value::as_str)
+                .find(|line| line.contains(&quoted_name))
+                .unwrap_or_else(|| panic!("compact frame element '{name}' missing from {state}"))
+        }
+
+        fn compact_frame_ref(state: &Value, name: &str) -> String {
+            compact_frame_line(state, name)
+                .strip_prefix('[')
+                .and_then(|line| line.split_once(']'))
+                .map(|(reference, _)| reference.to_string())
+                .unwrap_or_else(|| {
+                    panic!("ref for compact frame element '{name}' missing from {state}")
+                })
+        }
+
+        async fn serve(
+            body: String,
+            advertised_host: &str,
+        ) -> (String, tokio::task::JoinHandle<()>) {
+            let listener = tokio::net::TcpListener::bind("0.0.0.0:0")
+                .await
+                .expect("bind test server");
+            let port = listener.local_addr().expect("server address").port();
+            let task = tokio::spawn(async move {
+                loop {
+                    let Ok((mut socket, _)) = listener.accept().await else {
+                        return;
+                    };
+                    let mut request = [0_u8; 2048];
+                    let _ = socket.read(&mut request).await;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(), body
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                }
+            });
+            (format!("http://{advertised_host}:{port}"), task)
+        }
+
+        let child_body = r#"<!doctype html><html><body>
+            <button id="inside" onclick="this.textContent='Clicked inside frame'">Click inside frame</button>
+            <input id="frame-input" aria-label="Frame input" onkeydown="if(event.key==='Enter'){document.getElementById('key-status').textContent=event.isTrusted?'Trusted frame key':'Synthetic frame key'}">
+            <p id="key-status" role="status"></p>
+            <select id="frame-choice" aria-label="Frame choice">
+                <option value="alpha">Alpha</option><option value="beta">Beta</option>
+            </select>
+            <input id="frame-upload" type="file" aria-label="Frame upload" hidden onchange="document.getElementById('upload-status').textContent='Uploaded '+this.files[0].name">
+            <p id="upload-status" role="status"></p>
+        </body></html>"#.to_string();
+        let (child_url, child_server) = serve(child_body, "127.0.0.1").await;
+        let parent_body = format!(
+            r#"<!doctype html><html><body><h1>Parent</h1><iframe src="{child_url}"></iframe></body></html>"#
+        );
+        let (parent_url, parent_server) = serve(parent_body, "localhost").await;
+
+        let profile = "cross-origin-frame-live-test";
+        let (tool, _dir) = isolated_live_tool(profile);
+        tool.manager
+            .get_browser(profile)
+            .await
+            .expect("start browser");
+        let page = tool
+            .manager
+            .get_page(profile, None)
+            .await
+            .expect("blank page");
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            page.execute(
+                chromiumoxide::cdp::browser_protocol::page::NavigateParams::new(&parent_url),
+            ),
+        )
+        .await
+        .expect("navigation deadline")
+        .expect("navigate parent");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        let parent_can_read_child: bool = page
+            .evaluate(
+                "Boolean(document.querySelector('iframe').contentDocument && document.querySelector('iframe').contentDocument.body)",
+            )
+            .await
+            .expect("same-origin probe")
+            .into_value()
+            .expect("boolean same-origin result");
+        assert!(!parent_can_read_child, "fixture must be cross-origin");
+
+        let target_id = page.target_id().inner().clone();
+        let snapshot = tool
+            .execute(json!({
+                "action": "snapshot",
+                "profile": profile,
+                "targetId": target_id,
+                "interactive": true,
+            }))
+            .await
+            .expect("frame-aware snapshot");
+        let frame_button = snapshot["elements"]
+            .as_array()
+            .expect("snapshot elements")
+            .iter()
+            .find(|element| element["name"] == "Click inside frame")
+            .unwrap_or_else(|| panic!("button inside cross-origin frame: {snapshot}"));
+        assert!(frame_button["frame_id"].is_string(), "{frame_button}");
+        assert!(
+            frame_button["target_id"].is_string(),
+            "the fixture must be captured through a real OOPIF target: {frame_button}"
+        );
+        let frame_ref = frame_button["ref"].as_str().expect("frame ref");
+
+        let outcome = tool
+            .execute(json!({
+                "action": "act",
+                "actAction": "click",
+                "profile": profile,
+                "targetId": target_id,
+                "ref": frame_ref,
+            }))
+            .await
+            .expect("cross-origin click outcome");
+        assert_eq!(outcome["outcome"], "applied", "{outcome}");
+        assert_eq!(outcome["page_state_status"], "captured", "{outcome}");
+        let post_elements = outcome["page_state"]["elements"]
+            .as_array()
+            .expect("post-action frame-aware snapshot");
+        assert!(
+            post_elements
+                .iter()
+                .filter_map(Value::as_str)
+                .any(|line| line.contains("Clicked inside frame")),
+            "post-action snapshot did not independently observe the click: {outcome}"
+        );
+
+        let input_ref = compact_frame_ref(&outcome["page_state"], "Frame input");
+        let typed = tool
+            .execute(json!({
+                "action":"act", "actAction":"fill", "text":"OOPIF text",
+                "profile":profile, "targetId":target_id, "ref":input_ref,
+            }))
+            .await
+            .expect("cross-origin fill outcome");
+        assert_eq!(typed["outcome"], "applied", "{typed}");
+        assert!(
+            compact_frame_line(&typed["page_state"], "Frame input").contains("= \"OOPIF text\""),
+            "{typed}"
+        );
+
+        let input_ref = compact_frame_ref(&typed["page_state"], "Frame input");
+        let pressed = tool
+            .execute(json!({
+                "action":"act", "actAction":"press", "key":"Enter",
+                "profile":profile, "targetId":target_id, "ref":input_ref,
+            }))
+            .await
+            .expect("cross-origin key outcome");
+        assert_eq!(pressed["outcome"], "applied", "{pressed}");
+        assert!(
+            pressed["page_state"]["elements"]
+                .as_array()
+                .expect("post-key snapshot")
+                .iter()
+                .filter_map(Value::as_str)
+                .any(|line| line.contains("Trusted frame key")),
+            "OOPIF key event was not independently observed as trusted: {pressed}"
+        );
+
+        let choice_ref = compact_frame_ref(&pressed["page_state"], "Frame choice");
+        let options = tool
+            .execute(json!({
+                "action":"act", "actAction":"options",
+                "profile":profile, "targetId":target_id, "ref":choice_ref,
+            }))
+            .await
+            .expect("cross-origin options outcome");
+        assert_eq!(
+            options["options"].as_array().map(Vec::len),
+            Some(2),
+            "{options}"
+        );
+        let choice_ref = compact_frame_ref(&options["page_state"], "Frame choice");
+        let selected = tool
+            .execute(json!({
+                "action":"act", "actAction":"select", "value":"beta",
+                "profile":profile, "targetId":target_id, "ref":choice_ref,
+            }))
+            .await
+            .expect("cross-origin select outcome");
+        assert_eq!(selected["outcome"], "applied", "{selected}");
+        assert!(
+            compact_frame_line(&selected["page_state"], "Frame choice").contains("= \"beta\""),
+            "{selected}"
+        );
+
+        let upload_ref = compact_frame_ref(&selected["page_state"], "Frame upload");
+        let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+        let uploaded = tool
+            .execute(json!({
+                "action":"act", "actAction":"upload",
+                "path":fixture.display().to_string(),
+                "profile":profile, "targetId":target_id, "ref":upload_ref,
+            }))
+            .await
+            .expect("cross-origin upload outcome");
+        assert_eq!(uploaded["outcome"], "applied", "{uploaded}");
+        assert!(
+            uploaded["page_state"]["elements"]
+                .as_array()
+                .expect("post-upload snapshot")
+                .iter()
+                .filter_map(Value::as_str)
+                .any(|line| line.contains("Uploaded Cargo.toml")),
+            "OOPIF upload was not independently observed: {uploaded}"
+        );
+
+        let _ = tool.manager.stop(profile).await;
+        parent_server.abort();
+        child_server.abort();
+    }
+
+    /// Verifies the full production tool boundary for downloads: a click is
+    /// correlated with browser-level lifecycle events, completion has an
+    /// independently observed file, and the reported canonical path remains
+    /// inside the profile's download directory.
+    #[tokio::test]
+    #[ignore = "launches a real Chrome"]
+    async fn live_download_click_reports_validated_completion() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind download fixture");
+        let port = listener.local_addr().expect("fixture address").port();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut request = [0_u8; 4096];
+                let read = socket.read(&mut request).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&request[..read]);
+                let response = if request.starts_with("GET /file ") {
+                    let payload = b"rustykrab download verification\n";
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=\"../../verified.txt\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        payload.len(),
+                        String::from_utf8_lossy(payload)
+                    )
+                } else {
+                    let body = r#"<!doctype html><html><body><a id="download" href="/file">Download fixture</a></body></html>"#;
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(), body
+                    )
+                };
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        let profile = "download-live-test";
+        let (tool, _dir) = isolated_live_tool(profile);
+        tool.manager
+            .get_browser(profile)
+            .await
+            .expect("start browser with download observer");
+        let status = tool.manager.status(profile).await;
+        assert_eq!(status["downloads_status"], "ready", "{status}");
+        let page = tool
+            .manager
+            .get_page(profile, None)
+            .await
+            .expect("blank page");
+        let url = format!("http://127.0.0.1:{port}/");
+        tokio::time::timeout(Duration::from_secs(10), page.goto(&url))
+            .await
+            .expect("fixture navigation deadline")
+            .expect("navigate fixture");
+
+        let target_id = page.target_id().inner().clone();
+        let key = BrowserTool::store_key("global", profile, Some(&target_id));
+        let snapshot = snapshot::take_snapshot(
+            &page,
+            &SnapshotOptions {
+                interactive_only: true,
+                ..Default::default()
+            },
+            &tool.snapshot_store,
+            &key,
+        )
+        .await
+        .expect("download fixture snapshot");
+        let download_ref = snapshot["elements"]
+            .as_array()
+            .expect("snapshot elements")
+            .iter()
+            .find(|element| element["name"] == "Download fixture")
+            .and_then(|element| element["ref"].as_str())
+            .expect("download link ref");
+
+        let outcome = tool
+            .execute(json!({
+                "action": "act",
+                "actAction": "click",
+                "ref": download_ref,
+                "profile": profile,
+                "targetId": target_id,
+                "expect_download": true,
+                "download_timeout_ms": 10_000,
+            }))
+            .await
+            .expect("download click outcome");
+        assert_eq!(outcome["outcome"], "applied", "{outcome}");
+        assert_eq!(
+            outcome["download_observation"]["status"], "terminal",
+            "{outcome}"
+        );
+        assert_eq!(outcome["download_observation"]["completed"], 1, "{outcome}");
+        let download = &outcome["download_observation"]["downloads"][0];
+        assert_eq!(download["status"], "completed", "{outcome}");
+        assert_eq!(download["path_status"], "validated", "{outcome}");
+        let reported_path =
+            std::path::PathBuf::from(download["path"].as_str().expect("validated download path"));
+        let configured_root = std::fs::canonicalize(status["download_dir"].as_str().unwrap())
+            .expect("canonical download root");
+        assert!(reported_path.starts_with(&configured_root), "{outcome}");
+        assert_eq!(
+            std::fs::read(&reported_path).expect("downloaded file"),
+            b"rustykrab download verification\n"
+        );
+
+        let _ = tool.manager.stop(profile).await;
+        server.abort();
+    }
+
+    /// Native dialogs freeze the renderer. The browser-use pattern is to
+    /// handle them concurrently with the action and report what was closed.
+    #[tokio::test]
+    #[ignore = "launches a real Chrome"]
+    async fn live_click_accepts_and_reports_javascript_dialog() {
+        let profile = "dialog-click-live-test";
+        let (tool, _dir) = isolated_live_tool(profile);
+        tool.manager
+            .get_browser(profile)
+            .await
+            .expect("start browser");
+        let page = tool
+            .manager
+            .get_page(profile, None)
+            .await
+            .expect("blank page");
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            page.set_content(
+                r##"<html><body><button id="dialog" onclick="document.body.dataset.clicked='before'; alert('dialog observed'); document.body.dataset.clicked='after'">Open dialog</button></body></html>"##,
+            ),
+        )
+        .await
+        .expect("set_content deadline")
+        .expect("set_content");
+
+        let key = "test:dialog-click";
+        let snapshot = snapshot::take_snapshot(
+            &page,
+            &SnapshotOptions {
+                interactive_only: true,
+                ..Default::default()
+            },
+            &tool.snapshot_store,
+            key,
+        )
+        .await
+        .expect("snapshot");
+        let ref_id = snapshot["elements"][0]["ref"].as_str().expect("button ref");
+
+        let outcome = actions::execute_act(
+            &page,
+            &tool.snapshot_store,
+            key,
+            "click",
+            ref_id,
+            &json!({}),
+            actions::ActionPolicies {
+                dialog: config::DialogPolicy::Auto,
+                navigation: &config::SsrfPolicy::default(),
+            },
+        )
+        .await
+        .expect("dialog click outcome");
+        assert_eq!(outcome["outcome"], "applied", "{outcome}");
+        assert_eq!(outcome["dialogs"][0]["type"], "alert", "{outcome}");
+        assert_eq!(outcome["dialogs"][0]["accepted"], true, "{outcome}");
+        let clicked: String = page
+            .evaluate("document.body.dataset.clicked || ''")
+            .await
+            .expect("read post-dialog marker")
+            .into_value()
+            .expect("post-dialog marker string");
+        assert_eq!(clicked, "after");
+
+        let _ = tool.manager.stop(profile).await;
+    }
+
+    /// A page that blocks its renderer from a click handler used to consume
+    /// chromiumoxide's 30-second request timeout repeatedly and then the
+    /// runner's 60-second tool timeout. The complete action must now return an
+    /// explicit unknown outcome within its own deadline.
+    #[tokio::test]
+    #[ignore = "launches a real Chrome"]
+    async fn live_hanging_click_is_bounded_and_ambiguous() {
+        let profile = "hanging-click-live-test";
+        let (tool, _dir) = isolated_live_tool(profile);
+        tool.manager
+            .get_browser(profile)
+            .await
+            .expect("start browser");
+        let page = tool
+            .manager
+            .get_page(profile, None)
+            .await
+            .expect("blank page");
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            page.set_content(
+                r##"<html><body><button id="hang" onclick="while(true){}">Hang renderer</button></body></html>"##,
+            ),
+        )
+        .await
+        .expect("set_content deadline")
+        .expect("set_content");
+
+        let target_id = page.target_id().inner().clone();
+        let key = BrowserTool::store_key("global", profile, Some(&target_id));
+        let snapshot = snapshot::take_snapshot(
+            &page,
+            &SnapshotOptions {
+                interactive_only: true,
+                ..Default::default()
+            },
+            &tool.snapshot_store,
+            &key,
+        )
+        .await
+        .expect("snapshot");
+        let ref_id = snapshot["elements"][0]["ref"]
+            .as_str()
+            .expect("button ref")
+            .to_string();
+
+        let started = std::time::Instant::now();
+        let outcome = tool
+            .execute(json!({
+                "action": "act",
+                "actAction": "click",
+                "ref": ref_id,
+                "profile": profile,
+                "targetId": target_id,
+            }))
+            .await
+            .expect("bounded click outcome");
+        assert!(
+            started.elapsed() < Duration::from_secs(35),
+            "action plus browser recovery exceeded its deadline: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(outcome["outcome"], "unknown", "{outcome}");
+        assert_eq!(outcome["retry_safe"], false, "{outcome}");
+        assert_eq!(outcome["browser_degraded"], true, "{outcome}");
+        assert_eq!(outcome["recovery"]["status"], "recovered", "{outcome}");
+
+        // Independent post-recovery probe: the replacement Chrome accepts a
+        // new renderer command, rather than merely reporting that relaunch
+        // code ran.
+        let replacement = tool
+            .manager
+            .get_page(profile, None)
+            .await
+            .expect("replacement page");
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            replacement.set_content("<p id='healthy'>recovered</p>"),
+        )
+        .await
+        .expect("replacement renderer deadline")
+        .expect("replacement renderer command");
+        let healthy: String = replacement
+            .evaluate("document.querySelector('#healthy').textContent")
+            .await
+            .expect("replacement renderer response")
+            .into_value()
+            .expect("replacement renderer text");
+        assert_eq!(healthy, "recovered");
+
+        let _ = tool.manager.stop(profile).await;
+    }
+
     #[test]
     fn store_key_separates_tabs() {
         assert_eq!(
-            BrowserTool::store_key("default", Some("TARGET-1")),
-            "default:TARGET-1"
+            BrowserTool::store_key("conv-a", "default", Some("TARGET-1")),
+            "conv-a:default:TARGET-1"
         );
         assert_ne!(
-            BrowserTool::store_key("default", Some("TARGET-1")),
-            BrowserTool::store_key("default", Some("TARGET-2"))
+            BrowserTool::store_key("conv-a", "default", Some("TARGET-1")),
+            BrowserTool::store_key("conv-a", "default", Some("TARGET-2"))
         );
-        assert_eq!(BrowserTool::store_key("default", None), "default:active");
+        assert_ne!(
+            BrowserTool::store_key("conv-a", "default", Some("TARGET-1")),
+            BrowserTool::store_key("conv-b", "default", Some("TARGET-1"))
+        );
+        assert_eq!(
+            BrowserTool::store_key("conv-a", "default", None),
+            "conv-a:default:active"
+        );
     }
 }
 
@@ -1894,5 +5463,39 @@ mod act_action_tests {
             variants.contains(&"fill_credential"),
             "actAction enum: {variants:?}"
         );
+        // Observed with gemma4:26b on the payment eval: the model reached for
+        // act + actAction 'fill_payment', schema validation rejected it five
+        // times before the tool could route it, and in between the model
+        // typed the field's label into the name box. Accepting a spelling in
+        // `effective_action` is worthless if the schema refuses it first.
+        for sub_action in ["fill_payment", "pay"] {
+            assert!(
+                variants.contains(&sub_action),
+                "actAction enum must admit {sub_action}: {variants:?}"
+            );
+        }
+    }
+
+    /// The exact calls gemma4:26b made in the payment eval, run through the
+    /// same validator the agent runner applies before a tool executes.
+    ///
+    /// Also the guard on the pay claim: claiming happens entirely inside
+    /// the tool, so the call the model writes is unchanged. If a schema
+    /// edit ever crept in with a store change, the model's existing pay
+    /// calls would start being rejected before the tool could route them —
+    /// exactly the failure this test was written for.
+    #[test]
+    fn the_payment_sub_action_calls_the_model_made_pass_runner_validation() {
+        let params = super::schema_parameters();
+        for args in [
+            json!({"action": "act", "actAction": "fill_payment", "field": "number", "ref": "s6-5"}),
+            json!({"action": "act", "actAction": "pay", "ref": "s6-9"}),
+            json!({"action": "fill_payment", "field": "cvc", "ref": "s6-7"}),
+        ] {
+            rustykrab_core::validate_tool_args(&params, &args)
+                .unwrap_or_else(|e| panic!("{args} rejected before reaching the tool: {e:?}"));
+            super::BrowserTool::validate_action_args(args["action"].as_str().unwrap(), &args)
+                .unwrap_or_else(|e| panic!("{args} rejected by the tool: {e}"));
+        }
     }
 }

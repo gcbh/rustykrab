@@ -1,8 +1,8 @@
 # Architecture & Reusability Evaluation
 
-A structural review of the RustyKrab workspace. Second pass, against `main` at
-`fd1f1e2` — roughly 84k lines across 13 crates, 921 tests. The first pass ran
-against `d945495`; what it changed is recorded in
+A structural review of the RustyKrab workspace. The second-pass baseline was
+`main` at `fd1f1e2`; the current tree is roughly 90k lines across 14 crates and
+949 tests. The first pass ran against `d945495`; what it changed is recorded in
 [`05-first-pass-outcome.md`](05-first-pass-outcome.md).
 
 The review is deliberately split into **description** and **judgement**, because
@@ -18,6 +18,8 @@ of the code holds; the judgement is one reviewer's opinion at one point in time.
 | [`02-extension-seams.md`](02-extension-seams.md) | Every trait/abstraction in the system, who implements it, and whether it earns its keep |
 | [`03-dead-code-audit.md`](03-dead-code-audit.md) | The unreferenced items, what each is for, and whether to wire or delete it |
 | [`05-first-pass-outcome.md`](05-first-pass-outcome.md) | Which first-pass findings were acted on, and which were wrong |
+| [`06-release-pipeline.md`](06-release-pipeline.md) | Merge-triggered versioning, stack ownership, reproducibility, build, signing, and publication |
+| [`07-browser-use-parity.md`](07-browser-use-parity.md) | Rust browser execution parity with browser-use, verification evidence, and deliberate discontinuities |
 
 Per-component detail lives next to the code, one file per crate:
 
@@ -34,6 +36,7 @@ Per-component detail lives next to the code, one file per crate:
 - [`crates/rustykrab-dream/ARCHITECTURE.md`](../../crates/rustykrab-dream/ARCHITECTURE.md)
 - [`crates/rustykrab-cli/ARCHITECTURE.md`](../../crates/rustykrab-cli/ARCHITECTURE.md)
 - [`crates/rustykrab-e2e/ARCHITECTURE.md`](../../crates/rustykrab-e2e/ARCHITECTURE.md)
+- [`crates/rustykrab-projects/ARCHITECTURE.md`](../../crates/rustykrab-projects/ARCHITECTURE.md)
 
 ## Judgement (whether it is right and sensible)
 

@@ -7,7 +7,7 @@
 //!
 //! Signatures are unchanged, so callers that took `&AppState` still do.
 
-use rustykrab_agent::{AgentEvent, AgentHandle};
+use rustykrab_agent::{AgentEvent, AgentHandle, AgentRunCompletion};
 use rustykrab_core::types::{Conversation, Message};
 use rustykrab_runtime::{RunOptions, RuntimeError};
 use tokio::sync::mpsc;
@@ -56,7 +56,7 @@ pub async fn run_agent_interactive(
     (
         AgentHandle,
         mpsc::Receiver<AgentEvent>,
-        JoinHandle<rustykrab_core::Result<Conversation>>,
+        JoinHandle<AgentRunCompletion>,
     ),
     axum::http::StatusCode,
 > {

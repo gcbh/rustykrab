@@ -18,7 +18,9 @@ use uuid::Uuid;
 
 use crate::context::AgentContext;
 use crate::error::RuntimeError;
-use rustykrab_agent::{AgentEvent, AgentHandle, AgentRunner, HarnessProfile, OnMessageCallback};
+use rustykrab_agent::{
+    AgentEvent, AgentHandle, AgentRunCompletion, AgentRunner, HarnessProfile, OnMessageCallback,
+};
 use rustykrab_core::capability::{Capability, CapabilitySet};
 use rustykrab_core::session::Session;
 use rustykrab_core::types::{Conversation, Message, MessageContent, Role};
@@ -135,6 +137,28 @@ async fn build_and_inject_system_prompt(
     }
 
     let mut system_prompt = builder.build();
+    system_prompt.push_str(
+        "\n\n## Task continuity\n\
+         Interpret a short follow-up using the active user goal, the most recent \
+         relevant exchange, and any later corrections. Resolve references before \
+         choosing a tool; a familiar phrase by itself is not a new task. Explicit \
+         user task switches override the old goal. Preserve current dates, entities, \
+         constraints and authorization boundaries. Within the same task, a correction \
+         changes only the specified fields; other requirements remain unless withdrawn \
+         or contradicted. Do not transfer unrelated constraints across a task switch. \
+         If the referent is materially \
+         ambiguous, ask a focused question. Your first useful action should advance \
+         that current request. Failed or timed-out actions are not verified results; \
+         inspect current external state before retrying a potentially applied effect.",
+    );
+    // Custom soul files are user-owned and may still name absent tools. The
+    // session's actual schema is authoritative regardless of that wording.
+    system_prompt.push_str(
+        "\n\n## Tool availability\nInvoke only tools whose schemas are currently offered. \
+         References to tool names in general guidance are conditional on availability. \
+         Discover and load other available tools before invoking them; if discovery \
+         says a tool is unknown or forbidden, do not invent a call to it.",
+    );
 
     // Append channel context so the agent knows where this conversation lives.
     if let Some(ref source) = conv.channel_source {
@@ -403,15 +427,8 @@ async fn prepare_agent(
     }
 
     if let Some(cb) = build_memory_callback(ctx, conv) {
-        // The inbound user message was pushed onto conv.messages by
-        // routes.rs before the runner was constructed, so it never goes
-        // through push_message. Fire the callback once so the user turn
-        // is persisted alongside everything the runner generates.
-        if let Some(last) = conv.messages.last() {
-            if last.role == Role::User {
-                cb(last);
-            }
-        }
+        // Channels own initial inbound ingestion. Do not double-retain it
+        // here; this hook covers runner-produced and mid-run injected messages.
         runner = runner.with_on_message(cb);
     }
 
@@ -493,40 +510,54 @@ pub async fn run_agent_interactive(
     (
         AgentHandle,
         mpsc::Receiver<AgentEvent>,
-        JoinHandle<rustykrab_core::Result<Conversation>>,
+        JoinHandle<AgentRunCompletion>,
     ),
     RuntimeError,
 > {
     rustykrab_core::prompt_trace::with_trace_id(trace_id, async move {
-        // Resolve the harness profile once for both the system prompt and
-        // the agent config.
-        let profile = ctx.profile_for(user_content).await;
-        tracing::info!(profile = %profile.name, "harness profile selected");
-
-        build_and_inject_system_prompt(ctx, &mut conv, &profile, &RunOptions::default()).await;
-
-        let tool_names: Vec<&str> = ctx
-            .tools
-            .iter()
-            .filter(|t| t.available())
-            .map(|t| t.name())
-            .collect();
-        let caps = build_session_capabilities(ctx, &tool_names);
-        let session = Session::with_capabilities(conv.id, caps);
-
-        let runner = AgentRunner::new(ctx.provider.clone(), ctx.tools.clone(), ctx.sandbox.clone())
-            .with_config(profile.to_agent_config())
-            .with_todo_store(ctx.todos.clone());
-
-        // The agent loop runs in a tokio::spawn'd task inside `start`, so
-        // the task-local trace id won't follow it. Re-scope the spawned
-        // future from inside the runner is not possible without changing
-        // the runner API; for the interactive path we accept that the
-        // agent task itself logs without trace_id. The caller can still
-        // correlate by the conversation id printed at start.
-        Ok(runner.start(conv, session))
+        let (runner, session) =
+            prepare_agent(ctx, &mut conv, user_content, &RunOptions::default()).await?;
+        let busy = ctx.agent_id.map(|id| ctx.activity.begin_run(id));
+        // start() carries the task-local prompt trace into the spawned task.
+        // Keep the downtime exclusion alive until that task actually ends.
+        let (handle, events, task) = runner.start(conv, session);
+        let completion = tokio::spawn(async move {
+            let _busy = busy;
+            task.await
+                .expect("interactive runner catches execution panics")
+        });
+        Ok((handle, events, completion))
     })
     .await
+}
+
+/// Drain channel progress until completion or inactivity, then retrieve the
+/// owned conversation even on a stall. Cancellation interrupts execution; it
+/// never implies that an already-started external action was rolled back.
+pub async fn await_interactive_run(
+    handle: &AgentHandle,
+    events: mpsc::Receiver<AgentEvent>,
+    task: JoinHandle<AgentRunCompletion>,
+    idle_timeout: std::time::Duration,
+) -> Result<(AgentRunCompletion, bool), tokio::task::JoinError> {
+    let stalled = wait_for_idle_or_close(events, idle_timeout).await;
+    if stalled {
+        let _ = handle.cancel().await;
+    }
+    task.await.map(|completion| (completion, stalled))
+}
+
+async fn wait_for_idle_or_close(
+    mut events: mpsc::Receiver<AgentEvent>,
+    idle_timeout: std::time::Duration,
+) -> bool {
+    loop {
+        match tokio::time::timeout(idle_timeout, events.recv()).await {
+            Ok(Some(_)) => {}
+            Ok(None) => return false,
+            Err(_) => return true,
+        }
+    }
 }
 
 /// Run the agent loop with streaming events.
@@ -697,5 +728,40 @@ mod outcome_contract_tests {
             Some("verifiable"),
         )));
         assert!(contract_for_active_skill(&registry, &options_for("missing")).is_none());
+    }
+}
+
+#[cfg(test)]
+mod channel_lifecycle_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn closed_progress_is_completion_not_timeout() {
+        let (tx, rx) = mpsc::channel(1);
+        tx.send(AgentEvent::Done).await.unwrap();
+        drop(tx);
+        assert!(!wait_for_idle_or_close(rx, Duration::from_secs(1)).await);
+    }
+
+    #[tokio::test]
+    async fn silent_open_progress_is_a_stall() {
+        let (_tx, rx) = mpsc::channel(1);
+        assert!(wait_for_idle_or_close(rx, Duration::from_millis(10)).await);
+    }
+
+    #[tokio::test]
+    async fn each_progress_event_renews_idle_timeout() {
+        let (tx, rx) = mpsc::channel(1);
+        let progress = tokio::spawn(async move {
+            for _ in 0..4 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                tx.send(AgentEvent::TextDelta("progress".into()))
+                    .await
+                    .unwrap();
+            }
+        });
+        assert!(!wait_for_idle_or_close(rx, Duration::from_millis(60)).await);
+        progress.await.unwrap();
     }
 }

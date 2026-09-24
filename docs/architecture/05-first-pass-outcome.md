@@ -52,6 +52,35 @@ written twice (`max_tokens_retries` 8→4, `compact_history(conv, tools)` 2→1)
 while leaving the shared ones untouched, which is the check that the merge
 preserved the work rather than resolving over it.
 
+## Interactive continuity follow-up
+
+Against base `0b565fd`, shared interactive setup and owned completion repair
+failed-run history loss and queued-but-undispatched follow-ups. Telegram/Slack
+journal admission UUIDs, serialize fallback turns and fence resets; HTTP/SSE
+persist initial and partial-error histories. These are targeted repairs to the
+six-copy turn-sequence finding, not a unified transaction or exactly-once queue.
+Transport acknowledgement gaps, asynchronous memory durability, pending-input
+recovery UX and concurrent HTTP turns remain unresolved. Compaction/provider
+context changes are a separate dependent PR. See
+[`turn-durability.md`](../evals/turn-durability.md).
+
+The old runtime "no tests" finding was already stale at base `0b565fd`,
+which had 14 distillation tests. This slice adds three lifecycle helper tests.
+Direct turn-assembly coverage remains a separate gap; zero-test wording is retired.
+
+## Context and compaction follow-up
+
+The second split pins real user anchors, corrects generated-message roles,
+rejects incomplete summaries and gives the runner sole authority to compact.
+Ollama's schema-aware budget guard refuses overflow instead of silently
+discarding messages. Explicit harness policies and the production-compactor
+ablation evaluate alternatives without silently changing the Legacy default.
+Captured context tests also found absent default-seeded tools in
+`tools_load.active`; filtering the report and conditional memory guidance
+repair that static-catalog contradiction. Dynamic schema invalidation,
+task-switch readout failures and recall-after-restart coverage remain open.
+See [study summary](../evals/compaction-study-validation.md).
+
 ## Method note
 
 Three findings were wrong, and all three were caught by *implementing* them
