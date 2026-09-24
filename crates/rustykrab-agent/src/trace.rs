@@ -66,6 +66,7 @@ struct TracerInner {
 /// Sanitize a tool name to prevent prompt injection via trace summaries.
 /// Only allows alphanumeric characters, underscores, and hyphens,
 /// and limits length to 64 characters.
+///
 fn sanitize_tool_name(name: &str) -> String {
     name.chars()
         .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')

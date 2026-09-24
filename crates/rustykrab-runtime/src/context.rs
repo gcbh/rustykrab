@@ -55,6 +55,10 @@ pub struct AgentContext {
     pub harness_router: Option<Arc<HarnessRouter>>,
     pub orchestration_config: OrchestrationConfig,
     pub skill_registry: Arc<SkillRegistry>,
+    /// How to observe the effects a skill's `[outcome]` block declares.
+    /// `None` means this deployment can produce no ground truth, which is
+    /// the honest state rather than a degraded one.
+    pub probes: Option<Arc<rustykrab_core::ProbeRegistry>>,
     /// Hybrid memory. `None` when no memory backend is configured.
     pub memory: Option<Arc<MemorySystem>>,
     /// Persistent agent identifier, the owner for memory writes. `None`
@@ -110,6 +114,7 @@ impl AgentContext {
             orchestration_config: OrchestrationConfig::default(),
             skill_registry: Arc::new(SkillRegistry::new()),
             distiller: None,
+            probes: None,
             memory: None,
             agent_id: None,
             active_tools: Arc::new(ActiveToolsRegistry::new()),
@@ -179,6 +184,11 @@ impl AgentContext {
     /// Set the router, or leave static-profile mode in place when `None`.
     pub fn with_harness_router_opt(mut self, router: Option<Arc<HarnessRouter>>) -> Self {
         self.harness_router = router;
+        self
+    }
+
+    pub fn with_probes(mut self, probes: Arc<rustykrab_core::ProbeRegistry>) -> Self {
+        self.probes = Some(probes);
         self
     }
 

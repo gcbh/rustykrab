@@ -256,14 +256,62 @@ frontmatter addition:
 [outcome]
 # Definition of done (required for auto-improvement eligibility)
 success = "The requested calendar event exists and the user confirmed the details."
-# Optional machine-checkable post-conditions, if the effect is verifiable
-checks = ["calendar.event_created", "user.confirmed"]
+# Machine-checkable post-conditions. Each names a probe the deployment has
+# registered; a check nothing can observe makes the whole block advisory.
+checks = ["calendar_event_booked", "confirmation_sent"]
 # Signal class to trust: verifiable | explicit | implicit | judge
 signal = "verifiable"
 ```
 
 Skills with no `[outcome]` block are **frozen** -- they run, but the loop never
 edits them.
+
+A check names a **post-condition probe**: something that goes and looks at
+the world, independently of what the run reported doing. The probe is
+sampled twice, before the run and after, and the check passes only when the
+effect **appeared across that window**.
+
+The cheap alternative -- treat a check as satisfied when the run called a
+tool of that name and it returned `Ok` -- was tried and rejected, and the
+reason is the crux of this whole document. That question is about the
+agent's behaviour, not about the world: a run that created the event on the
+wrong day, for the wrong person, in the wrong calendar satisfies it exactly
+as well as a correct one. And the answer does not stay local. It becomes
+`Verifiable`, which is what `is_ground_truth()` admits, which is what
+`Readiness::Ready` requires, which is what permits the loop to mutate
+memory. A proxy the agent controls would end up as the sole evidence
+authorizing self-modification -- the loop grading its own homework, and
+precisely the Goodhart failure [P2](#p2-you-cannot-improve-what-you-cannot-measure)
+exists to prevent.
+
+Sampling twice matters for the same reason. "The calendar contains the
+event" is a claim about the calendar; "the calendar gained the event during
+this turn" is a claim about the turn. Only the second is a post-condition,
+and without it every subsequent run would be credited for work done once.
+
+Five properties are load-bearing, and each has a test that fails without it:
+
+- **Only `signal = "verifiable"` buys ground truth.** Checks alone do not.
+  A skill asking to be judged by a model must not have its runs promoted to
+  fact, or the loop can launder its own opinion into evidence.
+- **A check no probe can observe yields no contract at all**, and the run
+  falls back to the implicit signal. Not satisfied (invention), not unmet
+  (a typo in a `SKILL.md` would score a working skill as doing nothing,
+  forever). This is also what happens on a deployment that has registered
+  no probe for an effect some other deployment can see.
+- **An effect that predates the run is not credited to it.**
+- **An outstanding check is `Ambiguous`, not `Failure`.** A skill's effects
+  may legitimately span several turns, and from one run there is no way to
+  tell "did not do it" from "has not done it yet". Ambiguous records are
+  kept but excluded from success rates, so a working multi-turn skill is
+  never scored as harmful for being mid-conversation.
+- **Producing every effect and then erroring is not success.** Otherwise a
+  skill that reliably crashes after its side effects accumulates a clean
+  record.
+
+A probe that *errors* -- a calendar server briefly down -- is not an unmet
+check. It yields no verdict at all, because a server outage is not evidence
+about the skill.
 
 ### Skill improvement as offline learning from logged outcomes
 
@@ -422,6 +470,17 @@ Shipped and opt-in behind `RUSTYKRAB_OUTCOME_CAPTURE` (off by default).
   `signal`. `SkillMd::is_optimizable()` implements the freeze rule; an
   unset or unparseable `signal` degrades to `Implicit` rather than
   something stronger, so an unclear declaration buys no authority.
+- **`OutcomeContract` + `post_condition` + `probes`** — a skill's
+  `[outcome]` block becomes a checkable claim only when it declared
+  `signal = "verifiable"`, named at least one check, *and* every one of
+  those checks resolves to a probe this deployment has registered.
+  Anything else yields no contract and the run falls back to the implicit
+  signal. The contract is derived in `rustykrab-runtime`'s `prepare_agent`
+  from whichever skill the turn already resolved, so it applies to every
+  path — conversation, cron, peer-delegated — rather than only to the one
+  that happened to be wired. Which effects a skill *claims* comes from its
+  `SKILL.md`; which effects this machine can *observe* comes from
+  `build_probe_registry` in the CLI.
 - **`AgentRunner::capture_outcome`** — the per-run tracer was hoisted from
   `run_inner` to the `run`/`run_streaming` wrappers so capture sees the run's
   traces regardless of which of the inner loop's ~10 exit paths fired.
@@ -435,11 +494,10 @@ Two deliberate deviations from the plan above:
    `SqliteMemoryStorage` has no additive-migration phase to extend. Since
    tallies are *derived* from records rather than incremented in place, the
    column buys nothing until something mutates memory — which is Phase 2.
-2. **Verdicts are `Implicit` only.** Nothing yet checks a post-condition or
-   captures an explicit correction, so every record carries behavioural
-   evidence at low confidence and `is_actionable()` returns false for all of
-   them. That is the honest state: Phase 1 reports can be built on this,
-   Phase 2/3 promotion cannot.
+2. **Explicit corrections are still uncaptured.** A skill's declared
+   `checks` are now verified (see below), so runs it drives carry
+   `Verifiable` evidence; nothing yet notices a user *saying* the run was
+   wrong, so `Explicit` remains unused.
 
 ## What downtime does and does not solve
 
