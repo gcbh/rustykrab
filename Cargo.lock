@@ -4220,6 +4220,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "rustykrab-core",
+ "rustykrab-memory",
  "rustykrab-store",
  "serde",
  "serde_json",
