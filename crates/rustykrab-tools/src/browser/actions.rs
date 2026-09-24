@@ -1,14 +1,46 @@
-//! Ref-based action system modeled after OpenClaw's `act` command.
+//! CDP-native, ref-based action system informed by browser-use's action model.
 //!
 //! Actions use element refs from snapshots instead of raw CSS selectors.
-//! Supported actions: click, type, press, hover, select, fill, scroll,
-//! wait, evaluate.
+//! Supported actions include click, type/fill, press, hover, select/options,
+//! upload, drag, and wait.
 
+use chromiumoxide::cdp::browser_protocol::dom::{
+    BackendNodeId, DescribeNodeParams, GetContentQuadsParams, SetFileInputFilesParams,
+};
+use chromiumoxide::cdp::browser_protocol::input::{
+    DispatchKeyEventParams, DispatchKeyEventType, DispatchMouseEventParams, DispatchMouseEventType,
+    InsertTextParams, MouseButton,
+};
+use chromiumoxide::cdp::browser_protocol::page::{
+    EventJavascriptDialogOpening, FrameId, HandleJavaScriptDialogParams,
+};
+use chromiumoxide::cdp::js_protocol::runtime::{
+    CallFunctionOnParams, EvaluateParams, ExecutionContextId, RemoteObjectId,
+};
+use chromiumoxide::layout::{ElementQuad, Point};
 use chromiumoxide::Page;
 use rustykrab_core::{Error, Result, ToolError, ToolErrorKind};
 use serde_json::{json, Value};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio_stream::StreamExt;
 
-use super::snapshot::{take_snapshot, ElementRef, SnapshotOptions, SnapshotStore};
+use super::snapshot::{
+    take_snapshot, ElementRef, SnapshotOptions, SnapshotStore, IFRAME_SEP, SHADOW_SEP,
+};
+use super::{config::DialogPolicy, config::SsrfPolicy, policy};
+
+/// Allow renderer event handlers queued by an acknowledged input command to
+/// run before policy checks and the post-action snapshot. Browser-use applies a
+/// 100ms default gap between actions for the same reason. Without this barrier,
+/// a fast CDP response can race the click/input handler and return stale state.
+const POST_ACTION_SETTLE: Duration = Duration::from_millis(100);
+
+#[derive(Clone, Copy)]
+pub(crate) struct ActionPolicies<'a> {
+    pub dialog: DialogPolicy,
+    pub navigation: &'a SsrfPolicy,
+}
 
 /// Encode a string as a safe JavaScript string literal (including quotes).
 /// Uses serde_json serialization which properly escapes backslashes, quotes,
@@ -42,6 +74,610 @@ pub async fn execute_act(
     action: &str,
     ref_id: &str,
     args: &Value,
+    policies: ActionPolicies<'_>,
+) -> Result<Value> {
+    let dialog_watchdog = DialogWatchdog::start(page, policies.dialog).await;
+    let budget = action_budget(action, args);
+    let result = tokio::time::timeout(
+        budget,
+        execute_act_inner(page, store, store_key, action, ref_id, args),
+    )
+    .await;
+
+    let value = match result {
+        Ok(Ok(value)) => normalize_outcome(value),
+        Ok(Err(e)) if is_invalid_input(&e) || is_permission_denied(&e) => return Err(e),
+        Ok(Err(e)) => unknown_outcome(action, ref_id, "action_error", e.to_string(), true),
+        Err(_) => {
+            store.clear(store_key).await;
+            unknown_outcome(
+                action,
+                ref_id,
+                "action_deadline",
+                format!(
+                    "the complete browser action exceeded its {}ms deadline",
+                    budget.as_millis()
+                ),
+                true,
+            )
+        }
+    };
+
+    if value["outcome"] == "applied" && !matches!(action, "options" | "wait") {
+        tokio::time::sleep(POST_ACTION_SETTLE).await;
+    }
+
+    // Enforce policy before taking the post-action snapshot. Otherwise a form
+    // submit or click redirected to an internal service could return that
+    // service's DOM before the caller had a chance to inspect the final URL.
+    let navigation_guard = policy::enforce_page(page, policies.navigation).await;
+    let mut value = if navigation_guard["status"] == "blocked" {
+        store.clear(store_key).await;
+        let mut value = value;
+        if let Value::Object(ref mut object) = value {
+            object.insert("page_state".into(), Value::Null);
+            object.insert("snapshot".into(), Value::Null);
+            object.insert(
+                "page_state_status".into(),
+                Value::String("policy_blocked".into()),
+            );
+        }
+        value
+    } else {
+        attach_post_action_state(page, store, store_key, value).await?
+    };
+    if let Value::Object(ref mut object) = value {
+        object.insert("navigation_guard".into(), navigation_guard);
+    }
+    let value = match dialog_watchdog {
+        Some(watchdog) => watchdog.finish(value).await,
+        None => value,
+    };
+    tracing::debug!(
+        action,
+        ref_id,
+        outcome = value["outcome"].as_str().unwrap_or("missing"),
+        stage = value["stage"].as_str().unwrap_or("missing"),
+        "browser action completed"
+    );
+    Ok(value)
+}
+
+/// Click viewport coordinates from a native-resolution screenshot using the
+/// same side-effect and post-state contract as ref-based clicks.
+pub async fn execute_coordinate_click(
+    page: &Page,
+    store: &SnapshotStore,
+    store_key: &str,
+    x: f64,
+    y: f64,
+    dialog_policy: DialogPolicy,
+    navigation_policy: &SsrfPolicy,
+) -> Result<Value> {
+    let dialog_watchdog = DialogWatchdog::start(page, dialog_policy).await;
+    let point = Point::new(x, y);
+    let mut value = match tokio::time::timeout(CLICK_MOUSE_BUDGET, page.move_mouse(point)).await {
+        Ok(Ok(_)) => {
+            let pressed = DispatchMouseEventParams::builder()
+                .r#type(DispatchMouseEventType::MousePressed)
+                .x(x)
+                .y(y)
+                .button(MouseButton::Left)
+                .click_count(1)
+                .build()
+                .expect("complete coordinate mouse-press parameters");
+            match tokio::time::timeout(CLICK_PRESS_BUDGET, page.execute(pressed)).await {
+                Ok(Ok(_)) => {
+                    let released = DispatchMouseEventParams::builder()
+                        .r#type(DispatchMouseEventType::MouseReleased)
+                        .x(x)
+                        .y(y)
+                        .button(MouseButton::Left)
+                        .click_count(1)
+                        .build()
+                        .expect("complete coordinate mouse-release parameters");
+                    match tokio::time::timeout(CLICK_RELEASE_BUDGET, page.execute(released)).await {
+                        Ok(Ok(_)) => json!({
+                            "status": "clicked",
+                            "outcome": "applied",
+                            "action": "click_coordinates",
+                            "method": "cdp_mouse",
+                            "x": x,
+                            "y": y,
+                            "retry_safe": false,
+                            "browser_degraded": false,
+                        }),
+                        Ok(Err(error)) => unknown_outcome(
+                            "click_coordinates",
+                            &format!("{x},{y}"),
+                            "mouse_released",
+                            error.to_string(),
+                            true,
+                        ),
+                        Err(_) => unknown_outcome(
+                            "click_coordinates",
+                            &format!("{x},{y}"),
+                            "mouse_released",
+                            "mouse-release response timed out".to_string(),
+                            true,
+                        ),
+                    }
+                }
+                Ok(Err(error)) => unknown_outcome(
+                    "click_coordinates",
+                    &format!("{x},{y}"),
+                    "mouse_pressed",
+                    error.to_string(),
+                    true,
+                ),
+                Err(_) => unknown_outcome(
+                    "click_coordinates",
+                    &format!("{x},{y}"),
+                    "mouse_pressed",
+                    "mouse-press response timed out".to_string(),
+                    true,
+                ),
+            }
+        }
+        Ok(Err(error)) => json!({
+            "status": "failed",
+            "outcome": "not_applied",
+            "action": "click_coordinates",
+            "stage": "mouse_move",
+            "reason": error.to_string(),
+            "x": x,
+            "y": y,
+            "retry_safe": true,
+            "browser_degraded": false,
+        }),
+        Err(_) => json!({
+            "status": "failed",
+            "outcome": "not_applied",
+            "action": "click_coordinates",
+            "stage": "mouse_move",
+            "reason": "mouse-move response timed out",
+            "x": x,
+            "y": y,
+            "retry_safe": true,
+            "browser_degraded": true,
+        }),
+    };
+
+    if value["outcome"] == "applied" {
+        tokio::time::sleep(POST_ACTION_SETTLE).await;
+    }
+    let navigation_guard = policy::enforce_page(page, navigation_policy).await;
+    value = if navigation_guard["status"] == "blocked" {
+        store.clear(store_key).await;
+        if let Value::Object(ref mut object) = value {
+            object.insert("page_state".into(), Value::Null);
+            object.insert("snapshot".into(), Value::Null);
+            object.insert(
+                "page_state_status".into(),
+                Value::String("policy_blocked".into()),
+            );
+        }
+        value
+    } else {
+        attach_post_action_state(page, store, store_key, value).await?
+    };
+    if let Value::Object(ref mut object) = value {
+        object.insert("navigation_guard".into(), navigation_guard);
+    }
+    Ok(match dialog_watchdog {
+        Some(watchdog) => watchdog.finish(value).await,
+        None => value,
+    })
+}
+
+/// Send physical CDP keyboard input to the currently focused element.
+///
+/// browser-use exposes this independently of indexed/ref-based element
+/// actions because it is also needed for native shortcuts and controls that
+/// retain focus after a click. Keep it on the same outcome, dialog, policy,
+/// and post-state contract as the other side-effecting actions.
+pub async fn execute_send_keys(
+    page: &Page,
+    store: &SnapshotStore,
+    store_key: &str,
+    keys: &str,
+    dialog_policy: DialogPolicy,
+    navigation_policy: &SsrfPolicy,
+) -> Result<Value> {
+    let dialog_watchdog = DialogWatchdog::start(page, dialog_policy).await;
+    let result = tokio::time::timeout(Duration::from_secs(12), send_keys_inner(page, keys)).await;
+    let mut value = match result {
+        Ok(Ok(())) => json!({
+            "status": "sent",
+            "outcome": "applied",
+            "action": "send_keys",
+            "keys": keys,
+            "method": "cdp_keyboard",
+            "retry_safe": false,
+            "browser_degraded": false,
+        }),
+        Ok(Err(error)) if is_invalid_input(&error) => return Err(error),
+        Ok(Err(error)) => unknown_outcome(
+            "send_keys",
+            "active_element",
+            "key_dispatch",
+            error.to_string(),
+            true,
+        ),
+        Err(_) => unknown_outcome(
+            "send_keys",
+            "active_element",
+            "action_deadline",
+            "the complete send-keys action exceeded its 12000ms deadline".into(),
+            true,
+        ),
+    };
+
+    if value["outcome"] == "applied" {
+        tokio::time::sleep(POST_ACTION_SETTLE).await;
+    }
+    let navigation_guard = policy::enforce_page(page, navigation_policy).await;
+    value = if navigation_guard["status"] == "blocked" {
+        store.clear(store_key).await;
+        if let Value::Object(ref mut object) = value {
+            object.insert("page_state".into(), Value::Null);
+            object.insert("snapshot".into(), Value::Null);
+            object.insert(
+                "page_state_status".into(),
+                Value::String("policy_blocked".into()),
+            );
+        }
+        value
+    } else {
+        attach_post_action_state(page, store, store_key, value).await?
+    };
+    if let Value::Object(ref mut object) = value {
+        object.insert("navigation_guard".into(), navigation_guard);
+    }
+    Ok(match dialog_watchdog {
+        Some(watchdog) => watchdog.finish(value).await,
+        None => value,
+    })
+}
+
+fn normalize_key_alias(key: &str) -> String {
+    match key.trim().to_ascii_lowercase().as_str() {
+        "ctrl" | "control" => "Control".into(),
+        "alt" | "option" => "Alt".into(),
+        "meta" | "cmd" | "command" => "Meta".into(),
+        "shift" => "Shift".into(),
+        "enter" | "return" => "Enter".into(),
+        "tab" => "Tab".into(),
+        "delete" => "Delete".into(),
+        "backspace" => "Backspace".into(),
+        "escape" | "esc" => "Escape".into(),
+        "space" => " ".into(),
+        "up" => "ArrowUp".into(),
+        "down" => "ArrowDown".into(),
+        "left" => "ArrowLeft".into(),
+        "right" => "ArrowRight".into(),
+        "pageup" => "PageUp".into(),
+        "pagedown" => "PageDown".into(),
+        "home" => "Home".into(),
+        "end" => "End".into(),
+        _ => key.to_string(),
+    }
+}
+
+fn modifier_mask(key: &str) -> Option<i64> {
+    match key {
+        "Alt" => Some(1),
+        "Control" => Some(2),
+        "Meta" => Some(4),
+        "Shift" => Some(8),
+        _ => None,
+    }
+}
+
+async fn dispatch_key_event(
+    page: &Page,
+    event_type: DispatchKeyEventType,
+    key: &str,
+    modifiers: i64,
+) -> Result<()> {
+    let definition = chromiumoxide::keys::get_key_definition(key).ok_or_else(|| {
+        Error::ToolExecution(ToolError::invalid_input(format!(
+            "unsupported physical key '{key}'"
+        )))
+    })?;
+    let mut params = DispatchKeyEventParams::builder()
+        .r#type(event_type)
+        .key(definition.key)
+        .code(definition.code)
+        .windows_virtual_key_code(definition.key_code)
+        .native_virtual_key_code(definition.key_code);
+    if modifiers != 0 {
+        params = params.modifiers(modifiers);
+    }
+    page.execute(params.build().expect("complete key-event parameters"))
+        .await
+        .map_err(|error| {
+            Error::ToolExecution(format!("physical key dispatch failed: {error}").into())
+        })?;
+    Ok(())
+}
+
+async fn press_physical_key(page: &Page, key: &str) -> Result<()> {
+    let definition = chromiumoxide::keys::get_key_definition(key).ok_or_else(|| {
+        Error::ToolExecution(ToolError::invalid_input(format!(
+            "unsupported physical key '{key}'"
+        )))
+    })?;
+    let text = definition
+        .text
+        .map(str::to_string)
+        .or_else(|| (definition.key.chars().count() == 1).then(|| definition.key.to_string()));
+    let event_type = if text.is_some() {
+        DispatchKeyEventType::KeyDown
+    } else {
+        DispatchKeyEventType::RawKeyDown
+    };
+    let mut down = DispatchKeyEventParams::builder()
+        .r#type(event_type)
+        .key(definition.key)
+        .code(definition.code)
+        .windows_virtual_key_code(definition.key_code)
+        .native_virtual_key_code(definition.key_code);
+    if let Some(text) = text {
+        down = down.text(text);
+    }
+    page.execute(down.build().expect("complete key-down parameters"))
+        .await
+        .map_err(|error| {
+            Error::ToolExecution(format!("physical key-down failed: {error}").into())
+        })?;
+    dispatch_key_event(page, DispatchKeyEventType::KeyUp, key, 0).await
+}
+
+async fn send_keys_inner(page: &Page, keys: &str) -> Result<()> {
+    if keys.is_empty() {
+        return Err(Error::ToolExecution(ToolError::invalid_input(
+            "'send_keys' requires non-empty 'keys'",
+        )));
+    }
+
+    // Treat plus as a shortcut delimiter only when every prefix component is
+    // a modifier. This preserves literal text such as `a+b` and supports the
+    // browser-use spelling `Control++` for Control + plus.
+    let shortcut = if let Some(prefix) = keys.strip_suffix("++") {
+        let modifiers: Vec<String> = prefix.split('+').map(normalize_key_alias).collect();
+        if !modifiers.is_empty() && modifiers.iter().all(|key| modifier_mask(key).is_some()) {
+            Some((modifiers, "+".to_string()))
+        } else {
+            None
+        }
+    } else if let Some((prefix, main)) = keys.rsplit_once('+') {
+        let modifiers: Vec<String> = prefix.split('+').map(normalize_key_alias).collect();
+        if !main.trim().is_empty()
+            && !modifiers.is_empty()
+            && modifiers.iter().all(|key| modifier_mask(key).is_some())
+        {
+            Some((modifiers, normalize_key_alias(main)))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    if let Some((modifiers, main)) = shortcut {
+        let mask = modifiers
+            .iter()
+            .filter_map(|key| modifier_mask(key))
+            .fold(0, |combined, value| combined | value);
+        for modifier in &modifiers {
+            dispatch_key_event(page, DispatchKeyEventType::RawKeyDown, modifier, 0).await?;
+        }
+        dispatch_key_event(page, DispatchKeyEventType::RawKeyDown, &main, mask).await?;
+        dispatch_key_event(page, DispatchKeyEventType::KeyUp, &main, mask).await?;
+        for modifier in modifiers.iter().rev() {
+            dispatch_key_event(page, DispatchKeyEventType::KeyUp, modifier, 0).await?;
+        }
+        return Ok(());
+    }
+
+    let normalized = normalize_key_alias(keys);
+    let is_special = matches!(
+        normalized.as_str(),
+        "Enter"
+            | "Tab"
+            | "Delete"
+            | "Backspace"
+            | "Escape"
+            | "ArrowUp"
+            | "ArrowDown"
+            | "ArrowLeft"
+            | "ArrowRight"
+            | "PageUp"
+            | "PageDown"
+            | "Home"
+            | "End"
+            | "Control"
+            | "Alt"
+            | "Meta"
+            | "Shift"
+            | "F1"
+            | "F2"
+            | "F3"
+            | "F4"
+            | "F5"
+            | "F6"
+            | "F7"
+            | "F8"
+            | "F9"
+            | "F10"
+            | "F11"
+            | "F12"
+    );
+    if is_special {
+        press_physical_key(page, &normalized).await?;
+    } else {
+        for part in normalized.split_inclusive(['\n', '\r']) {
+            let text = part.trim_end_matches(['\n', '\r']);
+            if !text.is_empty() {
+                for character in text.chars() {
+                    let key = character.to_string();
+                    if chromiumoxide::keys::get_key_definition(&key).is_some() {
+                        press_physical_key(page, &key).await?;
+                    } else {
+                        // CDP's text insertion path covers Unicode characters
+                        // not represented in chromiumoxide's US keyboard map.
+                        page.execute(InsertTextParams::new(key))
+                            .await
+                            .map_err(|error| {
+                                Error::ToolExecution(
+                                    format!("Unicode text dispatch failed: {error}").into(),
+                                )
+                            })?;
+                    }
+                }
+            }
+            if part.ends_with(['\n', '\r']) {
+                press_physical_key(page, "Enter").await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Watch native JavaScript dialogs while an action is in flight. A modal
+/// `alert`, `confirm`, or `prompt` freezes the renderer until CDP handles it;
+/// without a concurrent listener, the action and the post-action snapshot can
+/// both time out even though the click itself succeeded.
+struct DialogWatchdog {
+    observations: Arc<tokio::sync::Mutex<Vec<Value>>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl DialogWatchdog {
+    async fn start(page: &Page, policy: DialogPolicy) -> Option<Self> {
+        let mut events = tokio::time::timeout(
+            Duration::from_millis(500),
+            page.event_listener::<EventJavascriptDialogOpening>(),
+        )
+        .await
+        .ok()?
+        .ok()?;
+        let page = page.clone();
+        let observations = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let task_observations = Arc::clone(&observations);
+        let task = tokio::spawn(async move {
+            while let Some(event) = events.next().await {
+                let dialog_type = event.r#type.as_ref().to_string();
+                let message = event.message.clone();
+                let accept = match policy {
+                    DialogPolicy::Accept => true,
+                    DialogPolicy::Dismiss => false,
+                    DialogPolicy::Auto => {
+                        matches!(dialog_type.as_str(), "alert" | "confirm" | "beforeunload")
+                    }
+                };
+                let handled = matches!(
+                    tokio::time::timeout(
+                        Duration::from_secs(2),
+                        page.execute(HandleJavaScriptDialogParams::new(accept)),
+                    )
+                    .await,
+                    Ok(Ok(_))
+                );
+                tracing::info!(
+                    dialog_type,
+                    handled,
+                    "handled JavaScript dialog opened by browser action"
+                );
+                task_observations.lock().await.push(json!({
+                    "type": dialog_type,
+                    "message": message,
+                    "accepted": handled && accept,
+                    "dismissed": handled && !accept,
+                    "handled": handled,
+                }));
+            }
+        });
+        Some(Self { observations, task })
+    }
+
+    async fn finish(self, mut value: Value) -> Value {
+        // Give a dialog event queued with the action response one scheduler
+        // turn to reach the listener before it is detached.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        self.task.abort();
+        let observations = self.observations.lock().await.clone();
+        if observations.is_empty() {
+            return value;
+        }
+
+        if let Value::Object(ref mut object) = value {
+            // A handled dialog opened during this click is independent
+            // evidence that the click handler ran. A missing mouse-release
+            // response is no longer ambiguous in that case.
+            let dialog_proves_click = matches!(
+                object.get("action").and_then(Value::as_str),
+                Some("click" | "click_coordinates")
+            ) && object.get("outcome").and_then(Value::as_str)
+                == Some("unknown")
+                && observations
+                    .iter()
+                    .any(|dialog| dialog["handled"].as_bool() == Some(true));
+            if dialog_proves_click {
+                object.insert("status".into(), Value::String("clicked".into()));
+                object.insert("outcome".into(), Value::String("applied".into()));
+                object.insert("browser_degraded".into(), Value::Bool(false));
+                object.insert("confirmed_by".into(), Value::String("dialog_opened".into()));
+                object.insert(
+                    "message".into(),
+                    Value::String(
+                        "The click opened and accepted a JavaScript dialog; the dialog event confirms the action was applied."
+                            .into(),
+                    ),
+                );
+            }
+            object.insert("dialogs".into(), Value::Array(observations));
+        }
+        value
+    }
+}
+
+/// Every successful call has an explicit outcome contract. Older action
+/// implementations returned only verbs such as `typed` or `pressed`, which
+/// made a credential caller treat any `Ok(Value)` as proof that the side
+/// effect happened. Preserve their useful details while making the outcome
+/// and retry semantics machine-readable.
+fn normalize_outcome(mut value: Value) -> Value {
+    if let Value::Object(ref mut object) = value {
+        if !object.contains_key("outcome") {
+            let status = object.get("status").and_then(Value::as_str);
+            let outcome = match status {
+                Some("new_snapshot" | "timeout") => "not_applied",
+                Some("unknown") => "unknown",
+                _ => "applied",
+            };
+            object.insert("outcome".into(), Value::String(outcome.into()));
+        }
+        object
+            .entry("retry_safe")
+            .or_insert_with(|| Value::Bool(false));
+        object
+            .entry("browser_degraded")
+            .or_insert_with(|| Value::Bool(false));
+    }
+    value
+}
+
+/// The actual action flow, wrapped as one future by [`execute_act`] so every
+/// sub-operation, stale-ref repair, and retry shares one absolute budget.
+async fn execute_act_inner(
+    page: &Page,
+    store: &SnapshotStore,
+    store_key: &str,
+    action: &str,
+    ref_id: &str,
+    args: &Value,
 ) -> Result<Value> {
     let element_ref = match store.get_ref(store_key, ref_id).await {
         Some(r) => r,
@@ -63,7 +699,7 @@ pub async fn execute_act(
 
     let url_before = current_url(page).await;
 
-    match dispatch_act(page, store, store_key, action, &element_ref.selector, args).await {
+    match dispatch_act(page, store, store_key, action, ref_id, &element_ref, args).await {
         Ok(v) => Ok(v),
         // A pre-action "element not found" (typed NotFound) means a stale ref —
         // recover. Genuine failures after the element resolved (click/type
@@ -86,17 +722,51 @@ pub async fn execute_act(
     }
 }
 
-/// Run a single ref-based action against an explicit CSS selector.
+/// Run a single ref-based action against an element captured in a specific
+/// document context. Child-frame identity is intentionally carried separately
+/// from the CSS selector: selectors are document-local, and concatenating an
+/// iframe selector cannot cross the same-origin boundary.
 async fn dispatch_act(
     page: &Page,
     store: &SnapshotStore,
     store_key: &str,
     action: &str,
-    selector: &str,
+    ref_id: &str,
+    element_ref: &ElementRef,
     args: &Value,
 ) -> Result<Value> {
+    if element_ref.target_id.is_some() {
+        let context = store.oopif_context(store_key).await.ok_or_else(|| {
+            Error::ToolExecution(
+                "site-isolated iframe action is unavailable because its CDP context expired; take a new snapshot"
+                    .into(),
+            )
+        })?;
+        let target = if action == "drag" {
+            let target_ref = args["targetRef"].as_str().ok_or_else(|| {
+                Error::ToolExecution(ToolError::invalid_input("drag requires targetRef"))
+            })?;
+            Some(store.get_ref(store_key, target_ref).await.ok_or_else(|| {
+                Error::ToolExecution(ToolError::not_found(format!(
+                    "target ref '{target_ref}' not found"
+                )))
+            })?)
+        } else {
+            None
+        };
+        return super::oopif::execute_action(
+            &context.websocket_url,
+            action,
+            element_ref,
+            target.as_ref(),
+            args,
+            &context.policy,
+        )
+        .await;
+    }
+
     match action {
-        "click" => act_click(page, selector).await,
+        "click" => act_click(page, ref_id, element_ref).await,
         "type" | "fill" => {
             let text = args["text"].as_str().ok_or_else(|| {
                 Error::ToolExecution(ToolError::invalid_input(
@@ -104,7 +774,7 @@ async fn dispatch_act(
                 ))
             })?;
             let clear = args["clear"].as_bool().unwrap_or(true); // fill clears by default
-            act_type(page, selector, text, clear).await
+            act_type(page, element_ref, text, clear).await
         }
         "press" => {
             let key = args["key"].as_str().ok_or_else(|| {
@@ -112,16 +782,16 @@ async fn dispatch_act(
                     "'press' action requires 'key' parameter",
                 ))
             })?;
-            act_press(page, selector, key).await
+            act_press(page, element_ref, key).await
         }
-        "hover" => act_hover(page, selector).await,
+        "hover" => act_hover(page, element_ref).await,
         "select" => {
             let value = args["value"].as_str().ok_or_else(|| {
                 Error::ToolExecution(ToolError::invalid_input(
                     "'select' action requires 'value' parameter",
                 ))
             })?;
-            act_select(page, selector, value).await
+            act_select(page, element_ref, value).await
         }
         "drag" => {
             let target_ref = args["targetRef"].as_str().ok_or_else(|| {
@@ -134,14 +804,34 @@ async fn dispatch_act(
                     "target ref '{target_ref}' not found"
                 )))
             })?;
-            act_drag(page, selector, &target.selector).await
+            act_drag(page, element_ref, &target).await
         }
+        "upload" => {
+            let paths = args["paths"]
+                .as_array()
+                .ok_or_else(|| {
+                    Error::ToolExecution(ToolError::invalid_input(
+                        "'upload' requires a non-empty 'paths' array",
+                    ))
+                })?
+                .iter()
+                .filter_map(Value::as_str)
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>();
+            if paths.is_empty() {
+                return Err(Error::ToolExecution(ToolError::invalid_input(
+                    "'upload' requires a non-empty 'paths' array",
+                )));
+            }
+            act_upload(page, element_ref, &paths).await
+        }
+        "options" => act_dropdown_options(page, element_ref).await,
         "wait" => {
-            let timeout_ms = args["timeout_ms"].as_u64().unwrap_or(10_000);
-            act_wait_for_element(page, selector, timeout_ms).await
+            let timeout_ms = args["timeout_ms"].as_u64().unwrap_or(10_000).min(30_000);
+            act_wait_for_element(page, element_ref, timeout_ms).await
         }
         _ => Err(Error::ToolExecution(ToolError::invalid_input(format!(
-            "unknown act action '{action}'. Available: click, type, fill, press, hover, select, drag, wait"
+            "unknown act action '{action}'. Available: click, type, fill, press, hover, select, drag, upload, options, wait"
         )))),
     }
 }
@@ -152,8 +842,33 @@ fn is_stale_element(e: &Error) -> bool {
     matches!(e, Error::ToolExecution(te) if te.kind == ToolErrorKind::NotFound)
 }
 
+fn is_invalid_input(e: &Error) -> bool {
+    matches!(e, Error::ToolExecution(te) if te.kind == ToolErrorKind::InvalidInput)
+}
+
+fn is_permission_denied(e: &Error) -> bool {
+    matches!(e, Error::ToolExecution(te) if te.kind == ToolErrorKind::PermissionDenied)
+}
+
 async fn current_url(page: &Page) -> Option<String> {
     page.url().await.ok().flatten()
+}
+
+/// Browser-use carries the current page state forward but does not retain a
+/// verbose accessibility object for every action.  Keep all visible text and
+/// refs here, while using the compact line representation to avoid making each
+/// model turn progressively slower on dense application pages.
+fn action_snapshot_options() -> SnapshotOptions {
+    SnapshotOptions {
+        // Preserve visible outcome text such as validation errors, login
+        // failures, live-region updates, and confirmation messages. Keeping
+        // only controls makes the next model turn cheaper, but can hide the
+        // only evidence that the preceding action succeeded or failed. The
+        // compact representation and snapshot output cap bound the cost.
+        interactive_only: false,
+        compact: true,
+        ..SnapshotOptions::default()
+    }
 }
 
 /// A stale-ref action failed. Re-snapshot, then either silently re-resolve the
@@ -172,7 +887,7 @@ async fn heal_or_escalate(
 ) -> Result<Value> {
     // Re-snapshot first: this refreshes the store (so find_by_identity sees the
     // current DOM) and gives us a payload to embed if we escalate.
-    let snapshot = take_snapshot(page, &SnapshotOptions::default(), store, store_key)
+    let snapshot = take_snapshot(page, &action_snapshot_options(), store, store_key)
         .await
         .ok();
     let url_after = current_url(page).await;
@@ -192,24 +907,31 @@ async fn heal_or_escalate(
     // Guard 2 — unique identity. Heal only when exactly one element still
     // matches the stale ref's role+name; none or several means escalate.
     let matches = store
-        .find_by_identity(store_key, &stale.role, &stale.name)
+        .find_by_identity(
+            store_key,
+            &stale.role,
+            &stale.name,
+            stale.frame_url.as_deref(),
+        )
         .await;
     match matches.as_slice() {
-        [only] => match dispatch_act(page, store, store_key, action, &only.selector, args).await {
-            Ok(mut v) => {
-                if let Value::Object(ref mut o) = v {
-                    o.insert("recovered".into(), Value::Bool(true));
+        [only] => {
+            match dispatch_act(page, store, store_key, action, &only.ref_id, only, args).await {
+                Ok(mut v) => {
+                    if let Value::Object(ref mut o) = v {
+                        o.insert("recovered".into(), Value::Bool(true));
+                    }
+                    Ok(v)
                 }
-                Ok(v)
+                Err(_) => Ok(new_snapshot_payload(
+                    action,
+                    ref_id,
+                    "the matching element could not be actioned",
+                    snapshot,
+                    url_after.as_deref(),
+                )),
             }
-            Err(_) => Ok(new_snapshot_payload(
-                action,
-                ref_id,
-                "the matching element could not be actioned",
-                snapshot,
-                url_after.as_deref(),
-            )),
-        },
+        }
         [] => Ok(new_snapshot_payload(
             action,
             ref_id,
@@ -227,6 +949,95 @@ async fn heal_or_escalate(
     }
 }
 
+/// Most interactions should either complete or produce actionable state well
+/// before the runner's 60-second browser-tool ceiling. `wait` is the exception:
+/// its caller-supplied wait is honored, with a small allowance for state
+/// capture, but capped so one model call cannot monopolize the browser.
+fn action_budget(action: &str, args: &Value) -> Duration {
+    if action == "wait" {
+        let requested = args["timeout_ms"].as_u64().unwrap_or(10_000);
+        return Duration::from_millis(requested.min(30_000).saturating_add(2_000));
+    }
+    Duration::from_secs(15)
+}
+
+/// Attach the current page state to an action result. This mirrors the useful
+/// browser-use invariant that an action and the state it produced travel back
+/// together. A failed state capture never changes the action outcome.
+async fn attach_post_action_state(
+    page: &Page,
+    store: &SnapshotStore,
+    store_key: &str,
+    mut value: Value,
+) -> Result<Value> {
+    if value["status"] == "new_snapshot" {
+        return Ok(value);
+    }
+
+    let state = tokio::time::timeout(
+        Duration::from_secs(5),
+        take_snapshot(page, &action_snapshot_options(), store, store_key),
+    )
+    .await;
+
+    if let Value::Object(ref mut object) = value {
+        match state {
+            Ok(Ok(snapshot)) => {
+                object.insert("page_state".into(), snapshot);
+                object.insert("page_state_status".into(), Value::String("captured".into()));
+            }
+            Ok(Err(error)) => {
+                object.insert("page_state".into(), Value::Null);
+                object.insert("page_state_status".into(), Value::String("failed".into()));
+                object.insert("page_state_reason".into(), Value::String(error.to_string()));
+            }
+            Err(_) => {
+                object.insert("page_state".into(), Value::Null);
+                object.insert(
+                    "page_state_status".into(),
+                    Value::String("timed_out".into()),
+                );
+                object.insert(
+                    "page_state_reason".into(),
+                    Value::String(
+                        "post-action snapshot exceeded its 5s observation budget; the action outcome is unchanged"
+                            .into(),
+                    ),
+                );
+            }
+        }
+    }
+    Ok(value)
+}
+
+fn unknown_outcome(
+    action: &str,
+    ref_id: &str,
+    stage: &str,
+    reason: String,
+    browser_degraded: bool,
+) -> Value {
+    tracing::warn!(
+        action,
+        ref_id,
+        stage,
+        browser_degraded,
+        reason = %reason,
+        "browser action outcome is unknown"
+    );
+    json!({
+        "status": "unknown",
+        "outcome": "unknown",
+        "action": action,
+        "ref": ref_id,
+        "stage": stage,
+        "reason": reason,
+        "retry_safe": false,
+        "browser_degraded": browser_degraded,
+        "message": "The browser may have applied this action before the response was lost. Do not repeat it blindly; use page_state or a new snapshot to determine what happened."
+    })
+}
+
 /// Re-snapshot and build a stale-ref escalation payload without attempting a
 /// heal (used when there's no stored identity to re-resolve).
 async fn escalate(
@@ -237,7 +1048,7 @@ async fn escalate(
     ref_id: &str,
     reason: &str,
 ) -> Value {
-    let snapshot = take_snapshot(page, &SnapshotOptions::default(), store, store_key)
+    let snapshot = take_snapshot(page, &action_snapshot_options(), store, store_key)
         .await
         .ok();
     let url = current_url(page).await;
@@ -278,8 +1089,8 @@ fn new_snapshot_payload(
 ///
 /// A page whose DOM handle has gone stale -- which happens after it
 /// navigates -- answers `DOM.querySelector` neither quickly nor at all.
-/// Unbounded, the call falls through to the CDP client's own 30s request
-/// timeout, the runner retries the identical call, and one unreachable
+/// Unbounded, the call falls through to the configurable CDP request timeout,
+/// the runner retries the identical call, and one unreachable
 /// input consumed three 60s tool budgets inside a single 600s trial
 /// before it ran out. The page itself was healthy throughout: the
 /// accessibility snapshot kept returning the full form while every
@@ -287,7 +1098,504 @@ fn new_snapshot_payload(
 ///
 /// Ten seconds is far longer than a live document needs and far shorter
 /// than a wedged one costs.
-const ELEMENT_OP_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+const ELEMENT_OP_BUDGET: Duration = Duration::from_secs(3);
+const CLICK_GEOMETRY_BUDGET: Duration = Duration::from_secs(3);
+const CLICK_MOUSE_BUDGET: Duration = Duration::from_secs(2);
+const CLICK_PRESS_BUDGET: Duration = Duration::from_secs(3);
+const CLICK_RELEASE_BUDGET: Duration = Duration::from_secs(5);
+const CLICK_JS_FALLBACK_BUDGET: Duration = Duration::from_secs(3);
+
+/// Resolve selectors through open shadow roots. Legacy `|||` chains are kept
+/// for refs produced by older snapshots; new iframe refs carry a CDP frame id
+/// and begin resolving from that frame's own `document`.
+const ELEMENT_RESOLVER: &str = r#"function(selector) {
+    var parts = String(selector).split(/( >>> | \|\|\| )/);
+    var root = document;
+    var element = root.querySelector(parts[0]);
+    for (var i = 1; element && i < parts.length; i += 2) {
+        var boundary = parts[i];
+        root = boundary === ' >>> ' ? element.shadowRoot : element.contentDocument;
+        if (!root || !root.querySelector) return null;
+        element = root.querySelector(parts[i + 1]);
+    }
+    return element || null;
+}"#;
+
+#[derive(Debug, Clone)]
+struct ResolvedElement {
+    object_id: RemoteObjectId,
+    backend_node_id: BackendNodeId,
+}
+
+/// A credential target is resolved once, before consulting the vault. Unlike
+/// ordinary text input it is never healed to a different node or sent to the
+/// currently focused element. Origin and field checks run again atomically
+/// with assignment, so a navigation/type mutation cannot redirect the value.
+pub(crate) struct CredentialTarget {
+    resolved: ResolvedElement,
+    origin: String,
+    field: String,
+}
+
+const CREDENTIAL_TARGET_CHECK: &str = r#"
+    if (!this.isConnected || !this.ownerDocument || !this.ownerDocument.defaultView) return 'detached';
+    var view = this.ownerDocument.defaultView;
+    try {
+        if (view.location.origin !== expectedOrigin || view.top.location.origin !== expectedOrigin) return 'origin_mismatch';
+    } catch (_) { return 'origin_mismatch'; }
+    if (this.tagName !== 'INPUT' || this.disabled || this.readOnly) return 'unsupported_field';
+    var kind = (this.type || '').toLowerCase();
+    var identity = [this.id, this.name, this.getAttribute('autocomplete'), this.getAttribute('aria-label')].join(' ').toLowerCase();
+    if (/cc-|card[\s_-]*(number|no|security|verification)|credit[\s_-]*card|\bcvv2?\b|\bcvc2?\b|\bcsc\b|security[\s_-]*code/.test(identity)) return 'payment_field';
+    if (field === 'password' ? kind !== 'password' : !['text', 'email', 'tel'].includes(kind)) return 'unsupported_field';
+"#;
+
+pub(crate) async fn prepare_credential_target(
+    page: &Page,
+    store: &SnapshotStore,
+    store_key: &str,
+    ref_id: &str,
+    origin: &str,
+    field: &str,
+) -> Result<CredentialTarget> {
+    let element_ref = store.get_ref(store_key, ref_id).await.ok_or_else(|| {
+        Error::ToolExecution(ToolError::not_found(
+            "credential ref expired; take a fresh snapshot",
+        ))
+    })?;
+    // OOPIFs are cross-origin by definition here. Ordinary same-origin child
+    // frames use the page's execution contexts and pass the live check below.
+    // Hosted sign-in/payment frames require a separate explicit consent model.
+    if element_ref.target_id.is_some() {
+        return Err(Error::ToolExecution(ToolError::permission_denied(
+            "credential fill into a site-isolated frame is not authorized",
+        )));
+    }
+    let resolved = resolve_element(page, &element_ref).await?;
+    let function = format!(
+        "function() {{ var expectedOrigin = {}; var field = {}; {CREDENTIAL_TARGET_CHECK} return 'ready'; }}",
+        js_string_literal(origin), js_string_literal(field)
+    );
+    let check = tokio::time::timeout(
+        ELEMENT_OP_BUDGET,
+        call_on_element(page, &resolved, &function),
+    )
+    .await
+    .map_err(|_| Error::ToolExecution("credential target verification timed out".into()))?
+    .map_err(|_| Error::ToolExecution("credential target verification failed".into()))?;
+    if check != "ready" {
+        return Err(Error::ToolExecution(ToolError::permission_denied(
+            "credential target must be an enabled login input in the live top-level origin; passwords require type=password",
+        )));
+    }
+    Ok(CredentialTarget {
+        resolved,
+        origin: origin.to_string(),
+        field: field.to_string(),
+    })
+}
+
+pub(crate) async fn fill_credential_target(
+    page: &Page,
+    target: &CredentialTarget,
+    value: &str,
+) -> Result<Value> {
+    // Setter is object-bound, not focus-bound. Do not use Input.insertText here:
+    // onfocus handlers can redirect focus to an unrelated or cross-origin box.
+    // Only constant status strings return across CDP; exception details may
+    // contain a value echoed by page code, so they are deliberately discarded.
+    let function = format!(
+        "function() {{ var expectedOrigin = {}; var field = {}; {CREDENTIAL_TARGET_CHECK} var value = {}; var setter = Object.getOwnPropertyDescriptor(view.HTMLInputElement.prototype, 'value').set; setter.call(this, value); this.dispatchEvent(new view.Event('input', {{bubbles:true}})); this.dispatchEvent(new view.Event('change', {{bubbles:true}})); return 'filled'; }}",
+        js_string_literal(&target.origin), js_string_literal(&target.field), js_string_literal(value)
+    );
+    match tokio::time::timeout(
+        ELEMENT_OP_BUDGET,
+        call_on_element(page, &target.resolved, &function),
+    )
+    .await
+    {
+        Ok(Ok(result)) if result == "filled" => {
+            Ok(json!({"status":"filled", "outcome":"applied", "retry_safe":false}))
+        }
+        Ok(Ok(_)) => Ok(
+            json!({"status":"blocked", "outcome":"not_applied", "retry_safe":true,
+            "reason":"credential target changed after verification; take a fresh snapshot"}),
+        ),
+        _ => Ok(
+            json!({"status":"unknown", "outcome":"unknown", "retry_safe":false,
+            "reason":"credential assignment was interrupted; inspect state without repeating it blindly"}),
+        ),
+    }
+}
+
+/// Enter one part of an approved card into the field behind `ref_id`.
+///
+/// The field is checked and filled in one page-side call
+/// ([`super::payment::FILL_PAYMENT_FIELD`]), so the origin, frame chain and
+/// field identity that were verified are the ones the value lands in. Card
+/// fields usually sit in a payment provider's site-isolated frame, so OOPIF
+/// refs go through the raw-CDP bridge rather than being refused as they are
+/// for login credentials.
+///
+/// Returns the script's status string. A CDP failure or page exception
+/// becomes `"interrupted"`: exception details can carry a value echoed by
+/// page code, so none of them travel back.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn fill_payment_field(
+    page: &Page,
+    store: &SnapshotStore,
+    store_key: &str,
+    ref_id: &str,
+    merchant_origin: &str,
+    provider_origins: &[String],
+    field: super::payment::PaymentField,
+    value_json: &str,
+) -> Result<String> {
+    let element_ref = store.get_ref(store_key, ref_id).await.ok_or_else(|| {
+        Error::ToolExecution(ToolError::not_found(
+            "payment field ref expired; take a fresh snapshot",
+        ))
+    })?;
+    let call = format!(
+        "return ({})(el, {}, {}, {}, {});",
+        super::payment::FILL_PAYMENT_FIELD,
+        js_string_literal(merchant_origin),
+        super::payment::origins_literal(provider_origins),
+        js_string_literal(field.as_str()),
+        value_json
+    );
+
+    let result = if element_ref.target_id.is_some() {
+        let context = store.oopif_context(store_key).await.ok_or_else(|| {
+            Error::ToolExecution(ToolError::not_found(
+                "the payment frame's CDP context expired; take a fresh snapshot",
+            ))
+        })?;
+        super::oopif::run_on_element(&context.websocket_url, &element_ref, &call, &context.policy)
+            .await
+            .map_err(|_| ())
+    } else {
+        let resolved = resolve_element(page, &element_ref).await?;
+        let function = format!("function() {{ var el = this; {call} }}");
+        match tokio::time::timeout(
+            ELEMENT_OP_BUDGET,
+            call_on_element(page, &resolved, &function),
+        )
+        .await
+        {
+            Ok(Ok(value)) => Ok(value),
+            _ => Err(()),
+        }
+    };
+    Ok(match result {
+        Ok(Value::String(status)) => status,
+        // The OOPIF bridge reports a missing element as `{ok: false}`.
+        Ok(value) if value["ok"] == false => "detached".to_string(),
+        _ => "interrupted".to_string(),
+    })
+}
+
+/// A pay control that has been checked to sit on the merchant's own page,
+/// with what pressing it would agree to.
+pub(crate) struct PayTarget {
+    element_ref: ElementRef,
+    /// The control's own label, e.g. "Pay $46.00".
+    pub label: String,
+    /// The top document's visible text, for the total check. Never returned
+    /// to the model.
+    pub text: String,
+}
+
+/// Resolve and verify the control the agent wants to press as pay.
+///
+/// `Ok(Err(status))` is a refusal with a constant reason; `Err` is a stale
+/// ref. Pay buttons in cross-site frames are refused: the total check reads
+/// the merchant's page, and a button elsewhere is not provably its button.
+pub(crate) async fn prepare_pay(
+    page: &Page,
+    store: &SnapshotStore,
+    store_key: &str,
+    ref_id: &str,
+    merchant_origin: &str,
+) -> Result<std::result::Result<PayTarget, &'static str>> {
+    let element_ref = store.get_ref(store_key, ref_id).await.ok_or_else(|| {
+        Error::ToolExecution(ToolError::not_found(
+            "pay ref expired; take a fresh snapshot",
+        ))
+    })?;
+    if element_ref.target_id.is_some() {
+        return Ok(Err("site_isolated_frame"));
+    }
+    let resolved = resolve_element(page, &element_ref).await?;
+    let function = format!(
+        "function() {{ return ({}).call(this, {}); }}",
+        super::payment::PAY_TARGET,
+        js_string_literal(merchant_origin)
+    );
+    let checked = tokio::time::timeout(
+        ELEMENT_OP_BUDGET,
+        call_on_element(page, &resolved, &function),
+    )
+    .await;
+    let Ok(Ok(checked)) = checked else {
+        return Ok(Err("detached"));
+    };
+    match checked["status"].as_str() {
+        Some("ready") => Ok(Ok(PayTarget {
+            element_ref,
+            label: checked["label"].as_str().unwrap_or_default().to_string(),
+            text: checked["text"].as_str().unwrap_or_default().to_string(),
+        })),
+        Some("origin_mismatch") => Ok(Err("origin_mismatch")),
+        Some("disabled") => Ok(Err("disabled")),
+        _ => Ok(Err("detached")),
+    }
+}
+
+/// Press a verified pay control with a trusted click.
+///
+/// Not routed through `execute_act`: its stale-ref healing may re-resolve
+/// to a different element by role and name, and the element pressed here
+/// must be the one whose page total was just checked.
+pub(crate) async fn press_pay(page: &Page, ref_id: &str, target: &PayTarget) -> Result<Value> {
+    act_click(page, ref_id, &target.element_ref)
+        .await
+        .map(normalize_outcome)
+}
+
+/// Whether an error from [`press_pay`] happened before any input reached
+/// the page, so the approval is not yet spent.
+pub(crate) fn failed_before_press(error: &Error) -> bool {
+    is_stale_element(error)
+}
+
+/// What clicking a control would mean on a page that has a card entered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SubmitVerdict {
+    /// Not a submit — a terms checkbox, a coupon field, a "show details"
+    /// toggle. The click goes through.
+    Other,
+    /// Submits the checkout, or could not be judged in the merchant's own
+    /// document. Routed through `pay`, which checks the total first.
+    Submits,
+    /// The control is in a site-isolated frame, where neither this check nor
+    /// `pay`'s total check can reach it.
+    SiteIsolated,
+}
+
+impl SubmitVerdict {
+    /// The verdict a ref's own frame settles, before the page is asked.
+    ///
+    /// A ref carrying a `target_id` lives in a site-isolated frame (an
+    /// OOPIF). The page-side [`super::payment::SUBMIT_LIKE`] check runs in
+    /// the merchant's document and cannot see it, and `prepare_pay` refuses
+    /// such refs outright, so reading it as "not a submit" would leave a
+    /// checkout whose pay button sits in the provider's frame with no total
+    /// check at all: `pay` unavailable and a plain click unguarded. It is
+    /// therefore treated as submitting — the same conservative default the
+    /// undecidable case already takes.
+    pub(crate) fn from_frame(element_ref: &ElementRef) -> Option<Self> {
+        element_ref
+            .target_id
+            .is_some()
+            .then_some(Self::SiteIsolated)
+    }
+}
+
+/// Whether the control behind `ref_id` would plausibly submit a checkout.
+pub(crate) async fn is_submit_like(
+    page: &Page,
+    store: &SnapshotStore,
+    store_key: &str,
+    ref_id: &str,
+) -> Result<SubmitVerdict> {
+    let element_ref = store.get_ref(store_key, ref_id).await.ok_or_else(|| {
+        Error::ToolExecution(ToolError::not_found("ref expired; take a fresh snapshot"))
+    })?;
+    if let Some(verdict) = SubmitVerdict::from_frame(&element_ref) {
+        return Ok(verdict);
+    }
+    let resolved = resolve_element(page, &element_ref).await?;
+    let function = format!(
+        "function() {{ return ({}).call(this); }}",
+        super::payment::SUBMIT_LIKE
+    );
+    match tokio::time::timeout(
+        ELEMENT_OP_BUDGET,
+        call_on_element(page, &resolved, &function),
+    )
+    .await
+    {
+        Ok(Ok(Value::Bool(false))) => Ok(SubmitVerdict::Other),
+        Ok(Ok(Value::Bool(true))) => Ok(SubmitVerdict::Submits),
+        // Undecidable is treated as submitting: the cost is one refused
+        // click the agent can route through `pay`.
+        _ => Ok(SubmitVerdict::Submits),
+    }
+}
+
+fn requires_document_resolver(element_ref: &ElementRef) -> bool {
+    element_ref.frame_id.is_some()
+        || element_ref.selector.contains(SHADOW_SEP)
+        || element_ref.selector.contains(IFRAME_SEP)
+}
+
+async fn execution_context_for_ref(
+    page: &Page,
+    element_ref: &ElementRef,
+) -> Result<Option<ExecutionContextId>> {
+    let Some(frame_id) = element_ref.frame_id.as_deref() else {
+        return Ok(None);
+    };
+    match tokio::time::timeout(
+        ELEMENT_OP_BUDGET,
+        page.frame_execution_context(FrameId::new(frame_id)),
+    )
+    .await
+    {
+        Ok(Ok(Some(context_id))) => Ok(Some(context_id)),
+        Ok(Ok(None)) => Err(Error::ToolExecution(ToolError::not_found(format!(
+            "frame execution context is no longer available for '{}'",
+            element_ref.frame_url.as_deref().unwrap_or(frame_id)
+        )))),
+        Ok(Err(error)) => Err(Error::ToolExecution(ToolError::not_found(format!(
+            "failed to resolve frame '{}': {error}",
+            element_ref.frame_url.as_deref().unwrap_or(frame_id)
+        )))),
+        Err(_) => Err(Error::ToolExecution(ToolError::not_found(format!(
+            "frame lookup timed out for '{}'",
+            element_ref.frame_url.as_deref().unwrap_or(frame_id)
+        )))),
+    }
+}
+
+fn resolver_expression(selector: &str) -> String {
+    format!("({ELEMENT_RESOLVER})({})", js_string_literal(selector))
+}
+
+fn element_expression(selector: &str, body: &str) -> String {
+    format!(
+        "(function() {{ var el = ({ELEMENT_RESOLVER})({}); if (!el) return 'element_not_found'; {body} }})()",
+        js_string_literal(selector)
+    )
+}
+
+async fn evaluate_in_element_context<T: serde::de::DeserializeOwned>(
+    page: &Page,
+    element_ref: &ElementRef,
+    expression: String,
+) -> Result<T> {
+    let context_id = execution_context_for_ref(page, element_ref).await?;
+    let mut params = EvaluateParams::builder()
+        .expression(expression)
+        .return_by_value(true);
+    if let Some(context_id) = context_id {
+        params = params.context_id(context_id);
+    }
+    let params = params
+        .build()
+        .map_err(|e| Error::ToolExecution(format!("invalid browser evaluation: {e}").into()))?;
+    let result = tokio::time::timeout(ELEMENT_OP_BUDGET, page.evaluate_expression(params))
+        .await
+        .map_err(|_| Error::ToolExecution("browser evaluation timed out".into()))?
+        .map_err(|e| Error::ToolExecution(format!("browser evaluation failed: {e}").into()))?;
+    result
+        .into_value()
+        .map_err(|e| Error::ToolExecution(format!("invalid browser evaluation result: {e}").into()))
+}
+
+async fn resolve_element(page: &Page, element_ref: &ElementRef) -> Result<ResolvedElement> {
+    let context_id = execution_context_for_ref(page, element_ref).await?;
+    let mut params = EvaluateParams::builder()
+        .expression(resolver_expression(&element_ref.selector))
+        .return_by_value(false);
+    if let Some(context_id) = context_id {
+        params = params.context_id(context_id);
+    }
+    let params = params
+        .build()
+        .map_err(|e| Error::ToolExecution(format!("invalid element lookup: {e}").into()))?;
+    let evaluated = tokio::time::timeout(ELEMENT_OP_BUDGET, page.evaluate_expression(params))
+        .await
+        .map_err(|_| {
+            Error::ToolExecution(ToolError::not_found(format!(
+                "element lookup timed out for '{}'",
+                element_ref.selector
+            )))
+        })?
+        .map_err(|e| {
+            Error::ToolExecution(ToolError::not_found(format!(
+                "element lookup failed for '{}': {e}",
+                element_ref.selector
+            )))
+        })?;
+    let object_id = evaluated.object().object_id.clone().ok_or_else(|| {
+        Error::ToolExecution(ToolError::not_found(format!(
+            "element not found: '{}'",
+            element_ref.selector
+        )))
+    })?;
+    let described = tokio::time::timeout(
+        ELEMENT_OP_BUDGET,
+        page.execute(
+            DescribeNodeParams::builder()
+                .object_id(object_id.clone())
+                .depth(0)
+                .build(),
+        ),
+    )
+    .await
+    .map_err(|_| Error::ToolExecution("element description timed out".into()))?
+    .map_err(|e| {
+        Error::ToolExecution(ToolError::not_found(format!(
+            "element detached before action: {e}"
+        )))
+    })?;
+    Ok(ResolvedElement {
+        object_id,
+        backend_node_id: described.node.backend_node_id,
+    })
+}
+
+async fn call_on_element(
+    page: &Page,
+    resolved: &ResolvedElement,
+    function: &str,
+) -> std::result::Result<Value, String> {
+    let params = CallFunctionOnParams::builder()
+        .function_declaration(function)
+        .object_id(resolved.object_id.clone())
+        .await_promise(true)
+        .return_by_value(true)
+        .build()
+        .map_err(|e| format!("invalid element function: {e}"))?;
+    let response = page.execute(params).await.map_err(|e| e.to_string())?;
+    if let Some(ref exception) = response.exception_details {
+        return Err(format!("JavaScript exception: {exception:?}"));
+    }
+    Ok(response.result.result.value.unwrap_or(Value::Null))
+}
+
+async fn resolved_clickable_point(page: &Page, resolved: &ResolvedElement) -> Result<Point> {
+    let quads = page
+        .execute(
+            GetContentQuadsParams::builder()
+                .backend_node_id(resolved.backend_node_id)
+                .build(),
+        )
+        .await
+        .map_err(|e| {
+            Error::ToolExecution(format!("could not read element geometry: {e}").into())
+        })?;
+    quads
+        .quads
+        .iter()
+        .filter(|quad| quad.inner().len() == 8)
+        .map(ElementQuad::from_quad)
+        .find(|quad| quad.quad_area() > 1.0)
+        .map(|quad| quad.quad_center())
+        .ok_or_else(|| Error::ToolExecution("element has no clickable geometry".into()))
+}
 
 /// `find_element` with a bound, and an error the model can act on.
 ///
@@ -305,11 +1613,9 @@ pub(super) async fn find_element_bounded(
         )))),
         Err(_) => Err(Error::ToolExecution(
             format!(
-                "'{selector}' did not respond within {}s. The page itself is \
-                 reachable -- a snapshot still works -- but the handle used to \
-                 query its DOM is stale, which happens after the page navigates. \
-                 Take a fresh snapshot and use the refs from it; repeating this \
-                 call will fail the same way.",
+                "element lookup for '{selector}' did not respond within {}s. \
+                 The selected target session may be stale or its renderer may \
+                 be unresponsive. A fresh snapshot or browser recovery is required.",
                 ELEMENT_OP_BUDGET.as_secs()
             )
             .into(),
@@ -317,22 +1623,458 @@ pub(super) async fn find_element_bounded(
     }
 }
 
-/// Click an element by CSS selector.
-async fn act_click(page: &Page, selector: &str) -> Result<Value> {
+/// Click an element using explicit, individually-bounded CDP stages.
+///
+/// Chromiumoxide's `Element::click()` hides scroll, geometry, move, press and
+/// release behind one future. A missing response in any stage used to consume
+/// one or two 30-second client timeouts before the runner killed the tool. The
+/// explicit sequence keeps failures attributable and, critically, distinguishes
+/// failures before a side effect from ambiguous failures after mouse-down.
+async fn act_click(page: &Page, ref_id: &str, element_ref: &ElementRef) -> Result<Value> {
+    if requires_document_resolver(element_ref) {
+        return act_click_in_document_context(page, ref_id, element_ref).await;
+    }
+    let selector = &element_ref.selector;
     let elem = find_element_bounded(page, selector).await?;
-    elem.click()
-        .await
-        .map_err(|e| Error::ToolExecution(format!("click failed on '{selector}': {e}").into()))?;
-    Ok(json!({ "status": "clicked", "selector": selector }))
+    let backend_node_id = elem.backend_node_id.inner();
+
+    tracing::debug!(
+        action = "click",
+        ref_id,
+        selector,
+        backend_node_id = *backend_node_id,
+        "browser action resolved element"
+    );
+
+    match tokio::time::timeout(CLICK_GEOMETRY_BUDGET, elem.scroll_into_view()).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => {
+            return Ok(js_click_fallback(
+                &elem,
+                ref_id,
+                selector,
+                "scroll_into_view",
+                e.to_string(),
+            )
+            .await)
+        }
+        Err(_) => {
+            return Ok(js_click_fallback(
+                &elem,
+                ref_id,
+                selector,
+                "scroll_into_view",
+                "stage timed out".to_string(),
+            )
+            .await)
+        }
+    }
+
+    let point = match tokio::time::timeout(CLICK_GEOMETRY_BUDGET, elem.clickable_point()).await {
+        Ok(Ok(point)) => point,
+        Ok(Err(e)) => {
+            return Ok(
+                js_click_fallback(&elem, ref_id, selector, "clickable_point", e.to_string()).await,
+            )
+        }
+        Err(_) => {
+            return Ok(js_click_fallback(
+                &elem,
+                ref_id,
+                selector,
+                "clickable_point",
+                "stage timed out".to_string(),
+            )
+            .await)
+        }
+    };
+
+    match tokio::time::timeout(CLICK_MOUSE_BUDGET, page.move_mouse(point)).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => {
+            return Ok(
+                js_click_fallback(&elem, ref_id, selector, "mouse_move", e.to_string()).await,
+            )
+        }
+        Err(_) => {
+            return Ok(js_click_fallback(
+                &elem,
+                ref_id,
+                selector,
+                "mouse_move",
+                "stage timed out".to_string(),
+            )
+            .await)
+        }
+    }
+
+    let pressed = DispatchMouseEventParams::builder()
+        .r#type(DispatchMouseEventType::MousePressed)
+        .x(point.x)
+        .y(point.y)
+        .button(MouseButton::Left)
+        .click_count(1)
+        .build()
+        .expect("complete mouse-press parameters");
+    match tokio::time::timeout(CLICK_PRESS_BUDGET, page.execute(pressed)).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => {
+            return Ok(unknown_outcome(
+                "click",
+                ref_id,
+                "mouse_pressed",
+                e.to_string(),
+                true,
+            ))
+        }
+        Err(_) => {
+            return Ok(unknown_outcome(
+                "click",
+                ref_id,
+                "mouse_pressed",
+                "mouse-press response timed out".to_string(),
+                true,
+            ))
+        }
+    }
+
+    let released = DispatchMouseEventParams::builder()
+        .r#type(DispatchMouseEventType::MouseReleased)
+        .x(point.x)
+        .y(point.y)
+        .button(MouseButton::Left)
+        .click_count(1)
+        .build()
+        .expect("complete mouse-release parameters");
+    match tokio::time::timeout(CLICK_RELEASE_BUDGET, page.execute(released)).await {
+        Ok(Ok(_)) => Ok(json!({
+            "status": "clicked",
+            "outcome": "applied",
+            "method": "cdp_mouse",
+            "ref": ref_id,
+            "selector": selector,
+            "retry_safe": false
+        })),
+        Ok(Err(e)) => Ok(unknown_outcome(
+            "click",
+            ref_id,
+            "mouse_released",
+            e.to_string(),
+            true,
+        )),
+        Err(_) => Ok(unknown_outcome(
+            "click",
+            ref_id,
+            "mouse_released",
+            "mouse-release response timed out".to_string(),
+            true,
+        )),
+    }
+}
+
+async fn act_click_in_document_context(
+    page: &Page,
+    ref_id: &str,
+    element_ref: &ElementRef,
+) -> Result<Value> {
+    let selector = &element_ref.selector;
+    let resolved = resolve_element(page, element_ref).await?;
+    tracing::debug!(
+        action = "click",
+        ref_id,
+        selector,
+        frame_id = ?element_ref.frame_id,
+        backend_node_id = *resolved.backend_node_id.inner(),
+        "browser action resolved frame/shadow element"
+    );
+
+    let scroll = tokio::time::timeout(
+        CLICK_GEOMETRY_BUDGET,
+        call_on_element(
+            page,
+            &resolved,
+            "function() { this.scrollIntoView({block:'center', inline:'center', behavior:'instant'}); return true; }",
+        ),
+    )
+    .await;
+    if !matches!(scroll, Ok(Ok(_))) {
+        let reason = match scroll {
+            Ok(Err(reason)) => reason,
+            Err(_) => "stage timed out".to_string(),
+            Ok(Ok(_)) => unreachable!(),
+        };
+        return Ok(js_click_fallback_resolved(
+            page,
+            &resolved,
+            ref_id,
+            element_ref,
+            "scroll_into_view",
+            reason,
+        )
+        .await);
+    }
+
+    let point = match tokio::time::timeout(
+        CLICK_GEOMETRY_BUDGET,
+        resolved_clickable_point(page, &resolved),
+    )
+    .await
+    {
+        Ok(Ok(point)) => point,
+        Ok(Err(error)) => {
+            return Ok(js_click_fallback_resolved(
+                page,
+                &resolved,
+                ref_id,
+                element_ref,
+                "clickable_point",
+                error.to_string(),
+            )
+            .await)
+        }
+        Err(_) => {
+            return Ok(js_click_fallback_resolved(
+                page,
+                &resolved,
+                ref_id,
+                element_ref,
+                "clickable_point",
+                "stage timed out".to_string(),
+            )
+            .await)
+        }
+    };
+
+    match tokio::time::timeout(CLICK_MOUSE_BUDGET, page.move_mouse(point)).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => {
+            return Ok(js_click_fallback_resolved(
+                page,
+                &resolved,
+                ref_id,
+                element_ref,
+                "mouse_move",
+                error.to_string(),
+            )
+            .await)
+        }
+        Err(_) => {
+            return Ok(js_click_fallback_resolved(
+                page,
+                &resolved,
+                ref_id,
+                element_ref,
+                "mouse_move",
+                "stage timed out".to_string(),
+            )
+            .await)
+        }
+    }
+
+    let pressed = DispatchMouseEventParams::builder()
+        .r#type(DispatchMouseEventType::MousePressed)
+        .x(point.x)
+        .y(point.y)
+        .button(MouseButton::Left)
+        .click_count(1)
+        .build()
+        .expect("complete mouse-press parameters");
+    match tokio::time::timeout(CLICK_PRESS_BUDGET, page.execute(pressed)).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => {
+            return Ok(unknown_outcome(
+                "click",
+                ref_id,
+                "mouse_pressed",
+                error.to_string(),
+                true,
+            ))
+        }
+        Err(_) => {
+            return Ok(unknown_outcome(
+                "click",
+                ref_id,
+                "mouse_pressed",
+                "mouse-press response timed out".to_string(),
+                true,
+            ))
+        }
+    }
+
+    let released = DispatchMouseEventParams::builder()
+        .r#type(DispatchMouseEventType::MouseReleased)
+        .x(point.x)
+        .y(point.y)
+        .button(MouseButton::Left)
+        .click_count(1)
+        .build()
+        .expect("complete mouse-release parameters");
+    match tokio::time::timeout(CLICK_RELEASE_BUDGET, page.execute(released)).await {
+        Ok(Ok(_)) => Ok(json!({
+            "status": "clicked",
+            "outcome": "applied",
+            "method": "cdp_mouse",
+            "ref": ref_id,
+            "selector": selector,
+            "frame_id": element_ref.frame_id,
+            "retry_safe": false
+        })),
+        Ok(Err(error)) => Ok(unknown_outcome(
+            "click",
+            ref_id,
+            "mouse_released",
+            error.to_string(),
+            true,
+        )),
+        Err(_) => Ok(unknown_outcome(
+            "click",
+            ref_id,
+            "mouse_released",
+            "mouse-release response timed out".to_string(),
+            true,
+        )),
+    }
+}
+
+async fn js_click_fallback_resolved(
+    page: &Page,
+    resolved: &ResolvedElement,
+    ref_id: &str,
+    element_ref: &ElementRef,
+    failed_stage: &str,
+    failed_reason: String,
+) -> Value {
+    match tokio::time::timeout(
+        CLICK_JS_FALLBACK_BUDGET,
+        call_on_element(page, resolved, "function() { this.click(); return true; }"),
+    )
+    .await
+    {
+        Ok(Ok(_)) => json!({
+            "status": "clicked",
+            "outcome": "applied",
+            "method": "javascript",
+            "fallback_from": failed_stage,
+            "ref": ref_id,
+            "selector": element_ref.selector,
+            "frame_id": element_ref.frame_id,
+            "retry_safe": false
+        }),
+        Ok(Err(error)) => unknown_outcome(
+            "click",
+            ref_id,
+            "javascript_click",
+            format!("{failed_stage} failed ({failed_reason}); JavaScript fallback failed: {error}"),
+            true,
+        ),
+        Err(_) => unknown_outcome(
+            "click",
+            ref_id,
+            "javascript_click",
+            format!("{failed_stage} failed ({failed_reason}); JavaScript fallback timed out"),
+            true,
+        ),
+    }
+}
+
+/// Browser-use's most valuable click fallback is `HTMLElement.click()` when
+/// layout/occlusion geometry cannot be obtained. It is still a CDP request, so
+/// a lost response is an *unknown* side-effect outcome rather than a safe error.
+async fn js_click_fallback(
+    elem: &chromiumoxide::Element,
+    ref_id: &str,
+    selector: &str,
+    failed_stage: &str,
+    failed_reason: String,
+) -> Value {
+    tracing::debug!(
+        action = "click",
+        ref_id,
+        selector,
+        failed_stage,
+        reason = %failed_reason,
+        "falling back to HTMLElement.click"
+    );
+    match tokio::time::timeout(
+        CLICK_JS_FALLBACK_BUDGET,
+        elem.call_js_fn("function() { this.click(); return true; }", false),
+    )
+    .await
+    {
+        Ok(Ok(_)) => json!({
+            "status": "clicked",
+            "outcome": "applied",
+            "method": "javascript",
+            "fallback_from": failed_stage,
+            "ref": ref_id,
+            "selector": selector,
+            "retry_safe": false
+        }),
+        Ok(Err(e)) => unknown_outcome(
+            "click",
+            ref_id,
+            "javascript_click",
+            format!("{failed_stage} failed ({failed_reason}); JavaScript fallback failed: {e}"),
+            true,
+        ),
+        Err(_) => unknown_outcome(
+            "click",
+            ref_id,
+            "javascript_click",
+            format!("{failed_stage} failed ({failed_reason}); JavaScript fallback timed out"),
+            true,
+        ),
+    }
 }
 
 /// Type text into an element, optionally clearing first.
-async fn act_type(page: &Page, selector: &str, text: &str, clear: bool) -> Result<Value> {
+async fn act_type(page: &Page, element_ref: &ElementRef, text: &str, clear: bool) -> Result<Value> {
+    if requires_document_resolver(element_ref) {
+        let resolved = resolve_element(page, element_ref).await?;
+        tokio::time::timeout(
+            CLICK_GEOMETRY_BUDGET,
+            call_on_element(page, &resolved, "function() { this.focus(); return true; }"),
+        )
+        .await
+        .map_err(|_| Error::ToolExecution("focus timed out".into()))?
+        .map_err(|error| Error::ToolExecution(format!("focus failed: {error}").into()))?;
+        if clear {
+            tokio::time::timeout(
+                CLICK_GEOMETRY_BUDGET,
+                call_on_element(
+                    page,
+                    &resolved,
+                    "function() { var p = Object.getPrototypeOf(this); var d = Object.getOwnPropertyDescriptor(p, 'value'); if (d && d.set) d.set.call(this, ''); else this.value = ''; this.dispatchEvent(new InputEvent('input', {bubbles:true, inputType:'deleteContentBackward'})); this.dispatchEvent(new Event('change', {bubbles:true})); return true; }",
+                ),
+            )
+            .await
+            .map_err(|_| Error::ToolExecution("clear timed out".into()))?
+            .map_err(|error| Error::ToolExecution(format!("clear failed: {error}").into()))?;
+        }
+        tokio::time::timeout(
+            Duration::from_secs(8),
+            page.execute(InsertTextParams::new(text)),
+        )
+        .await
+        .map_err(|_| Error::ToolExecution("typing timed out".into()))?
+        .map_err(|error| Error::ToolExecution(format!("typing failed: {error}").into()))?;
+        return Ok(json!({
+            "status": "typed",
+            "selector": element_ref.selector,
+            "frame_id": element_ref.frame_id,
+            "length": text.len(),
+            "cleared": clear
+        }));
+    }
+    let selector = &element_ref.selector;
     let elem = find_element_bounded(page, selector).await?;
 
-    // Focus the element
-    elem.click()
+    // Focus without clicking. A focus click can activate a surrounding label,
+    // submit control, or navigation and makes typing's outcome ambiguous before
+    // a character has been entered.
+    tokio::time::timeout(CLICK_GEOMETRY_BUDGET, elem.focus())
         .await
+        .map_err(|_| Error::ToolExecution(format!("focus timed out on '{selector}'").into()))?
         .map_err(|e| Error::ToolExecution(format!("failed to focus '{selector}': {e}").into()))?;
 
     if clear {
@@ -341,11 +2083,17 @@ async fn act_type(page: &Page, selector: &str, text: &str, clear: bool) -> Resul
         let clear_js = format!(
             "var el = document.querySelector({sel_lit}); if(el) {{ el.value = ''; el.dispatchEvent(new Event('input', {{bubbles: true}})); }}"
         );
-        let _ = page.evaluate(clear_js).await;
+        tokio::time::timeout(CLICK_GEOMETRY_BUDGET, page.evaluate(clear_js))
+            .await
+            .map_err(|_| Error::ToolExecution(format!("clear timed out on '{selector}'").into()))?
+            .map_err(|e| {
+                Error::ToolExecution(format!("clear failed on '{selector}': {e}").into())
+            })?;
     }
 
-    elem.type_str(text)
+    tokio::time::timeout(Duration::from_secs(8), elem.type_str(text))
         .await
+        .map_err(|_| Error::ToolExecution(format!("typing timed out on '{selector}'").into()))?
         .map_err(|e| Error::ToolExecution(format!("typing failed on '{selector}': {e}").into()))?;
 
     Ok(json!({
@@ -357,49 +2105,58 @@ async fn act_type(page: &Page, selector: &str, text: &str, clear: bool) -> Resul
 }
 
 /// Press a key on an element (e.g., "Enter", "Tab", "Escape").
-async fn act_press(page: &Page, selector: &str, key: &str) -> Result<Value> {
-    let sel_lit = js_string_literal(selector);
-    let key_lit = js_string_literal(key);
-    let js = format!(
-        r#"(function() {{
-            var el = document.querySelector({sel_lit});
-            if (!el) return 'element_not_found';
-            el.focus();
-            var event = new KeyboardEvent('keydown', {{
-                key: {key_lit},
-                code: {key_lit},
-                bubbles: true,
-                cancelable: true
-            }});
-            el.dispatchEvent(event);
-            var up = new KeyboardEvent('keyup', {{
-                key: {key_lit},
-                code: {key_lit},
-                bubbles: true,
-                cancelable: true
-            }});
-            el.dispatchEvent(up);
-            return 'pressed';
-        }})()"#
-    );
-
-    let result = page
-        .evaluate(js)
+async fn act_press(page: &Page, element_ref: &ElementRef, key: &str) -> Result<Value> {
+    let selector = &element_ref.selector;
+    if requires_document_resolver(element_ref) {
+        let resolved = resolve_element(page, element_ref).await?;
+        tokio::time::timeout(
+            CLICK_GEOMETRY_BUDGET,
+            call_on_element(page, &resolved, "function() { this.focus(); return true; }"),
+        )
         .await
-        .map_err(|e| Error::ToolExecution(format!("press failed: {e}").into()))?;
-
-    let status: String = result.into_value().unwrap_or_else(|_| "unknown".into());
-    if status == "element_not_found" {
-        return Err(Error::ToolExecution(ToolError::not_found(format!(
-            "element not found: '{selector}'"
-        ))));
+        .map_err(|_| Error::ToolExecution("focus timed out".into()))?
+        .map_err(|error| Error::ToolExecution(format!("focus failed: {error}").into()))?;
+    } else {
+        let elem = find_element_bounded(page, selector).await?;
+        tokio::time::timeout(CLICK_GEOMETRY_BUDGET, elem.focus())
+            .await
+            .map_err(|_| Error::ToolExecution(format!("focus timed out on '{selector}'").into()))?
+            .map_err(|error| {
+                Error::ToolExecution(format!("failed to focus '{selector}': {error}").into())
+            })?;
     }
+    send_keys_inner(page, key).await?;
 
-    Ok(json!({ "status": "pressed", "key": key, "selector": selector }))
+    Ok(json!({
+        "status": "pressed",
+        "key": key,
+        "selector": selector,
+        "method": "cdp_keyboard",
+    }))
 }
 
 /// Hover over an element.
-async fn act_hover(page: &Page, selector: &str) -> Result<Value> {
+async fn act_hover(page: &Page, element_ref: &ElementRef) -> Result<Value> {
+    let selector = &element_ref.selector;
+    if requires_document_resolver(element_ref) {
+        let resolved = resolve_element(page, element_ref).await?;
+        call_on_element(
+            page,
+            &resolved,
+            "function() { this.scrollIntoView({block:'center', inline:'center', behavior:'instant'}); return true; }",
+        )
+        .await
+        .map_err(|error| Error::ToolExecution(format!("hover scroll failed: {error}").into()))?;
+        let point = resolved_clickable_point(page, &resolved).await?;
+        page.move_mouse(point)
+            .await
+            .map_err(|error| Error::ToolExecution(format!("hover failed: {error}").into()))?;
+        return Ok(json!({
+            "status": "hovered",
+            "selector": selector,
+            "frame_id": element_ref.frame_id
+        }));
+    }
     let sel_lit = js_string_literal(selector);
     let js = format!(
         r#"(function() {{
@@ -438,26 +2195,43 @@ async fn act_hover(page: &Page, selector: &str) -> Result<Value> {
 }
 
 /// Select an option in a dropdown.
-async fn act_select(page: &Page, selector: &str, value: &str) -> Result<Value> {
+async fn act_select(page: &Page, element_ref: &ElementRef, value: &str) -> Result<Value> {
+    let selector = &element_ref.selector;
     let sel_lit = js_string_literal(selector);
     let val_lit = js_string_literal(value);
-    let js = format!(
-        r#"(function() {{
-            var el = document.querySelector({sel_lit});
-            if (!el) return 'element_not_found';
+    let js = if requires_document_resolver(element_ref) {
+        element_expression(
+            selector,
+            &format!(
+                r#"
             el.value = {val_lit};
             el.dispatchEvent(new Event('change', {{ bubbles: true }}));
             el.dispatchEvent(new Event('input', {{ bubbles: true }}));
-            return 'selected';
-        }})()"#
-    );
+            return 'selected';"#
+            ),
+        )
+    } else {
+        format!(
+            r#"(function() {{
+                var el = document.querySelector({sel_lit});
+                if (!el) return 'element_not_found';
+                el.value = {val_lit};
+                el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                return 'selected';
+            }})()"#
+        )
+    };
 
-    let result = page
-        .evaluate(js)
-        .await
-        .map_err(|e| Error::ToolExecution(format!("select failed: {e}").into()))?;
-
-    let status: String = result.into_value().unwrap_or_else(|_| "unknown".into());
+    let status: String = if requires_document_resolver(element_ref) {
+        evaluate_in_element_context(page, element_ref, js).await?
+    } else {
+        page.evaluate(js)
+            .await
+            .map_err(|e| Error::ToolExecution(format!("select failed: {e}").into()))?
+            .into_value()
+            .unwrap_or_else(|_| "unknown".into())
+    };
     if status == "element_not_found" {
         return Err(Error::ToolExecution(ToolError::not_found(format!(
             "element not found: '{selector}'"
@@ -467,14 +2241,118 @@ async fn act_select(page: &Page, selector: &str, value: &str) -> Result<Value> {
     Ok(json!({ "status": "selected", "selector": selector, "value": value }))
 }
 
+/// Upload local, pre-validated files through CDP's native file-input command.
+/// This works for hidden inputs and does not need to synthesize a chooser UI.
+async fn act_upload(page: &Page, element_ref: &ElementRef, paths: &[String]) -> Result<Value> {
+    let resolved = resolve_element(page, element_ref).await?;
+    let is_file_input = tokio::time::timeout(
+        ELEMENT_OP_BUDGET,
+        call_on_element(
+            page,
+            &resolved,
+            "function() { return this.tagName === 'INPUT' && String(this.type).toLowerCase() === 'file'; }",
+        ),
+    )
+    .await
+    .map_err(|_| Error::ToolExecution("file-input verification timed out".into()))?
+    .map_err(|error| {
+        Error::ToolExecution(format!("file-input verification failed: {error}").into())
+    })?
+    .as_bool()
+    .unwrap_or(false);
+    if !is_file_input {
+        return Err(Error::ToolExecution(ToolError::invalid_input(
+            "upload requires a live <input type='file'> ref",
+        )));
+    }
+    let params = SetFileInputFilesParams::builder()
+        .files(paths.iter().cloned())
+        .backend_node_id(resolved.backend_node_id)
+        .build()
+        .map_err(|error| Error::ToolExecution(format!("invalid upload request: {error}").into()))?;
+    tokio::time::timeout(Duration::from_secs(10), page.execute(params))
+        .await
+        .map_err(|_| Error::ToolExecution("file upload timed out".into()))?
+        .map_err(|error| Error::ToolExecution(format!("file upload failed: {error}").into()))?;
+    Ok(json!({
+        "status": "uploaded",
+        "selector": element_ref.selector,
+        "file_count": paths.len(),
+        "files": paths,
+    }))
+}
+
+/// Return the actual options available in a native `<select>` element.
+async fn act_dropdown_options(page: &Page, element_ref: &ElementRef) -> Result<Value> {
+    let result: Value = evaluate_in_element_context(
+        page,
+        element_ref,
+        element_expression(
+            &element_ref.selector,
+            r#"
+            if (el.tagName !== 'SELECT') return {status:'not_select'};
+            return {
+                status: 'ok',
+                multiple: Boolean(el.multiple),
+                disabled: Boolean(el.disabled),
+                options: Array.from(el.options).map(function(option, index) {
+                    return {
+                        index: index,
+                        text: (option.textContent || '').trim(),
+                        value: option.value,
+                        selected: option.selected,
+                        disabled: option.disabled
+                    };
+                })
+            };"#,
+        ),
+    )
+    .await?;
+    if result["status"] == "element_not_found" {
+        return Err(Error::ToolExecution(ToolError::not_found(format!(
+            "element not found: '{}'",
+            element_ref.selector
+        ))));
+    }
+    if result["status"] == "not_select" {
+        return Err(Error::ToolExecution(ToolError::invalid_input(
+            "dropdown options require a native <select> element",
+        )));
+    }
+    Ok(json!({
+        "status": "options",
+        "selector": element_ref.selector,
+        "multiple": result["multiple"],
+        "disabled": result["disabled"],
+        "options": result["options"],
+    }))
+}
+
 /// Drag one element to another.
-async fn act_drag(page: &Page, source_selector: &str, target_selector: &str) -> Result<Value> {
+async fn act_drag(page: &Page, source: &ElementRef, target: &ElementRef) -> Result<Value> {
+    if source.frame_id != target.frame_id {
+        return Err(Error::ToolExecution(ToolError::invalid_input(
+            "dragging between different frame documents is not supported",
+        )));
+    }
+    let source_selector = &source.selector;
+    let target_selector = &target.selector;
     let src_lit = js_string_literal(source_selector);
     let tgt_lit = js_string_literal(target_selector);
+    let source_lookup = if requires_document_resolver(source) {
+        format!("({ELEMENT_RESOLVER})({src_lit})")
+    } else {
+        format!("document.querySelector({src_lit})")
+    };
+    let target_lookup = if requires_document_resolver(target) {
+        format!("({ELEMENT_RESOLVER})({tgt_lit})")
+    } else {
+        format!("document.querySelector({tgt_lit})")
+    };
     let js = format!(
         r#"(function() {{
-            var src = document.querySelector({src_lit});
-            var tgt = document.querySelector({tgt_lit});
+            var src = {source_lookup};
+            var tgt = {target_lookup};
             if (!src) return 'source_not_found';
             if (!tgt) return 'target_not_found';
             var srcRect = src.getBoundingClientRect();
@@ -497,12 +2375,15 @@ async fn act_drag(page: &Page, source_selector: &str, target_selector: &str) -> 
         }})()"#
     );
 
-    let result = page
-        .evaluate(js)
-        .await
-        .map_err(|e| Error::ToolExecution(format!("drag failed: {e}").into()))?;
-
-    let status: String = result.into_value().unwrap_or_else(|_| "unknown".into());
+    let status: String = if requires_document_resolver(source) {
+        evaluate_in_element_context(page, source, js).await?
+    } else {
+        page.evaluate(js)
+            .await
+            .map_err(|e| Error::ToolExecution(format!("drag failed: {e}").into()))?
+            .into_value()
+            .unwrap_or_else(|_| "unknown".into())
+    };
     match status.as_str() {
         "source_not_found" => Err(Error::ToolExecution(ToolError::not_found(format!(
             "source element not found: '{source_selector}'"
@@ -519,26 +2400,150 @@ async fn act_drag(page: &Page, source_selector: &str, target_selector: &str) -> 
 }
 
 /// Wait for an element to appear.
-async fn act_wait_for_element(page: &Page, selector: &str, timeout_ms: u64) -> Result<Value> {
+async fn act_wait_for_element(
+    page: &Page,
+    element_ref: &ElementRef,
+    timeout_ms: u64,
+) -> Result<Value> {
+    let selector = &element_ref.selector;
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    let mut last_probe_timed_out = false;
     loop {
-        match page.find_element(selector).await {
-            Ok(_) => {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return Ok(json!({
+                "status": "timeout",
+                "outcome": "not_applied",
+                "selector": selector,
+                "timeout_ms": timeout_ms,
+                "browser_degraded": last_probe_timed_out,
+                "retry_safe": true,
+                "reason": if last_probe_timed_out {
+                    "the renderer did not answer the final element probe before the deadline"
+                } else {
+                    "the element did not appear before the deadline"
+                }
+            }));
+        }
+        let probe_budget = ELEMENT_OP_BUDGET.min(deadline - now);
+        let found = if requires_document_resolver(element_ref) {
+            tokio::time::timeout(
+                probe_budget,
+                evaluate_in_element_context::<bool>(
+                    page,
+                    element_ref,
+                    format!("Boolean({})", resolver_expression(selector)),
+                ),
+            )
+            .await
+            .map(|result| result.map(|found| found.then_some(())))
+        } else {
+            tokio::time::timeout(probe_budget, page.find_element(selector))
+                .await
+                .map(|result| {
+                    result.map(|_| Some(())).map_err(|error| {
+                        Error::ToolExecution(ToolError::not_found(error.to_string()))
+                    })
+                })
+        };
+        match found {
+            Ok(Ok(Some(_))) => {
                 return Ok(json!({
                     "status": "found",
+                    "outcome": "applied",
                     "selector": selector
                 }));
             }
-            Err(_) => {
+            Ok(Ok(None)) | Ok(Err(_)) => {
+                last_probe_timed_out = false;
                 if tokio::time::Instant::now() >= deadline {
                     return Ok(json!({
                         "status": "timeout",
+                        "outcome": "not_applied",
                         "selector": selector,
-                        "timeout_ms": timeout_ms
+                        "timeout_ms": timeout_ms,
+                        "browser_degraded": false,
+                        "retry_safe": true,
+                        "reason": "the element did not appear before the deadline"
+                    }));
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+            Err(_) => {
+                last_probe_timed_out = true;
+                if tokio::time::Instant::now() >= deadline {
+                    return Ok(json!({
+                        "status": "timeout",
+                        "outcome": "not_applied",
+                        "selector": selector,
+                        "timeout_ms": timeout_ms,
+                        "browser_degraded": true,
+                        "retry_safe": true,
+                        "reason": "the renderer did not answer the final element probe before the deadline"
                     }));
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(250)).await;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_success_shapes_receive_an_explicit_outcome_contract() {
+        let value = normalize_outcome(json!({ "status": "typed", "length": 4 }));
+        assert_eq!(value["outcome"], "applied");
+        assert_eq!(value["browser_degraded"], false);
+        assert_eq!(value["retry_safe"], false);
+    }
+
+    #[test]
+    fn normalization_preserves_failure_specific_retry_and_health_fields() {
+        let value = normalize_outcome(json!({
+            "status": "timeout",
+            "outcome": "not_applied",
+            "browser_degraded": true,
+            "retry_safe": true,
+        }));
+        assert_eq!(value["outcome"], "not_applied");
+        assert_eq!(value["browser_degraded"], true);
+        assert_eq!(value["retry_safe"], true);
+    }
+
+    fn button_ref(target_id: Option<&str>) -> ElementRef {
+        ElementRef {
+            ref_id: "s1-7".into(),
+            selector: "#pay".into(),
+            frame_id: None,
+            frame_url: None,
+            target_id: target_id.map(str::to_string),
+            role: "button".into(),
+            name: "Pay in frame".into(),
+            value: None,
+            interactive: true,
+            bounds: None,
+        }
+    }
+
+    #[test]
+    fn a_control_in_a_site_isolated_frame_counts_as_submitting() {
+        // The bypass this closes: `pay` refuses an OOPIF ref, so reading the
+        // same ref as "not a submit" left the in-frame pay button clickable
+        // with no total check anywhere.
+        // `Other` is the only verdict `enforce_payment_lock` lets through,
+        // and its match over this enum is exhaustive, so a ref in a frame
+        // cannot quietly become clickable again.
+        assert_eq!(
+            SubmitVerdict::from_frame(&button_ref(Some("F00F"))),
+            Some(SubmitVerdict::SiteIsolated)
+        );
+        assert_eq!(
+            SubmitVerdict::from_frame(&button_ref(None)),
+            None,
+            "a ref in the merchant's own document is decided by the page"
+        );
     }
 }

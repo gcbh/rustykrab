@@ -10,6 +10,10 @@
 # Usage:
 #   scripts/e2e.sh                      # scripted plumbing suite (fast, CI)
 #   scripts/e2e.sh --mode model         # gemma4 behaviour suite (slow)
+#   scripts/e2e.sh --mode browser       # opt-in live browser journeys
+#   scripts/e2e.sh --mode context       # task-context wire contracts (no model)
+#   scripts/e2e.sh --mode context-model --quick --reps 3  # local model, inert tools
+#   scripts/e2e.sh --mode compaction-study --reps 2       # local model, no domain actions
 #   scripts/e2e.sh --mode all --release
 #
 # Any flag other than --release is passed through to the runner.
@@ -28,6 +32,16 @@ for arg in "$@"; do
   fi
 done
 
+# Bind every machine-readable evidence artifact to the exact checkout that
+# built the daemon and runner. Callers may override this for packaged sources
+# that do not include Git metadata.
+if [[ -n "$(git status --porcelain --untracked-files=normal)" ]]; then
+  DETECTED_SOURCE_REVISION="$(git rev-parse HEAD)-dirty"
+else
+  DETECTED_SOURCE_REVISION="$(git rev-parse HEAD)"
+fi
+E2E_SOURCE_REVISION="${RUSTYKRAB_E2E_SOURCE_REVISION:-$DETECTED_SOURCE_REVISION}"
+
 echo "building daemon (--no-default-features)..." >&2
 cargo build -p rustykrab-cli --no-default-features "${CARGO_FLAGS[@]+"${CARGO_FLAGS[@]}"}"
 echo "building e2e runner..." >&2
@@ -36,7 +50,8 @@ cargo build -p rustykrab-e2e "${CARGO_FLAGS[@]+"${CARGO_FLAGS[@]}"}"
 # Report goes to stdout and to e2e-report.json (CI uploads it as an
 # artifact); the exit code is the runner's.
 set +e
-RUSTYKRAB_BIN="target/$PROFILE/rustykrab-cli" "target/$PROFILE/rustykrab-e2e" \
+RUSTYKRAB_E2E_SOURCE_REVISION="$E2E_SOURCE_REVISION" \
+  RUSTYKRAB_BIN="target/$PROFILE/rustykrab-cli" "target/$PROFILE/rustykrab-e2e" \
   "${RUNNER_ARGS[@]+"${RUNNER_ARGS[@]}"}" | tee e2e-report.json
 status=${PIPESTATUS[0]}
 exit "$status"

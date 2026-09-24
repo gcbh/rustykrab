@@ -14,10 +14,11 @@ members = [
     "crates/rustykrab-memory",
     "crates/rustykrab-dream",
     "crates/rustykrab-e2e",
+    "crates/rustykrab-projects",
 ]
 
 [workspace.package]
-version = "5.2.26"
+version = "5.3.0"
 edition = "2021"
 rust-version = "1.88"
 license = "MIT"
@@ -58,7 +59,11 @@ uuid = { version = "1", features = ["v4", "serde"] }
 
 # Time
 chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
 croner = "3"
+# Reads the host's IANA zone so a fresh install schedules in the operator's
+# local time without needing RUSTYKRAB_TIMEZONE set.
+iana-time-zone = "0.1"
 
 # Cryptography
 ed25519-dalek = { version = "2", features = ["rand_core", "serde"] }
@@ -110,6 +115,7 @@ rustykrab-skills = { path = "crates/rustykrab-skills" }
 rustykrab-cli = { path = "crates/rustykrab-cli" }
 rustykrab-memory = { path = "crates/rustykrab-memory" }
 rustykrab-dream = { path = "crates/rustykrab-dream" }
+rustykrab-projects = { path = "crates/rustykrab-projects" }
 
 [profile.release]
 lto = true

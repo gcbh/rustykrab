@@ -6,9 +6,12 @@ mod device;
 mod dream_cycles;
 mod dream_reports;
 mod guarded;
+mod inbound;
 mod jobs;
 pub mod keychain;
 mod outcomes;
+mod payment_request;
+mod projects;
 mod recall_archive;
 pub mod registry;
 mod secret;
@@ -17,6 +20,7 @@ mod tasks;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use rusqlite::OptionalExtension;
 use rustykrab_core::Error;
 use std::sync::Mutex;
 use zeroize::Zeroizing;
@@ -31,9 +35,16 @@ pub use device::{Device, DeviceStore, Principal};
 pub use dream_cycles::DreamCycleStore;
 pub use dream_reports::{DreamReportStore, StoredReport};
 pub use guarded::{GuardedSecrets, WriteOutcome};
+pub use inbound::InboundStore;
 pub use jobs::{JobRun, JobStore, ScheduledJob};
 pub use outcomes::OutcomeStore;
+pub use payment_request::{
+    stamp_utc, AuthorizedPayment, CardDetails, CardError, ClaimedCard, Filed, Money, PayClaim,
+    PayRefusal, PaymentRequest, PaymentRequestStore, PaymentStatus, PaymentTerms, CARD_TTL,
+    DEFAULT_DUPLICATE_WINDOW_MS, DEFAULT_PAY_COOLDOWN, PENDING_TTL_MS, STALE_CLAIM_MS,
+};
 pub use pending_links::PendingLinks;
+pub use projects::{ApplyRevisionResult, ProjectStore};
 pub use recall_archive::RecallArchiveStore;
 pub use secret::{SecretMeta, SecretStore, WriteAuthority};
 pub use tasks::{DelegatedTask, TaskStatus, TaskStore};
@@ -54,6 +65,18 @@ pub struct Store {
     /// Credential links minted this turn, waiting to be sent to the user
     /// once the agent has finished speaking. In memory only.
     pending_links: PendingLinks,
+    /// Cards approved for one purchase each. In memory only, shared by
+    /// every clone of this handle so the page that receives a card and the
+    /// browser that spends it see the same entry.
+    card_vault: payment_request::CardVault,
+    /// How long after one press the next one is refused, across every
+    /// conversation. Operator-tunable because "how fast is too fast" is a
+    /// property of the household, not of the code.
+    pay_cooldown: std::time::Duration,
+    /// How far back a payment counts as a duplicate of a new one.
+    /// Operator-tunable for the same reason as the cooldown; `0` turns the
+    /// duplicate hold off entirely.
+    duplicate_window_ms: i64,
     /// Where the database lives, so a background reader can open its own
     /// connection instead of queueing behind live traffic on this one.
     db_path: PathBuf,
@@ -95,8 +118,25 @@ impl Store {
             request_notifier: None,
             credential_backend: credential_backend::default_backend(),
             pending_links: PendingLinks::new(),
+            card_vault: payment_request::CardVault::default(),
+            pay_cooldown: payment_request::DEFAULT_PAY_COOLDOWN,
+            duplicate_window_ms: payment_request::DEFAULT_DUPLICATE_WINDOW_MS,
             db_path,
         })
+    }
+
+    /// How long after one press the next claim is refused. `Duration::ZERO`
+    /// disables the throttle.
+    pub fn with_pay_cooldown(mut self, cooldown: std::time::Duration) -> Self {
+        self.pay_cooldown = cooldown;
+        self
+    }
+
+    /// How far back a payment counts as a duplicate of a new one. `0`
+    /// disables the duplicate hold and the duplicate refusal at pay time.
+    pub fn with_duplicate_window_ms(mut self, window_ms: i64) -> Self {
+        self.duplicate_window_ms = window_ms;
+        self
     }
 
     pub(crate) fn run_migrations(conn: &rusqlite::Connection) -> Result<(), Error> {
@@ -123,6 +163,18 @@ impl Store {
                 data BLOB NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS channel_inbound (
+                message_id TEXT PRIMARY KEY,
+                channel TEXT NOT NULL,
+                external_key TEXT NOT NULL,
+                data TEXT NOT NULL,
+                conversation_id TEXT REFERENCES conversations(id) ON DELETE CASCADE,
+                status TEXT NOT NULL CHECK(status IN ('accepted','retained','cancelled')),
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_channel_inbound_pending
+                ON channel_inbound(channel,external_key) WHERE status='accepted';
+
             CREATE TABLE IF NOT EXISTS scheduled_jobs (
                 id              TEXT PRIMARY KEY,
                 schedule        TEXT NOT NULL,
@@ -136,7 +188,13 @@ impl Store {
                 last_run_at     TEXT,
                 created_at      TEXT NOT NULL,
                 conversation_id TEXT,
-                created_version TEXT
+                created_version TEXT,
+                -- IANA zone the `schedule` string is written in. Every
+                -- timestamp column above stays UTC; this records the lens
+                -- those UTC instants were derived through, so each advance
+                -- of next_run_at re-reads the offset from the zone database
+                -- and the job holds its wall-clock time across DST.
+                timezone        TEXT NOT NULL DEFAULT 'UTC'
             );
 
             CREATE INDEX IF NOT EXISTS idx_scheduled_jobs_due
@@ -207,6 +265,64 @@ impl Store {
 
             CREATE INDEX IF NOT EXISTS idx_credential_requests_pending
                 ON credential_requests (name) WHERE status = 'pending';
+
+            -- One purchase the agent may pay for (payment_request.rs). The
+            -- card itself is never here: it lives in an in-memory vault
+            -- until used or expired. The row is the approval and its audit
+            -- trail -- terms, who approved, when, and the last four digits.
+            -- `conversation_id` is unenforced for the same reason as on
+            -- `credential_requests`.
+            CREATE TABLE IF NOT EXISTS payment_requests (
+                id              TEXT PRIMARY KEY,
+                conversation_id TEXT,
+                merchant        TEXT NOT NULL,
+                origin          TEXT NOT NULL,
+                amount_minor    INTEGER NOT NULL,
+                currency        TEXT NOT NULL,
+                description     TEXT,
+                status          TEXT NOT NULL DEFAULT 'pending',
+                created_at      INTEGER NOT NULL,
+                decided_at      INTEGER,
+                decided_by      TEXT,
+                card_last4      TEXT,
+                used_at         INTEGER,
+                link_token_hash TEXT,
+                link_expires_at INTEGER,
+                -- When a press was claimed (status 'paying'). The claim is
+                -- the single-spend lock: one row may be 'paying' at a time,
+                -- and a claim older than STALE_CLAIM_MS is swept to 'used'
+                -- rather than released, because the press may have landed.
+                claimed_at      INTEGER,
+                -- The earlier request this one repeats, on a row filed
+                -- 'held' and on the confirmed re-ask that follows a hold.
+                -- Always names a payment, never the hold in between.
+                duplicate_of    TEXT,
+                -- The user was shown the hold and asked to pay anyway. The
+                -- only thing that lets a press past the duplicate check in
+                -- claim_for_pay, and the store sets it only when a 'held'
+                -- row already exists in the same conversation -- so the
+                -- model cannot pre-set it to skip the check.
+                duplicate_confirmed INTEGER NOT NULL DEFAULT 0
+            );
+
+            -- One purchase in flight per conversation, and the lookups that
+            -- enforce it only ever ask about live rows. A 'paying' row is
+            -- live: it is the press the global lock is held for. A 'held'
+            -- row is not: it was stopped before the user was ever asked,
+            -- and it must not supersede or be superseded by the live one.
+            CREATE INDEX IF NOT EXISTS idx_payment_requests_live
+                ON payment_requests (conversation_id)
+                WHERE status IN ('pending', 'authorized', 'paying');
+
+            -- Has this site already been paid this amount today? That is the
+            -- duplicate key, asked once when a request is filed and again
+            -- when a press is claimed. Partial, because the answer only
+            -- ever concerns rows that are live or spent; the terminal
+            -- 'declined'/'expired'/'superseded' rows are the bulk of an old
+            -- table and never match.
+            CREATE INDEX IF NOT EXISTS idx_payment_requests_dup
+                ON payment_requests (origin, amount_minor, currency, created_at)
+                WHERE status IN ('pending', 'authorized', 'paying', 'used', 'held');
 
             -- Superseded values, kept encrypted, so an approved change or a
             -- mistaken delete is recoverable.
@@ -376,6 +492,93 @@ impl Store {
 
             CREATE INDEX IF NOT EXISTS idx_dream_changes_target
                 ON dream_changes (target_id);
+
+            -- Conversational project planning. Revisions are immutable,
+            -- content-addressed snapshots; the project row points at the
+            -- current one. Request ids make both project creation and plan
+            -- changes safe to retry after an interrupted response.
+            CREATE TABLE IF NOT EXISTS projects (
+                id                        TEXT PRIMARY KEY,
+                create_request_id         TEXT NOT NULL UNIQUE,
+                repository_id             TEXT,
+                canonical_conversation_id TEXT,
+                title                     TEXT NOT NULL,
+                status                    TEXT NOT NULL,
+                judgment_policy           TEXT NOT NULL,
+                current_revision          TEXT,
+                create_request            TEXT NOT NULL,
+                data                      TEXT NOT NULL,
+                created_at                TEXT NOT NULL,
+                updated_at                TEXT NOT NULL,
+                FOREIGN KEY (id, current_revision)
+                    REFERENCES project_revisions(project_id, id)
+                    DEFERRABLE INITIALLY DEFERRED
+            );
+
+            CREATE TABLE IF NOT EXISTS project_revisions (
+                id                TEXT PRIMARY KEY,
+                project_id        TEXT NOT NULL
+                    REFERENCES projects(id) ON DELETE CASCADE,
+                parent_revision   TEXT,
+                sequence          INTEGER NOT NULL,
+                request_id        TEXT NOT NULL,
+                request_data      TEXT NOT NULL,
+                author            TEXT NOT NULL,
+                conversation_id   TEXT,
+                source_message_id TEXT,
+                summary           TEXT NOT NULL,
+                project_data      TEXT NOT NULL,
+                data              TEXT NOT NULL,
+                created_at        TEXT NOT NULL,
+                UNIQUE (project_id, sequence),
+                UNIQUE (project_id, request_id),
+                UNIQUE (project_id, id),
+                FOREIGN KEY (project_id, parent_revision)
+                    REFERENCES project_revisions(project_id, id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_project_revisions_project
+                ON project_revisions (project_id, sequence);
+
+            -- Nodes and edges are materialized per revision for indexed
+            -- inspection. Their complete typed representation, including
+            -- provenance and decision/question detail, remains in `data`;
+            -- the immutable revision snapshot is the reconstruction source.
+            CREATE TABLE IF NOT EXISTS plan_nodes (
+                revision_id TEXT NOT NULL,
+                project_id  TEXT NOT NULL
+                    REFERENCES projects(id) ON DELETE CASCADE,
+                id          TEXT NOT NULL,
+                kind        TEXT NOT NULL,
+                data        TEXT NOT NULL,
+                PRIMARY KEY (revision_id, id),
+                FOREIGN KEY (project_id, revision_id)
+                    REFERENCES project_revisions(project_id, id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_plan_nodes_project
+                ON plan_nodes (project_id, id);
+
+            CREATE TABLE IF NOT EXISTS plan_edges (
+                revision_id TEXT NOT NULL,
+                project_id  TEXT NOT NULL
+                    REFERENCES projects(id) ON DELETE CASCADE,
+                id          TEXT NOT NULL,
+                from_node   TEXT NOT NULL,
+                relation    TEXT NOT NULL,
+                to_node     TEXT NOT NULL,
+                data        TEXT NOT NULL,
+                PRIMARY KEY (revision_id, id),
+                FOREIGN KEY (project_id, revision_id)
+                    REFERENCES project_revisions(project_id, id) ON DELETE CASCADE,
+                FOREIGN KEY (revision_id, from_node)
+                    REFERENCES plan_nodes(revision_id, id) ON DELETE CASCADE,
+                FOREIGN KEY (revision_id, to_node)
+                    REFERENCES plan_nodes(revision_id, id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_plan_edges_project
+                ON plan_edges (project_id, from_node, to_node);
             ",
         )
         .map_err(|e| Error::Storage(e.to_string()))?;
@@ -405,6 +608,20 @@ impl Store {
         if !existing.iter().any(|c| c == "created_version") {
             conn.execute(
                 "ALTER TABLE scheduled_jobs ADD COLUMN created_version TEXT",
+                [],
+            )
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        }
+
+        if !existing.iter().any(|c| c == "timezone") {
+            // Backfill 'UTC' rather than the operator's zone. Pre-existing
+            // rows had their cron fields matched against UTC, so UTC is the
+            // lens they were genuinely created under; stamping them with a
+            // local zone would reinterpret them and move every live job's
+            // fire time by the offset. Rewriting a job to local intent is a
+            // decision for whoever owns the job, not for a migration.
+            conn.execute(
+                "ALTER TABLE scheduled_jobs ADD COLUMN timezone TEXT NOT NULL DEFAULT 'UTC'",
                 [],
             )
             .map_err(|e| Error::Storage(e.to_string()))?;
@@ -483,6 +700,73 @@ impl Store {
                 conn.execute(ddl, [])
                     .map_err(|e| Error::Storage(e.to_string()))?;
             }
+        }
+
+        // `payment_requests.claimed_at` arrived with the atomic pay claim.
+        // Rows predating it were never claimed — the press was taken
+        // straight from 'authorized' — so NULL is the honest value and
+        // there is nothing to back-fill. `CREATE INDEX IF NOT EXISTS`
+        // leaves an existing `idx_payment_requests_live` alone, so a
+        // database created before 'paying' existed keeps the old predicate
+        // and drops 'paying' rows out of the index that the
+        // one-purchase-per-conversation lookups ride on. Rebuild it only
+        // when the stored DDL is the old one, rather than dropping and
+        // recreating on every open.
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(payment_requests)")
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        let existing: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|e| Error::Storage(e.to_string()))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        drop(stmt);
+        //
+        // `duplicate_of` and `duplicate_confirmed` arrived with the
+        // duplicate hold. Both default to "not a duplicate", which is the
+        // honest reading of a row filed before anything looked: the check
+        // never ran on it, and back-filling would be inventing a judgement.
+        // `idx_payment_requests_dup` needs no rebuild clause — it is new,
+        // so `CREATE INDEX IF NOT EXISTS` above creates it on upgraded and
+        // fresh databases alike, and it indexes only columns that existed
+        // before this change.
+        for (column, ddl) in [
+            (
+                "claimed_at",
+                "ALTER TABLE payment_requests ADD COLUMN claimed_at INTEGER",
+            ),
+            (
+                "duplicate_of",
+                "ALTER TABLE payment_requests ADD COLUMN duplicate_of TEXT",
+            ),
+            (
+                "duplicate_confirmed",
+                "ALTER TABLE payment_requests
+                     ADD COLUMN duplicate_confirmed INTEGER NOT NULL DEFAULT 0",
+            ),
+        ] {
+            if !existing.iter().any(|c| c == column) {
+                conn.execute(ddl, [])
+                    .map_err(|e| Error::Storage(e.to_string()))?;
+            }
+        }
+        let live_index: Option<String> = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master
+                  WHERE type = 'index' AND name = 'idx_payment_requests_live'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        if live_index.is_some_and(|sql| !sql.contains("'paying'")) {
+            conn.execute_batch(
+                "DROP INDEX idx_payment_requests_live;
+                 CREATE INDEX idx_payment_requests_live
+                     ON payment_requests (conversation_id)
+                     WHERE status IN ('pending', 'authorized', 'paying');",
+            )
+            .map_err(|e| Error::Storage(e.to_string()))?;
         }
 
         // `job_runs.rustykrab_version` records which build executed each run.
@@ -604,6 +888,18 @@ impl Store {
         }
     }
 
+    /// Handle for purchases the agent asks the user to approve, and the
+    /// cards approved for them.
+    pub fn payment_requests(&self) -> PaymentRequestStore {
+        let payments = PaymentRequestStore::new(Arc::clone(&self.conn), self.card_vault.clone())
+            .with_pay_cooldown(self.pay_cooldown)
+            .with_duplicate_window_ms(self.duplicate_window_ms);
+        match &self.request_notifier {
+            Some(notifier) => payments.with_notifier(Arc::clone(notifier)),
+            None => payments,
+        }
+    }
+
     /// The agent-facing view of credential storage: create-only, with
     /// overwrites and deletes queued for approval. Tools receive this
     /// rather than [`SecretStore`], so the guard cannot be bypassed by
@@ -675,11 +971,20 @@ impl Store {
         Ok(OutcomeStore::new_read_only(Arc::new(Mutex::new(conn))))
     }
 
+    /// Return a handle for durable conversational-project planning.
+    pub fn projects(&self) -> ProjectStore {
+        ProjectStore::new(Arc::clone(&self.conn))
+    }
+
     /// Return a handle for channel address → conversation bindings, for
     /// every channel. Address a row with a [`ChannelAddress`] rather than a
     /// hand-built key.
     pub fn channel_bindings(&self) -> ChannelBindingStore {
         ChannelBindingStore::new(Arc::clone(&self.conn))
+    }
+
+    pub fn inbound(&self) -> InboundStore {
+        InboundStore::new(Arc::clone(&self.conn))
     }
 
     /// Return a handle for the durable recall archive (compaction-displaced
@@ -1003,6 +1308,109 @@ mod tests {
         );
     }
 
+    /// A database created before `paying` existed keeps the index SQLite
+    /// wrote for it, because `CREATE INDEX IF NOT EXISTS` will not replace
+    /// one. Left alone, the live-request index would stop covering rows
+    /// that are mid-press — the ones the supersede and "may this
+    /// conversation pay here" lookups most need to see.
+    #[test]
+    fn upgrading_teaches_the_live_payment_index_about_a_press_in_flight() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE payment_requests (
+                 id              TEXT PRIMARY KEY,
+                 conversation_id TEXT,
+                 merchant        TEXT NOT NULL,
+                 origin          TEXT NOT NULL,
+                 amount_minor    INTEGER NOT NULL,
+                 currency        TEXT NOT NULL,
+                 description     TEXT,
+                 status          TEXT NOT NULL DEFAULT 'pending',
+                 created_at      INTEGER NOT NULL,
+                 decided_at      INTEGER,
+                 decided_by      TEXT,
+                 card_last4      TEXT,
+                 used_at         INTEGER,
+                 link_token_hash TEXT,
+                 link_expires_at INTEGER
+             );
+             CREATE INDEX idx_payment_requests_live
+                 ON payment_requests (conversation_id)
+                 WHERE status IN ('pending', 'authorized');
+             INSERT INTO payment_requests
+                 (id, merchant, origin, amount_minor, currency, created_at)
+             VALUES ('old', 'Steamship Authority', 'https://example.com',
+                     4600, 'USD', 1);",
+        )
+        .unwrap();
+
+        Store::run_migrations(&conn).unwrap();
+
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM pragma_table_info('payment_requests')
+                 WHERE name = 'claimed_at'"
+            ),
+            1,
+            "the claim needs somewhere to record when it was taken"
+        );
+        let index: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master
+                  WHERE type = 'index' AND name = 'idx_payment_requests_live'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(index.contains("'paying'"), "{index}");
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM payment_requests"),
+            1,
+            "and the audit trail survives the rebuild"
+        );
+
+        // The duplicate hold's columns and its index. The index needs no
+        // rebuild clause of its own — it is new, so it is simply created —
+        // but an upgraded database must end up with it, or every duplicate
+        // lookup falls back to a scan of the whole payment history.
+        for column in ["duplicate_of", "duplicate_confirmed"] {
+            assert_eq!(
+                count(
+                    &conn,
+                    &format!(
+                        "SELECT COUNT(*) FROM pragma_table_info('payment_requests')
+                          WHERE name = '{column}'"
+                    )
+                ),
+                1,
+                "{column}"
+            );
+        }
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM sqlite_master
+                  WHERE type = 'index' AND name = 'idx_payment_requests_dup'"
+            ),
+            1
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM payment_requests WHERE duplicate_confirmed = 0"
+            ),
+            1,
+            "a row filed before the check existed was never judged a duplicate"
+        );
+
+        // Idempotent: a second open must not drop and rebuild the index it
+        // has already corrected.
+        Store::run_migrations(&conn).unwrap();
+        Store::run_migrations(&conn).unwrap();
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM payment_requests"), 1);
+    }
+
     #[test]
     fn adopting_foreign_keys_is_idempotent() {
         let conn = legacy_db();
@@ -1077,10 +1485,10 @@ mod tests {
                 .unwrap();
         }
 
-        assert!(JobStore::new(Arc::clone(&conn))
+        JobStore::new(Arc::clone(&conn))
             .delete_job("job")
             .await
-            .unwrap());
+            .unwrap();
 
         let guard = conn.lock().unwrap();
         assert_eq!(

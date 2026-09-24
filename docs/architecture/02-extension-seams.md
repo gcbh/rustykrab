@@ -93,6 +93,12 @@ override system that then puts most of them back. Either the profiles should
 diverge enough to justify the routing, or routing should be replaced by three
 config knobs.
 
+The continuity follow-up adds one genuinely swappable policy at this seam:
+`compaction_strategy` is a serialized enum carried from the base profile through
+routing into `AgentConfig`. The deterministic and live compaction evaluators
+select it explicitly. This does not make keyword task routing more meaningful;
+it prevents a task preset from silently replacing the chosen memory policy.
+
 ## Duplication, measured (second pass)
 
 **The agent loop is one function.** `run_inner` and `run_streaming_inner` were
@@ -119,9 +125,12 @@ genuinely differ, and the parts that *are* shared (`line_buffer`, `backoff`)
 are the parts that should be.
 
 **Token estimation** is one function in `core`. Note the provider-side
-constant is deliberately *not* folded in, and the module doc explains why —
-collapsing them removes headroom between the compaction threshold and the
-provider's own trim budget.
+constant is deliberately *not* folded in: both are heuristics, while actual
+usage anchors calibrate the runner. `ModelProvider::context_limit_for_tools`
+reports schema-aware usable input. Ollama refuses an oversized request with
+`ContextBudgetExceeded`; only the runner may compact/archive and retry. This
+replaces the old split authority in which the adapter could delete history
+after the runner believed it had preserved it.
 
 ## Reusability, crate by crate
 
@@ -152,7 +161,7 @@ Direct environment reads outside the composition root and E2E harness:
 
 | Crate | Reads | Examples |
 |---|---|---|
-| `tools` | 25 | `BROWSER_HEADLESS`, `CHROME_CDP_URL`, `X_API_BEARER_TOKEN`, `RUSTYKRAB_MCP_SERVERS`, `RUSTYKRAB_NODES` |
+| `tools` | 26 | `BROWSER_HEADLESS`, `CHROME_CDP_URL`, `RUSTYKRAB_BROWSER_DOWNLOAD_ROOT`, `X_API_BEARER_TOKEN`, `RUSTYKRAB_MCP_SERVERS`, `RUSTYKRAB_NODES` |
 | `providers` | 8 | `OLLAMA_NUM_CTX`, `OLLAMA_KEEP_ALIVE`, `ANTHROPIC_CONTEXT_LENGTH` |
 | `gateway` | 5 | `RUSTYKRAB_ALLOWED_ORIGINS`, `RUSTYKRAB_PUBLIC_URL` |
 | `agent` | 4 | `RUSTYKRAB_COMPACTION_*` |
