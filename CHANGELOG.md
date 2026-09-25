@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.3.4] - 2026-09-25
+
+- fix(agent): keep session context and trace id in batched tool calls (#661)
+
 ## [5.3.3] - 2026-09-25
 
 - fix(store): report an unreadable keychain as unreadable, not as a bad credential (#660)
