@@ -36,11 +36,12 @@ pub struct KnownCredential {
     /// The canonical request name — what the store dedupes on, and what
     /// the tools' own ask already uses.
     pub name: &'static str,
-    /// Words that identify this credential in whatever the model typed.
+    /// Word sets that identify this credential in whatever the model typed.
     ///
-    /// Matched against whole tokens, so `gmail_credentials` and "Google
-    /// Calendar" both hit Google while `my-gmailer-app` does not.
-    aliases: &'static [&'static str],
+    /// An alias matches a string when every one of its words appears there
+    /// as a whole token, so `gmail_credentials` and "Google Calendar" both
+    /// hit Google while `my-gmailer-app` and "Google Maps" do not.
+    aliases: &'static [&'static [&'static str]],
     /// Where the canonical field spec comes from.
     fields: Fields,
 }
@@ -69,25 +70,36 @@ enum Fields {
 pub static KNOWN: &[KnownCredential] = &[
     KnownCredential {
         name: crate::google_credentials::KEY_APP_PASSWORD,
-        // "gmail" and "google" both appear because the one credential
-        // serves mail and calendar, and the model names it after whichever
-        // it happened to be using.
-        aliases: &["gmail", "google", "googlemail", "caldav"],
+        // The one credential serves mail and calendar, and the model names
+        // it after whichever it happened to be using. "Google" alone is not
+        // enough: Maps, Gemini, Cloud and YouTube keys all mention it, and
+        // rewriting one of those onto this credential would ask the user
+        // for their Gmail app password and file it over the working one.
+        aliases: &[
+            &["gmail"],
+            &["googlemail"],
+            &["caldav"],
+            &["google", "mail"],
+            &["google", "calendar"],
+        ],
         fields: Fields::Google,
     },
     KnownCredential {
         name: "notion_api_token",
-        aliases: &["notion"],
+        aliases: &[&["notion"]],
         fields: Fields::Registry("notion_api_token"),
     },
     KnownCredential {
         name: "obsidian_api_key",
-        aliases: &["obsidian"],
+        aliases: &[&["obsidian"]],
         fields: Fields::Registry("obsidian_api_key"),
     },
     KnownCredential {
         name: "anthropic_api_key",
-        aliases: &["anthropic", "claude"],
+        // Not "claude" alone: a claude.ai login or session is not the API
+        // key the daemon itself runs on, and answering one filed as the
+        // other would replace that key.
+        aliases: &[&["anthropic"], &["claude", "api"]],
         fields: Fields::Registry("anthropic_api_key"),
     },
 ];
@@ -156,6 +168,11 @@ pub fn canonical_for(
     matched
 }
 
+/// Whether `name` is the canonical name of a credential in [`KNOWN`].
+pub fn is_known(name: &str) -> bool {
+    KNOWN.iter().any(|k| k.name == name)
+}
+
 /// Apply [`canonical_for`], returning what should actually be filed.
 ///
 /// Logs the rewrite: the request the user is shown will not be the one the
@@ -180,20 +197,21 @@ pub fn canonicalize(
     (known.name.to_string(), known.fields())
 }
 
-/// Whether `haystack` contains one of `aliases` as a whole word.
+/// Whether `haystack` contains every word of one of `aliases`.
 ///
 /// Word boundaries are every run of non-alphanumerics, so `gmail_app_password`,
 /// "Google Calendar" and `GMAIL-EMAIL` all split the way a reader would
 /// expect. Matching on whole tokens rather than substrings keeps
 /// `notion` out of `promotional_api_key`.
-fn mentions(haystack: &str, aliases: &[&str]) -> bool {
-    haystack
+fn mentions(haystack: &str, aliases: &[&[&str]]) -> bool {
+    let tokens: Vec<String> = haystack
         .split(|c: char| !c.is_ascii_alphanumeric())
         .filter(|t| !t.is_empty())
-        .any(|token| {
-            let token = token.to_ascii_lowercase();
-            aliases.contains(&token.as_str())
-        })
+        .map(|t| t.to_ascii_lowercase())
+        .collect();
+    aliases
+        .iter()
+        .any(|words| words.iter().all(|w| tokens.iter().any(|t| t == w)))
 }
 
 /// Whether a key belongs to the origin-derived website namespace.
@@ -359,6 +377,47 @@ mod tests {
     fn an_alias_inside_a_longer_word_does_not_match() {
         assert!(canonical_for("promotional_api_key", Some("Promotions"), &[]).is_none());
         assert!(canonical_for("gmailer_token", Some("Gmailer"), &[]).is_none());
+    }
+
+    /// Other Google products and a claude.ai login each mention a known
+    /// service by name. Rewriting them would ask the user for their Gmail
+    /// app password or Anthropic API key during an unrelated task, and file
+    /// the answer over the credential the application already uses.
+    #[test]
+    fn a_product_that_merely_shares_a_brand_is_left_alone() {
+        for (name, service, key) in [
+            ("google_maps_api_key", "Google Maps", "google_maps_api_key"),
+            ("gemini_api_key", "Google AI Studio", "gemini_api_key"),
+            (
+                "google_cloud_service_account",
+                "Google Cloud",
+                "gcp_sa_json",
+            ),
+            ("youtube_api_key", "YouTube (Google)", "youtube_api_key"),
+            ("claude_ai_session", "Claude.ai", "session_cookie"),
+        ] {
+            assert!(
+                canonical_for(name, Some(service), &[field(key)]).is_none(),
+                "{name} ({service}) was redirected"
+            );
+        }
+    }
+
+    /// The qualified forms still reach the credential they name.
+    #[test]
+    fn google_mail_calendar_and_the_claude_api_still_match() {
+        for (name, service, expected) in [
+            ("mail_login", "Google Mail", KEY_APP_PASSWORD),
+            (
+                "google_calendar_password",
+                "Google Calendar",
+                KEY_APP_PASSWORD,
+            ),
+            ("claude_api_key", "Claude API", "anthropic_api_key"),
+        ] {
+            let (got, _) = canonicalize(name, Some(service), vec![field("value")]);
+            assert_eq!(got, expected, "{name} ({service})");
+        }
     }
 
     /// Two services in one request is not something this can repair, and

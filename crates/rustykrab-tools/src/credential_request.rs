@@ -241,6 +241,34 @@ impl Tool for CredentialRequestTool {
             crate::known_credential::canonicalize(name, service.as_deref(), fields);
         let name = name.as_str();
 
+        // The redirect gives this request the name the tools' own ask used,
+        // so filing it now would supersede that ask -- and superseding kills
+        // the link the user already has, which then opens the same "Link
+        // expired" page a real expiry does. That is the sequence in the live
+        // store every time: `gmail` asks, then the model asks again. So when
+        // the known credential already has a live link, point at it instead,
+        // exactly as `google_credentials::ask` does. The fields are the
+        // canonical ones either way, so nothing the model asked for is lost.
+        if crate::known_credential::is_known(name)
+            && self.requests.has_live_link(name).await.unwrap_or(false)
+        {
+            let existing = self
+                .requests
+                .pending()
+                .await
+                .ok()
+                .and_then(|rows| rows.into_iter().find(|r| r.name == name));
+            if let Some(existing) = existing {
+                let where_to_look = service.unwrap_or_else(|| name.to_string());
+                return Ok(json!({
+                    "status": "already_requested",
+                    "request_id": existing.id,
+                    "link_sent_separately": true,
+                    "next_step": crate::credential_link::next_step_out_of_band(true, &where_to_look)
+                }));
+            }
+        }
+
         // Which conversation is asking. This is what makes the answer
         // resumable: when the user supplies the value, this is the turn to
         // bring back. `None` outside a runner scope — the request is still
@@ -392,6 +420,45 @@ mod tests {
                 .expect("the answer must land where Gmail reads it");
         assert_eq!(email, "me@gmail.com");
         assert_eq!(password, "abcdefghijklmnop");
+    }
+
+    /// The redirect must not cost the user the link they already have. The
+    /// tools' own ask files and links first; the model's request, now under
+    /// the same name, would otherwise supersede it and turn that link into
+    /// "Link expired" while a second one is sent.
+    #[tokio::test]
+    async fn a_live_link_from_the_canonical_ask_is_kept() {
+        let (_dir, store) = test_store();
+        let requests = store.credential_requests();
+
+        crate::google_credentials::ask(Some(&requests), None, "Gmail", "your app password").await;
+        let asked = requests.pending().await.unwrap();
+        let token = requests
+            .issue_link(&asked[0].id, crate::credential_link::LINK_TTL)
+            .await
+            .unwrap();
+
+        let out = CredentialRequestTool::new(requests.clone())
+            .execute(request(
+                "gmail_credentials",
+                "Gmail",
+                &[KEY_EMAIL, KEY_APP_PASSWORD],
+            ))
+            .await
+            .expect("pointing at the existing ask should succeed");
+
+        assert_eq!(out["status"], "already_requested");
+        assert_eq!(out["request_id"], asked[0].id.as_str());
+        let pending = requests.pending().await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            pending[0].id, asked[0].id,
+            "the canonical ask was superseded"
+        );
+        assert!(
+            requests.find_by_link(&token).await.unwrap().is_some(),
+            "the link the user already has must still open"
+        );
     }
 
     /// The service-name repair must not reach a website login: those are
