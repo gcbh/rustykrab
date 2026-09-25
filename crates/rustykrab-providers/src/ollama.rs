@@ -1610,7 +1610,7 @@ fn empty_response_error(
     prompt_tokens: Option<u32>,
     done_reason: Option<&str>,
 ) -> Error {
-    Error::ModelProvider(format!(
+    Error::ModelEmptyResponse(format!(
         "Ollama returned an empty response from {model}: no content, no tool calls, \
          and zero generated tokens (prompt_eval_count={}, done_reason={}). The prompt \
          most likely overran the model's context window — lower the prompt size or \
@@ -2276,6 +2276,10 @@ mod tests {
         }))
         .expect_err("a response with zero generated tokens must be an error");
 
+        assert!(
+            matches!(err, rustykrab_core::Error::ModelEmptyResponse(_)),
+            "typed so the agent loop can tell silence from a failed call: {err:?}"
+        );
         let text = err.to_string();
         assert!(text.contains("empty response"), "got: {text}");
         assert!(
