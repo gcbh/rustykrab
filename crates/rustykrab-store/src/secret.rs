@@ -282,15 +282,46 @@ impl SecretStore {
         self.credentials.set(&account, value)
     }
 
-    /// Read a credential held by the secure backend, if it holds one.
-    pub fn get_hardware(&self, name: &str) -> Option<String> {
+    /// Read a credential held by the secure backend, distinguishing "the
+    /// backend does not hold one" from "the backend could not be asked".
+    ///
+    /// Those two are not the same and must not be collapsed. A keychain read
+    /// fails for reasons that have nothing to do with whether the credential
+    /// exists — the commonest being `errSecInteractionNotAllowed` while the
+    /// machine is locked, which a long-running daemon hits mid-flight rather
+    /// than at startup, because the master key it loaded on boot is already
+    /// cached and only live credential reads go back to the keychain.
+    ///
+    /// Collapsing them is what [`get_hardware`] used to do, and the failure
+    /// it produced was genuinely hard to read: `Ok(None)` sent the caller to
+    /// the database, where a hardware-backed secret leaves a deliberately
+    /// empty row (see [`put_hardware`]), so `gmail_email` came back as `""`
+    /// — present, so not "missing", and empty, so not an address. The user
+    /// was told their stored email was invalid and asked to supply it again,
+    /// for four days, while a perfectly good credential sat in the keychain.
+    ///
+    /// [`get_hardware`]: Self::get_hardware
+    /// [`put_hardware`]: Self::put_hardware
+    pub fn try_get_hardware(&self, name: &str) -> Result<Option<String>, Error> {
         if !self.credentials.available() {
-            return None;
+            return Ok(None);
         }
         self.credentials
             .get(&crate::registry::keychain_account_for(name))
-            .ok()
-            .flatten()
+    }
+
+    /// Whether the secure backend holds a credential, treating an
+    /// unreadable backend as "no".
+    ///
+    /// Only for callers that are reporting on storage rather than reading a
+    /// value to use — `credential_read` listing which secrets live in
+    /// hardware, say. Anything that needs the credential itself wants
+    /// [`try_get_hardware`], so a locked keychain surfaces as a locked
+    /// keychain.
+    ///
+    /// [`try_get_hardware`]: Self::try_get_hardware
+    pub fn get_hardware(&self, name: &str) -> Option<String> {
+        self.try_get_hardware(name).ok().flatten()
     }
 
     pub async fn upsert_system(&self, name: &str, value: &str) -> Result<(), Error> {

@@ -199,8 +199,32 @@ pub async fn load(
     links: Option<&rustykrab_store::PendingLinks>,
     service: &str,
 ) -> Result<(String, String)> {
-    let email = secrets.get(KEY_EMAIL).await.ok();
-    let password = secrets.get(KEY_APP_PASSWORD).await.ok();
+    // Absent and unreadable are different faults with different remedies,
+    // and `.ok()` used to flatten both into "absent". Asking the user to
+    // supply the credential again is the right answer to "you never gave me
+    // one"; it is the wrong answer to "the credential store could not be
+    // read", where the value they would type is already stored and a fresh
+    // copy changes nothing. Filing the request is the costly half — it mints
+    // a one-time link and sends it — so a read failure stops before that.
+    let supplied = |read: Result<String>| -> Result<Option<String>> {
+        match read {
+            Ok(v) => Ok(Some(v)),
+            Err(Error::NotFound(_)) => Ok(None),
+            Err(other) => Err(Error::ToolExecution(
+                format!(
+                    "{service} is set up, but its credentials could not be read from \
+                     the credential store: {other}. The credential is not missing and \
+                     not wrong, so do not ask the user for it and do not tell them to \
+                     re-enter it. On macOS this is usually a locked machine denying \
+                     keychain access; it comes back when the machine is unlocked."
+                )
+                .into(),
+            )),
+        }
+    };
+
+    let email = supplied(secrets.get(KEY_EMAIL).await)?;
+    let password = supplied(secrets.get(KEY_APP_PASSWORD).await)?;
 
     let (email, password) = match (email, password) {
         (Some(email), Some(password)) => (email, password),
@@ -365,6 +389,63 @@ mod tests {
         assert!(
             !err.contains("credential_write"),
             "error leaked a tool name: {err}"
+        );
+    }
+
+    /// A credential backend that holds values but refuses to hand them
+    /// back — a locked macOS keychain.
+    #[derive(Default)]
+    struct UnreadableBackend;
+
+    impl rustykrab_store::credential_backend::CredentialBackend for UnreadableBackend {
+        fn name(&self) -> &str {
+            "unreadable (test)"
+        }
+        fn available(&self) -> bool {
+            true
+        }
+        fn get(&self, _: &str) -> std::result::Result<Option<String>, rustykrab_core::Error> {
+            Err(rustykrab_core::Error::Storage(
+                "keychain read failed: User interaction is not allowed".to_string(),
+            ))
+        }
+        fn set(&self, _: &str, _: &str) -> std::result::Result<(), rustykrab_core::Error> {
+            Ok(())
+        }
+        fn delete(&self, _: &str) -> std::result::Result<(), rustykrab_core::Error> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_credential_store_does_not_ask_the_user_to_re_enter_anything() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = rustykrab_store::Store::open(dir.path(), vec![7u8; 32])
+            .expect("open store")
+            .with_credential_backend(std::sync::Arc::new(UnreadableBackend));
+        let requests = store.credential_requests();
+
+        let err = load(&store.guarded_secrets(), Some(&requests), None, "Gmail")
+            .await
+            .unwrap_err()
+            .to_string();
+
+        // The observed failure: the user was asked for credentials that were
+        // already stored, and a one-time link was minted and sent for each
+        // attempt. Nothing about re-entering a password fixes a locked
+        // keychain, so nothing should be filed.
+        let pending = requests.pending().await.unwrap();
+        assert!(
+            pending.is_empty(),
+            "a read failure filed a request: {pending:?}"
+        );
+        assert!(
+            err.contains("could not be read"),
+            "error should name the real fault: {err}"
+        );
+        assert!(
+            !err.contains("is not an email address"),
+            "a read failure was reported as bad stored data: {err}"
         );
     }
 

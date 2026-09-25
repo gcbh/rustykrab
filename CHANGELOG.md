@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.3.3] - 2026-09-25
+
+- fix(store): report an unreadable keychain as unreadable, not as a bad credential (#660)
+
 ## [5.3.2] - 2026-09-25
 
 - fix(credentials): file a request for a known service under the name it is known by (#658)

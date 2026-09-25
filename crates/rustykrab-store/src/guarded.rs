@@ -117,10 +117,22 @@ impl GuardedSecrets {
     /// consulting only the database would find nothing and report the
     /// credential missing immediately after the user supplied it.
     pub async fn get(&self, name: &str) -> Result<String, Error> {
-        if let Some(v) = self.secrets.get_hardware(name) {
+        // A backend that cannot be read is an error, not an absence. Falling
+        // through to the database on a keychain failure is what turned a
+        // locked machine into "your stored Gmail address is not an email
+        // address": the row is there, and it is empty.
+        if let Some(v) = self.secrets.try_get_hardware(name)? {
             return Ok(v);
         }
-        self.secrets.get(name).await
+        match self.secrets.get(name).await {
+            // `put_hardware` keeps the live value in the backend and leaves
+            // an empty row behind, because the column is NOT NULL. That row
+            // means "this one lives in hardware" — it is not a credential,
+            // and handing `""` to a caller that is about to authenticate
+            // with it only produces a puzzling error further downstream.
+            Ok(v) if v.is_empty() => Err(Error::NotFound(format!("secret '{name}'"))),
+            other => other,
+        }
     }
 
     pub async fn list_names(&self) -> Result<Vec<String>, Error> {
@@ -137,6 +149,110 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Store::open(dir.path(), vec![9u8; 32]).expect("open");
         (dir, store.guarded_secrets(), store.secrets())
+    }
+
+    /// A credential backend that can be made to fail reads, or to forget
+    /// what it holds, without disturbing the database rows beside it.
+    ///
+    /// Both are states a real keychain reaches: denying reads while the
+    /// machine is locked, and losing an item outright.
+    #[derive(Default)]
+    struct FlakyBackend {
+        inner: crate::credential_backend::MemoryBackend,
+        deny_reads: std::sync::atomic::AtomicBool,
+        forget: std::sync::atomic::AtomicBool,
+    }
+
+    impl crate::credential_backend::CredentialBackend for FlakyBackend {
+        fn name(&self) -> &str {
+            "flaky (test)"
+        }
+        fn available(&self) -> bool {
+            true
+        }
+        fn get(&self, account: &str) -> Result<Option<String>, Error> {
+            use std::sync::atomic::Ordering;
+            if self.deny_reads.load(Ordering::SeqCst) {
+                // The message macOS actually produces when locked.
+                return Err(Error::Storage(
+                    "keychain read failed: User interaction is not allowed".to_string(),
+                ));
+            }
+            if self.forget.load(Ordering::SeqCst) {
+                return Ok(None);
+            }
+            crate::credential_backend::CredentialBackend::get(&self.inner, account)
+        }
+        fn set(&self, account: &str, value: &str) -> Result<(), Error> {
+            crate::credential_backend::CredentialBackend::set(&self.inner, account, value)
+        }
+        fn delete(&self, account: &str) -> Result<(), Error> {
+            crate::credential_backend::CredentialBackend::delete(&self.inner, account)
+        }
+    }
+
+    /// A store whose credential backend is a [`FlakyBackend`], with a Gmail
+    /// address already deposited in hardware the ordinary way.
+    async fn with_flaky_backend() -> (
+        tempfile::TempDir,
+        GuardedSecrets,
+        std::sync::Arc<FlakyBackend>,
+    ) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let backend = std::sync::Arc::new(FlakyBackend::default());
+        let store = Store::open(dir.path(), vec![9u8; 32])
+            .expect("open")
+            .with_credential_backend(backend.clone());
+        store
+            .secrets()
+            .put_hardware(
+                "gmail_email",
+                "me@gmail.com",
+                crate::secret::WriteAuthority::User {
+                    device: Some("device:test".to_string()),
+                },
+            )
+            .await
+            .expect("put_hardware");
+        (dir, store.guarded_secrets(), backend)
+    }
+
+    #[tokio::test]
+    async fn a_credential_store_that_cannot_be_read_is_an_error_not_an_empty_value() {
+        let (_dir, guard, backend) = with_flaky_backend().await;
+        assert_eq!(guard.get("gmail_email").await.unwrap(), "me@gmail.com");
+
+        // The machine locks; the credential is untouched but unreachable.
+        backend
+            .deny_reads
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        // The bug this pins: falling through to the database returned the
+        // empty placeholder row, so `gmail` reported the user's stored
+        // address was "not an email address" and asked them to supply it
+        // again — for four days, with a working credential in the keychain.
+        match guard.get("gmail_email").await {
+            Err(Error::Storage(msg)) => assert!(msg.contains("User interaction is not allowed")),
+            other => panic!("expected the read failure to surface, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_hardware_backed_secret_the_backend_lost_reads_as_absent() {
+        let (_dir, guard, backend) = with_flaky_backend().await;
+
+        // The keychain answers, and genuinely no longer holds the item.
+        backend
+            .forget
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        // The empty row `put_hardware` leaves behind marks where the value
+        // lives; it is not itself a credential. "Absent" is the honest
+        // answer, and the one that makes asking the user the right move.
+        match guard.get("gmail_email").await {
+            Err(Error::NotFound(what)) => assert!(what.contains("gmail_email")),
+            other => panic!("expected NotFound, got {other:?}"),
+        }
     }
 
     #[tokio::test]
