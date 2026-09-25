@@ -2570,6 +2570,17 @@ impl AgentRunner {
 
         let (hb_tx, mut hb_rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
 
+        // Task-locals do not cross `tokio::spawn`, so each spawned call has to
+        // re-enter them. Without this, any tool that reads the session context
+        // saw none whenever the model batched it with another call:
+        // `tools_list` / `tools_load` / `todo_write` failed outright, and
+        // `credential_request` filed its request under no conversation, so the
+        // secure link it minted was never delivered. The single-call path
+        // above runs inline and was never affected, which is why a model that
+        // emits one call per turn hid this.
+        let session_ctx = SESSION_TOOL_CONTEXT.try_with(Clone::clone).ok();
+        let trace_id = rustykrab_core::prompt_trace::current_trace_id();
+
         for call in calls {
             let call = call.clone();
             let tools = self.tool_index.clone();
@@ -2579,8 +2590,9 @@ impl AgentRunner {
             let sem = semaphore.clone();
             let hb_tx = hb_tx.clone();
             let interval = heartbeat_interval;
+            let session_ctx = session_ctx.clone();
 
-            let task = tokio::spawn(async move {
+            let task = tokio::spawn(with_task_locals(session_ctx, trace_id, async move {
                 let _permit = sem.acquire().await.expect("semaphore closed");
                 let start = Instant::now();
                 let result = if interval == 0 {
@@ -2617,7 +2629,7 @@ impl AgentRunner {
                     .await
                 };
                 (result, call.name.clone(), call.id.clone(), start.elapsed())
-            });
+            }));
             abort_on_drop.0.push(task.abort_handle());
             handles.push(task);
         }
@@ -4043,6 +4055,25 @@ fn fence_value(value: serde_json::Value) -> serde_json::Value {
     }
 }
 
+/// Run `fut` inside the task-locals a tool expects, for use under
+/// `tokio::spawn`, which starts every task with none of them.
+async fn with_task_locals<F: std::future::Future>(
+    session_ctx: Option<SessionToolContext>,
+    trace_id: Option<Uuid>,
+    fut: F,
+) -> F::Output {
+    let fut = async move {
+        match trace_id {
+            Some(id) => rustykrab_core::prompt_trace::with_trace_id(id, fut).await,
+            None => fut.await,
+        }
+    };
+    match session_ctx {
+        Some(ctx) => SESSION_TOOL_CONTEXT.scope(ctx, fut).await,
+        None => fut.await,
+    }
+}
+
 /// Standalone function so it can be moved into a tokio::spawn.
 async fn execute_single_tool(
     call: &ToolCall,
@@ -4473,6 +4504,94 @@ mod interactive_regression_tests {
             let _drop = DropNotice(self.dropped.clone());
             self.started.add_permits(1);
             std::future::pending().await
+        }
+    }
+
+    /// (conversation id from the session context, trace id) as one call saw them.
+    type ProbeSighting = (Option<Uuid>, Option<Uuid>);
+
+    /// Records what a tool can see of its caller: the session context and
+    /// the trace id, both carried by task-locals.
+    struct ContextProbe {
+        seen: Arc<Mutex<Vec<ProbeSighting>>>,
+    }
+    #[async_trait]
+    impl Tool for ContextProbe {
+        fn name(&self) -> &str {
+            "context_probe"
+        }
+        fn description(&self) -> &str {
+            "Reports the session context and trace id it runs under"
+        }
+        fn schema(&self) -> ToolSchema {
+            ToolSchema {
+                name: self.name().into(),
+                description: self.description().into(),
+                parameters: serde_json::json!({"type":"object"}),
+            }
+        }
+        async fn execute(&self, _: serde_json::Value) -> Result<serde_json::Value> {
+            let conversation =
+                rustykrab_core::active_tools::with_session_context(|c| c.conversation_id);
+            let trace = rustykrab_core::prompt_trace::current_trace_id();
+            self.seen.lock().unwrap().push((conversation, trace));
+            Ok(serde_json::json!({"ok": true}))
+        }
+    }
+
+    /// A batch of calls runs each call in its own spawned task. Task-locals
+    /// do not follow a spawn, so before this was fixed every tool in a batch
+    /// ran with no session context: `tools_list` failed and a credential
+    /// link was minted under no conversation and never delivered.
+    #[tokio::test]
+    async fn batched_tool_calls_keep_session_context_and_trace_id() {
+        let (p, _, conv, _) = setup(false, 4);
+        *p.response.lock().unwrap() = Some(MessageContent::MultiToolCall(
+            (0..3)
+                .map(|i| ToolCall {
+                    id: format!("probe-{i}"),
+                    name: "context_probe".into(),
+                    arguments: serde_json::json!({}),
+                })
+                .collect(),
+        ));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let runner = AgentRunner::new(
+            p.clone(),
+            vec![Arc::new(ContextProbe { seen: seen.clone() })],
+            Arc::new(NoSandbox),
+        )
+        .with_config(AgentConfig {
+            max_iterations: 4,
+            ..Default::default()
+        });
+        let session = Session::with_capabilities(
+            conv.id,
+            rustykrab_core::capability::CapabilitySet::for_tools_permissive(&["context_probe"]),
+        );
+        let conv_id = conv.id;
+        let trace_id = Uuid::new_v4();
+        let (_handle, _events, task) =
+            rustykrab_core::prompt_trace::with_trace_id(trace_id, async {
+                runner.start(conv, session)
+            })
+            .await;
+        p.entered.notified().await;
+        p.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 3, "every call in the batch ran");
+        for (conversation, trace) in seen.iter() {
+            assert_eq!(
+                *conversation,
+                Some(conv_id),
+                "session context reached the tool"
+            );
+            assert_eq!(*trace, Some(trace_id), "trace id reached the tool");
         }
     }
 
