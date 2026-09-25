@@ -78,8 +78,13 @@ PB=(/usr/libexec/PlistBuddy -c)
 # chmod 600 below — the same posture as the systemd EnvironmentFile documented
 # in the README. Without forwarding it, a daemon installed as a LaunchAgent can
 # never be configured to delegate, whatever the installing shell had exported.
+#
+# OLLAMA_TIMEOUT_SECS and RUSTYKRAB_MAX_CONTEXT_TOKENS were missing from this
+# list, so every reinstall silently dropped them from a hand-tuned plist: the
+# daemon fell back to the 32k Ollama context budget and the default timeout.
 for key in RUSTYKRAB_PROVIDER RUSTYKRAB_PORT RUSTYKRAB_WEB_UI RUST_LOG \
     OLLAMA_BASE_URL OLLAMA_MODEL OLLAMA_NUM_CTX RUSTYKRAB_NUM_CTX \
+    OLLAMA_TIMEOUT_SECS RUSTYKRAB_MAX_CONTEXT_TOKENS RUSTYKRAB_OUTCOME_CAPTURE \
     RUSTYKRAB_NODES RUSTYKRAB_NODE_TIMEOUT_SECS \
     CHROME_CDP_URL CHROME_CDP_PORT CHROME_EXECUTABLE \
     BROWSER_HEADLESS BROWSER_NO_SANDBOX RUSTYKRAB_BROWSER_ISOLATED_ROOT \
