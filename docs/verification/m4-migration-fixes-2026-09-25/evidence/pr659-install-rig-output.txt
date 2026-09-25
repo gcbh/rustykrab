@@ -1,0 +1,25 @@
+app under install: 5.3.0 Identifier=com.gcbh.rustykrab TeamIdentifier=3RRX845C4X 
+== pr659-with-keys (install.sh blob eced34f47bb00554ab40e1a9051948a97e147cfd, keys exported: yes) exit=0
+  plist env keys: HOME OLLAMA_MODEL OLLAMA_TIMEOUT_SECS PATH RUSTYKRAB_MAX_CONTEXT_TOKENS RUSTYKRAB_NUM_CTX RUSTYKRAB_OUTCOME_CAPTURE RUSTYKRAB_PROVIDER
+  OLLAMA_TIMEOUT_SECS = 901
+  RUSTYKRAB_MAX_CONTEXT_TOKENS = 40001
+  RUSTYKRAB_OUTCOME_CAPTURE = 1
+  plist mode 0o600
+  launchctl bootout gui/501/com.gcbh.rustykrab
+  launchctl bootstrap gui/501 <rig>/home/Library/LaunchAgents/com.gcbh.rustykrab.plist
+== main-with-keys (install.sh blob 61dee7ba80e78b6665812aebfcfb91fb00b83929, keys exported: yes) exit=0
+  plist env keys: HOME OLLAMA_MODEL PATH RUSTYKRAB_NUM_CTX RUSTYKRAB_PROVIDER
+  OLLAMA_TIMEOUT_SECS = <absent>
+  RUSTYKRAB_MAX_CONTEXT_TOKENS = <absent>
+  RUSTYKRAB_OUTCOME_CAPTURE = <absent>
+  plist mode 0o600
+  launchctl bootout gui/501/com.gcbh.rustykrab
+  launchctl bootstrap gui/501 <rig>/home/Library/LaunchAgents/com.gcbh.rustykrab.plist
+== pr659-without-keys (install.sh blob eced34f47bb00554ab40e1a9051948a97e147cfd, keys exported: no) exit=0
+  plist env keys: HOME OLLAMA_MODEL PATH RUSTYKRAB_NUM_CTX RUSTYKRAB_PROVIDER
+  OLLAMA_TIMEOUT_SECS = <absent>
+  RUSTYKRAB_MAX_CONTEXT_TOKENS = <absent>
+  RUSTYKRAB_OUTCOME_CAPTURE = <absent>
+  plist mode 0o600
+  launchctl bootout gui/501/com.gcbh.rustykrab
+  launchctl bootstrap gui/501 <rig>/home/Library/LaunchAgents/com.gcbh.rustykrab.plist
