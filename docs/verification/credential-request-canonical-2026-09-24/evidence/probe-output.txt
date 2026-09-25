@@ -1,0 +1,11 @@
+# Throwaway probe run at eb01cf8 (tree 3cfd748), crate rustykrab-tools, --no-default-features.
+# Source: probe-source.rs.txt (temporarily added as src/verify_probe.rs, then removed).
+PROBE google_maps_api_key              | Google Maps          -> gmail_app_password ["gmail_email", "gmail_app_password"]
+PROBE gemini_api_key                   | Google AI Studio     -> gmail_app_password ["gmail_email", "gmail_app_password"]
+PROBE google_cloud_service_account     | Google Cloud         -> gmail_app_password ["gmail_email", "gmail_app_password"]
+PROBE youtube_api_key                  | YouTube (Google)     -> gmail_app_password ["gmail_email", "gmail_app_password"]
+PROBE claude_ai_session                | Claude.ai            -> anthropic_api_key ["anthropic_api_key"]
+PROBE notion_calendar_login            | Notion Calendar      -> notion_api_token ["notion_api_token"]
+PROBE before tool: live_link=true first_link_resolves=true
+PROBE after tool: pending=1 name=gmail_app_password first_link_resolves=false new_id_differs=true
+test result: ok. 2 passed; 0 failed

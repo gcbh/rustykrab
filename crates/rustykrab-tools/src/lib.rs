@@ -94,9 +94,12 @@ pub(crate) mod obsidian;
 mod wiki;
 
 // Credentials (from main)
+// Which named credentials a request may be redirected onto, so the model
+// cannot invent a name that dedupes against nothing and stores nowhere.
 mod credential_read;
 mod credential_request;
 mod credential_write;
+pub mod known_credential;
 mod payment_request;
 
 // Skill tools

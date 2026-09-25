@@ -1,0 +1,8 @@
+FMT_OK
+    Checking rustykrab-e2e v5.3.0 (/Users/geoff/projects/rustycrab/.claude/worktrees/intelligent-liskov-5af115/crates/rustykrab-e2e)
+    Checking rustykrab-gateway v5.3.0 (/Users/geoff/projects/rustycrab/.claude/worktrees/intelligent-liskov-5af115/crates/rustykrab-gateway)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 43.52s
+PASSED_TOTAL 1125
+architecture docs OK — 14 crates, all documented, metrics current
+ARCH_OK
+exit=0
