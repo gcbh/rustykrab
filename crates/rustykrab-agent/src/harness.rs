@@ -24,8 +24,6 @@ pub struct HarnessProfile {
     /// Iteration count at which a soft warning is injected, nudging the agent
     /// to wrap up or save progress. Set to 0 to disable.
     pub soft_iteration_warning: usize,
-    /// Consecutive errors before injecting a reflection prompt.
-    pub max_consecutive_errors: usize,
     /// Max retries per failed tool call.
     pub max_tool_retries: u32,
 
@@ -46,7 +44,6 @@ impl Default for HarnessProfile {
             agent_name: "RustyKrab".to_string(),
             max_iterations: 200,
             soft_iteration_warning: 150,
-            max_consecutive_errors: 3,
             max_tool_retries: 2,
             max_context_tokens: 128_000,
             compaction_threshold_pct: 0.85,
@@ -56,11 +53,10 @@ impl Default for HarnessProfile {
 }
 
 impl HarnessProfile {
-    /// Preset optimized for coding tasks: reflect sooner on errors, more retries.
+    /// Preset optimized for coding tasks: more retries.
     pub fn coding() -> Self {
         Self {
             name: "coding".to_string(),
-            max_consecutive_errors: 2,
             max_tool_retries: 3,
             ..Self::default()
         }
@@ -90,7 +86,6 @@ impl HarnessProfile {
         AgentConfig {
             max_iterations: self.max_iterations,
             soft_iteration_warning: self.soft_iteration_warning,
-            max_consecutive_errors: self.max_consecutive_errors,
             max_tool_retries: self.max_tool_retries,
             max_context_tokens: self.max_context_tokens,
             compaction_threshold_pct: self.compaction_threshold_pct,

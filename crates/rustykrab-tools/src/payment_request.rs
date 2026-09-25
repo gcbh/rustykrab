@@ -135,11 +135,6 @@ impl Tool for PaymentRequestTool {
          17, 2:25pm\"}"
     }
 
-    /// Nothing more can happen until the user answers.
-    fn blocks_turn(&self) -> bool {
-        true
-    }
-
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: self.name().to_string(),

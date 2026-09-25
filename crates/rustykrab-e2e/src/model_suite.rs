@@ -165,7 +165,6 @@ fn tight_harness() -> String {
          agent_name = \"RustyKrab\"\n\
          max_iterations = 12\n\
          soft_iteration_warning = 0\n\
-         max_consecutive_errors = 3\n\
          max_tool_retries = 2\n\
          max_context_tokens = {TIGHT_CONTEXT_TOKENS}\n"
     )
@@ -178,7 +177,6 @@ pub(crate) fn bounded_harness() -> String {
      agent_name = \"RustyKrab\"\n\
      max_iterations = 10\n\
      soft_iteration_warning = 0\n\
-     max_consecutive_errors = 3\n\
      max_tool_retries = 2\n\
      max_context_tokens = 128000\n"
         .to_string()

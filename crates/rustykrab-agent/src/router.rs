@@ -82,9 +82,6 @@ impl HarnessRouter {
                 "soft_iteration_warning" => {
                     profile.soft_iteration_warning = self.base.soft_iteration_warning
                 }
-                "max_consecutive_errors" => {
-                    profile.max_consecutive_errors = self.base.max_consecutive_errors
-                }
                 "max_tool_retries" => profile.max_tool_retries = self.base.max_tool_retries,
                 _ => {}
             }

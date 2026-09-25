@@ -835,10 +835,6 @@ async fn send_message_stream(
                     }
                     Event::default().event(t).data(payload.to_string())
                 }
-                AgentEvent::Reflecting => Event::default().event("thinking").data(
-                    serde_json::json!({"type": "thinking", "delta": "reflecting on errors"})
-                        .to_string(),
-                ),
                 AgentEvent::Compressing => Event::default().event("thinking").data(
                     serde_json::json!({"type": "thinking", "delta": "compressing memory"})
                         .to_string(),
