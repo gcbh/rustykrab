@@ -1,0 +1,16 @@
+# M1 primary daemon: 'compaction context budget configured' lines per day
+# source: ~/Library/Application Support/rustykrab/logs/rustykrab.log.<date> on m1-max-64gb (read 2026-09-25)
+2026-09-02     4 max_context_tokens=128000    1 max_context_tokens=32000    2 max_context_tokens=50000 
+2026-09-03     1 max_context_tokens=32000    2 max_context_tokens=50000 
+2026-09-04     2 max_context_tokens=32000    1 max_context_tokens=50000 
+2026-09-10     4 max_context_tokens=32000 
+2026-09-15     1 max_context_tokens=32000 
+2026-09-16     1 max_context_tokens=32000 
+2026-09-18     1 max_context_tokens=128000    1 max_context_tokens=32000 
+
+# M1 LaunchAgent plist backups: OLLAMA_TIMEOUT_SECS / RUSTYKRAB_MAX_CONTEXT_TOKENS presence
+20260902T091059Z {'OLLAMA_TIMEOUT_SECS': '900', 'RUSTYKRAB_MAX_CONTEXT_TOKENS': '50000'}
+pre-5.2.26-20260903T014912Z {'OLLAMA_TIMEOUT_SECS': '900', 'RUSTYKRAB_MAX_CONTEXT_TOKENS': '50000'}
+pre-5.2.40-20260915T052454Z {'OLLAMA_TIMEOUT_SECS': '<absent>', 'RUSTYKRAB_MAX_CONTEXT_TOKENS': '<absent>'}
+pre-5.3.0-20260916T104141Z {'OLLAMA_TIMEOUT_SECS': '<absent>', 'RUSTYKRAB_MAX_CONTEXT_TOKENS': '<absent>'}
+pre-m4-20260925T052434Z {'OLLAMA_TIMEOUT_SECS': '<absent>', 'RUSTYKRAB_MAX_CONTEXT_TOKENS': '<absent>'}
