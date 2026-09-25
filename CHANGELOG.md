@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.3.6] - 2026-09-25
+
+- fix(agent): an empty reply to the task_complete reminder keeps the answer (#662)
+
 ## [5.3.5] - 2026-09-25
 
 - fix(install): forward context-budget, Ollama timeout and outcome-capture env (#659)

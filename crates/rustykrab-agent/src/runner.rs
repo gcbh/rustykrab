@@ -1579,6 +1579,21 @@ impl AgentRunner {
         );
     }
 
+    /// Whether the conversation ends in a `task_complete` reminder that
+    /// directly follows a non-empty assistant answer: the one state in which
+    /// an empty model response means "that answer was my last word".
+    fn answer_precedes_reminder(conv: &Conversation) -> bool {
+        let mut newest_first = conv.messages.iter().rev();
+        let reminded = newest_first.next().is_some_and(|m| {
+            m.role == Role::System && m.content.as_text() == Some(TASK_COMPLETE_REMINDER)
+        });
+        reminded
+            && newest_first.next().is_some_and(|m| {
+                m.role == Role::Assistant
+                    && m.content.as_text().is_some_and(|t| !t.trim().is_empty())
+            })
+    }
+
     /// Inject the `TASK_COMPLETE_REMINDER` as a user-role nudge after the
     /// model produced a text-only EndTurn mid-task. Bumps `retries` and
     /// returns `GiveUp` once the cap is exceeded so the caller can accept
@@ -2014,6 +2029,22 @@ impl AgentRunner {
                         )
                         .await;
                 }
+            }
+            // Reminded to call `task_complete`, a model that has already
+            // given its answer sometimes has nothing to add, and Ollama
+            // reports that silence as an error. Failing the run here threw
+            // away a finished answer and showed the user "I encountered an
+            // error" instead (qwen3.8, 31K-token Telegram turn, 2026-09-25).
+            // The answer is still the last assistant message, so it stands.
+            if matches!(&response, Err(Error::ModelEmptyResponse(_)))
+                && Self::answer_precedes_reminder(conv)
+            {
+                tracing::warn!(
+                    iteration,
+                    "empty response to the task_complete reminder — delivering the previous answer"
+                );
+                on_event(AgentEvent::Done);
+                return Ok(());
             }
             let ModelResponse {
                 message,
@@ -6629,6 +6660,9 @@ mod task_complete_tests {
     struct ScriptedProvider {
         script: Mutex<Vec<ModelResponse>>,
         chat_count: Mutex<usize>,
+        /// Once the script runs out, answer with the error Ollama raises
+        /// for a generation of zero tokens instead of panicking.
+        silent_when_exhausted: bool,
     }
 
     impl ScriptedProvider {
@@ -6636,16 +6670,27 @@ mod task_complete_tests {
             Self {
                 script: Mutex::new(script),
                 chat_count: Mutex::new(0),
+                silent_when_exhausted: false,
             }
         }
 
-        fn next(&self) -> ModelResponse {
+        fn then_silent(script: Vec<ModelResponse>) -> Self {
+            Self {
+                silent_when_exhausted: true,
+                ..Self::new(script)
+            }
+        }
+
+        fn next(&self) -> Result<ModelResponse> {
             let mut s = self.script.lock().unwrap();
             *self.chat_count.lock().unwrap() += 1;
             if s.is_empty() {
+                if self.silent_when_exhausted {
+                    return Err(Error::ModelEmptyResponse("scripted silence".into()));
+                }
                 panic!("ScriptedProvider ran out of canned responses");
             }
-            s.remove(0)
+            Ok(s.remove(0))
         }
     }
 
@@ -6655,7 +6700,7 @@ mod task_complete_tests {
             "scripted-mock"
         }
         async fn chat(&self, _: &[Message], _: &[ToolSchema]) -> Result<ModelResponse> {
-            Ok(self.next())
+            self.next()
         }
         async fn chat_with_choice(
             &self,
@@ -6663,7 +6708,7 @@ mod task_complete_tests {
             _: &[ToolSchema],
             _: ToolChoice,
         ) -> Result<ModelResponse> {
-            Ok(self.next())
+            self.next()
         }
     }
 
@@ -7038,6 +7083,58 @@ mod task_complete_tests {
                     .unwrap_or(false)),
             "expected re-prompt mentioning task_complete in the conversation"
         );
+    }
+
+    /// Reminded to call `task_complete` after giving a full answer, a model
+    /// may have nothing to add, and Ollama reports that as an error. The
+    /// answer already given must reach the user instead of a run failure.
+    #[tokio::test]
+    async fn empty_reply_to_the_reminder_delivers_the_previous_answer() {
+        let provider = Arc::new(ScriptedProvider::then_silent(vec![
+            tool_use_response("noop", serde_json::json!({})),
+            text_response("Your three most recent Notion pages are A, B and C."),
+        ]));
+        let (runner, session, conv_id) = make_runner(provider.clone());
+        let mut conv = make_conv();
+        conv.id = conv_id;
+
+        runner
+            .run(&mut conv, &session)
+            .await
+            .expect("an empty reply to the reminder must not fail the run");
+
+        let last_assistant_text = conv
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::Assistant && m.content.as_text().is_some())
+            .and_then(|m| m.content.as_text())
+            .expect("final assistant text must be present");
+        assert_eq!(
+            last_assistant_text,
+            "Your three most recent Notion pages are A, B and C."
+        );
+        assert_eq!(
+            *provider.chat_count.lock().unwrap(),
+            3,
+            "tool call, answer, then the silent reply to the reminder"
+        );
+    }
+
+    /// Silence is only an answer when there is an answer before it: an
+    /// empty first reply is still a failed call.
+    #[tokio::test]
+    async fn empty_reply_without_a_prior_answer_still_fails() {
+        let provider = Arc::new(ScriptedProvider::then_silent(Vec::new()));
+        let (runner, session, conv_id) = make_runner(provider.clone());
+        let mut conv = make_conv();
+        conv.id = conv_id;
+
+        let err = runner
+            .run(&mut conv, &session)
+            .await
+            .expect_err("nothing to fall back on");
+        assert!(matches!(err, Error::ModelEmptyResponse(_)), "got {err:?}");
     }
 
     #[tokio::test]

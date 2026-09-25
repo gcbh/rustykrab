@@ -130,6 +130,12 @@ pub enum Error {
     #[error("model provider error: {0}")]
     ModelProvider(String),
 
+    /// The model produced nothing at all: no text, no tool calls, zero
+    /// generated tokens. Displayed like `ModelProvider` but typed, so the
+    /// agent loop can tell "nothing more to say" from a failed call.
+    #[error("model provider error: {0}")]
+    ModelEmptyResponse(String),
+
     #[error("model provider rate limited: {0}")]
     ModelRateLimit(String),
 
@@ -210,7 +216,9 @@ impl Error {
             // The agent asked for something it isn't allowed to do
             // unilaterally; the user now has to decide.
             Error::PendingApproval { .. } => ToolErrorKind::PermissionDenied,
-            Error::ModelProvider(_) | Error::Channel(_) => ToolErrorKind::Transient,
+            Error::ModelProvider(_) | Error::ModelEmptyResponse(_) | Error::Channel(_) => {
+                ToolErrorKind::Transient
+            }
             Error::Config(_)
             | Error::Storage(_)
             | Error::Serialization(_)
