@@ -234,16 +234,16 @@ const EMPTY_RESPONSE_RETRY_LIMIT: usize = 1;
 /// Maximum retries for a planning-only response (model described intent
 /// without using tools).
 const PLANNING_ONLY_RETRY_LIMIT: usize = 2;
-/// Maximum number of times the runner will re-prompt the model to call
-/// `task_complete` after it stops with text-only output mid-task (i.e.
-/// after the agent has already invoked at least one tool this run).
-/// Past this cap the runner gives up and accepts the last text response
-/// rather than spinning until `max_iterations`. Small models that never
-/// learn to call `task_complete` thus degrade to the legacy behavior.
-const TASK_COMPLETE_RETRY_LIMIT: usize = 3;
+/// Delivered in place of an empty reply cut off by the output limit.
+const OUTPUT_LIMIT_NO_TEXT: &str = "I ran out of room before writing a reply. Ask me again, \
+     or narrow the request, and I'll answer directly.";
 
-/// Maximum consecutive `MaxTokens` responses before the runner gives up
-/// rather than re-prompting "Continue." again. Each retry re-sends the
+/// Maximum re-prompts when the model stops with `ToolUse` but sends no
+/// tool calls, before the run is abandoned as an error.
+const EMPTY_TOOL_USE_RETRY_LIMIT: usize = 3;
+
+/// Maximum consecutive *context-window* cutoffs before the runner gives up
+/// rather than compacting and re-prompting "Continue." again. Each retry re-sends the
 /// whole prompt, and when the cutoff was caused by the context *window*
 /// (not the generation cap) the retry also shrinks the model's remaining
 /// room — observed in production as completions walking down ~12 tokens
@@ -493,29 +493,6 @@ fn extract_task_complete_summary(calls: &[&ToolCall]) -> Option<String> {
         .and_then(|v| v.as_str())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
-}
-
-/// User-role nudge injected when the model produces a text-only response
-/// after it has already invoked tools this run. Reminds the model that
-/// `task_complete` is the explicit completion signal — text alone no
-/// longer terminates the loop once work is in progress.
-const TASK_COMPLETE_REMINDER: &str =
-    "You produced text but did not call `task_complete`. If the user's request \
-     is fully handled, call `task_complete` now with a `summary` containing the \
-     final answer the user should see. If more work remains, call the next tool \
-     to keep going — text alone will not end the turn now that you've started \
-     working.";
-
-/// Outcome of `AgentRunner::reprompt_for_task_complete`: tell the caller
-/// whether to keep looping or accept the last response. Lets the streaming
-/// and non-streaming run paths share the retry-cap bookkeeping while still
-/// emitting their own terminal events.
-enum CompletionReminderOutcome {
-    /// A reminder was injected — caller should `continue` the loop.
-    Continue,
-    /// Retry cap exceeded — caller should accept the last response and
-    /// return `Ok(())` (after emitting any provider-specific events).
-    GiveUp,
 }
 
 /// Classify a text-only assistant response.
@@ -814,8 +791,6 @@ pub enum AgentEvent {
         success: bool,
         error_message: Option<String>,
     },
-    /// The agent is reflecting after repeated errors.
-    Reflecting,
     /// The agent is compressing conversation memory.
     Compressing,
     /// A user message was received and queued during an active run.
@@ -944,8 +919,6 @@ pub struct AgentConfig {
     /// Iteration count at which a soft warning is injected, nudging the agent
     /// to wrap up or save progress. Set to 0 to disable.
     pub soft_iteration_warning: usize,
-    /// Maximum consecutive errors before reflecting.
-    pub max_consecutive_errors: usize,
     /// Maximum retries per failed tool call.
     pub max_tool_retries: u32,
     /// Estimated max context tokens for the model.
@@ -978,7 +951,6 @@ impl Default for AgentConfig {
         Self {
             max_iterations: 200,
             soft_iteration_warning: 150,
-            max_consecutive_errors: 3,
             max_tool_retries: 2,
             max_context_tokens: 128_000,
             compaction_threshold_pct: 0.85,
@@ -1579,59 +1551,6 @@ impl AgentRunner {
         );
     }
 
-    /// Whether the conversation ends in a `task_complete` reminder that
-    /// directly follows a non-empty assistant answer: the one state in which
-    /// an empty model response means "that answer was my last word".
-    fn answer_precedes_reminder(conv: &Conversation) -> bool {
-        let mut newest_first = conv.messages.iter().rev();
-        let reminded = newest_first.next().is_some_and(|m| {
-            m.role == Role::System && m.content.as_text() == Some(TASK_COMPLETE_REMINDER)
-        });
-        reminded
-            && newest_first.next().is_some_and(|m| {
-                m.role == Role::Assistant
-                    && m.content.as_text().is_some_and(|t| !t.trim().is_empty())
-            })
-    }
-
-    /// Inject the `TASK_COMPLETE_REMINDER` as a user-role nudge after the
-    /// model produced a text-only EndTurn mid-task. Bumps `retries` and
-    /// returns `GiveUp` once the cap is exceeded so the caller can accept
-    /// the last response rather than spinning to `max_iterations`.
-    fn reprompt_for_task_complete(
-        &self,
-        conv: &mut Conversation,
-        iteration: usize,
-        retries: &mut usize,
-        classification: &ResponseClass,
-    ) -> CompletionReminderOutcome {
-        *retries += 1;
-        if *retries > TASK_COMPLETE_RETRY_LIMIT {
-            tracing::warn!(
-                retries = *retries,
-                "task_complete reminder retries exhausted — accepting last response"
-            );
-            return CompletionReminderOutcome::GiveUp;
-        }
-        tracing::warn!(
-            iteration,
-            retries = *retries,
-            ?classification,
-            "EndTurn without task_complete after tool use — re-prompting"
-        );
-        self.push_message(
-            conv,
-            Message {
-                id: Uuid::new_v4(),
-                role: Role::System,
-                content: MessageContent::Text(TASK_COMPLETE_REMINDER.to_string()),
-                created_at: Utc::now(),
-                agent_version: Message::version_stamp(),
-            },
-        );
-        CompletionReminderOutcome::Continue
-    }
-
     /// Start the event-driven agent loop.
     ///
     /// Returns a handle for injecting events (user messages, cancellation),
@@ -1885,20 +1804,13 @@ impl AgentRunner {
         // the provider HTTP timeout.
         self.repair_oversized_summary(conv);
 
-        let mut consecutive_errors = 0;
         let mut soft_warning_injected = false;
         let mut empty_response_retries: usize = 0;
         let mut planning_only_retries: usize = 0;
         let mut empty_tool_use_retries: usize = 0;
         let mut max_tokens_retries: usize = 0;
-        let mut task_complete_retries: usize = 0;
         let mut had_side_effects = false;
         let mut has_called_any_tool = false;
-        // Set when a tool reports the turn is now waiting on someone
-        // else. Not reset per iteration: once the agent has asked the
-        // user for something, every later EndTurn this run is a stop,
-        // not an early exit.
-        let mut turn_blocked = false;
         // Per-run cache of the schemas sent to the model, keyed by the
         // active-set version so activations performed by `tools_load`
         // during the previous iteration are reflected in the next API
@@ -2030,22 +1942,6 @@ impl AgentRunner {
                         .await;
                 }
             }
-            // Reminded to call `task_complete`, a model that has already
-            // given its answer sometimes has nothing to add, and Ollama
-            // reports that silence as an error. Failing the run here threw
-            // away a finished answer and showed the user "I encountered an
-            // error" instead (qwen3.8, 31K-token Telegram turn, 2026-09-25).
-            // The answer is still the last assistant message, so it stands.
-            if matches!(&response, Err(Error::ModelEmptyResponse(_)))
-                && Self::answer_precedes_reminder(conv)
-            {
-                tracing::warn!(
-                    iteration,
-                    "empty response to the task_complete reminder — delivering the previous answer"
-                );
-                on_event(AgentEvent::Done);
-                return Ok(());
-            }
             let ModelResponse {
                 message,
                 usage,
@@ -2088,7 +1984,6 @@ impl AgentRunner {
                 empty_response_retries = 0;
                 planning_only_retries = 0;
                 max_tokens_retries = 0;
-                task_complete_retries = 0;
                 let calls = message.content.tool_calls();
                 let tool_names: Vec<&str> = calls.iter().map(|c| c.name.as_str()).collect();
                 tracing::info!(
@@ -2130,34 +2025,6 @@ impl AgentRunner {
                         }
                     }
                 }
-
-                // A tool that succeeded and blocks the turn (e.g. asking
-                // the user for a credential) means the right next move is
-                // one sentence and a stop.
-                if !turn_blocked {
-                    for (tool_name, _, result) in &results {
-                        if result.is_ok() {
-                            if let Some(t) = self.tool_index.get(tool_name) {
-                                if t.blocks_turn() {
-                                    turn_blocked = true;
-                                    tracing::info!(
-                                        tool = %tool_name,
-                                        "turn is blocked on the user — EndTurn will be accepted"
-                                    );
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-
-                let had_errors = results.iter().any(|(_, _, r)| {
-                    if let Ok(tr) = r {
-                        tr.output.get("error").is_some()
-                    } else {
-                        true
-                    }
-                });
 
                 for (tool_name, call_id, result) in results {
                     let (tool_msg, success, error_message) = match result {
@@ -2209,21 +2076,6 @@ impl AgentRunner {
                     self.push_message(conv, tool_msg);
                 }
 
-                if had_errors {
-                    consecutive_errors += 1;
-                    if consecutive_errors >= self.config.max_consecutive_errors {
-                        tracing::warn!(
-                            consecutive_errors,
-                            "injecting reflection prompt after repeated errors"
-                        );
-                        on_event(AgentEvent::Reflecting);
-                        self.inject_reflection(conv);
-                        consecutive_errors = 0;
-                    }
-                } else {
-                    consecutive_errors = 0;
-                }
-
                 // Explicit completion signal: the model called `task_complete`
                 // with a non-empty summary. Surface the summary as the final
                 // assistant message (so `extract_assistant_message` finds it)
@@ -2247,38 +2099,63 @@ impl AgentRunner {
 
             match stop_reason {
                 StopReason::MaxTokens => {
-                    max_tokens_retries += 1;
-                    if max_tokens_retries > MAX_TOKENS_RETRY_LIMIT {
-                        tracing::warn!(
-                            iteration,
-                            "max-tokens retries exhausted — accepting the truncated response"
-                        );
-                        on_event(AgentEvent::Done);
-                        return Ok(());
-                    }
-                    // Distinguish the two ways a generation gets cut off.
-                    // `num_predict` exhaustion means a verbose response —
-                    // "Continue." genuinely helps. *Window* exhaustion means
-                    // the prompt ate the model's room, and re-prompting only
-                    // shrinks it further (every retry appends messages), so
-                    // compact first and retry with room to work.
+                    // Two ways a generation gets cut off. *Window* exhaustion
+                    // means the prompt ate the model's room: compact, then
+                    // retry with room to work. Hitting the *output* limit
+                    // (`num_predict`) means the reply is as long as it gets,
+                    // so it is delivered as written. Nudging with "Continue."
+                    // mostly fed runaway loops (2026-08-19, 2026-09-01) and,
+                    // on Qwen3.8, reached the model folded into the leading
+                    // system block where it could not act on it.
                     let used = usage.prompt_tokens as usize + usage.completion_tokens as usize;
                     let window_exhausted = self
                         .provider
                         .total_context_window()
                         .is_some_and(|w| used + MAX_TOKENS_WINDOW_SLACK >= w);
-                    if window_exhausted {
+                    if !window_exhausted {
                         tracing::warn!(
                             iteration,
-                            used_tokens = used,
-                            "generation cut off by the context window — compacting before retrying"
+                            "model hit its output limit — delivering the reply as written"
                         );
-                        on_event(AgentEvent::Compressing);
-                        self.compact_history_preserving(conv, schemas, latest_user.as_ref())
-                            .await?;
-                    } else {
-                        tracing::warn!(iteration, "model hit max tokens, prompting to continue");
+                        if message
+                            .content
+                            .as_text()
+                            .is_some_and(|t| t.trim().is_empty())
+                        {
+                            // A thinking model can spend the whole output
+                            // allowance reasoning and write nothing. Say so,
+                            // rather than hand the channel an empty message.
+                            self.push_message(
+                                conv,
+                                Message {
+                                    id: Uuid::new_v4(),
+                                    role: Role::Assistant,
+                                    content: MessageContent::Text(OUTPUT_LIMIT_NO_TEXT.to_string()),
+                                    created_at: Utc::now(),
+                                    agent_version: Message::version_stamp(),
+                                },
+                            );
+                        }
+                        on_event(AgentEvent::Done);
+                        return Ok(());
                     }
+                    max_tokens_retries += 1;
+                    if max_tokens_retries > MAX_TOKENS_RETRY_LIMIT {
+                        tracing::warn!(
+                            iteration,
+                            "context-window retries exhausted — accepting the truncated response"
+                        );
+                        on_event(AgentEvent::Done);
+                        return Ok(());
+                    }
+                    tracing::warn!(
+                        iteration,
+                        used_tokens = used,
+                        "generation cut off by the context window — compacting before retrying"
+                    );
+                    on_event(AgentEvent::Compressing);
+                    self.compact_history_preserving(conv, schemas, latest_user.as_ref())
+                        .await?;
                     self.push_message(
                         conv,
                         Message {
@@ -2295,29 +2172,14 @@ impl AgentRunner {
                     let text = message.content.as_text().unwrap_or("");
                     let classification = classify_response(text, usage.completion_tokens);
 
-                    // If the agent has already called tools this run we no
-                    // longer trust an Ollama-style EndTurn as "task done":
-                    // the provider maps any text-only response to EndTurn
-                    // regardless of intent. Re-prompt the model to either
-                    // call `task_complete` with a final answer or continue
-                    // working. Cap by `TASK_COMPLETE_RETRY_LIMIT` so models
-                    // that never learn the protocol fall through to the
-                    // legacy accept-and-return behavior.
-                    if has_called_any_tool && !turn_blocked {
-                        match self.reprompt_for_task_complete(
-                            conv,
-                            iteration,
-                            &mut task_complete_retries,
-                            &classification,
-                        ) {
-                            CompletionReminderOutcome::Continue => continue,
-                            CompletionReminderOutcome::GiveUp => {
-                                on_event(AgentEvent::Done);
-                                return Ok(());
-                            }
-                        }
-                    }
-
+                    // After tool use this used to re-prompt for `task_complete`
+                    // on every text reply. It fired on 289 of ~304 tool-using
+                    // turns (M1, Aug–Sep 2026), 78% of them after replies the
+                    // classifier already called complete, where it mostly
+                    // cost a model call or pushed a finished answer into more
+                    // tool calls. The classifier now decides: a complete
+                    // reply ends the turn, and empty or narration-only
+                    // replies keep their own re-prompts below.
                     match classification {
                         ResponseClass::Complete => {
                             on_event(AgentEvent::Done);
@@ -2406,7 +2268,7 @@ impl AgentRunner {
                         return Ok(());
                     }
                     empty_tool_use_retries += 1;
-                    if empty_tool_use_retries > self.config.max_consecutive_errors {
+                    if empty_tool_use_retries > EMPTY_TOOL_USE_RETRY_LIMIT {
                         tracing::error!(
                             retries = empty_tool_use_retries,
                             "repeated ToolUse stop reason with no tool calls — aborting"
@@ -3726,43 +3588,6 @@ impl AgentRunner {
         );
 
         Ok(())
-    }
-
-    /// Inject a reflection prompt when the agent hits repeated errors.
-    fn inject_reflection(&self, conv: &mut Conversation) {
-        let mut recent_errors: Vec<String> = Vec::new();
-        for msg in conv.messages.iter().rev().take(10) {
-            if let MessageContent::ToolResult(tr) = &msg.content {
-                if tr.is_error {
-                    if let Some(err) = tr.output.get("error").and_then(|e| e.as_str()) {
-                        recent_errors.push(err.to_string());
-                    }
-                }
-            }
-            if recent_errors.len() >= 3 {
-                break;
-            }
-        }
-
-        let mut text = String::from("Multiple consecutive tool calls have failed.");
-        if !recent_errors.is_empty() {
-            text.push_str("\nRecent errors:\n");
-            for (i, err) in recent_errors.iter().enumerate() {
-                text.push_str(&format!("  {}. {}\n", i + 1, err));
-            }
-        }
-        text.push_str("Try a different approach.");
-
-        self.push_message(
-            conv,
-            Message {
-                id: Uuid::new_v4(),
-                role: Role::Assistant,
-                content: MessageContent::Text(text),
-                created_at: Utc::now(),
-                agent_version: Message::version_stamp(),
-            },
-        );
     }
 }
 
@@ -6870,34 +6695,58 @@ mod task_complete_tests {
         }
     }
 
+    /// Hitting the output limit ends the turn with the reply as written. The
+    /// runner used to append "Continue." and call again; on 2026-08-19 and
+    /// 2026-09-01 that loop was the failure, not the fix.
     #[tokio::test]
-    async fn consecutive_max_tokens_responses_are_capped() {
-        // Four straight MaxTokens responses: three get a "Continue."
-        // re-prompt, the fourth exhausts the cap and the run ends instead
-        // of looping until max_iterations (200) with an ever-growing
-        // history.
-        let provider = Arc::new(ScriptedProvider::new(vec![
-            max_tokens_response("partial a", 0, 0),
-            max_tokens_response("partial b", 0, 0),
-            max_tokens_response("partial c", 0, 0),
-            max_tokens_response("partial d", 0, 0),
-        ]));
+    async fn output_limit_reply_is_delivered_as_written() {
+        let provider = Arc::new(ScriptedProvider::new(vec![max_tokens_response(
+            "a long but useful partial answer",
+            0,
+            0,
+        )]));
         let (runner, session, conv_id) = make_runner(provider.clone());
         let mut conv = make_conv();
         conv.id = conv_id;
 
-        runner
-            .run(&mut conv, &session)
-            .await
-            .expect("run must end cleanly at the retry cap");
+        runner.run(&mut conv, &session).await.unwrap();
 
-        assert_eq!(*provider.chat_count.lock().unwrap(), 4);
-        let continues = conv
+        assert_eq!(*provider.chat_count.lock().unwrap(), 1, "no follow-up call");
+        assert!(
+            !conv
+                .messages
+                .iter()
+                .any(|m| m.content.as_text() == Some("Continue.")),
+            "no \"Continue.\" nudge"
+        );
+        let last = conv
             .messages
             .iter()
-            .filter(|m| m.role == Role::System && m.content.as_text() == Some("Continue."))
-            .count();
-        assert_eq!(continues, 3, "only the first three truncations re-prompt");
+            .rev()
+            .find(|m| m.role == Role::Assistant)
+            .and_then(|m| m.content.as_text());
+        assert_eq!(last, Some("a long but useful partial answer"));
+    }
+
+    /// A thinking model can spend the whole output allowance reasoning and
+    /// write nothing. The user is told so rather than sent an empty message.
+    #[tokio::test]
+    async fn output_limit_with_no_text_says_so() {
+        let provider = Arc::new(ScriptedProvider::new(vec![max_tokens_response("", 0, 0)]));
+        let (runner, session, conv_id) = make_runner(provider.clone());
+        let mut conv = make_conv();
+        conv.id = conv_id;
+
+        runner.run(&mut conv, &session).await.unwrap();
+
+        assert_eq!(*provider.chat_count.lock().unwrap(), 1);
+        let last = conv
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::Assistant)
+            .and_then(|m| m.content.as_text());
+        assert_eq!(last, Some(OUTPUT_LIMIT_NO_TEXT));
     }
 
     #[tokio::test]
@@ -7040,17 +6889,49 @@ mod task_complete_tests {
         assert_eq!(*provider.chat_count.lock().unwrap(), 2);
     }
 
+    /// A complete reply after tool use ends the turn: two model calls, no
+    /// `task_complete` round. This is the Telegram "list my recent Notion
+    /// pages" turn that on qwen3.8 was reminded, answered with silence, and
+    /// failed after 15 minutes (2026-09-25).
     #[tokio::test]
-    async fn endturn_after_tool_use_reprompts_for_task_complete() {
-        // Model calls noop, then ends with planning-only text (no
-        // task_complete). The runner must re-prompt rather than accept,
-        // even though Anthropic-style classification would have accepted
-        // the second message after side-effect equivalents.
+    async fn complete_reply_after_tool_use_ends_the_turn() {
         let provider = Arc::new(ScriptedProvider::new(vec![
             tool_use_response("noop", serde_json::json!({})),
-            // EndTurn without task_complete → must trigger re-prompt.
+            text_response("Your three most recent Notion pages are A, B and C."),
+        ]));
+        let (runner, session, conv_id) = make_runner(provider.clone());
+        let mut conv = make_conv();
+        conv.id = conv_id;
+
+        runner.run(&mut conv, &session).await.unwrap();
+
+        assert_eq!(*provider.chat_count.lock().unwrap(), 2);
+        let last = conv
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::Assistant && m.content.as_text().is_some())
+            .and_then(|m| m.content.as_text());
+        assert_eq!(
+            last,
+            Some("Your three most recent Notion pages are A, B and C.")
+        );
+        assert!(
+            !conv.messages.iter().any(|m| m
+                .content
+                .as_text()
+                .is_some_and(|t| t.contains("did not call `task_complete`"))),
+            "the task_complete reminder is gone"
+        );
+    }
+
+    /// Narration after tool use still gets its own nudge — the case where
+    /// the old reminder did useful work.
+    #[tokio::test]
+    async fn narration_after_tool_use_is_still_nudged() {
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            tool_use_response("noop", serde_json::json!({})),
             text_response("I'll keep digging into this for you. Stay tuned!"),
-            // Now model calls task_complete properly.
             tool_use_response(
                 "task_complete",
                 serde_json::json!({ "summary": "done at last" }),
@@ -7062,62 +6943,20 @@ mod task_complete_tests {
 
         runner.run(&mut conv, &session).await.unwrap();
 
-        let last_assistant_text = conv
-            .messages
-            .iter()
-            .rev()
-            .find(|m| m.role == Role::Assistant && m.content.as_text().is_some())
-            .and_then(|m| m.content.as_text())
-            .expect("final assistant text must be present");
-        assert_eq!(last_assistant_text, "done at last");
-
-        // All three scripted turns must have been consumed.
         assert_eq!(*provider.chat_count.lock().unwrap(), 3);
-
-        // The reminder must have been injected as a user-role message.
-        assert!(
-            conv.messages.iter().any(|m| m.role == Role::System
-                && m.content
-                    .as_text()
-                    .map(|t| t.contains("task_complete"))
-                    .unwrap_or(false)),
-            "expected re-prompt mentioning task_complete in the conversation"
-        );
-    }
-
-    /// Reminded to call `task_complete` after giving a full answer, a model
-    /// may have nothing to add, and Ollama reports that as an error. The
-    /// answer already given must reach the user instead of a run failure.
-    #[tokio::test]
-    async fn empty_reply_to_the_reminder_delivers_the_previous_answer() {
-        let provider = Arc::new(ScriptedProvider::then_silent(vec![
-            tool_use_response("noop", serde_json::json!({})),
-            text_response("Your three most recent Notion pages are A, B and C."),
-        ]));
-        let (runner, session, conv_id) = make_runner(provider.clone());
-        let mut conv = make_conv();
-        conv.id = conv_id;
-
-        runner
-            .run(&mut conv, &session)
-            .await
-            .expect("an empty reply to the reminder must not fail the run");
-
-        let last_assistant_text = conv
+        let last = conv
             .messages
             .iter()
             .rev()
             .find(|m| m.role == Role::Assistant && m.content.as_text().is_some())
-            .and_then(|m| m.content.as_text())
-            .expect("final assistant text must be present");
-        assert_eq!(
-            last_assistant_text,
-            "Your three most recent Notion pages are A, B and C."
-        );
-        assert_eq!(
-            *provider.chat_count.lock().unwrap(),
-            3,
-            "tool call, answer, then the silent reply to the reminder"
+            .and_then(|m| m.content.as_text());
+        assert_eq!(last, Some("done at last"));
+        assert!(
+            conv.messages.iter().any(|m| m
+                .content
+                .as_text()
+                .is_some_and(|t| t.contains("narrated work"))),
+            "the narration nudge fired"
         );
     }
 
@@ -7307,141 +7146,62 @@ mod task_complete_tests {
         assert_eq!(last_assistant_text, "real answer");
     }
 
-    #[tokio::test]
-    async fn task_complete_retry_limit_exhaustion_accepts_last_response() {
-        // After one real tool call the model narrates `TASK_COMPLETE_RETRY_LIMIT + 1`
-        // consecutive text-only EndTurns instead of ever calling
-        // `task_complete`. The runner must re-prompt up to the cap and then
-        // fall through to `Ok(())` — degrading gracefully to legacy
-        // behavior — rather than spinning until `max_iterations`.
-        let mut script = vec![tool_use_response("noop", serde_json::json!({}))];
-        // One more text response than the limit so the cap is exceeded.
-        for i in 0..=TASK_COMPLETE_RETRY_LIMIT {
-            script.push(text_response(&format!("still working on it ({i})")));
-        }
-        let total_provider_calls = script.len();
-        let provider = Arc::new(ScriptedProvider::new(script));
-        let (runner, session, conv_id) = make_runner(provider.clone());
-        let mut conv = make_conv();
-        conv.id = conv_id;
-
-        runner
-            .run(&mut conv, &session)
-            .await
-            .expect("loop should fall through gracefully after retries exhausted");
-
-        // Provider polled exactly once per scripted response — the loop
-        // stopped at the cap, not earlier and not later.
-        assert_eq!(*provider.chat_count.lock().unwrap(), total_provider_calls);
-
-        // The reminder must have been injected exactly `TASK_COMPLETE_RETRY_LIMIT`
-        // times: each text response below the cap triggers one reminder;
-        // the response that exceeds the cap returns without injecting.
-        let reminder_count = conv
-            .messages
-            .iter()
-            .filter(|m| {
-                m.role == Role::System
-                    && m.content
-                        .as_text()
-                        .map(|t| t.contains("did not call `task_complete`"))
-                        .unwrap_or(false)
-            })
-            .count();
-        assert_eq!(reminder_count, TASK_COMPLETE_RETRY_LIMIT);
-    }
-
-    /// A tool that blocks the turn, and is otherwise a noop.
-    struct BlockingTool;
+    /// Stands in for any tool that asks the user for something.
+    struct AskTheUserTool;
 
     #[async_trait]
-    impl Tool for BlockingTool {
+    impl Tool for AskTheUserTool {
         fn name(&self) -> &str {
             "ask_the_user"
         }
         fn description(&self) -> &str {
-            "test blocking tool"
+            "test tool that files a request for the user"
         }
         fn schema(&self) -> ToolSchema {
             ToolSchema {
                 name: "ask_the_user".into(),
-                description: "test blocking tool".into(),
+                description: "test tool that files a request for the user".into(),
                 parameters: serde_json::json!({"type": "object", "properties": {}}),
             }
-        }
-        fn blocks_turn(&self) -> bool {
-            true
         }
         async fn execute(&self, _args: serde_json::Value) -> Result<serde_json::Value> {
             Ok(serde_json::json!({"status": "requested"}))
         }
     }
 
-    fn runner_with_blocking_tool(provider: Arc<ScriptedProvider>) -> (AgentRunner, Session, Uuid) {
-        use rustykrab_tools::TaskCompleteTool;
-        let active = Arc::new(ActiveToolsRegistry::new());
-        let tools: Vec<Arc<dyn Tool>> =
-            vec![Arc::new(BlockingTool), Arc::new(TaskCompleteTool::new())];
-        let runner = AgentRunner::new(provider, tools, Arc::new(NoSandbox))
-            .with_active_tools(active.clone());
-        let conv_id = Uuid::new_v4();
-        active.activate(conv_id, ["ask_the_user"]);
-        let caps = CapabilitySet::for_tools_permissive(&["ask_the_user", "task_complete"]);
-        let session = Session::with_capabilities(conv_id, caps);
-        (runner, session, conv_id)
-    }
-
-    /// Asking the user for something is a legitimate reason to stop, and
-    /// the loop must let the turn end.
+    /// Asking the user for something ends the turn on its one sentence.
     ///
-    /// Without this the runner demands `task_complete` after any tool
-    /// call. The model cannot honestly call it — the task is blocked, not
-    /// done — so it churns instead. Observed against gemma4:26b: the
-    /// agent filed a credential request at iteration 29 and was still
-    /// going at 46, calling `todo_write` and `exec` to fill the turns.
+    /// The `task_complete` reminder used to demand an ending the model could
+    /// not honestly give. Observed against gemma4:26b: the agent filed a
+    /// credential request at iteration 29 and was still going at 46,
+    /// calling `todo_write` and `exec` to fill the turns. Tools once had to
+    /// opt out of the reminder (`blocks_turn`); with the reminder gone,
+    /// every tool gets this for free.
     #[tokio::test]
-    async fn a_blocked_turn_ends_without_task_complete() {
+    async fn asking_the_user_ends_the_turn() {
         let provider = Arc::new(ScriptedProvider::new(vec![
             tool_use_response("ask_the_user", serde_json::json!({})),
-            // The one sentence telling the user, then stop.
             text_response("I've asked for your Gmail app password."),
         ]));
-        let (runner, session, conv_id) = runner_with_blocking_tool(provider.clone());
+        let active = Arc::new(ActiveToolsRegistry::new());
+        let runner = AgentRunner::new(
+            provider.clone(),
+            vec![Arc::new(AskTheUserTool)],
+            Arc::new(NoSandbox),
+        )
+        .with_active_tools(active.clone());
+        let conv_id = Uuid::new_v4();
+        active.activate(conv_id, ["ask_the_user"]);
+        let session = Session::with_capabilities(
+            conv_id,
+            CapabilitySet::for_tools_permissive(&["ask_the_user"]),
+        );
         let mut conv = make_conv();
         conv.id = conv_id;
 
         runner.run(&mut conv, &session).await.unwrap();
 
-        // Two calls: the tool use, and the sentence. A third would mean
-        // the runner re-prompted for `task_complete`.
-        assert_eq!(
-            *provider.chat_count.lock().unwrap(),
-            2,
-            "a blocked turn must not be re-prompted for task_complete"
-        );
-    }
-
-    /// The suppression is specific to blocking tools — an ordinary tool
-    /// followed by a bare EndTurn must still be re-prompted, or this fix
-    /// would disable the completion protocol wholesale.
-    #[tokio::test]
-    async fn a_normal_tool_is_still_reprompted() {
-        let provider = Arc::new(ScriptedProvider::new(vec![
-            tool_use_response("noop", serde_json::json!({})),
-            text_response("I'll keep digging into this for you."),
-            tool_use_response("task_complete", serde_json::json!({ "summary": "done" })),
-        ]));
-        let (runner, session, conv_id) = make_runner(provider.clone());
-        let mut conv = make_conv();
-        conv.id = conv_id;
-
-        runner.run(&mut conv, &session).await.unwrap();
-
-        assert_eq!(
-            *provider.chat_count.lock().unwrap(),
-            3,
-            "a non-blocking tool must still be held to the completion protocol"
-        );
+        assert_eq!(*provider.chat_count.lock().unwrap(), 2);
     }
 }
 

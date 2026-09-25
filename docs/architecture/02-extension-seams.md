@@ -187,9 +187,7 @@ Worth naming, because a review that only lists problems misrepresents the code:
 
 - **`Tool` is a well-designed trait.** `available()` keeps unconfigured tools out
   of the model's schema list; `sandbox_requirements()` replaces hardcoded
-  name allowlists with declared capabilities; `blocks_turn()` encodes a subtle
-  and real distinction (stopped-early vs stopped-because-blocked) that most
-  agent loops get wrong.
+  name allowlists with declared capabilities.
 - **`ModelProvider` defaults are correctly chosen.** `context_limit`,
   `supports_vision`, `requires_paired_tool_results`, `chat_with_ctx`,
   `chat_with_choice` all have defaults that degrade safely, so a new provider
