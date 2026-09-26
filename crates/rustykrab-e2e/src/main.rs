@@ -24,6 +24,7 @@ mod browser_suite;
 mod classify;
 mod compaction_study;
 mod context_suite;
+mod control_suite;
 mod credential_suite;
 mod fixture_repo;
 mod judge;
@@ -159,6 +160,19 @@ const AGENT_SCRIPT: &str = r#"{
     }
   ]
 }"#;
+
+/// The script the scripted daemon replays: [`AGENT_SCRIPT`] plus the
+/// control suite's orchestration and worker scenarios, which live beside
+/// the scenarios that send their triggers.
+fn agent_script() -> Result<String> {
+    let mut script: Value = serde_json::from_str(AGENT_SCRIPT)?;
+    let control = control_suite::agent_script_scenarios();
+    script["scenarios"]
+        .as_array_mut()
+        .ok_or_else(|| anyhow!("AGENT_SCRIPT has no scenarios array"))?
+        .extend(control);
+    Ok(serde_json::to_string_pretty(&script)?)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -320,6 +334,9 @@ struct Ctx {
     /// Owns the disposable daemon so scenarios can prove restart recovery
     /// against the same port and data directory.
     daemon: Arc<tokio::sync::Mutex<Option<Child>>>,
+    /// The Telegram and GitHub stand-ins the scripted daemon talks to.
+    /// `None` for daemons booted without them (the model suites).
+    stand_ins: Option<surface::StandIns>,
 }
 
 impl Ctx {
@@ -353,6 +370,18 @@ impl Ctx {
     /// Stop the live daemon, prove the port went dark, and boot a distinct
     /// process against the same durable state.
     async fn restart_daemon(&self) -> Result<(u32, u32)> {
+        self.restart_daemon_with(|| async { Ok(()) }).await
+    }
+
+    /// [`Ctx::restart_daemon`], running `while_down` after the old process
+    /// has stopped and before the new one boots: for state that must be
+    /// written while nothing is running, such as jobs that fall due while
+    /// the daemon is down.
+    async fn restart_daemon_with<F, Fut>(&self, while_down: F) -> Result<(u32, u32)>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<()>>,
+    {
         let mut daemon = self.daemon.lock().await;
         let previous = daemon
             .take()
@@ -369,8 +398,14 @@ impl Ctx {
         {
             bail!("daemon still answered after shutdown");
         }
+        while_down().await?;
 
-        let mut replacement = spawn_daemon(&self.bin, &self.data_dir, self.port()?)?;
+        let mut replacement = spawn_daemon(
+            &self.bin,
+            &self.data_dir,
+            self.port()?,
+            self.stand_ins.as_ref(),
+        )?;
         let replacement_pid = replacement.id();
         if replacement_pid == previous_pid {
             bail!("replacement daemon reused pid {previous_pid}");
@@ -1142,8 +1177,9 @@ fn pick_free_port() -> Result<u16> {
 
 /// Which provider the daemon under test should run.
 pub enum Backend<'a> {
-    /// Replay a fixed script — no model, no network, deterministic.
-    Scripted,
+    /// Replay a fixed script: no model, no network, deterministic. With
+    /// stand-ins, the daemon's Telegram and GitHub calls go to them.
+    Scripted(Option<&'a surface::StandIns>),
     /// A real model via Ollama, with the tool registry replaced by stubs
     /// the scenario controls.
     Model {
@@ -1169,8 +1205,13 @@ pub enum Backend<'a> {
     },
 }
 
-fn spawn_daemon(bin: &str, data_dir: &std::path::Path, port: u16) -> Result<Child> {
-    spawn_daemon_with(bin, data_dir, port, &Backend::Scripted)
+fn spawn_daemon(
+    bin: &str,
+    data_dir: &std::path::Path,
+    port: u16,
+    stand_ins: Option<&surface::StandIns>,
+) -> Result<Child> {
+    spawn_daemon_with(bin, data_dir, port, &Backend::Scripted(stand_ins))
 }
 
 /// The budget the daemon picks for Ollama when nothing overrides it
@@ -1256,12 +1297,15 @@ fn spawn_daemon_with(
         .env("RUSTYKRAB_MODEL_CACHE_DIR", shared_model_cache());
 
     match backend {
-        Backend::Scripted => {
+        Backend::Scripted(stand_ins) => {
             let script_path = data_dir.join("e2e-script.json");
-            std::fs::write(&script_path, AGENT_SCRIPT)?;
+            std::fs::write(&script_path, agent_script()?)?;
             command
                 .env("RUSTYKRAB_PROVIDER", "scripted")
                 .env("RUSTYKRAB_SCRIPT_PATH", &script_path);
+            if let Some(stand_ins) = stand_ins {
+                stand_ins.configure(command);
+            }
         }
         Backend::Model {
             model,
@@ -2002,11 +2046,23 @@ async fn run_scripted(bin: &str, case_filter: Option<&str>) -> Result<Vec<Scenar
         .tempdir()?;
     let data_dir = tmp.path().to_path_buf();
     let port = pick_free_port()?;
+    let stand_ins = surface::StandIns::start().await?;
 
     let daemon = Arc::new(tokio::sync::Mutex::new(Some(spawn_daemon(
-        bin, &data_dir, port,
+        bin,
+        &data_dir,
+        port,
+        Some(&stand_ins),
     )?)));
-    let result = run_suite(bin, &data_dir, port, Arc::clone(&daemon), case_filter).await;
+    let result = run_suite(
+        bin,
+        &data_dir,
+        port,
+        Arc::clone(&daemon),
+        stand_ins,
+        case_filter,
+    )
+    .await;
     if let Some(child) = daemon.lock().await.take() {
         shutdown_daemon(child).await;
     }
@@ -2219,6 +2275,7 @@ fn scripted_scenarios() -> Vec<(Expected, (&'static str, ScenarioFn))> {
     ];
     scenarios.extend(payment_suite::scenarios());
     scenarios.extend(planning_suite::scenarios());
+    scenarios.extend(control_suite::scenarios());
     scenarios
 }
 
@@ -2227,6 +2284,7 @@ async fn run_suite(
     data_dir: &std::path::Path,
     port: u16,
     daemon: Arc<tokio::sync::Mutex<Option<Child>>>,
+    stand_ins: surface::StandIns,
     case_filter: Option<&str>,
 ) -> Result<Vec<ScenarioReport>> {
     let base = format!("http://127.0.0.1:{port}");
@@ -2261,6 +2319,7 @@ async fn run_suite(
         bin: bin.to_string(),
         data_dir: data_dir.to_path_buf(),
         daemon,
+        stand_ins: Some(stand_ins),
     };
 
     let scenarios: Vec<_> = scripted_scenarios()
@@ -2327,6 +2386,35 @@ mod shed_tests {
             outside.path().join("app/user-data").exists(),
             "a user-data directory behind a symlink was deleted"
         );
+    }
+}
+
+#[cfg(test)]
+mod agent_script_tests {
+    use super::*;
+
+    /// The merged script must load in the daemon's own parser, or the
+    /// scripted daemon refuses to boot and every scenario fails for a
+    /// reason that has nothing to do with it.
+    #[test]
+    fn the_merged_script_parses_in_the_scripted_provider() {
+        let script = agent_script().expect("merge");
+        rustykrab_providers::ScriptedProvider::from_json(&script).expect("scripted provider");
+    }
+
+    /// A control trigger that contained, or was contained in, an existing
+    /// one would hijack that scenario's replay: longest match wins.
+    #[test]
+    fn control_triggers_never_overlap_the_existing_ones() {
+        let base: Value = serde_json::from_str(AGENT_SCRIPT).unwrap();
+        let control = control_suite::agent_script_scenarios();
+        for existing in base["scenarios"].as_array().unwrap() {
+            let a = existing["trigger"].as_str().unwrap().to_lowercase();
+            for added in &control {
+                let b = added["trigger"].as_str().unwrap().to_lowercase();
+                assert!(!a.contains(&b) && !b.contains(&a), "{a:?} overlaps {b:?}");
+            }
+        }
     }
 }
 

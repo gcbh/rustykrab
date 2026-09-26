@@ -846,6 +846,7 @@ async fn run_once(
             // Model scenarios already own their one-shot daemon directly;
             // only the scripted planning suite exercises in-scenario restarts.
             daemon: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+            stand_ins: None,
         };
 
         let started = Instant::now();
