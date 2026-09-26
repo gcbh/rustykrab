@@ -14,6 +14,10 @@ rustykrab-channels.workspace = true
 rustykrab-memory.workspace = true
 rustykrab-skills.workspace = true
 rustykrab-projects.workspace = true
+# The control layer: `/api/work` calls its `ControlHandle`; `Provenance`
+# comes from the tools crate's work backend.
+rustykrab-control.workspace = true
+rustykrab-tools.workspace = true
 axum.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
@@ -31,3 +35,6 @@ ring.workspace = true
 mime_guess = "2"
 rand.workspace = true
 hex.workspace = true
+
+[dev-dependencies]
+async-trait.workspace = true
