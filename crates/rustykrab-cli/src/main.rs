@@ -3,6 +3,7 @@ mod chat;
 mod computer_backend;
 mod prompt_log;
 mod task_queue;
+mod work_cmd;
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -428,12 +429,15 @@ async fn main() -> anyhow::Result<()> {
     if args.len() >= 2 && args[1] == "pair" {
         return handle_pair_subcommand(&data_dir).await;
     }
+    if args.len() >= 2 && args[1] == "work" {
+        return work_cmd::run(&data_dir, &args[2..]).await;
+    }
     // An unrecognized subcommand must not silently fall through to
     // "start the daemon" — a typo would boot a full agent instead of
     // reporting the mistake.
     if let Some(unknown) = args.get(1).filter(|a| !a.starts_with('-')) {
         eprintln!("unknown subcommand '{unknown}'");
-        eprintln!("subcommands: skill, keychain, chat, dream, pair");
+        eprintln!("subcommands: skill, keychain, chat, dream, pair, work");
         eprintln!("run with no arguments to start the daemon");
         std::process::exit(2);
     }

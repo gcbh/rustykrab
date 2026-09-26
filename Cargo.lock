@@ -4177,6 +4177,7 @@ dependencies = [
  "rustls",
  "rustykrab-agent",
  "rustykrab-channels",
+ "rustykrab-control",
  "rustykrab-core",
  "rustykrab-dream",
  "rustykrab-gateway",
