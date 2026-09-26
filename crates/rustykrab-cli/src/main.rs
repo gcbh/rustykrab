@@ -10,6 +10,8 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use rustykrab_control::handle::ControlHandle;
+
 use chrono::Utc;
 
 /// Re-exported so the version shown by `--version` is the same string
@@ -214,6 +216,113 @@ impl ChannelHub {
 /// trait so the `message` tool can deliver to Telegram, Slack, or Signal
 /// without resorting to shell `curl` (which is sandbox-restricted and would
 /// also bypass the channel allowlist / retry / chunking logic).
+/// The work tools' backend, bound once the controller exists. The local
+/// worker is built before the controller, because the controller takes its
+/// worker list at construction, and the tools that worker runs need the
+/// controller as their backend; this breaks the cycle. Unbound calls fail
+/// closed.
+#[derive(Default)]
+struct DeferredWorkBackend {
+    inner: std::sync::OnceLock<Arc<dyn rustykrab_tools::WorkBackend>>,
+}
+
+impl DeferredWorkBackend {
+    fn bind(&self, backend: Arc<dyn rustykrab_tools::WorkBackend>) {
+        let _ = self.inner.set(backend);
+    }
+
+    fn bound(&self) -> rustykrab_core::Result<&Arc<dyn rustykrab_tools::WorkBackend>> {
+        self.inner.get().ok_or_else(|| {
+            rustykrab_core::Error::Internal("the work backend is not bound yet".into())
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl rustykrab_tools::WorkBackend for DeferredWorkBackend {
+    async fn file(
+        &self,
+        draft: rustykrab_core::work::WorkItemDraft,
+        provenance: rustykrab_tools::Provenance,
+    ) -> rustykrab_core::Result<rustykrab_core::work::PlanOutcome> {
+        self.bound()?.file(draft, provenance).await
+    }
+
+    async fn status(
+        &self,
+        query: rustykrab_tools::StatusQuery,
+        principal: &rustykrab_tools::Principal,
+    ) -> rustykrab_core::Result<Vec<rustykrab_tools::WorkStatusView>> {
+        self.bound()?.status(query, principal).await
+    }
+
+    async fn report(
+        &self,
+        item: rustykrab_core::work::WorkItemId,
+        report: rustykrab_core::work::ResultReport,
+        provenance: rustykrab_tools::Provenance,
+    ) -> rustykrab_core::Result<()> {
+        self.bound()?.report(item, report, provenance).await
+    }
+
+    fn tool_state(&self, name: &str) -> rustykrab_tools::ToolState {
+        self.inner
+            .get()
+            .map(|b| b.tool_state(name))
+            .unwrap_or(rustykrab_tools::ToolState::Unknown)
+    }
+
+    fn mcp_server_configured(&self, name: &str) -> bool {
+        self.inner
+            .get()
+            .map(|b| b.mcp_server_configured(name))
+            .unwrap_or(false)
+    }
+}
+
+/// Deliver the controller's notices from the work outbox (plan section
+/// 6.6): each row goes out on its channel and is marked delivered only when
+/// the send succeeds, so a channel outage delays a notice rather than
+/// losing it. Telegram needs a chat id; the first allowed chat is the user.
+async fn deliver_work_notices(
+    store: rustykrab_store::Store,
+    backend: Arc<dyn MessageBackend>,
+    default_chat: Option<String>,
+    every_secs: u64,
+) {
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(every_secs.max(1)));
+    loop {
+        interval.tick().await;
+        let pending = match store.work_outbox_pending().await {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::warn!(error = %e, "could not read the work outbox");
+                continue;
+            }
+        };
+        for row in pending {
+            let chat = if row.channel == "telegram" {
+                default_chat.as_deref()
+            } else {
+                None
+            };
+            match backend
+                .send_message(&row.channel, &row.body, chat, None)
+                .await
+            {
+                Ok(_) => {
+                    if let Err(e) = store.work_outbox_mark_delivered(&row.id).await {
+                        tracing::warn!(error = %e, id = %row.id, "notice sent but not marked delivered");
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(error = %e, id = %row.id, channel = %row.channel, "work notice not delivered yet");
+                }
+            }
+        }
+    }
+}
+
 struct MessageAdapter {
     hub: Arc<ChannelHub>,
 }
@@ -989,7 +1098,7 @@ async fn main() -> anyhow::Result<()> {
     let message_backend: Arc<dyn MessageBackend> = Arc::new(MessageAdapter {
         hub: channel_hub.clone(),
     });
-    tools.extend(rustykrab_tools::message_tools(message_backend));
+    tools.extend(rustykrab_tools::message_tools(message_backend.clone()));
     tracing::info!("message tool registered");
 
     // --- Cron tool (task scheduling) ---
@@ -1136,6 +1245,56 @@ async fn main() -> anyhow::Result<()> {
         "skill-tools registered"
     );
 
+    // --- Control layer: work items, a local worker and the controller ---
+    // See docs/plans/control-layer-and-worker-fleet.md. The local worker
+    // runs with the work tools, whose backend is the controller, and the
+    // controller takes its worker list at construction: the deferred
+    // backend breaks that cycle and is bound as soon as the controller
+    // exists. Registered before the stub switch below so the evaluation
+    // harness can script the work tools like any other.
+    let deferred_work_backend = Arc::new(DeferredWorkBackend::default());
+    let control_notice_channel = if std::env::var_os("TELEGRAM_BOT_TOKEN").is_some() {
+        "telegram"
+    } else {
+        "webchat"
+    };
+    let local_worker: Arc<dyn rustykrab_control::worker::Worker> =
+        Arc::new(rustykrab_agent::LocalWorker::new(
+            "pinch",
+            rustykrab_agent::LocalWorker::default_definition("pinch"),
+            provider.clone(),
+            tools.clone(),
+            Arc::new(ProcessSandbox::new()),
+            deferred_work_backend.clone() as Arc<dyn rustykrab_tools::WorkBackend>,
+        ));
+    let control_catalog = rustykrab_control::controller::StaticCatalog {
+        tools: tools
+            .iter()
+            .map(|t| (t.name().to_string(), rustykrab_tools::ToolState::Loaded))
+            .collect(),
+        mcp_servers: HashSet::new(),
+        credentials: HashSet::new(),
+    };
+    let control_config = rustykrab_control::controller::ControllerConfig {
+        notice_channel: control_notice_channel.to_string(),
+        ..Default::default()
+    };
+    let controller = Arc::new(
+        rustykrab_control::controller::Controller::new(
+            store.clone(),
+            vec![local_worker],
+            control_config,
+        )
+        .with_catalog(Arc::new(control_catalog)),
+    );
+    deferred_work_backend.bind(controller.clone());
+    tools.extend(rustykrab_tools::work_tools(controller.clone()));
+    tracing::info!(
+        worker = "pinch",
+        notices = control_notice_channel,
+        "control layer registered"
+    );
+
     // --- Tool stubs (evaluation harness only) ---
     // RUSTYKRAB_TOOL_STUBS swaps real tools for scripted stand-ins whose
     // answers the harness controls, so a scenario can reach an upstream
@@ -1240,6 +1399,7 @@ async fn main() -> anyhow::Result<()> {
     // Clone store handle so we can flush it after the server shuts down.
     let store_handle = store.clone();
     let mut state = rustykrab_gateway::AppState::new(store, tools, provider, auth_token)
+        .with_control(controller.clone() as Arc<dyn rustykrab_control::handle::ControlHandle>)
         // Loopback is always allowed; this adds the names other clients
         // reach us by, e.g. the tailnet hostname the phone uses.
         .with_origin_policy(rustykrab_gateway::OriginPolicy::from_env())
@@ -1619,6 +1779,50 @@ async fn main() -> anyhow::Result<()> {
             job_executor_loop(executor_store, executor_queue).await;
         }));
         tracing::info!("job executor started (30s poll interval)");
+    }
+
+    // --- Control layer: the tick loop and notice delivery ---
+    // One pass of the controller per tick (plan section 6); notices the
+    // controller wrote to the work outbox go out through the message
+    // backend, one per parent, and stay pending until a send succeeds.
+    {
+        let tick_secs: u64 = std::env::var("RUSTYKRAB_CONTROL_TICK_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(5)
+            .max(1);
+        let tick_controller = controller.clone();
+        infra_handles.push(tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(tick_secs));
+            loop {
+                interval.tick().await;
+                match tick_controller.tick().await {
+                    Ok(report) => {
+                        if report.transitions > 0 || report.notices > 0 {
+                            tracing::info!(
+                                leased = report.leased.len(),
+                                reconciled = report.reconciled.len(),
+                                transitions = report.transitions,
+                                notices = report.notices,
+                                "control tick"
+                            );
+                        }
+                    }
+                    Err(e) => tracing::warn!(error = %e, "control tick failed"),
+                }
+            }
+        }));
+        let outbox_store = store_handle.clone();
+        let outbox_backend = message_backend.clone();
+        let default_chat = std::env::var("TELEGRAM_ALLOWED_CHATS").ok().and_then(|v| {
+            v.split(',')
+                .map(|c| c.trim().to_string())
+                .find(|c| !c.is_empty())
+        });
+        infra_handles.push(tokio::spawn(async move {
+            deliver_work_notices(outbox_store, outbox_backend, default_chat, tick_secs).await;
+        }));
+        tracing::info!(tick_secs, "control layer started");
     }
 
     // Save a reference to the video channel for shutdown.
