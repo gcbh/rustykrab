@@ -280,6 +280,75 @@ impl rustykrab_tools::WorkBackend for DeferredWorkBackend {
     }
 }
 
+/// Worker runs kept as conversations in the store, like any other (plan
+/// section 16, Phase 1), under the controller's run id.
+struct StoreTranscripts {
+    conversations: rustykrab_store::ConversationStore,
+}
+
+#[async_trait::async_trait]
+impl rustykrab_agent::RunTranscripts for StoreTranscripts {
+    async fn save(
+        &self,
+        conversation: &rustykrab_core::types::Conversation,
+    ) -> rustykrab_core::Result<()> {
+        self.conversations.save(conversation).await
+    }
+}
+
+/// The controller's view of the host's tool registry (plan section 7,
+/// scenario 11). A tool every conversation starts with active (the
+/// active-tools seed) is `Loaded`; any other registered tool is
+/// `RegisteredUnloaded`, so a `work_file` outside a session answers "load
+/// it" instead of filing work the caller could do itself, and the ladder
+/// knows the tool exists. An MCP server counts as configured when its tools
+/// are registered. Filled once the registry is final, after the stub switch.
+#[derive(Default)]
+struct RegistryCatalog {
+    inner: std::sync::RwLock<rustykrab_control::controller::StaticCatalog>,
+}
+
+impl RegistryCatalog {
+    fn fill(&self, tools: &[Arc<dyn rustykrab_core::Tool>], seed: &[String]) {
+        let catalog = rustykrab_control::controller::StaticCatalog {
+            tools: tools
+                .iter()
+                .map(|t| {
+                    let state = if seed.iter().any(|s| s == t.name()) {
+                        rustykrab_tools::ToolState::Loaded
+                    } else {
+                        rustykrab_tools::ToolState::RegisteredUnloaded
+                    };
+                    (t.name().to_string(), state)
+                })
+                .collect(),
+            mcp_servers: tools
+                .iter()
+                .filter_map(|t| {
+                    let rest = t.name().strip_prefix("mcp__")?;
+                    rest.split_once("__").map(|(server, _)| server.to_string())
+                })
+                .collect(),
+            credentials: HashSet::new(),
+        };
+        *self.inner.write().unwrap_or_else(|e| e.into_inner()) = catalog;
+    }
+
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, rustykrab_control::controller::StaticCatalog> {
+        self.inner.read().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+impl rustykrab_control::controller::ToolCatalog for RegistryCatalog {
+    fn tool_state(&self, name: &str) -> rustykrab_tools::ToolState {
+        rustykrab_control::controller::ToolCatalog::tool_state(&*self.read(), name)
+    }
+
+    fn mcp_server_configured(&self, name: &str) -> bool {
+        rustykrab_control::controller::ToolCatalog::mcp_server_configured(&*self.read(), name)
+    }
+}
+
 /// Deliver the controller's notices from the work outbox (plan section
 /// 6.6): each row goes out on its channel and is marked delivered only when
 /// the send succeeds, so a channel outage delays a notice rather than
@@ -1258,23 +1327,22 @@ async fn main() -> anyhow::Result<()> {
     } else {
         "webchat"
     };
-    let local_worker: Arc<dyn rustykrab_control::worker::Worker> =
-        Arc::new(rustykrab_agent::LocalWorker::new(
+    let local_worker: Arc<dyn rustykrab_control::worker::Worker> = Arc::new(
+        rustykrab_agent::LocalWorker::new(
             "pinch",
             rustykrab_agent::LocalWorker::default_definition("pinch"),
             provider.clone(),
             tools.clone(),
             Arc::new(ProcessSandbox::new()),
             deferred_work_backend.clone() as Arc<dyn rustykrab_tools::WorkBackend>,
-        ));
-    let control_catalog = rustykrab_control::controller::StaticCatalog {
-        tools: tools
-            .iter()
-            .map(|t| (t.name().to_string(), rustykrab_tools::ToolState::Loaded))
-            .collect(),
-        mcp_servers: HashSet::new(),
-        credentials: HashSet::new(),
-    };
+        )
+        .with_transcripts(Arc::new(StoreTranscripts {
+            conversations: store.conversations(),
+        })),
+    );
+    // Filled below, once the registry is final (after the stub switch) and
+    // the active-tools seed is known.
+    let control_catalog = Arc::new(RegistryCatalog::default());
     let control_config = rustykrab_control::controller::ControllerConfig {
         notice_channel: control_notice_channel.to_string(),
         ..Default::default()
@@ -1285,7 +1353,7 @@ async fn main() -> anyhow::Result<()> {
             vec![local_worker],
             control_config,
         )
-        .with_catalog(Arc::new(control_catalog)),
+        .with_catalog(control_catalog.clone()),
     );
     deferred_work_backend.bind(controller.clone());
     tools.extend(rustykrab_tools::work_tools(controller.clone()));
@@ -1348,6 +1416,7 @@ async fn main() -> anyhow::Result<()> {
                 .map(str::to_string),
         );
     }
+    control_catalog.fill(&tools, &seed);
     let active_tools = if seed.is_empty() {
         Arc::new(rustykrab_core::active_tools::ActiveToolsRegistry::new())
     } else {

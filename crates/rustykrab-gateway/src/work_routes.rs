@@ -15,30 +15,44 @@
 //! the store and repeats its own status column), and every route that needs
 //! the controller answers 503 `control_unavailable`.
 //!
-//! Not served yet: SSE progress events (section 14). The hook is a
-//! `GET /api/work/stream` fed from `Store::work_events_since` (or a broadcast
-//! the controller publishes after each tick), framed like the message stream
-//! in `routes.rs`; cascade events already carry their `origin`.
+//! Filings: `POST /api/work` files one `work_file` draft, `POST
+//! /api/work/plan` a whole `work_plan` graph, and `POST /api/work/import`
+//! a delivery `StackManifest` as its layered `code` graph (the only path by
+//! which a `code` graph enters). Each answers with the `PlanOutcome`, 422
+//! when rejected, and may carry `origin_conversation_id` so the
+//! controller reports to that conversation's channel as it does for a
+//! conversation that called `work_file`.
+//!
+//! `GET /api/work/events` is the SSE progress stream (section 14): every
+//! `work_item_events` row written after the stream opened, one frame each,
+//! polled from the store by row id so no row is sent twice or skipped.
+//! Cascade events carry their `origin`.
 
 use std::collections::{BTreeMap, HashSet};
+use std::convert::Infallible;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use chrono::{DateTime, NaiveDate, Utc};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use tokio_stream::wrappers::ReceiverStream;
 
 use rustykrab_control::graph::FilingSource;
 use rustykrab_control::handle::{ControlHandle, GraphView, TickReport};
-use rustykrab_control::ladder::RUNGS;
+use rustykrab_control::import::{self, StackManifest};
+use rustykrab_control::ladder::{self, RUNGS};
 use rustykrab_core::work::{
-    BlockedReason, CancelReason, Edge, EventKind, Evidence, PlanOutcome, Rung, Status, WorkEvent,
-    WorkItem, WorkItemId, WorkKind, WorkPlan,
+    BlockedReason, Budget, CancelReason, Edge, Evidence, Lease, PlanOutcome, Rung, RungEvent,
+    Status, WorkError, WorkEvent, WorkItem, WorkItemDraft, WorkItemId, WorkKind, WorkPlan,
 };
 use rustykrab_core::Error;
 use rustykrab_store::{ArchivedItem, Principal, WorkFilter, WorkPlanRow, WorkStoreError};
@@ -48,9 +62,11 @@ use crate::AppState;
 
 pub(crate) fn routes() -> Router<AppState> {
     Router::new()
-        .route("/api/work", get(list_items))
+        .route("/api/work", get(list_items).post(file_one))
         .route("/api/work/ready", get(ready_items))
+        .route("/api/work/events", get(event_stream))
         .route("/api/work/plan", post(file_plan))
+        .route("/api/work/import", post(import_slice))
         .route("/api/work/tick", post(tick))
         .route("/api/work/archive", get(archive_list))
         .route("/api/work/archive/{id}", get(archive_get))
@@ -101,7 +117,8 @@ pub struct EdgeView {
     pub archived: Option<String>,
 }
 
-/// `GET /api/work/{id}`.
+/// `GET /api/work/{id}`: the item with what section 4's item shape keeps
+/// beside it, its lease, ladder, last error, evidence and events.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ItemDetail {
     pub item: WorkItem,
@@ -111,9 +128,22 @@ pub struct ItemDetail {
     pub dependents: Vec<Edge>,
     #[serde(default)]
     pub rollup: Option<RollupView>,
-    /// How many events and pieces of evidence it has.
-    pub events: usize,
-    pub evidence: usize,
+    /// The live lease, with the fan-in inputs copied into its brief. A
+    /// lease lives only while the item is active.
+    #[serde(default)]
+    pub lease: Option<Lease>,
+    /// Every rung climbed, oldest first (sections 8 and 9).
+    #[serde(default)]
+    pub ladder: Vec<RungEvent>,
+    /// The error behind the latest rung that carried one.
+    #[serde(default)]
+    pub last_error: Option<WorkError>,
+    /// Oldest first.
+    #[serde(default)]
+    pub evidence: Vec<Evidence>,
+    /// Oldest first.
+    #[serde(default)]
+    pub events: Vec<WorkEvent>,
 }
 
 /// `GET /api/work/{id}/graph`: the controller's [`GraphView`] plus the
@@ -381,21 +411,45 @@ fn control(state: &AppState) -> Result<Arc<dyn ControlHandle>, WorkApiError> {
 }
 
 /// The rungs a list of events climbed, in first-climbed order. A rung
-/// event's reason starts with the rung's name (`retry: timeout`).
+/// event's reason is its `RungEvent` as JSON, as the controller writes it
+/// (`rustykrab_control::ladder::encode_rung_event`).
 pub fn rungs_climbed(events: &[WorkEvent]) -> Vec<Rung> {
     let mut climbed = Vec::new();
-    for event in events.iter().filter(|e| e.kind == EventKind::Rung) {
-        let Some(reason) = event.reason.as_deref() else {
-            continue;
-        };
-        let name = reason.split(':').next().unwrap_or_default().trim();
-        if let Some(rung) = RUNGS.iter().copied().find(|r| r.as_str() == name) {
-            if !climbed.contains(&rung) {
-                climbed.push(rung);
-            }
+    for rung in events.iter().filter_map(ladder::rung_event).map(|e| e.rung) {
+        if RUNGS.contains(&rung) && !climbed.contains(&rung) {
+            climbed.push(rung);
         }
     }
     climbed
+}
+
+/// A filing body: the filing itself plus the optional
+/// `origin_conversation_id` whose channel the controller reports to.
+fn filing_body<T: DeserializeOwned>(
+    body: &Bytes,
+    what: &str,
+) -> Result<(serde_json::Value, T, Option<String>), WorkApiError> {
+    let raw: serde_json::Value = serde_json::from_slice(body)
+        .map_err(|e| WorkApiError::bad_request(format!("invalid {what}: {e}")))?;
+    let origin = raw
+        .get("origin_conversation_id")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string);
+    let parsed: T = serde_json::from_value(raw.clone())
+        .map_err(|e| WorkApiError::bad_request(format!("invalid {what}: {e}")))?;
+    Ok((raw, parsed, origin))
+}
+
+/// A filing's answer: `accepted` with the given status, 422 when rejected
+/// with every failed check.
+fn outcome_response(outcome: PlanOutcome, accepted: StatusCode) -> Response {
+    let status = match outcome {
+        PlanOutcome::Accepted(_) => accepted,
+        PlanOutcome::Rejected(_) => StatusCode::UNPROCESSABLE_ENTITY,
+    };
+    (status, Json(outcome)).into_response()
 }
 
 // ── helpers over the store and the controller ──────────────────────────
@@ -582,15 +636,19 @@ async fn item_detail(
     }
     let dependents = store.work_dependents_of(&id).await?;
     let rollup = rollup_of(&state, &item).await?;
-    let events = store.work_events(&id).await?.len();
-    let evidence = store.work_evidence_list(&id).await?.len();
+    let lease = store.work_lease_get(&id).await?;
+    let events = store.work_events(&id).await?;
+    let evidence = store.work_evidence_list(&id).await?;
     Ok(Json(ItemDetail {
         item,
         edges,
         dependents,
         rollup,
-        events,
+        lease,
+        ladder: ladder::ladder_of_events(&events),
+        last_error: ladder::last_error(&events),
         evidence,
+        events,
     }))
 }
 
@@ -707,10 +765,12 @@ struct ArchiveQuery {
     kind: Option<String>,
     since: Option<String>,
     q: Option<String>,
+    /// The CLI's word for `q` (`work archive search <text>`).
+    search: Option<String>,
 }
 
 /// `GET /api/work/archive`: one-line summaries, most recently closed first;
-/// `q` searches ids, titles and summaries.
+/// `q` (or `search`) searches ids, titles and summaries.
 async fn archive_list(
     State(state): State<AppState>,
     Query(query): Query<ArchiveQuery>,
@@ -728,7 +788,13 @@ async fn archive_list(
         .filter(|s| !s.trim().is_empty())
         .map(parse_since)
         .transpose()?;
-    let archived = match query.q.as_deref().map(str::trim).filter(|q| !q.is_empty()) {
+    let text = query
+        .q
+        .as_deref()
+        .or(query.search.as_deref())
+        .map(str::trim)
+        .filter(|q| !q.is_empty());
+    let archived = match text {
         Some(text) => store
             .work_archive_search(text)
             .await?
@@ -756,6 +822,25 @@ async fn archive_get(
 
 // ── command handlers ───────────────────────────────────────────────────
 
+/// `POST /api/work`: file one `work_file` draft as a one-item plan
+/// (section 14.1), `FilingSource::WorkFile`. 201 with the accepted outcome,
+/// 422 with every failed check.
+async fn file_one(
+    State(state): State<AppState>,
+    principal: Option<Extension<Principal>>,
+    body: Bytes,
+) -> Result<Response, WorkApiError> {
+    let control = control(&state)?;
+    let (_, draft, origin) = filing_body::<WorkItemDraft>(&body, "work item draft")?;
+    let provenance = Provenance {
+        conversation_id: origin,
+        filed_by_item: None,
+        actor: actor_of(principal),
+    };
+    let outcome = control.file_draft(draft, provenance).await?;
+    Ok(outcome_response(outcome, StatusCode::CREATED))
+}
+
 /// `POST /api/work/plan`: file a whole graph (section 14.1). 200 with the
 /// accepted outcome, 422 with every failed check.
 async fn file_plan(
@@ -764,10 +849,9 @@ async fn file_plan(
     body: Bytes,
 ) -> Result<Response, WorkApiError> {
     let control = control(&state)?;
-    let plan: WorkPlan = serde_json::from_slice(&body)
-        .map_err(|e| WorkApiError::bad_request(format!("invalid work_plan: {e}")))?;
+    let (_, plan, origin) = filing_body::<WorkPlan>(&body, "work_plan")?;
     let provenance = Provenance {
-        conversation_id: None,
+        conversation_id: origin,
         filed_by_item: None,
         actor: actor_of(principal),
     };
@@ -776,11 +860,36 @@ async fn file_plan(
     let outcome = control
         .file_plan(plan, provenance, FilingSource::Planner)
         .await?;
-    let status = match outcome {
-        PlanOutcome::Accepted(_) => StatusCode::OK,
-        PlanOutcome::Rejected(_) => StatusCode::UNPROCESSABLE_ENTITY,
+    Ok(outcome_response(outcome, StatusCode::OK))
+}
+
+/// `POST /api/work/import`: the delivery import (sections 4, 6.1 and
+/// 14.1). The body is `{ "manifest": StackManifest }` (or the bare
+/// manifest); the slice becomes one parent, a child parent per layer and a
+/// `code` child per delivery work item, filed through the validator as
+/// `FilingSource::DeliveryImport`, the only source that may file `code`.
+/// No `work_plan` call is made and no planner runs. 201 accepted, 422
+/// rejected whole (a cyclic manifest with `cycle`).
+async fn import_slice(
+    State(state): State<AppState>,
+    principal: Option<Extension<Principal>>,
+    body: Bytes,
+) -> Result<Response, WorkApiError> {
+    let control = control(&state)?;
+    let (raw, _, origin) = filing_body::<serde_json::Value>(&body, "import")?;
+    let manifest_json = raw.get("manifest").cloned().unwrap_or(raw);
+    let manifest: StackManifest = serde_json::from_value(manifest_json)
+        .map_err(|e| WorkApiError::bad_request(format!("invalid StackManifest: {e}")))?;
+    let plan = import::plan_of(&manifest, Budget::default());
+    let provenance = Provenance {
+        conversation_id: origin,
+        filed_by_item: None,
+        actor: actor_of(principal),
     };
-    Ok((status, Json(outcome)).into_response())
+    let outcome = control
+        .file_plan(plan, provenance, FilingSource::DeliveryImport)
+        .await?;
+    Ok(outcome_response(outcome, StatusCode::CREATED))
 }
 
 /// `POST /api/work/{id}/approve`: release the items held under root `{id}`.
@@ -840,6 +949,69 @@ async fn cancel(
         cancelled,
         already_finished,
     }))
+}
+
+/// How often the progress stream polls the store for new events.
+const EVENT_POLL: Duration = Duration::from_millis(250);
+/// Events read per poll; a burst larger than this drains over later polls.
+const EVENT_BATCH: usize = 500;
+
+/// `GET /api/work/events`: the SSE progress stream (section 14). Every
+/// event written after the stream opened (or after the row id in
+/// `Last-Event-ID`, when a client resumes) is one frame: `event:` the
+/// event kind, `id:` its row id, `data:` the `WorkEvent` as JSON (item,
+/// at, kind, from, to, actor, reason, upstream, origin, evidence_ref). The
+/// store is polled by row id, so a frame is never repeated or skipped.
+async fn event_stream(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Response, WorkApiError> {
+    let store = state.agent.store.clone();
+    let resume = headers
+        .get("last-event-id")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<i64>().ok());
+    let mut cursor = match resume {
+        Some(id) => id,
+        None => store.work_events_last_id().await?,
+    };
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(EVENT_BATCH);
+    tokio::spawn(async move {
+        let mut poll = tokio::time::interval(EVENT_POLL);
+        loop {
+            poll.tick().await;
+            if tx.is_closed() {
+                return;
+            }
+            let rows = match store.work_events_after(cursor, EVENT_BATCH).await {
+                Ok(rows) => rows,
+                Err(e) => {
+                    tracing::warn!(error = %e, "work event stream could not read the store");
+                    continue;
+                }
+            };
+            for (id, event) in rows {
+                cursor = id;
+                let data = match serde_json::to_string(&event) {
+                    Ok(data) => data,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "work event not serialisable");
+                        continue;
+                    }
+                };
+                let frame = Event::default()
+                    .event(event.kind.as_str())
+                    .id(id.to_string())
+                    .data(data);
+                if tx.send(Ok(frame)).await.is_err() {
+                    return;
+                }
+            }
+        }
+    });
+    Ok(Sse::new(ReceiverStream::new(rx))
+        .keep_alive(KeepAlive::default())
+        .into_response())
 }
 
 /// `POST /api/work/tick`: one pass of the controller loop, for tests and
