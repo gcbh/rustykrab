@@ -4132,6 +4132,7 @@ dependencies = [
  "chrono",
  "futures",
  "regex",
+ "rustykrab-control",
  "rustykrab-core",
  "rustykrab-tools",
  "serde",

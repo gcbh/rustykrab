@@ -61,6 +61,11 @@ struct TracerInner {
     iterations: u32,
     /// How many times compression was triggered.
     compressions: u32,
+    /// How many completion reminders the runner sent (`task_complete`, or
+    /// `result_report` in a worker run).
+    completion_reminders: u32,
+    /// Whether the run ended because it reached its iteration cap.
+    iteration_limit_reached: bool,
 }
 
 /// Sanitize a tool name to prevent prompt injection via trace summaries.
@@ -122,6 +127,16 @@ impl ExecutionTracer {
         self.lock_inner().compressions += 1;
     }
 
+    /// Count a completion reminder sent to the model.
+    pub fn record_completion_reminder(&self) {
+        self.lock_inner().completion_reminders += 1;
+    }
+
+    /// Record that the run reached its iteration cap.
+    pub fn record_iteration_limit(&self) {
+        self.lock_inner().iteration_limit_reached = true;
+    }
+
     /// Get aggregated stats for all tools.
     pub fn tool_stats(&self) -> HashMap<String, ToolStats> {
         self.lock_inner().stats.clone()
@@ -135,6 +150,16 @@ impl ExecutionTracer {
     /// Compactions triggered this run.
     pub fn compressions(&self) -> u32 {
         self.lock_inner().compressions
+    }
+
+    /// Completion reminders sent this run.
+    pub fn completion_reminders(&self) -> u32 {
+        self.lock_inner().completion_reminders
+    }
+
+    /// Whether the run ended at its iteration cap.
+    pub fn iteration_limit_reached(&self) -> bool {
+        self.lock_inner().iteration_limit_reached
     }
 
     /// Get the full trace log.

@@ -30,7 +30,10 @@ rustykrab-core        (no internal deps — the contract layer)
    rustykrab-tools  ----+      +---- rustykrab-dream
         ^
         |
-   rustykrab-agent   (core, tools)
+   rustykrab-control (core, store, tools)   work-item graph, ladder, Worker
+        ^
+        |
+   rustykrab-agent   (core, tools, control)
         ^
         |
    rustykrab-runtime (core, store, agent, memory, skills)   <-- NEW

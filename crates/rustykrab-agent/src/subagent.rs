@@ -17,7 +17,7 @@ use chrono::Utc;
 use rustykrab_core::active_tools::SESSION_TOOL_CONTEXT;
 use rustykrab_core::model::ModelProvider;
 use rustykrab_core::types::{Conversation, Message, MessageContent, Role};
-use rustykrab_core::{AgentRegistry, CapabilitySet, Error, Result, Session, Tool};
+use rustykrab_core::{AgentDefinition, AgentRegistry, CapabilitySet, Error, Result, Session, Tool};
 use rustykrab_tools::SessionManager;
 use serde_json::{json, Value};
 use tokio::sync::Semaphore;
@@ -26,6 +26,18 @@ use uuid::Uuid;
 use crate::harness::HarnessProfile;
 use crate::runner::AgentRunner;
 use crate::sandbox::Sandbox;
+
+/// The harness profile an [`AgentDefinition`] names; an unknown name gets
+/// the default. Shared with [`crate::LocalWorker`], which runs a definition
+/// the same way for the controller.
+pub(crate) fn profile_for(def: &AgentDefinition) -> HarnessProfile {
+    match def.profile.as_str() {
+        "coding" => HarnessProfile::coding(),
+        "research" => HarnessProfile::research(),
+        "creative" => HarnessProfile::creative(),
+        _ => HarnessProfile::default(),
+    }
+}
 
 /// Runs sub-agents against an [`AgentRegistry`] using a fresh
 /// [`AgentRunner`] per call.
@@ -161,12 +173,7 @@ impl SessionManager for SubagentRunner {
             .await
             .map_err(|_| Error::Internal("subagent semaphore closed".into()))?;
 
-        let profile = match def.profile.as_str() {
-            "coding" => HarnessProfile::coding(),
-            "research" => HarnessProfile::research(),
-            "creative" => HarnessProfile::creative(),
-            _ => HarnessProfile::default(),
-        };
+        let profile = profile_for(&def);
 
         let caps = self.derive_capabilities(def.allowed_tools.as_deref());
         let conv_id = Uuid::new_v4();

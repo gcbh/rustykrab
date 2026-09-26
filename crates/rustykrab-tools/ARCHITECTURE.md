@@ -298,9 +298,10 @@ drafts inside its report.
   (else an explicit `item`), leaves the error fingerprint to the controller,
   and passes `discovered` drafts through unfiled. A successful call returns
   `task_complete`'s `{ok, summary}` shape, `run_end_summary` reads either
-  tool's success, and `blocks_turn` stops the completion reminder; the runner
-  must end the run on that success (after the call, since a rejected report
-  must not end it). That wiring belongs to the agent runner, not here.
+  tool's success, and the agent runner ends the run on that success, after
+  the call, since a rejected report must not end it (see
+  `rustykrab-agent/ARCHITECTURE.md`). `blocks_turn` matters only to a runner
+  that does not.
 - **`StubWorkBackend`** records every call and serves filed items back
   through `status`, for tests and the e2e scripted daemon.
 
