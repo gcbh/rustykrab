@@ -12,10 +12,10 @@
 //! the shape `task_complete` returns, and [`run_end_summary`] reads it for
 //! either tool, so the runner can end the run on the call's success with no
 //! further model turn. The runner recognises `task_complete` by name before
-//! it executes; `result_report` must be read after it executes, because a
-//! rejected report must not end the run. Until the runner does that,
-//! [`Tool::blocks_turn`] makes it accept the model's next text-only reply
-//! as the end of the turn instead of re-prompting for `task_complete`.
+//! it executes; `result_report` is read after it executes, because a
+//! rejected report must not end the run (see `finalize_run_end` in
+//! `rustykrab-agent`). [`Tool::blocks_turn`] additionally makes a text-only
+//! reply end the turn instead of re-prompting for `task_complete`.
 
 use std::collections::HashSet;
 use std::sync::Arc;
