@@ -703,6 +703,7 @@ pub enum ErrorSubclass {
     Loop,
     Empty,
     // capability_gap
+    #[serde(rename = "tool")]
     ToolGap,
     Credential,
     Consent,
@@ -732,6 +733,48 @@ pub enum ErrorSubclass {
 }
 
 impl ErrorSubclass {
+    pub const ALL: [ErrorSubclass; 30] = [
+        ErrorSubclass::InvalidArgs,
+        ErrorSubclass::NotFound,
+        ErrorSubclass::Timeout,
+        ErrorSubclass::UpstreamError,
+        ErrorSubclass::Format,
+        ErrorSubclass::Refusal,
+        ErrorSubclass::HallucinatedTool,
+        ErrorSubclass::Loop,
+        ErrorSubclass::Empty,
+        ErrorSubclass::ToolGap,
+        ErrorSubclass::Credential,
+        ErrorSubclass::Consent,
+        ErrorSubclass::Compute,
+        ErrorSubclass::Knowledge,
+        ErrorSubclass::Network,
+        ErrorSubclass::Disk,
+        ErrorSubclass::Permission,
+        ErrorSubclass::Process,
+        ErrorSubclass::Dependency,
+        ErrorSubclass::ClaimMismatch,
+        ErrorSubclass::CheckFailed,
+        ErrorSubclass::Incomplete,
+        ErrorSubclass::Scope,
+        ErrorSubclass::SingleWriter,
+        ErrorSubclass::Ceiling,
+        ErrorSubclass::Iterations,
+        ErrorSubclass::Tokens,
+        ErrorSubclass::Wall,
+        ErrorSubclass::Repairs,
+        ErrorSubclass::Unclassified,
+    ];
+
+    /// The subclass whose string form is `raw`, if any. Every value has one
+    /// string form, shared by serde and `as_str`.
+    pub fn parse(raw: &str) -> Option<ErrorSubclass> {
+        ErrorSubclass::ALL
+            .iter()
+            .copied()
+            .find(|s| s.as_str() == raw)
+    }
+
     pub fn class(&self) -> ErrorClass {
         use ErrorSubclass::*;
         match self {
@@ -1180,6 +1223,16 @@ mod tests {
         assert_eq!(ErrorSubclass::Timeout.class(), ErrorClass::Tool);
         assert!(ErrorSubclass::Timeout.is_transient());
         assert!(!ErrorSubclass::Scope.is_transient());
+    }
+
+    #[test]
+    fn every_subclass_has_one_string_form_shared_by_serde_and_as_str() {
+        for s in ErrorSubclass::ALL {
+            let json = serde_json::to_value(s).unwrap();
+            assert_eq!(json.as_str().unwrap(), s.as_str(), "{s:?}");
+            assert_eq!(ErrorSubclass::parse(s.as_str()), Some(s));
+        }
+        assert_eq!(ErrorSubclass::parse("tool"), Some(ErrorSubclass::ToolGap));
     }
 
     #[test]
