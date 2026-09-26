@@ -23,6 +23,7 @@ weight. Counts are `impl X for` occurrences including test doubles.
 | `ComputerBackend` | **`tools`** | 2 | Correctly implemented above the consumer |
 | `VideoBackend` | **`tools`** | 1 | Fine — implementation is in the same crate |
 | `SessionManager` | **`tools`** | 1 | Correctly implemented above the consumer |
+| `WorkBackend` | **`tools`** `work_backend.rs` | 1 stub | Correctly placed above the consumer: the `work_file`, `work_status` and `result_report` tools call it; the controller adapter in `rustykrab-cli` implements it (Phase 1, round 2) |
 | `Skill` | `skills/skill.rs` | 1 | Thin — `SkillMd` is the only shape |
 | `Channel` | `channels/channel.rs` | **1** | **Not earning its keep** |
 | `GatewayBackend` | `tools/gateway_backend.rs` | **0** | **Dead** |
@@ -53,6 +54,7 @@ Which traits are actually blocked, by where their real implementor lives:
 | `VideoBackend` | `VideoChannelAdapter` | `rustykrab-tools` | no, same crate |
 | `CronBackend` | `CronAdapter` | `rustykrab-cli` | no, above |
 | `MessageBackend` | `MessageAdapter` | `rustykrab-cli` | no, above |
+| `WorkBackend` | controller adapter (round 2) | `rustykrab-cli` | no, above |
 
 `CronAdapter` and `MessageAdapter` are also not pass-throughs — `CronAdapter`
 merges the calling conversation's channel context into cron arguments, which

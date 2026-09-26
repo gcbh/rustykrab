@@ -1025,6 +1025,9 @@ pub enum RejectionReason {
     KindNotAllowed,
     AlreadyPlanned,
     RateLimited,
+    /// Only when policy has promoted the `sequential_split` warning to a
+    /// rejection (section 14.1).
+    SequentialSplit,
 }
 
 impl RejectionReason {
@@ -1049,6 +1052,7 @@ impl RejectionReason {
             KindNotAllowed => "kind_not_allowed",
             AlreadyPlanned => "already_planned",
             RateLimited => "rate_limited",
+            SequentialSplit => "sequential_split",
         }
     }
 }
