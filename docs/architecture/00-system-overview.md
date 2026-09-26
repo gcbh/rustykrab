@@ -12,7 +12,7 @@ of long-polling channel loops. A message arriving on any surface becomes a
 *turn*: the agent loop calls the model, executes the tools it asks for, and
 repeats until the model signals completion.
 
-**Second-pass snapshot: 14 crates, ~90,200 lines, 949 tests.** Current mechanical
+**Second-pass snapshot: 15 crates, ~90,200 lines, 949 tests.** Current mechanical
 counts live in the generated crate summaries; the continuity follow-up below
 is derived against base `0b565fd` plus its recorded working-tree changes.
 

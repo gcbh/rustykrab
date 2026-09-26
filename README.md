@@ -587,7 +587,7 @@ expectations.
 
 ## Architecture
 
-A Cargo workspace of 14 crates under `crates/`:
+A Cargo workspace of 15 crates under `crates/`:
 
 ```
 rustykrab-cli          Binary entrypoint, daemon management, channel loops

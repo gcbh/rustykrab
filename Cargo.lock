@@ -4198,6 +4198,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustykrab-control"
+version = "5.3.6"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "hex",
+ "rustykrab-core",
+ "rustykrab-store",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "rustykrab-core"
 version = "5.3.6"
 dependencies = [

@@ -1,0 +1,22 @@
+[package]
+name = "rustykrab-control"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Control layer: the work-item graph engine, error classification, the resolution ladder and the controller loop"
+
+[dependencies]
+rustykrab-core = { workspace = true }
+rustykrab-store = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }

@@ -32,6 +32,7 @@ pub mod todo;
 pub mod token_estimate;
 pub mod tool;
 pub mod types;
+pub mod work;
 
 pub use active_tools::{
     with_session_context, ActiveToolsRegistry, SessionToolContext, SESSION_TOOL_CONTEXT,
