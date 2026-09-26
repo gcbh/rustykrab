@@ -113,6 +113,13 @@ mod tools_load;
 // distinguish "model paused mid-task" from "model finished the task."
 mod task_complete;
 
+// Control-layer work tools: file one discovered item, read items, and end a
+// worker run with its typed result. The backend is the controller.
+mod result_report;
+pub mod work_backend;
+mod work_file;
+mod work_status;
+
 // MCP connector (remote MCP servers exposed as native tools)
 mod mcp_connector;
 
@@ -215,6 +222,15 @@ pub use tools_load::ToolsLoadTool;
 
 // Completion signaling
 pub use task_complete::TaskCompleteTool;
+
+// Control-layer work tools
+pub use result_report::{run_end_summary, ResultReportTool, RUN_ENDING_TOOLS};
+pub use work_backend::{
+    Principal, Provenance, StatusQuery, StatusSelector, StubWorkBackend, ToolState, WorkBackend,
+    WorkCall, WorkRunContext, WorkStatusView, WORK_RUN_CONTEXT,
+};
+pub use work_file::WorkFileTool;
+pub use work_status::WorkStatusTool;
 
 // MCP connector
 pub use mcp_connector::{mcp_connector_tools, McpRemoteTool};
@@ -342,6 +358,20 @@ pub fn wiki_tools(
     memory: std::sync::Arc<dyn MemoryBackend>,
 ) -> Vec<std::sync::Arc<dyn rustykrab_core::Tool>> {
     vec![std::sync::Arc::new(WikiTool::new(wiki_dir, memory))]
+}
+
+/// Collect the control-layer work tools that require a [`WorkBackend`]:
+/// `work_file`, `work_status` and `result_report` (plan section 14).
+/// `work_plan` is deliberately absent: only the `planner` definition holds
+/// it, and a worker's follow-up work travels as drafts in its report.
+pub fn work_tools(
+    backend: std::sync::Arc<dyn WorkBackend>,
+) -> Vec<std::sync::Arc<dyn rustykrab_core::Tool>> {
+    vec![
+        std::sync::Arc::new(WorkFileTool::new(backend.clone())),
+        std::sync::Arc::new(WorkStatusTool::new(backend.clone())),
+        std::sync::Arc::new(ResultReportTool::new(backend)),
+    ]
 }
 
 /// Collect messaging tools that require a MessageBackend into a Vec.
