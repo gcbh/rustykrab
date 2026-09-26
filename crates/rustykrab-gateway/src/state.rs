@@ -1,5 +1,6 @@
 use rustykrab_agent::{HarnessProfile, HarnessRouter, Sandbox};
 use rustykrab_channels::{SignalChannel, SlackChannel, TelegramChannel, VideoChannel};
+use rustykrab_control::handle::ControlHandle;
 use rustykrab_core::activity::ActivityTracker;
 use rustykrab_core::model::ModelProvider;
 use rustykrab_core::orchestration::OrchestrationConfig;
@@ -21,7 +22,8 @@ use crate::rate_limit::{RateLimitConfig, RateLimiter};
 /// with no HTTP in sight — a Telegram loop, a scheduled job, a test — can
 /// hold one without constructing a web server's state. The rest of this
 /// struct is the web server: auth, rate limiting, origin policy, the
-/// credential page, and the channel handles the webhook routes deliver to.
+/// credential page, the controller handle `/api/work` calls, and the channel
+/// handles the webhook routes deliver to.
 #[derive(Clone)]
 pub struct AppState {
     /// Everything needed to run a turn. See [`AgentContext`].
@@ -38,6 +40,11 @@ pub struct AppState {
     /// queue. Shared between the `/api/tasks` handlers, which enqueue and
     /// cancel, and the worker, which drains.
     pub task_signal: crate::tasks::TaskQueueSignal,
+    /// The control layer's handle, for `/api/work` (plan section 14). `None`
+    /// until the composition root wires a controller: the `/api/work` read
+    /// routes then answer from `agent.store` alone, and every route that
+    /// needs the controller answers 503.
+    pub control: Option<Arc<dyn ControlHandle>>,
 
     // --- Outbound channels, delivered to by the webhook routes ---
     pub telegram: Option<Arc<TelegramChannel>>,
@@ -61,6 +68,7 @@ impl AppState {
             origin_policy: OriginPolicy::default(),
             credential_page_policy: crate::PageIdentityPolicy::default(),
             task_signal: crate::tasks::TaskQueueSignal::new(),
+            control: None,
             telegram: None,
             signal: None,
             slack: None,
@@ -171,6 +179,13 @@ impl AppState {
 
     pub fn with_rate_limit(mut self, config: RateLimitConfig) -> Self {
         self.rate_limiter = Arc::new(RateLimiter::new(config));
+        self
+    }
+
+    /// Wire the controller the `/api/work` routes call. It should run over
+    /// the same store as `agent.store`, which those routes read.
+    pub fn with_control(mut self, control: Arc<dyn ControlHandle>) -> Self {
+        self.control = Some(control);
         self
     }
 

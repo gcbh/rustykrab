@@ -17,6 +17,8 @@ rustykrab-skills.workspace = true
 rustykrab-providers.workspace = true
 rustykrab-memory.workspace = true
 rustykrab-dream.workspace = true
+# `rustykrab work` reads the controller's graph and tick reply shapes.
+rustykrab-control.workspace = true
 axum.workspace = true
 async-trait.workspace = true
 chrono.workspace = true

@@ -4178,6 +4178,7 @@ dependencies = [
  "rustls",
  "rustykrab-agent",
  "rustykrab-channels",
+ "rustykrab-control",
  "rustykrab-core",
  "rustykrab-dream",
  "rustykrab-gateway",
@@ -4278,6 +4279,7 @@ dependencies = [
 name = "rustykrab-gateway"
 version = "5.3.6"
 dependencies = [
+ "async-trait",
  "axum",
  "base64 0.22.1",
  "chrono",
@@ -4289,12 +4291,14 @@ dependencies = [
  "rust-embed",
  "rustykrab-agent",
  "rustykrab-channels",
+ "rustykrab-control",
  "rustykrab-core",
  "rustykrab-memory",
  "rustykrab-projects",
  "rustykrab-runtime",
  "rustykrab-skills",
  "rustykrab-store",
+ "rustykrab-tools",
  "serde",
  "serde_json",
  "sha2",
