@@ -133,17 +133,10 @@ fn parse_class(raw: &str) -> Option<ErrorClass> {
     CLASSES.iter().copied().find(|c| c.as_str() == raw)
 }
 
-/// Accepts the plan's word (`as_str`, e.g. `tool` under `capability_gap`)
-/// and the serde word (`tool_gap`), which differ for that one subclass.
+/// Every subclass has one string form, shared by serde and `as_str`
+/// (`tool` under `capability_gap` included).
 fn parse_subclass(raw: &str) -> Option<ErrorSubclass> {
-    SUBCLASSES.iter().copied().find(|s| {
-        s.as_str() == raw
-            || serde_json::to_value(s)
-                .ok()
-                .and_then(|v| v.as_str().map(str::to_string))
-                .as_deref()
-                == Some(raw)
-    })
+    ErrorSubclass::parse(raw)
 }
 
 fn subclasses_of(class: ErrorClass) -> String {
@@ -801,9 +794,8 @@ mod tests {
         );
         assert!(stub.calls().is_empty());
 
-        // The plan's word for a missing tool (`tool`) and the serde word
-        // (`tool_gap`) both mean capability_gap's subclass.
-        for sub in ["tool", "tool_gap"] {
+        // The plan's word for a missing tool is `tool`, under capability_gap.
+        for sub in ["tool"] {
             WORK_RUN_CONTEXT
                 .scope(
                     run("item-1"),
