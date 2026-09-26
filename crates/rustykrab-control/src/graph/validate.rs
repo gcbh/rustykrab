@@ -211,9 +211,8 @@ impl Rejection {
             .collect()
     }
 
-    /// The tool-result shape. A `sequential_split` rejection maps to
-    /// `invalid_item` with its detail prefixed, until `RejectionReason`
-    /// gains its own variant.
+    /// The tool-result shape. A `sequential_split` rejection, which only
+    /// exists once policy has promoted the warning, carries its own reason.
     pub fn to_core(&self) -> PlanRejected {
         PlanRejected {
             failed: self
@@ -226,9 +225,9 @@ impl Rejection {
                         detail: f.detail.clone(),
                     },
                     Check::SequentialSplit => FailedCheck {
-                        reason: RejectionReason::InvalidItem,
+                        reason: RejectionReason::SequentialSplit,
                         offending: f.offending.clone(),
-                        detail: format!("sequential_split: {}", f.detail),
+                        detail: f.detail.clone(),
                     },
                 })
                 .collect(),

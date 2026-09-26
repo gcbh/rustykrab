@@ -133,8 +133,8 @@ fn scenario_19_blocks_chain_that_adds_nothing_warns_sequential_split() {
     let r = reject(&planned_root(), &p, &strict);
     assert_eq!(r.checks(), vec![Check::SequentialSplit]);
     let core = r.to_core();
-    assert_eq!(core.failed[0].reason, RejectionReason::InvalidItem);
-    assert!(core.failed[0].detail.starts_with("sequential_split: "));
+    assert_eq!(core.failed[0].reason, RejectionReason::SequentialSplit);
+    assert!(!core.failed[0].detail.is_empty());
 }
 
 #[test]
