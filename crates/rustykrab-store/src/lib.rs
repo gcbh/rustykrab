@@ -16,6 +16,7 @@ mod recall_archive;
 pub mod registry;
 mod secret;
 mod tasks;
+mod work_items;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -48,6 +49,10 @@ pub use projects::{ApplyRevisionResult, ProjectStore};
 pub use recall_archive::RecallArchiveStore;
 pub use secret::{SecretMeta, SecretStore, WriteAuthority};
 pub use tasks::{DelegatedTask, TaskStatus, TaskStore};
+pub use work_items::{
+    ArchivedItem, OutboxDraft, OutboxRow, RepointSpec, TransitionSpec, WorkApplied, WorkFilter,
+    WorkOp, WorkPlanRow, WorkStoreError,
+};
 
 /// Top-level database handle wrapping a SQLite connection.
 ///
@@ -194,7 +199,11 @@ impl Store {
                 -- those UTC instants were derived through, so each advance
                 -- of next_run_at re-reads the offset from the zone database
                 -- and the job holds its wall-clock time across DST.
-                timezone        TEXT NOT NULL DEFAULT 'UTC'
+                timezone        TEXT NOT NULL DEFAULT 'UTC',
+                -- The work item a firing becomes (control-layer plan,
+                -- section 13). Not a foreign key: the item may be archived
+                -- while the job keeps its schedule.
+                work_item_id    TEXT
             );
 
             CREATE INDEX IF NOT EXISTS idx_scheduled_jobs_due
@@ -383,7 +392,11 @@ impl Store {
                 trace_id        TEXT,
                 created_at      TEXT NOT NULL,
                 started_at      TEXT,
-                finished_at     TEXT
+                finished_at     TEXT,
+                -- The work item this task mirrors, once the controller
+                -- leases delegated work (control-layer plan, section 13).
+                -- Unenforced for the same reason as `conversation_id`.
+                work_item_id    TEXT
             );
 
             -- The worker's only hot query is the oldest queued task.
@@ -579,6 +592,178 @@ impl Store {
 
             CREATE INDEX IF NOT EXISTS idx_plan_edges_project
                 ON plan_edges (project_id, from_node, to_node);
+
+            -- The control layer's work items
+            -- (docs/plans/control-layer-and-worker-fleet.md, section 13;
+            -- code in work_items/). The columns the controller filters on
+            -- are scalar; list fields are JSON. `parent`, `status_origin`,
+            -- `plan_id`, `held_by` and `origin_conversation_id` are
+            -- deliberately not foreign keys: aging archives a closed parent
+            -- and its closed children in whatever order the control crate
+            -- chooses, and the rest record provenance, not ownership. No
+            -- CHECK on `status` or `kind`: an unknown value reads as
+            -- `failed` (the conservative case) instead of failing the write
+            -- a newer build made.
+            CREATE TABLE IF NOT EXISTS work_items (
+                id                     TEXT PRIMARY KEY,
+                kind                   TEXT NOT NULL,
+                title                  TEXT NOT NULL,
+                objective              TEXT NOT NULL,
+                done_when              TEXT NOT NULL,
+                status                 TEXT NOT NULL,
+                -- Set for `blocked` and `cancelled` only.
+                status_reason          TEXT,
+                -- The root-cause item of a cascade status.
+                status_origin          TEXT,
+                priority               INTEGER NOT NULL DEFAULT 0,
+                parent                 TEXT,
+                worker_kind            TEXT NOT NULL DEFAULT 'any',
+                origin_conversation_id TEXT,
+                -- The `at(time)` trigger, else NULL; `trigger` is the truth.
+                trigger_at             TEXT,
+                expires_at             TEXT,
+                -- Control columns no model sees.
+                plan_id                TEXT,
+                held_by                TEXT,
+                created_at             TEXT NOT NULL,
+                updated_at             TEXT NOT NULL,
+                -- Set by the transition into a closed status.
+                closed_at              TEXT,
+                constraints            TEXT NOT NULL DEFAULT '[]',
+                decisions_made         TEXT NOT NULL DEFAULT '[]',
+                artifact_refs          TEXT NOT NULL DEFAULT '[]',
+                required_tools         TEXT NOT NULL DEFAULT '[]',
+                required_mcp_servers   TEXT NOT NULL DEFAULT '[]',
+                writable_resources     TEXT NOT NULL DEFAULT '[]',
+                inputs_from            TEXT NOT NULL DEFAULT '[]',
+                preconditions          TEXT NOT NULL DEFAULT '[]',
+                budget                 TEXT NOT NULL,
+                trigger                TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_work_items_ready
+                ON work_items (status, priority);
+            CREATE INDEX IF NOT EXISTS idx_work_items_parent
+                ON work_items (parent, status);
+            CREATE INDEX IF NOT EXISTS idx_work_items_trigger
+                ON work_items (status, trigger_at);
+            CREATE INDEX IF NOT EXISTS idx_work_items_expiry
+                ON work_items (status, expires_at);
+            CREATE INDEX IF NOT EXISTS idx_work_items_closed
+                ON work_items (closed_at) WHERE closed_at IS NOT NULL;
+
+            -- Typed edges: `item` is the downstream and goes with its work
+            -- item; `depends_on` is not a foreign key, because a
+            -- `supersedes` or `discovered_from` edge may outlive its
+            -- target's live row. Re-pointing rewrites `depends_on` in place
+            -- and the event log keeps the old value.
+            CREATE TABLE IF NOT EXISTS work_item_deps (
+                item       TEXT NOT NULL
+                    REFERENCES work_items(id) ON DELETE CASCADE,
+                depends_on TEXT NOT NULL,
+                kind       TEXT NOT NULL,
+                PRIMARY KEY (item, depends_on, kind)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_work_item_deps_upstream
+                ON work_item_deps (depends_on, kind);
+
+            -- Append-only. Keyed on the item id without a foreign key, so
+            -- the history outlives compaction into `work_item_archive`.
+            CREATE TABLE IF NOT EXISTS work_item_events (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                item         TEXT NOT NULL,
+                at           TEXT NOT NULL,
+                kind         TEXT NOT NULL,
+                from_status  TEXT,
+                from_reason  TEXT,
+                to_status    TEXT,
+                to_reason    TEXT,
+                actor        TEXT NOT NULL,
+                reason       TEXT,
+                upstream     TEXT,
+                origin       TEXT,
+                evidence_ref TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_work_item_events_item
+                ON work_item_events (item, at);
+
+            -- Pointers, never bodies. Outlives compaction like the events.
+            CREATE TABLE IF NOT EXISTS work_item_evidence (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                item        TEXT NOT NULL,
+                kind        TEXT NOT NULL,
+                ref         TEXT NOT NULL,
+                hash        TEXT,
+                verified_by TEXT,
+                at          TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_work_item_evidence_item
+                ON work_item_evidence (item);
+
+            -- Notices written in the transaction that caused them and
+            -- delivered from here, so a restart neither drops nor repeats
+            -- one. `parent` and `origin` are unenforced: the notice must
+            -- survive the items it reports on being archived.
+            CREATE TABLE IF NOT EXISTS work_outbox (
+                id           TEXT PRIMARY KEY,
+                parent       TEXT NOT NULL,
+                origin       TEXT,
+                channel      TEXT NOT NULL,
+                body         TEXT NOT NULL,
+                created_at   TEXT NOT NULL,
+                delivered_at TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_work_outbox_pending
+                ON work_outbox (created_at) WHERE delivered_at IS NULL;
+
+            -- One line per compacted item, written in the transaction that
+            -- deletes its `work_items` row. Lossy by design.
+            CREATE TABLE IF NOT EXISTS work_item_archive (
+                id            TEXT PRIMARY KEY,
+                kind          TEXT NOT NULL,
+                title         TEXT NOT NULL,
+                parent        TEXT,
+                status        TEXT NOT NULL,
+                status_reason TEXT,
+                worker        TEXT,
+                cost          TEXT,
+                closed_at     TEXT NOT NULL,
+                archived_at   TEXT NOT NULL,
+                summary       TEXT NOT NULL,
+                edges         TEXT NOT NULL DEFAULT '[]'
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_work_item_archive_closed
+                ON work_item_archive (kind, closed_at);
+
+            -- One row per accepted `work_plan` call. `root` and `filed_by`
+            -- are unenforced: the plan stays previewable after its items
+            -- are archived.
+            CREATE TABLE IF NOT EXISTS work_plans (
+                id                TEXT PRIMARY KEY,
+                root              TEXT NOT NULL,
+                filed_by          TEXT,
+                rationale         TEXT NOT NULL DEFAULT '',
+                approval_question TEXT,
+                policy            TEXT,
+                created_at        TEXT NOT NULL
+            );
+
+            -- A lease on a leaf item. Ownership: it has no meaning without
+            -- its live item, so it cascades.
+            CREATE TABLE IF NOT EXISTS leases (
+                item         TEXT PRIMARY KEY
+                    REFERENCES work_items(id) ON DELETE CASCADE,
+                worker       TEXT NOT NULL,
+                since        TEXT NOT NULL,
+                ttl_seconds  INTEGER NOT NULL,
+                heartbeat_at TEXT NOT NULL,
+                inputs       TEXT NOT NULL DEFAULT '[]'
+            );
             ",
         )
         .map_err(|e| Error::Storage(e.to_string()))?;
@@ -608,6 +793,17 @@ impl Store {
         if !existing.iter().any(|c| c == "created_version") {
             conn.execute(
                 "ALTER TABLE scheduled_jobs ADD COLUMN created_version TEXT",
+                [],
+            )
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        }
+
+        // `work_item_id` arrived with the control layer. Jobs created
+        // before it have never fired as work items, so NULL is the honest
+        // value and there is nothing to back-fill.
+        if !existing.iter().any(|c| c == "work_item_id") {
+            conn.execute(
+                "ALTER TABLE scheduled_jobs ADD COLUMN work_item_id TEXT",
                 [],
             )
             .map_err(|e| Error::Storage(e.to_string()))?;
@@ -784,6 +980,27 @@ impl Store {
         if !existing.iter().any(|c| c == "rustykrab_version") {
             conn.execute("ALTER TABLE job_runs ADD COLUMN rustykrab_version TEXT", [])
                 .map_err(|e| Error::Storage(e.to_string()))?;
+        }
+
+        // `delegated_tasks.work_item_id` arrived with the control layer, for
+        // the same reason and with the same NULL for older rows as
+        // `scheduled_jobs.work_item_id`. Nothing reads or writes it yet;
+        // the task queue behaves exactly as before.
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(delegated_tasks)")
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        let existing: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|e| Error::Storage(e.to_string()))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        drop(stmt);
+        if !existing.iter().any(|c| c == "work_item_id") {
+            conn.execute(
+                "ALTER TABLE delegated_tasks ADD COLUMN work_item_id TEXT",
+                [],
+            )
+            .map_err(|e| Error::Storage(e.to_string()))?;
         }
 
         // Databases created before conversations were normalized have a
@@ -1171,6 +1388,30 @@ fn adopt_declared_foreign_keys(conn: &rusqlite::Connection) -> Result<(), Error>
         &["CREATE INDEX IF NOT EXISTS idx_job_runs_job_id
                ON job_runs (job_id, finished_at DESC)"],
     )
+}
+
+#[cfg(test)]
+impl Store {
+    /// A store over a fresh in-memory database, with the pragmas `open`
+    /// sets that matter to tests (foreign keys on), for tests that need
+    /// `Store` itself rather than one repository handle.
+    pub(crate) fn open_in_memory() -> Store {
+        let conn = rusqlite::Connection::open_in_memory().expect("in-memory database");
+        conn.execute_batch("PRAGMA foreign_keys = ON;")
+            .expect("foreign keys on");
+        Self::run_migrations(&conn).expect("migrations");
+        Store {
+            conn: Arc::new(Mutex::new(conn)),
+            master_key: Zeroizing::new(vec![7u8; 32]),
+            request_notifier: None,
+            credential_backend: Arc::new(credential_backend::MemoryBackend::new()),
+            pending_links: PendingLinks::new(),
+            card_vault: payment_request::CardVault::default(),
+            pay_cooldown: payment_request::DEFAULT_PAY_COOLDOWN,
+            duplicate_window_ms: payment_request::DEFAULT_DUPLICATE_WINDOW_MS,
+            db_path: PathBuf::from(":memory:"),
+        }
+    }
 }
 
 pub(crate) async fn with_conn<T, F>(
