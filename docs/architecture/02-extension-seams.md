@@ -24,6 +24,7 @@ weight. Counts are `impl X for` occurrences including test doubles.
 | `VideoBackend` | **`tools`** | 1 | Fine — implementation is in the same crate |
 | `SessionManager` | **`tools`** | 1 | Correctly implemented above the consumer |
 | `WorkBackend` | **`tools`** `work_backend.rs` | 1 stub | Correctly placed above the consumer: the `work_file`, `work_status` and `result_report` tools call it; the controller adapter in `rustykrab-cli` implements it (Phase 1, round 2) |
+| `Worker` | **`control`** `worker.rs` | 1 | Correctly placed: the controller calls it, and `LocalWorker` in `rustykrab-agent` implements it above the controller. Peer, Claude Code and Codex workers are the later implementations |
 | `Skill` | `skills/skill.rs` | 1 | Thin — `SkillMd` is the only shape |
 | `Channel` | `channels/channel.rs` | **1** | **Not earning its keep** |
 | `GatewayBackend` | `tools/gateway_backend.rs` | **0** | **Dead** |

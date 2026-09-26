@@ -23,6 +23,8 @@ use rustykrab_core::types::{
     ContentPart, Conversation, Message, MessageContent, Role, ToolCall, ToolResult, ToolSchema,
 };
 use rustykrab_core::{Error, Result, SandboxRequirements, Tool};
+use rustykrab_tools::work_backend::with_work_run;
+use rustykrab_tools::{run_end_summary, WorkRunContext, RUN_ENDING_TOOLS, WORK_RUN_CONTEXT};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
@@ -495,10 +497,11 @@ fn extract_task_complete_summary(calls: &[&ToolCall]) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// User-role nudge injected when the model produces a text-only response
+/// System-role nudge injected when the model produces a text-only response
 /// after it has already invoked tools this run. Reminds the model that
 /// `task_complete` is the explicit completion signal — text alone no
-/// longer terminates the loop once work is in progress.
+/// longer terminates the loop once work is in progress. A worker run gets
+/// [`RESULT_REPORT_REMINDER`] instead.
 const TASK_COMPLETE_REMINDER: &str =
     "You produced text but did not call `task_complete`. If the user's request \
      is fully handled, call `task_complete` now with a `summary` containing the \
@@ -506,7 +509,63 @@ const TASK_COMPLETE_REMINDER: &str =
      to keep going — text alone will not end the turn now that you've started \
      working.";
 
-/// Outcome of `AgentRunner::reprompt_for_task_complete`: tell the caller
+/// The tool that ends a worker run (plan section 5). A worker run is held
+/// to its typed report: `task_complete` neither appears in its schemas nor
+/// ends it.
+const WORKER_COMPLETION_TOOL: &str = "result_report";
+
+/// The worker-run counterpart of [`TASK_COMPLETE_REMINDER`], sent as a
+/// `[System notice]` user turn like every other notice in a worker run.
+const RESULT_REPORT_REMINDER: &str =
+    "You produced text but did not call `result_report`. Text alone does not end a \
+     work item. If the work is done, call `result_report` now with its summary. If \
+     you cannot finish, call it with `blocked` or `error` set. If more work remains, \
+     call the next tool.";
+
+/// What a runner notice starts with in a worker run (plan section 12.1).
+const NOTICE_PREFIX: &str = "[System notice] ";
+
+/// Whether the current task is running a worker's work item: the caller
+/// scoped [`WORK_RUN_CONTEXT`] around the run. The runner carries the
+/// binding into every task it spawns, so this holds anywhere inside it.
+fn in_worker_run() -> bool {
+    with_work_run(|_| ()).is_some()
+}
+
+/// A notice from the runner to the model: a nudge, a warning, a compaction
+/// instruction. Outside a worker run it keeps the system role it has always
+/// had. In a worker run it is a `[System notice]` user turn (plan section
+/// 12.1): Ollama's Qwen 3.5-family template folds a non-leading system
+/// message to the top of the prompt, so the model never sees it last and
+/// the cached prefix is lost, and qwen3.8 has answered a mid-history system
+/// message with nothing at all. A worker's conversation keeps one leading
+/// system message, whatever the model.
+fn runner_notice(text: impl Into<String>) -> Message {
+    let text = text.into();
+    if in_worker_run() {
+        Message::stamped(
+            Role::User,
+            MessageContent::Text(format!("{NOTICE_PREFIX}{text}")),
+        )
+    } else {
+        Message::stamped(Role::System, MessageContent::Text(text))
+    }
+}
+
+/// Whether `message` is a completion reminder the runner sent: the system
+/// `task_complete` reminder, or a worker run's `result_report` notice.
+fn is_completion_reminder(message: &Message) -> bool {
+    let Some(text) = message.content.as_text() else {
+        return false;
+    };
+    match message.role {
+        Role::System => text == TASK_COMPLETE_REMINDER,
+        Role::User => text.strip_prefix(NOTICE_PREFIX) == Some(RESULT_REPORT_REMINDER),
+        _ => false,
+    }
+}
+
+/// Outcome of `AgentRunner::reprompt_for_completion`: tell the caller
 /// whether to keep looping or accept the last response. Lets the streaming
 /// and non-streaming run paths share the retry-cap bookkeeping while still
 /// emitting their own terminal events.
@@ -1558,14 +1617,15 @@ impl AgentRunner {
         Some(anchored_total + appended)
     }
 
-    /// Push the `task_complete` summary as the final assistant message and
-    /// log the termination. Shared by the streaming and non-streaming run
-    /// paths; the caller is responsible for emitting any provider-specific
-    /// events (e.g. `AgentEvent::TextDelta` / `AgentEvent::Done`).
-    fn finalize_task_complete(&self, conv: &mut Conversation, iteration: usize, summary: String) {
+    /// Push a run-ending tool's summary (`task_complete`, or a worker's
+    /// `result_report`) as the final assistant message and log the
+    /// termination. Shared by the streaming and non-streaming run paths; the
+    /// caller is responsible for emitting any provider-specific events (e.g.
+    /// `AgentEvent::TextDelta` / `AgentEvent::Done`).
+    fn finalize_run_end(&self, conv: &mut Conversation, iteration: usize, summary: String) {
         tracing::info!(
             iteration,
-            "task_complete invoked — terminating run with model-supplied summary"
+            "run-ending tool succeeded; terminating run with model-supplied summary"
         );
         self.push_message(
             conv,
@@ -1579,14 +1639,12 @@ impl AgentRunner {
         );
     }
 
-    /// Whether the conversation ends in a `task_complete` reminder that
-    /// directly follows a non-empty assistant answer: the one state in which
-    /// an empty model response means "that answer was my last word".
+    /// Whether the conversation ends in a completion reminder that directly
+    /// follows a non-empty assistant answer: the one state in which an empty
+    /// model response means "that answer was my last word".
     fn answer_precedes_reminder(conv: &Conversation) -> bool {
         let mut newest_first = conv.messages.iter().rev();
-        let reminded = newest_first.next().is_some_and(|m| {
-            m.role == Role::System && m.content.as_text() == Some(TASK_COMPLETE_REMINDER)
-        });
+        let reminded = newest_first.next().is_some_and(is_completion_reminder);
         reminded
             && newest_first.next().is_some_and(|m| {
                 m.role == Role::Assistant
@@ -1594,22 +1652,31 @@ impl AgentRunner {
             })
     }
 
-    /// Inject the `TASK_COMPLETE_REMINDER` as a user-role nudge after the
-    /// model produced a text-only EndTurn mid-task. Bumps `retries` and
-    /// returns `GiveUp` once the cap is exceeded so the caller can accept
-    /// the last response rather than spinning to `max_iterations`.
-    fn reprompt_for_task_complete(
+    /// Remind the model of its completion signal after a text-only EndTurn
+    /// mid-task: [`TASK_COMPLETE_REMINDER`] as a system message in an
+    /// ordinary run, [`RESULT_REPORT_REMINDER`] as a `[System notice]` user
+    /// turn in a worker run. Bumps `retries` and returns `GiveUp` once the
+    /// cap is exceeded so the caller can accept the last response rather
+    /// than spinning to `max_iterations`.
+    fn reprompt_for_completion(
         &self,
         conv: &mut Conversation,
         iteration: usize,
         retries: &mut usize,
         classification: &ResponseClass,
     ) -> CompletionReminderOutcome {
+        let worker_run = in_worker_run();
+        let signal = if worker_run {
+            WORKER_COMPLETION_TOOL
+        } else {
+            "task_complete"
+        };
         *retries += 1;
         if *retries > TASK_COMPLETE_RETRY_LIMIT {
             tracing::warn!(
                 retries = *retries,
-                "task_complete reminder retries exhausted — accepting last response"
+                signal,
+                "completion reminder retries exhausted; accepting last response"
             );
             return CompletionReminderOutcome::GiveUp;
         }
@@ -1617,18 +1684,15 @@ impl AgentRunner {
             iteration,
             retries = *retries,
             ?classification,
-            "EndTurn without task_complete after tool use — re-prompting"
+            signal,
+            "EndTurn without the completion signal; re-prompting"
         );
-        self.push_message(
-            conv,
-            Message {
-                id: Uuid::new_v4(),
-                role: Role::System,
-                content: MessageContent::Text(TASK_COMPLETE_REMINDER.to_string()),
-                created_at: Utc::now(),
-                agent_version: Message::version_stamp(),
-            },
-        );
+        let reminder = if worker_run {
+            RESULT_REPORT_REMINDER
+        } else {
+            TASK_COMPLETE_REMINDER
+        };
+        self.push_message(conv, runner_notice(reminder));
         CompletionReminderOutcome::Continue
     }
 
@@ -1674,8 +1738,10 @@ impl AgentRunner {
         let probes = self.probes.clone();
 
         // Carry the trace id from the calling task into the spawned agent
-        // task so prompt-log rows and agent-loop logs share the same id.
+        // task so prompt-log rows and agent-loop logs share the same id, and
+        // a worker run's binding so the spawned loop is still that run.
         let trace_id = rustykrab_core::prompt_trace::current_trace_id();
+        let work_run = with_work_run(WorkRunContext::clone);
 
         let join_handle = tokio::spawn(async move {
             let runner = AgentRunner {
@@ -1701,6 +1767,12 @@ impl AgentRunner {
                 runner
                     .run_event_loop(conv, &session, inbound_rx, cancel_rx, outbound_tx)
                     .await
+            };
+            let body = async move {
+                match work_run {
+                    Some(ctx) => WORK_RUN_CONTEXT.scope(ctx, body).await,
+                    None => body.await,
+                }
             };
             let result = match trace_id {
                 Some(id) => rustykrab_core::prompt_trace::with_trace_id(id, body).await,
@@ -1832,12 +1904,25 @@ impl AgentRunner {
     /// Each call creates a fresh ExecutionTracer to prevent cross-session
     /// information leakage (H8).
     pub async fn run(&self, conv: &mut Conversation, session: &Session) -> Result<()> {
-        let ctx = self.build_session_context(session);
         // Created here rather than inside `run_inner` so the outcome
-        // capture below sees the run's traces regardless of which of the
-        // inner loop's many exit paths fired. Still one tracer per run,
-        // so there is no cross-session leakage (H8).
-        let tracer = ExecutionTracer::new();
+        // capture sees the run's traces regardless of which of the inner
+        // loop's many exit paths fired. Still one tracer per run, so there
+        // is no cross-session leakage (H8).
+        self.run_traced(conv, session, &ExecutionTracer::new())
+            .await
+    }
+
+    /// [`run`](Self::run), recording into a tracer the caller owns so it can
+    /// read the run's counters afterwards: iterations, completion reminders
+    /// sent, and whether the iteration cap ended the run. The caller must
+    /// give each run a fresh tracer (H8).
+    pub async fn run_traced(
+        &self,
+        conv: &mut Conversation,
+        session: &Session,
+        tracer: &ExecutionTracer,
+    ) -> Result<()> {
+        let ctx = self.build_session_context(session);
         // Sampled before the run, so the contract can tell an effect this
         // run produced from one that was already there.
         let window = self.sample_preconditions().await;
@@ -1845,10 +1930,10 @@ impl AgentRunner {
         let result = SESSION_TOOL_CONTEXT
             .scope(
                 ctx,
-                self.run_inner(conv, session, &discard, &tracer, &mut None, &mut 0),
+                self.run_inner(conv, session, &discard, tracer, &mut None, &mut 0),
             )
             .await;
-        self.capture_outcome(session, &tracer, result.is_err(), window)
+        self.capture_outcome(session, tracer, result.is_err(), window)
             .await;
         // Release the per-conversation token-estimate and usage-anchor
         // entries so long-lived runners don't accumulate one per
@@ -1892,6 +1977,10 @@ impl AgentRunner {
         let mut empty_tool_use_retries: usize = 0;
         let mut max_tokens_retries: usize = 0;
         let mut task_complete_retries: usize = 0;
+        // A worker run (the caller scoped `WORK_RUN_CONTEXT`) ends only on
+        // its `result_report`: text alone never ends it, `task_complete` is
+        // neither shown nor honoured, and every notice is a user turn.
+        let worker_run = in_worker_run();
         let mut had_side_effects = false;
         let mut has_called_any_tool = false;
         // Set when a tool reports the turn is now waiting on someone
@@ -1967,16 +2056,10 @@ impl AgentRunner {
                 soft_warning_injected = true;
                 self.push_message(
                     conv,
-                    Message {
-                        id: Uuid::new_v4(),
-                        role: Role::System,
-                        content: MessageContent::Text(format!(
-                            "[Warning: {iteration}/{} iterations used.]",
-                            self.config.max_iterations
-                        )),
-                        created_at: Utc::now(),
-                        agent_version: Message::version_stamp(),
-                    },
+                    runner_notice(format!(
+                        "[Warning: {iteration}/{} iterations used.]",
+                        self.config.max_iterations
+                    )),
                 );
             }
 
@@ -2078,8 +2161,10 @@ impl AgentRunner {
                 // First tool call this run — make `task_complete` visible
                 // in the schema from the next iteration onward. We hide it
                 // on no-tool turns (greetings, direct Q&A) so the model
-                // isn't tempted to use it as a chatty turn-ender.
-                if !has_called_any_tool {
+                // isn't tempted to use it as a chatty turn-ender. A worker
+                // run never sees it: its `result_report` is active from
+                // turn 0.
+                if !has_called_any_tool && !worker_run {
                     self.active_tools
                         .activate(session.conversation_id, ["task_complete"]);
                 }
@@ -2101,8 +2186,13 @@ impl AgentRunner {
                 // Capture the `task_complete` summary up front so we can
                 // surface it as the final assistant message after the tool
                 // batch finishes — even if the call vector is moved into
-                // `execute_tools_parallel_traced` below.
-                let task_complete_summary = extract_task_complete_summary(&calls);
+                // `execute_tools_parallel_traced` below. Not in a worker run,
+                // which only its report ends.
+                let task_complete_summary = if worker_run {
+                    None
+                } else {
+                    extract_task_complete_summary(&calls)
+                };
 
                 for call in &calls {
                     tracing::info!(tool = %call.name, call_id = %call.id, "tool call started");
@@ -2150,6 +2240,27 @@ impl AgentRunner {
                         }
                     }
                 }
+
+                // `result_report`, the typed successor of `task_complete`,
+                // is read after it ran rather than from its arguments: a
+                // report the host rejected must not end the run, and goes
+                // back to the model as an ordinary tool result so it can
+                // fix every line and call again. A worker run ends on its
+                // report only; any other run on either run-ending tool.
+                let run_ending: &[&str] = if worker_run {
+                    &[WORKER_COMPLETION_TOOL]
+                } else {
+                    &RUN_ENDING_TOOLS
+                };
+                let reported_summary = results.iter().find_map(|(tool_name, _, result)| {
+                    let output = &result.as_ref().ok()?.output;
+                    if run_ending.contains(&tool_name.as_str()) {
+                        run_end_summary(tool_name, output)
+                    } else {
+                        None
+                    }
+                });
+                let run_end = task_complete_summary.or(reported_summary);
 
                 let had_errors = results.iter().any(|(_, _, r)| {
                     if let Ok(tr) = r {
@@ -2225,19 +2336,20 @@ impl AgentRunner {
                 }
 
                 // Explicit completion signal: the model called `task_complete`
-                // with a non-empty summary. Surface the summary as the final
-                // assistant message (so `extract_assistant_message` finds it)
-                // and exit the loop. We only break *after* tool results were
-                // pushed so the conversation history stays well-formed: every
+                // with a non-empty summary, or a run-ending `result_report`
+                // was accepted. Surface the summary as the final assistant
+                // message (so `extract_assistant_message` finds it) and exit
+                // the loop. We only break *after* tool results were pushed so
+                // the conversation history stays well-formed: every
                 // tool_call has a matching tool_result.
                 //
                 // The synthesized message is also emitted as a TextDelta so
                 // streaming callers render the deliverable just like a
                 // model-produced final answer. A non-streaming caller's sink
                 // discards it.
-                if let Some(summary) = task_complete_summary {
+                if let Some(summary) = run_end {
                     on_event(AgentEvent::TextDelta(summary.clone()));
-                    self.finalize_task_complete(conv, iteration, summary);
+                    self.finalize_run_end(conv, iteration, summary);
                     on_event(AgentEvent::Done);
                     return Ok(());
                 }
@@ -2279,16 +2391,7 @@ impl AgentRunner {
                     } else {
                         tracing::warn!(iteration, "model hit max tokens, prompting to continue");
                     }
-                    self.push_message(
-                        conv,
-                        Message {
-                            id: Uuid::new_v4(),
-                            role: Role::System,
-                            content: MessageContent::Text("Continue.".to_string()),
-                            created_at: Utc::now(),
-                            agent_version: Message::version_stamp(),
-                        },
-                    );
+                    self.push_message(conv, runner_notice("Continue."));
                     continue;
                 }
                 StopReason::EndTurn => {
@@ -2303,14 +2406,28 @@ impl AgentRunner {
                     // working. Cap by `TASK_COMPLETE_RETRY_LIMIT` so models
                     // that never learn the protocol fall through to the
                     // legacy accept-and-return behavior.
-                    if has_called_any_tool && !turn_blocked {
-                        match self.reprompt_for_task_complete(
+                    //
+                    // A worker run is reminded of `result_report` on every
+                    // text-only EndTurn, from the first turn and even after
+                    // a turn-blocking tool, since a blocked worker reports
+                    // `blocked`. Each reminder is counted on the tracer so
+                    // the worker can tell the controller it happened.
+                    let hold_for_completion = if worker_run {
+                        true
+                    } else {
+                        has_called_any_tool && !turn_blocked
+                    };
+                    if hold_for_completion {
+                        match self.reprompt_for_completion(
                             conv,
                             iteration,
                             &mut task_complete_retries,
                             &classification,
                         ) {
-                            CompletionReminderOutcome::Continue => continue,
+                            CompletionReminderOutcome::Continue => {
+                                tracer.record_completion_reminder();
+                                continue;
+                            }
                             CompletionReminderOutcome::GiveUp => {
                                 on_event(AgentEvent::Done);
                                 return Ok(());
@@ -2344,15 +2461,9 @@ impl AgentRunner {
                             }
                             self.push_message(
                                 conv,
-                                Message {
-                                    id: Uuid::new_v4(),
-                                    role: Role::System,
-                                    content: MessageContent::Text(
-                                        "Your response was empty. Please provide a substantive answer or take an action.".to_string(),
-                                    ),
-                                    created_at: Utc::now(),
-                                                                    agent_version: Message::version_stamp(),
-                                },
+                                runner_notice(
+                                    "Your response was empty. Please provide a substantive answer or take an action.",
+                                ),
                             );
                             continue;
                         }
@@ -2378,16 +2489,9 @@ impl AgentRunner {
                             );
                             self.push_message(
                                 conv,
-                                Message {
-                                    id: Uuid::new_v4(),
-                                    role: Role::System,
-                                    content: MessageContent::Text(
-                                        "Your previous response described or narrated work without actually calling any tools, so nothing happened. Either call the tools now to do the work, or reply with a final answer (including admitting you can't) — do not promise future updates."
-                                            .to_string(),
-                                    ),
-                                    created_at: Utc::now(),
-                                                                    agent_version: Message::version_stamp(),
-                                },
+                                runner_notice(
+                                    "Your previous response described or narrated work without actually calling any tools, so nothing happened. Either call the tools now to do the work, or reply with a final answer (including admitting you can't) — do not promise future updates.",
+                                ),
                             );
                             continue;
                         }
@@ -2421,19 +2525,27 @@ impl AgentRunner {
                     );
                     self.push_message(
                         conv,
-                        Message {
-                            id: Uuid::new_v4(),
-                            role: Role::System,
-                            content: MessageContent::Text(
-                                "Your previous response indicated a tool call but none was found. Please retry.".to_string(),
-                            ),
-                            created_at: Utc::now(),
-                                                    agent_version: Message::version_stamp(),
-                        },
+                        runner_notice(
+                            "Your previous response indicated a tool call but none was found. Please retry.",
+                        ),
                     );
                     continue;
                 }
             }
+        }
+
+        tracer.record_iteration_limit();
+        // A worker's iteration budget belongs to the controller, which
+        // classifies the spent budget and climbs the item's ladder. A
+        // summary here could not be a report anyway: the call below carries
+        // no tools, so `result_report` is out of reach.
+        if worker_run {
+            tracing::warn!(
+                max_iterations = self.config.max_iterations,
+                "iteration cap reached in a worker run; ending without a report"
+            );
+            on_event(AgentEvent::Done);
+            return Ok(());
         }
 
         // Escalate to user.
@@ -2608,9 +2720,9 @@ impl AgentRunner {
         // `credential_request` filed its request under no conversation, so the
         // secure link it minted was never delivered. The single-call path
         // above runs inline and was never affected, which is why a model that
-        // emits one call per turn hid this.
-        let session_ctx = SESSION_TOOL_CONTEXT.try_with(Clone::clone).ok();
-        let trace_id = rustykrab_core::prompt_trace::current_trace_id();
+        // emits one call per turn hid this. A worker run's binding is carried
+        // the same way, or a batched `result_report` would find no item.
+        let locals = TaskLocals::capture();
 
         for call in calls {
             let call = call.clone();
@@ -2621,9 +2733,9 @@ impl AgentRunner {
             let sem = semaphore.clone();
             let hb_tx = hb_tx.clone();
             let interval = heartbeat_interval;
-            let session_ctx = session_ctx.clone();
+            let locals = locals.clone();
 
-            let task = tokio::spawn(with_task_locals(session_ctx, trace_id, async move {
+            let task = tokio::spawn(with_task_locals(locals, async move {
                 let _permit = sem.acquire().await.expect("semaphore closed");
                 let start = Instant::now();
                 let result = if interval == 0 {
@@ -3505,13 +3617,9 @@ impl AgentRunner {
             // output targets the same size as the recursive path. ~1.5
             // tokens per word leaves headroom under the token cap.
             let max_words = (summary_cap_tokens as f64 / 1.5).floor().max(128.0) as usize;
-            let compaction_prompt = Message {
-                id: Uuid::new_v4(),
-                role: Role::System,
-                content: MessageContent::Text(strategy.summary_prompt(max_words, false)),
-                created_at: Utc::now(),
-                agent_version: Message::version_stamp(),
-            };
+            // Appended after the history, so in a worker run it is a
+            // user-role notice like every other (plan section 12.1).
+            let compaction_prompt = runner_notice(strategy.summary_prompt(max_words, false));
 
             // Keep the live history unchanged even if the summarizer future
             // is cancelled. This costs one deep clone at the high-water mark.
@@ -3663,21 +3771,17 @@ impl AgentRunner {
             created_at: Utc::now(),
             agent_version: Message::version_stamp(),
         };
-        let continuation_msg = Message {
-            id: Uuid::new_v4(),
-            role: Role::System,
-            content: MessageContent::Text(if strategy == CompactionStrategy::Legacy {
-                "Continue from the summary above. Do not repeat already-completed work.".to_string()
-            } else {
-                let mut text = "Continue the current user task using the handoff and verbatim turns. Later user corrections and explicit task switches override earlier goals or summary claims. Resolve short follow-ups in context. A summary is lossy: verify uncertain details via recall, and never treat attempted or failed actions as completed. Refresh browser state before using element refs.".to_string();
-                if strategy == CompactionStrategy::StructuredMessageTail {
-                    text.push_str(" Within the same task, apply corrections only to the fields changed; retain other preferences and constraints unless explicitly withdrawn or contradicted. A newer summary omitting an older requirement does not cancel it. Check verbatim context before choosing the next action. Do not transfer unrelated constraints across an explicit task switch.");
-                }
-                text
-            }),
-            created_at: Utc::now(),
-            agent_version: Message::version_stamp(),
-        };
+        // Lands after the summary, mid-history: a user-role notice in a
+        // worker run (plan section 12.1).
+        let continuation_msg = runner_notice(if strategy == CompactionStrategy::Legacy {
+            "Continue from the summary above. Do not repeat already-completed work.".to_string()
+        } else {
+            let mut text = "Continue the current user task using the handoff and verbatim turns. Later user corrections and explicit task switches override earlier goals or summary claims. Resolve short follow-ups in context. A summary is lossy: verify uncertain details via recall, and never treat attempted or failed actions as completed. Refresh browser state before using element refs.".to_string();
+            if strategy == CompactionStrategy::StructuredMessageTail {
+                text.push_str(" Within the same task, apply corrections only to the fields changed; retain other preferences and constraints unless explicitly withdrawn or contradicted. A newer summary omitting an older requirement does not cancel it. Check verbatim context before choosing the next action. Do not transfer unrelated constraints across an explicit task switch.");
+            }
+            text
+        });
 
         new_messages.push(summary_msg.clone());
         new_messages.push(continuation_msg.clone());
@@ -4086,13 +4190,41 @@ fn fence_value(value: serde_json::Value) -> serde_json::Value {
     }
 }
 
-/// Run `fut` inside the task-locals a tool expects, for use under
-/// `tokio::spawn`, which starts every task with none of them.
-async fn with_task_locals<F: std::future::Future>(
+/// The task-locals a tool expects, captured from the calling task so a
+/// spawned task can re-enter them.
+#[derive(Clone)]
+struct TaskLocals {
     session_ctx: Option<SessionToolContext>,
     trace_id: Option<Uuid>,
-    fut: F,
-) -> F::Output {
+    /// The work item a worker run holds (`result_report`, `work_file` and
+    /// `work_status` read it for provenance and the item binding).
+    work_run: Option<WorkRunContext>,
+}
+
+impl TaskLocals {
+    fn capture() -> Self {
+        Self {
+            session_ctx: SESSION_TOOL_CONTEXT.try_with(Clone::clone).ok(),
+            trace_id: rustykrab_core::prompt_trace::current_trace_id(),
+            work_run: with_work_run(WorkRunContext::clone),
+        }
+    }
+}
+
+/// Run `fut` inside the task-locals a tool expects, for use under
+/// `tokio::spawn`, which starts every task with none of them.
+async fn with_task_locals<F: std::future::Future>(locals: TaskLocals, fut: F) -> F::Output {
+    let TaskLocals {
+        session_ctx,
+        trace_id,
+        work_run,
+    } = locals;
+    let fut = async move {
+        match work_run {
+            Some(ctx) => WORK_RUN_CONTEXT.scope(ctx, fut).await,
+            None => fut.await,
+        }
+    };
     let fut = async move {
         match trace_id {
             Some(id) => rustykrab_core::prompt_trace::with_trace_id(id, fut).await,
@@ -4623,6 +4755,87 @@ mod interactive_regression_tests {
                 "session context reached the tool"
             );
             assert_eq!(*trace, Some(trace_id), "trace id reached the tool");
+        }
+    }
+
+    /// Records the work item a tool sees bound to its run.
+    struct WorkRunProbe {
+        seen: Arc<Mutex<Vec<Option<String>>>>,
+    }
+    #[async_trait]
+    impl Tool for WorkRunProbe {
+        fn name(&self) -> &str {
+            "work_run_probe"
+        }
+        fn description(&self) -> &str {
+            "Reports the work item its run holds"
+        }
+        fn schema(&self) -> ToolSchema {
+            ToolSchema {
+                name: self.name().into(),
+                description: self.description().into(),
+                parameters: serde_json::json!({"type":"object"}),
+            }
+        }
+        async fn execute(&self, _: serde_json::Value) -> Result<serde_json::Value> {
+            let item = with_work_run(|r| r.item.clone());
+            self.seen.lock().unwrap().push(item);
+            Ok(serde_json::json!({"ok": true}))
+        }
+    }
+
+    /// The same spawn boundary as above, for a worker run's binding: a
+    /// batched `result_report` must still find the item its run holds, or
+    /// it reports on nothing. Driven through `start`, which spawns the loop
+    /// itself, so both spawns are crossed.
+    #[tokio::test]
+    async fn batched_tool_calls_keep_the_work_run_binding() {
+        let (p, _, conv, _) = setup(false, 4);
+        *p.response.lock().unwrap() = Some(MessageContent::MultiToolCall(
+            (0..3)
+                .map(|i| ToolCall {
+                    id: format!("probe-{i}"),
+                    name: "work_run_probe".into(),
+                    arguments: serde_json::json!({}),
+                })
+                .collect(),
+        ));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let runner = AgentRunner::new(
+            p.clone(),
+            vec![Arc::new(WorkRunProbe { seen: seen.clone() })],
+            Arc::new(NoSandbox),
+        )
+        .with_config(AgentConfig {
+            max_iterations: 4,
+            ..Default::default()
+        });
+        let session = Session::with_capabilities(
+            conv.id,
+            rustykrab_core::capability::CapabilitySet::for_tools_permissive(&["work_run_probe"]),
+        );
+        let binding = WorkRunContext {
+            item: "item-41".into(),
+            actor: "worker:pinch".into(),
+        };
+        let (_handle, _events, task) = WORK_RUN_CONTEXT
+            .scope(binding, async { runner.start(conv, session) })
+            .await;
+        p.entered.notified().await;
+        p.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 3, "every call in the batch ran");
+        for item in seen.iter() {
+            assert_eq!(
+                item.as_deref(),
+                Some("item-41"),
+                "the binding reached the tool"
+            );
         }
     }
 
@@ -7441,6 +7654,389 @@ mod task_complete_tests {
             *provider.chat_count.lock().unwrap(),
             3,
             "a non-blocking tool must still be held to the completion protocol"
+        );
+    }
+}
+
+/// Worker runs: `WORK_RUN_CONTEXT` scoped around the run makes it one
+/// (plan sections 5 and 12.1).
+#[cfg(test)]
+mod worker_run_tests {
+    use super::*;
+    use async_trait::async_trait;
+    use rustykrab_core::capability::CapabilitySet;
+    use rustykrab_core::model::{ModelResponse, StopReason, Usage};
+    use rustykrab_core::types::{ToolCall, ToolSchema};
+    use rustykrab_tools::{ResultReportTool, StubWorkBackend, TaskCompleteTool, WorkCall};
+    use std::sync::Mutex;
+
+    use crate::sandbox::NoSandbox;
+
+    /// Plays a script, one response per call, and records each request:
+    /// the messages sent and the names of the tools offered.
+    struct Recording {
+        script: Mutex<Vec<ModelResponse>>,
+        requests: Mutex<Vec<(Vec<Message>, Vec<String>)>>,
+    }
+
+    impl Recording {
+        fn new(script: Vec<ModelResponse>) -> Arc<Self> {
+            Arc::new(Self {
+                script: Mutex::new(script),
+                requests: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn next(&self, messages: &[Message], tools: &[ToolSchema]) -> Result<ModelResponse> {
+            self.requests.lock().unwrap().push((
+                messages.to_vec(),
+                tools.iter().map(|t| t.name.clone()).collect(),
+            ));
+            let mut script = self.script.lock().unwrap();
+            assert!(!script.is_empty(), "the script ran out");
+            Ok(script.remove(0))
+        }
+
+        fn requests(&self) -> Vec<(Vec<Message>, Vec<String>)> {
+            self.requests.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for Recording {
+        fn name(&self) -> &str {
+            "worker-run-recording"
+        }
+        async fn chat(&self, messages: &[Message], tools: &[ToolSchema]) -> Result<ModelResponse> {
+            self.next(messages, tools)
+        }
+        async fn chat_with_choice(
+            &self,
+            messages: &[Message],
+            tools: &[ToolSchema],
+            _: ToolChoice,
+        ) -> Result<ModelResponse> {
+            self.next(messages, tools)
+        }
+    }
+
+    struct Noop;
+
+    #[async_trait]
+    impl Tool for Noop {
+        fn name(&self) -> &str {
+            "noop"
+        }
+        fn description(&self) -> &str {
+            "does nothing"
+        }
+        fn schema(&self) -> ToolSchema {
+            ToolSchema {
+                name: "noop".into(),
+                description: "does nothing".into(),
+                parameters: serde_json::json!({"type": "object", "properties": {}}),
+            }
+        }
+        async fn execute(&self, _: serde_json::Value) -> Result<serde_json::Value> {
+            Ok(serde_json::json!({"ok": true}))
+        }
+    }
+
+    fn respond(content: MessageContent, stop_reason: StopReason) -> ModelResponse {
+        ModelResponse {
+            message: Message::stamped(Role::Assistant, content),
+            usage: Usage::default(),
+            stop_reason,
+            text: None,
+        }
+    }
+
+    fn call(name: &str, args: serde_json::Value) -> ModelResponse {
+        respond(
+            MessageContent::ToolCall(ToolCall {
+                id: Uuid::new_v4().to_string(),
+                name: name.into(),
+                arguments: args,
+            }),
+            StopReason::ToolUse,
+        )
+    }
+
+    fn text(t: &str) -> ModelResponse {
+        respond(MessageContent::Text(t.into()), StopReason::EndTurn)
+    }
+
+    fn binding() -> WorkRunContext {
+        WorkRunContext {
+            item: "item-7".into(),
+            actor: "worker:pinch".into(),
+        }
+    }
+
+    /// A runner over `noop`, `task_complete` and `result_report`, with
+    /// `noop` and `result_report` active from turn 0 as a local worker
+    /// activates them.
+    fn worker(
+        provider: Arc<Recording>,
+        config: AgentConfig,
+    ) -> (AgentRunner, Session, Conversation, Arc<StubWorkBackend>) {
+        let stub = Arc::new(StubWorkBackend::new());
+        let tools: Vec<Arc<dyn Tool>> = vec![
+            Arc::new(Noop),
+            Arc::new(TaskCompleteTool::new()),
+            Arc::new(ResultReportTool::new(stub.clone())),
+        ];
+        let active = Arc::new(ActiveToolsRegistry::new());
+        let runner = AgentRunner::new(provider, tools, Arc::new(NoSandbox))
+            .with_active_tools(active.clone())
+            .with_config(config);
+        let conv_id = Uuid::new_v4();
+        active.activate(conv_id, ["noop", "result_report"]);
+        let caps = CapabilitySet::for_tools_permissive(&["noop", "task_complete", "result_report"]);
+        let session = Session::with_capabilities(conv_id, caps);
+        let mut conv = Conversation {
+            id: conv_id,
+            messages: vec![
+                Message::stamped(Role::System, MessageContent::Text("You are pinch.".into())),
+                Message::stamped(
+                    Role::User,
+                    MessageContent::Text("work item: #item-7".into()),
+                ),
+            ],
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            title: None,
+            summary: None,
+            detected_profile: None,
+            channel_source: None,
+            channel_id: None,
+            channel_thread_id: None,
+        };
+        conv.id = conv_id;
+        (runner, session, conv, stub)
+    }
+
+    fn last_assistant_text(conv: &Conversation) -> Option<&str> {
+        conv.messages
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::Assistant && m.content.as_text().is_some())
+            .and_then(|m| m.content.as_text())
+    }
+
+    /// `result_report` is `task_complete`'s typed successor: a report the
+    /// host accepts ends the run with its summary, a rejected one goes back
+    /// to the model as an ordinary tool result, and `task_complete` is
+    /// neither offered to a worker nor able to end its run.
+    #[tokio::test]
+    async fn a_worker_run_ends_on_an_accepted_report_only() {
+        let provider = Recording::new(vec![
+            call("noop", serde_json::json!({})),
+            call(
+                "result_report",
+                serde_json::json!({
+                    "summary": "slow",
+                    "error": { "class": "model", "subclass": "timeout", "detail": "slow" }
+                }),
+            ),
+            call(
+                "task_complete",
+                serde_json::json!({ "summary": "all done" }),
+            ),
+            call(
+                "result_report",
+                serde_json::json!({ "summary": "Booked the 9:40." }),
+            ),
+        ]);
+        let (runner, session, mut conv, stub) = worker(provider.clone(), AgentConfig::default());
+
+        WORK_RUN_CONTEXT
+            .scope(binding(), runner.run(&mut conv, &session))
+            .await
+            .unwrap();
+
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 4, "the run ended on the accepted report");
+        for (i, (_, tools)) in requests.iter().enumerate() {
+            assert!(
+                tools.iter().any(|n| n == "result_report"),
+                "call {i}: {tools:?}"
+            );
+            assert!(
+                !tools.iter().any(|n| n == "task_complete"),
+                "call {i}: {tools:?}"
+            );
+        }
+        assert_eq!(last_assistant_text(&conv), Some("Booked the 9:40."));
+
+        let rejection = requests[2]
+            .0
+            .iter()
+            .find_map(|m| match &m.content {
+                MessageContent::ToolResult(r) if r.is_error => Some(r.output.to_string()),
+                _ => None,
+            })
+            .expect("the rejected report went back to the model");
+        assert!(
+            rejection.contains("result_report not accepted"),
+            "{rejection}"
+        );
+
+        let reports: Vec<_> = stub
+            .calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                WorkCall::Report { item, report, .. } => Some((item, report.summary)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            reports,
+            vec![("item-7".to_string(), "Booked the 9:40.".to_string())]
+        );
+    }
+
+    /// Text never ends a worker run, even on the first turn: the runner
+    /// reminds the model of `result_report` in a user turn, and counts it.
+    #[tokio::test]
+    async fn text_in_a_worker_run_is_answered_with_a_counted_user_notice() {
+        let provider = Recording::new(vec![
+            text("The cheapest plan is B at 12 GBP."),
+            call(
+                "result_report",
+                serde_json::json!({ "summary": "B is cheapest." }),
+            ),
+        ]);
+        let (runner, session, mut conv, _) = worker(provider.clone(), AgentConfig::default());
+        let tracer = ExecutionTracer::new();
+
+        WORK_RUN_CONTEXT
+            .scope(binding(), runner.run_traced(&mut conv, &session, &tracer))
+            .await
+            .unwrap();
+
+        assert_eq!(tracer.completion_reminders(), 1);
+        let reminder = &provider.requests()[1].0.last().unwrap().clone();
+        assert_eq!(reminder.role, Role::User);
+        assert_eq!(
+            reminder.content.as_text(),
+            Some(format!("{NOTICE_PREFIX}{RESULT_REPORT_REMINDER}").as_str())
+        );
+        assert_eq!(last_assistant_text(&conv), Some("B is cheapest."));
+    }
+
+    /// A worker's spent iteration budget ends the run with no summary call
+    /// and no report, and the tracer says why.
+    #[tokio::test]
+    async fn a_worker_run_that_never_reports_stops_at_its_cap() {
+        let provider = Recording::new(vec![
+            call("noop", serde_json::json!({})),
+            call("noop", serde_json::json!({})),
+            call("noop", serde_json::json!({})),
+        ]);
+        let config = AgentConfig {
+            max_iterations: 3,
+            ..AgentConfig::default()
+        };
+        let (runner, session, mut conv, stub) = worker(provider.clone(), config);
+        let tracer = ExecutionTracer::new();
+
+        WORK_RUN_CONTEXT
+            .scope(binding(), runner.run_traced(&mut conv, &session, &tracer))
+            .await
+            .unwrap();
+
+        assert!(tracer.iteration_limit_reached());
+        assert_eq!(tracer.iterations(), 3);
+        assert_eq!(provider.requests().len(), 3, "no summary call past the cap");
+        assert!(stub.calls().is_empty());
+    }
+
+    /// Plan section 12.1: in a worker run every runner notice is a user
+    /// turn, so no request carries a system message after the first.
+    #[tokio::test]
+    async fn no_request_in_a_worker_run_carries_a_non_leading_system_message() {
+        let provider = Recording::new(vec![
+            // Prose: the completion reminder.
+            text("Let me look into the plans."),
+            // Cut off: "Continue." (the soft warning fires before this call).
+            respond(
+                MessageContent::Text("Plan A costs".into()),
+                StopReason::MaxTokens,
+            ),
+            // Said it called a tool and did not.
+            respond(MessageContent::Text(String::new()), StopReason::ToolUse),
+            // Nothing: the reminder again.
+            text(""),
+            call("noop", serde_json::json!({})),
+            call(
+                "result_report",
+                serde_json::json!({ "summary": "B is cheapest." }),
+            ),
+        ]);
+        let config = AgentConfig {
+            soft_iteration_warning: 1,
+            ..AgentConfig::default()
+        };
+        let (runner, session, mut conv, _) = worker(provider.clone(), config);
+
+        WORK_RUN_CONTEXT
+            .scope(binding(), runner.run(&mut conv, &session))
+            .await
+            .unwrap();
+
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 6);
+        for (i, (messages, _)) in requests.iter().enumerate() {
+            assert_eq!(messages[0].role, Role::System, "request {i}");
+            let late: Vec<_> = messages[1..]
+                .iter()
+                .filter(|m| m.role == Role::System)
+                .filter_map(|m| m.content.as_text())
+                .collect();
+            assert!(late.is_empty(), "request {i} carries {late:?}");
+        }
+        let notices = conv
+            .messages
+            .iter()
+            .filter(|m| {
+                m.role == Role::User
+                    && m.content
+                        .as_text()
+                        .is_some_and(|t| t.starts_with(NOTICE_PREFIX))
+            })
+            .count();
+        assert_eq!(
+            notices, 5,
+            "two reminders, the warning, Continue and the retry"
+        );
+    }
+
+    /// Outside a worker run an accepted `result_report` (naming its item)
+    /// ends the run as `task_complete` does, and the notices keep the
+    /// system role they have always had.
+    #[tokio::test]
+    async fn an_accepted_report_ends_an_ordinary_run_too() {
+        let provider = Recording::new(vec![
+            call("noop", serde_json::json!({})),
+            text("Working on it."),
+            call(
+                "result_report",
+                serde_json::json!({ "item": "item-9", "summary": "Filed the claim." }),
+            ),
+        ]);
+        let (runner, session, mut conv, stub) = worker(provider.clone(), AgentConfig::default());
+
+        runner.run(&mut conv, &session).await.unwrap();
+
+        assert_eq!(provider.requests().len(), 3);
+        assert_eq!(last_assistant_text(&conv), Some("Filed the claim."));
+        assert_eq!(stub.calls().len(), 1);
+        assert!(
+            conv.messages
+                .iter()
+                .any(|m| m.role == Role::System
+                    && m.content.as_text() == Some(TASK_COMPLETE_REMINDER))
         );
     }
 }
