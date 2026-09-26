@@ -41,6 +41,9 @@ pub(super) const W_UNRECOGNISED: &str =
 /// carries both still replays the failure).
 pub(super) const RAW_FAILURE: &str = "E2E-ZQX-17 flux capacitor desynchronised";
 pub(super) const W_PROBE_FIX: &str = "e2e-zqx-17";
+/// The classifier rule the internal item of 14 lands: `<subclass>:
+/// <pattern>` (section 9's extension point, as data).
+pub(super) const PROBE_RULE: &str = "process: e2e-zqx-17";
 pub(super) const W_DOC_ALPHA: &str = "e2e-control worker: attach document alpha";
 pub(super) const W_DOC_BETA_SLOW: &str = "e2e-control worker: attach document beta after a pause";
 pub(super) const W_DOC_GAMMA: &str = "e2e-control worker: attach document gamma";
@@ -91,6 +94,13 @@ pub(super) fn budget(tokens: u64) -> Value {
     json!({ "iterations": 10, "tokens": tokens, "wall_seconds": 600, "repairs": 2 })
 }
 
+/// A parent's budget: `tokens`, and room for ten [`budget`]s' iterations
+/// and wall time, since a parent's budget is an envelope over its
+/// children's in every dimension (plan sections 4.2 and 14.1).
+pub(super) fn envelope(tokens: u64) -> Value {
+    json!({ "iterations": 100, "tokens": tokens, "wall_seconds": 6000, "repairs": 2 })
+}
+
 /// The control suite's part of the scripted daemon's script, merged into
 /// `AGENT_SCRIPT` by `main.rs`.
 pub(crate) fn agent_script_scenarios() -> Vec<Value> {
@@ -103,7 +113,7 @@ pub(crate) fn agent_script_scenarios() -> Vec<Value> {
             "title": title,
             "objective": format!("{worker}. {title}"),
             "done_when": format!("{title} is confirmed"),
-            "budget": budget(if parent.is_none() { 200_000 } else { 20_000 }),
+            "budget": if parent.is_none() { envelope(200_000) } else { budget(20_000) },
         })
     };
     let s18_edge = |item: &str, depends_on: &str| json!({ "item": { "tmp": item }, "kind": "blocks", "depends_on": { "tmp": depends_on } });
@@ -271,8 +281,7 @@ pub(crate) fn agent_script_scenarios() -> Vec<Value> {
                     "summary": "The booking service timed out.",
                     "error": {
                         "class": "tool", "subclass": "timeout",
-                        "fingerprint": "e2e-control-timeout",
-                        "detail": "upstream timed out after 30s", "observed_by": "worker",
+                        "detail": "upstream timed out after 30s",
                     },
                 })),
                 done("Timed out."),
@@ -285,20 +294,24 @@ pub(crate) fn agent_script_scenarios() -> Vec<Value> {
                     "summary": "Stopped on an error I do not recognise.",
                     "error": {
                         "class": "unknown", "subclass": "unclassified",
-                        "fingerprint": "e2e-control-zqx-17",
-                        "detail": RAW_FAILURE, "observed_by": "worker",
+                        "detail": RAW_FAILURE,
                     },
                 })),
                 done("Stopped."),
             ],
         ),
+        // 14: the internal item lands its probe as a classifier rule the
+        // controller replays against the failure before it counts.
         script(
             W_PROBE_FIX,
             vec![
-                succeeded(
-                    "Added a probe that classifies E2E-ZQX-17.",
-                    ("path", "e2e-control/probe.rs"),
-                ),
+                report(json!({
+                    "summary": "Added a probe that classifies E2E-ZQX-17.",
+                    "artifacts": [
+                        { "kind": "path", "value": "e2e-control/probe.rs" },
+                        { "kind": "classifier_rule", "value": PROBE_RULE },
+                    ],
+                })),
                 done("Added the probe."),
             ],
         ),
@@ -506,7 +519,7 @@ mod tests {
         for scenario in agent_script_scenarios() {
             for step in scenario["steps"].as_array().unwrap() {
                 for call in step["toolCalls"].as_array().into_iter().flatten() {
-                    let args = call["arguments"].clone();
+                    let mut args = call["arguments"].clone();
                     match call["name"].as_str().unwrap() {
                         "work_file" => {
                             serde_json::from_value::<WorkItemDraft>(args).unwrap();
@@ -515,6 +528,22 @@ mod tests {
                             serde_json::from_value::<WorkPlan>(args).unwrap();
                         }
                         "result_report" => {
+                            // A worker reports class, subclass and detail;
+                            // the fingerprint and observer are the
+                            // controller's, and the tool refuses them.
+                            if let Some(error) = args["error"].as_object() {
+                                for key in error.keys() {
+                                    assert!(
+                                        ["class", "subclass", "detail", "artifact_refs"]
+                                            .contains(&key.as_str()),
+                                        "result_report error.{key} is not the worker's to set"
+                                    );
+                                }
+                                // What the tool fills in before the report
+                                // reaches the controller.
+                                args["error"]["fingerprint"] = json!("");
+                                args["error"]["observed_by"] = json!("worker_report");
+                            }
                             serde_json::from_value::<ResultReport>(args).unwrap();
                         }
                         _ => {}
