@@ -14,6 +14,8 @@
 //! - [`ladder`]: the resolution ladder as a pure state machine over an item's
 //!   rung history and budgets (sections 8 and 6.4).
 //! - [`handle`]: the controller as the gateway, the CLI and the tools see it.
+//! - [`import`]: the delivery import, a `StackManifest` turned into the
+//!   layered `code` graph of section 14.1, filed through the validator.
 //! - [`worker`]: workers as the controller sees them, and the brief they get.
 //! - [`controller`]: the loop itself (section 6), which drives the store
 //!   through the pure modules above.
@@ -25,5 +27,6 @@ pub mod controller;
 pub mod errors;
 pub mod graph;
 pub mod handle;
+pub mod import;
 pub mod ladder;
 pub mod worker;

@@ -64,7 +64,7 @@ use rustykrab_tools::work_backend::{
 };
 use tokio::task::JoinHandle;
 
-use crate::errors::{Recurrence, DEFAULT_PROMOTE_THRESHOLD};
+use crate::errors::{LearnedRule, Recurrence, DEFAULT_PROMOTE_THRESHOLD};
 use crate::graph::{ApprovalPolicy, FilingSource, SplitMode};
 use crate::handle::{ControlHandle, GraphView, TickReport};
 use crate::worker::Worker;
@@ -227,7 +227,9 @@ pub struct ControllerConfig {
     /// writable resources.
     pub approval: ApprovalPolicy,
     pub split_mode: SplitMode,
-    /// Supersede filings allowed per root within `supersede_window`.
+    /// Supersede filings allowed per root within `supersede_window`: the
+    /// caps' re-plans per parent by default (one, a placeholder until
+    /// Phase 0 measures it; plan sections 6.1 and 17).
     pub supersede_limit: u32,
     pub supersede_window: TimeDelta,
     /// 12.1: at most one running item per local worker, and per local
@@ -246,14 +248,15 @@ pub struct ControllerConfig {
 impl Default for ControllerConfig {
     fn default() -> Self {
         let month = TimeDelta::days(30);
+        let caps = GraphCaps::default();
         ControllerConfig {
-            caps: GraphCaps::default(),
+            caps,
             lease_ttl_seconds: 1_800,
             aging: WorkKind::ALL.iter().map(|k| (*k, month)).collect(),
             notice_channel: "default".to_string(),
             approval: ApprovalPolicy::default(),
             split_mode: SplitMode::Warn,
-            supersede_limit: 2,
+            supersede_limit: caps.max_replans_per_parent,
             supersede_window: TimeDelta::hours(1),
             serialise_local: true,
             default_budget: Budget::default(),
@@ -301,6 +304,9 @@ struct State {
     supersedes: Vec<(WorkItemId, DateTime<Utc>)>,
     /// Planning items with an accepted graph (`already_planned`).
     planned: HashSet<WorkItemId>,
+    /// Classifier rules `internal` items landed (section 9), rebuilt from
+    /// their evidence on the first tick.
+    learned: Vec<LearnedRule>,
 }
 
 /// The loop of plan section 6 over one store and a fixed set of workers.
@@ -342,6 +348,7 @@ impl Controller {
                 approved: HashMap::new(),
                 supersedes: Vec::new(),
                 planned: HashSet::new(),
+                learned: Vec::new(),
             }),
         }
     }
@@ -460,6 +467,14 @@ impl ControlHandle for Controller {
     ) -> Result<PlanOutcome, Error> {
         let _loop = self.loop_lock.lock().await;
         self.file_plan_locked(plan, provenance, source).await
+    }
+
+    async fn file_draft(
+        &self,
+        draft: WorkItemDraft,
+        provenance: Provenance,
+    ) -> Result<PlanOutcome, Error> {
+        WorkBackend::file(self, draft, provenance).await
     }
 
     async fn approve(&self, root: &str, actor: &str) -> Result<Vec<WorkItemId>, Error> {

@@ -94,6 +94,38 @@ fn scenario_19_twelve_items_for_a_three_step_errand_is_too_many() {
     assert_eq!(r.failed[0].offending, vec![id("P")]);
 }
 
+/// The cap is the tree's size, root included: a root with eleven children
+/// is twelve items and fits; twelve children under an existing root, with
+/// no planning item beside them (a scripted or REST caller), do not.
+#[test]
+fn scenario_19_the_item_cap_counts_the_root() {
+    let bare = G::new().add("P").set("P", |p| p.budget = big()).snap();
+    let twelve: Vec<_> = (0..12).map(|i| draft(&format!("s{i}"))).collect();
+    let r = reject(
+        &bare,
+        &plan(id("P"), twelve, vec![]),
+        &ctx(FilingSource::Planner),
+    );
+    assert_eq!(names(&r), vec!["too_many_items"]);
+
+    let mut s = G::new().snap();
+    let mut root = draft("R");
+    root.parent = None;
+    root.budget = Some(big());
+    let mut items = vec![root];
+    items.extend((0..11).map(|i| {
+        let mut d = draft(&format!("s{i}"));
+        d.parent = Some(tmp("R"));
+        d
+    }));
+    let accepted = accept(
+        &mut s,
+        &plan(tmp("R"), items, vec![]),
+        &ctx(FilingSource::Planner),
+    );
+    assert_eq!(accepted.items.len(), 12);
+}
+
 #[test]
 fn scenario_19_depth_beyond_the_cap_is_rejected() {
     let s = planned_root();

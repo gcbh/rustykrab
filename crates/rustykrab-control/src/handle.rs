@@ -3,7 +3,9 @@
 //! the controller itself is written; `controller::Controller` implements it.
 
 use async_trait::async_trait;
-use rustykrab_core::work::{Edge, PlanOutcome, Status, WorkItem, WorkItemId, WorkPlan};
+use rustykrab_core::work::{
+    Edge, ItemRef, PlanOutcome, Status, WorkItem, WorkItemDraft, WorkItemId, WorkPlan,
+};
 use rustykrab_core::Error;
 use rustykrab_tools::work_backend::Provenance;
 use serde::{Deserialize, Serialize};
@@ -58,6 +60,26 @@ pub trait ControlHandle: Send + Sync {
         provenance: Provenance,
         source: FilingSource,
     ) -> Result<PlanOutcome, Error>;
+
+    /// File one draft as a one-item plan (`work_file`'s contract, 14.1),
+    /// through the same validator, as `FilingSource::WorkFile`. The REST
+    /// face of `work_file`; the model-facing tool reaches the same path
+    /// through the controller's `WorkBackend`.
+    async fn file_draft(
+        &self,
+        mut draft: WorkItemDraft,
+        provenance: Provenance,
+    ) -> Result<PlanOutcome, Error> {
+        let tmp = draft.tmp.get_or_insert_with(|| "draft".to_string()).clone();
+        let plan = WorkPlan {
+            root: ItemRef::Tmp { tmp },
+            items: vec![draft],
+            edges: Vec::new(),
+            rationale: String::new(),
+        };
+        self.file_plan(plan, provenance, FilingSource::WorkFile)
+            .await
+    }
 
     /// Release the items held for approval under `root` (plan section 6.1).
     /// Returns the released ids.

@@ -15,11 +15,15 @@ use rustykrab_core::work::{
 use rustykrab_core::Error;
 use rustykrab_store::WorkFilter;
 
-use crate::errors::{gap_of, GapKind, Recurrence};
+use crate::errors::{gap_of, GapKind, LearnedRule, Recurrence, CLASSIFIER_RULE};
 use crate::graph::Snapshot;
 use crate::ladder::LadderState;
 
 use super::Controller;
+
+/// Who verified a landed classifier rule: the controller, by replaying the
+/// failure its `internal` item was filed for.
+pub(super) const REPLAYED: &str = "replay";
 
 /// The outcome a taken worker switch records: `switched from <worker>`.
 pub(super) const SWITCHED: &str = "switched from ";
@@ -30,18 +34,15 @@ pub(super) fn approval_marker(question: &str) -> String {
     format!("approved {question}")
 }
 
-/// A rung event's `reason` is its [`RungEvent`] as JSON, so the ladder is
-/// re-derived from the store after a restart, errors and fingerprints
-/// included.
+/// A rung event's `reason` is its [`RungEvent`] as JSON
+/// ([`crate::ladder::encode_rung_event`]), so the ladder is re-derived from
+/// the store after a restart, errors and fingerprints included.
 pub(super) fn encode_rung(event: &RungEvent) -> String {
-    serde_json::to_string(event).unwrap_or_default()
+    crate::ladder::encode_rung_event(event)
 }
 
 pub(super) fn decode_rung(event: &WorkEvent) -> Option<RungEvent> {
-    if event.kind != EventKind::Rung {
-        return None;
-    }
-    serde_json::from_str(event.reason.as_deref()?).ok()
+    crate::ladder::rung_event(event)
 }
 
 /// An item's ladder from its events.
@@ -117,11 +118,7 @@ pub(super) fn history(events: &[WorkEvent]) -> History {
 /// The error behind an item's latest rung, for a failed input's error class
 /// and a notice's "not done" line.
 pub(super) fn last_error(events: &[WorkEvent]) -> Option<rustykrab_core::work::WorkError> {
-    events
-        .iter()
-        .rev()
-        .filter_map(decode_rung)
-        .find_map(|r| r.error)
+    crate::ladder::last_error(events)
 }
 
 impl Controller {
@@ -206,6 +203,20 @@ impl Controller {
             }
         }
         self.state().recurrence = recurrence;
+        Ok(())
+    }
+
+    /// Rebuild the classifier rules `internal` items landed from their
+    /// `classifier_rule` evidence: the rows the controller verified by
+    /// replay, oldest first (section 9).
+    pub(super) async fn load_learned(&self) -> Result<(), Error> {
+        let rows = self.store.work_evidence_of_kind(CLASSIFIER_RULE).await?;
+        let learned: Vec<LearnedRule> = rows
+            .iter()
+            .filter(|e| e.verified_by.as_deref() == Some(REPLAYED))
+            .filter_map(|e| LearnedRule::parse(&e.item, &e.reference).ok())
+            .collect();
+        self.state().learned = learned;
         Ok(())
     }
 

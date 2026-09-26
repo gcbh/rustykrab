@@ -51,6 +51,12 @@ pub struct Brief {
     pub last_error: Option<String>,
     pub budget: Budget,
     pub origin_conversation_id: Option<String>,
+    /// The id the controller gave this run, recorded as the item's `run`
+    /// evidence at lease time. A worker that keeps a transcript keeps it
+    /// under this id (the local worker's conversation id), so the pointer
+    /// outlives a run that is cancelled or lost mid-way.
+    #[serde(default)]
+    pub run: Option<String>,
 }
 
 /// A worker the controller can lease an item to.

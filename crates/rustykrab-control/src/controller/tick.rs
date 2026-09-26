@@ -7,14 +7,16 @@ use std::sync::Arc;
 
 use chrono::{DateTime, TimeDelta, Utc};
 use rustykrab_core::work::{
-    BlockedReason, ErrorClass, Rung, RungEvent, Status, WorkError, WorkItem, WorkItemId, WorkerKind,
+    BlockedReason, ErrorClass, Rung, RungEvent, Status, WorkError, WorkItem, WorkItemId, WorkKind,
+    WorkerKind,
 };
 use rustykrab_core::{Error, ToolErrorKind};
 use rustykrab_store::{TransitionSpec, WorkOp};
 use rustykrab_tools::work_backend::{ToolState, WorkRunContext, WORK_RUN_CONTEXT};
 
 use crate::errors::{
-    classify, fingerprint, gap_of, Context, FailureInput, GapKind, VerifierVerdict,
+    apply_learned, classify, fingerprint, gap_of, Context, FailureInput, GapKind, LearnedRule,
+    VerifierVerdict, CLASSIFIER_RULE,
 };
 use crate::graph::{self, Effects};
 use crate::handle::TickReport;
@@ -22,10 +24,10 @@ use crate::ladder::{self, Decision, LadderContext, LadderState, SurfaceReason};
 use crate::worker::{Brief, Worker};
 
 use super::batch::{has_open_plan_b, Batch};
-use super::brief::{brief_for, first_line, ERROR, RESULT_REPORT, SUMMARY};
+use super::brief::{brief_for, first_line, ERROR, RESULT_REPORT, RUN, SUMMARY};
 use super::commit::Written;
-use super::filing::{parked_on_landed_capability, parked_reason};
-use super::load::{history, ladder_from, SWITCHED};
+use super::filing::{parked_on_landed_capability, parked_reason, waiting_on_mcp};
+use super::load::{history, ladder_from, REPLAYED, SWITCHED};
 use super::notice::{label, Cause};
 use super::{Controller, Finished, Run, RunResult};
 
@@ -112,6 +114,7 @@ impl Controller {
         let first = !self.state().resumed;
         if first {
             self.load_recurrence(now).await?;
+            self.load_learned().await?;
         }
         let mut report = TickReport::default();
         let mut noticed: HashSet<WorkItemId> = HashSet::new();
@@ -303,9 +306,13 @@ impl Controller {
             }
         }
 
-        // Capability items that landed release what waited on them.
+        // Capability items that landed release what waited on them, and a
+        // configured MCP server releases what named it.
         for id in parked_on_landed_capability(&b.snap) {
             changed.extend(b.move_to(&id, Status::Queued, "controller", "capability landed"));
+        }
+        for id in waiting_on_mcp(&b.snap, |s| self.catalog.mcp_server_configured(s)) {
+            changed.extend(b.move_to(&id, Status::Queued, "controller", "MCP server configured"));
         }
 
         // Readiness (time triggers that fired), roll-ups and verification.
@@ -483,14 +490,30 @@ impl Controller {
             );
             return self.fail(b, item, worker, error, &result.artifacts).await;
         }
+        let rules = match self.replay_rules(item, result).await? {
+            Ok(rules) => rules,
+            Err(why) => {
+                let error = classify(
+                    &FailureInput::Verifier {
+                        verdict: VerifierVerdict::ClaimMismatch,
+                        detail: why,
+                    },
+                    &ctx,
+                );
+                return self.fail(b, item, worker, error, &result.artifacts).await;
+            }
+        };
         for artifact in &result.artifacts {
-            b.evidence(
-                &item.id,
-                &artifact.kind,
-                &artifact.value,
-                Some(RESULT_REPORT),
-            );
+            // A landed rule is verified by the replay above, not by being
+            // in the report.
+            let verified = if item.kind == WorkKind::Internal && artifact.kind == CLASSIFIER_RULE {
+                REPLAYED
+            } else {
+                RESULT_REPORT
+            };
+            b.evidence(&item.id, &artifact.kind, &artifact.value, Some(verified));
         }
+        b.learned.extend(rules);
         b.evidence(&item.id, SUMMARY, result.summary.trim(), None);
         for path in &result.changed_paths {
             b.evidence(&item.id, "changed_path", path, None);
@@ -524,6 +547,59 @@ impl Controller {
         ))
     }
 
+    /// The classifier rules an `internal` item's report lands (section 9,
+    /// scenario 14), each checked as the item's `done_when` says: replaying
+    /// a failure the item was filed for (the `item` refs it carries) through
+    /// the classifier with the rule must yield a class other than
+    /// `unknown`. `Err` names the rule that fails, which fails the report.
+    /// Any other item's rules are not rules, just artifacts.
+    async fn replay_rules(
+        &self,
+        item: &WorkItem,
+        result: &rustykrab_core::work::ResultReport,
+    ) -> Result<Result<Vec<LearnedRule>, String>, Error> {
+        if item.kind != WorkKind::Internal {
+            return Ok(Ok(Vec::new()));
+        }
+        let raw: Vec<&str> = result
+            .artifacts
+            .iter()
+            .filter(|a| a.kind == CLASSIFIER_RULE)
+            .map(|a| a.value.as_str())
+            .collect();
+        if raw.is_empty() {
+            return Ok(Ok(Vec::new()));
+        }
+        let mut failures: Vec<WorkError> = Vec::new();
+        for r in item.artifact_refs.iter().filter(|r| r.kind == "item") {
+            if let Some(e) = ladder::last_error(&self.store.work_events(&r.value).await?) {
+                failures.push(e);
+            }
+        }
+        let ctx = Context {
+            tool: None,
+            worker_kind: None,
+        };
+        let mut rules = Vec::new();
+        for text in raw {
+            let rule = match LearnedRule::parse(&item.id, text) {
+                Ok(rule) => rule,
+                Err(why) => return Ok(Err(format!("classifier_rule {text:?}: {why}"))),
+            };
+            let replays = failures.iter().any(|f| {
+                apply_learned(f.clone(), std::slice::from_ref(&rule), &ctx).class
+                    != ErrorClass::Unknown
+            });
+            if !replays {
+                return Ok(Err(format!(
+                    "classifier_rule {text:?} does not classify the failure this item was filed for"
+                )));
+            }
+            rules.push(rule);
+        }
+        Ok(Ok(rules))
+    }
+
     /// A failed run: its partial artifacts and its error as evidence, then
     /// the ladder.
     async fn fail(
@@ -534,6 +610,16 @@ impl Controller {
         error: WorkError,
         artifacts: &[rustykrab_core::work::ArtifactRef],
     ) -> Result<Vec<WorkItemId>, Error> {
+        // What the built-in classifiers left unknown, a landed rule may
+        // know (section 9, scenario 14).
+        let error = apply_learned(
+            error,
+            &self.state().learned,
+            &Context {
+                tool: None,
+                worker_kind: Some(self.worker_kind(worker)),
+            },
+        );
         for artifact in artifacts {
             b.evidence(&item.id, &artifact.kind, &artifact.value, None);
         }
@@ -972,7 +1058,9 @@ impl Controller {
             } else {
                 Vec::new()
             };
-            let brief = brief_for(&item, inputs.clone(), more, prior, &hist);
+            let mut brief = brief_for(&item, inputs.clone(), more, prior, &hist);
+            let run_id = uuid::Uuid::new_v4().to_string();
+            brief.run = Some(run_id.clone());
             if let Err(e) = self
                 .store
                 .work_lease_acquire(
@@ -985,6 +1073,23 @@ impl Controller {
             {
                 tracing::warn!(item = %item.id, error = %e, "lease refused");
                 continue;
+            }
+            // The run's pointer, before it starts: whatever happens to the
+            // run (a cancel, a restart), the item keeps where its partial
+            // work is.
+            if let Err(e) = self
+                .store
+                .work_evidence_add(rustykrab_core::work::Evidence {
+                    item: item.id.clone(),
+                    kind: RUN.to_string(),
+                    reference: run_id,
+                    hash: None,
+                    verified_by: None,
+                    at: Utc::now(),
+                })
+                .await
+            {
+                tracing::warn!(item = %item.id, error = %e, "run pointer not recorded");
             }
             let name = worker.name().to_string();
             let run = spawn(worker.clone(), brief, self.clock.now());

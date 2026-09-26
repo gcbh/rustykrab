@@ -493,7 +493,11 @@ fn validation_returns_every_failed_check_at_once() {
         ],
     );
     let s = base();
-    let r = reject(&s, &p, &planner());
+    // Nine drafts, P and the three items open under it: over the default
+    // cap of 12, which this test is not about.
+    let mut ctx = planner();
+    ctx.caps.max_items = 16;
+    let r = reject(&s, &p, &ctx);
     assert_eq!(
         names(&r),
         vec![
@@ -507,7 +511,7 @@ fn validation_returns_every_failed_check_at_once() {
         ]
     );
     // The tool result carries the same list; nothing was filed.
-    match validate(&s, &p, &planner()).to_outcome() {
+    match validate(&s, &p, &ctx).to_outcome() {
         PlanOutcome::Rejected(core) => assert_eq!(core.failed.len(), r.failed.len()),
         PlanOutcome::Accepted(_) => panic!("accepted"),
     }
