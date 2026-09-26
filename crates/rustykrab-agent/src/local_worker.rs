@@ -77,6 +77,19 @@ const REFS_MAX: usize = 8;
 /// Characters of the model's last text quoted in a failure's detail.
 const QUOTE_MAX: usize = 200;
 
+/// Where a [`LocalWorker`] keeps its runs' transcripts. A run is a
+/// conversation like any other (plan section 16, Phase 1 exit: a task is
+/// "completed by a scoped local worker in another" conversation), kept
+/// under the id the controller gave the run ([`Brief::run`]), so the item's
+/// `run` evidence points at it. The composition root implements this over
+/// the conversation store; without one, runs are not kept.
+#[async_trait]
+pub trait RunTranscripts: Send + Sync {
+    /// Store the run's conversation as it stands, replacing an earlier
+    /// save of the same id.
+    async fn save(&self, conversation: &Conversation) -> Result<()>;
+}
+
 /// What one run of a [`LocalWorker`] did, beyond its result: the numbers the
 /// controller cannot read from a [`ResultReport`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -104,6 +117,7 @@ pub struct LocalWorker {
     /// Every tool a run may call, sorted: [`Self::ceiling_of`].
     ceiling: Vec<String>,
     recall: Option<Arc<RecallStore>>,
+    transcripts: Option<Arc<dyn RunTranscripts>>,
     /// The KV slot runs wait for. Local work is serialised per model
     /// (plan section 12.1), so workers on one model share one.
     slot: Arc<Semaphore>,
@@ -141,6 +155,7 @@ impl LocalWorker {
             backend,
             ceiling,
             recall: None,
+            transcripts: None,
             slot: Arc::new(Semaphore::new(1)),
             last_run: Mutex::new(None),
         }
@@ -158,6 +173,27 @@ impl LocalWorker {
     pub fn with_recall_store(mut self, store: Arc<RecallStore>) -> Self {
         self.recall = Some(store);
         self
+    }
+
+    /// Keep each run's conversation in `transcripts`: once with the brief
+    /// before the first model call, so a run that is cancelled or lost
+    /// mid-way still leaves its brief behind, and again when it ends.
+    pub fn with_transcripts(mut self, transcripts: Arc<dyn RunTranscripts>) -> Self {
+        self.transcripts = Some(transcripts);
+        self
+    }
+
+    async fn keep(&self, conv: &Conversation) {
+        if let Some(sink) = &self.transcripts {
+            if let Err(e) = sink.save(conv).await {
+                tracing::warn!(
+                    worker = %self.name,
+                    conversation = %conv.id,
+                    error = %e,
+                    "worker run transcript not kept"
+                );
+            }
+        }
     }
 
     /// A definition for a general local worker: the default harness
@@ -295,6 +331,10 @@ impl Worker for LocalWorker {
             models: vec![self.provider.name().to_string()],
             tools: self.ceiling.clone(),
             mcp_servers,
+            // A local run writes through this daemon's own tools, so it can
+            // reach any resource they can. Who may write a resource at once
+            // is the controller's single-writer rule, not a capability.
+            writable_resources: vec!["*".to_string()],
             ..WorkerCapabilities::default()
         }
     }
@@ -326,7 +366,13 @@ impl Worker for LocalWorker {
         let mut tools = rustykrab_tools::work_tools(recorder.clone());
         tools.extend(self.tools.iter().cloned());
 
-        let conv_id = Uuid::new_v4();
+        // The controller's run id, when it is one, names the conversation,
+        // so the item's `run` evidence points at this transcript.
+        let conv_id = brief
+            .run
+            .as_deref()
+            .and_then(|r| Uuid::parse_str(r).ok())
+            .unwrap_or_else(Uuid::new_v4);
         let session = Session::with_capabilities(conv_id, Self::capabilities_for(&self.ceiling));
         let active = Arc::new(ActiveToolsRegistry::new());
         active.activate(conv_id, activate);
@@ -350,6 +396,7 @@ impl Worker for LocalWorker {
         }
 
         let mut conv = self.conversation(conv_id, &brief);
+        self.keep(&conv).await;
         let tracer = ExecutionTracer::new();
         let binding = WorkRunContext {
             item: brief.item.clone(),
@@ -365,6 +412,7 @@ impl Worker for LocalWorker {
                 .ok(),
         };
 
+        self.keep(&conv).await;
         let reports = recorder.take();
         let stats = LocalRun {
             item: brief.item.clone(),
@@ -866,6 +914,7 @@ mod tests {
             last_error: None,
             budget: Budget::default(),
             origin_conversation_id: None,
+            run: None,
         }
     }
 
@@ -964,6 +1013,48 @@ mod tests {
                 reported: true,
             }
         );
+    }
+
+    /// Every save a [`RunTranscripts`] received, in order.
+    #[derive(Default)]
+    struct Kept(Mutex<Vec<Conversation>>);
+
+    #[async_trait]
+    impl RunTranscripts for Kept {
+        async fn save(&self, conversation: &Conversation) -> Result<()> {
+            self.0.lock().unwrap().push(conversation.clone());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_run_is_kept_as_a_conversation_under_the_controllers_run_id() {
+        let provider = Recording::new(vec![report("B is cheapest.")]);
+        let (worker, _) = worker(provider, vec![Arc::new(Named("noop"))]);
+        let kept = Arc::new(Kept::default());
+        let worker = worker.with_transcripts(kept.clone());
+        let run = Uuid::new_v4();
+        let mut b = brief("item-8");
+        b.run = Some(run.to_string());
+
+        worker.run(b).await.unwrap();
+
+        let saves = kept.0.lock().unwrap().clone();
+        assert_eq!(saves.len(), 2, "once with the brief, once at the end");
+        assert!(saves.iter().all(|c| c.id == run));
+        assert_eq!(
+            saves[0].messages.len(),
+            2,
+            "the brief is kept before any call"
+        );
+        assert_eq!(saves[0].channel_source.as_deref(), Some("worker"));
+        assert_eq!(saves[0].channel_thread_id.as_deref(), Some("item-8"));
+        let last = &saves[1];
+        assert!(last.messages.len() > 2, "the whole run is kept at the end");
+        assert!(last.messages.iter().any(|m| matches!(
+            &m.content,
+            MessageContent::ToolCall(call) if call.name == "result_report"
+        )));
     }
 
     #[tokio::test]
@@ -1134,6 +1225,9 @@ mod tests {
         assert!(caps.tools.iter().any(|t| t == "browser"));
         assert!(caps.tools.iter().any(|t| t == "result_report"));
         assert!(!caps.tools.iter().any(|t| t == "task_complete"));
+        // Any resource: the controller's single-writer rule serialises
+        // writers; a capability that listed none would lease no writer.
+        assert_eq!(caps.writable_resources, ["*"]);
     }
 
     #[tokio::test]

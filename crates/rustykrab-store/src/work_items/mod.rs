@@ -621,6 +621,15 @@ impl Store {
             .await
     }
 
+    /// Every item's evidence of one kind, oldest first, live or archived:
+    /// how the controller re-reads what landed as data rather than status,
+    /// such as the classifier rules `internal` items add (section 9).
+    pub async fn work_evidence_of_kind(&self, kind: &str) -> Result<Vec<Evidence>, WorkStoreError> {
+        let kind = kind.to_string();
+        self.work_call(move |conn| ops::evidence_of_kind(conn, &kind))
+            .await
+    }
+
     /// An item's events, oldest first. Live or archived.
     pub async fn work_events(&self, item: &str) -> Result<Vec<WorkEvent>, WorkStoreError> {
         let item = item.to_string();
@@ -635,6 +644,24 @@ impl Store {
     ) -> Result<Vec<WorkEvent>, WorkStoreError> {
         self.work_call(move |conn| ops::events_since(conn, at))
             .await
+    }
+
+    /// Up to `limit` events written after the event with row id `after`,
+    /// oldest first, each with its row id: the cursor of the SSE progress
+    /// stream (plan section 14).
+    pub async fn work_events_after(
+        &self,
+        after: i64,
+        limit: usize,
+    ) -> Result<Vec<(i64, WorkEvent)>, WorkStoreError> {
+        self.work_call(move |conn| ops::events_after(conn, after, limit))
+            .await
+    }
+
+    /// The row id of the newest event (0 for none), where a stream that
+    /// wants only what happens next starts.
+    pub async fn work_events_last_id(&self) -> Result<i64, WorkStoreError> {
+        self.work_call(ops::events_last_id).await
     }
 
     /// Queue a notice. Returns its id.

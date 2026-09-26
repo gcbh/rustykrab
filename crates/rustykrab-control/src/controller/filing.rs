@@ -115,6 +115,33 @@ pub(super) const CAPABILITY_PARKED: [BlockedReason; 5] = [
     BlockedReason::PreconditionFailed,
 ];
 
+/// Items accepted as `blocked(needs_tool)` for an unconfigured MCP server
+/// (section 7) whose servers are all configured now. An item parked behind
+/// a capability item waits for that item instead.
+pub(super) fn waiting_on_mcp(
+    snap: &Snapshot,
+    configured: impl Fn(&str) -> bool,
+) -> Vec<WorkItemId> {
+    snap.items()
+        .iter()
+        .filter(|i| {
+            i.held_by.is_none()
+                && i.status == Status::Blocked(BlockedReason::NeedsTool)
+                && !i.required_mcp_servers.is_empty()
+                && i.required_mcp_servers.iter().all(|s| configured(s))
+        })
+        .filter(|i| {
+            !snap.edges_held_by(&i.id).any(|e| {
+                e.kind == EdgeKind::Blocks
+                    && snap
+                        .item(&e.depends_on)
+                        .is_some_and(|u| u.kind == WorkKind::Capability)
+            })
+        })
+        .map(|i| i.id.clone())
+        .collect()
+}
+
 /// Items parked on capability items that have all landed.
 pub(super) fn parked_on_landed_capability(snap: &Snapshot) -> Vec<WorkItemId> {
     snap.items()
@@ -216,6 +243,7 @@ impl Controller {
                         b.planned.push(filer.clone());
                     }
                 }
+                self.hold_for_mcp(b, &accepted);
                 if !accepted.held.is_empty() {
                     b.notify(
                         &accepted.root,
@@ -228,6 +256,32 @@ impl Controller {
                 Ok(accepted)
             }
             Validation::Rejected(rejection) => Err(rejection),
+        }
+    }
+
+    /// Section 7: a new item naming an MCP server this host has not
+    /// configured is accepted as `blocked(needs_tool)`, and the sweep
+    /// releases it once the server is configured ([`waiting_on_mcp`]).
+    fn hold_for_mcp(&self, b: &mut Batch, accepted: &Accepted) {
+        for item in &accepted.items {
+            let missing: Vec<&str> = item
+                .required_mcp_servers
+                .iter()
+                .filter(|s| !self.catalog.mcp_server_configured(s))
+                .map(String::as_str)
+                .collect();
+            if missing.is_empty() || b.status(&item.id) != Some(Status::Queued) {
+                continue;
+            }
+            b.move_to(
+                &item.id,
+                Status::Blocked(BlockedReason::NeedsTool),
+                "controller",
+                format!(
+                    "waiting for MCP server {}: not configured on this host",
+                    missing.join(", ")
+                ),
+            );
         }
     }
 
@@ -247,9 +301,17 @@ impl Controller {
                 Ok(outcome)
             }
             Err(rejection) => {
+                // The rejection is an event dreaming can count (6.1): on the
+                // item that filed, else on the existing root the filing was
+                // under (a REST or CLI caller has no item of its own).
+                let root = match &plan.root {
+                    ItemRef::Id(id) => Some(id.as_str()),
+                    ItemRef::Tmp { .. } => None,
+                };
                 let filer = provenance
                     .filed_by_item
                     .as_deref()
+                    .or(root)
                     .filter(|id| b.snap.contains(id));
                 if let Some(filer) = filer {
                     self.store

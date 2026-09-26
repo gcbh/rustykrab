@@ -222,6 +222,96 @@ async fn scenario_14_an_unclassifiable_failure_files_an_internal_item_with_its_e
     );
 }
 
+/// A rule report for the internal item: `classifier_rule` `<subclass>:
+/// <pattern>`.
+fn landing(rule: &str) -> Step {
+    report(rustykrab_core::work::ResultReport {
+        summary: "Added the probe.".to_string(),
+        artifacts: vec![rustykrab_core::work::ArtifactRef {
+            kind: crate::errors::CLASSIFIER_RULE.to_string(),
+            value: rule.to_string(),
+        }],
+        ..rustykrab_core::work::ResultReport::default()
+    })
+}
+
+fn first_error(events: &[rustykrab_core::work::WorkEvent]) -> rustykrab_core::work::WorkError {
+    events
+        .iter()
+        .filter_map(crate::controller::load::decode_rung)
+        .find_map(|r| r.error)
+        .expect("a rung with its error")
+}
+
+#[tokio::test]
+async fn scenario_14_the_internal_items_rule_lands_after_replay_and_classifies_the_failure() {
+    const RAW: &str = "E2E-ZQX-17 flux capacitor desynchronised";
+    let h = Harness::new(&["pinch"]);
+    for title in [
+        "Reconcile the ledger",
+        "Reconcile it again",
+        "And once more",
+    ] {
+        for _ in 0..6 {
+            h.script
+                .push(title, report(failure(ErrorSubclass::Unclassified, RAW)));
+        }
+    }
+    let x = h.file_one(draft("x", "Reconcile the ledger")).await;
+    h.step().await;
+    h.step().await;
+    assert_eq!(
+        first_error(&h.events(&x).await).class,
+        rustykrab_core::work::ErrorClass::Unknown
+    );
+    let internal = h.of_kind(WorkKind::Internal).await;
+    assert_eq!(internal.len(), 1);
+    let fix = internal[0].clone();
+
+    // A rule that does not classify the failure fails the report; the
+    // repair lands one that does.
+    h.script
+        .push(&fix.title, landing("process: nothing like this"));
+    h.script.push(&fix.title, landing("process: e2e-zqx-17"));
+    h.drain().await;
+    assert_eq!(h.status(&fix.id).await, Status::Done);
+    let refused = first_error(&h.events(&fix.id).await);
+    assert_eq!(refused.subclass, ErrorSubclass::ClaimMismatch);
+    let kept: Vec<Evidence> = h
+        .store()
+        .work_evidence_list(&fix.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.kind == crate::errors::CLASSIFIER_RULE)
+        .collect();
+    // The refused rule stays as the failed attempt's unverified evidence;
+    // only the replayed one is verified, and only that one is consulted.
+    let verified: Vec<&str> = kept
+        .iter()
+        .filter(|e| e.verified_by.as_deref() == Some("replay"))
+        .map(|e| e.reference.as_str())
+        .collect();
+    assert_eq!(verified, ["process: e2e-zqx-17"], "{kept:?}");
+    assert_eq!(kept.len(), 2);
+
+    // The same failure on a new item is classified by the landed rule.
+    let y = h.file_one(draft("y", "Reconcile it again")).await;
+    h.drain().await;
+    let again = first_error(&h.events(&y).await);
+    assert_eq!(again.subclass, ErrorSubclass::Process);
+    assert!(again.observed_by.starts_with("rule:learned:"), "{again:?}");
+
+    // And after a restart, from the evidence alone.
+    let h = h.restart(&["pinch"]);
+    let z = h.file_one(draft("z", "And once more")).await;
+    h.drain().await;
+    assert_eq!(
+        first_error(&h.events(&z).await).subclass,
+        ErrorSubclass::Process
+    );
+}
+
 // ── 20 ─────────────────────────────────────────────────────────────────
 
 fn chain() -> WorkPlan {

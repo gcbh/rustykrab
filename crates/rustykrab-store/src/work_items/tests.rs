@@ -928,3 +928,84 @@ async fn a_filing_is_accepted_whole_or_not_at_all() {
         Err(WorkStoreError::NotFound(_))
     ));
 }
+
+#[tokio::test]
+async fn the_event_cursor_returns_each_row_once_in_write_order() {
+    let store = seeded(vec![item("a", Status::Running)], vec![]).await;
+    let start = store.work_events_last_id().await.unwrap();
+    let note = |n: i64| WorkEvent {
+        item: "a".into(),
+        // One timestamp for all three: a time cursor could not tell them
+        // apart, the row id can.
+        at: at(60),
+        kind: EventKind::Warning,
+        from: None,
+        to: None,
+        actor: "controller".into(),
+        reason: Some(format!("note {n}")),
+        upstream: None,
+        origin: None,
+        evidence_ref: None,
+    };
+    for n in 0..3 {
+        store.work_event_append(&note(n)).await.unwrap();
+    }
+    let first = store.work_events_after(start, 2).await.unwrap();
+    assert_eq!(
+        first.iter().map(|(_, e)| e.clone()).collect::<Vec<_>>(),
+        vec![note(0), note(1)]
+    );
+    let cursor = first.last().unwrap().0;
+    let rest = store.work_events_after(cursor, 10).await.unwrap();
+    assert_eq!(rest.len(), 1);
+    assert_eq!(rest[0].1, note(2));
+    assert_eq!(store.work_events_last_id().await.unwrap(), rest[0].0);
+    assert!(store
+        .work_events_after(rest[0].0, 10)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn evidence_is_found_by_kind_across_items() {
+    let store = seeded(
+        vec![item("a", Status::Done), item("b", Status::Running)],
+        vec![],
+    )
+    .await;
+    let evidence = |item: &str, kind: &str, reference: &str, secs: i64| Evidence {
+        item: item.into(),
+        kind: kind.into(),
+        reference: reference.into(),
+        hash: None,
+        verified_by: Some("result_report".into()),
+        at: at(secs),
+    };
+    store
+        .work_evidence_add(evidence("b", "classifier_rule", "process: zqx", 2))
+        .await
+        .unwrap();
+    store
+        .work_evidence_add(evidence("a", "path", "probe.rs", 1))
+        .await
+        .unwrap();
+    store
+        .work_evidence_add(evidence("a", "classifier_rule", "network: flux", 3))
+        .await
+        .unwrap();
+    let rules = store
+        .work_evidence_of_kind("classifier_rule")
+        .await
+        .unwrap();
+    let found: Vec<(&str, &str)> = rules
+        .iter()
+        .map(|e| (e.item.as_str(), e.reference.as_str()))
+        .collect();
+    assert_eq!(found, [("b", "process: zqx"), ("a", "network: flux")]);
+    assert!(store
+        .work_evidence_of_kind("nothing")
+        .await
+        .unwrap()
+        .is_empty());
+}

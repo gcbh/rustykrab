@@ -43,7 +43,7 @@ pub(crate) const PRIORITY_MAX: i64 = 100;
 
 const WORK_KINDS: [&str; 4] = ["personal", "research", "capability", "internal"];
 const WORKER_KINDS: [&str; 5] = ["any", "local", "peer", "claude_code", "codex"];
-const ARTIFACT_KINDS: [&str; 6] = ["message", "path", "url", "commit", "item", "other"];
+pub(crate) const ARTIFACT_KINDS: [&str; 6] = ["message", "path", "url", "commit", "item", "other"];
 const EDGE_KINDS: [&str; 3] = ["blocks", "waits_for", "conditional_on_failure"];
 const TRIGGER_KINDS: [&str; 5] = ["now", "at", "on_credential", "on_mcp", "on_answer"];
 
@@ -265,6 +265,18 @@ pub(crate) fn take_artifacts(
     max_items: usize,
     out: &mut Vec<Problem>,
 ) -> Vec<ArtifactRef> {
+    take_artifacts_of(obj, key, path, max_items, &ARTIFACT_KINDS, out)
+}
+
+/// [`take_artifacts`] with the kinds this field allows.
+pub(crate) fn take_artifacts_of(
+    obj: &Map<String, Value>,
+    key: &str,
+    path: &str,
+    max_items: usize,
+    kinds: &[&str],
+    out: &mut Vec<Problem>,
+) -> Vec<ArtifactRef> {
     let arr = match obj.get(key) {
         None | Some(Value::Null) => return Vec::new(),
         Some(Value::Array(a)) => a,
@@ -300,11 +312,11 @@ pub(crate) fn take_artifacts(
         };
         check_keys(entry, &["kind", "value"], &at, out);
         let kind = take_text(entry, "kind", &at, NAME_MAX, true, out);
-        if !kind.is_empty() && !ARTIFACT_KINDS.contains(&kind.as_str()) {
+        if !kind.is_empty() && !kinds.contains(&kind.as_str()) {
             out.push(Problem::invalid(
                 &at,
                 "kind",
-                format!("`{kind}` is not one of {}", ARTIFACT_KINDS.join(", ")),
+                format!("`{kind}` is not one of {}", kinds.join(", ")),
             ));
         }
         let value = take_text(entry, "value", &at, POINTER_MAX, true, out);

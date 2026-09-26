@@ -84,6 +84,7 @@ impl Controller {
         for item in &b.planned {
             state.planned.insert(item.clone());
         }
+        state.learned.extend(std::mem::take(&mut b.learned));
         drop(state);
         noticed.extend(roots.into_iter().map(|(root, _)| root));
         Ok(Some(written))

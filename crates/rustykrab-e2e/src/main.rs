@@ -435,6 +435,10 @@ impl Ctx {
             .env("RUSTYKRAB_DATA_DIR", &self.data_dir)
             .env("RUSTYKRAB_MASTER_KEY", MASTER_KEY_HEX)
             .env("RUSTYKRAB_AUTH_TOKEN", AUTH_TOKEN)
+            // Commands that talk to the running daemon (`work ...`) reach
+            // this throwaway one, never a developer's daemon on the default
+            // port.
+            .env("RUSTYKRAB_GATEWAY_URL", &self.base)
             .env("RUSTYKRAB_DISABLE_KEYCHAIN", "1")
             // Credentials must go to a secure store, and there isn't one here —
             // the line above saw to that. Without this the harness cannot
@@ -1302,7 +1306,12 @@ fn spawn_daemon_with(
             std::fs::write(&script_path, agent_script()?)?;
             command
                 .env("RUSTYKRAB_PROVIDER", "scripted")
-                .env("RUSTYKRAB_SCRIPT_PATH", &script_path);
+                .env("RUSTYKRAB_SCRIPT_PATH", &script_path)
+                // The controller's loop at its shortest: the control
+                // scenarios wait on several ticks each (a lease, a result,
+                // a ladder rung), and the 5 s default would spend most of
+                // their time budget idle.
+                .env("RUSTYKRAB_CONTROL_TICK_SECS", "1");
             if let Some(stand_ins) = stand_ins {
                 stand_ins.configure(command);
             }

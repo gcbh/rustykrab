@@ -25,6 +25,10 @@ pub(super) const SUMMARY: &str = "summary";
 pub(super) const ERROR: &str = "error";
 /// Who verified an artifact in Phase 1: its presence in the report.
 pub(super) const RESULT_REPORT: &str = "result_report";
+/// The evidence kind of a run's pointer: the id the worker keeps its
+/// transcript under, written at lease time. Unverified, so never handed on
+/// as an input.
+pub(super) const RUN: &str = "run";
 
 /// Refs one input may carry, each of evidence and artifacts.
 const REFS_PER_INPUT: usize = 8;
@@ -188,5 +192,6 @@ pub(super) fn brief_for(
         last_error: history.repair.clone(),
         budget: item.budget,
         origin_conversation_id: item.origin_conversation_id.clone(),
+        run: None,
     }
 }

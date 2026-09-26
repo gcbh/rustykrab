@@ -15,15 +15,19 @@
 //! promotion to order 3.
 //!
 //! Layout: `classify.rs` maps inputs to errors, `rules.rs` holds the message
-//! rule table, `fingerprint.rs` normalises messages, hashes them and counts
-//! recurrence. This file holds the input vocabulary and the defect path.
+//! rule table, `learned.rs` the rules `internal` items land at run time
+//! (consulted only for what the table leaves `unknown`), `fingerprint.rs`
+//! normalises messages, hashes them and counts recurrence. This file holds
+//! the input vocabulary and the defect path.
 
 mod classify;
 mod fingerprint;
+mod learned;
 mod rules;
 
 pub use classify::{classify, classify_with};
 pub use fingerprint::{fingerprint, normalise, Recurrence, DEFAULT_PROMOTE_THRESHOLD};
+pub use learned::{apply_learned, LearnedRule, CLASSIFIER_RULE};
 pub use rules::{MessageRule, MESSAGE_RULES};
 
 use rustykrab_core::work::{
@@ -380,7 +384,14 @@ pub fn internal_item_draft(err: &WorkError, evidence: Vec<ArtifactRef>) -> WorkI
                 "Replaying the attached evidence through the classifier yields a class other \
                  than unknown, and a test pins that classification for fingerprint {fp}."
             ),
-            vec!["Add measurement only; change no behaviour beyond classification.".to_string()],
+            vec![
+                "Add measurement only; change no behaviour beyond classification.".to_string(),
+                format!(
+                    "A message rule may land as a `{}` artifact, `<subclass>: <pattern>`; \
+                     it counts once the failure replays through it as classified.",
+                    learned::CLASSIFIER_RULE
+                ),
+            ],
         )
     } else {
         (
@@ -467,7 +478,8 @@ mod tests {
         assert!(d.done_when.contains("other than unknown"));
         assert_eq!(d.artifact_refs.len(), 2);
         assert_eq!(d.artifact_refs[1].value, "/var/log/worker.log");
-        assert_eq!(d.constraints.len(), 1);
+        assert_eq!(d.constraints.len(), 2);
+        assert!(d.constraints[1].contains("`classifier_rule` artifact"));
         // The model proposes, code transitions: nothing here is a status,
         // and the host fills parent and provenance.
         assert!(d.parent.is_none());

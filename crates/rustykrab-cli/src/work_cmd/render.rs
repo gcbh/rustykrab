@@ -449,10 +449,31 @@ pub(super) fn detail(d: &ItemDetail) -> String {
     field(&mut out, "writes", item.writable_resources.join(", "));
     field(&mut out, "tools", item.required_tools.join(", "));
     field(&mut out, "budget", Spend::of(&item.budget).text());
+    if let Some(lease) = &d.lease {
+        field(
+            &mut out,
+            "leased to",
+            format!("{} since {}", lease.worker, when(&lease.since)),
+        );
+    }
+    let rungs: Vec<&str> = d.ladder.iter().map(|r| r.rung.as_str()).collect();
+    field(&mut out, "rungs", rungs.join(", "));
+    if let Some(error) = &d.last_error {
+        field(
+            &mut out,
+            "last error",
+            format!(
+                "{}/{}: {}",
+                error.class.as_str(),
+                error.subclass.as_str(),
+                error.detail
+            ),
+        );
+    }
     field(
         &mut out,
         "history",
-        format!("{} events, {} evidence", d.events, d.evidence),
+        format!("{} events, {} evidence", d.events.len(), d.evidence.len()),
     );
     out
 }
@@ -658,7 +679,9 @@ pub(super) fn tick(r: &TickReport) -> String {
 mod tests {
     use super::*;
 
-    use rustykrab_core::work::{BlockedReason, WorkKind, WorkerKind};
+    use rustykrab_core::work::{
+        BlockedReason, EventKind, Evidence, RungEvent, WorkEvent, WorkKind, WorkerKind,
+    };
     use rustykrab_gateway::work_routes::{EdgeView, FinishedItem, GraphReply, RollupView};
     use rustykrab_store::WorkPlanRow;
 
@@ -1030,8 +1053,36 @@ Approve with `rustykrab work approve #t`, or decline with `rustykrab work reject
             ],
             dependents: vec![blocks("45", "44")],
             rollup: None,
-            events: 3,
-            evidence: 1,
+            lease: None,
+            ladder: vec![RungEvent {
+                rung: Rung::Retry,
+                at: at(2),
+                error: None,
+                outcome: "retry on pinch".into(),
+            }],
+            last_error: None,
+            events: (0..3)
+                .map(|n| WorkEvent {
+                    item: "44".into(),
+                    at: at(2 + n),
+                    kind: EventKind::Transition,
+                    from: None,
+                    to: None,
+                    actor: "controller".into(),
+                    reason: None,
+                    upstream: None,
+                    origin: None,
+                    evidence_ref: None,
+                })
+                .collect(),
+            evidence: vec![Evidence {
+                item: "44".into(),
+                kind: "message".into(),
+                reference: "m1".into(),
+                hash: None,
+                verified_by: None,
+                at: at(3),
+            }],
         });
         for line in [
             "#44 Book flight and hotel",
@@ -1041,6 +1092,7 @@ Approve with `rustykrab work approve #t`, or decline with `rustykrab work reject
             "  archived   #9 Renew the passport  personal  done",
             "  needed by  #45 (blocks)",
             "  budget     200k tokens, 25 iterations, 1h",
+            "  rungs      retry",
             "  history    3 events, 1 evidence",
         ] {
             assert!(

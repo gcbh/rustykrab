@@ -52,6 +52,7 @@ enum Call {
         actor: String,
         source: FilingSource,
         items: usize,
+        origin: Option<String>,
     },
     Approve {
         root: String,
@@ -100,6 +101,7 @@ impl ControlHandle for StubControl {
             actor: provenance.actor,
             source,
             items: plan.items.len(),
+            origin: provenance.conversation_id,
         });
         if plan.items.len() > 3 {
             return Ok(PlanOutcome::Rejected(PlanRejected {
@@ -280,7 +282,21 @@ fn edge(item: &str, kind: EdgeKind, depends_on: &str) -> rustykrab_core::work::E
     }
 }
 
+/// A rung event as the controller writes it: `rung: outcome` becomes the
+/// `RungEvent` JSON the controller stores; anything that does not name a
+/// rung is kept as raw text, which no reader takes for a rung.
 fn rung(item: &str, reason: &str) -> WorkEvent {
+    let (name, outcome) = reason.split_once(':').unwrap_or((reason, ""));
+    let encoded = serde_json::from_value::<rustykrab_core::work::Rung>(json!(name.trim()))
+        .map(|rung| {
+            rustykrab_control::ladder::encode_rung_event(&rustykrab_core::work::RungEvent {
+                rung,
+                at: Utc::now(),
+                error: None,
+                outcome: outcome.trim().to_string(),
+            })
+        })
+        .unwrap_or_else(|_| reason.to_string());
     WorkEvent {
         item: item.into(),
         at: Utc::now(),
@@ -288,7 +304,7 @@ fn rung(item: &str, reason: &str) -> WorkEvent {
         from: None,
         to: None,
         actor: "controller".into(),
-        reason: Some(reason.into()),
+        reason: Some(encoded),
         upstream: None,
         origin: None,
         evidence_ref: None,
@@ -682,11 +698,13 @@ async fn a_rejected_plan_returns_422_with_every_failed_check() {
                 actor: "user:master".into(),
                 source: FilingSource::Planner,
                 items: 4,
+                origin: None,
             },
             Call::FilePlan {
                 actor: "user:master".into(),
                 source: FilingSource::Planner,
                 items: 1,
+                origin: None,
             },
         ]
     );
@@ -849,6 +867,168 @@ async fn the_archive_is_searchable_and_stays_out_of_live_reads() {
 }
 
 #[tokio::test]
+async fn the_archive_takes_search_as_well_as_q() {
+    let h = harness().await;
+    let (status, body) = h.get("/api/work/archive?search=passport").await;
+    assert_eq!(status, Http::OK);
+    assert_eq!(body["archived"][0]["id"], "old");
+    let (_, body) = h
+        .get("/api/work/archive?search=nothing%20like%20this")
+        .await;
+    assert!(body["archived"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn one_draft_files_as_work_file_with_its_origin_conversation() {
+    let h = harness().await;
+    let draft = json!({
+        "kind": "personal",
+        "title": "Renew the parking permit",
+        "objective": "renew it online",
+        "done_when": "the renewal confirmation is attached",
+        "origin_conversation_id": "conv-7",
+    });
+    let (status, body) = h.post("/api/work", Some(draft)).await;
+    assert_eq!(status, Http::CREATED, "{body}");
+    assert_eq!(body["outcome"], "accepted");
+
+    let (status, body) = h.post("/api/work", Some(json!({ "title": 3 }))).await;
+    assert_eq!(status, Http::BAD_REQUEST);
+    assert_eq!(body["error"], "invalid_request");
+
+    assert_eq!(
+        h.control.calls(),
+        [Call::FilePlan {
+            actor: "user:master".into(),
+            source: FilingSource::WorkFile,
+            items: 1,
+            origin: Some("conv-7".into()),
+        }]
+    );
+}
+
+#[tokio::test]
+async fn a_stack_manifest_imports_as_the_delivery_import() {
+    let h = harness().await;
+    let manifest = json!({
+        "slice": { "id": "s1", "title": "Work items over REST", "objective": "o" },
+        "layers": [
+            { "id": "l1", "title": "Persist", "acceptance": "survives a restart",
+              "parent_layer": null,
+              "work_items": [
+                  { "id": "w1", "title": "Table", "objective": "o", "done_when": "d",
+                    "delivery_dependencies": [] },
+                  { "id": "w2", "title": "Store API", "objective": "o", "done_when": "d",
+                    "delivery_dependencies": ["w1"] } ] },
+            { "id": "l2", "title": "List", "acceptance": "lists open items",
+              "parent_layer": "l1",
+              "work_items": [
+                  { "id": "w3", "title": "Route", "objective": "o", "done_when": "d",
+                    "delivery_dependencies": [] } ] },
+        ],
+    });
+    // The stub rejects any plan of more than three items, so the six-item
+    // slice comes back whole as 422 with every failed check.
+    let (status, body) = h
+        .post("/api/work/import", Some(json!({ "manifest": manifest })))
+        .await;
+    assert_eq!(status, Http::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["outcome"], "rejected");
+    let (status, _) = h
+        .post(
+            "/api/work/import",
+            Some(json!({ "manifest": { "layers": [] } })),
+        )
+        .await;
+    assert_eq!(status, Http::BAD_REQUEST);
+    assert_eq!(
+        h.control.calls(),
+        [Call::FilePlan {
+            actor: "user:master".into(),
+            source: FilingSource::DeliveryImport,
+            items: 6,
+            origin: None,
+        }]
+    );
+}
+
+/// Frames of `GET /api/work/events` until `want` frames arrived or two
+/// seconds passed, as `(event, id, data)`.
+async fn read_frames(mut response: reqwest::Response, want: usize) -> Vec<(String, String, Value)> {
+    let mut buffer = String::new();
+    let mut frames = Vec::new();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    while frames.len() < want {
+        let Ok(Ok(Some(chunk))) = tokio::time::timeout_at(deadline, response.chunk()).await else {
+            break;
+        };
+        buffer.push_str(&String::from_utf8_lossy(&chunk));
+        while let Some(end) = buffer.find("\n\n") {
+            let frame: String = buffer.drain(..end + 2).collect();
+            let (mut kind, mut id, mut data) = (String::new(), String::new(), String::new());
+            for line in frame.lines() {
+                if let Some(v) = line.strip_prefix("event:") {
+                    kind = v.trim().to_string();
+                } else if let Some(v) = line.strip_prefix("id:") {
+                    id = v.trim().to_string();
+                } else if let Some(v) = line.strip_prefix("data:") {
+                    data.push_str(v.trim());
+                }
+            }
+            if !data.is_empty() {
+                frames.push((kind, id, serde_json::from_str(&data).unwrap()));
+            }
+        }
+    }
+    frames
+}
+
+#[tokio::test]
+async fn the_progress_stream_sends_each_new_event_once() {
+    let h = harness().await;
+    let open = |last: Option<&str>| {
+        let mut request = h
+            .client
+            .get(format!("{}/api/work/events", h.base))
+            .bearer_auth(TOKEN);
+        if let Some(id) = last {
+            request = request.header("last-event-id", id);
+        }
+        request.send()
+    };
+    let response = open(None).await.unwrap();
+    assert_eq!(response.status(), Http::OK);
+    assert!(response.headers()["content-type"]
+        .to_str()
+        .unwrap()
+        .starts_with("text/event-stream"));
+    // Seeded history is not replayed; what happens next is.
+    h.store
+        .work_event_append(&rung("h", "repair: after the stream opened"))
+        .await
+        .unwrap();
+    let frames = read_frames(response, 1).await;
+    assert_eq!(frames.len(), 1, "{frames:?}");
+    let (kind, id, data) = &frames[0];
+    assert_eq!(kind, "rung");
+    assert_eq!(data["item"], "h");
+    assert_eq!(data["kind"], "rung");
+    assert!(data["actor"].is_string() && data.get("origin").is_some());
+
+    // A client resuming after that id sees only what came later.
+    h.store
+        .work_event_append(&rung("h", "retry: later still"))
+        .await
+        .unwrap();
+    let frames = read_frames(open(Some(id)).await.unwrap(), 2).await;
+    assert_eq!(frames.len(), 1, "{frames:?}");
+    assert!(frames[0].2["reason"]
+        .as_str()
+        .unwrap()
+        .contains("later still"));
+}
+
+#[tokio::test]
 async fn unauthenticated_requests_are_refused_like_the_other_routes() {
     let h = harness().await;
     for (method, path) in [
@@ -937,13 +1117,18 @@ async fn the_plan_preview_names_the_pending_plan_and_its_holds() {
 }
 
 #[tokio::test]
-async fn item_detail_counts_history() {
+async fn item_detail_carries_its_ladder_evidence_and_events() {
     let h = harness().await;
     let (_, body) = h.get("/api/work/h").await;
-    assert_eq!(body["events"], 4);
-    assert_eq!(body["evidence"], 0);
+    let detail: super::ItemDetail = serde_json::from_value(body.clone()).unwrap();
+    assert_eq!(detail.events.len(), 4);
+    assert!(detail.evidence.is_empty());
+    assert!(detail.lease.is_none());
+    let climbed: Vec<&str> = detail.ladder.iter().map(|r| r.rung.as_str()).collect();
+    assert_eq!(climbed, ["retry", "retry", "repair", "switch_worker"]);
+    assert_eq!(body["events"][0]["kind"], "rung");
     let (_, body) = h.get("/api/work/f").await;
-    assert_eq!(body["evidence"], 1);
+    assert_eq!(body["evidence"].as_array().unwrap().len(), 1);
     let (_, body) = h.get("/api/work/p").await;
     assert_eq!(body["rollup"]["children_total"], 4);
     let (status, body) = h.get("/api/work/f/evidence").await;

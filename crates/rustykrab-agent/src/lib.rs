@@ -13,7 +13,7 @@ pub mod voting;
 
 pub use compaction::CompactionStrategy;
 pub use harness::HarnessProfile;
-pub use local_worker::{LocalRun, LocalWorker};
+pub use local_worker::{LocalRun, LocalWorker, RunTranscripts};
 pub use recall_tools::recall_tools;
 pub use rlm::RecursiveExecutor;
 pub use router::HarnessRouter;

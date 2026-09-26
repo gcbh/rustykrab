@@ -39,7 +39,8 @@ pub use summary::summary;
 
 use chrono::{DateTime, Utc};
 use rustykrab_core::work::{
-    BlockedReason, ErrorClass, Rung, RungBudgets, RungEvent, Trigger, WorkError,
+    BlockedReason, ErrorClass, EventKind, Rung, RungBudgets, RungEvent, Trigger, WorkError,
+    WorkEvent,
 };
 use serde::{Deserialize, Serialize};
 
@@ -58,6 +59,37 @@ pub const RUNGS: [Rung; 10] = [
     Rung::Replan,
     Rung::Surface,
 ];
+
+/// How a rung is stored: a `rung` event whose `reason` is the
+/// [`RungEvent`] as JSON, so the ladder, its errors and their fingerprints
+/// re-derive from the store after a restart.
+pub fn encode_rung_event(event: &RungEvent) -> String {
+    serde_json::to_string(event).unwrap_or_default()
+}
+
+/// The [`RungEvent`] a stored `rung` event carries, or `None` for any other
+/// event or an unreadable reason.
+pub fn rung_event(event: &WorkEvent) -> Option<RungEvent> {
+    if event.kind != EventKind::Rung {
+        return None;
+    }
+    serde_json::from_str(event.reason.as_deref()?).ok()
+}
+
+/// An item's ladder as its events record it, oldest rung first.
+pub fn ladder_of_events(events: &[WorkEvent]) -> Vec<RungEvent> {
+    events.iter().filter_map(rung_event).collect()
+}
+
+/// The error behind the latest rung that carried one (section 9's
+/// `last_error`).
+pub fn last_error(events: &[WorkEvent]) -> Option<WorkError> {
+    events
+        .iter()
+        .rev()
+        .filter_map(rung_event)
+        .find_map(|r| r.error)
+}
 
 /// A rung's place in [`RUNGS`], for "the highest order reached".
 fn rank(rung: Rung) -> u8 {

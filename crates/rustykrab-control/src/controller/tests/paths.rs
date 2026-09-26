@@ -420,6 +420,112 @@ async fn a_rejected_filing_stores_nothing_but_its_rejection() {
     assert!(h.outbox().await.is_empty());
 }
 
+/// A run's pointer is evidence from the moment of its lease, and the brief
+/// names the same id, so a worker's transcript is found from the item even
+/// when the run never reports.
+#[tokio::test]
+async fn each_lease_records_its_run_id_as_evidence_and_in_the_brief() {
+    let h = Harness::new(&["pinch"]);
+    h.script
+        .push("Book the dentist", report(done("Book the dentist")));
+    let id = h.file_one(draft("d", "Book the dentist")).await;
+    h.tick().await;
+    let runs: Vec<String> = h
+        .store()
+        .work_evidence_list(&id)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.kind == "run")
+        .map(|e| e.reference)
+        .collect();
+    assert_eq!(runs.len(), 1);
+    h.drain().await;
+    let briefs = h.script.briefs_for("Book the dentist");
+    assert_eq!(briefs[0].run.as_deref(), Some(runs[0].as_str()));
+}
+
+/// The items of one filing keep the order the caller listed them in.
+#[tokio::test]
+async fn a_filings_items_keep_their_listed_order() {
+    let h = Harness::new(&[]);
+    let mut items = vec![draft("P", "Errands")];
+    for n in 0..5 {
+        let mut d = draft(&format!("s{n}"), &format!("Step {n}"));
+        d.parent = Some(tmp("P"));
+        d.trigger = rustykrab_core::work::Trigger::At(h.clock.now() + TimeDelta::days(365));
+        items.push(d);
+    }
+    let accepted = h.file(plan(items)).await;
+    let listed: Vec<String> = h
+        .store()
+        .work_children(&accepted.ids["P"])
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|i| i.title)
+        .collect();
+    assert_eq!(listed, ["Step 0", "Step 1", "Step 2", "Step 3", "Step 4"]);
+}
+
+/// A caller with no item of its own (REST, the CLI) still leaves a
+/// rejection dreaming can count: on the existing root it filed under.
+#[tokio::test]
+async fn a_rejection_under_an_existing_root_is_an_event_on_the_root() {
+    let h = Harness::new(&[]);
+    let mut root = draft("R", "Run the errands");
+    root.trigger = rustykrab_core::work::Trigger::At(h.clock.now() + TimeDelta::days(365));
+    let r = h.file_one(root).await;
+    let mut code = draft("k", "Fix the errand app");
+    code.kind = Some(WorkKind::Code);
+    let outcome = ControlHandle::file_plan(
+        &h.ctl,
+        WorkPlan {
+            root: rustykrab_core::work::ItemRef::Id(r.clone()),
+            items: vec![code],
+            edges: Vec::new(),
+            rationale: "one fix".to_string(),
+        },
+        Provenance::default(),
+        FilingSource::Planner,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(outcome, PlanOutcome::Rejected(_)), "{outcome:?}");
+    let rejections: Vec<String> = h
+        .events(&r)
+        .await
+        .into_iter()
+        .filter(|e| e.kind == rustykrab_core::work::EventKind::Rejection)
+        .filter_map(|e| e.reason)
+        .collect();
+    assert_eq!(rejections.len(), 1, "{rejections:?}");
+    assert!(rejections[0].contains("kind_not_allowed"), "{rejections:?}");
+}
+
+/// Section 7: an unconfigured MCP server is a `needs_tool` wait, not a
+/// ready item that fails at lease time; configuring it releases the item.
+#[tokio::test]
+async fn an_unconfigured_mcp_server_is_accepted_as_needs_tool_until_configured() {
+    let h = Harness::new(&["pinch"]);
+    let mut d = draft("board", "Read the board");
+    d.required_mcp_servers = vec!["linear".to_string()];
+    let id = h.file_one(d).await;
+    assert_eq!(
+        h.status(&id).await,
+        Status::Blocked(BlockedReason::NeedsTool)
+    );
+    let t = h.tick().await;
+    assert!(t.leased.is_empty(), "nothing leases an item that waits");
+
+    let snap = h.ctl.load().await.unwrap();
+    assert!(crate::controller::filing::waiting_on_mcp(&snap, |_| false).is_empty());
+    assert_eq!(
+        crate::controller::filing::waiting_on_mcp(&snap, |s| s == "linear"),
+        vec![id]
+    );
+}
+
 #[tokio::test]
 async fn status_and_graph_views_show_the_tree_with_roll_ups() {
     let h = Harness::new(&[]);

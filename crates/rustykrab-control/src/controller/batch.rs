@@ -51,6 +51,8 @@ pub(super) struct Batch {
     pub superseded_under: Vec<WorkItemId>,
     /// Planning items this batch accepted a graph for.
     pub planned: Vec<WorkItemId>,
+    /// Classifier rules this batch landed, consulted once it is written.
+    pub learned: Vec<crate::errors::LearnedRule>,
     /// `(item, old, new)` of edge re-points already written: the store
     /// moves the matching `inputs_from` entry with the edge, so the
     /// engine's separate input re-point is not written again.
@@ -72,6 +74,7 @@ impl Batch {
             approved: Vec::new(),
             superseded_under: Vec::new(),
             planned: Vec::new(),
+            learned: Vec::new(),
             moved_inputs: HashSet::new(),
         }
     }

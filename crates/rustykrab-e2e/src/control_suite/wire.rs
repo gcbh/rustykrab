@@ -187,7 +187,9 @@ pub(super) fn node(
 }
 
 /// The root of a `work_plan` graph. A parent is never leased, so it names
-/// no worker behaviour.
+/// no worker behaviour. Its budget is an envelope over its children's
+/// (plan section 4.2: children's budgets sum within the root's), so it
+/// covers ten [`node`]s in every dimension.
 pub(super) fn root_node(tmp: &str, name: &str, tag: &str) -> Value {
     json!({
         "tmp": tmp,
@@ -195,7 +197,7 @@ pub(super) fn root_node(tmp: &str, name: &str, tag: &str) -> Value {
         "title": format!("{name} {tag}"),
         "objective": name,
         "done_when": "every child is closed and the outcome is reported",
-        "budget": budget(200_000),
+        "budget": envelope(200_000),
     })
 }
 
@@ -456,13 +458,22 @@ pub(super) fn rungs(view: &Value) -> Vec<(String, Option<DateTime<Utc>>)> {
     let logged = events_of(view, EventKind::Rung)
         .into_iter()
         .filter_map(|event| {
-            let name = event["rung"]
-                .as_str()
-                .or_else(|| event["reason"].as_str())?
-                .to_string();
+            let name = match event["rung"].as_str() {
+                Some(name) => name.to_string(),
+                None => rung_named_by(event["reason"].as_str()?)?,
+            };
             Some((name, time(&event["at"])))
         });
     ladder.chain(logged).collect()
+}
+
+/// The rung a rung event's reason names: the controller stores the
+/// `RungEvent` as JSON; a bare `rung: detail` line is read by its prefix.
+fn rung_named_by(reason: &str) -> Option<String> {
+    if let Ok(parsed) = serde_json::from_str::<Value>(reason) {
+        return parsed["rung"].as_str().map(str::to_string);
+    }
+    Some(reason.split(':').next()?.trim().to_string())
 }
 
 pub(super) fn climbed(view: &Value, rung: Rung) -> bool {
@@ -537,6 +548,37 @@ pub(super) fn input_refs(input: &Value) -> Result<Vec<ArtifactRef>> {
     Ok(refs)
 }
 
+/// `GET /api/work/{id}/graph` as a tree: the reply lists the nodes depth
+/// first, each with its item and edges; this nests them by parent, each
+/// node gaining `children`.
+pub(super) async fn graph_tree(ctx: &Ctx, root: &str) -> Result<Value> {
+    let reply = get(ctx, &format!("{WORK}/{root}/graph")).await?;
+    let nodes = reply["nodes"]
+        .as_array()
+        .cloned()
+        .ok_or_else(|| anyhow!("the graph of {root} has no nodes: {reply}"))?;
+    fn nest(nodes: &[Value], id: &str) -> Value {
+        let mut node = nodes
+            .iter()
+            .find(|n| body(n)["id"] == id)
+            .cloned()
+            .unwrap_or(Value::Null);
+        let children: Vec<Value> = nodes
+            .iter()
+            .filter(|n| body(n)["parent"] == id)
+            .map(|n| nest(nodes, body(n)["id"].as_str().unwrap_or_default()))
+            .collect();
+        node["children"] = Value::Array(children);
+        node
+    }
+    let tree = nest(&nodes, root);
+    ensure!(
+        !tree["item"].is_null(),
+        "the graph of {root} omits its root"
+    );
+    Ok(tree)
+}
+
 pub(super) fn edges(view: &Value) -> Vec<Value> {
     field(view, "edges").as_array().cloned().unwrap_or_default()
 }
@@ -565,6 +607,19 @@ pub(super) async fn list(ctx: &Ctx, query: &str) -> Result<Vec<Value>> {
         .as_array()
         .cloned()
         .ok_or_else(|| anyhow!("GET {path} is not a list: {}", excerpt(&answer.to_string())))
+}
+
+/// The rows of `GET /api/work/archive`: an array, or under `archived` (the
+/// gateway's `ArchiveList`) or `items`.
+pub(super) fn archive_rows(answer: &Value) -> Vec<Value> {
+    if let Some(rows) = answer.as_array() {
+        return rows.clone();
+    }
+    answer["archived"]
+        .as_array()
+        .or_else(|| answer["items"].as_array())
+        .cloned()
+        .unwrap_or_default()
 }
 
 pub(super) async fn find_titled(ctx: &Ctx, wanted: &str) -> Result<Option<Value>> {
@@ -609,8 +664,10 @@ pub(super) async fn wait_listed(
     }
 }
 
+/// Every live child of `parent`, closed ones included, sorted: what a
+/// re-plan would change.
 pub(super) async fn children(ctx: &Ctx, parent: &str) -> Result<Vec<String>> {
-    let mut ids: Vec<String> = list(ctx, &format!("parent={parent}"))
+    let mut ids: Vec<String> = list(ctx, &format!("parent={parent}&include_closed=true"))
         .await?
         .iter()
         .map(id)
@@ -964,26 +1021,6 @@ pub(super) async fn wait_error(ctx: &Ctx, id: &str) -> Result<WorkError> {
         .with_context(|| format!("unreadable last_error on {}", title(&view)))
 }
 
-/// A Telegram message naming every item, each by title or id.
-pub(super) async fn wait_message_naming(ctx: &Ctx, names: &[(String, String)]) -> Result<String> {
-    let deadline = Instant::now() + SETTLE;
-    loop {
-        let found = stand_ins(ctx)?.telegram.all().into_iter().find(|message| {
-            names.iter().all(|(title, id)| {
-                message.contains(title.as_str()) || message.contains(id.as_str())
-            })
-        });
-        if let Some(message) = found {
-            return Ok(message);
-        }
-        ensure!(
-            Instant::now() < deadline,
-            "no Telegram message named all of {names:?} after {SETTLE:?}"
-        );
-        tokio::time::sleep(POLL).await;
-    }
-}
-
 /// Whether a user-facing message names a rung: by name, in words, or by
 /// its order in the ladder.
 pub(super) fn mentions_rung(message: &str, rung: &str) -> bool {
@@ -1202,12 +1239,15 @@ mod tests {
                 { "kind": "transition", "at": "2026-09-26T10:00:00Z", "to": { "status": "queued" }, "actor": "controller" },
                 { "kind": "lease", "at": "2026-09-26T10:00:05Z", "actor": "worker:pinch" },
                 { "kind": "rung", "at": "2026-09-26T10:00:07Z", "reason": "retry", "actor": "controller" },
+                { "kind": "rung", "at": "2026-09-26T10:00:08Z", "actor": "controller",
+                  "reason": "{\"rung\":\"switch_worker\",\"at\":\"2026-09-26T10:00:08Z\",\"error\":null,\"outcome\":\"skipped\"}" },
                 { "kind": "transition", "at": "2026-09-26T10:00:09Z", "to": { "status": "done" }, "actor": "controller" },
             ],
         });
         let (start, end) = active_span(&view).unwrap();
         assert_eq!((end - start).num_seconds(), 4);
         assert!(climbed(&view, Rung::Retry));
+        assert!(climbed(&view, Rung::SwitchWorker));
         assert!(!climbed(&view, Rung::Repair));
         assert_eq!(worker_of(&view).as_deref(), Some("pinch"));
         assert!(was_leased(&view));

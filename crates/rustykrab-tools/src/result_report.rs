@@ -31,8 +31,9 @@ use serde_json::{json, Map, Value};
 
 use crate::work_backend::{host_provenance, with_work_run, WorkBackend};
 use crate::work_file::{
-    check_keys, draft_properties, parse_draft, take_artifacts, take_opt_text, take_text,
-    take_text_list, DraftMode, Problem, ENTRY_MAX, LIST_MAX, NAME_MAX, POINTER_MAX,
+    check_keys, draft_properties, parse_draft, take_artifacts, take_artifacts_of, take_opt_text,
+    take_text, take_text_list, DraftMode, Problem, ARTIFACT_KINDS, ENTRY_MAX, LIST_MAX, NAME_MAX,
+    POINTER_MAX,
 };
 
 /// Tools whose successful result ends the run, with its `summary` as the
@@ -57,6 +58,20 @@ pub fn run_end_summary(tool_name: &str, output: &Value) -> Option<String> {
 const SUMMARY_MAX: usize = 1_500;
 const DETAIL_MAX: usize = 600;
 const ARTIFACTS_MAX: usize = 20;
+
+/// What a result's `artifacts` may point at: a draft's pointer kinds, plus
+/// `classifier_rule`, the `<subclass>: <pattern>` row an `internal` item
+/// lands for an `unknown` failure (plan section 9). The controller replays
+/// the failure through it before it counts.
+const RESULT_ARTIFACT_KINDS: [&str; 7] = [
+    ARTIFACT_KINDS[0],
+    ARTIFACT_KINDS[1],
+    ARTIFACT_KINDS[2],
+    ARTIFACT_KINDS[3],
+    ARTIFACT_KINDS[4],
+    ARTIFACT_KINDS[5],
+    "classifier_rule",
+];
 const CHANGED_PATHS_MAX: usize = 100;
 const CHECKS_MAX: usize = 20;
 const QUESTIONS_MAX: usize = 5;
@@ -359,7 +374,14 @@ fn parse_report(args: &Value, out: &mut Vec<Problem>) -> (Option<String>, Result
     let item = take_opt_text(obj, "item", "", POINTER_MAX, out)
         .map(|s| s.trim_start_matches('#').trim().to_string());
     let summary = take_text(obj, "summary", "", SUMMARY_MAX, true, out);
-    let artifacts = take_artifacts(obj, "artifacts", "", ARTIFACTS_MAX, out);
+    let artifacts = take_artifacts_of(
+        obj,
+        "artifacts",
+        "",
+        ARTIFACTS_MAX,
+        &RESULT_ARTIFACT_KINDS,
+        out,
+    );
     let changed_paths = take_text_list(
         obj,
         "changed_paths",
@@ -460,7 +482,7 @@ impl Tool for ResultReportTool {
                         "items": {
                             "type": "object",
                             "properties": {
-                                "kind": { "type": "string", "enum": ["message", "path", "url", "commit", "item", "other"] },
+                                "kind": { "type": "string", "enum": RESULT_ARTIFACT_KINDS },
                                 "value": { "type": "string" }
                             },
                             "required": ["kind", "value"],
@@ -665,6 +687,33 @@ mod tests {
             .as_object()
             .unwrap()
             .contains_key("tmp"));
+    }
+
+    #[tokio::test]
+    async fn a_report_may_land_a_classifier_rule_but_a_draft_may_not_point_at_one() {
+        let stub = Arc::new(StubWorkBackend::new());
+        let args = json!({
+            "summary": "Added a probe for E2E-ZQX-17.",
+            "artifacts": [{ "kind": "classifier_rule", "value": "process: e2e-zqx-17" }],
+        });
+        let out = WORK_RUN_CONTEXT
+            .scope(run("item-2"), tool(&stub).execute(args))
+            .await
+            .unwrap();
+        assert_eq!(out["ok"], json!(true));
+        let (_, report) = reports(&stub).pop().unwrap();
+        assert_eq!(report.artifacts[0].kind, "classifier_rule");
+
+        let drafted = json!({
+            "summary": "Found a follow-up.",
+            "discovered": [{ "title": "Probe it", "objective": "o", "done_when": "d",
+                             "artifact_refs": [{ "kind": "classifier_rule", "value": "process: x" }] }],
+        });
+        let err = WORK_RUN_CONTEXT
+            .scope(run("item-2"), tool(&stub).execute(drafted))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("classifier_rule"), "{err}");
     }
 
     #[tokio::test]

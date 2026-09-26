@@ -25,6 +25,8 @@ weight. Counts are `impl X for` occurrences including test doubles.
 | `SessionManager` | **`tools`** | 1 | Correctly implemented above the consumer |
 | `WorkBackend` | **`tools`** `work_backend.rs` | 1 stub | Correctly placed above the consumer: the `work_file`, `work_status` and `result_report` tools call it; the controller adapter in `rustykrab-cli` implements it (Phase 1, round 2) |
 | `Worker` | **`control`** `worker.rs` | 1 | Correctly placed: the controller calls it, and `LocalWorker` in `rustykrab-agent` implements it above the controller. Peer, Claude Code and Codex workers are the later implementations |
+| `ToolCatalog` | **`control`** `controller/mod.rs` | 2 | Earns its keep: `StaticCatalog` for tests, `RegistryCatalog` in `rustykrab-cli` over the final tool registry and the active-tools seed (registered but unloaded tools, configured MCP servers) |
+| `RunTranscripts` | **`agent`** `local_worker.rs` | 1 + 1 test | Correctly placed: `LocalWorker` keeps each run's conversation through it, and `StoreTranscripts` in `rustykrab-cli` implements it over the conversation store, which `agent` does not depend on |
 | `Skill` | `skills/skill.rs` | 1 | Thin — `SkillMd` is the only shape |
 | `Channel` | `channels/channel.rs` | **1** | **Not earning its keep** |
 | `GatewayBackend` | `tools/gateway_backend.rs` | **0** | **Dead** |

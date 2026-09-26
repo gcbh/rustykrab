@@ -15,7 +15,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use rustykrab_core::work::{
     BlockedReason, Budget, CancelReason, Edge, EdgeKind, FailedCheck, GraphCaps, ItemRef,
     PlanAccepted, PlanOutcome, PlanRejected, PlanWarning, RejectionReason, Status, Trigger,
@@ -873,7 +873,10 @@ impl<'a> Run<'a> {
             status_origin: None,
             plan_id: Some(plan_id.to_string()),
             held_by: None,
-            created_at: self.ctx.now,
+            // Items of one filing keep the order the caller listed them in:
+            // each is stamped a microsecond after the one before, and the
+            // store and the controller's select break ties by `created_at`.
+            created_at: self.ctx.now + TimeDelta::microseconds(i64::try_from(i).unwrap_or(0)),
             updated_at: self.ctx.now,
             closed_at: None,
         }
@@ -989,8 +992,9 @@ impl<'a> Run<'a> {
         }
     }
 
-    /// Open items under the root after the filing (the root itself not
-    /// counted), plus new items filed elsewhere.
+    /// The open tree the filing leaves: the root and the open items under
+    /// it (so the cap is on the tree's size, 12 items meaning a root and
+    /// eleven others), plus new items filed elsewhere.
     fn check_count(&mut self, work: &Snapshot, root: Option<&str>) {
         let max = self.ctx.caps.max_items as usize;
         let under: HashSet<WorkItemId> = root
@@ -998,22 +1002,21 @@ impl<'a> Run<'a> {
             .unwrap_or_default()
             .into_iter()
             .collect();
-        let open_under = under
-            .iter()
-            .filter(|id| work.status(id).is_some_and(|s| !s.is_closed()))
-            .count();
+        let open = |id: &str| work.status(id).is_some_and(|s| !s.is_closed());
+        let open_under = under.iter().filter(|id| open(id)).count();
+        let root_open = usize::from(root.is_some_and(open));
         let elsewhere = self
             .ids
             .iter()
             .filter(|id| !under.contains(*id) && Some(id.as_str()) != root)
             .count();
-        let count = open_under + elsewhere;
+        let count = root_open + open_under + elsewhere;
         if count > max {
             let offending = root.map(|r| vec![self.label(r)]).unwrap_or_default();
             self.fail(
                 RejectionReason::TooManyItems,
                 offending,
-                format!("{count} open items under the root; the cap is {max}"),
+                format!("{count} open items in the tree; the cap is {max}"),
             );
         }
     }

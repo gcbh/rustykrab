@@ -544,6 +544,18 @@ key, so an item holds at most one. Acquiring it moves the item from `ready` to
 `leased` and writes a `lease` event whose actor is `worker:<name>`, in one
 transaction; a transition into any waiting or closed status drops it. The
 brief's copied `inputs` are stored on the lease (section 4.3) and go with it.
+What outlives the lease is the `run` evidence row the controller writes at
+lease time: the id the run's transcript is kept under (the local worker's
+conversation id), so a cancelled or lost run still points at its partial work.
+
+**Evidence kinds the controller reads back.** Besides the artifacts a report
+claims, `work_item_evidence` carries the controller's own rows: `summary`,
+`error`, `run`, and `classifier_rule` (a `<subclass>: <pattern>` row an
+`internal` item landed, `verified_by = 'replay'` once the controller replayed
+the failure through it). The last is reloaded across items on start
+(`work_evidence_of_kind`), which is how a landed rule survives restarts and
+aging (section 9). The SSE progress stream pages `work_item_events` by its
+autoincrement `id` (`work_events_after`), not by time.
 
 **Aging is lossy by design.** `work_item_archive` takes one line per
 compacted closed item, written in the transaction that deletes its
