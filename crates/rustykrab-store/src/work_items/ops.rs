@@ -496,6 +496,33 @@ pub(super) fn events_of(conn: &Connection, item: &str) -> Result<Vec<WorkEvent>,
     )
 }
 
+/// Events with a row id above `after`, in row order, each with its id: a
+/// cursor that, unlike a timestamp, never repeats or skips a row written
+/// in the same millisecond.
+pub(super) fn events_after(
+    conn: &Connection,
+    after: i64,
+    limit: usize,
+) -> Result<Vec<(i64, WorkEvent)>, WorkStoreError> {
+    collect(
+        conn,
+        &format!(
+            "SELECT id, {EVENT_COLUMNS} FROM work_item_events WHERE id > ?1 ORDER BY id LIMIT ?2"
+        ),
+        params![after, i64::try_from(limit).unwrap_or(i64::MAX)],
+        |row| Ok((row.get::<_, i64>("id")?, event_from_row(row)?)),
+    )
+}
+
+/// The id of the newest event, 0 when there is none.
+pub(super) fn events_last_id(conn: &Connection) -> Result<i64, WorkStoreError> {
+    Ok(conn.query_row(
+        "SELECT COALESCE(MAX(id), 0) FROM work_item_events",
+        [],
+        |row| row.get(0),
+    )?)
+}
+
 pub(super) fn events_since(
     conn: &Connection,
     at: DateTime<Utc>,
@@ -540,6 +567,20 @@ pub(super) fn evidence_of(conn: &Connection, item: &str) -> Result<Vec<Evidence>
             "SELECT {EVIDENCE_COLUMNS} FROM work_item_evidence WHERE item = ?1 ORDER BY at, id"
         ),
         params![item],
+        evidence_from_row,
+    )
+}
+
+pub(super) fn evidence_of_kind(
+    conn: &Connection,
+    kind: &str,
+) -> Result<Vec<Evidence>, WorkStoreError> {
+    collect(
+        conn,
+        &format!(
+            "SELECT {EVIDENCE_COLUMNS} FROM work_item_evidence WHERE kind = ?1 ORDER BY at, id"
+        ),
+        params![kind],
         evidence_from_row,
     )
 }
