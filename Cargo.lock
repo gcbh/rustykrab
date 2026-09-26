@@ -4206,6 +4206,7 @@ dependencies = [
  "hex",
  "rustykrab-core",
  "rustykrab-store",
+ "rustykrab-tools",
  "serde",
  "serde_json",
  "sha2",

@@ -10,6 +10,7 @@ description = "Control layer: the work-item graph engine, error classification, 
 [dependencies]
 rustykrab-core = { workspace = true }
 rustykrab-store = { workspace = true }
+rustykrab-tools = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

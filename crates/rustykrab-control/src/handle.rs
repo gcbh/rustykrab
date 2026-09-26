@@ -1,0 +1,95 @@
+//! The controller's handle: what the gateway routes, the CLI and the work
+//! tools call. Defined here so those callers can be built against it while
+//! the controller itself is written; `controller::Controller` implements it.
+
+use async_trait::async_trait;
+use rustykrab_core::work::{Edge, PlanOutcome, Status, WorkItem, WorkItemId, WorkPlan};
+use rustykrab_core::Error;
+use rustykrab_tools::work_backend::Provenance;
+use serde::{Deserialize, Serialize};
+
+use crate::graph::FilingSource;
+
+/// One node of a `work show --graph` tree (plan section 14.2).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GraphNode {
+    pub item: WorkItem,
+    /// Depth below the root; the root is 0.
+    pub depth: u32,
+    /// Edges the item holds (it is the downstream).
+    pub edges: Vec<Edge>,
+    /// The computed roll-up for a parent, `None` for a leaf.
+    pub rollup: Option<Status>,
+    pub children_done: u32,
+    pub children_total: u32,
+    /// Set when the item has aged into the archive: its one-line summary.
+    pub archived_summary: Option<String>,
+}
+
+/// The tree under a root, in depth-first order.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GraphView {
+    pub root: WorkItemId,
+    pub nodes: Vec<GraphNode>,
+}
+
+/// What one pass of the loop did (plan section 6).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TickReport {
+    pub made_ready: Vec<WorkItemId>,
+    pub leased: Vec<WorkItemId>,
+    pub reconciled: Vec<WorkItemId>,
+    pub expired: Vec<WorkItemId>,
+    pub archived: Vec<WorkItemId>,
+    pub transitions: usize,
+    pub notices: usize,
+}
+
+/// The controller as its callers see it. Every method is one store
+/// transaction or one pass of the loop; none lets a caller set a status.
+#[async_trait]
+pub trait ControlHandle: Send + Sync {
+    /// File a whole graph through validation (plan section 14.1). Every
+    /// filing path uses this: the planner, a `work_file` draft wrapped in a
+    /// plan, a worker's `discovered` drafts, the delivery import.
+    async fn file_plan(
+        &self,
+        plan: WorkPlan,
+        provenance: Provenance,
+        source: FilingSource,
+    ) -> Result<PlanOutcome, Error>;
+
+    /// Release the items held for approval under `root` (plan section 6.1).
+    /// Returns the released ids.
+    async fn approve(&self, root: &str, actor: &str) -> Result<Vec<WorkItemId>, Error>;
+
+    /// Decline a pending plan: the held items under `root` become
+    /// `cancelled(requested)` and cascade (plan section 4.5). Returns the
+    /// cancelled ids.
+    async fn reject(
+        &self,
+        root: &str,
+        reason: Option<String>,
+        actor: &str,
+    ) -> Result<Vec<WorkItemId>, Error>;
+
+    /// Cancel an item and its open subtree (`cancelled(requested)`, then
+    /// cascade). Returns the cancelled ids; a leased child's lease is revoked.
+    async fn cancel(
+        &self,
+        item: &str,
+        reason: Option<String>,
+        actor: &str,
+    ) -> Result<Vec<WorkItemId>, Error>;
+
+    /// One pass of the loop: sweep expiries and time triggers, settle
+    /// readiness and roll-ups, lease and run ready items on available
+    /// workers, reconcile finished runs, climb ladders, write notices, age
+    /// closed items. The daemon calls it on a timer; tests and the CLI call
+    /// it directly.
+    async fn tick(&self) -> Result<TickReport, Error>;
+
+    /// The tree under `root` for `work show --graph` and
+    /// `GET /api/work/{id}/graph`.
+    async fn graph(&self, root: &str) -> Result<GraphView, Error>;
+}
