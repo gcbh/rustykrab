@@ -51,6 +51,10 @@ impl Captured {
     pub fn drain(&self) -> Vec<String> {
         std::mem::take(&mut *self.0.lock().unwrap())
     }
+    /// Every message so far, oldest first, without draining them.
+    pub fn all(&self) -> Vec<String> {
+        self.0.lock().unwrap().clone()
+    }
     pub fn joined(&self) -> String {
         self.0.lock().unwrap().join("\n")
     }
@@ -139,5 +143,212 @@ pub fn configure_channel(
                 .env("SIGNAL_ALLOWED_NUMBERS", SIGNAL_USER)
                 .env("SIGNAL_WEBHOOK_SECRET", WEBHOOK_SECRET);
         }
+    }
+}
+
+/// The repository the GitHub stand-in pretends to be.
+pub const GITHUB_REPO: &str = "e2e-owner/e2e-repo";
+
+/// Where the scripted daemon's Telegram webhook is registered. Only the
+/// stand-in ever sees it: webhook mode means inbound messages arrive solely
+/// through `POST /webhook/telegram`, so the long-poll loop never spins
+/// against a stand-in that answers `getUpdates` at once.
+const TELEGRAM_WEBHOOK_URL: &str = "https://harness.example.ts.net/webhook/telegram";
+
+/// The external APIs the scripted daemon talks to, stood in for locally:
+/// the Telegram Bot API, so a scenario can read every message the bot sent,
+/// and GitHub's issue API, so a scenario can read every call the projection
+/// adapter made. Started once per scripted suite and kept across daemon
+/// restarts, so what reached the user can be counted over a restart.
+#[derive(Clone)]
+pub struct StandIns {
+    pub telegram: Captured,
+    telegram_base: String,
+    pub github: GithubStandIn,
+    github_base: String,
+}
+
+impl StandIns {
+    pub async fn start() -> Result<Self> {
+        let telegram = Captured::default();
+        let telegram_base = start_capture_server(telegram.clone()).await?;
+        let github = GithubStandIn::default();
+        let github_base = github.start().await?;
+        Ok(Self {
+            telegram,
+            telegram_base,
+            github,
+            github_base,
+        })
+    }
+
+    /// Point a scripted daemon at the stand-ins. The GitHub variables are
+    /// read by the projection adapter of the control plan's Phase 6; until
+    /// it exists nothing reads them.
+    pub fn configure(&self, command: &mut std::process::Command) {
+        configure_channel(command, Surface::Telegram, &self.telegram_base);
+        command
+            .env("TELEGRAM_WEBHOOK_URL", TELEGRAM_WEBHOOK_URL)
+            .env("RUSTYKRAB_GITHUB_API_BASE", &self.github_base)
+            .env("RUSTYKRAB_GITHUB_REPO", GITHUB_REPO)
+            .env("RUSTYKRAB_GITHUB_TOKEN", "e2e-github-token");
+    }
+}
+
+/// One call the daemon made to the GitHub stand-in.
+#[derive(Debug, Clone)]
+pub struct GithubCall {
+    pub method: String,
+    pub path: String,
+    pub body: Value,
+}
+
+#[derive(Default)]
+struct GithubState {
+    calls: Vec<GithubCall>,
+    /// Issues by number, as the stand-in currently holds them.
+    issues: std::collections::BTreeMap<u64, Value>,
+}
+
+/// A minimal GitHub issue API: create, read, list, edit, label and comment.
+/// Every call is logged, and a scenario can edit an issue the way a person
+/// on github.com would, to prove the next projection overwrites it.
+#[derive(Clone, Default)]
+pub struct GithubStandIn(Arc<Mutex<GithubState>>);
+
+impl GithubStandIn {
+    pub fn calls(&self) -> Vec<GithubCall> {
+        self.0.lock().unwrap().calls.clone()
+    }
+
+    pub fn issues(&self) -> Vec<Value> {
+        self.0.lock().unwrap().issues.values().cloned().collect()
+    }
+
+    /// Change one field of an issue as a person on github.com would.
+    pub fn hand_edit(&self, number: u64, field: &str, value: Value) -> Result<()> {
+        let mut state = self.0.lock().unwrap();
+        let Some(issue) = state.issues.get_mut(&number) else {
+            bail!("the GitHub stand-in has no issue #{number}");
+        };
+        issue[field] = value;
+        Ok(())
+    }
+
+    fn handle(&self, method: &str, path: &str, body: Value) -> (u16, Value) {
+        let mut state = self.0.lock().unwrap();
+        state.calls.push(GithubCall {
+            method: method.to_string(),
+            path: path.to_string(),
+            body: body.clone(),
+        });
+        let prefix = format!("/repos/{GITHUB_REPO}/issues");
+        let Some(rest) = path.strip_prefix(&prefix) else {
+            return (200, json!({}));
+        };
+        let segments: Vec<&str> = rest.split('/').filter(|s| !s.is_empty()).collect();
+        match (method, segments.as_slice()) {
+            ("POST", []) => {
+                let number = state.issues.len() as u64 + 1;
+                let mut issue = body;
+                issue["number"] = json!(number);
+                issue["state"] = json!("open");
+                issue["html_url"] =
+                    json!(format!("https://github.com/{GITHUB_REPO}/issues/{number}"));
+                state.issues.insert(number, issue.clone());
+                (201, issue)
+            }
+            ("GET", []) => (200, Value::Array(state.issues.values().cloned().collect())),
+            (_, [number, tail @ ..]) => {
+                let Some(issue) = number
+                    .parse::<u64>()
+                    .ok()
+                    .and_then(|n| state.issues.get_mut(&n))
+                else {
+                    return (404, json!({"message": "Not Found"}));
+                };
+                match (method, tail) {
+                    ("GET", []) => (200, issue.clone()),
+                    ("PATCH", []) => {
+                        if let (Some(target), Some(changes)) =
+                            (issue.as_object_mut(), body.as_object())
+                        {
+                            for (key, value) in changes {
+                                target.insert(key.clone(), value.clone());
+                            }
+                        }
+                        (200, issue.clone())
+                    }
+                    ("POST", ["labels"]) => {
+                        let mut labels = issue["labels"].as_array().cloned().unwrap_or_default();
+                        labels.extend(body["labels"].as_array().cloned().unwrap_or_default());
+                        issue["labels"] = Value::Array(labels);
+                        (200, issue["labels"].clone())
+                    }
+                    ("POST", ["comments"]) => (201, json!({"id": 1, "body": body["body"]})),
+                    ("GET", ["comments"]) => (200, json!([])),
+                    _ => (200, json!({})),
+                }
+            }
+            _ => (200, json!({})),
+        }
+    }
+
+    async fn start(&self) -> Result<String> {
+        use axum::body::Bytes;
+        use axum::extract::State;
+        use axum::http::{Method, StatusCode, Uri};
+        use axum::response::IntoResponse;
+        use axum::Json;
+
+        async fn serve(
+            State(stand_in): State<GithubStandIn>,
+            method: Method,
+            uri: Uri,
+            body: Bytes,
+        ) -> impl IntoResponse {
+            let body = serde_json::from_slice(&body).unwrap_or(Value::Null);
+            let (status, reply) = stand_in.handle(method.as_str(), uri.path(), body);
+            (
+                StatusCode::from_u16(status).unwrap_or(StatusCode::OK),
+                Json(reply),
+            )
+        }
+
+        let app = axum::Router::new()
+            .fallback(axum::routing::any(serve))
+            .with_state(self.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        Ok(format!("http://127.0.0.1:{}", addr.port()))
+    }
+}
+
+#[cfg(test)]
+mod github_stand_in_tests {
+    use super::*;
+
+    #[test]
+    fn issues_are_created_edited_by_hand_and_patched_back() {
+        let github = GithubStandIn::default();
+        let issues = format!("/repos/{GITHUB_REPO}/issues");
+        let (status, created) =
+            github.handle("POST", &issues, json!({"title": "T", "labels": ["x"]}));
+        assert_eq!(status, 201);
+        assert_eq!(created["number"], 1);
+        github.hand_edit(1, "title", json!("edited")).unwrap();
+        assert_eq!(github.issues()[0]["title"], "edited");
+        let (status, patched) =
+            github.handle("PATCH", &format!("{issues}/1"), json!({"title": "T"}));
+        assert_eq!(status, 200);
+        assert_eq!(patched["title"], "T");
+        assert_eq!(
+            github.handle("GET", &format!("{issues}/9"), Value::Null).0,
+            404
+        );
+        assert_eq!(github.calls().len(), 3);
     }
 }
