@@ -851,6 +851,7 @@ pub fn stage_from(
     let relative = binary_relative(is_app);
     let copy = Command::new("cp")
         .arg("-Rp")
+        .arg("--")
         .arg(&from)
         .arg(scratch.path.join(&relative))
         .output()
@@ -944,13 +945,13 @@ pub async fn run(data_dir: &Path, args: &[String]) -> anyhow::Result<()> {
         }
         Cmd::Apply(args) => {
             // Held until the slice 6 review's fixes land (update-flow.md,
-            // "Slice 6: not yet safe"): the swap trusts staged.json, and an
-            // interrupted apply can leave no daemon running.
+            // "Slice 6: not yet safe"): an interrupted apply can leave no
+            // daemon running, and a failed rollback is quiet.
             if std::env::var("RUSTYKRAB_UPDATE_APPLY_UNREVIEWED").as_deref() != Ok("1") {
                 eprintln!(
                     "rustykrab update apply is not yet safe to run: its review found that it \
-                     trusts staged.json and cannot recover an interrupted swap. See \
-                     docs/plans/update-flow.md."
+                     cannot recover an interrupted swap and that a failed rollback is quiet. \
+                     See docs/plans/update-flow.md."
                 );
                 std::process::exit(3);
             }

@@ -146,6 +146,18 @@ from running. Until they are fixed the CLI refuses
      `updates/<X.Y.Z>/<binary or app>`;
    - for a release, requires the version to be newer than the running
      one.
+
+   *Fixed (2026-09-28).* `newest_staged` skips a record that does not
+   parse and refuses the newest one unless its directory is its plain
+   `X.Y.Z` version and its path is `updates/<version>/RustyKrab.app` or
+   `updates/<version>/rustykrab-cli` by kind, with no symlink on the way
+   (`check_canonical`). A release (a stage with a tag) must be newer than
+   the version `/api/version` reports. `DirSwap::swap_in` copies with
+   `cp -Rp --` and, before any rename, passes the copy through
+   `NextCheck`: a real directory or regular file, the Developer ID
+   signature of the configured team under launchd, and its own
+   `--version` reporting the staged version and commit. The `Verifier`
+   reaches the swap through `Host`, so the tests script it.
 2. **An interrupted apply can leave no daemon, and the next run does not
    recover.** A journal (`updates/apply-state.json`, the phase and both
    commits) lets the next run finish or roll back first. If the stop step
@@ -163,6 +175,17 @@ Also required:
 - The verify step counts a tick advance only when no ticks are failing.
 - `--url` must be loopback or https.
 - The LaunchAgent plist gets an `ExitTimeOut` above the drain grace.
+
+*Fixed (2026-09-28)*, all but the plist: the script service stops only
+the one process listening on the URL's port, and only when it listens on
+loopback alone and runs the installed executable (`ps -o comm=`, or
+`/proc/<pid>/exe` on Linux); no listener, several, or any other process
+is refused. `apply` refuses before any change unless the running daemon
+reports `controller.lock` `held` and `consecutive_failed_ticks` 0.
+`verify` counts a `last_tick` advance only while no ticks are failing,
+and a failing tick starts the count again. `--url` must be https or http
+to `127.0.0.1`, `::1` or `localhost`. Items 2 to 4 and the plist are
+still open, so the `RUSTYKRAB_UPDATE_APPLY_UNREVIEWED` gate stays.
 
 ## Not yet
 
