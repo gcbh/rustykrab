@@ -1428,6 +1428,9 @@ pub fn render_executor_brief(
     out.push_str(
         "- Keep notes or task lists of your own if they help; nothing but the JSON below is \
          read.\n\
+         - Each checks_run entry is a shell command you actually ran via Bash, copied \
+         exactly, with no results or descriptions. Checks done with Grep, Read or Glob belong \
+         in the summary or known_limits, not checks_run.\n\
          - Follow-up work you notice goes in \"discovered\", one draft each; do not do it.\n\
          - If you cannot finish, set \"blocked\" or \"error\" (class, subclass, detail) \
          instead of guessing. ",
@@ -2204,6 +2207,32 @@ printf '{"summary":"added status","changed_paths":["src/lib.rs"],"checks_run":["
         assert!(
             prompt.contains(
                 r#"{"reason": "needs_decision", "detail": "the question or what you need", "needs": []}"#
+            ),
+            "{prompt}"
+        );
+    }
+
+    #[test]
+    fn the_brief_says_checks_run_holds_verbatim_shell_commands() {
+        let prompt = render_executor_brief(
+            &brief(None),
+            "shipwright",
+            WorkerKind::ClaudeCode,
+            Path::new("/tmp/w"),
+            Path::new("/tmp/skills"),
+            Some(80),
+        );
+        assert!(
+            prompt.contains(
+                "Each checks_run entry is a shell command you actually ran via Bash, copied \
+                 exactly, with no results or descriptions."
+            ),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains(
+                "Checks done with Grep, Read or Glob belong in the summary or known_limits, \
+                 not checks_run."
             ),
             "{prompt}"
         );
