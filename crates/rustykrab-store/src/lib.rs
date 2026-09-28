@@ -52,7 +52,10 @@ pub use projects::{ApplyRevisionResult, ProjectStore};
 pub use proposals::{ProjectionRow, ProposalEvidence, ProposalRow};
 pub use recall_archive::RecallArchiveStore;
 pub use secret::{SecretMeta, SecretStore, WriteAuthority};
-pub use tasks::{DelegatedTask, TaskStatus, TaskStore};
+pub use tasks::{
+    DelegatedTask, NewTask, Orphans, TaskStatus, TaskStore, MAX_ATTEMPTS as TASK_MAX_ATTEMPTS,
+    UNREADABLE_TOOLS,
+};
 pub use work_items::{
     ArchivedItem, LeaseRecord, OutboxDraft, OutboxRow, RepointSpec, RunSpend, Spend,
     TransitionSpec, WorkApplied, WorkFilter, WorkOp, WorkPlanRow, WorkStoreError,
@@ -401,8 +404,8 @@ impl Store {
                 created_at      TEXT NOT NULL,
                 started_at      TEXT,
                 finished_at     TEXT,
-                -- The work item this task mirrors, once the controller
-                -- leases delegated work (control-layer plan, section 13).
+                -- The work item this task runs, on the controller that
+                -- leased it to this node (control-layer plan, section 13).
                 -- Unenforced for the same reason as `conversation_id`.
                 work_item_id    TEXT
             );
@@ -995,8 +998,9 @@ impl Store {
 
         // `delegated_tasks.work_item_id` arrived with the control layer, for
         // the same reason and with the same NULL for older rows as
-        // `scheduled_jobs.work_item_id`. Nothing reads or writes it yet;
-        // the task queue behaves exactly as before.
+        // `scheduled_jobs.work_item_id`. A peer worker's structured
+        // submission writes it (Phase 5, below); a free-text task leaves it
+        // NULL.
         let mut stmt = conn
             .prepare("PRAGMA table_info(delegated_tasks)")
             .map_err(|e| Error::Storage(e.to_string()))?;
@@ -1013,6 +1017,16 @@ impl Store {
             )
             .map_err(|e| Error::Storage(e.to_string()))?;
         }
+
+        // ── Control layer, Phase 5: peer workers over the tailnet ──
+        // (docs/plans/control-layer-and-worker-fleet.md, sections 5 and
+        // 13.) `delegated_tasks` gains the typed half of a submission
+        // (`required_tools`, `brief`, the submitting controller's
+        // `run_id`), its typed result (`result_json`), what the run spent
+        // (`usage`) and how often it was claimed (`attempts`); a restart
+        // now returns an interrupted task to the queue instead of failing
+        // it. The columns and the run index are in `tasks::migrate`.
+        tasks::migrate(conn)?;
 
         // ── Control layer, Phase 1 close-out: lease history and spend ──
         // (docs/plans/control-layer-and-worker-fleet.md, sections 4.3, 4.6

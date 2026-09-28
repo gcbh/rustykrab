@@ -93,11 +93,19 @@ pub async fn run_task_worker(state: AppState) {
     let store = state.agent.store.tasks();
 
     // Tasks left `running` belonged to an agent loop that died with the
-    // previous process. Nothing will ever complete them, so fail them
-    // now rather than leaving a peer polling forever.
-    match store.fail_orphaned().await {
-        Ok(0) => {}
-        Ok(n) => tracing::warn!(count = n, "failed delegated tasks orphaned by a restart"),
+    // previous process. Nothing will ever complete them as they stand, and
+    // nothing is failed by the restart alone: they go back to the queue
+    // and run again, and the peer polling one sees it resume. One that was
+    // interrupted too often is failed with the reason instead.
+    match store.requeue_orphaned().await {
+        Ok(orphans) => {
+            if !orphans.requeued.is_empty() {
+                tracing::warn!(tasks = ?orphans.requeued, "delegated tasks interrupted by a restart are queued again");
+            }
+            if !orphans.failed.is_empty() {
+                tracing::error!(tasks = ?orphans.failed, "delegated tasks interrupted too often were failed");
+            }
+        }
         Err(e) => tracing::error!(error = %e, "could not reconcile orphaned delegated tasks"),
     }
 
@@ -432,6 +440,13 @@ mod tests {
             created_at: Utc::now(),
             started_at: None,
             finished_at: None,
+            work_item_id: None,
+            required_tools: Vec::new(),
+            brief: None,
+            run_id: None,
+            report: None,
+            usage: None,
+            attempts: 0,
         }
     }
 

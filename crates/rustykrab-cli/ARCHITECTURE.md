@@ -273,8 +273,9 @@ shared turn transaction and bounded lifecycle-map eviction remain separate work.
 
 - `task_queue.rs` — bounded `mpsc` + semaphore, in memory. Carries cron fires
   and credential-wake resumptions. A restart drops anything queued.
-- `gateway/tasks.rs` over `store::tasks` — durable, backed by `delegated_tasks`,
-  survives restart, supports cancellation.
+- `gateway/tasks.rs` over `store::tasks`: durable, backed by `delegated_tasks`,
+  survives restart (an interrupted task is queued again), supports
+  cancellation.
 
 Cron survives the gap because `scheduled_jobs.next_run_at` is only advanced
 after execution, so a dropped task is re-picked on the next 30-second tick (and

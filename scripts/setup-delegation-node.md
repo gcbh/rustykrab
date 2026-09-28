@@ -50,8 +50,10 @@ Three things follow from that shape:
   spent 3.3s.
 
 Tasks survive a restart of either machine: the queue is persisted, and a task
-the node was mid-way through when it died is reported as failed rather than
-left pending forever.
+the node was mid-way through when it died goes back to the queue and runs
+again when the node comes back, rather than being failed by the restart
+alone. A task interrupted three times is failed instead, with the reason, so
+one that takes the node down each time it runs stops doing so.
 
 ## Recursion
 

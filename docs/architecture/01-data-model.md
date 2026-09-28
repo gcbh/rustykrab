@@ -338,16 +338,29 @@ its own delivery target after its originating conversation is deleted.
 ```
 delegated_tasks(id PK, message, conversation_id, status, result, error,
                 principal, hop_budget, allowed_tools, trace_id,
-                created_at, started_at, finished_at, work_item_id)
+                created_at, started_at, finished_at, work_item_id,
+                required_tools, brief, run_id, result_json, usage,
+                attempts DEFAULT 0)
    INDEX (status, created_at)
+   INDEX idx_delegated_tasks_run (run_id) WHERE run_id IS NOT NULL
 ```
 
-`work_item_id` arrived with the control layer, for the task a leased work item
-mirrors; like the `scheduled_jobs` column it is nullable, unenforced and not
-yet written, and the queue's behaviour is unchanged.
+`work_item_id` arrived with the control layer, for the work item a task runs
+on the controller that leased it; like the `scheduled_jobs` column it is
+nullable and unenforced (the item lives in another machine's store). Phase 5
+writes it, with the rest of a structured submission: `required_tools` (JSON,
+activated before the node's first model call, inside its ceiling), `brief`
+(the typed brief as JSON), and `run_id`, the submitting controller's run,
+which makes a submission idempotent: at most one task per run, found again by
+`idx_delegated_tasks_run`. A structured task's result is typed:
+`result_json` is the section 5 `ResultReport`, and `usage` what the run
+spent. `attempts` counts claims; a restart returns a `running` task to
+`queued` instead of failing it, and fails it only once it has been claimed
+three times.
 
-**Assessment: correct.** The worker's only hot query is "oldest queued", and
-the index is `(status, created_at)`. `allowed_tools` as a serialised list is
+**Assessment: correct.** The worker's hot query is "oldest queued", and the
+index is `(status, created_at)`; a resubmission's lookup by run has its own
+partial index. `allowed_tools` as a serialised list is
 acceptable — it is a policy snapshot, not a queryable relation.
 
 ### Outcome instrumentation
