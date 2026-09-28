@@ -181,3 +181,54 @@ that commit. Batch 4 has five items: the blocked-question fix, drain on
 shutdown with interrupted runs requeued without penalty, the controller
 lock, failed ticks in `/api/version`, and the worker's turn budget with
 recovery of a run that hits the turn cap.
+
+## Fourth cycle (2026-09-28)
+
+All five items verified in 24 minutes:
+- the blocked-question fix;
+- drain on shutdown;
+- the controller lock;
+- failed ticks in `/api/version`;
+- the worker's turn budget, with a capped run resumed once for its
+  contract.
+
+With `RUSTYKRAB_HOLD_DISCOVERED` on, the builder's six follow-ups waited
+instead of running. Four were approved as filed, one was widened and
+refiled, and one was superseded.
+
+Merging took three hand resolutions, all where two branches grew the same
+structure. The lock, the failed ticks and drain each added fields to
+`LoopStatus` and `/api/version`, and all were kept. Drain and the
+turn-budget change both rewrote how an external run is started and
+awaited. The shutdown check moved into the shared `execute`, which now
+reads whether shutdown ended the group before letting it go, and a run
+cut off at its turn cap is not resumed once shutdown has ended it. The
+merge also exposed a flaky lock test. A process that another test forks
+in parallel shares the lock's close-on-exec descriptor until it execs,
+so a release can take a moment to be seen, and the lock tests now wait
+it out.
+
+The pieces were then used for real on the builder:
+- The old build stopped on SIGTERM in one second.
+- The new build reported `lock: held` through `/api/version`.
+- A second daemon started on the same data directory reported `waiting`
+  and never ticked.
+- A SIGTERM to the first drained it and it exited. The second took the
+  lock within one tick and ran the loop.
+
+That is the cutover sequence of `update-flow.md`, done by hand.
+
+Turn-cap recovery was checked against the real CLI (2.1.283), since a
+worker cannot run `claude` itself. A `claude -p` run capped at one turn
+ended `error_max_turns` with a `session_id`, exit code 1. Resuming it with
+`--resume <id> --max-turns 2` and the recovery prompt returned `success`
+and a contract that reported, correctly, that nothing had been committed.
+
+The gate at merge: 1,824 unit tests, clippy, fmt, the architecture
+checker, and the scripted e2e suite (55 pass, 13 xfail, 0 fail). The
+builder runs `ec9160f`. Batch 5 has seven items. Four are the approved
+follow-ups: the blocked shape in the local worker's brief, interrupted
+local runs, an e2e scenario for two daemons on one data directory, and
+failed ticks in the log. Three are new: slice 5 of the update flow
+(`rustykrab update check` and `stage`), the manual tick route respecting
+the lock, and README rows for the control layer's variables.
