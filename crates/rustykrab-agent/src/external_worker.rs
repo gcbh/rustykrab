@@ -1020,10 +1020,17 @@ fn prune_dirs(root: &Path, window: Duration) {
 
 /// Claude Code's `stream-json`: one JSON event per line. Tool uses of
 /// `Bash` are the commands it ran; the last `result` event is the envelope
-/// with the final message, the turn count and the cost.
+/// with the final message, the turn count and the cost. A run ended before
+/// that envelope (daemon shutdown) keeps what its assistant turns reported:
+/// one turn per distinct message, and that message's usage.
 fn read_claude(stdout: &str) -> Transcript {
     let mut t = Transcript::default();
-    for line in stdout.lines() {
+    // Tokens per assistant message id. Claude Code prints one event per
+    // content block, each repeating its message's usage, so the last seen
+    // stands for the message.
+    let mut turns_seen: Vec<(String, u64)> = Vec::new();
+    let mut enveloped = false;
+    for (n, line) in stdout.lines().enumerate() {
         let Ok(event) = serde_json::from_str::<Value>(line.trim()) else {
             continue;
         };
@@ -1032,7 +1039,16 @@ fn read_claude(stdout: &str) -> Transcript {
         }
         match event["type"].as_str() {
             Some("assistant") => {
-                for block in event["message"]["content"].as_array().into_iter().flatten() {
+                let message = &event["message"];
+                let id = message["id"]
+                    .as_str()
+                    .map_or_else(|| format!("line-{n}"), str::to_string);
+                let tokens = claude_tokens(&message["usage"]);
+                match turns_seen.iter_mut().find(|(seen, _)| *seen == id) {
+                    Some(turn) => turn.1 = tokens,
+                    None => turns_seen.push((id, tokens)),
+                }
+                for block in message["content"].as_array().into_iter().flatten() {
                     if block["type"] == "tool_use" && block["name"] == "Bash" {
                         if let Some(c) = block["input"]["command"].as_str() {
                             t.commands.push(c.to_string());
@@ -1041,18 +1057,10 @@ fn read_claude(stdout: &str) -> Transcript {
                 }
             }
             Some("result") => {
+                enveloped = true;
                 let turns = event["num_turns"].as_u64().unwrap_or(0);
-                let usage = &event["usage"];
-                let tokens = [
-                    "input_tokens",
-                    "output_tokens",
-                    "cache_creation_input_tokens",
-                ]
-                .iter()
-                .filter_map(|k| usage[k].as_u64())
-                .sum();
                 t.usage = RunUsage {
-                    tokens,
+                    tokens: claude_tokens(&event["usage"]),
                     iterations: u32::try_from(turns).unwrap_or(u32::MAX),
                     ..RunUsage::default()
                 };
@@ -1079,7 +1087,26 @@ fn read_claude(stdout: &str) -> Transcript {
             _ => {}
         }
     }
+    if !enveloped {
+        t.usage = RunUsage {
+            tokens: turns_seen.iter().map(|(_, tokens)| tokens).sum(),
+            iterations: u32::try_from(turns_seen.len()).unwrap_or(u32::MAX),
+            ..RunUsage::default()
+        };
+    }
     t
+}
+
+/// The tokens a Claude Code `usage` object counts.
+fn claude_tokens(usage: &Value) -> u64 {
+    [
+        "input_tokens",
+        "output_tokens",
+        "cache_creation_input_tokens",
+    ]
+    .iter()
+    .filter_map(|k| usage[k].as_u64())
+    .sum()
 }
 
 /// `codex exec --json`: one JSON event per line. Command executions are the
@@ -1823,6 +1850,70 @@ wait
         }
         // The worktree is kept for retention.
         assert!(ws.path.exists());
+    }
+
+    /// An agent that prints two assistant turns (the first as two content
+    /// blocks repeating its usage) and then waits to be ended, never
+    /// reaching its `result` envelope.
+    const HALFWAY: &str = r#"#!/bin/sh
+echo '{"type":"system","subtype":"init","session_id":"sess-1"}'
+echo '{"type":"assistant","message":{"id":"msg-1","content":[{"type":"text","text":"looking"}],"usage":{"input_tokens":100,"output_tokens":20,"cache_creation_input_tokens":5}}}'
+echo '{"type":"assistant","message":{"id":"msg-1","content":[{"type":"tool_use","name":"Bash","input":{"command":"ls"}}],"usage":{"input_tokens":100,"output_tokens":20,"cache_creation_input_tokens":5}}}'
+echo '{"type":"user","message":{"content":[{"type":"tool_result","content":"src"}]}}'
+echo '{"type":"assistant","message":{"id":"msg-2","content":[{"type":"text","text":"editing"}],"usage":{"input_tokens":200,"output_tokens":30}}}'
+echo $$ > "$RUSTYKRAB_DATA_DIR/agent.pid.tmp"
+mv "$RUSTYKRAB_DATA_DIR/agent.pid.tmp" "$RUSTYKRAB_DATA_DIR/agent.pid"
+sleep 60 &
+wait
+"#;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_interrupted_run_keeps_the_usage_it_had_printed() {
+        let f = Fixture::new();
+        let groups = Arc::new(RunGroups::default());
+        let worker = Arc::new(
+            f.worker(WorkerKind::ClaudeCode, f.agent("claude", HALFWAY))
+                .with_groups(groups.clone()),
+        );
+        let run = tokio::spawn({
+            let worker = worker.clone();
+            let ws = f.workspace();
+            async move { worker.run(brief(Some(ws))).await }
+        });
+        let pid = f.data.path().join("agent.pid");
+        let started = std::time::Instant::now();
+        while !pid.exists() {
+            assert!(
+                started.elapsed() < Duration::from_secs(15),
+                "agent never started"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        assert_eq!(groups.terminate_all(Duration::from_secs(2)).await, 1);
+        let outcome = tokio::time::timeout(Duration::from_secs(10), run)
+            .await
+            .expect("the run ends once its agent is terminated")
+            .unwrap();
+        let err = outcome.expect_err("a terminated run has no result");
+        assert!(RunFailure::from_error(&err).is_some_and(|f| f.is_interrupted()));
+
+        // Two turns, msg-1 counted once: 125 + 230 tokens.
+        let usage = worker.usage("run-1").expect("an interrupted run has usage");
+        assert_eq!((usage.tokens, usage.iterations), (355, 2));
+        assert!(usage.wall_ms > 0);
+    }
+
+    #[test]
+    fn a_result_envelope_outranks_the_turns_seen_before_it() {
+        let stdout = [
+            r#"{"type":"assistant","message":{"id":"m1","content":[],"usage":{"input_tokens":1,"output_tokens":1}}}"#,
+            r#"{"type":"result","subtype":"success","num_turns":3,"usage":{"input_tokens":40,"output_tokens":2},"result":"{}"}"#,
+        ]
+        .join("\n");
+        let t = read_claude(&stdout);
+        assert_eq!((t.usage.tokens, t.usage.iterations), (42, 3));
     }
 
     #[tokio::test]
