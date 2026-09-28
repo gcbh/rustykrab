@@ -171,11 +171,16 @@ fn collapse(s: &str) -> String {
 /// Whether a normalised claimed check ran in `command`: it equals one of
 /// the command's segments (split on `&&`, `||`, `;` and `|`, so a leading
 /// `cd <dir> &&` is its own segment), or it appears in the command as a
-/// whole, which covers a shell wrapper such as `bash -lc '...'` and a claim
-/// that is itself compound.
+/// whole command, which covers a shell wrapper such as `bash -lc '...'` and
+/// a claim that is itself compound. A whole appearance has to end where a
+/// command ends, so `cargo test` did not run inside `cargo test-foo`, nor
+/// `python3 x.py` inside `python3 x.py --fix`.
 fn check_ran_in(wanted: &str, command: &str) -> bool {
     let command = collapse(command);
-    if command.contains(wanted) {
+    if command
+        .match_indices(wanted)
+        .any(|(i, _)| starts_command(&command[..i]) && ends_command(&command[i + wanted.len()..]))
+    {
         return true;
     }
     command
@@ -185,6 +190,33 @@ fn check_ran_in(wanted: &str, command: &str) -> bool {
         .split(';')
         .map(|s| s.trim().trim_matches(|c| c == '\'' || c == '"').trim())
         .any(|s| s == wanted)
+}
+
+/// Whether a command can start after `before`: at the start of the line, a
+/// word break, an opening quote or bracket, or a shell separator.
+fn starts_command(before: &str) -> bool {
+    before
+        .chars()
+        .next_back()
+        .is_none_or(|c| c.is_whitespace() || "'\"(;&|".contains(c))
+}
+
+/// Whether a command ends where `after` begins: at the end of the line, a
+/// closing quote or bracket, a shell separator, or a redirection such as
+/// `2>&1`. Another argument does not end it.
+fn ends_command(after: &str) -> bool {
+    let rest = after.trim_start();
+    let Some(first) = rest.chars().next() else {
+        return true;
+    };
+    if "'\")>;&|<".contains(first) {
+        return true;
+    }
+    // A numbered redirection (`2>&1`) is its own word, after a space.
+    rest.len() < after.len()
+        && rest
+            .trim_start_matches(|c: char| c.is_ascii_digit())
+            .starts_with(['>', '<'])
 }
 
 /// Whether a normalised claimed check ran among the recorded commands `ran`:
@@ -1852,6 +1884,35 @@ mod tests {
             ],
         ));
         assert!(verifies("cargo clippy ;", &["cargo clippy"]));
+    }
+
+    #[test]
+    fn a_claim_that_ran_only_as_a_prefix_of_a_longer_command_does_not_verify() {
+        assert!(!verifies("cargo test", &["cargo test-foo"]));
+        assert!(!verifies(
+            "cargo test",
+            &["cd /repo && cargo test-foo --all"]
+        ));
+        assert!(!verifies(
+            "python3 scripts/check_architecture_docs.py",
+            &["python3 scripts/check_architecture_docs.py --fix"],
+        ));
+        assert!(!verifies(
+            "python3 scripts/check_architecture_docs.py",
+            &["bash -lc 'python3 scripts/check_architecture_docs.py --fix'"],
+        ));
+        assert!(!verifies(
+            "cargo test -p rustykrab",
+            &["cargo test -p rustykrab-control"]
+        ));
+        assert!(!verifies("argo test", &["cargo test"]));
+        // Ending at a separator, a quote or a redirection still counts.
+        assert!(verifies(
+            "python3 scripts/check_architecture_docs.py",
+            &["bash -lc 'python3 scripts/check_architecture_docs.py'"],
+        ));
+        assert!(verifies("cargo test", &["cargo test 2>&1 | tail -5"]));
+        assert!(verifies("cargo test", &["(cargo test)"]));
     }
 
     #[test]
