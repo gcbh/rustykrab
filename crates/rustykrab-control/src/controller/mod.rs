@@ -386,6 +386,13 @@ struct State {
     last_aged: Option<DateTime<Utc>>,
     /// When the last tick that completed finished.
     last_tick: Option<DateTime<Utc>>,
+    /// When the last failed tick gave up, and its error class.
+    last_failure: Option<(DateTime<Utc>, &'static str)>,
+    /// Failed ticks since the last one that completed.
+    consecutive_failures: u32,
+    /// Test seam: the next tick returns this error before doing anything.
+    #[cfg(test)]
+    fail_next_tick: Option<Error>,
 }
 
 /// The loop of plan section 6 over one store and the workers of a
@@ -434,6 +441,10 @@ impl Controller {
                 spent: None,
                 last_aged: None,
                 last_tick: None,
+                last_failure: None,
+                consecutive_failures: 0,
+                #[cfg(test)]
+                fail_next_tick: None,
             }),
         }
     }
@@ -619,6 +630,9 @@ impl ControlHandle for Controller {
         Some(LoopStatus {
             last_tick: state.last_tick,
             runs_in_flight: state.runs.len(),
+            last_failed_tick: state.last_failure.map(|(at, _)| at),
+            last_failure_class: state.last_failure.map(|(_, class)| class.to_string()),
+            consecutive_failed_ticks: state.consecutive_failures,
         })
     }
 

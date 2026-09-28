@@ -23,13 +23,19 @@ struct VersionReply {
     controller: ControllerReply,
 }
 
-/// The controller's state. `last_tick` and `runs_in_flight` are `None`
-/// when no controller is wired, or when the wired handle runs no loop.
+/// The controller's state. Every field but `wired` is `None` when no
+/// controller is wired, or when the wired handle runs no loop. A failing
+/// loop shows `consecutive_failed_ticks` climbing with a fresh
+/// `last_failed_tick`; a stuck one shows neither `last_tick` nor
+/// `last_failed_tick` moving.
 #[derive(Debug, Serialize)]
 struct ControllerReply {
     wired: bool,
     last_tick: Option<DateTime<Utc>>,
     runs_in_flight: Option<usize>,
+    last_failed_tick: Option<DateTime<Utc>>,
+    last_failure_class: Option<String>,
+    consecutive_failed_ticks: Option<u32>,
 }
 
 async fn version(State(state): State<AppState>) -> Json<VersionReply> {
@@ -41,7 +47,10 @@ async fn version(State(state): State<AppState>) -> Json<VersionReply> {
         controller: ControllerReply {
             wired: state.control.is_some(),
             last_tick: status.as_ref().and_then(|s| s.last_tick),
-            runs_in_flight: status.map(|s| s.runs_in_flight),
+            runs_in_flight: status.as_ref().map(|s| s.runs_in_flight),
+            last_failed_tick: status.as_ref().and_then(|s| s.last_failed_tick),
+            consecutive_failed_ticks: status.as_ref().map(|s| s.consecutive_failed_ticks),
+            last_failure_class: status.and_then(|s| s.last_failure_class),
         },
     })
 }
@@ -196,6 +205,7 @@ mod tests {
                 .with_control(Arc::new(StubControl(Some(LoopStatus {
                     last_tick: Some(at()),
                     runs_in_flight: 2,
+                    ..LoopStatus::default()
                 })))),
         )
         .await;
@@ -212,6 +222,36 @@ mod tests {
             .parse()
             .unwrap();
         assert_eq!(last, at());
+        assert_eq!(body["controller"]["last_failed_tick"], Value::Null);
+        assert_eq!(body["controller"]["last_failure_class"], Value::Null);
+        assert_eq!(body["controller"]["consecutive_failed_ticks"], 0);
+    }
+
+    #[tokio::test]
+    async fn version_reports_the_controller_failed_ticks() {
+        let failed_at = at() + chrono::TimeDelta::seconds(30);
+        let base = serve(state().with_control(Arc::new(StubControl(Some(LoopStatus {
+            last_tick: Some(at()),
+            runs_in_flight: 0,
+            last_failed_tick: Some(failed_at),
+            last_failure_class: Some("storage".into()),
+            consecutive_failed_ticks: 3,
+        })))))
+        .await;
+        let (status, body) = get_version(&base).await;
+        assert_eq!(status, Http::OK, "{body}");
+        let controller = &body["controller"];
+        assert_eq!(controller["wired"], true);
+        assert_eq!(controller["consecutive_failed_ticks"], 3);
+        assert_eq!(controller["last_failure_class"], "storage");
+        let failed: DateTime<Utc> = controller["last_failed_tick"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(failed, failed_at);
+        let last: DateTime<Utc> = controller["last_tick"].as_str().unwrap().parse().unwrap();
+        assert_eq!(last, at());
     }
 
     #[tokio::test]
@@ -224,6 +264,9 @@ mod tests {
         assert_eq!(body["controller"]["wired"], false);
         assert_eq!(body["controller"]["last_tick"], Value::Null);
         assert_eq!(body["controller"]["runs_in_flight"], Value::Null);
+        assert_eq!(body["controller"]["last_failed_tick"], Value::Null);
+        assert_eq!(body["controller"]["last_failure_class"], Value::Null);
+        assert_eq!(body["controller"]["consecutive_failed_ticks"], Value::Null);
     }
 
     #[tokio::test]

@@ -187,8 +187,62 @@ fn check_ran_in(wanted: &str, command: &str) -> bool {
         .any(|s| s == wanted)
 }
 
+/// The class a failed tick reports: the variant of the error it returned.
+/// Exhaustive, so a new variant has to be named here.
+pub(super) fn failure_class(err: &Error) -> &'static str {
+    match err {
+        Error::ModelProvider(_) => "model_provider",
+        Error::ModelEmptyResponse(_) => "model_empty_response",
+        Error::ModelRateLimit(_) => "model_rate_limit",
+        Error::ModelAuthError(_) => "model_auth",
+        Error::ModelBadRequest(_) => "model_bad_request",
+        Error::ContextBudgetExceeded { .. } => "context_budget_exceeded",
+        Error::ModelOverloaded(_) => "model_overloaded",
+        Error::ContentPolicy => "content_policy",
+        Error::ToolExecution(_) => "tool_execution",
+        Error::Config(_) => "config",
+        Error::Storage(_) => "storage",
+        Error::Serialization(_) => "serialization",
+        Error::Channel(_) => "channel",
+        Error::Auth(_) => "auth",
+        Error::NotFound(_) => "not_found",
+        Error::AlreadyExists(_) => "already_exists",
+        Error::PendingApproval { .. } => "pending_approval",
+        Error::Internal(_) => "internal",
+    }
+}
+
 impl Controller {
+    /// One pass, and its outcome recorded for [`LoopStatus`]: a completed
+    /// pass sets `last_tick` and clears the failure count, a failed one
+    /// records its time and class and counts up.
+    ///
+    /// [`LoopStatus`]: crate::handle::LoopStatus
     pub(super) async fn tick_locked(&self) -> Result<TickReport, Error> {
+        #[cfg(test)]
+        let injected = self.state().fail_next_tick.take();
+        #[cfg(not(test))]
+        let injected: Option<Error> = None;
+        let result = match injected {
+            Some(err) => Err(err),
+            None => self.tick_pass().await,
+        };
+        let now = self.clock.now();
+        let mut state = self.state();
+        match &result {
+            Ok(_) => {
+                state.last_tick = Some(now);
+                state.consecutive_failures = 0;
+            }
+            Err(err) => {
+                state.last_failure = Some((now, failure_class(err)));
+                state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+            }
+        }
+        result
+    }
+
+    async fn tick_pass(&self) -> Result<TickReport, Error> {
         let now = self.clock.now();
         let first = !self.state().resumed;
         if first {
@@ -202,7 +256,6 @@ impl Controller {
         self.reconcile_all(now, &mut report, &mut noticed).await?;
         self.select_and_lease(&mut report).await?;
         self.age(now, &mut report).await?;
-        self.state().last_tick = Some(self.clock.now());
         Ok(report)
     }
 
