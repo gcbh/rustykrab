@@ -924,7 +924,12 @@ async fn main() -> anyhow::Result<()> {
     let memory_storage = Arc::new(
         SqliteMemoryStorage::open(&memory_db_path).expect("failed to open memory database"),
     );
-    let model_cache_dir = data_dir.join("models");
+    // RUSTYKRAB_MODEL_CACHE_DIR lets several data dirs (the E2E harness's
+    // throwaway boots) share one embedding-model download.
+    let model_cache_dir = std::env::var_os("RUSTYKRAB_MODEL_CACHE_DIR")
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| data_dir.join("models"));
     std::fs::create_dir_all(&model_cache_dir)?;
     // Lazy: ONNX Runtime init (and a ~275MB model download on first run)
     // happens off-thread on the first embed() call instead of blocking

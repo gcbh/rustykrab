@@ -244,6 +244,7 @@ All configuration is via environment variables. No plaintext config files.
 | `RUSTYKRAB_UPDATE_TEAM_ID` | `3RRX845C4X` | Apple team a staged `RustyKrab.app` must be signed by. The team is pinned, so a correctly signed bundle from anyone else is refused; set this for a fork signed by another team |
 | `RUSTYKRAB_GITHUB_API_BASE` | `https://api.github.com` | GitHub API base for the review surface (a GitHub Enterprise host, or the e2e harness's stand-in) |
 | `RUSTYKRAB_DATA_DIR` | OS local data dir + `/rustykrab` | Data directory (store, logs, `soul.md`, `harness.toml`, agent definitions). Falls back to `./rustykrab` when the OS has no local data dir. The E2E harness points it at a throwaway directory |
+| `RUSTYKRAB_MODEL_CACHE_DIR` | `<data dir>/models` | Where the fastembed ONNX embedding model is downloaded and cached. Unused in builds without the `embeddings` feature. The E2E harness points it at one shared directory so its throwaway boots download the model once |
 | `RUSTYKRAB_PORT` | `3000` | Gateway port. The bind address is always loopback (`127.0.0.1`) and is not configurable. `rustykrab pair` also uses it to build the default pairing URL when `RUSTYKRAB_PUBLIC_URL` is unset. A value that is not a port number is fatal |
 | `RUSTYKRAB_GATEWAY_URL` | `http://127.0.0.1:3000` | Daemon base URL the client subcommands (`chat`, `work`, `worker`) talk to. Must be an http(s) URL with a host |
 | `RUSTYKRAB_SOUL_PATH` | `<data dir>/soul.md` | Soul file loaded into the system prompt; seeded with the built-in default if missing |
