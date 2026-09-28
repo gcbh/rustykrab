@@ -25,7 +25,9 @@ builder.
 Pieces 3 and 4 were exercised by hand on the builder on 2026-09-28. A
 second daemon on the same data directory reported `waiting` and never
 ticked. When the first got SIGTERM, it drained and exited, and the second
-took the lock within one tick.
+took the lock within one tick. The e2e scenario
+`control/two-daemons-one-data-dir-only-one-ticks` now checks the lock half
+of that on every `scripts/e2e.sh` run, as must-pass.
 
 ## Slice 5: where a new version comes from, and how it is checked
 
