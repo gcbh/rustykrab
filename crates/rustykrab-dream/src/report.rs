@@ -56,6 +56,20 @@ pub trait OutcomeSource: Send + Sync {
     /// depend on how many artifacts happened to be in play, which is a
     /// property of the traffic rather than of the evidence.
     async fn verdict_totals(&self, ground_truth_only: bool) -> Result<OutcomeTally>;
+
+    /// Up to `limit` record ids per artifact of `kind`, as (failures,
+    /// successes), newest first: what a proposal cites as its evidence and
+    /// its counterexamples (control plan section 10). The default cites
+    /// nothing, for a source that cannot name its records.
+    async fn cite(
+        &self,
+        kind: AttributionKind,
+        ground_truth_only: bool,
+        limit: usize,
+    ) -> Result<std::collections::BTreeMap<String, (Vec<String>, Vec<String>)>> {
+        let _ = (kind, ground_truth_only, limit);
+        Ok(std::collections::BTreeMap::new())
+    }
 }
 
 /// What the evidence supports saying about one artifact.
