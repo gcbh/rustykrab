@@ -1,6 +1,7 @@
 mod chat;
 #[cfg(feature = "computer-use")]
 mod computer_backend;
+mod daemon_client;
 mod prompt_log;
 mod task_queue;
 mod work_cmd;

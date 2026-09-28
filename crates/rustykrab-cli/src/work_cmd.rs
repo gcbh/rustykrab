@@ -2,9 +2,9 @@
 //! (`docs/plans/control-layer-and-worker-fleet.md`, section 14.2).
 //!
 //! Every subcommand is one or two calls to the running daemon's `/api/work`
-//! routes, made the way `chat` makes its calls: the gateway URL from
-//! `RUSTYKRAB_GATEWAY_URL`, the daemon's bearer token, and the gateway's
-//! own origin on every request. Nothing here opens the store or builds a
+//! routes, through the loopback client `chat` shares (`daemon_client.rs`):
+//! the gateway URL from `RUSTYKRAB_GATEWAY_URL`, the daemon's bearer token,
+//! and the gateway's own origin on every request. Nothing here opens the store or builds a
 //! controller; a command enters as a typed request the controller applies
 //! (section 11). Rendering is pure and lives in [`render`].
 //!
@@ -16,7 +16,6 @@ mod render;
 use std::path::Path;
 use std::time::Duration;
 
-use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, ORIGIN};
 use reqwest::{StatusCode, Url};
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
@@ -27,7 +26,10 @@ use rustykrab_gateway::work_routes::{
 };
 use rustykrab_store::ArchivedItem;
 
-const DEFAULT_GATEWAY_URL: &str = "http://127.0.0.1:3000";
+use crate::daemon_client;
+
+/// How long one call to the daemon may take.
+const TIMEOUT: Duration = Duration::from_secs(120);
 
 /// The length of a UUID, the store's id: anything this long is used as
 /// given rather than resolved as a prefix.
@@ -339,35 +341,13 @@ fn not_live(error: &anyhow::Error) -> bool {
 
 impl Daemon {
     async fn connect(data_dir: &Path) -> anyhow::Result<Daemon> {
-        let raw =
-            std::env::var("RUSTYKRAB_GATEWAY_URL").unwrap_or_else(|_| DEFAULT_GATEWAY_URL.into());
-        let base = Url::parse(&raw)
-            .map_err(|e| anyhow::anyhow!("invalid RUSTYKRAB_GATEWAY_URL `{raw}`: {e}"))?;
-        if !matches!(base.scheme(), "http" | "https") || base.host().is_none() {
-            anyhow::bail!("RUSTYKRAB_GATEWAY_URL must be an http(s) URL with a host");
-        }
-        let token = resolve_auth_token(data_dir).await?;
-        Daemon::new(base, &token)
+        let (base, http) = daemon_client::connect(data_dir, TIMEOUT).await?;
+        Ok(Daemon { http, base })
     }
 
+    #[cfg(test)]
     fn new(base: Url, token: &str) -> anyhow::Result<Daemon> {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            AUTHORIZATION,
-            HeaderValue::from_str(&format!("Bearer {token}"))
-                .map_err(|e| anyhow::anyhow!("invalid auth token: {e}"))?,
-        );
-        // The gateway requires an Origin on every /api request; this
-        // trusted loopback client supplies the gateway's own.
-        headers.insert(
-            ORIGIN,
-            HeaderValue::from_str(&base.origin().ascii_serialization())
-                .map_err(|e| anyhow::anyhow!("invalid gateway origin: {e}"))?,
-        );
-        let http = reqwest::Client::builder()
-            .default_headers(headers)
-            .timeout(Duration::from_secs(120))
-            .build()?;
+        let http = daemon_client::client(&base, token, TIMEOUT)?;
         Ok(Daemon { http, base })
     }
 
@@ -581,40 +561,6 @@ async fn execute(daemon: &Daemon, command: Command) -> anyhow::Result<String> {
             render::tick(&report)
         }
     })
-}
-
-/// The daemon's bearer token: `RUSTYKRAB_AUTH_TOKEN`, then the keychain,
-/// then the store, the chain `chat` uses.
-async fn resolve_auth_token(data_dir: &Path) -> anyhow::Result<String> {
-    if let Ok(v) = std::env::var("RUSTYKRAB_AUTH_TOKEN") {
-        if !v.trim().is_empty() {
-            return Ok(v.trim().to_string());
-        }
-    }
-    let spec = rustykrab_store::registry::lookup("rustykrab_auth_token")
-        .ok_or_else(|| anyhow::anyhow!("auth-token spec missing from registry"))?;
-    if rustykrab_store::keychain::keychain_available() {
-        if let Ok(Some(cred)) = rustykrab_store::keychain::get_credential(
-            rustykrab_store::registry::keychain_service(),
-            spec.keychain_account,
-        ) {
-            return Ok(cred.value);
-        }
-    }
-    let db_path = data_dir.join("db");
-    if db_path.exists() {
-        if let Ok(master_key) = rustykrab_store::keychain::resolve_master_key() {
-            if let Ok(store) = rustykrab_store::Store::open(&db_path, master_key) {
-                if let Ok(v) = store.secrets().get(spec.store_name).await {
-                    return Ok(v);
-                }
-            }
-        }
-    }
-    anyhow::bail!(
-        "could not resolve the auth token. Set RUSTYKRAB_AUTH_TOKEN to the value \
-         the daemon printed at startup."
-    )
 }
 
 #[cfg(test)]
