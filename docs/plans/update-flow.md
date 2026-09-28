@@ -159,13 +159,15 @@ from running. Until they are fixed the CLI refuses
    `--version` reporting the staged version and commit. The `Verifier`
    reaches the swap through `Host`, so the tests script it.
 2. **An interrupted apply can leave no daemon, and the next run does not
-   recover.** A journal (`updates/apply-state.json`, the phase and both
-   commits) lets the next run finish or roll back first. If the stop step
+   recover.** A journal (`.<name>.apply-state.json` beside the install,
+   the phase and both commits) lets the next run finish or roll back
+   first. If the stop step
    fails, the service is started again.
 3. **A failure to write the bad record aborts the rollback.** The rollback
    must go on and report the failure with its outcome.
 4. **A failed rollback is quiet.** It must write
-   `updates/apply-failed.json`, always try to start the service last, and
+   `.<name>.apply-failed.json` beside the install, always try to start
+   the service last, and
    make every later run print that file and stop until a person clears it.
 
 Progress:
@@ -182,8 +184,9 @@ Progress:
   the copy's checks move before the daemon is stopped, so a bad stage
   never takes it down. `SwapRoot::swap_in` is split into `prepare` (clear
   `.next`, `cp -Rp --`, `NextCheck`), run while the daemon is up, and
-  `commit` (the two renames), run after the stop. The journal
-  `updates/apply-state.json` (temp file, then rename) holds the phase
+  `commit` (the two renames), run after the stop. The journal, then
+  `updates/apply-state.json` (part 2b moved it beside the install) and
+  written as a temp file then a rename, holds the phase
   (`stopping`, `swapped`, `started`), both commits and the `bad.json`
   entry. Every run first calls `recover`: an install path missing with
   `.prev` beside it gets `.prev` back; a journal at `swapped` or `started`
@@ -192,7 +195,8 @@ Progress:
   that recovers applies nothing new. A failed stop starts the service
   again unless it is still up. A failure writing `bad.json` is logged,
   the rollback goes on, and the outcome reports it. Any rollback error
-  writes `updates/apply-failed.json` (what failed, both commits, the
+  writes the failure record, then `updates/apply-failed.json` and now
+  beside the install (what failed, both commits, the
   time), clears the journal and last starts the service unless it is
   running; while that file exists every run puts it on stderr, exits
   non-zero and changes nothing. The rollback's stop is retried once; if
@@ -224,6 +228,39 @@ Progress:
   checks the installed and `.prev` binaries against the journal's
   commits, and it fixes the crash window, the launchd stop and the
   smaller findings.
+
+- **Part 2b is done**, behind the same gate:
+  - The journal is `.<name>.apply-state.json` and the failure record
+    `.<name>.apply-failed.json`, both beside the install
+    (`SwapRoot::state_path`; for the launchd default,
+    `~/Applications/.RustyKrab.app.apply-state.json`). Files of those
+    names in the data dir are ignored.
+  - Before `recover` rolls anything back, it runs the `Verifier`'s
+    `--version` on the installed and `.prev` binaries. They must report
+    the journal's `to_commit` and `from_commit`. Otherwise it writes the
+    failure record and stops nothing.
+  - A journal at `stopping` whose `.next` is gone and whose installed
+    binary reports `to_commit` is the crash between the renames and the
+    `swapped` write, and is rolled back like `swapped`.
+  - `apply` checks the running daemon's health before it compares
+    commits, so a daemon of the staged commit stuck waiting on the lock
+    is not reported as already running.
+  - `Launchd::stop` waits for the job to unload even when `bootout`
+    errors, and fails only if it is still loaded after 60 s. After a
+    failed stop, `apply` clears the journal only once `/api/version`
+    answers with the old commit.
+  - A journal that does not parse (an unknown phase, say) writes the
+    failure record and starts the service.
+  - A rollback finding no `.prev` and the installed binary already on
+    `from_commit` (one that crashed late) skips the stop and the restore.
+    It only starts the service if need be and verifies it.
+  - A failed `commit` that leaves nothing at the install path writes the
+    failure record. A failure to clear the journal after a failed stop
+    or commit is logged, not returned over the original error.
+
+  Moving the files beside the install makes them as hard to write as the
+  install itself, and no harder. The same-user limit below still holds.
+  The gate stays until part 2b is re-reviewed and part 3 lands.
 
 **The limit of all this.** Workers run as the same macOS user as the
 daemon, so "a worker cannot write it" holds only as far as the worker's
