@@ -18,13 +18,13 @@
 //! reply end the turn instead of re-prompting for `task_complete`.
 
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use async_trait::async_trait;
 use rustykrab_core::types::ToolSchema;
 use rustykrab_core::work::{
     BlockedReason, BlockedReport, ErrorClass, ErrorSubclass, Question, RejectionReason,
-    ResultReport, WorkError,
+    ResultReport, WorkError, BLOCKED_SHAPE_GUIDANCE,
 };
 use rustykrab_core::{validate_tool_args, Error, Result, Tool, ToolError};
 use serde_json::{json, Map, Value};
@@ -440,6 +440,17 @@ impl ResultReportTool {
     }
 }
 
+/// The tool description, built once around the shared blocked-shape guidance.
+static DESCRIPTION: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "End your work item with its typed result, as your LAST call. summary: what you did, \
+         in a few lines. Pointers, not content: artifacts, changed_paths, commit, checks_run. \
+         If you could not finish, set blocked or error (what failed). {BLOCKED_SHAPE_GUIDANCE} \
+         Follow-up work goes in discovered, one draft per item: the controller files it, you \
+         do not. The run ends when this call succeeds."
+    )
+});
+
 #[async_trait]
 impl Tool for ResultReportTool {
     fn name(&self) -> &str {
@@ -447,14 +458,7 @@ impl Tool for ResultReportTool {
     }
 
     fn description(&self) -> &str {
-        "End your work item with its typed result, as your LAST call. summary: what you did, \
-         in a few lines. Pointers, not content: artifacts, changed_paths, commit, checks_run. \
-         If you could not finish, set blocked or error (what failed). blocked is \
-         {\"reason\": \"needs_decision\", \"detail\": \"the question or what you need\", \
-         \"needs\": []}, its reason one of needs_tool, needs_credential, needs_decision or \
-         needs_consent; the question goes in detail. \
-         Follow-up work goes in discovered, one draft per item: the controller files it, you \
-         do not. The run ends when this call succeeds."
+        &DESCRIPTION
     }
 
     fn schema(&self) -> ToolSchema {
