@@ -299,7 +299,10 @@ could move to a crate of its own if the adapters grow.
   WebSearch"` followed by the spec's `denied_tools` (a spec can deny
   more, never less), plus `--model` and, for a capability build,
   `--add-dir <skills dir>`. Codex has no deny list flag, so a codex spec's
-  `denied_tools` is dropped with a warning. Codex: `codex exec --json --skip-git-repo-check --sandbox
+  `denied_tools` is dropped with a warning. A path-scoped deny such as `Read(~/.config/**)`
+  stops Claude Code's file tools only: a command the allow list admits, such
+  as `cargo` (which runs build scripts), can still read any file the user
+  can, so it is a guard against a worker wandering, not confinement. Codex: `codex exec --json --skip-git-repo-check --sandbox
   workspace-write --cd <dir> --output-last-message <file>`, plus the same
   two. The environment is cleared except `PATH`, `HOME`, the locale, the
   agent's own config and key variables, the spec's pass-through names, and

@@ -418,6 +418,17 @@ pub async fn apply(cfg: &Config, host: &Host<'_>, yes: bool) -> anyhow::Result<O
     if running_commit == commit {
         return Ok(Outcome::AlreadyRunning(plan));
     }
+    // `tag` is a field of staged.json, which a worker can write, so it
+    // cannot decide whether the version check applies: every stage must be
+    // at least the running version (an older signed release copied in as a
+    // "local build" is a downgrade), and a release must be newer.
+    if is_newer(&plan.running.version, &plan.staged.version)? {
+        bail!(
+            "staged {} is older than the running {}; refusing a downgrade",
+            plan.staged.version,
+            plan.running.version
+        );
+    }
     if plan.staged.tag.is_some() && !is_newer(&plan.staged.version, &plan.running.version)? {
         bail!(
             "staged release {} is not newer than the running {}; refusing it",

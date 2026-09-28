@@ -629,7 +629,7 @@ async fn an_older_or_equal_release_is_refused() {
     *rig.verifier.version.lock().unwrap() = "5.3.5".to_string();
     write_stage_of(&rig.cfg, "5.3.5", NEW, Some("v5.3.5"), "binary", false);
     let err = apply(&rig.cfg, &rig.host(), true).await.unwrap_err();
-    assert!(err.to_string().contains("not newer"), "{err:#}");
+    assert!(err.to_string().contains("downgrade"), "{err:#}");
     rig.assert_untouched();
 
     std::fs::remove_dir_all(rig.cfg.updates_dir()).unwrap();
@@ -637,6 +637,25 @@ async fn an_older_or_equal_release_is_refused() {
     let err = apply(&rig.cfg, &rig.host(), true).await.unwrap_err();
     assert!(err.to_string().contains("not newer"), "{err:#}");
     rig.assert_untouched();
+}
+
+/// A worker can copy an older signed release into `updates/` and write a
+/// record for it with no tag, as if it were a local build: still refused.
+#[tokio::test]
+async fn an_older_stage_without_a_tag_is_refused_as_a_downgrade() {
+    for launchd in [false, true] {
+        let rig = Rig::new(NewMode::Healthy, launchd).await;
+        *rig.verifier.version.lock().unwrap() = "5.0.0".to_string();
+        let (kind, verified) = if launchd {
+            ("app", true)
+        } else {
+            ("binary", false)
+        };
+        write_stage_of(&rig.cfg, "5.0.0", NEW, None, kind, verified);
+        let err = apply(&rig.cfg, &rig.host(), true).await.unwrap_err();
+        assert!(err.to_string().contains("downgrade"), "{err:#}");
+        rig.assert_untouched();
+    }
 }
 
 #[tokio::test]
