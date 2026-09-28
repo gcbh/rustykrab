@@ -11,8 +11,8 @@
 //! the calls the GitHub stand-in logged.
 //!
 //! Every scenario is written to pass once its phase ships and is marked
-//! `XFail` until then. Phase 1 has shipped (see [`PROMOTED`] and
-//! [`HELD_BACK`]); the routes of Phases 3 to 6 do not exist, so their
+//! `XFail` until then. Phases 1 and 3 have shipped (see [`PROMOTED`] and
+//! [`HELD_BACK`]); the routes of Phases 4 to 6 do not exist, so their
 //! scenarios fail at their first request, on a status code rather than a
 //! panic or a hang.
 //!
@@ -71,11 +71,14 @@
 //!   `GET /api/work/events` (the SSE stream), `POST /api/work/import` (the
 //!   delivery import of 26, `{ "manifest": StackManifest }`),
 //!   `GET /api/work/archive?search=` (the archive view of 28, rows under
-//!   `archived`). Not served yet:
+//!   `archived`). Served since Phase 3: `GET /api/workers` (rows under
+//!   `workers`, each with its `routing_record` keyed by work class) and
+//!   `POST /api/workers` with `kind`, `name`, `repos` and `command` (the
+//!   Claude Code executable). Not served yet:
 //!   `POST /api/work/evaluate` (run the nightly evaluation now, Phase 6),
 //!   `GET /api/work/metrics` (the section 1.1 metrics of 16),
-//!   `POST /api/workers` with `command` (the Claude Code executable) or
-//!   `base_url` and `token` (a peer), `capability: build | acquire` on a
+//!   `POST /api/workers` with `base_url` and `token` (a peer, Phase 5),
+//!   `capability: build | acquire` on a
 //!   capability draft (27), `subject` and `review_tier` on a proposal
 //!   draft (12), and the GitHub adapter reading `RUSTYKRAB_GITHUB_API_BASE`,
 //!   `RUSTYKRAB_GITHUB_REPO` and `RUSTYKRAB_GITHUB_TOKEN` (`surface.rs`).
@@ -122,19 +125,33 @@ enum Phase {
 
 /// The phases that have shipped. Their scenarios must pass; every other
 /// scenario is `XFail`. Promoting a phase is this one edit.
-const PROMOTED: &[Phase] = &[Phase::One];
+const PROMOTED: &[Phase] = &[Phase::One, Phase::Three, Phase::ThreeExit];
 
 /// Scenarios of a promoted phase that stay `XFail`, each with why. An
 /// entry here is a known gap in a shipped phase, named rather than hidden;
 /// the report still runs it, and it turns the suite red the day it passes,
 /// so it leaves this list the same day.
-const HELD_BACK: &[(u8, &str)] = &[(
-    30,
-    "a cron firing still runs as a task-queue conversation: moving it onto a work item \
-     needs the job's persistent conversation, SKILL.md injection and per-job delivery \
-     target carried into the worker run, and a gate that holds local leases while an \
-     interactive turn runs (plan 12.1)",
-)];
+const HELD_BACK: &[(u8, &str)] = &[
+    (
+        13,
+        "Phase 4: the build, the verified tool and the resumed run with it active all pass; \
+         the last check, that the user was never asked, reads GET /api/questions, which \
+         the question router of Phase 4 serves",
+    ),
+    (
+        17,
+        "Phase 6: the local code item, its routing record and the escalation to claude_code \
+         pass; the routing proposal needs POST /api/work/evaluate and the proposal kind, \
+         which dreaming's evaluation of Phase 6 builds",
+    ),
+    (
+        30,
+        "a cron firing still runs as a task-queue conversation: moving it onto a work item \
+         needs the job's persistent conversation, SKILL.md injection and per-job delivery \
+         target carried into the worker run, and a gate that holds local leases while an \
+         interactive turn runs (plan 12.1)",
+    ),
+];
 
 /// Plan scenarios another suite owns, with where. Read by the catalog
 /// test that holds every plan number to exactly one home.
