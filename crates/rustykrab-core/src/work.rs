@@ -596,6 +596,9 @@ pub enum EventKind {
     /// a decision (accept, decline, amend) synced back from one. A note:
     /// the decision's own transition, when it has one, is a `transition`.
     Review,
+    /// A worker run ended: what it spent and what the worker reports about
+    /// itself (its completion-reminder count). Changes no status.
+    Run,
 }
 
 impl EventKind {
@@ -610,6 +613,7 @@ impl EventKind {
             EventKind::Rejection => "rejection",
             EventKind::Warning => "warning",
             EventKind::Review => "review",
+            EventKind::Run => "run",
         }
     }
 
@@ -624,6 +628,7 @@ impl EventKind {
             "rejection" => Some(EventKind::Rejection),
             "warning" => Some(EventKind::Warning),
             "review" => Some(EventKind::Review),
+            "run" => Some(EventKind::Run),
             _ => None,
         }
     }

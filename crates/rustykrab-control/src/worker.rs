@@ -3,7 +3,8 @@
 //! implementation lives in `rustykrab-agent` (`LocalWorker`); peers, Claude
 //! Code and Codex come in later phases. A run that ends without a result
 //! returns a [`RunFailure`], which [`run_failure_input`] turns back into
-//! what the classifier reads.
+//! what the classifier reads. [`Worker::usage`] is how a run's spend and
+//! self-counts reach the controller once it ends.
 
 use async_trait::async_trait;
 use rustykrab_core::work::{
@@ -76,6 +77,30 @@ pub trait Worker: Send + Sync {
     /// Run one brief to its typed result. The controller verifies the result
     /// before anything counts; a worker never transitions an item.
     async fn run(&self, brief: Brief) -> Result<ResultReport, Error>;
+
+    /// What the run with this id (the brief's `run`) spent and what the
+    /// worker counted about itself, once the run has ended or been
+    /// stopped. The controller asks once per run, records the spend
+    /// (`work_spend`) and the counts as a `run` event on the item. `None`:
+    /// the worker keeps no such numbers, and the controller records its own
+    /// wall time with no token count.
+    fn usage(&self, _run: &str) -> Option<RunUsage> {
+        None
+    }
+}
+
+/// What one worker run spent and counted (see [`Worker::usage`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunUsage {
+    /// Tokens the run's model calls consumed (prompt and completion).
+    pub tokens: u64,
+    pub wall_ms: u64,
+    /// Model turns the run took.
+    pub iterations: u32,
+    /// Completion reminders the runner sent after a text-only reply (plan
+    /// section 12.1 measures these as net-negative; the controller records
+    /// how often they happen).
+    pub reminders: u32,
 }
 
 // ── a run that ends without a result ──────────────────────────────────────

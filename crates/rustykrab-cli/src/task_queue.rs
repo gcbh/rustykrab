@@ -621,7 +621,7 @@ async fn execute_cron_task(
 /// Resume this job's persistent conversation, or create one on the first
 /// run. If the stored id points at a conversation that has been deleted
 /// out from under us, silently create a fresh one and re-link.
-async fn resume_or_create_conversation(
+pub(crate) async fn resume_or_create_conversation(
     job: &rustykrab_store::ScheduledJob,
     state: &AppState,
     store: &rustykrab_store::Store,
@@ -678,7 +678,22 @@ fn build_scheduled_prompt(
              do not promise future updates."
             .to_string(),
     };
-    let body = match last_run_at {
+    format!(
+        "{}\n\n{SCHEDULED_CONTEXT_RECOVERY}\n\n{delivery}",
+        scheduled_task_body(task_prompt, last_run_at)
+    )
+}
+
+/// The first paragraph of a scheduled run's prompt: whether the task is due
+/// for the first time or again (with earlier runs in this conversation),
+/// then the task itself. Shared by the task-queue run and the work-item
+/// firing (`scheduled_work.rs`), which differ only in how the result is
+/// delivered.
+pub(crate) fn scheduled_task_body(
+    task_prompt: &str,
+    last_run_at: Option<chrono::DateTime<chrono::Utc>>,
+) -> String {
+    match last_run_at {
         Some(last) => format!(
             "[Scheduled task] Your scheduled task is due again. Earlier runs are in \
              this conversation — refer to them for any state, filenames, or \
@@ -691,20 +706,20 @@ fn build_scheduled_prompt(
              (filenames, conventions, summaries) can simply be written down here.\n\n\
              Task: {task_prompt}"
         ),
-    };
-    // The task string is all that survives from the conversation where this
-    // job was created — no chat history comes with it. Terse tasks ("daily
-    // briefing") therefore produce generic output unless the model first
-    // recovers the user's standing preferences from memory. Say so
-    // explicitly rather than relying on the soul prompt's general
-    // memory_search guidance.
-    let context_recovery = "You do not have the conversation this job was created in. Before \
-         composing output, call memory_search for the user's standing preferences and any \
-         earlier decisions relevant to this task (recipients, filters, format, tone, things \
-         to exclude), and apply what you find. Prefer concrete specifics you recover over \
-         generic defaults.";
-    format!("{body}\n\n{context_recovery}\n\n{delivery}")
+    }
 }
+
+/// The task string is all that survives from the conversation where a job
+/// was created: no chat history comes with it. Terse tasks ("daily
+/// briefing") therefore produce generic output unless the model first
+/// recovers the user's standing preferences from memory. Said explicitly
+/// rather than relying on the soul prompt's general memory_search guidance.
+pub(crate) const SCHEDULED_CONTEXT_RECOVERY: &str =
+    "You do not have the conversation this job was created in. Before \
+     composing output, call memory_search for the user's standing preferences and any \
+     earlier decisions relevant to this task (recipients, filters, format, tone, things \
+     to exclude), and apply what you find. Prefer concrete specifics you recover over \
+     generic defaults.";
 
 /// If `task_prompt` references a registered SKILL.md skill, return
 /// `(name, body)` so the runner can inline the recipe into the prompt.
@@ -734,7 +749,10 @@ fn build_scheduled_prompt(
 /// way must not have its runs promoted to ground truth, and a skill that
 /// named nothing has stated nothing to check. In both cases the run falls
 /// back to the weaker implicit signal rather than inventing evidence.
-fn resolve_skill_for_task(registry: &SkillRegistry, task_prompt: &str) -> Option<(String, String)> {
+pub(crate) fn resolve_skill_for_task(
+    registry: &SkillRegistry,
+    task_prompt: &str,
+) -> Option<(String, String)> {
     let trimmed = task_prompt.trim();
     if trimmed.is_empty() {
         return None;
@@ -822,7 +840,7 @@ fn is_skill_name_char(c: char) -> bool {
 /// Existing values are preserved — we only fill in unset fields. This is
 /// idempotent: repeat calls with the same target are a no-op once the
 /// conversation has been stamped.
-fn persist_channel_context_onto_conversation(
+pub(crate) fn persist_channel_context_onto_conversation(
     conv: &mut Conversation,
     channel: Option<&str>,
     chat_id: Option<&str>,
@@ -863,7 +881,7 @@ const DEFAULT_THREAD_ID_ENV: &str = "RUSTYKRAB_DEFAULT_THREAD_ID";
 ///   2. The job's persistent conversation's `channel_*` fields (set when
 ///      the conversation originated from a channel).
 ///   3. Operator-wide env defaults.
-fn resolve_delivery_target(
+pub(crate) fn resolve_delivery_target(
     job_channel: Option<&str>,
     job_chat_id: Option<&str>,
     job_thread_id: Option<&str>,
@@ -913,7 +931,7 @@ fn resolve_delivery_target(
 /// to write a URL itself. The user was promised a link that could not arrive
 /// and shown nothing. Draining here rather than at the call sites means a
 /// future delivery path cannot reintroduce that by forgetting a step.
-async fn deliver_response(
+pub(crate) async fn deliver_response(
     target: &str,
     channel: Option<&str>,
     chat_id: Option<&str>,

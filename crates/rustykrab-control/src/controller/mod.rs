@@ -20,9 +20,11 @@
 //!    filings and ladder rungs written in one transaction.
 //! 3. **Select, match, lease and run** (steps 1 to 4): ready leaves by
 //!    priority, the single-writer rule over every active item, the
-//!    local-model rule of 12.1, the cheapest healthy worker that covers the
-//!    item; the lease carries the fan-in inputs of 4.3 and 6.3 and the run
-//!    is spawned under tokio.
+//!    local-model rule of 12.1 (one run per local model, and none while
+//!    [`ModelActivity`] says an interactive turn holds it), the cheapest
+//!    healthy worker that covers the item; the lease carries the fan-in
+//!    inputs of 4.3 and 6.3 and the run is spawned under tokio. A run that
+//!    ends or is stopped has its spend recorded (`spend.rs`).
 //! 4. **Aging** (4.6), when nothing is running.
 //!
 //! Every transaction that closes a root, expires an item or surfaces a
@@ -31,7 +33,9 @@
 //! waits for the next tick instead of writing a second notice.
 //!
 //! Layout: `batch.rs` builds one transaction over a working snapshot;
-//! `load.rs` reads the store back (the snapshot, rung histories);
+//! `load.rs` reads the store back (the snapshot, rung histories, a
+//! firing's conversation); `spend.rs` records what runs spend and gives
+//! parents their remaining budgets;
 //! `brief.rs` builds a run's inputs and brief; `filing.rs` is every filing
 //! path and the user's approve, reject and cancel; `tick.rs` is the loop;
 //! `notice.rs` renders the 6.6 message.
@@ -43,10 +47,15 @@ mod filing;
 mod load;
 mod notice;
 mod review;
+mod spend;
 mod tick;
 
 #[cfg(test)]
 mod tests;
+
+/// The evidence kind a verified result's full summary is kept under: what
+/// a host delivering the result (a scheduled job's firing) reads back.
+pub use brief::SUMMARY as SUMMARY_EVIDENCE;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -59,7 +68,7 @@ use rustykrab_core::work::{
     WorkItemId, WorkKind, WorkPlan, WorkerKind,
 };
 use rustykrab_core::Error;
-use rustykrab_store::Store;
+use rustykrab_store::{Spend, Store};
 use rustykrab_tools::work_backend::{
     Principal, Provenance, StatusQuery, ToolState, WorkBackend, WorkStatusView,
 };
@@ -210,6 +219,25 @@ pub struct NoLedger;
 
 impl ProgressLedger for NoLedger {}
 
+/// Work on a local model the controller does not run itself: an
+/// interactive turn, a credential wake (plan section 12.1). While a model
+/// is busy the controller leases no local worker on it, so a scheduled
+/// firing waits for the turn instead of evicting its prefix cache. The
+/// composition root implements it over the gateway's activity tracker.
+pub trait ModelActivity: Send + Sync {
+    /// Whether `model` (a local worker's advertised model) is serving work
+    /// outside the controller right now.
+    fn busy(&self, _model: &str) -> bool {
+        false
+    }
+}
+
+/// Nothing runs outside the controller.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoActivity;
+
+impl ModelActivity for NoActivity {}
+
 // ── configuration ───────────────────────────────────────────────────────
 
 /// What policy sets for the loop.
@@ -274,6 +302,12 @@ type RunResult = Result<ResultReport, Error>;
 /// A spawned worker run.
 struct Run {
     worker: String,
+    /// The id the controller gave the run (the brief's `run`), which the
+    /// worker's [`Worker::usage`] answers for.
+    run_id: String,
+    /// When it started, on the wall clock: the run's wall time when the
+    /// worker keeps none.
+    started: std::time::Instant,
     handle: JoinHandle<RunResult>,
     /// When the run started, or last showed progress, on the controller's
     /// clock: the lease TTL counts from here.
@@ -308,6 +342,10 @@ struct State {
     /// Classifier rules `internal` items landed (section 9), rebuilt from
     /// their evidence on the first tick.
     learned: Vec<LearnedRule>,
+    /// What each item's runs spent (`work_spend`), read once on the first
+    /// load and kept current as runs end: a parent's remaining budget is
+    /// its budget less what its subtree spent (4.2).
+    spent: Option<HashMap<WorkItemId, Spend>>,
 }
 
 /// The loop of plan section 6 over one store and a fixed set of workers.
@@ -321,6 +359,7 @@ pub struct Controller {
     catalog: Arc<dyn ToolCatalog>,
     routing: Arc<dyn Routing>,
     ledger: Arc<dyn ProgressLedger>,
+    activity: Arc<dyn ModelActivity>,
     /// Serialises the loop's writers: a tick, a filing, an approval, a
     /// cancel. Never held while a worker runs.
     loop_lock: tokio::sync::Mutex<()>,
@@ -340,6 +379,7 @@ impl Controller {
             catalog: Arc::new(StaticCatalog::default()),
             routing: Arc::new(CheapestFirst),
             ledger: Arc::new(NoLedger),
+            activity: Arc::new(NoActivity),
             loop_lock: tokio::sync::Mutex::new(()),
             state: Mutex::new(State {
                 runs: HashMap::new(),
@@ -350,6 +390,7 @@ impl Controller {
                 supersedes: Vec::new(),
                 planned: HashSet::new(),
                 learned: Vec::new(),
+                spent: None,
             }),
         }
     }
@@ -371,6 +412,13 @@ impl Controller {
 
     pub fn with_progress_ledger(mut self, ledger: Arc<dyn ProgressLedger>) -> Self {
         self.ledger = ledger;
+        self
+    }
+
+    /// The busy signal of plan 12.1: local leases wait while `activity`
+    /// says their model serves work outside the controller.
+    pub fn with_activity(mut self, activity: Arc<dyn ModelActivity>) -> Self {
+        self.activity = activity;
         self
     }
 

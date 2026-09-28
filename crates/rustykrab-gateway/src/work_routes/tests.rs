@@ -14,6 +14,7 @@ use uuid::Uuid;
 
 use rustykrab_control::graph::FilingSource;
 use rustykrab_control::handle::{ControlHandle, GraphNode, GraphView, TickReport};
+use rustykrab_control::Provenance;
 use rustykrab_core::model::{ModelProvider, ModelResponse};
 use rustykrab_core::types::{Message, ToolSchema};
 use rustykrab_core::work::{
@@ -23,7 +24,6 @@ use rustykrab_core::work::{
 };
 use rustykrab_core::Error;
 use rustykrab_store::{Store, WorkPlanRow};
-use rustykrab_tools::work_backend::Provenance;
 
 use super::{parse_status_filter, GraphReply, StatusFilter};
 use crate::AppState;

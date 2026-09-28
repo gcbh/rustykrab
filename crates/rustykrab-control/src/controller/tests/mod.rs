@@ -5,6 +5,7 @@
 //! clock that moves one second per tick, and runs scripted [`Worker`]s that
 //! return canned [`ResultReport`]s per item title.
 
+mod closeout;
 mod paths;
 mod review;
 mod scenarios;
@@ -187,7 +188,20 @@ impl Worker for Scripted {
             }
         }
     }
+
+    /// Every scripted run spends the same: [`SCRIPTED_USAGE`].
+    fn usage(&self, _run: &str) -> Option<crate::worker::RunUsage> {
+        Some(SCRIPTED_USAGE)
+    }
 }
+
+/// What each scripted run reports it spent and counted.
+pub(super) const SCRIPTED_USAGE: crate::worker::RunUsage = crate::worker::RunUsage {
+    tokens: 1_000,
+    wall_ms: 1_500,
+    iterations: 3,
+    reminders: 2,
+};
 
 // ── canned results and drafts ───────────────────────────────────────────
 

@@ -63,10 +63,25 @@ impl Controller {
         }
         self.store.work_apply(std::mem::take(&mut b.ops)).await?;
 
+        let stopped = self.apply_in_memory(&mut b);
+        // A stopped run spent what it spent: recorded like one that ended.
+        for (id, run) in &stopped {
+            self.record_run(id, run, "stopped").await;
+        }
+        noticed.extend(roots.into_iter().map(|(root, _)| root));
+        Ok(Some(written))
+    }
+
+    /// The in-memory side of a written batch: stop the runs it revoked
+    /// (returned, so their spend is recorded), count fingerprints, note
+    /// approvals, supersedes, planning runs and landed rules.
+    fn apply_in_memory(&self, b: &mut Batch) -> Vec<(WorkItemId, super::Run)> {
         let mut state = self.state();
+        let mut stopped = Vec::new();
         for id in &b.revoke {
             if let Some(run) = state.runs.remove(id) {
                 run.handle.abort();
+                stopped.push((id.clone(), run));
             }
             state.finished.remove(id);
         }
@@ -85,9 +100,7 @@ impl Controller {
             state.planned.insert(item.clone());
         }
         state.learned.extend(std::mem::take(&mut b.learned));
-        drop(state);
-        noticed.extend(roots.into_iter().map(|(root, _)| root));
-        Ok(Some(written))
+        stopped
     }
 
     /// The store reads a notice for `root` needs: ladders of what failed or

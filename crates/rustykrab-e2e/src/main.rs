@@ -1315,7 +1315,11 @@ fn spawn_daemon_with(
                 // scenarios wait on several ticks each (a lease, a result,
                 // a ladder rung), and the 5 s default would spend most of
                 // their time budget idle.
-                .env("RUSTYKRAB_CONTROL_TICK_SECS", "1");
+                .env("RUSTYKRAB_CONTROL_TICK_SECS", "1")
+                // Scheduled firings run as work items the controller
+                // schedules (control scenario 30); off by default in a
+                // real daemon.
+                .env("RUSTYKRAB_CRON_WORK_ITEMS", "1");
             if let Some(stand_ins) = stand_ins {
                 stand_ins.configure(command);
             }

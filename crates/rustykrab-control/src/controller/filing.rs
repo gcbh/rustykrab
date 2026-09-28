@@ -17,7 +17,7 @@ use rustykrab_core::work::{
     WorkError, WorkEvent, WorkItem, WorkItemDraft, WorkItemId, WorkKind, WorkPlan,
 };
 use rustykrab_core::Error;
-use rustykrab_store::{ArchivedItem, WorkPlanRow};
+use rustykrab_store::{ArchivedItem, WorkOp, WorkPlanRow};
 use rustykrab_tools::work_backend::{
     Principal, Provenance, StatusQuery, StatusSelector, WorkStatusView, DEFAULT_ACTOR,
 };
@@ -166,6 +166,32 @@ pub(super) fn parked_on_landed_capability(snap: &Snapshot) -> Vec<WorkItemId> {
         .collect()
 }
 
+/// Capability items nothing needs any more (plan 6.2 and section 8): not
+/// leased or running, held by no approval, and every item that waited on
+/// them through an ordering edge has closed. Each comes with the dependent
+/// that closed last, the origin of its `cancelled(cascade)`. A capability
+/// item nothing ever waited on (one filed on its own) is left alone.
+pub(super) fn unneeded_capabilities(snap: &Snapshot) -> Vec<(WorkItemId, WorkItemId)> {
+    snap.items()
+        .iter()
+        .filter(|i| i.kind == WorkKind::Capability && i.status.is_waiting() && i.held_by.is_none())
+        .filter_map(|i| {
+            let dependents: Vec<&WorkItem> = snap
+                .edges_naming(&i.id)
+                .filter(|e| e.kind.is_ordering())
+                .filter_map(|e| snap.item(&e.item))
+                .collect();
+            if dependents.is_empty() || dependents.iter().any(|d| !d.status.is_closed()) {
+                return None;
+            }
+            let last = dependents
+                .iter()
+                .max_by_key(|d| (d.closed_at.unwrap_or(d.updated_at), d.id.clone()))?;
+            Some((i.id.clone(), last.id.clone()))
+        })
+        .collect()
+}
+
 impl Controller {
     /// The filing context for `source` from the configuration and the
     /// caller's provenance: a worker's scope is its own parent's subtree
@@ -183,6 +209,7 @@ impl Controller {
         ctx.sequential_split = self.config.split_mode;
         ctx.default_budget = self.config.default_budget;
         ctx.supersede_limit = self.config.supersede_limit;
+        ctx.remaining_budget = self.remaining_budgets(snap);
         ctx.origin_conversation_id = provenance.conversation_id.clone();
         // The ladder's own filings are system work under policy, not a plan
         // the user approves (section 8); an accepted proposal's work was
@@ -646,6 +673,7 @@ impl Controller {
             if let Some(row) = b.snap.item_mut(&item.id) {
                 row.held_by = None;
             }
+            b.ops.push(WorkOp::ReleaseHold(item.id.clone()));
             b.approved.push(item.id.clone());
             released.push(item.id);
         }

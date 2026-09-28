@@ -318,10 +318,15 @@ lens they were created under — the migration backfills rather than
 reinterprets, because moving a live job's fire time is not a migration's call
 to make.
 
-`work_item_id` is the control layer's link from a job to the work item a
-firing becomes (control-layer plan, section 13), added by a guarded `ALTER`.
-It is nullable and unenforced, since the item may be archived while the job
-keeps its schedule, and nothing writes it yet: `JobStore` behaves as before.
+`work_item_id` is the control layer's link from a job to the work item its
+latest firing became (control-layer plan, section 13), added by a guarded
+`ALTER`. It is nullable and unenforced, since the item may be archived while
+the job keeps its schedule. With `RUSTYKRAB_CRON_WORK_ITEMS=1` the daemon
+writes it for every firing (`rustykrab-cli/src/scheduled_work.rs`); the
+controller reads it (`job_for_work_item`) to run a firing in the job's own
+`conversation_id`, a column no model writes, so no filing can point a run at
+a conversation of its choosing. With the switch off (the default) nothing
+writes it and jobs run through the task queue as before.
 
 The remaining duplication is `(channel, chat_id, thread_id)` on
 `scheduled_jobs`: it repeats addressing information that can also live in
@@ -485,6 +490,11 @@ work_item_evidence(id AUTOINC, item, kind, ref, hash, verified_by, at)
    INDEX idx_work_item_evidence_item (item)
 leases(item PK REFERENCES work_items(id) ON DELETE CASCADE,
        worker, since, ttl_seconds, heartbeat_at, inputs JSON)
+work_lease_history(id AUTOINC, item, worker, since, ttl_seconds,
+                   heartbeat_at, inputs JSON, released_at)
+   INDEX idx_work_lease_history_item (item, since)
+work_spend(id AUTOINC, item, run, worker, tokens, wall_ms, iterations, at)
+   INDEX idx_work_spend_item (item)
 work_plans(id PK, root, filed_by, rationale, approval_question, policy,
            created_at)
 work_outbox(id PK, parent, origin, channel, body, created_at, delivered_at)
@@ -544,9 +554,19 @@ key, so an item holds at most one. Acquiring it moves the item from `ready` to
 `leased` and writes a `lease` event whose actor is `worker:<name>`, in one
 transaction; a transition into any waiting or closed status drops it. The
 brief's copied `inputs` are stored on the lease (section 4.3) and go with it.
-What outlives the lease is the `run` evidence row the controller writes at
+What outlives the lease is its copy in `work_lease_history`, written in the
+same transaction that drops the live row, whatever drops it, with
+`released_at`, so what a worker was given stays readable after the item
+closes or is archived; and the `run` evidence row the controller writes at
 lease time: the id the run's transcript is kept under (the local worker's
-conversation id), so a cancelled or lost run still points at its partial work.
+conversation id, or a scheduled job's own conversation for its firing), so
+a cancelled or lost run still points at its partial work.
+
+**Spend is one row per run.** `work_spend` records what each worker run
+spent (tokens across its model calls, wall time, iterations) when it ends
+or is stopped, whether or not its item is still live. A parent's remaining
+budget is its budget less what its subtree spent (section 4.2), and
+compaction writes the item's total into the archive's `cost`.
 
 **Evidence kinds the controller reads back.** Besides the artifacts a report
 claims, `work_item_evidence` carries the controller's own rows: `summary`,
@@ -564,8 +584,9 @@ and reason, the worker from its last `lease` event, closing time, those edges
 as JSON, and a summary built from the typed fields with no model involved.
 Constraints, decisions and the rest of the brief go; events and evidence stay.
 Which items age is the control crate's decision (section 4.6); the store only
-refuses to compact an item that is not closed. `cost` is NULL until something
-records spend.
+refuses to compact an item that is not closed. `cost` is the item's total
+spend as JSON (`runs`, `tokens`, `wall_ms`, `iterations`), NULL when no run
+recorded any.
 
 `work_outbox` holds the notices a transition causes, written in the same
 transaction and delivered from here, so a restart neither drops nor repeats
@@ -582,8 +603,9 @@ Unenforced on purpose, and the DDL says so:
   whatever order the control crate picks, so the link cannot be a constraint.
 - `work_items.status_origin`, `plan_id`, `held_by`, `origin_conversation_id`:
   provenance, not ownership.
-- `work_item_events.item` and `work_item_evidence.item`: the history must
-  outlive compaction, so neither cascades from `work_items`.
+- `work_item_events.item`, `work_item_evidence.item`,
+  `work_lease_history.item` and `work_spend.item`: the history must outlive
+  compaction, so none cascades from `work_items`.
 - `work_outbox.parent` and `origin`, `work_plans.root` and `filed_by`,
   `work_item_archive.parent`: records about items that may since have been
   archived.

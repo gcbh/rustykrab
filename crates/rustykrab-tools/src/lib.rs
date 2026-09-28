@@ -234,7 +234,7 @@ pub use work_file::WorkFileTool;
 pub use work_status::WorkStatusTool;
 
 // MCP connector
-pub use mcp_connector::{mcp_connector_tools, McpRemoteTool};
+pub use mcp_connector::{configured_mcp_servers, mcp_connector_tools, McpRemoteTool};
 
 /// Collect all built-in tools that require no external backend into a Vec.
 ///

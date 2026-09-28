@@ -130,13 +130,6 @@ const PROMOTED: &[Phase] = &[Phase::One, Phase::Six];
 /// the report still runs it, and it turns the suite red the day it passes,
 /// so it leaves this list the same day.
 const HELD_BACK: &[(u8, &str)] = &[
-    (
-        30,
-        "a cron firing still runs as a task-queue conversation: moving it onto a work item \
-         needs the job's persistent conversation, SKILL.md injection and per-job delivery \
-         target carried into the worker run, and a gate that holds local leases while an \
-         interactive turn runs (plan 12.1)",
-    ),
     // Phase 6: the avoidable-escalation criterion reads questions through
     // `rustykrab_dream::QuestionReader`, which the daemon wires to nothing
     // until Phase 4's `questions` table and `/api/questions` land.
@@ -1402,7 +1395,13 @@ async fn s30(ctx: &Ctx) -> Result<()> {
         spans.len() == 2 && (spans[0].1 <= spans[1].0 || spans[1].1 <= spans[0].0),
         "the overdue jobs ran together: {spans:?}"
     );
-    let listed: Vec<String> = list(ctx, "").await?.iter().map(id).collect();
+    // Done by now, so listed with the closed items (`work list --all`):
+    // plain `work list` is open items only (plan 14.2).
+    let listed: Vec<String> = list(ctx, "include_closed=true")
+        .await?
+        .iter()
+        .map(id)
+        .collect();
     for firing in &firings {
         ensure!(
             listed.contains(firing),
