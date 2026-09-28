@@ -1308,19 +1308,31 @@ async fn main() -> anyhow::Result<()> {
     // One KV slot per model (plan 12.1): the local worker and the runs of
     // a peer's briefs on this node (peers.rs) wait on the same one.
     let model_slot = Arc::new(tokio::sync::Semaphore::new(1));
-    let local_worker: Arc<dyn rustykrab_control::worker::Worker> = Arc::new(
-        rustykrab_agent::LocalWorker::new(
-            fleet.local_name.clone(),
-            agent_defs::worker_definition(&agent_definitions, &fleet.local_name),
-            provider.clone(),
-            tools.clone(),
-            Arc::new(ProcessSandbox::new()),
-            deferred_work_backend.clone() as Arc<dyn rustykrab_tools::WorkBackend>,
-        )
-        .with_transcripts(scheduled_work::transcripts(&store, skill_registry.clone()))
-        .with_late_tools(fleet.skills.clone())
-        .with_slot(model_slot.clone()),
-    );
+    // RUSTYKRAB_LOCAL_WORKER=off: a daemon with no local model registers no
+    // local worker, so routing never leases an item to one (fleet.rs).
+    let local_worker_on = fleet::local_worker_enabled();
+    let local_worker: Option<Arc<dyn rustykrab_control::worker::Worker>> = if local_worker_on {
+        Some(Arc::new(
+            rustykrab_agent::LocalWorker::new(
+                fleet.local_name.clone(),
+                agent_defs::worker_definition(&agent_definitions, &fleet.local_name),
+                provider.clone(),
+                tools.clone(),
+                Arc::new(ProcessSandbox::new()),
+                deferred_work_backend.clone() as Arc<dyn rustykrab_tools::WorkBackend>,
+            )
+            .with_transcripts(scheduled_work::transcripts(&store, skill_registry.clone()))
+            .with_late_tools(fleet.skills.clone())
+            .with_slot(model_slot.clone()),
+        ))
+    } else {
+        tracing::info!(
+            worker = %fleet.local_name,
+            "local worker off ({}=off): none registered or leased to",
+            fleet::LOCAL_WORKER_ENV
+        );
+        None
+    };
     let delegated_runs = peers::delegated_runs(peers::NodeParts {
         name: fleet.local_name.clone(),
         definition: agent_defs::worker_definition(&agent_definitions, &fleet.local_name),
@@ -1360,6 +1372,7 @@ async fn main() -> anyhow::Result<()> {
     let work_tool_names = work_host::add_work_tools(&mut tools, controller.clone());
     tracing::info!(
         worker = %fleet.local_name,
+        local_worker = if local_worker_on { "on" } else { "off" },
         notices = control_notice_channel,
         "control layer registered"
     );
