@@ -195,6 +195,14 @@ pub enum BlockedReason {
     UpstreamExpired,
 }
 
+/// How a worker shapes a `blocked` report, spelled out once for every brief
+/// and tool description that asks for one (external and local worker briefs,
+/// the `result_report` tool), so they cannot drift apart.
+pub const BLOCKED_SHAPE_GUIDANCE: &str =
+    "blocked is {\"reason\": \"needs_decision\", \"detail\": \"the question or what you \
+     need\", \"needs\": []}, its reason one of needs_tool, needs_credential, needs_decision \
+     or needs_consent; the question goes in detail.";
+
 impl BlockedReason {
     pub const ALL: [BlockedReason; 10] = [
         BlockedReason::NeedsCredential,

@@ -1068,11 +1068,10 @@ pub fn render_brief(brief: &Brief) -> String {
     out.push_str(
         "End this run with one result_report call, as your last call. Put pointers in it \
          (paths, URLs, ids), not content. If you cannot finish, set blocked or error (what \
-         failed). blocked is {\"reason\": \"needs_decision\", \"detail\": \"the question or \
-         what you need\", \"needs\": []}, its reason one of needs_tool, needs_credential, \
-         needs_decision or needs_consent; the question goes in detail. Follow-up work goes in discovered. Text alone does not end \
-         this run.",
+         failed). ",
     );
+    out.push_str(rustykrab_core::work::BLOCKED_SHAPE_GUIDANCE);
+    out.push_str(" Follow-up work goes in discovered. Text alone does not end this run.");
     out
 }
 

@@ -1389,11 +1389,10 @@ pub fn render_executor_brief(
          read.\n\
          - Follow-up work you notice goes in \"discovered\", one draft each; do not do it.\n\
          - If you cannot finish, set \"blocked\" or \"error\" (class, subclass, detail) \
-         instead of guessing. \"blocked\" is {\"reason\": \"needs_decision\", \"detail\": \
-         \"the question or what you need\", \"needs\": []}, its reason one of needs_tool, \
-         needs_credential, needs_decision or needs_consent; the question goes in \"detail\".\n\
-         End with one JSON object and nothing after it, the result contract:\n",
+         instead of guessing. ",
     );
+    out.push_str(rustykrab_core::work::BLOCKED_SHAPE_GUIDANCE);
+    out.push_str("\nEnd with one JSON object and nothing after it, the result contract:\n");
     out.push_str(CONTRACT_SHAPE);
     out.push('\n');
     out
