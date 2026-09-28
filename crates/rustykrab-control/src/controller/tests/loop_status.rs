@@ -3,7 +3,7 @@
 
 use super::super::tick::failure_class;
 use super::*;
-use crate::handle::LoopStatus;
+use crate::handle::{LockState, LoopStatus};
 
 impl Harness {
     /// Make the next tick fail with `err`, then tick and return its error.
@@ -83,6 +83,37 @@ async fn a_completed_tick_resets_the_count_and_keeps_the_last_failure() {
 
     h.failing_tick(Error::Config("bad".into())).await;
     assert_eq!(h.loop_status().consecutive_failed_ticks, 1);
+}
+
+#[tokio::test]
+async fn tick_refuses_while_the_loop_waits_on_the_lock_and_ticks_otherwise() {
+    let h = Harness::new(&["pinch"]);
+
+    h.ctl.state().lock = Some(LockState::Waiting);
+    let err = ControlHandle::tick(&h.ctl)
+        .await
+        .expect_err("a waiting loop does not tick");
+    assert!(matches!(err, Error::LockWaiting(_)), "{err}");
+    assert!(err.to_string().contains("controller.lock"), "{err}");
+    let status = h.loop_status();
+    assert_eq!(status.last_tick, None, "the refusal ran no pass");
+    assert_eq!(
+        status.consecutive_failed_ticks, 0,
+        "a refusal is not a failed tick"
+    );
+
+    h.ctl.state().lock = Some(LockState::Held);
+    ControlHandle::tick(&h.ctl)
+        .await
+        .expect("a loop holding the lock ticks");
+    assert_eq!(h.loop_status().last_tick, Some(h.clock.now()));
+
+    h.clock.advance(TimeDelta::seconds(1));
+    h.ctl.state().lock = None;
+    ControlHandle::tick(&h.ctl)
+        .await
+        .expect("a controller no loop drives ticks");
+    assert_eq!(h.loop_status().last_tick, Some(h.clock.now()));
 }
 
 #[test]

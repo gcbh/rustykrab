@@ -194,6 +194,12 @@ pub enum Error {
     #[error("change to '{name}' needs your approval (request {request_id})")]
     PendingApproval { request_id: String, name: String },
 
+    /// A lock another process holds refused the call before it did
+    /// anything: the controller's `tick` while its loop is `waiting` on
+    /// `controller.lock`. Retry once the holder releases it.
+    #[error("lock waiting: {0}")]
+    LockWaiting(String),
+
     #[error("{0}")]
     Internal(String),
 }
@@ -216,9 +222,10 @@ impl Error {
             // The agent asked for something it isn't allowed to do
             // unilaterally; the user now has to decide.
             Error::PendingApproval { .. } => ToolErrorKind::PermissionDenied,
-            Error::ModelProvider(_) | Error::ModelEmptyResponse(_) | Error::Channel(_) => {
-                ToolErrorKind::Transient
-            }
+            Error::ModelProvider(_)
+            | Error::ModelEmptyResponse(_)
+            | Error::Channel(_)
+            | Error::LockWaiting(_) => ToolErrorKind::Transient,
             Error::Config(_)
             | Error::Storage(_)
             | Error::Serialization(_)
