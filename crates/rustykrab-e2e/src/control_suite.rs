@@ -262,13 +262,21 @@ pub(crate) fn scenarios() -> Vec<(Expected, (&'static str, ScenarioFn))> {
 /// Fleet behaviour outside the plan's section 15, so outside the numbered
 /// catalog and its promotion rule: each is must-pass from the day it lands.
 fn fleet_scenarios() -> Vec<(Expected, (&'static str, ScenarioFn))> {
-    vec![(
-        Expected::Pass,
+    vec![
         (
-            "control/local-worker-off-leases-to-the-external-worker",
-            |ctx| Box::pin(local_worker_off(ctx)),
+            Expected::Pass,
+            (
+                "control/local-worker-off-leases-to-the-external-worker",
+                |ctx| Box::pin(local_worker_off(ctx)),
+            ),
         ),
-    )]
+        (
+            Expected::Pass,
+            ("control/two-daemons-one-data-dir-only-one-ticks", |ctx| {
+                Box::pin(two_daemons_one_data_dir(ctx))
+            }),
+        ),
+    ]
 }
 
 // ── Phase 1: work items and the controller skeleton ──────────────────
@@ -1795,6 +1803,116 @@ async fn local_worker_off(shared: &Ctx) -> Result<()> {
             .any(|w| w["kind"] == "local" && w["live"] == true),
         "GET /api/workers lists a live local worker: {after:?}"
     );
+    Ok(())
+}
+
+/// A scripted daemon sharing a data directory with another, killed when
+/// the scenario ends however it ends.
+struct CutoverDaemon {
+    base: String,
+    child: Option<std::process::Child>,
+}
+
+impl Drop for CutoverDaemon {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+impl CutoverDaemon {
+    /// Boot a daemon on `dir`, keeping its log as `log` so a second boot
+    /// on the same directory does not truncate the first one's.
+    async fn boot(shared: &Ctx, dir: &std::path::Path, log: &str) -> Result<CutoverDaemon> {
+        let port = crate::pick_free_port()?;
+        let child = crate::spawn_daemon(&shared.bin, dir, port, None)?;
+        // The daemon writes through its open handle, so the rename moves
+        // the whole log, before and after.
+        std::fs::rename(dir.join("daemon.log"), dir.join(log))?;
+        let mut daemon = CutoverDaemon {
+            base: format!("http://127.0.0.1:{port}"),
+            child: Some(child),
+        };
+        let child = daemon.child.as_mut().expect("just spawned");
+        crate::wait_for_health(&daemon.base, &shared.client, child)
+            .await
+            .with_context(|| {
+                format!(
+                    "{log}: {}",
+                    std::fs::read_to_string(dir.join(log)).unwrap_or_default()
+                )
+            })?;
+        Ok(daemon)
+    }
+
+    /// `controller.lock` as `GET /api/version` reports it: `"held"`,
+    /// `"waiting"`, or `null` before the loop first tries the lock.
+    async fn lock(&self, shared: &Ctx) -> Result<Value> {
+        let body: Value = shared
+            .client
+            .get(format!("{}/api/version", self.base))
+            .bearer_auth(crate::AUTH_TOKEN)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        Ok(body["controller"]["lock"].clone())
+    }
+
+    /// Poll until the lock reads `want`, for up to 30 seconds (the scripted
+    /// daemon ticks every second).
+    async fn wait_lock(&self, shared: &Ctx, want: &str) -> Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let lock = self.lock(shared).await?;
+            if lock == want {
+                return Ok(());
+            }
+            ensure!(
+                Instant::now() < deadline,
+                "{} never reported controller.lock {want:?}; last {lock}",
+                self.base
+            );
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+
+    async fn stop(mut self) {
+        if let Some(child) = self.child.take() {
+            crate::shutdown_daemon(child).await;
+        }
+    }
+}
+
+/// An update's cutover: two daemons on one data directory. Exactly one
+/// holds `controller.lock` and ticks, the other reports `waiting` on
+/// `GET /api/version`, and once the holder stops the waiting one takes
+/// the lock and reports `held`. Boots its own pair, since stopping the
+/// shared daemon would take it from every scenario after this one.
+async fn two_daemons_one_data_dir(shared: &Ctx) -> Result<()> {
+    let dir = tempfile::Builder::new()
+        .prefix("rustykrab-e2e-cutover-")
+        .tempdir()?;
+    let first = CutoverDaemon::boot(shared, dir.path(), "daemon-first.log").await?;
+    first.wait_lock(shared, "held").await?;
+
+    let second = CutoverDaemon::boot(shared, dir.path(), "daemon-second.log").await?;
+    second.wait_lock(shared, "waiting").await?;
+    // Give the waiting loop several more ticks: it must keep waiting, and
+    // the holder must keep holding, while both run.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let (a, b) = (first.lock(shared).await?, second.lock(shared).await?);
+    ensure!(
+        a == "held" && b == "waiting",
+        "with both running, expected held/waiting, got {a}/{b}"
+    );
+
+    first.stop().await;
+    second.wait_lock(shared, "held").await?;
+    second.stop().await;
     Ok(())
 }
 
