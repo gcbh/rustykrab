@@ -8,7 +8,8 @@ use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Params};
 use uuid::Uuid;
 
 use rustykrab_core::work::{
-    Edge, EventKind, Evidence, InputRef, Lease, Status, Trigger, WorkEvent, WorkItem, WorkKind,
+    ArtifactRef, Edge, EventKind, Evidence, InputRef, Lease, Status, Trigger, WorkEvent, WorkItem,
+    WorkKind,
 };
 
 use super::rows::{
@@ -75,7 +76,30 @@ pub(super) fn apply(
             crate::proposals::put_facets(conn, item, facets).map_err(WorkStoreError::from)
         }
         WorkOp::ReleaseHold(item) => release_hold(conn, item, now),
+        WorkOp::AddArtifactRef { item, artifact } => add_artifact_ref(conn, item, artifact, now),
     }
+}
+
+/// Append `artifact` to an item's refs unless it is already there.
+/// Refused for an id no live item has.
+pub(super) fn add_artifact_ref(
+    conn: &Connection,
+    item: &str,
+    artifact: &ArtifactRef,
+    now: DateTime<Utc>,
+) -> Result<(), WorkStoreError> {
+    let Some(mut row) = get_item(conn, item)? else {
+        return Err(WorkStoreError::NotFound(format!("work item {item}")));
+    };
+    if row.artifact_refs.contains(artifact) {
+        return Ok(());
+    }
+    row.artifact_refs.push(artifact.clone());
+    conn.execute(
+        "UPDATE work_items SET artifact_refs = ?2, updated_at = ?3 WHERE id = ?1",
+        params![item, to_json(&row.artifact_refs)?, ts(&now)],
+    )?;
+    Ok(())
 }
 
 /// Clear an item's approval hold. Refused for an id no live item has.

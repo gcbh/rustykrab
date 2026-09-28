@@ -570,6 +570,66 @@ async fn the_ladder_reuses_an_internal_item_only_in_the_same_repository() {
 }
 
 #[tokio::test]
+async fn a_reused_internal_item_names_every_failing_item_as_evidence() {
+    let h = Harness::with(
+        ControllerConfig::default(),
+        StaticCatalog::default(),
+        &["pinch"],
+    );
+    let failing = [
+        ("Port the parser", "repo:/src/app"),
+        ("Port the lexer", "repo:/src/lib"),
+        ("Port the printer", "repo:/src/app"),
+    ];
+    for (title, repo) in failing {
+        h.script.push(
+            title,
+            Step::Fail(Error::Internal("flux capacitor desynchronised".to_string())),
+        );
+        let mut x = code_follow_up("x", title);
+        x.writable_resources = vec![repo.to_string()];
+        h.file_one(x).await;
+    }
+    for _ in 0..6 {
+        h.step().await;
+    }
+    let internal = h.of_kind(WorkKind::Internal).await;
+    let evidence_of = |repo: &str| -> Vec<String> {
+        let item = internal
+            .iter()
+            .find(|i| i.writable_resources == vec![repo.to_string()])
+            .unwrap_or_else(|| panic!("no internal item for {repo}: {internal:?}"));
+        item.artifact_refs
+            .iter()
+            .filter(|r| r.kind == "item")
+            .map(|r| r.value.clone())
+            .collect()
+    };
+    let mut named = Vec::new();
+    for repo in ["repo:/src/app", "repo:/src/lib"] {
+        let mut titles = Vec::new();
+        for id in evidence_of(repo) {
+            titles.push(h.item(&id).await.title);
+        }
+        titles.sort();
+        named.push(titles);
+    }
+    assert_eq!(
+        named[0],
+        vec![
+            "Port the parser".to_string(),
+            "Port the printer".to_string()
+        ],
+        "the reused item names both failures in its repository"
+    );
+    assert_eq!(
+        named[1],
+        vec!["Port the lexer".to_string()],
+        "the other repository's failure stays on its own item"
+    );
+}
+
+#[tokio::test]
 async fn hold_discovered_holds_the_ladders_internal_item_for_consent() {
     let item = internal_item_for_a_failing_code_item(true).await;
     assert_eq!(item.status, Status::Blocked(BlockedReason::NeedsConsent));

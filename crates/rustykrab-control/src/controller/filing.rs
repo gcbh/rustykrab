@@ -644,7 +644,25 @@ impl Controller {
                 && i.title == draft.title
                 && repos_of(&i.writable_resources) == repos
         }) {
-            return Ok(open.id.clone());
+            // The later failure is evidence too: add what the draft names
+            // that the open item does not have yet.
+            let id = open.id.clone();
+            let fresh: Vec<ArtifactRef> = draft
+                .artifact_refs
+                .iter()
+                .filter(|r| !open.artifact_refs.contains(r))
+                .cloned()
+                .collect();
+            for artifact in fresh {
+                if let Some(row) = b.snap.item_mut(&id) {
+                    row.artifact_refs.push(artifact.clone());
+                }
+                b.ops.push(WorkOp::AddArtifactRef {
+                    item: id.clone(),
+                    artifact,
+                });
+            }
+            return Ok(id);
         }
         let tmp = "internal".to_string();
         draft.tmp = Some(tmp.clone());
