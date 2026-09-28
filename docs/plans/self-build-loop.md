@@ -362,3 +362,36 @@ Gate: 1,908 unit tests, 79 environment variables documented; e2e 56
 pass, 13 xfail, 0 fail. The builder runs `9956a02`, redeployed through
 `update stage --from` with a run in flight, which was interrupted and
 requeued as designed.
+
+## Ninth and tenth cycles (2026-09-28)
+
+Slice 6 parts 2b and 3 verified, as did eight smaller items:
+- a redirect test for the downloader;
+- runtime-built variable names in the env-docs check;
+- rate-limited drain logging;
+- an interrupted run keeping the spend it had reached;
+- the model-cache variable;
+- two tests;
+- one item that ran out of turns and was cancelled as low value.
+
+Follow-ups filed since the redeploy carry their filer's eight
+constraints.
+
+The fourth security review of slice 6 cleared parts 2b and 3 and set out
+what remains before each use of the gate:
+- **For the builder's script service:** recovery must verify what it
+  starts, and a few smaller checks. That is part 4, now building. Part 4
+  also narrows the CLI gate so the script service runs without the
+  override.
+- **For launchd, on the owner's machine:** the probe must stop sending
+  the Keychain-held token to whatever process answers on the port, the
+  updater job must be built, and the owner must decide on worker
+  isolation.
+
+Once part 4 merges and is reviewed, the builder can be redeployed by
+`rustykrab update apply` itself rather than by hand. That is the first
+time the loop would update the system that runs it without a person
+swapping files.
+
+Gate: 1,933 unit tests, 80 environment variables and 5 runtime patterns
+documented; e2e 56 pass, 13 xfail, 0 fail. The builder runs `90cd700`.
