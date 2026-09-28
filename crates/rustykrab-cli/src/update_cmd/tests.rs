@@ -685,6 +685,81 @@ async fn the_token_goes_to_the_api_host_only() {
     );
 }
 
+/// The asset URL names the API's own host, so the token goes with it, but
+/// that URL redirects to another host: the redirected request carries none.
+#[tokio::test]
+async fn a_redirect_to_another_host_drops_the_token() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base = format!("http://{addr}");
+    let bytes = archive();
+    let name = format!("rustykrab-{TARGET}.tar.gz");
+    let release = serde_json::json!({
+        "tag_name": "v5.4.0",
+        "assets": [{
+            "name": name,
+            "browser_download_url": format!("{base}/redirect/{name}"),
+            "digest": format!("sha256:{}", sha256_hex(&bytes)),
+            "size": bytes.len() as u64,
+        }],
+    });
+    // `localhost` reaches the same listener under another host.
+    let elsewhere = format!("http://localhost:{}/download/{name}", addr.port());
+    let auth = Arc::new(Mutex::new(Vec::<String>::new()));
+    let seen = |auth: &Arc<Mutex<Vec<String>>>, route: &str, headers: &axum::http::HeaderMap| {
+        let header = headers
+            .get("authorization")
+            .map(|v| v.to_str().unwrap_or("?").to_string())
+            .unwrap_or_else(|| "none".to_string());
+        auth.lock().unwrap().push(format!("{route}:{header}"));
+    };
+    let (a1, a2, a3) = (auth.clone(), auth.clone(), auth.clone());
+    let app = Router::new()
+        .route(
+            "/repos/gcbh/rustykrab/releases/latest",
+            get(move |headers: axum::http::HeaderMap| {
+                seen(&a1, "release", &headers);
+                let release = release.clone();
+                async move { axum::Json(release) }
+            }),
+        )
+        .route(
+            &format!("/redirect/{name}"),
+            get(move |headers: axum::http::HeaderMap| {
+                seen(&a2, "redirect", &headers);
+                let to = elsewhere.clone();
+                async move { axum::response::Redirect::temporary(&to) }
+            }),
+        )
+        .route(
+            &format!("/download/{name}"),
+            get(move |headers: axum::http::HeaderMap| {
+                seen(&a3, "download", &headers);
+                let bytes = bytes.clone();
+                async move { bytes }
+            }),
+        );
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let data = tempfile::tempdir().unwrap();
+    let cfg = Config {
+        token: Some("ghp_secret".to_string()),
+        ..config(data.path(), &base)
+    };
+    let outcome = stage_release(&cfg, &Scripted::passing("5.4.0"), false)
+        .await
+        .unwrap();
+    assert!(matches!(outcome, StageOutcome::Staged(_)));
+    assert_eq!(
+        *auth.lock().unwrap(),
+        vec![
+            "release:Bearer ghp_secret".to_string(),
+            "redirect:Bearer ghp_secret".to_string(),
+            "download:none".to_string(),
+        ]
+    );
+}
+
 #[test]
 fn an_asset_url_must_be_https_unless_the_api_is_a_local_http_stand_in() {
     let api = "https://api.github.com";
