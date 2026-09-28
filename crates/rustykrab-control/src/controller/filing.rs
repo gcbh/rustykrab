@@ -397,9 +397,12 @@ impl Controller {
     /// parent they file as one graph, scoped to that subtree; an item with
     /// no parent files each draft as its own root. Each draft inherits the
     /// item's `repo:` resources and worker constraint unless it sets its own
-    /// ([`inherit_from`]), and drafts sharing an inherited repository are
-    /// ordered ([`order_inherited_writers`]). A rejection is recorded on the
-    /// item. Returns the ids to settle.
+    /// ([`inherit_from`]), drafts sharing an inherited repository are
+    /// ordered ([`order_inherited_writers`]), and every draft runs after the
+    /// open writers of its repositories under the parent
+    /// ([`order_after_open_writers`]), whether it inherited the repository or
+    /// named it. A rejection is recorded on the item. Returns the ids to
+    /// settle.
     pub(super) fn file_discovered(
         &self,
         b: &mut Batch,
@@ -424,6 +427,7 @@ impl Controller {
         let plans: Vec<WorkPlan> = match &item.parent {
             Some(parent) => {
                 order_inherited_writers(&mut drafts, &inherited);
+                order_after_open_writers(&b.snap, parent, &mut drafts);
                 vec![WorkPlan {
                     root: ItemRef::Id(parent.clone()),
                     items: drafts,
@@ -960,6 +964,38 @@ fn order_inherited_writers(drafts: &mut [WorkItemDraft], inherited: &[Vec<String
                 drafts[i].edges.push(DraftEdge {
                     kind: EdgeKind::Blocks,
                     depends_on,
+                });
+            }
+        }
+    }
+}
+
+/// Discovered drafts filed under `root` run after the open items already
+/// there that write one of their repositories: each gets a `blocks` edge
+/// on every such open leaf, unless it already names one or files under it.
+/// A discovered draft is follow-up work, so it queues behind the writers in
+/// flight rather than rejecting the filing as a `single_writer_conflict`;
+/// this holds for a repository the draft named as for one it inherited.
+fn order_after_open_writers(snap: &Snapshot, root: &str, drafts: &mut [WorkItemDraft]) {
+    let writers: Vec<&WorkItem> = snap
+        .descendants(root)
+        .iter()
+        .filter_map(|id| snap.item(id))
+        .filter(|i| !i.status.is_closed() && !snap.has_children(&i.id))
+        .collect();
+    for d in drafts.iter_mut() {
+        for w in &writers {
+            let writes = d
+                .writable_resources
+                .iter()
+                .any(|r| is_repo(r) && w.writable_resources.contains(r));
+            let upstream = ItemRef::Id(w.id.clone());
+            let linked = d.parent.as_ref() == Some(&upstream)
+                || d.edges.iter().any(|e| e.depends_on == upstream);
+            if writes && !linked {
+                d.edges.push(DraftEdge {
+                    kind: EdgeKind::Blocks,
+                    depends_on: upstream,
                 });
             }
         }
