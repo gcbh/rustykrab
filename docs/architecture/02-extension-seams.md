@@ -24,9 +24,10 @@ weight. Counts are `impl X for` occurrences including test doubles.
 | `VideoBackend` | **`tools`** | 1 | Fine — implementation is in the same crate |
 | `SessionManager` | **`tools`** | 1 | Correctly implemented above the consumer |
 | `WorkBackend` | **`tools`** `work_backend.rs` | 1 stub | Correctly placed above the consumer: the `work_file`, `work_status` and `result_report` tools call it; the controller adapter in `rustykrab-cli` implements it (Phase 1, round 2) |
-| `Worker` | **`control`** `worker.rs` | 1 | Correctly placed: the controller calls it, and `LocalWorker` in `rustykrab-agent` implements it above the controller. Peer, Claude Code and Codex workers are the later implementations |
-| `ToolCatalog` | **`control`** `controller/mod.rs` | 2 | Earns its keep: `StaticCatalog` for tests, `RegistryCatalog` in `rustykrab-cli` over the final tool registry and the active-tools seed (registered but unloaded tools, configured MCP servers) |
-| `RunTranscripts` | **`agent`** `local_worker.rs` | 1 + 1 test | Correctly placed: `LocalWorker` keeps each run's conversation through it, and `StoreTranscripts` in `rustykrab-cli` implements it over the conversation store, which `agent` does not depend on |
+| `Worker` | **`control`** `worker.rs` | 1 | Correctly placed: the controller calls it, and `LocalWorker` in `rustykrab-agent` implements it above the controller. Its defaulted `usage` carries a run's spend and completion-reminder count back to the controller. Peer, Claude Code and Codex workers are the later implementations |
+| `ToolCatalog` | **`control`** `controller/mod.rs` | 2 | Earns its keep: `StaticCatalog` for tests, `RegistryCatalog` in `rustykrab-cli` over the final tool registry and the active-tools seed (registered but unloaded tools, MCP servers named in `RUSTYKRAB_MCP_SERVERS` or with registered tools) |
+| `ModelActivity` | **`control`** `controller/mod.rs` | 1 + 1 test | Earns its keep: plan 12.1's busy signal, the controller's only view of interactive turns; `TurnActivity` in `rustykrab-cli` implements it over the gateway's `ActivityTracker`, which the controller does not depend on |
+| `RunTranscripts` | **`agent`** `local_worker.rs` | 1 + 2 test | Correctly placed: `LocalWorker` keeps each run's conversation through it and, through its defaulted `resume`, continues a kept one; `JobTranscripts` in `rustykrab-cli` implements it over the conversation store (which `agent` does not depend on) and resumes a scheduled firing's job conversation with its SKILL.md and prompt |
 | `Skill` | `skills/skill.rs` | 1 | Thin — `SkillMd` is the only shape |
 | `Channel` | `channels/channel.rs` | **1** | **Not earning its keep** |
 | `GatewayBackend` | `tools/gateway_backend.rs` | **0** | **Dead** |

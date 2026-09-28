@@ -39,9 +39,9 @@ rustykrab-core        (no internal deps — the contract layer)
    rustykrab-runtime (core, store, agent, memory, skills)   <-- NEW
         ^      ^
         |      |
-        |      +-- rustykrab-gateway  (+ channels)
+        |      +-- rustykrab-gateway  (+ channels, control)
         |               ^
-        +---------------+-- rustykrab-cli
+        +---------------+-- rustykrab-cli  (+ control)
 
 rustykrab-projects    (no internal deps — immutable planning domain)
    ^                  ^
@@ -52,6 +52,16 @@ rustykrab-projects    (no internal deps — immutable planning domain)
 rustykrab-e2e         (core, store, tools, agent, providers)
                      daemon boundary tests + direct production-compactor ablation
 ```
+
+`rustykrab-control` is the control layer of
+`docs/plans/control-layer-and-worker-fleet.md`: the work-item graph, the
+resolution ladder, the error taxonomy and the controller loop, over the
+store, with the `Worker` trait `rustykrab-agent` implements (`LocalWorker`).
+The gateway depends on it directly for `/api/work` (its `ControlHandle`, the
+reply types and the re-exported `Provenance`, so the gateway needs no direct
+dependency on `rustykrab-tools`), and the CLI for the `work` subcommand and
+the composition root, which builds the controller, its local worker and its
+host wiring (tick loop, notice delivery, scheduled firings).
 
 `rustykrab-runtime` is new since the first pass and is the significant change
 to the shape of the system. The turn-running layer used to live inside the
@@ -66,7 +76,7 @@ no axum in its dependency tree.
 | Contracts | `core` | `Tool`, `ModelProvider`, `MemoryBackend`, `Capability`, `Session`, token estimation |
 | Planning domain | `projects` | Immutable revisions, provenance rules, validated planning graph, deterministic projections |
 | Capability providers | `providers`, `store`, `memory`, `skills`, `channels` | Each owns one external dependency |
-| Behaviour | `tools`, `agent` | Tool implementations; the model-call/tool-exec loop |
+| Behaviour | `tools`, `control`, `agent` | Tool implementations; the control layer (work items, ladder, controller loop); the model-call/tool-exec loop and the local worker |
 | Application service | **`runtime`** | Assemble a turn: prompt, session, capabilities, memory hooks |
 | Transport | `gateway`, channel loops in `cli` | HTTP/SSE, Telegram polling, Slack events |
 | Composition | `cli` | Read env, build everything, spawn background tasks |
@@ -91,7 +101,11 @@ main()
  ├─ slack_agent_loop               events     -> process_slack_message
  ├─ signal receive loop
  ├─ job_executor_loop              30s tick   -> due cron jobs -> TaskQueue
+ │   (or, with RUSTYKRAB_CRON_WORK_ITEMS=1, scheduled_work: each firing
+ │    filed as a work item the controller runs)
  ├─ TaskQueue worker               in-memory mpsc, bounded
+ ├─ controller tick loop           work items: lease, run, reconcile, age
+ ├─ work notice delivery           the work outbox, to each item's thread
  ├─ delegated-task worker          durable queue in `delegated_tasks`
  ├─ memory idle lifecycle sweep
  ├─ memory FTS5 index rebuild      once, at boot
