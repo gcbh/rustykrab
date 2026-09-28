@@ -165,6 +165,33 @@ impl Default for Retention {
 const SIGKILL: i32 = 9;
 const SIGTERM: i32 = 15;
 
+/// How long a run its wall limit ended gets for its pipes to drain once its
+/// group is killed.
+const DRAIN_GRACE: Duration = Duration::from_secs(2);
+
+/// Copy `pipe` into a buffer as it arrives, so what a run printed survives
+/// the run being ended. The task finishes at end of file.
+fn capture<R>(pipe: Option<R>) -> (Arc<Mutex<Vec<u8>>>, tokio::task::JoinHandle<()>)
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    use tokio::io::AsyncReadExt as _;
+    let buf = Arc::new(Mutex::new(Vec::new()));
+    let task = tokio::spawn({
+        let buf = buf.clone();
+        async move {
+            let Some(mut pipe) = pipe else { return };
+            let mut chunk = [0u8; 8192];
+            while let Ok(n @ 1..) = pipe.read(&mut chunk).await {
+                buf.lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .extend_from_slice(&chunk[..n]);
+            }
+        }
+    });
+    (buf, task)
+}
+
 /// Send `signal` to every process in group `group`; 0 only probes. Whether
 /// the call succeeded, which for a probe means the group still exists.
 #[cfg(unix)]
@@ -645,19 +672,25 @@ impl ExternalWorker {
 
     /// Start `cmd` in a process group recorded in [`RunGroups`] and wait
     /// for it, up to `limit`. Whatever it left running in its group is
-    /// killed when this returns. Also says whether daemon shutdown
+    /// killed when this returns. Its output is read as it arrives, so a run
+    /// its wall limit ended still hands back what it had printed (the
+    /// second value, only then). Also says whether daemon shutdown
     /// ([`RunGroups::terminate_all`]) ended the group, which must be read
     /// before the group is let go.
     async fn execute(
         &self,
         mut cmd: tokio::process::Command,
         limit: Duration,
-    ) -> (Result<std::process::Output>, bool) {
-        let child = match cmd.spawn() {
+    ) -> (
+        Result<std::process::Output>,
+        Option<std::process::Output>,
+        bool,
+    ) {
+        let mut child = match cmd.spawn() {
             Ok(child) => child,
             Err(e) => {
                 let why = format!("cannot start {}: {e}", self.config.command.display());
-                return (Err(process_failure(None, &why)), false);
+                return (Err(process_failure(None, &why)), None, false);
             }
         };
         // The agent leads its own group, so the group id is its pid.
@@ -665,25 +698,65 @@ impl ExternalWorker {
             .id()
             .and_then(|pid| i32::try_from(pid).ok())
             .map(|pid| self.groups.enter(pid));
-        let output = match tokio::time::timeout(limit, child.wait_with_output()).await {
-            // The child was dropped with the future, and killed; the rest
-            // of its group goes when `group` does.
-            Err(_) => Err(RunFailure::Budget {
-                budget: BudgetKind::Wall,
-                detail: format!(
-                    "{}s wall budget spent before {} returned",
-                    limit.as_secs(),
-                    self.config.command.display()
-                ),
-            }
-            .into_error()),
-            Ok(Err(e)) => Err(process_failure(None, &e.to_string())),
-            Ok(Ok(output)) => Ok(output),
-        };
+        let (stdout, mut stdout_task) = capture(child.stdout.take());
+        let (stderr, mut stderr_task) = capture(child.stderr.take());
+        let finished = tokio::time::timeout(limit, async {
+            let status = child.wait().await;
+            let _ = (&mut stdout_task).await;
+            let _ = (&mut stderr_task).await;
+            status
+        })
+        .await;
+        if finished.is_err() {
+            let _ = child.start_kill();
+        }
         let interrupted = group.as_ref().is_some_and(GroupGuard::interrupted);
-        // Whatever the agent left running in its group goes with it.
+        // Whatever the agent left running in its group goes with it, which
+        // also closes the pipes it held.
         drop(group);
-        (output, interrupted)
+        let taken = |buf: &Arc<Mutex<Vec<u8>>>| {
+            std::mem::take(&mut *buf.lock().unwrap_or_else(|e| e.into_inner()))
+        };
+        match finished {
+            Ok(Ok(status)) => {
+                let output = std::process::Output {
+                    status,
+                    stdout: taken(&stdout),
+                    stderr: taken(&stderr),
+                };
+                (Ok(output), None, interrupted)
+            }
+            Ok(Err(e)) => (
+                Err(process_failure(None, &e.to_string())),
+                None,
+                interrupted,
+            ),
+            Err(_) => {
+                // Let the readers drain what is still in the pipes, briefly.
+                let _ = tokio::time::timeout(DRAIN_GRACE, async {
+                    let _ = (&mut stdout_task).await;
+                    let _ = (&mut stderr_task).await;
+                })
+                .await;
+                stdout_task.abort();
+                stderr_task.abort();
+                let partial = child.wait().await.ok().map(|status| std::process::Output {
+                    status,
+                    stdout: taken(&stdout),
+                    stderr: taken(&stderr),
+                });
+                let failure = RunFailure::Budget {
+                    budget: BudgetKind::Wall,
+                    detail: format!(
+                        "{}s wall budget spent before {} returned",
+                        limit.as_secs(),
+                        self.config.command.display()
+                    ),
+                }
+                .into_error();
+                (Err(failure), partial, interrupted)
+            }
+        }
     }
 
     /// Resume a Claude Code session that stopped at its turn cap and ask
@@ -703,10 +776,15 @@ impl ExternalWorker {
             return (None, false);
         }
         let cmd = self.command(&resume_prompt(), dir, brief, last, Some(session));
-        let (executed, interrupted) = self.execute(cmd, limit).await;
+        let (executed, partial, interrupted) = self.execute(cmd, limit).await;
         let recovered = match executed {
             Ok(output) => self.read_output(brief, run, &output, last, true).0,
-            Err(e) => Err(e),
+            Err(e) => {
+                if let Some(partial) = &partial {
+                    let _ = self.read_output(brief, run, partial, last, true);
+                }
+                Err(e)
+            }
         };
         let report = match recovered {
             // A worktree run that committed nothing has nothing to recover:
@@ -906,10 +984,17 @@ impl Worker for ExternalWorker {
             secs => self.config.timeout.min(Duration::from_secs(secs)),
         };
         let started = std::time::Instant::now();
-        let (executed, mut interrupted) = self.execute(cmd, limit).await;
+        let (executed, partial, mut interrupted) = self.execute(cmd, limit).await;
         let (mut outcome, resume) = match executed {
             Ok(output) => self.read_output(&brief, &run_id, &output, &last, false),
-            Err(e) => (Err(e), None),
+            // Ended by its wall limit: record what it had spent, and keep
+            // the timeout as the outcome.
+            Err(e) => {
+                if let Some(partial) = &partial {
+                    let _ = self.read_output(&brief, &run_id, partial, &last, false);
+                }
+                (Err(e), None)
+            }
         };
         // A run that stopped at its turn cap may still have committed its
         // work: ask the same session for the contract, within what is left
@@ -1901,6 +1986,27 @@ wait
 
         // Two turns, msg-1 counted once: 125 + 230 tokens.
         let usage = worker.usage("run-1").expect("an interrupted run has usage");
+        assert_eq!((usage.tokens, usage.iterations), (355, 2));
+        assert!(usage.wall_ms > 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_timed_out_run_keeps_the_usage_it_had_printed() {
+        let f = Fixture::new();
+        let mut worker = f.worker(WorkerKind::ClaudeCode, f.agent("claude", HALFWAY));
+        worker.config.timeout = Duration::from_millis(1500);
+        let started = std::time::Instant::now();
+        let err = worker.run(brief(None)).await.unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "killed, not waited"
+        );
+        let e = classify(&run_failure_input(&err), &Context::default());
+        assert_eq!(e.subclass, ErrorSubclass::Wall);
+
+        // Two turns, msg-1 counted once: 125 + 230 tokens.
+        let usage = worker.usage("run-1").expect("a timed-out run has usage");
         assert_eq!((usage.tokens, usage.iterations), (355, 2));
         assert!(usage.wall_ms > 0);
     }
