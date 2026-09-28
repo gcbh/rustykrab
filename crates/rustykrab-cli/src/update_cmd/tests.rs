@@ -685,10 +685,18 @@ async fn the_token_goes_to_the_api_host_only() {
     );
 }
 
-/// The asset URL names the API's own host, so the token goes with it, but
-/// that URL redirects to another host: the redirected request carries none.
-#[tokio::test]
-async fn a_redirect_to_another_host_drops_the_token() {
+/// Where [`redirected_download_auth`] sends the asset URL's redirect.
+enum RedirectTo {
+    /// `localhost` on the API's port: another host.
+    OtherHost,
+    /// `127.0.0.1` on a second listener: the same host, another port.
+    OtherPort,
+}
+
+/// Stage a release whose asset URL names the API's own host and port, so
+/// the token goes with it, and which redirects as `to` says. Returns the
+/// `route:authorization` each request arrived with.
+async fn redirected_download_auth(to: RedirectTo) -> Vec<String> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let base = format!("http://{addr}");
@@ -703,8 +711,12 @@ async fn a_redirect_to_another_host_drops_the_token() {
             "size": bytes.len() as u64,
         }],
     });
-    // `localhost` reaches the same listener under another host.
-    let elsewhere = format!("http://localhost:{}/download/{name}", addr.port());
+    let other = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let elsewhere = match to {
+        // `localhost` reaches the same listener under another host.
+        RedirectTo::OtherHost => format!("http://localhost:{}/download/{name}", addr.port()),
+        RedirectTo::OtherPort => format!("http://{}/download/{name}", other.local_addr().unwrap()),
+    };
     let auth = Arc::new(Mutex::new(Vec::<String>::new()));
     let seen = |auth: &Arc<Mutex<Vec<String>>>, route: &str, headers: &axum::http::HeaderMap| {
         let header = headers
@@ -739,7 +751,9 @@ async fn a_redirect_to_another_host_drops_the_token() {
                 async move { bytes }
             }),
         );
+    let other_app = app.clone();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    tokio::spawn(async move { axum::serve(other, other_app).await.unwrap() });
 
     let data = tempfile::tempdir().unwrap();
     let cfg = Config {
@@ -750,8 +764,31 @@ async fn a_redirect_to_another_host_drops_the_token() {
         .await
         .unwrap();
     assert!(matches!(outcome, StageOutcome::Staged(_)));
+    let seen = auth.lock().unwrap().clone();
+    seen
+}
+
+/// The asset URL's redirect goes to another host: the redirected request
+/// carries no token.
+#[tokio::test]
+async fn a_redirect_to_another_host_drops_the_token() {
     assert_eq!(
-        *auth.lock().unwrap(),
+        redirected_download_auth(RedirectTo::OtherHost).await,
+        vec![
+            "release:Bearer ghp_secret".to_string(),
+            "redirect:Bearer ghp_secret".to_string(),
+            "download:none".to_string(),
+        ]
+    );
+}
+
+/// The asset URL's redirect stays on the API's host but goes to another
+/// port, which the host-and-port rule of [`asset_request_sends_token`]
+/// treats as elsewhere: the redirected request carries no token.
+#[tokio::test]
+async fn a_redirect_to_another_port_on_the_same_host_drops_the_token() {
+    assert_eq!(
+        redirected_download_auth(RedirectTo::OtherPort).await,
         vec![
             "release:Bearer ghp_secret".to_string(),
             "redirect:Bearer ghp_secret".to_string(),
