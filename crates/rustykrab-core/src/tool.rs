@@ -90,3 +90,32 @@ pub trait Tool: Send + Sync {
     /// Execute the tool with the given arguments, returning a JSON result.
     async fn execute(&self, args: Value) -> Result<Value>;
 }
+
+/// What every tool an MCP server contributes is named with:
+/// `mcp__<server>__<remote tool>`. Grouping by server is in the name, so
+/// a definition can name a server and a catalog can list by one without a
+/// side table.
+pub const MCP_TOOL_PREFIX: &str = "mcp__";
+
+/// The MCP server a tool name belongs to (`mcp__<server>__<tool>`), or
+/// `None` for a native tool or a malformed name.
+pub fn mcp_server_of(name: &str) -> Option<&str> {
+    name.strip_prefix(MCP_TOOL_PREFIX)?
+        .split_once("__")
+        .filter(|(server, tool)| !server.is_empty() && !tool.is_empty())
+        .map(|(server, _)| server)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mcp_names_carry_their_server() {
+        assert_eq!(mcp_server_of("mcp__linear__create_issue"), Some("linear"));
+        assert_eq!(mcp_server_of("mcp__linear__a__b"), Some("linear"));
+        for native in ["read", "mcp__", "mcp____x", "mcp__linear", "mcp__linear__"] {
+            assert_eq!(mcp_server_of(native), None, "{native}");
+        }
+    }
+}

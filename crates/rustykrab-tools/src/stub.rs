@@ -141,6 +141,11 @@ pub struct StubSpec {
     /// tool scenario measures.
     pub parameters: Value,
     pub script: StubScript,
+    /// Whether the stub is declared from turn 0. `false` registers it in
+    /// the catalog only, so a case can measure the model finding it with
+    /// `tools_list` and calling it by append (plan scenario 10).
+    #[serde(default = "default_true")]
+    pub visible: bool,
 }
 
 /// Tools the agent loop drives by name, which `replace` must never strip.
@@ -197,6 +202,16 @@ impl StubFile {
             );
         }
         Ok(parsed)
+    }
+
+    /// Stubs marked `"visible": false`: registered for the catalog, and
+    /// left out of the seed that declares a stubbed registry from turn 0.
+    pub fn hidden_names(&self) -> Vec<String> {
+        self.tools
+            .iter()
+            .filter(|s| !s.visible)
+            .map(|s| s.name.clone())
+            .collect()
     }
 
     /// Apply this file to the daemon's tool list.
@@ -422,6 +437,23 @@ mod tests {
             "only the tool the runner forces survives; everything else the model would \
              merely be tempted to explore"
         );
+    }
+
+    #[test]
+    fn a_hidden_stub_is_registered_but_not_seeded() {
+        let file: StubFile = serde_json::from_str(
+            r#"{"mode":"replace","keep":["tools_list"],"tools":[
+                {"name":"get_weather","description":"d","parameters":{"type":"object"},
+                 "script":{"responses":[]},"visible":false},
+                {"name":"get_forecast","description":"d","parameters":{"type":"object"},
+                 "script":{"responses":[]}}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(file.hidden_names(), ["get_weather"]);
+        let applied = file.apply(vec![Arc::new(NamedTool("tools_list"))]);
+        let names: Vec<&str> = applied.iter().map(|t| t.name()).collect();
+        assert_eq!(names, ["tools_list", "get_weather", "get_forecast"]);
     }
 
     #[test]

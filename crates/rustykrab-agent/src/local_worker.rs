@@ -14,8 +14,10 @@
 //!   (sections 6 step 4, 6.3 and 12);
 //! - the brief's `required_tools`, the tools of its `required_mcp_servers`
 //!   and the `work_*` tools activated in the run's [`ActiveToolsRegistry`]
-//!   before the first model call, so the tool block is fixed from turn 0
-//!   (section 12; Phase 2 adds `AgentDefinition.tools` for the rest);
+//!   before the first model call, with the definition's visible set
+//!   (`AgentDefinition.tools` and `mcp_servers`), so the tool block is
+//!   fixed from turn 0 and anything found later arrives by append
+//!   (section 12);
 //! - [`WORK_RUN_CONTEXT`] bound to the brief's item, which makes the runner
 //!   treat the conversation as a worker run: only a successful
 //!   `result_report` ends it, text is answered with a counted
@@ -44,7 +46,7 @@ use rustykrab_core::types::{Conversation, Message, MessageContent, Role};
 use rustykrab_core::work::{
     ArtifactRef, PlanOutcome, ResultReport, WorkItemDraft, WorkItemId, WorkerKind,
 };
-use rustykrab_core::{AgentDefinition, CapabilitySet, Error, Result, Session, Tool};
+use rustykrab_core::{mcp_server_of, AgentDefinition, CapabilitySet, Error, Result, Session, Tool};
 use rustykrab_tools::work_backend::{
     Principal, Provenance, StatusQuery, ToolState, WorkBackend, WorkRunContext, WorkStatusView,
     WORK_RUN_CONTEXT,
@@ -64,9 +66,6 @@ const WORK_TOOL_NAMES: [&str; 3] = ["work_file", "work_status", "result_report"]
 
 /// The ordinary conversation's completion signal. A worker never holds it.
 const TASK_COMPLETE: &str = "task_complete";
-
-/// Prefix of the tools one MCP server contributes (`mcp__<server>__<tool>`).
-const MCP_PREFIX: &str = "mcp__";
 
 /// Characters kept of one line of the brief.
 const LINE_MAX: usize = 400;
@@ -196,22 +195,25 @@ impl LocalWorker {
         }
     }
 
-    /// A definition for a general local worker: the default harness
-    /// profile, the host's whole catalog as its ceiling, and a system prompt
-    /// that states the worker's contract once, ahead of every brief.
+    /// The definition of a general local worker named `id`: the built-in
+    /// `worker` definition file (`rustykrab-skills/agents/worker.md`), with
+    /// the default harness profile, the host's whole catalog as its ceiling,
+    /// and a system prompt that states the worker's contract once, ahead of
+    /// every brief. A daemon that loads `<data dir>/agents/worker.md` passes
+    /// that one through [`Self::named_definition`] instead.
     pub fn default_definition(id: &str) -> AgentDefinition {
+        let worker = rustykrab_skills::builtin_agent("worker")
+            .expect("the built-in worker definition is embedded in the binary");
+        Self::named_definition(&worker, id)
+    }
+
+    /// `definition` for the worker named `name`: its id becomes the name,
+    /// and `{name}` in its system prompt is replaced with it.
+    pub fn named_definition(definition: &AgentDefinition, name: &str) -> AgentDefinition {
         AgentDefinition {
-            id: id.to_string(),
-            description: "Runs one work item for the controller and reports a typed result.".into(),
-            system_prompt: format!(
-                "You are {id}, a RustyKrab worker. Each run gives you one work item. Do the \
-                 work with your tools, then call result_report once, as your last call: the \
-                 run ends only when that call succeeds. Report pointers (paths, URLs, ids), \
-                 not content. If you cannot finish, report blocked or error instead of \
-                 guessing. Put follow-up work in discovered; do not do it."
-            ),
-            profile: "default".into(),
-            allowed_tools: None,
+            id: name.to_string(),
+            system_prompt: definition.system_prompt.replace("{name}", name),
+            ..definition.clone()
         }
     }
 
@@ -251,11 +253,18 @@ impl LocalWorker {
     }
 
     /// The tools to activate before the first model call, or the gap that
-    /// stops the run before it starts. The controller matches a brief to a
-    /// worker whose capabilities cover it, so a gap here means the two
-    /// disagreed; it comes back typed, for the ladder's order 2.
+    /// stops the run before it starts: the `work_*` tools, the definition's
+    /// visible set (its `tools` and its `mcp_servers`' tools, within the
+    /// ceiling), and the brief's `required_tools` and required servers. The
+    /// controller matches a brief to a worker whose capabilities cover it,
+    /// so a gap here means the two disagreed; it comes back typed, for the
+    /// ladder's order 2.
     fn activation(&self, brief: &Brief) -> std::result::Result<Vec<String>, RunFailure> {
         let mut names: Vec<String> = WORK_TOOL_NAMES.iter().map(|n| n.to_string()).collect();
+        names.extend(
+            self.definition
+                .visible_set(self.ceiling.iter().map(String::as_str)),
+        );
         for tool in &brief.required_tools {
             if !self.ceiling.contains(tool) {
                 return Err(RunFailure::Gap {
@@ -332,9 +341,14 @@ impl Worker for LocalWorker {
             tools: self.ceiling.clone(),
             mcp_servers,
             // A local run writes through this daemon's own tools, so it can
-            // reach any resource they can. Who may write a resource at once
-            // is the controller's single-writer rule, not a capability.
-            writable_resources: vec!["*".to_string()],
+            // reach any resource they can, unless its definition names the
+            // ones it may. Who may write a resource at once is the
+            // controller's single-writer rule, not a capability.
+            writable_resources: if self.definition.writable_resources.is_empty() {
+                vec!["*".to_string()]
+            } else {
+                self.definition.writable_resources.clone()
+            },
             ..WorkerCapabilities::default()
         }
     }
@@ -489,14 +503,6 @@ impl Worker for LocalWorker {
         };
         Err(failure.into_error())
     }
-}
-
-/// The server an MCP tool name belongs to (`mcp__<server>__<tool>`).
-fn mcp_server_of(name: &str) -> Option<&str> {
-    name.strip_prefix(MCP_PREFIX)?
-        .split_once("__")
-        .map(|(server, _)| server)
-        .filter(|s| !s.is_empty())
 }
 
 /// The last non-empty text the model wrote, if any.
@@ -1228,6 +1234,75 @@ mod tests {
         // Any resource: the controller's single-writer rule serialises
         // writers; a capability that listed none would lease no writer.
         assert_eq!(caps.writable_resources, ["*"]);
+    }
+
+    #[tokio::test]
+    async fn a_definitions_visible_set_is_declared_from_the_first_prefill() {
+        let provider = Recording::new(vec![report("done")]);
+        let coder = rustykrab_skills::builtin_agent("coder").unwrap();
+        let mut definition = LocalWorker::named_definition(&coder, "clawd");
+        definition.mcp_servers = vec!["linear".into()];
+        let w = LocalWorker::new(
+            "clawd",
+            definition,
+            provider.clone(),
+            vec![
+                Arc::new(Named("read")),
+                Arc::new(Named("exec")),
+                Arc::new(Named("browser")),
+                Arc::new(Named("mcp__linear__search")),
+                Arc::new(Named("mcp__jira__search")),
+            ],
+            Arc::new(NoSandbox),
+            Arc::new(StubWorkBackend::new()),
+        );
+
+        w.run(brief("item-13")).await.unwrap();
+
+        let (_, mut first) = provider.requests()[0].clone();
+        first.sort();
+        assert_eq!(
+            first,
+            [
+                "exec",
+                "mcp__linear__search",
+                "read",
+                "result_report",
+                "work_file",
+                "work_status"
+            ],
+            "the coder's filesystem and runtime tools the host has, its server's \
+             tools, and the work tools; not the rest of the catalog"
+        );
+    }
+
+    #[test]
+    fn the_default_definition_is_the_worker_file_under_the_workers_name() {
+        let d = LocalWorker::default_definition("pinch");
+        assert_eq!(d.id, "pinch");
+        assert!(
+            d.system_prompt.starts_with(
+                "You are pinch, a RustyKrab worker. Each run gives you one work item."
+            ),
+            "{}",
+            d.system_prompt
+        );
+        assert!(!d.system_prompt.contains("{name}"));
+        assert_eq!(d.profile, "default");
+        assert!(d.allowed_tools.is_none() && d.tools.is_empty());
+
+        // A definition that names what it may write narrows the capability.
+        let mut narrowed = d.clone();
+        narrowed.writable_resources = vec!["calendar".into()];
+        let w = LocalWorker::new(
+            "pinch",
+            narrowed,
+            Recording::new(Vec::new()),
+            Vec::new(),
+            Arc::new(NoSandbox),
+            Arc::new(StubWorkBackend::new()),
+        );
+        assert_eq!(w.capabilities().writable_resources, ["calendar"]);
     }
 
     #[tokio::test]

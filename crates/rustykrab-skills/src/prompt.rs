@@ -27,10 +27,11 @@ call the tool with that skill's name and follow the instructions it returns; do 
 that you would call it.\n\n\
 When available, use memory_save to persist important facts; context is limited. Before \
 acting on standing preferences or earlier decisions, use memory_search if available \
-to check what you already know. Invoke only tools whose schemas are currently offered; \
-discover and load other available tools first. A tool name mentioned in this guidance \
-does not establish availability. If memory tools are unavailable, use the supplied \
-conversation and state any missing information rather than inventing a tool call.";
+to check what you already know. Invoke only tools you have been given, in your tool list \
+or delivered by a tools_list search; find others with tools_list first. A tool name \
+mentioned in this guidance does not establish availability. If memory tools are unavailable, \
+use the supplied conversation and state any missing information rather than inventing a tool \
+call.";
 
 /// Return the baked-in default soul template (with the literal `{name}`
 /// placeholder still in it). Exposed so `rustykrab-cli` can seed the

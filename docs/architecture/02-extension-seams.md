@@ -202,8 +202,10 @@ Worth naming, because a review that only lists problems misrepresents the code:
   agent loops get wrong.
 - **`ModelProvider` defaults are correctly chosen.** `context_limit`,
   `supports_vision`, `requires_paired_tool_results`, `chat_with_ctx`,
-  `chat_with_choice` all have defaults that degrade safely, so a new provider
-  implements one method.
+  `chat_with_choice` and `accepts_undeclared_tool_calls` all have defaults
+  that degrade safely, so a new provider implements one method. The last is
+  capability data for the append path (control-layer plan, section 12): a
+  provider that says nothing keeps late tools on the re-render path.
 - **The capability model is real.** `Capability::Subagent` and
   `Capability::ComputerUse` are required *in addition to* the per-tool grant,
   and the dangerous ones are gated at four independent layers.

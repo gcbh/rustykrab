@@ -117,6 +117,22 @@ pub trait ModelProvider: Send + Sync {
         true
     }
 
+    /// Whether the model can call a tool whose schema it has seen only as
+    /// text in the conversation (a tool result), not in the request's
+    /// declared tools array.
+    ///
+    /// Capability data, never a branch on a model name (plan
+    /// `docs/plans/control-layer-and-worker-fleet.md`, section 12.1). When
+    /// `true` the runner delivers tools found mid-run by append, leaving the
+    /// tools array, and with it the cached prompt prefix, unchanged
+    /// ([`crate::LateToolBinding::Append`]); otherwise it re-renders the
+    /// array. The default is the safe answer: an API that validates tool
+    /// calls against the declared array would reject the append path's
+    /// calls. A harness profile can override either way.
+    fn accepts_undeclared_tool_calls(&self) -> bool {
+        false
+    }
+
     /// Send a conversation to the model and get back the next message.
     async fn chat(&self, messages: &[Message], tools: &[ToolSchema]) -> Result<ModelResponse>;
 

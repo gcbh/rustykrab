@@ -32,11 +32,13 @@ pub mod timezone;
 pub mod todo;
 pub mod token_estimate;
 pub mod tool;
+pub mod tool_block;
 pub mod types;
 pub mod work;
 
 pub use active_tools::{
-    with_session_context, ActiveToolsRegistry, SessionToolContext, SESSION_TOOL_CONTEXT,
+    with_session_context, ActiveToolsRegistry, Callable, LateToolBinding, SessionToolContext,
+    SESSION_TOOL_CONTEXT,
 };
 pub use activity::{ActivityTracker, RunGuard};
 pub use agent_def::{AgentDefinition, AgentRegistry};
@@ -62,4 +64,5 @@ pub use todo::{render_todos, TodoItem, TodoStatus, TodoStore};
 pub use token_estimate::{
     estimate_bytes, estimate_message_bytes, estimate_text_tokens, max_bytes_for_tokens,
 };
-pub use tool::{SandboxRequirements, Tool};
+pub use tool::{mcp_server_of, SandboxRequirements, Tool, MCP_TOOL_PREFIX};
+pub use tool_block::{ToolBlockObservation, ToolBlockTracker};

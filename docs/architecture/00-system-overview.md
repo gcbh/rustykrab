@@ -23,7 +23,7 @@ rustykrab-core        (no internal deps — the contract layer)
    ^  ^  ^  ^  ^
    |  |  |  |  +-- rustykrab-providers   anthropic, openai, ollama, scripted
    |  |  |  +----- rustykrab-memory      hybrid retrieval, own SQLite db
-   |  |  +-------- rustykrab-skills      SKILL.md loader + ed25519 verify
+   |  |  +-------- rustykrab-skills      SKILL.md + agents/*.md loader, ed25519 verify
    |  +----------- rustykrab-channels    telegram, slack, signal, video, mcp
    +-------------- rustykrab-store       SQLite: conversations, secrets, jobs
                         ^      ^
@@ -34,7 +34,7 @@ rustykrab-core        (no internal deps — the contract layer)
                                             review surface (issue projection)
         ^
         |
-   rustykrab-agent   (core, tools, control)
+   rustykrab-agent   (core, tools, control, skills)
         ^
         |
    rustykrab-runtime (core, store, agent, memory, skills)   <-- NEW

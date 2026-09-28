@@ -52,7 +52,7 @@ const TIGHT_CONTEXT_TOKENS: usize = 6_000;
 /// running. At 6144 the compaction threshold lands near 5.2k tokens,
 /// which two bulky turns reach, and every other scenario stays far below
 /// it.
-const TIGHT_NUM_CTX: u32 = 6_144;
+pub(crate) const TIGHT_NUM_CTX: u32 = 6_144;
 
 pub struct ModelCase {
     pub id: &'static str,
@@ -671,6 +671,10 @@ pub fn cases() -> Vec<ModelCase> {
             0.7,
         )),
     ]
+    .into_iter()
+    // ── late binding (plan scenario 10) ──────────────────────────────
+    .chain(crate::late_binding::cases())
+    .collect()
 }
 
 /// Run the model suite. Returns the reports and the judge that graded.
@@ -867,6 +871,8 @@ async fn run_once(
         let mut transcript =
             Transcript::from_store(&data_dir.join("db").join("store.db"), &conv_id)?;
         transcript.duration_ms = started.elapsed().as_millis();
+        // The provider logs each request's tool block; the store does not.
+        transcript.tool_blocks = crate::tool_blocks::read(&data_dir, &conv_id);
         Ok::<_, anyhow::Error>(transcript)
     }
     .await;

@@ -106,6 +106,7 @@ mod payment_request;
 mod skills;
 
 // Meta tools (tool discovery &amp; activation)
+mod tool_catalog;
 mod tools_list;
 mod tools_load;
 
