@@ -106,6 +106,13 @@ impl WorkerKind {
             _ => None,
         }
     }
+
+    /// Whether a worker of this kind edits a repository checkout: a
+    /// `code` item leased to one needs a `repo:` writable resource, or
+    /// the worker starts in an empty directory with nothing to change.
+    pub fn needs_checkout(&self) -> bool {
+        matches!(self, WorkerKind::ClaudeCode | WorkerKind::Codex)
+    }
 }
 
 // ── edges ──────────────────────────────────────────────────────────────
@@ -1085,6 +1092,9 @@ pub enum RejectionReason {
     /// Only when policy has promoted the `sequential_split` warning to a
     /// rejection (section 14.1).
     SequentialSplit,
+    /// A `code` item constrained to a worker that edits a checkout
+    /// (`claude_code`, `codex`) names no `repo:` writable resource.
+    NoRepository,
 }
 
 impl RejectionReason {
@@ -1110,6 +1120,7 @@ impl RejectionReason {
             AlreadyPlanned => "already_planned",
             RateLimited => "rate_limited",
             SequentialSplit => "sequential_split",
+            NoRepository => "no_repository",
         }
     }
 }

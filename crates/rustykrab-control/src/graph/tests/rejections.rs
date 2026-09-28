@@ -4,7 +4,7 @@
 use std::collections::BTreeSet;
 
 use rustykrab_core::work::{
-    CancelReason, DraftEdge, EdgeKind, PlanOutcome, RejectionReason, Status, WorkKind,
+    CancelReason, DraftEdge, EdgeKind, PlanOutcome, RejectionReason, Status, WorkKind, WorkerKind,
 };
 
 use super::*;
@@ -208,6 +208,24 @@ fn rate_limited() -> Rejection {
     c.supersedes_in_window = 1;
     c.supersede_limit = 1;
     reject(&base(), &under_p(vec![superseding("a", "wait1")]), &c)
+}
+
+/// A code item for each checkout-editing worker kind, with no `repo:`.
+fn no_repository() -> Rejection {
+    let mut c = planner();
+    c.allow_code = true;
+    let code = |t: &str, kind: WorkerKind| {
+        let mut d = draft(t);
+        d.kind = Some(WorkKind::Code);
+        d.worker_kind = kind;
+        d.writable_resources = vec![format!("calendar:{t}")];
+        d
+    };
+    let items = vec![
+        code("claude", WorkerKind::ClaudeCode),
+        code("codex", WorkerKind::Codex),
+    ];
+    reject(&base(), &under_p(items), &c)
 }
 
 fn only(r: &Rejection, reason: RejectionReason) -> Vec<Vec<ItemRef>> {
@@ -447,6 +465,32 @@ fn rejects_rate_limited() {
 }
 
 #[test]
+fn rejects_no_repository() {
+    let r = no_repository();
+    assert_eq!(
+        only(&r, RejectionReason::NoRepository),
+        vec![vec![tmp("claude")], vec![tmp("codex")]]
+    );
+    assert!(r.failed[0].detail.contains("repo:"), "{r:#?}");
+
+    // With a repository, for a worker needing no checkout, or with no
+    // worker constraint at all, the same code item files.
+    let mut c = planner();
+    c.allow_code = true;
+    let mut with_repo = draft("with_repo");
+    with_repo.kind = Some(WorkKind::Code);
+    with_repo.worker_kind = WorkerKind::ClaudeCode;
+    with_repo.writable_resources = vec!["repo:/src/app".into()];
+    let mut local = draft("local");
+    local.kind = Some(WorkKind::Code);
+    local.worker_kind = WorkerKind::Local;
+    let mut any = draft("any");
+    any.kind = Some(WorkKind::Code);
+    let mut s = base();
+    accept(&mut s, &under_p(vec![with_repo, local, any]), &c);
+}
+
+#[test]
 fn every_rejection_reason_is_reachable() {
     let all = [
         unknown_ref(),
@@ -467,6 +511,7 @@ fn every_rejection_reason_is_reachable() {
         kind_not_allowed(),
         already_planned(),
         rate_limited(),
+        no_repository(),
     ];
     let reached: BTreeSet<&str> = all.iter().flat_map(names).collect();
     let expected: BTreeSet<&str> = [
@@ -488,6 +533,7 @@ fn every_rejection_reason_is_reachable() {
         RejectionReason::KindNotAllowed,
         RejectionReason::AlreadyPlanned,
         RejectionReason::RateLimited,
+        RejectionReason::NoRepository,
     ]
     .iter()
     .map(|r| r.as_str())

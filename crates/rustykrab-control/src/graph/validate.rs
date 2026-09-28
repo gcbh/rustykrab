@@ -27,6 +27,7 @@ use super::order::Arcs;
 use super::ready::{edge_summary, verdict, Verdict};
 use super::supersede::{supersede_in, supersede_refusals};
 use super::{Effects, Link, Snapshot, Transition};
+use crate::workspace::{Workspace, REPO_PREFIX};
 
 // ── inputs ─────────────────────────────────────────────────────────────
 
@@ -431,6 +432,7 @@ pub fn validate(snap: &Snapshot, plan: &WorkPlan, ctx: &FilingContext) -> Valida
     // Drafts.
     let kinds = run.resolve_kinds(&parents);
     run.check_drafts(&kinds);
+    run.check_repos(&kinds, &parents);
 
     // Scope.
     let scope: Option<WorkItemId> = ctx
@@ -877,6 +879,35 @@ impl<'a> Run<'a> {
                     "code graphs come only from the delivery compiler",
                 );
             }
+        }
+    }
+
+    /// A `code` leaf constrained to a worker that edits a checkout
+    /// (`claude_code`, `codex`) must name its repository as a `repo:`
+    /// writable resource: without one the worker gets an empty directory
+    /// and nothing to change. A draft that parents others in this plan is
+    /// never leased, so it is not held to this.
+    fn check_repos(&mut self, kinds: &[WorkKind], parents: &[Option<WorkItemId>]) {
+        let plan = self.plan;
+        for (i, draft) in plan.items.iter().enumerate() {
+            let is_parent = parents.iter().any(|p| p.as_ref() == Some(&self.ids[i]));
+            if kinds[i] != WorkKind::Code
+                || is_parent
+                || !draft.worker_kind.needs_checkout()
+                || Workspace::repo_of(&draft.writable_resources).is_some()
+            {
+                continue;
+            }
+            let label = self.label(&self.ids[i]);
+            self.fail(
+                RejectionReason::NoRepository,
+                vec![label],
+                format!(
+                    "a code item for a {} worker needs its repository as a {REPO_PREFIX}<path> \
+                     writable resource",
+                    draft.worker_kind.as_str()
+                ),
+            );
         }
     }
 

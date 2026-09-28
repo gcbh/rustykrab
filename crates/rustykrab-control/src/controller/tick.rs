@@ -68,11 +68,14 @@ fn absorb(report: &mut TickReport, written: Written) {
 }
 
 /// Whether `worker` can take `item`: kind, tools, MCP servers and
-/// writable resources all covered (`*` covers everything).
+/// writable resources all covered (`*` covers everything). A `code` item
+/// with no `repo:` resource never goes to a worker that edits a checkout
+/// ([`WorkerKind::needs_checkout`]): it would get an empty directory.
 pub(super) fn covers(worker: &dyn Worker, item: &WorkItem) -> bool {
     let caps = worker.capabilities();
     let has = |list: &[String], want: &String| list.iter().any(|x| x == want || x == "*");
     (item.worker_kind == WorkerKind::Any || item.worker_kind == worker.kind())
+        && !lacks_checkout(worker.kind(), item)
         && item.required_tools.iter().all(|t| has(&caps.tools, t))
         && item
             .required_mcp_servers
@@ -82,6 +85,14 @@ pub(super) fn covers(worker: &dyn Worker, item: &WorkItem) -> bool {
             .writable_resources
             .iter()
             .all(|r| has(&caps.writable_resources, r))
+}
+
+/// Whether a worker of `kind` would run `item` without a checkout: a
+/// `code` item naming no repository, for a worker that edits one.
+pub(super) fn lacks_checkout(kind: WorkerKind, item: &WorkItem) -> bool {
+    item.kind == WorkKind::Code
+        && kind.needs_checkout()
+        && Workspace::repo_of(&item.writable_resources).is_none()
 }
 
 /// The blocked state a surfaced failure parks in (sections 7 and 8).
@@ -1584,6 +1595,13 @@ impl Controller {
                 &load,
                 &models,
             ) else {
+                if lacks_checkout(WorkerKind::ClaudeCode, &item) {
+                    tracing::info!(
+                        item = %item.id,
+                        "left unleased: a code item with no repo: resource goes only to a \
+                         worker that needs no checkout"
+                    );
+                }
                 continue;
             };
             let (inputs, more) = self.build_inputs(&snap, &item).await?;

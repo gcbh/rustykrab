@@ -254,6 +254,38 @@ async fn scenario_02_a_commit_and_its_paths_are_verified_and_a_false_claim_is_ca
 }
 
 #[tokio::test]
+async fn a_code_item_without_a_repository_never_goes_to_a_coding_worker() {
+    let repo = Repo::new();
+    let root = tempfile::tempdir().unwrap();
+    let claude = Coder::new("pinch", WorkerKind::ClaudeCode, &repo, Claim::Honest);
+    let codex = Coder::new("nipper", WorkerKind::Codex, &repo, Claim::Honest);
+    let h = Harness::with_fleet(config(&root), vec![claude.clone(), codex.clone()]);
+
+    // No worker constraint and no repository: it files, and waits
+    // unleased rather than handing a coding worker an empty directory.
+    let mut bare = code_draft("Tidy the helper", &repo, WorkerKind::Any);
+    bare.writable_resources.clear();
+    let unleased = h.file_one(bare).await;
+    h.drain().await;
+    assert_eq!(h.status(&unleased).await, Status::Ready);
+    assert_eq!((claude.runs(), codex.runs()), (0, 0));
+
+    // The same item with its repository leases and gets its worktree.
+    let task = h
+        .file_one(code_draft("Tidy the helper", &repo, WorkerKind::Any))
+        .await;
+    h.drain().await;
+    assert_eq!(h.status(&task).await, Status::Done);
+    assert_eq!(claude.runs() + codex.runs(), 1);
+    let brief = [&claude, &codex]
+        .iter()
+        .find_map(|w| w.briefs.lock().unwrap().first().cloned())
+        .expect("a brief");
+    assert_eq!(brief.workspace.expect("a workspace").repo, repo.path());
+    assert_eq!(h.status(&unleased).await, Status::Ready);
+}
+
+#[tokio::test]
 async fn scenario_17_a_local_code_result_counts_and_a_failed_verification_escalates() {
     let repo = Repo::new();
     let root = tempfile::tempdir().unwrap();
@@ -458,7 +490,10 @@ impl Worker for Any {
         self.kind
     }
     fn capabilities(&self) -> WorkerCapabilities {
-        WorkerCapabilities::default()
+        WorkerCapabilities {
+            writable_resources: vec!["*".to_string()],
+            ..WorkerCapabilities::default()
+        }
     }
     async fn run(&self, brief: Brief) -> Result<ResultReport, Error> {
         self.briefs.lock().unwrap().push(brief.clone());
@@ -559,6 +594,7 @@ async fn an_accepted_routing_proposal_moves_the_default_tier() {
     // A code item now starts on the coding agent, not the local worker.
     let mut helper = draft("code", "Add a helper");
     helper.kind = Some(WorkKind::Code);
+    helper.writable_resources = vec![format!("{REPO_PREFIX}/src/app")];
     let task = h.file_one(helper).await;
     h.step().await;
     h.step().await;
