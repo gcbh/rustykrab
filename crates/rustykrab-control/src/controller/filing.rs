@@ -185,8 +185,9 @@ impl Controller {
         ctx.supersede_limit = self.config.supersede_limit;
         ctx.origin_conversation_id = provenance.conversation_id.clone();
         // The ladder's own filings are system work under policy, not a plan
-        // the user approves (section 8).
-        ctx.approval = if source == FilingSource::Ladder {
+        // the user approves (section 8); an accepted proposal's work was
+        // approved on the review surface (section 10).
+        ctx.approval = if matches!(source, FilingSource::Ladder | FilingSource::Proposal) {
             ApprovalPolicy::default()
         } else {
             self.config.approval.clone()
@@ -233,6 +234,10 @@ impl Controller {
             Validation::Accepted(accepted) => {
                 let row = plan_row(&accepted, plan, provenance, b.now);
                 b.file(&accepted, row, &actor_of(provenance));
+                // Phase 6 (sections 10 and 11): the review facets land with
+                // the rows, and a new proposal waits for its review.
+                self.record_facets(b, plan, &accepted);
+                self.hold_for_review(b, &accepted);
                 if accepted.supersedes {
                     if let Some(root) = scope_root(&ctx, plan) {
                         b.superseded_under.push(root);
@@ -471,6 +476,11 @@ impl Controller {
                     value: item.id.clone(),
                 }],
                 trigger: need.trigger.clone(),
+                capability: Some(match rung {
+                    Rung::Build => rustykrab_core::work::CapabilityMode::Build,
+                    Rung::Request => rustykrab_core::work::CapabilityMode::Request,
+                    _ => rustykrab_core::work::CapabilityMode::Acquire,
+                }),
                 ..WorkItemDraft::default()
             }],
         };

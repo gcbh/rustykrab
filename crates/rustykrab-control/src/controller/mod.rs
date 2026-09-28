@@ -42,6 +42,7 @@ mod commit;
 mod filing;
 mod load;
 mod notice;
+mod review;
 mod tick;
 
 #[cfg(test)]
@@ -509,6 +510,16 @@ impl ControlHandle for Controller {
 
     async fn graph(&self, root: &str) -> Result<GraphView, Error> {
         self.graph_view(root).await
+    }
+
+    async fn review_decision(
+        &self,
+        proposal: &str,
+        decision: rustykrab_core::proposal::ReviewDecision,
+        actor: &str,
+    ) -> Result<rustykrab_core::proposal::ReviewOutcome, Error> {
+        let _loop = self.loop_lock.lock().await;
+        self.review_decision_locked(proposal, decision, actor).await
     }
 }
 

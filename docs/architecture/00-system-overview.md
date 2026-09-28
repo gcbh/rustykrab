@@ -30,7 +30,8 @@ rustykrab-core        (no internal deps — the contract layer)
    rustykrab-tools  ----+      +---- rustykrab-dream
         ^
         |
-   rustykrab-control (core, store, tools)   work-item graph, ladder, Worker
+   rustykrab-control (core, store, tools)   work-item graph, ladder, Worker,
+                                            review surface (issue projection)
         ^
         |
    rustykrab-agent   (core, tools, control)
@@ -70,7 +71,7 @@ no axum in its dependency tree.
 | Application service | **`runtime`** | Assemble a turn: prompt, session, capabilities, memory hooks |
 | Transport | `gateway`, channel loops in `cli` | HTTP/SSE, Telegram polling, Slack events |
 | Composition | `cli` | Read env, build everything, spawn background tasks |
-| Verification | `e2e`, `dream` | Black-box scenarios, direct compactor ablation; offline outcome analysis |
+| Verification | `e2e`, `dream` | Black-box scenarios, direct compactor ablation; offline outcome analysis, and the control layer's evaluation pass (expectation metrics, proposals filed through the controller's validator) |
 
 The context evaluator also links `core` and `tools` to reuse production tool
 schemas and argument validation for inert replacements. Turn execution still

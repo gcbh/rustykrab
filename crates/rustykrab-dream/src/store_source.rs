@@ -35,7 +35,40 @@ impl OutcomeSource for StoreOutcomeSource {
     async fn verdict_totals(&self, ground_truth_only: bool) -> Result<OutcomeTally> {
         self.outcomes.verdict_totals(ground_truth_only).await
     }
+
+    /// From the newest records the store keeps (`CITE_WINDOW` of them):
+    /// citations are pointers for a reviewer, not a tally, so a bounded
+    /// read is enough.
+    async fn cite(
+        &self,
+        kind: AttributionKind,
+        ground_truth_only: bool,
+        limit: usize,
+    ) -> Result<std::collections::BTreeMap<String, (Vec<String>, Vec<String>)>> {
+        let mut out: std::collections::BTreeMap<String, (Vec<String>, Vec<String>)> =
+            std::collections::BTreeMap::new();
+        for record in self.outcomes.recent(CITE_WINDOW).await? {
+            if ground_truth_only && !record.signal.is_ground_truth() {
+                continue;
+            }
+            for a in record.attributions.iter().filter(|a| a.kind == kind) {
+                let entry = out.entry(a.id.clone()).or_default();
+                let list = match record.verdict {
+                    rustykrab_core::outcome::OutcomeVerdict::Failure => &mut entry.0,
+                    rustykrab_core::outcome::OutcomeVerdict::Success => &mut entry.1,
+                    rustykrab_core::outcome::OutcomeVerdict::Ambiguous => continue,
+                };
+                if list.len() < limit {
+                    list.push(record.id.to_string());
+                }
+            }
+        }
+        Ok(out)
+    }
 }
+
+/// How many of the newest outcome records a citation looks through.
+const CITE_WINDOW: u32 = 2_000;
 
 /// Keeps completed analysis passes in the database.
 #[derive(Clone)]

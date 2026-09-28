@@ -58,8 +58,8 @@ pub use rollup::{rollup, rollup_all, Rollup};
 pub use snapshot::Snapshot;
 pub use supersede::{supersede, supersede_refusals, SupersedeRefusal};
 pub use validate::{
-    validate, Accepted, ApprovalPolicy, ApprovalTrigger, Check, Failure, FilingContext,
-    FilingSource, Rejection, SplitMode, Validation,
+    review_scope_violation, validate, Accepted, ApprovalPolicy, ApprovalTrigger, Check, Failure,
+    FilingContext, FilingSource, Rejection, SplitMode, Validation,
 };
 
 /// What a [`Repoint`] moves: an edge row, or an `inputs_from` entry.
