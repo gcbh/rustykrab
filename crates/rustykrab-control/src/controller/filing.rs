@@ -397,8 +397,8 @@ impl Controller {
     /// parent they file as one graph, scoped to that subtree; an item with
     /// no parent files each draft as its own root. Each draft inherits the
     /// item's `repo:` resources and worker constraint unless it sets its own
-    /// ([`inherit_from`]), and drafts sharing an inherited repository are
-    /// ordered ([`order_inherited_writers`]). A rejection is recorded on the
+    /// ([`inherit_from`]), and drafts sharing a repository are ordered
+    /// ([`order_repo_writers`]). A rejection is recorded on the
     /// item. Returns the ids to settle.
     pub(super) fn file_discovered(
         &self,
@@ -416,14 +416,13 @@ impl Controller {
             actor: format!("worker:{worker}"),
         };
         let rationale = format!("discovered while working on {}", short(&item.id));
-        let (mut drafts, inherited): (Vec<WorkItemDraft>, Vec<Vec<String>>) =
-            drafts.iter().map(|d| inherit_from(item, d)).unzip();
+        let mut drafts: Vec<WorkItemDraft> = drafts.iter().map(|d| inherit_from(item, d)).collect();
         for (i, d) in drafts.iter_mut().enumerate() {
             d.tmp.get_or_insert_with(|| format!("d{i}"));
         }
         let plans: Vec<WorkPlan> = match &item.parent {
             Some(parent) => {
-                order_inherited_writers(&mut drafts, &inherited);
+                order_repo_writers(&mut drafts);
                 vec![WorkPlan {
                     root: ItemRef::Id(parent.clone()),
                     items: drafts,
@@ -903,44 +902,37 @@ impl Controller {
 /// A discovered draft as filed under `filer`: one naming no `repo:`
 /// resource takes the filer's, and one with no worker constraint takes the
 /// filer's, so a code follow-up keeps its repository and its worker. A
-/// draft that sets either keeps its own. Returns the resources it inherited.
-fn inherit_from(filer: &WorkItem, draft: &WorkItemDraft) -> (WorkItemDraft, Vec<String>) {
+/// draft that sets either keeps its own.
+fn inherit_from(filer: &WorkItem, draft: &WorkItemDraft) -> WorkItemDraft {
     let mut d = draft.clone();
-    let mut inherited = Vec::new();
     if !d.writable_resources.iter().any(|r| is_repo(r)) {
-        inherited.extend(
+        d.writable_resources.extend(
             filer
                 .writable_resources
                 .iter()
                 .filter(|r| is_repo(r))
                 .cloned(),
         );
-        d.writable_resources.extend(inherited.iter().cloned());
     }
     if d.worker_kind == WorkerKind::Any {
         d.worker_kind = filer.worker_kind;
     }
-    (d, inherited)
+    d
 }
 
 fn is_repo(resource: &str) -> bool {
     resource.starts_with(crate::workspace::REPO_PREFIX)
 }
 
-/// Drafts filed as one graph that write the same repository, where either
-/// inherited it, run in the order the worker listed them: each gets a
+/// Drafts filed as one graph that write the same repository, inherited or
+/// named themselves, run in the order the worker listed them: each gets a
 /// `blocks` edge on the last earlier draft writing that repository, unless
-/// the two are already linked. Two unordered writers of one resource are a
-/// `single_writer_conflict`, so without this a worker's second inherited
-/// follow-up would reject the whole filing. Every draft carries a `tmp`.
-fn order_inherited_writers(drafts: &mut [WorkItemDraft], inherited: &[Vec<String>]) {
-    let tmp_of = |d: &WorkItemDraft| ItemRef::Tmp {
-        tmp: d.tmp.clone().unwrap_or_default(),
-    };
-    let links = |a: &WorkItemDraft, b: &WorkItemDraft| {
-        a.edges.iter().any(|e| e.depends_on == tmp_of(b))
-            || b.edges.iter().any(|e| e.depends_on == tmp_of(a))
-    };
+/// one already depends on the other through the drafts' own edges (an edge
+/// then would be redundant or close a cycle). Two unordered writers of one
+/// resource are a `single_writer_conflict`, and a worker's list is the only
+/// order it gives, so without this a second follow-up in the same
+/// repository would reject the whole filing. Every draft carries a `tmp`.
+fn order_repo_writers(drafts: &mut [WorkItemDraft]) {
     for i in 1..drafts.len() {
         let mut upstreams: Vec<usize> = Vec::new();
         for r in drafts[i].writable_resources.iter().filter(|r| is_repo(r)) {
@@ -950,13 +942,15 @@ fn order_inherited_writers(drafts: &mut [WorkItemDraft], inherited: &[Vec<String
             else {
                 continue;
             };
-            if (inherited[i].contains(r) || inherited[j].contains(r)) && !upstreams.contains(&j) {
+            if !upstreams.contains(&j) {
                 upstreams.push(j);
             }
         }
         for j in upstreams {
-            if !links(&drafts[i], &drafts[j]) {
-                let depends_on = tmp_of(&drafts[j]);
+            if !depends(drafts, i, j) && !depends(drafts, j, i) {
+                let depends_on = ItemRef::Tmp {
+                    tmp: drafts[j].tmp.clone().unwrap_or_default(),
+                };
                 drafts[i].edges.push(DraftEdge {
                     kind: EdgeKind::Blocks,
                     depends_on,
@@ -964,6 +958,31 @@ fn order_inherited_writers(drafts: &mut [WorkItemDraft], inherited: &[Vec<String
             }
         }
     }
+}
+
+/// Whether draft `from` reaches draft `to` over the drafts' own edges.
+fn depends(drafts: &[WorkItemDraft], from: usize, to: usize) -> bool {
+    let index_of = |r: &ItemRef| match r {
+        ItemRef::Tmp { tmp } => drafts.iter().position(|d| d.tmp.as_ref() == Some(tmp)),
+        ItemRef::Id(_) => None,
+    };
+    let mut seen = vec![false; drafts.len()];
+    let mut stack = vec![from];
+    while let Some(k) = stack.pop() {
+        if k == to {
+            return true;
+        }
+        if std::mem::replace(&mut seen[k], true) {
+            continue;
+        }
+        stack.extend(
+            drafts[k]
+                .edges
+                .iter()
+                .filter_map(|e| index_of(&e.depends_on)),
+        );
+    }
+    false
 }
 
 /// The scope a supersede counts against: the caller's subtree, else the

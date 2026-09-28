@@ -419,6 +419,45 @@ async fn a_discovered_draft_naming_no_repo_inherits_the_filers_repo() {
 }
 
 #[tokio::test]
+async fn discovered_drafts_naming_the_same_repo_run_in_the_order_listed() {
+    let mut first = code_follow_up("f", "Port the helper");
+    first.writable_resources = vec!["repo:/src/other".to_string()];
+    let mut second = code_follow_up("g", "Test the ported helper");
+    second.writable_resources = vec!["repo:/src/other".to_string()];
+    let (h, kids) = discovered_under_a_repo_item(vec![first, second]).await;
+    let (first, second) = (&kids["Port the helper"], &kids["Test the ported helper"]);
+    let edges = h.store().work_edges_of(&second.id).await.unwrap();
+    assert!(edges
+        .iter()
+        .any(|e| e.kind == EdgeKind::Blocks && e.depends_on == first.id));
+}
+
+#[tokio::test]
+async fn discovered_repo_writers_already_ordered_by_their_own_edges_get_no_cycle() {
+    // `a` waits on `c`, and all three write one repository: listed order
+    // would put `c` after `b` after `a`, closing a cycle, so `c` is left
+    // ordered by the path it already has.
+    let mut a = code_follow_up("a", "Wire the helper");
+    a.edges = vec![on(EdgeKind::Blocks, "c")];
+    let b = code_follow_up("b", "Document the helper");
+    let c = code_follow_up("c", "Add the helper's types");
+    let (h, kids) = discovered_under_a_repo_item(vec![a, b, c]).await;
+    let (a, b, c) = (
+        &kids["Wire the helper"],
+        &kids["Document the helper"],
+        &kids["Add the helper's types"],
+    );
+    let b_edges = h.store().work_edges_of(&b.id).await.unwrap();
+    assert!(b_edges
+        .iter()
+        .any(|e| e.kind == EdgeKind::Blocks && e.depends_on == a.id));
+    let c_edges = h.store().work_edges_of(&c.id).await.unwrap();
+    assert!(!c_edges
+        .iter()
+        .any(|e| e.item == c.id && e.kind == EdgeKind::Blocks));
+}
+
+#[tokio::test]
 async fn a_discovered_draft_with_no_worker_constraint_inherits_the_filers() {
     let (_h, kids) =
         discovered_under_a_repo_item(vec![code_follow_up("f", "Document the helper")]).await;
