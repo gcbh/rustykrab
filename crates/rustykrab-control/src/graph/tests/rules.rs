@@ -569,7 +569,25 @@ fn hold_discovered_holds_a_workers_follow_ups_whole_and_nothing_else() {
 
     // The same graph filed through `work_file` is not a worker's follow-up.
     let mut c = ctx(FilingSource::WorkFile);
+    c.approval = policy.clone();
+    let accepted = accept(&mut two_parents(), &p, &c);
+    assert!(accepted.held.is_empty());
+    assert!(accepted.triggers.is_empty());
+
+    // The ladder's `internal` items are held the same way; its other
+    // filings are not.
+    let mut internal = draft("i");
+    internal.kind = Some(WorkKind::Internal);
+    let mut c = ctx(FilingSource::Ladder);
     c.approval = policy;
+    let mut s = two_parents();
+    let accepted = accept(&mut s, &plan(id("P"), vec![internal], vec![]), &c);
+    let [i] = ids(&accepted, &["i"]).try_into().unwrap();
+    assert_eq!(
+        accepted.triggers,
+        vec![ApprovalTrigger::LadderInternal { items: 1 }]
+    );
+    assert_eq!(st(&s, &i), Status::Blocked(BlockedReason::NeedsConsent));
     let accepted = accept(&mut two_parents(), &p, &c);
     assert!(accepted.held.is_empty());
     assert!(accepted.triggers.is_empty());
