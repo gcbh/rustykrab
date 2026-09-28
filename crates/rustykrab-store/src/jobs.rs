@@ -273,6 +273,62 @@ impl JobStore {
         .await
     }
 
+    /// Point a job at the work item of its latest firing
+    /// (`scheduled_jobs.work_item_id`, control-layer plan section 13): the
+    /// firing is that item, which the controller runs and serialises with
+    /// everything else.
+    pub async fn set_work_item_id(&self, job_id: &str, item: &str) -> Result<(), Error> {
+        let (job_id, item) = (job_id.to_string(), item.to_string());
+        with_conn(&self.conn, move |conn| {
+            let rows = conn
+                .execute(
+                    "UPDATE scheduled_jobs SET work_item_id = ?1 WHERE id = ?2",
+                    params![item, job_id],
+                )
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            if rows == 0 {
+                return Err(Error::NotFound(format!("job {job_id}")));
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    /// The work item of the job's latest firing, if it has fired as one.
+    pub async fn work_item_id(&self, job_id: &str) -> Result<Option<String>, Error> {
+        let job_id = job_id.to_string();
+        with_conn(&self.conn, move |conn| {
+            conn.query_row(
+                "SELECT work_item_id FROM scheduled_jobs WHERE id = ?1",
+                params![job_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Error::NotFound(format!("job {job_id}")),
+                other => Error::Storage(other.to_string()),
+            })
+        })
+        .await
+    }
+
+    /// The job whose latest firing is `item`, if any: how a firing is told
+    /// apart from other work, from a column no model can write.
+    pub async fn job_for_work_item(&self, item: &str) -> Result<Option<ScheduledJob>, Error> {
+        let item = item.to_string();
+        with_conn(&self.conn, move |conn| {
+            match conn.query_row(
+                &format!("SELECT {JOB_COLUMNS} FROM scheduled_jobs WHERE work_item_id = ?1"),
+                params![item],
+                row_to_job,
+            ) {
+                Ok(job) => Ok(Some(job)),
+                Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                Err(e) => Err(Error::Storage(e.to_string())),
+            }
+        })
+        .await
+    }
+
     /// Attach a conversation id to a job. Called on the first run once the
     /// executor has created (or resumed) the conversation the agent uses.
     pub async fn set_conversation_id(
@@ -687,6 +743,41 @@ mod tests {
             fetched.created_version.as_deref(),
             Some(rustykrab_core::VERSION)
         );
+    }
+
+    #[tokio::test]
+    async fn a_firing_links_its_job_to_its_work_item() {
+        let s = in_memory_jobs();
+        let job = s
+            .create_job(
+                "0 9 * * *",
+                "Water the plants.",
+                None,
+                None,
+                None,
+                "UTC",
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(s.work_item_id(&job.id).await.unwrap(), None);
+        assert!(s.job_for_work_item("item-1").await.unwrap().is_none());
+
+        s.set_work_item_id(&job.id, "item-1").await.unwrap();
+        assert_eq!(
+            s.work_item_id(&job.id).await.unwrap().as_deref(),
+            Some("item-1")
+        );
+        let found = s.job_for_work_item("item-1").await.unwrap().unwrap();
+        assert_eq!(found.id, job.id);
+
+        // The next firing replaces the link; the old item names no job.
+        s.set_work_item_id(&job.id, "item-2").await.unwrap();
+        assert!(s.job_for_work_item("item-1").await.unwrap().is_none());
+        assert!(matches!(
+            s.set_work_item_id("no-such-job", "item-3").await,
+            Err(Error::NotFound(_))
+        ));
     }
 
     #[tokio::test]

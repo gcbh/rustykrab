@@ -50,8 +50,8 @@ pub use recall_archive::RecallArchiveStore;
 pub use secret::{SecretMeta, SecretStore, WriteAuthority};
 pub use tasks::{DelegatedTask, TaskStatus, TaskStore};
 pub use work_items::{
-    ArchivedItem, OutboxDraft, OutboxRow, RepointSpec, TransitionSpec, WorkApplied, WorkFilter,
-    WorkOp, WorkPlanRow, WorkStoreError,
+    ArchivedItem, LeaseRecord, OutboxDraft, OutboxRow, RepointSpec, RunSpend, Spend,
+    TransitionSpec, WorkApplied, WorkFilter, WorkOp, WorkPlanRow, WorkStoreError,
 };
 
 /// Top-level database handle wrapping a SQLite connection.
@@ -1002,6 +1002,52 @@ impl Store {
             )
             .map_err(|e| Error::Storage(e.to_string()))?;
         }
+
+        // ── Control layer, Phase 1 close-out: lease history and spend ──
+        // (docs/plans/control-layer-and-worker-fleet.md, sections 4.3, 4.6
+        // and 13; code in work_items/). Both are history, like the events:
+        // keyed on the item id with no foreign key, so they outlive the
+        // live row and its compaction into `work_item_archive`.
+        //
+        // `work_lease_history` keeps every lease once it ends (released,
+        // closed, returned to ready), with the `inputs` it copied into the
+        // brief, so what a worker was given stays queryable after the live
+        // `leases` row is gone. `work_spend` is one row per worker run: the
+        // tokens and wall time it spent. A parent's remaining budget is its
+        // budget less what its subtree spent, and the archive's `cost` is
+        // the item's total.
+        conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS work_lease_history (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                item         TEXT NOT NULL,
+                worker       TEXT NOT NULL,
+                since        TEXT NOT NULL,
+                ttl_seconds  INTEGER NOT NULL,
+                heartbeat_at TEXT NOT NULL,
+                inputs       TEXT NOT NULL DEFAULT '[]',
+                released_at  TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_work_lease_history_item
+                ON work_lease_history (item, since);
+
+            CREATE TABLE IF NOT EXISTS work_spend (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                item       TEXT NOT NULL,
+                run        TEXT,
+                worker     TEXT NOT NULL,
+                tokens     INTEGER NOT NULL DEFAULT 0,
+                wall_ms    INTEGER NOT NULL DEFAULT 0,
+                iterations INTEGER NOT NULL DEFAULT 0,
+                at         TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_work_spend_item
+                ON work_spend (item);
+            ",
+        )
+        .map_err(|e| Error::Storage(e.to_string()))?;
 
         // Databases created before conversations were normalized have a
         // two-column `conversations` table; add the promoted metadata

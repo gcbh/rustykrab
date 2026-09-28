@@ -17,8 +17,8 @@ use super::rows::{
     EVIDENCE_COLUMNS, ITEM_COLUMNS, LEASE_COLUMNS, OUTBOX_COLUMNS, PLAN_COLUMNS,
 };
 use super::{
-    ArchivedItem, OutboxDraft, OutboxRow, RepointSpec, TransitionSpec, WorkApplied, WorkFilter,
-    WorkOp, WorkPlanRow, WorkStoreError,
+    ArchivedItem, LeaseRecord, OutboxDraft, OutboxRow, RepointSpec, RunSpend, Spend,
+    TransitionSpec, WorkApplied, WorkFilter, WorkOp, WorkPlanRow, WorkStoreError,
 };
 
 /// The closed statuses, as SQL, for "open by the status column".
@@ -71,7 +71,24 @@ pub(super) fn apply(
             applied.outbox_ids.push(enqueue_outbox(conn, draft, now)?);
             Ok(())
         }
+        WorkOp::ReleaseHold(item) => release_hold(conn, item, now),
     }
+}
+
+/// Clear an item's approval hold. Refused for an id no live item has.
+pub(super) fn release_hold(
+    conn: &Connection,
+    item: &str,
+    now: DateTime<Utc>,
+) -> Result<(), WorkStoreError> {
+    let cleared = conn.execute(
+        "UPDATE work_items SET held_by = NULL, updated_at = ?2 WHERE id = ?1",
+        params![item, ts(&now)],
+    )?;
+    if cleared == 0 {
+        return Err(WorkStoreError::NotFound(format!("work item {item}")));
+    }
+    Ok(())
 }
 
 // ── items ──────────────────────────────────────────────────────────────
@@ -427,7 +444,7 @@ pub(super) fn transition(
         ],
     )?;
     if !spec.to.is_active() {
-        conn.execute("DELETE FROM leases WHERE item = ?1", params![spec.item])?;
+        end_lease(conn, &spec.item, now)?;
     }
 
     let event = WorkEvent {
@@ -690,12 +707,124 @@ pub(super) fn lease_heartbeat(
 pub(super) fn lease_release(
     conn: &Connection,
     item: &str,
+    now: DateTime<Utc>,
 ) -> Result<Option<Lease>, WorkStoreError> {
-    let lease = get_lease(conn, item)?;
-    if lease.is_some() {
-        conn.execute("DELETE FROM leases WHERE item = ?1", params![item])?;
+    end_lease(conn, item, now)
+}
+
+/// End the item's lease, if it has one: copy it into
+/// `work_lease_history` with `now` as its end, then drop the live row.
+/// Every path that drops a lease comes through here, so no lease leaves
+/// the record.
+fn end_lease(
+    conn: &Connection,
+    item: &str,
+    now: DateTime<Utc>,
+) -> Result<Option<Lease>, WorkStoreError> {
+    let Some(lease) = get_lease(conn, item)? else {
+        return Ok(None);
+    };
+    conn.execute(
+        &format!(
+            "INSERT INTO work_lease_history ({LEASE_COLUMNS}, released_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
+        ),
+        params![
+            lease.item,
+            lease.worker,
+            ts(&lease.since),
+            i64::try_from(lease.ttl_seconds).unwrap_or(i64::MAX),
+            ts(&lease.heartbeat_at),
+            to_json(&lease.inputs)?,
+            ts(&now),
+        ],
+    )?;
+    conn.execute("DELETE FROM leases WHERE item = ?1", params![item])?;
+    Ok(Some(lease))
+}
+
+/// Every lease `item` held: the history, oldest first, then the live one.
+pub(super) fn lease_history(
+    conn: &Connection,
+    item: &str,
+) -> Result<Vec<LeaseRecord>, WorkStoreError> {
+    let mut out = collect(
+        conn,
+        &format!(
+            "SELECT {LEASE_COLUMNS}, released_at FROM work_lease_history
+              WHERE item = ?1 ORDER BY since, id"
+        ),
+        params![item],
+        |row| {
+            let released: String = row.get("released_at")?;
+            Ok(LeaseRecord {
+                lease: lease_from_row(row)?,
+                released_at: super::rows::parse_ts(&released),
+            })
+        },
+    )?;
+    if let Some(live) = get_lease(conn, item)? {
+        out.push(LeaseRecord {
+            lease: live,
+            released_at: None,
+        });
     }
-    Ok(lease)
+    Ok(out)
+}
+
+// ── spend ──────────────────────────────────────────────────────────────
+
+pub(super) fn record_spend(conn: &Connection, spend: &RunSpend) -> Result<(), WorkStoreError> {
+    conn.execute(
+        "INSERT INTO work_spend (item, run, worker, tokens, wall_ms, iterations, at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            spend.item,
+            spend.run,
+            spend.worker,
+            i64::try_from(spend.tokens).unwrap_or(i64::MAX),
+            i64::try_from(spend.wall_ms).unwrap_or(i64::MAX),
+            i64::from(spend.iterations),
+            ts(&spend.at),
+        ],
+    )?;
+    Ok(())
+}
+
+fn spend_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Spend> {
+    let n = |i: usize| -> rusqlite::Result<u64> {
+        Ok(u64::try_from(row.get::<_, i64>(i)?).unwrap_or(0))
+    };
+    Ok(Spend {
+        runs: u32::try_from(n(0)?).unwrap_or(u32::MAX),
+        tokens: n(1)?,
+        wall_ms: n(2)?,
+        iterations: n(3)?,
+    })
+}
+
+pub(super) fn spend_of(conn: &Connection, item: &str) -> Result<Spend, WorkStoreError> {
+    Ok(conn.query_row(
+        "SELECT COUNT(*), COALESCE(SUM(tokens), 0), COALESCE(SUM(wall_ms), 0),
+                COALESCE(SUM(iterations), 0)
+           FROM work_spend WHERE item = ?1",
+        params![item],
+        spend_from_row,
+    )?)
+}
+
+pub(super) fn spend_totals(
+    conn: &Connection,
+) -> Result<std::collections::HashMap<String, Spend>, WorkStoreError> {
+    let rows = collect(
+        conn,
+        "SELECT COUNT(*), COALESCE(SUM(tokens), 0), COALESCE(SUM(wall_ms), 0),
+                COALESCE(SUM(iterations), 0), item
+           FROM work_spend GROUP BY item",
+        [],
+        |row| Ok((row.get::<_, String>(4)?, spend_from_row(row)?)),
+    )?;
+    Ok(rows.into_iter().collect())
 }
 
 /// Leases are few (one per active leaf), so the expiry test runs in Rust,
@@ -856,10 +985,17 @@ pub(super) fn archive_one(
     let edges = edges_of(conn, id)?;
     let worker = last_worker(conn, id)?;
     let summary = archive_summary(&item, worker.as_deref());
+    // What its runs spent; NULL when no run recorded any.
+    let spent = spend_of(conn, id)?;
+    let cost = if spent.runs > 0 {
+        Some(to_json(&spent)?)
+    } else {
+        None
+    };
     conn.execute(
         &format!(
             "INSERT INTO work_item_archive ({ARCHIVE_COLUMNS})
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8, ?9, ?10, ?11)"
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"
         ),
         params![
             item.id,
@@ -869,6 +1005,7 @@ pub(super) fn archive_one(
             item.status.name(),
             item.status.reason(),
             worker,
+            cost,
             ts(&item.closed_at.unwrap_or(item.updated_at)),
             ts(&now),
             summary,
@@ -876,7 +1013,7 @@ pub(super) fn archive_one(
         ],
     )?;
     conn.execute("DELETE FROM work_item_deps WHERE item = ?1", params![id])?;
-    conn.execute("DELETE FROM leases WHERE item = ?1", params![id])?;
+    end_lease(conn, id, now)?;
     conn.execute("DELETE FROM work_items WHERE id = ?1", params![id])?;
     Ok(true)
 }
