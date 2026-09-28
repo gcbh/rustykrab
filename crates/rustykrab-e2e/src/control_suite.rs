@@ -1651,7 +1651,9 @@ async fn s31(ctx: &Ctx) -> Result<()> {
     let discovered_title = "Add a changelog entry [e2e-control s31]";
     let discovered = wait_titled(ctx, discovered_title).await?;
     tokio::time::sleep(QUIET).await;
-    let everything = list(ctx, "").await?;
+    // Closed items too: the follow-up inherits its parent's worker and
+    // repository, so it may already have run by the time this counts.
+    let everything = list(ctx, "include_closed=true").await?;
     ensure!(
         everything
             .iter()
