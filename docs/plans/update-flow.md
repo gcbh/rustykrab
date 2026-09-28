@@ -1,6 +1,6 @@
 # Plan: updating a running RustyKrab
 
-**Status:** Slices 1 to 5 built (2026-09-28); slice 6 merged but held until its review's fixes land
+**Status:** Slices 1 to 5 built; slice 6 built in four reviewed parts and gated (2026-09-28)
 **Builds on:** `control-layer-and-worker-fleet.md`, `self-build-loop.md`
 
 A new version of the daemon has to replace the old one without losing
@@ -20,7 +20,7 @@ builder.
 | 3 | Drain: on shutdown the controller leases nothing new, gives runs `RUSTYKRAB_DRAIN_SECS` (20) to finish, then ends them as interrupted, returned to `ready` with no rung | built (batch 4) |
 | 4 | Controller lock: an exclusive `flock` on `<data>/controller.lock`; only the holder ticks, and `/api/version` reports `held` or `waiting`; failed ticks reported beside it | built (batch 4) |
 | 5 | Release source and verifier: `rustykrab update check` and `rustykrab update stage` | built (batch 5), with the review's fixes |
-| 6 | Supervisor: `rustykrab update apply`, swap, restart, verify, roll back | merged (batch 6); the CLI refuses to run it until the fixes below land |
+| 6 | Supervisor: `rustykrab update apply`, swap, restart, verify, roll back | built in four reviewed parts; gated, see "Slice 6: status" |
 
 Pieces 3 and 4 were exercised by hand on the builder on 2026-09-28. A
 second daemon on the same data directory reported `waiting` and never
