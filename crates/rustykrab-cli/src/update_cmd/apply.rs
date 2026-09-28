@@ -15,11 +15,19 @@
 //!
 //! A journal (`.<name>.apply-state.json`, beside the install rather than in
 //! the data dir a worker can write) records how far an apply got, so the
-//! next run can put an interrupted one right before anything else. Before
-//! it rolls anything back it checks that the installed and `.prev` binaries
-//! report the journal's commits. A rollback that does not finish writes
-//! `.<name>.apply-failed.json` beside the install, and every later run
-//! refuses until a person deletes it.
+//! next run can put an interrupted one right before anything else: a new
+//! version that is running and verifies is kept, and anything else is
+//! rolled back. Before it rolls anything back it checks that the installed
+//! and `.prev` binaries report the journal's commits, and `.prev` passes the
+//! symlink check (and under launchd the signature check) before it is run
+//! or restored. Every service recovery starts is verified. A rollback or
+//! recovery that does not finish writes `.<name>.apply-failed.json` beside
+//! the install, saying what is installed, and every later run refuses until
+//! a person deletes it.
+//!
+//! Before anything changes, the installed binary must report the running
+//! commit, and `apply` refuses to run inside the daemon's own launchd job
+//! or from a binary under the install it swaps.
 //!
 //! `staged.json` sits in the data dir, which a worker can write, so apply
 //! trusts none of it: the record must be canonical, the copy beside the
@@ -213,7 +221,8 @@ pub enum Outcome {
         bad_record_error: Option<String>,
     },
     /// An interrupted apply was found (a journal, or an install path gone
-    /// with `.prev` beside it) and put right. Nothing new was applied.
+    /// with `.prev` beside it) and put right: finished when its new version
+    /// verified, rolled back otherwise. Nothing new was applied.
     Recovered(Recovery),
 }
 
@@ -226,8 +235,12 @@ pub struct Recovery {
     pub restored_prev: bool,
     /// The new version was rolled back and recorded as bad.
     pub rolled_back: bool,
-    /// The service was not running and was started.
+    /// The service was not running and was started, and verified.
     pub started: bool,
+    /// The journal was at `swapped` or `started` and the new version was
+    /// running and verified: the apply had got that far, so only the
+    /// journal was cleared.
+    pub finished: bool,
     /// Writing `bad.json` failed; the recovery went on regardless.
     pub bad_record_error: Option<String>,
 }
@@ -477,26 +490,7 @@ impl NextCheck<'_> {
     /// symlink; under launchd its signature must verify; and its binary's
     /// `--version` must report the staged version and commit.
     pub fn check(&self, next: &Path, app: bool) -> anyhow::Result<()> {
-        let meta = std::fs::symlink_metadata(next)
-            .with_context(|| format!("reading {}", next.display()))?;
-        let binary = if app {
-            if !meta.is_dir() {
-                bail!("{} is not a directory; refusing it", next.display());
-            }
-            let macos = next.join("Contents").join("MacOS");
-            let binary = macos.join(BINARY_NAME);
-            for p in [&next.join("Contents"), &macos, &binary] {
-                if is_symlink(p) {
-                    bail!("{} is a symbolic link; refusing it", p.display());
-                }
-            }
-            binary
-        } else {
-            if !meta.is_file() {
-                bail!("{} is not a regular file; refusing it", next.display());
-            }
-            next.to_path_buf()
-        };
+        let binary = check_no_symlink(next, app)?;
         if let Some(team) = self.team_id {
             self.verifier
                 .verify_signature(next, team)
@@ -521,6 +515,50 @@ impl NextCheck<'_> {
         }
         Ok(())
     }
+}
+
+/// `path` must be a real directory (`app`) or regular file, with no symlink
+/// down to the binary it runs. Returns that binary.
+fn check_no_symlink(path: &Path, app: bool) -> anyhow::Result<PathBuf> {
+    let meta =
+        std::fs::symlink_metadata(path).with_context(|| format!("reading {}", path.display()))?;
+    if app {
+        if !meta.is_dir() {
+            bail!("{} is not a directory; refusing it", path.display());
+        }
+        let macos = path.join("Contents").join("MacOS");
+        let binary = macos.join(BINARY_NAME);
+        for p in [&path.join("Contents"), &macos, &binary] {
+            if is_symlink(p) {
+                bail!("{} is a symbolic link; refusing it", p.display());
+            }
+        }
+        Ok(binary)
+    } else {
+        if !meta.is_file() {
+            bail!("{} is not a regular file; refusing it", path.display());
+        }
+        Ok(path.to_path_buf())
+    }
+}
+
+/// Before `.prev` is run or restored: the symlink check [`NextCheck`] runs
+/// on the copy, and under launchd its signature check. `.prev` sits beside
+/// the install, so it is as writable as the install and is checked again.
+fn check_prev(cfg: &Config, host: &Host<'_>) -> anyhow::Result<()> {
+    let prev = host.swap.prev_path()?;
+    // A bundle is installed as a directory; `.prev` must be the same kind.
+    let app = std::fs::symlink_metadata(host.swap.installed())
+        .or_else(|_| std::fs::symlink_metadata(&prev))
+        .with_context(|| format!("reading {}", prev.display()))?
+        .is_dir();
+    check_no_symlink(&prev, app).context("the .prev beside the install")?;
+    if host.service.is_launchd() {
+        host.verifier
+            .verify_signature(&prev, &cfg.team_id)
+            .context("signature check refused .prev")?;
+    }
+    Ok(())
 }
 
 /// The `bad.json` entry for a stage: a release by its version, a local
@@ -645,6 +683,12 @@ pub async fn apply(cfg: &Config, host: &Host<'_>, yes: bool) -> anyhow::Result<O
         return Ok(Outcome::Planned(plan));
     }
 
+    // What is installed becomes `.prev`, and a rollback returns to it, so it
+    // must be the version that is running now.
+    binary_reports(host, &plan.installed, &running_commit).context(
+        "the installed binary is not the running daemon's commit, so a rollback would not \
+         return to it; the daemon was not stopped",
+    )?;
     let check = NextCheck {
         verifier: host.verifier,
         team_id: host.service.is_launchd().then_some(cfg.team_id.as_str()),
@@ -703,14 +747,23 @@ pub async fn apply(cfg: &Config, host: &Host<'_>, yes: bool) -> anyhow::Result<O
                 None,
             ));
         }
-        let restarted = host.service.start();
-        if restarted.is_ok() {
-            clear_journal_logged(host.swap);
-        }
-        return Err(e.context(match restarted {
-            Ok(()) => "swapping the staged version in; the old one was started again",
-            Err(_) => "swapping the staged version in; starting the old one also failed",
-        }));
+        // As after a failed stop, the journal is kept until `/api/version`
+        // answers with the old commit.
+        let restarted = match host.service.start() {
+            Ok(()) => wait_for_commit(host, &journal.from_commit).await,
+            Err(e) => Err(e.context("starting the old version again")),
+        };
+        let context = match &restarted {
+            Ok(()) => {
+                clear_journal_logged(host.swap);
+                "swapping the staged version in; the old version is running again".to_string()
+            }
+            Err(r) => format!(
+                "swapping the staged version in; the old version was not seen running again \
+                 ({r:#}), so the journal is kept for the next run"
+            ),
+        };
+        return Err(e.context(context));
     }
     let brought_up: anyhow::Result<()> = async {
         write_journal(host.swap, &mut journal, Phase::Swapped)?;
@@ -787,11 +840,12 @@ fn already_rolled_back(host: &Host<'_>, journal: &Journal) -> bool {
 /// the journal's `to_commit` and `.prev` its `from_commit`, or a rollback
 /// must already have put `.prev` back. A journal that matches neither was
 /// not written by the apply that left these files, so nothing is stopped.
-fn check_rollback(host: &Host<'_>, journal: &Journal) -> anyhow::Result<()> {
+fn check_rollback(cfg: &Config, host: &Host<'_>, journal: &Journal) -> anyhow::Result<()> {
     if already_rolled_back(host, journal) {
         return Ok(());
     }
     let matched = binary_reports(host, host.swap.installed(), &journal.to_commit).and_then(|()| {
+        check_prev(cfg, host)?;
         binary_reports(host, &host.swap.prev_path()?, &journal.from_commit)
             .context("the .prev binary")
     });
@@ -822,6 +876,12 @@ async fn roll_back(
                 .await
                 .context("verifying the previous version");
         }
+        // Checked before the new version is stopped, so a `.prev` that
+        // fails leaves the new version up rather than nothing.
+        check_prev(cfg, host).context(
+            "restoring the previous version: .prev failed its checks, so the new version was \
+             not stopped",
+        )?;
         if host.service.running() {
             if let Err(first) = host.service.stop() {
                 tracing::warn!("stopping the new version for the rollback: {first:#}; once more");
@@ -859,29 +919,84 @@ async fn roll_back(
     }
 }
 
+/// Which version is installed, as far as `fail_loudly` can tell.
+enum Installed {
+    Nothing,
+    Previous,
+    New,
+    Unknown,
+}
+
+/// What is installed, against the journal's two commits. `None` without a
+/// journal, when there is nothing to compare with.
+fn identify_installed(host: &Host<'_>, journal: Option<&Journal>) -> Option<Installed> {
+    let journal = journal?;
+    let installed = host.swap.installed();
+    Some(if std::fs::symlink_metadata(installed).is_err() {
+        Installed::Nothing
+    } else if binary_reports(host, installed, &journal.from_commit).is_ok() {
+        Installed::Previous
+    } else if binary_reports(host, installed, &journal.to_commit).is_ok() {
+        Installed::New
+    } else {
+        Installed::Unknown
+    })
+}
+
 /// A rollback or recovery that did not finish: write `apply-failed.json`
-/// (what failed, both commits, the time), clear the journal, since a person
-/// takes over from here, and try to start the service last. Returns the
-/// error to report, with whatever of that also failed.
+/// (what failed, what is installed, both commits, the time), clear the
+/// journal, since a person takes over from here, and try to start the
+/// service last. It is not started when the installed binary reports
+/// neither of the journal's commits: an unidentified binary is never
+/// started. Returns the error to report, with whatever of that also failed.
+///
+/// Without a journal (it could not be read) nothing is cleared: the caller
+/// keeps an unreadable journal aside for the person who takes over.
 fn fail_loudly(
     host: &Host<'_>,
     journal: Option<&Journal>,
     error: anyhow::Error,
     bad_record_error: Option<&str>,
 ) -> anyhow::Error {
+    let installed = identify_installed(host, journal);
     let mut what = format!("{error:#}");
     if let Some(bad) = bad_record_error {
         what.push_str(&format!(
             "; recording the new version as bad also failed: {bad}"
         ));
     }
+    // Say what is in place, not what was meant to happen.
+    let path = host.swap.installed().display();
+    let state = match (&installed, journal) {
+        (None, _) | (_, None) => {
+            "with no readable journal, nothing was rolled back and which version is installed \
+             is not known"
+                .to_string()
+        }
+        (Some(Installed::Nothing), Some(_)) => format!("nothing is installed at {path}"),
+        (Some(Installed::Previous), Some(j)) => format!(
+            "the previous version ({}) is installed at {path}",
+            j.from_commit
+        ),
+        (Some(Installed::New), Some(j)) => format!(
+            "the new version ({}) is still installed at {path}; the previous version ({}) \
+             was not restored",
+            j.to_commit, j.from_commit
+        ),
+        (Some(Installed::Unknown), Some(j)) => format!(
+            "the binary installed at {path} reports neither {} nor {}, so nothing was \
+             restored and it was not started",
+            j.from_commit, j.to_commit
+        ),
+    };
+    what.push_str(&format!("; {state}"));
     let record = ApplyFailed {
         what: what.clone(),
         from_commit: journal.map(|j| j.from_commit.clone()),
         to_commit: journal.map(|j| j.to_commit.clone()),
         at: Utc::now(),
     };
-    let mut message = format!("the rollback failed: {what}");
+    let mut message = format!("apply did not finish: {what}");
     match write_atomic(host.swap, FAILED_FILE, &record) {
         Ok(()) => message.push_str(&format!(
             "; recorded in {}, and apply refuses until a person deletes it",
@@ -891,36 +1006,85 @@ fn fail_loudly(
         )),
         Err(e) => message.push_str(&format!("; writing {FAILED_FILE} failed too: {e:#}")),
     }
-    if let Err(e) = clear_journal(host.swap) {
-        message.push_str(&format!("; {e:#}"));
+    if journal.is_some() {
+        if let Err(e) = clear_journal(host.swap) {
+            message.push_str(&format!("; {e:#}"));
+        }
     }
-    match start_unless_running(host.service) {
-        Ok(()) => message.push_str("; the service was left running"),
-        Err(e) => message.push_str(&format!("; starting the service failed: {e:#}")),
+    if matches!(installed, Some(Installed::Unknown)) {
+        message.push_str(if host.service.running() {
+            "; the service is running"
+        } else {
+            "; the service is not running"
+        });
+    } else {
+        match start_unless_running(host.service) {
+            Ok(()) => message.push_str("; the service was left running"),
+            Err(e) => message.push_str(&format!("; starting the service failed: {e:#}")),
+        }
     }
     tracing::error!("{message}");
     anyhow!(message)
 }
 
+/// Move an unreadable journal aside to `.<name>.apply-state.json.unreadable`,
+/// so a person can still read it. Returns where it went.
+fn keep_unreadable_journal(swap: &dyn SwapRoot) -> anyhow::Result<PathBuf> {
+    let path = swap.state_path(STATE_FILE)?;
+    let kept = swap.state_path(&format!("{STATE_FILE}.unreadable"))?;
+    std::fs::rename(&path, &kept)
+        .with_context(|| format!("moving {} to {}", path.display(), kept.display()))?;
+    Ok(kept)
+}
+
+/// The commit the installed binary's `--version` reports.
+fn installed_commit(host: &Host<'_>) -> anyhow::Result<String> {
+    let binary = installed_executable(host.swap.installed());
+    let printed = host.verifier.run_version(&binary)?;
+    match parse_version_output(&printed) {
+        Some((_, Some(commit))) => Ok(commit),
+        _ => bail!(
+            "{} reports no commit: {:?}",
+            binary.display(),
+            printed.trim()
+        ),
+    }
+}
+
 /// Put right an apply that did not finish, before anything else:
 ///
-/// - the install path missing with `.prev` beside it: move `.prev` back;
-/// - a journal at `swapped` or `started`, or at `stopping` with the copy
-///   gone and the installed binary reporting the staged commit (a crash
-///   between the renames and the `swapped` write): the new version was in
-///   place when the run stopped, so roll it back in full and record it bad,
-///   once the installed and `.prev` binaries are seen to report the
-///   journal's commits ([`check_rollback`]);
+/// - the install path missing with `.prev` beside it: check `.prev`
+///   ([`check_prev`]) and move it back;
+/// - a journal at `swapped` or `started` whose new version is running and
+///   passes [`verify`]: the apply got that far, so the journal is cleared
+///   and nothing is rolled back;
+/// - otherwise a journal at `swapped` or `started`, or at `stopping` with
+///   the copy gone and the installed binary not reporting `from_commit` (a
+///   crash between the renames and the `swapped` write, or a `--version`
+///   that did not answer): the new version may be in place, so roll it back
+///   in full and record it bad, once the installed and `.prev` binaries are
+///   seen to report the journal's commits ([`check_rollback`]);
 /// - otherwise a journal at `stopping`: nothing was swapped; drop the copy;
-/// - then, if the service is not running, start it, and clear the journal.
+/// - then, if the service is not running, start it and verify it reports
+///   the journal's `from_commit` (without a journal, the commit the
+///   installed binary reports), and clear the journal.
 ///
 /// `None` when there was nothing to recover. A failure, including a journal
-/// that cannot be read or does not match the binaries, writes
-/// `apply-failed.json`.
+/// that cannot be read or does not match the binaries, and a started
+/// service that fails verify, writes `apply-failed.json`. An unreadable
+/// journal is kept as `.<name>.apply-state.json.unreadable`.
 pub async fn recover(cfg: &Config, host: &Host<'_>) -> anyhow::Result<Option<Recovery>> {
     let journal = match read_journal(host.swap) {
         Ok(journal) => journal,
-        Err(e) => return Err(fail_loudly(host, None, e, None)),
+        Err(e) => {
+            let e = match keep_unreadable_journal(host.swap) {
+                Ok(kept) => e.context(format!("it is kept as {}", kept.display())),
+                Err(r) => e.context(format!(
+                    "moving it aside failed too ({r:#}); it is left in place"
+                )),
+            };
+            return Err(fail_loudly(host, None, e, None));
+        }
     };
     let installed_missing = std::fs::symlink_metadata(host.swap.installed()).is_err();
     let restore_prev = installed_missing && host.swap.has_prev();
@@ -937,7 +1101,8 @@ pub async fn recover(cfg: &Config, host: &Host<'_>) -> anyhow::Result<Option<Rec
         installed_missing
     );
     if restore_prev {
-        if let Err(e) = host.swap.restore() {
+        let restored = check_prev(cfg, host).and_then(|()| host.swap.restore());
+        if let Err(e) = restored {
             return Err(fail_loudly(
                 host,
                 journal.as_ref(),
@@ -950,21 +1115,41 @@ pub async fn recover(cfg: &Config, host: &Host<'_>) -> anyhow::Result<Option<Rec
     if let Some(journal) = &journal {
         let swapped = match journal.phase {
             Phase::Swapped | Phase::Started => true,
+            // Only a binary seen to report `from_commit` counts as not
+            // swapped: a `--version` that fails or times out is taken as
+            // swapped, so the checks below run before anything is started.
             Phase::Stopping => {
                 let next_gone = host
                     .swap
                     .next_path()
                     .is_ok_and(|next| std::fs::symlink_metadata(next).is_err());
-                next_gone && binary_reports(host, host.swap.installed(), &journal.to_commit).is_ok()
+                next_gone
+                    && binary_reports(host, host.swap.installed(), &journal.from_commit).is_err()
             }
         };
+        let finished = matches!(journal.phase, Phase::Swapped | Phase::Started)
+            && !recovery.restored_prev
+            && host.service.running()
+            && binary_reports(host, host.swap.installed(), &journal.to_commit).is_ok()
+            && match verify(host, &journal.to_commit).await {
+                Ok(()) => true,
+                Err(e) => {
+                    tracing::warn!("the new version is running but not healthy: {e:#}");
+                    false
+                }
+            };
+        if finished {
+            clear_journal(host.swap)?;
+            recovery.finished = true;
+            return Ok(Some(recovery));
+        }
         if swapped {
             let checked = if recovery.restored_prev {
                 // `.prev` is already back in place.
                 binary_reports(host, host.swap.installed(), &journal.from_commit)
                     .context("the journal does not match the restored .prev")
             } else {
-                check_rollback(host, journal)
+                check_rollback(cfg, host, journal)
             };
             if let Err(e) = checked {
                 return Err(fail_loudly(host, Some(journal), e, None));
@@ -989,6 +1174,23 @@ pub async fn recover(cfg: &Config, host: &Host<'_>) -> anyhow::Result<Option<Rec
             ));
         }
         recovery.started = true;
+        // `start` returning is not the service being up: it must answer
+        // healthy with the commit it was put back to.
+        let verified = match &journal {
+            Some(journal) => verify(host, &journal.from_commit).await,
+            None => match installed_commit(host) {
+                Ok(commit) => verify(host, &commit).await,
+                Err(e) => Err(e),
+            },
+        };
+        if let Err(e) = verified {
+            return Err(fail_loudly(
+                host,
+                journal.as_ref(),
+                e.context("verifying the service started after recovering an interrupted apply"),
+                recovery.bad_record_error.as_deref(),
+            ));
+        }
     }
     clear_journal(host.swap)?;
     Ok(Some(recovery))
@@ -1614,6 +1816,36 @@ pub fn base_url(arg: Option<&str>, default: anyhow::Result<Url>) -> anyhow::Resu
     }
 }
 
+/// `apply` stops the daemon, so it must not be the daemon or run from the
+/// binary it swaps: refuse inside the daemon's own launchd job
+/// (`XPC_SERVICE_NAME` is [`BUNDLE_ID`]), and when `exe` resolves to a path
+/// under `installed`.
+pub fn refuse_inside_daemon(
+    xpc_service: Option<&str>,
+    exe: Option<&Path>,
+    installed: &Path,
+) -> anyhow::Result<()> {
+    if xpc_service == Some(BUNDLE_ID) {
+        bail!(
+            "apply is running inside the daemon's own launchd job ({BUNDLE_ID}), and stopping \
+             the daemon would stop it too; run it from its own job or a shell"
+        );
+    }
+    let resolve = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    if let Some(exe) = exe {
+        let (exe, installed) = (resolve(exe), resolve(installed));
+        if exe.starts_with(&installed) {
+            bail!(
+                "apply is running from {}, under the install {} it would swap; run it from a \
+                 copy kept outside it",
+                exe.display(),
+                installed.display()
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Entry point from `update_cmd::run`.
 pub async fn run(cfg: &Config, data_dir: &Path, args: ApplyArgs) -> anyhow::Result<()> {
     let yes = args.yes || std::env::var("RUSTYKRAB_UPDATE_AUTO").is_ok_and(|v| v.trim() == "1");
@@ -1639,6 +1871,11 @@ pub async fn run(cfg: &Config, data_dir: &Path, args: ApplyArgs) -> anyhow::Resu
             (Box::new(script), installed)
         }
     };
+    refuse_inside_daemon(
+        std::env::var("XPC_SERVICE_NAME").ok().as_deref(),
+        std::env::current_exe().ok().as_deref(),
+        &installed,
+    )?;
     let swap = DirSwap { installed };
     let host = Host {
         service: service.as_ref(),
@@ -1684,7 +1921,13 @@ pub async fn run(cfg: &Config, data_dir: &Path, args: ApplyArgs) -> anyhow::Resu
                 done.push("rolled the new version back".to_string());
             }
             if r.started {
-                done.push("started the service".to_string());
+                done.push("started the service and verified it".to_string());
+            }
+            if r.finished {
+                done.push(
+                    "found its new version running and verified, and cleared its journal"
+                        .to_string(),
+                );
             }
             if done.is_empty() {
                 done.push("dropped the copy it had not swapped in".to_string());

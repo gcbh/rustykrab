@@ -170,6 +170,8 @@ struct ScriptedVerifier {
     signature_checked: Mutex<Vec<PathBuf>>,
     /// Every binary whose `--version` ran.
     version_ran: Mutex<Vec<PathBuf>>,
+    /// How many of the next `--version` runs time out.
+    timeouts: Mutex<usize>,
 }
 
 impl ScriptedVerifier {
@@ -180,6 +182,7 @@ impl ScriptedVerifier {
             signed: Mutex::new(true),
             signature_checked: Mutex::new(Vec::new()),
             version_ran: Mutex::new(Vec::new()),
+            timeouts: Mutex::new(0),
         }
     }
 }
@@ -198,9 +201,18 @@ impl Verifier for ScriptedVerifier {
 
     fn run_version(&self, binary: &Path) -> anyhow::Result<String> {
         self.version_ran.lock().unwrap().push(binary.to_path_buf());
+        {
+            let mut timeouts = self.timeouts.lock().unwrap();
+            if *timeouts > 0 {
+                *timeouts -= 1;
+                bail!("{} --version timed out", binary.display());
+            }
+        }
+        // The override is what the copy beside the install reports.
+        let is_copy = binary.to_string_lossy().contains(".next");
         let commit = match self.commit_override.lock().unwrap().clone() {
-            Some(commit) => commit,
-            None => std::fs::read_to_string(binary)?.trim().to_string(),
+            Some(commit) if is_copy => commit,
+            _ => std::fs::read_to_string(binary)?.trim().to_string(),
         };
         Ok(format!(
             "rustykrab {} ({commit}, 2026-09-28)\n",
@@ -389,8 +401,9 @@ async fn a_healthy_new_version_is_left_in_place_with_prev_kept() {
     assert_eq!(rig.installed(), NEW);
     assert_eq!(
         *rig.verifier.version_ran.lock().unwrap(),
-        [rig.next()],
-        "--version ran on the copy beside the install, not the stage"
+        [rig.binary.clone(), rig.next()],
+        "--version ran on the installed binary, then on the copy beside the install, not \
+         the stage"
     );
     let prev = rig.prev().expect(".prev is kept");
     assert_eq!(std::fs::read_to_string(prev).unwrap(), OLD);
@@ -548,8 +561,8 @@ async fn launchd_checks_the_signature_of_the_copy_and_refuses_an_unsigned_one() 
     assert!(matches!(outcome, Outcome::Applied(_)), "{outcome:?}");
     assert_eq!(rig.installed(), NEW);
     assert_eq!(
-        *rig.verifier.version_ran.lock().unwrap(),
-        [rig.next().join("Contents").join("MacOS").join(BINARY_NAME)],
+        rig.verifier.version_ran.lock().unwrap().last(),
+        Some(&rig.next().join("Contents").join("MacOS").join(BINARY_NAME)),
         "--version ran on the binary inside the copy"
     );
 }
@@ -978,8 +991,10 @@ async fn an_apply_interrupted_after_the_swap_is_rolled_back_by_the_next_run() {
     for phase in [Phase::Swapped, Phase::Started] {
         let rig = Rig::new(NewMode::Healthy, false).await;
         applied(&rig).await;
-        // The run was killed with the new version in place.
+        // The run was killed with the new version in place, and it does not
+        // verify.
         write_journal_at(&rig.swap, phase);
+        rig.service.daemon.lock().unwrap().new_mode = NewMode::NoLock;
 
         let outcome = apply(&rig.cfg, &rig.host(), true).await.unwrap();
         let Outcome::Recovered(recovery) = outcome else {
@@ -1073,6 +1088,7 @@ async fn a_failure_to_record_the_bad_version_does_not_stop_the_rollback() {
     let rig = Rig::new(NewMode::Healthy, false).await;
     applied(&rig).await;
     write_journal_at(&rig.swap, Phase::Started);
+    rig.service.daemon.lock().unwrap().new_mode = NewMode::NoLock;
     let bad = rig.cfg.updates_dir().join("bad.json");
     std::fs::create_dir_all(&bad).unwrap();
     let outcome = apply(&rig.cfg, &rig.host(), true).await.unwrap();
@@ -1097,10 +1113,18 @@ async fn a_failed_rollback_writes_apply_failed_and_later_runs_refuse() {
 
     let err = apply(&rig.cfg, &rig.host(), true).await.unwrap_err();
     let text = format!("{err:#}");
-    assert!(text.contains("the rollback failed"), "{text}");
+    assert!(text.contains("apply did not finish"), "{text}");
     assert!(text.contains("restoring the previous version"), "{text}");
-    // The service is started last, after the rollback's stop.
-    assert_eq!(rig.service.calls(), ["stop", "start", "stop", "start"]);
+    // It says what is in place, not that a rollback happened.
+    assert!(
+        text.contains("the new version (new2222) is still installed")
+            && text.contains("was not restored"),
+        "{text}"
+    );
+    // `.prev` is checked before the new version is stopped, so that is
+    // left up.
+    assert_eq!(rig.service.calls(), ["stop", "start"]);
+    assert!(rig.service.daemon.lock().unwrap().running);
     let failed: ApplyFailed =
         serde_json::from_str(&std::fs::read_to_string(failed_file(&rig.swap)).unwrap()).unwrap();
     assert_eq!(failed.from_commit.as_deref(), Some(OLD));
@@ -1118,7 +1142,7 @@ async fn a_failed_rollback_writes_apply_failed_and_later_runs_refuse() {
         let text = format!("{err:#}");
         assert!(text.contains(FAILED_FILE), "{text}");
         assert!(text.contains(NEW) && text.contains("restoring"), "{text}");
-        assert_eq!(rig.service.calls().len(), 4, "nothing was touched");
+        assert_eq!(rig.service.calls().len(), 2, "nothing was touched");
     }
 
     // Until a person deletes it. The new version is still installed and
@@ -1239,6 +1263,7 @@ async fn a_journal_that_does_not_match_the_binaries_stops_nothing() {
     let rig = Rig::new(NewMode::Healthy, false).await;
     applied(&rig).await;
     write_journal_of(&rig.swap, Phase::Started, "zzz9999", NEW);
+    rig.service.daemon.lock().unwrap().new_mode = NewMode::NoLock;
     let err = apply(&rig.cfg, &rig.host(), false).await.unwrap_err();
     assert!(format!("{err:#}").contains("do not match"), "{err:#}");
     assert!(rig.service.calls().is_empty(), "{:?}", rig.service.calls());
@@ -1338,6 +1363,14 @@ async fn an_unparseable_journal_leaves_a_failure_record_and_a_started_service() 
 
     let err = apply(&rig.cfg, &rig.host(), false).await.unwrap_err();
     assert!(format!("{err:#}").contains("parsing"), "{err:#}");
+    // The journal is kept aside for a person, not deleted.
+    let kept = rig
+        .swap
+        .state_path(&format!("{STATE_FILE}.unreadable"))
+        .unwrap();
+    assert!(format!("{err:#}").contains("kept as"), "{err:#}");
+    assert!(std::fs::read_to_string(&kept).unwrap().contains("exploded"));
+    assert!(!rig.swap.state_path(STATE_FILE).unwrap().exists());
     assert_eq!(rig.service.calls(), ["start"]);
     assert!(rig.service.daemon.lock().unwrap().running);
     assert_eq!(rig.installed(), OLD);
@@ -1416,6 +1449,277 @@ async fn a_missing_install_after_a_commit_failure_is_reported_loudly() {
 
     let err = apply(&rig.cfg, &host, true).await.unwrap_err();
     assert!(err.to_string().contains(FAILED_FILE), "{err:#}");
+}
+
+#[tokio::test]
+async fn a_recovery_whose_started_service_fails_verify_is_reported_loudly() {
+    // An apply interrupted while stopping: the old version is started again,
+    // but it never holds the lock.
+    let rig = Rig::new(NewMode::Healthy, false).await;
+    write_stage(&rig.cfg, NEW, None, "binary", false);
+    write_journal_at(&rig.swap, Phase::Stopping);
+    std::fs::write(rig.next(), NEW).unwrap();
+    {
+        let mut daemon = rig.service.daemon.lock().unwrap();
+        daemon.running = false;
+        daemon.old_lock = "waiting";
+    }
+    let err = apply(&rig.cfg, &rig.host(), true).await.unwrap_err();
+    let text = format!("{err:#}");
+    assert!(text.contains("verifying the service started"), "{text}");
+    assert!(
+        text.contains("previous version (old1111) is installed"),
+        "{text}"
+    );
+    assert_eq!(rig.service.calls(), ["start"]);
+    assert!(failed_file(&rig.swap).exists());
+    assert_eq!(read_journal(&rig.swap).unwrap(), None);
+
+    // A missing install with `.prev` beside it and no journal: the restored
+    // binary's own commit is what must answer.
+    let rig = Rig::new(NewMode::Healthy, false).await;
+    let prev = sibling(&rig.swap.installed, "", ".prev").unwrap();
+    std::fs::rename(&rig.swap.installed, &prev).unwrap();
+    {
+        let mut daemon = rig.service.daemon.lock().unwrap();
+        daemon.running = false;
+        daemon.old_failed_ticks = 3;
+    }
+    let err = apply(&rig.cfg, &rig.host(), false).await.unwrap_err();
+    let text = format!("{err:#}");
+    assert!(text.contains("consecutive_failed_ticks is 3"), "{text}");
+    assert!(text.contains("no readable journal"), "{text}");
+    assert_eq!(rig.installed(), OLD);
+    assert!(failed_file(&rig.swap).exists());
+}
+
+/// A swap whose `commit` fails and leaves the installed version in place.
+struct FailsCommit<'a>(&'a DirSwap);
+
+impl SwapRoot for FailsCommit<'_> {
+    fn installed(&self) -> &Path {
+        self.0.installed()
+    }
+    fn prepare(&self, staged: &Path, check: &NextCheck<'_>) -> anyhow::Result<()> {
+        self.0.prepare(staged, check)
+    }
+    fn commit(&self) -> anyhow::Result<()> {
+        bail!("scripted: the rename failed")
+    }
+    fn discard(&self) -> anyhow::Result<()> {
+        self.0.discard()
+    }
+    fn has_prev(&self) -> bool {
+        self.0.has_prev()
+    }
+    fn restore(&self) -> anyhow::Result<()> {
+        self.0.restore()
+    }
+}
+
+#[tokio::test]
+async fn a_commit_failure_waits_for_the_old_commit_before_clearing_the_journal() {
+    // The old version answers again: the journal is cleared.
+    let rig = Rig::new(NewMode::Healthy, false).await;
+    write_stage(&rig.cfg, NEW, None, "binary", false);
+    let swap = FailsCommit(&rig.swap);
+    let host = Host {
+        swap: &swap,
+        ..rig.host()
+    };
+    let err = apply(&rig.cfg, &host, true).await.unwrap_err();
+    assert!(
+        format!("{err:#}").contains("old version is running again"),
+        "{err:#}"
+    );
+    assert_eq!(rig.service.calls(), ["stop", "start"]);
+    assert_eq!(read_journal(&rig.swap).unwrap(), None);
+
+    // What comes up answers with another commit: the journal is kept.
+    let rig = Rig::new(NewMode::Healthy, false).await;
+    write_stage(&rig.cfg, NEW, None, "binary", false);
+    let binary = rig.binary.clone();
+    *rig.service.on_start.lock().unwrap() = Some(Box::new(move || {
+        std::fs::write(&binary, "other55").unwrap();
+    }));
+    let swap = FailsCommit(&rig.swap);
+    let host = Host {
+        swap: &swap,
+        ..rig.host()
+    };
+    let err = apply(&rig.cfg, &host, true).await.unwrap_err();
+    assert!(format!("{err:#}").contains("journal is kept"), "{err:#}");
+    assert_eq!(
+        read_journal(&rig.swap).unwrap().map(|j| j.phase),
+        Some(Phase::Stopping)
+    );
+}
+
+#[tokio::test]
+async fn an_installed_binary_not_on_the_running_commit_refuses_before_any_change() {
+    let rig = Rig::new(NewMode::Healthy, false).await;
+    write_stage(&rig.cfg, NEW, None, "binary", false);
+    // The daemon runs OLD from elsewhere; the installed binary is another.
+    let elsewhere = tempfile::tempdir().unwrap();
+    let running = elsewhere.path().join(BINARY_NAME);
+    std::fs::write(&running, OLD).unwrap();
+    rig.service.daemon.lock().unwrap().installed = running;
+    std::fs::write(&rig.binary, "other55").unwrap();
+
+    let err = apply(&rig.cfg, &rig.host(), true).await.unwrap_err();
+    let text = format!("{err:#}");
+    assert!(text.contains("not the running daemon's commit"), "{text}");
+    assert!(text.contains("the daemon was not stopped"), "{text}");
+    assert!(rig.service.calls().is_empty(), "{:?}", rig.service.calls());
+    assert_eq!(rig.installed(), "other55");
+    assert_eq!(rig.prev(), None);
+    assert!(!rig.next().exists());
+    assert_eq!(read_journal(&rig.swap).unwrap(), None);
+}
+
+#[tokio::test]
+async fn a_verified_new_version_at_swapped_or_started_clears_the_journal() {
+    for phase in [Phase::Swapped, Phase::Started] {
+        let rig = Rig::new(NewMode::Healthy, false).await;
+        applied(&rig).await;
+        write_journal_at(&rig.swap, phase);
+
+        let outcome = apply(&rig.cfg, &rig.host(), true).await.unwrap();
+        let Outcome::Recovered(recovery) = outcome else {
+            panic!("expected a recovery, got {outcome:?}");
+        };
+        assert!(recovery.finished && !recovery.rolled_back, "{recovery:?}");
+        assert!(rig.service.calls().is_empty(), "{:?}", rig.service.calls());
+        assert_eq!(rig.installed(), NEW, "{phase:?}: nothing is rolled back");
+        assert!(rig.prev().is_some());
+        assert!(read_bad(&rig.cfg).unwrap().is_empty());
+        assert_eq!(read_journal(&rig.swap).unwrap(), None);
+        assert!(!failed_file(&rig.swap).exists());
+    }
+}
+
+#[tokio::test]
+async fn a_timed_out_version_at_stopping_is_handled_as_swapped() {
+    // The renames were done and the journal says `stopping`; the first
+    // `--version` of the installed binary times out. It is not taken as the
+    // old version and started: it is checked, then rolled back.
+    let rig = Rig::new(NewMode::Healthy, false).await;
+    applied(&rig).await;
+    write_journal_at(&rig.swap, Phase::Stopping);
+    rig.service.daemon.lock().unwrap().running = false;
+    *rig.verifier.timeouts.lock().unwrap() = 1;
+
+    let outcome = apply(&rig.cfg, &rig.host(), false).await.unwrap();
+    let Outcome::Recovered(recovery) = outcome else {
+        panic!("expected a recovery, got {outcome:?}");
+    };
+    assert!(recovery.rolled_back);
+    assert_eq!(rig.service.calls(), ["start"]);
+    assert_eq!(rig.installed(), OLD);
+    assert_eq!(read_bad(&rig.cfg).unwrap(), bad_new());
+
+    // It never answers: nothing is restored and the unidentified binary is
+    // not started.
+    let rig = Rig::new(NewMode::Healthy, false).await;
+    applied(&rig).await;
+    write_journal_at(&rig.swap, Phase::Stopping);
+    rig.service.daemon.lock().unwrap().running = false;
+    *rig.verifier.timeouts.lock().unwrap() = usize::MAX;
+
+    let err = apply(&rig.cfg, &rig.host(), false).await.unwrap_err();
+    let text = format!("{err:#}");
+    assert!(text.contains("timed out"), "{text}");
+    assert!(text.contains("it was not started"), "{text}");
+    assert!(rig.service.calls().is_empty(), "{:?}", rig.service.calls());
+    assert!(!rig.service.daemon.lock().unwrap().running);
+    assert_eq!(rig.installed(), NEW);
+    assert!(failed_file(&rig.swap).exists());
+}
+
+#[tokio::test]
+async fn a_symlinked_prev_is_not_restored() {
+    // A rollback of an interrupted apply.
+    let rig = Rig::new(NewMode::Healthy, false).await;
+    applied(&rig).await;
+    write_journal_at(&rig.swap, Phase::Started);
+    rig.service.daemon.lock().unwrap().new_mode = NewMode::NoLock;
+    let elsewhere = tempfile::tempdir().unwrap();
+    let target = elsewhere.path().join("payload");
+    std::fs::write(&target, OLD).unwrap();
+    let prev = rig.prev().unwrap();
+    std::fs::remove_file(&prev).unwrap();
+    std::os::unix::fs::symlink(&target, &prev).unwrap();
+
+    let err = apply(&rig.cfg, &rig.host(), false).await.unwrap_err();
+    assert!(format!("{err:#}").contains("not a regular file"), "{err:#}");
+    assert!(rig.service.calls().is_empty(), "{:?}", rig.service.calls());
+    assert_eq!(rig.installed(), NEW);
+    assert!(is_symlink(&prev));
+    assert!(failed_file(&rig.swap).exists());
+
+    // A missing install with a symlinked `.prev` beside it.
+    let rig = Rig::new(NewMode::Healthy, false).await;
+    let prev = sibling(&rig.swap.installed, "", ".prev").unwrap();
+    std::fs::remove_file(&rig.swap.installed).unwrap();
+    std::os::unix::fs::symlink(&target, &prev).unwrap();
+    rig.service.daemon.lock().unwrap().running = false;
+
+    let err = apply(&rig.cfg, &rig.host(), false).await.unwrap_err();
+    assert!(format!("{err:#}").contains("restoring .prev"), "{err:#}");
+    assert!(std::fs::symlink_metadata(&rig.swap.installed).is_err());
+    assert!(is_symlink(&prev));
+    assert!(failed_file(&rig.swap).exists());
+}
+
+#[tokio::test]
+async fn launchd_checks_the_signature_of_prev_before_a_rollback() {
+    let rig = Rig::new(NewMode::Healthy, true).await;
+    write_stage(&rig.cfg, NEW, None, "app", true);
+    let outcome = apply(&rig.cfg, &rig.host(), true).await.unwrap();
+    assert!(matches!(outcome, Outcome::Applied(_)), "{outcome:?}");
+    rig.service.calls.lock().unwrap().clear();
+    write_journal_at(&rig.swap, Phase::Started);
+    rig.service.daemon.lock().unwrap().new_mode = NewMode::NoLock;
+    *rig.verifier.signed.lock().unwrap() = false;
+
+    let err = apply(&rig.cfg, &rig.host(), false).await.unwrap_err();
+    assert!(
+        format!("{err:#}").contains("signature check refused .prev"),
+        "{err:#}"
+    );
+    assert!(rig
+        .verifier
+        .signature_checked
+        .lock()
+        .unwrap()
+        .contains(&rig.prev().unwrap()));
+    assert!(rig.service.calls().is_empty(), "{:?}", rig.service.calls());
+    assert_eq!(rig.installed(), NEW);
+}
+
+#[test]
+fn apply_refuses_inside_the_daemon() {
+    let root = tempfile::tempdir().unwrap();
+    let app = bundle(root.path(), OLD);
+    let inside = app.join("Contents").join("MacOS").join(BINARY_NAME);
+    let elsewhere = tempfile::tempdir().unwrap();
+    let copy = elsewhere.path().join(BINARY_NAME);
+    std::fs::write(&copy, OLD).unwrap();
+
+    // The daemon's own launchd job.
+    let err = refuse_inside_daemon(Some(BUNDLE_ID), Some(&copy), &app).unwrap_err();
+    assert!(err.to_string().contains("launchd job"), "{err:#}");
+    // Run from the bundle it would swap, directly or through a symlink.
+    let err = refuse_inside_daemon(None, Some(&inside), &app).unwrap_err();
+    assert!(err.to_string().contains("under the install"), "{err:#}");
+    let link = elsewhere.path().join("link");
+    std::os::unix::fs::symlink(&inside, &link).unwrap();
+    assert!(refuse_inside_daemon(None, Some(&link), &app).is_err());
+    // A bare binary is its own install path.
+    assert!(refuse_inside_daemon(None, Some(&copy), &copy).is_err());
+    // The updater's own job, from a copy outside the bundle, runs.
+    refuse_inside_daemon(Some("com.gcbh.rustykrab.updater"), Some(&copy), &app).unwrap();
+    refuse_inside_daemon(None, None, &app).unwrap();
 }
 
 #[test]
