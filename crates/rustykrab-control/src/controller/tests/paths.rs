@@ -426,6 +426,7 @@ async fn discovered_under_a_repo_item(
     let mut x = draft("x", "Add a status helper");
     x.worker_kind = WorkerKind::Local;
     x.writable_resources = vec!["repo:/src/app".to_string(), "calendar:home".to_string()];
+    x.constraints = vec!["Never push.".to_string()];
     let ids = h.file(plan(vec![draft("P", "Status page"), x])).await.ids;
     for _ in 0..3 {
         h.step().await;
@@ -662,6 +663,23 @@ async fn a_discovered_draft_with_no_worker_constraint_inherits_the_filers() {
     let (_h, kids) =
         discovered_under_a_repo_item(vec![code_follow_up("f", "Document the helper")]).await;
     assert_eq!(kids["Document the helper"].worker_kind, WorkerKind::Local);
+}
+
+#[tokio::test]
+async fn a_discovered_draft_inherits_the_filers_constraints_after_its_own() {
+    let mut f = code_follow_up("f", "Document the helper");
+    f.constraints = vec!["Keep it short.".to_string(), "Never push.".to_string()];
+    let (_h, kids) = discovered_under_a_repo_item(vec![f]).await;
+    assert_eq!(
+        kids["Document the helper"].constraints,
+        vec!["Keep it short.".to_string(), "Never push.".to_string()],
+        "the filer's rule is carried once, after the draft's own"
+    );
+    let (_h, kids) = discovered_under_a_repo_item(vec![code_follow_up("g", "Wire the page")]).await;
+    assert_eq!(
+        kids["Wire the page"].constraints,
+        vec!["Never push.".to_string()]
+    );
 }
 
 #[tokio::test]

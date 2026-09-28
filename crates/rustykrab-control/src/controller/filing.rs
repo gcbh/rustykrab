@@ -943,6 +943,15 @@ fn inherit_from(filer: &WorkItem, draft: &WorkItemDraft) -> WorkItemDraft {
     if d.worker_kind == WorkerKind::Any {
         d.worker_kind = filer.worker_kind;
     }
+    // The filer's rules hold for its follow-ups too: a follow-up that did
+    // not inherit them ran with none (2026-09-28), outside the worktree
+    // rule its filer was given. A rule that turns out too narrow for the
+    // follow-up surfaces as a question, the safer failure.
+    for c in &filer.constraints {
+        if !d.constraints.contains(c) {
+            d.constraints.push(c.clone());
+        }
+    }
     d
 }
 
@@ -952,13 +961,7 @@ fn inherit_from(filer: &WorkItem, draft: &WorkItemDraft) -> WorkItemDraft {
 /// the same repository under the same rules instead of in an empty
 /// scratch directory.
 fn inherit_internal(failing: &WorkItem, draft: &WorkItemDraft) -> WorkItemDraft {
-    let mut d = inherit_from(failing, draft);
-    for c in &failing.constraints {
-        if !d.constraints.contains(c) {
-            d.constraints.push(c.clone());
-        }
-    }
-    d
+    inherit_from(failing, draft)
 }
 
 fn is_repo(resource: &str) -> bool {
