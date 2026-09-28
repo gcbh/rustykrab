@@ -35,4 +35,9 @@ fn main() {
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_else(|| "unknown".to_string());
     println!("cargo:rustc-env=RUSTYKRAB_BUILD_DATE={build_date}");
+
+    // The target triple, so `rustykrab update stage` asks for the release
+    // asset built for this binary (`rustykrab-<target>.tar.gz`).
+    let target = std::env::var("TARGET").unwrap_or_else(|_| "unknown".to_string());
+    println!("cargo:rustc-env=RUSTYKRAB_TARGET={target}");
 }

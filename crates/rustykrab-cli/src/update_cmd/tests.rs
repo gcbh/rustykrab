@@ -1,0 +1,408 @@
+//! `rustykrab update` against a local stand-in for the GitHub releases API,
+//! serving a release and an archive built in the test. The signature check
+//! and the `--version` run are scripted, except in the macOS test that runs
+//! the real `codesign`.
+
+use std::sync::{Arc, Mutex};
+
+use axum::routing::get;
+use axum::Router;
+
+use super::*;
+
+const TARGET: &str = "test-target";
+const RUNNING: &str = "5.3.6";
+
+/// A scripted [`Verifier`] that records what it was asked to do.
+struct Scripted {
+    signature: Result<(), String>,
+    version_output: String,
+    calls: Mutex<Vec<String>>,
+}
+
+impl Scripted {
+    fn passing(version: &str) -> Self {
+        Self {
+            signature: Ok(()),
+            version_output: format!("rustykrab {version} (abc1234, 2026-09-28)\n"),
+            calls: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn calls(&self) -> Vec<String> {
+        self.calls.lock().unwrap().clone()
+    }
+}
+
+impl Verifier for Scripted {
+    fn verify_signature(&self, _app: &Path, team_id: &str) -> anyhow::Result<()> {
+        self.calls.lock().unwrap().push(format!("sign:{team_id}"));
+        self.signature.clone().map_err(|e| anyhow!(e))
+    }
+
+    fn run_version(&self, _binary: &Path) -> anyhow::Result<String> {
+        self.calls.lock().unwrap().push("version".to_string());
+        Ok(self.version_output.clone())
+    }
+}
+
+/// A `RustyKrab.app` layout with a placeholder binary, as a directory.
+fn bundle_in(dir: &Path) -> PathBuf {
+    let app = dir.join(APP_NAME);
+    let macos = app.join("Contents").join("MacOS");
+    std::fs::create_dir_all(&macos).unwrap();
+    std::fs::write(macos.join(BINARY_NAME), "#!/bin/sh\necho placeholder\n").unwrap();
+    app
+}
+
+/// `rustykrab-<target>.tar.gz` holding a bundle, built with the system tar.
+fn archive() -> Vec<u8> {
+    let dir = tempfile::tempdir().unwrap();
+    bundle_in(dir.path());
+    let out = dir.path().join("out.tar.gz");
+    let status = Command::new("tar")
+        .arg("-czf")
+        .arg(&out)
+        .arg("-C")
+        .arg(dir.path())
+        .arg(APP_NAME)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    std::fs::read(out).unwrap()
+}
+
+enum Digest {
+    Right,
+    Wrong,
+    Missing,
+}
+
+/// Serve `/repos/gcbh/rustykrab/releases/latest` and the asset; returns
+/// the base URL and a count of asset downloads.
+async fn stand_in(tag: &str, digest: Digest, bytes: Vec<u8>) -> (String, Arc<Mutex<usize>>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let name = format!("rustykrab-{TARGET}.tar.gz");
+    let digest = match digest {
+        Digest::Right => serde_json::json!(format!("sha256:{}", sha256_hex(&bytes))),
+        Digest::Wrong => serde_json::json!(format!("sha256:{}", "0".repeat(64))),
+        Digest::Missing => serde_json::Value::Null,
+    };
+    let release = serde_json::json!({
+        "tag_name": tag,
+        "assets": [{
+            "name": name,
+            "browser_download_url": format!("{base}/download/{name}"),
+            "digest": digest,
+        }],
+    });
+    let downloads = Arc::new(Mutex::new(0usize));
+    let counter = downloads.clone();
+    let app = Router::new()
+        .route(
+            "/repos/gcbh/rustykrab/releases/latest",
+            get(move || {
+                let release = release.clone();
+                async move { axum::Json(release) }
+            }),
+        )
+        .route(
+            &format!("/download/{name}"),
+            get(move || {
+                *counter.lock().unwrap() += 1;
+                let bytes = bytes.clone();
+                async move { bytes }
+            }),
+        );
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (base, downloads)
+}
+
+fn config(data_dir: &Path, api_base: &str) -> Config {
+    Config {
+        data_dir: data_dir.to_path_buf(),
+        repo: DEFAULT_REPO.to_string(),
+        api_base: api_base.to_string(),
+        token: None,
+        target: TARGET.to_string(),
+        running_version: RUNNING.to_string(),
+        team_id: DEFAULT_TEAM_ID.to_string(),
+    }
+}
+
+/// Everything under `updates/`, so a refusal can be shown to leave nothing.
+fn updates_entries(data_dir: &Path) -> Vec<String> {
+    match std::fs::read_dir(data_dir.join("updates")) {
+        Ok(entries) => entries
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+#[test]
+fn sha256_matches_the_standard_vector() {
+    assert_eq!(
+        sha256_hex(b"abc"),
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    );
+}
+
+#[test]
+fn versions_compare_as_numbers() {
+    assert!(is_newer("v5.3.10", "5.3.9").unwrap());
+    assert!(!is_newer("v5.3.6", "5.3.6").unwrap());
+    assert!(!is_newer("5.2.99", "5.3.0").unwrap());
+    assert!(is_newer("v5.3", "5.3.0").is_err());
+}
+
+#[test]
+fn version_output_gives_version_and_commit() {
+    assert_eq!(
+        parse_version_output("rustykrab 5.4.0 (abc1234-dirty, 2026-09-28)\n"),
+        Some(("5.4.0".to_string(), Some("abc1234-dirty".to_string())))
+    );
+    assert_eq!(
+        parse_version_output("rustykrab 5.4.0 (unknown, unknown)"),
+        Some(("5.4.0".to_string(), None))
+    );
+    assert_eq!(parse_version_output("something else"), None);
+}
+
+#[test]
+fn signing_details_pin_identifier_and_team() {
+    let good = "Executable=/x\nIdentifier=com.gcbh.rustykrab\nFormat=app bundle\nTeamIdentifier=3RRX845C4X\n";
+    assert!(check_signing_details(good, DEFAULT_TEAM_ID).is_ok());
+    let other_team = good.replace("3RRX845C4X", "ABCDE12345");
+    assert!(check_signing_details(&other_team, DEFAULT_TEAM_ID).is_err());
+    assert!(check_signing_details(&other_team, "ABCDE12345").is_ok());
+    let other_id = good.replace("com.gcbh.rustykrab", "com.example.krab");
+    assert!(check_signing_details(&other_id, DEFAULT_TEAM_ID).is_err());
+    let unsigned = "Identifier=com.gcbh.rustykrab\nTeamIdentifier=not set\n";
+    assert!(check_signing_details(unsigned, DEFAULT_TEAM_ID).is_err());
+}
+
+#[test]
+fn parses_the_two_forms() {
+    let args = |s: &str| s.split_whitespace().map(String::from).collect::<Vec<_>>();
+    assert_eq!(parse(&args("check")), Ok(Cmd::Check));
+    assert_eq!(
+        parse(&args("stage --from /tmp/RustyKrab.app --force")),
+        Ok(Cmd::Stage {
+            from: Some(PathBuf::from("/tmp/RustyKrab.app")),
+            force: true
+        })
+    );
+    assert!(parse(&args("stage --from")).is_err());
+    assert!(parse(&args("apply")).is_err());
+}
+
+#[tokio::test]
+async fn check_reports_a_newer_release() {
+    let (base, _) = stand_in("v5.4.0", Digest::Right, archive()).await;
+    let data = tempfile::tempdir().unwrap();
+    let latest = check(&config(data.path(), &base)).await.unwrap();
+    assert_eq!(latest.version, "5.4.0");
+    assert!(latest.newer);
+}
+
+#[tokio::test]
+async fn a_digest_mismatch_is_refused_and_nothing_is_extracted() {
+    let (base, downloads) = stand_in("v5.4.0", Digest::Wrong, archive()).await;
+    let data = tempfile::tempdir().unwrap();
+    let verifier = Scripted::passing("5.4.0");
+    let err = stage_release(&config(data.path(), &base), &verifier, false)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("sha256"), "{err:#}");
+    assert_eq!(*downloads.lock().unwrap(), 1);
+    assert!(updates_entries(data.path()).is_empty());
+    assert!(
+        verifier.calls().is_empty(),
+        "nothing may run before the digest"
+    );
+}
+
+#[tokio::test]
+async fn a_missing_digest_is_refused() {
+    let (base, downloads) = stand_in("v5.4.0", Digest::Missing, archive()).await;
+    let data = tempfile::tempdir().unwrap();
+    let verifier = Scripted::passing("5.4.0");
+    let err = stage_release(&config(data.path(), &base), &verifier, false)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("no sha256 digest"), "{err:#}");
+    assert_eq!(*downloads.lock().unwrap(), 0);
+    assert!(updates_entries(data.path()).is_empty());
+    assert!(verifier.calls().is_empty());
+}
+
+#[tokio::test]
+async fn a_release_that_is_not_newer_stages_nothing() {
+    let (base, downloads) = stand_in("v5.3.6", Digest::Right, archive()).await;
+    let data = tempfile::tempdir().unwrap();
+    let verifier = Scripted::passing("5.3.6");
+    let outcome = stage_release(&config(data.path(), &base), &verifier, false)
+        .await
+        .unwrap();
+    assert!(matches!(outcome, StageOutcome::NotNewer(ref l) if l.version == "5.3.6"));
+    assert_eq!(*downloads.lock().unwrap(), 0);
+    assert!(updates_entries(data.path()).is_empty());
+}
+
+#[tokio::test]
+async fn a_good_release_is_staged_with_its_record() {
+    let bytes = archive();
+    let digest = format!("sha256:{}", sha256_hex(&bytes));
+    let (base, _) = stand_in("v5.4.0", Digest::Right, bytes).await;
+    let data = tempfile::tempdir().unwrap();
+    let verifier = Scripted::passing("5.4.0");
+    let StageOutcome::Staged(staged) = stage_release(&config(data.path(), &base), &verifier, false)
+        .await
+        .unwrap()
+    else {
+        panic!("a newer release with the right digest stages");
+    };
+
+    // Signature first, then the one --version run.
+    assert_eq!(
+        verifier.calls(),
+        vec![format!("sign:{DEFAULT_TEAM_ID}"), "version".to_string()]
+    );
+    let dir = data.path().join("updates").join("5.4.0");
+    assert_eq!(staged.path, dir.join(APP_NAME));
+    assert!(dir
+        .join(APP_NAME)
+        .join("Contents/MacOS")
+        .join(BINARY_NAME)
+        .is_file());
+    assert_eq!(updates_entries(data.path()), vec!["5.4.0".to_string()]);
+
+    let record: Staged =
+        serde_json::from_str(&std::fs::read_to_string(dir.join(STAGED_FILE)).unwrap()).unwrap();
+    assert_eq!(record, staged);
+    assert_eq!(record.version, "5.4.0");
+    assert_eq!(record.tag.as_deref(), Some("v5.4.0"));
+    assert_eq!(record.commit.as_deref(), Some("abc1234"));
+    assert_eq!(record.digest.as_deref(), Some(digest.as_str()));
+    assert!(record
+        .source
+        .ends_with(&format!("rustykrab-{TARGET}.tar.gz")));
+}
+
+#[tokio::test]
+async fn a_refused_signature_runs_nothing_and_stages_nothing() {
+    let (base, _) = stand_in("v5.4.0", Digest::Right, archive()).await;
+    let data = tempfile::tempdir().unwrap();
+    let verifier = Scripted {
+        signature: Err("signed by team ABCDE12345".to_string()),
+        ..Scripted::passing("5.4.0")
+    };
+    assert!(stage_release(&config(data.path(), &base), &verifier, false)
+        .await
+        .is_err());
+    assert_eq!(verifier.calls(), vec![format!("sign:{DEFAULT_TEAM_ID}")]);
+    assert!(updates_entries(data.path()).is_empty());
+}
+
+#[tokio::test]
+async fn a_binary_reporting_another_version_is_refused() {
+    let (base, _) = stand_in("v5.4.0", Digest::Right, archive()).await;
+    let data = tempfile::tempdir().unwrap();
+    let verifier = Scripted::passing("5.3.9");
+    let err = stage_release(&config(data.path(), &base), &verifier, false)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("reports 5.3.9"), "{err:#}");
+    assert!(updates_entries(data.path()).is_empty());
+}
+
+#[tokio::test]
+async fn a_bad_version_needs_force() {
+    let (base, _) = stand_in("v5.4.0", Digest::Right, archive()).await;
+    let data = tempfile::tempdir().unwrap();
+    let updates = data.path().join("updates");
+    std::fs::create_dir_all(&updates).unwrap();
+    std::fs::write(updates.join(BAD_FILE), r#"[{"version": "5.4.0"}]"#).unwrap();
+    let cfg = config(data.path(), &base);
+    let verifier = Scripted::passing("5.4.0");
+
+    let err = stage_release(&cfg, &verifier, false).await.unwrap_err();
+    assert!(err.to_string().contains("recorded as bad"), "{err:#}");
+    assert!(!updates.join("5.4.0").exists());
+
+    let outcome = stage_release(&cfg, &verifier, true).await.unwrap();
+    assert!(matches!(outcome, StageOutcome::Staged(_)));
+    assert!(updates.join("5.4.0").join(STAGED_FILE).is_file());
+}
+
+#[test]
+fn from_a_local_bundle_checks_the_signature_and_has_no_digest() {
+    let src = tempfile::tempdir().unwrap();
+    let app = bundle_in(src.path());
+    let data = tempfile::tempdir().unwrap();
+    let cfg = config(data.path(), "http://127.0.0.1:9");
+    let verifier = Scripted::passing("5.3.6");
+    let staged = stage_from(&cfg, &verifier, &app, false).unwrap();
+    assert_eq!(
+        verifier.calls(),
+        vec![format!("sign:{DEFAULT_TEAM_ID}"), "version".to_string()]
+    );
+    assert_eq!(staged.version, "5.3.6");
+    assert_eq!(staged.digest, None);
+    assert_eq!(staged.tag, None);
+    assert_eq!(
+        staged.path,
+        data.path().join("updates").join("5.3.6").join(APP_NAME)
+    );
+    assert!(staged
+        .path
+        .join("Contents/MacOS")
+        .join(BINARY_NAME)
+        .is_file());
+}
+
+#[test]
+fn from_a_bare_binary_skips_the_signature() {
+    let src = tempfile::tempdir().unwrap();
+    let binary = src.path().join("some-build");
+    std::fs::write(&binary, "#!/bin/sh\n").unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let cfg = config(data.path(), "http://127.0.0.1:9");
+    let verifier = Scripted::passing("5.4.1");
+    let staged = stage_from(&cfg, &verifier, &binary, false).unwrap();
+    assert_eq!(verifier.calls(), vec!["version".to_string()]);
+    assert_eq!(
+        staged.path,
+        data.path().join("updates").join("5.4.1").join(BINARY_NAME)
+    );
+    assert!(data
+        .path()
+        .join("updates/5.4.1")
+        .join(STAGED_FILE)
+        .is_file());
+}
+
+/// The real `codesign` refuses a bundle nobody signed, and the release is
+/// not staged.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn real_codesign_refuses_an_unsigned_bundle() {
+    let src = tempfile::tempdir().unwrap();
+    let app = bundle_in(src.path());
+    assert!(SystemVerifier
+        .verify_signature(&app, DEFAULT_TEAM_ID)
+        .is_err());
+
+    let (base, _) = stand_in("v5.4.0", Digest::Right, archive()).await;
+    let data = tempfile::tempdir().unwrap();
+    let err = stage_release(&config(data.path(), &base), &SystemVerifier, false)
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{err:#}").contains("signature check refused"),
+        "{err:#}"
+    );
+    assert!(updates_entries(data.path()).is_empty());
+}
