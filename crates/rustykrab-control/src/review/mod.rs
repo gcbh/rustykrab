@@ -30,7 +30,7 @@ pub use project::{
     digest, is_projectable, local_ref, project, ItemView, Projection, ProjectionContext,
     LABEL_ACCEPTED, LABEL_DECLINED, LABEL_MANAGED,
 };
-pub use sync::{parse_decisions, sync, Synced};
+pub use sync::{parse_decisions, pull_decisions, push_projections, sync, Synced};
 
 /// One issue as the surface holds it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

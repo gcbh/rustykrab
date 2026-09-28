@@ -115,55 +115,64 @@ async fn live_items(store: &Store) -> Result<HashMap<WorkItemId, WorkItem>, Erro
         .collect())
 }
 
-/// One pass: every open proposal's decisions are read back and applied
-/// through `control` as typed review events, then every projectable live
-/// item is written to `surface`, creating its issue or rewriting one that
-/// changed or was edited by hand. Per-item failures are reported and the
-/// pass goes on; the next pass retries them.
-pub async fn sync(
-    store: &Store,
-    surface: &dyn ReviewSurface,
-    control: &dyn ControlHandle,
-    now: DateTime<Utc>,
-) -> Result<Synced, Error> {
-    let name = surface.name().to_string();
-    let mut out = Synced::default();
-    let mut rows = store.work_projections_all(&name).await?;
-    let listed: HashMap<String, Issue> = surface
+async fn listed(surface: &dyn ReviewSurface) -> Result<HashMap<String, Issue>, Error> {
+    Ok(surface
         .issues()
         .await?
         .into_iter()
         .map(|i| (i.number.clone(), i))
-        .collect();
-    let mut items = live_items(store).await?;
+        .collect())
+}
 
-    // Decisions in: only an open proposal takes one.
-    let mut decided_any = false;
-    let mut open_proposals: Vec<(WorkItemId, ProjectionRow)> = rows
-        .iter()
+/// The issue a row names: from the listing, else read on its own (one a
+/// human took the managed label off). `Ok(None)` when it is gone.
+async fn issue_of(
+    surface: &dyn ReviewSurface,
+    listed: &HashMap<String, Issue>,
+    number: &str,
+) -> Result<Option<Issue>, Error> {
+    match listed.get(number) {
+        Some(issue) => Ok(Some(issue.clone())),
+        None => surface.issue(number).await,
+    }
+}
+
+/// Decisions in: every open projected proposal's decision labels and new
+/// trusted comments, applied through `control` as typed review events,
+/// oldest first, until one closes the proposal. Only an open proposal
+/// takes a decision, so a label left on a closed one is inert.
+pub async fn pull_decisions(
+    store: &Store,
+    surface: &dyn ReviewSurface,
+    control: &dyn ControlHandle,
+) -> Result<Synced, Error> {
+    let name = surface.name().to_string();
+    let mut out = Synced::default();
+    let rows = store.work_projections_all(&name).await?;
+    let items = live_items(store).await?;
+    let mut open: Vec<(WorkItemId, ProjectionRow)> = rows
+        .into_iter()
         .filter(|(id, _)| {
             items
-                .get(*id)
+                .get(id)
                 .is_some_and(|i| i.kind == WorkKind::Proposal && !i.status.is_closed())
         })
-        .map(|(id, row)| (id.clone(), row.clone()))
         .collect();
-    open_proposals.sort_by(|a, b| a.0.cmp(&b.0));
-    for (id, mut row) in open_proposals {
-        let issue = match listed.get(&row.external_id) {
-            Some(issue) => Some(issue.clone()),
-            None => match surface.issue(&row.external_id).await {
-                Ok(found) => found,
-                Err(e) => {
-                    out.report
-                        .errors
-                        .push(format!("read issue {}: {e}", row.external_id));
-                    continue;
-                }
-            },
-        };
-        let Some(issue) = issue else {
-            continue;
+    if open.is_empty() {
+        return Ok(out);
+    }
+    open.sort_by(|a, b| a.0.cmp(&b.0));
+    let listed = listed(surface).await?;
+    for (id, mut row) in open {
+        let issue = match issue_of(surface, &listed, &row.external_id).await {
+            Ok(Some(issue)) => issue,
+            Ok(None) => continue,
+            Err(e) => {
+                out.report
+                    .errors
+                    .push(format!("read issue {}: {e}", row.external_id));
+                continue;
+            }
         };
         let comments = match surface.comments(&row.external_id).await {
             Ok(c) => c,
@@ -179,7 +188,6 @@ pub async fn sync(
             match control.review_decision(&id, decision, &actor).await {
                 Ok(outcome) => {
                     out.report.decisions += 1;
-                    decided_any = true;
                     let closed = outcome.status.is_closed();
                     out.decisions.push(outcome);
                     if closed {
@@ -196,15 +204,26 @@ pub async fn sync(
             if row.last_comment.as_deref() != Some(last.id.as_str()) {
                 row.last_comment = Some(last.id.clone());
                 store.work_projection_put(&row).await?;
-                rows.insert(id.clone(), row);
             }
         }
     }
-    if decided_any {
-        items = live_items(store).await?;
-    }
+    Ok(out)
+}
 
-    // Projections out.
+/// Projections out: every projectable live item is written to `surface`,
+/// its issue created, or rewritten when the item changed or the issue no
+/// longer shows its projection (a hand edit). Per-item failures are
+/// reported and the pass goes on; the next pass retries them.
+pub async fn push_projections(
+    store: &Store,
+    surface: &dyn ReviewSurface,
+    control: &dyn ControlHandle,
+    now: DateTime<Utc>,
+) -> Result<ProjectionReport, Error> {
+    let name = surface.name().to_string();
+    let mut report = ProjectionReport::default();
+    let mut rows = store.work_projections_all(&name).await?;
+    let items = live_items(store).await?;
     let facets: HashMap<WorkItemId, WorkFacets> = store.work_facets_all().await?;
     let parents: HashSet<WorkItemId> = items.values().filter_map(|i| i.parent.clone()).collect();
     let mut ctx = ProjectionContext {
@@ -219,7 +238,11 @@ pub async fn sync(
         .values()
         .filter(|i| is_projectable(i, ctx.facets.get(&i.id)))
         .collect();
+    if order.is_empty() {
+        return Ok(report);
+    }
     order.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
+    let listed = listed(surface).await?;
     for item in order {
         let edges = store.work_edges_of(&item.id).await?;
         let evidence = store.work_evidence_list(&item.id).await?;
@@ -256,32 +279,26 @@ pub async fn sync(
         };
         let wanted = digest(&projection);
         let existing = match rows.get(&item.id) {
-            Some(row) => {
-                let issue = match listed.get(&row.external_id) {
-                    Some(i) => Some(i.clone()),
-                    None => match surface.issue(&row.external_id).await {
-                        Ok(i) => i,
-                        Err(e) => {
-                            out.report
-                                .errors
-                                .push(format!("read issue {}: {e}", row.external_id));
-                            continue;
-                        }
-                    },
-                };
-                issue.map(|i| (row.clone(), i))
-            }
+            Some(row) => match issue_of(surface, &listed, &row.external_id).await {
+                Ok(issue) => issue.map(|i| (row.clone(), i)),
+                Err(e) => {
+                    report
+                        .errors
+                        .push(format!("read issue {}: {e}", row.external_id));
+                    continue;
+                }
+            },
             None => None,
         };
         let written = match existing {
             Some((row, issue)) => {
                 if row.digest == wanted && matches(&issue, &projection) {
-                    out.report.unchanged += 1;
+                    report.unchanged += 1;
                     continue;
                 }
                 match surface.update(&row.external_id, &projection).await {
                     Ok(issue) => {
-                        out.report.updated.push(item.id.clone());
+                        report.updated.push(item.id.clone());
                         ProjectionRow {
                             digest: wanted,
                             projected_at: now,
@@ -290,14 +307,14 @@ pub async fn sync(
                         }
                     }
                     Err(e) => {
-                        out.report.errors.push(format!("update {}: {e}", item.id));
+                        report.errors.push(format!("update {}: {e}", item.id));
                         continue;
                     }
                 }
             }
             None => match surface.create(&projection).await {
                 Ok(issue) => {
-                    out.report.created.push(item.id.clone());
+                    report.created.push(item.id.clone());
                     ProjectionRow {
                         item: item.id.clone(),
                         surface: name.clone(),
@@ -309,7 +326,7 @@ pub async fn sync(
                     }
                 }
                 Err(e) => {
-                    out.report.errors.push(format!("create {}: {e}", item.id));
+                    report.errors.push(format!("create {}: {e}", item.id));
                     continue;
                 }
             },
@@ -319,6 +336,23 @@ pub async fn sync(
         store.work_projection_put(&written).await?;
         rows.insert(item.id.clone(), written);
     }
+    Ok(report)
+}
+
+/// One whole pass: decisions in, then projections out, so an acceptance
+/// read now has its `code` item projected in the same pass.
+pub async fn sync(
+    store: &Store,
+    surface: &dyn ReviewSurface,
+    control: &dyn ControlHandle,
+    now: DateTime<Utc>,
+) -> Result<Synced, Error> {
+    let mut out = pull_decisions(store, surface, control).await?;
+    let pushed = push_projections(store, surface, control, now).await?;
+    out.report.created = pushed.created;
+    out.report.updated = pushed.updated;
+    out.report.unchanged = pushed.unchanged;
+    out.report.errors.extend(pushed.errors);
     Ok(out)
 }
 
