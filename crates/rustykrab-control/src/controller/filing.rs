@@ -65,6 +65,11 @@ fn describe_trigger(t: &ApprovalTrigger) -> String {
         ApprovalTrigger::CodeOutsideSlice { item } => {
             format!("{} is code outside an authorised slice", short(item))
         }
+        ApprovalTrigger::Discovered { items } => {
+            format!(
+                "{items} follow-up items a worker discovered, which the policy holds for a person"
+            )
+        }
     }
 }
 

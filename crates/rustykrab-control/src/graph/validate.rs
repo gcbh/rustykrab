@@ -83,6 +83,11 @@ pub struct ApprovalPolicy {
     /// `Some`: a `code` item with no ancestor here is held with what
     /// depends on it. `None`: no code trigger.
     pub authorized_slices: Option<BTreeSet<WorkItemId>>,
+    /// Hold every graph of a worker's `discovered` drafts whole, so
+    /// follow-up work a worker files waits for a person instead of running
+    /// at once (a self-building daemon, whose follow-ups would otherwise
+    /// run on a base that lacks their siblings' unmerged work).
+    pub hold_discovered: bool,
 }
 
 /// An approval trigger that fired (6.1).
@@ -92,6 +97,7 @@ pub enum ApprovalTrigger {
     Budget { tokens: u64, threshold: u64 },
     UndelegatedResource { item: WorkItemId, resource: String },
     CodeOutsideSlice { item: WorkItemId },
+    Discovered { items: u32 },
 }
 
 /// Everything [`validate`] needs besides the snapshot and the filing.
@@ -1613,6 +1619,10 @@ fn approve(
             });
             whole = true;
         }
+    }
+    if policy.hold_discovered && ctx.source == FilingSource::Discovered {
+        triggers.push(ApprovalTrigger::Discovered { items: count });
+        whole = true;
     }
     let leaves: Vec<&WorkItem> = ids
         .iter()

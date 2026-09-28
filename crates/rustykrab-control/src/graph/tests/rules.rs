@@ -543,6 +543,38 @@ fn code_outside_an_authorized_slice_is_held_and_is_an_approval_point() {
     assert_eq!(accepted.warnings.len(), 1);
 }
 
+#[test]
+fn hold_discovered_holds_a_workers_follow_ups_whole_and_nothing_else() {
+    let p = plan(
+        id("P"),
+        vec![draft("a"), draft("b")],
+        vec![pe(tmp("b"), EdgeKind::Blocks, tmp("a"))],
+    );
+    let policy = ApprovalPolicy {
+        hold_discovered: true,
+        ..ApprovalPolicy::default()
+    };
+
+    let mut c = ctx(FilingSource::Discovered);
+    c.approval = policy.clone();
+    let mut s = two_parents();
+    let accepted = accept(&mut s, &p, &c);
+    let [a, b] = ids(&accepted, &["a", "b"]).try_into().unwrap();
+    assert_eq!(accepted.held, vec![a.clone(), b.clone()]);
+    assert_eq!(
+        accepted.triggers,
+        vec![ApprovalTrigger::Discovered { items: 2 }]
+    );
+    assert_eq!(st(&s, &a), Status::Blocked(BlockedReason::NeedsConsent));
+
+    // The same graph filed through `work_file` is not a worker's follow-up.
+    let mut c = ctx(FilingSource::WorkFile);
+    c.approval = policy;
+    let accepted = accept(&mut two_parents(), &p, &c);
+    assert!(accepted.held.is_empty());
+    assert!(accepted.triggers.is_empty());
+}
+
 /// `top` with two child parents: `S`, an authorised slice, and `P`.
 fn two_parents() -> Snapshot {
     G::new()

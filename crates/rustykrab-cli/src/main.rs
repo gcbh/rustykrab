@@ -1366,6 +1366,15 @@ async fn main() -> anyhow::Result<()> {
     {
         control_config.aging_max_gap = chrono::TimeDelta::seconds(secs.max(1));
     }
+    // A self-building daemon holds its workers' follow-up items for a
+    // person (plan 6.1's approval hold), so they never run on a base that
+    // lacks their siblings' unmerged work.
+    if std::env::var("RUSTYKRAB_HOLD_DISCOVERED")
+        .is_ok_and(|v| matches!(v.trim(), "1" | "true" | "on" | "yes"))
+    {
+        control_config.approval.hold_discovered = true;
+        tracing::info!("RUSTYKRAB_HOLD_DISCOVERED: workers' follow-up items wait for approval");
+    }
     let controller = Arc::new(
         rustykrab_control::controller::Controller::new(store.clone(), Vec::new(), control_config)
             .with_registry(fleet.registry.clone())
