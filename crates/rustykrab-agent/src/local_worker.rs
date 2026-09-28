@@ -915,6 +915,7 @@ mod tests {
             budget: Budget::default(),
             origin_conversation_id: None,
             run: None,
+            workspace: None,
         }
     }
 

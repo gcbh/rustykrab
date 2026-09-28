@@ -21,19 +21,39 @@ use crate::errors::{
 use crate::graph::{self, Effects};
 use crate::handle::TickReport;
 use crate::ladder::{self, Decision, LadderContext, LadderState, SurfaceReason};
-use crate::worker::{Brief, Worker};
+use crate::routing::{work_class, CapabilityRef, Judged, Verdict};
+use crate::worker::{run_failure_input, Brief, Worker, COMMAND_RUN};
+use crate::workspace::{self, CodeClaim, CodeVerdict, Workspace, WORKSPACE_EVIDENCE};
 
 use super::batch::{has_open_plan_b, Batch};
 use super::brief::{brief_for, first_line, ERROR, RESULT_REPORT, RUN, SUMMARY};
 use super::commit::Written;
 use super::filing::{parked_on_landed_capability, parked_reason, waiting_on_mcp};
-use super::load::{history, ladder_from, REPLAYED, SWITCHED};
+use super::load::{history, ladder_from, ESCALATING_ABOVE, REPLAYED, SWITCHED};
 use super::notice::{label, Cause};
 use super::{Controller, Finished, Run, RunResult};
 
 /// Moves the ladder may make on one failure before it must surface: the
 /// improve and skipped-switch rungs continue the climb, the rest end it.
 const MAX_CLIMB: usize = 16;
+
+/// Who verified a claim: git for a commit and its paths, the host's
+/// catalog for a built tool, the adapter's command record for a check.
+const BY_GIT: &str = "git";
+const BY_CATALOG: &str = "catalog";
+
+/// One evidence row a verified claim adds: kind, reference, verifier.
+type Proof = (String, String, Option<String>);
+
+/// How a failure counts in the routing record: a capability gap or a
+/// policy stop is not the worker's result, so it is not recorded.
+fn verdict_of(error: &WorkError) -> Option<Verdict> {
+    match error.class {
+        ErrorClass::Verification => Some(Verdict::NotVerified),
+        ErrorClass::CapabilityGap | ErrorClass::Policy => None,
+        _ => Some(Verdict::Failed),
+    }
+}
 
 fn absorb(report: &mut TickReport, written: Written) {
     report.transitions += written.transitions;
@@ -373,10 +393,16 @@ impl Controller {
                 continue;
             }
             self.reconcile_one(&mut b, &id, &finished).await?;
+            let judged = std::mem::take(&mut b.judged);
             match self.commit(b, noticed).await {
                 Ok(Some(written)) => {
                     absorb(report, written);
                     report.reconciled.push(id);
+                    // Only once the transition is written, so a result
+                    // deferred to the next tick is not counted twice.
+                    for j in &judged {
+                        self.routing.record(j).await;
+                    }
                 }
                 Ok(None) => {
                     self.state().finished.insert(id, finished);
@@ -403,7 +429,7 @@ impl Controller {
         let mut changed = match &finished.outcome {
             Err(e) => {
                 let error = classify(
-                    &FailureInput::from_core_error(None, e),
+                    &run_failure_input(e),
                     &Context {
                         tool: None,
                         worker_kind: Some(self.worker_kind(worker)),
@@ -420,12 +446,15 @@ impl Controller {
         Ok(())
     }
 
-    /// What Phase 1 can verify of a report: an error is a failure; a typed
-    /// block parks (a cascade reason is not the worker's to claim);
-    /// questions park as `needs_decision`; a `done` claim with an empty
-    /// summary fails verification; otherwise the item is `done`, with its
-    /// artifacts as evidence verified by the report and its other claims
-    /// (paths, commit, checks) recorded unverified.
+    /// Judge a report (section 5: every result is a claim): an error is a
+    /// failure; `needs_tool` climbs the ladder's order 2 (a tool that
+    /// exists is loaded, one that does not is built); any other typed block
+    /// parks (a cascade reason is not the worker's to claim); questions
+    /// park as `needs_decision`; a `done` claim with an empty summary, or
+    /// with claims the evidence does not bear out ([`Self::verify_claims`]),
+    /// fails verification; otherwise the item is `done`, its artifacts
+    /// evidence verified by the report and its checked claims evidence
+    /// verified by what checked them.
     async fn judge(
         &self,
         b: &mut Batch,
@@ -451,6 +480,24 @@ impl Controller {
                             "the worker reported {}, which only the controller's cascade sets",
                             Status::Blocked(blocked.reason)
                         ),
+                    },
+                    &ctx,
+                );
+                return self.fail(b, item, worker, error, &result.artifacts).await;
+            }
+            if blocked.reason == BlockedReason::NeedsTool {
+                // Section 7: `needs_tool` is a capability gap for the
+                // ladder, never a question. Order 2 loads a tool the host
+                // has and builds one it does not (section 8).
+                let tool = blocked
+                    .needs
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| blocked.detail.clone());
+                let error = classify(
+                    &FailureInput::CapabilityGap {
+                        gap: GapKind::Tool,
+                        name: tool,
                     },
                     &ctx,
                 );
@@ -503,9 +550,23 @@ impl Controller {
                 return self.fail(b, item, worker, error, &result.artifacts).await;
             }
         };
+        let proofs = match self.verify_claims(item, result).await? {
+            Ok(proofs) => proofs,
+            Err((verdict, why)) => {
+                let error = classify(
+                    &FailureInput::Verifier {
+                        verdict,
+                        detail: why,
+                    },
+                    &ctx,
+                );
+                return self.fail(b, item, worker, error, &result.artifacts).await;
+            }
+        };
         for artifact in &result.artifacts {
             // A landed rule is verified by the replay above, not by being
-            // in the report.
+            // in the report; an adapter's command record is what checks
+            // were verified against.
             let verified = if item.kind == WorkKind::Internal && artifact.kind == CLASSIFIER_RULE {
                 REPLAYED
             } else {
@@ -515,19 +576,30 @@ impl Controller {
         }
         b.learned.extend(rules);
         b.evidence(&item.id, SUMMARY, result.summary.trim(), None);
-        for path in &result.changed_paths {
-            b.evidence(&item.id, "changed_path", path, None);
+        let proved = |kind: &str| proofs.iter().any(|(k, _, _)| k == kind);
+        for (kind, reference, by) in &proofs {
+            b.evidence(&item.id, kind, reference, by.as_deref());
         }
-        if let Some(commit) = &result.commit {
-            b.evidence(&item.id, "commit", commit, None);
+        // Claims nothing checked stay on the record, unverified.
+        if !proved("changed_path") {
+            for path in &result.changed_paths {
+                b.evidence(&item.id, "changed_path", path, None);
+            }
         }
-        for check in &result.checks_run {
-            b.evidence(&item.id, "check_run", check, None);
+        if !proved("commit") {
+            if let Some(commit) = &result.commit {
+                b.evidence(&item.id, "commit", commit, None);
+            }
+        }
+        if !proved("check_run") {
+            for check in &result.checks_run {
+                b.evidence(&item.id, "check_run", check, None);
+            }
         }
         for limit in &result.known_limits {
             b.evidence(&item.id, "known_limit", limit, None);
         }
-        self.routing.record(worker, item, true);
+        self.judged(b, item, worker, Verdict::Verified).await?;
         b.own(
             &item.id,
             Status::Verifying,
@@ -540,7 +612,7 @@ impl Controller {
             Status::Done,
             "controller",
             format!(
-                "verified: {} artifact(s); {}",
+                "verified on {worker}: {} artifact(s); {}",
                 result.artifacts.len(),
                 first_line(&result.summary)
             ),
@@ -600,6 +672,178 @@ impl Controller {
         Ok(Ok(rules))
     }
 
+    /// What the controller checks of a claimed result beyond its summary
+    /// (section 5), as evidence rows to add, or the verdict and why when
+    /// the result claims more than the evidence shows:
+    ///
+    /// - a `code` item's commit and changed paths, against the run's
+    ///   workspace ([`workspace::verify`]); a `code` result that claims a
+    ///   commit or paths with no workspace to check them against claims
+    ///   beyond the evidence;
+    /// - every check it names, against the commands its adapter recorded
+    ///   the agent running ([`COMMAND_RUN`]), where any were recorded;
+    /// - a capability build of a tool: that the host now has the tool.
+    async fn verify_claims(
+        &self,
+        item: &WorkItem,
+        result: &rustykrab_core::work::ResultReport,
+    ) -> Result<Result<Vec<Proof>, (VerifierVerdict, String)>, Error> {
+        let mut proofs: Vec<Proof> = Vec::new();
+        if item.kind == WorkKind::Code {
+            match self.workspace_of(&item.id).await? {
+                Some(ws) => {
+                    let claim_commit = result.commit.clone();
+                    let claim_paths = result.changed_paths.clone();
+                    let verdict = tokio::task::spawn_blocking(move || {
+                        workspace::verify(
+                            &ws,
+                            CodeClaim {
+                                commit: claim_commit.as_deref(),
+                                changed_paths: &claim_paths,
+                            },
+                        )
+                    })
+                    .await
+                    .map_err(|e| Error::Internal(format!("verification task failed: {e}")))?;
+                    match verdict {
+                        Ok(CodeVerdict::Verified {
+                            commit,
+                            changed_paths,
+                        }) => {
+                            proofs.push(("commit".into(), commit, Some(BY_GIT.into())));
+                            for path in changed_paths {
+                                proofs.push(("changed_path".into(), path, Some(BY_GIT.into())));
+                            }
+                        }
+                        Ok(CodeVerdict::Mismatch(why)) => {
+                            return Ok(Err((VerifierVerdict::ClaimMismatch, why)))
+                        }
+                        Ok(CodeVerdict::Incomplete(why)) => {
+                            return Ok(Err((VerifierVerdict::Incomplete, why)))
+                        }
+                        Err(why) => {
+                            return Ok(Err((
+                                VerifierVerdict::Incomplete,
+                                format!("the claim could not be checked: {why}"),
+                            )))
+                        }
+                    }
+                }
+                None if result.commit.is_some() || !result.changed_paths.is_empty() => {
+                    return Ok(Err((
+                        VerifierVerdict::ClaimMismatch,
+                        "the result claims a commit or changed paths, but the item has no \
+                         workspace to check them against (name its repository as a \
+                         repo:<path> writable resource)"
+                            .to_string(),
+                    )));
+                }
+                None => {}
+            }
+        }
+        let ran: Vec<String> = result
+            .artifacts
+            .iter()
+            .filter(|a| a.kind == COMMAND_RUN)
+            .map(|a| a.value.to_lowercase())
+            .collect();
+        if !ran.is_empty() {
+            for check in &result.checks_run {
+                let wanted = check.trim().to_lowercase();
+                if wanted.is_empty() {
+                    continue;
+                }
+                if !ran.iter().any(|c| c.contains(&wanted)) {
+                    return Ok(Err((
+                        VerifierVerdict::ClaimMismatch,
+                        format!(
+                            "the result says the check `{check}` ran, but it is not among \
+                             the {} command(s) the worker ran",
+                            ran.len()
+                        ),
+                    )));
+                }
+                proofs.push(("check_run".into(), check.clone(), Some(COMMAND_RUN.into())));
+            }
+        }
+        if let Some(cap) = CapabilityRef::of(item) {
+            if cap.rung == Rung::Build && cap.gap == GapKind::Tool {
+                self.catalog.refresh();
+                if self.catalog.tool_state(&cap.subject) == ToolState::Unknown {
+                    return Ok(Err((
+                        VerifierVerdict::ClaimMismatch,
+                        format!(
+                            "the result says the tool is built, but the host has no tool named \
+                             `{}`",
+                            cap.subject
+                        ),
+                    )));
+                }
+                proofs.push(("tool".into(), cap.subject, Some(BY_CATALOG.into())));
+            }
+        }
+        Ok(Ok(proofs))
+    }
+
+    /// The workspace the item's latest run was given, from its lease-time
+    /// evidence.
+    async fn workspace_of(&self, item: &str) -> Result<Option<Workspace>, Error> {
+        Ok(self
+            .store
+            .work_evidence_list(item)
+            .await?
+            .iter()
+            .rev()
+            .find(|e| e.kind == WORKSPACE_EVIDENCE)
+            .and_then(|e| serde_json::from_str(&e.reference).ok()))
+    }
+
+    /// Queue a judged result of a routed class for its worker's routing
+    /// record (section 10), written once the batch is.
+    async fn judged(
+        &self,
+        b: &mut Batch,
+        item: &WorkItem,
+        worker: &str,
+        verdict: Verdict,
+    ) -> Result<(), Error> {
+        let Some(class) = work_class(item) else {
+            return Ok(());
+        };
+        let repairs = self.ladder_of(item).await?.used(Rung::Repair);
+        // The run this result came from: the item's latest `run` pointer.
+        let run = self
+            .store
+            .work_evidence_list(&item.id)
+            .await?
+            .into_iter()
+            .rev()
+            .find(|e| e.kind == RUN)
+            .map(|e| e.reference);
+        let usage = run
+            .as_deref()
+            .and_then(|r| self.worker(worker).and_then(|w| w.usage(r)));
+        let wall_seconds = match (usage, self.store.work_lease_get(&item.id).await?) {
+            (Some(u), _) if u.wall_ms > 0 => u.wall_ms / 1_000,
+            (_, Some(lease)) => {
+                u64::try_from((Utc::now() - lease.since).num_seconds()).unwrap_or(0)
+            }
+            _ => 0,
+        };
+        b.judged.push(Judged {
+            worker: worker.to_string(),
+            worker_kind: self.worker_kind(worker),
+            item: item.id.clone(),
+            class,
+            verdict,
+            repairs,
+            wall_seconds,
+            usage,
+            at: b.now,
+        });
+        Ok(())
+    }
+
     /// A failed run: its partial artifacts and its error as evidence, then
     /// the ladder.
     async fn fail(
@@ -636,7 +880,29 @@ impl Controller {
             verified_by: Some(error.observed_by.clone()),
             at: b.now,
         });
-        self.routing.record(worker, item, false);
+        // A claim beyond the evidence is recorded as what it is (section
+        // 5): the item passes through `verifying` into
+        // `blocked(verification_failed)` before the ladder moves it on.
+        if error.class == ErrorClass::Verification
+            && b.status(&item.id).is_some_and(|s| s.is_active())
+        {
+            b.own(
+                &item.id,
+                Status::Verifying,
+                "controller",
+                "checking the result report",
+                None,
+            );
+            b.move_to(
+                &item.id,
+                Status::Blocked(BlockedReason::VerificationFailed),
+                "controller",
+                format!("verification failed on {worker}: {}", error.detail),
+            );
+        }
+        if let Some(verdict) = verdict_of(&error) {
+            self.judged(b, item, worker, verdict).await?;
+        }
         self.climb(b, item, worker, error).await
     }
 
@@ -728,10 +994,22 @@ impl Controller {
             .is_some_and(|g| matches!(g.kind, GapKind::Credential | GapKind::Consent));
         let tool_exists = match &gap {
             Some(g) if g.kind == GapKind::Tool => {
+                self.catalog.refresh();
                 Some(self.catalog.tool_state(&g.subject) != ToolState::Unknown)
             }
             _ => None,
         };
+        // A failed verification escalates: the switch rung looks above the
+        // failing worker's tier, not beside it (sections 5 and 8).
+        let floor = (error.class == ErrorClass::Verification)
+            .then(|| {
+                self.worker(worker)
+                    .map(|w| self.routing.cost_tier(w.as_ref()))
+            })
+            .flatten()
+            .into_iter()
+            .chain(history(&events).floor)
+            .max();
         let ctx = LadderContext {
             error: &error,
             recurrence_count: seen,
@@ -754,7 +1032,7 @@ impl Controller {
                     };
                     self.rung(b, &id, &mut state, rung, &error, outcome);
                 }
-                Decision::SwitchWorker if !self.has_alternative(item, &excluded) => {
+                Decision::SwitchWorker if !self.has_alternative(item, &excluded, floor) => {
                     self.rung(
                         b,
                         &id,
@@ -765,14 +1043,11 @@ impl Controller {
                     );
                 }
                 Decision::SwitchWorker => {
-                    self.rung(
-                        b,
-                        &id,
-                        &mut state,
-                        rung,
-                        &error,
-                        format!("{SWITCHED}{worker}"),
-                    );
+                    let outcome = match floor {
+                        Some(tier) => format!("{SWITCHED}{worker}{ESCALATING_ABOVE}{tier}"),
+                        None => format!("{SWITCHED}{worker}"),
+                    };
+                    self.rung(b, &id, &mut state, rung, &error, outcome);
                     return Ok(b.move_to(&id, Status::Queued, "controller", "switch worker"));
                 }
                 Decision::Retry => {
@@ -992,13 +1267,20 @@ impl Controller {
         );
     }
 
-    /// Whether a healthy worker other than `excluded` could take `item`.
-    fn has_alternative(&self, item: &WorkItem, excluded: &HashSet<String>) -> bool {
-        self.workers.iter().any(|w| {
+    /// Whether a healthy worker other than `excluded`, and above `floor`'s
+    /// cost tier when one is set, could take `item`.
+    fn has_alternative(
+        &self,
+        item: &WorkItem,
+        excluded: &HashSet<String>,
+        floor: Option<u32>,
+    ) -> bool {
+        self.registry.workers().iter().any(|w| {
             !excluded.contains(w.name())
                 && w.healthy()
                 && covers(w.as_ref(), item)
                 && self.routing.qualifies(w.as_ref(), item)
+                && floor.is_none_or(|f| self.routing.cost_tier(w.as_ref()) > f)
         })
     }
 
@@ -1049,7 +1331,7 @@ impl Controller {
             }
             let events = self.store.work_events(&item.id).await?;
             let hist = history(&events);
-            let Some(worker) = self.pick(&item, &hist.excluded, &load, &models) else {
+            let Some(worker) = self.pick(&item, &hist.excluded, hist.floor, &load, &models) else {
                 continue;
             };
             let (inputs, more) = self.build_inputs(&snap, &item).await?;
@@ -1061,6 +1343,7 @@ impl Controller {
             let mut brief = brief_for(&item, inputs.clone(), more, prior, &hist);
             let run_id = uuid::Uuid::new_v4().to_string();
             brief.run = Some(run_id.clone());
+            brief.workspace = self.plan_workspace(&item, &run_id).await;
             if let Err(e) = self
                 .store
                 .work_lease_acquire(
@@ -1091,6 +1374,24 @@ impl Controller {
             {
                 tracing::warn!(item = %item.id, error = %e, "run pointer not recorded");
             }
+            // The workspace the controller pinned, which verification reads
+            // back: the parent commit is the controller's, not the worker's.
+            if let Some(ws) = &brief.workspace {
+                let recorded = self
+                    .store
+                    .work_evidence_add(rustykrab_core::work::Evidence {
+                        item: item.id.clone(),
+                        kind: WORKSPACE_EVIDENCE.to_string(),
+                        reference: serde_json::to_string(ws).unwrap_or_default(),
+                        hash: Some(ws.base.clone()),
+                        verified_by: None,
+                        at: Utc::now(),
+                    })
+                    .await;
+                if let Err(e) = recorded {
+                    tracing::warn!(item = %item.id, error = %e, "workspace not recorded");
+                }
+            }
             let name = worker.name().to_string();
             let run = spawn(worker.clone(), brief, self.clock.now());
             self.state().runs.insert(item.id.clone(), run);
@@ -1114,6 +1415,29 @@ impl Controller {
         Ok(())
     }
 
+    /// The workspace a `code` run of `item` gets (section 5): its
+    /// repository's `HEAD` pinned as the parent commit, a new branch and a
+    /// worktree under the configured root. `None` for other items, without
+    /// a root, or when the repository has no commit to start from.
+    async fn plan_workspace(&self, item: &WorkItem, run: &str) -> Option<Workspace> {
+        if item.kind != WorkKind::Code {
+            return None;
+        }
+        let root = self.config.worktree_root.clone()?;
+        let repo = Workspace::repo_of(&item.writable_resources)?;
+        let at = repo.clone();
+        let base = tokio::task::spawn_blocking(move || workspace::head(&at))
+            .await
+            .ok()?;
+        match base {
+            Ok(base) => Some(Workspace::plan(&root, &repo, &base, &item.id, run)),
+            Err(why) => {
+                tracing::warn!(item = %item.id, %why, "no workspace: the repository has no commit");
+                None
+            }
+        }
+    }
+
     /// Live runs per worker, and the models local runs occupy.
     fn load_by_worker(&self) -> (HashMap<String, usize>, HashSet<String>) {
         let state = self.state();
@@ -1130,32 +1454,46 @@ impl Controller {
         (load, models)
     }
 
-    /// Step 2: the cheapest healthy worker that covers the item, has room,
-    /// and (for a local worker) whose model is not busy.
+    /// Step 2: the cheapest tier of healthy workers that cover the item,
+    /// whose routing record qualifies them for its class and, after a
+    /// failed verification escalated the item, above `floor`'s tier; then
+    /// a worker of that tier with room and (for a local worker) whose model
+    /// is not busy. When every worker of the cheapest tier is busy the item
+    /// waits for one: a tier is escalated on failure, never on load (plan
+    /// sections 6 step 2 and 17, "cheapest-qualifying worker, and escalation
+    /// only on failure").
     fn pick(
         &self,
         item: &WorkItem,
         excluded: &HashSet<String>,
+        floor: Option<u32>,
         load: &HashMap<String, usize>,
         models: &HashSet<String>,
     ) -> Option<Arc<dyn Worker>> {
-        let mut candidates: Vec<(u32, usize, &Arc<dyn Worker>)> = self
-            .workers
+        let workers = self.registry.workers();
+        let qualified: Vec<(u32, usize, &Arc<dyn Worker>)> = workers
             .iter()
             .enumerate()
             .filter(|(_, w)| {
-                let local = self.config.serialise_local && w.kind() == WorkerKind::Local;
                 w.healthy()
                     && !excluded.contains(w.name())
                     && covers(w.as_ref(), item)
                     && self.routing.qualifies(w.as_ref(), item)
-                    && load.get(w.name()).copied().unwrap_or(0) < self.capacity(w.as_ref())
-                    && !(local && w.capabilities().models.iter().any(|m| models.contains(m)))
+                    && floor.is_none_or(|f| self.routing.cost_tier(w.as_ref()) > f)
             })
             .map(|(i, w)| (self.routing.cost_tier(w.as_ref()), i, w))
             .collect();
-        candidates.sort_by_key(|(tier, i, _)| (*tier, *i));
-        candidates.first().map(|(_, _, w)| Arc::clone(w))
+        let cheapest = qualified.iter().map(|(tier, _, _)| *tier).min()?;
+        qualified
+            .into_iter()
+            .filter(|(tier, _, w)| {
+                let local = self.config.serialise_local && w.kind() == WorkerKind::Local;
+                *tier == cheapest
+                    && load.get(w.name()).copied().unwrap_or(0) < self.capacity(w.as_ref())
+                    && !(local && w.capabilities().models.iter().any(|m| models.contains(m)))
+            })
+            .min_by_key(|(_, i, _)| *i)
+            .map(|(_, _, w)| Arc::clone(w))
     }
 
     // ── 4. aging ────────────────────────────────────────────────────────

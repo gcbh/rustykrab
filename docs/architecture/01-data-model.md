@@ -492,6 +492,9 @@ work_outbox(id PK, parent, origin, channel, body, created_at, delivered_at)
 work_item_archive(id PK, kind, title, parent, status, status_reason, worker,
                   cost JSON, closed_at, archived_at, summary, edges JSON)
    INDEX idx_work_item_archive_closed (kind, closed_at)
+workers(name PK, kind, capabilities JSON, config JSON, health, last_seen,
+        cost_tier, routing_record JSON, created_at, updated_at)
+routing_defaults(class PK, tier, set_by, reason, set_at)
 ```
 
 The durable half of the control layer
@@ -501,8 +504,21 @@ reads the open items and their edges into memory, computes readiness, cascade
 and roll-up there, and writes each decision back through the store. The row
 types are `rustykrab_core::work` (`WorkItem`, `Edge`, `WorkEvent`, `Evidence`,
 `Lease`), so the store, the controller, the tools and the CLI share one
-vocabulary. The `workers`, `questions` and `judgment_policies` tables of
-section 13 arrive with later phases.
+vocabulary. `workers` arrived with Phase 3; the `questions` and
+`judgment_policies` tables of section 13 arrive with later phases.
+
+**Workers are keyed by the registry's name, and nothing points at them.**
+`leases.worker`, a lease event's `worker:<name>` actor and the archive's
+`worker` column name a worker as text, because a worker's history outlives
+its removal. `config` is the spec an external worker was added with (its
+command, repositories and limits), which rebuilds it after a restart.
+`routing_record` is one JSON object keyed by work class; its shape is
+written out in `rustykrab-store/ARCHITECTURE.md` because dreaming reads it.
+It changes only through a read-modify-write in one transaction
+(`WorkerStore::update_record`), so concurrent results never lose an update.
+`routing_defaults` holds each routed class's default tier: seeded by the
+controller with its policy's prior, moved only by an accepted routing
+proposal (`set_by` names it).
 
 **Scalar where the controller filters, JSON where it only reads.** `status`,
 `status_reason` (set for `blocked` and `cancelled` only), `status_origin`,
@@ -587,6 +603,8 @@ Unenforced on purpose, and the DDL says so:
 - `work_outbox.parent` and `origin`, `work_plans.root` and `filed_by`,
   `work_item_archive.parent`: records about items that may since have been
   archived.
+- `leases.worker` and the `worker` columns and actors that name a worker:
+  a removed worker's history keeps its name.
 
 ## `memory.db`
 

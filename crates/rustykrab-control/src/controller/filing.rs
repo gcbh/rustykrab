@@ -466,10 +466,20 @@ impl Controller {
                     need.subject,
                     short(&item.id)
                 ),
-                artifact_refs: vec![ArtifactRef {
-                    kind: "item".to_string(),
-                    value: item.id.clone(),
-                }],
+                artifact_refs: vec![
+                    ArtifactRef {
+                        kind: "item".to_string(),
+                        value: item.id.clone(),
+                    },
+                    // What it is for, typed: the verifier checks a built
+                    // tool exists and routing names the class by it.
+                    crate::routing::CapabilityRef {
+                        rung,
+                        gap: need.gap,
+                        subject: need.subject.clone(),
+                    }
+                    .to_ref(),
+                ],
                 trigger: need.trigger.clone(),
                 ..WorkItemDraft::default()
             }],

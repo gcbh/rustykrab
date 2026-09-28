@@ -7,6 +7,7 @@
 
 mod paths;
 mod scenarios;
+mod workers;
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
@@ -28,7 +29,7 @@ use tokio::sync::Notify;
 use uuid::Uuid;
 
 use super::load::decode_rung;
-use super::{merge, Clock, Controller, ControllerConfig, ManualClock, StaticCatalog};
+use super::{merge, Clock, Controller, ControllerConfig, ManualClock, StaticCatalog, ToolCatalog};
 use crate::graph::FilingSource;
 use crate::handle::{ControlHandle, TickReport};
 use crate::worker::{Brief, Worker, WorkerCapabilities};
@@ -303,7 +304,7 @@ pub(super) struct Harness {
     pub script: Arc<Script>,
     store: Store,
     config: ControllerConfig,
-    catalog: Arc<StaticCatalog>,
+    catalog: Arc<dyn ToolCatalog>,
     dir: Arc<TempDir>,
 }
 
@@ -317,28 +318,54 @@ impl Harness {
     }
 
     pub fn with(config: ControllerConfig, catalog: StaticCatalog, workers: &[&str]) -> Harness {
+        Harness::with_catalog(config, Arc::new(catalog), workers)
+    }
+
+    /// A harness over any catalog, such as one that learns a tool when a
+    /// capability build lands.
+    pub fn with_catalog(
+        config: ControllerConfig,
+        catalog: Arc<dyn ToolCatalog>,
+        workers: &[&str],
+    ) -> Harness {
         let path = std::env::temp_dir().join(format!("rk-controller-{}", Uuid::new_v4()));
         let store = Store::open(&path, vec![9u8; 32]).expect("store opens");
         let dir = Arc::new(TempDir(path));
         let clock = Arc::new(ManualClock::new(Utc::now()));
         let script = Arc::new(Script::default());
-        Harness::build(
-            store,
-            config,
-            Arc::new(catalog),
-            workers,
+        Harness::build(store, config, catalog, workers, clock, script, dir, 1)
+    }
+
+    /// A harness over the given workers, routed by their records
+    /// ([`crate::routing::RecordRouting`]): the Phase 3 controller.
+    pub fn with_fleet(config: ControllerConfig, fleet: Vec<Arc<dyn Worker>>) -> Harness {
+        let path = std::env::temp_dir().join(format!("rk-controller-{}", Uuid::new_v4()));
+        let store = Store::open(&path, vec![9u8; 32]).expect("store opens");
+        let dir = Arc::new(TempDir(path));
+        let clock = Arc::new(ManualClock::new(Utc::now()));
+        let script = Arc::new(Script::default());
+        let catalog: Arc<dyn ToolCatalog> = Arc::new(StaticCatalog::default());
+        let ctl = Controller::new(store.clone(), fleet, config.clone())
+            .with_clock(clock.clone())
+            .with_catalog(catalog.clone());
+        let routing = Arc::new(crate::routing::RecordRouting::new(ctl.registry().clone()));
+        let ctl = ctl.with_routing(routing);
+        Harness {
+            ctl,
             clock,
             script,
+            store,
+            config,
+            catalog,
             dir,
-            1,
-        )
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
     fn build(
         store: Store,
         config: ControllerConfig,
-        catalog: Arc<StaticCatalog>,
+        catalog: Arc<dyn ToolCatalog>,
         workers: &[&str],
         clock: Arc<ManualClock>,
         script: Arc<Script>,

@@ -108,8 +108,8 @@ pub struct FilingContext {
     pub scope: Option<WorkItemId>,
     /// Ids the caller may see. `None`: every item in the snapshot.
     pub visible: Option<BTreeSet<WorkItemId>>,
-    /// Whether `code` items may be filed: the delivery import only, by
-    /// default.
+    /// Whether `code` items may be filed: by default everything but a
+    /// planner's graph and the ladder's capability items.
     pub allow_code: bool,
     pub sequential_split: SplitMode,
     /// Filings that superseded something under this root inside the rate
@@ -147,7 +147,17 @@ impl FilingContext {
             caps: GraphCaps::default(),
             scope: None,
             visible: None,
-            allow_code: source == FilingSource::DeliveryImport,
+            // A planner's graph never holds code (section 6.1); a single
+            // `work_file` draft, a worker's discovered follow-up and an
+            // accepted proposal may (sections 5, 10 and 15, scenarios 2,
+            // 17 and 31), as may the delivery import.
+            allow_code: matches!(
+                source,
+                FilingSource::DeliveryImport
+                    | FilingSource::WorkFile
+                    | FilingSource::Discovered
+                    | FilingSource::Proposal
+            ),
             sequential_split: SplitMode::Warn,
             supersedes_in_window: 0,
             supersede_limit: 2,

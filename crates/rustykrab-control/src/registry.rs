@@ -1,0 +1,680 @@
+//! The worker registry (plan sections 5 and 13): the named workers the
+//! controller may lease to, persisted in the store's `workers` table.
+//!
+//! Names are the registry's. A worker added without one, and the local
+//! worker when it first registers itself, gets the first free name of
+//! [`NAME_POOL`]; a name the user asks for is kept if it is free and
+//! well-formed. The name is what leases, events and channel messages carry
+//! (`worker:<name>`), so it never changes once given: the local worker
+//! reclaims its row's name on every start.
+//!
+//! Two kinds of worker live here. The daemon builds its own (the local
+//! worker) and [`WorkerRegistry::register`]s it. External workers
+//! (`claude_code`, `codex`) are described by a [`WorkerSpec`], built by the
+//! injected [`WorkerFactory`], and their spec is stored as the row's
+//! `config`, so [`WorkerRegistry::restore`] rebuilds them after a restart.
+//!
+//! The registry also caches each worker's cost tier and routing record so
+//! the controller's match step reads them without a store round trip;
+//! [`WorkerRegistry::update_record`] writes the record through the store's
+//! one-transaction update and refreshes the cache.
+
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
+
+use chrono::{DateTime, Utc};
+use rustykrab_core::work::WorkerKind;
+use rustykrab_core::Error;
+use rustykrab_store::{ClassRecord, RoutingRecord, Store, WorkerRow, WorkerUpsert};
+use serde::{Deserialize, Serialize};
+
+use crate::controller::default_cost_tier;
+use crate::worker::{Worker, WorkerCapabilities};
+
+/// Names the registry gives out, in order. The local worker, registering
+/// first on a fresh daemon, is `snapper`. The plan's own examples, `pinch`
+/// and `krabby`, are left for the user to give ("give that one to
+/// pinch").
+pub const NAME_POOL: [&str; 10] = [
+    "snapper", "hermit", "coral", "shelly", "barnacle", "kelp", "limpet", "nipper", "scuttle",
+    "reef",
+];
+
+/// The longest name the registry accepts.
+const NAME_MAX: usize = 32;
+
+/// What `rustykrab worker add` and `POST /api/workers` describe: an
+/// external worker and the limits its adapter runs under. Stored as the
+/// worker's `config`, so the same spec rebuilds it after a restart.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerSpec {
+    pub kind: WorkerKind,
+    /// The name asked for; the registry assigns one when it is `None`.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Repositories the worker may work in. Each becomes a `repo:<path>`
+    /// writable resource it covers.
+    #[serde(default)]
+    pub repos: Vec<String>,
+    /// The executable (`claude`, `codex`, or a path).
+    #[serde(default)]
+    pub command: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    /// The agent's own tool allowlist; empty takes the adapter's default.
+    #[serde(default)]
+    pub allowed_tools: Vec<String>,
+    #[serde(default)]
+    pub max_turns: Option<u32>,
+    #[serde(default)]
+    pub permission_mode: Option<String>,
+    #[serde(default)]
+    pub timeout_seconds: Option<u64>,
+    #[serde(default)]
+    pub concurrency: Option<usize>,
+    /// Overrides the kind's default cost tier.
+    #[serde(default)]
+    pub cost_tier: Option<u32>,
+    /// Environment variables passed through to the agent's process, by
+    /// name. Nothing else of the daemon's environment is.
+    #[serde(default)]
+    pub env: Vec<String>,
+}
+
+/// Builds the worker a spec describes, under the name the registry gave
+/// it. The composition root implements it over the adapters in
+/// `rustykrab-agent`.
+pub trait WorkerFactory: Send + Sync {
+    fn build(&self, name: &str, spec: &WorkerSpec) -> Result<Arc<dyn Worker>, String>;
+}
+
+/// One worker as `GET /api/workers` and `rustykrab workers` show it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WorkerView {
+    pub name: String,
+    pub kind: String,
+    /// Built and leasable in this process.
+    pub live: bool,
+    pub healthy: bool,
+    pub health: String,
+    pub last_seen: Option<DateTime<Utc>>,
+    pub cost_tier: u32,
+    pub concurrency: usize,
+    pub capabilities: WorkerCapabilities,
+    /// Keyed by work class; the shape is `rustykrab_store::ClassRecord`.
+    pub routing_record: RoutingRecord,
+    /// The spec an external worker was added with.
+    #[serde(default)]
+    pub spec: Option<WorkerSpec>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// The named workers of this daemon.
+pub struct WorkerRegistry {
+    store: Store,
+    factory: RwLock<Option<Arc<dyn WorkerFactory>>>,
+    /// Leasable workers, in registration order (the match step's tie
+    /// break).
+    live: RwLock<Vec<Arc<dyn Worker>>>,
+    tiers: RwLock<HashMap<String, u32>>,
+    records: RwLock<HashMap<String, RoutingRecord>>,
+    /// Serialises name assignment, so two adds cannot take one name.
+    naming: tokio::sync::Mutex<()>,
+}
+
+fn lock_err<T>(e: std::sync::PoisonError<T>) -> T {
+    e.into_inner()
+}
+
+/// Whether `name` is a well-formed worker name: a letter, then letters,
+/// digits, `-` or `_`, at most 32 characters.
+pub fn valid_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    name.len() <= NAME_MAX
+        && chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+impl WorkerRegistry {
+    pub fn new(store: Store) -> WorkerRegistry {
+        WorkerRegistry {
+            store,
+            factory: RwLock::new(None),
+            live: RwLock::new(Vec::new()),
+            tiers: RwLock::new(HashMap::new()),
+            records: RwLock::new(HashMap::new()),
+            naming: tokio::sync::Mutex::new(()),
+        }
+    }
+
+    /// A registry over fixed workers, in memory only: nothing is written
+    /// to the store until a routing record is. What `Controller::new`
+    /// builds for tests and scripted daemons.
+    pub fn fixed(store: Store, workers: Vec<Arc<dyn Worker>>) -> WorkerRegistry {
+        let registry = WorkerRegistry::new(store);
+        *registry.live.write().unwrap_or_else(lock_err) = workers;
+        registry
+    }
+
+    pub fn with_factory(self, factory: Arc<dyn WorkerFactory>) -> WorkerRegistry {
+        *self.factory.write().unwrap_or_else(lock_err) = Some(factory);
+        self
+    }
+
+    pub fn store(&self) -> &Store {
+        &self.store
+    }
+
+    /// The leasable workers, in registration order.
+    pub fn workers(&self) -> Vec<Arc<dyn Worker>> {
+        self.live.read().unwrap_or_else(lock_err).clone()
+    }
+
+    pub fn get(&self, name: &str) -> Option<Arc<dyn Worker>> {
+        self.live
+            .read()
+            .unwrap_or_else(lock_err)
+            .iter()
+            .find(|w| w.name() == name)
+            .cloned()
+    }
+
+    /// A worker's cost tier: its row's, else its kind's default.
+    pub fn cost_tier(&self, worker: &dyn Worker) -> u32 {
+        self.tiers
+            .read()
+            .unwrap_or_else(lock_err)
+            .get(worker.name())
+            .copied()
+            .unwrap_or_else(|| default_cost_tier(worker.kind()))
+    }
+
+    /// A worker's record for one class of work, from the cache.
+    pub fn record_of(&self, worker: &str, class: &str) -> Option<ClassRecord> {
+        self.records
+            .read()
+            .unwrap_or_else(lock_err)
+            .get(worker)
+            .and_then(|r| r.get(class))
+            .cloned()
+    }
+
+    /// Load cost tiers and routing records from the store into the cache.
+    pub async fn load(&self) -> Result<(), Error> {
+        let rows = self.store.workers().list().await?;
+        self.cache(&rows);
+        Ok(())
+    }
+
+    fn cache(&self, rows: &[WorkerRow]) {
+        let mut tiers = self.tiers.write().unwrap_or_else(lock_err);
+        let mut records = self.records.write().unwrap_or_else(lock_err);
+        for row in rows {
+            tiers.insert(row.name.clone(), row.cost_tier);
+            records.insert(row.name.clone(), row.routing_record.clone());
+        }
+    }
+
+    /// The name a new worker gets: `wanted` when it is well-formed and
+    /// free, else the first free name of the pool, else `worker-<n>`.
+    pub async fn assign_name(&self, wanted: Option<&str>) -> Result<String, Error> {
+        let taken: Vec<String> = self
+            .store
+            .workers()
+            .list()
+            .await?
+            .into_iter()
+            .map(|r| r.name)
+            .chain(self.workers().iter().map(|w| w.name().to_string()))
+            .collect();
+        if let Some(name) = wanted {
+            let name = name.trim();
+            if !valid_name(name) {
+                return Err(Error::Config(format!(
+                    "invalid worker name `{name}`: a letter, then letters, digits, - or _, \
+                     at most {NAME_MAX} characters"
+                )));
+            }
+            if taken.iter().any(|t| t == name) {
+                return Err(Error::AlreadyExists(format!("worker {name}")));
+            }
+            return Ok(name.to_string());
+        }
+        if let Some(free) = NAME_POOL.iter().find(|n| !taken.iter().any(|t| t == *n)) {
+            return Ok((*free).to_string());
+        }
+        let mut n = taken.len() + 1;
+        loop {
+            let name = format!("worker-{n}");
+            if !taken.contains(&name) {
+                return Ok(name);
+            }
+            n += 1;
+        }
+    }
+
+    /// The local worker's name: the one its row already has, so it is
+    /// stable across restarts, else a newly assigned one.
+    pub async fn local_name(&self) -> Result<String, Error> {
+        let _naming = self.naming.lock().await;
+        let rows = self.store.workers().list().await?;
+        if let Some(row) = rows.iter().find(|r| r.kind() == Some(WorkerKind::Local)) {
+            return Ok(row.name.clone());
+        }
+        self.assign_name(None).await
+    }
+
+    /// Make a worker the daemon built itself leasable and record it.
+    /// `config` is stored as its row's config; `cost_tier` overrides its
+    /// kind's default.
+    pub async fn register(
+        &self,
+        worker: Arc<dyn Worker>,
+        config: serde_json::Value,
+        cost_tier: Option<u32>,
+    ) -> Result<WorkerView, Error> {
+        let healthy = worker.healthy();
+        let row = self
+            .store
+            .workers()
+            .upsert(WorkerUpsert {
+                name: worker.name().to_string(),
+                kind: worker.kind(),
+                capabilities: serde_json::to_value(worker.capabilities())
+                    .unwrap_or(serde_json::Value::Null),
+                config,
+                health: health_line(healthy),
+                last_seen: healthy.then(Utc::now),
+                cost_tier: cost_tier.unwrap_or_else(|| default_cost_tier(worker.kind())),
+            })
+            .await?;
+        self.cache(std::slice::from_ref(&row));
+        {
+            let mut live = self.live.write().unwrap_or_else(lock_err);
+            live.retain(|w| w.name() != worker.name());
+            live.push(worker.clone());
+        }
+        Ok(view(&row, Some(&worker)))
+    }
+
+    /// `worker add`: build an external worker from `spec` and register it.
+    pub async fn add(&self, spec: WorkerSpec) -> Result<WorkerView, Error> {
+        if !matches!(spec.kind, WorkerKind::ClaudeCode | WorkerKind::Codex) {
+            return Err(Error::Config(format!(
+                "`{}` workers are not added by hand: the local worker registers itself and \
+                 peers pair (Phase 5); add claude_code or codex",
+                spec.kind.as_str()
+            )));
+        }
+        let factory = self
+            .factory
+            .read()
+            .unwrap_or_else(lock_err)
+            .clone()
+            .ok_or_else(|| Error::Config("this daemon cannot build external workers".into()))?;
+        let _naming = self.naming.lock().await;
+        let name = self.assign_name(spec.name.as_deref()).await?;
+        let worker = factory.build(&name, &spec).map_err(Error::Config)?;
+        let mut stored = spec.clone();
+        stored.name = Some(name);
+        let config = serde_json::to_value(&stored).map_err(|e| Error::Internal(e.to_string()))?;
+        self.register(worker, config, spec.cost_tier).await
+    }
+
+    /// Remove an external worker: it takes no new leases, and its row
+    /// goes. Its history (leases, events) keeps its name.
+    pub async fn remove(&self, name: &str) -> Result<bool, Error> {
+        let row = self.store.workers().get(name).await?;
+        if row.as_ref().and_then(WorkerRow::kind) == Some(WorkerKind::Local) {
+            return Err(Error::Config(format!(
+                "{name} is this daemon's local worker, which registers itself"
+            )));
+        }
+        let was_live = {
+            let mut live = self.live.write().unwrap_or_else(lock_err);
+            let before = live.len();
+            live.retain(|w| w.name() != name);
+            live.len() != before
+        };
+        let removed = self.store.workers().remove(name).await?;
+        self.tiers.write().unwrap_or_else(lock_err).remove(name);
+        self.records.write().unwrap_or_else(lock_err).remove(name);
+        Ok(removed || was_live)
+    }
+
+    /// Rebuild every stored external worker through the factory (at
+    /// start). A spec the factory refuses is recorded as the row's health
+    /// and left out. Returns the names rebuilt.
+    pub async fn restore(&self) -> Result<Vec<String>, Error> {
+        let rows = self.store.workers().list().await?;
+        self.cache(&rows);
+        let factory = self.factory.read().unwrap_or_else(lock_err).clone();
+        let mut restored = Vec::new();
+        for row in rows {
+            if !matches!(row.kind(), Some(WorkerKind::ClaudeCode | WorkerKind::Codex)) {
+                continue;
+            }
+            if self.get(&row.name).is_some() {
+                continue;
+            }
+            let spec: Result<WorkerSpec, String> =
+                serde_json::from_value(row.config.clone()).map_err(|e| e.to_string());
+            let built = match (&factory, spec) {
+                (Some(f), Ok(spec)) => f.build(&row.name, &spec),
+                (None, _) => Err("this daemon cannot build external workers".into()),
+                (_, Err(why)) => Err(format!("unreadable spec: {why}")),
+            };
+            match built {
+                Ok(worker) => {
+                    let healthy = worker.healthy();
+                    self.store
+                        .workers()
+                        .touch(&row.name, &health_line(healthy), healthy.then(Utc::now))
+                        .await?;
+                    self.live.write().unwrap_or_else(lock_err).push(worker);
+                    restored.push(row.name);
+                }
+                Err(why) => {
+                    tracing::warn!(worker = %row.name, %why, "worker not restored");
+                    self.store
+                        .workers()
+                        .touch(&row.name, &format!("unavailable: {why}"), None)
+                        .await?;
+                }
+            }
+        }
+        Ok(restored)
+    }
+
+    /// Every worker with its row, health checked now: a healthy live
+    /// worker's `last_seen` moves to now.
+    pub async fn views(&self) -> Result<Vec<WorkerView>, Error> {
+        let workers = self.store.workers();
+        let mut out = Vec::new();
+        for row in workers.list().await? {
+            let live = self.get(&row.name);
+            let row = match &live {
+                Some(w) => {
+                    let healthy = w.healthy();
+                    let line = health_line(healthy);
+                    workers
+                        .touch(&row.name, &line, healthy.then(Utc::now))
+                        .await?;
+                    workers.get(&row.name).await?.unwrap_or(row)
+                }
+                None => row,
+            };
+            out.push(view(&row, live.as_ref()));
+        }
+        // Workers built in memory only (a fixed registry) have no row.
+        for w in self.workers() {
+            if !out.iter().any(|v| v.name == w.name()) {
+                out.push(WorkerView {
+                    name: w.name().to_string(),
+                    kind: w.kind().as_str().to_string(),
+                    live: true,
+                    healthy: w.healthy(),
+                    health: health_line(w.healthy()),
+                    last_seen: None,
+                    cost_tier: self.cost_tier(w.as_ref()),
+                    concurrency: w.concurrency(),
+                    capabilities: w.capabilities(),
+                    routing_record: self
+                        .records
+                        .read()
+                        .unwrap_or_else(lock_err)
+                        .get(w.name())
+                        .cloned()
+                        .unwrap_or_default(),
+                    spec: None,
+                    created_at: Utc::now(),
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    pub async fn view(&self, name: &str) -> Result<Option<WorkerView>, Error> {
+        Ok(self.views().await?.into_iter().find(|v| v.name == name))
+    }
+
+    /// Change a worker's routing record in one store transaction and
+    /// refresh the cache. A worker with no row (a fixed registry's) gets
+    /// one first, so its record is kept.
+    pub async fn update_record<F>(&self, name: &str, change: F) -> Result<RoutingRecord, Error>
+    where
+        F: FnOnce(&mut RoutingRecord) + Send + 'static,
+    {
+        let workers = self.store.workers();
+        if workers.get(name).await?.is_none() {
+            let Some(w) = self.get(name) else {
+                return Err(Error::NotFound(format!("worker {name}")));
+            };
+            workers
+                .upsert(WorkerUpsert {
+                    name: name.to_string(),
+                    kind: w.kind(),
+                    capabilities: serde_json::to_value(w.capabilities())
+                        .unwrap_or(serde_json::Value::Null),
+                    config: serde_json::json!({}),
+                    health: health_line(w.healthy()),
+                    last_seen: None,
+                    cost_tier: self.cost_tier(w.as_ref()),
+                })
+                .await?;
+        }
+        let record = workers.update_record(name, change).await?;
+        self.records
+            .write()
+            .unwrap_or_else(lock_err)
+            .insert(name.to_string(), record.clone());
+        Ok(record)
+    }
+}
+
+fn health_line(healthy: bool) -> String {
+    if healthy {
+        "healthy".to_string()
+    } else {
+        "unhealthy".to_string()
+    }
+}
+
+fn view(row: &WorkerRow, live: Option<&Arc<dyn Worker>>) -> WorkerView {
+    let capabilities = match live {
+        Some(w) => w.capabilities(),
+        None => serde_json::from_value(row.capabilities.clone()).unwrap_or_default(),
+    };
+    WorkerView {
+        name: row.name.clone(),
+        kind: row.kind.clone(),
+        live: live.is_some(),
+        healthy: live.is_some_and(|w| w.healthy()),
+        health: row.health.clone(),
+        last_seen: row.last_seen,
+        cost_tier: row.cost_tier,
+        concurrency: live.map_or(1, |w| w.concurrency()),
+        capabilities,
+        routing_record: row.routing_record.clone(),
+        spec: serde_json::from_value(row.config.clone())
+            .ok()
+            .filter(|s: &WorkerSpec| s.kind != WorkerKind::Any),
+        created_at: row.created_at,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use rustykrab_core::work::ResultReport;
+
+    use crate::worker::Brief;
+
+    struct Named {
+        name: String,
+        kind: WorkerKind,
+        repos: Vec<String>,
+    }
+
+    #[async_trait]
+    impl Worker for Named {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn kind(&self) -> WorkerKind {
+            self.kind
+        }
+        fn capabilities(&self) -> WorkerCapabilities {
+            WorkerCapabilities {
+                repos: self.repos.clone(),
+                ..WorkerCapabilities::default()
+            }
+        }
+        async fn run(&self, _brief: Brief) -> Result<ResultReport, Error> {
+            Ok(ResultReport::default())
+        }
+    }
+
+    struct Factory;
+
+    impl WorkerFactory for Factory {
+        fn build(&self, name: &str, spec: &WorkerSpec) -> Result<Arc<dyn Worker>, String> {
+            if spec.command.as_deref() == Some("missing") {
+                return Err("command missing".into());
+            }
+            Ok(Arc::new(Named {
+                name: name.to_string(),
+                kind: spec.kind,
+                repos: spec.repos.clone(),
+            }))
+        }
+    }
+
+    fn temp_store() -> (tempfile::TempDir, Store) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("db"), vec![7u8; 32]).unwrap();
+        (dir, store)
+    }
+
+    fn spec(kind: WorkerKind, name: Option<&str>) -> WorkerSpec {
+        WorkerSpec {
+            kind,
+            name: name.map(str::to_string),
+            repos: vec!["/src/app".to_string()],
+            command: Some("claude".to_string()),
+            ..WorkerSpec::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn names_are_assigned_kept_and_refused_when_taken() {
+        let (_dir, store) = temp_store();
+        let registry = WorkerRegistry::new(store.clone()).with_factory(Arc::new(Factory));
+        let local = registry.local_name().await.unwrap();
+        assert_eq!(local, "snapper");
+        registry
+            .register(
+                Arc::new(Named {
+                    name: local.clone(),
+                    kind: WorkerKind::Local,
+                    repos: Vec::new(),
+                }),
+                serde_json::json!({}),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(registry.local_name().await.unwrap(), "snapper", "stable");
+
+        let pinch = registry
+            .add(spec(WorkerKind::ClaudeCode, Some("pinch")))
+            .await
+            .unwrap();
+        assert_eq!(pinch.name, "pinch");
+        assert_eq!(pinch.cost_tier, 3);
+        let taken = registry
+            .add(spec(WorkerKind::ClaudeCode, Some("pinch")))
+            .await;
+        assert!(matches!(taken, Err(Error::AlreadyExists(_))), "{taken:?}");
+        let bad = registry
+            .add(spec(WorkerKind::Codex, Some("not a name")))
+            .await;
+        assert!(matches!(bad, Err(Error::Config(_))));
+        let assigned = registry.add(spec(WorkerKind::Codex, None)).await.unwrap();
+        assert_eq!(assigned.name, "hermit", "the first free pool name");
+        assert_eq!(assigned.cost_tier, 2);
+        let local_add = registry.add(spec(WorkerKind::Local, None)).await;
+        assert!(local_add.is_err(), "the local worker is not added by hand");
+        assert!(registry.remove("snapper").await.is_err());
+
+        let names: Vec<String> = registry
+            .views()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|v| v.name)
+            .collect();
+        assert_eq!(names, ["snapper", "pinch", "hermit"]);
+    }
+
+    #[tokio::test]
+    async fn external_workers_are_rebuilt_from_their_spec_after_a_restart() {
+        let (_dir, store) = temp_store();
+        let before = WorkerRegistry::new(store.clone()).with_factory(Arc::new(Factory));
+        before
+            .add(spec(WorkerKind::ClaudeCode, Some("pinch")))
+            .await
+            .unwrap();
+        let mut broken = spec(WorkerKind::Codex, Some("nipper"));
+        broken.command = Some("claude".to_string());
+        before.add(broken).await.unwrap();
+        before
+            .update_record("pinch", |r| {
+                r.entry("code".to_string()).or_default().verified_done = 4;
+            })
+            .await
+            .unwrap();
+        // The codex spec's command goes missing across the restart.
+        let conn_store = store.workers();
+        let mut row = conn_store.get("nipper").await.unwrap().unwrap();
+        row.config["command"] = serde_json::json!("missing");
+        conn_store
+            .upsert(WorkerUpsert {
+                name: row.name.clone(),
+                kind: WorkerKind::Codex,
+                capabilities: row.capabilities.clone(),
+                config: row.config.clone(),
+                health: row.health.clone(),
+                last_seen: row.last_seen,
+                cost_tier: row.cost_tier,
+            })
+            .await
+            .unwrap();
+
+        let after = WorkerRegistry::new(store.clone()).with_factory(Arc::new(Factory));
+        assert_eq!(after.restore().await.unwrap(), ["pinch"]);
+        let pinch = after.get("pinch").expect("rebuilt");
+        assert_eq!(pinch.capabilities().repos, ["/src/app"]);
+        assert_eq!(after.record_of("pinch", "code").unwrap().verified_done, 4);
+        let nipper = store.workers().get("nipper").await.unwrap().unwrap();
+        assert!(
+            nipper.health.starts_with("unavailable"),
+            "{}",
+            nipper.health
+        );
+        assert!(after.get("nipper").is_none());
+        assert!(after.remove("pinch").await.unwrap());
+        assert!(after.get("pinch").is_none());
+    }
+
+    #[test]
+    fn worker_names_are_checked() {
+        for good in ["pinch", "pinch-s17", "a_b", "K9"] {
+            assert!(valid_name(good), "{good}");
+        }
+        for bad in ["", "9lives", "a b", "a/b", &"x".repeat(33)] {
+            assert!(!valid_name(bad), "{bad}");
+        }
+    }
+}

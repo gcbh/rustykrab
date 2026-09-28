@@ -15,14 +15,18 @@
 //!    items parked on a capability item that is now `done` are released;
 //!    then readiness (time triggers), roll-ups and parent verification are
 //!    settled.
-//! 2. **Reconcile** (step 5 and section 5): each finished run is verified,
-//!    its evidence attached and its typed transition, cascade, `discovered`
-//!    filings and ladder rungs written in one transaction.
+//! 2. **Reconcile** (step 5 and section 5): each finished run is verified
+//!    (a `code` result against git), its evidence attached and its typed
+//!    transition, cascade, `discovered` filings and ladder rungs written in
+//!    one transaction; the producing worker's routing record is written
+//!    after it.
 //! 3. **Select, match, lease and run** (steps 1 to 4): ready leaves by
 //!    priority, the single-writer rule over every active item, the
-//!    local-model rule of 12.1, the cheapest healthy worker that covers the
-//!    item; the lease carries the fan-in inputs of 4.3 and 6.3 and the run
-//!    is spawned under tokio.
+//!    local-model rule of 12.1, the cheapest tier of healthy workers that
+//!    cover the item and that routing qualifies for its class (waiting for
+//!    that tier when it is busy); the lease carries the fan-in inputs of
+//!    4.3 and 6.3 and, for a `code` item, its workspace, and the run is
+//!    spawned under tokio.
 //! 4. **Aging** (4.6), when nothing is running.
 //!
 //! Every transaction that closes a root, expires an item or surfaces a
@@ -48,6 +52,7 @@ mod tick;
 mod tests;
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -67,6 +72,8 @@ use tokio::task::JoinHandle;
 use crate::errors::{LearnedRule, Recurrence, DEFAULT_PROMOTE_THRESHOLD};
 use crate::graph::{ApprovalPolicy, FilingSource, SplitMode};
 use crate::handle::{ControlHandle, GraphView, TickReport};
+use crate::registry::WorkerRegistry;
+use crate::routing::Judged;
 use crate::worker::Worker;
 
 // ── injected seams ───────────────────────────────────────────────────────
@@ -135,6 +142,12 @@ pub trait ToolCatalog: Send + Sync {
     fn precondition_holds(&self, _check: &Precondition) -> bool {
         true
     }
+
+    /// Look again for what appeared since the catalog was built: a skill a
+    /// capability build wrote at run time (section 8, rung 2b). The
+    /// controller calls it before it decides a tool is missing and before
+    /// it verifies a build.
+    fn refresh(&self) {}
 }
 
 /// A fixed [`ToolCatalog`]: what is not listed is unknown or unconfigured.
@@ -159,9 +172,11 @@ impl ToolCatalog for StaticCatalog {
     }
 }
 
-/// The routing record's seam (plan sections 5 and 10). Phase 1 routes by
-/// capabilities and cost tier only; Phase 3 fills `qualifies` from the
-/// record evaluation writes and reads `record` to write it.
+/// The routing record's seam (plan sections 5 and 10). [`CheapestFirst`]
+/// routes by capabilities and cost tier only;
+/// [`crate::routing::RecordRouting`] reads each worker's record for the
+/// item's class of work and writes it from every judged result.
+#[async_trait]
 pub trait Routing: Send + Sync {
     /// Whether the worker's record qualifies it for this item's class of
     /// work.
@@ -174,8 +189,9 @@ pub trait Routing: Send + Sync {
         default_cost_tier(worker.kind())
     }
 
-    /// Called when a run's result is judged: `verified` when it stood.
-    fn record(&self, _worker: &str, _item: &WorkItem, _verified: bool) {}
+    /// Called once a judged result of a routed class is written: verified,
+    /// claimed but not verified, or failed.
+    async fn record(&self, _judged: &Judged) {}
 }
 
 /// Phase 1 routing: every covering worker qualifies, cheapest tier first.
@@ -243,6 +259,10 @@ pub struct ControllerConfig {
     /// How far back recurrence counts are rebuilt from rung events on the
     /// first tick.
     pub recurrence_window: TimeDelta,
+    /// Where `code` runs get their worktrees (section 5): the daemon's
+    /// `<data dir>/worktrees`. `None`: no workspace is planned, and a
+    /// `code` result's claims cannot be checked against git.
+    pub worktree_root: Option<PathBuf>,
 }
 
 impl Default for ControllerConfig {
@@ -262,6 +282,7 @@ impl Default for ControllerConfig {
             default_budget: Budget::default(),
             promote_threshold: DEFAULT_PROMOTE_THRESHOLD,
             recurrence_window: month,
+            worktree_root: None,
         }
     }
 }
@@ -309,12 +330,12 @@ struct State {
     learned: Vec<LearnedRule>,
 }
 
-/// The loop of plan section 6 over one store and a fixed set of workers.
-/// It implements [`ControlHandle`] for the gateway and the CLI, and
-/// [`WorkBackend`] for the model-facing work tools.
+/// The loop of plan section 6 over one store and the workers of a
+/// [`WorkerRegistry`]. It implements [`ControlHandle`] for the gateway and
+/// the CLI, and [`WorkBackend`] for the model-facing work tools.
 pub struct Controller {
     store: Store,
-    workers: Vec<Arc<dyn Worker>>,
+    registry: Arc<WorkerRegistry>,
     config: ControllerConfig,
     clock: Arc<dyn Clock>,
     catalog: Arc<dyn ToolCatalog>,
@@ -327,13 +348,14 @@ pub struct Controller {
 }
 
 impl Controller {
-    /// A controller on the wall clock, with an empty catalog, cheapest-first
-    /// routing and no progress ledger.
+    /// A controller over a fixed set of workers (an in-memory registry), on
+    /// the wall clock, with an empty catalog, cheapest-first routing and no
+    /// progress ledger.
     pub fn new(store: Store, workers: Vec<Arc<dyn Worker>>, config: ControllerConfig) -> Self {
         let recurrence = Recurrence::with_threshold(config.promote_threshold);
         Controller {
+            registry: Arc::new(WorkerRegistry::fixed(store.clone(), workers)),
             store,
-            workers,
             config,
             clock: Arc::new(SystemClock),
             catalog: Arc::new(StaticCatalog::default()),
@@ -351,6 +373,17 @@ impl Controller {
                 learned: Vec::new(),
             }),
         }
+    }
+
+    /// Lease to the workers of `registry` instead: the daemon's registry,
+    /// which `worker add` grows while the loop runs.
+    pub fn with_registry(mut self, registry: Arc<WorkerRegistry>) -> Self {
+        self.registry = registry;
+        self
+    }
+
+    pub fn registry(&self) -> &Arc<WorkerRegistry> {
+        &self.registry
     }
 
     pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
@@ -426,8 +459,8 @@ impl Controller {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn worker(&self, name: &str) -> Option<&Arc<dyn Worker>> {
-        self.workers.iter().find(|w| w.name() == name)
+    fn worker(&self, name: &str) -> Option<Arc<dyn Worker>> {
+        self.registry.get(name)
     }
 
     fn worker_kind(&self, name: &str) -> WorkerKind {

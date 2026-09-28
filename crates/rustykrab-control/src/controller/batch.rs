@@ -53,6 +53,9 @@ pub(super) struct Batch {
     pub planned: Vec<WorkItemId>,
     /// Classifier rules this batch landed, consulted once it is written.
     pub learned: Vec<crate::errors::LearnedRule>,
+    /// Judged results of routed classes, written to the producing workers'
+    /// routing records once the batch is (plan section 10).
+    pub judged: Vec<crate::routing::Judged>,
     /// `(item, old, new)` of edge re-points already written: the store
     /// moves the matching `inputs_from` entry with the edge, so the
     /// engine's separate input re-point is not written again.
@@ -75,6 +78,7 @@ impl Batch {
             superseded_under: Vec::new(),
             planned: Vec::new(),
             learned: Vec::new(),
+            judged: Vec::new(),
             moved_inputs: HashSet::new(),
         }
     }

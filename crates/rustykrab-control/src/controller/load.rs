@@ -28,6 +28,11 @@ pub(super) const REPLAYED: &str = "replay";
 /// The outcome a taken worker switch records: `switched from <worker>`.
 pub(super) const SWITCHED: &str = "switched from ";
 
+/// What a switch after a failed verification adds to its outcome:
+/// `switched from <worker>; escalating above tier <n>`. Later leases skip
+/// every worker at or below that tier (sections 5 and 8).
+pub(super) const ESCALATING_ABOVE: &str = "; escalating above tier ";
+
 /// The reason an approval writes on each item it releases, so a restart
 /// can tell a released hold from a pending one (`held_by` stays set).
 pub(super) fn approval_marker(question: &str) -> String {
@@ -64,6 +69,9 @@ pub(super) struct History {
     pub repair: Option<String>,
     /// Tools a capability rung acquired or built, to activate up front.
     pub activate: Vec<String>,
+    /// Set once a failed verification escalated the item: leases go only
+    /// to workers above this cost tier.
+    pub floor: Option<u32>,
 }
 
 pub(super) fn history(events: &[WorkEvent]) -> History {
@@ -87,6 +95,13 @@ pub(super) fn history(events: &[WorkEvent]) -> History {
                 if rung.rung == Rung::SwitchWorker && rung.outcome.starts_with(SWITCHED) {
                     if let Some(w) = &last_worker {
                         out.excluded.insert(w.clone());
+                    }
+                    let tier = rung
+                        .outcome
+                        .split_once(ESCALATING_ABOVE)
+                        .and_then(|(_, n)| n.trim().parse::<u32>().ok());
+                    if let Some(tier) = tier {
+                        out.floor = Some(out.floor.map_or(tier, |f| f.max(tier)));
                     }
                 }
                 if matches!(rung.rung, Rung::Acquire | Rung::Build) {

@@ -116,6 +116,9 @@ impl Controller {
                     }
                 }
                 Status::Done if leaf => {
+                    if let Some(w) = self.finished_by(id).await? {
+                        data.workers.insert(id.clone(), w);
+                    }
                     let stored = self.store.work_evidence_list(id).await?;
                     let pending = b.evidence.iter().filter(|e| e.item == *id);
                     let mut refs: Vec<ArtifactRef> = Vec::new();
@@ -138,5 +141,26 @@ impl Controller {
             }
         }
         Ok(data)
+    }
+
+    /// The worker a done leaf ran on: its live lease while the batch that
+    /// closes it is being written, else its last `lease` event.
+    async fn finished_by(&self, item: &str) -> Result<Option<String>, Error> {
+        if let Some(w) = self.worker_of(item).await? {
+            return Ok(Some(w));
+        }
+        Ok(self
+            .store
+            .work_events(item)
+            .await?
+            .iter()
+            .rev()
+            .find(|e| e.kind == rustykrab_core::work::EventKind::Lease)
+            .map(|e| {
+                e.actor
+                    .strip_prefix("worker:")
+                    .unwrap_or(&e.actor)
+                    .to_string()
+            }))
     }
 }

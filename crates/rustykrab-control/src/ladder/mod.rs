@@ -20,7 +20,9 @@
 //!    item has one, else the item parks in its typed blocked state and the
 //!    parent asks. It is never re-planned around.
 //! 4. The item's own rungs, skipped by error class: order 0 retries transient
-//!    subclasses only; order 1 repairs, then switches worker; a capability
+//!    subclasses only; order 1 repairs, then switches worker, and a failed
+//!    verification switches after one repair, since a worker that claimed
+//!    more than it did once is escalated rather than asked again; a capability
 //!    gap, or a missing dependency (an install), skips both and goes to
 //!    order 2 (2a acquire, 2b build when the host confirms the tool does not
 //!    exist, 2c request when the gap is capacity), one per gap; a spent
@@ -390,6 +392,17 @@ fn own_rung(state: &LadderState, ctx: &LadderContext) -> Option<Decision> {
     }
     if err.subclass.is_transient() && state.left(Rung::Retry) > 0 {
         return Some(Decision::Retry);
+    }
+    if err.class == ErrorClass::Verification && state.left(Rung::SwitchWorker) > 0 {
+        let repaired = state.history.iter().any(|e| {
+            e.rung == Rung::Repair
+                && e.error
+                    .as_ref()
+                    .is_some_and(|x| x.class == ErrorClass::Verification)
+        });
+        if repaired {
+            return Some(Decision::SwitchWorker);
+        }
     }
     if state.left(Rung::Repair) > 0 {
         let repaired_before = state

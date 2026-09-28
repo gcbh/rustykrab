@@ -1,0 +1,429 @@
+//! Phase 3 against a real store and real git: `code` results verified from
+//! their workspace (scenario 2), the routing record and escalation of
+//! scenario 17's first half, and a worker's own tracker kept out of the
+//! store (scenario 31). The workers here create their workspace and commit
+//! in it the way the adapters in `rustykrab-agent` do.
+
+use std::sync::{Arc, Mutex};
+
+use async_trait::async_trait;
+use rustykrab_core::work::{
+    BlockedReason, EdgeKind, ResultReport, Rung, Status, WorkItemDraft, WorkKind, WorkerKind,
+};
+use rustykrab_core::Error;
+
+use super::{draft, Harness};
+use crate::controller::ControllerConfig;
+use crate::routing::CODE;
+use crate::worker::{Brief, RunUsage, Worker, WorkerCapabilities};
+use crate::workspace::tests::{commit_all, run_git, Repo};
+use crate::workspace::REPO_PREFIX;
+
+/// What a coding worker claims about the change it makes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Claim {
+    /// The commit it made and the path it changed.
+    Honest,
+    /// A path it did not change.
+    WrongPath,
+    /// A commit that does not exist, and no change at all.
+    NoSuchCommit,
+    /// An honest change, plus its own task list and Beads database in the
+    /// worktree and one discovered draft.
+    KeepsItsOwnTracker,
+}
+
+struct Coder {
+    name: &'static str,
+    kind: WorkerKind,
+    repos: Vec<String>,
+    claim: Claim,
+    briefs: Mutex<Vec<Brief>>,
+}
+
+impl Coder {
+    fn new(name: &'static str, kind: WorkerKind, repo: &Repo, claim: Claim) -> Arc<Coder> {
+        Arc::new(Coder {
+            name,
+            kind,
+            repos: vec![repo.path().display().to_string()],
+            claim,
+            briefs: Mutex::new(Vec::new()),
+        })
+    }
+
+    fn runs(&self) -> usize {
+        self.briefs.lock().unwrap().len()
+    }
+}
+
+#[async_trait]
+impl Worker for Coder {
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    fn kind(&self) -> WorkerKind {
+        self.kind
+    }
+
+    fn capabilities(&self) -> WorkerCapabilities {
+        WorkerCapabilities {
+            repos: self.repos.clone(),
+            writable_resources: self
+                .repos
+                .iter()
+                .map(|r| format!("{REPO_PREFIX}{r}"))
+                .collect(),
+            ..WorkerCapabilities::default()
+        }
+    }
+
+    fn usage(&self, _run: &str) -> Option<RunUsage> {
+        Some(RunUsage {
+            tokens: 1_000,
+            wall_ms: 4_000,
+            iterations: 3,
+            reminders: 0,
+        })
+    }
+
+    async fn run(&self, brief: Brief) -> Result<ResultReport, Error> {
+        self.briefs.lock().unwrap().push(brief.clone());
+        let ws = brief
+            .workspace
+            .clone()
+            .ok_or_else(|| Error::Internal("a code brief carries a workspace".into()))?;
+        let claim = self.claim;
+        tokio::task::spawn_blocking(move || {
+            ws.create().map_err(Error::Internal)?;
+            let mut report = ResultReport {
+                summary: "changed the helper".to_string(),
+                ..ResultReport::default()
+            };
+            if claim != Claim::NoSuchCommit {
+                std::fs::write(ws.path.join("src/lib.rs"), "pub fn helper() {}\n").unwrap();
+                if claim == Claim::KeepsItsOwnTracker {
+                    std::fs::create_dir_all(ws.path.join(".beads")).unwrap();
+                    std::fs::write(
+                        ws.path.join(".beads/issues.jsonl"),
+                        "{\"id\":\"bd-1\",\"title\":\"beads task\"}\n",
+                    )
+                    .unwrap();
+                    std::fs::write(ws.path.join("TODO.md"), "- [ ] claude task\n").unwrap();
+                    run_git(&ws.path, &["add", "src/lib.rs"]);
+                    run_git(
+                        &ws.path,
+                        &[
+                            "-c",
+                            "user.name=t",
+                            "-c",
+                            "user.email=t@example.invalid",
+                            "commit",
+                            "-q",
+                            "--no-gpg-sign",
+                            "-m",
+                            "change",
+                        ],
+                    );
+                    report.commit = Some(run_git(&ws.path, &["rev-parse", "HEAD"]));
+                    report.discovered = vec![WorkItemDraft {
+                        kind: Some(WorkKind::Code),
+                        title: "Add a changelog entry".to_string(),
+                        objective: "Record the change in CHANGELOG.md".to_string(),
+                        done_when: "CHANGELOG.md names the change".to_string(),
+                        ..WorkItemDraft::default()
+                    }];
+                } else {
+                    report.commit = Some(commit_all(&ws.path, "change"));
+                }
+            }
+            report.changed_paths = vec![match claim {
+                Claim::WrongPath => "src/elsewhere.rs".to_string(),
+                _ => "src/lib.rs".to_string(),
+            }];
+            if claim == Claim::NoSuchCommit {
+                report.commit = Some("0000000000000000000000000000000000000000".into());
+            }
+            ws.remove().map_err(Error::Internal)?;
+            Ok(report)
+        })
+        .await
+        .map_err(|e| Error::Internal(e.to_string()))?
+    }
+}
+
+fn config(root: &tempfile::TempDir) -> ControllerConfig {
+    ControllerConfig {
+        worktree_root: Some(root.path().to_path_buf()),
+        ..ControllerConfig::default()
+    }
+}
+
+fn code_draft(title: &str, repo: &Repo, kind: WorkerKind) -> WorkItemDraft {
+    let mut d = draft("code", title);
+    d.kind = Some(WorkKind::Code);
+    d.worker_kind = kind;
+    d.writable_resources = vec![format!("{REPO_PREFIX}{}", repo.path().display())];
+    d
+}
+
+#[tokio::test]
+async fn scenario_02_a_commit_and_its_paths_are_verified_and_a_false_claim_is_caught() {
+    let repo = Repo::new();
+    let root = tempfile::tempdir().unwrap();
+    let honest = Coder::new("pinch", WorkerKind::ClaudeCode, &repo, Claim::Honest);
+    let h = Harness::with_fleet(config(&root), vec![honest.clone()]);
+
+    let task = h
+        .file_one(code_draft(
+            "Add a status helper",
+            &repo,
+            WorkerKind::ClaudeCode,
+        ))
+        .await;
+    h.drain().await;
+    assert_eq!(h.status(&task).await, Status::Done);
+    let evidence = h.store().work_evidence_list(&task).await.unwrap();
+    let commit = evidence
+        .iter()
+        .find(|e| e.kind == "commit")
+        .expect("commit evidence");
+    assert_eq!(commit.verified_by.as_deref(), Some("git"));
+    assert_eq!(
+        run_git(repo.path(), &["cat-file", "-t", &commit.reference]),
+        "commit"
+    );
+    assert!(evidence.iter().any(|e| e.kind == "changed_path"
+        && e.reference == "src/lib.rs"
+        && e.verified_by.as_deref() == Some("git")));
+    let ws = evidence
+        .iter()
+        .find(|e| e.kind == "workspace")
+        .expect("the workspace is recorded at lease time");
+    assert!(ws.reference.contains(&root.path().display().to_string()));
+    // The user's checkout never moved, and the worktree is gone.
+    assert_eq!(run_git(repo.path(), &["status", "--short"]), "");
+    assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+    let brief = honest.briefs.lock().unwrap()[0].clone();
+    let workspace = brief.workspace.expect("a workspace");
+    assert_eq!(workspace.repo, repo.path());
+    assert!(workspace.branch.starts_with("rustykrab/work/"));
+    // The worker is named in the report, and its record counts the result.
+    let outbox = h.outbox().await;
+    assert!(
+        outbox[0].body.contains("Result (pinch)"),
+        "{}",
+        outbox[0].body
+    );
+    let record = h.ctl.registry().record_of("pinch", CODE).unwrap();
+    assert_eq!(record.verified_done, 1);
+    assert_eq!(record.cost.tokens, 1_000);
+
+    // A result whose claimed paths differ from the diff.
+    let liar = Coder::new("pinch", WorkerKind::ClaudeCode, &repo, Claim::WrongPath);
+    let h = Harness::with_fleet(config(&root), vec![liar.clone()]);
+    let claimed = h
+        .file_one(code_draft(
+            "Add a second helper",
+            &repo,
+            WorkerKind::ClaudeCode,
+        ))
+        .await;
+    h.drain().await;
+    assert_eq!(
+        h.status(&claimed).await,
+        Status::Blocked(BlockedReason::VerificationFailed)
+    );
+    let events = h.events(&claimed).await;
+    let failed = events
+        .iter()
+        .filter(|e| e.to == Some(Status::Blocked(BlockedReason::VerificationFailed)))
+        .count();
+    assert!(failed >= 2, "each false claim is recorded: {failed}");
+    let error = crate::ladder::last_error(&events).expect("an error");
+    assert!(
+        error.detail.contains("src/elsewhere.rs"),
+        "{}",
+        error.detail
+    );
+    assert!(h.rungs(&claimed).await.contains(&Rung::SwitchWorker));
+    let record = h.ctl.registry().record_of("pinch", CODE).unwrap();
+    assert!(record.claimed_not_verified >= 2);
+    assert!(record.probation);
+}
+
+#[tokio::test]
+async fn scenario_17_a_local_code_result_counts_and_a_failed_verification_escalates() {
+    let repo = Repo::new();
+    let root = tempfile::tempdir().unwrap();
+    let local_good = Coder::new("krabby", WorkerKind::Local, &repo, Claim::Honest);
+    let claude = Coder::new("pinch", WorkerKind::ClaudeCode, &repo, Claim::Honest);
+    let h = Harness::with_fleet(config(&root), vec![local_good.clone(), claude.clone()]);
+
+    // A code item with no worker constraint starts on the cheapest worker
+    // the record qualifies: the local one, on probation.
+    let first = h
+        .file_one(code_draft("Document the helper", &repo, WorkerKind::Any))
+        .await;
+    h.drain().await;
+    assert_eq!(h.status(&first).await, Status::Done);
+    assert_eq!((local_good.runs(), claude.runs()), (1, 0));
+    let record = h.ctl.registry().record_of("krabby", CODE).unwrap();
+    assert_eq!(record.verified_done, 1);
+    assert!(record.probation);
+
+    // A local worker that claims an edit that never happened fails
+    // verification twice, then the item escalates past its tier.
+    let local_bad = Coder::new("krabby", WorkerKind::Local, &repo, Claim::NoSuchCommit);
+    let claude = Coder::new("pinch", WorkerKind::ClaudeCode, &repo, Claim::Honest);
+    let h = Harness::with_fleet(config(&root), vec![local_bad.clone(), claude.clone()]);
+    let second = h
+        .file_one(code_draft(
+            "Document the helper's errors",
+            &repo,
+            WorkerKind::Any,
+        ))
+        .await;
+    h.drain().await;
+    assert_eq!(h.status(&second).await, Status::Done);
+    assert_eq!((local_bad.runs(), claude.runs()), (2, 1));
+    let events = h.events(&second).await;
+    let failed = events
+        .iter()
+        .filter(|e| e.to == Some(Status::Blocked(BlockedReason::VerificationFailed)))
+        .count();
+    assert_eq!(failed, 2);
+    assert_eq!(
+        h.rungs(&second).await,
+        vec![Rung::Repair, Rung::SwitchWorker]
+    );
+    let rung = events
+        .iter()
+        .filter_map(crate::controller::load::decode_rung)
+        .find(|r| r.rung == Rung::SwitchWorker)
+        .unwrap();
+    assert_eq!(
+        rung.outcome,
+        "switched from krabby; escalating above tier 0"
+    );
+    let local = h.ctl.registry().record_of("krabby", CODE).unwrap();
+    assert_eq!(local.claimed_not_verified, 2);
+    let escalated = h.ctl.registry().record_of("pinch", CODE).unwrap();
+    assert_eq!((escalated.verified_done, escalated.repairs), (1, 1));
+    // The controller moves no default on its own: the policy is unchanged.
+    let policy = crate::routing::RoutingPolicy::default();
+    assert_eq!(policy.default_tiers.get(CODE), Some(&0));
+}
+
+#[tokio::test]
+async fn scenario_31_one_discovered_draft_is_filed_and_the_workers_tracker_stays_out() {
+    let repo = Repo::new();
+    let root = tempfile::tempdir().unwrap();
+    let coder = Coder::new(
+        "pinch",
+        WorkerKind::ClaudeCode,
+        &repo,
+        Claim::KeepsItsOwnTracker,
+    );
+    let h = Harness::with_fleet(config(&root), vec![coder]);
+    let task = h
+        .file_one(code_draft(
+            "Add a status helper and track it",
+            &repo,
+            WorkerKind::ClaudeCode,
+        ))
+        .await;
+    for _ in 0..4 {
+        h.step().await;
+    }
+    assert_eq!(h.status(&task).await, Status::Done);
+    let everything = h
+        .store()
+        .work_list(&rustykrab_store::WorkFilter {
+            include_closed: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let filed: Vec<_> = everything
+        .iter()
+        .filter(|i| i.title == "Add a changelog entry")
+        .collect();
+    assert_eq!(filed.len(), 1, "exactly one item from the one draft");
+    assert_eq!(filed[0].kind, WorkKind::Code);
+    let edges = h.store().work_edges_of(&filed[0].id).await.unwrap();
+    assert!(edges
+        .iter()
+        .any(|e| e.kind == EdgeKind::DiscoveredFrom && e.depends_on == task));
+    assert!(
+        !everything
+            .iter()
+            .any(|i| i.title.contains("beads task") || i.title.contains("claude task")),
+        "nothing from the worker's own tracker reached the store"
+    );
+    // Its untracked files are not claimed changes either.
+    let evidence = h.store().work_evidence_list(&task).await.unwrap();
+    let paths: Vec<&str> = evidence
+        .iter()
+        .filter(|e| e.kind == "changed_path")
+        .map(|e| e.reference.as_str())
+        .collect();
+    assert_eq!(paths, ["src/lib.rs"]);
+}
+
+#[tokio::test]
+async fn a_code_claim_with_no_workspace_to_check_is_not_done() {
+    let repo = Repo::new();
+    // No worktree root: nothing to check a claimed commit against.
+    let coder = Coder::new("pinch", WorkerKind::ClaudeCode, &repo, Claim::Honest);
+    let h = Harness::with_fleet(ControllerConfig::default(), vec![coder.clone()]);
+    let task = h
+        .file_one(code_draft("Add a helper", &repo, WorkerKind::ClaudeCode))
+        .await;
+    h.drain().await;
+    // The worker errors without a workspace; nothing it claims is done.
+    assert_ne!(h.status(&task).await, Status::Done);
+    assert!(coder.runs() >= 1);
+}
+
+/// Section 17: "cheapest-qualifying worker, and escalation only on
+/// failure". A busy local worker is waited for; an idle coding agent is not
+/// given the item because the cheap tier is occupied.
+#[tokio::test]
+async fn a_busy_cheapest_tier_is_waited_for_not_escalated_past() {
+    let script = Arc::new(super::Script::default());
+    let gate = Arc::new(tokio::sync::Notify::new());
+    script.push(
+        "First errand",
+        super::Step::Wait(gate.clone(), Box::new(super::done("First errand"))),
+    );
+    let local = Arc::new(super::Scripted {
+        name: "snapper".to_string(),
+        concurrency: 1,
+        script: script.clone(),
+    });
+    let repo = Repo::new();
+    let claude = Coder::new("pinch", WorkerKind::ClaudeCode, &repo, Claim::Honest);
+    let h = Harness::with_fleet(ControllerConfig::default(), vec![local, claude.clone()]);
+    let first = h.file_one(draft("a", "First errand")).await;
+    let second = h.file_one(draft("b", "Second errand")).await;
+    h.step().await;
+    h.step().await;
+    assert_eq!(
+        h.status(&second).await,
+        Status::Ready,
+        "it waits for the local worker"
+    );
+    assert_eq!(claude.runs(), 0);
+
+    gate.notify_one();
+    h.drain().await;
+    assert_eq!(h.status(&first).await, Status::Done);
+    assert_eq!(h.status(&second).await, Status::Done);
+    assert_eq!(claude.runs(), 0, "the coding agent never took an errand");
+    assert!(script
+        .briefs()
+        .iter()
+        .all(|(worker, _)| worker == "snapper"));
+}

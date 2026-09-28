@@ -49,7 +49,8 @@ impl Cause {
 pub(super) struct NoticeData {
     /// The ladder of each failed or blocked item in the tree.
     pub ladders: HashMap<WorkItemId, LadderState>,
-    /// The worker running each active leaf.
+    /// The worker running each active leaf, and the worker that finished
+    /// each done one: names are shown in every message (section 5).
     pub workers: HashMap<WorkItemId, String>,
     /// Verified evidence refs of each done leaf.
     pub evidence: HashMap<WorkItemId, Vec<ArtifactRef>>,
@@ -163,6 +164,9 @@ pub(super) fn render(snap: &Snapshot, root: &str, data: &NoticeData, causes: &[C
             .filter(|i| i.status == Status::Done)
             .map(|i| {
                 let mut line = label(i);
+                if let Some(w) = data.workers.get(&i.id) {
+                    line.push_str(&format!(" on {w}"));
+                }
                 if let Some(s) = data.summaries.get(&i.id) {
                     line.push_str(&format!(": {}", clip(s, 120)));
                 }
@@ -174,8 +178,11 @@ pub(super) fn render(snap: &Snapshot, root: &str, data: &NoticeData, causes: &[C
             .collect();
         lines.extend(list("Done", done));
     } else if r.status == Status::Done {
-        if let Some(s) = data.summaries.get(&r.id) {
-            lines.push(format!("Result: {}.", clip(s, 240)));
+        match (data.summaries.get(&r.id), data.workers.get(&r.id)) {
+            (Some(s), Some(w)) => lines.push(format!("Result ({w}): {}.", clip(s, 240))),
+            (Some(s), None) => lines.push(format!("Result: {}.", clip(s, 240))),
+            (None, Some(w)) => lines.push(format!("Done by {w}.")),
+            (None, None) => {}
         }
         if let Some(ev) = data.evidence.get(&r.id).filter(|e| !e.is_empty()) {
             lines.push(format!("Evidence: {}.", refs(ev)));

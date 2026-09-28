@@ -1,7 +1,9 @@
 //! What a run is given (plan section 6, step 4, and 6.3): the typed brief
 //! and its fan-in block.
 //!
-//! The inputs block copies, from each item in `inputs_from`, pointers only:
+//! The inputs block copies, from each item in `inputs_from` and each
+//! `capability` item the ladder parked the item behind (section 8: the
+//! original resumes with what the build produced), pointers only:
 //! its verified evidence refs and artifact refs, its closed status, one
 //! line of its result summary and, for a failed input, its error. A parent
 //! input contributes its verification record and its done leaves' refs. The
@@ -10,7 +12,7 @@
 //! copied set is stored with the lease, so the brief can be rebuilt.
 
 use rustykrab_core::work::{
-    ArtifactRef, EventKind, Evidence, InputRef, Status, WorkItem, WorkItemId,
+    ArtifactRef, EdgeKind, EventKind, Evidence, InputRef, Status, WorkItem, WorkItemId, WorkKind,
 };
 use rustykrab_core::Error;
 
@@ -65,7 +67,20 @@ impl Controller {
         let max = self.config.caps.max_inputs as usize;
         let budget = self.config.caps.max_input_tokens as usize;
         let mut spent = 0usize;
-        for id in &item.inputs_from {
+        // The capability items the ladder parked this item behind are
+        // inputs too, once done: the resumed run starts from what the
+        // build or acquisition reported (section 8).
+        let capabilities: Vec<WorkItemId> = snap
+            .edges_held_by(&item.id)
+            .filter(|e| e.kind == EdgeKind::Blocks)
+            .filter(|e| !item.inputs_from.contains(&e.depends_on))
+            .filter(|e| {
+                snap.item(&e.depends_on)
+                    .is_some_and(|u| u.kind == WorkKind::Capability && u.status == Status::Done)
+            })
+            .map(|e| e.depends_on.clone())
+            .collect();
+        for id in item.inputs_from.iter().chain(&capabilities) {
             let Some(up) = snap.item(id) else {
                 more.push(id.clone());
                 continue;
@@ -193,5 +208,6 @@ pub(super) fn brief_for(
         budget: item.budget,
         origin_conversation_id: item.origin_conversation_id.clone(),
         run: None,
+        workspace: None,
     }
 }

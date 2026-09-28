@@ -17,6 +17,7 @@ pub mod registry;
 mod secret;
 mod tasks;
 mod work_items;
+mod workers;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -52,6 +53,9 @@ pub use tasks::{DelegatedTask, TaskStatus, TaskStore};
 pub use work_items::{
     ArchivedItem, OutboxDraft, OutboxRow, RepointSpec, TransitionSpec, WorkApplied, WorkFilter,
     WorkOp, WorkPlanRow, WorkStoreError,
+};
+pub use workers::{
+    ClassCost, ClassRecord, RoutingDefault, RoutingRecord, WorkerRow, WorkerStore, WorkerUpsert,
 };
 
 /// Top-level database handle wrapping a SQLite connection.
@@ -768,6 +772,9 @@ impl Store {
         )
         .map_err(|e| Error::Storage(e.to_string()))?;
 
+        // Phase 3 of the control layer: the worker registry (`workers.rs`).
+        workers::migrate(conn)?;
+
         // Additive migrations for pre-existing databases. `PRAGMA table_info`
         // lists current columns; only ALTER if a column is missing.
         let mut stmt = conn
@@ -1134,6 +1141,11 @@ impl Store {
     /// node worker (`rustykrab_gateway::tasks`).
     pub fn tasks(&self) -> TaskStore {
         TaskStore::new(Arc::clone(&self.conn))
+    }
+
+    /// Return a handle for the control layer's worker registry rows.
+    pub fn workers(&self) -> WorkerStore {
+        WorkerStore::new(Arc::clone(&self.conn))
     }
 
     /// Return a handle for scheduled-job operations.

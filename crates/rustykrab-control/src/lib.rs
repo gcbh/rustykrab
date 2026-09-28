@@ -17,6 +17,12 @@
 //! - [`import`]: the delivery import, a `StackManifest` turned into the
 //!   layered `code` graph of section 14.1, filed through the validator.
 //! - [`worker`]: workers as the controller sees them, and the brief they get.
+//! - [`registry`]: the named workers (section 5), persisted in the store's
+//!   `workers` table, and the factory that builds external ones.
+//! - [`routing`]: work classes, the routing record and the policy that reads
+//!   it (sections 5 and 10).
+//! - [`workspace`]: isolated git worktrees for `code` runs and the check of a
+//!   `code` result against them (section 5).
 //! - [`controller`]: the loop itself (section 6), which drives the store
 //!   through the pure modules above.
 //!
@@ -29,4 +35,7 @@ pub mod graph;
 pub mod handle;
 pub mod import;
 pub mod ladder;
+pub mod registry;
+pub mod routing;
 pub mod worker;
+pub mod workspace;

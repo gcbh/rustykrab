@@ -131,9 +131,50 @@ async fn scenario_09_an_item_expires_the_user_is_told_and_nothing_runs() {
 
 // ── 13 ─────────────────────────────────────────────────────────────────
 
+/// A catalog that learns a tool when told the build wrote it, and
+/// counts the refreshes that asked (section 8, rung 2b: the daemon loads
+/// what a build wrote at run time).
+#[derive(Default)]
+struct Learning {
+    built: std::sync::Mutex<Vec<String>>,
+    written: std::sync::Mutex<Vec<String>>,
+    refreshes: std::sync::atomic::AtomicUsize,
+}
+
+impl Learning {
+    fn write(&self, tool: &str) {
+        self.written.lock().unwrap().push(tool.to_string());
+    }
+}
+
+impl super::super::ToolCatalog for Learning {
+    fn tool_state(&self, name: &str) -> rustykrab_tools::work_backend::ToolState {
+        if self.built.lock().unwrap().iter().any(|t| t == name) {
+            rustykrab_tools::work_backend::ToolState::RegisteredUnloaded
+        } else {
+            rustykrab_tools::work_backend::ToolState::Unknown
+        }
+    }
+
+    fn mcp_server_configured(&self, _name: &str) -> bool {
+        false
+    }
+
+    fn refresh(&self) {
+        self.refreshes.fetch_add(1, Ordering::SeqCst);
+        let written = self.written.lock().unwrap().clone();
+        *self.built.lock().unwrap() = written;
+    }
+}
+
 #[tokio::test]
 async fn scenario_13_a_missing_tool_files_a_capability_build_and_the_original_resumes_with_it() {
-    let h = Harness::new(&["pinch"]);
+    let catalog = Arc::new(Learning::default());
+    let h = Harness::with_catalog(
+        crate::controller::ControllerConfig::default(),
+        catalog.clone(),
+        &["pinch"],
+    );
     h.script.push(
         "Render the invoice",
         report(failure(ErrorSubclass::ToolGap, "needs tool: pdf_render")),
@@ -151,6 +192,14 @@ async fn scenario_13_a_missing_tool_files_a_capability_build_and_the_original_re
     assert_eq!(caps.len(), 1);
     assert_eq!(caps[0].title, "Build tool: pdf_render");
     assert!(caps[0].parent.is_none(), "not part of the original's chain");
+    assert!(
+        caps[0]
+            .artifact_refs
+            .iter()
+            .any(|r| r.kind == "capability" && r.value == "build tool:pdf_render"),
+        "{:?}",
+        caps[0].artifact_refs
+    );
     let edges = h.store().work_edges_of(&x).await.unwrap();
     assert!(edges.contains(&Edge {
         item: x.clone(),
@@ -158,16 +207,43 @@ async fn scenario_13_a_missing_tool_files_a_capability_build_and_the_original_re
         kind: EdgeKind::Blocks,
     }));
     assert_eq!(h.rungs(&x).await, vec![Rung::Build]);
+    assert!(
+        catalog.refreshes.load(Ordering::SeqCst) > 0,
+        "looked again first"
+    );
 
-    // The capability item runs like any other; once it is done the
-    // original resumes with the tool activated up front.
+    // A build that reports done without the tool existing is a claim
+    // beyond the evidence: it fails verification and repairs.
+    h.step().await;
+    h.step().await;
+    let events = h.events(&caps[0].id).await;
+    assert!(
+        events
+            .iter()
+            .any(|e| e.to == Some(Status::Blocked(BlockedReason::VerificationFailed))),
+        "{events:#?}"
+    );
+
+    // The build writes the tool; the repaired run verifies it, and the
+    // original resumes with the tool activated up front and the build's
+    // report among its inputs.
+    catalog.write("pdf_render");
     h.drain().await;
     assert_eq!(h.status(&caps[0].id).await, Status::Done);
+    let evidence = h.store().work_evidence_list(&caps[0].id).await.unwrap();
+    assert!(evidence.iter().any(|e| e.kind == "tool"
+        && e.reference == "pdf_render"
+        && e.verified_by.as_deref() == Some("catalog")));
     assert_eq!(h.status(&x).await, Status::Done);
     let briefs = h.script.briefs_for("Render the invoice");
     assert_eq!(briefs.len(), 2);
     assert!(briefs[1].required_tools.contains(&"pdf_render".to_string()));
     assert!(briefs[1].last_error.is_some());
+    assert!(
+        briefs[1].inputs.iter().any(|i| i.item == caps[0].id),
+        "the resumed brief carries the build: {:?}",
+        briefs[1].inputs
+    );
 
     // The user was never asked: one notice, the final report.
     let outbox = h.outbox().await;

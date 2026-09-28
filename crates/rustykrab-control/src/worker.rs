@@ -1,9 +1,9 @@
 //! Workers as the controller sees them (plan section 5): a name, a kind,
-//! advertised capabilities, and one way to run a brief. The local sub-agent
-//! implementation lives in `rustykrab-agent` (`LocalWorker`); peers, Claude
-//! Code and Codex come in later phases. A run that ends without a result
-//! returns a [`RunFailure`], which [`run_failure_input`] turns back into
-//! what the classifier reads.
+//! advertised capabilities, and one way to run a brief. The implementations
+//! live in `rustykrab-agent`: `LocalWorker`, and `ExternalWorker` for the
+//! `claude_code` and `codex` kinds; peers come in Phase 5. A run that ends
+//! without a result returns a [`RunFailure`], which [`run_failure_input`]
+//! turns back into what the classifier reads.
 
 use async_trait::async_trait;
 use rustykrab_core::work::{
@@ -12,7 +12,8 @@ use rustykrab_core::work::{
 use rustykrab_core::Error;
 use serde::{Deserialize, Serialize};
 
-use crate::errors::{BudgetKind, FailureInput, GapKind, ProviderProblem};
+use crate::errors::{BudgetKind, FailureInput, GapKind, PolicyStop, ProviderProblem};
+use crate::workspace::Workspace;
 
 /// What a worker advertises (plan section 5).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -57,7 +58,19 @@ pub struct Brief {
     /// outlives a run that is cancelled or lost mid-way.
     #[serde(default)]
     pub run: Option<String>,
+    /// For a `code` item with a repository: the isolated worktree the run
+    /// works in, its branch and the parent commit the controller pinned
+    /// (see [`crate::workspace`]). The worker creates it before the run and
+    /// removes the directory after; the controller verifies against it.
+    #[serde(default)]
+    pub workspace: Option<Workspace>,
 }
+
+/// The artifact kind a worker's adapter attests for each command the agent
+/// ran, read from the agent's own event stream (a model-written one is
+/// dropped). A claimed check is verified against these (plan section 5:
+/// "the named checks ran").
+pub const COMMAND_RUN: &str = "command_run";
 
 /// A worker the controller can lease an item to.
 #[async_trait]
@@ -76,6 +89,30 @@ pub trait Worker: Send + Sync {
     /// Run one brief to its typed result. The controller verifies the result
     /// before anything counts; a worker never transitions an item.
     async fn run(&self, brief: Brief) -> Result<ResultReport, Error>;
+
+    /// What the run with this id (the brief's `run`) spent and what the
+    /// worker counted about itself, once the run has ended or been
+    /// stopped. The controller asks once per run, records the spend
+    /// (`work_spend`) and the counts as a `run` event on the item. `None`:
+    /// the worker keeps no such numbers, and the controller records its own
+    /// wall time with no token count.
+    fn usage(&self, _run: &str) -> Option<RunUsage> {
+        None
+    }
+}
+
+/// What one worker run spent and counted (see [`Worker::usage`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunUsage {
+    /// Tokens the run's model calls consumed (prompt and completion).
+    pub tokens: u64,
+    pub wall_ms: u64,
+    /// Model turns the run took.
+    pub iterations: u32,
+    /// Completion reminders the runner sent after a text-only reply (plan
+    /// section 12.1 measures these as net-negative; the controller records
+    /// how often they happen).
+    pub reminders: u32,
 }
 
 // ── a run that ends without a result ──────────────────────────────────────
@@ -102,6 +139,15 @@ pub enum RunFailure {
     /// The worker lacks something the brief requires; `name` is the tool,
     /// server or credential missing.
     Gap { gap: GapKind, name: String },
+    /// The worker's own process exited without a result: an external
+    /// agent's CLI, by code, or `None` when a signal ended it.
+    Process {
+        code: Option<i32>,
+        stderr_tail: String,
+    },
+    /// The worker refused the brief on a policy check: a repository
+    /// outside the ones it was added for is `scope`.
+    Policy { stop: PolicyStop, detail: String },
 }
 
 impl RunFailure {
@@ -135,6 +181,17 @@ impl RunFailure {
                 gap: GapKind::parse(word)?,
                 name: detail,
             }),
+            ("process", word) => Some(RunFailure::Process {
+                code: match word {
+                    "signal" => None,
+                    code => Some(code.parse().ok()?),
+                },
+                stderr_tail: detail,
+            }),
+            ("policy", word) => Some(RunFailure::Policy {
+                stop: STOPS.iter().copied().find(|s| stop_word(*s) == word)?,
+                detail,
+            }),
             _ => None,
         }
     }
@@ -147,16 +204,29 @@ impl RunFailure {
             }
             RunFailure::Model { problem, detail } => FailureInput::Provider { problem, detail },
             RunFailure::Gap { gap, name } => FailureInput::CapabilityGap { gap, name },
+            RunFailure::Process { code, stderr_tail } => {
+                FailureInput::ProcessExit { code, stderr_tail }
+            }
+            RunFailure::Policy { stop, detail } => FailureInput::Policy { stop, detail },
         }
     }
 }
 
 impl std::fmt::Display for RunFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let code;
         let (class, word, detail) = match self {
             RunFailure::Budget { budget, detail } => ("budget", budget_word(*budget), detail),
             RunFailure::Model { problem, detail } => ("model", problem_word(*problem), detail),
             RunFailure::Gap { gap, name } => ("capability_gap", gap.as_str(), name),
+            RunFailure::Process {
+                code: exit,
+                stderr_tail,
+            } => {
+                code = exit.map_or_else(|| "signal".to_string(), |c| c.to_string());
+                ("process", code.as_str(), stderr_tail)
+            }
+            RunFailure::Policy { stop, detail } => ("policy", stop_word(*stop), detail),
         };
         write!(f, "{}{class}/{word}: {detail}", Self::PREFIX)
     }
@@ -185,6 +255,16 @@ const PROBLEMS: [ProviderProblem; 6] = [
     ProviderProblem::HallucinatedTool,
     ProviderProblem::Unavailable,
 ];
+
+const STOPS: [PolicyStop; 3] = [
+    PolicyStop::Scope,
+    PolicyStop::SingleWriter,
+    PolicyStop::Ceiling,
+];
+
+fn stop_word(stop: PolicyStop) -> &'static str {
+    stop.subclass().as_str()
+}
 
 fn budget_word(budget: BudgetKind) -> &'static str {
     budget.subclass().as_str()
@@ -218,6 +298,18 @@ mod tests {
         out.extend(GapKind::ALL.iter().map(|&gap| RunFailure::Gap {
             gap,
             name: "mcp server linear".into(),
+        }));
+        out.push(RunFailure::Process {
+            code: Some(2),
+            stderr_tail: "error: unknown flag: --bogus".into(),
+        });
+        out.push(RunFailure::Process {
+            code: None,
+            stderr_tail: String::new(),
+        });
+        out.extend(STOPS.iter().map(|&stop| RunFailure::Policy {
+            stop,
+            detail: "repo:/elsewhere is not one of this worker's repositories".into(),
         }));
         out
     }
