@@ -579,10 +579,23 @@ impl Controller {
                 );
                 return self.fail(b, item, worker, error, &result.artifacts).await;
             }
+            // No item parks with a blank question: a blocked report that
+            // says nothing falls back to the report's summary, then to a
+            // sentence naming the reason.
+            let detail = [blocked.detail.trim(), result.summary.trim()]
+                .into_iter()
+                .find(|s| !s.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| {
+                    format!(
+                        "the worker reported {} without saying what it needs",
+                        Status::Blocked(blocked.reason)
+                    )
+                });
             let text = if blocked.needs.is_empty() {
-                blocked.detail.clone()
+                detail
             } else {
-                format!("{} (needs {})", blocked.detail, blocked.needs.join(", "))
+                format!("{detail} (needs {})", blocked.needs.join(", "))
             };
             return self.park(b, item, blocked.reason, &text).await;
         }

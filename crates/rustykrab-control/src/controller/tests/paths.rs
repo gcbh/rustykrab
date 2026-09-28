@@ -9,8 +9,8 @@ use std::time::Duration;
 
 use chrono::TimeDelta;
 use rustykrab_core::work::{
-    BlockedReason, CancelReason, EdgeKind, ErrorSubclass, Question, ResultReport, Rung, Status,
-    WorkKind, WorkerKind,
+    BlockedReason, BlockedReport, CancelReason, EdgeKind, ErrorSubclass, Question, ResultReport,
+    Rung, Status, WorkKind, WorkerKind,
 };
 use rustykrab_tools::work_backend::{
     Principal, Provenance, StatusQuery, StatusSelector, ToolState, WorkBackend,
@@ -178,6 +178,62 @@ async fn a_question_parks_the_item_as_needs_decision_and_asks_through_the_parent
         outbox[0].body.contains("Which one? [Tasca / Cervejaria]"),
         "{}",
         outbox[0].body
+    );
+}
+
+#[tokio::test]
+async fn a_blocked_report_with_no_detail_never_parks_with_a_blank_question() {
+    let h = Harness::new(&["pinch"]);
+    h.script.push(
+        "Pick a schema",
+        report(ResultReport {
+            summary: "Which of the two schemas should win?".to_string(),
+            blocked: Some(BlockedReport {
+                reason: BlockedReason::NeedsDecision,
+                detail: "  ".to_string(),
+                needs: Vec::new(),
+            }),
+            ..ResultReport::default()
+        }),
+    );
+    h.script.push(
+        "Pick a colour",
+        report(ResultReport {
+            blocked: Some(BlockedReport {
+                reason: BlockedReason::NeedsDecision,
+                detail: String::new(),
+                needs: Vec::new(),
+            }),
+            ..ResultReport::default()
+        }),
+    );
+    let ids = h
+        .file(plan(vec![
+            draft("P", "Tidy the store"),
+            draft("x", "Pick a schema"),
+            draft("y", "Pick a colour"),
+        ]))
+        .await
+        .ids;
+    h.drain().await;
+    for key in ["x", "y"] {
+        assert_eq!(
+            h.status(&ids[key]).await,
+            Status::Blocked(BlockedReason::NeedsDecision)
+        );
+    }
+    let outbox = h.outbox().await;
+    assert!(
+        outbox
+            .iter()
+            .any(|m| m.body.contains("Which of the two schemas should win?")),
+        "{outbox:?}"
+    );
+    assert!(
+        outbox
+            .iter()
+            .any(|m| m.body.contains("without saying what it needs")),
+        "{outbox:?}"
     );
 }
 
