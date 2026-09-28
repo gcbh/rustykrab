@@ -61,12 +61,24 @@ pub(crate) fn apply_tool_stubs(tools: Vec<Arc<dyn Tool>>) -> anyhow::Result<Stub
 /// Register the work tools over `backend`, after the stub switch, so a
 /// `replace` stub file keeps them. A name the registry already has (a stub
 /// scripting one of them) is left as it is.
-pub(crate) fn add_work_tools(tools: &mut Vec<Arc<dyn Tool>>, backend: Arc<dyn WorkBackend>) {
+///
+/// Returns the names it added. The stub switch's active-tools seed leaves
+/// them out: the stub file is the harness's closed world, and a worker run
+/// declares the work tools it needs itself, so seeding them into every
+/// conversation only spends the model suite's deliberately tight context
+/// window on schemas no case uses.
+pub(crate) fn add_work_tools(
+    tools: &mut Vec<Arc<dyn Tool>>,
+    backend: Arc<dyn WorkBackend>,
+) -> Vec<String> {
+    let mut added = Vec::new();
     for tool in rustykrab_tools::work_tools(backend) {
         if !tools.iter().any(|t| t.name() == tool.name()) {
+            added.push(tool.name().to_string());
             tools.push(tool);
         }
     }
+    added
 }
 
 // ── the busy signal (plan 12.1) ────────────────────────────────────────

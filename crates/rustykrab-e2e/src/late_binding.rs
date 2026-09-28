@@ -25,7 +25,14 @@
 use serde_json::{json, Value};
 
 use crate::assertion::Assertion;
-use crate::model_suite::{bounded_harness, ModelCase, TIGHT_NUM_CTX};
+use crate::model_suite::{bounded_harness, ModelCase};
+
+/// The late binding experiment's window (2026-09-24). Scenario 10 measures
+/// whether a tool found among near-misses is called by append, not how a
+/// tight window compacts: at the model suite's 6,144 the base tools'
+/// schemas and the reply reserve leave no room for the turn, and every
+/// request is refused before it reaches the model.
+const LATE_BINDING_NUM_CTX: u32 = 32_768;
 
 /// The experiment's base: RustyKrab's meta and seed tools, with their real
 /// descriptions. Kept real rather than stubbed, since the append path is
@@ -345,7 +352,7 @@ pub(crate) fn cases() -> Vec<ModelCase> {
                  append, with the tool block unchanged across the run",
             )
             .with_harness(bounded_harness())
-            .with_num_ctx(TIGHT_NUM_CTX)
+            .with_num_ctx(LATE_BINDING_NUM_CTX)
             .keeping(BASE)
             .ask(turn(&task));
             for tool in catalog(&task, n, true) {
@@ -371,7 +378,7 @@ pub(crate) fn cases() -> Vec<ModelCase> {
              nothing and no near-miss is called in its place",
         )
         .with_harness(bounded_harness())
-        .with_num_ctx(TIGHT_NUM_CTX)
+        .with_num_ctx(LATE_BINDING_NUM_CTX)
         .keeping(BASE)
         .ask(turn(&task))
         .expect(Assertion::NoRunError)

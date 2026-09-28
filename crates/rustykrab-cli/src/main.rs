@@ -1335,7 +1335,7 @@ async fn main() -> anyhow::Result<()> {
     );
     fleet.start(local_worker).await?;
     deferred_work_backend.bind(controller.clone());
-    work_host::add_work_tools(&mut tools, controller.clone());
+    let work_tool_names = work_host::add_work_tools(&mut tools, controller.clone());
     tracing::info!(
         worker = %fleet.local_name,
         notices = control_notice_channel,
@@ -1362,7 +1362,7 @@ async fn main() -> anyhow::Result<()> {
             tools
                 .iter()
                 .map(|t| t.name().to_string())
-                .filter(|n| !hidden_stubs.contains(n)),
+                .filter(|n| !hidden_stubs.contains(n) && !work_tool_names.contains(n)),
         );
     }
     if let Ok(raw) = std::env::var("RUSTYKRAB_ACTIVE_TOOLS") {
