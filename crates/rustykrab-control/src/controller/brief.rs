@@ -21,7 +21,7 @@ use super::load::{last_error, History};
 use super::Controller;
 
 /// Evidence kinds the controller writes that are not refs to hand on.
-pub(super) const SUMMARY: &str = "summary";
+pub const SUMMARY: &str = "summary";
 pub(super) const ERROR: &str = "error";
 /// Who verified an artifact in Phase 1: its presence in the report.
 pub(super) const RESULT_REPORT: &str = "result_report";

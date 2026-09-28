@@ -30,3 +30,9 @@ pub mod handle;
 pub mod import;
 pub mod ladder;
 pub mod worker;
+
+/// Who filed and on whose behalf: the record every filing path through
+/// [`handle::ControlHandle`] takes. Defined beside the work tools'
+/// backend in `rustykrab-tools`; re-exported so a caller of the handle
+/// (the gateway) needs no dependency on the tool crate for it.
+pub use rustykrab_tools::work_backend::Provenance;

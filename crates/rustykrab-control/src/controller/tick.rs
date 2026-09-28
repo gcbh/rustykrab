@@ -21,12 +21,14 @@ use crate::errors::{
 use crate::graph::{self, Effects};
 use crate::handle::TickReport;
 use crate::ladder::{self, Decision, LadderContext, LadderState, SurfaceReason};
-use crate::worker::{Brief, Worker};
+use crate::worker::{run_failure_input, Brief, Worker};
 
 use super::batch::{has_open_plan_b, Batch};
 use super::brief::{brief_for, first_line, ERROR, RESULT_REPORT, RUN, SUMMARY};
 use super::commit::Written;
-use super::filing::{parked_on_landed_capability, parked_reason, waiting_on_mcp};
+use super::filing::{
+    parked_on_landed_capability, parked_reason, unneeded_capabilities, waiting_on_mcp,
+};
 use super::load::{history, ladder_from, REPLAYED, SWITCHED};
 use super::notice::{label, Cause};
 use super::{Controller, Finished, Run, RunResult};
@@ -314,6 +316,11 @@ impl Controller {
         for id in waiting_on_mcp(&b.snap, |s| self.catalog.mcp_server_configured(s)) {
             changed.extend(b.move_to(&id, Status::Queued, "controller", "MCP server configured"));
         }
+        // A capability item nothing waits on any more is cancelled before
+        // anyone leases it (6.2): the chain that needed it closed.
+        for (id, origin) in unneeded_capabilities(&b.snap) {
+            changed.extend(b.cancel_unneeded(&id, &origin));
+        }
 
         // Readiness (time triggers that fired), roll-ups and verification.
         changed.extend(all);
@@ -349,6 +356,7 @@ impl Controller {
             (ready, runs)
         };
         for (id, run) in done_runs {
+            self.record_run(&id, &run, "ended").await;
             if run.reported {
                 continue;
             }
@@ -402,8 +410,11 @@ impl Controller {
         let worker = finished.worker.as_str();
         let mut changed = match &finished.outcome {
             Err(e) => {
+                // A typed `RunFailure` (a spent budget, a model that never
+                // reported) comes back typed; anything else as the core
+                // error reports it.
                 let error = classify(
-                    &FailureInput::from_core_error(None, e),
+                    &run_failure_input(e),
                     &Context {
                         tool: None,
                         worker_kind: Some(self.worker_kind(worker)),
@@ -1059,7 +1070,10 @@ impl Controller {
                 Vec::new()
             };
             let mut brief = brief_for(&item, inputs.clone(), more, prior, &hist);
-            let run_id = uuid::Uuid::new_v4().to_string();
+            let run_id = match self.continued_conversation(&item.id).await {
+                Some(conversation) => conversation,
+                None => uuid::Uuid::new_v4().to_string(),
+            };
             brief.run = Some(run_id.clone());
             if let Err(e) = self
                 .store
@@ -1150,7 +1164,11 @@ impl Controller {
                     && covers(w.as_ref(), item)
                     && self.routing.qualifies(w.as_ref(), item)
                     && load.get(w.name()).copied().unwrap_or(0) < self.capacity(w.as_ref())
-                    && !(local && w.capabilities().models.iter().any(|m| models.contains(m)))
+                    && !(local
+                        && w.capabilities()
+                            .models
+                            .iter()
+                            .any(|m| models.contains(m) || self.activity.busy(m)))
             })
             .map(|(i, w)| (self.routing.cost_tier(w.as_ref()), i, w))
             .collect();
@@ -1180,6 +1198,7 @@ impl Controller {
 /// tools read their provenance from.
 fn spawn(worker: Arc<dyn Worker>, brief: Brief, since: DateTime<Utc>) -> Run {
     let name = worker.name().to_string();
+    let run_id = brief.run.clone().unwrap_or_default();
     let binding = WorkRunContext {
         item: brief.item.clone(),
         actor: format!("worker:{name}"),
@@ -1188,6 +1207,8 @@ fn spawn(worker: Arc<dyn Worker>, brief: Brief, since: DateTime<Utc>) -> Run {
         tokio::spawn(WORK_RUN_CONTEXT.scope(binding, async move { worker.run(brief).await }));
     Run {
         worker: name,
+        run_id,
+        started: std::time::Instant::now(),
         handle,
         since,
         reported: false,

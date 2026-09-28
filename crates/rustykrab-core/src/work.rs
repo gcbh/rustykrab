@@ -592,6 +592,9 @@ pub enum EventKind {
     Resume,
     Rejection,
     Warning,
+    /// A worker run ended: what it spent and what the worker reports about
+    /// itself (its completion-reminder count). Changes no status.
+    Run,
 }
 
 impl EventKind {
@@ -605,6 +608,7 @@ impl EventKind {
             EventKind::Resume => "resume",
             EventKind::Rejection => "rejection",
             EventKind::Warning => "warning",
+            EventKind::Run => "run",
         }
     }
 
@@ -618,6 +622,7 @@ impl EventKind {
             "resume" => Some(EventKind::Resume),
             "rejection" => Some(EventKind::Rejection),
             "warning" => Some(EventKind::Warning),
+            "run" => Some(EventKind::Run),
             _ => None,
         }
     }
