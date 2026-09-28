@@ -121,3 +121,63 @@ reason recorded; six were refiled as the third batch, beside the first
 slice of the update flow (graceful shutdown on SIGTERM with no orphaned
 worker processes, and `GET /api/version`). The builder was redeployed with
 its local worker off, using the switch it built in batch 2.
+
+## Third cycle (2026-09-28)
+
+All eight items verified: the first two slices of the update flow
+(graceful shutdown on SIGTERM, with each external run in a process group
+of its own that shutdown ends, and `GET /api/version` with the build and
+the controller's last tick and live runs), a controller-level test of
+`checks_run`, an e2e scenario for a daemon with its local worker off, the
+Ollama 404 fix, the local worker's model check, draft ordering, and the
+empty tool name. The two update-flow pieces were reviewed line by line and
+merged as built.
+
+The cycle's lesson is in what the builder did next. It filed 24 more items
+itself, and each ran at once on the integration tip, which lacked its
+siblings' unmerged branches. So it rediscovered the same problems: the
+Ollama 404 was fixed three times, the Anthropic and OpenAI 404s twice,
+draft ordering three times, and the empty tool name at five layers. By the
+end it had filed items asking for a sibling branch to be merged and for
+the controller to stop filing duplicates. In all, 32 items took 31 runs,
+1.95M tokens and 78 minutes of worker time.
+
+Review picked one branch from each group. Three reviewers read the groups
+in parallel, test-merging in throwaway worktrees:
+
+- Ollama 404: the minimal mapping was kept. The fuller variant also added
+  a "model not found" rule that would have turned any 404, a wrong URL
+  included, into an install request.
+- Empty tool name: only the validator-and-ladder layer was kept. Of the
+  others, one substituted a placeholder name that would have filed "Build
+  tool: unnamed required tool", two turned the gap into an unknown error,
+  and one guarded code nothing reaches.
+- Draft ordering: two complementary fixes were merged together (among the
+  drafts themselves, and after open writers already there), with the
+  third's test carried over.
+- Health: the model check and the health line were both merged, with
+  three review fixes. The probe got a 5 s timeout, so a wedged Ollama
+  cannot stall startup. An outage no longer marks a missing model healthy.
+  The health line now says which model is missing.
+
+Two guardrails came out of it:
+
+- **`RUSTYKRAB_HOLD_DISCOVERED`** holds every graph of a worker's follow-ups
+  for a person (`ApprovalPolicy::hold_discovered`). The builder now runs
+  with it on, so its ideas queue for the coordinator instead of running on
+  a stale base. The underlying fix is the trusted merge step, which would
+  let a follow-up start from its siblings' work. Until it exists, the hold
+  keeps the builder's intake to what has been reviewed.
+- **A blocked report must carry its question.** Five runs parked
+  `needs_decision` with a blank question: the brief never named the
+  `detail` field, and the parser filled a missing one with an empty
+  string. What those workers asked is lost. The fix is the first item of
+  batch 4.
+
+The gate at merge: 1,802 unit tests, clippy, fmt, the architecture
+checker, and the scripted e2e suite (55 pass, 13 xfail, 0 fail). The
+builder was redeployed from `a3b7dee`, and its own `/api/version` reports
+that commit. Batch 4 has five items: the blocked-question fix, drain on
+shutdown with interrupted runs requeued without penalty, the controller
+lock, failed ticks in `/api/version`, and the worker's turn budget with
+recovery of a run that hits the turn cap.
