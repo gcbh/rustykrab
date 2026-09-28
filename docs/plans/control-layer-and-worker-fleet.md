@@ -1645,6 +1645,24 @@ Added as `xfail` first, in the existing e2e harness:
 
 ## 16. Implementation phases
 
+### Build status (2026-09-28)
+
+Built on `feat/control-layer-phase1` (not yet merged to main) unless noted.
+Scenario numbers are section 15's; "passes" means against the real daemon in
+the scripted e2e suite, promoted so a regression fails it.
+
+| Phase | State | Scenarios |
+|---|---|---|
+| 0 Measure | Two of four measurements taken (`docs/measurements/`): mid-run tool-set changes (2 in 24 runs; most changes were runs sharing the model) and interleaving cost (62 to 148 ms per switch once cached; memory is the limit). The sub-agent model-suite run waits on the suite's 6,144-token window, which no longer fits the tool schemas on main either; the graph caps need recorded multi-step requests | n/a |
+| 1 Work items and controller | Built | 1, 4, 6, 9, 11, 14, 19 to 26, 28, 30, 32 pass; 30 (a cron firing as a work item) ships behind `RUSTYKRAB_CRON_WORK_ITEMS=1`, off by default until a live-model check |
+| 2 Toolsets | Built, plus argument coercion, notices as user turns, a stop to repeated failed searches, and strict dispatch (callable means declared or appended) | 10 passes live: late append among near-misses 24/24 on gemma4 and on qwen3.8 |
+| 3 Worker registry | Built: `workers`, routing record, `claude_code` and `codex` adapters, commit and diff verification | 2, 17, 31 pass; 13 waits for Phase 4's questions route |
+| 4 Questions and planner | Built on `feat/control-p4-questions`, not merged | 3, 5, 18, 29 pass on that branch |
+| 5 Peers | Built | 8 passes, with a restart on either side |
+| 6 Proposals | Built, with issue text withheld for items filed from local-only work (section 11) | 7, 12, 16, 27 pass; 15 waits for Phase 4 |
+| 7 Delivery integration | Not built: needs the delivery plan's `rustykrab-delivery` | 26 passes against a recorded manifest fixture only |
+| 8 Self-management | Not built: needs the delivery plan's Phase 12 | n/a |
+
 ### Phase 0 — Measure
 
 Count mid-run tool-set changes from the Ollama provider's fingerprint log and
