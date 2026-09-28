@@ -11,6 +11,7 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets
 cargo test --workspace
 python3 scripts/check_architecture_docs.py
+python3 scripts/check_env_docs.py
 ```
 
 Fix formatting automatically with `cargo fmt --all`.
