@@ -191,6 +191,13 @@ impl ControlHandle for StubControl {
     }
 
     async fn tick(&self) -> Result<TickReport, Error> {
+        // As the controller does: a loop waiting on the lock refuses.
+        let lock = self.status.lock().unwrap().as_ref().and_then(|s| s.lock);
+        if lock == Some(LockState::Waiting) {
+            return Err(Error::LockWaiting(
+                "another process holds controller.lock".into(),
+            ));
+        }
         self.record(Call::Tick);
         Ok(TickReport {
             made_ready: vec!["r".into()],

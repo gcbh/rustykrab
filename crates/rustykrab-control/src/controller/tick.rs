@@ -208,6 +208,7 @@ pub(super) fn failure_class(err: &Error) -> &'static str {
         Error::NotFound(_) => "not_found",
         Error::AlreadyExists(_) => "already_exists",
         Error::PendingApproval { .. } => "pending_approval",
+        Error::LockWaiting(_) => "lock_waiting",
         Error::Internal(_) => "internal",
     }
 }

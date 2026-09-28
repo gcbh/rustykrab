@@ -91,7 +91,7 @@ use tokio::task::JoinHandle;
 use crate::errors::{LearnedRule, Recurrence, DEFAULT_PROMOTE_THRESHOLD};
 use crate::graph::{ApprovalPolicy, FilingSource, SplitMode};
 use crate::handle::{ControlHandle, GraphView, LockState, LoopStatus, TickReport};
-use crate::lock::LoopLock;
+use crate::lock::{LoopLock, LOCK_FILE};
 use crate::registry::WorkerRegistry;
 use crate::routing::Judged;
 use crate::worker::Worker;
@@ -646,8 +646,17 @@ impl ControlHandle for Controller {
         self.cancel_locked(item, reason, actor).await
     }
 
+    /// Refuses with [`Error::LockWaiting`] while the loop last found
+    /// `controller.lock` held by another process, checked under the loop's
+    /// own lock so no caller needs a separate check that could race. `Held`,
+    /// or no loop driving the controller (`None`), ticks.
     async fn tick(&self) -> Result<TickReport, Error> {
         let _loop = self.loop_lock.lock().await;
+        if self.state().lock == Some(LockState::Waiting) {
+            return Err(Error::LockWaiting(format!(
+                "another process holds {LOCK_FILE}; this controller is waiting on it and does not tick"
+            )));
+        }
         self.tick_locked().await
     }
 
