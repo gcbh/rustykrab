@@ -685,6 +685,11 @@ fn collect_evidence(transcript: &Transcript, config: &JourneyConfig) -> BrowserE
         if call.failed {
             evidence.failed_browser_calls += 1;
         }
+        // The counts above are attempts; everything below is journey
+        // progress, which only a call that ran can make.
+        if call.refused {
+            continue;
+        }
         if action == "open" || action == "navigate" {
             evidence.navigation_calls += 1;
             if call.args["url"]
@@ -973,6 +978,36 @@ mod tests {
             min_route_inputs: 2,
             requires_flight_details: true,
         }
+    }
+
+    #[test]
+    fn journey_progress_needs_browser_calls_that_ran() {
+        let browser = |action: &str, refused: bool| crate::transcript::ToolInvocation {
+            tool: "browser".into(),
+            args: json!({ "action": action, "url": "https://www.google.com/travel/flights" }),
+            output: Some(json!({ "error": "not callable" })),
+            failed: refused,
+            refused,
+        };
+        let transcript = Transcript {
+            calls: vec![browser("open", true), browser("snapshot", true)],
+            ..Transcript::default()
+        };
+        let evidence = collect_evidence(&transcript, &google_config());
+        assert_eq!(evidence.browser_calls, 2);
+        assert_eq!(evidence.failed_browser_calls, 2);
+        assert_eq!(evidence.navigation_calls, 0);
+        assert_eq!(evidence.snapshot_calls, 0);
+        assert!(evidence.requested_hosts.is_empty());
+
+        let transcript = Transcript {
+            calls: vec![browser("open", false), browser("snapshot", false)],
+            ..Transcript::default()
+        };
+        let evidence = collect_evidence(&transcript, &google_config());
+        assert_eq!(evidence.navigation_calls, 1);
+        assert_eq!(evidence.snapshot_calls, 1);
+        assert_eq!(evidence.requested_hosts, vec!["google.com"]);
     }
 
     #[test]

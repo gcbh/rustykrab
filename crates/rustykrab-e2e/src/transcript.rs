@@ -237,9 +237,10 @@ impl Transcript {
     /// Every tool result for `tool`, rendered as text. Used to assert on
     /// what a tool actually returned to the model — memory recall, most
     /// importantly, where the question is whether retrieval found the fact
-    /// at all, separately from whether the model then used it.
+    /// at all, separately from whether the model then used it. Only calls
+    /// that ran: a refusal is the host's answer, not the tool's output.
     pub fn outputs_of(&self, tool: &str) -> String {
-        self.calls_to(tool)
+        self.executed(tool)
             .iter()
             .filter_map(|c| c.output.as_ref())
             .map(|o| o.to_string())
@@ -449,5 +450,12 @@ mod tests {
         assert!(t.calls[0].refused && t.calls[0].failed);
         assert!(!t.calls[1].refused && t.calls[1].failed);
         assert_eq!(t.executed("get_forecast").len(), 1);
+        // The refusal is the host's answer, not the tool's output.
+        let outputs = t.outputs_of("get_forecast");
+        assert!(outputs.contains("upstream down"), "{outputs}");
+        assert!(
+            !outputs.contains(rustykrab_agent::NOT_CALLABLE),
+            "{outputs}"
+        );
     }
 }

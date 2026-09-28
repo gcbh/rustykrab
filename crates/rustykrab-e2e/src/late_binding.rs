@@ -394,7 +394,7 @@ pub(crate) fn cases() -> Vec<ModelCase> {
         .keeping(BASE)
         .ask(turn(&task))
         .expect(Assertion::NoRunError)
-        .expect(Assertion::ToolCalled("tools_list".into()))
+        .expect(Assertion::ToolExecuted("tools_list".into()))
         .expect(Assertion::FinalNonEmpty)
         .expect(Assertion::ToolBlockUnchanged { min_requests: 2 });
         for tool in catalog(&task, 5, false) {
@@ -454,14 +454,6 @@ mod tests {
         for case in cases.iter().filter(|c| !c.id.contains("-missing-")) {
             assert_eq!(case.attempts.len(), 1, "{}", case.id);
             let target = &case.attempts[0];
-            assert!(
-                case.assertions.iter().all(|a| !matches!(
-                    a,
-                    Assertion::ToolCalled(_) | Assertion::ToolArgContains { .. }
-                )),
-                "{}",
-                case.id
-            );
             assert!(case
                 .assertions
                 .iter()

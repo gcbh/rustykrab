@@ -906,6 +906,7 @@ pub(super) fn worker_runs(ctx: &Ctx, marker: &str) -> Result<Vec<Transcript>> {
     let mut runs = Vec::new();
     for conversation in conversations_mentioning(ctx, marker)? {
         let transcript = Transcript::from_store(&ctx.db_path, &conversation)?;
+        // Attempts count: this only picks out worker runs, not their success.
         if !transcript.calls_to("result_report").is_empty() {
             runs.push(transcript);
         }

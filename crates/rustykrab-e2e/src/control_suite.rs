@@ -1857,7 +1857,7 @@ async fn s18(ctx: &Ctx) -> Result<()> {
         for conversation in conversations_mentioning(ctx, S18_PLANNER)? {
             let run = Transcript::from_store(&ctx.db_path, &conversation)?;
             let answered = run
-                .calls_to("work_plan")
+                .executed("work_plan")
                 .iter()
                 .filter(|c| c.output.is_some())
                 .count();
@@ -1871,7 +1871,7 @@ async fn s18(ctx: &Ctx) -> Result<()> {
         );
         tokio::time::sleep(POLL).await;
     };
-    let calls = run.calls_to("work_plan");
+    let calls = run.executed("work_plan");
     let outcome = |n: usize| -> Result<PlanOutcome> {
         let output = calls[n].output.clone().unwrap_or_default();
         serde_json::from_value(output.clone())
