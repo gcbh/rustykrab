@@ -1159,3 +1159,50 @@ async fn releasing_a_hold_clears_held_by_in_a_batch() {
     ));
     store.work_release_hold("a").await.unwrap();
 }
+
+#[tokio::test]
+async fn adding_an_artifact_ref_appends_once_and_refuses_unknown_ids() {
+    let mut seeded_item = item("a", Status::Running);
+    seeded_item.artifact_refs = vec![ArtifactRef {
+        kind: "path".into(),
+        value: "src/lib.rs".into(),
+    }];
+    let store = seeded(vec![seeded_item], vec![]).await;
+    let commit = ArtifactRef {
+        kind: "commit".into(),
+        value: "1d1608b".into(),
+    };
+    let add = |id: &str, artifact: &ArtifactRef| WorkOp::AddArtifactRef {
+        item: id.into(),
+        artifact: artifact.clone(),
+    };
+
+    // Appends after the refs already there, keeping their order.
+    store.work_apply(vec![add("a", &commit)]).await.unwrap();
+    let refs = store.work_get("a").await.unwrap().unwrap().artifact_refs;
+    assert_eq!(refs.len(), 2);
+    assert_eq!(refs[1], commit);
+
+    // An identical ref is a no-op, not a second copy.
+    store.work_apply(vec![add("a", &commit)]).await.unwrap();
+    assert_eq!(
+        store.work_get("a").await.unwrap().unwrap().artifact_refs,
+        refs
+    );
+
+    // An unknown id is refused, and the whole batch rolls back with it.
+    let other = ArtifactRef {
+        kind: "url".into(),
+        value: "https://example.com".into(),
+    };
+    assert!(matches!(
+        store
+            .work_apply(vec![add("a", &other), add("missing", &other)])
+            .await,
+        Err(WorkStoreError::NotFound(_))
+    ));
+    assert_eq!(
+        store.work_get("a").await.unwrap().unwrap().artifact_refs,
+        refs
+    );
+}
