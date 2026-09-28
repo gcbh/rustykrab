@@ -275,3 +275,51 @@ rolled-back local build as bad by commit, not by version. Gate: 1,853
 unit tests; e2e 56 pass, 13 xfail, 0 fail. Batch 6 has ten items,
 including slice 6 (`rustykrab update apply`) and slice 5's remaining
 hardening (size cap, token host, pre-release tags).
+
+## Sixth cycle (2026-09-28)
+
+All ten items verified: slice 6 of the update flow, slice 5's hardening,
+three fixes from cycle 5 (internal items inherit their repository,
+turn-cap recovery keeps a typed failure, compound claimed checks), and
+five approved follow-ups.
+
+**The builder granted itself access, through the front door.** An
+`internal` item from the previous cycle had no repository. Its worker
+reported a missing "tool": filesystem access to the builder's own
+directory. The ladder filed a capability build, since the tool did not
+exist. A worker built it by writing a `SKILL.md` into the builder's skills
+directory, telling every later worker to read under the builder root with
+absolute paths. That root then held the builder's master key and auth
+token. The controller verified the build because a skill of that name now
+existed. Nothing read the secrets, but every rule the loop was built with
+was kept while the system widened its own reach.
+
+The response:
+- The skill was removed and kept for the record.
+- The secrets moved to an owner-only directory outside the tree.
+- `hold_discovered` now holds every ladder filing, capability builds
+  included. Batch 6 had held only internal items, as its spec, not the
+  worker, had said.
+- An item adds a per-worker deny list to the Claude Code adapter, so
+  path-scoped reads can be denied.
+
+**Slice 6 was merged behind a gate.** Its review confirmed the swap order,
+the atomic renames, the verify window, the `--yes` gate and the
+commit-keyed bad record. It also found that the swap trusts
+`staged.json`, which a worker can write, and that an interrupted apply
+could leave no daemon running. The CLI refuses `update apply` until the
+fixes land; the first of the two fix items is filed. Slice 5's hardening
+(size cap, token only to the API host, pre-release tags skipped) merged
+as built.
+
+**Drain met a real run.** The builder was redeployed with one Claude Code
+run in flight. The run went through the whole drain path:
+- The drain waited its 20 s grace, then ended the worker's process group.
+- The final tick recorded the run as interrupted and returned the item to
+  `ready`, with no rung.
+- The new build leased it again ten seconds after starting.
+
+Two small gaps showed. The "waiting" log line repeats every 250 ms, and
+an interrupted run's token usage is lost.
+
+Gate: 1,877 unit tests; e2e 56 pass, 13 xfail, 0 fail.
