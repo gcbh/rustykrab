@@ -406,3 +406,138 @@ async fn real_codesign_refuses_an_unsigned_bundle() {
     );
     assert!(updates_entries(data.path()).is_empty());
 }
+
+/// Anyone can make an ad-hoc signature that names the release's identifier
+/// and team: `codesign -dv` then prints both. The Developer ID requirement
+/// refuses it, since no certificate chains to Apple.
+#[cfg(target_os = "macos")]
+#[test]
+fn real_codesign_refuses_an_ad_hoc_signature_that_claims_the_team() {
+    let src = tempfile::tempdir().unwrap();
+    let app = bundle_in(src.path());
+    std::fs::write(
+        app.join("Contents/Info.plist"),
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><plist version=\"1.0\"><dict>\
+             <key>CFBundleIdentifier</key><string>{BUNDLE_ID}</string>\
+             <key>CFBundleExecutable</key><string>{BINARY_NAME}</string></dict></plist>"
+        ),
+    )
+    .unwrap();
+    let signed = std::process::Command::new("codesign")
+        .args(["-s", "-", "--force", "--identifier", BUNDLE_ID])
+        .args(["--team-id", DEFAULT_TEAM_ID])
+        .arg(&app)
+        .output()
+        .unwrap();
+    assert!(signed.status.success(), "{signed:?}");
+    // What the old check read says yes.
+    let details = std::process::Command::new("codesign")
+        .arg("-dv")
+        .arg(&app)
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&details.stderr).into_owned();
+    assert!(
+        check_signing_details(&text, DEFAULT_TEAM_ID).is_ok(),
+        "{text}"
+    );
+    // The requirement says no.
+    let err = SystemVerifier
+        .verify_signature(&app, DEFAULT_TEAM_ID)
+        .unwrap_err();
+    assert!(
+        format!("{err:#}").contains("not signed by Developer ID team"),
+        "{err:#}"
+    );
+}
+
+#[test]
+fn versions_are_digits_only() {
+    assert_eq!(parse_semver("+5.4.0"), None);
+    assert_eq!(parse_semver("5.4.0-rc.1"), None);
+    assert_eq!(parse_semver("5..0"), None);
+    assert!(is_plain_version("5.4.0"));
+    for bad in ["..", ".", "v5.4.0", "5.4", "5.4.0/..", "5.4.0 "] {
+        assert!(!is_plain_version(bad), "{bad:?}");
+    }
+}
+
+/// A local build that reports a version like `..` must not name, and so
+/// replace, a directory outside `updates/<version>/`.
+#[test]
+fn a_local_build_reporting_a_path_as_its_version_is_refused_and_the_data_dir_kept() {
+    let src = tempfile::tempdir().unwrap();
+    let binary = src.path().join("odd-build");
+    std::fs::write(&binary, "#!/bin/sh\n").unwrap();
+    let data = tempfile::tempdir().unwrap();
+    std::fs::write(data.path().join("keep.db"), "precious").unwrap();
+    let cfg = config(data.path(), "http://127.0.0.1:9");
+    for version in ["..", "."] {
+        let verifier = Scripted {
+            version_output: format!("rustykrab {version} (abc1234, 2026-09-28)\n"),
+            ..Scripted::passing("5.4.1")
+        };
+        let err = stage_from(&cfg, &verifier, &binary, false).unwrap_err();
+        assert!(format!("{err:#}").contains("not X.Y.Z"), "{err:#}");
+        assert_eq!(
+            std::fs::read_to_string(data.path().join("keep.db")).unwrap(),
+            "precious"
+        );
+    }
+    assert!(updates_entries(data.path()).is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_payload_that_is_a_symbolic_link_is_refused() {
+    let elsewhere = tempfile::tempdir().unwrap();
+    let real = bundle_in(elsewhere.path());
+    let dir = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink(&real, dir.path().join(APP_NAME)).unwrap();
+    let err = payload(dir.path()).unwrap_err();
+    assert!(format!("{err:#}").contains("symbolic link"), "{err:#}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_version_run_that_hangs_is_killed() {
+    let mut cmd = Command::new("sh");
+    cmd.args(["-c", "sleep 30"]);
+    let started = std::time::Instant::now();
+    let err = output_within(cmd, std::time::Duration::from_millis(300)).unwrap_err();
+    assert!(err.to_string().contains("killed"), "{err}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+}
+
+#[test]
+fn the_record_says_what_was_staged_and_whether_its_signature_was_checked() {
+    let src = tempfile::tempdir().unwrap();
+    let binary = src.path().join("some-build");
+    std::fs::write(&binary, "#!/bin/sh\n").unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let cfg = config(data.path(), "http://127.0.0.1:9");
+    let staged = stage_from(&cfg, &Scripted::passing("5.4.1"), &binary, false).unwrap();
+    assert_eq!(staged.kind, "binary");
+    assert!(!staged.signature_verified);
+
+    let app = bundle_in(src.path());
+    let staged = stage_from(&cfg, &Scripted::passing("5.4.2"), &app, false).unwrap();
+    assert_eq!(staged.kind, "app");
+    assert_eq!(staged.signature_verified, cfg!(target_os = "macos"));
+    let record: Staged = serde_json::from_str(
+        &std::fs::read_to_string(data.path().join("updates/5.4.2").join(STAGED_FILE)).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(record, staged);
+}
+
+#[test]
+fn a_stage_killed_midway_leaves_no_scratch_behind_the_next() {
+    let data = tempfile::tempdir().unwrap();
+    let updates = data.path().join("updates");
+    std::fs::create_dir_all(updates.join(".staging-left-by-a-kill/x")).unwrap();
+    let scratch = Scratch::new(&updates).unwrap();
+    assert!(!updates.join(".staging-left-by-a-kill").exists());
+    drop(scratch);
+}

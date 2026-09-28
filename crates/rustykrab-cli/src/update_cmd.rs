@@ -101,24 +101,51 @@ pub trait Verifier {
 /// The real checks: `codesign` on macOS, and the staged binary itself.
 pub struct SystemVerifier;
 
+/// The code requirement a release bundle must satisfy: signed by a
+/// certificate that chains to Apple, issued under Developer ID (the
+/// intermediate's and the leaf's Developer ID marker extensions), to team
+/// `team_id`, for [`BUNDLE_ID`]. `codesign` evaluates it against the
+/// certificate chain. The `Identifier=` and `TeamIdentifier=` lines of
+/// `codesign -dv` are not enough on their own: they are fields of the
+/// signature, and an ad-hoc signature (`codesign -s - --team-id ...`) can
+/// carry any team.
+pub fn designated_requirement(team_id: &str) -> String {
+    format!(
+        "=anchor apple generic and identifier \"{BUNDLE_ID}\" and \
+         certificate leaf[subject.OU] = \"{team_id}\" and \
+         certificate 1[field.1.2.840.113635.100.6.2.6] exists and \
+         certificate leaf[field.1.2.840.113635.100.6.1.13] exists"
+    )
+}
+
+/// How long the staged binary's `--version` run may take.
+const VERSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 impl Verifier for SystemVerifier {
     fn verify_signature(&self, app: &Path, team_id: &str) -> anyhow::Result<()> {
         if !cfg!(target_os = "macos") {
             // No signature to check off macOS yet; the digest is the check.
             return Ok(());
         }
+        if team_id.is_empty() || !team_id.chars().all(|c| c.is_ascii_alphanumeric()) {
+            bail!("team id {team_id:?} is not a Developer ID team");
+        }
         let verify = Command::new("codesign")
-            .args(["--verify", "--deep", "--strict"])
+            .args(["--verify", "--deep", "--strict", "-R"])
+            .arg(designated_requirement(team_id))
             .arg(app)
             .output()
             .context("running codesign --verify")?;
         if !verify.status.success() {
             bail!(
-                "{} fails codesign --verify --deep --strict: {}",
+                "{} is not signed by Developer ID team {team_id} as {BUNDLE_ID} \
+                 (codesign --verify with the requirement): {}",
                 app.display(),
                 String::from_utf8_lossy(&verify.stderr).trim()
             );
         }
+        // The requirement decided; the details only make a refusal of an
+        // otherwise valid signature clearer.
         let details = Command::new("codesign")
             .arg("-dv")
             .arg(app)
@@ -138,14 +165,39 @@ impl Verifier for SystemVerifier {
     }
 
     fn run_version(&self, binary: &Path) -> anyhow::Result<String> {
-        let out = Command::new(binary)
-            .arg("--version")
-            .output()
+        let mut cmd = Command::new(binary);
+        cmd.arg("--version");
+        let out = output_within(cmd, VERSION_TIMEOUT)
             .with_context(|| format!("running {} --version", binary.display()))?;
         if !out.status.success() {
             bail!("{} --version exited with {}", binary.display(), out.status);
         }
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+}
+
+/// Run `cmd` to completion, or kill it once `limit` passes.
+pub fn output_within(
+    mut cmd: Command,
+    limit: std::time::Duration,
+) -> anyhow::Result<std::process::Output> {
+    use std::process::Stdio;
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let deadline = std::time::Instant::now() + limit;
+    loop {
+        if child.try_wait()?.is_some() {
+            return Ok(child.wait_with_output()?);
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("did not finish within {}s; killed", limit.as_secs());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
     }
 }
 
@@ -194,8 +246,21 @@ pub fn parse_version_output(text: &str) -> Option<(String, Option<String>)> {
 pub fn parse_semver(text: &str) -> Option<Vec<u64>> {
     let text = text.trim();
     let text = text.strip_prefix('v').unwrap_or(text);
-    let parts: Option<Vec<u64>> = text.split('.').map(|p| p.parse().ok()).collect();
+    let parts: Option<Vec<u64>> = text
+        .split('.')
+        .map(|p| {
+            (!p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| p.parse().ok())
+                .flatten()
+        })
+        .collect();
     parts.filter(|p| p.len() == 3)
+}
+
+/// Whether `version` is exactly `X.Y.Z` in digits, and so safe to name a
+/// directory under `updates/` with.
+pub fn is_plain_version(version: &str) -> bool {
+    version.bytes().all(|b| b.is_ascii_digit() || b == b'.') && parse_semver(version).is_some()
 }
 
 /// Whether `candidate` is above `running`, compared as numbers.
@@ -259,6 +324,14 @@ pub struct Staged {
     pub digest: Option<String>,
     pub path: PathBuf,
     pub staged_at: DateTime<Utc>,
+    /// `app` for a `RustyKrab.app`, `binary` for a bare binary.
+    #[serde(default)]
+    pub kind: String,
+    /// Whether the Developer ID signature was checked: always for an app on
+    /// macOS, never for a bare binary or off macOS. Slice 6 reads it before
+    /// it swaps anything in.
+    #[serde(default)]
+    pub signature_verified: bool,
 }
 
 /// One entry of `<data>/updates/bad.json`, written by a rollback.
@@ -357,6 +430,13 @@ impl Scratch {
     fn new(updates: &Path) -> anyhow::Result<Self> {
         std::fs::create_dir_all(updates)
             .with_context(|| format!("creating {}", updates.display()))?;
+        // A killed stage leaves its scratch behind (Drop never ran).
+        for entry in std::fs::read_dir(updates)?.flatten() {
+            let stale = entry.file_name().to_string_lossy().starts_with(".staging-");
+            if stale && entry.file_type().is_ok_and(|t| t.is_dir()) {
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
+        }
         let path = updates.join(format!(".staging-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&path).with_context(|| format!("creating {}", path.display()))?;
         Ok(Self { path, keep: false })
@@ -374,13 +454,27 @@ impl Drop for Scratch {
 /// The staged thing inside a directory: a bundle and its binary, or a bare
 /// binary.
 fn payload(dir: &Path) -> anyhow::Result<(Option<PathBuf>, PathBuf)> {
+    // Every path it hands on must be what it says, not a link out of the
+    // staging directory.
+    let is_link = |p: &Path| std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink());
     let app = dir.join(APP_NAME);
+    let binary_in_app = app.join("Contents").join("MacOS").join(BINARY_NAME);
+    for p in [
+        &app,
+        &app.join("Contents"),
+        &app.join("Contents").join("MacOS"),
+        &binary_in_app,
+        &dir.join(BINARY_NAME),
+    ] {
+        if is_link(p) {
+            bail!("{} is a symbolic link; refusing it", p.display());
+        }
+    }
     if app.is_dir() {
-        let binary = app.join("Contents").join("MacOS").join(BINARY_NAME);
-        if !binary.is_file() {
+        if !binary_in_app.is_file() {
             bail!("{APP_NAME} has no Contents/MacOS/{BINARY_NAME}");
         }
-        return Ok((Some(app), binary));
+        return Ok((Some(app), binary_in_app));
     }
     let binary = dir.join(BINARY_NAME);
     if binary.is_file() {
@@ -419,17 +513,26 @@ fn commit_stage(
     mut staged: Staged,
     relative: &Path,
 ) -> anyhow::Result<Staged> {
+    // The version becomes a directory name, and the directory is replaced:
+    // only a plain `X.Y.Z` may name it, never `..` or `.`.
+    if !is_plain_version(&staged.version) {
+        bail!(
+            "the staged binary reports version {:?}, which is not X.Y.Z; refusing it",
+            staged.version
+        );
+    }
     let dest = cfg.updates_dir().join(&staged.version);
+    staged.path = dest.join(relative);
+    // The record goes in first, so a stage that is in place always has one.
+    let record = serde_json::to_string_pretty(&staged)?;
+    std::fs::write(scratch.path.join(STAGED_FILE), record + "\n")
+        .with_context(|| format!("writing {}", scratch.path.join(STAGED_FILE).display()))?;
     if dest.exists() {
         std::fs::remove_dir_all(&dest).with_context(|| format!("replacing {}", dest.display()))?;
     }
     std::fs::rename(&scratch.path, &dest)
         .with_context(|| format!("moving the staged version to {}", dest.display()))?;
     scratch.keep = true;
-    staged.path = dest.join(relative);
-    let record = serde_json::to_string_pretty(&staged)?;
-    std::fs::write(dest.join(STAGED_FILE), record + "\n")
-        .with_context(|| format!("writing {}", dest.join(STAGED_FILE).display()))?;
     Ok(staged)
 }
 
@@ -516,6 +619,8 @@ pub async fn stage_release(
     }
 
     let relative = binary_relative(app.is_some());
+    let kind = kind_of(app.is_some());
+    let signature_verified = app.is_some() && cfg!(target_os = "macos");
     let inner = Scratch {
         path: extract,
         keep: false,
@@ -528,10 +633,16 @@ pub async fn stage_release(
         digest: Some(format!("sha256:{expected}")),
         path: PathBuf::new(),
         staged_at: Utc::now(),
+        kind,
+        signature_verified,
     };
     let staged = commit_stage(cfg, inner, staged, &relative)?;
     drop(scratch);
     Ok(StageOutcome::Staged(staged))
+}
+
+fn kind_of(is_app: bool) -> String {
+    if is_app { "app" } else { "binary" }.to_string()
 }
 
 fn binary_relative(is_app: bool) -> PathBuf {
@@ -592,6 +703,8 @@ pub fn stage_from(
         digest: None,
         path: PathBuf::new(),
         staged_at: Utc::now(),
+        kind: kind_of(app.is_some()),
+        signature_verified: app.is_some() && cfg!(target_os = "macos"),
     };
     commit_stage(cfg, scratch, staged, &relative)
 }

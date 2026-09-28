@@ -1,6 +1,6 @@
 # Plan: updating a running RustyKrab
 
-**Status:** Slices 1 to 4 built (2026-09-28); slices 5 and 6 to build
+**Status:** Slices 1 to 5 built (2026-09-28); slice 6 to build
 **Builds on:** `control-layer-and-worker-fleet.md`, `self-build-loop.md`
 
 A new version of the daemon has to replace the old one without losing
@@ -19,7 +19,7 @@ builder.
 | 2 | `GET /api/version`: version, commit, build date, and the controller's last tick and live runs | built (batch 3) |
 | 3 | Drain: on shutdown the controller leases nothing new, gives runs `RUSTYKRAB_DRAIN_SECS` (20) to finish, then ends them as interrupted, returned to `ready` with no rung | built (batch 4) |
 | 4 | Controller lock: an exclusive `flock` on `<data>/controller.lock`; only the holder ticks, and `/api/version` reports `held` or `waiting`; failed ticks reported beside it | built (batch 4) |
-| 5 | Release source and verifier: `rustykrab update check` and `rustykrab update stage` | to build |
+| 5 | Release source and verifier: `rustykrab update check` and `rustykrab update stage` | built (batch 5), with the review's fixes |
 | 6 | Supervisor: `rustykrab update apply`, swap, restart, verify, roll back | to build, after 5 |
 
 Pieces 3 and 4 were exercised by hand on the builder on 2026-09-28. A
@@ -48,19 +48,32 @@ touches the running daemon.
   downloaded. A missing or different digest refuses the release. Nothing
   from the download is extracted before this passes.
 - **Signature before execution.** The archive is extracted with the
-  system `tar` into `<data>/updates/<version>/`. On macOS the staged
-  `RustyKrab.app` must pass `codesign --verify --deep --strict`, and
-  `codesign -dv` must show `Identifier=com.gcbh.rustykrab` and
-  `TeamIdentifier=3RRX845C4X`. The team is pinned, so a correctly signed
-  bundle from anyone else is refused, and `RUSTYKRAB_UPDATE_TEAM_ID`
-  overrides the pin for a fork. The same team and identifier are what
-  keep the Data Protection Keychain readable after the swap. On Linux
-  there is no signature to check yet, so the digest is the check.
+  system `tar` into `<data>/updates/<version>/`, and nothing in it may be a
+  symbolic link. On macOS the staged `RustyKrab.app` must satisfy, under
+  `codesign --verify --deep --strict -R`, the requirement
+  `anchor apple generic and identifier "com.gcbh.rustykrab" and
+  certificate leaf[subject.OU] = "3RRX845C4X"`, plus the Developer ID
+  markers on the intermediate and leaf certificates. `codesign` checks
+  that against the certificate chain. The `Identifier=` and
+  `TeamIdentifier=` lines of `codesign -dv` are not enough on their own:
+  they are fields of the signature, and an ad-hoc signature
+  (`codesign -s - --team-id 3RRX845C4X`) prints both. A review caught this
+  flaw in the first version of this plan. The team is pinned, so a
+  correctly signed bundle from anyone else is refused, and
+  `RUSTYKRAB_UPDATE_TEAM_ID` overrides the pin for a fork. The same team
+  and identifier are what keep the Data Protection Keychain readable after
+  the swap. On Linux there is no signature to check yet, so the digest is
+  the check.
 - **Then `--version`.** Only after the signature passes does the staged
-  binary run, once, with `--version`. It must print the release's
-  version, and its commit is recorded.
+  binary run, once, with `--version`, and it is killed after 10 s. It must
+  print the release's version, and its commit is recorded. A version names
+  a directory only when it is exactly `X.Y.Z` in digits, so a local build
+  printing `..` cannot reach outside `updates/`.
 - **The record.** `<data>/updates/<version>/staged.json` holds the
-  version, tag, commit, source, digest, path and time. A version recorded
+  version, tag, commit, source, digest, path and time. It also holds the
+  `kind` (`app` or `binary`) and whether the signature was checked. It is
+  written before the stage is moved into place, and a scratch directory
+  left by a killed stage is removed by the next one. A version recorded
   as bad by a rollback (slice 6) is never staged again without
   `--force`.
 - **Tests.** A local HTTP stand-in for the GitHub API serves a release
