@@ -3293,8 +3293,17 @@ async fn run_control_tick(control: &dyn ControlHandle) {
 /// The one tick run at shutdown to reconcile the runs just interrupted.
 /// A failure is logged with its class and consecutive count, the same way
 /// `run_control_tick` logs one, and a `controller.lock` refusal likewise
-/// as the lock, not a failure.
+/// as the lock, not a failure. A daemon whose loop last found the lock
+/// `Waiting` never ticked, so it skips the tick rather than ask for one the
+/// controller would refuse.
 async fn run_final_control_tick(control: &dyn ControlHandle) {
+    use rustykrab_control::handle::LockState;
+    if control.loop_status().and_then(|s| s.lock) == Some(LockState::Waiting) {
+        tracing::info!(
+            "final control tick skipped: another process holds controller.lock and this daemon never ticked"
+        );
+        return;
+    }
     match control.tick().await {
         Err(rustykrab_core::Error::LockWaiting(message)) => tracing::info!(
             %message,
@@ -3431,8 +3440,13 @@ mod control_tick_log_tests {
     }
 
     /// A controller whose loop is waiting on `controller.lock`: its tick
-    /// refuses the way the real one does and records no failure.
-    struct WaitingControl;
+    /// refuses the way the real one does and records no failure. `lock` is
+    /// what `loop_status` reports; `ticks` counts the calls to `tick`.
+    #[derive(Default)]
+    struct WaitingControl {
+        lock: Option<rustykrab_control::handle::LockState>,
+        ticks: Mutex<u32>,
+    }
 
     #[async_trait::async_trait]
     impl ControlHandle for WaitingControl {
@@ -3464,6 +3478,7 @@ mod control_tick_log_tests {
             Err(unused())
         }
         async fn tick(&self) -> Result<TickReport, Error> {
+            *self.ticks.lock().unwrap() += 1;
             Err(Error::LockWaiting(
                 "another process holds controller.lock; this controller is waiting on it and does not tick".into(),
             ))
@@ -3472,7 +3487,10 @@ mod control_tick_log_tests {
             Err(unused())
         }
         fn loop_status(&self) -> Option<LoopStatus> {
-            Some(LoopStatus::default())
+            Some(LoopStatus {
+                lock: self.lock,
+                ..LoopStatus::default()
+            })
         }
     }
 
@@ -3486,8 +3504,11 @@ mod control_tick_log_tests {
             .finish();
         let _guard = tracing::subscriber::set_default(subscriber);
 
-        run_control_tick(&WaitingControl).await;
-        run_final_control_tick(&WaitingControl).await;
+        // No loop status yet: the final tick asks and meets the refusal.
+        let control = WaitingControl::default();
+        run_control_tick(&control).await;
+        run_final_control_tick(&control).await;
+        assert_eq!(*control.ticks.lock().unwrap(), 2);
 
         let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
         let lines: Vec<&str> = log.lines().collect();
@@ -3503,6 +3524,31 @@ mod control_tick_log_tests {
             assert!(!line.contains("failed"), "{line}");
             assert!(!line.contains("class="), "{line}");
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn final_tick_is_skipped_when_the_loop_is_waiting() {
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let control = WaitingControl {
+            lock: Some(rustykrab_control::handle::LockState::Waiting),
+            ..WaitingControl::default()
+        };
+        run_final_control_tick(&control).await;
+
+        assert_eq!(*control.ticks.lock().unwrap(), 0, "tick was called");
+        let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(lines.len(), 1, "{log}");
+        assert!(lines[0].contains("INFO"), "{log}");
+        assert!(lines[0].contains("final control tick skipped"), "{log}");
+        assert!(!lines[0].contains("failed"), "{log}");
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -365,13 +365,15 @@ once, and tries again each interval. Each pass is `run_control_tick`,
 which logs a failed tick with the `class` and `consecutive` count read
 back from `loop_status`, the same `last_failure_class` and
 `consecutive_failed_ticks` that `GET /api/version` reports. A tick the
-controller refuses with `Error::LockWaiting` (the shutdown reconcile tick,
-`run_final_control_tick`, can meet one while the loop waits) is logged at
-info as skipped because another process holds `controller.lock`, never as
-a failure, since it records no failure class to read back. `rustykrab
+controller refuses with `Error::LockWaiting` is logged at info as skipped
+because another process holds `controller.lock`, never as a failure, since
+it records no failure class to read back. The shutdown reconcile tick,
+`run_final_control_tick`, reads the loop's last `LockState` from
+`loop_status` first and, when it is `Waiting`, logs the same skip without
+calling `ControlHandle::tick` at all; the refusal branch stays for a loop
+that has not yet tried the lock. `rustykrab
 work tick` shows the daemon's 409 `controller_lock_waiting` message as its
 error. The other infra task is
-`work_host::deliver_work_notices`, which drains the work outbox through
 `work_host::deliver_work_notices`, which drains the work outbox through
 `MessageAdapter` and marks a row delivered only when the send succeeds.
 Each notice goes where its item came from, resolved at delivery time: a
