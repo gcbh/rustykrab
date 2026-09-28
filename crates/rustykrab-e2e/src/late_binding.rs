@@ -11,10 +11,13 @@
 //! alone. The model is asked to search with `tools_list`; the search
 //! appends what the host finds plausible as text, and the model calls it.
 //!
-//! A case passes when the target is called with the task's key argument and
+//! A case passes when the target *runs* with the task's key argument and
 //! every request of the run declared the same tools array (the provider's
 //! `tool block sent` log). The target never enters the array, so a pass
-//! means it was called by append. A missing case passes when no near-miss
+//! means it was called by append. A call to the target the host refused
+//! (made before a search appended it) is an attempt, not the model
+//! succeeding: it does not pass the case, and is counted in the report's
+//! `classes` as the missing cases' attempts are. A missing case passes when no near-miss
 //! *runs* in the target's place: the host told the model nothing matched,
 //! and a call to a tool no search made callable is refused unrun (plan
 //! section 12), which is the host doing its job. The attempts are still
@@ -369,14 +372,15 @@ pub(crate) fn cases() -> Vec<ModelCase> {
             let target = name_of(&(task.target)());
             out.push(
                 case.expect(Assertion::NoRunError)
-                    .expect(Assertion::ToolCalled(target.clone()))
-                    .expect(Assertion::ToolArgContains {
-                        tool: target,
+                    .expect(Assertion::ToolExecuted(target.clone()))
+                    .expect(Assertion::ToolExecutedArgContains {
+                        tool: target.clone(),
                         pointer: task.pointer.into(),
                         needle: task.needle.into(),
                     })
                     .expect(Assertion::Compacted(false))
-                    .expect(Assertion::ToolBlockUnchanged { min_requests: 3 }),
+                    .expect(Assertion::ToolBlockUnchanged { min_requests: 3 })
+                    .counting_attempts(target),
             );
         }
 
@@ -444,6 +448,27 @@ mod tests {
                 "{}",
                 case.id
             );
+        }
+        // A found-target case judges that the target ran, never merely that
+        // it was called, and counts its attempts.
+        for case in cases.iter().filter(|c| !c.id.contains("-missing-")) {
+            assert_eq!(case.attempts.len(), 1, "{}", case.id);
+            let target = &case.attempts[0];
+            assert!(
+                case.assertions.iter().all(|a| !matches!(
+                    a,
+                    Assertion::ToolCalled(_) | Assertion::ToolArgContains { .. }
+                )),
+                "{}",
+                case.id
+            );
+            assert!(case
+                .assertions
+                .iter()
+                .any(|a| matches!(a, Assertion::ToolExecuted(t) if t == target)));
+            assert!(case.assertions.iter().any(
+                |a| matches!(a, Assertion::ToolExecutedArgContains { tool, .. } if tool == target)
+            ));
         }
         let weather5 = &cases[0].stubs["tools"];
         assert_eq!(weather5[2]["name"], "get_weather");

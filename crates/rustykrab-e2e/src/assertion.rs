@@ -7,7 +7,7 @@
 
 use serde_json::Value;
 
-use crate::transcript::Transcript;
+use crate::transcript::{ToolInvocation, Transcript};
 
 #[derive(Debug, Clone)]
 pub enum Assertion {
@@ -26,6 +26,9 @@ pub enum Assertion {
     FinalMatches(String),
     /// The named tool was called at least once.
     ToolCalled(String),
+    /// The named tool ran at least once: a call the host refused as not
+    /// callable in the conversation is an attempt, not the tool running.
+    ToolExecuted(String),
     /// The named tool was never called.
     ToolNotCalled(String),
     /// The named tool never ran: every call to it, if any, was refused by
@@ -41,6 +44,13 @@ pub enum Assertion {
     /// Some call to `tool` had an argument at `pointer` (a JSON pointer,
     /// e.g. `/city`) whose string form contains `needle`.
     ToolArgContains {
+        tool: String,
+        pointer: String,
+        needle: String,
+    },
+    /// Like [`Assertion::ToolArgContains`], over only the calls to `tool`
+    /// that ran: a refused call carrying the argument does not count.
+    ToolExecutedArgContains {
         tool: String,
         pointer: String,
         needle: String,
@@ -93,6 +103,7 @@ impl Assertion {
             Assertion::FinalContainsNone(v) => format!("final contains none {v:?}"),
             Assertion::FinalMatches(p) => format!("final matches /{p}/"),
             Assertion::ToolCalled(t) => format!("called {t}"),
+            Assertion::ToolExecuted(t) => format!("ran {t}"),
             Assertion::ToolNotCalled(t) => format!("never called {t}"),
             Assertion::ToolNotExecuted(t) => format!("never ran {t}"),
             Assertion::ToolCallCount { tool, min, max } => {
@@ -103,6 +114,11 @@ impl Assertion {
                 pointer,
                 needle,
             } => format!("{tool}{pointer} contains {needle:?}"),
+            Assertion::ToolExecutedArgContains {
+                tool,
+                pointer,
+                needle,
+            } => format!("{tool} ran with {pointer} containing {needle:?}"),
             Assertion::ToolCallOrder(v) => format!("call order {v:?}"),
             Assertion::ToolOutputContainsAny { tool, needles } => {
                 format!("{tool} returned any {needles:?}")
@@ -179,6 +195,20 @@ impl Assertion {
                 }
             }
 
+            Assertion::ToolExecuted(tool) => {
+                let attempted = t.calls_to(tool).len();
+                if !t.executed(tool).is_empty() {
+                    Ok(())
+                } else if attempted > 0 {
+                    Err(format!(
+                        "{tool} never ran: the host refused all {attempted} call(s) to it ({})",
+                        called_summary(t)
+                    ))
+                } else {
+                    Err(format!("{tool} was never called ({})", called_summary(t)))
+                }
+            }
+
             Assertion::ToolNotCalled(tool) => {
                 let n = t.calls_to(tool).len();
                 if n == 0 {
@@ -210,21 +240,20 @@ impl Assertion {
                 tool,
                 pointer,
                 needle,
-            } => {
-                let want = needle.to_lowercase();
-                let seen: Vec<String> = t
-                    .calls_to(tool)
-                    .iter()
-                    .filter_map(|c| c.args.pointer(pointer).map(render))
-                    .collect();
-                if seen.iter().any(|v| v.to_lowercase().contains(&want)) {
-                    Ok(())
-                } else {
-                    Err(format!(
-                        "no {tool} call had {needle:?} at {pointer}; saw {seen:?}"
-                    ))
-                }
-            }
+            } => arg_contains(&t.calls_to(tool), pointer, needle).map_err(|seen| {
+                format!("no {tool} call had {needle:?} at {pointer}; saw {seen:?}")
+            }),
+
+            Assertion::ToolExecutedArgContains {
+                tool,
+                pointer,
+                needle,
+            } => arg_contains(&t.executed(tool), pointer, needle).map_err(|seen| {
+                format!(
+                    "no {tool} call that ran had {needle:?} at {pointer}; saw {seen:?} ({})",
+                    called_summary(t)
+                )
+            }),
 
             Assertion::ToolCallOrder(expected) => {
                 let mut remaining = expected.iter();
@@ -365,6 +394,21 @@ fn contains_all(haystack: &str, needles: &[String]) -> Result<(), Vec<String>> {
     }
 }
 
+/// Case-insensitive "some call has `needle` at `pointer`". On failure
+/// returns the values seen there.
+fn arg_contains(calls: &[&ToolInvocation], pointer: &str, needle: &str) -> Result<(), Vec<String>> {
+    let want = needle.to_lowercase();
+    let seen: Vec<String> = calls
+        .iter()
+        .filter_map(|c| c.args.pointer(pointer).map(render))
+        .collect();
+    if seen.iter().any(|v| v.to_lowercase().contains(&want)) {
+        Ok(())
+    } else {
+        Err(seen)
+    }
+}
+
 /// JSON values stringify with quotes; bare strings should not.
 fn render(v: &Value) -> String {
     match v {
@@ -391,7 +435,16 @@ fn called_summary(t: &Transcript) -> String {
         "called: {}",
         t.calls
             .iter()
-            .map(|c| format!("{}{}", c.tool, if c.failed { ":error" } else { "" }))
+            .map(|c| {
+                let mark = if c.refused {
+                    ":refused"
+                } else if c.failed {
+                    ":error"
+                } else {
+                    ""
+                };
+                format!("{}{mark}", c.tool)
+            })
             .collect::<Vec<_>>()
             .join(", ")
     )
@@ -405,7 +458,6 @@ pub fn s(items: &[&str]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transcript::ToolInvocation;
     use serde_json::json;
 
     fn with_calls(calls: Vec<ToolInvocation>) -> Transcript {
@@ -440,6 +492,45 @@ mod tests {
         assert!(Assertion::ToolNotExecuted("get_forecast".into())
             .check(&t)
             .is_err());
+    }
+
+    #[test]
+    fn executed_requires_a_call_that_ran() {
+        let mut refused = call("get_weather", json!({ "city": "Lisbon" }), true);
+        refused.refused = true;
+        let ran = Assertion::ToolExecuted("get_weather".into());
+        let ran_with = Assertion::ToolExecutedArgContains {
+            tool: "get_weather".into(),
+            pointer: "/city".into(),
+            needle: "lisbon".into(),
+        };
+
+        // A refused call is an attempt: `ToolCalled` counts it, the
+        // executed assertions do not.
+        let t = with_calls(vec![refused.clone()]);
+        assert!(Assertion::ToolCalled("get_weather".into())
+            .check(&t)
+            .is_ok());
+        let why = ran.check(&t).unwrap_err();
+        assert!(why.contains("refused"), "{why}");
+        assert!(ran_with.check(&t).is_err());
+
+        assert!(ran.check(&with_calls(vec![])).is_err());
+
+        // The key argument must be on a call that ran.
+        let t = with_calls(vec![
+            refused.clone(),
+            call("get_weather", json!({ "city": "Porto" }), false),
+        ]);
+        assert!(ran.check(&t).is_ok());
+        assert!(ran_with.check(&t).is_err());
+
+        let t = with_calls(vec![
+            refused,
+            call("get_weather", json!({ "city": "Lisbon" }), false),
+        ]);
+        assert!(ran.check(&t).is_ok());
+        assert!(ran_with.check(&t).is_ok());
     }
 
     #[test]
