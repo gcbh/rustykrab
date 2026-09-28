@@ -57,6 +57,10 @@ pub struct LoopStatus {
     pub last_tick: Option<DateTime<Utc>>,
     /// Runs live in this process.
     pub runs_in_flight: usize,
+    /// The daemon is shutting down: ticks lease nothing new but still
+    /// reconcile what finishes.
+    #[serde(default)]
+    pub draining: bool,
 }
 
 /// The controller as its callers see it. Every method is one store
@@ -131,6 +135,12 @@ pub trait ControlHandle: Send + Sync {
     fn loop_status(&self) -> Option<LoopStatus> {
         None
     }
+
+    /// Start (or stop) draining: while it is set a tick leases nothing
+    /// new, and still sweeps and reconciles, so the runs in flight can
+    /// finish before the daemon exits. A handle that runs no loop ignores
+    /// it.
+    fn set_draining(&self, _draining: bool) {}
 
     /// Apply a decision a human took on the review surface to a proposal
     /// (plan sections 10 and 11), as one transaction with its `review`

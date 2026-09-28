@@ -21,8 +21,12 @@
 //!    (a `code` result against git), its evidence attached and its typed
 //!    transition, cascade, `discovered` filings and ladder rungs written in
 //!    one transaction; the producing worker's routing record is written
-//!    after it.
-//! 3. **Select, match, lease and run** (steps 1 to 4): ready leaves by
+//!    after it. A run the host ended on its way down
+//!    ([`crate::worker::RunFailure::Interrupted`]) is no failure: its item
+//!    returns to `ready` with a `resume` event and its lease released, no
+//!    rung climbed and no repair counted.
+//! 3. **Select, match, lease and run** (steps 1 to 4), skipped while the
+//!    controller is draining ([`ControlHandle::set_draining`]): ready leaves by
 //!    priority, the single-writer rule over every active item, the
 //!    local-model rule of 12.1 (one run per local model, and none while
 //!    [`ModelActivity`] says an interactive turn holds it), the cheapest
@@ -67,6 +71,7 @@ pub use brief::SUMMARY as SUMMARY_EVIDENCE;
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -404,6 +409,9 @@ pub struct Controller {
     /// cancel. Never held while a worker runs.
     loop_lock: tokio::sync::Mutex<()>,
     state: Mutex<State>,
+    /// Set on the way down ([`ControlHandle::set_draining`]): ticks lease
+    /// nothing new.
+    draining: AtomicBool,
 }
 
 impl Controller {
@@ -435,6 +443,7 @@ impl Controller {
                 last_aged: None,
                 last_tick: None,
             }),
+            draining: AtomicBool::new(false),
         }
     }
 
@@ -523,6 +532,11 @@ impl Controller {
             }
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
+    }
+
+    /// Whether the controller is draining ([`ControlHandle::set_draining`]).
+    pub fn is_draining(&self) -> bool {
+        self.draining.load(Ordering::SeqCst)
     }
 
     fn state(&self) -> MutexGuard<'_, State> {
@@ -619,7 +633,15 @@ impl ControlHandle for Controller {
         Some(LoopStatus {
             last_tick: state.last_tick,
             runs_in_flight: state.runs.len(),
+            draining: self.is_draining(),
         })
+    }
+
+    fn set_draining(&self, draining: bool) {
+        self.draining.store(draining, Ordering::SeqCst);
+        if draining {
+            tracing::info!("controller draining: leasing nothing new");
+        }
     }
 
     async fn review_decision(

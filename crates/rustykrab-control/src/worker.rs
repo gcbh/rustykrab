@@ -197,6 +197,10 @@ pub enum RunFailure {
     /// The worker refused the brief on a policy check: a repository
     /// outside the ones it was added for is `scope`.
     Policy { stop: PolicyStop, detail: String },
+    /// The host ended the run on its way down (daemon shutdown), not the
+    /// worker: the controller returns the item to `ready` with its lease
+    /// released, climbs no rung and counts no repair.
+    Interrupted { detail: String },
 }
 
 impl RunFailure {
@@ -241,11 +245,19 @@ impl RunFailure {
                 stop: STOPS.iter().copied().find(|s| stop_word(*s) == word)?,
                 detail,
             }),
+            ("interrupted", SHUTDOWN) => Some(RunFailure::Interrupted { detail }),
             _ => None,
         }
     }
 
-    /// The input [`crate::errors::classify`] takes.
+    /// Whether the host, not the worker, ended the run.
+    pub fn is_interrupted(&self) -> bool {
+        matches!(self, RunFailure::Interrupted { .. })
+    }
+
+    /// The input [`crate::errors::classify`] takes. The controller never
+    /// classifies an interruption; a host that does (a peer's report) sees
+    /// a process a signal ended.
     pub fn input(&self) -> FailureInput {
         match self.clone() {
             RunFailure::Budget { budget, detail } => {
@@ -257,6 +269,10 @@ impl RunFailure {
                 FailureInput::ProcessExit { code, stderr_tail }
             }
             RunFailure::Policy { stop, detail } => FailureInput::Policy { stop, detail },
+            RunFailure::Interrupted { detail } => FailureInput::ProcessExit {
+                code: None,
+                stderr_tail: detail,
+            },
         }
     }
 }
@@ -276,6 +292,7 @@ impl std::fmt::Display for RunFailure {
                 ("process", code.as_str(), stderr_tail)
             }
             RunFailure::Policy { stop, detail } => ("policy", stop_word(*stop), detail),
+            RunFailure::Interrupted { detail } => ("interrupted", SHUTDOWN, detail),
         };
         write!(f, "{}{class}/{word}: {detail}", Self::PREFIX)
     }
@@ -288,6 +305,9 @@ pub fn run_failure_input(err: &Error) -> FailureInput {
         None => FailureInput::from_core_error(None, err),
     }
 }
+
+/// The one interruption there is: the daemon shutting down.
+const SHUTDOWN: &str = "shutdown";
 
 const BUDGETS: [BudgetKind; 4] = [
     BudgetKind::Iterations,
@@ -360,6 +380,9 @@ mod tests {
             stop,
             detail: "repo:/elsewhere is not one of this worker's repositories".into(),
         }));
+        out.push(RunFailure::Interrupted {
+            detail: "the daemon shut down: ended by terminate_all".into(),
+        });
         out
     }
 

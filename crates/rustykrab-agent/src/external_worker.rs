@@ -51,7 +51,10 @@
 //! worktree is kept and pruned by retention. Daemon shutdown calls
 //! [`RunGroups::terminate_all`], which sends every live group SIGTERM and
 //! then SIGKILL after a short grace, so no agent outlives the daemon and
-//! keeps working while the next daemon re-runs its item.
+//! keeps working while the next daemon re-runs its item. It marks the
+//! groups it ends first, and a run whose group was marked returns
+//! [`RunFailure::Interrupted`] instead of a failed process, which the
+//! controller returns to `ready` without climbing the ladder.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
@@ -161,6 +164,9 @@ fn signal_group(_group: i32, _signal: i32) -> bool {
 #[derive(Debug, Default)]
 pub struct RunGroups {
     live: Mutex<HashSet<i32>>,
+    /// Groups [`RunGroups::terminate_all`] ended: their runs report an
+    /// interruption, not a failure.
+    interrupted: Mutex<HashSet<i32>>,
 }
 
 /// One run's membership in a [`RunGroups`]: dropping it forgets the group
@@ -177,7 +183,23 @@ impl Drop for GroupGuard {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&self.group);
+        self.groups
+            .interrupted
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.group);
         signal_group(self.group, SIGKILL);
+    }
+}
+
+impl GroupGuard {
+    /// Whether shutdown ended this run's group.
+    fn interrupted(&self) -> bool {
+        self.groups
+            .interrupted
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&self.group)
     }
 }
 
@@ -214,14 +236,19 @@ impl RunGroups {
 
     /// End every live run: SIGTERM to each group, then SIGKILL to any
     /// still there after `grace`. Returns how many groups were signalled.
-    /// The runs see a failed process and keep their worktrees for
-    /// retention.
+    /// Each group is marked first, so its run reports
+    /// [`RunFailure::Interrupted`] rather than a failed process, and keeps
+    /// its worktree for retention.
     pub async fn terminate_all(&self, grace: Duration) -> usize {
         let groups = self.live();
         if groups.is_empty() {
             return 0;
         }
         tracing::info!(groups = ?groups, "terminating external worker runs");
+        self.interrupted
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .extend(groups.iter().copied());
         for &group in &groups {
             signal_group(group, SIGTERM);
         }
@@ -705,6 +732,22 @@ impl Worker for ExternalWorker {
             Ok(Err(e)) => Err(process_failure(None, &e.to_string())),
             Ok(Ok(output)) => self.read_output(&brief, &run_id, &output, &last),
         };
+        // Shutdown ended the group: whatever the process said, the run was
+        // interrupted, not failed. A report it managed to hand in stands.
+        let interrupted = outcome.is_err() && group.as_ref().is_some_and(GroupGuard::interrupted);
+        let outcome = match outcome {
+            Err(e) if interrupted => Err(RunFailure::Interrupted {
+                detail: tail(
+                    &format!(
+                        "the daemon shut down and ended {}: {e}",
+                        self.config.command.display()
+                    ),
+                    STDERR_TAIL,
+                ),
+            }
+            .into_error()),
+            other => other,
+        };
         // Whatever the agent left running in its group goes with it.
         drop(group);
         self.usage
@@ -726,7 +769,8 @@ impl Worker for ExternalWorker {
         });
 
         // Retention: a run with a result gives its directory back; one
-        // without keeps it for diagnosis unless policy says otherwise.
+        // without (an interrupted one included) keeps it for diagnosis
+        // unless policy says otherwise.
         let keep = outcome.is_err() && matches!(self.config.retention, Retention::KeepFailed(_));
         if !keep {
             match workspace {
@@ -1476,8 +1520,13 @@ wait
             .await
             .expect("the run ends once its agent is terminated")
             .unwrap();
-        assert!(outcome.is_err(), "a terminated run has no result");
+        let err = outcome.expect_err("a terminated run has no result");
+        assert!(
+            RunFailure::from_error(&err).is_some_and(|f| f.is_interrupted()),
+            "shutdown reports an interruption, not a failure: {err}"
+        );
         assert!(groups.live().is_empty());
+        assert!(groups.interrupted.lock().unwrap().is_empty());
 
         // Nothing is left in the group, the child included.
         let started = std::time::Instant::now();

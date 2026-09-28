@@ -23,13 +23,16 @@ struct VersionReply {
     controller: ControllerReply,
 }
 
-/// The controller's state. `last_tick` and `runs_in_flight` are `None`
-/// when no controller is wired, or when the wired handle runs no loop.
+/// The controller's state. `last_tick`, `runs_in_flight` and `draining`
+/// are `None` when no controller is wired, or when the wired handle runs no
+/// loop. `draining` is set once the daemon is shutting down: nothing new is
+/// leased while the runs in flight finish.
 #[derive(Debug, Serialize)]
 struct ControllerReply {
     wired: bool,
     last_tick: Option<DateTime<Utc>>,
     runs_in_flight: Option<usize>,
+    draining: Option<bool>,
 }
 
 async fn version(State(state): State<AppState>) -> Json<VersionReply> {
@@ -41,7 +44,8 @@ async fn version(State(state): State<AppState>) -> Json<VersionReply> {
         controller: ControllerReply {
             wired: state.control.is_some(),
             last_tick: status.as_ref().and_then(|s| s.last_tick),
-            runs_in_flight: status.map(|s| s.runs_in_flight),
+            runs_in_flight: status.as_ref().map(|s| s.runs_in_flight),
+            draining: status.map(|s| s.draining),
         },
     })
 }
@@ -196,6 +200,7 @@ mod tests {
                 .with_control(Arc::new(StubControl(Some(LoopStatus {
                     last_tick: Some(at()),
                     runs_in_flight: 2,
+                    draining: false,
                 })))),
         )
         .await;
@@ -206,6 +211,7 @@ mod tests {
         assert_eq!(body["build_date"], "2026-09-27");
         assert_eq!(body["controller"]["wired"], true);
         assert_eq!(body["controller"]["runs_in_flight"], 2);
+        assert_eq!(body["controller"]["draining"], false);
         let last: DateTime<Utc> = body["controller"]["last_tick"]
             .as_str()
             .unwrap()
@@ -224,6 +230,22 @@ mod tests {
         assert_eq!(body["controller"]["wired"], false);
         assert_eq!(body["controller"]["last_tick"], Value::Null);
         assert_eq!(body["controller"]["runs_in_flight"], Value::Null);
+        assert_eq!(body["controller"]["draining"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn a_draining_controller_says_so() {
+        let base = serve(state().with_control(Arc::new(StubControl(Some(LoopStatus {
+            last_tick: Some(at()),
+            runs_in_flight: 1,
+            draining: true,
+        })))))
+        .await;
+        let (status, body) = get_version(&base).await;
+        assert_eq!(status, Http::OK, "{body}");
+        assert_eq!(body["controller"]["wired"], true);
+        assert_eq!(body["controller"]["draining"], true);
+        assert_eq!(body["controller"]["runs_in_flight"], 1);
     }
 
     #[tokio::test]
@@ -234,6 +256,7 @@ mod tests {
         assert_eq!(body["controller"]["wired"], true);
         assert_eq!(body["controller"]["last_tick"], Value::Null);
         assert_eq!(body["controller"]["runs_in_flight"], 0);
+        assert_eq!(body["controller"]["draining"], false);
     }
 
     #[tokio::test]
