@@ -1,6 +1,6 @@
 # Plan: updating a running RustyKrab
 
-**Status:** Slices 1 to 5 built (2026-09-28); slice 6 to build
+**Status:** Slices 1 to 5 built (2026-09-28); slice 6 merged but held until its review's fixes land
 **Builds on:** `control-layer-and-worker-fleet.md`, `self-build-loop.md`
 
 A new version of the daemon has to replace the old one without losing
@@ -20,7 +20,7 @@ builder.
 | 3 | Drain: on shutdown the controller leases nothing new, gives runs `RUSTYKRAB_DRAIN_SECS` (20) to finish, then ends them as interrupted, returned to `ready` with no rung | built (batch 4) |
 | 4 | Controller lock: an exclusive `flock` on `<data>/controller.lock`; only the holder ticks, and `/api/version` reports `held` or `waiting`; failed ticks reported beside it | built (batch 4) |
 | 5 | Release source and verifier: `rustykrab update check` and `rustykrab update stage` | built (batch 5), with the review's fixes |
-| 6 | Supervisor: `rustykrab update apply`, swap, restart, verify, roll back | to build, after 5 |
+| 6 | Supervisor: `rustykrab update apply`, swap, restart, verify, roll back | merged (batch 6); the CLI refuses to run it until the fixes below land |
 
 Pieces 3 and 4 were exercised by hand on the builder on 2026-09-28. A
 second daemon on the same data directory reported `waiting` and never
@@ -124,6 +124,45 @@ outside the bundle it replaces, so it is never the process it stops.
 Otherwise it reports what it would do and leaves a notice. For the
 builder the steps are the same with a plain binary path and `start.sh`
 in place of launchd.
+
+## Slice 6: not yet safe
+
+The first build of slice 6 got the swap order, the atomic renames, the
+90 s verify window, the `--yes` gate and the commit-keyed bad record
+right. Its security review (2026-09-28) found four problems that keep it
+from running. Until they are fixed the CLI refuses
+`rustykrab update apply` unless `RUSTYKRAB_UPDATE_APPLY_UNREVIEWED=1`.
+
+1. **It trusts `staged.json`, which a worker can write.** The launchd
+   refusal reads `kind` and `signature_verified` from the record, `path`
+   is never checked, and the version is not compared with the running
+   one. The swap must re-check what it is about to install. It copies the
+   stage beside the install, then:
+   - refuses a symlink;
+   - checks the signature requirement (slice 5) on the copy;
+   - runs the copy's `--version` and requires the staged version and
+     commit;
+   - requires the record's directory and path to be the canonical
+     `updates/<X.Y.Z>/<binary or app>`;
+   - for a release, requires the version to be newer than the running
+     one.
+2. **An interrupted apply can leave no daemon, and the next run does not
+   recover.** A journal (`updates/apply-state.json`, the phase and both
+   commits) lets the next run finish or roll back first. If the stop step
+   fails, the service is started again.
+3. **A failure to write the bad record aborts the rollback.** The rollback
+   must go on and report the failure with its outcome.
+4. **A failed rollback is quiet.** It must write
+   `updates/apply-failed.json`, always try to start the service last, and
+   make every later run print that file and stop until a person clears it.
+
+Also required:
+- The script service stops only a loopback listener whose executable is
+  the installed one.
+- A daemon that is already failing ticks is not updated.
+- The verify step counts a tick advance only when no ticks are failing.
+- `--url` must be loopback or https.
+- The LaunchAgent plist gets an `ExitTimeOut` above the drain grace.
 
 ## Not yet
 
