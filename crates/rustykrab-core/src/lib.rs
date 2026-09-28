@@ -57,7 +57,7 @@ pub use post_condition::{Observation, PostCondition, ProbeRegistry, ProbeWindow}
 pub use probes::{FilePresence, MemoryWritten};
 pub use recall::RecallStore;
 pub use retrieval_log::RetrievalLog;
-pub use schema_validate::validate_tool_args;
+pub use schema_validate::{coerce_tool_args, validate_tool_args, Coercion};
 pub use session::Session;
 pub use timezone::Tz;
 pub use todo::{render_todos, TodoItem, TodoStatus, TodoStore};

@@ -698,6 +698,7 @@ impl LocalWorker {
             reminders = stats.reminders,
             rejected_reports = stats.rejected_reports,
             reported = stats.reported,
+            coerced_args = tracer.arg_coercions(),
             "local worker run ended"
         );
         *self.last_run.lock().unwrap_or_else(|e| e.into_inner()) = Some(stats.clone());

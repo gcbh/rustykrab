@@ -1744,6 +1744,60 @@ impl AgentRunner {
         CompletionReminderOutcome::Continue
     }
 
+    /// Each call with its string arguments coerced to the scalar types its
+    /// tool's schema declares (`rustykrab_core::coerce_tool_args`), or
+    /// `None` for a call that needed nothing, in the order given. A late
+    /// bound tool reaches Qwen's XML tool-call format untyped, so without
+    /// this every integer argument of an appended tool was rejected. Each
+    /// coercion is a debug line and counts on the tracer; a batch that
+    /// coerced anything says how many at info, so a run's log measures it.
+    fn coerce_arguments(
+        &self,
+        calls: &[&ToolCall],
+        iteration: usize,
+        tracer: &ExecutionTracer,
+    ) -> Vec<Option<ToolCall>> {
+        let mut total = 0;
+        let coerced = calls
+            .iter()
+            .map(|call| {
+                // The executor's lookup: exact name, then the base name.
+                let name = call.name.trim();
+                let base = name.split(':').next().unwrap_or(name);
+                let schema = self
+                    .tool_index
+                    .schema(name)
+                    .or_else(|| self.tool_index.schema(base))?;
+                let (arguments, changes) =
+                    rustykrab_core::coerce_tool_args(&schema.parameters, &call.arguments)?;
+                for change in &changes {
+                    tracing::debug!(
+                        tool = %call.name,
+                        call_id = %call.id,
+                        field = %change.pointer,
+                        to = change.to,
+                        "coerced a string argument to its schema type"
+                    );
+                }
+                total += changes.len();
+                Some(ToolCall {
+                    id: call.id.clone(),
+                    name: call.name.clone(),
+                    arguments,
+                })
+            })
+            .collect();
+        if total > 0 {
+            tracer.record_arg_coercions(total);
+            tracing::info!(
+                iteration,
+                coerced = total,
+                "tool arguments coerced to their schema types"
+            );
+        }
+        coerced
+    }
+
     /// Start the event-driven agent loop.
     ///
     /// Returns a handle for injecting events (user messages, cancellation),
@@ -2256,6 +2310,16 @@ impl AgentRunner {
                         call_id: call.id.clone(),
                     });
                 }
+
+                // String arguments that are exactly the scalar their schema
+                // declares are typed before dispatch; the conversation keeps
+                // the call as the model wrote it.
+                let coerced = self.coerce_arguments(&calls, iteration, tracer);
+                let calls: Vec<&ToolCall> = calls
+                    .iter()
+                    .zip(&coerced)
+                    .map(|(call, typed)| typed.as_ref().unwrap_or(call))
+                    .collect();
 
                 let results = self
                     .execute_tools_parallel_traced(calls, session, tracer, Some(on_event))

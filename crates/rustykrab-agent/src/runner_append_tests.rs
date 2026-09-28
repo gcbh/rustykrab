@@ -151,14 +151,60 @@ fn tools() -> Vec<Arc<dyn Tool>> {
 
 /// A runner over [`tools`], and a session that may call all of them.
 fn setup(provider: Arc<Recording>) -> (AgentRunner, Session, Arc<ActiveToolsRegistry>) {
+    setup_with(provider, Vec::new())
+}
+
+/// [`setup`] with `extra` tools registered beside [`tools`].
+fn setup_with(
+    provider: Arc<Recording>,
+    extra: Vec<Arc<dyn Tool>>,
+) -> (AgentRunner, Session, Arc<ActiveToolsRegistry>) {
     let active = Arc::new(ActiveToolsRegistry::new());
+    let mut all = tools();
+    all.extend(extra);
+    let names: Vec<String> = all.iter().map(|t| t.name().to_string()).collect();
     let runner =
-        AgentRunner::new(provider, tools(), Arc::new(NoSandbox)).with_active_tools(active.clone());
-    let names: Vec<String> = tools().iter().map(|t| t.name().to_string()).collect();
+        AgentRunner::new(provider, all, Arc::new(NoSandbox)).with_active_tools(active.clone());
     let names: Vec<&str> = names.iter().map(String::as_str).collect();
     let session =
         Session::with_capabilities(Uuid::new_v4(), CapabilitySet::for_tools_permissive(&names));
     (runner, session, active)
+}
+
+/// Scenario 10's calendar target: an integer parameter, and the arguments
+/// each call arrived with.
+#[derive(Default)]
+struct Calendar {
+    seen: Mutex<Vec<Value>>,
+}
+
+#[async_trait]
+impl Tool for Calendar {
+    fn name(&self) -> &str {
+        "create_calendar_event"
+    }
+    fn description(&self) -> &str {
+        "Create an event on the user's calendar."
+    }
+    fn schema(&self) -> ToolSchema {
+        ToolSchema {
+            name: self.name().into(),
+            description: self.description().into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "title": { "type": "string" },
+                    "start": { "type": "string" },
+                    "duration_minutes": { "type": "integer" }
+                },
+                "required": ["title"]
+            }),
+        }
+    }
+    async fn execute(&self, args: Value) -> Result<Value> {
+        self.seen.lock().unwrap().push(args);
+        Ok(json!({ "created": true, "event_id": "evt-5521" }))
+    }
 }
 
 fn conversation(id: Uuid) -> Conversation {
@@ -338,4 +384,62 @@ async fn compaction_folds_appended_tools_into_the_array() {
         active.version(conv_id) > before,
         "the next request re-renders"
     );
+}
+
+/// Qwen's XML tool-call format carries every parameter as text, and Ollama
+/// types a parameter only from a declared tool, so an appended tool's
+/// integer arrives as a string (scenario 10, qwen3.8, 2026-09-28: 21
+/// rejected calls). The host types an exact string before dispatch.
+#[tokio::test]
+async fn an_appended_tools_integer_sent_as_text_is_coerced_before_dispatch() {
+    let provider = Recording::new(
+        true,
+        vec![
+            call("tools_list", json!({ "query": "calendar event" })),
+            call(
+                "create_calendar_event",
+                json!({ "title": "Dentist", "start": "2026-10-02T09:30", "duration_minutes": "30" }),
+            ),
+            call(
+                "create_calendar_event",
+                json!({ "title": "Dentist", "duration_minutes": "half an hour" }),
+            ),
+            call("task_complete", json!({ "summary": "Booked." })),
+        ],
+    );
+    let calendar = Arc::new(Calendar::default());
+    let (runner, session, _) = setup_with(provider, vec![calendar.clone() as Arc<dyn Tool>]);
+    let mut conv = conversation(session.conversation_id);
+    let tracer = ExecutionTracer::new();
+
+    runner
+        .run_traced(&mut conv, &session, &tracer)
+        .await
+        .unwrap();
+
+    // The exact string was typed and the tool ran with a number.
+    let seen = calendar.seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 1, "{seen:?}");
+    assert_eq!(seen[0]["duration_minutes"], json!(30));
+    assert_eq!(seen[0]["title"], json!("Dentist"));
+    let results = results_of(&conv, "create_calendar_event");
+    assert!(!results[0].0, "{:?}", results[0]);
+    // A string that is not exactly an integer is rejected as before.
+    assert!(results[1].0, "{:?}", results[1]);
+    assert!(
+        results[1]
+            .1
+            .contains("field 'duration_minutes' must be integer, got string"),
+        "{:?}",
+        results[1]
+    );
+    assert_eq!(tracer.arg_coercions(), 1);
+    // The conversation keeps the call as the model wrote it.
+    let written = conv
+        .messages
+        .iter()
+        .flat_map(|m| m.content.tool_calls())
+        .find(|c| c.name == "create_calendar_event")
+        .map(|c| c.arguments["duration_minutes"].clone());
+    assert_eq!(written, Some(json!("30")));
 }
