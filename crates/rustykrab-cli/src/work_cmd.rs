@@ -309,7 +309,7 @@ fn resolve_among<'a>(
 
 // ── the daemon ─────────────────────────────────────────────────────────
 
-struct Daemon {
+pub(crate) struct Daemon {
     http: reqwest::Client,
     base: Url,
 }
@@ -338,7 +338,7 @@ fn not_live(error: &anyhow::Error) -> bool {
 }
 
 impl Daemon {
-    async fn connect(data_dir: &Path) -> anyhow::Result<Daemon> {
+    pub(crate) async fn connect(data_dir: &Path) -> anyhow::Result<Daemon> {
         let raw =
             std::env::var("RUSTYKRAB_GATEWAY_URL").unwrap_or_else(|_| DEFAULT_GATEWAY_URL.into());
         let base = Url::parse(&raw)
@@ -382,7 +382,7 @@ impl Daemon {
         url
     }
 
-    async fn get<T: DeserializeOwned>(
+    pub(crate) async fn get<T: DeserializeOwned>(
         &self,
         segments: &[&str],
         query: &[(&str, &str)],
@@ -391,7 +391,7 @@ impl Daemon {
         self.read(self.http.get(url.clone()), &url).await
     }
 
-    async fn post<T: DeserializeOwned>(
+    pub(crate) async fn post<T: DeserializeOwned>(
         &self,
         segments: &[&str],
         body: Option<Value>,
@@ -402,6 +402,11 @@ impl Daemon {
             request = request.json(&body);
         }
         self.read(request, &url).await
+    }
+
+    pub(crate) async fn delete<T: DeserializeOwned>(&self, segments: &[&str]) -> anyhow::Result<T> {
+        let url = self.url(segments, &[]);
+        self.read(self.http.delete(url.clone()), &url).await
     }
 
     async fn read<T: DeserializeOwned>(

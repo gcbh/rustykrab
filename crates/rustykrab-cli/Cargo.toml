@@ -51,3 +51,6 @@ default = ["embeddings"]
 embeddings = ["rustykrab-memory/fastembed"]
 # Concrete enigo + xcap implementation of the computer-use backend.
 computer-use = ["dep:enigo", "dep:xcap"]
+
+[dev-dependencies]
+tempfile = "3"

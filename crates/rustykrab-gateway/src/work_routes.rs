@@ -132,6 +132,11 @@ pub struct ItemDetail {
     /// lease lives only while the item is active.
     #[serde(default)]
     pub lease: Option<Lease>,
+    /// Every lease the item has had, oldest first, from its `lease`
+    /// events: which named worker ran each attempt (plan section 5), so a
+    /// closed item still names the worker that finished it.
+    #[serde(default)]
+    pub leases: Vec<LeaseRecord>,
     /// Every rung climbed, oldest first (sections 8 and 9).
     #[serde(default)]
     pub ladder: Vec<RungEvent>,
@@ -144,6 +149,13 @@ pub struct ItemDetail {
     /// Oldest first.
     #[serde(default)]
     pub events: Vec<WorkEvent>,
+}
+
+/// One lease an item had: the worker and when.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LeaseRecord {
+    pub worker: String,
+    pub since: DateTime<Utc>,
 }
 
 /// `GET /api/work/{id}/graph`: the controller's [`GraphView`] plus the
@@ -639,12 +651,25 @@ async fn item_detail(
     let lease = store.work_lease_get(&id).await?;
     let events = store.work_events(&id).await?;
     let evidence = store.work_evidence_list(&id).await?;
+    let leases = events
+        .iter()
+        .filter(|e| e.kind == rustykrab_core::work::EventKind::Lease)
+        .map(|e| LeaseRecord {
+            worker: e
+                .actor
+                .strip_prefix("worker:")
+                .unwrap_or(&e.actor)
+                .to_string(),
+            since: e.at,
+        })
+        .collect();
     Ok(Json(ItemDetail {
         item,
         edges,
         dependents,
         rollup,
         lease,
+        leases,
         ladder: ladder::ladder_of_events(&events),
         last_error: ladder::last_error(&events),
         evidence,

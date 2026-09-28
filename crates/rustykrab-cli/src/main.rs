@@ -1,9 +1,11 @@
 mod chat;
 #[cfg(feature = "computer-use")]
 mod computer_backend;
+mod fleet;
 mod prompt_log;
 mod task_queue;
 mod work_cmd;
+mod worker_cmd;
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -610,12 +612,15 @@ async fn main() -> anyhow::Result<()> {
     if args.len() >= 2 && args[1] == "work" {
         return work_cmd::run(&data_dir, &args[2..]).await;
     }
+    if args.len() >= 2 && (args[1] == "workers" || args[1] == "worker") {
+        return worker_cmd::run(&data_dir, &args[1..]).await;
+    }
     // An unrecognized subcommand must not silently fall through to
     // "start the daemon" — a typo would boot a full agent instead of
     // reporting the mistake.
     if let Some(unknown) = args.get(1).filter(|a| !a.starts_with('-')) {
         eprintln!("unknown subcommand '{unknown}'");
-        eprintln!("subcommands: skill, keychain, chat, dream, pair, work");
+        eprintln!("subcommands: skill, keychain, chat, dream, pair, work, workers, worker");
         eprintln!("run with no arguments to start the daemon");
         std::process::exit(2);
     }
@@ -1327,10 +1332,20 @@ async fn main() -> anyhow::Result<()> {
     } else {
         "webchat"
     };
+    // The registry names the local worker (plan section 5) and holds the
+    // external ones `rustykrab worker add` builds; see `fleet.rs`.
+    let fleet = fleet::Fleet::open(
+        &store,
+        &data_dir,
+        &skills_dir,
+        skill_registry.clone(),
+        &tools,
+    )
+    .await?;
     let local_worker: Arc<dyn rustykrab_control::worker::Worker> = Arc::new(
         rustykrab_agent::LocalWorker::new(
-            "pinch",
-            rustykrab_agent::LocalWorker::default_definition("pinch"),
+            fleet.local_name.clone(),
+            rustykrab_agent::LocalWorker::default_definition(&fleet.local_name),
             provider.clone(),
             tools.clone(),
             Arc::new(ProcessSandbox::new()),
@@ -1338,27 +1353,27 @@ async fn main() -> anyhow::Result<()> {
         )
         .with_transcripts(Arc::new(StoreTranscripts {
             conversations: store.conversations(),
-        })),
+        }))
+        .with_late_tools(fleet.skills.clone()),
     );
     // Filled below, once the registry is final (after the stub switch) and
     // the active-tools seed is known.
     let control_catalog = Arc::new(RegistryCatalog::default());
-    let control_config = rustykrab_control::controller::ControllerConfig {
+    let control_config = fleet.config(rustykrab_control::controller::ControllerConfig {
         notice_channel: control_notice_channel.to_string(),
         ..Default::default()
-    };
+    });
     let controller = Arc::new(
-        rustykrab_control::controller::Controller::new(
-            store.clone(),
-            vec![local_worker],
-            control_config,
-        )
-        .with_catalog(control_catalog.clone()),
+        rustykrab_control::controller::Controller::new(store.clone(), Vec::new(), control_config)
+            .with_registry(fleet.registry.clone())
+            .with_routing(fleet.routing())
+            .with_catalog(fleet.catalog(control_catalog.clone())),
     );
+    fleet.start(local_worker).await?;
     deferred_work_backend.bind(controller.clone());
     tools.extend(rustykrab_tools::work_tools(controller.clone()));
     tracing::info!(
-        worker = "pinch",
+        worker = %fleet.local_name,
         notices = control_notice_channel,
         "control layer registered"
     );
@@ -1469,6 +1484,7 @@ async fn main() -> anyhow::Result<()> {
     let store_handle = store.clone();
     let mut state = rustykrab_gateway::AppState::new(store, tools, provider, auth_token)
         .with_control(controller.clone() as Arc<dyn rustykrab_control::handle::ControlHandle>)
+        .with_workers(fleet.registry.clone())
         // Loopback is always allowed; this adds the names other clients
         // reach us by, e.g. the tailnet hostname the phone uses.
         .with_origin_policy(rustykrab_gateway::OriginPolicy::from_env())

@@ -1054,6 +1054,7 @@ Approve with `rustykrab work approve #t`, or decline with `rustykrab work reject
             dependents: vec![blocks("45", "44")],
             rollup: None,
             lease: None,
+            leases: Vec::new(),
             ladder: vec![RungEvent {
                 rung: Rung::Retry,
                 at: at(2),

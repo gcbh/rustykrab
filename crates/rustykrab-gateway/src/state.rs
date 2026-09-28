@@ -45,6 +45,10 @@ pub struct AppState {
     /// routes then answer from `agent.store` alone, and every route that
     /// needs the controller answers 503.
     pub control: Option<Arc<dyn ControlHandle>>,
+    /// The worker registry, for `/api/workers` (plan sections 5 and 14).
+    /// `None` until the composition root wires one; those routes then
+    /// answer 503.
+    pub workers: Option<Arc<rustykrab_control::registry::WorkerRegistry>>,
 
     // --- Outbound channels, delivered to by the webhook routes ---
     pub telegram: Option<Arc<TelegramChannel>>,
@@ -69,6 +73,7 @@ impl AppState {
             credential_page_policy: crate::PageIdentityPolicy::default(),
             task_signal: crate::tasks::TaskQueueSignal::new(),
             control: None,
+            workers: None,
             telegram: None,
             signal: None,
             slack: None,
@@ -186,6 +191,15 @@ impl AppState {
     /// the same store as `agent.store`, which those routes read.
     pub fn with_control(mut self, control: Arc<dyn ControlHandle>) -> Self {
         self.control = Some(control);
+        self
+    }
+
+    /// Wire the worker registry the `/api/workers` routes read and grow.
+    pub fn with_workers(
+        mut self,
+        workers: Arc<rustykrab_control::registry::WorkerRegistry>,
+    ) -> Self {
+        self.workers = Some(workers);
         self
     }
 

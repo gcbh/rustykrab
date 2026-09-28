@@ -30,7 +30,8 @@ rustykrab-core        (no internal deps — the contract layer)
    rustykrab-tools  ----+      +---- rustykrab-dream
         ^
         |
-   rustykrab-control (core, store, tools)   work-item graph, ladder, Worker
+   rustykrab-control (core, store, tools)   work-item graph, ladder, Worker,
+                                            worker registry, routing, worktrees
         ^
         |
    rustykrab-agent   (core, tools, control)
@@ -93,6 +94,10 @@ main()
  ├─ job_executor_loop              30s tick   -> due cron jobs -> TaskQueue
  ├─ TaskQueue worker               in-memory mpsc, bounded
  ├─ delegated-task worker          durable queue in `delegated_tasks`
+ ├─ control loop                   tick -> lease -> worker runs: a local
+ │                                 conversation, or a `claude`/`codex`
+ │                                 process in a worktree under the data dir
+ ├─ work outbox notifier           one message per parent, from `work_outbox`
  ├─ memory idle lifecycle sweep
  ├─ memory FTS5 index rebuild      once, at boot
  └─ DreamWorker                    read-only outcome analysis, idle-gated

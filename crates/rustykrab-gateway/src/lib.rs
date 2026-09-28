@@ -13,6 +13,7 @@ pub mod tasks;
 mod telegram_webhook;
 mod webchat;
 pub mod work_routes;
+pub mod worker_routes;
 
 pub use auth::generate_token;
 pub mod run;
@@ -68,6 +69,7 @@ pub fn router(state: AppState) -> Router {
         .merge(routes::api_routes())
         .merge(project_routes::routes())
         .merge(work_routes::routes())
+        .merge(worker_routes::routes())
         .merge(telegram_webhook::telegram_routes())
         .merge(signal_webhook::signal_routes())
         .merge(credential_page::routes())
