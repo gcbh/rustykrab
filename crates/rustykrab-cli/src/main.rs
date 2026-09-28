@@ -2003,12 +2003,14 @@ async fn main() -> anyhow::Result<()> {
     // the runtime can still reap them, before the tasks driving them are
     // aborted. Their worktrees stay for retention, and each reports an
     // interruption: one more tick returns their items to `ready` with no
-    // rung, so the next daemon runs them again.
-    let ended = rustykrab_agent::RunGroups::global()
+    // rung, so the next daemon runs them again. Local runs in this process
+    // are interrupted the same way instead of dying with their tasks.
+    let external = rustykrab_agent::RunGroups::global()
         .terminate_all(std::time::Duration::from_secs(5))
         .await;
-    if ended > 0 {
-        tracing::info!(runs = ended, "external worker runs terminated");
+    let local = rustykrab_agent::LocalRuns::global().interrupt_all("daemon shutting down");
+    if external + local > 0 {
+        tracing::info!(external, local, "worker runs ended for shutdown");
         controller
             .wait_for_runs(std::time::Duration::from_secs(5))
             .await;

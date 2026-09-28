@@ -6,11 +6,11 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-use rustykrab_agent::{LocalWorker, NoSandbox};
+use rustykrab_agent::{LocalRuns, LocalWorker, NoSandbox};
 use rustykrab_control::controller::{Controller, ControllerConfig, ManualClock};
 use rustykrab_core::model::{ModelProvider, ModelResponse, StopReason, Usage};
 use rustykrab_core::types::{Message, MessageContent, Role, ToolCall, ToolSchema};
-use rustykrab_core::work::Trigger;
+use rustykrab_core::work::{EventKind, Trigger};
 use serde_json::json;
 
 use super::*;
@@ -19,6 +19,9 @@ use super::*;
 struct Replay {
     script: Mutex<VecDeque<ModelResponse>>,
     requests: Mutex<Vec<Vec<Message>>>,
+    /// Set: every call records its request and then never answers.
+    hold: std::sync::atomic::AtomicBool,
+    called: tokio::sync::Notify,
 }
 
 impl Replay {
@@ -26,6 +29,8 @@ impl Replay {
         Arc::new(Replay {
             script: Mutex::new(script.into()),
             requests: Mutex::new(Vec::new()),
+            hold: std::sync::atomic::AtomicBool::new(false),
+            called: tokio::sync::Notify::new(),
         })
     }
 
@@ -46,6 +51,10 @@ impl ModelProvider for Replay {
         _tools: &[ToolSchema],
     ) -> rustykrab_core::Result<ModelResponse> {
         self.requests.lock().unwrap().push(messages.to_vec());
+        self.called.notify_one();
+        if self.hold.load(std::sync::atomic::Ordering::SeqCst) {
+            std::future::pending::<()>().await;
+        }
         self.script
             .lock()
             .unwrap()
@@ -78,6 +87,8 @@ struct Daemon {
     state: AppState,
     controller: Arc<Controller>,
     provider: Arc<Replay>,
+    /// The worker's own run set, so interrupting it ends no other test's.
+    runs: Arc<LocalRuns>,
     dir: PathBuf,
 }
 
@@ -123,6 +134,7 @@ fn daemon(script: Vec<ModelResponse>, ahead: TimeDelta) -> Daemon {
     ));
     let provider = Replay::new(script);
     let deferred = Arc::new(crate::DeferredWorkBackend::default());
+    let runs = Arc::new(LocalRuns::default());
     let worker = LocalWorker::new(
         "pinch",
         LocalWorker::default_definition("pinch"),
@@ -131,7 +143,8 @@ fn daemon(script: Vec<ModelResponse>, ahead: TimeDelta) -> Daemon {
         Arc::new(NoSandbox),
         deferred.clone(),
     )
-    .with_transcripts(transcripts(&store, skills));
+    .with_transcripts(transcripts(&store, skills))
+    .with_runs(runs.clone());
     let controller = Arc::new(
         Controller::new(
             store.clone(),
@@ -147,6 +160,7 @@ fn daemon(script: Vec<ModelResponse>, ahead: TimeDelta) -> Daemon {
         state,
         controller,
         provider,
+        runs,
         dir,
     }
 }
@@ -295,6 +309,52 @@ async fn a_firing_runs_in_the_jobs_conversation_with_its_skill_and_is_recorded_o
         1
     );
     assert!(d.store().work_open_items().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_local_run_still_going_at_shutdown_is_interrupted_and_its_item_ready_again() {
+    let d = daemon(Vec::new(), TimeDelta::seconds(30));
+    d.provider
+        .hold
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let draft = WorkItemDraft {
+        title: "Tidy the notes".into(),
+        objective: "Tidy the notes".into(),
+        done_when: "the notes are tidy".into(),
+        ..WorkItemDraft::default()
+    };
+    let provenance = Provenance {
+        conversation_id: None,
+        filed_by_item: None,
+        actor: "agent".into(),
+    };
+    let id = match d.controller.file_draft(draft, provenance).await.unwrap() {
+        PlanOutcome::Accepted(a) => a.root,
+        other => panic!("{other:?}"),
+    };
+    let leased = d.controller.tick().await.unwrap();
+    assert_eq!(leased.leased, vec![id.clone()]);
+    tokio::time::timeout(Duration::from_secs(5), d.provider.called.notified())
+        .await
+        .expect("the run reaches the model");
+    assert_eq!(d.runs.live(), 1);
+
+    // Shutdown past the drain grace, as `main` does it: interrupt the local
+    // runs, wait for them, and one final tick reconciles.
+    ControlHandle::set_draining(d.controller.as_ref(), true);
+    assert_eq!(d.runs.interrupt_all("daemon shutting down"), 1);
+    d.controller.wait_for_runs(Duration::from_secs(5)).await;
+    let last = d.controller.tick().await.unwrap();
+    assert_eq!(last.reconciled, vec![id.clone()], "{last:?}");
+    assert_eq!(d.runs.live(), 0);
+
+    let item = d.store().work_get(&id).await.unwrap().unwrap();
+    assert_eq!(item.status, Status::Ready);
+    let events = d.store().work_events(&id).await.unwrap();
+    assert!(
+        events.iter().all(|e| e.kind != EventKind::Rung),
+        "no rung climbed: {events:?}"
+    );
 }
 
 #[tokio::test]
