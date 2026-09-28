@@ -39,8 +39,9 @@ use reqwest::Url;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    is_bad, is_newer, is_plain_version, output_within, parse_version_output, record_bad,
-    BadVersion, Config, Staged, Verifier, APP_NAME, BINARY_NAME, BUNDLE_ID, STAGED_FILE,
+    is_bad, is_newer, is_plain_version, output_within, parse_semver, parse_version_output,
+    record_bad, BadVersion, Config, Staged, Verifier, APP_NAME, BINARY_NAME, BUNDLE_ID,
+    STAGED_FILE,
 };
 
 /// How long the new version has to come up healthy.
@@ -312,9 +313,12 @@ fn refuse_after_failure(cfg: &Config) -> anyhow::Result<()> {
     }
 }
 
-/// The `staged.json` with the latest `staged_at` under `<data>/updates/`.
-/// A record that does not parse is skipped; the newest one is refused
-/// unless it is canonical ([`check_canonical`]).
+/// The canonical `staged.json` under `<data>/updates/` with the highest
+/// version, and of those the latest `staged_at`. A record that does not
+/// parse or is not canonical ([`check_canonical`]) is skipped with a
+/// warning, so a stray record cannot block a good one; `staged_at` is a
+/// field a worker writes, so it only breaks a tie. When records were found
+/// but every one was skipped, the reasons are the error.
 pub fn newest_staged(cfg: &Config) -> anyhow::Result<Option<Staged>> {
     let updates = cfg.updates_dir();
     let entries = match std::fs::read_dir(&updates) {
@@ -322,7 +326,8 @@ pub fn newest_staged(cfg: &Config) -> anyhow::Result<Option<Staged>> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e).with_context(|| format!("reading {}", updates.display())),
     };
-    let mut newest: Option<(String, Staged)> = None;
+    let mut newest: Option<(Vec<u64>, Staged)> = None;
+    let mut skipped = Vec::new();
     for entry in entries.flatten() {
         let dir = entry.file_name().to_string_lossy().into_owned();
         if dir.starts_with('.') {
@@ -339,18 +344,31 @@ pub fn newest_staged(cfg: &Config) -> anyhow::Result<Option<Staged>> {
                 continue;
             }
         };
+        if let Err(e) = check_canonical(cfg, &dir, &staged) {
+            tracing::warn!("skipping {}: {e:#}", record.display());
+            skipped.push(format!("{e:#}"));
+            continue;
+        }
+        // Canonical, so the version is plain X.Y.Z and parses.
+        let Some(version) = parse_semver(&staged.version) else {
+            continue;
+        };
         if newest
             .as_ref()
-            .is_none_or(|(_, n)| staged.staged_at > n.staged_at)
+            .is_none_or(|(v, n)| (&version, staged.staged_at) > (v, n.staged_at))
         {
-            newest = Some((dir, staged));
+            newest = Some((version, staged));
         }
     }
-    let Some((dir, staged)) = newest else {
-        return Ok(None);
-    };
-    check_canonical(cfg, &dir, &staged)?;
-    Ok(Some(staged))
+    match newest {
+        Some((_, staged)) => Ok(Some(staged)),
+        None if skipped.is_empty() => Ok(None),
+        None => bail!(
+            "no canonical stage under {}; skipped: {}",
+            updates.display(),
+            skipped.join("; ")
+        ),
+    }
 }
 
 fn is_symlink(path: &Path) -> bool {
@@ -1180,19 +1198,7 @@ impl Processes for SystemProcesses {
     }
 
     fn executable(&self, pid: u32) -> anyhow::Result<PathBuf> {
-        let proc_exe = PathBuf::from(format!("/proc/{pid}/exe"));
-        if cfg!(target_os = "linux") {
-            return std::fs::read_link(&proc_exe)
-                .with_context(|| format!("reading {}", proc_exe.display()));
-        }
-        let mut cmd = Command::new("ps");
-        cmd.args(["-o", "comm=", "-p"]).arg(pid.to_string());
-        let out = output_within(cmd, INSPECT_WITHIN).context("running ps")?;
-        let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if !out.status.success() || path.is_empty() {
-            bail!("ps names no executable for process {pid}");
-        }
-        Ok(PathBuf::from(path))
+        executable_of(pid)
     }
 
     fn terminate(&self, pid: u32) -> anyhow::Result<()> {
@@ -1209,6 +1215,34 @@ impl Processes for SystemProcesses {
             .status()
             .is_ok_and(|s| s.success())
     }
+}
+
+/// The executable `pid` runs, as the kernel knows it: `proc_pidpath` on
+/// macOS. Not `ps -o comm=`, which prints the process's own `argv[0]`, a
+/// string any process can set to the installed path.
+#[cfg(target_os = "macos")]
+fn executable_of(pid: u32) -> anyhow::Result<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    let pid_c = libc::c_int::try_from(pid).context("process id out of range")?;
+    let mut buf = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    // SAFETY: `buf` is writable for `buf.len()` bytes, the size passed, and
+    // `proc_pidpath` writes at most that many.
+    let len = unsafe { libc::proc_pidpath(pid_c, buf.as_mut_ptr().cast(), buf.len() as u32) };
+    if len <= 0 {
+        bail!(
+            "proc_pidpath names no executable for process {pid}: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    buf.truncate(len as usize);
+    Ok(PathBuf::from(std::ffi::OsStr::from_bytes(&buf)))
+}
+
+/// The executable `pid` runs: the `/proc/<pid>/exe` link on Linux.
+#[cfg(not(target_os = "macos"))]
+fn executable_of(pid: u32) -> anyhow::Result<PathBuf> {
+    let proc_exe = PathBuf::from(format!("/proc/{pid}/exe"));
+    std::fs::read_link(&proc_exe).with_context(|| format!("reading {}", proc_exe.display()))
 }
 
 /// The `p` and `n` fields of `lsof -F pn`.
@@ -1273,11 +1307,21 @@ pub fn the_daemon(processes: &dyn Processes, port: u16, installed: &Path) -> any
     }
     let exe = processes.executable(pid)?;
     let want = installed_executable(installed);
-    let same = match (std::fs::canonicalize(&exe), std::fs::canonicalize(&want)) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => exe == want,
+    if !exe.is_absolute() {
+        bail!(
+            "process {pid} names its executable by the relative path {}; refusing to stop it",
+            exe.display()
+        );
+    }
+    let canonical = |path: &Path| {
+        std::fs::canonicalize(path).with_context(|| {
+            format!(
+                "resolving {}; refusing to stop process {pid} without comparing real paths",
+                path.display()
+            )
+        })
     };
-    if !same {
+    if canonical(&exe)? != canonical(&want)? {
         bail!(
             "process {pid} on port {port} runs {}, not the installed {}; refusing to stop it",
             exe.display(),
@@ -1375,30 +1419,41 @@ fn describe(plan: &Plan) -> String {
 }
 
 /// `--url` carries the bearer token, so it must be https, or plain http to
-/// loopback (`127.0.0.1`, `::1` or `localhost`).
+/// the loopback address `127.0.0.1` or `[::1]`, any port. `localhost` is
+/// refused: it is a name the resolver may send elsewhere.
 pub fn check_url(raw: &str) -> anyhow::Result<Url> {
-    let url = Url::parse(raw).map_err(|e| anyhow!("invalid --url `{raw}`: {e}"))?;
+    check_url_named(raw, "--url")
+}
+
+fn check_url_named(raw: &str, what: &str) -> anyhow::Result<Url> {
+    let url = Url::parse(raw).map_err(|e| anyhow!("invalid {what} `{raw}`: {e}"))?;
     if url.host().is_none() {
-        bail!("--url `{raw}` has no host");
+        bail!("{what} `{raw}` has no host");
     }
     match url.scheme() {
         "https" => Ok(url),
-        "http" if matches!(url.host_str(), Some("127.0.0.1" | "[::1]" | "localhost")) => Ok(url),
+        "http" if matches!(url.host_str(), Some("127.0.0.1" | "[::1]")) => Ok(url),
         "http" => bail!(
-            "--url `{raw}` is plain http to a host that is not loopback, which would send \
-             the token in the clear; use https, or 127.0.0.1, ::1 or localhost"
+            "{what} `{raw}` is plain http to a host that is not a loopback address, which \
+             could send the token in the clear; use https, or http://127.0.0.1 or http://[::1]"
         ),
-        other => bail!("--url `{raw}` is {other}, not http(s)"),
+        other => bail!("{what} `{raw}` is {other}, not http(s)"),
+    }
+}
+
+/// The daemon's URL: `--url`, or else `default` (the gateway URL from
+/// `RUSTYKRAB_GATEWAY_URL`), and either way through the same check.
+pub fn base_url(arg: Option<&str>, default: anyhow::Result<Url>) -> anyhow::Result<Url> {
+    match arg {
+        Some(raw) => check_url(raw),
+        None => check_url_named(default?.as_str(), "the gateway URL (RUSTYKRAB_GATEWAY_URL)"),
     }
 }
 
 /// Entry point from `update_cmd::run`.
 pub async fn run(cfg: &Config, data_dir: &Path, args: ApplyArgs) -> anyhow::Result<()> {
     let yes = args.yes || std::env::var("RUSTYKRAB_UPDATE_AUTO").is_ok_and(|v| v.trim() == "1");
-    let base = match &args.url {
-        Some(raw) => check_url(raw)?,
-        None => crate::daemon_client::gateway_url()?,
-    };
+    let base = base_url(args.url.as_deref(), crate::daemon_client::gateway_url())?;
     let token = crate::daemon_client::resolve_auth_token(data_dir).await?;
     let probe = HttpProbe::new(&base, &token)?;
     let (service, installed): (Box<dyn ServiceManager>, PathBuf) = match args.service {

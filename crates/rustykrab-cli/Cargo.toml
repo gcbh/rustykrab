@@ -35,6 +35,8 @@ dirs = "6"
 toml.workspace = true
 reqwest.workspace = true
 rpassword = "7"
+# `update apply` reads a listener's executable with `proc_pidpath` on macOS.
+libc.workspace = true
 
 # Computer-use backend (optional): screen capture + input synthesis.
 # Off by default — pulls in X11/Wayland system dependencies. Enable with
