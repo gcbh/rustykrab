@@ -47,9 +47,10 @@ use serde_json::json;
 use tokio_stream::wrappers::ReceiverStream;
 
 use rustykrab_control::graph::FilingSource;
-use rustykrab_control::handle::{ControlHandle, GraphView, TickReport};
+use rustykrab_control::handle::{ControlHandle, GraphView, LockState, TickReport};
 use rustykrab_control::import::{self, StackManifest};
 use rustykrab_control::ladder::{self, RUNGS};
+use rustykrab_control::lock::LOCK_FILE;
 use rustykrab_control::Provenance;
 use rustykrab_core::work::{
     BlockedReason, Budget, CancelReason, Edge, Evidence, Lease, PlanOutcome, Rung, RungEvent,
@@ -1040,9 +1041,22 @@ async fn event_stream(
 }
 
 /// `POST /api/work/tick`: one pass of the controller loop, for tests and
-/// the CLI.
+/// the CLI. Only the holder of `controller.lock` ticks, so while the loop
+/// reports the lock `waiting` (another process holds it) this refuses with
+/// 409 `controller_lock_waiting`. A held lock, or a controller no loop
+/// drives (`lock` `None`), ticks.
 async fn tick(State(state): State<AppState>) -> Result<Json<TickReport>, WorkApiError> {
-    Ok(Json(control(&state)?.tick().await?))
+    let control = control(&state)?;
+    if control.loop_status().and_then(|s| s.lock) == Some(LockState::Waiting) {
+        return Err(WorkApiError::new(
+            StatusCode::CONFLICT,
+            "controller_lock_waiting",
+            format!(
+                "another process holds {LOCK_FILE}; this daemon's controller is waiting on it and does not tick"
+            ),
+        ));
+    }
+    Ok(Json(control.tick().await?))
 }
 
 #[cfg(test)]

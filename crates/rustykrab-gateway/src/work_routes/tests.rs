@@ -13,7 +13,9 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use rustykrab_control::graph::FilingSource;
-use rustykrab_control::handle::{ControlHandle, GraphNode, GraphView, TickReport};
+use rustykrab_control::handle::{
+    ControlHandle, GraphNode, GraphView, LockState, LoopStatus, TickReport,
+};
 use rustykrab_control::Provenance;
 use rustykrab_core::model::{ModelProvider, ModelResponse};
 use rustykrab_core::types::{Message, ToolSchema};
@@ -77,6 +79,8 @@ enum Call {
 struct StubControl {
     store: Store,
     calls: Mutex<Vec<Call>>,
+    /// What `loop_status` answers; `None` for a controller no loop drives.
+    status: Mutex<Option<LoopStatus>>,
 }
 
 impl StubControl {
@@ -86,6 +90,13 @@ impl StubControl {
 
     fn calls(&self) -> Vec<Call> {
         self.calls.lock().unwrap().clone()
+    }
+
+    fn set_lock(&self, lock: Option<LockState>) {
+        *self.status.lock().unwrap() = Some(LoopStatus {
+            lock,
+            ..LoopStatus::default()
+        });
     }
 }
 
@@ -186,6 +197,10 @@ impl ControlHandle for StubControl {
             transitions: 1,
             ..TickReport::default()
         })
+    }
+
+    fn loop_status(&self) -> Option<LoopStatus> {
+        self.status.lock().unwrap().clone()
     }
 
     /// The live subtree, depth first, each parent rolled up to its own
@@ -470,6 +485,7 @@ async fn harness_with(with_control: bool) -> Harness {
     let control = Arc::new(StubControl {
         store: store.clone(),
         calls: Mutex::default(),
+        status: Mutex::default(),
     });
     let mut state = AppState::new(
         store.clone(),
@@ -595,6 +611,41 @@ async fn every_route_answers() {
     let (_, tick) = h.post("/api/work/tick", None).await;
     let report: TickReport = serde_json::from_value(tick).unwrap();
     assert_eq!(report.made_ready, vec!["r".to_string()]);
+}
+
+#[tokio::test]
+async fn tick_refuses_while_the_controller_lock_is_waiting() {
+    let h = harness().await;
+    h.control.set_lock(Some(LockState::Waiting));
+    let (status, body) = h.post("/api/work/tick", None).await;
+    assert_eq!(status, Http::CONFLICT, "{body}");
+    assert_eq!(body["error"], "controller_lock_waiting");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap()
+            .contains("controller.lock"),
+        "{body}"
+    );
+    assert!(h.control.calls().is_empty(), "no tick ran");
+}
+
+#[tokio::test]
+async fn tick_runs_when_the_lock_is_held_or_no_loop_drives_the_controller() {
+    let h = harness().await;
+    // No loop status at all: a controller no loop drives.
+    let (status, body) = h.post("/api/work/tick", None).await;
+    assert_eq!(status, Http::OK, "{body}");
+    // A loop that has not tried the lock yet.
+    h.control.set_lock(None);
+    let (status, body) = h.post("/api/work/tick", None).await;
+    assert_eq!(status, Http::OK, "{body}");
+    h.control.set_lock(Some(LockState::Held));
+    let (status, body) = h.post("/api/work/tick", None).await;
+    assert_eq!(status, Http::OK, "{body}");
+    let report: TickReport = serde_json::from_value(body).unwrap();
+    assert_eq!(report.made_ready, vec!["r".to_string()]);
+    assert_eq!(h.control.calls(), vec![Call::Tick, Call::Tick, Call::Tick]);
 }
 
 #[tokio::test]
