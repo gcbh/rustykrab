@@ -7,6 +7,7 @@ use axum::extract::State;
 use axum::routing::get;
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
+use rustykrab_control::handle::LockState;
 use serde::Serialize;
 
 use crate::AppState;
@@ -27,7 +28,9 @@ struct VersionReply {
 /// controller is wired, or when the wired handle runs no loop. A failing
 /// loop shows `consecutive_failed_ticks` climbing with a fresh
 /// `last_failed_tick`; a stuck one shows neither `last_tick` nor
-/// `last_failed_tick` moving.
+/// `last_failed_tick` moving. `lock` is `"held"` when this process holds
+/// the data directory's `controller.lock` and ticks, `"waiting"` while
+/// another process holds it, and `None` before the loop first tries it.
 #[derive(Debug, Serialize)]
 struct ControllerReply {
     wired: bool,
@@ -36,6 +39,7 @@ struct ControllerReply {
     last_failed_tick: Option<DateTime<Utc>>,
     last_failure_class: Option<String>,
     consecutive_failed_ticks: Option<u32>,
+    lock: Option<LockState>,
 }
 
 async fn version(State(state): State<AppState>) -> Json<VersionReply> {
@@ -48,6 +52,7 @@ async fn version(State(state): State<AppState>) -> Json<VersionReply> {
             wired: state.control.is_some(),
             last_tick: status.as_ref().and_then(|s| s.last_tick),
             runs_in_flight: status.as_ref().map(|s| s.runs_in_flight),
+            lock: status.as_ref().and_then(|s| s.lock),
             last_failed_tick: status.as_ref().and_then(|s| s.last_failed_tick),
             consecutive_failed_ticks: status.as_ref().map(|s| s.consecutive_failed_ticks),
             last_failure_class: status.and_then(|s| s.last_failure_class),
@@ -236,6 +241,7 @@ mod tests {
             last_failed_tick: Some(failed_at),
             last_failure_class: Some("storage".into()),
             consecutive_failed_ticks: 3,
+            ..LoopStatus::default()
         })))))
         .await;
         let (status, body) = get_version(&base).await;
@@ -267,6 +273,7 @@ mod tests {
         assert_eq!(body["controller"]["last_failed_tick"], Value::Null);
         assert_eq!(body["controller"]["last_failure_class"], Value::Null);
         assert_eq!(body["controller"]["consecutive_failed_ticks"], Value::Null);
+        assert_eq!(body["controller"]["lock"], Value::Null);
     }
 
     #[tokio::test]
@@ -277,6 +284,48 @@ mod tests {
         assert_eq!(body["controller"]["wired"], true);
         assert_eq!(body["controller"]["last_tick"], Value::Null);
         assert_eq!(body["controller"]["runs_in_flight"], 0);
+        assert_eq!(body["controller"]["lock"], Value::Null);
+    }
+
+    /// A real controller whose loop lock another holder has taken reports
+    /// `waiting`, and `held` once the other lets go.
+    #[tokio::test]
+    async fn version_reports_the_controller_lock_waiting_then_held() {
+        use rustykrab_control::controller::{Controller, ControllerConfig};
+        use rustykrab_control::handle::LockState;
+        use rustykrab_control::lock::{ControllerLock, LoopLock};
+
+        let data_dir = std::env::temp_dir().join(format!("rk-version-lock-{}", Uuid::new_v4()));
+        let store = Store::open(&data_dir, vec![9u8; 32]).expect("store opens");
+        let controller = Arc::new(Controller::new(
+            store.clone(),
+            Vec::new(),
+            ControllerConfig::default(),
+        ));
+        let base = serve(
+            AppState::new(store, vec![], Arc::new(UnusedProvider), TOKEN.into())
+                .with_control(controller.clone()),
+        )
+        .await;
+
+        let (_, body) = get_version(&base).await;
+        assert_eq!(body["controller"]["lock"], Value::Null, "{body}");
+
+        let mut ours = LoopLock::in_data_dir(&data_dir);
+        let other = ControllerLock::try_acquire(ours.path())
+            .unwrap()
+            .expect("the other daemon takes the lock first");
+        let (state, error) = controller.claim_loop_lock(&mut ours);
+        assert!(error.is_none(), "{error:?}");
+        assert_eq!(state, LockState::Waiting);
+        let (_, body) = get_version(&base).await;
+        assert_eq!(body["controller"]["lock"], "waiting", "{body}");
+
+        drop(other);
+        let (state, _) = controller.claim_loop_lock(&mut ours);
+        assert_eq!(state, LockState::Held);
+        let (_, body) = get_version(&base).await;
+        assert_eq!(body["controller"]["lock"], "held", "{body}");
     }
 
     #[tokio::test]

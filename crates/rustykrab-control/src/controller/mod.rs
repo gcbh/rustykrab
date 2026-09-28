@@ -85,7 +85,8 @@ use tokio::task::JoinHandle;
 
 use crate::errors::{LearnedRule, Recurrence, DEFAULT_PROMOTE_THRESHOLD};
 use crate::graph::{ApprovalPolicy, FilingSource, SplitMode};
-use crate::handle::{ControlHandle, GraphView, LoopStatus, TickReport};
+use crate::handle::{ControlHandle, GraphView, LockState, LoopStatus, TickReport};
+use crate::lock::LoopLock;
 use crate::registry::WorkerRegistry;
 use crate::routing::Judged;
 use crate::worker::Worker;
@@ -393,6 +394,8 @@ struct State {
     /// Test seam: the next tick returns this error before doing anything.
     #[cfg(test)]
     fail_next_tick: Option<Error>,
+    /// The loop's hold on `controller.lock`, as it last found it.
+    lock: Option<LockState>,
 }
 
 /// The loop of plan section 6 over one store and the workers of a
@@ -445,6 +448,7 @@ impl Controller {
                 consecutive_failures: 0,
                 #[cfg(test)]
                 fail_next_tick: None,
+                lock: None,
             }),
         }
     }
@@ -534,6 +538,18 @@ impl Controller {
             }
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
+    }
+
+    /// Try `lock` for the loop and record what it found, for
+    /// [`ControlHandle::loop_status`]. The loop ticks only on `Held`; an
+    /// error trying the lock counts as `Waiting` and is returned beside it.
+    pub fn claim_loop_lock(&self, lock: &mut LoopLock) -> (LockState, Option<std::io::Error>) {
+        let (found, error) = match lock.poll() {
+            Ok(found) => (found, None),
+            Err(e) => (LockState::Waiting, Some(e)),
+        };
+        self.state().lock = Some(found);
+        (found, error)
     }
 
     fn state(&self) -> MutexGuard<'_, State> {
@@ -633,6 +649,7 @@ impl ControlHandle for Controller {
             last_failed_tick: state.last_failure.map(|(at, _)| at),
             last_failure_class: state.last_failure.map(|(_, class)| class.to_string()),
             consecutive_failed_ticks: state.consecutive_failures,
+            lock: state.lock,
         })
     }
 

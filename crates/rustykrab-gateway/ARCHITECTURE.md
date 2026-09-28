@@ -38,7 +38,7 @@ code — the one part of that job that genuinely is the web server's.
 | `credential_page.rs` | 353 | One-time-token credential capture page; shared page shell and tailnet identity |
 | `payment_page.rs` | 445 | One-time-token purchase approval page (`/p/{token}`) |
 | `origin.rs` | 249 | Origin header validation |
-| `version_route.rs` | 313 | `GET /api/version`: the running build's version, commit and build date (`AppState::build`) and the controller's state (wired, last tick, runs in flight, and the last failed tick's time and error class with the count of consecutive failed ticks, from `ControlHandle::loop_status`); route tests over the real router beside it. `GET /api/health` stays the bare `ok` install and cutover scripts read |
+| `version_route.rs` | 313 | `GET /api/version`: the running build's version, commit and build date (`AppState::build`) and the controller's state (wired, last tick, runs in flight, the last failed tick's time and error class with the count of consecutive failed ticks, and `lock`: `held` when this process holds the data directory's `controller.lock` and ticks, `waiting` while another process holds it, `null` before the loop first tries it; all from `ControlHandle::loop_status`); route tests over the real router beside it. `GET /api/health` stays the bare `ok` install and cutover scripts read |
 | `state.rs` | 303 | `AppState`: 15 fields, including the runtime `AgentContext`, the optional `ControlHandle`, `WorkerRegistry`, `EvaluationHandle` and `NodeWorkers`, and the `BuildInfo` the composition root stamps |
 | `run.rs` | 98 | Thin HTTP adapters around `rustykrab-runtime` |
 | `webchat.rs`, `logging.rs`, `auth.rs`, webhooks, `lib.rs` | 502 | HTTP support and router assembly |
