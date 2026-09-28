@@ -9,7 +9,7 @@
 //! `<data dir>/updates/<version>/` only after every check has passed, in
 //! this order: the digest before anything is extracted, the signature
 //! before anything is run, and the staged binary's own `--version` last.
-//! Swapping it in is slice 6.
+//! Swapping it in is slice 6, `rustykrab update apply`, in [`apply`].
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -29,10 +29,22 @@ usage: rustykrab update <command>
                                  --from stages a local RustyKrab.app or binary
                                  instead, --force stages a version recorded
                                  as bad
+  apply [--yes] [--service launchd|script:<start-command>]
+        [--url URL] [--installed PATH]
+                                 swap the newest staged version in: stop the
+                                 daemon, move the installed one to .prev, move
+                                 the stage into place, start it and verify it
+                                 through /api/version within 90 s; on any
+                                 failure restore .prev and record the new one
+                                 as bad. Without --yes (or
+                                 RUSTYKRAB_UPDATE_AUTO=1) it prints the plan
+                                 and changes nothing
 
 Reads RUSTYKRAB_UPDATE_REPO (default gcbh/rustykrab), RUSTYKRAB_GITHUB_TOKEN
 (optional, for rate limits), RUSTYKRAB_UPDATE_API_BASE (default
-https://api.github.com) and RUSTYKRAB_UPDATE_TEAM_ID (default 3RRX845C4X).";
+https://api.github.com) and RUSTYKRAB_UPDATE_TEAM_ID (default 3RRX845C4X).
+apply also reads RUSTYKRAB_UPDATE_AUTO, RUSTYKRAB_AUTH_TOKEN and
+RUSTYKRAB_GATEWAY_URL (the default for --url).";
 
 pub const DEFAULT_REPO: &str = "gcbh/rustykrab";
 pub const DEFAULT_API_BASE: &str = "https://api.github.com";
@@ -335,9 +347,26 @@ pub struct Staged {
 }
 
 /// One entry of `<data>/updates/bad.json`, written by a rollback.
-#[derive(Debug, Clone, Deserialize)]
+///
+/// A release is recorded by its version alone. A local build has no tag and
+/// every local build reports the package version, so it is recorded by its
+/// commit too: an entry with a commit matches only that commit, and one bad
+/// local build does not block every later one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BadVersion {
     pub version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
+}
+
+impl BadVersion {
+    /// Whether this entry names `version` built from `commit`.
+    pub fn matches(&self, version: &str, commit: Option<&str>) -> bool {
+        match &self.commit {
+            Some(bad) => commit == Some(bad.as_str()),
+            None => self.version == version,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -399,22 +428,48 @@ pub async fn check(cfg: &Config) -> anyhow::Result<Latest> {
     latest_of(&release, cfg)
 }
 
-/// Whether `version` is recorded in `<data>/updates/bad.json`.
-pub fn is_bad(cfg: &Config, version: &str) -> anyhow::Result<bool> {
+/// Every entry of `<data>/updates/bad.json`; none when it does not exist.
+pub fn read_bad(cfg: &Config) -> anyhow::Result<Vec<BadVersion>> {
     let path = cfg.updates_dir().join(BAD_FILE);
     let text = match std::fs::read_to_string(&path) {
         Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
     };
-    let bad: Vec<BadVersion> =
-        serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
-    Ok(bad.iter().any(|b| b.version == version))
+    serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))
 }
 
-fn refuse_bad(cfg: &Config, version: &str, force: bool) -> anyhow::Result<()> {
-    if !force && is_bad(cfg, version)? {
-        bail!("{version} is recorded as bad by a rollback; pass --force to stage it anyway");
+/// Whether `version` built from `commit` is recorded in
+/// `<data>/updates/bad.json` (see [`BadVersion::matches`]).
+pub fn is_bad(cfg: &Config, version: &str, commit: Option<&str>) -> anyhow::Result<bool> {
+    Ok(read_bad(cfg)?.iter().any(|b| b.matches(version, commit)))
+}
+
+/// Add `entry` to `<data>/updates/bad.json`, unless it is already there.
+pub fn record_bad(cfg: &Config, entry: BadVersion) -> anyhow::Result<()> {
+    let mut bad = read_bad(cfg)?;
+    if bad.contains(&entry) {
+        return Ok(());
+    }
+    bad.push(entry);
+    let dir = cfg.updates_dir();
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    let path = dir.join(BAD_FILE);
+    let tmp = dir.join(format!(".{BAD_FILE}.tmp"));
+    std::fs::write(&tmp, serde_json::to_string_pretty(&bad)? + "\n")
+        .with_context(|| format!("writing {}", tmp.display()))?;
+    std::fs::rename(&tmp, &path).with_context(|| format!("writing {}", path.display()))
+}
+
+fn refuse_bad(
+    cfg: &Config,
+    version: &str,
+    commit: Option<&str>,
+    force: bool,
+) -> anyhow::Result<()> {
+    if !force && is_bad(cfg, version, commit)? {
+        let which = commit.map(|c| format!(" ({c})")).unwrap_or_default();
+        bail!("{version}{which} is recorded as bad by a rollback; pass --force to stage it anyway");
     }
     Ok(())
 }
@@ -548,7 +603,9 @@ pub async fn stage_release(
     if !latest.newer {
         return Ok(StageOutcome::NotNewer(latest));
     }
-    refuse_bad(cfg, &latest.version, force)?;
+    // A release is recorded by version; its commit is not known until its
+    // binary runs, after the download.
+    refuse_bad(cfg, &latest.version, None, force)?;
 
     let name = cfg.asset_name();
     let asset = release
@@ -694,7 +751,7 @@ pub fn stage_from(
     }
     let (app, binary) = payload(&scratch.path)?;
     let (version, commit) = verify_payload(cfg, verifier, app.as_deref(), &binary)?;
-    refuse_bad(cfg, &version, force)?;
+    refuse_bad(cfg, &version, commit.as_deref(), force)?;
     let staged = Staged {
         version,
         tag: None,
@@ -714,6 +771,7 @@ enum Cmd {
     Help,
     Check,
     Stage { from: Option<PathBuf>, force: bool },
+    Apply(apply::ApplyArgs),
 }
 
 fn parse(args: &[String]) -> Result<Cmd, String> {
@@ -737,6 +795,7 @@ fn parse(args: &[String]) -> Result<Cmd, String> {
             }
             Ok(Cmd::Stage { from, force })
         }
+        Some("apply") => apply::parse_args(&args[1..]).map(Cmd::Apply),
         Some(other) => Err(format!("unknown update command '{other}'")),
     }
 }
@@ -784,6 +843,7 @@ pub async fn run(data_dir: &Path, args: &[String]) -> anyhow::Result<()> {
                 ),
             }
         }
+        Cmd::Apply(args) => apply::run(&cfg, data_dir, args).await?,
     }
     Ok(())
 }
@@ -796,6 +856,8 @@ fn print_staged(staged: &Staged) {
         staged.path.display()
     );
 }
+
+pub mod apply;
 
 #[cfg(test)]
 mod tests;
