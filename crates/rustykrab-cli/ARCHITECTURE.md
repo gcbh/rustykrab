@@ -37,7 +37,7 @@ daemon; `update apply` reads only `GET /api/version`, the same way.
 | `worker_cmd.rs` | 365 | `rustykrab workers` and `rustykrab worker show / add / remove` over `/api/workers`, `worker add peer --url --pairing-code` among them |
 | `update_cmd.rs` | 863 | `rustykrab update check` and `rustykrab update stage [--from PATH] [--force]`: the latest GitHub release, its digest, the `Verifier` seam (`codesign` and one `--version` run), `staged.json`, and `bad.json` (`BadVersion`, matched by commit when an entry has one) |
 | `update_cmd/tests.rs` | 545 | `update` against a local axum stand-in for the releases API, with scripted and (on macOS) real `codesign` checks |
-| `update_cmd/apply.rs` | 727 | `rustykrab update apply`: the supervisor. The `ServiceManager` (`Launchd`, `Script`), `SwapRoot` (`DirSwap`) and `VersionProbe` (`HttpProbe`) seams, the swap, the 90 s verification and the rollback |
+| `update_cmd/apply.rs` | 727 | `rustykrab update apply`: the supervisor. The `ServiceManager` (`Launchd`, `Script`), `SwapRoot` (`DirSwap`), `VersionProbe` (`HttpProbe`) and `Processes` (`SystemProcesses`) seams, the canonical-record and copy checks (`check_canonical`, `NextCheck`), the swap, the 90 s verification and the rollback |
 | `update_cmd/apply/tests.rs` | 429 | `apply` with a scripted service manager and a local axum stand-in for `/api/version` that reports whichever version is installed |
 | `computer_backend.rs` | 375 | `ComputerBackend` impl (enigo + xcap), feature-gated |
 | `prompt_log.rs` | 69 | `TraceSink` impl writing prompt traces to disk |
@@ -148,39 +148,59 @@ version and commit.
 
 `apply [--yes] [--service launchd|script:<start-command>] [--url URL]
 [--installed PATH]` swaps the newest `staged.json` (latest `staged_at`)
-in:
+in. `staged.json` is in the data dir, which a worker can write, so it
+re-derives everything it relies on:
 
-1. It refuses a stage with no commit, one recorded as bad, and, with the
-   launchd service, one whose `kind` is not `app` or whose
-   `signature_verified` is false. It reads the running version from
-   `GET /api/version` at `--url` (default `RUSTYKRAB_GATEWAY_URL`) with the
-   bearer token (`RUSTYKRAB_AUTH_TOKEN` first, as `daemon_client` resolves
-   it) and the daemon's own `Origin`. If the staged commit is the running
-   one there is nothing to do.
+1. `newest_staged` skips a record that does not parse and refuses the
+   newest unless it is canonical (`check_canonical`): its directory is its
+   plain `X.Y.Z` version, its path is `updates/<version>/RustyKrab.app`
+   (kind `app`) or `updates/<version>/rustykrab-cli` (kind `binary`), and
+   no symlink is on the way. It refuses a stage with no commit, one
+   recorded as bad, and, with the launchd service, one whose `kind` is not
+   `app` or whose `signature_verified` is false. It reads the running
+   version from `GET /api/version` at `--url` (default
+   `RUSTYKRAB_GATEWAY_URL`; `--url` must be https or http to `127.0.0.1`,
+   `::1` or `localhost`, `check_url`) with the bearer token
+   (`RUSTYKRAB_AUTH_TOKEN` first, as `daemon_client` resolves it) and the
+   daemon's own `Origin`. If the staged commit is the running one there is
+   nothing to do. A release (a stage with a tag) must be newer than the
+   running version, and the running daemon must report `controller.lock`
+   `held` and `consecutive_failed_ticks` 0, or nothing changes.
 2. Without `--yes` or `RUSTYKRAB_UPDATE_AUTO=1` it prints the plan and
    changes nothing.
 3. It stops the daemon through the `ServiceManager` and waits for it to
    exit. `Launchd`: `launchctl bootout gui/<uid>/com.gcbh.rustykrab`, then
    polls `launchctl print` until the job is gone. `Script`: SIGTERM to the
-   pids `lsof` finds listening on the URL's port, then waits for each.
-4. `DirSwap` copies the stage beside the installed bundle or binary
-   (`.<name>.next`), renames the installed one to `<name>.prev` (removing
-   an older one) and the copy into place: both renames are in one
-   directory. The default installed path under launchd is
-   `~/Applications/RustyKrab.app`; `script:` needs `--installed`.
+   one process `lsof` finds listening on the URL's port, only when it
+   listens on loopback alone and runs the installed executable (`ps -o
+   comm=`, or `/proc/<pid>/exe` on Linux; `the_daemon`), then waits for
+   it. No listener, several, or any other process is refused. The
+   process table is the `Processes` seam (`SystemProcesses`).
+4. `DirSwap` copies the stage (`cp -Rp --`) beside the installed bundle or
+   binary (`.<name>.next`) and passes the copy through `NextCheck` before
+   any rename: a real directory (app) or regular file (binary), not a
+   symlink; under launchd the Developer ID signature of the configured
+   team; its binary's `--version` reporting the staged version and commit.
+   The `Verifier` comes in through `Host`. Then it renames the installed
+   one to `<name>.prev` (removing an older one) and the copy into place:
+   both renames are in one directory. The default installed path under
+   launchd is `~/Applications/RustyKrab.app`; `script:` needs
+   `--installed`.
 5. It starts the service (`launchctl bootstrap gui/<uid>
    ~/Library/LaunchAgents/com.gcbh.rustykrab.plist`, or the start command
    run detached in its own process group) and verifies within 90 s that
    `/api/version` reports the staged commit, `controller.lock` `held`, a
-   `last_tick` that advances twice and `consecutive_failed_ticks` 0.
+   `last_tick` that advances twice while no ticks are failing, and
+   `consecutive_failed_ticks` 0.
 6. On any failure it records the stage in `bad.json` first (a release by
    version, a local build by commit, `bad_entry`), stops the new version,
    restores `.prev`, starts it and verifies it the same way against the
    commit it read in step 1. A rollback exits non-zero.
 
-The three seams are traits so the tests script the service manager and
-serve `/api/version` from a local axum router whose answers follow the
-installed file; no test runs `launchctl` or signals a process.
+The seams are traits so the tests script the service manager, the
+verifier and the process table, and serve `/api/version` from a local
+axum router whose answers follow the installed file; no test runs
+`launchctl` or signals a process.
 
 ## The worker fleet
 
