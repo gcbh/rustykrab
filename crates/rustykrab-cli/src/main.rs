@@ -1935,6 +1935,16 @@ async fn main() -> anyhow::Result<()> {
 
     server.await?;
 
+    // End every live external worker run (its whole process group) while
+    // the runtime can still reap them, before the tasks driving them are
+    // aborted. Their worktrees stay for retention.
+    let ended = rustykrab_agent::RunGroups::global()
+        .terminate_all(std::time::Duration::from_secs(5))
+        .await;
+    if ended > 0 {
+        tracing::info!(runs = ended, "external worker runs terminated");
+    }
+
     // Abort infrastructure tasks and log any panics.
     for handle in &infra_handles {
         handle.abort();
@@ -3128,11 +3138,57 @@ async fn checkpoint_channel_input(
     }
 }
 
-async fn shutdown_signal() {
-    tokio::signal::ctrl_c()
-        .await
-        .expect("failed to listen for ctrl+c");
-    tracing::info!("shutdown signal received");
+/// Resolves on Ctrl-C or, on unix, SIGTERM (what `launchctl stop` and
+/// `kill` send), so both run the same graceful shutdown. The SIGTERM
+/// handler is installed when this is called, not when it is first polled.
+fn shutdown_signal() -> impl std::future::Future<Output = ()> {
+    #[cfg(unix)]
+    let terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .map_err(|e| {
+            tracing::warn!(error = %e, "cannot listen for SIGTERM; only Ctrl-C shuts down");
+        });
+    async move {
+        let ctrl_c = async {
+            tokio::signal::ctrl_c()
+                .await
+                .expect("failed to listen for ctrl+c");
+        };
+        #[cfg(unix)]
+        let terminate = async move {
+            match terminate {
+                Ok(mut signal) => {
+                    signal.recv().await;
+                }
+                Err(()) => std::future::pending::<()>().await,
+            }
+        };
+        #[cfg(not(unix))]
+        let terminate = std::future::pending::<()>();
+        let which = tokio::select! {
+            _ = ctrl_c => "ctrl-c",
+            _ = terminate => "SIGTERM",
+        };
+        tracing::info!(signal = which, "shutdown signal received");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod shutdown_signal_tests {
+    use super::shutdown_signal;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn sigterm_resolves_the_shutdown_signal() {
+        let signal = shutdown_signal();
+        let sent = std::process::Command::new("kill")
+            .args(["-TERM", &std::process::id().to_string()])
+            .status()
+            .unwrap();
+        assert!(sent.success());
+        tokio::time::timeout(Duration::from_secs(10), signal)
+            .await
+            .expect("SIGTERM starts graceful shutdown");
+    }
 }
 
 #[cfg(test)]

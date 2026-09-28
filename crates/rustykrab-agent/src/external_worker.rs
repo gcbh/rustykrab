@@ -44,14 +44,20 @@
 //! names the spec lists pass through, plus `RUSTYKRAB_DATA_DIR` and
 //! `RUSTYKRAB_SKILLS_DIR`. The daemon's own secrets never do.
 //!
-//! **Cancel** drops the run's future, which kills the process
-//! (`kill_on_drop`); its worktree is kept and pruned by retention.
+//! **Its process group.** On unix the agent starts in a process group of
+//! its own, and every live run's group is recorded in a [`RunGroups`].
+//! **Cancel** drops the run's future, which kills the whole group, not just
+//! the agent (`kill_on_drop` alone would miss what the agent started); its
+//! worktree is kept and pruned by retention. Daemon shutdown calls
+//! [`RunGroups::terminate_all`], which sends every live group SIGTERM and
+//! then SIGKILL after a short grace, so no agent outlives the daemon and
+//! keeps working while the next daemon re-runs its item.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -120,6 +126,127 @@ pub enum Retention {
 impl Default for Retention {
     fn default() -> Self {
         Retention::KeepFailed(Duration::from_secs(7 * 24 * 3600))
+    }
+}
+
+const SIGKILL: i32 = 9;
+const SIGTERM: i32 = 15;
+
+/// Send `signal` to every process in group `group`; 0 only probes. Whether
+/// the call succeeded, which for a probe means the group still exists.
+#[cfg(unix)]
+fn signal_group(group: i32, signal: i32) -> bool {
+    extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+    // A group id of 1 or less would name init or every process, never an
+    // agent's own group.
+    if group <= 1 {
+        return false;
+    }
+    // SAFETY: kill(2) takes plain integers and touches no memory of ours; a
+    // negative pid addresses the process group.
+    unsafe { kill(-group, signal) == 0 }
+}
+
+#[cfg(not(unix))]
+fn signal_group(_group: i32, _signal: i32) -> bool {
+    false
+}
+
+/// The process groups of the external runs alive right now, so daemon
+/// shutdown can end them. Every [`ExternalWorker`] records into
+/// [`RunGroups::global`] unless given its own
+/// ([`ExternalWorker::with_groups`]).
+#[derive(Debug, Default)]
+pub struct RunGroups {
+    live: Mutex<HashSet<i32>>,
+}
+
+/// One run's membership in a [`RunGroups`]: dropping it forgets the group
+/// and kills whatever is left in it.
+struct GroupGuard {
+    groups: Arc<RunGroups>,
+    group: i32,
+}
+
+impl Drop for GroupGuard {
+    fn drop(&mut self) {
+        self.groups
+            .live
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.group);
+        signal_group(self.group, SIGKILL);
+    }
+}
+
+impl RunGroups {
+    /// The daemon's one set, which every worker records into by default.
+    pub fn global() -> Arc<RunGroups> {
+        static GLOBAL: OnceLock<Arc<RunGroups>> = OnceLock::new();
+        GLOBAL.get_or_init(Arc::default).clone()
+    }
+
+    /// The group ids of the live runs.
+    pub fn live(&self) -> Vec<i32> {
+        let mut live: Vec<i32> = self
+            .live
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .copied()
+            .collect();
+        live.sort_unstable();
+        live
+    }
+
+    fn enter(self: &Arc<Self>, group: i32) -> GroupGuard {
+        self.live
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(group);
+        GroupGuard {
+            groups: self.clone(),
+            group,
+        }
+    }
+
+    /// End every live run: SIGTERM to each group, then SIGKILL to any
+    /// still there after `grace`. Returns how many groups were signalled.
+    /// The runs see a failed process and keep their worktrees for
+    /// retention.
+    pub async fn terminate_all(&self, grace: Duration) -> usize {
+        let groups = self.live();
+        if groups.is_empty() {
+            return 0;
+        }
+        tracing::info!(groups = ?groups, "terminating external worker runs");
+        for &group in &groups {
+            signal_group(group, SIGTERM);
+        }
+        let deadline = tokio::time::Instant::now() + grace;
+        loop {
+            // Gone once its run has let it go, or nothing answers in it.
+            let live = self.live();
+            let left: Vec<i32> = groups
+                .iter()
+                .copied()
+                .filter(|g| live.contains(g) && signal_group(*g, 0))
+                .collect();
+            if left.is_empty() {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                tracing::warn!(groups = ?left, "external runs outlived SIGTERM; killing");
+                for group in left {
+                    signal_group(group, SIGKILL);
+                }
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        groups.len()
     }
 }
 
@@ -198,6 +325,8 @@ pub struct ExternalWorker {
     /// The commands the last run of each item was seen to run, handed from
     /// reading the output to attesting the report.
     commands: Mutex<HashMap<String, Vec<String>>>,
+    /// Where its live runs' process groups are recorded.
+    groups: Arc<RunGroups>,
 }
 
 /// What one invocation printed, read.
@@ -219,7 +348,15 @@ impl ExternalWorker {
             config,
             usage: Mutex::new(HashMap::new()),
             commands: Mutex::new(HashMap::new()),
+            groups: RunGroups::global(),
         }
+    }
+
+    /// Record live runs' process groups in `groups` instead of the global
+    /// set.
+    pub fn with_groups(mut self, groups: Arc<RunGroups>) -> ExternalWorker {
+        self.groups = groups;
+        self
     }
 
     pub fn config(&self) -> &ExternalConfig {
@@ -370,6 +507,9 @@ impl ExternalWorker {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        // Its own group, so the whole tree it starts can be ended at once.
+        #[cfg(unix)]
+        cmd.process_group(0);
         let own: &[&str] = match c.kind {
             WorkerKind::Codex => &CODEX_ENV,
             _ => &CLAUDE_ENV,
@@ -531,8 +671,14 @@ impl Worker for ExternalWorker {
                 &format!("cannot start {}: {e}", self.config.command.display()),
             )
         })?;
+        // The agent leads its own group, so the group id is its pid.
+        let group = child
+            .id()
+            .and_then(|pid| i32::try_from(pid).ok())
+            .map(|pid| self.groups.enter(pid));
         let outcome = match tokio::time::timeout(limit, child.wait_with_output()).await {
-            // The child was dropped with the future, and killed.
+            // The child was dropped with the future, and killed; the rest
+            // of its group goes when `group` does.
             Err(_) => Err(RunFailure::Budget {
                 budget: BudgetKind::Wall,
                 detail: format!(
@@ -545,6 +691,8 @@ impl Worker for ExternalWorker {
             Ok(Err(e)) => Err(process_failure(None, &e.to_string())),
             Ok(Ok(output)) => self.read_output(&brief, &run_id, &output, &last),
         };
+        // Whatever the agent left running in its group goes with it.
+        drop(group);
         self.usage
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -1245,6 +1393,95 @@ echo "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"num_turn
             !f.data.path().join("leaked.txt").exists(),
             "environment leaked"
         );
+    }
+
+    /// An agent that starts a child of its own and then waits: it never
+    /// returns unless something ends it.
+    const SLEEPER: &str = r#"#!/bin/sh
+sleep 60 &
+echo $! > "$RUSTYKRAB_DATA_DIR/child.pid.tmp"
+mv "$RUSTYKRAB_DATA_DIR/child.pid.tmp" "$RUSTYKRAB_DATA_DIR/child.pid"
+echo $$ > "$RUSTYKRAB_DATA_DIR/agent.pid.tmp"
+mv "$RUSTYKRAB_DATA_DIR/agent.pid.tmp" "$RUSTYKRAB_DATA_DIR/agent.pid"
+wait
+"#;
+
+    /// The process group `pid` is in, as `ps` reports it.
+    #[cfg(unix)]
+    fn group_of(pid: i32) -> Option<i32> {
+        let out = Command::new("ps")
+            .args(["-o", "pgid=", "-p", &pid.to_string()])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shutdown_ends_the_agent_and_everything_in_its_process_group() {
+        let f = Fixture::new();
+        let groups = Arc::new(RunGroups::default());
+        let mut worker = f
+            .worker(WorkerKind::ClaudeCode, f.agent("claude", SLEEPER))
+            .with_groups(groups.clone());
+        worker.config.retention = Retention::KeepFailed(Duration::from_secs(3600));
+        let worker = Arc::new(worker);
+        let ws = f.workspace();
+        let run = tokio::spawn({
+            let worker = worker.clone();
+            let ws = ws.clone();
+            async move { worker.run(brief(Some(ws))).await }
+        });
+
+        let read_pid = |name: &str| {
+            std::fs::read_to_string(f.data.path().join(name))
+                .ok()
+                .and_then(|s| s.trim().parse::<i32>().ok())
+        };
+        let started = std::time::Instant::now();
+        let (agent, child) = loop {
+            if let (Some(a), Some(c)) = (read_pid("agent.pid"), read_pid("child.pid")) {
+                break (a, c);
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(15),
+                "agent never started"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+
+        // The agent leads a group of its own, its child is in it, and the
+        // daemon (this test) is not.
+        assert_eq!(groups.live(), [agent]);
+        assert_eq!(group_of(agent), Some(agent));
+        assert_eq!(group_of(child), Some(agent));
+        assert_ne!(group_of(std::process::id() as i32), Some(agent));
+
+        assert_eq!(groups.terminate_all(Duration::from_secs(2)).await, 1);
+        let outcome = tokio::time::timeout(Duration::from_secs(10), run)
+            .await
+            .expect("the run ends once its agent is terminated")
+            .unwrap();
+        assert!(outcome.is_err(), "a terminated run has no result");
+        assert!(groups.live().is_empty());
+
+        // Nothing is left in the group, the child included.
+        let started = std::time::Instant::now();
+        while signal_group(agent, 0) {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "process group {agent} outlived shutdown"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // The worktree is kept for retention.
+        assert!(ws.path.exists());
+    }
+
+    #[tokio::test]
+    async fn terminate_all_with_no_live_runs_signals_nothing() {
+        let groups = RunGroups::default();
+        assert_eq!(groups.terminate_all(Duration::from_millis(10)).await, 0);
     }
 
     #[tokio::test]
