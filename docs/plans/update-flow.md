@@ -203,12 +203,28 @@ Progress:
   it fails again nothing is restored under the running daemon. The
   LaunchAgent plist gets `ExitTimeOut` 45, above the 20 s drain grace.
   The gate stays until this is re-reviewed and part 3 lands.
-- **Part 3 follows** with the re-review's smaller points:
-  - read the listener's executable with `proc_pidpath` rather than
-    `ps -o comm=`, which prints the process's own `argv[0]`;
-  - accept only `127.0.0.1` and `[::1]`, and check the default gateway
-    URL too;
-  - choose a stage by version rather than by the record's `staged_at`.
+- **Part 3 is done**, with the re-review's smaller points:
+  - `SystemProcesses::executable` reads the listener's executable with
+    `libc::proc_pidpath` on macOS (and `/proc/<pid>/exe` on Linux), not
+    `ps -o comm=`, which prints the process's own `argv[0]`. `the_daemon`
+    refuses a relative executable path, and refuses when either path fails
+    to canonicalize instead of falling back to comparing raw strings. A
+    test starts a `sleep` whose `argv[0]` is the installed path and reads
+    back `sleep`.
+  - `check_url` accepts only https, or http to `127.0.0.1` or `[::1]` on
+    any port; `localhost` is refused, since a resolver can send it
+    elsewhere. The default gateway URL (`RUSTYKRAB_GATEWAY_URL`) goes
+    through the same check (`base_url`).
+  - `newest_staged` takes the highest version, then the latest
+    `staged_at`. A record that is not canonical is skipped with a warning
+    rather than refusing every apply, so a stray record with a future
+    `staged_at` cannot block a good stage; when every record is skipped,
+    the reasons are the error.
+  - The tests record the path `--version` ran on and check it is the
+    `.next` copy.
+
+  The `RUSTYKRAB_UPDATE_APPLY_UNREVIEWED` gate stays until part 2b and
+  part 3 are re-reviewed.
 
 - **Part 2 is merged** (batch 8), behind the same gate. The copy's checks
   now run before the stop, and a journal lets the next run recover.
@@ -290,7 +306,10 @@ reports `controller.lock` `held` and `consecutive_failed_ticks` 0.
 and a failing tick starts the count again. `--url` must be https or http
 to `127.0.0.1`, `::1` or `localhost`. Items 2 to 4 and the plist
 followed in part 2 (above); the `RUSTYKRAB_UPDATE_APPLY_UNREVIEWED` gate
-stays until part 2 is re-reviewed and part 3 lands.
+stays until part 2 is re-reviewed and part 3 lands. Part 3 (above)
+replaced `ps -o comm=` with `proc_pidpath` and dropped `localhost`: the
+URL, `--url` or the default, must now be https or http to `127.0.0.1` or
+`[::1]`.
 
 ## Not yet
 

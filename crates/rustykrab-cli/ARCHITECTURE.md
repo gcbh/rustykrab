@@ -147,20 +147,23 @@ is how a release is recorded. `stage` of a release checks by version
 version and commit.
 
 `apply [--yes] [--service launchd|script:<start-command>] [--url URL]
-[--installed PATH]` swaps the newest `staged.json` (latest `staged_at`)
-in. `staged.json` is in the data dir, which a worker can write, so it
-re-derives everything it relies on:
+[--installed PATH]` swaps the newest canonical `staged.json` (highest
+version, then latest `staged_at`) in. `staged.json` is in the data dir,
+which a worker can write, so it re-derives everything it relies on:
 
-1. `newest_staged` skips a record that does not parse and refuses the
-   newest unless it is canonical (`check_canonical`): its directory is its
-   plain `X.Y.Z` version, its path is `updates/<version>/RustyKrab.app`
-   (kind `app`) or `updates/<version>/rustykrab-cli` (kind `binary`), and
-   no symlink is on the way. It refuses a stage with no commit, one
-   recorded as bad, and, with the launchd service, one whose `kind` is not
-   `app` or whose `signature_verified` is false. It reads the running
-   version from `GET /api/version` at `--url` (default
-   `RUSTYKRAB_GATEWAY_URL`; `--url` must be https or http to `127.0.0.1`,
-   `::1` or `localhost`, `check_url`) with the bearer token
+1. `newest_staged` skips, with a warning, a record that does not parse or
+   is not canonical (`check_canonical`): its directory is its plain
+   `X.Y.Z` version, its path is `updates/<version>/RustyKrab.app` (kind
+   `app`) or `updates/<version>/rustykrab-cli` (kind `binary`), and no
+   symlink is on the way. Of the rest it takes the highest version, and
+   only then the latest `staged_at`, a field a worker writes; when every
+   record was skipped the reasons are the error. It refuses a stage with
+   no commit, one recorded as bad, and, with the launchd service, one
+   whose `kind` is not `app` or whose `signature_verified` is false. It
+   reads the running version from `GET /api/version` at `--url` (default
+   `RUSTYKRAB_GATEWAY_URL`; either must be https or http to `127.0.0.1` or
+   `[::1]`, any port, and `localhost` is refused: `check_url`,
+   `base_url`) with the bearer token
    (`RUSTYKRAB_AUTH_TOKEN` first, as `daemon_client` resolves it) and the
    daemon's own `Origin`. The running daemon must report `controller.lock`
    `held` and `consecutive_failed_ticks` 0, or nothing changes; this is
@@ -186,9 +189,12 @@ re-derives everything it relies on:
    that errors while the job drains is waited out the same way, and the
    stop fails only if the job is still loaded after 60 s. `Script`: SIGTERM to the
    one process `lsof` finds listening on the URL's port, only when it
-   listens on loopback alone and runs the installed executable (`ps -o
-   comm=`, or `/proc/<pid>/exe` on Linux; `the_daemon`), then waits for
-   it. No listener, several, or any other process is refused. The
+   listens on loopback alone and runs the installed executable, then
+   waits for it. The executable is what the kernel reports
+   (`libc::proc_pidpath` on macOS, `/proc/<pid>/exe` on Linux), never
+   `argv[0]`, which a process sets itself; it must be absolute, and both
+   it and the installed path must canonicalize before they are compared
+   (`the_daemon`). No listener, several, or any other process is refused. The
    process table is the `Processes` seam (`SystemProcesses`). If the stop
    fails, it drops the copy and starts the service again unless it is
    still running, and removes the journal only once `/api/version`

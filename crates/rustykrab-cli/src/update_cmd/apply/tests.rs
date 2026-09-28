@@ -168,6 +168,8 @@ struct ScriptedVerifier {
     commit_override: Mutex<Option<String>>,
     signed: Mutex<bool>,
     signature_checked: Mutex<Vec<PathBuf>>,
+    /// Every binary whose `--version` ran.
+    version_ran: Mutex<Vec<PathBuf>>,
 }
 
 impl ScriptedVerifier {
@@ -177,6 +179,7 @@ impl ScriptedVerifier {
             commit_override: Mutex::new(None),
             signed: Mutex::new(true),
             signature_checked: Mutex::new(Vec::new()),
+            version_ran: Mutex::new(Vec::new()),
         }
     }
 }
@@ -194,6 +197,7 @@ impl Verifier for ScriptedVerifier {
     }
 
     fn run_version(&self, binary: &Path) -> anyhow::Result<String> {
+        self.version_ran.lock().unwrap().push(binary.to_path_buf());
         let commit = match self.commit_override.lock().unwrap().clone() {
             Some(commit) => commit,
             None => std::fs::read_to_string(binary)?.trim().to_string(),
@@ -383,6 +387,11 @@ async fn a_healthy_new_version_is_left_in_place_with_prev_kept() {
     assert!(matches!(outcome, Outcome::Applied(_)), "{outcome:?}");
     assert_eq!(rig.service.calls(), ["stop", "start"]);
     assert_eq!(rig.installed(), NEW);
+    assert_eq!(
+        *rig.verifier.version_ran.lock().unwrap(),
+        [rig.next()],
+        "--version ran on the copy beside the install, not the stage"
+    );
     let prev = rig.prev().expect(".prev is kept");
     assert_eq!(std::fs::read_to_string(prev).unwrap(), OLD);
     assert!(!rig.next().exists());
@@ -538,6 +547,11 @@ async fn launchd_checks_the_signature_of_the_copy_and_refuses_an_unsigned_one() 
     let outcome = apply(&rig.cfg, &rig.host(), true).await.unwrap();
     assert!(matches!(outcome, Outcome::Applied(_)), "{outcome:?}");
     assert_eq!(rig.installed(), NEW);
+    assert_eq!(
+        *rig.verifier.version_ran.lock().unwrap(),
+        [rig.next().join("Contents").join("MacOS").join(BINARY_NAME)],
+        "--version ran on the binary inside the copy"
+    );
 }
 
 #[tokio::test]
@@ -568,16 +582,10 @@ async fn a_copy_that_reports_another_commit_or_version_is_refused() {
 #[tokio::test]
 async fn a_record_outside_its_version_directory_is_refused() {
     let rig = Rig::new(NewMode::Healthy, false).await;
-    // A record in updates/5.3.9/ that names 5.3.6.
+    // A record in updates/5.3.9/ that names 5.3.6, alone.
     let staged = write_stage_of(&rig.cfg, "5.3.6", NEW, None, "binary", false);
-    let dir = rig.cfg.updates_dir().join("5.3.9");
-    write_record(
-        &dir,
-        &Staged {
-            staged_at: Utc::now() + chrono::Duration::seconds(5),
-            ..staged
-        },
-    );
+    std::fs::remove_dir_all(rig.cfg.updates_dir().join("5.3.6")).unwrap();
+    write_record(&rig.cfg.updates_dir().join("5.3.9"), &staged);
     let err = apply(&rig.cfg, &rig.host(), true).await.unwrap_err();
     assert!(err.to_string().contains("names version"), "{err:#}");
     rig.assert_untouched();
@@ -718,6 +726,68 @@ async fn an_unhealthy_running_daemon_is_not_updated() {
         "{err:#}"
     );
     rig.assert_untouched();
+}
+
+#[tokio::test]
+async fn a_non_canonical_record_does_not_block_a_canonical_one() {
+    let rig = Rig::new(NewMode::Healthy, false).await;
+    let staged = write_stage_of(&rig.cfg, "5.3.6", NEW, None, "binary", false);
+    // A record in updates/5.3.9/ that names 5.3.6, staged later: skipped.
+    write_record(
+        &rig.cfg.updates_dir().join("5.3.9"),
+        &Staged {
+            staged_at: Utc::now() + chrono::Duration::days(365),
+            ..staged.clone()
+        },
+    );
+    // A higher version in its own directory whose path points elsewhere,
+    // staged later too: skipped.
+    let mut elsewhere = write_stage_of(&rig.cfg, "5.3.8", "evil999", None, "binary", false);
+    elsewhere.path = rig._root.path().join(BINARY_NAME);
+    elsewhere.staged_at = Utc::now() + chrono::Duration::days(365);
+    write_record(&rig.cfg.updates_dir().join("5.3.8"), &elsewhere);
+
+    let outcome = apply(&rig.cfg, &rig.host(), false).await.unwrap();
+    let Outcome::Planned(plan) = outcome else {
+        panic!("expected a plan, got {outcome:?}");
+    };
+    assert_eq!(plan.staged.version, "5.3.6");
+    assert_eq!(plan.staged.path, staged.path);
+}
+
+#[test]
+fn the_highest_version_is_chosen_then_the_latest_staged_at() {
+    let data = tempfile::tempdir().unwrap();
+    let cfg = config(data.path());
+    let now = Utc::now();
+    let restamp = |version: &str, at: DateTime<Utc>| {
+        let dir = cfg.updates_dir().join(version);
+        let mut staged: Staged =
+            serde_json::from_str(&std::fs::read_to_string(dir.join(STAGED_FILE)).unwrap()).unwrap();
+        staged.staged_at = at;
+        write_record(&dir, &staged);
+    };
+    // 5.10.0 is above 5.9.0 as numbers, not as text, and wins though it
+    // was staged earlier.
+    write_stage_of(&cfg, "5.9.0", "nine999", None, "binary", false);
+    write_stage_of(&cfg, "5.10.0", "ten1010", None, "binary", false);
+    restamp("5.9.0", now + chrono::Duration::days(30));
+    restamp("5.10.0", now - chrono::Duration::days(30));
+    assert_eq!(newest_staged(&cfg).unwrap().unwrap().version, "5.10.0");
+
+    // Nothing canonical at all: the reasons are the error.
+    std::fs::remove_dir_all(cfg.updates_dir()).unwrap();
+    let staged = write_stage_of(&cfg, "5.3.6", NEW, None, "binary", false);
+    std::fs::remove_dir_all(cfg.updates_dir().join("5.3.6")).unwrap();
+    write_record(&cfg.updates_dir().join("5.3.7"), &staged);
+    let err = newest_staged(&cfg).unwrap_err();
+    assert!(err.to_string().contains("no canonical stage"), "{err:#}");
+    assert!(err.to_string().contains("names version"), "{err:#}");
+
+    // An empty updates directory is nothing staged, not an error.
+    std::fs::remove_dir_all(cfg.updates_dir()).unwrap();
+    std::fs::create_dir_all(cfg.updates_dir()).unwrap();
+    assert!(newest_staged(&cfg).unwrap().is_none());
 }
 
 #[tokio::test]
@@ -1381,13 +1451,17 @@ fn the_url_must_be_loopback_or_https() {
     for ok in [
         "http://127.0.0.1:3100",
         "http://[::1]:3100",
-        "http://localhost:3100",
-        "http://LOCALHOST:3100",
+        "http://127.0.0.1",
+        "http://[::1]:9",
         "https://daemon.example.com",
+        "https://localhost:3100",
     ] {
         check_url(ok).unwrap_or_else(|e| panic!("{ok}: {e:#}"));
     }
     for bad in [
+        "http://localhost:3100",
+        "http://LOCALHOST:3100",
+        "http://localhost",
         "http://192.168.1.10:3100",
         "http://daemon.example.com",
         "http://127.0.0.1.example.com",
@@ -1400,11 +1474,67 @@ fn the_url_must_be_loopback_or_https() {
     assert!(err.to_string().contains("loopback"), "{err:#}");
 }
 
+#[test]
+fn the_default_gateway_url_is_checked_too() {
+    let url = |raw: &str| Ok(Url::parse(raw).unwrap());
+    // With no --url, the gateway URL goes through the same check.
+    for bad in [
+        "http://localhost:3000",
+        "http://192.168.1.10:3000",
+        "http://daemon.example.com",
+    ] {
+        let err = base_url(None, url(bad)).unwrap_err();
+        assert!(err.to_string().contains("RUSTYKRAB_GATEWAY_URL"), "{err:#}");
+    }
+    for ok in [
+        "http://127.0.0.1:3000",
+        "http://[::1]:3000",
+        "https://d.example",
+    ] {
+        base_url(None, url(ok)).unwrap_or_else(|e| panic!("{ok}: {e:#}"));
+    }
+    // A default that did not parse stays an error.
+    assert!(base_url(None, Err(anyhow!("unparseable"))).is_err());
+    // --url wins over the default, and is checked itself.
+    let chosen = base_url(Some("http://127.0.0.1:3100"), url("http://localhost:1")).unwrap();
+    assert_eq!(chosen.port(), Some(3100));
+    assert!(base_url(Some("http://localhost:3100"), url("http://127.0.0.1:3000")).is_err());
+}
+
+/// One row of a scripted process table: what a process calls itself
+/// (`argv[0]`, what `ps -o comm=` printed) and what it really runs.
+#[derive(Clone)]
+struct Proc {
+    pid: u32,
+    argv0: PathBuf,
+    exe: PathBuf,
+}
+
+/// A process whose `argv[0]` is its executable.
+fn proc(pid: u32, exe: &Path) -> Proc {
+    Proc {
+        pid,
+        argv0: exe.to_path_buf(),
+        exe: exe.to_path_buf(),
+    }
+}
+
 /// The host's processes, scripted: who listens where, and what each runs.
+/// `executable` answers from the kernel's column, never from `argv0`.
 struct ScriptedProcesses {
     listeners: Vec<Listener>,
-    exes: Vec<(u32, PathBuf)>,
+    table: Vec<Proc>,
     terminated: Arc<Mutex<Vec<u32>>>,
+}
+
+impl ScriptedProcesses {
+    /// What `ps -o comm=` would print for `pid`.
+    fn argv0(&self, pid: u32) -> Option<&Path> {
+        self.table
+            .iter()
+            .find(|p| p.pid == pid)
+            .map(|p| p.argv0.as_path())
+    }
 }
 
 impl Processes for ScriptedProcesses {
@@ -1413,10 +1543,10 @@ impl Processes for ScriptedProcesses {
     }
 
     fn executable(&self, pid: u32) -> anyhow::Result<PathBuf> {
-        self.exes
+        self.table
             .iter()
-            .find(|(p, _)| *p == pid)
-            .map(|(_, exe)| exe.clone())
+            .find(|p| p.pid == pid)
+            .map(|p| p.exe.clone())
             .ok_or_else(|| anyhow!("no process {pid}"))
     }
 
@@ -1443,11 +1573,11 @@ fn the_script_service_stops_only_the_installed_binary_on_loopback() {
         address: address.to_string(),
     };
 
-    let stop = |listeners: Vec<Listener>, exes: Vec<(u32, PathBuf)>| {
+    let stop = |listeners: Vec<Listener>, table: Vec<Proc>| {
         let terminated = Arc::new(Mutex::new(Vec::new()));
         let processes = ScriptedProcesses {
             listeners,
-            exes,
+            table,
             terminated: terminated.clone(),
         };
         let script = Script::new(
@@ -1465,33 +1595,61 @@ fn the_script_service_stops_only_the_installed_binary_on_loopback() {
     // The installed binary on loopback is stopped.
     let (result, terminated) = stop(
         vec![listen(42, "127.0.0.1:3100"), listen(42, "[::1]:3100")],
-        vec![(42, installed.clone())],
+        vec![proc(42, &installed)],
     );
     result.unwrap();
     assert_eq!(terminated, [42]);
+
+    // Its argv[0], what `ps -o comm=` printed, claims the installed path;
+    // the executable is another binary. Refused, and nothing is signalled.
+    let impostor = ScriptedProcesses {
+        listeners: vec![listen(42, "127.0.0.1:3100")],
+        table: vec![Proc {
+            pid: 42,
+            argv0: installed.clone(),
+            exe: other.clone(),
+        }],
+        terminated: Arc::new(Mutex::new(Vec::new())),
+    };
+    assert_eq!(impostor.argv0(42), Some(installed.as_path()));
+    let err = the_daemon(&impostor, 3100, &installed).unwrap_err();
+    assert!(err.to_string().contains("not the installed"), "{err:#}");
+    assert!(impostor.terminated.lock().unwrap().is_empty());
 
     let refusals = [
         // Another executable on the port.
         (
             vec![listen(42, "127.0.0.1:3100")],
-            vec![(42, other.clone())],
+            vec![proc(42, &other)],
             "not the installed",
+        ),
+        // A relative executable path, though it names the installed file.
+        (
+            vec![listen(42, "127.0.0.1:3100")],
+            vec![proc(42, Path::new(BINARY_NAME))],
+            "relative path",
+        ),
+        // An executable that does not resolve (deleted, or never there).
+        (
+            vec![listen(42, "127.0.0.1:3100")],
+            vec![proc(42, &root.path().join("gone").join(BINARY_NAME))],
+            "resolving",
         ),
         // Listening on every interface.
         (
             vec![listen(42, "*:3100")],
-            vec![(42, installed.clone())],
+            vec![proc(42, &installed)],
             "not on loopback",
         ),
         (
             vec![listen(42, "127.0.0.1:3100"), listen(42, "10.0.0.2:3100")],
-            vec![(42, installed.clone())],
+            vec![proc(42, &installed)],
             "not on loopback",
         ),
         // Two processes.
         (
             vec![listen(42, "127.0.0.1:3100"), listen(43, "127.0.0.1:3100")],
-            vec![(42, installed.clone()), (43, installed.clone())],
+            vec![proc(42, &installed), proc(43, &installed)],
             "refusing to pick one",
         ),
         // Nobody, though the daemon answered.
@@ -1530,4 +1688,34 @@ fn reads_lsof_listeners() {
     assert!(!is_loopback_address("*:3100"));
     assert!(!is_loopback_address("0.0.0.0:3100"));
     assert!(!is_loopback_address("[::]:3100"));
+}
+
+/// The real lookup reads what the kernel runs, not `argv[0]`: a child whose
+/// `argv[0]` claims to be the installed binary is named by its real
+/// executable. The child is this test's own `sleep`, killed at the end.
+#[test]
+fn the_system_executable_is_the_real_one_not_argv0() {
+    use std::os::unix::process::CommandExt;
+    let root = tempfile::tempdir().unwrap();
+    let installed = root.path().join(BINARY_NAME);
+    std::fs::write(&installed, OLD).unwrap();
+    let sleep = ["/bin/sleep", "/usr/bin/sleep"]
+        .into_iter()
+        .map(Path::new)
+        .find(|p| p.exists())
+        .expect("a sleep binary");
+    let mut child = Command::new(sleep)
+        .arg0(&installed)
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let found = SystemProcesses.executable(child.id());
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let found = found.unwrap();
+    assert!(found.is_absolute(), "{}", found.display());
+    assert_eq!(
+        std::fs::canonicalize(&found).unwrap(),
+        std::fs::canonicalize(sleep).unwrap()
+    );
 }
