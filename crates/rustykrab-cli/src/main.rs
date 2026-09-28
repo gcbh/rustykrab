@@ -34,6 +34,15 @@ const BUILD_DATE: &str = env!("RUSTYKRAB_BUILD_DATE");
 fn version_string() -> String {
     format!("{VERSION} ({GIT_HASH}{GIT_DIRTY}, {BUILD_DATE})")
 }
+
+/// The facts `version_string` prints, for `GET /api/version`.
+fn build_info() -> rustykrab_gateway::BuildInfo {
+    rustykrab_gateway::BuildInfo {
+        version: VERSION.to_string(),
+        commit: Some(format!("{GIT_HASH}{GIT_DIRTY}")),
+        build_date: Some(BUILD_DATE.to_string()),
+    }
+}
 use rustykrab_agent::{AgentHandle, HarnessProfile, HarnessRouter, ProcessSandbox, SubagentRunner};
 use rustykrab_channels::slack::SlackInboundMessage;
 use rustykrab_channels::telegram::ChannelMessage;
@@ -1472,6 +1481,7 @@ async fn main() -> anyhow::Result<()> {
         .with_workers(fleet.registry.clone())
         .with_delegation(delegated_runs)
         .with_evaluation(evaluator.clone())
+        .with_build_info(build_info())
         // Loopback is always allowed; this adds the names other clients
         // reach us by, e.g. the tailnet hostname the phone uses.
         .with_origin_policy(rustykrab_gateway::OriginPolicy::from_env())
@@ -3133,6 +3143,22 @@ async fn shutdown_signal() {
         .await
         .expect("failed to listen for ctrl+c");
     tracing::info!("shutdown signal received");
+}
+
+#[cfg(test)]
+mod version_tests {
+    use super::*;
+
+    #[test]
+    fn api_version_reports_what_dash_dash_version_prints() {
+        let info = build_info();
+        let commit = info.commit.expect("the build script stamps a commit");
+        let date = info.build_date.expect("the build script stamps a date");
+        assert_eq!(
+            version_string(),
+            format!("{} ({commit}, {date})", info.version)
+        );
+    }
 }
 
 #[cfg(test)]

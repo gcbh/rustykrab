@@ -202,6 +202,7 @@ impl Controller {
         self.reconcile_all(now, &mut report, &mut noticed).await?;
         self.select_and_lease(&mut report).await?;
         self.age(now, &mut report).await?;
+        self.state().last_tick = Some(self.clock.now());
         Ok(report)
     }
 

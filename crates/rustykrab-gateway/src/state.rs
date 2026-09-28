@@ -15,6 +15,27 @@ use uuid::Uuid;
 use crate::origin::OriginPolicy;
 use crate::rate_limit::{RateLimitConfig, RateLimiter};
 
+/// The running build, as `rustykrab --version` prints it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildInfo {
+    /// The package version.
+    pub version: String,
+    /// The source commit, with `-dirty` when the tree had local changes.
+    pub commit: Option<String>,
+    /// The date the binary was built.
+    pub build_date: Option<String>,
+}
+
+impl Default for BuildInfo {
+    fn default() -> Self {
+        Self {
+            version: rustykrab_core::VERSION.to_string(),
+            commit: None,
+            build_date: None,
+        }
+    }
+}
+
 /// Shared application state threaded through axum handlers.
 ///
 /// Two halves, deliberately separated. `agent` is everything a turn needs
@@ -60,6 +81,10 @@ pub struct AppState {
     /// submission is refused, and `GET /api/node` advertises no structured
     /// delegation.
     pub delegation: Option<Arc<dyn rustykrab_control::peer::NodeWorkers>>,
+    /// What `GET /api/version` reports about the running build. The
+    /// binary's build script stamps the commit and date, so only the
+    /// composition root can fill them in; until it does they read `None`.
+    pub build: BuildInfo,
 
     // --- Outbound channels, delivered to by the webhook routes ---
     pub telegram: Option<Arc<TelegramChannel>>,
@@ -87,6 +112,7 @@ impl AppState {
             workers: None,
             evaluation: None,
             delegation: None,
+            build: BuildInfo::default(),
             telegram: None,
             signal: None,
             slack: None,
@@ -231,6 +257,12 @@ impl AppState {
         delegation: Arc<dyn rustykrab_control::peer::NodeWorkers>,
     ) -> Self {
         self.delegation = Some(delegation);
+        self
+    }
+
+    /// Report `build` from `GET /api/version`.
+    pub fn with_build_info(mut self, build: BuildInfo) -> Self {
+        self.build = build;
         self
     }
 

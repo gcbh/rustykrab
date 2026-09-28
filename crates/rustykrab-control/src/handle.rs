@@ -3,6 +3,7 @@
 //! the controller itself is written; `controller::Controller` implements it.
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use rustykrab_core::proposal::{ReviewDecision, ReviewOutcome};
 use rustykrab_core::work::{
     Edge, ItemRef, PlanOutcome, Status, WorkItem, WorkItemDraft, WorkItemId, WorkPlan,
@@ -46,6 +47,16 @@ pub struct TickReport {
     pub archived: Vec<WorkItemId>,
     pub transitions: usize,
     pub notices: usize,
+}
+
+/// What the loop reports about itself, for `GET /api/version`: read from
+/// memory, never from the store, so asking cannot wait on a tick.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoopStatus {
+    /// When the last tick that completed finished; `None` before the first.
+    pub last_tick: Option<DateTime<Utc>>,
+    /// Runs live in this process.
+    pub runs_in_flight: usize,
 }
 
 /// The controller as its callers see it. Every method is one store
@@ -115,6 +126,11 @@ pub trait ControlHandle: Send + Sync {
     /// The tree under `root` for `work show --graph` and
     /// `GET /api/work/{id}/graph`.
     async fn graph(&self, root: &str) -> Result<GraphView, Error>;
+
+    /// The loop's own state, or `None` for a handle that runs no loop.
+    fn loop_status(&self) -> Option<LoopStatus> {
+        None
+    }
 
     /// Apply a decision a human took on the review surface to a proposal
     /// (plan sections 10 and 11), as one transaction with its `review`
