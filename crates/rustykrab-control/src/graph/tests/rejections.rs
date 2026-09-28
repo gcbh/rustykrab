@@ -251,6 +251,40 @@ fn rejects_invalid_item() {
 }
 
 #[test]
+fn rejects_a_capability_item_with_an_empty_tool_name() {
+    let build = |tmp_id: &str, title: &str, name: &str| {
+        let mut d = draft(tmp_id);
+        d.kind = Some(WorkKind::Capability);
+        d.title = title.into();
+        d.capability = Some(rustykrab_core::work::CapabilityMode::Build);
+        d.artifact_refs = vec![crate::routing::CapabilityRef {
+            gap: crate::errors::GapKind::Tool,
+            subject: name.into(),
+        }
+        .to_ref()];
+        d
+    };
+    let a = build("a", "Build tool: ", "");
+    let b = build("b", "Build tool: pdf_render", "  ");
+    let c = build("c", "Build tool:  ", "pdf_render");
+    for source in [FilingSource::Planner, FilingSource::Ladder] {
+        let r = reject(
+            &base(),
+            &under_p(vec![a.clone(), b.clone(), c.clone()]),
+            &ctx(source),
+        );
+        assert_eq!(
+            only(&r, RejectionReason::InvalidItem),
+            vec![vec![tmp("a")], vec![tmp("b")], vec![tmp("c")]],
+            "{source:?}"
+        );
+    }
+    // A named one files.
+    let named = build("d", "Build tool: pdf_render", "pdf_render");
+    accept(&mut base(), &under_p(vec![named]), &planner());
+}
+
+#[test]
 fn rejects_cycle() {
     let offending = only(&cycle(), RejectionReason::Cycle);
     // k's edge onto its own parent, and the a/b loop.

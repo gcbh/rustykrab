@@ -834,6 +834,29 @@ impl<'a> Run<'a> {
                     self.fail(RejectionReason::OutOfScope, vec![label.clone()], detail);
                 }
             }
+            // A capability item names what it builds, acquires or requests;
+            // one whose need is `tool:` with no name is work nobody can do.
+            if kinds[i] == WorkKind::Capability {
+                let unnamed = draft.artifact_refs.iter().any(|r| {
+                    r.kind == crate::routing::CAPABILITY_REF
+                        && r.value
+                            .split_once(':')
+                            .map_or(r.value.as_str(), |(_, s)| s)
+                            .trim()
+                            .is_empty()
+                });
+                let untitled = draft
+                    .title
+                    .split_once(':')
+                    .is_some_and(|(_, name)| name.trim().is_empty());
+                if unnamed || untitled {
+                    self.fail(
+                        RejectionReason::InvalidItem,
+                        vec![label.clone()],
+                        "a capability item needs the name of the tool or resource it answers",
+                    );
+                }
+            }
             if kinds[i] == WorkKind::Code && !self.ctx.allow_code {
                 self.fail(
                     RejectionReason::KindNotAllowed,

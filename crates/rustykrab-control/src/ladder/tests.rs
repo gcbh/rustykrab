@@ -278,6 +278,30 @@ fn a_capability_gap_skips_orders_0_and_1_for_its_order_2_rung() {
 }
 
 #[test]
+fn a_gap_with_no_name_goes_to_triage_not_to_a_capability_item() {
+    let unnamed = gap(GapKind::Tool, "");
+    assert_eq!(crate::errors::unnamed_gap(&unnamed), Some(GapKind::Tool));
+    let ctx = LadderContext {
+        tool_exists: Some(false),
+        ..LadderContext::new(&unnamed)
+    };
+    let mut state = LadderState::default();
+    let d = next(&state, &ctx);
+    assert!(matches!(d, Decision::Improve { .. }), "{d:?}");
+    record(&mut state, d.rung(), unnamed.clone(), "filed #9", at(0));
+    // Triaged, the climb skips order 2 and surfaces: no build is filed.
+    let d = next(&state, &ctx);
+    assert!(matches!(d, Decision::Surface(_)), "{d:?}");
+
+    let draft = crate::errors::internal_item_draft(&unnamed, Vec::new());
+    assert!(
+        draft.title.starts_with("Name the missing tool"),
+        "{}",
+        draft.title
+    );
+}
+
+#[test]
 fn one_capability_item_per_gap() {
     let carrier = gap(GapKind::Credential, "carrier login");
     let mut state = LadderState::new(RungBudgets {
