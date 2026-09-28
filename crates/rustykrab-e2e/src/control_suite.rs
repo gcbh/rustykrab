@@ -38,7 +38,9 @@
 //! one (a worker's `supersedes` draft in 25) goes through REST instead.
 //! Scenarios that need an external worker (2, 13, 17, 31) register a
 //! Claude Code stand-in executable from `fixture_repo.rs`; scenario 8 boots
-//! a second scripted daemon as the peer.
+//! a second scripted daemon as the peer. The fleet scenarios outside the
+//! plan's numbering (`fleet_scenarios`) boot their own daemon when their
+//! premise is a daemon setting, such as `RUSTYKRAB_LOCAL_WORKER=off`.
 //!
 //! # Wire assumptions
 //!
@@ -249,10 +251,24 @@ fn catalog() -> Vec<Entry> {
 }
 
 pub(crate) fn scenarios() -> Vec<(Expected, (&'static str, ScenarioFn))> {
-    catalog()
+    let mut scenarios: Vec<_> = catalog()
         .into_iter()
         .map(|entry| (entry.expected(), (entry.id, entry.run)))
-        .collect()
+        .collect();
+    scenarios.extend(fleet_scenarios());
+    scenarios
+}
+
+/// Fleet behaviour outside the plan's section 15, so outside the numbered
+/// catalog and its promotion rule: each is must-pass from the day it lands.
+fn fleet_scenarios() -> Vec<(Expected, (&'static str, ScenarioFn))> {
+    vec![(
+        Expected::Pass,
+        (
+            "control/local-worker-off-leases-to-the-external-worker",
+            |ctx| Box::pin(local_worker_off(ctx)),
+        ),
+    )]
 }
 
 // ── Phase 1: work items and the controller skeleton ──────────────────
@@ -1676,6 +1692,112 @@ async fn s31(ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
+/// A scripted daemon of its own, booted with `RUSTYKRAB_LOCAL_WORKER=off`,
+/// killed when the scenario ends however it ends.
+struct LocalWorkerOffDaemon {
+    ctx: Ctx,
+    _dir: tempfile::TempDir,
+}
+
+impl Drop for LocalWorkerOffDaemon {
+    fn drop(&mut self) {
+        if let Ok(mut daemon) = self.ctx.daemon.try_lock() {
+            if let Some(mut child) = daemon.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+}
+
+impl LocalWorkerOffDaemon {
+    async fn boot(shared: &Ctx) -> Result<LocalWorkerOffDaemon> {
+        let dir = tempfile::Builder::new()
+            .prefix("rustykrab-e2e-local-off-")
+            .tempdir()?;
+        let port = crate::pick_free_port()?;
+        let base = format!("http://127.0.0.1:{port}");
+        let mut child = crate::spawn_daemon_env(
+            &shared.bin,
+            dir.path(),
+            port,
+            &crate::Backend::Scripted(None),
+            &[("RUSTYKRAB_LOCAL_WORKER", "off")],
+        )?;
+        if let Err(e) = crate::wait_for_health(&base, &shared.client, &mut child).await {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(e);
+        }
+        let store = rustykrab_store::Store::open(
+            dir.path().join("db"),
+            crate::hex_decode(crate::MASTER_KEY_HEX)?,
+        )?;
+        let ctx = Ctx {
+            base,
+            client: shared.client.clone(),
+            secrets: store.secrets(),
+            db_path: dir.path().join("db").join("store.db"),
+            bin: shared.bin.clone(),
+            data_dir: dir.path().to_path_buf(),
+            daemon: std::sync::Arc::new(tokio::sync::Mutex::new(Some(child))),
+            stand_ins: None,
+        };
+        Ok(LocalWorkerOffDaemon { ctx, _dir: dir })
+    }
+}
+
+/// A daemon with the local worker off and one external worker: an item
+/// that names no worker kind, which routing would otherwise give the
+/// cheapest-tier local worker, is leased to the external worker, and
+/// `GET /api/workers` lists no live local worker. It boots its own daemon,
+/// since the shared one's local worker is what the other scenarios run on.
+async fn local_worker_off(shared: &Ctx) -> Result<()> {
+    let daemon = LocalWorkerOffDaemon::boot(shared).await?;
+    let ctx = &daemon.ctx;
+    let before = workers(ctx).await?;
+    ensure!(
+        !before
+            .iter()
+            .any(|w| w["kind"] == "local" && w["live"] == true),
+        "a live local worker is registered with the local worker off: {before:?}"
+    );
+    let repo = FixtureRepo::create()?;
+    let stand_in = ClaudeCodeStandIn::create()?;
+    register_claude_code(ctx, "pinch-local-off", &repo, &stand_in).await?;
+    let change = code_draft(
+        "Add a status helper",
+        &tag(0),
+        "Implement the change",
+        &repo,
+    );
+    ensure!(
+        change.get("worker_kind").is_none(),
+        "the draft must leave the worker unconstrained: {change}"
+    );
+    let task = file(ctx, change).await?;
+    let finished = wait_status(ctx, &task, Status::Done).await?;
+    ensure!(
+        worker_of(&finished).as_deref() == Some("pinch-local-off"),
+        "the unconstrained item ran on {:?}, not the external worker",
+        worker_of(&finished)
+    );
+    let after = workers(ctx).await?;
+    ensure!(
+        after
+            .iter()
+            .any(|w| w["name"] == "pinch-local-off" && w["live"] == true),
+        "the external worker is not live: {after:?}"
+    );
+    ensure!(
+        !after
+            .iter()
+            .any(|w| w["kind"] == "local" && w["live"] == true),
+        "GET /api/workers lists a live local worker: {after:?}"
+    );
+    Ok(())
+}
+
 /// Scenario 13: A worker fails on a tool that does not exist; the ladder files a
 /// `capability` build item, the tool is built and verified, the original
 /// item resumes with it activated, and the user is never asked.
@@ -2680,7 +2802,11 @@ mod tests {
     fn promoted_phases_are_must_pass_and_the_rest_remain_xfail() {
         let catalog = catalog();
         let scenarios = scenarios();
-        assert_eq!(scenarios.len(), 31);
+        assert_eq!(scenarios.len(), catalog.len() + fleet_scenarios().len());
+        assert_eq!(catalog.len(), 31);
+        assert!(fleet_scenarios()
+            .iter()
+            .all(|(expected, _)| *expected == Expected::Pass));
         let held = |e: &Entry| HELD_BACK.iter().any(|(n, _)| *n == e.number);
         for (entry, (expected, (id, _))) in catalog.iter().zip(&scenarios) {
             assert_eq!(*id, entry.id);

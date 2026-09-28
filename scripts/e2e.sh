@@ -47,11 +47,17 @@ cargo build -p rustykrab-cli --no-default-features "${CARGO_FLAGS[@]+"${CARGO_FL
 echo "building e2e runner..." >&2
 cargo build -p rustykrab-e2e "${CARGO_FLAGS[@]+"${CARGO_FLAGS[@]}"}"
 
+# Where cargo put the binaries: `target/` unless CARGO_TARGET_DIR or a
+# cargo config moves it (a shared target dir across worktrees does).
+TARGET_DIR="$(cargo metadata --no-deps --format-version 1 |
+  sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')"
+TARGET_DIR="${TARGET_DIR:-target}"
+
 # Report goes to stdout and to e2e-report.json (CI uploads it as an
 # artifact); the exit code is the runner's.
 set +e
 RUSTYKRAB_E2E_SOURCE_REVISION="$E2E_SOURCE_REVISION" \
-  RUSTYKRAB_BIN="target/$PROFILE/rustykrab-cli" "target/$PROFILE/rustykrab-e2e" \
+  RUSTYKRAB_BIN="$TARGET_DIR/$PROFILE/rustykrab-cli" "$TARGET_DIR/$PROFILE/rustykrab-e2e" \
   "${RUNNER_ARGS[@]+"${RUNNER_ARGS[@]}"}" | tee e2e-report.json
 status=${PIPESTATUS[0]}
 exit "$status"

@@ -1262,6 +1262,19 @@ fn spawn_daemon_with(
     port: u16,
     backend: &Backend<'_>,
 ) -> Result<Child> {
+    spawn_daemon_env(bin, data_dir, port, backend, &[])
+}
+
+/// [`spawn_daemon_with`], with `extra` set last, over everything the
+/// harness sets: for a scenario whose premise is one daemon setting, such
+/// as `RUSTYKRAB_LOCAL_WORKER=off`.
+fn spawn_daemon_env(
+    bin: &str,
+    data_dir: &std::path::Path,
+    port: u16,
+    backend: &Backend<'_>,
+    extra: &[(&str, &str)],
+) -> Result<Child> {
     let log = std::fs::File::create(data_dir.join("daemon.log"))?;
     let mut command = Command::new(bin);
     let command = &mut command;
@@ -1429,6 +1442,9 @@ fn spawn_daemon_with(
                 command.env(key, value);
             }
         }
+    }
+    for (key, value) in extra {
+        command.env(key, value);
     }
 
     let child = command
