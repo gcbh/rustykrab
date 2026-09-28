@@ -42,7 +42,8 @@ pub enum FilingSource {
     /// A worker's `discovered` drafts, which the controller submits as one
     /// graph (6.5).
     Discovered,
-    /// A `capability` item the ladder files (section 8).
+    /// A `capability` or `internal` item the ladder files (sections 8
+    /// and 9).
     Ladder,
     /// An accepted proposal (section 10).
     Proposal,
@@ -86,7 +87,9 @@ pub struct ApprovalPolicy {
     /// Hold every graph of a worker's `discovered` drafts whole, so
     /// follow-up work a worker files waits for a person instead of running
     /// at once (a self-building daemon, whose follow-ups would otherwise
-    /// run on a base that lacks their siblings' unmerged work).
+    /// run on a base that lacks their siblings' unmerged work). A ladder
+    /// filing of only `internal` items is held whole the same way; its
+    /// `capability` items are not.
     pub hold_discovered: bool,
 }
 
@@ -98,6 +101,7 @@ pub enum ApprovalTrigger {
     UndelegatedResource { item: WorkItemId, resource: String },
     CodeOutsideSlice { item: WorkItemId },
     Discovered { items: u32 },
+    LadderInternal { items: u32 },
 }
 
 /// Everything [`validate`] needs besides the snapshot and the filing.
@@ -1622,6 +1626,14 @@ fn approve(
     }
     if policy.hold_discovered && ctx.source == FilingSource::Discovered {
         triggers.push(ApprovalTrigger::Discovered { items: count });
+        whole = true;
+    }
+    let all_internal = !ids.is_empty()
+        && ids
+            .iter()
+            .all(|id| work.item(id).is_some_and(|i| i.kind == WorkKind::Internal));
+    if policy.hold_discovered && ctx.source == FilingSource::Ladder && all_internal {
+        triggers.push(ApprovalTrigger::LadderInternal { items: count });
         whole = true;
     }
     let leaves: Vec<&WorkItem> = ids

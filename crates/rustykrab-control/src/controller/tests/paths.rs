@@ -474,6 +474,67 @@ async fn a_discovered_draft_naming_no_repo_inherits_the_filers_repo() {
         .any(|e| e.kind == EdgeKind::Blocks && e.depends_on == first.id));
 }
 
+/// A code item writing a repository under a worker and constraints fails
+/// unclassified, so the ladder files an `internal` item for it; returns
+/// that item.
+async fn internal_item_for_a_failing_code_item(hold_discovered: bool) -> WorkItem {
+    let mut config = ControllerConfig::default();
+    config.approval.hold_discovered = hold_discovered;
+    let h = Harness::with(config, StaticCatalog::default(), &["pinch"]);
+    h.script.push(
+        "Port the parser",
+        Step::Fail(Error::Internal("flux capacitor desynchronised".to_string())),
+    );
+    let mut x = code_follow_up("x", "Port the parser");
+    x.worker_kind = WorkerKind::Local;
+    x.writable_resources = vec!["repo:/src/app".to_string(), "calendar:home".to_string()];
+    x.constraints = vec!["Change only files under src/parser/.".to_string()];
+    h.file_one(x).await;
+    for _ in 0..3 {
+        h.step().await;
+        if let Some(item) = h.of_kind(WorkKind::Internal).await.into_iter().next() {
+            return item;
+        }
+    }
+    panic!("the ladder filed no internal item");
+}
+
+#[tokio::test]
+async fn the_ladders_internal_item_inherits_the_failing_items_repo_worker_and_constraints() {
+    let item = internal_item_for_a_failing_code_item(false).await;
+    assert_eq!(
+        item.writable_resources,
+        vec!["repo:/src/app".to_string()],
+        "only the repository is inherited, not the failing item's other resources"
+    );
+    assert_eq!(item.worker_kind, WorkerKind::Local);
+    assert!(
+        item.constraints
+            .contains(&"Change only files under src/parser/.".to_string()),
+        "{:?}",
+        item.constraints
+    );
+    // Its own constraints come first and are kept.
+    assert!(item.constraints.len() > 1, "{:?}", item.constraints);
+    assert_eq!(item.held_by, None);
+    assert!(
+        matches!(
+            item.status,
+            Status::Queued | Status::Ready | Status::Leased | Status::Running
+        ),
+        "without hold_discovered it runs: {:?}",
+        item.status
+    );
+}
+
+#[tokio::test]
+async fn hold_discovered_holds_the_ladders_internal_item_for_consent() {
+    let item = internal_item_for_a_failing_code_item(true).await;
+    assert_eq!(item.status, Status::Blocked(BlockedReason::NeedsConsent));
+    assert!(item.held_by.is_some());
+    assert_eq!(item.writable_resources, vec!["repo:/src/app".to_string()]);
+}
+
 #[tokio::test]
 async fn discovered_drafts_naming_the_same_repo_run_in_the_order_listed() {
     let mut first = code_follow_up("f", "Port the helper");

@@ -70,6 +70,9 @@ fn describe_trigger(t: &ApprovalTrigger) -> String {
                 "{items} follow-up items a worker discovered, which the policy holds for a person"
             )
         }
+        ApprovalTrigger::LadderInternal { items } => {
+            format!("{items} internal items the ladder filed, which the policy holds for a person")
+        }
     }
 }
 
@@ -218,12 +221,17 @@ impl Controller {
         ctx.remaining_budget = self.remaining_budgets(snap);
         ctx.origin_conversation_id = provenance.conversation_id.clone();
         // The ladder's own filings are system work under policy, not a plan
-        // the user approves (section 8); an accepted proposal's work was
-        // approved on the review surface (section 10).
-        ctx.approval = if matches!(source, FilingSource::Ladder | FilingSource::Proposal) {
-            ApprovalPolicy::default()
-        } else {
-            self.config.approval.clone()
+        // the user approves (section 8), except that `hold_discovered` holds
+        // its `internal` items as it holds a worker's follow-ups; an
+        // accepted proposal's work was approved on the review surface
+        // (section 10).
+        ctx.approval = match source {
+            FilingSource::Ladder => ApprovalPolicy {
+                hold_discovered: self.config.approval.hold_discovered,
+                ..ApprovalPolicy::default()
+            },
+            FilingSource::Proposal => ApprovalPolicy::default(),
+            _ => self.config.approval.clone(),
         };
         let caller = provenance
             .filed_by_item
@@ -570,8 +578,10 @@ impl Controller {
     }
 
     /// Order 3 (sections 8 and 9): the `internal` item for `error`, with
-    /// the failing item as evidence. An open one for the same fingerprint
-    /// is reused.
+    /// the failing item as evidence. It runs where the failing item ran:
+    /// it takes that item's `repo:` resources, worker constraint and
+    /// constraints ([`inherit_internal`]). An open one for the same
+    /// fingerprint is reused.
     pub(super) fn file_internal(
         &self,
         b: &mut Batch,
@@ -582,7 +592,7 @@ impl Controller {
             kind: "item".to_string(),
             value: item.id.clone(),
         }];
-        let draft = internal_item_draft(error, evidence);
+        let draft = inherit_internal(item, &internal_item_draft(error, evidence));
         self.file_system_item(b, draft, item.origin_conversation_id.clone())
     }
 
@@ -925,6 +935,21 @@ fn inherit_from(filer: &WorkItem, draft: &WorkItemDraft) -> WorkItemDraft {
     }
     if d.worker_kind == WorkerKind::Any {
         d.worker_kind = filer.worker_kind;
+    }
+    d
+}
+
+/// The ladder's `internal` item for a failure of `failing`: its repository
+/// and worker as [`inherit_from`] gives a discovered draft, and the failing
+/// item's constraints after its own, so a worker runs it in a worktree of
+/// the same repository under the same rules instead of in an empty
+/// scratch directory.
+fn inherit_internal(failing: &WorkItem, draft: &WorkItemDraft) -> WorkItemDraft {
+    let mut d = inherit_from(failing, draft);
+    for c in &failing.constraints {
+        if !d.constraints.contains(c) {
+            d.constraints.push(c.clone());
+        }
     }
     d
 }
