@@ -13,8 +13,9 @@ use std::collections::{BTreeSet, HashSet};
 
 use chrono::{DateTime, Utc};
 use rustykrab_core::work::{
-    ArtifactRef, BlockedReason, EdgeKind, EventKind, ItemRef, PlanEdge, PlanOutcome, Rung, Status,
-    WorkError, WorkEvent, WorkItem, WorkItemDraft, WorkItemId, WorkKind, WorkPlan,
+    ArtifactRef, BlockedReason, DraftEdge, EdgeKind, EventKind, ItemRef, PlanEdge, PlanOutcome,
+    Rung, Status, WorkError, WorkEvent, WorkItem, WorkItemDraft, WorkItemId, WorkKind, WorkPlan,
+    WorkerKind,
 };
 use rustykrab_core::Error;
 use rustykrab_store::{ArchivedItem, WorkOp, WorkPlanRow};
@@ -394,8 +395,11 @@ impl Controller {
 
     /// A worker's `discovered` drafts (section 5 and 6.5): under the item's
     /// parent they file as one graph, scoped to that subtree; an item with
-    /// no parent files each draft as its own root. A rejection is recorded
-    /// on the item. Returns the ids to settle.
+    /// no parent files each draft as its own root. Each draft inherits the
+    /// item's `repo:` resources and worker constraint unless it sets its own
+    /// ([`inherit_from`]), and drafts sharing an inherited repository are
+    /// ordered ([`order_inherited_writers`]). A rejection is recorded on the
+    /// item. Returns the ids to settle.
     pub(super) fn file_discovered(
         &self,
         b: &mut Batch,
@@ -412,19 +416,25 @@ impl Controller {
             actor: format!("worker:{worker}"),
         };
         let rationale = format!("discovered while working on {}", short(&item.id));
+        let (mut drafts, inherited): (Vec<WorkItemDraft>, Vec<Vec<String>>) =
+            drafts.iter().map(|d| inherit_from(item, d)).unzip();
+        for (i, d) in drafts.iter_mut().enumerate() {
+            d.tmp.get_or_insert_with(|| format!("d{i}"));
+        }
         let plans: Vec<WorkPlan> = match &item.parent {
-            Some(parent) => vec![WorkPlan {
-                root: ItemRef::Id(parent.clone()),
-                items: drafts.to_vec(),
-                edges: Vec::new(),
-                rationale,
-            }],
+            Some(parent) => {
+                order_inherited_writers(&mut drafts, &inherited);
+                vec![WorkPlan {
+                    root: ItemRef::Id(parent.clone()),
+                    items: drafts,
+                    edges: Vec::new(),
+                    rationale,
+                }]
+            }
             None => drafts
-                .iter()
-                .enumerate()
-                .map(|(i, d)| {
-                    let mut d = d.clone();
-                    let tmp = d.tmp.get_or_insert_with(|| format!("d{i}")).clone();
+                .into_iter()
+                .map(|d| {
+                    let tmp = d.tmp.clone().unwrap_or_default();
                     WorkPlan {
                         root: ItemRef::Tmp { tmp },
                         items: vec![d],
@@ -887,6 +897,72 @@ impl Controller {
             root: root.to_string(),
             nodes,
         })
+    }
+}
+
+/// A discovered draft as filed under `filer`: one naming no `repo:`
+/// resource takes the filer's, and one with no worker constraint takes the
+/// filer's, so a code follow-up keeps its repository and its worker. A
+/// draft that sets either keeps its own. Returns the resources it inherited.
+fn inherit_from(filer: &WorkItem, draft: &WorkItemDraft) -> (WorkItemDraft, Vec<String>) {
+    let mut d = draft.clone();
+    let mut inherited = Vec::new();
+    if !d.writable_resources.iter().any(|r| is_repo(r)) {
+        inherited.extend(
+            filer
+                .writable_resources
+                .iter()
+                .filter(|r| is_repo(r))
+                .cloned(),
+        );
+        d.writable_resources.extend(inherited.iter().cloned());
+    }
+    if d.worker_kind == WorkerKind::Any {
+        d.worker_kind = filer.worker_kind;
+    }
+    (d, inherited)
+}
+
+fn is_repo(resource: &str) -> bool {
+    resource.starts_with(crate::workspace::REPO_PREFIX)
+}
+
+/// Drafts filed as one graph that write the same repository, where either
+/// inherited it, run in the order the worker listed them: each gets a
+/// `blocks` edge on the last earlier draft writing that repository, unless
+/// the two are already linked. Two unordered writers of one resource are a
+/// `single_writer_conflict`, so without this a worker's second inherited
+/// follow-up would reject the whole filing. Every draft carries a `tmp`.
+fn order_inherited_writers(drafts: &mut [WorkItemDraft], inherited: &[Vec<String>]) {
+    let tmp_of = |d: &WorkItemDraft| ItemRef::Tmp {
+        tmp: d.tmp.clone().unwrap_or_default(),
+    };
+    let links = |a: &WorkItemDraft, b: &WorkItemDraft| {
+        a.edges.iter().any(|e| e.depends_on == tmp_of(b))
+            || b.edges.iter().any(|e| e.depends_on == tmp_of(a))
+    };
+    for i in 1..drafts.len() {
+        let mut upstreams: Vec<usize> = Vec::new();
+        for r in drafts[i].writable_resources.iter().filter(|r| is_repo(r)) {
+            let Some(j) = (0..i)
+                .rev()
+                .find(|&j| drafts[j].writable_resources.contains(r))
+            else {
+                continue;
+            };
+            if (inherited[i].contains(r) || inherited[j].contains(r)) && !upstreams.contains(&j) {
+                upstreams.push(j);
+            }
+        }
+        for j in upstreams {
+            if !links(&drafts[i], &drafts[j]) {
+                let depends_on = tmp_of(&drafts[j]);
+                drafts[i].edges.push(DraftEdge {
+                    kind: EdgeKind::Blocks,
+                    depends_on,
+                });
+            }
+        }
     }
 }
 

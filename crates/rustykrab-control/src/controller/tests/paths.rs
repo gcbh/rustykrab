@@ -10,7 +10,7 @@ use std::time::Duration;
 use chrono::TimeDelta;
 use rustykrab_core::work::{
     BlockedReason, CancelReason, EdgeKind, ErrorSubclass, Question, ResultReport, Rung, Status,
-    WorkKind,
+    WorkKind, WorkerKind,
 };
 use rustykrab_tools::work_backend::{
     Principal, Provenance, StatusQuery, StatusSelector, ToolState, WorkBackend,
@@ -351,6 +351,92 @@ async fn discovered_drafts_file_under_the_parent_with_provenance_and_run() {
         .any(|e| e.kind == EdgeKind::DiscoveredFrom && e.depends_on == ids["x"]));
     assert_eq!(found.status, Status::Done);
     assert_eq!(h.status(&ids["P"]).await, Status::Done);
+}
+
+/// Run `x` under a parent, constrained to local workers and writing a
+/// repository and a calendar, with `found` as its discovered drafts; returns
+/// the parent's children by title.
+async fn discovered_under_a_repo_item(
+    found: Vec<WorkItemDraft>,
+) -> (Harness, std::collections::HashMap<String, WorkItem>) {
+    let h = Harness::new(&["pinch"]);
+    h.script.push(
+        "Add a status helper",
+        report(ResultReport {
+            discovered: found,
+            ..done("Add a status helper")
+        }),
+    );
+    let mut x = draft("x", "Add a status helper");
+    x.worker_kind = WorkerKind::Local;
+    x.writable_resources = vec!["repo:/src/app".to_string(), "calendar:home".to_string()];
+    let ids = h.file(plan(vec![draft("P", "Status page"), x])).await.ids;
+    for _ in 0..3 {
+        h.step().await;
+    }
+    let kids = h
+        .store()
+        .work_children(&ids["P"])
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|k| (k.title.clone(), k))
+        .collect();
+    (h, kids)
+}
+
+fn code_follow_up(tmp: &str, title: &str) -> WorkItemDraft {
+    let mut d = draft(tmp, title);
+    d.kind = Some(WorkKind::Code);
+    d
+}
+
+#[tokio::test]
+async fn a_discovered_draft_naming_no_repo_inherits_the_filers_repo() {
+    let mut calendar_only = code_follow_up("c", "Update the changelog");
+    calendar_only.writable_resources = vec!["calendar:work".to_string()];
+    let (h, kids) = discovered_under_a_repo_item(vec![
+        code_follow_up("f", "Document the helper"),
+        calendar_only,
+    ])
+    .await;
+    let (first, second) = (&kids["Document the helper"], &kids["Update the changelog"]);
+    assert_eq!(
+        first.writable_resources,
+        vec!["repo:/src/app".to_string()],
+        "only the repository is inherited, not the filer's other resources"
+    );
+    assert_eq!(
+        second.writable_resources,
+        vec!["calendar:work".to_string(), "repo:/src/app".to_string()]
+    );
+    // Two writers of the inherited repository run in the order listed,
+    // rather than rejecting as unordered writers.
+    let edges = h.store().work_edges_of(&second.id).await.unwrap();
+    assert!(edges
+        .iter()
+        .any(|e| e.kind == EdgeKind::Blocks && e.depends_on == first.id));
+}
+
+#[tokio::test]
+async fn a_discovered_draft_with_no_worker_constraint_inherits_the_filers() {
+    let (_h, kids) =
+        discovered_under_a_repo_item(vec![code_follow_up("f", "Document the helper")]).await;
+    assert_eq!(kids["Document the helper"].worker_kind, WorkerKind::Local);
+}
+
+#[tokio::test]
+async fn a_discovered_draft_that_sets_its_repo_and_worker_keeps_them() {
+    let mut own = code_follow_up("f", "Port the helper");
+    own.writable_resources = vec!["repo:/src/other".to_string()];
+    own.worker_kind = WorkerKind::ClaudeCode;
+    let (_h, kids) = discovered_under_a_repo_item(vec![own]).await;
+    let filed = &kids["Port the helper"];
+    assert_eq!(
+        filed.writable_resources,
+        vec!["repo:/src/other".to_string()]
+    );
+    assert_eq!(filed.worker_kind, WorkerKind::ClaudeCode);
 }
 
 #[tokio::test]
