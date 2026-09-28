@@ -265,6 +265,24 @@ All configuration is via environment variables. No plaintext config files.
 | `RUSTYKRAB_SCRIPT_PATH` | unset | Script file for `RUSTYKRAB_PROVIDER=scripted` (E2E harness); required by that provider, which refuses to start without it |
 | `RUSTYKRAB_TOOL_STUBS` | unset | Path to a tool-stub file that swaps real tools for scripted stand-ins, all active from turn 0. Evaluation harness only |
 | `RUSTYKRAB_ACTIVE_TOOLS` | unset | Comma-separated tool names to seed active from turn 0. Evaluation harness only |
+| `RUSTYKRAB_ALLOWED_ORIGINS` | unset | Comma-separated extra origins the gateway accepts browser requests from, e.g. the tailnet URL the credential page is served on. A malformed entry is skipped with a warning. See [Serving the credential page over your tailnet](#serving-the-credential-page-over-your-tailnet) |
+| `RUSTYKRAB_CREDENTIAL_PAGE_ANONYMOUS` | off | `1`, `true`, `on` or `yes` let the credential and payment-approval pages answer without a `Tailscale-User-Login` identity. Never set it on a page reachable from beyond this machine |
+| `RUSTYKRAB_DISABLE_KEYCHAIN` | off | macOS: any value but empty, `0`, `false`, `no` or `off` keeps the daemon off the real Keychain. The evaluation harness sets it on every throwaway boot |
+| `RUSTYKRAB_APNS_ENVIRONMENT` | `sandbox` | APNs host for push notifications: `production` (or `prod`) sends to `api.push.apple.com`; anything else uses the sandbox |
+| `RUSTYKRAB_WORKSPACE` | current directory | Base directory the file tools are confined to |
+| `RUSTYKRAB_SSRF_ALLOW_HOSTS` | unset | Comma-separated host names exempt from the web tools' private-address block. Exact, case-insensitive, no wildcards. The evaluation harness forwards it to the daemons it boots |
+| `RUSTYKRAB_COMPACTION_INPUT_BUDGET_RATIO` | `0.5` | Fraction of the effective context limit a single compaction call may take as input. Values are clamped to (0, 1]; one that does not parse keeps the default |
+| `RUSTYKRAB_COMPACTION_EXPAND_CTX` | unset | A positive integer runs every summarization call at that context window; anything else leaves compaction at the everyday window. Each switch costs a KV-cache resize on local servers |
+| `RUSTYKRAB_BROWSER_ISOLATED_ROOT` | unset | Directory the browser tool isolates its profiles under, instead of redirecting `HOME`. The evaluation harness sets it per boot |
+| `RUSTYKRAB_BROWSER_BORROW_SYSTEM_PROFILE` | off | `1` symlinks the account's active system-Chrome profile into RustyKrab's user-data directory to reuse its sessions. Unsafe while that Chrome is running |
+| `RUSTYKRAB_BROWSER_DOWNLOAD_ROOT` | unset | Root for browser downloads, one subdirectory per profile. Unset, downloads stay under the profile's user-data directory |
+| `RUSTYKRAB_BROWSER_SWEEP` | off | `1` kills stale Chromium processes whose user-data directory is RustyKrab's when the browser manager starts |
+| `RUSTYKRAB_UPDATE_APPLY_UNREVIEWED` | unset | `1` lets `rustykrab update apply` run while it is held pending its review's fixes (`docs/plans/update-flow.md`); otherwise it refuses and exits 3 |
+| `RUSTYKRAB_BIN` | `target/debug/rustykrab-cli` | Daemon binary the evaluation harness (`rustykrab-e2e`) boots. Harness only |
+| `RUSTYKRAB_E2E_SOURCE_REVISION` | `unrecorded` | Source revision recorded in the evaluation harness's report. Harness only |
+| `RUSTYKRAB_COMPACTION_STUDY_ARM` | unset | `message-tail` runs only the structured message-tail arm of the harness's compaction study. Harness only |
+| `RUSTYKRAB_CONTEXT_BROWSER_READY` | unset | `1` tells the harness's context eval that its browser fixture is ready. Harness only |
+| `RUSTYKRAB_CONTEXT_COMPACTION_STRATEGY` | default strategy | Compaction strategy the harness's context eval runs under, by its serialized name. Harness only |
 
 ### Persisting credentials
 
