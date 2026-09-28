@@ -168,6 +168,26 @@ from running. Until they are fixed the CLI refuses
    `updates/apply-failed.json`, always try to start the service last, and
    make every later run print that file and stop until a person clears it.
 
+Progress:
+
+- **Item 1 is done** (batch 7): the record is canonical and its copy is
+  re-checked for signature, version and commit. It only updates a healthy
+  daemon, requires a loopback or https URL, and stops only the installed
+  binary. Its re-review found one blocking hole: the newer-version check
+  applied only to a stage with a tag, and the tag is a field a worker
+  writes, so an older signed release recorded as a tagless local build
+  could be applied. It was fixed at merge. Every stage must be at least
+  the running version.
+- **Items 2 to 4 are in part 2**, with one of the re-review's points: the
+  copy's checks move before the daemon is stopped, so a bad stage never
+  takes it down.
+- **Part 3 follows** with the re-review's smaller points:
+  - read the listener's executable with `proc_pidpath` rather than
+    `ps -o comm=`, which prints the process's own `argv[0]`;
+  - accept only `127.0.0.1` and `[::1]`, and check the default gateway
+    URL too;
+  - choose a stage by version rather than by the record's `staged_at`.
+
 Also required:
 - The script service stops only a loopback listener whose executable is
   the installed one.
