@@ -22,7 +22,7 @@ use crate::graph::{self, Effects};
 use crate::handle::TickReport;
 use crate::ladder::{self, Decision, LadderContext, LadderState, SurfaceReason};
 use crate::routing::{built_tool, work_class, Judged, Verdict};
-use crate::worker::{run_failure_input, Brief, Worker, COMMAND_RUN};
+use crate::worker::{run_failure_input, Brief, RunFailure, Worker, COMMAND_RUN};
 use crate::workspace::{self, CodeClaim, CodeVerdict, Workspace, WORKSPACE_EVIDENCE};
 
 use super::batch::{has_open_plan_b, Batch};
@@ -254,7 +254,10 @@ impl Controller {
         self.sweep(now, first, &mut report, &mut noticed).await?;
         self.state().resumed = true;
         self.reconcile_all(now, &mut report, &mut noticed).await?;
-        self.select_and_lease(&mut report).await?;
+        // Draining for shutdown: nothing new starts, what runs finishes.
+        if !self.is_draining() {
+            self.select_and_lease(&mut report).await?;
+        }
         self.age(now, &mut report).await?;
         Ok(report)
     }
@@ -553,6 +556,18 @@ impl Controller {
         };
         let worker = finished.worker.as_str();
         let mut changed = match &finished.outcome {
+            // The host ended the run on its way down: not the worker's
+            // failure. Back to `ready`, lease released, no rung, no repair
+            // counted; the worktree stays for retention and the next daemon
+            // runs the item again.
+            Err(e) if RunFailure::from_error(e).is_some_and(|f| f.is_interrupted()) => b.resume_to(
+                id,
+                Status::Ready,
+                format!(
+                    "the run on {worker} was interrupted by a daemon shutdown; returned to \
+                         ready"
+                ),
+            ),
             Err(e) => {
                 // A typed `RunFailure` (a spent budget, a model that never
                 // reported) comes back typed; anything else as the core

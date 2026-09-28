@@ -72,6 +72,10 @@ pub struct LoopStatus {
     /// before the loop first tries it, and for a controller no loop drives.
     #[serde(default)]
     pub lock: Option<LockState>,
+    /// The daemon is shutting down: ticks lease nothing new but still
+    /// reconcile what finishes.
+    #[serde(default)]
+    pub draining: bool,
 }
 
 /// The loop's hold on its data directory's `controller.lock`
@@ -157,6 +161,12 @@ pub trait ControlHandle: Send + Sync {
     fn loop_status(&self) -> Option<LoopStatus> {
         None
     }
+
+    /// Start (or stop) draining: while it is set a tick leases nothing
+    /// new, and still sweeps and reconciles, so the runs in flight can
+    /// finish before the daemon exits. A handle that runs no loop ignores
+    /// it.
+    fn set_draining(&self, _draining: bool) {}
 
     /// Apply a decision a human took on the review surface to a proposal
     /// (plan sections 10 and 11), as one transaction with its `review`

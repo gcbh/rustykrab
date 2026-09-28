@@ -125,10 +125,15 @@ mod tests {
             "a second lock on the same path is refused while the first is held"
         );
         drop(first);
-        assert!(
-            ControllerLock::try_acquire(&path).unwrap().is_some(),
-            "the lock is granted once the first is released"
-        );
+        // See the loop lock test below for why the release is awaited.
+        let started = std::time::Instant::now();
+        while ControllerLock::try_acquire(&path).unwrap().is_none() {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(5),
+                "the lock is granted once the first is released"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 
     #[test]
@@ -139,7 +144,17 @@ mod tests {
         assert_eq!(ours.poll().unwrap(), LockState::Waiting);
         assert_eq!(ours.poll().unwrap(), LockState::Waiting);
         drop(other);
-        assert_eq!(ours.poll().unwrap(), LockState::Held);
+        // A process another test forks in parallel shares the descriptor
+        // until it execs (it is close-on-exec), and with it the lock, so the
+        // release can take a moment to be seen.
+        let started = std::time::Instant::now();
+        while ours.poll().unwrap() == LockState::Waiting {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(5),
+                "the lock is granted once the other holder lets go"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         assert_eq!(ours.poll().unwrap(), LockState::Held);
         assert!(
             ControllerLock::try_acquire(&path).unwrap().is_none(),

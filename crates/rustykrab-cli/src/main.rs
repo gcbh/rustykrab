@@ -1985,18 +1985,40 @@ async fn main() -> anyhow::Result<()> {
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown_signal());
+    .with_graceful_shutdown({
+        // Drain before the server stops, so `/api/version` reports it: the
+        // controller leases nothing new and the runs in flight get
+        // RUSTYKRAB_DRAIN_SECS to finish while the tick loop reconciles them.
+        let control = controller.clone() as Arc<dyn ControlHandle>;
+        let grace = drain_grace();
+        async move {
+            shutdown_signal().await;
+            drain(control.as_ref(), grace).await;
+        }
+    });
 
     server.await?;
 
     // End every live external worker run (its whole process group) while
     // the runtime can still reap them, before the tasks driving them are
-    // aborted. Their worktrees stay for retention.
+    // aborted. Their worktrees stay for retention, and each reports an
+    // interruption: one more tick returns their items to `ready` with no
+    // rung, so the next daemon runs them again.
     let ended = rustykrab_agent::RunGroups::global()
         .terminate_all(std::time::Duration::from_secs(5))
         .await;
     if ended > 0 {
         tracing::info!(runs = ended, "external worker runs terminated");
+        controller
+            .wait_for_runs(std::time::Duration::from_secs(5))
+            .await;
+        match controller.tick().await {
+            Ok(report) => tracing::info!(
+                reconciled = report.reconciled.len(),
+                "interrupted runs reconciled"
+            ),
+            Err(e) => tracing::warn!(error = %e, "final control tick failed"),
+        }
     }
 
     // Abort infrastructure tasks and log any panics.
@@ -3223,6 +3245,87 @@ fn shutdown_signal() -> impl std::future::Future<Output = ()> {
             _ = terminate => "SIGTERM",
         };
         tracing::info!(signal = which, "shutdown signal received");
+    }
+}
+
+/// How long shutdown waits for the controller's runs in flight to finish
+/// before it ends them: `RUSTYKRAB_DRAIN_SECS`, 20 by default.
+fn drain_grace() -> std::time::Duration {
+    parse_drain_secs(std::env::var("RUSTYKRAB_DRAIN_SECS").ok().as_deref())
+}
+
+fn parse_drain_secs(value: Option<&str>) -> std::time::Duration {
+    const DEFAULT: u64 = 20;
+    let secs = match value.map(str::trim) {
+        None | Some("") => DEFAULT,
+        Some(v) => v.parse().unwrap_or_else(|_| {
+            tracing::warn!(
+                value = v,
+                "RUSTYKRAB_DRAIN_SECS is not whole seconds; using {DEFAULT}"
+            );
+            DEFAULT
+        }),
+    };
+    std::time::Duration::from_secs(secs)
+}
+
+/// Put the controller in its draining state and wait, up to `grace`, for
+/// the runs in flight to finish (the tick loop keeps reconciling them).
+/// Returns how many are still running.
+async fn drain(control: &dyn ControlHandle, grace: std::time::Duration) -> usize {
+    control.set_draining(true);
+    let deadline = tokio::time::Instant::now() + grace;
+    loop {
+        let in_flight = control.loop_status().map_or(0, |s| s.runs_in_flight);
+        if in_flight == 0 {
+            tracing::info!("controller drained");
+            return 0;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            tracing::warn!(
+                runs = in_flight,
+                grace_secs = grace.as_secs(),
+                "runs still in flight after the drain grace; ending them"
+            );
+            return in_flight;
+        }
+        tracing::info!(runs = in_flight, "draining: waiting for runs in flight");
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+}
+
+#[cfg(test)]
+mod drain_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn drain_grace_defaults_to_twenty_seconds() {
+        assert_eq!(parse_drain_secs(None), Duration::from_secs(20));
+        assert_eq!(parse_drain_secs(Some(" ")), Duration::from_secs(20));
+        assert_eq!(parse_drain_secs(Some("soon")), Duration::from_secs(20));
+        assert_eq!(parse_drain_secs(Some("45")), Duration::from_secs(45));
+        assert_eq!(parse_drain_secs(Some("0")), Duration::ZERO);
+    }
+
+    #[tokio::test]
+    async fn drain_sets_draining_and_returns_once_nothing_runs() {
+        let dir = std::env::temp_dir().join(format!("rk-drain-{}", uuid::Uuid::new_v4()));
+        let store = rustykrab_store::Store::open(&dir, vec![9u8; 32]).expect("store opens");
+        let controller = rustykrab_control::controller::Controller::new(
+            store,
+            Vec::new(),
+            rustykrab_control::controller::ControllerConfig::default(),
+        );
+        let started = std::time::Instant::now();
+        assert_eq!(drain(&controller, Duration::from_secs(20)).await, 0);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let status = controller.loop_status().unwrap();
+        assert!(status.draining);
+        let report = controller.tick().await.unwrap();
+        assert!(report.leased.is_empty());
+        drop(controller);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

@@ -31,6 +31,8 @@ struct VersionReply {
 /// `last_failed_tick` moving. `lock` is `"held"` when this process holds
 /// the data directory's `controller.lock` and ticks, `"waiting"` while
 /// another process holds it, and `None` before the loop first tries it.
+/// `draining` is set once the daemon is shutting down: nothing new is
+/// leased while the runs in flight finish.
 #[derive(Debug, Serialize)]
 struct ControllerReply {
     wired: bool,
@@ -40,6 +42,7 @@ struct ControllerReply {
     last_failure_class: Option<String>,
     consecutive_failed_ticks: Option<u32>,
     lock: Option<LockState>,
+    draining: Option<bool>,
 }
 
 async fn version(State(state): State<AppState>) -> Json<VersionReply> {
@@ -52,6 +55,7 @@ async fn version(State(state): State<AppState>) -> Json<VersionReply> {
             wired: state.control.is_some(),
             last_tick: status.as_ref().and_then(|s| s.last_tick),
             runs_in_flight: status.as_ref().map(|s| s.runs_in_flight),
+            draining: status.as_ref().map(|s| s.draining),
             lock: status.as_ref().and_then(|s| s.lock),
             last_failed_tick: status.as_ref().and_then(|s| s.last_failed_tick),
             consecutive_failed_ticks: status.as_ref().map(|s| s.consecutive_failed_ticks),
@@ -221,6 +225,7 @@ mod tests {
         assert_eq!(body["build_date"], "2026-09-27");
         assert_eq!(body["controller"]["wired"], true);
         assert_eq!(body["controller"]["runs_in_flight"], 2);
+        assert_eq!(body["controller"]["draining"], false);
         let last: DateTime<Utc> = body["controller"]["last_tick"]
             .as_str()
             .unwrap()
@@ -274,6 +279,23 @@ mod tests {
         assert_eq!(body["controller"]["last_failure_class"], Value::Null);
         assert_eq!(body["controller"]["consecutive_failed_ticks"], Value::Null);
         assert_eq!(body["controller"]["lock"], Value::Null);
+        assert_eq!(body["controller"]["draining"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn a_draining_controller_says_so() {
+        let base = serve(state().with_control(Arc::new(StubControl(Some(LoopStatus {
+            last_tick: Some(at()),
+            runs_in_flight: 1,
+            draining: true,
+            ..LoopStatus::default()
+        })))))
+        .await;
+        let (status, body) = get_version(&base).await;
+        assert_eq!(status, Http::OK, "{body}");
+        assert_eq!(body["controller"]["wired"], true);
+        assert_eq!(body["controller"]["draining"], true);
+        assert_eq!(body["controller"]["runs_in_flight"], 1);
     }
 
     #[tokio::test]
@@ -284,6 +306,7 @@ mod tests {
         assert_eq!(body["controller"]["wired"], true);
         assert_eq!(body["controller"]["last_tick"], Value::Null);
         assert_eq!(body["controller"]["runs_in_flight"], 0);
+        assert_eq!(body["controller"]["draining"], false);
         assert_eq!(body["controller"]["lock"], Value::Null);
     }
 
@@ -322,8 +345,16 @@ mod tests {
         assert_eq!(body["controller"]["lock"], "waiting", "{body}");
 
         drop(other);
-        let (state, _) = controller.claim_loop_lock(&mut ours);
-        assert_eq!(state, LockState::Held);
+        // A process another test forks in parallel shares the lock's
+        // descriptor until it execs, so the release can take a moment.
+        let started = std::time::Instant::now();
+        while controller.claim_loop_lock(&mut ours).0 == LockState::Waiting {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(5),
+                "the lock is granted once the other holder lets go"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
         let (_, body) = get_version(&base).await;
         assert_eq!(body["controller"]["lock"], "held", "{body}");
     }

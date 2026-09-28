@@ -7,6 +7,7 @@
 
 mod checks;
 mod closeout;
+mod drain;
 mod loop_status;
 mod model_check;
 mod paths;
