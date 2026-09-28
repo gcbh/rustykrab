@@ -458,6 +458,48 @@ async fn discovered_repo_writers_already_ordered_by_their_own_edges_get_no_cycle
 }
 
 #[tokio::test]
+async fn a_discovered_draft_runs_after_an_open_sibling_writing_its_inherited_repo() {
+    let h = Harness::new(&["pinch"]);
+    h.script.push(
+        "Add a status helper",
+        report(ResultReport {
+            discovered: vec![code_follow_up("f", "Document the helper")],
+            ..done("Add a status helper")
+        }),
+    );
+    let mut x = draft("x", "Add a status helper");
+    x.writable_resources = vec!["repo:/src/app".to_string()];
+    let mut y = draft("y", "Wire the status page");
+    y.writable_resources = vec!["repo:/src/app".to_string()];
+    y.edges = vec![on(EdgeKind::Blocks, "x")];
+    let ids = h
+        .file(plan(vec![draft("P", "Status page"), x, y]))
+        .await
+        .ids;
+    let mut found = None;
+    for _ in 0..3 {
+        h.step().await;
+        let kids = h.store().work_children(&ids["P"]).await.unwrap();
+        found = kids.into_iter().find(|k| k.title == "Document the helper");
+        if found.is_some() {
+            break;
+        }
+    }
+    let found = found.expect("the follow-up is accepted, not rejected as an unordered writer");
+    assert_eq!(found.writable_resources, vec!["repo:/src/app".to_string()]);
+    let edges = h.store().work_edges_of(&found.id).await.unwrap();
+    assert!(
+        edges
+            .iter()
+            .any(|e| e.kind == EdgeKind::Blocks && e.depends_on == ids["y"]),
+        "the follow-up waits for the open sibling writing the same repository"
+    );
+    h.drain().await;
+    assert_eq!(h.status(&ids["y"]).await, Status::Done);
+    assert_eq!(h.status(&found.id).await, Status::Done);
+}
+
+#[tokio::test]
 async fn a_discovered_draft_with_no_worker_constraint_inherits_the_filers() {
     let (_h, kids) =
         discovered_under_a_repo_item(vec![code_follow_up("f", "Document the helper")]).await;
