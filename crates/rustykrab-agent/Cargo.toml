@@ -9,6 +9,7 @@ license.workspace = true
 rustykrab-core.workspace = true
 rustykrab-tools.workspace = true
 rustykrab-control.workspace = true
+rustykrab-skills.workspace = true
 async-trait.workspace = true
 tokio.workspace = true
 serde_json.workspace = true

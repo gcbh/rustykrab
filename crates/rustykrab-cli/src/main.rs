@@ -1,3 +1,4 @@
+mod agent_defs;
 mod chat;
 #[cfg(feature = "computer-use")]
 mod computer_backend;
@@ -33,7 +34,6 @@ use rustykrab_channels::{SignalChannel, SlackChannel, TelegramChannel, VideoChan
 use rustykrab_core::model::ModelProvider;
 use rustykrab_core::orchestration::OrchestrationConfig;
 use rustykrab_core::types::{MessageContent, Role};
-use rustykrab_core::AgentRegistry;
 use rustykrab_gateway::AppState;
 use rustykrab_memory::backend::HybridMemoryBackend;
 #[cfg(not(feature = "embeddings"))]
@@ -1248,6 +1248,7 @@ async fn main() -> anyhow::Result<()> {
     // `Capability::Subagent` (granted by the gateway via
     // `AppState::subagents_enabled`) before the model can actually call
     // them.
+    let agent_definitions = agent_defs::load(&data_dir);
     let subagents_enabled = std::env::var("RUSTYKRAB_ENABLE_SUBAGENTS")
         .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "True"))
         .unwrap_or(false);
@@ -1257,7 +1258,7 @@ async fn main() -> anyhow::Result<()> {
         // about to add — that prevents a sub-agent from re-spawning itself
         // through the same registry. The per-tool depth guard inside
         // `SubagentsTool` is the second line of defence.
-        let agent_registry = Arc::new(AgentRegistry::with_defaults());
+        let agent_registry = Arc::new(agent_defs::subagents(&agent_definitions));
         let subagent_runner: Arc<dyn rustykrab_tools::SessionManager> =
             Arc::new(SubagentRunner::new(
                 provider.clone(),
@@ -1330,7 +1331,7 @@ async fn main() -> anyhow::Result<()> {
     let local_worker: Arc<dyn rustykrab_control::worker::Worker> = Arc::new(
         rustykrab_agent::LocalWorker::new(
             "pinch",
-            rustykrab_agent::LocalWorker::default_definition("pinch"),
+            agent_defs::worker_definition(&agent_definitions, "pinch"),
             provider.clone(),
             tools.clone(),
             Arc::new(ProcessSandbox::new()),

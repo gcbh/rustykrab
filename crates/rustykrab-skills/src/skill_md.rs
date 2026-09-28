@@ -152,9 +152,25 @@ impl SkillMd {
 /// Markdown instructions here...
 /// ```
 pub fn parse_skill_md(content: &str) -> Result<(SkillMdFrontmatter, String), String> {
+    let (toml_str, body) = split_frontmatter(content, "SKILL.md")?;
+    let frontmatter: SkillMdFrontmatter =
+        toml::from_str(toml_str).map_err(|e| format!("invalid SKILL.md frontmatter: {e}"))?;
+
+    Ok((frontmatter, body.to_string()))
+}
+
+/// Split a `---`-fenced TOML front-matter block from the markdown body
+/// after it. Shared by `SKILL.md` and agent definition files, which use the
+/// same layout; `kind` names the file in errors.
+pub(crate) fn split_frontmatter<'a>(
+    content: &'a str,
+    kind: &str,
+) -> Result<(&'a str, &'a str), String> {
     let trimmed = content.trim_start();
     if !trimmed.starts_with("---") {
-        return Err("SKILL.md must begin with `---` frontmatter delimiter".into());
+        return Err(format!(
+            "{kind} must begin with `---` frontmatter delimiter"
+        ));
     }
 
     // Skip the opening `---` line.
@@ -174,11 +190,7 @@ pub fn parse_skill_md(content: &str) -> Result<(SkillMdFrontmatter, String), Str
     } else {
         ""
     };
-
-    let frontmatter: SkillMdFrontmatter =
-        toml::from_str(toml_str).map_err(|e| format!("invalid SKILL.md frontmatter: {e}"))?;
-
-    Ok((frontmatter, body.to_string()))
+    Ok((toml_str, body))
 }
 
 #[async_trait]

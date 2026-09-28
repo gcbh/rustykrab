@@ -4134,6 +4134,7 @@ dependencies = [
  "regex",
  "rustykrab-control",
  "rustykrab-core",
+ "rustykrab-skills",
  "rustykrab-tools",
  "serde",
  "serde_json",
