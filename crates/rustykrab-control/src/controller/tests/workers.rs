@@ -346,16 +346,29 @@ async fn scenario_31_one_discovered_draft_is_filed_and_the_workers_tracker_stays
         })
         .await
         .unwrap();
-    let filed: Vec<_> = everything
+    // The follow-up inherits the repository and worker, so it runs too and
+    // this worker discovers the same draft again from it: count only what
+    // `task` discovered.
+    let mut filed = Vec::new();
+    for i in everything
         .iter()
         .filter(|i| i.title == "Add a changelog entry")
-        .collect();
+    {
+        let edges = h.store().work_edges_of(&i.id).await.unwrap();
+        if edges
+            .iter()
+            .any(|e| e.kind == EdgeKind::DiscoveredFrom && e.depends_on == task)
+        {
+            filed.push(i);
+        }
+    }
     assert_eq!(filed.len(), 1, "exactly one item from the one draft");
     assert_eq!(filed[0].kind, WorkKind::Code);
-    let edges = h.store().work_edges_of(&filed[0].id).await.unwrap();
-    assert!(edges
-        .iter()
-        .any(|e| e.kind == EdgeKind::DiscoveredFrom && e.depends_on == task));
+    assert_eq!(filed[0].worker_kind, WorkerKind::ClaudeCode);
+    assert_eq!(
+        filed[0].writable_resources,
+        vec![format!("{REPO_PREFIX}{}", repo.path().display())]
+    );
     assert!(
         !everything
             .iter()
