@@ -352,6 +352,13 @@ impl WorkerRegistry {
                 spec.kind.as_str()
             )));
         }
+        if spec.kind == WorkerKind::Codex && !spec.denied_tools.is_empty() {
+            return Err(Error::Config(format!(
+                "codex has no deny list, so denied_tools ({}) would not be enforced; \
+                 drop them or add a claude_code worker",
+                spec.denied_tools.join(", ")
+            )));
+        }
         let factory = self
             .factory
             .read()
@@ -897,6 +904,27 @@ mod tests {
         };
         assert_eq!(denied("pinch"), guarded.denied_tools);
         assert!(denied("coral").is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_codex_spec_with_denied_tools_is_refused_not_silently_dropped() {
+        let (_dir, store) = temp_store();
+        let registry = WorkerRegistry::new(store.clone()).with_factory(Arc::new(Factory));
+        let mut codex = spec(WorkerKind::Codex, Some("squid"));
+        codex.denied_tools = vec!["Read(~/.config/**)".to_string()];
+        let refused = registry.add(codex).await;
+        assert!(
+            matches!(&refused, Err(Error::Config(m)) if m.contains("denied_tools")),
+            "{refused:?}"
+        );
+        assert!(store.workers().get("squid").await.unwrap().is_none());
+        assert!(registry.get("squid").is_none());
+
+        // Without a deny list the same codex worker is added.
+        registry
+            .add(spec(WorkerKind::Codex, Some("squid")))
+            .await
+            .unwrap();
     }
 
     #[test]

@@ -10,7 +10,8 @@
 //!   `repos`, `command`, `model`, `allowed_tools`, `denied_tools`, `max_turns`,
 //!   `permission_mode`, `timeout_seconds`, `concurrency`, `cost_tier`,
 //!   `env`): 201 with the worker, 409 when the name is taken, 400 when the
-//!   spec is refused.
+//!   spec is refused (among others, a codex spec with `denied_tools`, which
+//!   codex cannot enforce).
 //! - `DELETE /api/workers/{name}` removes an external worker; its history
 //!   keeps the name.
 //!
@@ -283,5 +284,36 @@ mod tests {
             view.spec.unwrap().denied_tools,
             ["Read(~/.config/**)", "Edit(//Users/someone/secrets/**)"]
         );
+    }
+
+    #[tokio::test]
+    async fn a_codex_worker_with_denied_tools_is_a_bad_request() {
+        let (base, client) = serve().await;
+        let refused = client
+            .post(format!("{base}/api/workers"))
+            .bearer_auth(TOKEN)
+            .json(&json!({
+                "kind": "codex",
+                "name": "squid",
+                "repos": ["/src/app"],
+                "denied_tools": ["WebFetch"],
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(refused.status().as_u16(), 400);
+        let body: Value = refused.json().await.unwrap();
+        assert_eq!(body["error"], "invalid_request", "{body}");
+        assert!(
+            body["message"].as_str().unwrap().contains("denied_tools"),
+            "{body}"
+        );
+        let missing = client
+            .get(format!("{base}/api/workers/squid"))
+            .bearer_auth(TOKEN)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(missing.status().as_u16(), 404, "nothing was registered");
     }
 }

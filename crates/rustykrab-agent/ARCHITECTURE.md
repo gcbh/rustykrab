@@ -298,8 +298,10 @@ could move to a crate of its own if the adapters grow.
   --allowedTools <list> --disallowedTools "Bash(git push:*),WebFetch,
   WebSearch"` followed by the spec's `denied_tools` (a spec can deny
   more, never less), plus `--model` and, for a capability build,
-  `--add-dir <skills dir>`. Codex has no deny list flag, so a codex spec's
-  `denied_tools` is dropped with a warning. A path-scoped deny such as `Read(~/.config/**)`
+  `--add-dir <skills dir>`. Codex has no deny list flag, so the registry
+  refuses a codex spec with `denied_tools` at add time (400
+  `invalid_request`); one stored before that refusal is dropped here with
+  a warning. A path-scoped deny such as `Read(~/.config/**)`
   stops Claude Code's file tools only: a command the allow list admits, such
   as `cargo` (which runs build scripts), can still read any file the user
   can, so it is a guard against a worker wandering, not confinement. Codex: `codex exec --json --skip-git-repo-check --sandbox

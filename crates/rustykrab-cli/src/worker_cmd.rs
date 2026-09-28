@@ -29,7 +29,7 @@ usage: rustykrab workers
                                  add an external coding worker; the registry
                                  names it when --name is left out;
                                  --denied-tools adds to claude_code's deny
-                                 list (codex ignores it)
+                                 list (codex has none, so it is refused there)
   worker add peer --url URL (--pairing-code CODE | --token TOKEN)
              [--name N] [--timeout SECONDS] [--concurrency N] [--cost-tier N]
                                  add a paired node on the tailnet: the code
@@ -189,6 +189,13 @@ fn parse_add(kind: &str, rest: &[&str]) -> Result<WorkerSpec, String> {
     if spec.repos.is_empty() {
         return Err("worker add needs --repos: the repositories it may work in".into());
     }
+    if kind == WorkerKind::Codex && !spec.denied_tools.is_empty() {
+        return Err(
+            "codex has no deny list, so --denied-tools would not be enforced; \
+             drop it or add a claude_code worker"
+                .into(),
+        );
+    }
     Ok(spec)
 }
 
@@ -345,6 +352,18 @@ mod tests {
         assert_eq!(spec.kind, WorkerKind::Codex);
         assert_eq!(spec.repos.len(), 2, "space separated too");
         assert!(spec.name.is_none(), "the registry names it");
+
+        let refused = parse(&words(&format!(
+            "worker add codex --repos {} --denied-tools WebFetch",
+            repo.path().display()
+        )));
+        assert!(
+            refused
+                .as_ref()
+                .is_err_and(|e| e.contains("--denied-tools")),
+            "codex cannot enforce a deny list: {:?}",
+            refused.err()
+        );
     }
 
     #[test]
