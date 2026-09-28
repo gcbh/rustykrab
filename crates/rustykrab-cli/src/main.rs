@@ -2005,13 +2005,7 @@ async fn main() -> anyhow::Result<()> {
         controller
             .wait_for_runs(std::time::Duration::from_secs(5))
             .await;
-        match controller.tick().await {
-            Ok(report) => tracing::info!(
-                reconciled = report.reconciled.len(),
-                "interrupted runs reconciled"
-            ),
-            Err(e) => tracing::warn!(error = %e, "final control tick failed"),
-        }
+        run_final_control_tick(controller.as_ref()).await;
     }
 
     // Abort infrastructure tasks and log any panics.
@@ -3279,12 +3273,7 @@ async fn run_control_tick(control: &dyn ControlHandle) {
             }
         }
         Err(e) => {
-            let status = control.loop_status();
-            let class = status
-                .as_ref()
-                .and_then(|s| s.last_failure_class.clone())
-                .unwrap_or_else(|| "unknown".to_string());
-            let consecutive = status.map_or(0, |s| s.consecutive_failed_ticks);
+            let (class, consecutive) = tick_failure(control);
             tracing::warn!(
                 error = %e,
                 class = %class,
@@ -3293,6 +3282,39 @@ async fn run_control_tick(control: &dyn ControlHandle) {
             );
         }
     }
+}
+
+/// The one tick run at shutdown to reconcile the runs just interrupted.
+/// A failure is logged with its class and consecutive count, the same way
+/// `run_control_tick` logs one.
+async fn run_final_control_tick(control: &dyn ControlHandle) {
+    match control.tick().await {
+        Ok(report) => tracing::info!(
+            reconciled = report.reconciled.len(),
+            "interrupted runs reconciled"
+        ),
+        Err(e) => {
+            let (class, consecutive) = tick_failure(control);
+            tracing::warn!(
+                error = %e,
+                class = %class,
+                consecutive,
+                "final control tick failed"
+            );
+        }
+    }
+}
+
+/// The class and consecutive count the controller recorded for the tick
+/// that just failed, read back from `loop_status`.
+fn tick_failure(control: &dyn ControlHandle) -> (String, u32) {
+    let status = control.loop_status();
+    let class = status
+        .as_ref()
+        .and_then(|s| s.last_failure_class.clone())
+        .unwrap_or_else(|| "unknown".to_string());
+    let consecutive = status.map_or(0, |s| s.consecutive_failed_ticks);
+    (class, consecutive)
 }
 
 #[cfg(test)]
@@ -3395,6 +3417,30 @@ mod control_tick_log_tests {
             assert!(line.contains(&format!("consecutive={count}")), "{line}");
             assert!(line.contains("database is locked"), "{line}");
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_final_tick_logs_its_class_and_consecutive_count() {
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        // Two timer ticks failed before shutdown; the final one is the third.
+        let control = FailingControl(Mutex::new(2));
+        run_final_control_tick(&control).await;
+
+        let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(lines.len(), 1, "{log}");
+        let line = lines[0];
+        assert!(line.contains("final control tick failed"), "{line}");
+        assert!(line.contains("class=storage"), "{line}");
+        assert!(line.contains("consecutive=3"), "{line}");
+        assert!(line.contains("database is locked"), "{line}");
     }
 }
 
