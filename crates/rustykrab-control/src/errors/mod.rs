@@ -354,6 +354,15 @@ pub fn is_defect(err: &WorkError) -> bool {
     err.class == ErrorClass::Unknown
 }
 
+/// A capability gap that does not name what is missing (`needs tool: `).
+/// No capability item can answer it, so the ladder sends it to order 3 for
+/// triage instead of filing one nobody can act on.
+pub fn unnamed_gap(err: &WorkError) -> Option<GapKind> {
+    gap_of(err)
+        .filter(|g| g.subject.trim().is_empty())
+        .map(|g| g.kind)
+}
+
 /// The `internal` item the ladder's order 3 files.
 ///
 /// For an `unknown` error it asks for the probe, log line, check or parser
@@ -392,6 +401,23 @@ pub fn internal_item_draft(err: &WorkError, evidence: Vec<ArtifactRef>) -> WorkI
                     learned::CLASSIFIER_RULE
                 ),
             ],
+        )
+    } else if let Some(gap) = unnamed_gap(err) {
+        (
+            format!("Name the missing {} in failure {fp}", gap.as_str()),
+            format!(
+                "A capability gap was recorded without naming the {} it lacks (fingerprint \
+                 {fp}, observed_by {}), so no capability item could be filed for it: {}",
+                gap.as_str(),
+                err.observed_by,
+                err.detail
+            ),
+            format!(
+                "Replaying the attached evidence through the classifier names the missing {}, \
+                 and a test pins that for fingerprint {fp}.",
+                gap.as_str()
+            ),
+            vec!["Add measurement only; change no behaviour beyond classification.".to_string()],
         )
     } else {
         (

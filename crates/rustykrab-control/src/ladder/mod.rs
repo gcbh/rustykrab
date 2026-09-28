@@ -46,7 +46,7 @@ use rustykrab_core::work::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::errors::{gap_of, is_defect, Gap, GapKind, DEFAULT_PROMOTE_THRESHOLD};
+use crate::errors::{gap_of, is_defect, unnamed_gap, Gap, GapKind, DEFAULT_PROMOTE_THRESHOLD};
 
 /// Every rung, in the order the ladder climbs them.
 pub const RUNGS: [Rung; 10] = [
@@ -367,11 +367,14 @@ fn same_fingerprint(event: &RungEvent, err: &WorkError) -> bool {
         .is_some_and(|e| e.fingerprint == err.fingerprint)
 }
 
-/// Order 3 is due when the failure recurs or could not be classified, and
-/// has not already been filed for this fingerprint on this item.
+/// Order 3 is due when the failure recurs, could not be classified, or is a
+/// capability gap that names nothing, and has not already been filed for
+/// this fingerprint on this item.
 fn improve_due(state: &LadderState, ctx: &LadderContext) -> bool {
     let err = ctx.error;
-    let promoted = is_defect(err) || ctx.recurrence_count >= ctx.promote_threshold.max(1);
+    let promoted = is_defect(err)
+        || unnamed_gap(err).is_some()
+        || ctx.recurrence_count >= ctx.promote_threshold.max(1);
     promoted
         && state.left(Rung::Improve) > 0
         && !state
@@ -419,8 +422,13 @@ fn own_rung(state: &LadderState, ctx: &LadderContext) -> Option<Decision> {
     None
 }
 
-/// Order 2: one rung per gap, chosen by what is missing.
+/// Order 2: one rung per gap, chosen by what is missing. A gap that names
+/// nothing files no capability item: order 3 has triaged it, and the climb
+/// goes on to plan B, the parent's re-plan or the user.
 fn capability(state: &LadderState, ctx: &LadderContext, gap: Gap) -> Option<Decision> {
+    if gap.subject.trim().is_empty() {
+        return None;
+    }
     let rung = match gap.kind {
         GapKind::Tool if ctx.tool_exists == Some(false) => Rung::Build,
         GapKind::Capacity => Rung::Request,
