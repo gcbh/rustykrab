@@ -9,9 +9,11 @@
 //!    transaction: stored holds and, on the first tick, roll-ups that
 //!    disagree with what the edges derive are corrected with `resume`
 //!    events and an `internal` item (section 9); expiries apply with their
-//!    cascade; leases past their TTL either stall (a live run: the ladder
-//!    climbs) or return to `ready` (no run: a restart); on the first tick
-//!    every active leaf this process is not running returns to `ready`;
+//!    cascade; on the first tick a leaf whose worker still holds its run (a
+//!    peer's task, `reattach.rs`) is re-attached and keeps its lease;
+//!    leases past their TTL either stall (a live run: the ladder climbs) or
+//!    return to `ready` (no run: a restart); on the first tick every other
+//!    active leaf this process is not running returns to `ready`;
 //!    items parked on a capability item that is now `done` are released;
 //!    then readiness (time triggers), roll-ups and parent verification are
 //!    settled.
@@ -39,7 +41,8 @@
 //! Layout: `batch.rs` builds one transaction over a working snapshot;
 //! `load.rs` reads the store back (the snapshot, rung histories, a
 //! firing's conversation); `spend.rs` records what runs spend and gives
-//! parents their remaining budgets;
+//! parents their remaining budgets; `reattach.rs` keeps a run that
+//! outlived a restart (a peer's task) on its lease;
 //! `brief.rs` builds a run's inputs and brief; `filing.rs` is every filing
 //! path and the user's approve, reject and cancel; `tick.rs` is the loop;
 //! `notice.rs` renders the 6.6 message.
@@ -50,6 +53,7 @@ mod commit;
 mod filing;
 mod load;
 mod notice;
+mod reattach;
 mod review;
 mod spend;
 mod tick;

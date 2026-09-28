@@ -344,6 +344,39 @@ impl WorkerStore {
         .await
     }
 
+    /// Record what a worker advertises now (a peer node's models, tools,
+    /// MCP servers and machine, plan section 5) with the health check that
+    /// read it: the capabilities are replaced only when the worker
+    /// answered (`capabilities` is `Some`), so a node that is down keeps
+    /// the last advertisement it gave, marked by its health line.
+    pub async fn advertise(
+        &self,
+        name: &str,
+        capabilities: Option<serde_json::Value>,
+        health: &str,
+        seen: Option<DateTime<Utc>>,
+    ) -> Result<(), Error> {
+        let (name, health) = (name.to_string(), health.to_string());
+        with_conn(&self.conn, move |conn| {
+            conn.execute(
+                "UPDATE workers
+                    SET capabilities = COALESCE(?2, capabilities), health = ?3,
+                        last_seen = COALESCE(?4, last_seen), updated_at = ?5
+                  WHERE name = ?1",
+                params![
+                    name,
+                    capabilities.map(|c| c.to_string()),
+                    health,
+                    seen.as_ref().map(ts),
+                    ts(&Utc::now())
+                ],
+            )
+            .map_err(storage)?;
+            Ok(())
+        })
+        .await
+    }
+
     /// Change a worker's routing record in one transaction: read it, let
     /// `change` edit it, write it back. Returns the record as written, or
     /// `NotFound` when no worker has the name.

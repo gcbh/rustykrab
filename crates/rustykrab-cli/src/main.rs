@@ -5,6 +5,7 @@ mod computer_backend;
 mod daemon_client;
 mod evaluation;
 mod fleet;
+mod peers;
 mod prompt_log;
 mod scheduled_work;
 mod task_queue;
@@ -1304,6 +1305,9 @@ async fn main() -> anyhow::Result<()> {
         &tools,
     )
     .await?;
+    // One KV slot per model (plan 12.1): the local worker and the runs of
+    // a peer's briefs on this node (peers.rs) wait on the same one.
+    let model_slot = Arc::new(tokio::sync::Semaphore::new(1));
     let local_worker: Arc<dyn rustykrab_control::worker::Worker> = Arc::new(
         rustykrab_agent::LocalWorker::new(
             fleet.local_name.clone(),
@@ -1314,8 +1318,18 @@ async fn main() -> anyhow::Result<()> {
             deferred_work_backend.clone() as Arc<dyn rustykrab_tools::WorkBackend>,
         )
         .with_transcripts(scheduled_work::transcripts(&store, skill_registry.clone()))
-        .with_late_tools(fleet.skills.clone()),
+        .with_late_tools(fleet.skills.clone())
+        .with_slot(model_slot.clone()),
     );
+    let delegated_runs = peers::delegated_runs(peers::NodeParts {
+        name: fleet.local_name.clone(),
+        definition: agent_defs::worker_definition(&agent_definitions, &fleet.local_name),
+        provider: provider.clone(),
+        tools: tools.clone(),
+        store: store.clone(),
+        late: fleet.skills.clone(),
+        slot: model_slot,
+    });
     // Filled below, once the registry is final (the work tools added) and
     // the active-tools seed is known.
     let control_catalog = Arc::new(RegistryCatalog::default());
@@ -1435,6 +1449,7 @@ async fn main() -> anyhow::Result<()> {
     let mut state = rustykrab_gateway::AppState::new(store, tools, provider, auth_token)
         .with_control(controller.clone() as Arc<dyn rustykrab_control::handle::ControlHandle>)
         .with_workers(fleet.registry.clone())
+        .with_delegation(delegated_runs)
         .with_evaluation(evaluator.clone())
         // Loopback is always allowed; this adds the names other clients
         // reach us by, e.g. the tailnet hostname the phone uses.
@@ -1806,6 +1821,8 @@ async fn main() -> anyhow::Result<()> {
         }));
         tracing::info!("delegated-task worker started");
     }
+    // Peers' advertisements and health, recorded on their registry rows.
+    infra_handles.push(peers::spawn_refresh(fleet.registry.clone()));
 
     // --- Job executor (scheduled task runner) ---
     // With RUSTYKRAB_CRON_WORK_ITEMS=1 each firing is a work item the

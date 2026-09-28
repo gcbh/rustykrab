@@ -7,6 +7,7 @@
 
 mod closeout;
 mod paths;
+mod peers;
 mod review;
 mod scenarios;
 mod workers;

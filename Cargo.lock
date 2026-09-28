@@ -4132,6 +4132,7 @@ dependencies = [
  "chrono",
  "futures",
  "regex",
+ "reqwest 0.13.3",
  "rustykrab-control",
  "rustykrab-core",
  "rustykrab-skills",

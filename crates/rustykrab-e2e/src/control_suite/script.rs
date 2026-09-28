@@ -33,6 +33,8 @@ pub(super) const W_SUCCEED: &str = "e2e-control worker: succeed";
 pub(super) const W_PROBE: &str = "e2e-control worker: report the active tools";
 pub(super) const W_HOLD: &str = "e2e-control worker: hold the resource for three seconds";
 pub(super) const W_SLOW: &str = "e2e-control worker: work for twenty seconds";
+/// A peer's run long enough to restart either daemon inside it (8).
+pub(super) const W_PEER_PAUSE: &str = "e2e-control worker: work for eight seconds on the peer";
 pub(super) const W_TIMEOUT: &str = "e2e-control worker: fail with a timeout";
 pub(super) const W_UNRECOGNISED: &str =
     "e2e-control worker: fail in a way no classifier recognises";
@@ -275,6 +277,14 @@ pub(crate) fn agent_script_scenarios() -> Vec<Value> {
             ],
         ),
         script(
+            W_PEER_PAUSE,
+            vec![
+                call("exec", json!({ "command": "sleep 8", "timeout_secs": 20 })),
+                succeeded("Worked for eight seconds on the peer.", evidence),
+                done("Worked on the peer."),
+            ],
+        ),
+        script(
             W_TIMEOUT,
             vec![
                 report(json!({
@@ -470,6 +480,7 @@ mod tests {
             W_PROBE,
             W_HOLD,
             W_SLOW,
+            W_PEER_PAUSE,
             W_TIMEOUT,
             W_UNRECOGNISED,
             W_PROBE_FIX,

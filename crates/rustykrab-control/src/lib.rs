@@ -18,7 +18,11 @@
 //!   layered `code` graph of section 14.1, filed through the validator.
 //! - [`worker`]: workers as the controller sees them, and the brief they get.
 //! - [`registry`]: the named workers (section 5), persisted in the store's
-//!   `workers` table, and the factory that builds external ones.
+//!   `workers` table, and the factory that builds external ones and peers.
+//! - [`peer`]: the delegation contract a peer worker and its node share
+//!   (Phase 5): the typed submission, the task view with its typed result,
+//!   the ceiling refusal, the node's advertisement, and the node side's
+//!   `NodeWorkers` seam.
 //! - [`routing`]: work classes, the routing record and the policy that reads
 //!   it (sections 5 and 10).
 //! - [`workspace`]: isolated git worktrees for `code` runs and the check of a
@@ -38,6 +42,7 @@ pub mod graph;
 pub mod handle;
 pub mod import;
 pub mod ladder;
+pub mod peer;
 pub mod registry;
 pub mod review;
 pub mod routing;

@@ -27,7 +27,12 @@ usage: rustykrab workers
              [--allowed-tools T[,T...]] [--cost-tier N] [--env VAR[,VAR...]]
                                  add an external coding worker; the registry
                                  names it when --name is left out
-  worker remove <name>           remove an external worker
+  worker add peer --url URL (--pairing-code CODE | --token TOKEN)
+             [--name N] [--timeout SECONDS] [--concurrency N] [--cost-tier N]
+                                 add a paired node on the tailnet: the code
+                                 its `rustykrab-cli pair` printed is redeemed
+                                 for a token of this daemon's own
+  worker remove <name>           remove an external worker or a peer
 
 Talks to the daemon at RUSTYKRAB_GATEWAY_URL (default http://127.0.0.1:3000).";
 
@@ -36,7 +41,7 @@ enum Command {
     Help,
     List,
     Show(String),
-    Add(WorkerSpec),
+    Add(Box<WorkerSpec>),
     Remove(String),
 }
 
@@ -65,7 +70,16 @@ pub async fn run(data_dir: &Path, args: &[String]) -> anyhow::Result<()> {
             render_one(&view)
         }
         Command::Add(spec) => {
-            let body = serde_json::to_value(&spec)?;
+            let mut body = serde_json::to_value(&spec)?;
+            // A spec never serialises its secrets (they are kept out of the
+            // stored spec and every view), so the request carries them by
+            // hand, once, to the daemon that keeps them.
+            if let Some(token) = &spec.token {
+                body["token"] = serde_json::json!(token);
+            }
+            if let Some(code) = &spec.pairing_code {
+                body["pairing_code"] = serde_json::json!(code);
+            }
             let view: WorkerView = daemon.post(&["api", "workers"], Some(body)).await?;
             format!("added {}\n{}", view.name, render_one(&view))
         }
@@ -87,7 +101,9 @@ fn parse(args: &[String]) -> Result<Command, String> {
         }
         ["worker", "show", name] => Ok(Command::Show(name.to_string())),
         ["worker", "remove" | "rm", name] => Ok(Command::Remove(name.to_string())),
-        ["worker", "add", kind, rest @ ..] => parse_add(kind, rest).map(Command::Add),
+        ["worker", "add", kind, rest @ ..] => {
+            parse_add(kind, rest).map(|spec| Command::Add(Box::new(spec)))
+        }
         _ => Err(format!("unknown worker command: {}", words.join(" "))),
     }
 }
@@ -96,8 +112,13 @@ fn parse(args: &[String]) -> Result<Command, String> {
 /// since the daemon runs elsewhere.
 fn parse_add(kind: &str, rest: &[&str]) -> Result<WorkerSpec, String> {
     let kind = WorkerKind::parse(kind)
-        .filter(|k| matches!(k, WorkerKind::ClaudeCode | WorkerKind::Codex))
-        .ok_or_else(|| format!("worker kind must be claude_code or codex, not `{kind}`"))?;
+        .filter(|k| {
+            matches!(
+                k,
+                WorkerKind::ClaudeCode | WorkerKind::Codex | WorkerKind::Peer
+            )
+        })
+        .ok_or_else(|| format!("worker kind must be claude_code, codex or peer, not `{kind}`"))?;
     let mut spec = WorkerSpec {
         kind,
         ..WorkerSpec::default()
@@ -142,9 +163,22 @@ fn parse_add(kind: &str, rest: &[&str]) -> Result<WorkerSpec, String> {
                 spec.allowed_tools = split_list(value(i)?);
             }
             "--env" => spec.env = split_list(value(i)?),
+            "--url" => spec.base_url = Some(value(i)?.to_string()),
+            "--token" => spec.token = Some(value(i)?.to_string()),
+            "--pairing-code" => spec.pairing_code = Some(value(i)?.to_string()),
+            "--concurrency" => spec.concurrency = Some(number(value(i)?)? as usize),
             other => return Err(format!("unknown flag {other}")),
         }
         i += 2;
+    }
+    if kind == WorkerKind::Peer {
+        if spec.base_url.is_none() {
+            return Err("worker add peer needs --url: its node's gateway".into());
+        }
+        if spec.token.is_none() && spec.pairing_code.is_none() {
+            return Err("worker add peer needs --pairing-code or --token".into());
+        }
+        return Ok(spec);
     }
     if spec.repos.is_empty() {
         return Err("worker add needs --repos: the repositories it may work in".into());
@@ -226,6 +260,15 @@ fn render_one(w: &WorkerView) -> String {
         if let Some(command) = &spec.command {
             out.push_str(&format!("  command {command}\n"));
         }
+        if let Some(url) = &spec.base_url {
+            out.push_str(&format!("  node {url}\n"));
+        }
+    }
+    if let Some(machine) = &w.capabilities.machine {
+        out.push_str(&format!("  machine {machine}\n"));
+    }
+    if w.kind == WorkerKind::Peer.as_str() && !w.capabilities.tools.is_empty() {
+        out.push_str(&format!("  tools {}\n", w.capabilities.tools.join(", ")));
     }
     for (class, r) in &w.routing_record {
         out.push_str(&format!(
@@ -283,6 +326,28 @@ mod tests {
         assert_eq!(spec.kind, WorkerKind::Codex);
         assert_eq!(spec.repos.len(), 2, "space separated too");
         assert!(spec.name.is_none(), "the registry names it");
+    }
+
+    #[test]
+    fn worker_add_peer_takes_a_node_and_a_way_in() {
+        let Command::Add(spec) = parse(&words(
+            "worker add peer --name krabby --url https://m4.tailnet.ts.net --pairing-code ABCD2345",
+        ))
+        .unwrap() else {
+            panic!("not an add")
+        };
+        assert_eq!(spec.kind, WorkerKind::Peer);
+        assert_eq!(spec.base_url.as_deref(), Some("https://m4.tailnet.ts.net"));
+        assert_eq!(spec.pairing_code.as_deref(), Some("ABCD2345"));
+        assert!(spec.repos.is_empty(), "a peer needs no repositories here");
+        assert!(
+            parse(&words("worker add peer --token t")).is_err(),
+            "no url"
+        );
+        assert!(
+            parse(&words("worker add peer --url http://n")).is_err(),
+            "no token or code"
+        );
     }
 
     #[test]

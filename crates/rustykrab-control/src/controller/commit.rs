@@ -81,6 +81,11 @@ impl Controller {
         for id in &b.revoke {
             if let Some(run) = state.runs.remove(id) {
                 run.handle.abort();
+                // A run that lives outside this process (a peer's task)
+                // is ended there too.
+                if let Some(worker) = self.worker(&run.worker) {
+                    worker.stop(&run.run_id);
+                }
                 stopped.push((id.clone(), run));
             }
             state.finished.remove(id);
