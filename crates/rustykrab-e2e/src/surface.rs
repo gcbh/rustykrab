@@ -183,8 +183,9 @@ impl StandIns {
     }
 
     /// Point a scripted daemon at the stand-ins. The GitHub variables are
-    /// read by the projection adapter of the control plan's Phase 6; until
-    /// it exists nothing reads them.
+    /// read by the review surface's GitHub adapter (the control plan's
+    /// Phase 6, `rustykrab-cli`'s `evaluation.rs`): the repository, the API
+    /// base, and the token the credential registry resolves.
     pub fn configure(&self, command: &mut std::process::Command) {
         configure_channel(command, Surface::Telegram, &self.telegram_base);
         command
