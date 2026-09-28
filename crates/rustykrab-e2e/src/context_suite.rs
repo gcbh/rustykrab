@@ -298,7 +298,10 @@ fn fixture_response(body: &Value) -> Value {
         .as_array()
         .into_iter()
         .flatten()
-        .any(|t| t["function"]["name"] == "browser");
+        .any(|t| t["function"]["name"] == "browser")
+        || appended_names(msgs.as_slice())
+            .iter()
+            .any(|n| n == "browser");
     let function = if has_eval_result {
         json!({"name":"task_complete","arguments":{"summary":"Broadway availability remains unverified: the browser service is unavailable."}})
     } else if !browser_exposed {
@@ -506,9 +509,42 @@ pub(crate) fn local_url(s: &str) -> Result<String> {
     Ok(s.trim_end_matches('/').to_owned())
 }
 
+/// Names whose definitions a `tools_load` or `tools_list` result in these
+/// wire messages delivered as text: the append path (plan section 12), under
+/// which a callable tool need not be in the request's tools array.
+fn appended_names(messages: &[Value]) -> Vec<String> {
+    let mut names = Vec::new();
+    for message in messages.iter().filter(|m| m["role"] == "tool") {
+        let Some(content) = message["content"].as_str() else {
+            continue;
+        };
+        // `tools_load` answers with an object whose `tools` holds the
+        // appended definitions; a `tools_list` search with a framing line
+        // and the definitions as a JSON array after it.
+        let definitions = match serde_json::from_str::<Value>(content) {
+            Ok(object) if object["tools"].is_array() => object["tools"].clone(),
+            _ => content
+                .split_once('\n')
+                .and_then(|(_, rest)| serde_json::from_str::<Value>(rest).ok())
+                .unwrap_or(Value::Null),
+        };
+        for name in definitions
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|d| d["function"]["name"].as_str())
+        {
+            names.push(name.to_string());
+        }
+    }
+    names
+}
+
 /// Join a real tools_load result to the next actor request's offered schemas.
 /// Only adjacent actor exchanges are compared: historical activation reports
 /// need not describe availability after later registry or capability changes.
+/// A name counts as available when the request declares it or when an
+/// earlier tool result in the same request appended its definition.
 fn tool_availability_check(records: &[Value]) -> Value {
     let actor: Vec<_> = records
         .iter()
@@ -547,18 +583,28 @@ fn tool_availability_check(records: &[Value]) -> Value {
             .flatten()
             .filter_map(|s| s["function"]["name"].as_str())
             .collect();
+        let appended = appended_names(
+            pair[1]["wire_request"]["messages"]
+                .as_array()
+                .map(Vec::as_slice)
+                .unwrap_or_default(),
+        );
         let mut missing = vec![];
         if let Some(report) = &report {
             for field in ["active", "loaded"] {
                 for name in report[field].as_array().into_iter().flatten() {
-                    if name.as_str().is_none_or(|n| !offered.contains(&n)) {
+                    let available = name
+                        .as_str()
+                        .is_some_and(|n| offered.contains(&n) || appended.iter().any(|a| a == n));
+                    if !available {
                         missing.push(json!({"field":field,"name":name}));
                     }
                 }
             }
         }
         checks.push(json!({"sequence":pair[1]["sequence"],"load_report":report,
-            "offered":offered,"not_offered":missing,"passed":report.is_some() && missing.is_empty()}));
+            "offered":offered,"appended":appended,"not_offered":missing,
+            "passed":report.is_some() && missing.is_empty()}));
     }
     json!({"passed":checks.iter().all(|c| c["passed"] == true),"observed_load_transitions":checks.len(),"checks":checks})
 }
@@ -1364,6 +1410,27 @@ mod tests {
             .push(load);
         assert_eq!(tool_availability_check(&[first, next])["passed"], false);
     }
+
+    #[test]
+    fn an_appended_definition_makes_a_tool_available_without_the_array() {
+        let first = json!({"wire_request":{"stream":true,"tools":[]},"response":{"tool_calls":[{"function":{"name":"tools_load"}}]}});
+        let load = json!({"role":"assistant","tool_calls":[{"function":{"name":"tools_load"}}]});
+        let report = json!({"active":["browser"],"loaded":["browser"],
+            "tools":[{"type":"function","function":{"name":"browser"}}]});
+        let next = json!({"wire_request":{"stream":true,"tools":[],
+            "messages":[load,{"role":"tool","content":report.to_string()}]}});
+        let checked = tool_availability_check(&[first, next]);
+        assert_eq!(checked["passed"], true, "{checked}");
+        assert_eq!(checked["checks"][0]["appended"], json!(["browser"]));
+
+        // A search result carries its definitions after a framing line.
+        let search = json!({"role":"tool","content":format!(
+            "Found 1 tool for \"web\". It is callable now.\n{}",
+            json!([{"type":"function","function":{"name":"web_fetch"}}])
+        )});
+        assert_eq!(appended_names(&[search]), ["web_fetch"]);
+    }
+
     fn observed_call(name: &str, args: Value) -> Value {
         let specs: Value = serde_json::from_str(&stubs().unwrap()).unwrap();
         let schema = specs["tools"]

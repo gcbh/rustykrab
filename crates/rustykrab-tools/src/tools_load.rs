@@ -1,13 +1,20 @@
 use async_trait::async_trait;
-use rustykrab_core::active_tools::with_session_context;
+use rustykrab_core::active_tools::{with_session_context, LateToolBinding};
 use rustykrab_core::types::ToolSchema;
 use rustykrab_core::{Error, Result, Tool};
 use serde_json::{json, Value};
 
-/// Meta-tool that marks a set of tools as "active" on the current session.
+use crate::tool_catalog::definition;
+
+/// Meta-tool that makes tools callable by exact name.
 ///
-/// Subsequent model API calls include only the schemas for the meta-tools
-/// plus the currently-active set, keeping the per-request payload small.
+/// One contract with `tools_list` (plan section 12): a tool is made callable
+/// by the conversation's [`LateToolBinding`], appended (its definition
+/// returned as text, the tools array untouched) or declared. A tool that is
+/// callable already, declared or appended by an earlier search, is a cheap
+/// no-op that answers "already callable" and never touches the array: gemma4
+/// called `tools_load` on a third of the tools a search had just delivered,
+/// and each of those used to cost a full re-prefill.
 pub struct ToolsLoadTool;
 
 impl ToolsLoadTool {
@@ -29,9 +36,10 @@ impl Tool for ToolsLoadTool {
     }
 
     fn description(&self) -> &str {
-        "Load a set of tools into the current session's active set so \
-         subsequent API calls include their full schemas. Accepts an array \
-         of tool names."
+        "Make tools callable by exact name, for a name you know that is not callable yet, \
+         such as one from a tools_list catalog listing. Not needed for a tool a tools_list \
+         search returned, or one in your tool list: those are callable already, so call them \
+         directly. Loading an already callable tool changes nothing."
     }
 
     fn schema(&self) -> ToolSchema {
@@ -44,7 +52,7 @@ impl Tool for ToolsLoadTool {
                     "names": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Tool names to activate for this session."
+                        "description": "Exact tool names to make callable."
                     }
                 },
                 "required": ["names"]
@@ -84,7 +92,9 @@ impl Tool for ToolsLoadTool {
                     None => unknown.push(requested.clone()),
                     Some(tool) => {
                         if caps.can_use_tool(tool.name()) {
-                            loaded.push(tool.name().to_string());
+                            if !loaded.iter().any(|n| n == tool.name()) {
+                                loaded.push(tool.name().to_string());
+                            }
                         } else {
                             forbidden.push(requested.clone());
                         }
@@ -92,15 +102,24 @@ impl Tool for ToolsLoadTool {
                 }
             }
 
-            if !loaded.is_empty() {
-                ctx.active_tools
-                    .activate(ctx.conversation_id, loaded.iter().cloned());
-            }
+            let made = ctx
+                .active_tools
+                .make_callable(ctx.conversation_id, loaded.iter().cloned());
+            let appended: Vec<String> = match made.binding {
+                LateToolBinding::Append => made.newly.clone(),
+                LateToolBinding::Rerender => Vec::new(),
+            };
+            // The append itself: the model's only copy of these definitions.
+            let definitions: Vec<Value> = appended
+                .iter()
+                .filter_map(|name| ctx.all_tools.iter().find(|t| t.name() == name.as_str()))
+                .map(|tool| definition(&tool.schema()))
+                .collect();
 
-            let active_now: Vec<String> = {
+            let callable_now: Vec<String> = {
                 let mut v: Vec<String> = ctx
                     .active_tools
-                    .active_for(ctx.conversation_id)
+                    .callable_for(ctx.conversation_id)
                     .into_iter()
                     .filter(|name| {
                         caps.can_use_tool(name)
@@ -114,11 +133,45 @@ impl Tool for ToolsLoadTool {
                 v
             };
 
+            let mut note = Vec::new();
+            if !made.newly.is_empty() {
+                note.push(match made.binding {
+                    LateToolBinding::Append => format!(
+                        "Callable now: {}. Call with your normal tool-call format, exactly \
+                         like your other tools; the definitions are in `tools`.",
+                        made.newly.join(", ")
+                    ),
+                    LateToolBinding::Rerender => format!(
+                        "Callable now: {}. Call with your normal tool-call format.",
+                        made.newly.join(", ")
+                    ),
+                });
+            }
+            if !made.already.is_empty() {
+                note.push(format!(
+                    "Already callable, nothing to load: {}. Call directly.",
+                    made.already.join(", ")
+                ));
+            }
+            if !unknown.is_empty() {
+                note.push(format!(
+                    "Not in the catalog: {}. Search with tools_list and a query.",
+                    unknown.join(", ")
+                ));
+            }
+            if !forbidden.is_empty() {
+                note.push(format!("Not permitted here: {}.", forbidden.join(", ")));
+            }
+
             json!({
+                "note": note.join(" "),
                 "loaded": loaded,
+                "already_callable": made.already,
+                "appended": appended,
+                "tools": definitions,
                 "unknown": unknown,
                 "forbidden": forbidden,
-                "active": active_now,
+                "active": callable_now,
             })
         })
         .ok_or_else(|| {
@@ -193,5 +246,96 @@ mod tests {
         assert_eq!(result["loaded"], json!(["browser"]));
         assert_eq!(result["unknown"], json!(["memory_search", "unavailable"]));
         assert_eq!(result["forbidden"], json!(["forbidden"]));
+    }
+
+    fn weather_ctx(binding: LateToolBinding) -> SessionToolContext {
+        let registry = ActiveToolsRegistry::new();
+        let conversation_id = uuid::Uuid::new_v4();
+        registry.set_late_binding(conversation_id, binding);
+        registry.activate(conversation_id, ["memory_search"]);
+        SessionToolContext {
+            conversation_id,
+            capabilities: Arc::new(CapabilitySet::for_tools(&[
+                "memory_search",
+                "get_weather",
+                "track_package",
+            ])),
+            all_tools: Arc::new(vec![
+                Arc::new(FixtureTool("memory_search", true)),
+                Arc::new(FixtureTool("get_weather", true)),
+                Arc::new(FixtureTool("track_package", true)),
+            ]),
+            active_tools: Arc::new(registry),
+            recall: Arc::new(RecallStore::new()),
+            todos: Arc::new(TodoStore::new()),
+        }
+    }
+
+    async fn load(ctx: &SessionToolContext, names: Value) -> Value {
+        SESSION_TOOL_CONTEXT
+            .scope(
+                ctx.clone(),
+                ToolsLoadTool::new().execute(json!({ "names": names })),
+            )
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn under_append_a_load_returns_the_definition_and_keeps_the_array() {
+        let ctx = weather_ctx(LateToolBinding::Append);
+        let r = load(&ctx, json!(["get_weather"])).await;
+        assert_eq!(r["appended"], json!(["get_weather"]));
+        assert_eq!(r["tools"][0]["function"]["name"], "get_weather");
+        assert!(r["note"]
+            .as_str()
+            .unwrap()
+            .starts_with("Callable now: get_weather."));
+        assert_eq!(r["active"], json!(["get_weather", "memory_search"]));
+        assert!(ctx
+            .active_tools
+            .is_appended(ctx.conversation_id, "get_weather"));
+        assert_eq!(
+            ctx.active_tools.version(ctx.conversation_id),
+            1,
+            "only the seed's"
+        );
+    }
+
+    #[tokio::test]
+    async fn loading_a_callable_tool_is_a_no_op_that_says_so() {
+        let ctx = weather_ctx(LateToolBinding::Append);
+        // Appended by an earlier search, as tools_list does.
+        ctx.active_tools
+            .make_callable(ctx.conversation_id, ["get_weather"]);
+        let version = ctx.active_tools.version(ctx.conversation_id);
+
+        let r = load(&ctx, json!(["get_weather", "memory_search"])).await;
+        assert_eq!(
+            r["already_callable"],
+            json!(["get_weather", "memory_search"])
+        );
+        assert_eq!(r["appended"], json!([]));
+        assert_eq!(r["tools"], json!([]), "nothing repeated");
+        assert!(r["note"]
+            .as_str()
+            .unwrap()
+            .starts_with("Already callable, nothing to load: get_weather, memory_search."));
+        assert_eq!(ctx.active_tools.version(ctx.conversation_id), version);
+    }
+
+    #[tokio::test]
+    async fn under_rerender_a_load_declares_the_tool() {
+        let ctx = weather_ctx(LateToolBinding::Rerender);
+        let before = ctx.active_tools.version(ctx.conversation_id);
+        let r = load(&ctx, json!(["track_package", "nope"])).await;
+        assert_eq!(r["loaded"], json!(["track_package"]));
+        assert_eq!(r["appended"], json!([]));
+        assert_eq!(r["tools"], json!([]));
+        assert_eq!(r["unknown"], json!(["nope"]));
+        assert!(ctx
+            .active_tools
+            .is_active(ctx.conversation_id, "track_package"));
+        assert!(ctx.active_tools.version(ctx.conversation_id) > before);
     }
 }

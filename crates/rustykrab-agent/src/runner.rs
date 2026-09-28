@@ -7,7 +7,9 @@ use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use futures::FutureExt;
-use rustykrab_core::active_tools::{ActiveToolsRegistry, SessionToolContext, SESSION_TOOL_CONTEXT};
+use rustykrab_core::active_tools::{
+    ActiveToolsRegistry, LateToolBinding, SessionToolContext, SESSION_TOOL_CONTEXT,
+};
 use rustykrab_core::capability::Capability;
 use rustykrab_core::model::{
     ModelProvider, ModelResponse, StopReason, StreamEvent, ToolChoice, Usage,
@@ -39,10 +41,12 @@ use uuid::Uuid;
 ///
 /// `task_complete` is *not* listed here on purpose: exposing the
 /// completion signal from turn 0 tempts the model to call it for simple
-/// Q&A and greetings. The runner instead activates it via
-/// `self.active_tools` the first time the model uses any tool this run,
-/// so it appears in the schema exactly when the runner starts requiring
-/// it.
+/// Q&A and greetings. The runner instead makes it callable the first time
+/// the model uses any tool this run, the way any late tool is (plan section
+/// 12): declared in the schema under [`LateToolBinding::Rerender`], and
+/// under [`LateToolBinding::Append`] appended, with its definition riding on
+/// the completion reminder, so the tools array the run started with is the
+/// one it keeps.
 const META_TOOL_NAMES: &[&str] = &[
     "tools_list",
     "tools_load",
@@ -59,8 +63,7 @@ fn is_meta_tool(name: &str) -> bool {
 
 /// Tool names seeded into every conversation's active set on the first
 /// schema computation, so they're visible from turn 0 without the model
-/// having to discover them via `tools_list` and turn them on with
-/// `tools_load`.
+/// having to find them with a `tools_list` search.
 ///
 /// Unlike [`META_TOOL_NAMES`], these go through the normal per-conversation
 /// active set: they're reported by `tools_load`, capability-gated, and
@@ -559,7 +562,9 @@ fn is_completion_reminder(message: &Message) -> bool {
         return false;
     };
     match message.role {
-        Role::System => text == TASK_COMPLETE_REMINDER,
+        // Under the append path the reminder carries `task_complete`'s
+        // definition after the fixed text.
+        Role::System => text.starts_with(TASK_COMPLETE_REMINDER),
         Role::User => text.strip_prefix(NOTICE_PREFIX) == Some(RESULT_REPORT_REMINDER),
         _ => false,
     }
@@ -1030,6 +1035,13 @@ pub struct AgentConfig {
     /// Interval between [`AgentEvent::ToolHeartbeat`] emissions during a
     /// long-running tool call. 0 disables heartbeats.
     pub tool_heartbeat_interval_secs: u64,
+    /// How a tool found mid-run reaches the model: appended as text with
+    /// the tools array fixed, or declared by re-rendering the array (plan
+    /// section 12). `None` takes the provider's capability data
+    /// ([`ModelProvider::accepts_undeclared_tool_calls`]); a harness profile
+    /// sets it for a model whose template path differs from its provider's
+    /// default.
+    pub late_tool_binding: Option<LateToolBinding>,
 }
 
 impl Default for AgentConfig {
@@ -1046,6 +1058,7 @@ impl Default for AgentConfig {
             llm_trigger_strategy: LlmTriggerStrategy::Debounce(Duration::from_secs(2)),
             force_tool_use_first_iteration: false,
             tool_heartbeat_interval_secs: 30,
+            late_tool_binding: None,
         }
     }
 }
@@ -1388,10 +1401,44 @@ impl AgentRunner {
         self
     }
 
+    /// How a tool found mid-run reaches the model in this runner's runs
+    /// (plan section 12): the config's override, else the provider's
+    /// capability data. Never a branch on a model name.
+    fn late_binding(&self) -> LateToolBinding {
+        self.config.late_tool_binding.unwrap_or_else(|| {
+            if self.provider.accepts_undeclared_tool_calls() {
+                LateToolBinding::Append
+            } else {
+                LateToolBinding::Rerender
+            }
+        })
+    }
+
+    /// The completion reminder of an ordinary run. When `task_complete`
+    /// reached this conversation by append it is not in the tools array, so
+    /// the reminder that asks for it carries its definition.
+    fn task_complete_reminder(&self, conv_id: Uuid) -> String {
+        if self.active_tools.is_appended(conv_id, "task_complete") {
+            if let Some(schema) = self.tool_index.schema("task_complete") {
+                let definition = serde_json::json!({
+                    "type": "function",
+                    "function": {
+                        "name": schema.name,
+                        "description": schema.description,
+                        "parameters": schema.parameters,
+                    }
+                });
+                return format!("{TASK_COMPLETE_REMINDER}\n{definition}");
+            }
+        }
+        TASK_COMPLETE_REMINDER.to_string()
+    }
+
     /// Build the set of schemas sent to the model on the next request,
     /// honoring session capabilities and the per-conversation active set.
     /// Meta-tools (`tools_list`, `tools_load`) are always included so the
-    /// agent can always discover and load more tools.
+    /// agent can always discover and load more tools. Appended tools are
+    /// callable but never sent here: their definitions are in the history.
     ///
     /// Also returns the active-set version the schema list reflects, for
     /// use by the per-run cache in the agent loops (see
@@ -1434,8 +1481,9 @@ impl AgentRunner {
     /// Refresh the per-run schema cache if (and only if) the
     /// conversation's active set changed since the cache was built. Keeps
     /// the per-iteration cost O(1): schemas are rebuilt exactly when
-    /// `tools_load` (or the runner itself) activates something new, not on
-    /// every loop iteration.
+    /// something new is declared, not on every loop iteration. Under the
+    /// append path that is only compaction folding appended tools in, so a
+    /// run's tools array is the one its first request carried.
     fn refresh_schema_cache(
         &self,
         session: &Session,
@@ -1688,9 +1736,9 @@ impl AgentRunner {
             "EndTurn without the completion signal; re-prompting"
         );
         let reminder = if worker_run {
-            RESULT_REPORT_REMINDER
+            RESULT_REPORT_REMINDER.to_string()
         } else {
-            TASK_COMPLETE_REMINDER
+            self.task_complete_reminder(conv.id)
         };
         self.push_message(conv, runner_notice(reminder));
         CompletionReminderOutcome::Continue
@@ -1970,6 +2018,13 @@ impl AgentRunner {
         // the provider HTTP timeout.
         self.repair_oversized_summary(conv);
 
+        // How late tools reach the model is fixed before the first request
+        // (plan section 12): by append when the provider takes a call to a
+        // tool it saw only as text, so the tools array this run declares
+        // is the one it keeps.
+        self.active_tools
+            .set_late_binding(session.conversation_id, self.late_binding());
+
         let mut consecutive_errors = 0;
         let mut soft_warning_injected = false;
         let mut empty_response_retries: usize = 0;
@@ -2158,15 +2213,15 @@ impl AgentRunner {
 
             // Handle tool calls.
             if message.content.has_tool_calls() {
-                // First tool call this run — make `task_complete` visible
-                // in the schema from the next iteration onward. We hide it
-                // on no-tool turns (greetings, direct Q&A) so the model
-                // isn't tempted to use it as a chatty turn-ender. A worker
-                // run never sees it: its `result_report` is active from
-                // turn 0.
+                // First tool call this run: make `task_complete` callable
+                // from the next iteration onward, declared or appended by
+                // the run's late binding. We hide it on no-tool turns
+                // (greetings, direct Q&A) so the model isn't tempted to use
+                // it as a chatty turn-ender. A worker run never sees it: its
+                // `result_report` is active from turn 0.
                 if !has_called_any_tool && !worker_run {
                     self.active_tools
-                        .activate(session.conversation_id, ["task_complete"]);
+                        .make_callable(session.conversation_id, ["task_complete"]);
                 }
                 has_called_any_tool = true;
                 empty_tool_use_retries = 0;
@@ -3821,6 +3876,18 @@ impl AgentRunner {
         // exist. The next LLM call re-anchors on the compacted history.
         self.set_token_estimate(conv, after_tokens);
         self.forget_usage_anchor(conv.id);
+        // The prompt is rewritten and re-prefilled anyway, so the tools this
+        // conversation received by append move into the declared block:
+        // the history that carried their definitions may be gone (plan
+        // section 12). The next request carries the grown array.
+        let folded = self.active_tools.fold_appended(conv.id);
+        if !folded.is_empty() {
+            tracing::info!(
+                conversation_id = %conv.id,
+                ?folded,
+                "compaction: appended tools folded into the tool block"
+            );
+        }
         tracing::info!(
             before_messages = before_len,
             after_messages = conv.messages.len(),
@@ -8751,3 +8818,7 @@ mod compaction_budget_tests {
         assert_eq!(compaction_input_budget(120_000, 1.0), 120_000 - 4_096);
     }
 }
+
+#[cfg(test)]
+#[path = "runner_append_tests.rs"]
+mod append_path_tests;
