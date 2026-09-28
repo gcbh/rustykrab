@@ -49,6 +49,10 @@ jobs:
       # Every RUSTYKRAB_ variable read with env::var / var_os has a row in
       # README.md's Configuration table, the only place config is listed.
       - run: python3 scripts/check_env_docs.py
+      # Feeds the checker synthetic env-reading helpers with an undocumented
+      # name, so a regression in helper detection fails CI instead of
+      # silently passing every real read.
+      - run: python3 scripts/test_check_env_docs.py
 
   fmt:
     name: Format
