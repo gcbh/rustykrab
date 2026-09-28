@@ -378,6 +378,13 @@ pub enum WorkOp {
     /// Clear the item's `held_by`: its approval question was answered
     /// (section 6.1). Changes no status; the caller writes the event.
     ReleaseHold(WorkItemId),
+    /// Append an artifact ref to a live item's `artifact_refs`, unless an
+    /// identical one is already there: a reused internal item gathering
+    /// each later failing item as evidence (section 9). Changes no status.
+    AddArtifactRef {
+        item: WorkItemId,
+        artifact: rustykrab_core::work::ArtifactRef,
+    },
 }
 
 /// What a [`Store::work_apply`] batch wrote, in op order.
