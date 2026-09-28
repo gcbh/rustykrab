@@ -1847,19 +1847,65 @@ impl CutoverDaemon {
         Ok(daemon)
     }
 
-    /// `controller.lock` as `GET /api/version` reports it: `"held"`,
-    /// `"waiting"`, or `null` before the loop first tries the lock.
-    async fn lock(&self, shared: &Ctx) -> Result<Value> {
-        let body: Value = shared
+    /// `GET <path>` on this daemon, as JSON.
+    async fn get(&self, shared: &Ctx, path: &str) -> Result<Value> {
+        Ok(shared
             .client
-            .get(format!("{}/api/version", self.base))
+            .get(format!("{}{path}", self.base))
             .bearer_auth(crate::AUTH_TOKEN)
             .send()
             .await?
             .error_for_status()?
             .json()
+            .await?)
+    }
+
+    /// The `controller` object of `GET /api/version`.
+    async fn controller(&self, shared: &Ctx) -> Result<Value> {
+        Ok(self.get(shared, "/api/version").await?["controller"].clone())
+    }
+
+    /// `controller.lock` as `GET /api/version` reports it: `"held"`,
+    /// `"waiting"`, or `null` before the loop first tries the lock.
+    async fn lock(&self, shared: &Ctx) -> Result<Value> {
+        Ok(self.controller(shared).await?["lock"].clone())
+    }
+
+    /// `POST /api/work` on this daemon: file one item, returning its id.
+    async fn file(&self, shared: &Ctx, draft: Value) -> Result<String> {
+        let answer: Value = shared
+            .client
+            .post(format!("{}{WORK}", self.base))
+            .bearer_auth(crate::AUTH_TOKEN)
+            .json(&draft)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
             .await?;
-        Ok(body["controller"]["lock"].clone())
+        let outcome: PlanOutcome = serde_json::from_value(answer.clone()).with_context(|| {
+            format!("POST {WORK} did not answer with a filing outcome: {answer}")
+        })?;
+        Ok(accepted(outcome)?.root)
+    }
+
+    /// Poll the item until it is done, for up to [`SETTLE`].
+    async fn wait_done(&self, shared: &Ctx, id: &str) -> Result<Value> {
+        let deadline = Instant::now() + SETTLE;
+        loop {
+            let view = self.get(shared, &format!("{WORK}/{id}")).await?;
+            let now = status(&view)?;
+            if now == Status::Done {
+                return Ok(view);
+            }
+            ensure!(
+                !now.is_closed() && Instant::now() < deadline,
+                "{} never finished on {}; last {now}",
+                title(&view),
+                self.base
+            );
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
     }
 
     /// Poll until the lock reads `want`, for up to 30 seconds (the scripted
@@ -1890,8 +1936,10 @@ impl CutoverDaemon {
 /// An update's cutover: two daemons on one data directory. Exactly one
 /// holds `controller.lock` and ticks, the other reports `waiting` on
 /// `GET /api/version`, and once the holder stops the waiting one takes
-/// the lock and reports `held`. Boots its own pair, since stopping the
-/// shared daemon would take it from every scenario after this one.
+/// the lock and reports `held`. The waiting one never ticks: an item filed
+/// through it is run to done by the holder while its `last_tick` stays
+/// null. Boots its own pair, since stopping the shared daemon would take
+/// it from every scenario after this one.
 async fn two_daemons_one_data_dir(shared: &Ctx) -> Result<()> {
     let dir = tempfile::Builder::new()
         .prefix("rustykrab-e2e-cutover-")
@@ -1910,8 +1958,46 @@ async fn two_daemons_one_data_dir(shared: &Ctx) -> Result<()> {
         "with both running, expected held/waiting, got {a}/{b}"
     );
 
+    // File through the waiting daemon: only the holder's loop may lease
+    // and run it, and the waiting loop must not complete a single tick.
+    let errand = second
+        .file(
+            shared,
+            draft("personal", "File during the cutover", &tag(0), W_SUCCEED),
+        )
+        .await?;
+    let finished = first.wait_done(shared, &errand).await?;
+    ensure!(
+        worker_of(&finished).is_some(),
+        "the item filed through the waiting daemon finished without a lease: {finished}"
+    );
+    let (held, waited) = (
+        first.controller(shared).await?,
+        second.controller(shared).await?,
+    );
+    ensure!(
+        !held["last_tick"].is_null(),
+        "the holder reports no tick: {held}"
+    );
+    ensure!(
+        waited["lock"] == "waiting" && waited["last_tick"].is_null(),
+        "the waiting daemon ticked while another held controller.lock: {waited}"
+    );
+
     first.stop().await;
     second.wait_lock(shared, "held").await?;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let took_over = second.controller(shared).await?;
+        if !took_over["last_tick"].is_null() {
+            break;
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "the second daemon holds the lock but never ticked: {took_over}"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
     second.stop().await;
     Ok(())
 }
