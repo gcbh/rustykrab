@@ -60,7 +60,7 @@ use chrono::Utc;
 use rustykrab_control::errors::{BudgetKind, GapKind, ProviderProblem};
 use rustykrab_control::worker::{Brief, RunFailure, RunUsage, Worker, WorkerCapabilities};
 use rustykrab_core::active_tools::ActiveToolsRegistry;
-use rustykrab_core::model::ModelProvider;
+use rustykrab_core::model::{ModelCheck, ModelProvider};
 use rustykrab_core::recall::RecallStore;
 use rustykrab_core::types::{Conversation, Message, MessageContent, Role};
 use rustykrab_core::work::{
@@ -191,7 +191,15 @@ pub struct LocalWorker {
     last_run: Mutex<Option<LocalRun>>,
     /// Spend per run id, for [`Worker::usage`].
     spending: Mutex<HashMap<String, Arc<Spending>>>,
+    /// The provider's last answer to [`ModelProvider::check_model`] and
+    /// when it was asked; `None` until the first [`Worker::refresh`].
+    model: Mutex<Option<(Instant, ModelCheck)>>,
 }
+
+/// How often [`Worker::refresh`] asks the provider about its model again.
+/// The registry refreshes every few seconds; a model pulled or removed
+/// shows within this long.
+const MODEL_CHECK_EVERY: Duration = Duration::from_secs(30);
 
 impl LocalWorker {
     /// A local worker named `name` (the registry's name for it, "pinch")
@@ -229,6 +237,7 @@ impl LocalWorker {
             slot: Arc::new(Semaphore::new(1)),
             last_run: Mutex::new(None),
             spending: Mutex::new(HashMap::new()),
+            model: Mutex::new(None),
         }
     }
 
@@ -517,10 +526,45 @@ impl Worker for LocalWorker {
         1
     }
 
-    /// A local worker is as available as the daemon it runs in. Its
-    /// provider's failures come back from `run` for the ladder to classify
-    /// rather than taking the worker out of the registry.
+    /// A local worker is as available as the daemon it runs in, unless its
+    /// provider's server said at the last [`Worker::refresh`] that the
+    /// model does not exist: then no item could run, and none is leased.
+    /// Other provider failures come back from `run` for the ladder to
+    /// classify rather than taking the worker out of the registry.
     fn healthy(&self) -> bool {
+        !matches!(
+            *self.model.lock().unwrap_or_else(|e| e.into_inner()),
+            Some((_, ModelCheck::Missing(_)))
+        )
+    }
+
+    /// Ask the provider whether its model exists (the registry does at
+    /// registration and on its timer), at most once per
+    /// [`MODEL_CHECK_EVERY`]. Returns `false` when it asked too recently.
+    async fn refresh(&self) -> bool {
+        let due = self
+            .model
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_none_or(|(at, _)| at.elapsed() >= MODEL_CHECK_EVERY);
+        if !due {
+            return false;
+        }
+        let check = self.provider.check_model().await;
+        let mut model = self.model.lock().unwrap_or_else(|e| e.into_inner());
+        let was_missing = matches!(*model, Some((_, ModelCheck::Missing(_))));
+        match &check {
+            ModelCheck::Missing(why) if !was_missing => {
+                tracing::warn!(worker = %self.name, %why, "local worker unhealthy: its model is missing");
+            }
+            ModelCheck::Missing(_) => {}
+            _ if was_missing => {
+                tracing::info!(worker = %self.name, "local worker healthy again: its model is back");
+            }
+            _ => {}
+        }
+        *model = Some((Instant::now(), check));
         true
     }
 
@@ -1923,6 +1967,65 @@ mod tests {
         assert_eq!(usage.iterations, 2);
         assert_eq!(usage.reminders, 1);
         assert_eq!(w.usage("never-ran"), None);
+    }
+
+    /// Answers `check_model` with whatever the test set, counting asks.
+    struct Checked {
+        answer: Mutex<ModelCheck>,
+        asked: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ModelProvider for Checked {
+        fn name(&self) -> &str {
+            "checked"
+        }
+        async fn check_model(&self) -> ModelCheck {
+            self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.answer.lock().unwrap().clone()
+        }
+        async fn chat(&self, _: &[Message], _: &[ToolSchema]) -> Result<ModelResponse> {
+            Err(Error::ModelEmptyResponse("never called".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn health_follows_the_providers_model_check() {
+        let provider = Arc::new(Checked {
+            answer: Mutex::new(ModelCheck::Missing("no model `nope:1b`".into())),
+            asked: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let w = LocalWorker::new(
+            "snapper",
+            LocalWorker::default_definition("snapper"),
+            provider.clone(),
+            Vec::new(),
+            Arc::new(NoSandbox),
+            Arc::new(StubWorkBackend::new()),
+        );
+        assert!(w.healthy(), "healthy until the provider has been asked");
+
+        assert!(w.refresh().await);
+        assert!(!w.healthy(), "a missing model makes the worker unhealthy");
+        assert!(!w.refresh().await, "asked too recently to ask again");
+        let asked = |p: &Checked| p.asked.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(asked(&provider), 1);
+
+        // Once due again, the model is back.
+        *provider.answer.lock().unwrap() = ModelCheck::Available;
+        let long_ago = Instant::now()
+            .checked_sub(MODEL_CHECK_EVERY)
+            .expect("the clock is past one check interval");
+        w.model.lock().unwrap().as_mut().unwrap().0 = long_ago;
+        assert!(w.refresh().await);
+        assert!(w.healthy());
+
+        // A server that cannot say does not make the worker unhealthy.
+        *provider.answer.lock().unwrap() = ModelCheck::Unknown;
+        w.model.lock().unwrap().as_mut().unwrap().0 = long_ago;
+        assert!(w.refresh().await);
+        assert!(w.healthy());
+        assert_eq!(asked(&provider), 3);
     }
 
     /// A kept conversation every run under its id continues.

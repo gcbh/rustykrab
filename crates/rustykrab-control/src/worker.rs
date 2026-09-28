@@ -133,7 +133,9 @@ pub trait Worker: Send + Sync {
 
     /// Ask the worker where it stands now, before the registry records
     /// what [`Worker::capabilities`] and [`Worker::healthy`] say on its row:
-    /// a peer re-reads its node's advertisement and health. Returns whether
+    /// a peer re-reads its node's advertisement and health, a local worker
+    /// asks its provider whether its model exists. The registry asks at
+    /// registration and on its timer. Returns whether
     /// it asked (a worker that knows everything locally, or that asked
     /// recently, returns `false` and its row is left alone). Default: never.
     async fn refresh(&self) -> bool {

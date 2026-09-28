@@ -43,6 +43,8 @@ factored out, which is the correct line to have drawn.
 
 `ollama.rs` is 2.7× the size of the next provider because it manages the
 server, not just the request: `detect_context_window` reads `/api/show`,
+`check_model` asks `/api/show` whether the configured model exists (404 is
+`ModelCheck::Missing`; any other failure is `Unknown`) without loading it,
 `detect_model_shape` derives KV geometry, `log_kv_cache_estimate` reports VRAM
 implications, `validate_input_budget` refuses oversized requests without deleting
 messages, and

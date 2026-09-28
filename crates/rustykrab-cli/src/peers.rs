@@ -92,7 +92,8 @@ pub(crate) async fn pair(name: &str, mut spec: WorkerSpec) -> Result<WorkerSpec,
 }
 
 /// Ask the registry's workers where they stand every [`REFRESH_TICK`],
-/// recording what a peer advertises and its health on its row.
+/// recording what a peer advertises and its health on its row, and whether
+/// the local worker's model exists.
 pub(crate) fn spawn_refresh(registry: Arc<WorkerRegistry>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(REFRESH_TICK);

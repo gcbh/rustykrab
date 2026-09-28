@@ -7,6 +7,7 @@
 
 mod checks;
 mod closeout;
+mod model_check;
 mod paths;
 mod peers;
 mod review;

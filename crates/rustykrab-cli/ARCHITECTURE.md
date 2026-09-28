@@ -109,7 +109,11 @@ peer spec, the factory redeems the code at the node for a device token named
 after this machine, and the registry keeps the token in the secret store.
 `spawn_refresh` asks every worker where it stands every two seconds, which
 is how a peer's node advertisement (models, tools, MCP servers, machine) and
-health reach its row and the controller's match step. The same daemon is
+health reach its row and the controller's match step. The local worker
+answers the same timer, at most every 30 seconds, by asking its provider
+whether its model exists (`ModelProvider::check_model`), so with
+`OLLAMA_MODEL` naming a model the server does not have it is listed
+unhealthy and leased nothing. The same daemon is
 also a node: `main` wires `DelegatedRuns` into the gateway
 (`with_delegation`), built from the `worker` definition under the local
 worker's name, over the same tools, sharing one model slot with the local

@@ -15,7 +15,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use rustykrab_control::errors::BudgetKind;
 use rustykrab_control::worker::RunFailure;
-use rustykrab_core::model::{ModelProvider, ModelResponse, StreamEvent, ToolChoice, Usage};
+use rustykrab_core::model::{
+    ModelCheck, ModelProvider, ModelResponse, StreamEvent, ToolChoice, Usage,
+};
 use rustykrab_core::types::{Message, ToolSchema};
 use rustykrab_core::Result;
 
@@ -82,6 +84,10 @@ impl MeteredProvider {
 impl ModelProvider for MeteredProvider {
     fn name(&self) -> &str {
         self.inner.name()
+    }
+
+    async fn check_model(&self) -> ModelCheck {
+        self.inner.check_model().await
     }
 
     fn context_limit(&self) -> Option<usize> {
