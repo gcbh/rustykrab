@@ -57,6 +57,17 @@ pub struct LoopStatus {
     pub last_tick: Option<DateTime<Utc>>,
     /// Runs live in this process.
     pub runs_in_flight: usize,
+    /// When the last tick that failed gave up; `None` before the first
+    /// failure. Kept after a later tick completes, so a recovered loop
+    /// still shows when it last failed.
+    pub last_failed_tick: Option<DateTime<Utc>>,
+    /// The error class of that failure (`storage`, `internal`, ...), the
+    /// variant of the error the tick returned; `None` before the first.
+    pub last_failure_class: Option<String>,
+    /// Ticks that failed in a row since the last one that completed; 0
+    /// once a tick completes. A stuck loop shows an old `last_tick` and a
+    /// count that stops moving; a failing one shows the count climbing.
+    pub consecutive_failed_ticks: u32,
 }
 
 /// The controller as its callers see it. Every method is one store
