@@ -944,20 +944,36 @@ pub async fn run(data_dir: &Path, args: &[String]) -> anyhow::Result<()> {
             }
         }
         Cmd::Apply(args) => {
-            // Held until the slice 6 review's fixes are re-reviewed and its
-            // part 3 lands (update-flow.md, "Slice 6: not yet safe").
-            if std::env::var("RUSTYKRAB_UPDATE_APPLY_UNREVIEWED").as_deref() != Ok("1") {
-                eprintln!(
-                    "rustykrab update apply is not yet safe to run: the fixes from its review \
-                     are not yet re-reviewed and some of its points are still open. \
-                     See docs/plans/update-flow.md."
-                );
+            let unreviewed =
+                std::env::var("RUSTYKRAB_UPDATE_APPLY_UNREVIEWED").as_deref() == Ok("1");
+            if let Err(message) = apply_gate(&args.service, unreviewed) {
+                eprintln!("{message}");
                 std::process::exit(3);
             }
             apply::run(&cfg, data_dir, args).await?
         }
     }
     Ok(())
+}
+
+/// Whether `apply` may run with `service`. The builder's script service
+/// may; launchd, on the owner's machine, is held behind
+/// `RUSTYKRAB_UPDATE_APPLY_UNREVIEWED=1` until what it still needs is built
+/// (update-flow.md, "Slice 6: status").
+fn apply_gate(service: &apply::ServiceSpec, unreviewed: bool) -> Result<(), String> {
+    match service {
+        apply::ServiceSpec::Script(_) => Ok(()),
+        apply::ServiceSpec::Launchd if unreviewed => Ok(()),
+        apply::ServiceSpec::Launchd => Err(
+            "rustykrab update apply under launchd is not yet safe to run. It still needs: \
+             /api/version served without authentication and a check that the listener is the \
+             launchd job's own process, so the probe stops carrying the token; the \
+             com.gcbh.rustykrab.updater job in scripts/install.sh; and the owner's decision on \
+             worker isolation. --service script:<cmd> runs without this gate. \
+             See docs/plans/update-flow.md, \"Slice 6: status\"."
+                .to_string(),
+        ),
+    }
 }
 
 fn print_staged(staged: &Staged) {

@@ -20,7 +20,7 @@ builder.
 | 3 | Drain: on shutdown the controller leases nothing new, gives runs `RUSTYKRAB_DRAIN_SECS` (20) to finish, then ends them as interrupted, returned to `ready` with no rung | built (batch 4) |
 | 4 | Controller lock: an exclusive `flock` on `<data>/controller.lock`; only the holder ticks, and `/api/version` reports `held` or `waiting`; failed ticks reported beside it | built (batch 4) |
 | 5 | Release source and verifier: `rustykrab update check` and `rustykrab update stage` | built (batch 5), with the review's fixes |
-| 6 | Supervisor: `rustykrab update apply`, swap, restart, verify, roll back | built in four reviewed parts; gated, see "Slice 6: status" |
+| 6 | Supervisor: `rustykrab update apply`, swap, restart, verify, roll back | built in four parts; runs for the builder's script service, launchd still gated, see "Slice 6: status" |
 
 Pieces 3 and 4 were exercised by hand on the builder on 2026-09-28. A
 second daemon on the same data directory reported `waiting` and never
@@ -127,9 +127,13 @@ in place of launchd.
 
 ## Slice 6: status (2026-09-28)
 
-Slice 6 was built in four parts, each reviewed for security before it
-merged. The CLI still refuses `rustykrab update apply` unless
-`RUSTYKRAB_UPDATE_APPLY_UNREVIEWED=1`.
+Slice 6 was built in four parts; the first three were each reviewed for
+security before they merged. Part 4 made the changes listed under "What
+part 4 changed" below, which were what the gate waited on for the
+builder's script service. `rustykrab update apply --service
+script:<cmd>` now runs without `RUSTYKRAB_UPDATE_APPLY_UNREVIEWED`. The
+launchd service still refuses unless `RUSTYKRAB_UPDATE_APPLY_UNREVIEWED=1`,
+and its refusal names what launchd still needs (below).
 
 **What `apply` does now:**
 
@@ -141,11 +145,15 @@ merged. The CLI still refuses `rustykrab update apply` unless
   - Every stage must be at least the running version, and a release
     must be newer. The downgrade check once depended on the record's
     `tag`, and a worker writes that field.
-- **It checks the copy before stopping anything.** The stage is copied
-  beside the install (`cp -Rp --`). That copy must not be a symlink, must
-  carry the Developer ID signature under launchd, and its own
-  `--version` must report the staged version and commit. Only then is
+- **It checks the copy before stopping anything.** The installed binary
+  must report the running commit, since it becomes `.prev`. The stage is
+  copied beside the install (`cp -Rp --`). That copy must not be a
+  symlink, must carry the Developer ID signature under launchd, and its
+  own `--version` must report the staged version and commit. Only then is
   the daemon stopped and the two renames made.
+- **It is never the daemon.** It refuses to run when `XPC_SERVICE_NAME`
+  is `com.gcbh.rustykrab` (the daemon's own launchd job), or when its own
+  executable canonicalizes to a path under the install it swaps.
 - **It only updates a healthy daemon.**
   - Before any change, the running daemon must hold `controller.lock`
     with no failing ticks.
@@ -160,32 +168,52 @@ merged. The CLI still refuses `rustykrab update apply` unless
   (`stopping`, `swapped`, `started`) and both commits. Every run first
   calls `recover`:
   - a missing install gets `.prev` back;
-  - an interrupted swap is rolled back, but only after the installed and
-    `.prev` binaries report the journal's commits;
-  - a crash between the renames and the journal write is recognised;
-  - an unparseable journal writes the failure record;
+  - a journal at `swapped` or `started` whose new version is running and
+    verifies is cleared, not rolled back;
+  - any other interrupted swap is rolled back, but only after the
+    installed and `.prev` binaries report the journal's commits;
+  - a crash between the renames and the journal write is recognised: at
+    `stopping`, `.next` gone and an installed binary not seen to report
+    `from_commit` counts as swapped, so a `--version` that times out
+    cannot start an unchecked binary;
+  - every service it starts is verified, not just that `start()`
+    returned;
+  - an unparseable journal is kept as `.apply-state.json.unreadable` and
+    writes the failure record;
   - a late-crashed rollback is not redone.
-  A launchd stop that errors mid-drain waits for the job to unload.
+  A launchd stop that errors mid-drain waits for the job to unload. A
+  failed commit, like a failed stop, keeps the journal until the old
+  commit answers.
+- **It checks `.prev` before using it.** Before `.prev` is run or
+  restored it passes the symlink check the copy gets, and under launchd
+  the signature check. A rollback checks it before stopping the new
+  version.
 - **It fails loudly.** A failure to write `bad.json` never aborts a
-  rollback. A failed rollback writes a failure record beside the install,
-  always tries to start the service last, and blocks every later run
-  until a person deletes the record. The plist's `ExitTimeOut` (45 s) is
-  above the drain grace.
+  rollback. A rollback or recovery that does not finish writes a failure
+  record beside the install, which says which version is installed and
+  whether the previous one was restored, not that a rollback ran. It
+  tries to start the service last, unless the installed binary reports
+  neither of the journal's commits. The record blocks every later run
+  until a person deletes it. The plist's `ExitTimeOut` (45 s) is above
+  the drain grace.
 
-**Before the gate lifts for the builder's script service** (part 4):
+**What part 4 changed, for the builder's script service** (not yet
+reviewed for security):
 
-- `recover` verifies every service it starts, not just that `start()`
-  returned, and writes the failure record if verify fails. The
-  commit-failure branch waits for the old commit before clearing the
-  journal.
+- `recover` verifies every service it starts, and writes the failure
+  record if verify fails. The commit-failure branch waits for the old
+  commit before clearing the journal.
 - The installed binary must report the running commit before a swap.
 - A journal at `swapped` or `started` whose new version verifies is
   cleared, not rolled back.
 - A stage at `stopping` counts as swapped whenever `.next` is gone and the
   installed binary does not report `from_commit`.
 - `.prev` passes the symlink and signature checks before a restore.
-- An unreadable journal is renamed, not deleted.
-- `apply` refuses to run inside the daemon's own launchd job.
+- An unreadable journal is renamed, not deleted, and the failure record
+  says accurately what was and was not restored.
+- `apply` refuses to run inside the daemon's own launchd job, or from a
+  binary under the install.
+- The CLI gate no longer applies to `--service script:<cmd>`.
 
 **Before launchd, on the owner's machine, it must also:**
 

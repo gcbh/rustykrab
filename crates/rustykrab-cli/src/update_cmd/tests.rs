@@ -798,6 +798,23 @@ async fn a_pre_release_tag_stages_nothing_and_check_says_so() {
 }
 
 #[test]
+fn the_script_service_runs_without_the_gate_variable_and_launchd_does_not() {
+    let script = apply::ServiceSpec::Script("./start.sh".to_string());
+    assert_eq!(apply_gate(&script, false), Ok(()));
+    assert_eq!(apply_gate(&script, true), Ok(()));
+
+    let err = apply_gate(&apply::ServiceSpec::Launchd, false).unwrap_err();
+    for needed in [
+        "without authentication",
+        "com.gcbh.rustykrab.updater",
+        "isolation",
+    ] {
+        assert!(err.contains(needed), "{err}");
+    }
+    assert_eq!(apply_gate(&apply::ServiceSpec::Launchd, true), Ok(()));
+}
+
+#[test]
 fn config_debug_redacts_the_token() {
     let cfg = Config {
         token: Some("ghp_secret".to_string()),
