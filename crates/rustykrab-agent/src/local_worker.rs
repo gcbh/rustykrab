@@ -970,8 +970,10 @@ pub fn render_brief(brief: &Brief) -> String {
     out.push('\n');
     out.push_str(
         "End this run with one result_report call, as your last call. Put pointers in it \
-         (paths, URLs, ids), not content. If you cannot finish, set blocked (what you need) \
-         or error (what failed). Follow-up work goes in discovered. Text alone does not end \
+         (paths, URLs, ids), not content. If you cannot finish, set blocked or error (what \
+         failed). blocked is {\"reason\": \"needs_decision\", \"detail\": \"the question or \
+         what you need\", \"needs\": []}, its reason one of needs_tool, needs_credential, \
+         needs_decision or needs_consent; the question goes in detail. Follow-up work goes in discovered. Text alone does not end \
          this run.",
     );
     out
@@ -2245,6 +2247,17 @@ mod tests {
         for absent in ["inputs:", "repair:", "artifact_refs:", "decisions_made:"] {
             assert!(!plain.contains(absent), "{absent} in:\n{plain}");
         }
+    }
+
+    #[test]
+    fn the_brief_shows_where_a_blocked_report_puts_its_question() {
+        let prompt = render_brief(&brief("item-1"));
+        assert!(
+            prompt.contains(
+                r#"{"reason": "needs_decision", "detail": "the question or what you need", "needs": []}"#
+            ),
+            "{prompt}"
+        );
     }
 
     #[test]

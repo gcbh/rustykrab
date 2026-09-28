@@ -449,7 +449,10 @@ impl Tool for ResultReportTool {
     fn description(&self) -> &str {
         "End your work item with its typed result, as your LAST call. summary: what you did, \
          in a few lines. Pointers, not content: artifacts, changed_paths, commit, checks_run. \
-         If you could not finish, set blocked (what you need) or error (what failed). \
+         If you could not finish, set blocked or error (what failed). blocked is \
+         {\"reason\": \"needs_decision\", \"detail\": \"the question or what you need\", \
+         \"needs\": []}, its reason one of needs_tool, needs_credential, needs_decision or \
+         needs_consent; the question goes in detail. \
          Follow-up work goes in discovered, one draft per item: the controller files it, you \
          do not. The run ends when this call succeeds."
     }
@@ -660,6 +663,18 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.kind(), ToolErrorKind::InvalidInput);
         err.to_string()
+    }
+
+    #[test]
+    fn the_description_shows_where_a_blocked_report_puts_its_question() {
+        let tool = tool(&Arc::new(StubWorkBackend::new()));
+        let description = tool.description();
+        assert!(
+            description.contains(
+                r#"{"reason": "needs_decision", "detail": "the question or what you need", "needs": []}"#
+            ),
+            "{description}"
+        );
     }
 
     #[test]
