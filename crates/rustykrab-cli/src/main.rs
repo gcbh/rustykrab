@@ -9,6 +9,7 @@ mod peers;
 mod prompt_log;
 mod scheduled_work;
 mod task_queue;
+mod update_cmd;
 mod work_cmd;
 mod work_host;
 mod worker_cmd;
@@ -579,12 +580,15 @@ async fn main() -> anyhow::Result<()> {
     if args.len() >= 2 && (args[1] == "workers" || args[1] == "worker") {
         return worker_cmd::run(&data_dir, &args[1..]).await;
     }
+    if args.len() >= 2 && args[1] == "update" {
+        return update_cmd::run(&data_dir, &args[2..]).await;
+    }
     // An unrecognized subcommand must not silently fall through to
     // "start the daemon" — a typo would boot a full agent instead of
     // reporting the mistake.
     if let Some(unknown) = args.get(1).filter(|a| !a.starts_with('-')) {
         eprintln!("unknown subcommand '{unknown}'");
-        eprintln!("subcommands: skill, keychain, chat, dream, pair, work, workers, worker");
+        eprintln!("subcommands: skill, keychain, chat, dream, pair, work, workers, worker, update");
         eprintln!("run with no arguments to start the daemon");
         std::process::exit(2);
     }

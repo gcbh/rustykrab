@@ -237,7 +237,10 @@ All configuration is via environment variables. No plaintext config files.
 | `RUSTYKRAB_DRAIN_SECS` | `20` | On shutdown, seconds the controller waits for the runs in flight to finish, leasing nothing new, before it ends them. A value that is not a whole number of seconds is ignored with a warning and the default kept |
 | `RUSTYKRAB_AGING_MAX_GAP_SECS` | `900` | Longest the control layer's aging pass (compaction of what may age) waits for an idle tick before it runs anyway, so steady load cannot starve it. Values below `1` are raised to `1`; a value that is not a whole number keeps the default. The evaluation harness shortens it |
 | `RUSTYKRAB_GITHUB_REPO` | unset | `owner/name` of the repository whose issues are the review surface. `code`, `proposal`, `internal` and capability-build items are projected there under the `rustykrab` label; personal and research work never is. Unset, nothing is projected |
-| `RUSTYKRAB_GITHUB_TOKEN` | unset | Token for the review surface, overriding the `github_token` entry in the credential store (`rustykrab keychain`); it needs issues read and write on the repository |
+| `RUSTYKRAB_GITHUB_TOKEN` | unset | Token for the review surface, overriding the `github_token` entry in the credential store (`rustykrab keychain`); it needs issues read and write on the repository. `rustykrab update` also sends it, when set, to the releases API, for rate limits only |
+| `RUSTYKRAB_UPDATE_REPO` | `gcbh/rustykrab` | `owner/name` whose latest GitHub release `rustykrab update check` and `rustykrab update stage` read. See [Updating (`update` subcommand)](#updating-update-subcommand) |
+| `RUSTYKRAB_UPDATE_API_BASE` | `https://api.github.com` | GitHub API base for `rustykrab update` (a GitHub Enterprise host, or a test stand-in) |
+| `RUSTYKRAB_UPDATE_TEAM_ID` | `3RRX845C4X` | Apple team a staged `RustyKrab.app` must be signed by. The team is pinned, so a correctly signed bundle from anyone else is refused; set this for a fork signed by another team |
 | `RUSTYKRAB_GITHUB_API_BASE` | `https://api.github.com` | GitHub API base for the review surface (a GitHub Enterprise host, or the e2e harness's stand-in) |
 
 ### Persisting credentials
@@ -465,6 +468,28 @@ cargo run --release -p rustykrab-cli
 ### WebChat UI
 
 Open `http://127.0.0.1:3000` in a browser for the embedded WebChat interface.
+
+### Updating (`update` subcommand)
+
+```bash
+rustykrab-cli update check                      # is the latest release newer?
+rustykrab-cli update stage                      # download, verify and stage it
+rustykrab-cli update stage --from path/to/RustyKrab.app   # stage a local build
+```
+
+Neither touches the running daemon. `stage` downloads
+`rustykrab-<target>.tar.gz` from the latest release of
+`RUSTYKRAB_UPDATE_REPO` and refuses it unless the release API's `digest`
+for the asset is present and equals the SHA-256 of the bytes downloaded.
+Only then is it extracted, with the system `tar`. On macOS the bundle must
+pass `codesign --verify --deep --strict` and be signed as
+`com.gcbh.rustykrab` by team `RUSTYKRAB_UPDATE_TEAM_ID`; only after that
+does the staged binary run once, with `--version`, and it must print the
+release's version. The result lands in `<data dir>/updates/<version>/`
+with a `staged.json` record. A release that is not newer stages nothing,
+and a version recorded as bad in `<data dir>/updates/bad.json` is refused
+unless `--force`. `--from` takes a `RustyKrab.app` or a bare binary; it has
+no digest, but a bundle still goes through the signature check.
 
 ### Terminal chat (`chat` subcommand)
 

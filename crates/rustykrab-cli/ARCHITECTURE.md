@@ -14,15 +14,15 @@ the generated line above.
 Read the environment, construct every object in the system, wire them together,
 spawn the background tasks, run the channel loops, and shut down gracefully.
 Also: subcommands (`skill`, `pair`, `keychain`, `dream`, `work`, `workers`,
-`worker`) and the interactive chat REPL. The REPL, `work` and `worker`
-authenticate with the daemon's
+`worker`, `update`) and the interactive chat REPL. The REPL, `work` and
+`worker` authenticate with the daemon's
 bearer token and supply the configured gateway's own HTTP origin on every
 request, matching the gateway's mandatory Origin/CSRF boundary for sensitive
-`/api` routes.
+`/api` routes. `update` never talks to the daemon.
 
 | File | Lines | Role |
 |---|---|---|
-| `main.rs` | 4,051 | `main()` (~1,240 lines), adapters, channel loops, job executor, subcommands |
+| `main.rs` | 4,305 | `main()` (~1,240 lines), adapters, channel loops, job executor, subcommands |
 | `task_queue.rs` | 1,459 | In-memory bounded queue for cron, credential-wake and payment-approval wake work; its scheduled-run helpers (prompt, conversation, SKILL.md, delivery target and delivery) are shared with `scheduled_work.rs` |
 | `scheduled_work.rs` | 508 | Scheduled jobs as work items behind `RUSTYKRAB_CRON_WORK_ITEMS=1`: files each firing, finishes it (records the job run, advances the job, delivers the result), and `JobTranscripts`, the local worker's `RunTranscripts` that continues a firing's job conversation with its SKILL.md and prompt |
 | `work_host.rs` | 246 | The control layer's host side: the tool-stub switch applied before the worker takes its list, the work tools registered after it, the interactive-turn busy signal, and outbox notices routed to the thread their item came from |
@@ -34,6 +34,8 @@ request, matching the gateway's mandatory Origin/CSRF boundary for sensitive
 | `fleet.rs` | 298 | The worker fleet: opens the `WorkerRegistry` with `AgentFactory` (builds `ExternalWorker`s and peers from their spec, and redeems a peer's pairing code in `prepare`), names the local worker, and gives the controller its worktree root, `RecordRouting` and `FleetCatalog`; `RuntimeSkills` loads skills written at run time as tools (the local worker's `LateTools`) |
 | `peers.rs` | 188 | Peers over the tailnet (Phase 5), both halves: building a `PeerWorker` from its spec and redeeming its pairing code, the registry's refresh timer that records each peer's advertisement and health, and `DelegatedRuns`, how this daemon runs a peer's brief (its machine name and delegation resources from the environment, the local worker's model slot shared) |
 | `worker_cmd.rs` | 365 | `rustykrab workers` and `rustykrab worker show / add / remove` over `/api/workers`, `worker add peer --url --pairing-code` among them |
+| `update_cmd.rs` | 688 | `rustykrab update check` and `rustykrab update stage [--from PATH] [--force]`: the latest GitHub release, its digest, the `Verifier` seam (`codesign` and one `--version` run), `staged.json` |
+| `update_cmd/tests.rs` | 408 | `update` against a local axum stand-in for the releases API, with scripted and (on macOS) real `codesign` checks |
 | `computer_backend.rs` | 375 | `ComputerBackend` impl (enigo + xcap), feature-gated |
 | `prompt_log.rs` | 69 | `TraceSink` impl writing prompt traces to disk |
 | `agent_defs.rs` | 74 | Agent definitions for this daemon: the built-in files and `<data dir>/agents/*.md`, the sub-agent catalog (all but `worker`), the local worker's definition |
@@ -74,6 +76,48 @@ It reaches the daemon through `daemon_client.rs`, the one `pub(crate)`
 client `chat.rs` uses too: the gateway URL, the token chain (env, keychain,
 store) and the gateway's own origin on every request. `worker_cmd.rs`
 reuses `work_cmd`'s `Daemon` over it.
+
+## `rustykrab update`
+
+Slice 5 of `docs/plans/update-flow.md`: where a new version comes from and
+how it is checked. `update_cmd.rs` opens no store and does not call the
+daemon; slice 6's supervisor is what swaps a staged version in.
+
+- `check` reads the latest release of `RUSTYKRAB_UPDATE_REPO` (default
+  `gcbh/rustykrab`) from `RUSTYKRAB_UPDATE_API_BASE` (default
+  `https://api.github.com`) and says whether its `vX.Y.Z` tag is above the
+  running `VERSION`, compared as numbers. `RUSTYKRAB_GITHUB_TOKEN` is sent
+  when set, for rate limits only.
+- `stage` does the same, and when the release is newer and not listed in
+  `<data>/updates/bad.json` (a JSON array of `{"version": ...}`, written by
+  slice 6's rollback; `--force` overrides it) downloads the asset
+  `rustykrab-<target>.tar.gz`. The target triple is stamped by `build.rs`
+  as `RUSTYKRAB_TARGET`. The asset's `digest` from the release API must be
+  `sha256:<hex>` and equal the SHA-256 of the downloaded bytes; a missing
+  or different digest refuses the release before anything is written. The
+  hash is rustls's ring provider, already linked for TLS, so no hashing
+  crate is added.
+- Only then is the archive written and extracted with the system `tar`,
+  into a `.staging-<uuid>` scratch directory under `<data>/updates/` that
+  is removed on any refusal. On macOS the archive must hold a
+  `RustyKrab.app`, which must pass `codesign --verify --deep --strict`,
+  and `codesign -dv` must show `Identifier=com.gcbh.rustykrab` and
+  `TeamIdentifier=3RRX845C4X` (`RUSTYKRAB_UPDATE_TEAM_ID` overrides the
+  pin). Only after that does the staged binary run, once, with
+  `--version`; it must print the release's version, and its commit is
+  recorded. The checked tree is then renamed to `<data>/updates/<version>/`
+  and `staged.json` (version, tag, commit, source, digest, path,
+  staged_at) written beside it.
+- `stage --from <path>` copies a local `RustyKrab.app` or bare binary
+  (`cp -Rp`) instead. It has no digest or tag; a bundle still goes through
+  the signature check, and the version is whatever the staged copy's
+  `--version` prints.
+
+The signature check and the `--version` run sit behind the `Verifier`
+trait. `SystemVerifier` runs `codesign` (a no-op off macOS, where the
+digest is the check) and the binary; the tests script it, serve a release
+and an archive built in the test from a local axum router, and on macOS run
+the real `codesign` against an unsigned bundle.
 
 ## The worker fleet
 
