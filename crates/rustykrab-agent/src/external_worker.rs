@@ -1030,13 +1030,34 @@ fn sanitise(value: &mut Value) -> std::result::Result<(), String> {
             }
         }
     }
+    let summary = value["summary"].as_str().map(str::to_string);
     if let Some(blocked) = value.get_mut("blocked").filter(|b| b.is_object()) {
         let reason = Value::String(blocked["reason"].as_str().unwrap_or_default().to_string());
         if serde_json::from_value::<rustykrab_core::work::BlockedReason>(reason).is_err() {
             blocked["reason"] = Value::String("needs_decision".into());
         }
-        if blocked.get("detail").is_none() {
-            blocked["detail"] = Value::String(String::new());
+        // A worker that puts its question under another key, or leaves it
+        // out, still has it read: the first non-blank string among the
+        // blocked object's other fields (the usual names first), else the
+        // report's summary.
+        let text = |v: &Value| {
+            v.as_str()
+                .filter(|s| !s.trim().is_empty())
+                .map(str::to_string)
+        };
+        if blocked.get("detail").and_then(text).is_none() {
+            let fields = blocked.as_object().into_iter().flatten();
+            let usual = ["question", "need", "what_you_need", "message", "text"];
+            let found = usual
+                .iter()
+                .find_map(|key| blocked.get(*key).and_then(text))
+                .or_else(|| {
+                    fields
+                        .filter(|(key, _)| !matches!(key.as_str(), "reason" | "detail" | "needs"))
+                        .find_map(|(_, v)| text(v))
+                });
+            let detail = found.or_else(|| summary.filter(|s| !s.trim().is_empty()));
+            blocked["detail"] = Value::String(detail.unwrap_or_default());
         }
     }
     Ok(())
@@ -1164,9 +1185,10 @@ pub fn render_executor_brief(
         "- Keep notes or task lists of your own if they help; nothing but the JSON below is \
          read.\n\
          - Follow-up work you notice goes in \"discovered\", one draft each; do not do it.\n\
-         - If you cannot finish, set \"blocked\" (reason: needs_tool, needs_credential, \
-         needs_decision or needs_consent; what you need) or \"error\" (class, subclass, detail) \
-         instead of guessing.\n\
+         - If you cannot finish, set \"blocked\" or \"error\" (class, subclass, detail) \
+         instead of guessing. \"blocked\" is {\"reason\": \"needs_decision\", \"detail\": \
+         \"the question or what you need\", \"needs\": []}, its reason one of needs_tool, \
+         needs_credential, needs_decision or needs_consent; the question goes in \"detail\".\n\
          End with one JSON object and nothing after it, the result contract:\n\
          {\"summary\": \"...\", \"artifacts\": [{\"kind\": \"path\", \"value\": \"...\"}], \
          \"changed_paths\": [\"...\"], \"commit\": \"<sha>\" or null, \"checks_run\": [\"...\"], \
@@ -1663,6 +1685,56 @@ printf '{"summary":"added status","changed_paths":["src/lib.rs"],"checks_run":["
             rustykrab_core::work::BlockedReason::NeedsDecision
         );
         assert!(parse_contract("no json here").is_err());
+    }
+
+    #[test]
+    fn a_blocked_report_keeps_the_question_under_another_key_or_takes_the_summary() {
+        let elsewhere = parse_contract(
+            r#"{"summary":"stuck","blocked":{"reason":"needs_decision","question":"Which port?"}}"#,
+        )
+        .unwrap();
+        assert_eq!(elsewhere.blocked.unwrap().detail, "Which port?");
+        let blank = parse_contract(
+            r#"{"summary":"stuck","blocked":{"reason":"needs_decision","detail":"  ",
+               "what_you_need":"the API key's scope"}}"#,
+        )
+        .unwrap();
+        assert_eq!(blank.blocked.unwrap().detail, "the API key's scope");
+        let odd_key = parse_contract(
+            r#"{"summary":"stuck","blocked":{"reason":"needs_decision","ask":"Keep the flag?"}}"#,
+        )
+        .unwrap();
+        assert_eq!(odd_key.blocked.unwrap().detail, "Keep the flag?");
+        let none = parse_contract(
+            r#"{"summary":"Which of the two schemas should win?","blocked":{"reason":"needs_decision"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            none.blocked.unwrap().detail,
+            "Which of the two schemas should win?"
+        );
+        let kept = parse_contract(
+            r#"{"summary":"stuck","blocked":{"reason":"needs_decision","detail":"Merge now?","question":"other"}}"#,
+        )
+        .unwrap();
+        assert_eq!(kept.blocked.unwrap().detail, "Merge now?");
+    }
+
+    #[test]
+    fn the_brief_shows_where_a_blocked_report_puts_its_question() {
+        let prompt = render_executor_brief(
+            &brief(None),
+            "shipwright",
+            WorkerKind::ClaudeCode,
+            Path::new("/tmp/w"),
+            Path::new("/tmp/skills"),
+        );
+        assert!(
+            prompt.contains(
+                r#"{"reason": "needs_decision", "detail": "the question or what you need", "needs": []}"#
+            ),
+            "{prompt}"
+        );
     }
 
     fn question(text: &str, class: &str, options: &[&str]) -> rustykrab_core::work::Question {
