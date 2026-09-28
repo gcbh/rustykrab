@@ -187,6 +187,27 @@ fn check_ran_in(wanted: &str, command: &str) -> bool {
         .any(|s| s == wanted)
 }
 
+/// Whether a normalised claimed check ran among the recorded commands `ran`:
+/// the whole claim ran in one of them, or the claim is compound and each of
+/// its steps (split on the shell separators `&&` and `;` only, each step
+/// normalised as a claim of its own) ran in one of them. A claim joined by
+/// words, such as `... then re-check`, has no separator and is not split.
+fn claim_ran(wanted: &str, ran: &[String]) -> bool {
+    if ran.iter().any(|c| check_ran_in(wanted, c)) {
+        return true;
+    }
+    let steps: Vec<String> = wanted
+        .replace("&&", ";")
+        .split(';')
+        .map(claimed_check)
+        .filter(|s| !s.is_empty())
+        .collect();
+    !steps.is_empty()
+        && steps
+            .iter()
+            .all(|step| ran.iter().any(|c| check_ran_in(step, c)))
+}
+
 /// The class a failed tick reports: the variant of the error it returned.
 /// Exhaustive, so a new variant has to be named here.
 pub(super) fn failure_class(err: &Error) -> &'static str {
@@ -910,7 +931,7 @@ impl Controller {
                 if wanted.is_empty() {
                     continue;
                 }
-                if !ran.iter().any(|c| check_ran_in(&wanted, c)) {
+                if !claim_ran(&wanted, &ran) {
                     return Ok(Err((
                         VerifierVerdict::ClaimMismatch,
                         format!(
@@ -1753,11 +1774,11 @@ pub(super) fn spawn(worker: Arc<dyn Worker>, brief: Brief, since: DateTime<Utc>)
 
 #[cfg(test)]
 mod tests {
-    use super::{check_ran_in, claimed_check};
+    use super::{claim_ran, claimed_check};
 
     fn verifies(claim: &str, commands: &[&str]) -> bool {
-        let wanted = claimed_check(claim);
-        commands.iter().any(|c| check_ran_in(&wanted, c))
+        let ran: Vec<String> = commands.iter().map(|c| c.to_lowercase()).collect();
+        claim_ran(&claimed_check(claim), &ran)
     }
 
     #[test]
@@ -1809,5 +1830,62 @@ mod tests {
             &ran,
         ));
         assert!(!verifies("(86 passed)", &ran));
+    }
+
+    #[test]
+    fn a_compound_claim_verifies_when_each_step_ran_on_its_own() {
+        let ran = [
+            "python3 scripts/check_architecture_docs.py --fix",
+            "python3 scripts/check_architecture_docs.py",
+        ];
+        assert!(verifies(
+            "python3 scripts/check_architecture_docs.py --fix && \
+             python3 scripts/check_architecture_docs.py",
+            &ran,
+        ));
+        assert!(verifies(
+            "cargo fmt --all (ok); python3 scripts/check_architecture_docs.py (OK)",
+            &[
+                "cargo fmt --all",
+                "bash -lc 'python3 scripts/check_architecture_docs.py'"
+            ],
+        ));
+        assert!(verifies("cargo clippy ;", &["cargo clippy"]));
+    }
+
+    #[test]
+    fn a_compound_claim_fails_when_any_step_did_not_run() {
+        assert!(!verifies(
+            "python3 scripts/check_architecture_docs.py --fix && \
+             python3 scripts/check_architecture_docs.py",
+            &["python3 scripts/check_architecture_docs.py"],
+        ));
+        assert!(!verifies(
+            "cargo fmt --all; cargo clippy",
+            &["cargo fmt --all"]
+        ));
+        assert!(!verifies("&& ;", &["cargo fmt --all"]));
+    }
+
+    #[test]
+    fn a_claim_joined_by_words_is_not_split() {
+        let ran = [
+            "python3 scripts/check_architecture_docs.py --fix",
+            "python3 scripts/check_architecture_docs.py",
+        ];
+        assert!(!verifies(
+            "python3 scripts/check_architecture_docs.py --fix then re-check (OK)",
+            &ran,
+        ));
+        assert!(!verifies(
+            "python3 scripts/check_architecture_docs.py --fix and \
+             python3 scripts/check_architecture_docs.py",
+            &ran,
+        ));
+        // `||` and `|` are not separators a claim splits on.
+        assert!(!verifies(
+            "cargo fmt --all || cargo clippy",
+            &["cargo fmt --all", "cargo clippy"],
+        ));
     }
 }
