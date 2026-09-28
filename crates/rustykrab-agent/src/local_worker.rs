@@ -20,7 +20,14 @@
 //!   treat the conversation as a worker run: only a successful
 //!   `result_report` ends it, text is answered with a counted
 //!   `[System notice]` reminder, and no request carries a system message
-//!   after the first (section 12.1).
+//!   after the first (section 12.1);
+//! - tools that appeared after the worker was built ([`LateTools`]: a skill
+//!   a capability build wrote at run time, section 8 rung 2b) joining the
+//!   host's catalog, so a resumed item can activate the tool it waited for;
+//! - for a `code` brief with a workspace, the worktree created before the
+//!   run and removed after it, with `exec` bound to it, so the run works
+//!   and commits in the isolated checkout the controller verifies
+//!   (section 5).
 //!
 //! `run` returns the [`ResultReport`] the run's `result_report` call handed
 //! the injected [`WorkBackend`], exactly as the backend received it. A run
@@ -90,6 +97,14 @@ pub trait RunTranscripts: Send + Sync {
     async fn save(&self, conversation: &Conversation) -> Result<()>;
 }
 
+/// Tools that exist only once the daemon is running: the composition root
+/// rescans what a capability build may have written (a `SKILL.md` becomes
+/// a tool) and hands back every such tool. Asked at the start of each run
+/// and by [`LocalWorker::capabilities`].
+pub trait LateTools: Send + Sync {
+    fn tools(&self) -> Vec<Arc<dyn Tool>>;
+}
+
 /// What one run of a [`LocalWorker`] did, beyond its result: the numbers the
 /// controller cannot read from a [`ResultReport`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -118,6 +133,7 @@ pub struct LocalWorker {
     ceiling: Vec<String>,
     recall: Option<Arc<RecallStore>>,
     transcripts: Option<Arc<dyn RunTranscripts>>,
+    late: Option<Arc<dyn LateTools>>,
     /// The KV slot runs wait for. Local work is serialised per model
     /// (plan section 12.1), so workers on one model share one.
     slot: Arc<Semaphore>,
@@ -156,6 +172,7 @@ impl LocalWorker {
             ceiling,
             recall: None,
             transcripts: None,
+            late: None,
             slot: Arc::new(Semaphore::new(1)),
             last_run: Mutex::new(None),
         }
@@ -181,6 +198,30 @@ impl LocalWorker {
     pub fn with_transcripts(mut self, transcripts: Arc<dyn RunTranscripts>) -> Self {
         self.transcripts = Some(transcripts);
         self
+    }
+
+    /// Add the tools `late` hands back to the catalog of every run.
+    pub fn with_late_tools(mut self, late: Arc<dyn LateTools>) -> Self {
+        self.late = Some(late);
+        self
+    }
+
+    /// The host's tools with the late ones not already among them, and
+    /// the ceiling over both.
+    fn catalog(&self) -> (Vec<Arc<dyn Tool>>, Vec<String>) {
+        let Some(late) = &self.late else {
+            return (self.tools.clone(), self.ceiling.clone());
+        };
+        let mut tools = self.tools.clone();
+        for tool in late.tools() {
+            let name = tool.name();
+            let reserved = WORK_TOOL_NAMES.contains(&name) || name == TASK_COMPLETE;
+            if !reserved && !tools.iter().any(|t| t.name() == name) {
+                tools.push(tool);
+            }
+        }
+        let ceiling = Self::ceiling_of(&self.definition, &tools);
+        (tools, ceiling)
     }
 
     async fn keep(&self, conv: &Conversation) {
@@ -254,10 +295,14 @@ impl LocalWorker {
     /// stops the run before it starts. The controller matches a brief to a
     /// worker whose capabilities cover it, so a gap here means the two
     /// disagreed; it comes back typed, for the ladder's order 2.
-    fn activation(&self, brief: &Brief) -> std::result::Result<Vec<String>, RunFailure> {
+    fn activation(
+        &self,
+        brief: &Brief,
+        ceiling: &[String],
+    ) -> std::result::Result<Vec<String>, RunFailure> {
         let mut names: Vec<String> = WORK_TOOL_NAMES.iter().map(|n| n.to_string()).collect();
         for tool in &brief.required_tools {
-            if !self.ceiling.contains(tool) {
+            if !ceiling.contains(tool) {
                 return Err(RunFailure::Gap {
                     gap: GapKind::Tool,
                     name: tool.clone(),
@@ -268,7 +313,7 @@ impl LocalWorker {
         for server in &brief.required_mcp_servers {
             let before = names.len();
             names.extend(
-                self.ceiling
+                ceiling
                     .iter()
                     .filter(|n| mcp_server_of(n).is_some_and(|s| s.eq_ignore_ascii_case(server)))
                     .cloned(),
@@ -319,8 +364,8 @@ impl Worker for LocalWorker {
     }
 
     fn capabilities(&self) -> WorkerCapabilities {
-        let mut mcp_servers: Vec<String> = self
-            .ceiling
+        let (_, ceiling) = self.catalog();
+        let mut mcp_servers: Vec<String> = ceiling
             .iter()
             .filter_map(|n| mcp_server_of(n))
             .map(str::to_string)
@@ -329,7 +374,7 @@ impl Worker for LocalWorker {
         mcp_servers.dedup();
         WorkerCapabilities {
             models: vec![self.provider.name().to_string()],
-            tools: self.ceiling.clone(),
+            tools: ceiling.clone(),
             mcp_servers,
             // A local run writes through this daemon's own tools, so it can
             // reach any resource they can. Who may write a resource at once
@@ -353,18 +398,64 @@ impl Worker for LocalWorker {
     }
 
     async fn run(&self, brief: Brief) -> Result<ResultReport> {
-        let activate = self.activation(&brief).map_err(RunFailure::into_error)?;
+        let (host_tools, ceiling) = self.catalog();
+        let activate = self
+            .activation(&brief, &ceiling)
+            .map_err(RunFailure::into_error)?;
         let _slot = self
             .slot
             .acquire()
             .await
             .map_err(|_| Error::Internal("local worker slot closed".into()))?;
 
+        // A `code` run works in its own worktree: created now, `exec`
+        // bound to it, removed when the run ends (the branch stays).
+        if let Some(ws) = brief.workspace.clone() {
+            tokio::task::spawn_blocking(move || ws.create())
+                .await
+                .map_err(|e| Error::Internal(e.to_string()))?
+                .map_err(|why| {
+                    RunFailure::Process {
+                        code: Some(128),
+                        stderr_tail: why,
+                    }
+                    .into_error()
+                })?;
+        }
+        let result = self
+            .run_in(brief.clone(), host_tools, ceiling, activate)
+            .await;
+        if let Some(ws) = brief.workspace {
+            if let Err(why) = tokio::task::spawn_blocking(move || ws.remove())
+                .await
+                .unwrap_or_else(|e| Err(e.to_string()))
+            {
+                tracing::warn!(worker = %self.name, %why, "worktree not removed");
+            }
+        }
+        result
+    }
+}
+
+impl LocalWorker {
+    async fn run_in(
+        &self,
+        brief: Brief,
+        host_tools: Vec<Arc<dyn Tool>>,
+        ceiling: Vec<String>,
+        activate: Vec<String>,
+    ) -> Result<ResultReport> {
         // Fresh `work_*` tools per run, over a recorder, so the run returns
         // exactly the report the backend accepted and nothing else.
         let recorder = Arc::new(RecordingBackend::new(self.backend.clone()));
         let mut tools = rustykrab_tools::work_tools(recorder.clone());
-        tools.extend(self.tools.iter().cloned());
+        let workdir = brief.workspace.as_ref().map(|ws| ws.path.clone());
+        tools.extend(host_tools.into_iter().map(|t| match &workdir {
+            Some(dir) if t.name() == "exec" => {
+                Arc::new(rustykrab_tools::ExecTool::in_dir(dir.clone())) as Arc<dyn Tool>
+            }
+            _ => t,
+        }));
 
         // The controller's run id, when it is one, names the conversation,
         // so the item's `run` evidence points at this transcript.
@@ -373,7 +464,7 @@ impl Worker for LocalWorker {
             .as_deref()
             .and_then(|r| Uuid::parse_str(r).ok())
             .unwrap_or_else(Uuid::new_v4);
-        let session = Session::with_capabilities(conv_id, Self::capabilities_for(&self.ceiling));
+        let session = Session::with_capabilities(conv_id, Self::capabilities_for(&ceiling));
         let active = Arc::new(ActiveToolsRegistry::new());
         active.activate(conv_id, activate);
 
@@ -604,6 +695,20 @@ pub fn render_brief(brief: &Brief) -> String {
                 .map(|e| one_line(&format!("{}:{}", e.kind, e.reference), LINE_MAX));
             let _ = writeln!(out, "  prior_evidence: {}", list(refs));
         }
+    }
+    if let Some(ws) = &brief.workspace {
+        let _ = writeln!(
+            out,
+            "workspace: {} (exec runs here; branch {}, parent commit {})",
+            ws.path.display(),
+            ws.branch,
+            ws.base
+        );
+        let _ = writeln!(
+            out,
+            "  commit your change on this branch; report changed_paths relative to the \
+             repository root, exactly the files the commit changes"
+        );
     }
     let _ = writeln!(out, "budget: {} steps", brief.budget.iterations);
     if let Some(origin) = &brief.origin_conversation_id {
@@ -1307,6 +1412,127 @@ mod tests {
         let calls = stub.calls();
         assert_eq!(calls.len(), 1, "nothing filed, one report: {calls:?}");
         assert!(matches!(&calls[0], WorkCall::Report { report, .. } if report == &got));
+    }
+
+    /// Tools that appeared after the worker was built.
+    struct Late(Vec<&'static str>);
+
+    impl LateTools for Late {
+        fn tools(&self) -> Vec<Arc<dyn Tool>> {
+            self.0
+                .iter()
+                .map(|n| Arc::new(Named(n)) as Arc<dyn Tool>)
+                .collect()
+        }
+    }
+
+    /// Section 8, rung 2b: a skill a build wrote at run time is a tool the
+    /// resumed item can have active from its first step.
+    #[tokio::test]
+    async fn a_tool_written_at_run_time_can_be_activated_up_front() {
+        let provider = Recording::new(vec![report("High water at 14:05.")]);
+        let (w, _) = worker(provider.clone(), vec![Arc::new(Named("noop"))]);
+        let mut b = brief("item-13");
+        b.required_tools = vec!["tide_table".into()];
+        let err = w.run(b.clone()).await.unwrap_err();
+        assert!(
+            matches!(RunFailure::from_error(&err), Some(RunFailure::Gap { .. })),
+            "not there before the build: {err}"
+        );
+
+        let w = w.with_late_tools(Arc::new(Late(vec!["tide_table", "result_report"])));
+        assert!(w.capabilities().tools.iter().any(|t| t == "tide_table"));
+        w.run(b).await.unwrap();
+        let (_, first) = provider.requests()[0].clone();
+        assert!(first.iter().any(|t| t == "tide_table"), "{first:?}");
+        assert_eq!(
+            first.iter().filter(|t| *t == "result_report").count(),
+            1,
+            "a late tool never replaces a work tool"
+        );
+    }
+
+    fn git(dir: &std::path::Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// Section 5: a local `code` run works and commits in its own
+    /// worktree, which is gone afterwards; the branch keeps the commit.
+    #[tokio::test]
+    async fn a_code_run_commits_in_its_worktree() {
+        let repo = tempfile::tempdir().unwrap();
+        git(repo.path(), &["init", "--initial-branch=main"]);
+        std::fs::write(repo.path().join("lib.rs"), "pub fn a() {}\n").unwrap();
+        git(repo.path(), &["add", "."]);
+        git(
+            repo.path(),
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@x.invalid",
+                "commit",
+                "-q",
+                "--no-gpg-sign",
+                "-m",
+                "init",
+            ],
+        );
+        let base = git(repo.path(), &["rev-parse", "HEAD"]);
+        let root = tempfile::tempdir().unwrap();
+        let ws = rustykrab_control::workspace::Workspace::plan(
+            root.path(),
+            repo.path(),
+            &base,
+            "item-17",
+            "run-17",
+        );
+        let provider = Recording::new(vec![
+            call(
+                "exec",
+                json!({ "command": "echo '// local' >> lib.rs && git add lib.rs && git -c user.name=t -c user.email=t@x.invalid commit -q --no-gpg-sign -m local" }),
+            ),
+            call(
+                "result_report",
+                json!({ "summary": "Documented it.", "changed_paths": ["lib.rs"] }),
+            ),
+        ]);
+        let (w, _) = worker(
+            provider.clone(),
+            vec![Arc::new(rustykrab_tools::ExecTool::new())],
+        );
+        let mut b = brief("item-17");
+        b.kind = WorkKind::Code;
+        b.required_tools = vec!["exec".into()];
+        b.workspace = Some(ws.clone());
+
+        let got = w.run(b).await.unwrap();
+        assert_eq!(got.changed_paths, ["lib.rs"]);
+        let tip = ws.tip().unwrap().expect("the branch exists");
+        assert_ne!(tip, base, "the run committed on its branch");
+        assert!(!ws.path.exists(), "the worktree is removed");
+        assert_eq!(
+            git(repo.path(), &["rev-parse", "HEAD"]),
+            base,
+            "the checkout never moved"
+        );
+        let (messages, _) = provider.requests()[0].clone();
+        let rendered = messages[1].content.as_text().unwrap().to_string();
+        assert!(rendered.contains("workspace: "), "{rendered}");
+        assert!(rendered.contains(&ws.branch), "{rendered}");
     }
 
     #[test]

@@ -1,4 +1,5 @@
 pub mod compaction;
+pub mod external_worker;
 pub mod harness;
 pub mod local_worker;
 pub mod recall_tools;
@@ -12,8 +13,9 @@ pub mod trace;
 pub mod voting;
 
 pub use compaction::CompactionStrategy;
+pub use external_worker::{ExternalConfig, ExternalWorker, Retention};
 pub use harness::HarnessProfile;
-pub use local_worker::{LocalRun, LocalWorker, RunTranscripts};
+pub use local_worker::{LateTools, LocalRun, LocalWorker, RunTranscripts};
 pub use recall_tools::recall_tools;
 pub use rlm::RecursiveExecutor;
 pub use router::HarnessRouter;
