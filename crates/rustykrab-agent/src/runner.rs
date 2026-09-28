@@ -525,6 +525,12 @@ const RESULT_REPORT_REMINDER: &str =
      you cannot finish, call it with `blocked` or `error` set. If more work remains, \
      call the next tool.";
 
+/// What the error for a refused call says after the tool's name: a call to
+/// a registered tool this conversation has neither declared nor appended
+/// (plan section 12) is answered with it and never run. Public so an
+/// evaluation can tell the host's refusal from a tool that ran and failed.
+pub const NOT_CALLABLE: &str = "is not callable in this conversation";
+
 /// What a runner notice starts with (plan section 12.1).
 pub(crate) use rustykrab_core::types::SYSTEM_NOTICE_PREFIX as NOTICE_PREFIX;
 
@@ -1768,6 +1774,63 @@ impl AgentRunner {
         CompletionReminderOutcome::Continue
     }
 
+    /// Why `call` may not run in this conversation, or `None` when it may
+    /// (or when the executor has its own answer for it).
+    ///
+    /// Plan section 12: a tool is callable in a conversation when it is
+    /// declared in the run's tools array (the meta tools and the
+    /// conversation's active set) or appended to the conversation by a
+    /// search or a load. Under the append binding the provider takes a call
+    /// to any name, and dispatch used to run any registered tool inside the
+    /// ceiling: told a search found nothing, both default models called the
+    /// near-miss it named, and it ran (scenario 10, 2026-09-28). The same
+    /// rule holds under the re-render binding, where callable is exactly
+    /// what the tools array declares, so it is one rule for both.
+    ///
+    /// The capability ceiling stays the first check, and an unregistered
+    /// name the executor's "unknown tool": for both this answers `None`, so
+    /// the executor refuses them as it always has.
+    fn refusal(&self, session: &Session, call: &ToolCall) -> Option<Error> {
+        if !session.capabilities.can_use_tool(&call.name) {
+            return None;
+        }
+        let name = call.name.trim();
+        let base = name.split(':').next().unwrap_or(name);
+        let tool = self
+            .tool_index
+            .get(name)
+            .or_else(|| self.tool_index.get(base))?;
+        let name = tool.name();
+        let conv = session.conversation_id;
+        if is_meta_tool(name) || self.active_tools.is_callable(conv, name) {
+            return None;
+        }
+        let mut message = format!(
+            "tool '{name}' {NOT_CALLABLE}: it was not declared to you and no search made it \
+             callable, so it did not run. Search the catalog with tools_list for what you need."
+        );
+        if let Some(miss) = self
+            .active_tools
+            .search_misses(conv)
+            .into_iter()
+            .find(|miss| miss.near.iter().any(|n| n == name))
+        {
+            message.push_str(&format!(
+                " tools_list named it a non-match for \"{}\": it does not do what you \
+                 searched for, so do not use it in its place.",
+                miss.query
+            ));
+        }
+        tracing::warn!(
+            tool = name,
+            conversation_id = %conv,
+            "refused a call to a tool this conversation has not declared or appended"
+        );
+        Some(Error::ToolExecution(rustykrab_core::ToolError::not_found(
+            message,
+        )))
+    }
+
     /// Each call with its string arguments coerced to the scalar types its
     /// tool's schema declares (`rustykrab_core::coerce_tool_args`), or
     /// `None` for a call that needed nothing, in the order given. A late
@@ -2362,9 +2425,40 @@ impl AgentRunner {
                     .map(|(call, typed)| typed.as_ref().unwrap_or(call))
                     .collect();
 
-                let results = self
-                    .execute_tools_parallel_traced(calls, session, tracer, Some(on_event))
-                    .await;
+                // A call to a registered tool this conversation has neither
+                // declared nor appended is refused, never run (plan section
+                // 12); the rest run as a batch, and the results keep the
+                // calls' order.
+                let refusals: Vec<Option<Error>> = calls
+                    .iter()
+                    .map(|call| self.refusal(session, call))
+                    .collect();
+                let to_run: Vec<&ToolCall> = calls
+                    .iter()
+                    .zip(&refusals)
+                    .filter(|(_, refused)| refused.is_none())
+                    .map(|(call, _)| *call)
+                    .collect();
+                let mut ran = self
+                    .execute_tools_parallel_traced(to_run, session, tracer, Some(on_event))
+                    .await
+                    .into_iter();
+                let results: Vec<(String, String, Result<ToolResult>)> = calls
+                    .iter()
+                    .zip(refusals)
+                    .map(|(call, refused)| match refused {
+                        Some(err) => {
+                            tracer.record(ToolTrace {
+                                tool_name: call.name.clone(),
+                                success: false,
+                                duration: Duration::ZERO,
+                                error: Some(err.to_string()),
+                            });
+                            (call.name.clone(), call.id.clone(), Err(err))
+                        }
+                        None => ran.next().expect("one result per call that ran"),
+                    })
+                    .collect();
 
                 // Track side effects in streaming path.
                 if !had_side_effects {
@@ -4912,11 +5006,13 @@ mod interactive_regression_tests {
                 .collect(),
         ));
         let seen = Arc::new(Mutex::new(Vec::new()));
+        // Declared from turn 0, as a tool the model can call must be.
         let runner = AgentRunner::new(
             p.clone(),
             vec![Arc::new(ContextProbe { seen: seen.clone() })],
             Arc::new(NoSandbox),
         )
+        .with_active_tools(Arc::new(ActiveToolsRegistry::with_seed(["context_probe"])))
         .with_config(AgentConfig {
             max_iterations: 4,
             ..Default::default()
@@ -4999,6 +5095,7 @@ mod interactive_regression_tests {
             vec![Arc::new(WorkRunProbe { seen: seen.clone() })],
             Arc::new(NoSandbox),
         )
+        .with_active_tools(Arc::new(ActiveToolsRegistry::with_seed(["work_run_probe"])))
         .with_config(AgentConfig {
             max_iterations: 4,
             ..Default::default()
@@ -5053,7 +5150,8 @@ mod interactive_regression_tests {
                 dropped: dropped.clone(),
             })],
             Arc::new(NoSandbox),
-        );
+        )
+        .with_active_tools(Arc::new(ActiveToolsRegistry::with_seed(["hang_fixture"])));
         let session = Session::with_capabilities(
             conv.id,
             rustykrab_core::capability::CapabilitySet::for_tools_permissive(&["hang_fixture"]),

@@ -26,7 +26,7 @@ pub use rlm::RecursiveExecutor;
 pub use router::HarnessRouter;
 pub use runner::{
     AgentConfig, AgentEvent, AgentHandle, AgentRunCompletion, AgentRunner, InboundEvent,
-    LlmTriggerStrategy, OnMessageCallback,
+    LlmTriggerStrategy, OnMessageCallback, NOT_CALLABLE,
 };
 pub use sandbox::{
     tool_timeout_secs, NoSandbox, ProcessSandbox, Sandbox, SandboxPolicy,

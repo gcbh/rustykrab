@@ -518,3 +518,216 @@ async fn the_search_miss_limit_is_the_runs() {
         ["current forecast"]
     );
 }
+
+/// A catalog tool that counts the times it actually ran.
+struct Counted {
+    name: &'static str,
+    description: &'static str,
+    runs: std::sync::atomic::AtomicUsize,
+}
+
+impl Counted {
+    fn new(name: &'static str, description: &'static str) -> Arc<Self> {
+        Arc::new(Self {
+            name,
+            description,
+            runs: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+    fn runs(&self) -> usize {
+        self.runs.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl Tool for Counted {
+    fn name(&self) -> &str {
+        self.name
+    }
+    fn description(&self) -> &str {
+        self.description
+    }
+    fn schema(&self) -> ToolSchema {
+        ToolSchema {
+            name: self.name.into(),
+            description: self.description.into(),
+            parameters: json!({ "type": "object", "properties": { "city": { "type": "string" } } }),
+        }
+    }
+    async fn execute(&self, _: Value) -> Result<Value> {
+        self.runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(json!({ "tool": self.name }))
+    }
+}
+
+/// Plan section 12: a tool is callable when it is declared or appended.
+/// Told a search found nothing, both default models called the near-miss
+/// it named, and dispatch ran it (scenario 10, 2026-09-28). Now the call
+/// is refused, named as not callable here with a pointer to tools_list and
+/// the search that ruled it out, and the tool never runs; the ceiling and
+/// an unknown name keep their own answers.
+#[tokio::test]
+async fn under_append_a_call_to_a_tool_never_declared_or_appended_is_refused_unrun() {
+    let alarm = Counted::new("set_alarm", "Set an alarm on the user's phone.");
+    let uv = Counted::new("get_uv_index", "Get the current UV index for a city.");
+    let forbidden = Counted::new("forbidden", "Not this session's to call.");
+    let provider = Recording::new(
+        true,
+        vec![
+            // Nothing in the catalog: the forecast is named a non-match.
+            call("tools_list", json!({ "query": "current forecast" })),
+            call("get_forecast", json!({ "city": "Lisbon" })),
+            // Never searched for, never loaded.
+            call("set_alarm", json!({ "city": "Lisbon" })),
+            // Found by a search: appended, so it runs.
+            call("tools_list", json!({ "query": "current uv index" })),
+            call("get_uv_index", json!({ "city": "Lisbon" })),
+            // Not registered at all, and outside the session's ceiling.
+            call("teleport", json!({})),
+            call("forbidden", json!({})),
+            call("task_complete", json!({ "summary": "done" })),
+        ],
+    );
+    let (runner, session, active) = setup_with(
+        provider,
+        vec![
+            alarm.clone() as Arc<dyn Tool>,
+            uv.clone() as Arc<dyn Tool>,
+            forbidden.clone() as Arc<dyn Tool>,
+        ],
+    );
+    // `forbidden` is registered and outside the session's ceiling;
+    // `teleport` is inside it and registered nowhere.
+    let names: Vec<String> = runner
+        .tools
+        .iter()
+        .map(|t| t.name().to_string())
+        .filter(|n| n != "forbidden")
+        .chain(["teleport".to_string()])
+        .collect();
+    let names: Vec<&str> = names.iter().map(String::as_str).collect();
+    let session = Session::with_capabilities(
+        session.conversation_id,
+        CapabilitySet::for_tools_permissive(&names),
+    );
+    let runner = runner.with_config(AgentConfig {
+        max_consecutive_errors: 99,
+        ..AgentConfig::default()
+    });
+    let conv_id = session.conversation_id;
+    let mut conv = conversation(conv_id);
+
+    runner.run(&mut conv, &session).await.unwrap();
+
+    let (refused, forecast) = results_of(&conv, "get_forecast").remove(0);
+    assert!(refused, "{forecast}");
+    assert!(
+        forecast.contains(&format!("tool 'get_forecast' {NOT_CALLABLE}")),
+        "{forecast}"
+    );
+    assert!(forecast.contains("tools_list"), "{forecast}");
+    assert!(
+        forecast.contains("named it a non-match for \\\"current forecast\\\""),
+        "{forecast}"
+    );
+    let (refused, alarm_out) = results_of(&conv, "set_alarm").remove(0);
+    assert!(refused && alarm_out.contains(NOT_CALLABLE), "{alarm_out}");
+    assert!(!alarm_out.contains("non-match"), "{alarm_out}");
+    assert_eq!(alarm.runs(), 0, "a refused call never runs");
+
+    let (failed, uv_out) = results_of(&conv, "get_uv_index").remove(0);
+    assert!(!failed, "{uv_out}");
+    assert_eq!(uv.runs(), 1);
+    assert!(active.is_appended(conv_id, "get_uv_index"));
+
+    let (_, unknown) = results_of(&conv, "teleport").remove(0);
+    assert!(unknown.contains("unknown tool"), "{unknown}");
+    let (_, ceiling) = results_of(&conv, "forbidden").remove(0);
+    assert!(
+        ceiling.contains("does not have permission") && !ceiling.contains(NOT_CALLABLE),
+        "the ceiling answers first: {ceiling}"
+    );
+    assert_eq!(forbidden.runs(), 0);
+    assert_eq!(
+        conv.messages.last().and_then(|m| m.content.as_text()),
+        Some("done"),
+        "task_complete, appended at the first tool call, ended the run"
+    );
+}
+
+/// The same rule under the re-render binding, where callable is exactly
+/// what the tools array declares: a tool runs once a search declares it.
+#[tokio::test]
+async fn under_rerender_only_a_declared_tool_runs() {
+    let uv = Counted::new("get_uv_index", "Get the current UV index for a city.");
+    let provider = Recording::new(
+        false,
+        vec![
+            call("get_uv_index", json!({ "city": "Lisbon" })),
+            call("tools_list", json!({ "query": "current uv index" })),
+            call("get_uv_index", json!({ "city": "Lisbon" })),
+            call("task_complete", json!({ "summary": "done" })),
+        ],
+    );
+    let (runner, session, active) = setup_with(provider, vec![uv.clone() as Arc<dyn Tool>]);
+    let mut conv = conversation(session.conversation_id);
+
+    runner.run(&mut conv, &session).await.unwrap();
+
+    let results = results_of(&conv, "get_uv_index");
+    assert!(
+        results[0].0 && results[0].1.contains(NOT_CALLABLE),
+        "{results:?}"
+    );
+    assert!(!results[1].0, "{results:?}");
+    assert_eq!(uv.runs(), 1);
+    assert!(active.is_active(session.conversation_id, "get_uv_index"));
+}
+
+/// A tool declared from turn 0 (a seed, as `RUSTYKRAB_ACTIVE_TOOLS` and
+/// the stub file give an evaluation) runs without a search, batched or not.
+#[tokio::test]
+async fn a_seeded_tool_runs_without_a_search() {
+    let uv = Counted::new("get_uv_index", "Get the current UV index for a city.");
+    let provider = Recording::new(
+        true,
+        vec![
+            respond(
+                MessageContent::MultiToolCall(vec![
+                    ToolCall {
+                        id: "a".into(),
+                        name: "get_uv_index".into(),
+                        arguments: json!({ "city": "Lisbon" }),
+                    },
+                    ToolCall {
+                        id: "b".into(),
+                        name: "get_forecast".into(),
+                        arguments: json!({ "city": "Lisbon" }),
+                    },
+                ]),
+                StopReason::ToolUse,
+            ),
+            call("task_complete", json!({ "summary": "done" })),
+        ],
+    );
+    let (runner, session, _) = setup_with(provider, vec![uv.clone() as Arc<dyn Tool>]);
+    let runner =
+        runner.with_active_tools(Arc::new(ActiveToolsRegistry::with_seed(["get_uv_index"])));
+    let mut conv = conversation(session.conversation_id);
+
+    runner.run(&mut conv, &session).await.unwrap();
+
+    assert_eq!(uv.runs(), 1);
+    let (refused, forecast) = results_of(&conv, "get_forecast").remove(0);
+    assert!(refused && forecast.contains(NOT_CALLABLE), "{forecast}");
+    // The batch's results keep the calls' order.
+    let order: Vec<&str> = conv
+        .messages
+        .iter()
+        .filter_map(|m| match &m.content {
+            MessageContent::ToolResult(r) => Some(r.call_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(&order[..2], ["a", "b"]);
+}

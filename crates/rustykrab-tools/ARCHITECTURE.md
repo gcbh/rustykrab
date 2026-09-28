@@ -304,7 +304,11 @@ and neither changes the tools array under the append binding:
 The registry is in `core`, so neither `tools` nor `agent` owns the other's
 state, and which binding applies is the runner's, from provider capability
 data, never a tool looking at a model name. `work_file` counts an appended
-tool as loaded.
+tool as loaded. What the two meta-tools make callable is also all a
+conversation can run: the runner refuses, unrun, a call to a registered
+tool that is neither declared nor appended (see `rustykrab-agent`), so a
+tool named a non-match stays out of reach unless the model loads it by
+name.
 
 ## Control-layer work tools
 
