@@ -125,191 +125,88 @@ Otherwise it reports what it would do and leaves a notice. For the
 builder the steps are the same with a plain binary path and `start.sh`
 in place of launchd.
 
-## Slice 6: not yet safe
+## Slice 6: status (2026-09-28)
 
-The first build of slice 6 got the swap order, the atomic renames, the
-90 s verify window, the `--yes` gate and the commit-keyed bad record
-right. Its security review (2026-09-28) found four problems that keep it
-from running. Until they are fixed the CLI refuses
-`rustykrab update apply` unless `RUSTYKRAB_UPDATE_APPLY_UNREVIEWED=1`.
+Slice 6 was built in four parts, each reviewed for security before it
+merged. The CLI still refuses `rustykrab update apply` unless
+`RUSTYKRAB_UPDATE_APPLY_UNREVIEWED=1`.
 
-1. **It trusts `staged.json`, which a worker can write.** The launchd
-   refusal reads `kind` and `signature_verified` from the record, `path`
-   is never checked, and the version is not compared with the running
-   one. The swap must re-check what it is about to install. It copies the
-   stage beside the install, then:
-   - refuses a symlink;
-   - checks the signature requirement (slice 5) on the copy;
-   - runs the copy's `--version` and requires the staged version and
-     commit;
-   - requires the record's directory and path to be the canonical
-     `updates/<X.Y.Z>/<binary or app>`;
-   - for a release, requires the version to be newer than the running
-     one.
+**What `apply` does now:**
 
-   *Fixed (2026-09-28).* `newest_staged` skips a record that does not
-   parse and refuses the newest one unless its directory is its plain
-   `X.Y.Z` version and its path is `updates/<version>/RustyKrab.app` or
-   `updates/<version>/rustykrab-cli` by kind, with no symlink on the way
-   (`check_canonical`). A release (a stage with a tag) must be newer than
-   the version `/api/version` reports. `DirSwap::swap_in` copies with
-   `cp -Rp --` and, before any rename, passes the copy through
-   `NextCheck`: a real directory or regular file, the Developer ID
-   signature of the configured team under launchd, and its own
-   `--version` reporting the staged version and commit. The `Verifier`
-   reaches the swap through `Host`, so the tests script it.
-2. **An interrupted apply can leave no daemon, and the next run does not
-   recover.** A journal (`.<name>.apply-state.json` beside the install,
-   the phase and both commits) lets the next run finish or roll back
-   first. If the stop step
-   fails, the service is started again.
-3. **A failure to write the bad record aborts the rollback.** The rollback
-   must go on and report the failure with its outcome.
-4. **A failed rollback is quiet.** It must write
-   `.<name>.apply-failed.json` beside the install, always try to start
-   the service last, and
-   make every later run print that file and stop until a person clears it.
+- **It trusts nothing in `staged.json`.**
+  - The record must be canonical: `updates/<X.Y.Z>/<RustyKrab.app or
+    rustykrab-cli>`, with no symlink on the way.
+  - Among canonical records, the highest version wins, then the latest
+    `staged_at`. A record that is not canonical is skipped.
+  - Every stage must be at least the running version, and a release
+    must be newer. The downgrade check once depended on the record's
+    `tag`, and a worker writes that field.
+- **It checks the copy before stopping anything.** The stage is copied
+  beside the install (`cp -Rp --`). That copy must not be a symlink, must
+  carry the Developer ID signature under launchd, and its own
+  `--version` must report the staged version and commit. Only then is
+  the daemon stopped and the two renames made.
+- **It only updates a healthy daemon.**
+  - Before any change, the running daemon must hold `controller.lock`
+    with no failing ticks.
+  - After the start, verify counts a `last_tick` advance only while no
+    ticks fail.
+  - URLs must be https, or http to `127.0.0.1` or `[::1]`, and that
+    includes the default gateway URL.
+  - The script service stops only the one loopback listener whose
+    executable (`proc_pidpath`, or `/proc/<pid>/exe`) is the installed
+    binary.
+- **It recovers.** A journal beside the install records the phase
+  (`stopping`, `swapped`, `started`) and both commits. Every run first
+  calls `recover`:
+  - a missing install gets `.prev` back;
+  - an interrupted swap is rolled back, but only after the installed and
+    `.prev` binaries report the journal's commits;
+  - a crash between the renames and the journal write is recognised;
+  - an unparseable journal writes the failure record;
+  - a late-crashed rollback is not redone.
+  A launchd stop that errors mid-drain waits for the job to unload.
+- **It fails loudly.** A failure to write `bad.json` never aborts a
+  rollback. A failed rollback writes a failure record beside the install,
+  always tries to start the service last, and blocks every later run
+  until a person deletes the record. The plist's `ExitTimeOut` (45 s) is
+  above the drain grace.
 
-Progress:
+**Before the gate lifts for the builder's script service** (part 4):
 
-- **Item 1 is done** (batch 7): the record is canonical and its copy is
-  re-checked for signature, version and commit. It only updates a healthy
-  daemon, requires a loopback or https URL, and stops only the installed
-  binary. Its re-review found one blocking hole: the newer-version check
-  applied only to a stage with a tag, and the tag is a field a worker
-  writes, so an older signed release recorded as a tagless local build
-  could be applied. It was fixed at merge. Every stage must be at least
-  the running version.
-- **Items 2 to 4 are done** (part 2), with one of the re-review's points:
-  the copy's checks move before the daemon is stopped, so a bad stage
-  never takes it down. `SwapRoot::swap_in` is split into `prepare` (clear
-  `.next`, `cp -Rp --`, `NextCheck`), run while the daemon is up, and
-  `commit` (the two renames), run after the stop. The journal, then
-  `updates/apply-state.json` (part 2b moved it beside the install) and
-  written as a temp file then a rename, holds the phase
-  (`stopping`, `swapped`, `started`), both commits and the `bad.json`
-  entry. Every run first calls `recover`: an install path missing with
-  `.prev` beside it gets `.prev` back; a journal at `swapped` or `started`
-  is rolled back in full and the new version recorded bad; then the
-  service is started if it is not running and the journal cleared. A run
-  that recovers applies nothing new. A failed stop starts the service
-  again unless it is still up. A failure writing `bad.json` is logged,
-  the rollback goes on, and the outcome reports it. Any rollback error
-  writes the failure record, then `updates/apply-failed.json` and now
-  beside the install (what failed, both commits, the
-  time), clears the journal and last starts the service unless it is
-  running; while that file exists every run puts it on stderr, exits
-  non-zero and changes nothing. The rollback's stop is retried once; if
-  it fails again nothing is restored under the running daemon. The
-  LaunchAgent plist gets `ExitTimeOut` 45, above the 20 s drain grace.
-  The gate stays until this is re-reviewed and part 3 lands.
-- **Part 3 is done**, with the re-review's smaller points:
-  - `SystemProcesses::executable` reads the listener's executable with
-    `libc::proc_pidpath` on macOS (and `/proc/<pid>/exe` on Linux), not
-    `ps -o comm=`, which prints the process's own `argv[0]`. `the_daemon`
-    refuses a relative executable path, and refuses when either path fails
-    to canonicalize instead of falling back to comparing raw strings. A
-    test starts a `sleep` whose `argv[0]` is the installed path and reads
-    back `sleep`.
-  - `check_url` accepts only https, or http to `127.0.0.1` or `[::1]` on
-    any port; `localhost` is refused, since a resolver can send it
-    elsewhere. The default gateway URL (`RUSTYKRAB_GATEWAY_URL`) goes
-    through the same check (`base_url`).
-  - `newest_staged` takes the highest version, then the latest
-    `staged_at`. A record that is not canonical is skipped with a warning
-    rather than refusing every apply, so a stray record with a future
-    `staged_at` cannot block a good stage; when every record is skipped,
-    the reasons are the error.
-  - The tests record the path `--version` ran on and check it is the
-    `.next` copy.
+- `recover` verifies every service it starts, not just that `start()`
+  returned, and writes the failure record if verify fails. The
+  commit-failure branch waits for the old commit before clearing the
+  journal.
+- The installed binary must report the running commit before a swap.
+- A journal at `swapped` or `started` whose new version verifies is
+  cleared, not rolled back.
+- A stage at `stopping` counts as swapped whenever `.next` is gone and the
+  installed binary does not report `from_commit`.
+- `.prev` passes the symlink and signature checks before a restore.
+- An unreadable journal is renamed, not deleted.
+- `apply` refuses to run inside the daemon's own launchd job.
 
-  The `RUSTYKRAB_UPDATE_APPLY_UNREVIEWED` gate stays until part 2b and
-  part 3 are re-reviewed.
+**Before launchd, on the owner's machine, it must also:**
 
-- **Part 2 is merged** (batch 8), behind the same gate. The copy's checks
-  now run before the stop, and a journal lets the next run recover.
-  A rollback survives a bad-record failure, and a failed rollback writes
-  a file that blocks later runs. Its review found three more problems:
-  1. The journal and the failure file lived in the data directory, where
-     a worker could write. A forged journal could make the next run, even
-     one without `--yes`, roll a healthy daemon back to `.prev`, and
-     deleting the failure file would hide a failed rollback.
-  2. A crash between the renames and the journal's `swapped` write started
-     the new version unchecked, and later runs then reported nothing to
-     do.
-  3. Under launchd, a `bootout` that returns while the job is still
-     draining made the stop step give up without restarting it.
-
-  Part 2b moves both files beside the install. Before any rollback it
-  checks the installed and `.prev` binaries against the journal's
-  commits, and it fixes the crash window, the launchd stop and the
-  smaller findings.
-
-- **Part 2b is done**, behind the same gate:
-  - The journal is `.<name>.apply-state.json` and the failure record
-    `.<name>.apply-failed.json`, both beside the install
-    (`SwapRoot::state_path`; for the launchd default,
-    `~/Applications/.RustyKrab.app.apply-state.json`). Files of those
-    names in the data dir are ignored.
-  - Before `recover` rolls anything back, it runs the `Verifier`'s
-    `--version` on the installed and `.prev` binaries. They must report
-    the journal's `to_commit` and `from_commit`. Otherwise it writes the
-    failure record and stops nothing.
-  - A journal at `stopping` whose `.next` is gone and whose installed
-    binary reports `to_commit` is the crash between the renames and the
-    `swapped` write, and is rolled back like `swapped`.
-  - `apply` checks the running daemon's health before it compares
-    commits, so a daemon of the staged commit stuck waiting on the lock
-    is not reported as already running.
-  - `Launchd::stop` waits for the job to unload even when `bootout`
-    errors, and fails only if it is still loaded after 60 s. After a
-    failed stop, `apply` clears the journal only once `/api/version`
-    answers with the old commit.
-  - A journal that does not parse (an unknown phase, say) writes the
-    failure record and starts the service.
-  - A rollback finding no `.prev` and the installed binary already on
-    `from_commit` (one that crashed late) skips the stop and the restore.
-    It only starts the service if need be and verifies it.
-  - A failed `commit` that leaves nothing at the install path writes the
-    failure record. A failure to clear the journal after a failed stop
-    or commit is logged, not returned over the original error.
-
-  Moving the files beside the install makes them as hard to write as the
-  install itself, and no harder. The same-user limit below still holds.
-  The gate stays until part 2b is re-reviewed and part 3 lands.
-
-**The limit of all this.** Workers run as the same macOS user as the
-daemon, so "a worker cannot write it" holds only as far as the worker's
-tool rules go. Claude Code's edit tools stay inside the worktree, but a
-`cargo` build script it may run can write anywhere the user can. These
-checks stop a confused worker and make a determined one leave traces.
-Isolation that holds against a hostile worker needs a separate user or
-sandbox for workers. That is a decision for the owner, and the updater
-should not be installed on the live daemon without it being made
-knowingly.
-
-Also required:
-- The script service stops only a loopback listener whose executable is
-  the installed one.
-- A daemon that is already failing ticks is not updated.
-- The verify step counts a tick advance only when no ticks are failing.
-- `--url` must be loopback or https.
-- The LaunchAgent plist gets an `ExitTimeOut` above the drain grace.
-
-*Fixed (2026-09-28)*, all but the plist: the script service stops only
-the one process listening on the URL's port, and only when it listens on
-loopback alone and runs the installed executable (`ps -o comm=`, or
-`/proc/<pid>/exe` on Linux); no listener, several, or any other process
-is refused. `apply` refuses before any change unless the running daemon
-reports `controller.lock` `held` and `consecutive_failed_ticks` 0.
-`verify` counts a `last_tick` advance only while no ticks are failing,
-and a failing tick starts the count again. `--url` must be https or http
-to `127.0.0.1`, `::1` or `localhost`. Items 2 to 4 and the plist
-followed in part 2 (above); the `RUSTYKRAB_UPDATE_APPLY_UNREVIEWED` gate
-stays until part 2 is re-reviewed and part 3 lands. Part 3 (above)
-replaced `ps -o comm=` with `proc_pidpath` and dropped `localhost`: the
-URL, `--url` or the default, must now be https or http to `127.0.0.1` or
-`[::1]`.
+- **Stop sending the token to the probe.** Every probe carries the
+  daemon's token, which on the live install lives in the Keychain. While
+  the port is free during a stop or start, any same-user process that
+  binds it gets the token and can answer "healthy", leaving no daemon and
+  no failure record. The fix is to serve `/api/version` without
+  authentication (it carries only version, commit and controller state),
+  and to check that the listener is the launchd job's own process.
+- **Have its own job built:** `com.gcbh.rustykrab.updater` in
+  `scripts/install.sh`, on an interval, running from a copy of the binary
+  kept outside the bundle.
+- **Have the owner's decision on worker isolation.** Workers run as the
+  same macOS user as the daemon, so "a worker cannot write it" holds only
+  as far as the worker's tool rules go. Claude Code's edit tools stay
+  inside the worktree, but a `cargo` build script can write anywhere the
+  user can. The journal beside `~/Applications` is exactly as writable as
+  the install itself. These checks stop a confused worker and make a
+  determined one leave traces; they do not stop a hostile one. That needs
+  a separate user or a sandbox for workers, and it is the owner's call.
 
 ## Not yet
 
