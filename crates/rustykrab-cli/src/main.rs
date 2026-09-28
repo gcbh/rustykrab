@@ -3258,9 +3258,15 @@ fn parse_drain_secs(value: Option<&str>) -> std::time::Duration {
 
 /// One pass of the daemon's tick timer. A failed tick is logged with the
 /// class and consecutive count the controller recorded for it, read back
-/// from `loop_status`, so the log says what `GET /api/version` says.
+/// from `loop_status`, so the log says what `GET /api/version` says. A
+/// refusal because another process holds `controller.lock` is not a
+/// failure and is logged as the lock.
 async fn run_control_tick(control: &dyn ControlHandle) {
     match control.tick().await {
+        Err(rustykrab_core::Error::LockWaiting(message)) => tracing::info!(
+            %message,
+            "control tick skipped: another process holds controller.lock"
+        ),
         Ok(report) => {
             if report.transitions > 0 || report.notices > 0 {
                 tracing::info!(
@@ -3286,9 +3292,14 @@ async fn run_control_tick(control: &dyn ControlHandle) {
 
 /// The one tick run at shutdown to reconcile the runs just interrupted.
 /// A failure is logged with its class and consecutive count, the same way
-/// `run_control_tick` logs one.
+/// `run_control_tick` logs one, and a `controller.lock` refusal likewise
+/// as the lock, not a failure.
 async fn run_final_control_tick(control: &dyn ControlHandle) {
     match control.tick().await {
+        Err(rustykrab_core::Error::LockWaiting(message)) => tracing::info!(
+            %message,
+            "final control tick skipped: another process holds controller.lock"
+        ),
         Ok(report) => tracing::info!(
             reconciled = report.reconciled.len(),
             "interrupted runs reconciled"
@@ -3416,6 +3427,81 @@ mod control_tick_log_tests {
             assert!(line.contains("class=storage"), "{line}");
             assert!(line.contains(&format!("consecutive={count}")), "{line}");
             assert!(line.contains("database is locked"), "{line}");
+        }
+    }
+
+    /// A controller whose loop is waiting on `controller.lock`: its tick
+    /// refuses the way the real one does and records no failure.
+    struct WaitingControl;
+
+    #[async_trait::async_trait]
+    impl ControlHandle for WaitingControl {
+        async fn file_plan(
+            &self,
+            _: WorkPlan,
+            _: Provenance,
+            _: FilingSource,
+        ) -> Result<PlanOutcome, Error> {
+            Err(unused())
+        }
+        async fn approve(&self, _: &str, _: &str) -> Result<Vec<WorkItemId>, Error> {
+            Err(unused())
+        }
+        async fn reject(
+            &self,
+            _: &str,
+            _: Option<String>,
+            _: &str,
+        ) -> Result<Vec<WorkItemId>, Error> {
+            Err(unused())
+        }
+        async fn cancel(
+            &self,
+            _: &str,
+            _: Option<String>,
+            _: &str,
+        ) -> Result<Vec<WorkItemId>, Error> {
+            Err(unused())
+        }
+        async fn tick(&self) -> Result<TickReport, Error> {
+            Err(Error::LockWaiting(
+                "another process holds controller.lock; this controller is waiting on it and does not tick".into(),
+            ))
+        }
+        async fn graph(&self, _: &str) -> Result<GraphView, Error> {
+            Err(unused())
+        }
+        fn loop_status(&self) -> Option<LoopStatus> {
+            Some(LoopStatus::default())
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn waiting_tick_logs_the_lock_not_a_failure() {
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        run_control_tick(&WaitingControl).await;
+        run_final_control_tick(&WaitingControl).await;
+
+        let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(lines.len(), 2, "{log}");
+        assert!(lines[0].contains("control tick skipped"), "{log}");
+        assert!(lines[1].contains("final control tick skipped"), "{log}");
+        for line in lines {
+            assert!(line.contains("INFO"), "{line}");
+            assert!(
+                line.contains("another process holds controller.lock"),
+                "{line}"
+            );
+            assert!(!line.contains("failed"), "{line}");
+            assert!(!line.contains("class="), "{line}");
         }
     }
 

@@ -831,6 +831,66 @@ mod tests {
         }
     }
 
+    /// A controller whose loop waits on `controller.lock` another process
+    /// holds: `work tick`, and `run_until_idle` for scripted daemons, both
+    /// report the lock rather than a generic failure.
+    #[tokio::test]
+    async fn a_waiting_controller_reports_the_lock() {
+        use rustykrab_control::controller::{Controller, ControllerConfig};
+        use rustykrab_control::handle::LockState;
+        use rustykrab_control::lock::{ControllerLock, LoopLock};
+
+        const TOKEN: &str = "work-cmd-test-token";
+        let dir = std::env::temp_dir().join(format!("rk-work-lock-{}", uuid::Uuid::new_v4()));
+        let store = Store::open(&dir, vec![5u8; 32]).expect("store opens");
+        let _other = ControllerLock::try_acquire(&dir.join(rustykrab_control::lock::LOCK_FILE))
+            .unwrap()
+            .expect("the other process takes the lock");
+        let controller = Arc::new(Controller::new(
+            store.clone(),
+            Vec::new(),
+            ControllerConfig::default(),
+        ));
+        let (found, error) = controller.claim_loop_lock(&mut LoopLock::in_data_dir(&dir));
+        assert_eq!(found, LockState::Waiting);
+        assert!(error.is_none(), "{error:?}");
+
+        let idle = controller
+            .run_until_idle(3, std::time::Duration::ZERO)
+            .await
+            .unwrap_err();
+        assert!(matches!(idle, Error::LockWaiting(_)), "{idle:?}");
+        assert!(
+            idle.to_string()
+                .contains("another process holds controller.lock"),
+            "{idle}"
+        );
+
+        let state =
+            rustykrab_gateway::AppState::new(store, vec![], Arc::new(NoModel), TOKEN.into())
+                .with_control(controller);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = rustykrab_gateway::router(state);
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+        let daemon = Daemon::new(Url::parse(&format!("http://{addr}")).unwrap(), TOKEN).unwrap();
+        let refused = execute(&daemon, Command::Tick).await.unwrap_err();
+        let shown = refused.to_string();
+        assert!(
+            shown.contains("another process holds controller.lock"),
+            "{shown}"
+        );
+        assert!(shown.contains("409"), "{shown}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn commands_reach_the_daemon_and_render() {
         const TOKEN: &str = "work-cmd-test-token";
