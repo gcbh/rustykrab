@@ -656,9 +656,9 @@ impl ExternalWorker {
     }
 
     /// Resume a Claude Code session that stopped at its turn cap and ask
-    /// only for the result contract. `None` when there is no time left or
-    /// the resume did not return one; beside it, whether daemon shutdown
-    /// ended the resume.
+    /// only for the result contract. `None` when there is no time left, the
+    /// resume did not return one, or a run in a worktree reported no
+    /// commit; beside it, whether daemon shutdown ended the resume.
     async fn recover(
         &self,
         brief: &Brief,
@@ -678,6 +678,16 @@ impl ExternalWorker {
             Err(e) => Err(e),
         };
         let report = match recovered {
+            // A worktree run that committed nothing has nothing to recover:
+            // it stays the budget/iterations failure it already was.
+            Ok(report) if brief.workspace.is_some() && report.commit.is_none() => {
+                tracing::warn!(
+                    worker = %self.name,
+                    item = %brief.item,
+                    "resume after the turn cap reported no commit"
+                );
+                None
+            }
             Ok(mut report) => {
                 report.known_limits.push(format!(
                     "recovered after the turn cap: the run stopped at its {}-turn limit and this \
@@ -1918,6 +1928,33 @@ echo "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"num_turn
             assert!(f.data.path().join("resume.txt").exists(), "resumed once");
             std::fs::remove_file(f.data.path().join("resume.txt")).unwrap();
         }
+    }
+
+    /// The resume answers with a contract that names no commit.
+    const RESUME_NO_COMMIT: &str = r#"contract="{\\\"summary\\\":\\\"ran out\\\",\\\"changed_paths\\\":[],\\\"commit\\\":null,\\\"checks_run\\\":[],\\\"error\\\":{\\\"class\\\":\\\"budget\\\",\\\"subclass\\\":\\\"iterations\\\",\\\"detail\\\":\\\"Turn limit reached before committing\\\"}}"
+echo "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"num_turns\":1,\"session_id\":\"sess-1\",\"result\":\"$contract\"}""#;
+
+    #[tokio::test]
+    async fn a_resume_in_a_worktree_that_committed_nothing_stays_at_the_turn_cap() {
+        let f = Fixture::new();
+        let worker = f.worker(
+            WorkerKind::ClaudeCode,
+            f.agent("claude", &capped_claude(RESUME_NO_COMMIT)),
+        );
+        let err = worker.run(brief(Some(f.workspace()))).await.unwrap_err();
+        assert!(f.data.path().join("resume.txt").exists(), "resumed once");
+        assert!(
+            matches!(
+                RunFailure::from_error(&err),
+                Some(RunFailure::Budget {
+                    budget: BudgetKind::Iterations,
+                    ..
+                })
+            ),
+            "{err}"
+        );
+        let e = classify(&run_failure_input(&err), &Context::default());
+        assert_eq!(e.subclass, ErrorSubclass::Iterations, "{err}");
     }
 
     #[tokio::test]

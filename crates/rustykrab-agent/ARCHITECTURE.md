@@ -333,7 +333,8 @@ could move to a crate of its own if the adapters grow.
   directory, `--max-turns 2`, within what is left of the wall limit. Its
   contract is read and attested as usual (the commands and usage of both
   invocations count), with a `known_limits` entry saying it was recovered
-  after the turn cap. If the resume fails too, the run stays
+  after the turn cap. If the resume fails too, or a run in a worktree
+  resumes to a contract with no commit, the run stays
   `budget/iterations`. Codex has no such recovery.
 - **The result.** `parse_contract` reads the contract from the final
   message (whole, fenced, or the last balanced object), makes an unknown
