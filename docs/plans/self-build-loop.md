@@ -395,3 +395,32 @@ swapping files.
 
 Gate: 1,933 unit tests, 80 environment variables and 5 runtime patterns
 documented; e2e 56 pass, 13 xfail, 0 fail. The builder runs `90cd700`.
+
+## Eleventh cycle (2026-09-28)
+
+Slice 6 parts 4 and 5 verified and merged, each after an independent
+review. Part 4 verifies what recovery starts and narrows the CLI gate to
+the script service. Part 5 fixes that review's three findings:
+- a draining daemon counted as running;
+- the script gate could be used against the launchd daemon;
+- a failed restart wrote no failure record.
+
+The builder, having seen the pattern, filed an item asking for a security
+review of its own part 4. That was declined: the reviewer has to be
+independent of the builder.
+
+The first real `update apply` was prepared on the builder, and the
+reviewer's pre-flight checks all passed:
+- the installed binary is a regular file on the running commit;
+- the daemon holds the lock with no failing ticks and is not draining;
+- nothing is left from earlier runs;
+- one loopback listener;
+- nothing in flight.
+
+The stage was a `binary` at `1a4ed4f`. A dry run without `--yes` printed
+the right plan and changed nothing. The real run, detached so that
+nothing could kill it mid-swap, was refused by the session's permission
+check. It was not attempted another way, and the builder was left idle on
+`90cd700` for the owner to decide.
+
+Gate at `1a4ed4f`: 1,951 unit tests; e2e 56 pass, 13 xfail, 0 fail.
