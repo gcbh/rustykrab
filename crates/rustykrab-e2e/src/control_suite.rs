@@ -2333,8 +2333,9 @@ async fn s16(ctx: &Ctx) -> Result<()> {
 /// Scenario 27: `personal` and `research` items run to completion with no issue; a
 /// proposal is a `rustykrab-proposal` issue, a capability build is an issue,
 /// a credential acquisition is not; a proposal's `personal` input shows only
-/// as `local:#N`; a hand edit to a projected title is overwritten on the
-/// next projection.
+/// as `local:#N`, and because the proposal names a personal item its own
+/// title and text are withheld too (plan section 11); a hand edit to a
+/// projected title is overwritten on the next projection.
 async fn s27(ctx: &Ctx) -> Result<()> {
     let tag = tag(27);
     let dentist = file(ctx, draft("personal", "Book the dentist", &tag, W_SUCCEED)).await?;
@@ -2353,7 +2354,7 @@ async fn s27(ctx: &Ctx) -> Result<()> {
     );
     proposal["edges"] = json!([{ "kind": "waits_for", "depends_on": dentist }]);
     proposal["inputs_from"] = json!([dentist]);
-    file(ctx, proposal).await?;
+    let proposal_id = file(ctx, proposal).await?;
     let mut build = draft("capability", "Build a tide table tool", &tag, W_SUCCEED);
     build["capability"] = json!("build");
     file(ctx, build).await?;
@@ -2385,10 +2386,20 @@ async fn s27(ctx: &Ctx) -> Result<()> {
         about("Compare dentists nearby").is_empty(),
         "the research item reached GitHub"
     );
-    let projected = about("Pre-load caldav for calendar errands")
+    ensure!(
+        about("Pre-load caldav for calendar errands").is_empty(),
+        "the proposal's own title reached GitHub although it names a personal item"
+    );
+    let projected = github
+        .issues()
         .into_iter()
-        .next()
+        .find(|issue| issue.to_string().contains(&proposal_id))
         .ok_or_else(|| anyhow!("the proposal was not projected"))?;
+    ensure!(
+        labels(&projected).iter().any(|l| l == "rustykrab-redacted"),
+        "the proposal's issue is not labelled rustykrab-redacted: {:?}",
+        labels(&projected)
+    );
     ensure!(
         labels(&projected).iter().any(|l| l == "rustykrab-proposal"),
         "the proposal's issue is not labelled rustykrab-proposal: {:?}",
@@ -2415,9 +2426,7 @@ async fn s27(ctx: &Ctx) -> Result<()> {
         .find(|i| i["number"] == number)
         .unwrap_or_default();
     ensure!(
-        restored["title"]
-            .as_str()
-            .is_some_and(|t| t.contains("Pre-load caldav")),
+        restored["title"] == projected["title"],
         "the hand edit survived the next projection: {}",
         restored["title"]
     );

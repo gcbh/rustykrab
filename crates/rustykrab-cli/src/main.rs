@@ -2,8 +2,8 @@ mod agent_defs;
 mod chat;
 #[cfg(feature = "computer-use")]
 mod computer_backend;
-mod evaluation;
 mod daemon_client;
+mod evaluation;
 mod prompt_log;
 mod scheduled_work;
 mod task_queue;

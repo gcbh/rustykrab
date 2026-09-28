@@ -1612,7 +1612,8 @@ Added as `xfail` first, in the existing e2e harness:
     a `proposal` from dreaming appears as a `rustykrab-proposal` issue, a
     `capability` build appears as an issue, and a credential acquisition does
     not. A proposal whose `inputs_from` includes a `personal` item shows it
-    only as `local:#N`. A hand edit to a projected title is overwritten on
+    only as `local:#N`, and its own title and text are withheld (section
+    11). A hand edit to a projected title is overwritten on
     the next projection.
 28. With 500 closed items seeded, those older than the policy window are
     compacted to one-line summaries in `work_item_archive`; `work list`

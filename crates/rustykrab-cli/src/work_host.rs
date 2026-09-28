@@ -32,14 +32,16 @@ use crate::task_queue;
 
 // ── tool stubs and the work tools ──────────────────────────────────────
 
+/// The registry after the stub switch, and the stub names its file hides
+/// from the active-tools seed.
+pub(crate) type StubbedTools = (Vec<Arc<dyn Tool>>, Vec<String>);
+
 /// Apply `RUSTYKRAB_TOOL_STUBS` to the registry, when it is set. Called
 /// once, before the local worker takes its list, so the worker runs the
 /// same stub instances (and the same scripted call counts) the daemon does.
 /// Also returns the stubs the file marks hidden, which the active-tools
 /// seed leaves out. Must never be set on a real deployment.
-pub(crate) fn apply_tool_stubs(
-    tools: Vec<Arc<dyn Tool>>,
-) -> anyhow::Result<(Vec<Arc<dyn Tool>>, Vec<String>)> {
+pub(crate) fn apply_tool_stubs(tools: Vec<Arc<dyn Tool>>) -> anyhow::Result<StubbedTools> {
     let Some(path) = std::env::var_os("RUSTYKRAB_TOOL_STUBS") else {
         return Ok((tools, Vec::new()));
     };
