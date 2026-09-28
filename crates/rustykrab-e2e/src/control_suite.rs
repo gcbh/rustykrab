@@ -11,10 +11,10 @@
 //! the calls the GitHub stand-in logged.
 //!
 //! Every scenario is written to pass once its phase ships and is marked
-//! `XFail` until then. Phases 1, 3 and 6 have shipped (see [`PROMOTED`] and
-//! [`HELD_BACK`]); the routes of Phases 4 and 5 do not exist, so their
-//! scenarios fail at their first request, on a status code rather than a
-//! panic or a hang.
+//! `XFail` until then. Phases 1, 3, 5 and 6 have shipped (see [`PROMOTED`]
+//! and [`HELD_BACK`]); the routes of Phase 4 do not exist, so its scenarios
+//! fail at their first request, on a status code rather than a panic or a
+//! hang.
 //!
 //! # Promotion
 //!
@@ -81,8 +81,11 @@
 //!   capability draft (27), `subject` and `review_tier` on a proposal
 //!   draft (12), and the GitHub adapter reading `RUSTYKRAB_GITHUB_API_BASE`,
 //!   `RUSTYKRAB_GITHUB_REPO` and `RUSTYKRAB_GITHUB_TOKEN` (`surface.rs`).
-//!   Not served yet: `POST /api/workers` with `base_url` and `token` (a
-//!   peer, Phase 5).
+//!   Served since Phase 5: `POST /api/workers` with `kind: peer`,
+//!   `base_url` and `token` (a peer, leasable once the registry has read its
+//!   node's `GET /api/node` advertisement), and on the peer daemon the
+//!   `delegated_tasks` columns `work_item_id`, `status` and `attempts`,
+//!   which scenario 8 reads from the peer's store.
 
 mod script;
 mod wire;
@@ -126,7 +129,13 @@ enum Phase {
 
 /// The phases that have shipped. Their scenarios must pass; every other
 /// scenario is `XFail`. Promoting a phase is this one edit.
-const PROMOTED: &[Phase] = &[Phase::One, Phase::Three, Phase::ThreeExit, Phase::Six];
+const PROMOTED: &[Phase] = &[
+    Phase::One,
+    Phase::Three,
+    Phase::ThreeExit,
+    Phase::Five,
+    Phase::Six,
+];
 
 /// Scenarios of a promoted phase that stay `XFail`, each with why. An
 /// entry here is a known gap in a shipped phase, named rather than hidden;
@@ -200,7 +209,8 @@ macro_rules! catalog {
 /// Phase 5 there, but this driver restarts the daemon under a local lease,
 /// which Phase 1's resume (plan 6.7, the graph form of which is scenario
 /// 32) already satisfies. It is promoted with Phase 1 rather than left to
-/// xpass; its peer half is scenario 8's to prove in Phase 5.
+/// xpass; its peer half, a restart on either side of a peer's run, is in
+/// scenario 8's driver.
 #[rustfmt::skip]
 fn catalog() -> Vec<Entry> {
     catalog! {
@@ -2049,20 +2059,117 @@ async fn s04(ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
-/// A second daemon, killed when the scenario ends however it ends.
-struct PeerDaemon(Option<std::process::Child>);
+/// A second daemon as the peer: its own data dir and port, killed when the
+/// scenario ends however it ends.
+struct PeerDaemon {
+    child: Option<std::process::Child>,
+    dir: tempfile::TempDir,
+    port: u16,
+    base: String,
+}
 
 impl Drop for PeerDaemon {
     fn drop(&mut self) {
-        if let Some(mut child) = self.0.take() {
+        if let Some(mut child) = self.child.take() {
             let _ = child.kill();
             let _ = child.wait();
         }
     }
 }
 
+impl PeerDaemon {
+    async fn boot(ctx: &Ctx, port: u16) -> Result<PeerDaemon> {
+        let dir = tempfile::Builder::new()
+            .prefix("rustykrab-e2e-peer-")
+            .tempdir()?;
+        let mut peer = PeerDaemon {
+            child: None,
+            dir,
+            port,
+            base: format!("http://127.0.0.1:{port}"),
+        };
+        peer.start(ctx).await?;
+        Ok(peer)
+    }
+
+    async fn start(&mut self, ctx: &Ctx) -> Result<()> {
+        let mut child = crate::spawn_daemon(&ctx.bin, self.dir.path(), self.port, None)?;
+        crate::wait_for_health(&self.base, &ctx.client, &mut child).await?;
+        self.child = Some(child);
+        Ok(())
+    }
+
+    /// Kill the peer outright, mid-task, as a crash would, and boot it again
+    /// on the same store and port.
+    async fn crash_and_restart(&mut self, ctx: &Ctx) -> Result<()> {
+        if let Some(mut child) = self.child.take() {
+            child.kill()?;
+            child.wait()?;
+        }
+        self.start(ctx).await
+    }
+
+    fn db(&self) -> std::path::PathBuf {
+        self.dir.path().join("db").join("store.db")
+    }
+
+    /// The peer's delegated tasks for a controller's work item: status and
+    /// how often the peer claimed each.
+    fn tasks_for(&self, item: &str) -> Result<Vec<(String, i64)>> {
+        let conn = rusqlite::Connection::open_with_flags(
+            self.db(),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        let mut statement = conn.prepare(
+            "SELECT status, attempts FROM delegated_tasks WHERE work_item_id = ?1 \
+             ORDER BY created_at",
+        )?;
+        let rows = statement
+            .query_map([item], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<std::result::Result<_, _>>()?;
+        Ok(rows)
+    }
+
+    /// Wait until the peer is running its task for `item`.
+    async fn wait_running(&self, item: &str) -> Result<()> {
+        let deadline = Instant::now() + SETTLE;
+        loop {
+            if self
+                .tasks_for(item)
+                .unwrap_or_default()
+                .iter()
+                .any(|(status, _)| status == "running")
+            {
+                return Ok(());
+            }
+            ensure!(
+                Instant::now() < deadline,
+                "the peer never ran a task for #{item}: {:?}",
+                self.tasks_for(item)
+            );
+            tokio::time::sleep(POLL).await;
+        }
+    }
+}
+
+/// Whether the item's history moved it to `failed`.
+fn ever_failed(view: &Value) -> bool {
+    events(view)
+        .iter()
+        .any(|e| moved_to(e) == Some(Status::Failed))
+}
+
 /// Scenario 8: A peer node receives `required_tools`, activates them before its
 /// first prefill, and returns a structured result.
+///
+/// The Phase 5 exit goes further, and so does this driver: the item survives
+/// a restart on either side. The peer is registered before it boots (it is
+/// leasable once the registry reads its advertisement), runs a probe item
+/// with `caldav` required, then is killed in the middle of a second item's
+/// run (its task goes back to its queue and the controller sees it through),
+/// and the controller restarts in the middle of a third (the lease is
+/// re-checked against the peer's task and re-attached, not resubmitted).
+/// Scenario 4 is the local half of the same rule.
 async fn s08(ctx: &Ctx) -> Result<()> {
     let tag = tag(8);
     let port = crate::pick_free_port()?;
@@ -2073,15 +2180,9 @@ async fn s08(ctx: &Ctx) -> Result<()> {
         json!({ "name": "krabby", "kind": "peer", "base_url": base, "token": crate::AUTH_TOKEN }),
     )
     .await?;
-    let dir = tempfile::Builder::new()
-        .prefix("rustykrab-e2e-peer-")
-        .tempdir()?;
-    let mut peer = PeerDaemon(Some(crate::spawn_daemon(&ctx.bin, dir.path(), port, None)?));
-    let child = peer
-        .0
-        .as_mut()
-        .ok_or_else(|| anyhow!("the peer daemon is gone"))?;
-    crate::wait_for_health(&base, &ctx.client, child).await?;
+    let mut peer = PeerDaemon::boot(ctx, port).await?;
+
+    // Required tools active before the first prefill, a structured result.
     let mut task = draft("personal", "Check the harbour calendar", &tag, W_PROBE);
     task["worker_kind"] = json!("peer");
     task["required_tools"] = json!(["caldav"]);
@@ -2097,7 +2198,7 @@ async fn s08(ctx: &Ctx) -> Result<()> {
         "the peer's structured result did not become evidence: {}",
         evidence_text(&finished)
     );
-    let peer_db = dir.path().join("db").join("store.db");
+    let peer_db = peer.db();
     let conn = rusqlite::Connection::open_with_flags(
         &peer_db,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
@@ -2116,6 +2217,76 @@ async fn s08(ctx: &Ctx) -> Result<()> {
     ensure!(
         active.iter().any(|tool| tool == "caldav"),
         "the peer did not have caldav active at its first step: {active:?}"
+    );
+    let workers = get(ctx, WORKERS).await?;
+    let krabby = workers["workers"]
+        .as_array()
+        .and_then(|all| all.iter().find(|w| w["name"] == "krabby"))
+        .cloned()
+        .unwrap_or_default();
+    ensure!(
+        krabby["capabilities"]["tools"]
+            .as_array()
+            .is_some_and(|t| t.iter().any(|n| n == "caldav")),
+        "the registry did not record the peer's advertisement: {krabby}"
+    );
+    ensure!(
+        !krabby.to_string().contains(crate::AUTH_TOKEN),
+        "the registry shows the peer's token"
+    );
+
+    // The peer restarts mid-run: its task returns to its queue and runs
+    // again, and nothing is failed by the restart.
+    let mut inbox = draft("personal", "Tidy the peer's inbox", &tag, W_PEER_PAUSE);
+    inbox["worker_kind"] = json!("peer");
+    let inbox = file(ctx, inbox).await?;
+    peer.wait_running(&inbox).await?;
+    peer.crash_and_restart(ctx).await?;
+    let finished = wait_status(ctx, &inbox, Status::Done).await?;
+    ensure!(
+        !ever_failed(&finished),
+        "the peer's restart failed the item"
+    );
+    let tasks = peer.tasks_for(&inbox)?;
+    ensure!(
+        tasks.len() == 1 && tasks[0].1 >= 2 && tasks[0].0 == "done",
+        "the peer did not run its one task again after restarting: {tasks:?}"
+    );
+
+    // The controller restarts mid-run: the lease is re-checked against the
+    // peer's task, which still runs, and the controller re-attaches to it.
+    let mut photos = draft("personal", "Sort the peer's photos", &tag, W_PEER_PAUSE);
+    photos["worker_kind"] = json!("peer");
+    let photos = file(ctx, photos).await?;
+    peer.wait_running(&photos).await?;
+    ctx.restart_daemon().await?;
+    let finished = wait_status(ctx, &photos, Status::Done).await?;
+    ensure!(
+        !ever_failed(&finished),
+        "the controller's restart failed the item"
+    );
+    let history = events(&finished);
+    let reattached = history.iter().any(|e| {
+        e["kind"] == EventKind::Resume.as_str()
+            && e["reason"]
+                .as_str()
+                .is_some_and(|r| r.contains("re-attached"))
+    });
+    ensure!(
+        reattached,
+        "the controller did not re-attach to the peer's run: {}",
+        excerpt(&Value::Array(history.clone()).to_string())
+    );
+    ensure!(
+        !history
+            .iter()
+            .any(|e| moved_to(e) == Some(Status::Ready) && e["kind"] == EventKind::Resume.as_str()),
+        "the restart returned the peer's item to ready"
+    );
+    let tasks = peer.tasks_for(&photos)?;
+    ensure!(
+        tasks.len() == 1,
+        "the controller submitted the item again instead of re-attaching: {tasks:?}"
     );
     drop(peer);
     Ok(())
