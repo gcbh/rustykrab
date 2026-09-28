@@ -321,6 +321,13 @@ pub enum WorkOp {
     /// resume note.
     Note(WorkEvent),
     Outbox(OutboxDraft),
+    /// Write an item's review facets (`work_item_facets`, Phase 6): a
+    /// capability item's mode, a proposal's subject and review tier, in the
+    /// transaction that files the item.
+    Facets {
+        item: WorkItemId,
+        facets: rustykrab_core::work::WorkFacets,
+    },
 }
 
 /// What a [`Store::work_apply`] batch wrote, in op order.

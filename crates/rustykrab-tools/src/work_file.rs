@@ -803,6 +803,9 @@ pub(crate) fn parse_draft(
         edges,
         supersedes,
         plan,
+        // The review facets are not a model's to set: `work_file` files no
+        // proposals, and a capability's mode comes from the ladder or REST.
+        ..WorkItemDraft::default()
     }
 }
 

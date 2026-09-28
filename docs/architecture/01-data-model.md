@@ -502,7 +502,7 @@ and roll-up there, and writes each decision back through the store. The row
 types are `rustykrab_core::work` (`WorkItem`, `Edge`, `WorkEvent`, `Evidence`,
 `Lease`), so the store, the controller, the tools and the CLI share one
 vocabulary. The `workers`, `questions` and `judgment_policies` tables of
-section 13 arrive with later phases.
+section 13 arrive with later phases; Phase 6's tables are the next section.
 
 **Scalar where the controller filters, JSON where it only reads.** `status`,
 `status_reason` (set for `blocked` and `cancelled` only), `status_origin`,
@@ -587,6 +587,45 @@ Unenforced on purpose, and the DDL says so:
 - `work_outbox.parent` and `origin`, `work_plans.root` and `filed_by`,
   `work_item_archive.parent`: records about items that may since have been
   archived.
+
+### Evaluation, proposals and the review surface (control layer, Phase 6)
+
+```
+work_item_facets(item PK, capability, subject, review_tier)
+   INDEX idx_work_item_facets_subject (subject) WHERE subject IS NOT NULL
+proposals(item PK, subject, criterion, metric, body JSON, filed_by, created_at,
+          review, decided_by, decided_at, code_item, baseline,
+          outcome, observed, outcome_at)
+   INDEX idx_proposals_subject (subject, review)
+   INDEX idx_proposals_created (created_at)
+proposal_evidence(proposal, source, ref, PK(proposal, source, ref))
+expectation_metrics(id AUTOINC, pass, name, value, sample, data JSON,
+                    computed_at)
+   INDEX idx_expectation_metrics_pass (pass)
+   INDEX idx_expectation_metrics_name (name, computed_at)
+work_projections(item, surface, external_id, url, digest, projected_at,
+                 last_comment, PK(item, surface))
+```
+
+Code in `rustykrab-store/src/proposals.rs`; plan sections 1.1, 10, 11 and 13.
+`work_item_facets` is what the review surface needs beside a work item's row:
+a `capability` item's mode (only a build is projected) and a `proposal`'s
+subject and review tier. It is written by `WorkOp::Facets` in the
+`work_apply` that inserts the item, rather than as columns on `work_items`,
+because those two fields apply to two kinds out of six. `proposals` is
+section 13's "a kind of work item plus a join": the proposal itself is a
+`work_items` row of kind `proposal`; this row is dreaming's record of why it
+filed it (the section 10 body), the decision taken on the review surface, and
+what probation found, with `proposal_evidence` as the join to the
+`outcome_records`, `dream_reports`, work items and events it cites.
+`expectation_metrics` keeps every pass's section 1.1 metrics, the newest pass
+being what `GET /api/work/metrics` serves and what the next pass compares
+against. `work_projections` maps an item to its issue with a digest of the
+fields last written, so hand edits are detected and overwritten.
+
+Unenforced on purpose, as the work tables are: every item id here is a record
+about an item that may since have been archived, and `proposal_evidence.ref`
+names rows in several tables (and, for a memory, another database).
 
 ## `memory.db`
 
@@ -674,6 +713,8 @@ purpose*, and the DDL now says which is which.
 | `work_item_events.item`, `work_item_evidence.item` | No, deliberate | history outlives compaction |
 | `work_outbox`, `work_plans`, `work_item_archive` item ids | No, deliberate | records about items that may be archived |
 | `scheduled_jobs.work_item_id`, `delegated_tasks.work_item_id` | No, deliberate | the item may be archived; the row keeps working |
+| `work_item_facets.item`, `proposals.item`, `proposals.code_item`, `work_projections.item` | No, deliberate | records about items that may be archived |
+| `proposal_evidence.ref` | No, deliberate | names rows in several tables, and a memory in another database |
 | `outcome_attributions.target_id` (memory) | **Impossible** | other database |
 | `memory_links.source_id/target_id` | No | asymmetric with `chunks`; looks accidental |
 

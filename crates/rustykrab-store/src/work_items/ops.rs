@@ -71,6 +71,9 @@ pub(super) fn apply(
             applied.outbox_ids.push(enqueue_outbox(conn, draft, now)?);
             Ok(())
         }
+        WorkOp::Facets { item, facets } => {
+            crate::proposals::put_facets(conn, item, facets).map_err(WorkStoreError::from)
+        }
     }
 }
 

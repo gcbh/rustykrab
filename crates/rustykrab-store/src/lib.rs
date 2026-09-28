@@ -12,6 +12,8 @@ pub mod keychain;
 mod outcomes;
 mod payment_request;
 mod projects;
+// The control plan's Phase 6: facets, proposals, metrics and projections.
+mod proposals;
 mod recall_archive;
 pub mod registry;
 mod secret;
@@ -46,6 +48,7 @@ pub use payment_request::{
 };
 pub use pending_links::PendingLinks;
 pub use projects::{ApplyRevisionResult, ProjectStore};
+pub use proposals::{ProjectionRow, ProposalEvidence, ProposalRow};
 pub use recall_archive::RecallArchiveStore;
 pub use secret::{SecretMeta, SecretStore, WriteAuthority};
 pub use tasks::{DelegatedTask, TaskStatus, TaskStore};
@@ -1031,6 +1034,14 @@ impl Store {
                  ON conversations (updated_at DESC);",
         )
         .map_err(|e| Error::Storage(e.to_string()))?;
+
+        // The control plan's Phase 6 (sections 1.1, 10, 11 and 13): an
+        // item's review facets, dreaming's proposal records and the records
+        // they cite, the computed expectation metrics, and which issue each
+        // engineering item is projected to. New tables only, keyed on the
+        // item id without a foreign key so they outlive compaction; see
+        // `proposals.rs`.
+        proposals::migrate(conn)?;
 
         // Adopt the foreign keys the fresh-database DDL declares onto
         // databases created before it did. Runs after the additive column
