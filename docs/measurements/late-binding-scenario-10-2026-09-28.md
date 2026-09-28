@@ -62,14 +62,33 @@ of it against the live models, on the M4 (36 GB, Ollama, both models local).
   despite the host labelling the search "nothing matched" (qwen3.8 weather:
   `get_forecast` up to six times in a run).
 
-## Follow-up
+## After the fixes (same day, integration `58dbb4e`)
 
-Three fixes are in progress on `feat/control-portable-shape`: schema-guided
-coercion of exact string forms of integers, numbers and booleans before
-dispatch; every non-leading notice sent to every model as a `[System notice]`
-user turn; and a stop to repeated "nothing matched" searches, reported as a
-typed capability gap, with the cap's summary call keeping the tool block. The
-matrix is rerun on both models once they land.
+Three fixes landed on `feat/control-portable-shape`: schema-guided coercion of
+exact string forms of integers, numbers and booleans before dispatch; every
+non-leading notice sent to every model as a `[System notice]` user turn; and a
+stop to repeated "nothing matched" searches, reported as a typed capability
+gap, with the iteration cap's summary call keeping the tool block. The matrix
+was rerun on both models.
+
+| Case | gemma4:26b | qwen3.8:27b-mlx |
+|---|---|---|
+| late append, all six | **24/24** | **24/24** |
+| weather, missing | 0/4 | 0/4 |
+| calendar, missing | 4/4 | 4/4 |
+| package, missing | 0/4 | 0/4 |
+
+Scenario 10 as the plan states it (each model completes the distractor
+matrix at 12 of 12 with the tool block unchanged) now holds on both models,
+and the tool block stayed unchanged in every run, capped ones included.
+
+The two remaining missing-target failures have a host-side cause: the model
+called a near-miss (`get_forecast`, `lookup_order`, `list_recent_shipments`)
+after the host said nothing matched, and the runner executed it, because
+dispatch checked only the capability ceiling and the registry, not whether
+the tool was declared or appended in the run. Making "callable" mean
+declared or appended, as plan section 12 intends, is in progress on
+`feat/control-strict-dispatch`.
 
 ## The model suite's window no longer fits
 
