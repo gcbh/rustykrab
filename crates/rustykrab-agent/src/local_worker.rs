@@ -1070,7 +1070,7 @@ pub fn render_brief(brief: &Brief) -> String {
          (paths, URLs, ids), not content. If you cannot finish, set blocked or error (what \
          failed). ",
     );
-    out.push_str(rustykrab_core::work::BLOCKED_SHAPE_GUIDANCE);
+    out.push_str(&rustykrab_core::work::BLOCKED_SHAPE_GUIDANCE);
     out.push_str(" Follow-up work goes in discovered. Text alone does not end this run.");
     out
 }

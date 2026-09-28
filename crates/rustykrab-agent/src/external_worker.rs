@@ -1401,7 +1401,7 @@ pub fn render_executor_brief(
          - If you cannot finish, set \"blocked\" or \"error\" (class, subclass, detail) \
          instead of guessing. ",
     );
-    out.push_str(rustykrab_core::work::BLOCKED_SHAPE_GUIDANCE);
+    out.push_str(&rustykrab_core::work::BLOCKED_SHAPE_GUIDANCE);
     out.push_str("\nEnd with one JSON object and nothing after it, the result contract:\n");
     out.push_str(CONTRACT_SHAPE);
     out.push('\n');

@@ -163,11 +163,11 @@ fn subclasses_of(class: ErrorClass) -> String {
         .join(", ")
 }
 
-/// Reasons a worker may report; the cascade ones are the controller's.
+/// Reasons a worker may report, the same list [`BLOCKED_SHAPE_GUIDANCE`]
+/// names; the rest are the controller's.
 fn reportable_reasons() -> Vec<&'static str> {
-    BlockedReason::ALL
+    BlockedReason::MODEL_FILEABLE
         .iter()
-        .filter(|r| !r.is_cascade())
         .map(|r| r.as_str())
         .collect()
 }
@@ -193,6 +193,17 @@ fn parse_blocked(v: &Value, out: &mut Vec<Problem>) -> Option<BlockedReport> {
                 "reason",
                 format!(
                     "`{raw}` is set only by the controller's cascade; report what blocks you: {}",
+                    reportable_reasons().join(", ")
+                ),
+            ));
+            return None;
+        }
+        Some(r) if !r.is_model_fileable() => {
+            out.push(Problem::invalid(
+                at,
+                "reason",
+                format!(
+                    "`{raw}` is set only by the controller; report what blocks you: {}",
                     reportable_reasons().join(", ")
                 ),
             ));
@@ -445,9 +456,10 @@ static DESCRIPTION: LazyLock<String> = LazyLock::new(|| {
     format!(
         "End your work item with its typed result, as your LAST call. summary: what you did, \
          in a few lines. Pointers, not content: artifacts, changed_paths, commit, checks_run. \
-         If you could not finish, set blocked or error (what failed). {BLOCKED_SHAPE_GUIDANCE} \
+         If you could not finish, set blocked or error (what failed). {} \
          Follow-up work goes in discovered, one draft per item: the controller files it, you \
-         do not. The run ends when this call succeeds."
+         do not. The run ends when this call succeeds.",
+        *BLOCKED_SHAPE_GUIDANCE
     )
 });
 
@@ -682,6 +694,31 @@ mod tests {
     }
 
     #[test]
+    fn the_guidance_and_the_schema_offer_the_same_blocked_reasons() {
+        let schema = tool(&Arc::new(StubWorkBackend::new())).schema();
+        let offered: Vec<&str> = schema.parameters["properties"]["blocked"]["properties"]["reason"]
+            ["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        // The reasons the guidance names, read back out of its text.
+        let listed = BLOCKED_SHAPE_GUIDANCE
+            .split_once("its reason one of ")
+            .and_then(|(_, rest)| rest.split_once(';'))
+            .map(|(list, _)| list)
+            .expect("the guidance names its reasons");
+        let named: Vec<&str> = listed.split(", ").flat_map(|s| s.split(" or ")).collect();
+        assert_eq!(named, offered);
+        let fileable: Vec<&str> = BlockedReason::MODEL_FILEABLE
+            .iter()
+            .map(|r| r.as_str())
+            .collect();
+        assert_eq!(offered, fileable);
+    }
+
+    #[test]
     fn schema_mirrors_the_result_contract() {
         let schema = tool(&Arc::new(StubWorkBackend::new())).schema();
         assert_eq!(schema.name, "result_report");
@@ -826,9 +863,15 @@ mod tests {
         )
         .await;
         assert!(
-            msg.contains("`bored` is not one of needs_credential"),
+            msg.contains("`bored` is not one of needs_tool, needs_credential"),
             "{msg}"
         );
+        let msg = rejected(
+            &stub,
+            json!({ "summary": "stuck", "blocked": { "reason": "budget_exhausted" } }),
+        )
+        .await;
+        assert!(msg.contains("set only by the controller;"), "{msg}");
         assert!(stub.calls().is_empty());
 
         WORK_RUN_CONTEXT

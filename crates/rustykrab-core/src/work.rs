@@ -18,6 +18,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::sync::LazyLock;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -197,13 +198,39 @@ pub enum BlockedReason {
 
 /// How a worker shapes a `blocked` report, spelled out once for every brief
 /// and tool description that asks for one (external and local worker briefs,
-/// the `result_report` tool), so they cannot drift apart.
-pub const BLOCKED_SHAPE_GUIDANCE: &str =
-    "blocked is {\"reason\": \"needs_decision\", \"detail\": \"the question or what you \
-     need\", \"needs\": []}, its reason one of needs_tool, needs_credential, needs_decision \
-     or needs_consent; the question goes in detail.";
+/// the `result_report` tool), so they cannot drift apart. The reason list
+/// is [`BlockedReason::MODEL_FILEABLE`], the same list the `result_report`
+/// schema offers.
+pub static BLOCKED_SHAPE_GUIDANCE: LazyLock<String> = LazyLock::new(|| {
+    let names: Vec<&str> = BlockedReason::MODEL_FILEABLE
+        .iter()
+        .map(|r| r.as_str())
+        .collect();
+    let (last, rest) = names.split_last().expect("MODEL_FILEABLE is not empty");
+    format!(
+        "blocked is {{\"reason\": \"needs_decision\", \"detail\": \"the question or what you \
+         need\", \"needs\": []}}, its reason one of {} or {last}; the question goes in detail.",
+        rest.join(", ")
+    )
+});
 
 impl BlockedReason {
+    /// The reasons a worker may file on its own report (section 7). The
+    /// rest are the controller's: the cascade sets `upstream_*`, and
+    /// dispatch, budgets and verification set the others.
+    pub const MODEL_FILEABLE: [BlockedReason; 4] = [
+        BlockedReason::NeedsTool,
+        BlockedReason::NeedsCredential,
+        BlockedReason::NeedsDecision,
+        BlockedReason::NeedsConsent,
+    ];
+
+    /// Whether a worker may file this reason itself; see
+    /// [`BlockedReason::MODEL_FILEABLE`].
+    pub fn is_model_fileable(&self) -> bool {
+        BlockedReason::MODEL_FILEABLE.contains(self)
+    }
+
     pub const ALL: [BlockedReason; 10] = [
         BlockedReason::NeedsCredential,
         BlockedReason::NeedsDecision,
