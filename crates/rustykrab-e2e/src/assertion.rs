@@ -24,52 +24,51 @@ pub enum Assertion {
     FinalContainsNone(Vec<String>),
     /// The final answer matches this regex.
     FinalMatches(String),
-    /// The named tool was called at least once.
-    ToolCalled(String),
-    /// The named tool ran at least once: a call the host refused as not
-    /// callable in the conversation is an attempt, not the tool running.
+    // Success means the tool ran. A call the host refused as not callable
+    // in the conversation is an attempt, not the tool running, so the
+    // success-style tool assertions below all read `Transcript::executed`.
+    // Attempts are counted only where the attempt itself is the failure
+    // (`ToolNotCalled`, `RetriesAtMost`) and reported, unjudged, through
+    // `ModelCase::counting_attempts`.
+    /// The named tool ran at least once.
     ToolExecuted(String),
-    /// The named tool was never called.
+    /// The named tool was never called. Counts attempts: for a tool the
+    /// agent should not even try, trying is the failure.
     ToolNotCalled(String),
     /// The named tool never ran: every call to it, if any, was refused by
     /// the host as not callable in the conversation. Judges what executed;
     /// a refused call is the host doing its job.
     ToolNotExecuted(String),
-    /// The named tool was called between `min` and `max` times inclusive.
-    ToolCallCount {
+    /// The named tool ran between `min` and `max` times inclusive.
+    ToolExecutedCount {
         tool: String,
         min: usize,
         max: usize,
     },
-    /// Some call to `tool` had an argument at `pointer` (a JSON pointer,
-    /// e.g. `/city`) whose string form contains `needle`.
-    ToolArgContains {
-        tool: String,
-        pointer: String,
-        needle: String,
-    },
-    /// Like [`Assertion::ToolArgContains`], over only the calls to `tool`
-    /// that ran: a refused call carrying the argument does not count.
+    /// Some call to `tool` that ran had an argument at `pointer` (a JSON
+    /// pointer, e.g. `/city`) whose string form contains `needle`.
     ToolExecutedArgContains {
         tool: String,
         pointer: String,
         needle: String,
     },
-    /// These tools were called in this relative order (other calls may be
-    /// interleaved).
-    ToolCallOrder(Vec<String>),
+    /// These tools ran in this relative order (other calls may be
+    /// interleaved); a refused call does not advance the order.
+    ToolExecutedOrder(Vec<String>),
     /// Some result returned by `tool` contains one of these. Asserts on
     /// what the tool gave the model, separately from what the model then
     /// did with it.
     ToolOutputContainsAny { tool: String, needles: Vec<String> },
-    /// The named tool failed at least once and the agent still produced a
-    /// final answer containing one of `then_says` — the recovery path.
+    /// The named tool ran and failed at least once and the agent still
+    /// produced a final answer containing one of `then_says`: the recovery
+    /// path. A refused call is not a tool failure to recover from.
     RecoveredFrom {
         tool: String,
         then_says: Vec<String>,
     },
     /// The agent called a failing tool no more than `max` times before
-    /// moving on. Catches the infinite-retry failure mode.
+    /// moving on. Catches the infinite-retry failure mode, so it counts
+    /// attempts: a refused call still spends a turn of the loop.
     RetriesAtMost { tool: String, max: usize },
     /// Compaction did (or didn't) run.
     Compacted(bool),
@@ -102,24 +101,18 @@ impl Assertion {
             Assertion::FinalContainsAll(v) => format!("final contains all {v:?}"),
             Assertion::FinalContainsNone(v) => format!("final contains none {v:?}"),
             Assertion::FinalMatches(p) => format!("final matches /{p}/"),
-            Assertion::ToolCalled(t) => format!("called {t}"),
             Assertion::ToolExecuted(t) => format!("ran {t}"),
             Assertion::ToolNotCalled(t) => format!("never called {t}"),
             Assertion::ToolNotExecuted(t) => format!("never ran {t}"),
-            Assertion::ToolCallCount { tool, min, max } => {
-                format!("{tool} called {min}..={max} times")
+            Assertion::ToolExecutedCount { tool, min, max } => {
+                format!("{tool} ran {min}..={max} times")
             }
-            Assertion::ToolArgContains {
-                tool,
-                pointer,
-                needle,
-            } => format!("{tool}{pointer} contains {needle:?}"),
             Assertion::ToolExecutedArgContains {
                 tool,
                 pointer,
                 needle,
             } => format!("{tool} ran with {pointer} containing {needle:?}"),
-            Assertion::ToolCallOrder(v) => format!("call order {v:?}"),
+            Assertion::ToolExecutedOrder(v) => format!("run order {v:?}"),
             Assertion::ToolOutputContainsAny { tool, needles } => {
                 format!("{tool} returned any {needles:?}")
             }
@@ -187,14 +180,6 @@ impl Assertion {
                 Err(e) => Err(format!("invalid regex /{pattern}/: {e}")),
             },
 
-            Assertion::ToolCalled(tool) => {
-                if t.calls_to(tool).is_empty() {
-                    Err(format!("{tool} was never called ({})", called_summary(t)))
-                } else {
-                    Ok(())
-                }
-            }
-
             Assertion::ToolExecuted(tool) => {
                 let attempted = t.calls_to(tool).len();
                 if !t.executed(tool).is_empty() {
@@ -227,22 +212,17 @@ impl Assertion {
                 }
             }
 
-            Assertion::ToolCallCount { tool, min, max } => {
-                let n = t.calls_to(tool).len();
+            Assertion::ToolExecutedCount { tool, min, max } => {
+                let n = t.executed(tool).len();
                 if n >= *min && n <= *max {
                     Ok(())
                 } else {
-                    Err(format!("{tool} called {n}x, expected {min}..={max}"))
+                    Err(format!(
+                        "{tool} ran {n}x, expected {min}..={max} ({})",
+                        called_summary(t)
+                    ))
                 }
             }
-
-            Assertion::ToolArgContains {
-                tool,
-                pointer,
-                needle,
-            } => arg_contains(&t.calls_to(tool), pointer, needle).map_err(|seen| {
-                format!("no {tool} call had {needle:?} at {pointer}; saw {seen:?}")
-            }),
 
             Assertion::ToolExecutedArgContains {
                 tool,
@@ -255,10 +235,10 @@ impl Assertion {
                 )
             }),
 
-            Assertion::ToolCallOrder(expected) => {
+            Assertion::ToolExecutedOrder(expected) => {
                 let mut remaining = expected.iter();
                 let mut want = remaining.next();
-                for call in &t.calls {
+                for call in t.calls.iter().filter(|c| !c.refused) {
                     if Some(&call.tool) == want {
                         want = remaining.next();
                     }
@@ -266,7 +246,7 @@ impl Assertion {
                 match want {
                     None => Ok(()),
                     Some(missing) => Err(format!(
-                        "expected order {expected:?}; stalled at {missing} ({})",
+                        "expected run order {expected:?}; stalled at {missing} ({})",
                         called_summary(t)
                     )),
                 }
@@ -282,10 +262,10 @@ impl Assertion {
             }
 
             Assertion::RecoveredFrom { tool, then_says } => {
-                let calls = t.calls_to(tool);
-                if !calls.iter().any(|c| c.failed) {
+                if !t.executed(tool).iter().any(|c| c.failed) {
                     return Err(format!(
-                        "{tool} never failed, so there was nothing to recover from"
+                        "{tool} never ran and failed, so there was nothing to recover from ({})",
+                        called_summary(t)
                     ));
                 }
                 contains_any(&t.final_text, then_says).map_err(|m| {
@@ -505,12 +485,9 @@ mod tests {
             needle: "lisbon".into(),
         };
 
-        // A refused call is an attempt: `ToolCalled` counts it, the
-        // executed assertions do not.
+        // A refused call is an attempt, which the executed assertions do
+        // not count.
         let t = with_calls(vec![refused.clone()]);
-        assert!(Assertion::ToolCalled("get_weather".into())
-            .check(&t)
-            .is_ok());
         let why = ran.check(&t).unwrap_err();
         assert!(why.contains("refused"), "{why}");
         assert!(ran_with.check(&t).is_err());
@@ -533,6 +510,69 @@ mod tests {
         assert!(ran_with.check(&t).is_ok());
     }
 
+    fn refused(tool: &str) -> ToolInvocation {
+        let mut c = call(tool, json!({}), true);
+        c.refused = true;
+        c
+    }
+
+    #[test]
+    fn executed_count_ignores_calls_the_host_refused() {
+        let count = |min, max| Assertion::ToolExecutedCount {
+            tool: "weather".into(),
+            min,
+            max,
+        };
+        let t = with_calls(vec![
+            refused("weather"),
+            refused("weather"),
+            call("weather", json!({}), false),
+        ]);
+        assert!(count(1, 1).check(&t).is_ok());
+        let why = count(2, 3).check(&t).unwrap_err();
+        assert!(why.contains("ran 1x"), "{why}");
+        assert!(count(1, 3)
+            .check(&with_calls(vec![refused("weather")]))
+            .is_err());
+    }
+
+    #[test]
+    fn executed_order_skips_calls_the_host_refused() {
+        let order = Assertion::ToolExecutedOrder(s(&["search", "fetch"]));
+        // Only a refused call puts `search` first: attempted in order,
+        // never run in order.
+        let t = with_calls(vec![
+            refused("search"),
+            call("fetch", json!({}), false),
+            call("search", json!({}), false),
+        ]);
+        let why = order.check(&t).unwrap_err();
+        assert!(why.contains("stalled at fetch"), "{why}");
+
+        let t = with_calls(vec![
+            call("search", json!({}), false),
+            refused("noise"),
+            call("fetch", json!({}), false),
+        ]);
+        assert!(order.check(&t).is_ok());
+    }
+
+    #[test]
+    fn recovery_needs_a_failure_that_ran() {
+        let recovered = Assertion::RecoveredFrom {
+            tool: "flaky".into(),
+            then_says: s(&["all good"]),
+        };
+        let mut t = with_calls(vec![refused("flaky"), call("flaky", json!({}), false)]);
+        t.final_text = "all good".into();
+        assert!(
+            recovered.check(&t).is_err(),
+            "a refusal is the host declining, not the tool failing"
+        );
+        t.calls[1].failed = true;
+        assert!(recovered.check(&t).is_ok());
+    }
+
     #[test]
     fn contains_any_is_case_insensitive() {
         let t = Transcript {
@@ -552,10 +592,10 @@ mod tests {
             call("noise", json!({}), false),
             call("fetch", json!({}), false),
         ]);
-        assert!(Assertion::ToolCallOrder(s(&["search", "fetch"]))
+        assert!(Assertion::ToolExecutedOrder(s(&["search", "fetch"]))
             .check(&t)
             .is_ok());
-        assert!(Assertion::ToolCallOrder(s(&["fetch", "search"]))
+        assert!(Assertion::ToolExecutedOrder(s(&["fetch", "search"]))
             .check(&t)
             .is_err());
     }
@@ -567,7 +607,7 @@ mod tests {
             json!({ "location": { "city": "Reykjavik" } }),
             false,
         )]);
-        assert!(Assertion::ToolArgContains {
+        assert!(Assertion::ToolExecutedArgContains {
             tool: "weather".into(),
             pointer: "/location/city".into(),
             needle: "reykjavik".into(),

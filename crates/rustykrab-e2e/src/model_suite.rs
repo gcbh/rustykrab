@@ -336,8 +336,8 @@ pub fn cases() -> Vec<ModelCase> {
         ))
         .ask("What is the weather in Reykjavik right now? Use the tool, then tell me.")
         .expect(Assertion::NoRunError)
-        .expect(Assertion::ToolCalled("weather_lookup".into()))
-        .expect(Assertion::ToolArgContains {
+        .expect(Assertion::ToolExecuted("weather_lookup".into()))
+        .expect(Assertion::ToolExecutedArgContains {
             tool: "weather_lookup".into(),
             pointer: "/city".into(),
             needle: "reykjavik".into(),
@@ -365,17 +365,17 @@ pub fn cases() -> Vec<ModelCase> {
              confirmation code.",
         )
         .expect(Assertion::NoRunError)
-        .expect(Assertion::ToolArgContains {
+        .expect(Assertion::ToolExecutedArgContains {
             tool: "book_room".into(),
             pointer: "/room".into(),
             needle: "kelvin".into(),
         })
-        .expect(Assertion::ToolArgContains {
+        .expect(Assertion::ToolExecutedArgContains {
             tool: "book_room".into(),
             pointer: "/date".into(),
             needle: "2026-09-09".into(),
         })
-        .expect(Assertion::ToolArgContains {
+        .expect(Assertion::ToolExecutedArgContains {
             tool: "book_room".into(),
             pointer: "/start_time".into(),
             needle: "15:30".into(),
@@ -399,6 +399,7 @@ pub fn cases() -> Vec<ModelCase> {
         ))
         .ask("How many millilitres are in a litre? Just answer.")
         .expect(Assertion::NoRunError)
+        // Attempts count: reaching for an irrelevant tool is the failure.
         .expect(Assertion::ToolNotCalled("send_invoice".into()))
         .expect(Assertion::FinalContainsNone(s(&["invoice"])))
         .expect(Assertion::FinalContainsAny(s(&[
@@ -433,7 +434,7 @@ pub fn cases() -> Vec<ModelCase> {
         // count here would be counting the wrong thing; that the right
         // answer came back at all is what proves the retry ran, since the
         // first invocation returned nothing but an error.
-        .expect(Assertion::ToolCallCount {
+        .expect(Assertion::ToolExecutedCount {
             tool: "weather_lookup".into(),
             min: 1,
             max: 3,
@@ -490,7 +491,8 @@ pub fn cases() -> Vec<ModelCase> {
         ))
         .ask("What is the current share price of NVDA? Use the tool.")
         .expect(Assertion::NoRunError)
-        .expect(Assertion::ToolCalled("stock_quote".into()))
+        .expect(Assertion::ToolExecuted("stock_quote".into()))
+        // Attempts count: looping is the failure, refused or not.
         .expect(Assertion::RetriesAtMost {
             tool: "stock_quote".into(),
             max: 8,
@@ -517,7 +519,8 @@ pub fn cases() -> Vec<ModelCase> {
         ))
         .ask("Find my orders for a titanium kettle. Use the tool and tell me what you find.")
         .expect(Assertion::NoRunError)
-        .expect(Assertion::ToolCalled("search_orders".into()))
+        .expect(Assertion::ToolExecuted("search_orders".into()))
+        // Attempts count: looping is the failure, refused or not.
         .expect(Assertion::RetriesAtMost {
             tool: "search_orders".into(),
             max: 3,
@@ -552,8 +555,11 @@ pub fn cases() -> Vec<ModelCase> {
              You will need both tools.",
         )
         .expect(Assertion::NoRunError)
-        .expect(Assertion::ToolCallOrder(s(&["find_order", "order_status"])))
-        .expect(Assertion::ToolArgContains {
+        .expect(Assertion::ToolExecutedOrder(s(&[
+            "find_order",
+            "order_status",
+        ])))
+        .expect(Assertion::ToolExecutedArgContains {
             tool: "order_status".into(),
             pointer: "/order_id".into(),
             needle: "ORD-51993".into(),
@@ -653,7 +659,7 @@ pub fn cases() -> Vec<ModelCase> {
              Save it to memory, then confirm you have.",
         )
         .expect(Assertion::NoRunError)
-        .expect(Assertion::ToolCalled("memory_save".into())),
+        .expect(Assertion::ToolExecuted("memory_save".into())),
         ModelCase::new(
             "memory-round-trip",
             "A fact saved in one conversation is recalled in a different one",
@@ -683,7 +689,7 @@ pub fn cases() -> Vec<ModelCase> {
              memory, say so — do not guess.",
         )
         .expect(Assertion::NoRunError)
-        .expect(Assertion::ToolCalled("memory_search".into()))
+        .expect(Assertion::ToolExecuted("memory_search".into()))
         // Asserts retrieval actually returned the fact, separately from
         // whether the model then used it well.
         .expect(Assertion::ToolOutputContainsAny {
@@ -703,7 +709,7 @@ pub fn cases() -> Vec<ModelCase> {
              If it is not there, say so plainly.",
         )
         .expect(Assertion::NoRunError)
-        .expect(Assertion::ToolCalled("memory_search".into()))
+        .expect(Assertion::ToolExecuted("memory_search".into()))
         .expect(Assertion::FinalNonEmpty)
         .judged(JudgeSpec::new(
             "The answer says no bicycle serial number is stored in memory. Any answer that \

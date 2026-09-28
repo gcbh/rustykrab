@@ -132,7 +132,8 @@ async fn append_path_keeps_the_tool_block(ctx: &Ctx) -> Result<()> {
         "a load of an appended tool was not a no-op: {load:?}"
     );
 
-    // The appended tools were dispatched like declared ones.
+    // The appended tools were dispatched like declared ones. `!failed`
+    // judges execution: a refused call is always marked failed.
     let cron = run.calls_to("cron");
     ensure!(
         cron.len() == 1 && !cron[0].failed,
