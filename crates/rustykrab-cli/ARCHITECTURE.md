@@ -18,7 +18,8 @@ Also: subcommands (`skill`, `pair`, `keychain`, `dream`, `work`, `workers`,
 `worker` authenticate with the daemon's
 bearer token and supply the configured gateway's own HTTP origin on every
 request, matching the gateway's mandatory Origin/CSRF boundary for sensitive
-`/api` routes. `update` never talks to the daemon.
+`/api` routes. `update check` and `update stage` never talk to the
+daemon; `update apply` reads only `GET /api/version`, the same way.
 
 | File | Lines | Role |
 |---|---|---|
@@ -34,8 +35,10 @@ request, matching the gateway's mandatory Origin/CSRF boundary for sensitive
 | `fleet.rs` | 298 | The worker fleet: opens the `WorkerRegistry` with `AgentFactory` (builds `ExternalWorker`s and peers from their spec, and redeems a peer's pairing code in `prepare`), names the local worker, and gives the controller its worktree root, `RecordRouting` and `FleetCatalog`; `RuntimeSkills` loads skills written at run time as tools (the local worker's `LateTools`) |
 | `peers.rs` | 188 | Peers over the tailnet (Phase 5), both halves: building a `PeerWorker` from its spec and redeeming its pairing code, the registry's refresh timer that records each peer's advertisement and health, and `DelegatedRuns`, how this daemon runs a peer's brief (its machine name and delegation resources from the environment, the local worker's model slot shared) |
 | `worker_cmd.rs` | 365 | `rustykrab workers` and `rustykrab worker show / add / remove` over `/api/workers`, `worker add peer --url --pairing-code` among them |
-| `update_cmd.rs` | 688 | `rustykrab update check` and `rustykrab update stage [--from PATH] [--force]`: the latest GitHub release, its digest, the `Verifier` seam (`codesign` and one `--version` run), `staged.json` |
-| `update_cmd/tests.rs` | 408 | `update` against a local axum stand-in for the releases API, with scripted and (on macOS) real `codesign` checks |
+| `update_cmd.rs` | 863 | `rustykrab update check` and `rustykrab update stage [--from PATH] [--force]`: the latest GitHub release, its digest, the `Verifier` seam (`codesign` and one `--version` run), `staged.json`, and `bad.json` (`BadVersion`, matched by commit when an entry has one) |
+| `update_cmd/tests.rs` | 545 | `update` against a local axum stand-in for the releases API, with scripted and (on macOS) real `codesign` checks |
+| `update_cmd/apply.rs` | 727 | `rustykrab update apply`: the supervisor. The `ServiceManager` (`Launchd`, `Script`), `SwapRoot` (`DirSwap`) and `VersionProbe` (`HttpProbe`) seams, the swap, the 90 s verification and the rollback |
+| `update_cmd/apply/tests.rs` | 429 | `apply` with a scripted service manager and a local axum stand-in for `/api/version` that reports whichever version is installed |
 | `computer_backend.rs` | 375 | `ComputerBackend` impl (enigo + xcap), feature-gated |
 | `prompt_log.rs` | 69 | `TraceSink` impl writing prompt traces to disk |
 | `agent_defs.rs` | 74 | Agent definitions for this daemon: the built-in files and `<data dir>/agents/*.md`, the sub-agent catalog (all but `worker`), the local worker's definition |
@@ -79,9 +82,9 @@ reuses `work_cmd`'s `Daemon` over it.
 
 ## `rustykrab update`
 
-Slice 5 of `docs/plans/update-flow.md`: where a new version comes from and
-how it is checked. `update_cmd.rs` opens no store and does not call the
-daemon; slice 6's supervisor is what swaps a staged version in.
+Slices 5 and 6 of `docs/plans/update-flow.md`: where a new version comes
+from and how it is checked (`update_cmd.rs`), and the supervisor that swaps
+it in (`update_cmd/apply.rs`). Neither opens the store.
 
 - `check` reads the latest release of `RUSTYKRAB_UPDATE_REPO` (default
   `gcbh/rustykrab`) from `RUSTYKRAB_UPDATE_API_BASE` (default
@@ -93,8 +96,8 @@ daemon; slice 6's supervisor is what swaps a staged version in.
   to the host and port of the API base (`asset_request_sends_token`);
   `Config`'s `Debug` prints it as `<redacted>`.
 - `stage` does the same, and when the release is newer and not listed in
-  `<data>/updates/bad.json` (a JSON array of `{"version": ...}`, written by
-  slice 6's rollback; `--force` overrides it) downloads the asset
+  `<data>/updates/bad.json` (a JSON array of `{"version": ..., "commit":
+  ...}`, written by `apply`'s rollback; `--force` overrides it) downloads the asset
   `rustykrab-<target>.tar.gz`. The target triple is stamped by `build.rs`
   as `RUSTYKRAB_TARGET`. The asset's declared `size` must be present and
   at most `MAX_ASSET_BYTES` (256 MiB) before the download starts; its URL
@@ -134,6 +137,50 @@ digest is the check) and the binary; the tests script it, serve a release
 and an archive built in the test from a local axum router, and on macOS run
 the real `codesign` against an unsigned bundle and against an ad-hoc
 signature that claims the pinned team, and refuse both.
+
+`bad.json` entries match in two ways (`BadVersion::matches`). An entry
+with a `commit` matches only that commit: a local build has no tag and
+every local build reports the package version, so one bad local build must
+not block every later one. An entry without one matches its version, which
+is how a release is recorded. `stage` of a release checks by version
+(its commit is unknown before the download); `stage --from` checks by
+version and commit.
+
+`apply [--yes] [--service launchd|script:<start-command>] [--url URL]
+[--installed PATH]` swaps the newest `staged.json` (latest `staged_at`)
+in:
+
+1. It refuses a stage with no commit, one recorded as bad, and, with the
+   launchd service, one whose `kind` is not `app` or whose
+   `signature_verified` is false. It reads the running version from
+   `GET /api/version` at `--url` (default `RUSTYKRAB_GATEWAY_URL`) with the
+   bearer token (`RUSTYKRAB_AUTH_TOKEN` first, as `daemon_client` resolves
+   it) and the daemon's own `Origin`. If the staged commit is the running
+   one there is nothing to do.
+2. Without `--yes` or `RUSTYKRAB_UPDATE_AUTO=1` it prints the plan and
+   changes nothing.
+3. It stops the daemon through the `ServiceManager` and waits for it to
+   exit. `Launchd`: `launchctl bootout gui/<uid>/com.gcbh.rustykrab`, then
+   polls `launchctl print` until the job is gone. `Script`: SIGTERM to the
+   pids `lsof` finds listening on the URL's port, then waits for each.
+4. `DirSwap` copies the stage beside the installed bundle or binary
+   (`.<name>.next`), renames the installed one to `<name>.prev` (removing
+   an older one) and the copy into place: both renames are in one
+   directory. The default installed path under launchd is
+   `~/Applications/RustyKrab.app`; `script:` needs `--installed`.
+5. It starts the service (`launchctl bootstrap gui/<uid>
+   ~/Library/LaunchAgents/com.gcbh.rustykrab.plist`, or the start command
+   run detached in its own process group) and verifies within 90 s that
+   `/api/version` reports the staged commit, `controller.lock` `held`, a
+   `last_tick` that advances twice and `consecutive_failed_ticks` 0.
+6. On any failure it records the stage in `bad.json` first (a release by
+   version, a local build by commit, `bad_entry`), stops the new version,
+   restores `.prev`, starts it and verifies it the same way against the
+   commit it read in step 1. A rollback exits non-zero.
+
+The three seams are traits so the tests script the service manager and
+serve `/api/version` from a local axum router whose answers follow the
+installed file; no test runs `launchctl` or signals a process.
 
 ## The worker fleet
 

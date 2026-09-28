@@ -240,7 +240,9 @@ fn parses_the_two_forms() {
         })
     );
     assert!(parse(&args("stage --from")).is_err());
-    assert!(parse(&args("apply")).is_err());
+    assert!(parse(&args("apply --bogus")).is_err());
+    assert!(parse(&args("apply --service upstart")).is_err());
+    assert!(matches!(parse(&args("apply --yes")), Ok(Cmd::Apply(_))));
 }
 
 #[tokio::test]

@@ -240,6 +240,7 @@ All configuration is via environment variables. No plaintext config files.
 | `RUSTYKRAB_GITHUB_TOKEN` | unset | Token for the review surface, overriding the `github_token` entry in the credential store (`rustykrab keychain`); it needs issues read and write on the repository. `rustykrab update` also sends it, when set, to the releases API, for rate limits only |
 | `RUSTYKRAB_UPDATE_REPO` | `gcbh/rustykrab` | `owner/name` whose latest GitHub release `rustykrab update check` and `rustykrab update stage` read. See [Updating (`update` subcommand)](#updating-update-subcommand) |
 | `RUSTYKRAB_UPDATE_API_BASE` | `https://api.github.com` | GitHub API base for `rustykrab update` (a GitHub Enterprise host, or a test stand-in) |
+| `RUSTYKRAB_UPDATE_AUTO` | unset | `1` lets `rustykrab update apply` swap without `--yes`; otherwise it only prints its plan |
 | `RUSTYKRAB_UPDATE_TEAM_ID` | `3RRX845C4X` | Apple team a staged `RustyKrab.app` must be signed by. The team is pinned, so a correctly signed bundle from anyone else is refused; set this for a fork signed by another team |
 | `RUSTYKRAB_GITHUB_API_BASE` | `https://api.github.com` | GitHub API base for the review surface (a GitHub Enterprise host, or the e2e harness's stand-in) |
 | `RUSTYKRAB_DATA_DIR` | OS local data dir + `/rustykrab` | Data directory (store, logs, `soul.md`, `harness.toml`, agent definitions). Falls back to `./rustykrab` when the OS has no local data dir. The E2E harness points it at a throwaway directory |
@@ -497,9 +498,13 @@ Open `http://127.0.0.1:3000` in a browser for the embedded WebChat interface.
 rustykrab-cli update check                      # is the latest release newer?
 rustykrab-cli update stage                      # download, verify and stage it
 rustykrab-cli update stage --from path/to/RustyKrab.app   # stage a local build
+rustykrab-cli update apply                      # print what apply would do
+rustykrab-cli update apply --yes                # swap the staged version in
+rustykrab-cli update apply --yes --service 'script:./start.sh' \
+  --installed /path/to/rustykrab-cli --url http://127.0.0.1:3000   # no launchd
 ```
 
-Neither touches the running daemon. `stage` downloads
+`check` and `stage` do not touch the running daemon. `stage` downloads
 `rustykrab-<target>.tar.gz` from the latest release of
 `RUSTYKRAB_UPDATE_REPO` and refuses it unless the release API's `digest`
 for the asset is present and equals the SHA-256 of the bytes downloaded.
@@ -511,7 +516,26 @@ release's version. The result lands in `<data dir>/updates/<version>/`
 with a `staged.json` record. A release that is not newer stages nothing,
 and a version recorded as bad in `<data dir>/updates/bad.json` is refused
 unless `--force`. `--from` takes a `RustyKrab.app` or a bare binary; it has
-no digest, but a bundle still goes through the signature check.
+no digest, but a bundle still goes through the signature check. A local
+build has no tag and reports the package version, so a rollback records it
+in `bad.json` by its commit: a later build of the same version with another
+commit still stages.
+
+`apply` swaps in the newest staged version. It reads the running version
+from `GET /api/version` (bearer token from `RUSTYKRAB_AUTH_TOKEN`, URL from
+`--url` or `RUSTYKRAB_GATEWAY_URL`), stops the daemon and waits for it to
+exit, renames the installed `RustyKrab.app` (default
+`~/Applications/RustyKrab.app`) or binary to `.prev` and moves the stage
+into its place, and starts it again. Within 90 s the new daemon must report
+the staged commit, hold `controller.lock`, tick twice and have no failed
+ticks. Otherwise `apply` stops it, restores `.prev`, starts and verifies
+the old one, records the new one as bad and exits non-zero. The default
+`--service launchd` uses `launchctl bootout` and `bootstrap` on the
+`com.gcbh.rustykrab` LaunchAgent and only takes a bundle whose Developer ID
+signature was verified at stage time; `--service script:<start-command>`
+sends SIGTERM to the process listening on the daemon's port and runs the
+command detached, and needs `--installed`. Without `--yes` or
+`RUSTYKRAB_UPDATE_AUTO=1`, `apply` prints the plan and changes nothing.
 
 ### Terminal chat (`chat` subcommand)
 
