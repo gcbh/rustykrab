@@ -38,13 +38,19 @@ usage: rustykrab update <command>
                                  failure restore .prev and record the new one
                                  as bad. Without --yes (or
                                  RUSTYKRAB_UPDATE_AUTO=1) it prints the plan
-                                 and changes nothing
+                                 and changes nothing. Under launchd it
+                                 refuses unless
+                                 RUSTYKRAB_UPDATE_APPLY_UNREVIEWED=1;
+                                 script:<cmd> is only for a bare binary
+                                 launchd does not run, so --installed must
+                                 be a regular file outside any .app and
+                                 ~/Applications, and the stage a binary
 
 Reads RUSTYKRAB_UPDATE_REPO (default gcbh/rustykrab), RUSTYKRAB_GITHUB_TOKEN
 (optional, for rate limits), RUSTYKRAB_UPDATE_API_BASE (default
 https://api.github.com) and RUSTYKRAB_UPDATE_TEAM_ID (default 3RRX845C4X).
-apply also reads RUSTYKRAB_UPDATE_AUTO, RUSTYKRAB_AUTH_TOKEN and
-RUSTYKRAB_GATEWAY_URL (the default for --url).";
+apply also reads RUSTYKRAB_UPDATE_AUTO, RUSTYKRAB_UPDATE_APPLY_UNREVIEWED,
+RUSTYKRAB_AUTH_TOKEN and RUSTYKRAB_GATEWAY_URL (the default for --url).";
 
 pub const DEFAULT_REPO: &str = "gcbh/rustykrab";
 pub const DEFAULT_API_BASE: &str = "https://api.github.com";
@@ -957,7 +963,9 @@ pub async fn run(data_dir: &Path, args: &[String]) -> anyhow::Result<()> {
 }
 
 /// Whether `apply` may run with `service`. The builder's script service
-/// may; launchd, on the owner's machine, is held behind
+/// may, for a bare binary launchd does not run (`apply` itself refuses an
+/// install inside a `.app` or under `~/Applications`, and a staged app);
+/// launchd, on the owner's machine, is held behind
 /// `RUSTYKRAB_UPDATE_APPLY_UNREVIEWED=1` until what it still needs is built
 /// (update-flow.md, "Slice 6: status").
 fn apply_gate(service: &apply::ServiceSpec, unreviewed: bool) -> Result<(), String> {
@@ -969,8 +977,9 @@ fn apply_gate(service: &apply::ServiceSpec, unreviewed: bool) -> Result<(), Stri
              /api/version served without authentication and a check that the listener is the \
              launchd job's own process, so the probe stops carrying the token; the \
              com.gcbh.rustykrab.updater job in scripts/install.sh; and the owner's decision on \
-             worker isolation. --service script:<cmd> runs without this gate. \
-             See docs/plans/update-flow.md, \"Slice 6: status\"."
+             worker isolation. --service script:<cmd> is only for a bare binary launchd does \
+             not run: it refuses an --installed inside a .app or under ~/Applications, and a \
+             staged app. See docs/plans/update-flow.md, \"Slice 6: status\"."
                 .to_string(),
         ),
     }

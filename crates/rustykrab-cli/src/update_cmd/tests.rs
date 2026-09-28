@@ -848,6 +848,12 @@ fn the_script_service_runs_without_the_gate_variable_and_launchd_does_not() {
     ] {
         assert!(err.contains(needed), "{err}");
     }
+    // The script service is not offered as a way past the gate.
+    assert!(!err.contains("without this gate"), "{err}");
+    assert!(
+        err.contains("only for a bare binary launchd does not run"),
+        "{err}"
+    );
     assert_eq!(apply_gate(&apply::ServiceSpec::Launchd, true), Ok(()));
 }
 

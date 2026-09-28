@@ -158,15 +158,19 @@ which a worker can write, so it re-derives everything it relies on:
    symlink is on the way. Of the rest it takes the highest version, and
    only then the latest `staged_at`, a field a worker writes; when every
    record was skipped the reasons are the error. It refuses a stage with
-   no commit, one recorded as bad, and, with the launchd service, one
-   whose `kind` is not `app` or whose `signature_verified` is false. It
+   no commit, one recorded as bad, with the launchd service one whose
+   `kind` is not `app` or whose `signature_verified` is false, and with
+   the script service one whose `kind` is not `binary`, before anything
+   is stopped. It
    reads the running version from `GET /api/version` at `--url` (default
    `RUSTYKRAB_GATEWAY_URL`; either must be https or http to `127.0.0.1` or
    `[::1]`, any port, and `localhost` is refused: `check_url`,
    `base_url`) with the bearer token
    (`RUSTYKRAB_AUTH_TOKEN` first, as `daemon_client` resolves it) and the
    daemon's own `Origin`. The running daemon must report `controller.lock`
-   `held` and `consecutive_failed_ticks` 0, or nothing changes; this is
+   `held`, `consecutive_failed_ticks` 0 and not `controller.draining`
+   true (a daemon in its shutdown drain still answers), or nothing
+   changes; this is
    checked before the commits are compared, so a daemon of the staged
    commit stuck waiting on the lock is not reported as already running.
    If the staged commit is the running one there is nothing to do. Every
@@ -200,13 +204,14 @@ which a worker can write, so it re-derives everything it relies on:
    process table is the `Processes` seam (`SystemProcesses`). If the stop
    fails, it drops the copy and starts the service again unless it is
    still running, and removes the journal only once `/api/version`
-   answers with the old commit.
+   answers with the old commit, not draining (`wait_for_commit`);
+   otherwise it goes to `fail_loudly`.
 5. `DirSwap::commit` renames the installed one to `<name>.prev` (removing
    an older one) and the copy into place: both renames are in one
    directory. If that fails, the old version is started again and the
-   journal removed only once `/api/version` answers with the old commit;
-   if nothing is left at the install path it goes to `fail_loudly`
-   instead. The
+   journal removed only once `/api/version` answers with the old commit,
+   not draining; if it does not, or if nothing is left at the install
+   path, it goes to `fail_loudly` instead. The
    journal moves to `swapped`. The default installed path
    under launchd is `~/Applications/RustyKrab.app`; `script:` needs
    `--installed`.
@@ -215,8 +220,9 @@ which a worker can write, so it re-derives everything it relies on:
    run detached in its own process group), moves the journal to `started`
    and verifies within 90 s that `/api/version` reports the staged commit,
    `controller.lock` `held`, a `last_tick` that advances twice while no
-   ticks are failing, and `consecutive_failed_ticks` 0. On success the
-   journal is removed.
+   ticks are failing, `consecutive_failed_ticks` 0, and not
+   `controller.draining` true (a drain restarts the count). On success
+   the journal is removed.
 7. On any failure it rolls back (`roll_back`): it records the stage in
    `bad.json` first (a release by version, a local build by commit,
    `bad_entry`); a failure to write that is logged, carried on past and
@@ -246,16 +252,19 @@ otherwise a journal at `swapped` or `started`, or at `stopping` with
 (a crash between the renames and the `swapped` write, or a `--version`
 that timed out), is rolled back in full and the new version recorded
 bad; any other journal at `stopping` drops the copy; then, if the
-service is not running, it is started and verified against the
-journal's `from_commit` (without a journal, the commit the installed
-binary reports), and the journal removed. Before a rollback stops
+service is not running, it is started, and either way it is verified
+against the journal's `from_commit` (without a journal, the commit the
+installed binary reports) before the journal is removed, so a service
+that counts as running because its daemon is still draining never
+clears it; a failed verify goes to `fail_loudly`. Before a rollback stops
 anything, `check_rollback` runs the `Verifier`'s `--version` on the
 installed and `.prev` binaries (after `check_prev`) and requires the
 journal's `to_commit` and `from_commit`; a journal that does not match
 goes to `fail_loudly`, which stops nothing. A run that recovers applies
 nothing new (`Outcome::Recovered`).
 
-Any rollback or recovery error goes through `fail_loudly`: it writes
+Any rollback or recovery error, and a restart after a failed stop or
+swap that is not seen answering, goes through `fail_loudly`: it writes
 `.<name>.apply-failed.json` beside the install (`ApplyFailed`: what failed
 and what is installed, both commits, the time), removes the journal when
 there was one, since a person takes over, and last starts the service
@@ -268,8 +277,12 @@ and changes nothing, until a person deletes it.
 `run` refuses before anything else when `XPC_SERVICE_NAME` is
 `com.gcbh.rustykrab` (the daemon's own launchd job) or when the running
 executable canonicalizes to a path under the install
-(`refuse_inside_daemon`). `update_cmd::apply_gate` lets `--service
-script:<cmd>` run as is, and holds the launchd service behind
+(`refuse_inside_daemon`). With `--service script:<cmd>`, which swaps
+with no signature check and so is only for a bare binary launchd does
+not run, `run` first requires `--installed` to be a regular file with no
+`*.app` path component and not under `~/Applications`, as written and as
+it canonicalizes (`check_script_installed`). `update_cmd::apply_gate`
+lets the script service through and holds the launchd service behind
 `RUSTYKRAB_UPDATE_APPLY_UNREVIEWED=1`.
 
 The seams are traits so the tests script the service manager, the

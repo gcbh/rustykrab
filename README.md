@@ -291,7 +291,7 @@ All configuration is via environment variables. No plaintext config files.
 | `RUSTYKRAB_BROWSER_BORROW_SYSTEM_PROFILE` | off | `1` symlinks the account's active system-Chrome profile into RustyKrab's user-data directory to reuse its sessions. Unsafe while that Chrome is running |
 | `RUSTYKRAB_BROWSER_DOWNLOAD_ROOT` | unset | Root for browser downloads, one subdirectory per profile. Unset, downloads stay under the profile's user-data directory |
 | `RUSTYKRAB_BROWSER_SWEEP` | off | `1` kills stale Chromium processes whose user-data directory is RustyKrab's when the browser manager starts |
-| `RUSTYKRAB_UPDATE_APPLY_UNREVIEWED` | unset | `1` lets `rustykrab update apply` run while it is held pending its review's fixes (`docs/plans/update-flow.md`); otherwise it refuses and exits 3 |
+| `RUSTYKRAB_UPDATE_APPLY_UNREVIEWED` | unset | `1` lets `rustykrab update apply` run with the launchd service, which is held until what it still needs is built (`docs/plans/update-flow.md`, "Slice 6: status"); otherwise it refuses and exits 3. It does not gate `--service script:<cmd>`, which is only for a bare binary launchd does not run and refuses an `--installed` inside a `.app` or under `~/Applications`, and a staged app |
 | `RUSTYKRAB_BIN` | `target/debug/rustykrab-cli` | Daemon binary the evaluation harness (`rustykrab-e2e`) boots. Harness only |
 | `RUSTYKRAB_E2E_SOURCE_REVISION` | `unrecorded` | Source revision recorded in the evaluation harness's report. Harness only |
 | `RUSTYKRAB_COMPACTION_STUDY_ARM` | unset | `message-tail` runs only the structured message-tail arm of the harness's compaction study. Harness only |
