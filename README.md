@@ -225,11 +225,11 @@ All configuration is via environment variables. No plaintext config files.
 | `RUST_LOG` | `info` | Log level (`info`, `debug`, `rustykrab_gateway=debug`) |
 | `RUSTYKRAB_LOG_STDOUT` | auto | Force stdout logging on (`1`) or off (`0`). Default: enabled only when stdout is a terminal. The rolling log file under the data directory is always written |
 | `RUSTYKRAB_OUTCOME_CAPTURE` | `0` | Record how each completed run went, and which skill, memories, and tools were in play, into the `outcome_records` table. Observational only — it changes nothing about how the agent behaves. Groundwork for the self-improvement outer loop; see `DREAMING.md` |
+| | | When enabled, this also starts a **downtime analysis worker**: read-only, it aggregates recorded outcomes and logs a digest once the system has been quiet for 10 minutes, abandoning a pass if activity arrives mid-flight. It never writes and never calls a model |
 | `RUSTYKRAB_PUBLIC_URL` | unset | Base URL the agent puts in a credential or payment-approval link, e.g. `https://mac.tailnet.ts.net`. Unset, the agent falls back to telling the user a prompt is waiting in the app — so a link is never minted and the failure is silent |
 | `RUSTYKRAB_TAILNET_USERS` | unset | Comma-separated tailnet logins allowed to open a credential or payment-approval page. Empty means any authenticated tailnet user. Requires `tailscale serve` in front to inject `Tailscale-User-Login` |
 | `RUSTYKRAB_PAYMENT_COOLDOWN_SECS` | `30` | Seconds after one payment is pressed before another may be claimed, across every conversation. Not a limit on what the user may buy — each purchase is approved separately — but on how fast the agent can act on approvals it already holds, so a retry loop is caught by a human before it can run. `0` disables the throttle; a value that is not a whole number of seconds is ignored with a warning and the default kept. Independent of the single-spend lock, which is unconditional: one payment may be in flight at a time and each approval is spendable exactly once |
 | `RUSTYKRAB_PAYMENT_DUPLICATE_WINDOW_HOURS` | `24` | Hours back over which a payment counts as a repeat of one being filed now. The same site, amount and currency inside the window is held rather than sent to the user for approval: nothing is paid, the user is told, and the agent is told to stop. `0` disables the hold; a value that is not a whole number of hours is ignored with a warning and the default kept. The key is deliberately the origin, amount and currency — not the merchant name or the description, both of which the model writes and could reword its way past |
-| | | When enabled, this also starts a **downtime analysis worker**: read-only, it aggregates recorded outcomes and logs a digest once the system has been quiet for 10 minutes, abandoning a pass if activity arrives mid-flight. It never writes and never calls a model |
 | `RUSTYKRAB_EVALUATION_INTERVAL_SECS` | `86400` | How often the control layer's evaluation pass runs (`docs/plans/control-layer-and-worker-fleet.md`, sections 1.1, 10 and 11): the expectation metrics from stored events, the review surface's decisions synced back, proposals filed from ground-truth evidence only, and engineering items projected to issues. The first pass waits one interval; `0` turns the timer off and leaves `POST /api/work/evaluate`. It never calls a model |
 | `RUSTYKRAB_CONTROL_TICK_SECS` | `5` | Seconds between the control loop's ticks, which advance the work-item graph, reconcile runs and deliver the work outbox's notices. With `RUSTYKRAB_CRON_WORK_ITEMS=1` it is also how often scheduled jobs are checked for firing. Values below `1` are raised to `1`; a value that is not a whole number keeps the default. Only the daemon holding `controller.lock` in the data directory ticks |
 | `RUSTYKRAB_LOCAL_WORKER` | on | `off`, `false`, `0` or `no` register no local worker, so routing never leases a work item to one. For a daemon with no local model: the local worker sits on the cheapest tier, so every unconstrained item would otherwise go to it and fail. External workers and peers run as before |
@@ -242,6 +242,28 @@ All configuration is via environment variables. No plaintext config files.
 | `RUSTYKRAB_UPDATE_API_BASE` | `https://api.github.com` | GitHub API base for `rustykrab update` (a GitHub Enterprise host, or a test stand-in) |
 | `RUSTYKRAB_UPDATE_TEAM_ID` | `3RRX845C4X` | Apple team a staged `RustyKrab.app` must be signed by. The team is pinned, so a correctly signed bundle from anyone else is refused; set this for a fork signed by another team |
 | `RUSTYKRAB_GITHUB_API_BASE` | `https://api.github.com` | GitHub API base for the review surface (a GitHub Enterprise host, or the e2e harness's stand-in) |
+| `RUSTYKRAB_DATA_DIR` | OS local data dir + `/rustykrab` | Data directory (store, logs, `soul.md`, `harness.toml`, agent definitions). Falls back to `./rustykrab` when the OS has no local data dir. The E2E harness points it at a throwaway directory |
+| `RUSTYKRAB_PORT` | `3000` | Gateway port. The bind address is always loopback (`127.0.0.1`) and is not configurable. `rustykrab pair` also uses it to build the default pairing URL when `RUSTYKRAB_PUBLIC_URL` is unset. A value that is not a port number is fatal |
+| `RUSTYKRAB_GATEWAY_URL` | `http://127.0.0.1:3000` | Daemon base URL the client subcommands (`chat`, `work`, `worker`) talk to. Must be an http(s) URL with a host |
+| `RUSTYKRAB_SOUL_PATH` | `<data dir>/soul.md` | Soul file loaded into the system prompt; seeded with the built-in default if missing |
+| `RUSTYKRAB_HARNESS` | `default` | Harness profile preset: `default`, `coding`, `research` or `creative` (anything else means `default`). Ignored when `<data dir>/harness.toml` exists |
+| `RUSTYKRAB_HARNESS_ROUTER` | on | `off`, `0`, `false` or `no` disable the per-message harness router and pin the configured profile for every message |
+| `RUSTYKRAB_MAX_CONCURRENT_TASKS` | `4` | Background task-queue concurrency. A value that does not parse keeps the default |
+| `RUSTYKRAB_ENABLE_SUBAGENTS` | `false` | `1` or `true` register the sub-agent tools |
+| `RUSTYKRAB_DISTILL` | on | `off`, `0`, `false` or `no` disable memory distillation |
+| `RUSTYKRAB_VIDEO` | `false` | `true` or `1` enable the video channel, which keeps its projects under `<data dir>/video` |
+| `RUSTYKRAB_NPX_PATH` | `npx` | `npx` executable the video channel runs |
+| `RUSTYKRAB_COMPUTER_USE` | `false` | `true` or `1` register the computer-use tools. Only in builds with `--features computer-use` |
+| `RUSTYKRAB_COMPUTER_USE_READONLY` | `false` | `true` or `1` register the computer-use tools in read-only mode. Only read when `RUSTYKRAB_COMPUTER_USE` is on |
+| `RUSTYKRAB_MCP_SERVERS` | unset | Comma-separated MCP connector names; each is configured with `RUSTYKRAB_MCP_<NAME>_*`. See [MCP servers: credential refs](#mcp-servers-credential-refs) |
+| `RUSTYKRAB_PROMPT_LOG` | off | `1`, `true`, `TRUE` or `yes` write every prompt and response to a daily-rolling `prompts.log` — for debugging only, as it records conversation content |
+| `RUSTYKRAB_DEFAULT_CHANNEL` | unset | Fallback delivery channel for a scheduled job whose job and conversation carry none; without it such results are logged and discarded |
+| `RUSTYKRAB_DEFAULT_CHAT_ID` | unset | Fallback chat ID paired with `RUSTYKRAB_DEFAULT_CHANNEL` |
+| `RUSTYKRAB_DEFAULT_THREAD_ID` | unset | Fallback thread ID paired with `RUSTYKRAB_DEFAULT_CHANNEL` |
+| `RUSTYKRAB_CREDENTIAL_BACKEND` | platform secure store | `memory` keeps credentials in process memory, lost on restart. Evaluation harness only; never set it on a real deployment |
+| `RUSTYKRAB_SCRIPT_PATH` | unset | Script file for `RUSTYKRAB_PROVIDER=scripted` (E2E harness); required by that provider, which refuses to start without it |
+| `RUSTYKRAB_TOOL_STUBS` | unset | Path to a tool-stub file that swaps real tools for scripted stand-ins, all active from turn 0. Evaluation harness only |
+| `RUSTYKRAB_ACTIVE_TOOLS` | unset | Comma-separated tool names to seed active from turn 0. Evaluation harness only |
 
 ### Persisting credentials
 
