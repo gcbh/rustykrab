@@ -268,6 +268,12 @@ All configuration is via environment variables. No plaintext config files.
 | `RUSTYKRAB_ALLOWED_ORIGINS` | unset | Comma-separated extra origins the gateway accepts browser requests from, e.g. the tailnet URL the credential page is served on. A malformed entry is skipped with a warning. See [Serving the credential page over your tailnet](#serving-the-credential-page-over-your-tailnet) |
 | `RUSTYKRAB_CREDENTIAL_PAGE_ANONYMOUS` | off | `1`, `true`, `on` or `yes` let the credential and payment-approval pages answer without a `Tailscale-User-Login` identity. Never set it on a page reachable from beyond this machine |
 | `RUSTYKRAB_DISABLE_KEYCHAIN` | off | macOS: any value but empty, `0`, `false`, `no` or `off` keeps the daemon off the real Keychain. The evaluation harness sets it on every throwaway boot |
+| `RUSTYKRAB_APNS_KEY_ID` | unset | 10-character APNs signing key identifier. Push is off unless this, `RUSTYKRAB_APNS_TEAM_ID` and `RUSTYKRAB_APNS_TOPIC` are all set; the signing key itself lives in the encrypted store |
+| `RUSTYKRAB_APNS_TEAM_ID` | unset | 10-character Apple team identifier that owns the APNs key |
+| `RUSTYKRAB_APNS_TOPIC` | unset | The app's bundle id, sent as `apns-topic` |
+| `RUSTYKRAB_RATE_LIMIT_MAX` | `20` | Requests one IP may make per window before it is locked out. Zero or unparseable values keep the default |
+| `RUSTYKRAB_RATE_LIMIT_WINDOW_SECS` | `60` | Length of the rate-limit window in seconds. Zero or unparseable values keep the default |
+| `RUSTYKRAB_RATE_LIMIT_LOCKOUT_SECS` | `300` | Seconds an IP stays locked out after exceeding the limit. Zero or unparseable values keep the default |
 | `RUSTYKRAB_APNS_ENVIRONMENT` | `sandbox` | APNs host for push notifications: `production` (or `prod`) sends to `api.push.apple.com`; anything else uses the sandbox |
 | `RUSTYKRAB_WORKSPACE` | current directory | Base directory the file tools are confined to |
 | `RUSTYKRAB_SSRF_ALLOW_HOSTS` | unset | Comma-separated host names exempt from the web tools' private-address block. Exact, case-insensitive, no wildcards. The evaluation harness forwards it to the daemons it boots |

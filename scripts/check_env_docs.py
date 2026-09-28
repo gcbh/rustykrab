@@ -6,6 +6,11 @@ names a `RUSTYKRAB_` variable -- either as a string literal or through a
 `const NAME: &str = "RUSTYKRAB_..."` defined anywhere under `crates/` --
 must have a row in the Configuration table of README.md.
 
+Wrappers count too: any `fn helper(key: &str)` or `let helper = |key: &str|`
+whose body passes that parameter to `env::var` / `var_os` is a known
+env-reading helper, and a `helper("RUSTYKRAB_...")` call (turbofish allowed,
+e.g. `env_parse::<u64>(...)`) is checked like a direct read.
+
 Names read with the build-time `env!` / `option_env!` macros are set by
 build scripts, not by an operator, so they are allowlisted automatically;
 BUILD_TIME_ALLOWLIST covers any a build script reads back itself.
@@ -41,6 +46,15 @@ CONST = re.compile(
     r"\b(?:const|static)\s+(?P<ident>[A-Z_][A-Z0-9_]*)\s*:\s*&(?:'static\s+)?str\s*=\s*"
     rf"\"(?P<name>{NAME})\""
 )
+# A function or closure taking a `&str` parameter; its body is then searched
+# for an env read of that parameter.
+HELPER_DEF = re.compile(
+    r"(?:\bfn\s+(?P<fn>[a-z_][a-z0-9_]*)\s*(?:<[^>(]*>)?\s*\(\s*"
+    r"|\blet\s+(?P<cl>[a-z_][a-z0-9_]*)\s*=\s*(?:move\s*)?\|\s*)"
+    r"(?P<param>[a-z_][a-z0-9_]*)\s*:\s*&(?:'static\s+)?str\b"
+)
+# How far past a helper's signature to look for the env read of its parameter.
+HELPER_BODY_CHARS = 400
 BUILD_MACRO = re.compile(rf"\b(?:option_)?env!\(\s*\"(?P<name>{NAME})\"")
 README_ROW = re.compile(r"^\|\s*`(?P<name>[A-Z0-9_]+)`\s*\|")
 
@@ -68,6 +82,30 @@ def documented_names() -> set[str]:
     return names
 
 
+def env_helpers(sources: dict[Path, str]) -> set[str]:
+    """Functions and closures that read the variable named by their `&str` arg."""
+    helpers: set[str] = set()
+    for text in sources.values():
+        for m in HELPER_DEF.finditer(text):
+            body = text[m.end() : m.end() + HELPER_BODY_CHARS]
+            param = re.escape(m.group("param"))
+            read = rf"\b(?:env::var(?:_os)?|var_os)\s*\(\s*&?\s*{param}\s*\)"
+            if re.search(read, body):
+                helpers.add(m.group("fn") or m.group("cl"))
+    return helpers
+
+
+def helper_call(helpers: set[str]) -> re.Pattern[str] | None:
+    """`helper("RUSTYKRAB_...")` or `helper::<T>("RUSTYKRAB_...")`."""
+    if not helpers:
+        return None
+    alt = "|".join(sorted(map(re.escape, helpers)))
+    return re.compile(
+        rf"(?<![A-Za-z0-9_:.])(?:{alt})\s*(?:::\s*<[^>]*>\s*)?"
+        rf"\(\s*\"(?P<lit>{NAME})\""
+    )
+
+
 def main() -> int:
     sources = {p: p.read_text(errors="replace") for p in rust_sources()}
 
@@ -80,7 +118,12 @@ def main() -> int:
             build_time.add(m.group("name"))
 
     reads: dict[str, list[str]] = {}
+    call = helper_call(env_helpers(sources))
     for path, text in sources.items():
+        if call is not None:
+            for m in call.finditer(text):
+                where = f"{path.relative_to(ROOT)}:{line_of(text, m.start())}"
+                reads.setdefault(m.group("lit"), []).append(where)
         for m in READ.finditer(text):
             if m.group("lit") is not None:
                 names = {m.group("lit")}
