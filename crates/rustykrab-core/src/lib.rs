@@ -37,8 +37,8 @@ pub mod types;
 pub mod work;
 
 pub use active_tools::{
-    with_session_context, ActiveToolsRegistry, Callable, LateToolBinding, SessionToolContext,
-    SESSION_TOOL_CONTEXT,
+    with_session_context, ActiveToolsRegistry, Callable, LateToolBinding, SearchMiss,
+    SessionToolContext, DEFAULT_SEARCH_MISS_LIMIT, SESSION_TOOL_CONTEXT,
 };
 pub use activity::{ActivityTracker, RunGuard};
 pub use agent_def::{AgentDefinition, AgentRegistry};

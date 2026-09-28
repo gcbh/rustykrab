@@ -443,3 +443,78 @@ async fn an_appended_tools_integer_sent_as_text_is_coerced_before_dispatch() {
         .map(|c| c.arguments["duration_minutes"].clone());
     assert_eq!(written, Some(json!("30")));
 }
+
+/// Phase 2's exit, "no tool-block change after turn 0", holds for a run
+/// that reaches its iteration cap too: the summary request carries the
+/// run's block rather than none.
+#[tokio::test]
+async fn a_capped_run_keeps_its_tool_block_to_the_end() {
+    let provider = Recording::new(
+        true,
+        vec![
+            call("tools_list", json!({ "query": "current weather" })),
+            call("get_weather", json!({ "city": "Lisbon" })),
+            call("get_weather", json!({ "city": "Porto" })),
+            text("Lisbon is 17C; Porto is still to check."),
+        ],
+    );
+    let (runner, session, _) = setup(provider.clone());
+    let runner = runner.with_config(AgentConfig {
+        max_iterations: 3,
+        soft_iteration_warning: 0,
+        ..AgentConfig::default()
+    });
+    let mut conv = conversation(session.conversation_id);
+
+    runner.run(&mut conv, &session).await.unwrap();
+
+    let declared = provider.declared();
+    assert_eq!(declared.len(), 4, "three turns and the cap's summary");
+    assert!(
+        declared.iter().all(|d| d == &declared[0]),
+        "the tools array changed: {declared:?}"
+    );
+    assert_eq!(
+        conv.messages.last().and_then(|m| m.content.as_text()),
+        Some("Lisbon is 17C; Porto is still to check.")
+    );
+}
+
+/// The harness profile's `tool_search_miss_limit` reaches `tools_list`
+/// through the run: at 1, the second search for a need the catalog lacks
+/// is final, and the run's registry records the gap.
+#[tokio::test]
+async fn the_search_miss_limit_is_the_runs() {
+    let provider = Recording::new(
+        true,
+        vec![
+            call("tools_list", json!({ "query": "current forecast" })),
+            call("tools_list", json!({ "query": "current forecast" })),
+            call(
+                "task_complete",
+                json!({ "summary": "No tool can do that." }),
+            ),
+        ],
+    );
+    let (runner, session, active) = setup(provider);
+    let runner = runner.with_config(AgentConfig {
+        tool_search_miss_limit: 1,
+        ..AgentConfig::default()
+    });
+    let mut conv = conversation(session.conversation_id);
+
+    runner.run(&mut conv, &session).await.unwrap();
+
+    let answers = results_of(&conv, "tools_list");
+    assert!(answers[0].1.starts_with("No tool matched"), "{answers:?}");
+    assert!(
+        answers[1]
+            .1
+            .starts_with("No tool provides \"current forecast\"."),
+        "{answers:?}"
+    );
+    assert_eq!(
+        active.tool_gaps(session.conversation_id),
+        ["current forecast"]
+    );
+}

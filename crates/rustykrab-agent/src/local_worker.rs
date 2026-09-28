@@ -616,6 +616,8 @@ impl LocalWorker {
         let session = Session::with_capabilities(conv_id, Self::capabilities_for(&ceiling));
         let active = Arc::new(ActiveToolsRegistry::new());
         active.activate(conv_id, activate);
+        // Kept to read the run's tool gaps once it ends.
+        let registry = active.clone();
 
         // What the run spends, kept for the controller whatever happens to
         // it, and its token budget enforced at the provider.
@@ -716,6 +718,24 @@ impl LocalWorker {
                 );
             }
             return Ok(first);
+        }
+
+        // The host told the model no tool provides a need it kept searching
+        // for (`tools_list`), and the run ended without a report: that gap,
+        // typed, is why, whatever the run did after it, and the ladder's
+        // order 2 is what can resolve it (plan section 8).
+        if let Some(need) = registry.tool_gaps(conv_id).into_iter().next() {
+            tracing::warn!(
+                worker = %self.name,
+                item = %brief.item,
+                need = %need,
+                "run ended on a tool gap without a report"
+            );
+            return Err(RunFailure::Gap {
+                gap: GapKind::Tool,
+                name: need,
+            }
+            .into_error());
         }
 
         let failure = match ended {
@@ -1430,6 +1450,67 @@ mod tests {
         let err = w.run(b).await.unwrap_err();
         assert_eq!(classified(&err), (ErrorClass::Budget, ErrorSubclass::Wall));
         assert!(stub.calls().is_empty());
+    }
+
+    /// Plan section 8, order 2: a worker that keeps searching for a tool
+    /// the catalog lacks is told it is final, and a run that then ends
+    /// without a report fails as the typed gap, whatever came after it
+    /// (more prose, or the model going silent), so the ladder can acquire
+    /// or build the tool.
+    #[tokio::test]
+    async fn a_need_no_tool_provides_ends_the_run_as_a_tool_gap() {
+        let search = || call("tools_list", json!({ "query": "current weather" }));
+        let tools = || -> Vec<Arc<dyn Tool>> {
+            vec![
+                Arc::new(rustykrab_tools::ToolsListTool::new()),
+                Arc::new(Named("get_forecast")),
+            ]
+        };
+        let mut script = vec![search(), search(), search()];
+        script.extend((0..4).map(|_| text("No tool can tell the current weather.")));
+        let provider = Recording::new(script);
+        let (w, stub) = worker(provider.clone(), tools());
+
+        let err = w.run(brief("item-9")).await.unwrap_err();
+
+        assert_eq!(
+            RunFailure::from_error(&err),
+            Some(RunFailure::Gap {
+                gap: GapKind::Tool,
+                name: "current weather".into()
+            }),
+            "{err}"
+        );
+        assert_eq!(
+            classified(&err),
+            (ErrorClass::CapabilityGap, ErrorSubclass::ToolGap)
+        );
+        assert!(stub.calls().is_empty());
+        // The third search told the worker to report the gap, typed.
+        let told = provider.requests()[3]
+            .0
+            .iter()
+            .rev()
+            .find_map(|m| match &m.content {
+                MessageContent::ToolResult(r) => r.output.as_str().map(str::to_string),
+                _ => None,
+            })
+            .unwrap_or_default();
+        assert!(
+            told.starts_with("No tool provides \"current weather\".")
+                && told.contains("\"needs_tool\""),
+            "{told}"
+        );
+
+        // Silence after it: still the gap, not the provider's error.
+        let provider = Recording::new(vec![search(), search(), search()]);
+        let (w, _) = worker(provider, tools());
+        let err = w.run(brief("item-10")).await.unwrap_err();
+        assert_eq!(
+            classified(&err),
+            (ErrorClass::CapabilityGap, ErrorSubclass::ToolGap),
+            "{err}"
+        );
     }
 
     #[tokio::test]

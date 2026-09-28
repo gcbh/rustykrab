@@ -1061,6 +1061,10 @@ pub struct AgentConfig {
     /// sets it for a model whose template path differs from its provider's
     /// default.
     pub late_tool_binding: Option<LateToolBinding>,
+    /// How many `tools_list` searches for one need may find nothing in a
+    /// run before the next is answered as final: no tool provides it, and
+    /// the need is recorded as a tool gap (`rustykrab-tools`' `tools_list`).
+    pub tool_search_miss_limit: usize,
 }
 
 impl Default for AgentConfig {
@@ -1078,6 +1082,7 @@ impl Default for AgentConfig {
             force_tool_use_first_iteration: false,
             tool_heartbeat_interval_secs: 30,
             late_tool_binding: None,
+            tool_search_miss_limit: rustykrab_core::DEFAULT_SEARCH_MISS_LIMIT,
         }
     }
 }
@@ -2111,6 +2116,9 @@ impl AgentRunner {
         // is the one it keeps.
         self.active_tools
             .set_late_binding(session.conversation_id, self.late_binding());
+        // Searches that found nothing are counted per run.
+        self.active_tools
+            .begin_tool_search(session.conversation_id, self.config.tool_search_miss_limit);
 
         let mut consecutive_errors = 0;
         let mut soft_warning_injected = false;
@@ -2709,7 +2717,8 @@ impl AgentRunner {
             conv,
             runner_notice(format!(
                 "You have reached the iteration limit ({} iterations). \
-                 Summarize what you accomplished and what remains.",
+                 Summarize what you accomplished and what remains. Reply with text only: \
+                 no more tools will run.",
                 self.config.max_iterations
             )),
         );
@@ -2718,11 +2727,35 @@ impl AgentRunner {
                 on_event(AgentEvent::TextDelta(delta));
             }
         };
+        // The run's own tool block, not none: the block is the front of the
+        // prompt, so dropping it re-prefilled the whole conversation for
+        // the one request that ends it, and broke "no tool-block change
+        // after turn 0" for every capped run (plan section 12, Phase 2).
+        // It is there for the cache, not to act on.
+        self.refresh_schema_cache(session, session.conversation_id, &mut schema_cache);
+        let schemas: &[ToolSchema] = schema_cache.as_ref().map_or(&[], |(_, s)| s.as_slice());
         let final_response = self
             .provider
-            .chat_stream(&conv.messages, &[], &stream_callback)
+            .chat_stream(&conv.messages, schemas, &stream_callback)
             .await?;
-        self.push_message(conv, final_response.message);
+        let message = if final_response.message.content.has_tool_calls() {
+            // A call here would never run, and one left in the history has
+            // no result to pair with; keep the words, if any.
+            tracing::warn!("the iteration-cap summary answered with a tool call; keeping its text");
+            let text = final_response
+                .text
+                .filter(|t| !t.trim().is_empty())
+                .unwrap_or_else(|| {
+                    format!(
+                        "I reached the iteration limit ({} iterations) before finishing.",
+                        self.config.max_iterations
+                    )
+                });
+            Message::stamped(Role::Assistant, MessageContent::Text(text))
+        } else {
+            final_response.message
+        };
+        self.push_message(conv, message);
         on_event(AgentEvent::Done);
         Ok(())
     }
@@ -8281,7 +8314,7 @@ mod worker_run_tests {
                 notices[3],
                 "[System notice] Continue.",
                 "[System notice] Your previous response indicated a tool call but none was found. Please retry.",
-                "[System notice] You have reached the iteration limit (8 iterations). Summarize what you accomplished and what remains.",
+                "[System notice] You have reached the iteration limit (8 iterations). Summarize what you accomplished and what remains. Reply with text only: no more tools will run.",
             ],
         );
         assert!(notices[2].contains("Multiple consecutive tool calls have failed."));
@@ -8290,6 +8323,50 @@ mod worker_run_tests {
         assert_eq!(
             last_assistant_text(&conv),
             Some("I compared A and B; C is still to check.")
+        );
+        // The cap's summary request keeps the run's tool block rather
+        // than sending none (the append path's test holds the whole run to
+        // one block).
+        assert!(!requests[8].1.is_empty());
+        assert_eq!(requests[8].1, requests[7].1);
+    }
+
+    /// Offered the tool block, a model may answer the cap's summary
+    /// request with a call that would never run; its text is kept and the
+    /// history is left with no call unanswered.
+    #[tokio::test]
+    async fn a_tool_call_answering_the_cap_summary_is_not_kept() {
+        let mut reply = call("noop", serde_json::json!({}));
+        reply.text = Some("A and B compared.".into());
+        let provider = Recording::new(vec![
+            call("noop", serde_json::json!({})),
+            reply,
+            call("noop", serde_json::json!({})),
+            // No words this time.
+            call("noop", serde_json::json!({})),
+        ]);
+        let config = AgentConfig {
+            max_iterations: 1,
+            soft_iteration_warning: 0,
+            ..AgentConfig::default()
+        };
+        let (runner, session, mut conv, _) = worker(provider.clone(), config.clone());
+        runner.run(&mut conv, &session).await.unwrap();
+        assert_eq!(last_assistant_text(&conv), Some("A and B compared."));
+        assert_eq!(
+            conv.messages
+                .iter()
+                .flat_map(|m| m.content.tool_calls())
+                .count(),
+            1,
+            "only the turn's own call, which has its result"
+        );
+
+        let (runner, session, mut conv, _) = worker(provider, config);
+        runner.run(&mut conv, &session).await.unwrap();
+        assert_eq!(
+            last_assistant_text(&conv),
+            Some("I reached the iteration limit (1 iterations) before finishing.")
         );
     }
 

@@ -69,8 +69,10 @@ impl HarnessRouter {
         profile.max_context_tokens = self.base.max_context_tokens;
         profile.compaction_threshold_pct = self.base.compaction_threshold_pct;
         profile.compaction_strategy = self.base.compaction_strategy;
-        // How late tools reach the model is a fact about the model.
+        // How late tools reach the model is a fact about the model, and so
+        // is how long it may search for a tool the catalog lacks.
         profile.late_tool_binding = self.base.late_tool_binding;
+        profile.tool_search_miss_limit = self.base.tool_search_miss_limit;
 
         // The loop parameters are the preset's to choose — that is what a
         // preset is for — *unless* the operator named them. "Named" rather
@@ -365,6 +367,18 @@ mod base_preservation_tests {
             routed.compaction_strategy,
             crate::CompactionStrategy::StructuredMessageTail
         );
+    }
+
+    #[tokio::test]
+    async fn the_search_miss_limit_survives_task_routing() {
+        let base = HarnessProfile {
+            tool_search_miss_limit: 5,
+            ..HarnessProfile::default()
+        };
+        let routed = router_with_base(base)
+            .route("please write some code for me")
+            .await;
+        assert_eq!(routed.tool_search_miss_limit, 5);
     }
 
     #[tokio::test]

@@ -16,7 +16,10 @@
 //! `tool block sent` log). The target never enters the array, so a pass
 //! means it was called by append. A missing case passes when no near-miss
 //! is called in the target's place: the host told the model nothing
-//! matched.
+//! matched, and a need searched past the harness profile's
+//! `tool_search_miss_limit` (2) is answered as final, so the run need not
+//! reach its iteration cap. A calendar target sent `duration_minutes` as
+//! text (qwen3.8's XML tool calls) is typed by the host before dispatch.
 //!
 //! The experiment's 12 of 12 is three tasks at four repetitions: run
 //! `--mode model --case late-binding --reps 4`, once with `--model

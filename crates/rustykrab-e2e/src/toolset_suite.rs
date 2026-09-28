@@ -17,6 +17,11 @@
 //! model as `[System notice]` user turns, with no system message stored
 //! after the first and one tool block for the run.
 //!
+//! A third searches three times for a tool the catalog does not have: the
+//! first two answers say nothing matched, the third says no tool provides
+//! it and to tell the user, and the daemon logs the need as a
+//! `capability_gap/tool` for the conversation.
+//!
 //! Scenario 10 proper, the two default models on the distractor matrix,
 //! is the model suite's (`late_binding.rs`).
 
@@ -34,6 +39,12 @@ const DONE: &str = "e2e-toolsets: listed the scheduled jobs";
 const NOTICES: &str = "e2e-toolsets: notices are user turns";
 /// What the notices run's `task_complete` says.
 const NOTICES_DONE: &str = "e2e-toolsets: gave up on the bad action";
+/// The orchestration message that starts the missing-tool run.
+const MISSING: &str = "e2e-toolsets: search for a tool that is not there";
+/// What the missing-tool run searches for: no tool shares a word with it.
+const MISSING_NEED: &str = "teleport a sandwich";
+/// What the missing-tool run's `task_complete` says.
+const MISSING_DONE: &str = "e2e-toolsets: no tool can teleport a sandwich";
 
 /// This suite's part of the scripted daemon's script.
 pub(crate) fn agent_script_scenarios() -> Vec<Value> {
@@ -48,6 +59,15 @@ pub(crate) fn agent_script_scenarios() -> Vec<Value> {
                 call("tools_load", json!({ "names": ["cron"] })),
                 call("cron", json!({ "action": "list" })),
                 call("task_complete", json!({ "summary": DONE })),
+            ],
+        }),
+        json!({
+            "trigger": MISSING,
+            "steps": [
+                call("tools_list", json!({ "query": MISSING_NEED })),
+                call("tools_list", json!({ "query": MISSING_NEED })),
+                call("tools_list", json!({ "query": MISSING_NEED })),
+                call("task_complete", json!({ "summary": MISSING_DONE })),
             ],
         }),
         json!({
@@ -67,12 +87,17 @@ pub(crate) fn agent_script_scenarios() -> Vec<Value> {
 pub(crate) fn scenarios() -> Vec<(Expected, (&'static str, ScenarioFn))> {
     let append: ScenarioFn = |ctx| Box::pin(append_path_keeps_the_tool_block(ctx));
     let notices: ScenarioFn = |ctx| Box::pin(notices_are_user_turns(ctx));
+    let missing: ScenarioFn = |ctx| Box::pin(a_missing_tool_stops_the_search(ctx));
     vec![
         (
             Expected::Pass,
             ("toolsets/append-path-keeps-the-tool-block", append),
         ),
         (Expected::Pass, ("toolsets/notices-are-user-turns", notices)),
+        (
+            Expected::Pass,
+            ("toolsets/a-missing-tool-stops-the-search", missing),
+        ),
     ]
 }
 
@@ -165,6 +190,61 @@ async fn notices_are_user_turns(ctx: &Ctx) -> Result<()> {
 
     let blocks = crate::tool_blocks::read(&ctx.data_dir, &conversation);
     if let Some(why) = crate::tool_blocks::unchanged(&blocks, 5) {
+        bail!("{why}");
+    }
+    Ok(())
+}
+
+/// A need no tool provides: past the profile's two misses the search is
+/// answered as final, and the host logs the gap.
+async fn a_missing_tool_stops_the_search(ctx: &Ctx) -> Result<()> {
+    let conversation = ctx.create_conversation().await?;
+    ctx.send(&conversation, MISSING).await?;
+    let run = Transcript::from_store(&ctx.db_path, &conversation)?;
+
+    let answers: Vec<String> = run
+        .calls_to("tools_list")
+        .iter()
+        .map(|c| {
+            c.output
+                .as_ref()
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect();
+    ensure!(answers.len() == 3, "expected three searches: {answers:?}");
+    ensure!(
+        answers[..2]
+            .iter()
+            .all(|a| a.starts_with("No tool matched")),
+        "the first two searches were not plain misses: {answers:?}"
+    );
+    ensure!(
+        answers[2].starts_with(&format!("No tool provides \"{MISSING_NEED}\"."))
+            && answers[2].contains("Tell the user plainly"),
+        "the third search was not final: {:?}",
+        answers[2]
+    );
+    ensure!(
+        run.final_text.contains(MISSING_DONE),
+        "the run did not end on its task_complete: {:?}",
+        run.final_text
+    );
+
+    let log = std::fs::read_to_string(ctx.data_dir.join("daemon.log")).unwrap_or_default();
+    let gap = log.lines().any(|line| {
+        line.contains("no tool provides this need")
+            && line.contains(&conversation)
+            && line.contains("capability_gap")
+    });
+    ensure!(
+        gap,
+        "no capability_gap/tool line for {conversation} in daemon.log"
+    );
+
+    let blocks = crate::tool_blocks::read(&ctx.data_dir, &conversation);
+    if let Some(why) = crate::tool_blocks::unchanged(&blocks, 4) {
         bail!("{why}");
     }
     Ok(())

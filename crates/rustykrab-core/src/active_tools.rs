@@ -35,6 +35,17 @@
 //! text gets `Append`, any other `Rerender`. [`ActiveToolsRegistry::make_callable`]
 //! is the one entry point the meta-tools use, so the choice is made in one
 //! place and never by a tool looking at a model name.
+//!
+//! # Searches that found nothing
+//!
+//! A run also keeps the `tools_list` searches that found nothing
+//! ([`SearchMiss`]), so the host can stop a model searching for a tool the
+//! catalog does not have: after [`ActiveToolsRegistry::search_miss_limit`]
+//! misses of one need, the next is answered as final and recorded as a tool
+//! gap ([`ActiveToolsRegistry::tool_gaps`]), which a worker run turns into a
+//! typed `capability_gap/tool` for the controller's ladder (control plan
+//! section 8, order 2). What counts as the same need is `tools_list`'s rule;
+//! the registry only keeps the record, per run.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
@@ -71,6 +82,21 @@ impl LateToolBinding {
     }
 }
 
+/// Misses of one need a run allows before `tools_list` answers the next
+/// search for it as final (the harness profile's `tool_search_miss_limit`).
+pub const DEFAULT_SEARCH_MISS_LIMIT: usize = 2;
+
+/// A `tools_list` search that found nothing.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SearchMiss {
+    /// The need, as `tools_list` normalises it (stemmed terms, sorted).
+    pub terms: Vec<String>,
+    /// The query as the model wrote it.
+    pub query: String,
+    /// The tools the answer named as non-matches.
+    pub near: Vec<String>,
+}
+
 /// What [`ActiveToolsRegistry::make_callable`] did with each name.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Callable {
@@ -96,6 +122,13 @@ struct ActiveEntry {
     /// Bumped only when `names` changes: the version tracks the tools
     /// array, which is what caches (and the prompt prefix) depend on.
     version: u64,
+    /// This run's searches that found nothing, oldest first.
+    misses: Vec<SearchMiss>,
+    /// Misses of one need before the next is final; `None` takes
+    /// [`DEFAULT_SEARCH_MISS_LIMIT`].
+    miss_limit: Option<usize>,
+    /// Needs this run's searching gave up on, as first worded.
+    gaps: Vec<String>,
 }
 
 impl ActiveEntry {
@@ -265,6 +298,71 @@ impl ActiveToolsRegistry {
             .entry(conversation_id)
             .or_insert_with(|| ActiveEntry::seeded(&self.seed))
             .binding = binding;
+    }
+
+    /// Start a run's record of tool searches afresh: no misses, no gaps,
+    /// and `limit` misses of one need before the next search for it is
+    /// answered as final. The runner calls this at the start of every run.
+    pub fn begin_tool_search(&self, conversation_id: Uuid, limit: usize) {
+        let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        let entry = guard
+            .entry(conversation_id)
+            .or_insert_with(|| ActiveEntry::seeded(&self.seed));
+        entry.misses.clear();
+        entry.gaps.clear();
+        entry.miss_limit = Some(limit);
+    }
+
+    /// Misses of one need this conversation's run allows before the next
+    /// search for it is answered as final.
+    pub fn search_miss_limit(&self, conversation_id: Uuid) -> usize {
+        let guard = self.inner.read().unwrap_or_else(|e| e.into_inner());
+        guard
+            .get(&conversation_id)
+            .and_then(|entry| entry.miss_limit)
+            .unwrap_or(DEFAULT_SEARCH_MISS_LIMIT)
+    }
+
+    /// Record a search that found nothing.
+    pub fn record_search_miss(&self, conversation_id: Uuid, miss: SearchMiss) {
+        let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        guard
+            .entry(conversation_id)
+            .or_insert_with(|| ActiveEntry::seeded(&self.seed))
+            .misses
+            .push(miss);
+    }
+
+    /// This run's searches that found nothing, oldest first.
+    pub fn search_misses(&self, conversation_id: Uuid) -> Vec<SearchMiss> {
+        let guard = self.inner.read().unwrap_or_else(|e| e.into_inner());
+        guard
+            .get(&conversation_id)
+            .map(|entry| entry.misses.clone())
+            .unwrap_or_default()
+    }
+
+    /// Record that searching gave up on `need`: no tool provides it. Once
+    /// per need.
+    pub fn record_tool_gap(&self, conversation_id: Uuid, need: impl Into<String>) {
+        let need = need.into();
+        let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        let gaps = &mut guard
+            .entry(conversation_id)
+            .or_insert_with(|| ActiveEntry::seeded(&self.seed))
+            .gaps;
+        if !gaps.contains(&need) {
+            gaps.push(need);
+        }
+    }
+
+    /// The needs this run's searching gave up on, oldest first.
+    pub fn tool_gaps(&self, conversation_id: Uuid) -> Vec<String> {
+        let guard = self.inner.read().unwrap_or_else(|e| e.into_inner());
+        guard
+            .get(&conversation_id)
+            .map(|entry| entry.gaps.clone())
+            .unwrap_or_default()
     }
 
     /// How mid-run tool requests are delivered in a conversation;
@@ -557,5 +655,30 @@ mod tests {
         assert!(reg.is_active(conv, "exec"));
         assert!(!reg.is_appended(conv, "exec"));
         assert!(reg.appended_for(conv).is_empty());
+    }
+
+    #[test]
+    fn a_run_keeps_its_search_misses_and_gaps_and_the_next_run_starts_clean() {
+        let reg = ActiveToolsRegistry::new();
+        let conv = Uuid::new_v4();
+        assert_eq!(reg.search_miss_limit(conv), DEFAULT_SEARCH_MISS_LIMIT);
+        reg.begin_tool_search(conv, 3);
+        assert_eq!(reg.search_miss_limit(conv), 3);
+        let miss = SearchMiss {
+            terms: vec!["current".into(), "weather".into()],
+            query: "current weather".into(),
+            near: vec!["get_forecast".into()],
+        };
+        reg.record_search_miss(conv, miss.clone());
+        reg.record_tool_gap(conv, "current weather");
+        reg.record_tool_gap(conv, "current weather");
+        assert_eq!(reg.search_misses(conv), [miss]);
+        assert_eq!(reg.tool_gaps(conv), ["current weather"]);
+        assert!(reg.search_misses(Uuid::new_v4()).is_empty());
+
+        reg.begin_tool_search(conv, 2);
+        assert!(reg.search_misses(conv).is_empty());
+        assert!(reg.tool_gaps(conv).is_empty());
+        assert_eq!(reg.search_miss_limit(conv), 2);
     }
 }

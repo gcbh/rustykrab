@@ -48,6 +48,13 @@ pub struct HarnessProfile {
     /// model difference expressed as data, never as a code path (plan
     /// section 12.1).
     pub late_tool_binding: Option<LateToolBinding>,
+    /// How many `tools_list` searches for one need may find nothing in a
+    /// run before the host answers the next as final (no tool provides it;
+    /// tell the user, or in a worker run report `needs_tool`) and records a
+    /// `capability_gap/tool`. Told nothing matched, both default local
+    /// models kept searching until the iteration cap (scenario 10,
+    /// 2026-09-28).
+    pub tool_search_miss_limit: usize,
 }
 
 impl Default for HarnessProfile {
@@ -63,6 +70,7 @@ impl Default for HarnessProfile {
             compaction_threshold_pct: 0.85,
             compaction_strategy: CompactionStrategy::default(),
             late_tool_binding: None,
+            tool_search_miss_limit: rustykrab_core::DEFAULT_SEARCH_MISS_LIMIT,
         }
     }
 }
@@ -108,6 +116,7 @@ impl HarnessProfile {
             compaction_threshold_pct: self.compaction_threshold_pct,
             compaction_strategy: self.compaction_strategy,
             late_tool_binding: self.late_tool_binding,
+            tool_search_miss_limit: self.tool_search_miss_limit,
             ..AgentConfig::default()
         }
     }
@@ -148,5 +157,15 @@ mod tests {
             Some(LateToolBinding::Rerender)
         );
         assert!(serde_json::from_str::<HarnessProfile>(r#"{"late_tool_binding":"x"}"#).is_err());
+    }
+
+    #[test]
+    fn the_search_miss_limit_is_profile_data_defaulting_to_two() {
+        let old: HarnessProfile = serde_json::from_str("{}").unwrap();
+        assert_eq!(old.tool_search_miss_limit, 2);
+        assert_eq!(old.to_agent_config().tool_search_miss_limit, 2);
+        let profile: HarnessProfile =
+            serde_json::from_str(r#"{"tool_search_miss_limit":4}"#).unwrap();
+        assert_eq!(profile.to_agent_config().tool_search_miss_limit, 4);
     }
 }

@@ -1,12 +1,15 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use async_trait::async_trait;
-use rustykrab_core::active_tools::{with_session_context, LateToolBinding, SessionToolContext};
+use rustykrab_core::active_tools::{
+    with_session_context, LateToolBinding, SearchMiss, SessionToolContext,
+};
 use rustykrab_core::types::ToolSchema;
 use rustykrab_core::{Error, Result, Tool};
 use serde_json::{json, Value};
 
 use crate::tool_catalog::{self, Category, MAX_APPENDED_PER_SEARCH};
+use crate::work_backend::with_work_run;
 
 /// The two meta-tools never appear in their own catalog.
 const META: &[&str] = &["tools_list", "tools_load"];
@@ -26,6 +29,16 @@ const META: &[&str] = &["tools_list", "tools_load"];
 /// A match is labelled found only when [`tool_catalog`]'s plausibility test
 /// passes; otherwise the result says nothing matched and names the nearest
 /// tools as non-matches, so a near-miss is not taken for the tool.
+///
+/// A need searched again and again is answered as final: once a run's
+/// searches for one need (see [`tool_catalog`]) have found nothing as many
+/// times as the harness profile's `tool_search_miss_limit` (2 by default),
+/// the next one that finds nothing says no tool provides it and that the
+/// model should tell the user so (a worker: report `needs_tool`), and the
+/// need is recorded as a tool gap in the run's registry, logged as
+/// `capability_gap/tool`, for a worker run's ladder to take (control plan
+/// section 8, order 2). Within a need, a tool already named a non-match is
+/// not found by a later, broader search.
 pub struct ToolsListTool;
 
 impl ToolsListTool {
@@ -56,22 +69,69 @@ fn candidates(ctx: &SessionToolContext) -> Vec<ToolSchema> {
 /// the definitions or the non-matches as JSON after it.
 fn search(ctx: &SessionToolContext, query: &str) -> String {
     let catalog = candidates(ctx);
-    let result = tool_catalog::search(query, &catalog);
+    let mut result = tool_catalog::search(query, &catalog);
     let quoted = query.trim();
 
+    // Earlier misses of this need, and the tools they named non-matches,
+    // which a broader search for it may not now call found.
+    let need = tool_catalog::need_terms(query, &result);
+    let earlier: Vec<SearchMiss> = ctx
+        .active_tools
+        .search_misses(ctx.conversation_id)
+        .into_iter()
+        .filter(|miss| tool_catalog::same_need(&miss.terms, &need))
+        .collect();
+    let ruled_out: HashSet<&str> = earlier
+        .iter()
+        .flat_map(|miss| miss.near.iter().map(String::as_str))
+        .collect();
+    let (found, excluded): (Vec<_>, Vec<_>) = std::mem::take(&mut result.found)
+        .into_iter()
+        .partition(|f| !ruled_out.contains(f.name.as_str()));
+    result.found = found;
+
     if result.found.is_empty() {
-        if result.near.is_empty() {
+        let near: Vec<Value> = if excluded.is_empty() {
+            result
+                .near
+                .iter()
+                .map(|n| json!({ "name": n.name, "not_a_match": n.why() }))
+                .collect()
+        } else {
+            let first = earlier.first().map_or(quoted, |m| m.query.as_str());
+            excluded
+                .iter()
+                .map(|f| {
+                    json!({
+                        "name": f.name,
+                        "not_a_match": format!(
+                            "already named a non-match for the same need ('{first}')"
+                        ),
+                    })
+                })
+                .collect()
+        };
+        ctx.active_tools.record_search_miss(
+            ctx.conversation_id,
+            SearchMiss {
+                terms: need,
+                query: quoted.to_string(),
+                near: near
+                    .iter()
+                    .filter_map(|n| n["name"].as_str().map(str::to_string))
+                    .collect(),
+            },
+        );
+        if earlier.len() >= ctx.active_tools.search_miss_limit(ctx.conversation_id) {
+            return no_tool_provides(ctx, &earlier, quoted);
+        }
+        if near.is_empty() {
             return format!(
                 "No tool matched \"{quoted}\": none of its words appear in the tool catalog. \
                  Search again with other words, or call tools_list without a query to see the \
                  catalog by category."
             );
         }
-        let near: Vec<Value> = result
-            .near
-            .iter()
-            .map(|n| json!({ "name": n.name, "not_a_match": n.why() }))
-            .collect();
         return format!(
             "No tool matched \"{quoted}\". The nearest tools are listed below as non-matches: \
              none of them does what you searched for, so do not use one in its place. Search \
@@ -130,6 +190,39 @@ fn search(ctx: &SessionToolContext, query: &str) -> String {
         LateToolBinding::Rerender => json!(made.newly),
     };
     format!("{head}\n{body}")
+}
+
+/// The final answer to a need searched past the run's limit: no tool
+/// provides it, stop, and say so (a worker: report it, typed). Records the
+/// need as the run's tool gap under its first wording.
+fn no_tool_provides(ctx: &SessionToolContext, earlier: &[SearchMiss], quoted: &str) -> String {
+    let need = earlier.first().map_or(quoted, |m| m.query.as_str());
+    let searches = earlier.len() + 1;
+    ctx.active_tools
+        .record_tool_gap(ctx.conversation_id, need.to_string());
+    tracing::warn!(
+        conversation_id = %ctx.conversation_id,
+        class = "capability_gap",
+        subclass = "tool",
+        need,
+        searches,
+        "no tool provides this need; searching stopped"
+    );
+    let head = format!(
+        "No tool provides \"{need}\". The tool catalog has been searched for it {searches} \
+         times in this run and nothing matched, so this is final: do not search for it again, \
+         and do not use a near-miss in its place."
+    );
+    if with_work_run(|_| ()).is_some() {
+        let needs = Value::Array(vec![Value::String(need.to_string())]);
+        format!(
+            "{head} End your work item now with result_report, setting blocked.reason to \
+             \"needs_tool\" and blocked.needs to {needs}, so the controller can acquire or \
+             build the tool."
+        )
+    } else {
+        format!("{head} Tell the user plainly that you have no tool that can do this.")
+    }
 }
 
 /// The catalog by category, MCP tools grouped by server. Loads nothing.
@@ -366,6 +459,91 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("none of its words appear"));
+    }
+
+    #[tokio::test]
+    async fn a_need_that_keeps_missing_is_answered_as_final_and_recorded_as_a_gap() {
+        let c = ctx(LateToolBinding::Append);
+        let text = |v: Value| v.as_str().unwrap().to_string();
+
+        let first = text(call(&c, json!({"query": "current forecast"})).await);
+        assert!(first.starts_with("No tool matched"), "{first}");
+        assert!(first.contains("get_forecast"), "{first}");
+        // Broader, the same need: the tool it named a non-match stays one,
+        // rather than being found on one word of two.
+        let second = text(call(&c, json!({"query": "forecast"})).await);
+        assert!(
+            second.starts_with("No tool matched \"forecast\""),
+            "{second}"
+        );
+        assert!(
+            second.contains("already named a non-match for the same need ('current forecast')"),
+            "{second}"
+        );
+        assert!(c.active_tools.appended_for(c.conversation_id).is_empty());
+        assert!(c.active_tools.tool_gaps(c.conversation_id).is_empty());
+
+        // The limit's worth of misses: the next is final.
+        let third = text(call(&c, json!({"query": "the current forecast, please"})).await);
+        assert!(
+            third.starts_with("No tool provides \"current forecast\"."),
+            "{third}"
+        );
+        assert!(third.contains("searched for it 3 times"), "{third}");
+        assert!(third.contains("Tell the user plainly"), "{third}");
+        assert!(
+            !third.contains("get_forecast"),
+            "no near-miss is offered: {third}"
+        );
+        assert_eq!(
+            c.active_tools.tool_gaps(c.conversation_id),
+            ["current forecast"]
+        );
+
+        // Another need is counted on its own, and a find is still a find.
+        let other = text(call(&c, json!({"query": "teleportation"})).await);
+        assert!(other.contains("none of its words appear"), "{other}");
+        let found = text(call(&c, json!({"query": "current weather"})).await);
+        assert!(found.starts_with("Found 1 tool"), "{found}");
+    }
+
+    #[tokio::test]
+    async fn the_limit_is_the_runs_and_a_worker_is_told_to_report_the_gap() {
+        let c = ctx(LateToolBinding::Append);
+        c.active_tools.begin_tool_search(c.conversation_id, 1);
+        let binding = crate::work_backend::WorkRunContext {
+            item: "item-7".into(),
+            actor: "worker:pinch".into(),
+        };
+        let run = async {
+            let first = call(&c, json!({"query": "teleportation"})).await;
+            let second = call(&c, json!({"query": "teleport"})).await;
+            (first, second)
+        };
+        let (first, second) = crate::work_backend::WORK_RUN_CONTEXT
+            .scope(binding, run)
+            .await;
+        assert!(first.as_str().unwrap().starts_with("No tool matched"));
+        let second = second.as_str().unwrap();
+        assert!(
+            second.starts_with("No tool provides \"teleportation\"."),
+            "{second}"
+        );
+        assert!(
+            second.contains("blocked.reason to \"needs_tool\"")
+                && second.contains("[\"teleportation\"]"),
+            "{second}"
+        );
+        assert_eq!(
+            c.active_tools.tool_gaps(c.conversation_id),
+            ["teleportation"]
+        );
+
+        // A new run starts clean.
+        c.active_tools.begin_tool_search(c.conversation_id, 2);
+        let again = call(&c, json!({"query": "teleportation"})).await;
+        assert!(again.as_str().unwrap().starts_with("No tool matched"));
+        assert!(c.active_tools.tool_gaps(c.conversation_id).is_empty());
     }
 
     #[tokio::test]
