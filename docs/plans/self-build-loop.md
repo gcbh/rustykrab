@@ -323,3 +323,42 @@ Two small gaps showed. The "waiting" log line repeats every 250 ms, and
 an interrupted run's token usage is lost.
 
 Gate: 1,877 unit tests; e2e 56 pass, 13 xfail, 0 fail.
+
+## Seventh and eighth cycles (2026-09-28)
+
+Thirteen items verified across the two batches, most on their first run.
+
+**The blocked-question fix worked in the field.** A worker parked with its
+full question: it had been given a code item with no repository and an
+empty scratch directory, and asked whether to create a worktree or wait.
+The item had been filed by an internal item from before the inheritance
+fix, so it inherited no repository. The builder had already filed the
+right fix: never lease a code item to a coding worker without a
+checkout. It merged in batch 8.
+
+**Follow-ups did not inherit their filer's rules.** They took its
+repository and worker but not its constraints, so an approved follow-up
+ran without "do not read outside your worktree". Since this is a
+guardrail, the coordinator made the fix: follow-ups now inherit their
+filer's constraints, as the ladder's internal items do.
+
+**Slice 6 went through two more reviews:**
+- The first fix (trust nothing in `staged.json`) merged with one blocking
+  hole closed at merge. The version check applied only to stages with a
+  tag, a field a worker writes, so a downgrade could pass.
+- Part 2 (check before stopping, a journal, a loud failure) merged behind
+  the gate. Its review found that the journal's location let a forged
+  journal force a rollback, that a crash between the renames and the
+  journal write went unchecked, and that a launchd stop could give up
+  mid-drain.
+
+Parts 2b and 3 are filed. The reviews also surfaced the limit under all
+of this: workers run as the same user as the daemon, so "a worker cannot
+write it" holds only as far as tool rules go. That is recorded in
+`update-flow.md` as a decision for the owner before the updater touches
+the live daemon.
+
+Gate: 1,908 unit tests, 79 environment variables documented; e2e 56
+pass, 13 xfail, 0 fail. The builder runs `9956a02`, redeployed through
+`update stage --from` with a run in flight, which was interrupted and
+requeued as designed.
