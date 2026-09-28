@@ -374,11 +374,16 @@ async fn the_projection_rule_by_kind_holds_end_to_end() {
     assert!(surface.about("Compare dentists").is_empty());
     assert!(surface.about("Acquire the dentist").is_empty());
     assert!(surface.about(&research).is_empty());
+    // The proposal waits on a personal item, so it is projected with its
+    // own text withheld: it may quote what it was filed from.
+    assert!(surface.about("Pre-load caldav").is_empty());
     let issue = surface
-        .about("Pre-load caldav")
+        .about(&proposal_id)
         .pop()
         .expect("the proposal is projected");
     assert!(issue.labels.contains(&"rustykrab-proposal".to_string()));
+    assert!(issue.labels.contains(&"rustykrab-redacted".to_string()));
+    assert!(!issue.title.contains("caldav"), "{}", issue.title);
     assert!(
         issue.body.contains(&review::local_ref(&dentist)),
         "{}",
@@ -396,7 +401,8 @@ async fn the_projection_rule_by_kind_holds_end_to_end() {
     assert_eq!(again.report.updated, vec![proposal_id.clone()]);
     assert_eq!(
         surface.issue(&issue.number).await.unwrap().unwrap().title,
-        "Pre-load caldav for calendar errands"
+        issue.title,
+        "the projected title comes back"
     );
 }
 

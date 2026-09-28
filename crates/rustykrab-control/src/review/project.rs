@@ -15,6 +15,9 @@ pub const LABEL_MANAGED: &str = "rustykrab";
 pub const LABEL_ACCEPTED: &str = "rustykrab-accepted";
 /// A human's decline of a proposal.
 pub const LABEL_DECLINED: &str = "rustykrab-declined";
+/// On an issue whose free text was withheld because the item was filed
+/// from local-only work.
+pub const LABEL_REDACTED: &str = "rustykrab-redacted";
 
 /// The fields a projection writes. Everything else on the issue belongs
 /// to the humans, and only the decision vocabulary is read back.
@@ -69,6 +72,52 @@ impl ProjectionContext {
             _ => local_ref(id),
         }
     }
+
+    /// Whether `id` stays off the review surface: a personal or research
+    /// item, a capability acquisition or request, or an item no longer in
+    /// the live rows, whose kind is unknown and so reads as local.
+    pub fn is_local_only(&self, id: &str) -> bool {
+        match self.items.get(id) {
+            Some(i) => !is_projectable(i, self.facets.get(id)),
+            None => true,
+        }
+    }
+}
+
+/// Whether an item's own free text may have been written from local-only
+/// work. Its title, objective, definition of done, constraints and
+/// evidence can quote what it was filed from: an `internal` item embeds
+/// the raw error of the run that failed, and a proposal cites the records
+/// behind it. So when anything the item names (its parent, an edge, an
+/// input, an item pointer in its evidence or artifacts) is local-only,
+/// that text is withheld and only typed facts and opaque references are
+/// projected. An `internal` item that names no item at all has unknown
+/// provenance and is withheld too, the conservative reading.
+fn derived_from_local(view: &ItemView<'_>, ctx: &ProjectionContext) -> bool {
+    let item = view.item;
+    let named: Vec<&str> = item
+        .parent
+        .iter()
+        .map(String::as_str)
+        .chain(view.edges.iter().map(|e| e.depends_on.as_str()))
+        .chain(item.inputs_from.iter().map(String::as_str))
+        .chain(
+            view.evidence
+                .iter()
+                .filter(|e| e.kind == "item")
+                .map(|e| e.reference.as_str()),
+        )
+        .chain(
+            item.artifact_refs
+                .iter()
+                .filter(|r| r.kind == "item")
+                .map(|r| r.value.as_str()),
+        )
+        .collect();
+    if named.is_empty() {
+        return item.kind == WorkKind::Internal;
+    }
+    named.iter().any(|id| ctx.is_local_only(id))
 }
 
 fn short(id: &str) -> String {
@@ -130,7 +179,11 @@ pub fn project(view: &ItemView<'_>, ctx: &ProjectionContext) -> Option<Projectio
     if !is_projectable(item, facets) {
         return None;
     }
+    let redacted = derived_from_local(view, ctx);
     let mut labels = vec![LABEL_MANAGED.to_string(), kind_label(item)];
+    if redacted {
+        labels.push(LABEL_REDACTED.to_string());
+    }
     let mut lines: Vec<String> = vec![format!("<!-- rustykrab-item: {} -->", item.id)];
 
     let status = view.rollup.unwrap_or(item.status);
@@ -148,9 +201,13 @@ pub fn project(view: &ItemView<'_>, ctx: &ProjectionContext) -> Option<Projectio
     lines.push(head);
     if item.kind == WorkKind::Proposal {
         let tier = facets.and_then(|f| f.review_tier).unwrap_or_default();
-        let subject = facets
-            .and_then(|f| f.subject.clone())
-            .unwrap_or_else(|| "unspecified".to_string());
+        let subject = if redacted {
+            "withheld".to_string()
+        } else {
+            facets
+                .and_then(|f| f.subject.clone())
+                .unwrap_or_else(|| "unspecified".to_string())
+        };
         lines.push(format!(
             "**Subject:** {subject} · **Review tier:** {}",
             tier.as_str()
@@ -161,14 +218,26 @@ pub fn project(view: &ItemView<'_>, ctx: &ProjectionContext) -> Option<Projectio
         lines.push(format!("**Capability:** {}", mode.as_str()));
     }
 
-    lines.push(String::new());
-    lines.push("### Objective".to_string());
-    lines.push(item.objective.trim().to_string());
-    lines.push(String::new());
-    lines.push("### Done when".to_string());
-    lines.push(item.done_when.trim().to_string());
+    if redacted {
+        lines.push(String::new());
+        lines.push("### Details kept local".to_string());
+        lines.push(format!(
+            "This item was filed from work that stays on the machine (personal or research \
+             items, or items no longer on record), so its title, objective, definition of \
+             done, constraints and evidence are not projected. Read them with \
+             `rustykrab work show {}`.",
+            short(&item.id)
+        ));
+    } else {
+        lines.push(String::new());
+        lines.push("### Objective".to_string());
+        lines.push(item.objective.trim().to_string());
+        lines.push(String::new());
+        lines.push("### Done when".to_string());
+        lines.push(item.done_when.trim().to_string());
+    }
 
-    if !item.constraints.is_empty() {
+    if !redacted && !item.constraints.is_empty() {
         lines.push(String::new());
         lines.push("### Constraints".to_string());
         lines.extend(item.constraints.iter().map(|c| format!("- {}", c.trim())));
@@ -185,7 +254,7 @@ pub fn project(view: &ItemView<'_>, ctx: &ProjectionContext) -> Option<Projectio
             .map(|r| pointer(&r.kind, &r.value, ctx)),
     );
     evidence.dedup();
-    if !evidence.is_empty() {
+    if !redacted && !evidence.is_empty() {
         lines.push(String::new());
         lines.push("### Evidence".to_string());
         lines.extend(evidence.into_iter().map(|e| format!("- {e}")));
@@ -225,8 +294,17 @@ pub fn project(view: &ItemView<'_>, ctx: &ProjectionContext) -> Option<Projectio
             .to_string(),
     );
 
+    let title = if redacted {
+        format!(
+            "{} item {} (details kept local)",
+            item.kind.as_str(),
+            short(&item.id)
+        )
+    } else {
+        item.title.trim().to_string()
+    };
     Some(Projection {
-        title: item.title.trim().to_string(),
+        title,
         body: lines.join("\n"),
         labels,
         open: !item.status.is_closed(),
@@ -386,12 +464,74 @@ mod tests {
             out.body
         );
         assert!(out.body.contains("inputs from local:#d1234567"));
-        assert!(out.body.contains("item: local:#d1234567"));
         assert!(out.body.contains("discovered from #12"));
         assert!(!out.body.contains("#13"));
-        assert_eq!(out.title, "Pre-load caldav");
+        // The proposal names a personal item, so its own text is withheld
+        // too: it may quote what it was filed from.
+        assert!(!out.body.contains("objective of Pre-load"), "{}", out.body);
+        assert!(!out.title.contains("caldav"), "{}", out.title);
+        assert!(out.body.contains("Details kept local"));
+        assert!(out.labels.contains(&LABEL_REDACTED.to_string()));
         assert!(out.labels.contains(&"rustykrab-proposal".to_string()));
         assert!(out.labels.contains(&LABEL_MANAGED.to_string()));
+    }
+
+    #[test]
+    fn an_internal_item_from_a_personal_failure_withholds_the_raw_error() {
+        let mail = item("m1111111-aaaa", WorkKind::Personal, "Reply to the landlord");
+        let mut internal = item("i2222222-bbbb", WorkKind::Internal, "Classify: IMAP 550");
+        internal.objective =
+            "Add the probe that would have classified this: 550 mailbox jane@example.com full"
+                .into();
+        internal.artifact_refs = vec![ArtifactRef {
+            kind: "item".into(),
+            value: mail.id.clone(),
+        }];
+        let mut ctx = ProjectionContext::default();
+        for i in [&mail, &internal] {
+            ctx.items.insert(i.id.clone(), i.clone());
+        }
+        let out = project(&view(&internal), &ctx).unwrap();
+        for leak in ["jane@example.com", "550", "landlord", "IMAP"] {
+            assert!(!out.body.contains(leak), "{leak} in {}", out.body);
+            assert!(!out.title.contains(leak), "{leak} in {}", out.title);
+        }
+        assert!(out.labels.contains(&LABEL_REDACTED.to_string()));
+    }
+
+    #[test]
+    fn provenance_decides_what_is_withheld() {
+        let fix = item("f1111111-aaaa", WorkKind::Code, "Fix the parser");
+        let mut follow = item("c2222222-bbbb", WorkKind::Code, "Harden the parser");
+        follow.artifact_refs = vec![ArtifactRef {
+            kind: "item".into(),
+            value: fix.id.clone(),
+        }];
+        let mut ctx = ProjectionContext::default();
+        for i in [&fix, &follow] {
+            ctx.items.insert(i.id.clone(), i.clone());
+        }
+        let out = project(&view(&follow), &ctx).unwrap();
+        assert_eq!(
+            out.title, "Harden the parser",
+            "engineering-only provenance"
+        );
+        assert!(out.body.contains("objective of Harden the parser"));
+        assert!(!out.labels.contains(&LABEL_REDACTED.to_string()));
+
+        // An item pointer to something no longer on record reads as local.
+        let mut orphan = item("c3333333-cccc", WorkKind::Code, "Orphaned follow-up");
+        orphan.artifact_refs = vec![ArtifactRef {
+            kind: "item".into(),
+            value: "gone0000-dddd".into(),
+        }];
+        let out = project(&view(&orphan), &ctx).unwrap();
+        assert!(out.labels.contains(&LABEL_REDACTED.to_string()));
+
+        // An internal item with no provenance at all is withheld.
+        let bare = item("i4444444-eeee", WorkKind::Internal, "Unknown failure text");
+        let out = project(&view(&bare), &ctx).unwrap();
+        assert!(!out.title.contains("Unknown failure text"));
     }
 
     #[test]
