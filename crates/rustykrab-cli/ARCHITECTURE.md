@@ -159,7 +159,7 @@ the controller's approval policy to hold every graph of a worker's
 `discovered` drafts for a person (`ApprovalPolicy::hold_discovered`), and
 the `internal` items the ladder files for a failure with them: the
 follow-ups are filed, held as `blocked(needs_consent)` and released through
-`POST /api/work/{id}/approve`. The ladder's `capability` items are not held. It is for a daemon that builds its own
+`POST /api/work/{id}/approve`. The ladder's own filings, `internal` items and `capability` builds alike, are held the same way. It is for a daemon that builds its own
 repository, whose follow-ups would otherwise run at once on a base that
 lacks their siblings' unmerged branches.
 

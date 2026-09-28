@@ -70,8 +70,8 @@ fn describe_trigger(t: &ApprovalTrigger) -> String {
                 "{items} follow-up items a worker discovered, which the policy holds for a person"
             )
         }
-        ApprovalTrigger::LadderInternal { items } => {
-            format!("{items} internal items the ladder filed, which the policy holds for a person")
+        ApprovalTrigger::Ladder { items } => {
+            format!("{items} items the ladder filed, which the policy holds for a person")
         }
     }
 }

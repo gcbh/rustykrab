@@ -574,23 +574,32 @@ fn hold_discovered_holds_a_workers_follow_ups_whole_and_nothing_else() {
     assert!(accepted.held.is_empty());
     assert!(accepted.triggers.is_empty());
 
-    // The ladder's `internal` items are held the same way; its other
-    // filings are not.
-    let mut internal = draft("i");
-    internal.kind = Some(WorkKind::Internal);
+    // Every ladder filing is held the same way: an `internal` item, and a
+    // `capability` build, which would otherwise write a skill at once.
     let mut c = ctx(FilingSource::Ladder);
     c.approval = policy;
-    let mut s = two_parents();
-    let accepted = accept(&mut s, &plan(id("P"), vec![internal], vec![]), &c);
-    let [i] = ids(&accepted, &["i"]).try_into().unwrap();
-    assert_eq!(
-        accepted.triggers,
-        vec![ApprovalTrigger::LadderInternal { items: 1 }]
-    );
-    assert_eq!(st(&s, &i), Status::Blocked(BlockedReason::NeedsConsent));
-    let accepted = accept(&mut two_parents(), &p, &c);
+    for kind in [WorkKind::Internal, WorkKind::Capability] {
+        let mut d = draft("i");
+        d.kind = Some(kind);
+        if kind == WorkKind::Capability {
+            d.title = "Build tool: weather_lookup".to_string();
+        }
+        let mut s = two_parents();
+        let accepted = accept(&mut s, &plan(id("P"), vec![d], vec![]), &c);
+        let [i] = ids(&accepted, &["i"]).try_into().unwrap();
+        assert_eq!(
+            accepted.triggers,
+            vec![ApprovalTrigger::Ladder { items: 1 }]
+        );
+        assert_eq!(st(&s, &i), Status::Blocked(BlockedReason::NeedsConsent));
+    }
+
+    // Without the switch the ladder's filings are system work, unheld.
+    c.approval = ApprovalPolicy::default();
+    let mut d = draft("i");
+    d.kind = Some(WorkKind::Internal);
+    let accepted = accept(&mut two_parents(), &plan(id("P"), vec![d], vec![]), &c);
     assert!(accepted.held.is_empty());
-    assert!(accepted.triggers.is_empty());
 }
 
 /// `top` with two child parents: `S`, an authorised slice, and `P`.

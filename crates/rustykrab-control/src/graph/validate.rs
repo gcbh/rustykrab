@@ -87,9 +87,12 @@ pub struct ApprovalPolicy {
     /// Hold every graph of a worker's `discovered` drafts whole, so
     /// follow-up work a worker files waits for a person instead of running
     /// at once (a self-building daemon, whose follow-ups would otherwise
-    /// run on a base that lacks their siblings' unmerged work). A ladder
-    /// filing of only `internal` items is held whole the same way; its
-    /// `capability` items are not.
+    /// run on a base that lacks their siblings' unmerged work). Every
+    /// ladder filing is held whole the same way, its `capability` builds
+    /// above all: a build of a "tool" writes a skill every later run reads,
+    /// and on 2026-09-28 a self-building daemon answered a worker's missing
+    /// filesystem access by writing a skill that sent later workers to read
+    /// outside their worktrees.
     pub hold_discovered: bool,
 }
 
@@ -101,7 +104,7 @@ pub enum ApprovalTrigger {
     UndelegatedResource { item: WorkItemId, resource: String },
     CodeOutsideSlice { item: WorkItemId },
     Discovered { items: u32 },
-    LadderInternal { items: u32 },
+    Ladder { items: u32 },
 }
 
 /// Everything [`validate`] needs besides the snapshot and the filing.
@@ -1628,12 +1631,8 @@ fn approve(
         triggers.push(ApprovalTrigger::Discovered { items: count });
         whole = true;
     }
-    let all_internal = !ids.is_empty()
-        && ids
-            .iter()
-            .all(|id| work.item(id).is_some_and(|i| i.kind == WorkKind::Internal));
-    if policy.hold_discovered && ctx.source == FilingSource::Ladder && all_internal {
-        triggers.push(ApprovalTrigger::LadderInternal { items: count });
+    if policy.hold_discovered && ctx.source == FilingSource::Ladder && !ids.is_empty() {
+        triggers.push(ApprovalTrigger::Ladder { items: count });
         whole = true;
     }
     let leaves: Vec<&WorkItem> = ids
