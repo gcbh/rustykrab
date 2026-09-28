@@ -49,6 +49,11 @@ pub struct AppState {
     /// `None` until the composition root wires one; those routes then
     /// answer 503.
     pub workers: Option<Arc<rustykrab_control::registry::WorkerRegistry>>,
+    /// The control plan's evaluation pass (Phase 6), for
+    /// `POST /api/work/evaluate`. `None` until the composition root wires
+    /// one: that route then answers 503, and `GET /api/work/metrics` still
+    /// reads the store.
+    pub evaluation: Option<Arc<dyn crate::evaluate_routes::EvaluationHandle>>,
 
     // --- Outbound channels, delivered to by the webhook routes ---
     pub telegram: Option<Arc<TelegramChannel>>,
@@ -74,6 +79,7 @@ impl AppState {
             task_signal: crate::tasks::TaskQueueSignal::new(),
             control: None,
             workers: None,
+            evaluation: None,
             telegram: None,
             signal: None,
             slack: None,
@@ -200,6 +206,15 @@ impl AppState {
         workers: Arc<rustykrab_control::registry::WorkerRegistry>,
     ) -> Self {
         self.workers = Some(workers);
+        self
+    }
+
+    /// Wire the evaluation pass `POST /api/work/evaluate` runs on demand.
+    pub fn with_evaluation(
+        mut self,
+        evaluation: Arc<dyn crate::evaluate_routes::EvaluationHandle>,
+    ) -> Self {
+        self.evaluation = Some(evaluation);
         self
     }
 

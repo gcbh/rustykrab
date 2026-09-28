@@ -14,10 +14,32 @@
 //! The runner wraps its loop in [`SESSION_TOOL_CONTEXT::scope`]; meta-tools
 //! read the context via [`with_session_context`] to know which conversation
 //! they belong to.
+//!
+//! # Declared and appended tools
+//!
+//! A conversation's callable tools come in two kinds (plan
+//! `docs/plans/control-layer-and-worker-fleet.md`, section 12):
+//!
+//! - **declared** (the *active set*): rendered into the tools array of every
+//!   request. Chat templates put that array at the front of the prompt, so a
+//!   change to it invalidates the whole cached prefix and costs a full
+//!   re-prefill (35 s on qwen3.8 at 7K tokens).
+//! - **appended**: callable, but delivered to the model as text in a tool
+//!   result instead, so the tools array, and with it the cached prefix,
+//!   stays as it was. Compaction folds them into the declared set, since it
+//!   rewrites the prompt anyway.
+//!
+//! Which of the two a mid-run request for a tool produces is the
+//! conversation's [`LateToolBinding`], set by the runner from its provider's
+//! capability data: a provider whose model can call a tool it saw only as
+//! text gets `Append`, any other `Rerender`. [`ActiveToolsRegistry::make_callable`]
+//! is the one entry point the meta-tools use, so the choice is made in one
+//! place and never by a tool looking at a model name.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::capability::CapabilitySet;
@@ -25,12 +47,54 @@ use crate::recall::RecallStore;
 use crate::todo::TodoStore;
 use crate::tool::Tool;
 
+/// How a tool the model asks for mid-run reaches it. See the module docs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LateToolBinding {
+    /// Add the tool to the declared tools array: the next request re-renders
+    /// the front of the prompt. For providers that refuse a call to a tool
+    /// the request did not declare.
+    #[default]
+    Rerender,
+    /// Deliver the tool's schema as text in a tool result and record it as
+    /// callable, leaving the declared array untouched. For providers whose
+    /// model calls a tool it has only seen as text.
+    Append,
+}
+
+impl LateToolBinding {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LateToolBinding::Rerender => "rerender",
+            LateToolBinding::Append => "append",
+        }
+    }
+}
+
+/// What [`ActiveToolsRegistry::make_callable`] did with each name.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Callable {
+    /// Names that became callable by this call, in the order asked.
+    pub newly: Vec<String>,
+    /// Names that were callable already (declared or appended).
+    pub already: Vec<String>,
+    /// How the newly callable names were delivered.
+    pub binding: LateToolBinding,
+}
+
 /// Per-conversation active set plus a change counter, so consumers can
 /// cache work derived from the set (e.g. the runner's schema list) and
 /// invalidate only when the set actually changes.
 #[derive(Debug, Default)]
 struct ActiveEntry {
+    /// The declared set: rendered into every request's tools array.
     names: HashSet<String>,
+    /// Callable tools delivered as text. Disjoint from `names`.
+    appended: HashSet<String>,
+    /// How a mid-run request for a tool is delivered.
+    binding: LateToolBinding,
+    /// Bumped only when `names` changes: the version tracks the tools
+    /// array, which is what caches (and the prompt prefix) depend on.
     version: u64,
 }
 
@@ -40,7 +104,7 @@ impl ActiveEntry {
     fn seeded(seed: &HashSet<String>) -> Self {
         Self {
             names: seed.clone(),
-            version: 0,
+            ..Self::default()
         }
     }
 }
@@ -48,8 +112,12 @@ impl ActiveEntry {
 /// Tracks which tools are "active" for each conversation.
 ///
 /// Conversations start with the seed set (empty unless one was given). The
-/// meta-tool `tools_load` adds to it; the runner filters the schemas sent
-/// to the model down to (meta tools) ∪ (active set).
+/// host activates a run's visible set before its first model call; after
+/// that, `tools_list` and `tools_load` go through
+/// [`make_callable`](Self::make_callable), which appends or activates by the
+/// conversation's [`LateToolBinding`]. The runner sends the schemas of
+/// (meta tools) ∪ (active set); appended tools are callable without being
+/// sent.
 #[derive(Debug, Default)]
 pub struct ActiveToolsRegistry {
     inner: RwLock<HashMap<Uuid, ActiveEntry>>,
@@ -94,10 +162,152 @@ impl ActiveToolsRegistry {
             .or_insert_with(|| ActiveEntry::seeded(&self.seed));
         let mut changed = false;
         for name in names {
-            changed |= entry.names.insert(name.into());
+            let name = name.into();
+            entry.appended.remove(&name);
+            changed |= entry.names.insert(name);
         }
         if changed {
             entry.version += 1;
+        }
+    }
+
+    /// Record tools as callable for a conversation without declaring them:
+    /// the caller delivers their schemas as text. Leaves the
+    /// [`version`](Self::version), and so the tools array, unchanged.
+    /// Returns the names that were not callable before, in the order given.
+    pub fn append<I, S>(&self, conversation_id: Uuid, names: I) -> Vec<String>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        let entry = guard
+            .entry(conversation_id)
+            .or_insert_with(|| ActiveEntry::seeded(&self.seed));
+        let mut newly = Vec::new();
+        for name in names {
+            let name = name.into();
+            if !entry.names.contains(&name) && entry.appended.insert(name.clone()) {
+                newly.push(name);
+            }
+        }
+        newly
+    }
+
+    /// Make tools callable the way this conversation's [`LateToolBinding`]
+    /// says: appended under `Append`, activated under `Rerender`. Names
+    /// already callable are reported and left alone, so asking again is
+    /// free under either binding.
+    pub fn make_callable<I, S>(&self, conversation_id: Uuid, names: I) -> Callable
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        let entry = guard
+            .entry(conversation_id)
+            .or_insert_with(|| ActiveEntry::seeded(&self.seed));
+        let mut out = Callable {
+            binding: entry.binding,
+            ..Callable::default()
+        };
+        for name in names {
+            let name = name.into();
+            if entry.names.contains(&name) || entry.appended.contains(&name) {
+                if !out.already.contains(&name) {
+                    out.already.push(name);
+                }
+                continue;
+            }
+            match entry.binding {
+                LateToolBinding::Append => {
+                    entry.appended.insert(name.clone());
+                }
+                LateToolBinding::Rerender => {
+                    entry.names.insert(name.clone());
+                }
+            }
+            out.newly.push(name);
+        }
+        if entry.binding == LateToolBinding::Rerender && !out.newly.is_empty() {
+            entry.version += 1;
+        }
+        out
+    }
+
+    /// Move every appended tool into the declared set. For compaction,
+    /// which rewrites the prompt and re-prefills anyway, so the appended
+    /// schemas it displaces from the history live on in the tools array.
+    /// Returns the folded names, sorted; bumps the version when any.
+    pub fn fold_appended(&self, conversation_id: Uuid) -> Vec<String> {
+        let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        let Some(entry) = guard.get_mut(&conversation_id) else {
+            return Vec::new();
+        };
+        let mut folded: Vec<String> = entry.appended.drain().collect();
+        folded.sort();
+        let mut changed = false;
+        for name in &folded {
+            changed |= entry.names.insert(name.clone());
+        }
+        if changed {
+            entry.version += 1;
+        }
+        folded
+    }
+
+    /// Set how mid-run tool requests are delivered in a conversation. The
+    /// runner calls this at the start of every run, from its provider's
+    /// capability data or the harness profile's override.
+    pub fn set_late_binding(&self, conversation_id: Uuid, binding: LateToolBinding) {
+        let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        guard
+            .entry(conversation_id)
+            .or_insert_with(|| ActiveEntry::seeded(&self.seed))
+            .binding = binding;
+    }
+
+    /// How mid-run tool requests are delivered in a conversation;
+    /// `Rerender` until a runner says otherwise.
+    pub fn late_binding(&self, conversation_id: Uuid) -> LateToolBinding {
+        let guard = self.inner.read().unwrap_or_else(|e| e.into_inner());
+        guard
+            .get(&conversation_id)
+            .map(|entry| entry.binding)
+            .unwrap_or_default()
+    }
+
+    /// The tools appended to a conversation (callable, not declared), sorted.
+    pub fn appended_for(&self, conversation_id: Uuid) -> Vec<String> {
+        let guard = self.inner.read().unwrap_or_else(|e| e.into_inner());
+        let mut names: Vec<String> = guard
+            .get(&conversation_id)
+            .map(|entry| entry.appended.iter().cloned().collect())
+            .unwrap_or_default();
+        names.sort();
+        names
+    }
+
+    /// Whether a tool was appended to a conversation.
+    pub fn is_appended(&self, conversation_id: Uuid, name: &str) -> bool {
+        let guard = self.inner.read().unwrap_or_else(|e| e.into_inner());
+        guard
+            .get(&conversation_id)
+            .is_some_and(|entry| entry.appended.contains(name))
+    }
+
+    /// Whether the model may call a tool in a conversation: declared or
+    /// appended. Registration and capabilities are the caller's to check.
+    pub fn is_callable(&self, conversation_id: Uuid, name: &str) -> bool {
+        self.is_active(conversation_id, name) || self.is_appended(conversation_id, name)
+    }
+
+    /// Every declared or appended tool name of a conversation.
+    pub fn callable_for(&self, conversation_id: Uuid) -> HashSet<String> {
+        let guard = self.inner.read().unwrap_or_else(|e| e.into_inner());
+        match guard.get(&conversation_id) {
+            Some(entry) => entry.names.union(&entry.appended).cloned().collect(),
+            None => self.seed.clone(),
         }
     }
 
@@ -262,5 +472,90 @@ mod tests {
             version
         });
         assert_eq!(version, reg.version(conv));
+    }
+
+    #[test]
+    fn append_is_callable_without_touching_the_tools_array() {
+        let reg = ActiveToolsRegistry::new();
+        let conv = Uuid::new_v4();
+        reg.activate(conv, ["read"]);
+        let v = reg.version(conv);
+
+        assert_eq!(reg.append(conv, ["get_weather", "read"]), ["get_weather"]);
+        assert_eq!(
+            reg.version(conv),
+            v,
+            "an append is not a tools-array change"
+        );
+        assert!(reg.is_callable(conv, "get_weather"));
+        assert!(reg.is_appended(conv, "get_weather"));
+        assert!(!reg.is_active(conv, "get_weather"));
+        assert!(reg.is_callable(conv, "read") && !reg.is_appended(conv, "read"));
+        assert_eq!(reg.append(conv, ["get_weather"]), Vec::<String>::new());
+        let callable = reg.callable_for(conv);
+        assert!(callable.contains("read") && callable.contains("get_weather"));
+    }
+
+    #[test]
+    fn make_callable_follows_the_conversations_binding() {
+        let reg = ActiveToolsRegistry::new();
+        let rerender = Uuid::new_v4();
+        let append = Uuid::new_v4();
+        reg.set_late_binding(append, LateToolBinding::Append);
+        assert_eq!(reg.late_binding(rerender), LateToolBinding::Rerender);
+        assert_eq!(reg.late_binding(append), LateToolBinding::Append);
+
+        let r = reg.make_callable(rerender, ["browser"]);
+        assert_eq!(r.newly, ["browser"]);
+        assert_eq!(r.binding, LateToolBinding::Rerender);
+        assert!(reg.is_active(rerender, "browser"));
+        assert!(
+            reg.version(rerender) > 0,
+            "rerender changes the tools array"
+        );
+
+        let a = reg.make_callable(append, ["browser"]);
+        assert_eq!(a.newly, ["browser"]);
+        assert_eq!(a.binding, LateToolBinding::Append);
+        assert!(reg.is_appended(append, "browser"));
+        assert_eq!(
+            reg.version(append),
+            0,
+            "append leaves the tools array alone"
+        );
+
+        // Asking again is a no-op that says so, under either binding.
+        for conv in [rerender, append] {
+            let again = reg.make_callable(conv, ["browser", "browser"]);
+            assert!(again.newly.is_empty());
+            assert_eq!(again.already, ["browser"]);
+        }
+    }
+
+    #[test]
+    fn compaction_folds_appended_tools_into_the_declared_set() {
+        let reg = ActiveToolsRegistry::new();
+        let conv = Uuid::new_v4();
+        reg.set_late_binding(conv, LateToolBinding::Append);
+        reg.make_callable(conv, ["track_package", "get_weather"]);
+        assert_eq!(reg.version(conv), 0);
+
+        assert_eq!(reg.fold_appended(conv), ["get_weather", "track_package"]);
+        assert!(reg.version(conv) > 0);
+        assert!(reg.is_active(conv, "track_package"));
+        assert!(reg.appended_for(conv).is_empty());
+        assert!(reg.fold_appended(conv).is_empty());
+        assert!(reg.fold_appended(Uuid::new_v4()).is_empty());
+    }
+
+    #[test]
+    fn activating_an_appended_tool_declares_it_once() {
+        let reg = ActiveToolsRegistry::new();
+        let conv = Uuid::new_v4();
+        reg.append(conv, ["exec"]);
+        reg.activate(conv, ["exec"]);
+        assert!(reg.is_active(conv, "exec"));
+        assert!(!reg.is_appended(conv, "exec"));
+        assert!(reg.appended_for(conv).is_empty());
     }
 }

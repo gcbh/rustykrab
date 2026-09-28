@@ -803,6 +803,9 @@ pub(crate) fn parse_draft(
         edges,
         supersedes,
         plan,
+        // The review facets are not a model's to set: `work_file` files no
+        // proposals, and a capability's mode comes from the ladder or REST.
+        ..WorkItemDraft::default()
     }
 }
 
@@ -971,7 +974,9 @@ fn reach(backend: &dyn WorkBackend, name: &str) -> Reach {
         if !registered || !ctx.capabilities.can_use_tool(name) {
             return None;
         }
-        Some(ctx.active_tools.is_active(ctx.conversation_id, name))
+        // Callable counts: a tool a search appended is as loaded as a
+        // declared one (plan section 12).
+        Some(ctx.active_tools.is_callable(ctx.conversation_id, name))
     });
     match here {
         Some(Some(true)) => Reach::Fine,
@@ -1429,6 +1434,21 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(loaded["outcome"], "accepted", "{loaded}");
+    }
+
+    #[tokio::test]
+    async fn a_tool_a_search_appended_counts_as_loaded() {
+        let stub = Arc::new(StubWorkBackend::new());
+        let ctx = session(&["browser"], &[]);
+        ctx.active_tools.append(ctx.conversation_id, ["browser"]);
+        let out = SESSION_TOOL_CONTEXT
+            .scope(
+                ctx,
+                tool(&stub).execute(with(good(), "required_tools", json!(["browser"]))),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out["outcome"], "accepted", "{out}");
     }
 
     #[tokio::test]

@@ -1,10 +1,15 @@
+mod agent_defs;
 mod chat;
 #[cfg(feature = "computer-use")]
 mod computer_backend;
+mod daemon_client;
+mod evaluation;
 mod fleet;
 mod prompt_log;
+mod scheduled_work;
 mod task_queue;
 mod work_cmd;
+mod work_host;
 mod worker_cmd;
 
 use std::collections::{HashMap, HashSet};
@@ -35,7 +40,6 @@ use rustykrab_channels::{SignalChannel, SlackChannel, TelegramChannel, VideoChan
 use rustykrab_core::model::ModelProvider;
 use rustykrab_core::orchestration::OrchestrationConfig;
 use rustykrab_core::types::{MessageContent, Role};
-use rustykrab_core::AgentRegistry;
 use rustykrab_gateway::AppState;
 use rustykrab_memory::backend::HybridMemoryBackend;
 #[cfg(not(feature = "embeddings"))]
@@ -282,29 +286,14 @@ impl rustykrab_tools::WorkBackend for DeferredWorkBackend {
     }
 }
 
-/// Worker runs kept as conversations in the store, like any other (plan
-/// section 16, Phase 1), under the controller's run id.
-struct StoreTranscripts {
-    conversations: rustykrab_store::ConversationStore,
-}
-
-#[async_trait::async_trait]
-impl rustykrab_agent::RunTranscripts for StoreTranscripts {
-    async fn save(
-        &self,
-        conversation: &rustykrab_core::types::Conversation,
-    ) -> rustykrab_core::Result<()> {
-        self.conversations.save(conversation).await
-    }
-}
-
 /// The controller's view of the host's tool registry (plan section 7,
 /// scenario 11). A tool every conversation starts with active (the
 /// active-tools seed) is `Loaded`; any other registered tool is
 /// `RegisteredUnloaded`, so a `work_file` outside a session answers "load
 /// it" instead of filing work the caller could do itself, and the ladder
-/// knows the tool exists. An MCP server counts as configured when its tools
-/// are registered. Filled once the registry is final, after the stub switch.
+/// knows the tool exists. An MCP server counts as configured when it is
+/// named in `RUSTYKRAB_MCP_SERVERS` (connected or not) or its tools are
+/// registered. Filled once the registry is final, after the stub switch.
 #[derive(Default)]
 struct RegistryCatalog {
     inner: std::sync::RwLock<rustykrab_control::controller::StaticCatalog>,
@@ -324,12 +313,17 @@ impl RegistryCatalog {
                     (t.name().to_string(), state)
                 })
                 .collect(),
+            // Every server the host is configured with, connected or not,
+            // and every server whose tools registered; tool names carry the
+            // server lowercased, so both are kept lowercased.
             mcp_servers: tools
                 .iter()
                 .filter_map(|t| {
                     let rest = t.name().strip_prefix("mcp__")?;
                     rest.split_once("__").map(|(server, _)| server.to_string())
                 })
+                .chain(rustykrab_tools::configured_mcp_servers())
+                .map(|server| server.to_lowercase())
                 .collect(),
             credentials: HashSet::new(),
         };
@@ -347,50 +341,10 @@ impl rustykrab_control::controller::ToolCatalog for RegistryCatalog {
     }
 
     fn mcp_server_configured(&self, name: &str) -> bool {
-        rustykrab_control::controller::ToolCatalog::mcp_server_configured(&*self.read(), name)
-    }
-}
-
-/// Deliver the controller's notices from the work outbox (plan section
-/// 6.6): each row goes out on its channel and is marked delivered only when
-/// the send succeeds, so a channel outage delays a notice rather than
-/// losing it. Telegram needs a chat id; the first allowed chat is the user.
-async fn deliver_work_notices(
-    store: rustykrab_store::Store,
-    backend: Arc<dyn MessageBackend>,
-    default_chat: Option<String>,
-    every_secs: u64,
-) {
-    let mut interval = tokio::time::interval(std::time::Duration::from_secs(every_secs.max(1)));
-    loop {
-        interval.tick().await;
-        let pending = match store.work_outbox_pending().await {
-            Ok(rows) => rows,
-            Err(e) => {
-                tracing::warn!(error = %e, "could not read the work outbox");
-                continue;
-            }
-        };
-        for row in pending {
-            let chat = if row.channel == "telegram" {
-                default_chat.as_deref()
-            } else {
-                None
-            };
-            match backend
-                .send_message(&row.channel, &row.body, chat, None)
-                .await
-            {
-                Ok(_) => {
-                    if let Err(e) = store.work_outbox_mark_delivered(&row.id).await {
-                        tracing::warn!(error = %e, id = %row.id, "notice sent but not marked delivered");
-                    }
-                }
-                Err(e) => {
-                    tracing::debug!(error = %e, id = %row.id, channel = %row.channel, "work notice not delivered yet");
-                }
-            }
-        }
+        rustykrab_control::controller::ToolCatalog::mcp_server_configured(
+            &*self.read(),
+            &name.to_lowercase(),
+        )
     }
 }
 
@@ -1253,6 +1207,7 @@ async fn main() -> anyhow::Result<()> {
     // `Capability::Subagent` (granted by the gateway via
     // `AppState::subagents_enabled`) before the model can actually call
     // them.
+    let agent_definitions = agent_defs::load(&data_dir);
     let subagents_enabled = std::env::var("RUSTYKRAB_ENABLE_SUBAGENTS")
         .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "True"))
         .unwrap_or(false);
@@ -1262,7 +1217,7 @@ async fn main() -> anyhow::Result<()> {
         // about to add — that prevents a sub-agent from re-spawning itself
         // through the same registry. The per-tool depth guard inside
         // `SubagentsTool` is the second line of defence.
-        let agent_registry = Arc::new(AgentRegistry::with_defaults());
+        let agent_registry = Arc::new(agent_defs::subagents(&agent_definitions));
         let subagent_runner: Arc<dyn rustykrab_tools::SessionManager> =
             Arc::new(SubagentRunner::new(
                 provider.clone(),
@@ -1324,14 +1279,21 @@ async fn main() -> anyhow::Result<()> {
     // runs with the work tools, whose backend is the controller, and the
     // controller takes its worker list at construction: the deferred
     // backend breaks that cycle and is bound as soon as the controller
-    // exists. Registered before the stub switch below so the evaluation
-    // harness can script the work tools like any other.
+    // exists. Host wiring around the controller is in work_host.rs.
     let deferred_work_backend = Arc::new(DeferredWorkBackend::default());
     let control_notice_channel = if std::env::var_os("TELEGRAM_BOT_TOKEN").is_some() {
         "telegram"
     } else {
         "webchat"
     };
+    // --- Tool stubs (evaluation harness only) ---
+    // RUSTYKRAB_TOOL_STUBS swaps real tools for scripted stand-ins whose
+    // answers the harness controls; like RUSTYKRAB_PROVIDER=scripted, it
+    // must never be set on a real deployment. Applied after every real
+    // tool has registered, so `replace` means the whole registry, and
+    // before the local worker takes its list, so the worker runs the same
+    // stubs; the work tools register after it, so `replace` keeps them.
+    let (mut tools, hidden_stubs) = work_host::apply_tool_stubs(tools)?;
     // The registry names the local worker (plan section 5) and holds the
     // external ones `rustykrab worker add` builds; see `fleet.rs`.
     let fleet = fleet::Fleet::open(
@@ -1345,18 +1307,16 @@ async fn main() -> anyhow::Result<()> {
     let local_worker: Arc<dyn rustykrab_control::worker::Worker> = Arc::new(
         rustykrab_agent::LocalWorker::new(
             fleet.local_name.clone(),
-            rustykrab_agent::LocalWorker::default_definition(&fleet.local_name),
+            agent_defs::worker_definition(&agent_definitions, &fleet.local_name),
             provider.clone(),
             tools.clone(),
             Arc::new(ProcessSandbox::new()),
             deferred_work_backend.clone() as Arc<dyn rustykrab_tools::WorkBackend>,
         )
-        .with_transcripts(Arc::new(StoreTranscripts {
-            conversations: store.conversations(),
-        }))
+        .with_transcripts(scheduled_work::transcripts(&store, skill_registry.clone()))
         .with_late_tools(fleet.skills.clone()),
     );
-    // Filled below, once the registry is final (after the stub switch) and
+    // Filled below, once the registry is final (the work tools added) and
     // the active-tools seed is known.
     let control_catalog = Arc::new(RegistryCatalog::default());
     let control_config = fleet.config(rustykrab_control::controller::ControllerConfig {
@@ -1367,43 +1327,20 @@ async fn main() -> anyhow::Result<()> {
         rustykrab_control::controller::Controller::new(store.clone(), Vec::new(), control_config)
             .with_registry(fleet.registry.clone())
             .with_routing(fleet.routing())
-            .with_catalog(fleet.catalog(control_catalog.clone())),
+            .with_catalog(fleet.catalog(control_catalog.clone()))
+            .with_activity(work_host::turn_activity(
+                activity_tracker.clone(),
+                provider.name(),
+            )),
     );
     fleet.start(local_worker).await?;
     deferred_work_backend.bind(controller.clone());
-    tools.extend(rustykrab_tools::work_tools(controller.clone()));
+    work_host::add_work_tools(&mut tools, controller.clone());
     tracing::info!(
         worker = %fleet.local_name,
         notices = control_notice_channel,
         "control layer registered"
     );
-
-    // --- Tool stubs (evaluation harness only) ---
-    // RUSTYKRAB_TOOL_STUBS swaps real tools for scripted stand-ins whose
-    // answers the harness controls, so a scenario can reach an upstream
-    // that fails once, or never, or returns more text than the context
-    // window holds. The mirror image of RUSTYKRAB_PROVIDER=scripted, and
-    // like it, must never be set on a real deployment.
-    //
-    // Applied last, after every real tool has registered, so `replace`
-    // means the whole registry rather than whichever part of it had been
-    // built by this point.
-    let tools = match std::env::var_os("RUSTYKRAB_TOOL_STUBS") {
-        Some(path) => {
-            let path = std::path::PathBuf::from(path);
-            let stubs = rustykrab_tools::StubFile::from_path(&path)?;
-            let stubbed = stubs.apply(tools);
-            tracing::warn!(
-                path = %path.display(),
-                mode = ?stubs.mode,
-                tools = ?stubbed.iter().map(|t| t.name()).collect::<Vec<_>>(),
-                "RUSTYKRAB_TOOL_STUBS is set — the tool registry has been replaced with \
-                 scripted stubs. This is the evaluation harness switch."
-            );
-            stubbed
-        }
-        None => tools,
-    };
 
     // A stubbed registry is a closed world: the harness has already said
     // "these are the only tools." Progressive disclosure exists to keep a
@@ -1421,7 +1358,12 @@ async fn main() -> anyhow::Result<()> {
     // secret.
     let mut seed: Vec<String> = Vec::new();
     if std::env::var_os("RUSTYKRAB_TOOL_STUBS").is_some() {
-        seed.extend(tools.iter().map(|t| t.name().to_string()));
+        seed.extend(
+            tools
+                .iter()
+                .map(|t| t.name().to_string())
+                .filter(|n| !hidden_stubs.contains(n)),
+        );
     }
     if let Ok(raw) = std::env::var("RUSTYKRAB_ACTIVE_TOOLS") {
         seed.extend(
@@ -1479,12 +1421,16 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
+    // --- Evaluation and the review surface (control plan, Phase 6) ---
+    let evaluator = evaluation::evaluator(&store, controller.clone()).await;
+
     // --- Build gateway state ---
     // Clone store handle so we can flush it after the server shuts down.
     let store_handle = store.clone();
     let mut state = rustykrab_gateway::AppState::new(store, tools, provider, auth_token)
         .with_control(controller.clone() as Arc<dyn rustykrab_control::handle::ControlHandle>)
         .with_workers(fleet.registry.clone())
+        .with_evaluation(evaluator.clone())
         // Loopback is always allowed; this adds the names other clients
         // reach us by, e.g. the tailnet hostname the phone uses.
         .with_origin_policy(rustykrab_gateway::OriginPolicy::from_env())
@@ -1857,7 +1803,11 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // --- Job executor (scheduled task runner) ---
-    {
+    // With RUSTYKRAB_CRON_WORK_ITEMS=1 each firing is a work item the
+    // controller runs (scheduled_work.rs); otherwise the task queue runs it.
+    if let Some(handle) = scheduled_work::start(state.clone()) {
+        infra_handles.push(handle);
+    } else {
         let executor_store = store_handle.clone();
         let executor_queue = task_queue.clone();
         infra_handles.push(tokio::spawn(async move {
@@ -1905,8 +1855,10 @@ async fn main() -> anyhow::Result<()> {
                 .find(|c| !c.is_empty())
         });
         infra_handles.push(tokio::spawn(async move {
-            deliver_work_notices(outbox_store, outbox_backend, default_chat, tick_secs).await;
+            work_host::deliver_work_notices(outbox_store, outbox_backend, default_chat, tick_secs)
+                .await;
         }));
+        infra_handles.push(evaluation::spawn_nightly(evaluator));
         tracing::info!(tick_secs, "control layer started");
     }
 

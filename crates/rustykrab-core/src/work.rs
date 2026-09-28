@@ -592,6 +592,13 @@ pub enum EventKind {
     Resume,
     Rejection,
     Warning,
+    /// The review surface (section 11): an item projected to an issue, or
+    /// a decision (accept, decline, amend) synced back from one. A note:
+    /// the decision's own transition, when it has one, is a `transition`.
+    Review,
+    /// A worker run ended: what it spent and what the worker reports about
+    /// itself (its completion-reminder count). Changes no status.
+    Run,
 }
 
 impl EventKind {
@@ -605,6 +612,8 @@ impl EventKind {
             EventKind::Resume => "resume",
             EventKind::Rejection => "rejection",
             EventKind::Warning => "warning",
+            EventKind::Review => "review",
+            EventKind::Run => "run",
         }
     }
 
@@ -618,6 +627,8 @@ impl EventKind {
             "resume" => Some(EventKind::Resume),
             "rejection" => Some(EventKind::Rejection),
             "warning" => Some(EventKind::Warning),
+            "review" => Some(EventKind::Review),
+            "run" => Some(EventKind::Run),
             _ => None,
         }
     }
@@ -978,6 +989,17 @@ pub struct WorkItemDraft {
     /// The filing model's request for a planning step (section 6.1).
     #[serde(default)]
     pub plan: bool,
+    /// A `capability` item's mode (section 11): only a build is projected
+    /// to the review surface.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability: Option<CapabilityMode>,
+    /// A `proposal`'s subject: what it would change, as `<area>` or
+    /// `<area>:<name>` (section 10). See [`protected_subject`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+    /// The tier a `proposal` asks to be reviewed at (section 10).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_tier: Option<ReviewTier>,
 }
 
 /// An edge in a `work_plan` call, in `work_item_deps` row shape.
@@ -1157,6 +1179,183 @@ pub struct ResultReport {
     pub discovered: Vec<WorkItemDraft>,
 }
 
+// ── review facets (sections 10 and 11) ─────────────────────────────────
+
+/// What a `capability` item does (section 11). A build (a tool, skill, MCP
+/// adapter or worker adapter) is engineering a human reviews and is
+/// projected to the review surface; an acquisition or a request (loading
+/// a tool, a credential, consent, an install, compute) reaches the user
+/// through the channel and never becomes an issue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityMode {
+    Acquire,
+    Build,
+    Request,
+}
+
+impl CapabilityMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CapabilityMode::Acquire => "acquire",
+            CapabilityMode::Build => "build",
+            CapabilityMode::Request => "request",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<CapabilityMode> {
+        match raw {
+            "acquire" => Some(CapabilityMode::Acquire),
+            "build" => Some(CapabilityMode::Build),
+            "request" => Some(CapabilityMode::Request),
+            _ => None,
+        }
+    }
+}
+
+/// The tier a proposal is reviewed at (section 10), lowest first. A
+/// proposal whose subject is protected ([`protected_subject`]) is filed
+/// only at [`ReviewTier::Highest`].
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewTier {
+    #[default]
+    Standard,
+    Elevated,
+    Highest,
+}
+
+impl ReviewTier {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ReviewTier::Standard => "standard",
+            ReviewTier::Elevated => "elevated",
+            ReviewTier::Highest => "highest",
+        }
+    }
+
+    /// Conservative parse: an unreadable tier reads as `standard`, the
+    /// lowest, so a row nobody can interpret never passes the scope limit.
+    pub fn parse(raw: &str) -> ReviewTier {
+        match raw {
+            "elevated" => ReviewTier::Elevated,
+            "highest" => ReviewTier::Highest,
+            _ => ReviewTier::Standard,
+        }
+    }
+}
+
+/// The subject areas no proposal may touch below the highest review tier
+/// (section 10): policy, credentials, the controller, the ladder budgets,
+/// and the system's own measurement (metrics, evaluation, dreaming). Each
+/// entry is an area and the words that name it.
+pub const PROTECTED_AREAS: &[(&str, &[&str])] = &[
+    (
+        "policy",
+        &["policy", "policies", "judgment", "standing_judgment"],
+    ),
+    (
+        "credentials",
+        &["credential", "credentials", "secret", "secrets"],
+    ),
+    (
+        "controller",
+        &["controller", "control", "ladder", "question_router"],
+    ),
+    (
+        "ladder_budgets",
+        &["ladder_budgets", "budget", "budgets", "rung_budgets"],
+    ),
+    (
+        "measurement",
+        &[
+            "measurement",
+            "metric",
+            "metrics",
+            "evaluation",
+            "dreaming",
+            "dream",
+        ],
+    ),
+];
+
+/// The protected area a proposal subject falls in, if any. A subject is
+/// `<area>` or `<area>:<name>`; the area is compared case-insensitively,
+/// with `-` and spaces read as `_`.
+pub fn protected_subject(subject: &str) -> Option<&'static str> {
+    let area = subject
+        .split(':')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .replace(['-', ' '], "_");
+    PROTECTED_AREAS
+        .iter()
+        .find(|(_, words)| words.contains(&area.as_str()))
+        .map(|(name, _)| *name)
+}
+
+/// The lowest tier a proposal on `subject` may be filed at.
+pub fn required_review_tier(subject: Option<&str>) -> ReviewTier {
+    match subject.and_then(protected_subject) {
+        Some(_) => ReviewTier::Highest,
+        None => ReviewTier::Standard,
+    }
+}
+
+/// What the store keeps beside a work item for the review surface
+/// (`work_item_facets`): a capability item's mode, a proposal's subject
+/// and review tier. Only the fields that apply to the item's kind are
+/// kept.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkFacets {
+    #[serde(default)]
+    pub capability: Option<CapabilityMode>,
+    #[serde(default)]
+    pub subject: Option<String>,
+    #[serde(default)]
+    pub review_tier: Option<ReviewTier>,
+}
+
+impl WorkFacets {
+    /// The facets a draft of `kind` carries, or `None` when it carries
+    /// none that apply. A proposal always has a tier: the one it asked
+    /// for, else the one its subject requires.
+    pub fn of_draft(draft: &WorkItemDraft, kind: WorkKind) -> Option<WorkFacets> {
+        let facets = match kind {
+            WorkKind::Capability => WorkFacets {
+                capability: draft.capability,
+                ..WorkFacets::default()
+            },
+            WorkKind::Proposal => {
+                let subject = draft
+                    .subject
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string);
+                let tier = draft
+                    .review_tier
+                    .unwrap_or_else(|| required_review_tier(subject.as_deref()));
+                WorkFacets {
+                    capability: None,
+                    subject,
+                    review_tier: Some(tier),
+                }
+            }
+            _ => WorkFacets::default(),
+        };
+        (!facets.is_empty()).then_some(facets)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.capability.is_none() && self.subject.is_none() && self.review_tier.is_none()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1269,5 +1468,61 @@ mod tests {
         let json = serde_json::to_value(&o).unwrap();
         assert_eq!(json["outcome"], "rejected");
         assert_eq!(json["failed"][0]["reason"], "cycle");
+    }
+
+    #[test]
+    fn protected_subjects_need_the_highest_tier_and_others_do_not() {
+        for subject in [
+            "controller",
+            "policy",
+            "measurement",
+            "Credentials:gmail",
+            "ladder-budgets",
+            "metric:unknown_error_rate",
+        ] {
+            assert!(protected_subject(subject).is_some(), "{subject}");
+            assert_eq!(required_review_tier(Some(subject)), ReviewTier::Highest);
+        }
+        for subject in ["skill:calendar", "routing:code", "tool:caldav", ""] {
+            assert_eq!(protected_subject(subject), None, "{subject}");
+        }
+        assert_eq!(required_review_tier(None), ReviewTier::Standard);
+        assert!(ReviewTier::Standard < ReviewTier::Highest);
+        assert_eq!(ReviewTier::parse("bogus"), ReviewTier::Standard);
+    }
+
+    #[test]
+    fn drafts_carry_only_the_facets_their_kind_uses() {
+        let d: WorkItemDraft = serde_json::from_str(
+            r#"{"title":"t","objective":"o","done_when":"d",
+                "capability":"build","subject":"controller","review_tier":"standard"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            WorkFacets::of_draft(&d, WorkKind::Capability),
+            Some(WorkFacets {
+                capability: Some(CapabilityMode::Build),
+                ..WorkFacets::default()
+            })
+        );
+        let proposal = WorkFacets::of_draft(&d, WorkKind::Proposal).unwrap();
+        assert_eq!(proposal.subject.as_deref(), Some("controller"));
+        assert_eq!(proposal.review_tier, Some(ReviewTier::Standard));
+        assert_eq!(WorkFacets::of_draft(&d, WorkKind::Personal), None);
+        // A proposal that names no tier gets the one its subject requires.
+        let mut bare = d.clone();
+        bare.review_tier = None;
+        assert_eq!(
+            WorkFacets::of_draft(&bare, WorkKind::Proposal)
+                .unwrap()
+                .review_tier,
+            Some(ReviewTier::Highest)
+        );
+        // Unset facets stay out of the draft's JSON.
+        let plain: WorkItemDraft =
+            serde_json::from_str(r#"{"title":"t","objective":"o","done_when":"d"}"#).unwrap();
+        let json = serde_json::to_value(&plain).unwrap();
+        assert!(json.get("capability").is_none() && json.get("subject").is_none());
+        assert_eq!(EventKind::parse("review"), Some(EventKind::Review));
     }
 }

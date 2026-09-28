@@ -30,7 +30,8 @@
 //!   that runs early (section 13). An unknown edge kind reads as `blocks`.
 //! - **A lease lives only while its item is active.** Acquiring one moves the
 //!   item from `ready` to `leased`; a transition into a waiting or closed
-//!   status drops it in the same transaction.
+//!   status drops it in the same transaction, and every lease that ends is
+//!   copied into `work_lease_history` first, so its `inputs` stay readable.
 //!
 //! What it does not decide: readiness, cascade, roll-up, filing validation
 //! and which items age belong to the control crate. The store writes what it
@@ -290,8 +291,9 @@ pub struct ArchivedItem {
     pub status: Status,
     /// The worker that last held its lease, from the `lease` events.
     pub worker: Option<String>,
-    /// What it spent. Nothing records spend yet, so this is `None` until
-    /// something does; the column exists so aging need not change then.
+    /// What its runs spent, from `work_spend` at compaction time: a
+    /// [`Spend`] as JSON. `None` when no run recorded spend (it never ran,
+    /// or it closed before spend was recorded).
     pub cost: Option<serde_json::Value>,
     pub closed_at: DateTime<Utc>,
     pub archived_at: DateTime<Utc>,
@@ -299,6 +301,51 @@ pub struct ArchivedItem {
     pub summary: String,
     /// The edges the item held when it was compacted.
     pub edges: Vec<Edge>,
+}
+
+/// One lease an item held, live or ended (`leases` and
+/// `work_lease_history`): who held it, from when, and the `inputs` it
+/// copied into the brief (section 4.3).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeaseRecord {
+    pub lease: Lease,
+    /// When the lease ended; `None` for the live one.
+    pub released_at: Option<DateTime<Utc>>,
+}
+
+/// What one worker run spent (`work_spend`), recorded by the controller
+/// when the run ends.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunSpend {
+    pub item: WorkItemId,
+    /// The run's id (the brief's `run`), when it had one.
+    pub run: Option<String>,
+    pub worker: String,
+    pub tokens: u64,
+    pub wall_ms: u64,
+    pub iterations: u32,
+    pub at: DateTime<Utc>,
+}
+
+/// What an item's runs spent in all.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Spend {
+    pub runs: u32,
+    pub tokens: u64,
+    pub wall_ms: u64,
+    pub iterations: u64,
+}
+
+impl Spend {
+    /// The sum of two totals.
+    pub fn plus(self, other: Spend) -> Spend {
+        Spend {
+            runs: self.runs.saturating_add(other.runs),
+            tokens: self.tokens.saturating_add(other.tokens),
+            wall_ms: self.wall_ms.saturating_add(other.wall_ms),
+            iterations: self.iterations.saturating_add(other.iterations),
+        }
+    }
 }
 
 /// One write in a [`Store::work_apply`] batch. Applied in the order given.
@@ -321,6 +368,16 @@ pub enum WorkOp {
     /// resume note.
     Note(WorkEvent),
     Outbox(OutboxDraft),
+    /// Write an item's review facets (`work_item_facets`, Phase 6): a
+    /// capability item's mode, a proposal's subject and review tier, in the
+    /// transaction that files the item.
+    Facets {
+        item: WorkItemId,
+        facets: rustykrab_core::work::WorkFacets,
+    },
+    /// Clear the item's `held_by`: its approval question was answered
+    /// (section 6.1). Changes no status; the caller writes the event.
+    ReleaseHold(WorkItemId),
 }
 
 /// What a [`Store::work_apply`] batch wrote, in op order.
@@ -586,11 +643,53 @@ impl Store {
     }
 
     /// Drop the item's lease, returning it if there was one. Changes no
-    /// status: the controller's transition says what happened.
+    /// status: the controller's transition says what happened. The lease
+    /// moves to the history, like every lease that ends.
     pub async fn work_lease_release(&self, item: &str) -> Result<Option<Lease>, WorkStoreError> {
         let item = item.to_string();
-        self.work_tx(move |conn| ops::lease_release(conn, &item))
+        let now = Utc::now();
+        self.work_tx(move |conn| ops::lease_release(conn, &item, now))
             .await
+    }
+
+    /// Every lease `item` has held, oldest first: the ended ones from the
+    /// history with when they ended, then the live one. What a worker was
+    /// given (the lease's `inputs`) stays readable after the item closes
+    /// and after it is archived.
+    pub async fn work_lease_history(&self, item: &str) -> Result<Vec<LeaseRecord>, WorkStoreError> {
+        let item = item.to_string();
+        self.work_call(move |conn| ops::lease_history(conn, &item))
+            .await
+    }
+
+    /// Clear `item`'s `held_by` (its approval question was answered).
+    /// `NotFound` if no live item has the id.
+    pub async fn work_release_hold(&self, item: &str) -> Result<(), WorkStoreError> {
+        let item = item.to_string();
+        let now = Utc::now();
+        self.work_call(move |conn| ops::release_hold(conn, &item, now))
+            .await
+    }
+
+    /// Record what one worker run spent. The item need not be live: a run
+    /// can end after its item closed.
+    pub async fn work_spend_record(&self, spend: RunSpend) -> Result<(), WorkStoreError> {
+        self.work_call(move |conn| ops::record_spend(conn, &spend))
+            .await
+    }
+
+    /// What `item`'s runs spent in all.
+    pub async fn work_spend_of(&self, item: &str) -> Result<Spend, WorkStoreError> {
+        let item = item.to_string();
+        self.work_call(move |conn| ops::spend_of(conn, &item)).await
+    }
+
+    /// Every item's total spend, live or archived: what the controller's
+    /// remaining-budget arithmetic starts from.
+    pub async fn work_spend_totals(
+        &self,
+    ) -> Result<std::collections::HashMap<WorkItemId, Spend>, WorkStoreError> {
+        self.work_call(ops::spend_totals).await
     }
 
     /// Leases whose last heartbeat is more than their TTL before `now`.

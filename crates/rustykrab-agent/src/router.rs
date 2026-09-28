@@ -69,6 +69,8 @@ impl HarnessRouter {
         profile.max_context_tokens = self.base.max_context_tokens;
         profile.compaction_threshold_pct = self.base.compaction_threshold_pct;
         profile.compaction_strategy = self.base.compaction_strategy;
+        // How late tools reach the model is a fact about the model.
+        profile.late_tool_binding = self.base.late_tool_binding;
 
         // The loop parameters are the preset's to choose — that is what a
         // preset is for — *unless* the operator named them. "Named" rather

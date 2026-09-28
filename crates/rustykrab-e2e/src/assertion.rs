@@ -72,6 +72,11 @@ pub enum Assertion {
     LiveMessagesAtMost(usize),
     /// The agent finished within this many assistant turns.
     IterationsAtMost(usize),
+    /// Every request of the conversation declared the same tools array, at
+    /// least this many requests: the tool block was fixed from turn 0 and
+    /// late tools arrived by append (plan section 12, scenario 10). Reads
+    /// [`Transcript::tool_blocks`], so the caller must have read the log.
+    ToolBlockUnchanged { min_requests: usize },
 }
 
 impl Assertion {
@@ -105,6 +110,9 @@ impl Assertion {
             Assertion::ArchivedAtLeast(n) => format!("archived >= {n} chars of history"),
             Assertion::LiveMessagesAtMost(n) => format!("live window <= {n} messages"),
             Assertion::IterationsAtMost(n) => format!("assistant turns <= {n}"),
+            Assertion::ToolBlockUnchanged { min_requests } => {
+                format!("one tool block across >= {min_requests} requests")
+            }
         }
     }
 
@@ -303,6 +311,13 @@ impl Assertion {
                     Ok(())
                 } else {
                     Err(format!("{turns} assistant turns, expected <= {n}"))
+                }
+            }
+
+            Assertion::ToolBlockUnchanged { min_requests } => {
+                match crate::tool_blocks::unchanged(&t.tool_blocks, *min_requests) {
+                    None => Ok(()),
+                    Some(why) => Err(why),
                 }
             }
         }

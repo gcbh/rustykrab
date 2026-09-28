@@ -137,7 +137,8 @@ pub struct FilingContext {
 
 impl FilingContext {
     /// Defaults: the plan's placeholder caps, no scope beyond the root,
-    /// everything visible, `code` only for the delivery import,
+    /// everything visible, `code` only for the delivery import and an
+    /// accepted proposal,
     /// `sequential_split` as a warning, two supersede filings per window,
     /// no approval triggers.
     pub fn new(source: FilingSource, now: DateTime<Utc>) -> FilingContext {
@@ -340,6 +341,24 @@ impl Validation {
 }
 
 // ── the validator ──────────────────────────────────────────────────────
+
+/// Why a proposal draft is out of scope at the tier it asks for, if it is
+/// (section 10): its subject is protected and its tier is below the
+/// highest. A draft that names no tier is filed at the one its subject
+/// requires, so only an explicit lower tier is refused.
+pub fn review_scope_violation(draft: &rustykrab_core::work::WorkItemDraft) -> Option<String> {
+    use rustykrab_core::work::{protected_subject, ReviewTier};
+    let subject = draft.subject.as_deref()?;
+    let area = protected_subject(subject)?;
+    let tier = draft.review_tier?;
+    (tier < ReviewTier::Highest).then(|| {
+        format!(
+            "a proposal on `{subject}` touches {area}, which only the highest review tier \
+             may change; it asked for {}",
+            tier.as_str()
+        )
+    })
+}
 
 /// Validate one filing against the snapshot (14.1). Returns every failed
 /// check, or the rows and effects of the accepted filing.
@@ -804,6 +823,15 @@ impl<'a> Run<'a> {
                         vec![label.clone()],
                         "a budget needs iterations, tokens and wall seconds",
                     );
+                }
+            }
+            // Section 10's scope limit: a proposal touching policy,
+            // credentials, the controller, the ladder budgets or the
+            // system's own measurement is filed only at the highest review
+            // tier, whichever path it comes through.
+            if kinds[i] == WorkKind::Proposal {
+                if let Some(detail) = review_scope_violation(draft) {
+                    self.fail(RejectionReason::OutOfScope, vec![label.clone()], detail);
                 }
             }
             if kinds[i] == WorkKind::Code && !self.ctx.allow_code {

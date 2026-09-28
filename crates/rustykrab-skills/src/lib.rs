@@ -1,9 +1,11 @@
+pub mod agents;
 pub mod loader;
 pub mod prompt;
 mod skill;
 pub mod skill_md;
 pub mod verify;
 
+pub use agents::{agent_registry, builtin as builtin_agent, parse_agent_md, AGENTS_DIR};
 pub use loader::{load_single_skill, load_skills_from_dir};
 pub use prompt::SystemPromptBuilder;
 pub use skill::{Skill, SkillManifest, SkillRegistry};

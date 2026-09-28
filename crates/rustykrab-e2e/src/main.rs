@@ -28,12 +28,15 @@ mod control_suite;
 mod credential_suite;
 mod fixture_repo;
 mod judge;
+mod late_binding;
 mod login_suite;
 mod model_suite;
 mod payment_eval;
 mod payment_suite;
 mod planning_suite;
 mod surface;
+mod tool_blocks;
+mod toolset_suite;
 mod transcript;
 
 use std::path::{Component, Path, PathBuf};
@@ -167,10 +170,11 @@ const AGENT_SCRIPT: &str = r#"{
 fn agent_script() -> Result<String> {
     let mut script: Value = serde_json::from_str(AGENT_SCRIPT)?;
     let control = control_suite::agent_script_scenarios();
-    script["scenarios"]
+    let scenarios = script["scenarios"]
         .as_array_mut()
-        .ok_or_else(|| anyhow!("AGENT_SCRIPT has no scenarios array"))?
-        .extend(control);
+        .ok_or_else(|| anyhow!("AGENT_SCRIPT has no scenarios array"))?;
+    scenarios.extend(control);
+    scenarios.extend(toolset_suite::agent_script_scenarios());
     Ok(serde_json::to_string_pretty(&script)?)
 }
 
@@ -1311,7 +1315,11 @@ fn spawn_daemon_with(
                 // scenarios wait on several ticks each (a lease, a result,
                 // a ladder rung), and the 5 s default would spend most of
                 // their time budget idle.
-                .env("RUSTYKRAB_CONTROL_TICK_SECS", "1");
+                .env("RUSTYKRAB_CONTROL_TICK_SECS", "1")
+                // Scheduled firings run as work items the controller
+                // schedules (control scenario 30); off by default in a
+                // real daemon.
+                .env("RUSTYKRAB_CRON_WORK_ITEMS", "1");
             if let Some(stand_ins) = stand_ins {
                 stand_ins.configure(command);
             }
@@ -1414,12 +1422,14 @@ fn spawn_daemon_with(
     Ok(child)
 }
 
-/// The tool names a stub file declares, comma separated.
+/// The tool names a stub file declares from turn 0, comma separated: every
+/// stub not marked `"visible": false`, which the catalog holds unseeded.
 fn stub_tool_names(tool_stubs: &str) -> Option<String> {
     let parsed: Value = serde_json::from_str(tool_stubs).ok()?;
     let names: Vec<&str> = parsed["tools"]
         .as_array()?
         .iter()
+        .filter(|t| t["visible"] != false)
         .filter_map(|t| t["name"].as_str())
         .collect();
     if names.is_empty() {
@@ -2285,6 +2295,7 @@ fn scripted_scenarios() -> Vec<(Expected, (&'static str, ScenarioFn))> {
     scenarios.extend(payment_suite::scenarios());
     scenarios.extend(planning_suite::scenarios());
     scenarios.extend(control_suite::scenarios());
+    scenarios.extend(toolset_suite::scenarios());
     scenarios
 }
 
@@ -2416,7 +2427,8 @@ mod agent_script_tests {
     #[test]
     fn control_triggers_never_overlap_the_existing_ones() {
         let base: Value = serde_json::from_str(AGENT_SCRIPT).unwrap();
-        let control = control_suite::agent_script_scenarios();
+        let mut control = control_suite::agent_script_scenarios();
+        control.extend(toolset_suite::agent_script_scenarios());
         for existing in base["scenarios"].as_array().unwrap() {
             let a = existing["trigger"].as_str().unwrap().to_lowercase();
             for added in &control {

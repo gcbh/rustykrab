@@ -204,6 +204,36 @@ impl Batch {
         changed
     }
 
+    /// Cancel a capability item nothing needs any more (6.2):
+    /// `cancelled(cascade)` naming `origin`, the dependent whose close left
+    /// it unneeded, then its own cascade. Returns the ids to settle.
+    pub fn cancel_unneeded(&mut self, item: &str, origin: &str) -> Vec<WorkItemId> {
+        let Some(from) = self.status(item).filter(|s| !s.is_closed()) else {
+            return Vec::new();
+        };
+        let to = Status::Cancelled(CancelReason::Cascade);
+        let own = Effects {
+            transitions: vec![Transition {
+                item: item.to_string(),
+                from,
+                to,
+                kind: EventKind::Cascade,
+                reason: Some("no open item needs this capability any more".to_string()),
+                upstream: Some(origin.to_string()),
+                origin: Some(origin.to_string()),
+            }],
+            ..Effects::default()
+        };
+        self.effects(&own, "controller");
+        let mut changed = vec![item.to_string()];
+        let fx = graph::cascade(&self.snap, item, to, self.now);
+        for id in fx.touched() {
+            graph_push(&mut changed, &id);
+        }
+        self.effects(&fx, "controller");
+        changed
+    }
+
     /// Cancel `item` and its open subtree for a user or policy (4.2), with
     /// its own transition under `actor`. Returns the ids to settle and the
     /// ids cancelled.
@@ -430,6 +460,11 @@ impl Batch {
             return false;
         };
         if to == Status::Done && matches!(row.kind, WorkKind::Internal | WorkKind::Capability) {
+            return false;
+        }
+        // A capability item cancelled because nothing needs it any more is
+        // housekeeping: the user heard about the chain that needed it.
+        if to == Status::Cancelled(CancelReason::Cascade) && row.kind == WorkKind::Capability {
             return false;
         }
         !(to == Status::Failed && has_open_plan_b(&self.snap, item))

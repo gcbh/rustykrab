@@ -1009,3 +1009,153 @@ async fn evidence_is_found_by_kind_across_items() {
         .unwrap()
         .is_empty());
 }
+
+#[tokio::test]
+async fn an_ended_lease_keeps_its_inputs_in_the_history() {
+    let store = seeded(vec![item("a", Status::Ready)], vec![]).await;
+    let input = InputRef {
+        item: "up".into(),
+        title: "upstream".into(),
+        status: Status::Done,
+        edge: None,
+        evidence: vec![ArtifactRef {
+            kind: "path".into(),
+            value: "notes.md".into(),
+        }],
+        artifacts: vec![],
+        summary: "one line".into(),
+        error: None,
+    };
+    store
+        .work_lease_acquire("a", "pinch", 600, vec![input.clone()])
+        .await
+        .unwrap();
+    // Returned to ready (a lost run), leased again, then closed.
+    store
+        .work_transition_many(&[to("a", Status::Ready)])
+        .await
+        .unwrap();
+    store
+        .work_lease_acquire("a", "krabby", 600, vec![])
+        .await
+        .unwrap();
+    let live = store.work_lease_history("a").await.unwrap();
+    assert_eq!(live.len(), 2);
+    assert_eq!(live[0].lease.worker, "pinch");
+    assert_eq!(live[0].lease.inputs, vec![input.clone()]);
+    assert!(live[0].released_at.is_some());
+    assert_eq!(live[1].lease.worker, "krabby");
+    assert_eq!(live[1].released_at, None, "the live lease comes last");
+
+    store
+        .work_transition_many(&[to("a", Status::Running), to("a", Status::Done)])
+        .await
+        .unwrap();
+    assert_eq!(store.work_lease_get("a").await.unwrap(), None);
+    let ended = store.work_lease_history("a").await.unwrap();
+    assert_eq!(ended.len(), 2);
+    assert!(ended.iter().all(|r| r.released_at.is_some()));
+    assert_eq!(ended[0].lease.inputs, vec![input.clone()]);
+
+    // Compaction keeps the history, as it keeps events and evidence.
+    store
+        .work_archive_compact(&["a".into()], at(9))
+        .await
+        .unwrap();
+    assert_eq!(store.work_lease_history("a").await.unwrap().len(), 2);
+
+    // An explicit release ends the lease into the history too.
+    let store = seeded(vec![item("b", Status::Ready)], vec![]).await;
+    store
+        .work_lease_acquire("b", "pinch", 60, vec![])
+        .await
+        .unwrap();
+    assert!(store.work_lease_release("b").await.unwrap().is_some());
+    let released = store.work_lease_history("b").await.unwrap();
+    assert_eq!(released.len(), 1);
+    assert!(released[0].released_at.is_some());
+}
+
+#[tokio::test]
+async fn spend_sums_per_item_and_fills_the_archive_cost() {
+    let store = seeded(
+        vec![
+            item("a", Status::Done),
+            item("b", Status::Done),
+            item("c", Status::Cancelled(CancelReason::Requested)),
+        ],
+        vec![],
+    )
+    .await;
+    let run = |item: &str, tokens: u64, wall_ms: u64, iterations: u32| RunSpend {
+        item: item.into(),
+        run: Some(format!("run-{item}-{tokens}")),
+        worker: "pinch".into(),
+        tokens,
+        wall_ms,
+        iterations,
+        at: at(5),
+    };
+    store
+        .work_spend_record(run("a", 1_000, 2_500, 3))
+        .await
+        .unwrap();
+    store
+        .work_spend_record(run("a", 500, 500, 1))
+        .await
+        .unwrap();
+    store.work_spend_record(run("b", 70, 10, 1)).await.unwrap();
+    // A run may end after its item was archived.
+    store.work_spend_record(run("gone", 1, 1, 1)).await.unwrap();
+
+    let a = store.work_spend_of("a").await.unwrap();
+    assert_eq!(
+        a,
+        Spend {
+            runs: 2,
+            tokens: 1_500,
+            wall_ms: 3_000,
+            iterations: 4
+        }
+    );
+    assert_eq!(store.work_spend_of("c").await.unwrap(), Spend::default());
+    let totals = store.work_spend_totals().await.unwrap();
+    assert_eq!(totals.get("a"), Some(&a));
+    assert_eq!(totals.get("b").map(|s| s.tokens), Some(70));
+    assert_eq!(totals.get("c"), None);
+
+    store
+        .work_archive_compact(&["a".into(), "c".into()], at(9))
+        .await
+        .unwrap();
+    let archived = store.work_archive_get("a").await.unwrap().unwrap();
+    let cost: Spend = serde_json::from_value(archived.cost.expect("a cost")).unwrap();
+    assert_eq!(cost, a);
+    let never_ran = store.work_archive_get("c").await.unwrap().unwrap();
+    assert_eq!(never_ran.cost, None, "no run recorded spend");
+}
+
+#[tokio::test]
+async fn releasing_a_hold_clears_held_by_in_a_batch() {
+    let mut held = item("a", Status::Blocked(BlockedReason::NeedsConsent));
+    held.held_by = Some("q-1".into());
+    let store = seeded(vec![held], vec![]).await;
+    store
+        .work_apply(vec![
+            WorkOp::Transition(TransitionSpec {
+                reason: Some("approved q-1".into()),
+                ..to("a", Status::Queued)
+            }),
+            WorkOp::ReleaseHold("a".into()),
+        ])
+        .await
+        .unwrap();
+    let row = store.work_get("a").await.unwrap().unwrap();
+    assert_eq!(row.held_by, None);
+    assert_eq!(row.status, Status::Queued);
+    assert!(matches!(
+        store.work_release_hold("missing").await,
+        Err(WorkStoreError::NotFound(_))
+    ));
+    store.work_release_hold("a").await.unwrap();
+}

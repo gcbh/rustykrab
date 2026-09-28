@@ -50,13 +50,13 @@ use rustykrab_control::graph::FilingSource;
 use rustykrab_control::handle::{ControlHandle, GraphView, TickReport};
 use rustykrab_control::import::{self, StackManifest};
 use rustykrab_control::ladder::{self, RUNGS};
+use rustykrab_control::Provenance;
 use rustykrab_core::work::{
     BlockedReason, Budget, CancelReason, Edge, Evidence, Lease, PlanOutcome, Rung, RungEvent,
     Status, WorkError, WorkEvent, WorkItem, WorkItemDraft, WorkItemId, WorkKind, WorkPlan,
 };
 use rustykrab_core::Error;
 use rustykrab_store::{ArchivedItem, Principal, WorkFilter, WorkPlanRow, WorkStoreError};
-use rustykrab_tools::work_backend::Provenance;
 
 use crate::AppState;
 

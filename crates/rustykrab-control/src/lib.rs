@@ -23,6 +23,9 @@
 //!   it (sections 5 and 10).
 //! - [`workspace`]: isolated git worktrees for `code` runs and the check of a
 //!   `code` result against them (section 5).
+//! - [`review`]: the review surface of section 11: which items are projected
+//!   to issues and what they say, the adapter trait, and the one-way sync
+//!   that brings decisions back as typed events.
 //! - [`controller`]: the loop itself (section 6), which drives the store
 //!   through the pure modules above.
 //!
@@ -36,6 +39,13 @@ pub mod handle;
 pub mod import;
 pub mod ladder;
 pub mod registry;
+pub mod review;
 pub mod routing;
 pub mod worker;
 pub mod workspace;
+
+/// Who filed and on whose behalf: the record every filing path through
+/// [`handle::ControlHandle`] takes. Defined beside the work tools'
+/// backend in `rustykrab-tools`; re-exported so a caller of the handle
+/// (the gateway) needs no dependency on the tool crate for it.
+pub use rustykrab_tools::work_backend::Provenance;

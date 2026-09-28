@@ -33,8 +33,10 @@ pub(super) const SWITCHED: &str = "switched from ";
 /// every worker at or below that tier (sections 5 and 8).
 pub(super) const ESCALATING_ABOVE: &str = "; escalating above tier ";
 
-/// The reason an approval writes on each item it releases, so a restart
-/// can tell a released hold from a pending one (`held_by` stays set).
+/// The reason an approval writes on each item it releases: the audit
+/// record of the answer. The approval also clears `held_by`; the marker is
+/// still read so a hold an older build released (leaving `held_by` set)
+/// reads as released.
 pub(super) fn approval_marker(question: &str) -> String {
     format!("approved {question}")
 }
@@ -140,6 +142,7 @@ impl Controller {
     /// Every live row and every edge with an open end, with released
     /// approval holds cleared and fired non-time triggers marked.
     pub(super) async fn load(&self) -> Result<Snapshot, Error> {
+        self.ensure_spent().await?;
         let mut items = self
             .store
             .work_list(&WorkFilter {
@@ -233,6 +236,25 @@ impl Controller {
             .collect();
         self.state().learned = learned;
         Ok(())
+    }
+
+    /// The conversation a run of `item` continues, when `item` is a
+    /// scheduled job's firing (plan section 13: `scheduled_jobs` gains
+    /// `work_item_id`): the job's persistent conversation, so the firing
+    /// sees the job's earlier runs as a job run always has. The run's id is
+    /// that conversation's, which keeps the item's `run` evidence pointing
+    /// at the transcript. Read from the job row, which no model writes, so
+    /// no filing can point a run at a conversation of its choosing.
+    pub(super) async fn continued_conversation(&self, item: &str) -> Option<String> {
+        match self.store.jobs().job_for_work_item(item).await {
+            Ok(job) => job
+                .and_then(|j| j.conversation_id)
+                .filter(|c| uuid::Uuid::parse_str(c).is_ok()),
+            Err(e) => {
+                tracing::warn!(item = %item, error = %e, "scheduled firing not looked up");
+                None
+            }
+        }
     }
 
     /// The worker holding `item`: its live run here, else its lease row.

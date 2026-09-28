@@ -318,10 +318,15 @@ lens they were created under — the migration backfills rather than
 reinterprets, because moving a live job's fire time is not a migration's call
 to make.
 
-`work_item_id` is the control layer's link from a job to the work item a
-firing becomes (control-layer plan, section 13), added by a guarded `ALTER`.
-It is nullable and unenforced, since the item may be archived while the job
-keeps its schedule, and nothing writes it yet: `JobStore` behaves as before.
+`work_item_id` is the control layer's link from a job to the work item its
+latest firing became (control-layer plan, section 13), added by a guarded
+`ALTER`. It is nullable and unenforced, since the item may be archived while
+the job keeps its schedule. With `RUSTYKRAB_CRON_WORK_ITEMS=1` the daemon
+writes it for every firing (`rustykrab-cli/src/scheduled_work.rs`); the
+controller reads it (`job_for_work_item`) to run a firing in the job's own
+`conversation_id`, a column no model writes, so no filing can point a run at
+a conversation of its choosing. With the switch off (the default) nothing
+writes it and jobs run through the task queue as before.
 
 The remaining duplication is `(channel, chat_id, thread_id)` on
 `scheduled_jobs`: it repeats addressing information that can also live in
@@ -485,6 +490,11 @@ work_item_evidence(id AUTOINC, item, kind, ref, hash, verified_by, at)
    INDEX idx_work_item_evidence_item (item)
 leases(item PK REFERENCES work_items(id) ON DELETE CASCADE,
        worker, since, ttl_seconds, heartbeat_at, inputs JSON)
+work_lease_history(id AUTOINC, item, worker, since, ttl_seconds,
+                   heartbeat_at, inputs JSON, released_at)
+   INDEX idx_work_lease_history_item (item, since)
+work_spend(id AUTOINC, item, run, worker, tokens, wall_ms, iterations, at)
+   INDEX idx_work_spend_item (item)
 work_plans(id PK, root, filed_by, rationale, approval_question, policy,
            created_at)
 work_outbox(id PK, parent, origin, channel, body, created_at, delivered_at)
@@ -505,7 +515,8 @@ and roll-up there, and writes each decision back through the store. The row
 types are `rustykrab_core::work` (`WorkItem`, `Edge`, `WorkEvent`, `Evidence`,
 `Lease`), so the store, the controller, the tools and the CLI share one
 vocabulary. `workers` arrived with Phase 3; the `questions` and
-`judgment_policies` tables of section 13 arrive with later phases.
+`judgment_policies` tables of section 13 arrive with later phases; Phase 6's
+tables are the next section.
 
 **Workers are keyed by the registry's name, and nothing points at them.**
 `leases.worker`, a lease event's `worker:<name>` actor and the archive's
@@ -560,9 +571,19 @@ key, so an item holds at most one. Acquiring it moves the item from `ready` to
 `leased` and writes a `lease` event whose actor is `worker:<name>`, in one
 transaction; a transition into any waiting or closed status drops it. The
 brief's copied `inputs` are stored on the lease (section 4.3) and go with it.
-What outlives the lease is the `run` evidence row the controller writes at
+What outlives the lease is its copy in `work_lease_history`, written in the
+same transaction that drops the live row, whatever drops it, with
+`released_at`, so what a worker was given stays readable after the item
+closes or is archived; and the `run` evidence row the controller writes at
 lease time: the id the run's transcript is kept under (the local worker's
-conversation id), so a cancelled or lost run still points at its partial work.
+conversation id, or a scheduled job's own conversation for its firing), so
+a cancelled or lost run still points at its partial work.
+
+**Spend is one row per run.** `work_spend` records what each worker run
+spent (tokens across its model calls, wall time, iterations) when it ends
+or is stopped, whether or not its item is still live. A parent's remaining
+budget is its budget less what its subtree spent (section 4.2), and
+compaction writes the item's total into the archive's `cost`.
 
 **Evidence kinds the controller reads back.** Besides the artifacts a report
 claims, `work_item_evidence` carries the controller's own rows: `summary`,
@@ -580,8 +601,9 @@ and reason, the worker from its last `lease` event, closing time, those edges
 as JSON, and a summary built from the typed fields with no model involved.
 Constraints, decisions and the rest of the brief go; events and evidence stay.
 Which items age is the control crate's decision (section 4.6); the store only
-refuses to compact an item that is not closed. `cost` is NULL until something
-records spend.
+refuses to compact an item that is not closed. `cost` is the item's total
+spend as JSON (`runs`, `tokens`, `wall_ms`, `iterations`), NULL when no run
+recorded any.
 
 `work_outbox` holds the notices a transition causes, written in the same
 transaction and delivered from here, so a restart neither drops nor repeats
@@ -598,13 +620,53 @@ Unenforced on purpose, and the DDL says so:
   whatever order the control crate picks, so the link cannot be a constraint.
 - `work_items.status_origin`, `plan_id`, `held_by`, `origin_conversation_id`:
   provenance, not ownership.
-- `work_item_events.item` and `work_item_evidence.item`: the history must
-  outlive compaction, so neither cascades from `work_items`.
+- `work_item_events.item`, `work_item_evidence.item`,
+  `work_lease_history.item` and `work_spend.item`: the history must outlive
+  compaction, so none cascades from `work_items`.
 - `work_outbox.parent` and `origin`, `work_plans.root` and `filed_by`,
   `work_item_archive.parent`: records about items that may since have been
   archived.
 - `leases.worker` and the `worker` columns and actors that name a worker:
   a removed worker's history keeps its name.
+
+### Evaluation, proposals and the review surface (control layer, Phase 6)
+
+```
+work_item_facets(item PK, capability, subject, review_tier)
+   INDEX idx_work_item_facets_subject (subject) WHERE subject IS NOT NULL
+proposals(item PK, subject, criterion, metric, body JSON, filed_by, created_at,
+          review, decided_by, decided_at, code_item, baseline,
+          outcome, observed, outcome_at)
+   INDEX idx_proposals_subject (subject, review)
+   INDEX idx_proposals_created (created_at)
+proposal_evidence(proposal, source, ref, PK(proposal, source, ref))
+expectation_metrics(id AUTOINC, pass, name, value, sample, data JSON,
+                    computed_at)
+   INDEX idx_expectation_metrics_pass (pass)
+   INDEX idx_expectation_metrics_name (name, computed_at)
+work_projections(item, surface, external_id, url, digest, projected_at,
+                 last_comment, PK(item, surface))
+```
+
+Code in `rustykrab-store/src/proposals.rs`; plan sections 1.1, 10, 11 and 13.
+`work_item_facets` is what the review surface needs beside a work item's row:
+a `capability` item's mode (only a build is projected) and a `proposal`'s
+subject and review tier. It is written by `WorkOp::Facets` in the
+`work_apply` that inserts the item, rather than as columns on `work_items`,
+because those two fields apply to two kinds out of six. `proposals` is
+section 13's "a kind of work item plus a join": the proposal itself is a
+`work_items` row of kind `proposal`; this row is dreaming's record of why it
+filed it (the section 10 body), the decision taken on the review surface, and
+what probation found, with `proposal_evidence` as the join to the
+`outcome_records`, `dream_reports`, work items and events it cites.
+`expectation_metrics` keeps every pass's section 1.1 metrics, the newest pass
+being what `GET /api/work/metrics` serves and what the next pass compares
+against. `work_projections` maps an item to its issue with a digest of the
+fields last written, so hand edits are detected and overwritten.
+
+Unenforced on purpose, as the work tables are: every item id here is a record
+about an item that may since have been archived, and `proposal_evidence.ref`
+names rows in several tables (and, for a memory, another database).
 
 ## `memory.db`
 
@@ -692,6 +754,8 @@ purpose*, and the DDL now says which is which.
 | `work_item_events.item`, `work_item_evidence.item` | No, deliberate | history outlives compaction |
 | `work_outbox`, `work_plans`, `work_item_archive` item ids | No, deliberate | records about items that may be archived |
 | `scheduled_jobs.work_item_id`, `delegated_tasks.work_item_id` | No, deliberate | the item may be archived; the row keeps working |
+| `work_item_facets.item`, `proposals.item`, `proposals.code_item`, `work_projections.item` | No, deliberate | records about items that may be archived |
+| `proposal_evidence.ref` | No, deliberate | names rows in several tables, and a memory in another database |
 | `outcome_attributions.target_id` (memory) | **Impossible** | other database |
 | `memory_links.source_id/target_id` | No | asymmetric with `chunks`; looks accidental |
 

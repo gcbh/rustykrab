@@ -14,10 +14,9 @@ rustykrab-channels.workspace = true
 rustykrab-memory.workspace = true
 rustykrab-skills.workspace = true
 rustykrab-projects.workspace = true
-# The control layer: `/api/work` calls its `ControlHandle`; `Provenance`
-# comes from the tools crate's work backend.
+# The control layer: `/api/work` calls its `ControlHandle`, and takes
+# `Provenance` from its re-export.
 rustykrab-control.workspace = true
-rustykrab-tools.workspace = true
 axum.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true

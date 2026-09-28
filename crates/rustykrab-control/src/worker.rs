@@ -3,7 +3,8 @@
 //! live in `rustykrab-agent`: `LocalWorker`, and `ExternalWorker` for the
 //! `claude_code` and `codex` kinds; peers come in Phase 5. A run that ends
 //! without a result returns a [`RunFailure`], which [`run_failure_input`]
-//! turns back into what the classifier reads.
+//! turns back into what the classifier reads. [`Worker::usage`] is how a
+//! run's spend and self-counts reach the controller once it ends.
 
 use async_trait::async_trait;
 use rustykrab_core::work::{

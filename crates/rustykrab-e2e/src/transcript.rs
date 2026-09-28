@@ -50,6 +50,10 @@ pub struct Transcript {
     pub duration_ms: u128,
     /// Set when the run itself failed rather than merely scoring badly.
     pub error: Option<String>,
+    /// The tool block each of the conversation's requests declared, from
+    /// the daemon log (`crate::tool_blocks`). Empty unless the caller read
+    /// the log; the store does not record it.
+    pub tool_blocks: Vec<crate::tool_blocks::ToolBlockSeen>,
 }
 
 impl Transcript {
@@ -178,6 +182,7 @@ impl Transcript {
             live_messages: messages.len(),
             duration_ms: 0,
             error: None,
+            tool_blocks: Vec::new(),
         }
     }
 

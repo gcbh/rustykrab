@@ -11,8 +11,8 @@
 //! the calls the GitHub stand-in logged.
 //!
 //! Every scenario is written to pass once its phase ships and is marked
-//! `XFail` until then. Phases 1 and 3 have shipped (see [`PROMOTED`] and
-//! [`HELD_BACK`]); the routes of Phases 4 to 6 do not exist, so their
+//! `XFail` until then. Phases 1, 3 and 6 have shipped (see [`PROMOTED`] and
+//! [`HELD_BACK`]); the routes of Phases 4 and 5 do not exist, so their
 //! scenarios fail at their first request, on a status code rather than a
 //! panic or a hang.
 //!
@@ -74,14 +74,15 @@
 //!   `archived`). Served since Phase 3: `GET /api/workers` (rows under
 //!   `workers`, each with its `routing_record` keyed by work class) and
 //!   `POST /api/workers` with `kind`, `name`, `repos` and `command` (the
-//!   Claude Code executable). Not served yet:
-//!   `POST /api/work/evaluate` (run the nightly evaluation now, Phase 6),
-//!   `GET /api/work/metrics` (the section 1.1 metrics of 16),
-//!   `POST /api/workers` with `base_url` and `token` (a peer, Phase 5),
-//!   `capability: build | acquire` on a
+//!   Claude Code executable). Served since Phase 6: `POST /api/work/evaluate`
+//!   (run the nightly evaluation now: decisions synced back, metrics,
+//!   criteria, proposals, projection), `GET /api/work/metrics` (the section
+//!   1.1 metrics of 16, under `metrics`), `capability: build | acquire` on a
 //!   capability draft (27), `subject` and `review_tier` on a proposal
 //!   draft (12), and the GitHub adapter reading `RUSTYKRAB_GITHUB_API_BASE`,
 //!   `RUSTYKRAB_GITHUB_REPO` and `RUSTYKRAB_GITHUB_TOKEN` (`surface.rs`).
+//!   Not served yet: `POST /api/workers` with `base_url` and `token` (a
+//!   peer, Phase 5).
 
 mod script;
 mod wire;
@@ -125,7 +126,7 @@ enum Phase {
 
 /// The phases that have shipped. Their scenarios must pass; every other
 /// scenario is `XFail`. Promoting a phase is this one edit.
-const PROMOTED: &[Phase] = &[Phase::One, Phase::Three, Phase::ThreeExit];
+const PROMOTED: &[Phase] = &[Phase::One, Phase::Three, Phase::ThreeExit, Phase::Six];
 
 /// Scenarios of a promoted phase that stay `XFail`, each with why. An
 /// entry here is a known gap in a shipped phase, named rather than hidden;
@@ -140,16 +141,18 @@ const HELD_BACK: &[(u8, &str)] = &[
     ),
     (
         17,
-        "Phase 6: the local code item, its routing record and the escalation to claude_code \
-         pass; the routing proposal needs POST /api/work/evaluate and the proposal kind, \
-         which dreaming's evaluation of Phase 6 builds",
+        "the local code item, its routing record and the escalation to claude_code pass; \
+         dreaming reads routing records through StaticRouting until the daemon's reader \
+         over the workers table is wired",
     ),
+    // Phase 6: the avoidable-escalation criterion reads questions through
+    // `rustykrab_dream::QuestionReader`, which the daemon wires to nothing
+    // until Phase 4's `questions` table and `/api/questions` land.
     (
-        30,
-        "a cron firing still runs as a task-queue conversation: moving it onto a work item \
-         needs the job's persistent conversation, SKILL.md injection and per-job delivery \
-         target carried into the worker run, and a gate that holds local leases while an \
-         interactive turn runs (plan 12.1)",
+        15,
+        "waits for Phase 4: the scenario asks through GET /api/questions and answers through \
+         POST /api/questions/{id}/answer, and dreaming reads the surfaced question and its \
+         recorded default through QuestionReader, wired to the questions table at merge",
     ),
 ];
 
@@ -1407,7 +1410,13 @@ async fn s30(ctx: &Ctx) -> Result<()> {
         spans.len() == 2 && (spans[0].1 <= spans[1].0 || spans[1].1 <= spans[0].0),
         "the overdue jobs ran together: {spans:?}"
     );
-    let listed: Vec<String> = list(ctx, "").await?.iter().map(id).collect();
+    // Done by now, so listed with the closed items (`work list --all`):
+    // plain `work list` is open items only (plan 14.2).
+    let listed: Vec<String> = list(ctx, "include_closed=true")
+        .await?
+        .iter()
+        .map(id)
+        .collect();
     for firing in &firings {
         ensure!(
             listed.contains(firing),
@@ -2339,8 +2348,9 @@ async fn s16(ctx: &Ctx) -> Result<()> {
 /// Scenario 27: `personal` and `research` items run to completion with no issue; a
 /// proposal is a `rustykrab-proposal` issue, a capability build is an issue,
 /// a credential acquisition is not; a proposal's `personal` input shows only
-/// as `local:#N`; a hand edit to a projected title is overwritten on the
-/// next projection.
+/// as `local:#N`, and because the proposal names a personal item its own
+/// title and text are withheld too (plan section 11); a hand edit to a
+/// projected title is overwritten on the next projection.
 async fn s27(ctx: &Ctx) -> Result<()> {
     let tag = tag(27);
     let dentist = file(ctx, draft("personal", "Book the dentist", &tag, W_SUCCEED)).await?;
@@ -2359,7 +2369,7 @@ async fn s27(ctx: &Ctx) -> Result<()> {
     );
     proposal["edges"] = json!([{ "kind": "waits_for", "depends_on": dentist }]);
     proposal["inputs_from"] = json!([dentist]);
-    file(ctx, proposal).await?;
+    let proposal_id = file(ctx, proposal).await?;
     let mut build = draft("capability", "Build a tide table tool", &tag, W_SUCCEED);
     build["capability"] = json!("build");
     file(ctx, build).await?;
@@ -2391,10 +2401,20 @@ async fn s27(ctx: &Ctx) -> Result<()> {
         about("Compare dentists nearby").is_empty(),
         "the research item reached GitHub"
     );
-    let projected = about("Pre-load caldav for calendar errands")
+    ensure!(
+        about("Pre-load caldav for calendar errands").is_empty(),
+        "the proposal's own title reached GitHub although it names a personal item"
+    );
+    let projected = github
+        .issues()
         .into_iter()
-        .next()
+        .find(|issue| issue.to_string().contains(&proposal_id))
         .ok_or_else(|| anyhow!("the proposal was not projected"))?;
+    ensure!(
+        labels(&projected).iter().any(|l| l == "rustykrab-redacted"),
+        "the proposal's issue is not labelled rustykrab-redacted: {:?}",
+        labels(&projected)
+    );
     ensure!(
         labels(&projected).iter().any(|l| l == "rustykrab-proposal"),
         "the proposal's issue is not labelled rustykrab-proposal: {:?}",
@@ -2421,9 +2441,7 @@ async fn s27(ctx: &Ctx) -> Result<()> {
         .find(|i| i["number"] == number)
         .unwrap_or_default();
     ensure!(
-        restored["title"]
-            .as_str()
-            .is_some_and(|t| t.contains("Pre-load caldav")),
+        restored["title"] == projected["title"],
         "the hand edit survived the next projection: {}",
         restored["title"]
     );

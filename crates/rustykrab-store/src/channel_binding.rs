@@ -75,6 +75,36 @@ impl ChannelAddress {
             Self::Signal { peer } => peer.clone(),
         }
     }
+
+    /// The address a stored `(channel, external_key)` pair names: the
+    /// inverse of [`Self::channel`] and [`Self::external_key`]. `None` for
+    /// an unknown channel or a key that is not that channel's shape.
+    pub fn parse(channel: &str, key: &str) -> Option<ChannelAddress> {
+        match channel {
+            "telegram" => {
+                let (chat, thread) = key.split_once(':')?;
+                Some(Self::Telegram {
+                    chat_id: chat.parse().ok()?,
+                    thread_id: thread.parse().ok()?,
+                })
+            }
+            "slack" => {
+                let mut parts = key.splitn(3, ':');
+                let team_id = parts.next()?.to_string();
+                let channel_id = parts.next()?.to_string();
+                let thread_ts = parts.next()?.to_string();
+                (!channel_id.is_empty()).then_some(Self::Slack {
+                    team_id,
+                    channel_id,
+                    thread_ts,
+                })
+            }
+            "signal" if !key.is_empty() => Some(Self::Signal {
+                peer: key.to_string(),
+            }),
+            _ => None,
+        }
+    }
 }
 
 /// Maps channel addresses to conversation UUIDs.
@@ -129,6 +159,38 @@ impl ChannelBindingStore {
             )
             .map_err(|e| Error::Storage(e.to_string()))?;
             Ok(())
+        })
+        .await
+    }
+
+    /// Where `conv_id` lives on a channel: the address bound to it, the
+    /// most recently bound when there are several. `None` when no channel
+    /// address is bound to it (a web chat, a job's own conversation), or
+    /// when the stored key does not parse as its channel's address.
+    ///
+    /// The reverse of [`Self::lookup`], for answering a conversation where
+    /// it came from: the control layer delivers a work item's notices to
+    /// the thread its originating conversation is bound to.
+    pub async fn address_of(&self, conv_id: Uuid) -> Result<Option<ChannelAddress>, Error> {
+        with_conn(&self.conn, move |conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT channel, external_key FROM channel_bindings
+                     WHERE conv_id = ?1 ORDER BY created_at DESC, rowid DESC",
+                )
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            let rows = stmt
+                .query_map(params![conv_id.to_string()], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            for row in rows {
+                let (channel, key) = row.map_err(|e| Error::Storage(e.to_string()))?;
+                if let Some(address) = ChannelAddress::parse(&channel, &key) {
+                    return Ok(Some(address));
+                }
+            }
+            Ok(None)
         })
         .await
     }
@@ -284,6 +346,56 @@ mod tests {
         assert_eq!(store.lookup(&addr).await.unwrap(), Some(conv));
         store.unbind(&addr).await.unwrap();
         assert_eq!(store.lookup(&addr).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn a_conversation_resolves_back_to_its_address() {
+        let (store, conn) = store();
+        let (tg, sl, sig, none) = (
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        );
+        for id in [tg, sl, sig, none] {
+            insert_conversation(&conn, id);
+        }
+        let addresses = [
+            (
+                tg,
+                ChannelAddress::Telegram {
+                    chat_id: -1003776932999,
+                    thread_id: 198,
+                },
+            ),
+            (
+                sl,
+                ChannelAddress::Slack {
+                    team_id: "T1".into(),
+                    channel_id: "C9".into(),
+                    thread_ts: "1712345678.000100".into(),
+                },
+            ),
+            (
+                sig,
+                ChannelAddress::Signal {
+                    peer: "+15551234567".into(),
+                },
+            ),
+        ];
+        for (conv, addr) in &addresses {
+            store.bind(addr, *conv).await.unwrap();
+        }
+        for (conv, addr) in &addresses {
+            assert_eq!(store.address_of(*conv).await.unwrap().as_ref(), Some(addr));
+            assert_eq!(
+                ChannelAddress::parse(addr.channel(), &addr.external_key()).as_ref(),
+                Some(addr)
+            );
+        }
+        assert_eq!(store.address_of(none).await.unwrap(), None);
+        assert_eq!(ChannelAddress::parse("telegram", "not-a-key"), None);
+        assert_eq!(ChannelAddress::parse("webchat", "x"), None);
     }
 
     #[tokio::test]

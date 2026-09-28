@@ -1140,6 +1140,14 @@ Rules:
 - **Projection never carries a local-only item.** A projected item whose
   parent, edge or `inputs_from` is a `personal` or `research` item shows it as
   an opaque reference (`local:#N`), never its title, objective or evidence.
+- **Nor text filed from one.** An item's own text can quote what it was filed
+  from: an `internal` item embeds the raw error of the run that failed, and a
+  proposal cites the records behind it. So when anything a projected item
+  names (its parent, an edge, an input, an item pointer in its evidence) is
+  local-only, or no longer on record, the issue carries only typed facts and
+  opaque references, under a neutral title and the `rustykrab-redacted`
+  label. An `internal` item that names no item at all is treated the same
+  way, since its provenance is unknown.
 - **Projected fields.** Title, objective, `done_when`, status (roll-up status
   for a parent), worker, evidence links, the parent as a sub-issue and edges as
   references where the surface supports them. The issue never decides
@@ -1604,7 +1612,8 @@ Added as `xfail` first, in the existing e2e harness:
     a `proposal` from dreaming appears as a `rustykrab-proposal` issue, a
     `capability` build appears as an issue, and a credential acquisition does
     not. A proposal whose `inputs_from` includes a `personal` item shows it
-    only as `local:#N`. A hand edit to a projected title is overwritten on
+    only as `local:#N`, and its own title and text are withheld (section
+    11). A hand edit to a projected title is overwritten on
     the next projection.
 28. With 500 closed items seeded, those older than the policy window are
     compacted to one-line summaries in `work_item_archive`; `work list`
