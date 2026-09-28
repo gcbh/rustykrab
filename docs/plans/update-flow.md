@@ -178,9 +178,27 @@ Progress:
   writes, so an older signed release recorded as a tagless local build
   could be applied. It was fixed at merge. Every stage must be at least
   the running version.
-- **Items 2 to 4 are in part 2**, with one of the re-review's points: the
-  copy's checks move before the daemon is stopped, so a bad stage never
-  takes it down.
+- **Items 2 to 4 are done** (part 2), with one of the re-review's points:
+  the copy's checks move before the daemon is stopped, so a bad stage
+  never takes it down. `SwapRoot::swap_in` is split into `prepare` (clear
+  `.next`, `cp -Rp --`, `NextCheck`), run while the daemon is up, and
+  `commit` (the two renames), run after the stop. The journal
+  `updates/apply-state.json` (temp file, then rename) holds the phase
+  (`stopping`, `swapped`, `started`), both commits and the `bad.json`
+  entry. Every run first calls `recover`: an install path missing with
+  `.prev` beside it gets `.prev` back; a journal at `swapped` or `started`
+  is rolled back in full and the new version recorded bad; then the
+  service is started if it is not running and the journal cleared. A run
+  that recovers applies nothing new. A failed stop starts the service
+  again unless it is still up. A failure writing `bad.json` is logged,
+  the rollback goes on, and the outcome reports it. Any rollback error
+  writes `updates/apply-failed.json` (what failed, both commits, the
+  time), clears the journal and last starts the service unless it is
+  running; while that file exists every run puts it on stderr, exits
+  non-zero and changes nothing. The rollback's stop is retried once; if
+  it fails again nothing is restored under the running daemon. The
+  LaunchAgent plist gets `ExitTimeOut` 45, above the 20 s drain grace.
+  The gate stays until this is re-reviewed and part 3 lands.
 - **Part 3 follows** with the re-review's smaller points:
   - read the listener's executable with `proc_pidpath` rather than
     `ps -o comm=`, which prints the process's own `argv[0]`;
@@ -204,8 +222,9 @@ is refused. `apply` refuses before any change unless the running daemon
 reports `controller.lock` `held` and `consecutive_failed_ticks` 0.
 `verify` counts a `last_tick` advance only while no ticks are failing,
 and a failing tick starts the count again. `--url` must be https or http
-to `127.0.0.1`, `::1` or `localhost`. Items 2 to 4 and the plist are
-still open, so the `RUSTYKRAB_UPDATE_APPLY_UNREVIEWED` gate stays.
+to `127.0.0.1`, `::1` or `localhost`. Items 2 to 4 and the plist
+followed in part 2 (above); the `RUSTYKRAB_UPDATE_APPLY_UNREVIEWED` gate
+stays until part 2 is re-reviewed and part 3 lands.
 
 ## Not yet
 
