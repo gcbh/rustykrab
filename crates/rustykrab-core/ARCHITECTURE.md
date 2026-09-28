@@ -101,7 +101,7 @@ and `chat`; `chat_stream` falls back to `chat` and emits one text event,
 the re-render path an API that validates calls against the declared array
 accepts, and `check_model` returns `ModelCheck::Unknown` (it has not
 asked), which a local worker reads as healthy, as it did before the check
-existed. Ollama overrides it: `Missing` when `/api/show` answers 404.
+existed. Ollama overrides it: `Missing` when `/api/show` answers 404, asked with a 5 s timeout of its own so a wedged server cannot hold the registry's refresh.
 `context_limit_for_tools` defaults to `context_limit`, while adapters with
 tool-dependent overhead report the actual request's usable message budget.
 `ContextBudgetExceeded` is an explicit, non-retryable-without-change refusal

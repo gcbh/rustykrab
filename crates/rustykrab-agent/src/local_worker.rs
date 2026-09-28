@@ -538,9 +538,21 @@ impl Worker for LocalWorker {
         )
     }
 
+    /// Why the worker is unhealthy, for its health line: the provider's own
+    /// account of the missing model.
+    fn unhealthy_reason(&self) -> Option<String> {
+        match &*self.model.lock().unwrap_or_else(|e| e.into_inner()) {
+            Some((_, ModelCheck::Missing(why))) => Some(why.clone()),
+            _ => None,
+        }
+    }
+
     /// Ask the provider whether its model exists (the registry does at
     /// registration and on its timer), at most once per
     /// [`MODEL_CHECK_EVERY`]. Returns `false` when it asked too recently.
+    /// A server that cannot say (`Unknown`: unreachable, or an unexpected
+    /// status) leaves the last answer standing, so a missing model stays
+    /// missing through an outage and is asked about again when due.
     async fn refresh(&self) -> bool {
         let due = self
             .model
@@ -554,16 +566,24 @@ impl Worker for LocalWorker {
         let check = self.provider.check_model().await;
         let mut model = self.model.lock().unwrap_or_else(|e| e.into_inner());
         let was_missing = matches!(*model, Some((_, ModelCheck::Missing(_))));
-        match &check {
-            ModelCheck::Missing(why) if !was_missing => {
-                tracing::warn!(worker = %self.name, %why, "local worker unhealthy: its model is missing");
+        let check = match check {
+            ModelCheck::Missing(why) => {
+                if !was_missing {
+                    tracing::warn!(worker = %self.name, %why, "local worker unhealthy: its model is missing");
+                }
+                ModelCheck::Missing(why)
             }
-            ModelCheck::Missing(_) => {}
-            _ if was_missing => {
-                tracing::info!(worker = %self.name, "local worker healthy again: its model is back");
+            ModelCheck::Available => {
+                if was_missing {
+                    tracing::info!(worker = %self.name, "local worker healthy again: its model is back");
+                }
+                ModelCheck::Available
             }
-            _ => {}
-        }
+            ModelCheck::Unknown => match model.take() {
+                Some((_, kept @ ModelCheck::Missing(_))) => kept,
+                _ => ModelCheck::Unknown,
+            },
+        };
         *model = Some((Instant::now(), check));
         true
     }
@@ -2007,6 +2027,11 @@ mod tests {
 
         assert!(w.refresh().await);
         assert!(!w.healthy(), "a missing model makes the worker unhealthy");
+        assert_eq!(
+            w.unhealthy_reason().as_deref(),
+            Some("no model `nope:1b`"),
+            "the health line says why"
+        );
         assert!(!w.refresh().await, "asked too recently to ask again");
         let asked = |p: &Checked| p.asked.load(std::sync::atomic::Ordering::SeqCst);
         assert_eq!(asked(&provider), 1);
@@ -2025,7 +2050,20 @@ mod tests {
         w.model.lock().unwrap().as_mut().unwrap().0 = long_ago;
         assert!(w.refresh().await);
         assert!(w.healthy());
+        assert_eq!(w.unhealthy_reason(), None);
         assert_eq!(asked(&provider), 3);
+
+        // Nor does it make a missing model healthy: the last answer stands.
+        *provider.answer.lock().unwrap() = ModelCheck::Missing("gone again".into());
+        w.model.lock().unwrap().as_mut().unwrap().0 = long_ago;
+        assert!(w.refresh().await);
+        assert!(!w.healthy());
+        *provider.answer.lock().unwrap() = ModelCheck::Unknown;
+        w.model.lock().unwrap().as_mut().unwrap().0 = long_ago;
+        assert!(w.refresh().await);
+        assert!(!w.healthy(), "an outage keeps a missing model missing");
+        assert_eq!(w.unhealthy_reason().as_deref(), Some("gone again"));
+        assert_eq!(asked(&provider), 5);
     }
 
     /// A kept conversation every run under its id continues.

@@ -1124,9 +1124,12 @@ impl ModelProvider for OllamaProvider {
     /// failure (server down, a 500) leaves the answer unknown.
     async fn check_model(&self) -> ModelCheck {
         let url = format!("{}/api/show", self.base_url);
+        // The chat client's timeout is sized for generation; a health probe
+        // on a wedged Ollama must not hold the registry's refresh or startup.
         let resp = match self
             .client
             .post(&url)
+            .timeout(std::time::Duration::from_secs(5))
             .json(&serde_json::json!({ "model": self.model }))
             .send()
             .await
