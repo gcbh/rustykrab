@@ -232,3 +232,46 @@ local runs, an e2e scenario for two daemons on one data directory, and
 failed ticks in the log. Three are new: slice 5 of the update flow
 (`rustykrab update check` and `stage`), the manual tick route respecting
 the lock, and README rows for the control layer's variables.
+
+## Fifth cycle (2026-09-28)
+
+All seven items verified, among them slice 5 of the update flow
+(`rustykrab update check` and `stage`). Three things stood out.
+
+**Review caught a flaw that verification could not.** An independent
+security review of slice 5 found that its signature check could be forged.
+The spec was at fault, not the worker: it had asked for the `Identifier=`
+and `TeamIdentifier=` lines of `codesign -dv`. Those are fields of the
+signature, and `codesign -s - --team-id 3RRX845C4X` puts the pinned team
+into an ad-hoc signature that passes `codesign --verify`. The check now
+verifies a Developer ID requirement against the certificate chain. It was
+confirmed against the forged bundle, which it refuses, and against the
+installed release bundle, which satisfies it. The same review found that
+a local build printing `..` as its version would have staged over the
+data directory. Both were fixed at merge, with tests, and the plan was
+corrected. The builder's verifier can only confirm what the spec asked
+for; a wrong spec passes. That is why security-relevant slices get a
+second reader.
+
+**Items the ladder files itself are a gap.** Two `internal` items filed
+by the ladder ran without a repository. One wrote a patch into its run
+directory and filed a follow-up asking for it to be applied. The other
+read a sibling run's worktree to write a classifier rule. Ladder filings
+also bypass `hold_discovered`. Batch 6 makes them inherit the failing
+item's repository, worker and constraints, and holds them with the rest.
+
+**Turn-cap recovery worked, and exposed the next step.** Three runs hit
+the turn cap. The resume returned a contract saying nothing was
+committed, with its reason in free text, and the classifier did not know
+the text. Batch 6 keeps such a run as the typed `budget/iterations`
+failure instead. A verifier gap recurred four times: a compound claimed
+check whose steps ran separately. That is also in batch 6.
+
+The builder was redeployed through slice 5 itself:
+`rustykrab update stage --from <build>` staged the binary with its record
+(`kind: binary`, `signature_verified: false`), and the swap was done by
+hand. Every integration build reports version 5.3.6, so slice 6 records a
+rolled-back local build as bad by commit, not by version. Gate: 1,853
+unit tests; e2e 56 pass, 13 xfail, 0 fail. Batch 6 has ten items,
+including slice 6 (`rustykrab update apply`) and slice 5's remaining
+hardening (size cap, token host, pre-release tags).
