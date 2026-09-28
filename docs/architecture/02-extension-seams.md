@@ -26,6 +26,9 @@ weight. Counts are `impl X for` occurrences including test doubles.
 | `WorkBackend` | **`tools`** `work_backend.rs` | 1 stub | Correctly placed above the consumer: the `work_file`, `work_status` and `result_report` tools call it; the controller adapter in `rustykrab-cli` implements it (Phase 1, round 2) |
 | `Worker` | **`control`** `worker.rs` | 1 | Correctly placed: the controller calls it, and `LocalWorker` in `rustykrab-agent` implements it above the controller. Peer, Claude Code and Codex workers are the later implementations |
 | `ToolCatalog` | **`control`** `controller/mod.rs` | 2 | Earns its keep: `StaticCatalog` for tests, `RegistryCatalog` in `rustykrab-cli` over the final tool registry and the active-tools seed (registered but unloaded tools, configured MCP servers) |
+| `ReviewSurface` | **`control`** `review/mod.rs` | 1 + 1 test | Earns its keep: the review-surface decision (GitHub or Linear) is still open, so the projection and sync are written once against it; `GithubIssues` in `rustykrab-cli` is the first implementation, an in-memory surface in the controller tests the second |
+| `WorkRecordSource`, `QuestionReader`, `RoutingRecordReader`, `ProposalFiler`, `EvaluationLedger` | **`dream`** `evaluate/mod.rs` | 1-2 + test fakes each | Correct inversion, as `OutcomeSource`: the pass reads the store, Phases 3 and 4 and files through the controller without depending on any of them; the store-backed impls are in `dream`, the filer in `rustykrab-cli` |
+| `EvaluationHandle` | **`gateway`** `evaluate_routes.rs` | 1 + 1 test | Correctly placed above the consumer: `POST /api/work/evaluate` calls it, and the CLI's `Evaluator` implements it with a boxed future |
 | `RunTranscripts` | **`agent`** `local_worker.rs` | 1 + 1 test | Correctly placed: `LocalWorker` keeps each run's conversation through it, and `StoreTranscripts` in `rustykrab-cli` implements it over the conversation store, which `agent` does not depend on |
 | `Skill` | `skills/skill.rs` | 1 | Thin — `SkillMd` is the only shape |
 | `Channel` | `channels/channel.rs` | **1** | **Not earning its keep** |
@@ -58,6 +61,8 @@ Which traits are actually blocked, by where their real implementor lives:
 | `CronBackend` | `CronAdapter` | `rustykrab-cli` | no, above |
 | `MessageBackend` | `MessageAdapter` | `rustykrab-cli` | no, above |
 | `WorkBackend` | controller adapter (round 2) | `rustykrab-cli` | no, above |
+| `ReviewSurface` | `GithubIssues` | `rustykrab-cli` | no, above |
+| `ProposalFiler` | `ControlFiler` | `rustykrab-cli` | no, above |
 
 `CronAdapter` and `MessageAdapter` are also not pass-throughs — `CronAdapter`
 merges the calling conversation's channel context into cron arguments, which

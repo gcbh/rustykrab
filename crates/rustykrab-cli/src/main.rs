@@ -1,6 +1,7 @@
 mod chat;
 #[cfg(feature = "computer-use")]
 mod computer_backend;
+mod evaluation;
 mod prompt_log;
 mod task_queue;
 mod work_cmd;
@@ -1464,11 +1465,15 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
+    // --- Evaluation and the review surface (control plan, Phase 6) ---
+    let evaluator = evaluation::evaluator(&store, controller.clone()).await;
+
     // --- Build gateway state ---
     // Clone store handle so we can flush it after the server shuts down.
     let store_handle = store.clone();
     let mut state = rustykrab_gateway::AppState::new(store, tools, provider, auth_token)
         .with_control(controller.clone() as Arc<dyn rustykrab_control::handle::ControlHandle>)
+        .with_evaluation(evaluator.clone())
         // Loopback is always allowed; this adds the names other clients
         // reach us by, e.g. the tailnet hostname the phone uses.
         .with_origin_policy(rustykrab_gateway::OriginPolicy::from_env())
@@ -1891,6 +1896,7 @@ async fn main() -> anyhow::Result<()> {
         infra_handles.push(tokio::spawn(async move {
             deliver_work_notices(outbox_store, outbox_backend, default_chat, tick_secs).await;
         }));
+        infra_handles.push(evaluation::spawn_nightly(evaluator));
         tracing::info!(tick_secs, "control layer started");
     }
 
