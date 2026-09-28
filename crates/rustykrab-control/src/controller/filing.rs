@@ -581,7 +581,7 @@ impl Controller {
     /// the failing item as evidence. It runs where the failing item ran:
     /// it takes that item's `repo:` resources, worker constraint and
     /// constraints ([`inherit_internal`]). An open one for the same
-    /// fingerprint is reused.
+    /// fingerprint in the same repository is reused.
     pub(super) fn file_internal(
         &self,
         b: &mut Batch,
@@ -634,8 +634,15 @@ impl Controller {
         mut draft: WorkItemDraft,
         conversation: Option<String>,
     ) -> Result<WorkItemId, String> {
+        // Reused only in the same repository: an item inherits the failing
+        // item's `repo:` resources, so one scoped to another repository
+        // would run the fix in the wrong worktree.
+        let repos = repos_of(&draft.writable_resources);
         if let Some(open) = b.snap.items().iter().find(|i| {
-            i.kind == WorkKind::Internal && !i.status.is_closed() && i.title == draft.title
+            i.kind == WorkKind::Internal
+                && !i.status.is_closed()
+                && i.title == draft.title
+                && repos_of(&i.writable_resources) == repos
         }) {
             return Ok(open.id.clone());
         }
@@ -956,6 +963,18 @@ fn inherit_internal(failing: &WorkItem, draft: &WorkItemDraft) -> WorkItemDraft 
 
 fn is_repo(resource: &str) -> bool {
     resource.starts_with(crate::workspace::REPO_PREFIX)
+}
+
+/// The `repo:` resources among `resources`, sorted and deduplicated.
+fn repos_of(resources: &[String]) -> Vec<&str> {
+    let mut repos: Vec<&str> = resources
+        .iter()
+        .map(String::as_str)
+        .filter(|r| is_repo(r))
+        .collect();
+    repos.sort_unstable();
+    repos.dedup();
+    repos
 }
 
 /// Drafts filed as one graph that write the same repository, inherited or

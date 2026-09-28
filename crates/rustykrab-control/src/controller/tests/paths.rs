@@ -528,6 +528,47 @@ async fn the_ladders_internal_item_inherits_the_failing_items_repo_worker_and_co
 }
 
 #[tokio::test]
+async fn the_ladder_reuses_an_internal_item_only_in_the_same_repository() {
+    let h = Harness::with(
+        ControllerConfig::default(),
+        StaticCatalog::default(),
+        &["pinch"],
+    );
+    let failing = [
+        ("Port the parser", "repo:/src/app"),
+        ("Port the lexer", "repo:/src/lib"),
+        ("Port the printer", "repo:/src/app"),
+    ];
+    for (title, repo) in failing {
+        h.script.push(
+            title,
+            Step::Fail(Error::Internal("flux capacitor desynchronised".to_string())),
+        );
+        let mut x = code_follow_up("x", title);
+        x.writable_resources = vec![repo.to_string()];
+        h.file_one(x).await;
+    }
+    for _ in 0..6 {
+        h.step().await;
+    }
+    let internal = h.of_kind(WorkKind::Internal).await;
+    let mut repos: Vec<Vec<String>> = internal
+        .iter()
+        .map(|i| i.writable_resources.clone())
+        .collect();
+    repos.sort();
+    assert_eq!(
+        repos,
+        vec![
+            vec!["repo:/src/app".to_string()],
+            vec!["repo:/src/lib".to_string()],
+        ],
+        "one internal item per repository: {internal:?}"
+    );
+    assert_eq!(internal[0].title, internal[1].title, "the same fingerprint");
+}
+
+#[tokio::test]
 async fn hold_discovered_holds_the_ladders_internal_item_for_consent() {
     let item = internal_item_for_a_failing_code_item(true).await;
     assert_eq!(item.status, Status::Blocked(BlockedReason::NeedsConsent));
