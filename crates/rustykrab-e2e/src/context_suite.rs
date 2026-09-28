@@ -1114,9 +1114,16 @@ async fn trial(
                 ))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
+        // A runner notice is a user turn (control plan 12.1) the runner
+        // wrote, not input a channel admitted, so it has no journal row.
         let inbound: Vec<_> = canonical_final
             .iter()
             .filter(|m| m["role"] == "user" && !initial.iter().any(|old| old["id"] == m["id"]))
+            .filter(|m| {
+                !m["content"]["data"]
+                    .as_str()
+                    .is_some_and(|t| t.starts_with(rustykrab_core::types::SYSTEM_NOTICE_PREFIX))
+            })
             .collect();
         let mut checks = Vec::new();
         for message in inbound {
