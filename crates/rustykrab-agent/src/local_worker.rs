@@ -71,7 +71,7 @@ use rustykrab_tools::work_backend::{
     Principal, Provenance, StatusQuery, ToolState, WorkBackend, WorkRunContext, WorkStatusView,
     WORK_RUN_CONTEXT,
 };
-use tokio::sync::Semaphore;
+use tokio::sync::{watch, Semaphore};
 use uuid::Uuid;
 
 use crate::metered::{Meter, MeteredProvider};
@@ -171,6 +171,87 @@ pub struct LocalRun {
     pub reported: bool,
 }
 
+/// The local runs in flight in this process, so the daemon can end them on
+/// its way down: the in-process counterpart of
+/// [`crate::external_worker::RunGroups`]. Each [`LocalWorker`] run joins
+/// the set [`LocalWorker::with_runs`] gave it ([`LocalRuns::global`] by
+/// default) for as long as it runs, waiting for its slot included.
+#[derive(Default)]
+pub struct LocalRuns {
+    live: Mutex<HashMap<u64, watch::Sender<Option<String>>>>,
+    next: std::sync::atomic::AtomicU64,
+}
+
+impl LocalRuns {
+    /// The set every [`LocalWorker`] joins unless told otherwise.
+    pub fn global() -> Arc<LocalRuns> {
+        static GLOBAL: std::sync::OnceLock<Arc<LocalRuns>> = std::sync::OnceLock::new();
+        GLOBAL
+            .get_or_init(|| Arc::new(LocalRuns::default()))
+            .clone()
+    }
+
+    /// How many runs are in the set now.
+    pub fn live(&self) -> usize {
+        self.lock().len()
+    }
+
+    /// End every run in the set: each stops where it is, removes its
+    /// worktree and returns [`RunFailure::Interrupted`] carrying `detail`.
+    /// Returns how many were told.
+    pub fn interrupt_all(&self, detail: &str) -> usize {
+        let live = self.lock();
+        for tx in live.values() {
+            tx.send_replace(Some(detail.to_string()));
+        }
+        live.len()
+    }
+
+    fn enter(self: &Arc<Self>) -> RunEntry {
+        let id = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (tx, rx) = watch::channel(None);
+        self.lock().insert(id, tx);
+        RunEntry {
+            runs: self.clone(),
+            id,
+            rx,
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<u64, watch::Sender<Option<String>>>> {
+        self.live.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// One run's membership in a [`LocalRuns`]; dropping it leaves the set.
+struct RunEntry {
+    runs: Arc<LocalRuns>,
+    id: u64,
+    rx: watch::Receiver<Option<String>>,
+}
+
+impl RunEntry {
+    /// Resolves, with the typed error, once the run is interrupted.
+    async fn interrupted(&self) -> Error {
+        let mut rx = self.rx.clone();
+        let told = rx
+            .wait_for(Option::is_some)
+            .await
+            .map(|detail| detail.clone().unwrap_or_default());
+        match told {
+            Ok(detail) => RunFailure::Interrupted { detail }.into_error(),
+            // The sender lives until this entry drops.
+            Err(_) => std::future::pending().await,
+        }
+    }
+}
+
+impl Drop for RunEntry {
+    fn drop(&mut self) {
+        self.runs.lock().remove(&self.id);
+    }
+}
+
 /// The `local` worker kind: a sub-agent conversation on this daemon.
 pub struct LocalWorker {
     name: String,
@@ -188,6 +269,8 @@ pub struct LocalWorker {
     /// The KV slot runs wait for. Local work is serialised per model
     /// (plan section 12.1), so workers on one model share one.
     slot: Arc<Semaphore>,
+    /// The set its runs join, so shutdown can interrupt them.
+    runs: Arc<LocalRuns>,
     last_run: Mutex<Option<LocalRun>>,
     /// Spend per run id, for [`Worker::usage`].
     spending: Mutex<HashMap<String, Arc<Spending>>>,
@@ -235,6 +318,7 @@ impl LocalWorker {
             transcripts: None,
             late: None,
             slot: Arc::new(Semaphore::new(1)),
+            runs: LocalRuns::global(),
             last_run: Mutex::new(None),
             spending: Mutex::new(HashMap::new()),
             model: Mutex::new(None),
@@ -245,6 +329,12 @@ impl LocalWorker {
     /// workers on one model never run at once.
     pub fn with_slot(mut self, slot: Arc<Semaphore>) -> Self {
         self.slot = slot;
+        self
+    }
+
+    /// Join `runs` instead of [`LocalRuns::global`].
+    pub fn with_runs(mut self, runs: Arc<LocalRuns>) -> Self {
+        self.runs = runs;
         self
     }
 
@@ -615,11 +705,13 @@ impl Worker for LocalWorker {
         let activate = self
             .activation(&brief, &ceiling)
             .map_err(RunFailure::into_error)?;
-        let _slot = self
-            .slot
-            .acquire()
-            .await
-            .map_err(|_| Error::Internal("local worker slot closed".into()))?;
+        let entry = self.runs.enter();
+        let _slot = tokio::select! {
+            slot = self.slot.acquire() => {
+                slot.map_err(|_| Error::Internal("local worker slot closed".into()))?
+            }
+            e = entry.interrupted() => return Err(e),
+        };
 
         // A `code` run works in its own worktree: created now, `exec`
         // bound to it, removed when the run ends (the branch stays).
@@ -635,9 +727,14 @@ impl Worker for LocalWorker {
                     .into_error()
                 })?;
         }
-        let result = self
-            .run_in(brief.clone(), host_tools, ceiling, activate)
-            .await;
+        // Shutdown interrupts the run where it is; the worktree still goes.
+        let result = tokio::select! {
+            result = self.run_in(brief.clone(), host_tools, ceiling, activate) => result,
+            e = entry.interrupted() => {
+                tracing::info!(worker = %self.name, "local run interrupted");
+                Err(e)
+            }
+        };
         if let Some(ws) = brief.workspace {
             if let Err(why) = tokio::task::spawn_blocking(move || ws.remove())
                 .await

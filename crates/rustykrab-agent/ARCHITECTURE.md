@@ -315,7 +315,12 @@ could move to a crate of its own if the adapters grow.
   process, and the controller returns its item to `ready` with no rung
   and no repair counted; a report the agent handed in first still stands.
   With no result its worktree is kept for retention. Signals go through a direct `kill(2)` declaration rather than
-  a `libc` dependency.
+  a `libc` dependency. `LocalWorker` has the in-process counterpart,
+  `LocalRuns` (`LocalRuns::global()` unless given another through
+  `with_runs`): a run joins it before waiting for its slot, and
+  `LocalRuns::interrupt_all` at shutdown makes it stop where it is, remove
+  its worktree and return `RunFailure::Interrupted`, so the final tick
+  reconciles it instead of the task dying with the controller.
 - **The brief** is the delivery plan's executor brief
   (`render_executor_brief`): the item's typed fields, inputs, the prior
   failure, repository, worktree, branch and parent commit, what a
