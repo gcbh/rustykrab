@@ -85,7 +85,7 @@ use tokio::task::JoinHandle;
 
 use crate::errors::{LearnedRule, Recurrence, DEFAULT_PROMOTE_THRESHOLD};
 use crate::graph::{ApprovalPolicy, FilingSource, SplitMode};
-use crate::handle::{ControlHandle, GraphView, TickReport};
+use crate::handle::{ControlHandle, GraphView, LoopStatus, TickReport};
 use crate::registry::WorkerRegistry;
 use crate::routing::Judged;
 use crate::worker::Worker;
@@ -384,6 +384,8 @@ struct State {
     spent: Option<HashMap<WorkItemId, Spend>>,
     /// When the last aging pass ran, for `aging_max_gap`.
     last_aged: Option<DateTime<Utc>>,
+    /// When the last tick that completed finished.
+    last_tick: Option<DateTime<Utc>>,
 }
 
 /// The loop of plan section 6 over one store and the workers of a
@@ -431,6 +433,7 @@ impl Controller {
                 learned: Vec::new(),
                 spent: None,
                 last_aged: None,
+                last_tick: None,
             }),
         }
     }
@@ -609,6 +612,14 @@ impl ControlHandle for Controller {
 
     async fn graph(&self, root: &str) -> Result<GraphView, Error> {
         self.graph_view(root).await
+    }
+
+    fn loop_status(&self) -> Option<LoopStatus> {
+        let state = self.state();
+        Some(LoopStatus {
+            last_tick: state.last_tick,
+            runs_in_flight: state.runs.len(),
+        })
     }
 
     async fn review_decision(

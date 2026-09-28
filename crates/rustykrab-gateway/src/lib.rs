@@ -12,6 +12,7 @@ mod signal_webhook;
 mod state;
 pub mod tasks;
 mod telegram_webhook;
+mod version_route;
 mod webchat;
 pub mod work_routes;
 pub mod worker_routes;
@@ -26,7 +27,7 @@ pub use run::{
     run_agent_with_options,
 };
 pub use rustykrab_runtime::{AgentContext, RunOptions, RuntimeError};
-pub use state::AppState;
+pub use state::{AppState, BuildInfo};
 pub use tasks::{run_task_worker, TaskQueueSignal};
 
 use axum::extract::Request;
@@ -68,6 +69,7 @@ async fn security_headers_middleware(request: Request, next: Next) -> Response {
 pub fn router(state: AppState) -> Router {
     Router::new()
         .merge(routes::api_routes())
+        .merge(version_route::routes())
         .merge(project_routes::routes())
         .merge(work_routes::routes())
         .merge(worker_routes::routes())

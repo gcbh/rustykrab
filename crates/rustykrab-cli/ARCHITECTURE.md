@@ -141,7 +141,9 @@ rebuild, constructs the memory backend, spawns the idle lifecycle sweep, builds
 the video channel, loads and audits the skill registry, assembles ~65 tools
 across nine factory calls, loads the orchestration config, snapshots tools for
 sub-agents, applies tool stubs (before the local worker takes its list),
-builds `AppState` through ~15 builder calls,
+builds `AppState` through ~15 builder calls (one, `with_build_info`, hands
+the gateway the version, commit and build date `--version` prints, for
+`GET /api/version`),
 constructs the task queue, spawns the job executor, the delegated-task worker,
 the worker registry's refresh timer and the dream worker, binds the HTTP server, starts the Telegram/Slack/Signal
 loops, and waits on the shutdown signal. `shutdown_signal` resolves on
