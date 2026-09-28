@@ -233,7 +233,10 @@ takes the exclusive `$RUSTYKRAB_DATA_DIR/controller.lock`
 (`rustykrab_control::lock::LoopLock`) and holds it for the life of the
 task, so an old and a new daemon overlapping during a cutover never both
 run the loop; while another process holds it the loop runs no tick, logs
-once, and tries again each interval; and
+once, and tries again each interval. Each pass is `run_control_tick`,
+which logs a failed tick with the `class` and `consecutive` count read
+back from `loop_status`, the same `last_failure_class` and
+`consecutive_failed_ticks` that `GET /api/version` reports; and
 `work_host::deliver_work_notices`, which drains the work outbox through
 `MessageAdapter` and marks a row delivered only when the send succeeds.
 Each notice goes where its item came from, resolved at delivery time: a

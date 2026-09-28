@@ -1928,20 +1928,7 @@ async fn main() -> anyhow::Result<()> {
                         }
                     }
                 }
-                match tick_controller.tick().await {
-                    Ok(report) => {
-                        if report.transitions > 0 || report.notices > 0 {
-                            tracing::info!(
-                                leased = report.leased.len(),
-                                reconciled = report.reconciled.len(),
-                                transitions = report.transitions,
-                                notices = report.notices,
-                                "control tick"
-                            );
-                        }
-                    }
-                    Err(e) => tracing::warn!(error = %e, "control tick failed"),
-                }
+                run_control_tick(tick_controller.as_ref()).await;
             }
         }));
         let outbox_store = store_handle.clone();
@@ -3269,6 +3256,142 @@ fn parse_drain_secs(value: Option<&str>) -> std::time::Duration {
         }),
     };
     std::time::Duration::from_secs(secs)
+}
+
+/// One pass of the daemon's tick timer. A failed tick is logged with the
+/// class and consecutive count the controller recorded for it, read back
+/// from `loop_status`, so the log says what `GET /api/version` says.
+async fn run_control_tick(control: &dyn ControlHandle) {
+    match control.tick().await {
+        Ok(report) => {
+            if report.transitions > 0 || report.notices > 0 {
+                tracing::info!(
+                    leased = report.leased.len(),
+                    reconciled = report.reconciled.len(),
+                    transitions = report.transitions,
+                    notices = report.notices,
+                    "control tick"
+                );
+            }
+        }
+        Err(e) => {
+            let status = control.loop_status();
+            let class = status
+                .as_ref()
+                .and_then(|s| s.last_failure_class.clone())
+                .unwrap_or_else(|| "unknown".to_string());
+            let consecutive = status.map_or(0, |s| s.consecutive_failed_ticks);
+            tracing::warn!(
+                error = %e,
+                class = %class,
+                consecutive,
+                "control tick failed"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod control_tick_log_tests {
+    use super::*;
+    use rustykrab_control::graph::FilingSource;
+    use rustykrab_control::handle::{GraphView, LoopStatus, TickReport};
+    use rustykrab_control::Provenance;
+    use rustykrab_core::work::{PlanOutcome, WorkItemId, WorkPlan};
+    use rustykrab_core::Error;
+    use std::sync::Mutex;
+
+    /// A controller whose every tick fails with a storage error, counting
+    /// the failures the way the real one does.
+    #[derive(Default)]
+    struct FailingControl(Mutex<u32>);
+
+    fn unused() -> Error {
+        Error::Internal("not used by these tests".into())
+    }
+
+    #[async_trait::async_trait]
+    impl ControlHandle for FailingControl {
+        async fn file_plan(
+            &self,
+            _: WorkPlan,
+            _: Provenance,
+            _: FilingSource,
+        ) -> Result<PlanOutcome, Error> {
+            Err(unused())
+        }
+        async fn approve(&self, _: &str, _: &str) -> Result<Vec<WorkItemId>, Error> {
+            Err(unused())
+        }
+        async fn reject(
+            &self,
+            _: &str,
+            _: Option<String>,
+            _: &str,
+        ) -> Result<Vec<WorkItemId>, Error> {
+            Err(unused())
+        }
+        async fn cancel(
+            &self,
+            _: &str,
+            _: Option<String>,
+            _: &str,
+        ) -> Result<Vec<WorkItemId>, Error> {
+            Err(unused())
+        }
+        async fn tick(&self) -> Result<TickReport, Error> {
+            *self.0.lock().unwrap() += 1;
+            Err(Error::Storage("database is locked".into()))
+        }
+        async fn graph(&self, _: &str) -> Result<GraphView, Error> {
+            Err(unused())
+        }
+        fn loop_status(&self) -> Option<LoopStatus> {
+            Some(LoopStatus {
+                last_failure_class: Some("storage".into()),
+                consecutive_failed_ticks: *self.0.lock().unwrap(),
+                ..LoopStatus::default()
+            })
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_tick_logs_its_class_and_consecutive_count() {
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let control = FailingControl::default();
+        run_control_tick(&control).await;
+        run_control_tick(&control).await;
+
+        let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(lines.len(), 2, "{log}");
+        for (line, count) in lines.iter().zip(1..) {
+            assert!(line.contains("control tick failed"), "{line}");
+            assert!(line.contains("class=storage"), "{line}");
+            assert!(line.contains(&format!("consecutive={count}")), "{line}");
+            assert!(line.contains("database is locked"), "{line}");
+        }
+    }
 }
 
 /// Put the controller in its draining state and wait, up to `grace`, for
