@@ -86,14 +86,35 @@ async fn stand_in(daemon: Shared) -> Url {
     base
 }
 
+type Hook = Box<dyn FnOnce() + Send>;
+
 /// A service manager that flips the stand-in on and off and records calls.
 struct ScriptedService {
     daemon: Shared,
     launchd: bool,
     calls: Mutex<Vec<&'static str>>,
+    /// Which calls to `stop` fail, counting from 0.
+    failing_stops: Mutex<Vec<usize>>,
+    /// Whether a failing stop still took the daemon down.
+    failed_stop_takes_it_down: Mutex<bool>,
+    stops: Mutex<usize>,
+    /// Run on the first `start`, before the daemon is up.
+    on_start: Mutex<Option<Hook>>,
 }
 
 impl ScriptedService {
+    fn new(daemon: Shared, launchd: bool) -> Self {
+        Self {
+            daemon,
+            launchd,
+            calls: Mutex::new(Vec::new()),
+            failing_stops: Mutex::new(Vec::new()),
+            failed_stop_takes_it_down: Mutex::new(false),
+            stops: Mutex::new(0),
+            on_start: Mutex::new(None),
+        }
+    }
+
     fn calls(&self) -> Vec<&'static str> {
         self.calls.lock().unwrap().clone()
     }
@@ -110,14 +131,32 @@ impl ServiceManager for ScriptedService {
 
     fn stop(&self) -> anyhow::Result<()> {
         self.calls.lock().unwrap().push("stop");
+        let n = {
+            let mut stops = self.stops.lock().unwrap();
+            *stops += 1;
+            *stops - 1
+        };
+        if self.failing_stops.lock().unwrap().contains(&n) {
+            if *self.failed_stop_takes_it_down.lock().unwrap() {
+                self.daemon.lock().unwrap().running = false;
+            }
+            bail!("scripted stop {n} failed");
+        }
         self.daemon.lock().unwrap().running = false;
         Ok(())
     }
 
     fn start(&self) -> anyhow::Result<()> {
         self.calls.lock().unwrap().push("start");
+        if let Some(hook) = self.on_start.lock().unwrap().take() {
+            hook();
+        }
         self.daemon.lock().unwrap().running = true;
         Ok(())
+    }
+
+    fn running(&self) -> bool {
+        self.daemon.lock().unwrap().running
     }
 }
 
@@ -274,11 +313,7 @@ impl Rig {
             _data: data,
             _root: root,
             binary,
-            service: ScriptedService {
-                daemon,
-                launchd,
-                calls: Mutex::new(Vec::new()),
-            },
+            service: ScriptedService::new(daemon, launchd),
             swap: DirSwap { installed },
             probe: HttpProbe::new(&base, TOKEN).unwrap(),
             verifier: ScriptedVerifier::new("5.3.6"),
@@ -495,11 +530,8 @@ async fn launchd_checks_the_signature_of_the_copy_and_refuses_an_unsigned_one() 
         [rig.next()],
         "the signature checked is the copy's"
     );
-    // The old version was started again and nothing moved.
-    assert_eq!(rig.service.calls(), ["stop", "start"]);
-    assert_eq!(rig.installed(), OLD);
-    assert_eq!(rig.prev(), None);
-    assert!(!rig.next().exists());
+    // The copy was checked before the daemon was stopped: nothing moved.
+    rig.assert_untouched();
 
     // Signed, it applies.
     *rig.verifier.signed.lock().unwrap() = true;
@@ -516,16 +548,20 @@ async fn a_copy_that_reports_another_commit_or_version_is_refused() {
     *rig.verifier.commit_override.lock().unwrap() = Some("evil999".to_string());
     let err = apply(&rig.cfg, &rig.host(), true).await.unwrap_err();
     assert!(format!("{err:#}").contains("evil999"), "{err:#}");
-    assert_eq!(rig.service.calls(), ["stop", "start"]);
-    assert_eq!(rig.installed(), OLD);
-    assert_eq!(rig.prev(), None);
-    assert!(!rig.next().exists());
+    assert!(
+        format!("{err:#}").contains("the daemon was not stopped"),
+        "{err:#}"
+    );
+    // A stage that fails its copy checks never takes the daemon down.
+    rig.assert_untouched();
+    assert!(rig.service.daemon.lock().unwrap().running);
+    assert_eq!(read_journal(&rig.cfg).unwrap(), None);
 
     *rig.verifier.commit_override.lock().unwrap() = None;
     *rig.verifier.version.lock().unwrap() = "9.9.9".to_string();
     let err = apply(&rig.cfg, &rig.host(), true).await.unwrap_err();
     assert!(format!("{err:#}").contains("9.9.9"), "{err:#}");
-    assert_eq!(rig.installed(), OLD);
+    rig.assert_untouched();
     assert!(read_bad(&rig.cfg).unwrap().is_empty());
 }
 
@@ -617,7 +653,7 @@ fn the_swap_refuses_a_copy_that_is_a_symlink() {
         installed: installed.clone(),
     };
     // `cp -R` copies the link as a link, and the copy is refused.
-    let err = swap.swap_in(&link, &check).unwrap_err();
+    let err = swap.prepare(&link, &check).unwrap_err();
     assert!(err.to_string().contains("not a regular file"), "{err:#}");
     assert_eq!(std::fs::read_to_string(&installed).unwrap(), OLD);
     assert!(std::fs::symlink_metadata(sibling(&installed, ".", ".next").unwrap()).is_err());
@@ -725,8 +761,8 @@ impl VersionProbe for Sequence {
 
 #[tokio::test]
 async fn verify_ignores_tick_advances_while_ticks_fail() {
-    let service = ScriptedService {
-        daemon: Arc::new(Mutex::new(Daemon {
+    let service = ScriptedService::new(
+        Arc::new(Mutex::new(Daemon {
             running: true,
             installed: PathBuf::new(),
             new_mode: NewMode::Healthy,
@@ -734,9 +770,8 @@ async fn verify_ignores_tick_advances_while_ticks_fail() {
             old_lock: "held",
             old_failed_ticks: 0,
         })),
-        launchd: false,
-        calls: Mutex::new(Vec::new()),
-    };
+        false,
+    );
     let swap = DirSwap {
         installed: PathBuf::from("/nonexistent"),
     };
@@ -799,7 +834,10 @@ fn the_swap_moves_a_bundle_and_restores_it() {
     let swap = DirSwap {
         installed: installed.clone(),
     };
-    swap.swap_in(&staged, &check).unwrap();
+    swap.prepare(&staged, &check).unwrap();
+    // Prepared, nothing installed has moved yet.
+    assert_eq!(binary(&installed), OLD);
+    swap.commit().unwrap();
     assert_eq!(binary(&installed), NEW);
     assert_eq!(binary(&root.path().join(format!("{APP_NAME}.prev"))), OLD);
     assert_eq!(binary(&staged), NEW, "the stage is copied, not consumed");
@@ -816,6 +854,263 @@ fn the_swap_moves_a_bundle_and_restores_it() {
         .collect();
     left.sort();
     assert_eq!(left, [APP_NAME]);
+}
+
+/// The journal an apply of the local build `NEW` over `OLD` writes.
+fn write_journal_at(cfg: &Config, phase: Phase) {
+    write_atomic(
+        cfg,
+        STATE_FILE,
+        &Journal {
+            phase,
+            from_commit: OLD.to_string(),
+            to_commit: NEW.to_string(),
+            bad: BadVersion {
+                version: "5.3.6".to_string(),
+                commit: Some(NEW.to_string()),
+            },
+            at: Utc::now(),
+        },
+    )
+    .unwrap();
+}
+
+fn bad_new() -> Vec<BadVersion> {
+    vec![BadVersion {
+        version: "5.3.6".to_string(),
+        commit: Some(NEW.to_string()),
+    }]
+}
+
+fn failed_file(cfg: &Config) -> PathBuf {
+    cfg.updates_dir().join(FAILED_FILE)
+}
+
+/// Swap `NEW` in with a healthy apply, then clear the service's calls.
+async fn applied(rig: &Rig) {
+    write_stage(&rig.cfg, NEW, None, "binary", false);
+    let outcome = apply(&rig.cfg, &rig.host(), true).await.unwrap();
+    assert!(matches!(outcome, Outcome::Applied(_)), "{outcome:?}");
+    assert_eq!(
+        read_journal(&rig.cfg).unwrap(),
+        None,
+        "the journal is cleared"
+    );
+    rig.service.calls.lock().unwrap().clear();
+}
+
+#[tokio::test]
+async fn an_apply_interrupted_after_the_swap_is_rolled_back_by_the_next_run() {
+    for phase in [Phase::Swapped, Phase::Started] {
+        let rig = Rig::new(NewMode::Healthy, false).await;
+        applied(&rig).await;
+        // The run was killed with the new version in place.
+        write_journal_at(&rig.cfg, phase);
+
+        let outcome = apply(&rig.cfg, &rig.host(), true).await.unwrap();
+        let Outcome::Recovered(recovery) = outcome else {
+            panic!("expected a recovery, got {outcome:?}");
+        };
+        assert_eq!(recovery.phase, Some(phase));
+        assert!(recovery.rolled_back);
+        assert_eq!(recovery.bad_record_error, None);
+        assert_eq!(rig.service.calls(), ["stop", "start"]);
+        assert_eq!(rig.installed(), OLD, "{phase:?}: .prev is restored");
+        assert_eq!(read_bad(&rig.cfg).unwrap(), bad_new());
+        assert_eq!(read_journal(&rig.cfg).unwrap(), None);
+        assert!(!failed_file(&rig.cfg).exists());
+
+        // The next run refuses the stage as bad and changes nothing.
+        let err = apply(&rig.cfg, &rig.host(), true).await.unwrap_err();
+        assert!(err.to_string().contains("recorded as bad"), "{err:#}");
+        assert_eq!(rig.service.calls().len(), 2);
+    }
+}
+
+#[tokio::test]
+async fn an_apply_interrupted_while_stopping_starts_the_old_version_again() {
+    let rig = Rig::new(NewMode::Healthy, false).await;
+    write_stage(&rig.cfg, NEW, None, "binary", false);
+    write_journal_at(&rig.cfg, Phase::Stopping);
+    std::fs::write(rig.next(), NEW).unwrap();
+    rig.service.daemon.lock().unwrap().running = false;
+
+    let outcome = apply(&rig.cfg, &rig.host(), true).await.unwrap();
+    let Outcome::Recovered(recovery) = outcome else {
+        panic!("expected a recovery, got {outcome:?}");
+    };
+    assert!(recovery.started && !recovery.rolled_back);
+    assert_eq!(rig.service.calls(), ["start"]);
+    assert_eq!(rig.installed(), OLD);
+    assert!(!rig.next().exists(), "the unswapped copy is dropped");
+    assert!(read_bad(&rig.cfg).unwrap().is_empty());
+    assert_eq!(read_journal(&rig.cfg).unwrap(), None);
+}
+
+#[tokio::test]
+async fn a_missing_install_with_prev_beside_it_is_restored_and_started() {
+    let rig = Rig::new(NewMode::Healthy, false).await;
+    let prev = sibling(&rig.swap.installed, "", ".prev").unwrap();
+    std::fs::rename(&rig.swap.installed, &prev).unwrap();
+    rig.service.daemon.lock().unwrap().running = false;
+
+    let outcome = apply(&rig.cfg, &rig.host(), false).await.unwrap();
+    let Outcome::Recovered(recovery) = outcome else {
+        panic!("expected a recovery, got {outcome:?}");
+    };
+    assert!(recovery.restored_prev && recovery.started);
+    assert_eq!(recovery.phase, None);
+    assert_eq!(rig.service.calls(), ["start"]);
+    assert_eq!(rig.installed(), OLD);
+    assert_eq!(rig.prev(), None);
+    assert_eq!(
+        rig.probe.probe().await.unwrap().commit.as_deref(),
+        Some(OLD)
+    );
+}
+
+#[tokio::test]
+async fn a_failure_to_record_the_bad_version_does_not_stop_the_rollback() {
+    // In the rollback of a run.
+    let rig = Rig::new(NewMode::NoLock, false).await;
+    write_stage(&rig.cfg, NEW, None, "binary", false);
+    let bad = rig.cfg.updates_dir().join("bad.json");
+    let dir = bad.clone();
+    *rig.service.on_start.lock().unwrap() = Some(Box::new(move || {
+        // bad.json becomes a directory, so writing it fails.
+        std::fs::create_dir_all(&dir).unwrap();
+    }));
+    let outcome = apply(&rig.cfg, &rig.host(), true).await.unwrap();
+    let Outcome::RolledBack {
+        bad_record_error, ..
+    } = outcome
+    else {
+        panic!("expected a rollback, got {outcome:?}");
+    };
+    assert!(bad_record_error.is_some());
+    assert_eq!(rig.service.calls(), ["stop", "start", "stop", "start"]);
+    assert_eq!(rig.installed(), OLD);
+    assert_eq!(rig.prev(), None);
+    assert_eq!(read_journal(&rig.cfg).unwrap(), None);
+    assert!(!failed_file(&rig.cfg).exists());
+    std::fs::remove_dir(&bad).unwrap();
+
+    // In the recovery of an interrupted one.
+    let rig = Rig::new(NewMode::Healthy, false).await;
+    applied(&rig).await;
+    write_journal_at(&rig.cfg, Phase::Started);
+    let bad = rig.cfg.updates_dir().join("bad.json");
+    std::fs::create_dir_all(&bad).unwrap();
+    let outcome = apply(&rig.cfg, &rig.host(), true).await.unwrap();
+    let Outcome::Recovered(recovery) = outcome else {
+        panic!("expected a recovery, got {outcome:?}");
+    };
+    assert!(recovery.rolled_back);
+    assert!(recovery.bad_record_error.is_some());
+    assert_eq!(rig.installed(), OLD);
+    assert_eq!(read_journal(&rig.cfg).unwrap(), None);
+}
+
+#[tokio::test]
+async fn a_failed_rollback_writes_apply_failed_and_later_runs_refuse() {
+    let rig = Rig::new(NewMode::NoLock, false).await;
+    write_stage(&rig.cfg, NEW, None, "binary", false);
+    let prev = sibling(&rig.swap.installed, "", ".prev").unwrap();
+    *rig.service.on_start.lock().unwrap() = Some(Box::new(move || {
+        // `.prev` vanishes, so the rollback cannot restore it.
+        std::fs::remove_file(&prev).unwrap();
+    }));
+
+    let err = apply(&rig.cfg, &rig.host(), true).await.unwrap_err();
+    let text = format!("{err:#}");
+    assert!(text.contains("the rollback failed"), "{text}");
+    assert!(text.contains("restoring the previous version"), "{text}");
+    // The service is started last, after the rollback's stop.
+    assert_eq!(rig.service.calls(), ["stop", "start", "stop", "start"]);
+    let failed: ApplyFailed =
+        serde_json::from_str(&std::fs::read_to_string(failed_file(&rig.cfg)).unwrap()).unwrap();
+    assert_eq!(failed.from_commit.as_deref(), Some(OLD));
+    assert_eq!(failed.to_commit.as_deref(), Some(NEW));
+    assert!(failed.what.contains("restoring"), "{}", failed.what);
+    assert_eq!(read_bad(&rig.cfg).unwrap(), bad_new());
+    assert_eq!(read_journal(&rig.cfg).unwrap(), None);
+
+    // Every later run prints the file and changes nothing, with or without
+    // a new stage.
+    std::fs::remove_dir_all(rig.cfg.updates_dir().join("5.3.6")).unwrap();
+    write_stage(&rig.cfg, "later33", None, "binary", false);
+    for yes in [true, false] {
+        let err = apply(&rig.cfg, &rig.host(), yes).await.unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.contains(FAILED_FILE), "{text}");
+        assert!(text.contains(NEW) && text.contains("restoring"), "{text}");
+        assert_eq!(rig.service.calls().len(), 4, "nothing was touched");
+    }
+
+    // Until a person deletes it. The new version is still installed and
+    // does not hold the lock, so the next run refuses for that instead.
+    std::fs::remove_file(failed_file(&rig.cfg)).unwrap();
+    let err = apply(&rig.cfg, &rig.host(), false).await.unwrap_err();
+    let text = format!("{err:#}");
+    assert!(!text.contains(FAILED_FILE), "{text}");
+    assert!(text.contains("not healthy"), "{text}");
+}
+
+#[tokio::test]
+async fn a_rollback_retries_a_failed_stop_once_and_never_restores_under_a_running_daemon() {
+    // The retry succeeds: the rollback completes.
+    let rig = Rig::new(NewMode::NoLock, false).await;
+    write_stage(&rig.cfg, NEW, None, "binary", false);
+    *rig.service.failing_stops.lock().unwrap() = vec![1];
+    let outcome = apply(&rig.cfg, &rig.host(), true).await.unwrap();
+    assert!(matches!(outcome, Outcome::RolledBack { .. }), "{outcome:?}");
+    assert_eq!(
+        rig.service.calls(),
+        ["stop", "start", "stop", "stop", "start"]
+    );
+    assert_eq!(rig.installed(), OLD);
+
+    // Both fail: the new version is left in place and running, and it is
+    // reported.
+    let rig = Rig::new(NewMode::NoLock, false).await;
+    write_stage(&rig.cfg, NEW, None, "binary", false);
+    *rig.service.failing_stops.lock().unwrap() = vec![1, 2];
+    let err = apply(&rig.cfg, &rig.host(), true).await.unwrap_err();
+    assert!(format!("{err:#}").contains("failed twice"), "{err:#}");
+    assert_eq!(rig.service.calls(), ["stop", "start", "stop", "stop"]);
+    assert_eq!(rig.installed(), NEW, "nothing restored under it");
+    assert!(rig.service.daemon.lock().unwrap().running);
+    assert!(failed_file(&rig.cfg).exists());
+}
+
+#[tokio::test]
+async fn a_failed_stop_starts_the_service_again() {
+    let rig = Rig::new(NewMode::Healthy, false).await;
+    write_stage(&rig.cfg, NEW, None, "binary", false);
+    *rig.service.failing_stops.lock().unwrap() = vec![0];
+    *rig.service.failed_stop_takes_it_down.lock().unwrap() = true;
+
+    let err = apply(&rig.cfg, &rig.host(), true).await.unwrap_err();
+    assert!(
+        format!("{err:#}").contains("old version is running again"),
+        "{err:#}"
+    );
+    assert_eq!(rig.service.calls(), ["stop", "start"]);
+    assert!(rig.service.daemon.lock().unwrap().running);
+    assert_eq!(rig.installed(), OLD);
+    assert_eq!(rig.prev(), None);
+    assert!(!rig.next().exists());
+    assert_eq!(read_journal(&rig.cfg).unwrap(), None);
+    assert!(read_bad(&rig.cfg).unwrap().is_empty());
+
+    // A failed stop that left it up does not start a second one.
+    let rig = Rig::new(NewMode::Healthy, false).await;
+    write_stage(&rig.cfg, NEW, None, "binary", false);
+    *rig.service.failing_stops.lock().unwrap() = vec![0];
+    apply(&rig.cfg, &rig.host(), true).await.unwrap_err();
+    assert_eq!(rig.service.calls(), ["stop"]);
+    assert!(rig.service.daemon.lock().unwrap().running);
+    assert_eq!(rig.installed(), OLD);
 }
 
 #[test]

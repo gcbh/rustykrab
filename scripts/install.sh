@@ -100,6 +100,10 @@ done
 "${PB[@]}" 'Add :RunAtLoad bool true' "$PLIST"
 "${PB[@]}" 'Add :KeepAlive bool true' "$PLIST"
 "${PB[@]}" 'Add :ThrottleInterval integer 10' "$PLIST"
+# launchd SIGKILLs a job ExitTimeOut seconds after SIGTERM (20 by default).
+# The daemon drains for RUSTYKRAB_DRAIN_SECS (20 by default) before it exits,
+# so give it room above that grace to finish cleanly.
+"${PB[@]}" 'Add :ExitTimeOut integer 45' "$PLIST"
 "${PB[@]}" 'Add :ProcessType string Background' "$PLIST"
 "${PB[@]}" "Add :StandardOutPath string $LOG_DIR/launchagent.log" "$PLIST"
 "${PB[@]}" "Add :StandardErrorPath string $LOG_DIR/launchagent.log" "$PLIST"

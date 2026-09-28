@@ -3,14 +3,20 @@
 //! `docs/plans/update-flow.md`).
 //!
 //! The steps: read the newest `staged.json` and the running version from
-//! `/api/version`; stop the daemon through its service manager and wait for
-//! it to exit; rename the installed bundle or binary to `.prev` and move the
-//! stage into place, both in one directory; start it; verify within 90 s
-//! that it reports the staged commit, holds `controller.lock`, ticks twice
-//! and has no failed ticks. On any failure the new version is stopped,
-//! `.prev` restored, started and verified the same way, and the new version
-//! recorded in `bad.json`. Without `--yes` (or `RUSTYKRAB_UPDATE_AUTO=1`)
-//! nothing changes: the plan is printed.
+//! `/api/version`; copy the stage beside the install and check the copy,
+//! while the daemon is still up; stop the daemon through its service
+//! manager and wait for it to exit; rename the installed bundle or binary to
+//! `.prev` and move the copy into place, both in one directory; start it;
+//! verify within 90 s that it reports the staged commit, holds
+//! `controller.lock`, ticks twice and has no failed ticks. On any failure
+//! the new version is recorded in `bad.json`, stopped, `.prev` restored,
+//! started and verified the same way. Without `--yes` (or
+//! `RUSTYKRAB_UPDATE_AUTO=1`) nothing changes: the plan is printed.
+//!
+//! A journal (`updates/apply-state.json`) records how far an apply got, so
+//! the next run can put an interrupted one right before anything else. A
+//! rollback that does not finish writes `updates/apply-failed.json`, and
+//! every later run refuses until a person deletes it.
 //!
 //! `staged.json` sits in the data dir, which a worker can write, so apply
 //! trusts none of it: the record must be canonical, the copy beside the
@@ -30,7 +36,7 @@ use anyhow::{anyhow, bail, Context};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use reqwest::Url;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use super::{
     is_bad, is_newer, is_plain_version, output_within, parse_version_output, record_bad,
@@ -107,16 +113,26 @@ pub trait ServiceManager: Send + Sync {
     fn describe(&self) -> String;
     fn stop(&self) -> anyhow::Result<()>;
     fn start(&self) -> anyhow::Result<()>;
+    /// Whether the daemon is up, as the service manager sees it.
+    fn running(&self) -> bool;
 }
 
 /// Where the installed version lives, and the two renames beside it.
 pub trait SwapRoot: Send + Sync {
     fn installed(&self) -> &Path;
-    /// Copy `staged` beside the installed version, pass the copy through
-    /// `check`, then move the installed version to `.prev`, replacing an
-    /// older one, and the copy into its place. On an error the installed
-    /// version is left where it was.
-    fn swap_in(&self, staged: &Path, check: &NextCheck<'_>) -> anyhow::Result<()>;
+    /// Copy `staged` beside the installed version (`.next`, replacing any
+    /// left over) and pass the copy through `check`. Nothing installed is
+    /// touched, so this runs while the daemon is still up; on an error the
+    /// copy is removed.
+    fn prepare(&self, staged: &Path, check: &NextCheck<'_>) -> anyhow::Result<()>;
+    /// Move the installed version to `.prev`, replacing an older one, and
+    /// the prepared copy into its place. On an error the installed version
+    /// is put back where it was.
+    fn commit(&self) -> anyhow::Result<()>;
+    /// Remove a prepared copy that will not be committed.
+    fn discard(&self) -> anyhow::Result<()>;
+    /// Whether a `.prev` is beside the installed version.
+    fn has_prev(&self) -> bool;
     /// Put `.prev` back in place of whatever is installed.
     fn restore(&self) -> anyhow::Result<()>;
 }
@@ -172,8 +188,128 @@ pub enum Outcome {
     /// The new version is in place and healthy; `.prev` is kept.
     Applied(Plan),
     /// The new version failed verification, was replaced by `.prev` and
-    /// recorded as bad.
-    RolledBack { plan: Plan, reason: String },
+    /// recorded as bad. `bad_record_error` is set when writing `bad.json`
+    /// failed; the rollback went on regardless.
+    RolledBack {
+        plan: Plan,
+        reason: String,
+        bad_record_error: Option<String>,
+    },
+    /// An interrupted apply was found (a journal, or an install path gone
+    /// with `.prev` beside it) and put right. Nothing new was applied.
+    Recovered(Recovery),
+}
+
+/// What `recover` found and did.
+#[derive(Debug, Default)]
+pub struct Recovery {
+    /// The journal's phase, when there was one.
+    pub phase: Option<Phase>,
+    /// The install path was missing and `.prev` was moved back.
+    pub restored_prev: bool,
+    /// The new version was rolled back and recorded as bad.
+    pub rolled_back: bool,
+    /// The service was not running and was started.
+    pub started: bool,
+    /// Writing `bad.json` failed; the recovery went on regardless.
+    pub bad_record_error: Option<String>,
+}
+
+/// The journal of an apply in progress.
+pub const STATE_FILE: &str = "apply-state.json";
+/// Written by a rollback that failed; every later apply refuses while it is
+/// there.
+pub const FAILED_FILE: &str = "apply-failed.json";
+
+/// How far an apply got. Written before the step it names finishes: at
+/// `Stopping` nothing is swapped, at `Swapped` the new version is in place,
+/// at `Started` it has been started.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Phase {
+    Stopping,
+    Swapped,
+    Started,
+}
+
+/// `<data>/updates/apply-state.json`: the phase and both commits, so the
+/// next run can finish or roll back an apply that was interrupted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Journal {
+    pub phase: Phase,
+    /// The commit that was running before the apply.
+    pub from_commit: String,
+    /// The staged commit being applied.
+    pub to_commit: String,
+    /// What `bad.json` gets if the new version is rolled back.
+    pub bad: BadVersion,
+    pub at: DateTime<Utc>,
+}
+
+/// `<data>/updates/apply-failed.json`: a rollback that did not finish.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApplyFailed {
+    pub what: String,
+    /// Unknown when there was no journal.
+    pub from_commit: Option<String>,
+    pub to_commit: Option<String>,
+    pub at: DateTime<Utc>,
+}
+
+/// Write `value` as JSON to `updates/<name>`, as a temp file then a rename.
+fn write_atomic<T: Serialize>(cfg: &Config, name: &str, value: &T) -> anyhow::Result<()> {
+    let dir = cfg.updates_dir();
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    let path = dir.join(name);
+    let tmp = dir.join(format!(".{name}.tmp"));
+    std::fs::write(&tmp, serde_json::to_string_pretty(value)? + "\n")
+        .with_context(|| format!("writing {}", tmp.display()))?;
+    std::fs::rename(&tmp, &path).with_context(|| format!("writing {}", path.display()))
+}
+
+fn write_journal(cfg: &Config, journal: &mut Journal, phase: Phase) -> anyhow::Result<()> {
+    journal.phase = phase;
+    journal.at = Utc::now();
+    write_atomic(cfg, STATE_FILE, journal).context("writing the apply journal")
+}
+
+/// The journal of an interrupted apply, if there is one.
+pub fn read_journal(cfg: &Config) -> anyhow::Result<Option<Journal>> {
+    let path = cfg.updates_dir().join(STATE_FILE);
+    match std::fs::read_to_string(&path) {
+        Ok(text) => serde_json::from_str(&text)
+            .map(Some)
+            .with_context(|| format!("parsing {}; a person must look at it", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+    }
+}
+
+fn clear_journal(cfg: &Config) -> anyhow::Result<()> {
+    let path = cfg.updates_dir().join(STATE_FILE);
+    match std::fs::remove_file(&path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            Err(e).with_context(|| format!("removing {}", path.display()))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Refuse to do anything while `apply-failed.json` is there: it names a
+/// rollback that did not finish, and only a person can say what state the
+/// install is in. Its text is in the error, which reaches stderr.
+fn refuse_after_failure(cfg: &Config) -> anyhow::Result<()> {
+    let path = cfg.updates_dir().join(FAILED_FILE);
+    match std::fs::read_to_string(&path) {
+        Ok(text) => bail!(
+            "{} exists: an earlier rollback did not finish, so apply changes nothing until \
+             a person has checked the install and deleted that file. It says:\n{}",
+            path.display(),
+            text.trim()
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+    }
 }
 
 /// The `staged.json` with the latest `staged_at` under `<data>/updates/`.
@@ -281,7 +417,7 @@ pub fn check_canonical(cfg: &Config, dir: &str, staged: &Staged) -> anyhow::Resu
 }
 
 /// What the copy beside the install must be before it replaces anything:
-/// the checks [`SwapRoot::swap_in`] runs on it.
+/// the checks [`SwapRoot::prepare`] runs on it.
 pub struct NextCheck<'a> {
     pub verifier: &'a (dyn Verifier + Sync),
     /// The Developer ID team the copy must be signed by: set under launchd,
@@ -356,7 +492,16 @@ pub fn bad_entry(staged: &Staged) -> BadVersion {
 }
 
 /// `rustykrab update apply`, against `host`.
+///
+/// It refuses while `apply-failed.json` is there, and first puts right an
+/// apply that was interrupted ([`recover`]); a run that recovers applies
+/// nothing new. Recovery runs without `--yes`: it only finishes what a
+/// `--yes` run started.
 pub async fn apply(cfg: &Config, host: &Host<'_>, yes: bool) -> anyhow::Result<Outcome> {
+    refuse_after_failure(cfg)?;
+    if let Some(recovery) = recover(cfg, host).await? {
+        return Ok(Outcome::Recovered(recovery));
+    }
     let staged = newest_staged(cfg)?.ok_or_else(|| {
         anyhow!(
             "nothing staged under {}; run `rustykrab update stage` first",
@@ -459,39 +604,255 @@ pub async fn apply(cfg: &Config, host: &Host<'_>, yes: bool) -> anyhow::Result<O
         version: &plan.staged.version,
         commit: &commit,
     };
-    host.service.stop().context("stopping the daemon")?;
-    if let Err(e) = host.swap.swap_in(&plan.staged.path, &check) {
-        // The installed version is where it was: start it again.
+    // The copy is checked while the daemon is still up, so a stage that
+    // fails its checks never takes it down.
+    host.swap
+        .prepare(&plan.staged.path, &check)
+        .context("checking the copy of the stage; the daemon was not stopped")?;
+    let mut journal = Journal {
+        phase: Phase::Stopping,
+        from_commit: running_commit,
+        to_commit: commit.clone(),
+        bad: bad_entry(&plan.staged),
+        at: Utc::now(),
+    };
+    if let Err(e) = write_journal(cfg, &mut journal, Phase::Stopping) {
+        let _ = host.swap.discard();
+        return Err(e.context("the daemon was not stopped"));
+    }
+    if let Err(e) = host.service.stop() {
+        // Nothing is swapped, so the old version is still installed: make
+        // sure it runs. The journal is kept if that fails, so the next run
+        // tries again.
+        let _ = host.swap.discard();
+        let restarted = start_unless_running(host.service);
+        if restarted.is_ok() {
+            clear_journal(cfg)?;
+        }
+        return Err(e.context(match restarted {
+            Ok(()) => "stopping the daemon; the old version is running again",
+            Err(_) => "stopping the daemon; starting the old version again also failed",
+        }));
+    }
+    if let Err(e) = host.swap.commit() {
+        // `commit` put the installed version back: start it again.
+        let _ = host.swap.discard();
         let restarted = host.service.start();
+        if restarted.is_ok() {
+            clear_journal(cfg)?;
+        }
         return Err(e.context(match restarted {
             Ok(()) => "swapping the staged version in; the old one was started again",
             Err(_) => "swapping the staged version in; starting the old one also failed",
         }));
     }
-    let failure = match host.service.start() {
-        Err(e) => Some(format!("starting the new version: {e:#}")),
-        Ok(()) => verify(host, &commit).await.err().map(|e| format!("{e:#}")),
-    };
-    let Some(reason) = failure else {
-        return Ok(Outcome::Applied(plan));
-    };
-
-    // Roll back. The new version is recorded first, so it is never tried
-    // again even if what follows fails too.
-    record_bad(cfg, bad_entry(&plan.staged))?;
-    if let Err(e) = host.service.stop() {
-        tracing::warn!("stopping the new version for the rollback: {e:#}");
+    let brought_up: anyhow::Result<()> = async {
+        write_journal(cfg, &mut journal, Phase::Swapped)?;
+        host.service.start().context("starting the new version")?;
+        write_journal(cfg, &mut journal, Phase::Started)?;
+        verify(host, &commit).await
     }
-    host.swap
-        .restore()
-        .with_context(|| format!("restoring the previous version after: {reason}"))?;
-    host.service
-        .start()
-        .with_context(|| format!("starting the previous version after: {reason}"))?;
-    verify(host, &running_commit)
+    .await;
+    let reason = match brought_up {
+        Ok(()) => {
+            clear_journal(cfg).context(
+                "the new version is applied and verified, but its journal is left at \
+                 `started`, so the next run would roll it back; remove the journal by hand",
+            )?;
+            return Ok(Outcome::Applied(plan));
+        }
+        Err(e) => format!("{e:#}"),
+    };
+    let bad_record_error = roll_back(cfg, host, &journal)
         .await
-        .with_context(|| format!("verifying the previous version after: {reason}"))?;
-    Ok(Outcome::RolledBack { plan, reason })
+        .with_context(|| format!("rolling back after: {reason}"))?;
+    Ok(Outcome::RolledBack {
+        plan,
+        reason,
+        bad_record_error,
+    })
+}
+
+/// Start the service unless it is already up: a second start of a daemon
+/// that is running would at best fail and at worst run two.
+fn start_unless_running(service: &dyn ServiceManager) -> anyhow::Result<()> {
+    if service.running() {
+        return Ok(());
+    }
+    service.start()
+}
+
+/// Record the journal's new version as bad. A failure is logged and
+/// returned, never raised: it must not stop a rollback.
+fn record_bad_logged(cfg: &Config, journal: &Journal) -> Option<String> {
+    record_bad(cfg, journal.bad.clone()).err().map(|e| {
+        tracing::error!(
+            "recording {} ({}) as bad: {e:#}",
+            journal.bad.version,
+            journal.to_commit
+        );
+        format!("{e:#}")
+    })
+}
+
+/// Stop the new version, put `.prev` back, start it and verify it reports
+/// `journal.from_commit`, then clear the journal. The new version is
+/// recorded bad first, so it is not tried again even if what follows fails;
+/// a failure to record it is returned with the outcome and the rollback goes
+/// on. Any other failure writes `apply-failed.json` ([`fail_loudly`]).
+async fn roll_back(
+    cfg: &Config,
+    host: &Host<'_>,
+    journal: &Journal,
+) -> anyhow::Result<Option<String>> {
+    let bad_record_error = record_bad_logged(cfg, journal);
+    let steps: anyhow::Result<()> = async {
+        if host.service.running() {
+            if let Err(first) = host.service.stop() {
+                tracing::warn!("stopping the new version for the rollback: {first:#}; once more");
+                // Files are never swapped under a running daemon.
+                host.service.stop().map_err(|e| {
+                    anyhow!(
+                        "stopping the new version for the rollback failed twice ({first:#}; \
+                         then {e:#}), so the previous version was not restored under it"
+                    )
+                })?;
+            }
+        }
+        host.swap
+            .restore()
+            .context("restoring the previous version")?;
+        host.service
+            .start()
+            .context("starting the previous version")?;
+        verify(host, &journal.from_commit)
+            .await
+            .context("verifying the previous version")
+    }
+    .await;
+    match steps {
+        Ok(()) => {
+            clear_journal(cfg)?;
+            Ok(bad_record_error)
+        }
+        Err(e) => Err(fail_loudly(
+            cfg,
+            host,
+            Some(journal),
+            e,
+            bad_record_error.as_deref(),
+        )),
+    }
+}
+
+/// A rollback or recovery that did not finish: write `apply-failed.json`
+/// (what failed, both commits, the time), clear the journal, since a person
+/// takes over from here, and try to start the service last. Returns the
+/// error to report, with whatever of that also failed.
+fn fail_loudly(
+    cfg: &Config,
+    host: &Host<'_>,
+    journal: Option<&Journal>,
+    error: anyhow::Error,
+    bad_record_error: Option<&str>,
+) -> anyhow::Error {
+    let mut what = format!("{error:#}");
+    if let Some(bad) = bad_record_error {
+        what.push_str(&format!(
+            "; recording the new version as bad also failed: {bad}"
+        ));
+    }
+    let record = ApplyFailed {
+        what: what.clone(),
+        from_commit: journal.map(|j| j.from_commit.clone()),
+        to_commit: journal.map(|j| j.to_commit.clone()),
+        at: Utc::now(),
+    };
+    let path = cfg.updates_dir().join(FAILED_FILE);
+    let mut message = format!("the rollback failed: {what}");
+    match write_atomic(cfg, FAILED_FILE, &record) {
+        Ok(()) => message.push_str(&format!(
+            "; recorded in {}, and apply refuses until a person deletes it",
+            path.display()
+        )),
+        Err(e) => message.push_str(&format!("; writing {} failed too: {e:#}", path.display())),
+    }
+    if let Err(e) = clear_journal(cfg) {
+        message.push_str(&format!("; {e:#}"));
+    }
+    match start_unless_running(host.service) {
+        Ok(()) => message.push_str("; the service was left running"),
+        Err(e) => message.push_str(&format!("; starting the service failed: {e:#}")),
+    }
+    tracing::error!("{message}");
+    anyhow!(message)
+}
+
+/// Put right an apply that did not finish, before anything else:
+///
+/// - the install path missing with `.prev` beside it: move `.prev` back;
+/// - a journal at `swapped` or `started`: the new version was in place when
+///   the run stopped, so roll it back in full and record it bad;
+/// - a journal at `stopping`: nothing was swapped; drop the copy;
+/// - then, if the service is not running, start it, and clear the journal.
+///
+/// `None` when there was nothing to recover. A failure writes
+/// `apply-failed.json`.
+pub async fn recover(cfg: &Config, host: &Host<'_>) -> anyhow::Result<Option<Recovery>> {
+    let journal = read_journal(cfg)?;
+    let installed_missing = std::fs::symlink_metadata(host.swap.installed()).is_err();
+    let restore_prev = installed_missing && host.swap.has_prev();
+    if journal.is_none() && !restore_prev {
+        return Ok(None);
+    }
+    let mut recovery = Recovery {
+        phase: journal.as_ref().map(|j| j.phase),
+        ..Recovery::default()
+    };
+    tracing::warn!(
+        "recovering an interrupted apply (journal phase {:?}, install path missing {})",
+        recovery.phase,
+        installed_missing
+    );
+    if restore_prev {
+        if let Err(e) = host.swap.restore() {
+            return Err(fail_loudly(
+                cfg,
+                host,
+                journal.as_ref(),
+                e.context("the install path is missing; restoring .prev"),
+                None,
+            ));
+        }
+        recovery.restored_prev = true;
+    }
+    if let Some(journal) = &journal {
+        if matches!(journal.phase, Phase::Swapped | Phase::Started) {
+            if recovery.restored_prev {
+                // `.prev` is already back in place.
+                recovery.bad_record_error = record_bad_logged(cfg, journal);
+            } else {
+                recovery.bad_record_error = roll_back(cfg, host, journal).await?;
+            }
+            recovery.rolled_back = true;
+        } else {
+            let _ = host.swap.discard();
+        }
+    }
+    if !host.service.running() {
+        if let Err(e) = host.service.start() {
+            return Err(fail_loudly(
+                cfg,
+                host,
+                journal.as_ref(),
+                e.context("starting the service after recovering an interrupted apply"),
+                recovery.bad_record_error.as_deref(),
+            ));
+        }
+        recovery.started = true;
+    }
+    clear_journal(cfg)?;
+    Ok(Some(recovery))
 }
 
 /// Within `host.verify_within`, `/api/version` must report `commit`,
@@ -574,11 +935,11 @@ impl SwapRoot for DirSwap {
         &self.installed
     }
 
-    fn swap_in(&self, staged: &Path, check: &NextCheck<'_>) -> anyhow::Result<()> {
+    fn prepare(&self, staged: &Path, check: &NextCheck<'_>) -> anyhow::Result<()> {
         // The stage may be on another volume; copy it next to the installed
-        // version first, so both moves are renames in one directory.
+        // version first, so both moves in `commit` are renames in one
+        // directory.
         let next = sibling(&self.installed, ".", ".next")?;
-        let prev = sibling(&self.installed, "", ".prev")?;
         let app = std::fs::symlink_metadata(&self.installed)
             .with_context(|| format!("reading {}", self.installed.display()))?
             .is_dir();
@@ -604,6 +965,15 @@ impl SwapRoot for DirSwap {
             let _ = remove_any(&next);
             return Err(e);
         }
+        Ok(())
+    }
+
+    fn commit(&self) -> anyhow::Result<()> {
+        let next = sibling(&self.installed, ".", ".next")?;
+        let prev = sibling(&self.installed, "", ".prev")?;
+        if std::fs::symlink_metadata(&next).is_err() {
+            bail!("no prepared {} to move into place", next.display());
+        }
         remove_any(&prev)?;
         std::fs::rename(&self.installed, &prev)
             .with_context(|| format!("moving {} to .prev", self.installed.display()))?;
@@ -614,6 +984,15 @@ impl SwapRoot for DirSwap {
                 .with_context(|| format!("moving the stage to {}", self.installed.display()));
         }
         Ok(())
+    }
+
+    fn discard(&self) -> anyhow::Result<()> {
+        remove_any(&sibling(&self.installed, ".", ".next")?)
+    }
+
+    fn has_prev(&self) -> bool {
+        sibling(&self.installed, "", ".prev")
+            .is_ok_and(|prev| std::fs::symlink_metadata(prev).is_ok())
     }
 
     fn restore(&self) -> anyhow::Result<()> {
@@ -758,6 +1137,10 @@ impl ServiceManager for Launchd {
             .arg(format!("gui/{}", self.uid))
             .arg(&self.plist);
         run_checked(cmd, "launchctl bootstrap").map(drop)
+    }
+
+    fn running(&self) -> bool {
+        self.loaded()
     }
 }
 
@@ -966,6 +1349,12 @@ impl ServiceManager for Script {
             .with_context(|| format!("starting `{}`", self.command))
             .map(drop)
     }
+
+    fn running(&self) -> bool {
+        self.processes
+            .listeners(self.port)
+            .is_ok_and(|l| !l.is_empty())
+    }
 }
 
 fn describe(plan: &Plan) -> String {
@@ -1054,11 +1443,45 @@ pub async fn run(cfg: &Config, data_dir: &Path, args: ApplyArgs) -> anyhow::Resu
             "applied and verified:\n{}\nthe previous version is kept as .prev",
             describe(&plan)
         ),
-        Outcome::RolledBack { plan, reason } => bail!(
+        Outcome::RolledBack {
+            plan,
+            reason,
+            bad_record_error,
+        } => bail!(
             "rolled back: staged {} failed verification ({reason}); the previous \
-             version is running again and the staged one is recorded as bad",
-            plan.staged.version
+             version is running again and {}",
+            plan.staged.version,
+            match bad_record_error {
+                None => "the staged one is recorded as bad".to_string(),
+                Some(e) => format!("recording the staged one as bad FAILED ({e})"),
+            }
         ),
+        Outcome::Recovered(r) => {
+            let mut done = Vec::new();
+            if r.restored_prev {
+                done.push("moved .prev back to the missing install path".to_string());
+            }
+            if r.rolled_back {
+                done.push("rolled the new version back".to_string());
+            }
+            if r.started {
+                done.push("started the service".to_string());
+            }
+            if done.is_empty() {
+                done.push("dropped the copy it had not swapped in".to_string());
+            }
+            let summary = format!(
+                "recovered an interrupted apply (journal phase {}): {}; nothing new was applied",
+                r.phase
+                    .map_or("none".to_string(), |p| format!("{p:?}").to_lowercase()),
+                done.join(", ")
+            );
+            match (r.rolled_back, r.bad_record_error) {
+                (_, Some(e)) => bail!("{summary}; recording the new version as bad FAILED ({e})"),
+                (true, None) => bail!("{summary}; the new version is recorded as bad"),
+                (false, None) => println!("{summary}"),
+            }
+        }
     }
     Ok(())
 }
