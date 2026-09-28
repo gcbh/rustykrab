@@ -20,10 +20,12 @@
 //! rolled back. Before it rolls anything back it checks that the installed
 //! and `.prev` binaries report the journal's commits, and `.prev` passes the
 //! symlink check (and under launchd the signature check) before it is run
-//! or restored. Every service recovery starts is verified. A rollback or
-//! recovery that does not finish writes `.<name>.apply-failed.json` beside
-//! the install, saying what is installed, and every later run refuses until
-//! a person deletes it.
+//! or restored. Recovery verifies the service, started or already up, before
+//! it clears the journal; a daemon reporting `controller.draining` never
+//! passes. A rollback, a recovery or a restart after a failed stop or swap
+//! that does not finish writes `.<name>.apply-failed.json` beside the
+//! install, saying what is installed, and every later run refuses until a
+//! person deletes it.
 //!
 //! Before anything changes, the installed binary must report the running
 //! commit, and `apply` refuses to run inside the daemon's own launchd job
@@ -182,6 +184,9 @@ pub struct ControllerReport {
     pub last_tick: Option<DateTime<Utc>>,
     pub consecutive_failed_ticks: Option<u32>,
     pub lock: Option<String>,
+    /// Set once the daemon is shutting down. A draining daemon still
+    /// answers, but it is on its way out, so it never counts as running.
+    pub draining: Option<bool>,
 }
 
 /// The host the supervisor acts on, and how patiently.
@@ -606,6 +611,17 @@ pub async fn apply(cfg: &Config, host: &Host<'_>, yes: bool) -> anyhow::Result<O
             staged.signature_verified
         );
     }
+    // Off launchd nothing checks a signature, so only a bare binary is
+    // swapped: a bundle is what launchd runs.
+    if !host.service.is_launchd() && staged.kind != "binary" {
+        bail!(
+            "{} is only for a bare binary launchd does not run; staged {} is kind {:?}, so it \
+             is refused and nothing was stopped",
+            host.service.describe(),
+            staged.version,
+            staged.kind
+        );
+    }
     if is_bad(cfg, &staged.version, Some(&commit))? {
         bail!(
             "staged {} ({commit}) is recorded as bad by a rollback; not applying it again",
@@ -646,16 +662,20 @@ pub async fn apply(cfg: &Config, host: &Host<'_>, yes: bool) -> anyhow::Result<O
     // Checked before the staged commit is taken as running: a daemon of that
     // commit that does not hold the lock or fails ticks is not "applied".
     let controller = &plan.running.controller;
-    if controller.lock.as_deref() != Some("held") || controller.consecutive_failed_ticks != Some(0)
+    if controller.lock.as_deref() != Some("held")
+        || controller.consecutive_failed_ticks != Some(0)
+        || controller.draining == Some(true)
     {
         bail!(
-            "the running daemon is not healthy (controller.lock {}, consecutive_failed_ticks {}); \
-             an update is only applied over a daemon that holds the lock and is not failing \
-             ticks, so a rollback has a healthy version to return to",
+            "the running daemon is not healthy (controller.lock {}, consecutive_failed_ticks {}, \
+             draining {}); an update is only applied over a daemon that holds the lock, is not \
+             failing ticks and is not shutting down, so a rollback has a healthy version to \
+             return to",
             controller.lock.as_deref().unwrap_or("(unknown)"),
             controller
                 .consecutive_failed_ticks
-                .map_or("(unknown)".to_string(), |n| n.to_string())
+                .map_or("(unknown)".to_string(), |n| n.to_string()),
+            controller.draining.unwrap_or(false)
         );
     }
     if running_commit == commit {
@@ -713,24 +733,29 @@ pub async fn apply(cfg: &Config, host: &Host<'_>, yes: bool) -> anyhow::Result<O
     }
     if let Err(e) = host.service.stop() {
         // Nothing is swapped, so the old version is still installed: make
-        // sure it runs. The journal is kept until `/api/version` answers
-        // with the old commit, so the next run checks again otherwise.
+        // sure it runs. The journal is cleared only once `/api/version`
+        // answers with the old commit; otherwise the failure is recorded
+        // ([`fail_loudly`]).
         let _ = host.swap.discard();
         let restarted = match start_unless_running(host.service) {
             Ok(()) => wait_for_commit(host, &journal.from_commit).await,
             Err(e) => Err(e.context("starting the old version again")),
         };
-        let context = match &restarted {
+        return Err(match restarted {
             Ok(()) => {
                 clear_journal_logged(host.swap);
-                "stopping the daemon; the old version is running again".to_string()
+                e.context("stopping the daemon; the old version is running again")
             }
-            Err(r) => format!(
-                "stopping the daemon; the old version was not seen running again ({r:#}), so \
-                 the journal is kept for the next run"
+            Err(r) => fail_loudly(
+                host,
+                Some(&journal),
+                e.context(format!(
+                    "stopping the daemon failed, and the old version was not seen running \
+                     again ({r:#})"
+                )),
+                None,
             ),
-        };
-        return Err(e.context(context));
+        });
     }
     if let Err(e) = host.swap.commit() {
         let _ = host.swap.discard();
@@ -747,23 +772,28 @@ pub async fn apply(cfg: &Config, host: &Host<'_>, yes: bool) -> anyhow::Result<O
                 None,
             ));
         }
-        // As after a failed stop, the journal is kept until `/api/version`
-        // answers with the old commit.
+        // As after a failed stop, the journal is cleared only once
+        // `/api/version` answers with the old commit, and the failure is
+        // recorded otherwise.
         let restarted = match host.service.start() {
             Ok(()) => wait_for_commit(host, &journal.from_commit).await,
             Err(e) => Err(e.context("starting the old version again")),
         };
-        let context = match &restarted {
+        return Err(match restarted {
             Ok(()) => {
                 clear_journal_logged(host.swap);
-                "swapping the staged version in; the old version is running again".to_string()
+                e.context("swapping the staged version in; the old version is running again")
             }
-            Err(r) => format!(
-                "swapping the staged version in; the old version was not seen running again \
-                 ({r:#}), so the journal is kept for the next run"
+            Err(r) => fail_loudly(
+                host,
+                Some(&journal),
+                e.context(format!(
+                    "swapping the staged version in failed, and the old version was not seen \
+                     running again ({r:#})"
+                )),
+                None,
             ),
-        };
-        return Err(e.context(context));
+        });
     }
     let brought_up: anyhow::Result<()> = async {
         write_journal(host.swap, &mut journal, Phase::Swapped)?;
@@ -1065,13 +1095,15 @@ fn installed_commit(host: &Host<'_>) -> anyhow::Result<String> {
 ///   in full and record it bad, once the installed and `.prev` binaries are
 ///   seen to report the journal's commits ([`check_rollback`]);
 /// - otherwise a journal at `stopping`: nothing was swapped; drop the copy;
-/// - then, if the service is not running, start it and verify it reports
-///   the journal's `from_commit` (without a journal, the commit the
-///   installed binary reports), and clear the journal.
+/// - then, if the service is not running, start it; either way verify it
+///   reports the journal's `from_commit` (without a journal, the commit the
+///   installed binary reports), and only then clear the journal. A service
+///   that counts as running may be a daemon in its shutdown drain, which
+///   [`verify`] refuses.
 ///
 /// `None` when there was nothing to recover. A failure, including a journal
-/// that cannot be read or does not match the binaries, and a started
-/// service that fails verify, writes `apply-failed.json`. An unreadable
+/// that cannot be read or does not match the binaries, and a service that
+/// fails verify, writes `apply-failed.json`. An unreadable
 /// journal is kept as `.<name>.apply-state.json.unreadable`.
 pub async fn recover(cfg: &Config, host: &Host<'_>) -> anyhow::Result<Option<Recovery>> {
     let journal = match read_journal(host.swap) {
@@ -1174,23 +1206,30 @@ pub async fn recover(cfg: &Config, host: &Host<'_>) -> anyhow::Result<Option<Rec
             ));
         }
         recovery.started = true;
-        // `start` returning is not the service being up: it must answer
-        // healthy with the commit it was put back to.
-        let verified = match &journal {
-            Some(journal) => verify(host, &journal.from_commit).await,
-            None => match installed_commit(host) {
-                Ok(commit) => verify(host, &commit).await,
-                Err(e) => Err(e),
-            },
+    }
+    // Whether it was started here or was already up, the journal is cleared
+    // only once the service answers healthy with the commit it was put back
+    // to: `start` returning is not the service being up, and a daemon the
+    // service manager counts as running may be in its shutdown drain.
+    let verified = match &journal {
+        Some(journal) => verify(host, &journal.from_commit).await,
+        None => match installed_commit(host) {
+            Ok(commit) => verify(host, &commit).await,
+            Err(e) => Err(e),
+        },
+    };
+    if let Err(e) = verified {
+        let what = if recovery.started {
+            "verifying the service started after recovering an interrupted apply"
+        } else {
+            "verifying the running service after recovering an interrupted apply"
         };
-        if let Err(e) = verified {
-            return Err(fail_loudly(
-                host,
-                journal.as_ref(),
-                e.context("verifying the service started after recovering an interrupted apply"),
-                recovery.bad_record_error.as_deref(),
-            ));
-        }
+        return Err(fail_loudly(
+            host,
+            journal.as_ref(),
+            e.context(what),
+            recovery.bad_record_error.as_deref(),
+        ));
     }
     clear_journal(host.swap)?;
     Ok(Some(recovery))
@@ -1198,9 +1237,9 @@ pub async fn recover(cfg: &Config, host: &Host<'_>) -> anyhow::Result<Option<Rec
 
 /// Within `host.verify_within`, `/api/version` must report `commit`,
 /// `controller.lock` `held`, a `last_tick` that advances twice and no
-/// consecutive failed ticks. An advance counts only while no ticks are
-/// failing, and a failing tick starts the count again: a tick that ran and
-/// failed is not progress.
+/// consecutive failed ticks, and must not be draining. An advance counts
+/// only while no ticks are failing, and a failing tick or a drain starts the
+/// count again: a tick that ran and failed is not progress.
 pub async fn verify(host: &Host<'_>, commit: &str) -> anyhow::Result<()> {
     let deadline = Instant::now() + host.verify_within;
     let mut last_tick: Option<DateTime<Utc>> = None;
@@ -1216,6 +1255,12 @@ pub async fn verify(host: &Host<'_>, commit: &str) -> anyhow::Result<()> {
                 "controller.lock is {}, not held",
                 r.controller.lock.as_deref().unwrap_or("(unknown)")
             ),
+            // A daemon in its shutdown drain still answers and may still
+            // hold the lock, but it is about to exit.
+            Ok(r) if r.controller.draining == Some(true) => {
+                advances = 0;
+                "it is draining, shutting down".to_string()
+            }
             Ok(r) => {
                 let healthy = r.controller.consecutive_failed_ticks == Some(0);
                 if !healthy {
@@ -1248,12 +1293,16 @@ pub async fn verify(host: &Host<'_>, commit: &str) -> anyhow::Result<()> {
     }
 }
 
-/// Within `host.verify_within`, `/api/version` must answer with `commit`.
-/// Less than [`verify`]: it only shows which version is up.
+/// Within `host.verify_within`, `/api/version` must answer with `commit`,
+/// not draining. Less than [`verify`]: it only shows which version is up.
 async fn wait_for_commit(host: &Host<'_>, commit: &str) -> anyhow::Result<()> {
     let deadline = Instant::now() + host.verify_within;
     loop {
         let problem = match host.probe.probe().await {
+            Ok(r) if r.controller.draining == Some(true) => format!(
+                "it reports commit {} but is draining, shutting down",
+                r.commit.as_deref().unwrap_or("(none)")
+            ),
             Ok(r) if r.commit.as_deref() == Some(commit) => return Ok(()),
             Ok(r) => format!(
                 "it reports commit {}",
@@ -1846,9 +1895,62 @@ pub fn refuse_inside_daemon(
     Ok(())
 }
 
+/// The script service swaps with no signature check, so it is only for a
+/// bare binary launchd does not run: `installed` must be a regular file
+/// (not a symlink), with no `*.app` component and not under
+/// `~/Applications` (`home` joined with `Applications`), as written and as
+/// it resolves.
+pub fn check_script_installed(installed: &Path, home: Option<&Path>) -> anyhow::Result<()> {
+    let refuse = |why: String| {
+        anyhow!(
+            "--service script:<cmd> is only for a bare binary launchd does not run, and \
+             --installed {} {why}; refusing it before anything runs",
+            installed.display()
+        )
+    };
+    let meta = std::fs::symlink_metadata(installed)
+        .map_err(|e| refuse(format!("cannot be read ({e})")))?;
+    if !meta.is_file() {
+        return Err(refuse("is not a regular file".to_string()));
+    }
+    let resolved =
+        std::fs::canonicalize(installed).map_err(|e| refuse(format!("does not resolve ({e})")))?;
+    let applications = home.map(|h| {
+        let dir = h.join("Applications");
+        let real = std::fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
+        (dir, real)
+    });
+    for path in [installed, resolved.as_path()] {
+        let in_bundle = path.components().any(|c| {
+            Path::new(c.as_os_str())
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("app"))
+        });
+        if in_bundle {
+            return Err(refuse(format!(
+                "is inside an app bundle ({})",
+                path.display()
+            )));
+        }
+        if let Some((dir, real)) = &applications {
+            if path.starts_with(dir) || path.starts_with(real) {
+                return Err(refuse(format!("is under {}", dir.display())));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Entry point from `update_cmd::run`.
 pub async fn run(cfg: &Config, data_dir: &Path, args: ApplyArgs) -> anyhow::Result<()> {
     let yes = args.yes || std::env::var("RUSTYKRAB_UPDATE_AUTO").is_ok_and(|v| v.trim() == "1");
+    if let ServiceSpec::Script(_) = &args.service {
+        let installed = args
+            .installed
+            .as_deref()
+            .ok_or_else(|| anyhow!("--service script:... needs --installed PATH"))?;
+        check_script_installed(installed, dirs::home_dir().as_deref())?;
+    }
     let base = base_url(args.url.as_deref(), crate::daemon_client::gateway_url())?;
     let token = crate::daemon_client::resolve_auth_token(data_dir).await?;
     let probe = HttpProbe::new(&base, &token)?;

@@ -36,6 +36,9 @@ struct Daemon {
     /// How the old version's controller looks.
     old_lock: &'static str,
     old_failed_ticks: u32,
+    /// How many more answers report `controller.draining` true, whichever
+    /// version is up; `u32::MAX` never stops.
+    draining_for: u32,
 }
 
 type Shared = Arc<Mutex<Daemon>>;
@@ -69,6 +72,10 @@ async fn stand_in(daemon: Shared) -> Url {
                     (true, NewMode::WrongCommit) => ("stale99", "held", 0),
                     (true, NewMode::NoLock) => (NEW, "waiting", 0),
                 };
+                let draining = d.draining_for > 0;
+                if draining && d.draining_for != u32::MAX {
+                    d.draining_for -= 1;
+                }
                 Ok(axum::Json(serde_json::json!({
                     "version": "5.3.6",
                     "commit": commit,
@@ -77,6 +84,7 @@ async fn stand_in(daemon: Shared) -> Url {
                         "last_tick": tick,
                         "consecutive_failed_ticks": failed,
                         "lock": lock,
+                        "draining": draining,
                     },
                 })))
             }
@@ -100,6 +108,8 @@ struct ScriptedService {
     stops: Mutex<usize>,
     /// Run on the first `start`, before the daemon is up.
     on_start: Mutex<Option<Hook>>,
+    /// Run on the first `stop`, before it succeeds or fails.
+    on_stop: Mutex<Option<Hook>>,
 }
 
 impl ScriptedService {
@@ -112,6 +122,7 @@ impl ScriptedService {
             failed_stop_takes_it_down: Mutex::new(false),
             stops: Mutex::new(0),
             on_start: Mutex::new(None),
+            on_stop: Mutex::new(None),
         }
     }
 
@@ -131,6 +142,9 @@ impl ServiceManager for ScriptedService {
 
     fn stop(&self) -> anyhow::Result<()> {
         self.calls.lock().unwrap().push("stop");
+        if let Some(hook) = self.on_stop.lock().unwrap().take() {
+            hook();
+        }
         let n = {
             let mut stops = self.stops.lock().unwrap();
             *stops += 1;
@@ -322,6 +336,7 @@ impl Rig {
             ticks: 0,
             old_lock: "held",
             old_failed_ticks: 0,
+            draining_for: 0,
         }));
         let base = stand_in(daemon.clone()).await;
         Self {
@@ -837,6 +852,7 @@ impl VersionProbe for Sequence {
                 last_tick: DateTime::<Utc>::from_timestamp(1_800_000_000 + tick, 0),
                 consecutive_failed_ticks: Some(failed),
                 lock: Some("held".to_string()),
+                draining: None,
             },
         })
     }
@@ -852,6 +868,7 @@ async fn verify_ignores_tick_advances_while_ticks_fail() {
             ticks: 0,
             old_lock: "held",
             old_failed_ticks: 0,
+            draining_for: 0,
         })),
         false,
     );
@@ -1212,7 +1229,7 @@ async fn a_failed_stop_starts_the_service_again() {
 }
 
 #[tokio::test]
-async fn a_failed_stop_keeps_the_journal_until_the_old_commit_answers() {
+async fn a_failed_stop_whose_restart_fails_writes_the_failure_record() {
     let rig = Rig::new(NewMode::Healthy, false).await;
     write_stage(&rig.cfg, NEW, None, "binary", false);
     *rig.service.failing_stops.lock().unwrap() = vec![0];
@@ -1224,12 +1241,71 @@ async fn a_failed_stop_keeps_the_journal_until_the_old_commit_answers() {
     }));
 
     let err = apply(&rig.cfg, &rig.host(), true).await.unwrap_err();
-    assert!(format!("{err:#}").contains("journal is kept"), "{err:#}");
+    let text = format!("{err:#}");
+    assert!(text.contains("stopping the daemon failed"), "{text}");
+    assert!(text.contains("not seen running again"), "{text}");
+    assert!(text.contains("reports neither"), "{text}");
     assert_eq!(rig.service.calls(), ["stop", "start"]);
-    assert_eq!(
-        read_journal(&rig.swap).unwrap().map(|j| j.phase),
-        Some(Phase::Stopping)
+    assert!(failed_file(&rig.swap).exists(), "{text}");
+    assert_eq!(read_journal(&rig.swap).unwrap(), None);
+
+    // A later run refuses until a person deletes the record.
+    let err = apply(&rig.cfg, &rig.host(), true).await.unwrap_err();
+    assert!(err.to_string().contains(FAILED_FILE), "{err:#}");
+    assert_eq!(rig.service.calls(), ["stop", "start"]);
+}
+
+#[tokio::test]
+async fn a_failed_stop_whose_old_version_only_drains_writes_the_failure_record() {
+    // The stop failed and left the old version up, but in its shutdown
+    // drain: it answers with the old commit and must not count as running.
+    let rig = Rig::new(NewMode::Healthy, false).await;
+    write_stage(&rig.cfg, NEW, None, "binary", false);
+    *rig.service.failing_stops.lock().unwrap() = vec![0];
+    let daemon = rig.service.daemon.clone();
+    *rig.service.on_stop.lock().unwrap() = Some(Box::new(move || {
+        daemon.lock().unwrap().draining_for = u32::MAX;
+    }));
+
+    let err = apply(&rig.cfg, &rig.host(), true).await.unwrap_err();
+    let text = format!("{err:#}");
+    assert!(text.contains("draining"), "{text}");
+    assert!(text.contains("not seen running again"), "{text}");
+    // Still up as the service manager sees it, so no second start.
+    assert_eq!(rig.service.calls(), ["stop"]);
+    assert!(failed_file(&rig.swap).exists(), "{text}");
+    assert_eq!(read_journal(&rig.swap).unwrap(), None);
+    assert_eq!(rig.installed(), OLD);
+}
+
+#[tokio::test]
+async fn a_failed_commit_whose_restart_fails_writes_the_failure_record() {
+    let rig = Rig::new(NewMode::Healthy, false).await;
+    write_stage(&rig.cfg, NEW, None, "binary", false);
+    let daemon = rig.service.daemon.clone();
+    *rig.service.on_start.lock().unwrap() = Some(Box::new(move || {
+        // The old version comes up and goes straight into a drain.
+        daemon.lock().unwrap().draining_for = u32::MAX;
+    }));
+    let swap = FailsCommit(&rig.swap);
+    let host = Host {
+        swap: &swap,
+        ..rig.host()
+    };
+    let err = apply(&rig.cfg, &host, true).await.unwrap_err();
+    let text = format!("{err:#}");
+    assert!(
+        text.contains("swapping the staged version in failed"),
+        "{text}"
     );
+    assert!(text.contains("draining"), "{text}");
+    assert!(
+        text.contains("previous version (old1111) is installed"),
+        "{text}"
+    );
+    assert_eq!(rig.service.calls(), ["stop", "start"]);
+    assert!(failed_file(&rig.swap).exists(), "{text}");
+    assert_eq!(read_journal(&rig.swap).unwrap(), None);
 }
 
 #[tokio::test]
@@ -1535,7 +1611,8 @@ async fn a_commit_failure_waits_for_the_old_commit_before_clearing_the_journal()
     assert_eq!(rig.service.calls(), ["stop", "start"]);
     assert_eq!(read_journal(&rig.swap).unwrap(), None);
 
-    // What comes up answers with another commit: the journal is kept.
+    // What comes up answers with another commit: the journal is not cleared
+    // over it as if the old version were back; the failure is recorded.
     let rig = Rig::new(NewMode::Healthy, false).await;
     write_stage(&rig.cfg, NEW, None, "binary", false);
     let binary = rig.binary.clone();
@@ -1548,11 +1625,10 @@ async fn a_commit_failure_waits_for_the_old_commit_before_clearing_the_journal()
         ..rig.host()
     };
     let err = apply(&rig.cfg, &host, true).await.unwrap_err();
-    assert!(format!("{err:#}").contains("journal is kept"), "{err:#}");
-    assert_eq!(
-        read_journal(&rig.swap).unwrap().map(|j| j.phase),
-        Some(Phase::Stopping)
-    );
+    let text = format!("{err:#}");
+    assert!(text.contains("not seen running again"), "{text}");
+    assert!(failed_file(&rig.swap).exists(), "{text}");
+    assert_eq!(read_journal(&rig.swap).unwrap(), None);
 }
 
 #[tokio::test]
@@ -2022,4 +2098,202 @@ fn the_system_executable_is_the_real_one_not_argv0() {
         std::fs::canonicalize(&found).unwrap(),
         std::fs::canonicalize(sleep).unwrap()
     );
+}
+
+/// A daemon in its shutdown drain: the right commit, the lock held, ticks
+/// advancing with none failing, and `controller.draining` true.
+struct Draining(Mutex<i64>);
+
+#[async_trait]
+impl VersionProbe for Draining {
+    async fn probe(&self) -> anyhow::Result<VersionReport> {
+        let mut tick = self.0.lock().unwrap();
+        *tick += 1;
+        Ok(VersionReport {
+            version: "5.3.6".to_string(),
+            commit: Some(OLD.to_string()),
+            controller: ControllerReport {
+                last_tick: DateTime::<Utc>::from_timestamp(1_800_000_000 + *tick, 0),
+                consecutive_failed_ticks: Some(0),
+                lock: Some("held".to_string()),
+                draining: Some(true),
+            },
+        })
+    }
+}
+
+#[tokio::test]
+async fn verify_and_wait_for_commit_fail_while_the_daemon_drains() {
+    let rig = Rig::new(NewMode::Healthy, false).await;
+    let probe = Draining(Mutex::new(0));
+    let host = Host {
+        probe: &probe,
+        verify_within: Duration::from_millis(200),
+        ..rig.host()
+    };
+    let err = verify(&host, OLD).await.unwrap_err();
+    assert!(format!("{err:#}").contains("draining"), "{err:#}");
+    let err = wait_for_commit(&host, OLD).await.unwrap_err();
+    assert!(format!("{err:#}").contains("draining"), "{err:#}");
+    assert!(
+        *probe.0.lock().unwrap() > 4,
+        "both polled until the deadline"
+    );
+
+    // `draining: false` and a missing field both count as not draining.
+    let report: VersionReport = serde_json::from_value(serde_json::json!({
+        "version": "5.3.6",
+        "commit": OLD,
+        "controller": {"lock": "held", "draining": false},
+    }))
+    .unwrap();
+    assert_eq!(report.controller.draining, Some(false));
+    let report: VersionReport = serde_json::from_value(serde_json::json!({
+        "version": "5.3.6",
+        "commit": OLD,
+        "controller": {"lock": "held"},
+    }))
+    .unwrap();
+    assert_eq!(report.controller.draining, None);
+}
+
+#[tokio::test]
+async fn a_draining_daemon_is_not_updated() {
+    let rig = Rig::new(NewMode::Healthy, false).await;
+    write_stage(&rig.cfg, NEW, None, "binary", false);
+    rig.service.daemon.lock().unwrap().draining_for = u32::MAX;
+    let err = apply(&rig.cfg, &rig.host(), true).await.unwrap_err();
+    assert!(format!("{err:#}").contains("draining true"), "{err:#}");
+    rig.assert_untouched();
+}
+
+#[tokio::test]
+async fn a_recovery_during_a_drain_does_not_clear_the_journal_over_it() {
+    // An apply interrupted while stopping, and the old version, which the
+    // service manager counts as running, is in its shutdown drain for good:
+    // the journal is not simply cleared, the failure is recorded.
+    let rig = Rig::new(NewMode::Healthy, false).await;
+    write_stage(&rig.cfg, NEW, None, "binary", false);
+    write_journal_at(&rig.swap, Phase::Stopping);
+    std::fs::write(rig.next(), NEW).unwrap();
+    rig.service.daemon.lock().unwrap().draining_for = u32::MAX;
+
+    let err = apply(&rig.cfg, &rig.host(), true).await.unwrap_err();
+    let text = format!("{err:#}");
+    assert!(text.contains("verifying the running service"), "{text}");
+    assert!(text.contains("draining"), "{text}");
+    assert!(
+        text.contains("previous version (old1111) is installed"),
+        "{text}"
+    );
+    assert!(rig.service.calls().is_empty(), "{:?}", rig.service.calls());
+    assert!(failed_file(&rig.swap).exists());
+    assert_eq!(read_journal(&rig.swap).unwrap(), None);
+    assert_eq!(rig.installed(), OLD);
+
+    // A drain that ends, with the old version answering healthy after it:
+    // the journal is cleared only once it verifies.
+    let rig = Rig::new(NewMode::Healthy, false).await;
+    write_stage(&rig.cfg, NEW, None, "binary", false);
+    write_journal_at(&rig.swap, Phase::Stopping);
+    std::fs::write(rig.next(), NEW).unwrap();
+    rig.service.daemon.lock().unwrap().draining_for = 5;
+
+    let outcome = apply(&rig.cfg, &rig.host(), true).await.unwrap();
+    let Outcome::Recovered(recovery) = outcome else {
+        panic!("expected a recovery, got {outcome:?}");
+    };
+    assert!(!recovery.started && !recovery.rolled_back);
+    assert_eq!(
+        rig.service.daemon.lock().unwrap().draining_for,
+        0,
+        "verify polled through the drain"
+    );
+    assert!(rig.service.calls().is_empty(), "{:?}", rig.service.calls());
+    assert!(!failed_file(&rig.swap).exists());
+    assert_eq!(read_journal(&rig.swap).unwrap(), None);
+    assert!(!rig.next().exists());
+}
+
+#[test]
+fn the_script_service_refuses_an_install_in_a_bundle_or_under_applications() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    let file = |path: PathBuf| {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, OLD).unwrap();
+        path
+    };
+    let bare = file(root.path().join("bin").join(BINARY_NAME));
+    check_script_installed(&bare, Some(&home)).unwrap();
+
+    let refused = |path: &Path, why: &str| {
+        let err = check_script_installed(path, Some(&home)).unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.contains(why), "{}: {text}", path.display());
+        assert!(
+            text.contains("only for a bare binary launchd does not run"),
+            "{text}"
+        );
+    };
+    // The binary inside a bundle, anywhere, and the bundle itself.
+    let in_app = file(
+        root.path()
+            .join("Elsewhere")
+            .join(APP_NAME)
+            .join("Contents")
+            .join("MacOS")
+            .join(BINARY_NAME),
+    );
+    refused(&in_app, "inside an app bundle");
+    refused(
+        &root.path().join("Elsewhere").join(APP_NAME),
+        "regular file",
+    );
+    // Anything under ~/Applications, bundle or not.
+    let applications = home.join("Applications");
+    refused(
+        &file(applications.join("tools").join(BINARY_NAME)),
+        "Applications",
+    );
+    let installed_app = bundle(&applications, OLD);
+    refused(&installed_app, "regular file");
+    refused(
+        &installed_app
+            .join("Contents")
+            .join("MacOS")
+            .join(BINARY_NAME),
+        "inside an app bundle",
+    );
+    // A symlink to it, and a path through a symlinked directory into it.
+    let link = root.path().join("link");
+    std::os::unix::fs::symlink(applications.join("tools").join(BINARY_NAME), &link).unwrap();
+    refused(&link, "regular file");
+    let dir_link = root.path().join("dirlink");
+    std::os::unix::fs::symlink(applications.join("tools"), &dir_link).unwrap();
+    refused(&dir_link.join(BINARY_NAME), "Applications");
+    let macos_link = root.path().join("macos");
+    std::os::unix::fs::symlink(installed_app.join("Contents").join("MacOS"), &macos_link).unwrap();
+    refused(&macos_link.join(BINARY_NAME), "inside an app bundle");
+    // Nothing there.
+    refused(&root.path().join("missing"), "cannot be read");
+}
+
+#[tokio::test]
+async fn the_script_service_refuses_a_staged_app_before_any_stop() {
+    // A bundle installed, the daemon run by something other than launchd.
+    let mut rig = Rig::new(NewMode::Healthy, true).await;
+    rig.service.launchd = false;
+    write_stage(&rig.cfg, NEW, None, "app", true);
+
+    let err = apply(&rig.cfg, &rig.host(), true).await.unwrap_err();
+    let text = format!("{err:#}");
+    assert!(
+        text.contains("only for a bare binary launchd does not run"),
+        "{text}"
+    );
+    assert!(text.contains("\"app\""), "{text}");
+    rig.assert_untouched();
+    assert!(rig.verifier.version_ran.lock().unwrap().is_empty());
+    assert_eq!(read_journal(&rig.swap).unwrap(), None);
 }

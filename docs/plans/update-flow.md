@@ -20,7 +20,7 @@ builder.
 | 3 | Drain: on shutdown the controller leases nothing new, gives runs `RUSTYKRAB_DRAIN_SECS` (20) to finish, then ends them as interrupted, returned to `ready` with no rung | built (batch 4) |
 | 4 | Controller lock: an exclusive `flock` on `<data>/controller.lock`; only the holder ticks, and `/api/version` reports `held` or `waiting`; failed ticks reported beside it | built (batch 4) |
 | 5 | Release source and verifier: `rustykrab update check` and `rustykrab update stage` | built (batch 5), with the review's fixes |
-| 6 | Supervisor: `rustykrab update apply`, swap, restart, verify, roll back | built in four parts; runs for the builder's script service, launchd still gated, see "Slice 6: status" |
+| 6 | Supervisor: `rustykrab update apply`, swap, restart, verify, roll back | built in five parts; runs for the builder's script service (a bare binary only), launchd still gated, see "Slice 6: status" |
 
 Pieces 3 and 4 were exercised by hand on the builder on 2026-09-28. A
 second daemon on the same data directory reported `waiting` and never
@@ -127,13 +127,16 @@ in place of launchd.
 
 ## Slice 6: status (2026-09-28)
 
-Slice 6 was built in four parts; the first three were each reviewed for
+Slice 6 was built in five parts; the first three were each reviewed for
 security before they merged. Part 4 made the changes listed under "What
 part 4 changed" below, which were what the gate waited on for the
-builder's script service. `rustykrab update apply --service
-script:<cmd>` now runs without `RUSTYKRAB_UPDATE_APPLY_UNREVIEWED`. The
-launchd service still refuses unless `RUSTYKRAB_UPDATE_APPLY_UNREVIEWED=1`,
-and its refusal names what launchd still needs (below).
+builder's script service. Part 5 fixed what part 4's review found (under
+"What part 5 changed"). `rustykrab update apply --service script:<cmd>`
+runs without `RUSTYKRAB_UPDATE_APPLY_UNREVIEWED`, and only for a bare
+binary launchd does not run. The launchd service still refuses unless
+`RUSTYKRAB_UPDATE_APPLY_UNREVIEWED=1`, and its refusal names what launchd
+still needs (below); it no longer points at the script service as a way
+past it.
 
 **What `apply` does now:**
 
@@ -156,9 +159,11 @@ and its refusal names what launchd still needs (below).
   executable canonicalizes to a path under the install it swaps.
 - **It only updates a healthy daemon.**
   - Before any change, the running daemon must hold `controller.lock`
-    with no failing ticks.
+    with no failing ticks, and must not report `controller.draining`.
   - After the start, verify counts a `last_tick` advance only while no
-    ticks fail.
+    ticks fail. A daemon in its shutdown drain still answers, so neither
+    verify nor the wait for the old commit passes while it reports
+    `draining` true.
   - URLs must be https, or http to `127.0.0.1` or `[::1]`, and that
     includes the default gateway URL.
   - The script service stops only the one loopback listener whose
@@ -176,14 +181,21 @@ and its refusal names what launchd still needs (below).
     `stopping`, `.next` gone and an installed binary not seen to report
     `from_commit` counts as swapped, so a `--version` that times out
     cannot start an unchecked binary;
-  - every service it starts is verified, not just that `start()`
-    returned;
+  - before the journal is cleared the service is verified against
+    `from_commit`, whether recovery started it or it was already up,
+    and a failed verify writes the failure record;
   - an unparseable journal is kept as `.apply-state.json.unreadable` and
     writes the failure record;
   - a late-crashed rollback is not redone.
-  A launchd stop that errors mid-drain waits for the job to unload. A
-  failed commit, like a failed stop, keeps the journal until the old
-  commit answers.
+  A launchd stop that errors mid-drain waits for the job to unload. After
+  a failed stop or commit the journal is cleared once the old commit
+  answers, not draining; when it is not seen again, the failure record
+  is written.
+- **The script service is only for a bare binary.** It swaps with no
+  signature check, so `--installed` must be a regular file with no
+  `*.app` path component and not under `~/Applications`, as written and
+  as it resolves, and the stage must be of kind `binary`. Both are
+  checked before anything is stopped.
 - **It checks `.prev` before using it.** Before `.prev` is run or
   restored it passes the symlink check the copy gets, and under launchd
   the signature check. A rollback checks it before stopping the new
@@ -214,6 +226,27 @@ reviewed for security):
 - `apply` refuses to run inside the daemon's own launchd job, or from a
   binary under the install.
 - The CLI gate no longer applies to `--service script:<cmd>`.
+
+**What part 5 changed**, after part 4's review (not yet reviewed for
+security):
+
+- A daemon in its shutdown drain keeps answering `/api/version` with
+  `controller.draining` true, and part 4 counted it as running. Verify
+  and the wait for the old commit now fail while it drains, and so does
+  the health check before an apply. `recover` always verifies
+  `from_commit` at the end, starting the service only if it is not
+  running, and writes the failure record if that fails, so a rerun
+  during a drain never clears the journal over a dying daemon.
+- The narrowed gate checked only the service manager, so `--service
+  script:<cmd> --installed ~/Applications/RustyKrab.app` with the launchd
+  daemon's URL would stop the launchd job and swap with no signature
+  check. The script service now refuses an `--installed` that is not a
+  regular file, has a `*.app` component or is under `~/Applications`,
+  and a stage of kind `app`, before anything runs. The gate's message
+  says the script service is only for a bare binary launchd does not
+  run, and no longer offers it as a way past the gate.
+- After a failed stop or commit, an old version that is not seen again
+  now writes the failure record instead of only returning an error.
 
 **Before launchd, on the owner's machine, it must also:**
 
