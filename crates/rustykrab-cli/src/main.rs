@@ -1333,10 +1333,18 @@ async fn main() -> anyhow::Result<()> {
     // Filled below, once the registry is final (the work tools added) and
     // the active-tools seed is known.
     let control_catalog = Arc::new(RegistryCatalog::default());
-    let control_config = fleet.config(rustykrab_control::controller::ControllerConfig {
+    let mut control_config = fleet.config(rustykrab_control::controller::ControllerConfig {
         notice_channel: control_notice_channel.to_string(),
         ..Default::default()
     });
+    // How long aging may wait for an idle tick before it runs anyway
+    // (plan 4.6); the evaluation harness shortens it.
+    if let Some(secs) = std::env::var("RUSTYKRAB_AGING_MAX_GAP_SECS")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+    {
+        control_config.aging_max_gap = chrono::TimeDelta::seconds(secs.max(1));
+    }
     let controller = Arc::new(
         rustykrab_control::controller::Controller::new(store.clone(), Vec::new(), control_config)
             .with_registry(fleet.registry.clone())

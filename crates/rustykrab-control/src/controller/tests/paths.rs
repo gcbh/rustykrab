@@ -586,6 +586,52 @@ async fn closed_trees_age_into_the_archive_at_idle() {
 }
 
 #[tokio::test]
+async fn steady_load_does_not_starve_aging() {
+    // A one-minute window, so a closed tree is old enough to age well
+    // inside the fifteen-minute gap.
+    let config = ControllerConfig {
+        aging: WorkKind::ALL
+            .iter()
+            .map(|k| (*k, TimeDelta::minutes(1)))
+            .collect(),
+        ..ControllerConfig::default()
+    };
+    let gap = config.aging_max_gap;
+    let h = Harness::with(config, StaticCatalog::default(), &["pinch", "krill"]);
+    // A run that stays in flight throughout, beside a tree that finishes.
+    let gate = Arc::new(tokio::sync::Notify::new());
+    h.script.push(
+        "Long job",
+        Step::Wait(gate.clone(), Box::new(done("Long job"))),
+    );
+    let long = h.file_one(draft("l", "Long job")).await;
+    let ids = h
+        .file(plan(vec![draft("P", "Old errand"), draft("a", "Do it")]))
+        .await
+        .ids;
+    h.drain().await;
+    assert_eq!(h.status(&ids["P"]).await, Status::Done);
+    assert_eq!(h.status(&long).await, Status::Running);
+
+    // Old enough to age, but the last pass was recent and a run is in
+    // flight: a busy tick inside the gap leaves it alone.
+    h.clock.advance(TimeDelta::minutes(2));
+    let busy = h.tick().await;
+    assert!(busy.archived.is_empty(), "{:?}", busy.archived);
+
+    // Once the gap has passed, the pass runs although the run holds on.
+    h.clock.advance(gap);
+    let due = h.tick().await;
+    let mut archived = due.archived.clone();
+    archived.sort();
+    let mut expected = vec![ids["P"].clone(), ids["a"].clone()];
+    expected.sort();
+    assert_eq!(archived, expected);
+    assert_eq!(h.status(&long).await, Status::Running);
+    gate.notify_one();
+}
+
+#[tokio::test]
 async fn a_credential_gap_with_a_plan_b_runs_the_plan_b_before_asking() {
     let h = Harness::new(&["pinch"]);
     h.script.push(

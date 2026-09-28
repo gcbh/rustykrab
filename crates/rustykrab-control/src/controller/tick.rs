@@ -1566,10 +1566,19 @@ impl Controller {
 
     // ── 4. aging ────────────────────────────────────────────────────────
 
-    /// Compact what 4.6 lets age, at idle: only when nothing runs.
+    /// Compact what 4.6 lets age: at idle, when nothing runs, and otherwise
+    /// at least every `aging_max_gap`, so steady load cannot starve it.
     async fn age(&self, now: DateTime<Utc>, report: &mut TickReport) -> Result<(), Error> {
-        if !self.state().runs.is_empty() {
-            return Ok(());
+        {
+            let mut state = self.state();
+            let idle = state.runs.is_empty();
+            let overdue = state
+                .last_aged
+                .is_none_or(|at| now - at >= self.config.aging_max_gap);
+            if !idle && !overdue {
+                return Ok(());
+            }
+            state.last_aged = Some(now);
         }
         let snap = self.load().await?;
         let ids = graph::aging_candidates(&snap, now, &self.config.aging);

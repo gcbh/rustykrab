@@ -1316,6 +1316,9 @@ fn spawn_daemon_with(
                 // a ladder rung), and the 5 s default would spend most of
                 // their time budget idle.
                 .env("RUSTYKRAB_CONTROL_TICK_SECS", "1")
+                // Aging waits for an idle tick at most this long; the shared
+                // daemon is rarely idle while other scenarios run.
+                .env("RUSTYKRAB_AGING_MAX_GAP_SECS", "2")
                 // Scheduled firings run as work items the controller
                 // schedules (control scenario 30); off by default in a
                 // real daemon.

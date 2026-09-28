@@ -275,6 +275,11 @@ pub struct ControllerConfig {
     /// How long after closing an item of each kind ages into the archive
     /// (4.6). A kind with no window never ages.
     pub aging: HashMap<WorkKind, TimeDelta>,
+    /// Aging prefers idle ticks, when no run is in flight, but runs at
+    /// least this often whatever is running, so a daemon that always has a
+    /// long run going (an external agent, a peer) still ages. Compaction
+    /// never touches an item open work names, so it is safe mid-run.
+    pub aging_max_gap: TimeDelta,
     /// The outbox channel notices are written for.
     pub notice_channel: String,
     /// The approval triggers of 6.1: item count, total budget, delegated
@@ -311,6 +316,7 @@ impl Default for ControllerConfig {
             caps,
             lease_ttl_seconds: 1_800,
             aging: WorkKind::ALL.iter().map(|k| (*k, month)).collect(),
+            aging_max_gap: TimeDelta::minutes(15),
             notice_channel: "default".to_string(),
             approval: ApprovalPolicy::default(),
             split_mode: SplitMode::Warn,
@@ -376,6 +382,8 @@ struct State {
     /// load and kept current as runs end: a parent's remaining budget is
     /// its budget less what its subtree spent (4.2).
     spent: Option<HashMap<WorkItemId, Spend>>,
+    /// When the last aging pass ran, for `aging_max_gap`.
+    last_aged: Option<DateTime<Utc>>,
 }
 
 /// The loop of plan section 6 over one store and the workers of a
@@ -422,6 +430,7 @@ impl Controller {
                 planned: HashSet::new(),
                 learned: Vec::new(),
                 spent: None,
+                last_aged: None,
             }),
         }
     }
