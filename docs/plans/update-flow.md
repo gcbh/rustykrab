@@ -40,9 +40,17 @@ touches the running daemon.
   `vX.Y.Z` is above the running `VERSION`, compared as numbers. The asset
   is `rustykrab-<target>.tar.gz` for the target the binary was built for
   (`aarch64-apple-darwin`, `x86_64-unknown-linux-gnu`). A token is
-  optional (`RUSTYKRAB_GITHUB_TOKEN`), for rate limits only. With
+  optional (`RUSTYKRAB_GITHUB_TOKEN`), for rate limits only. It is sent
+  only to the API host, never to whatever host the asset URL names, and
+  `Config`'s `Debug` output redacts it. A tag that is not a plain
+  `vX.Y.Z`, such as the pre-release `v5.4.0-rc.1`, is nothing newer to
+  stage, and `check` says so. With
   `--from <path>` the source is a local build instead, either a
   `RustyKrab.app` or a bare binary, which is the builder's case.
+- **Size before the download.** The release API's `size` for the asset
+  must be present and at most 256 MiB, and the asset URL must be `https`.
+  The body is read in chunks and refused as soon as it passes the
+  declared size or the cap, or if it ends short of the declared size.
 - **Digest first.** The release API's `digest` for the asset
   (`sha256:<hex>`) must be present and must equal the SHA-256 of the bytes
   downloaded. A missing or different digest refuses the release. Nothing
@@ -79,7 +87,11 @@ touches the running daemon.
 - **Tests.** A local HTTP stand-in for the GitHub API serves a release
   and an archive built in the test. Tests cover: a digest mismatch is
   refused, a missing digest is refused, a release that is not newer
-  stages nothing, and a good one is staged with its record. The
+  stages nothing, and a good one is staged with its record. A security
+  review added: an asset declared over the cap is refused without a
+  download, a body longer or shorter than declared is refused, the token
+  does not reach an asset on another host, and a pre-release tag stages
+  nothing. The
   signature check sits behind a seam so the tests can script it. One
   macOS test runs the real `codesign` against an unsigned bundle and
   expects a refusal.

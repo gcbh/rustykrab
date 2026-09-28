@@ -46,10 +46,13 @@ pub const BINARY_NAME: &str = "rustykrab-cli";
 /// Versions a rollback (slice 6) recorded as bad, under `<data>/updates/`.
 pub const BAD_FILE: &str = "bad.json";
 pub const STAGED_FILE: &str = "staged.json";
+/// The largest release asset `stage` downloads: 256 MiB. A release whose
+/// declared size is above it is refused before the download starts.
+pub const MAX_ASSET_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Everything the commands read from the environment, so tests can point
 /// them at a local stand-in.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Config {
     pub data_dir: PathBuf,
     pub repo: String,
@@ -58,6 +61,21 @@ pub struct Config {
     pub target: String,
     pub running_version: String,
     pub team_id: String,
+}
+
+/// The token never reaches a log line or an error message.
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("data_dir", &self.data_dir)
+            .field("repo", &self.repo)
+            .field("api_base", &self.api_base)
+            .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .field("target", &self.target)
+            .field("running_version", &self.running_version)
+            .field("team_id", &self.team_id)
+            .finish()
+    }
 }
 
 impl Config {
@@ -303,6 +321,9 @@ struct Asset {
     browser_download_url: String,
     #[serde(default)]
     digest: Option<String>,
+    /// Bytes, as the release API declares them.
+    #[serde(default)]
+    size: Option<u64>,
 }
 
 /// What `check` found.
@@ -311,6 +332,32 @@ pub struct Latest {
     pub tag: String,
     pub version: String,
     pub newer: bool,
+    /// Whether the tag is a plain `vX.Y.Z`. A pre-release such as
+    /// `v5.4.0-rc.1` is not, and is never newer.
+    pub plain: bool,
+}
+
+impl Latest {
+    /// What `check` prints, and `stage` when it stages nothing.
+    pub fn describe(&self, cfg: &Config) -> String {
+        if !self.plain {
+            format!(
+                "nothing newer: {} {} is not a plain vX.Y.Z release (a pre-release?), \
+                 so the running {} stays",
+                cfg.repo, self.tag, cfg.running_version
+            )
+        } else if self.newer {
+            format!(
+                "{} {} is newer than the running {}",
+                cfg.repo, self.tag, cfg.running_version
+            )
+        } else {
+            format!(
+                "up to date: {} {} is not newer than the running {}",
+                cfg.repo, self.tag, cfg.running_version
+            )
+        }
+    }
 }
 
 /// `<data>/updates/<version>/staged.json`: what was staged, from where, and
@@ -361,6 +408,57 @@ fn with_auth(req: reqwest::RequestBuilder, cfg: &Config) -> reqwest::RequestBuil
     }
 }
 
+/// Check an asset URL before anything is fetched from it, and say whether
+/// the token may go with the request. The asset must be `https`, unless
+/// `api_base` is itself `http` (a local stand-in). The token goes only to
+/// the host and port of `api_base`, never to whatever host the release
+/// names; reqwest drops it on a redirect to another host.
+pub fn asset_request_sends_token(api_base: &str, asset_url: &str) -> anyhow::Result<bool> {
+    let api = reqwest::Url::parse(api_base)
+        .with_context(|| format!("RUSTYKRAB_UPDATE_API_BASE {api_base:?} is not a URL"))?;
+    let asset = reqwest::Url::parse(asset_url)
+        .with_context(|| format!("the asset URL {asset_url:?} is not a URL"))?;
+    match asset.scheme() {
+        "https" => {}
+        "http" if api.scheme() == "http" => {}
+        other => bail!("the asset URL {asset_url:?} is {other}, not https; refusing it"),
+    }
+    Ok(api.host_str().is_some()
+        && api.host_str() == asset.host_str()
+        && api.port_or_known_default() == asset.port_or_known_default())
+}
+
+/// Read a response body in chunks, stopping as soon as it passes `declared`
+/// bytes or [`MAX_ASSET_BYTES`], and refusing one shorter than `declared`.
+async fn read_capped(
+    mut resp: reqwest::Response,
+    declared: u64,
+    name: &str,
+) -> anyhow::Result<Vec<u8>> {
+    let limit = declared.min(MAX_ASSET_BYTES);
+    let mut body = Vec::with_capacity(usize::try_from(limit).unwrap_or(0));
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .with_context(|| format!("downloading {name}"))?
+    {
+        if body.len() as u64 + chunk.len() as u64 > limit {
+            bail!(
+                "{name} is longer than its declared {declared} bytes \
+                 (cap {MAX_ASSET_BYTES}); refusing it"
+            );
+        }
+        body.extend_from_slice(&chunk);
+    }
+    if body.len() as u64 != declared {
+        bail!(
+            "{name} is {} bytes, the release declares {declared}; refusing it",
+            body.len()
+        );
+    }
+    Ok(body)
+}
+
 async fn fetch_latest(client: &reqwest::Client, cfg: &Config) -> anyhow::Result<Release> {
     let url = format!(
         "{}/repos/{}/releases/latest",
@@ -384,11 +482,14 @@ fn latest_of(release: &Release, cfg: &Config) -> anyhow::Result<Latest> {
         .strip_prefix('v')
         .unwrap_or(&release.tag_name)
         .to_string();
-    let newer = is_newer(&version, &cfg.running_version)?;
+    // A pre-release or any other odd tag is nothing to stage.
+    let plain = is_plain_version(&version);
+    let newer = plain && is_newer(&version, &cfg.running_version)?;
     Ok(Latest {
         tag: release.tag_name.clone(),
         version,
         newer,
+        plain,
     })
 }
 
@@ -568,19 +669,31 @@ pub async fn stage_release(
                 latest.tag
             )
         })?;
+    let declared = asset.size.ok_or_else(|| {
+        anyhow!(
+            "release {} gives no size for {name}; refusing it",
+            latest.tag
+        )
+    })?;
+    if declared > MAX_ASSET_BYTES {
+        bail!("{name} declares {declared} bytes, over the {MAX_ASSET_BYTES}-byte cap; refusing it");
+    }
+    let send_token = asset_request_sends_token(&cfg.api_base, &asset.browser_download_url)?;
 
-    let resp = with_auth(client.get(&asset.browser_download_url), cfg)
-        .header("Accept", "application/octet-stream")
+    let mut req = client
+        .get(&asset.browser_download_url)
+        .header("Accept", "application/octet-stream");
+    if send_token {
+        req = with_auth(req, cfg);
+    }
+    let resp = req
         .send()
         .await
         .with_context(|| format!("downloading {name}"))?;
     if !resp.status().is_success() {
         bail!("downloading {name}: {}", resp.status());
     }
-    let bytes = resp
-        .bytes()
-        .await
-        .with_context(|| format!("downloading {name}"))?;
+    let bytes = read_capped(resp, declared, &name).await?;
     let actual = sha256_hex(&bytes);
     if actual != expected {
         bail!("{name} has sha256 {actual}, the release says {expected}; refusing it");
@@ -757,20 +870,7 @@ pub async fn run(data_dir: &Path, args: &[String]) -> anyhow::Result<()> {
     let cfg = Config::from_env(data_dir);
     match cmd {
         Cmd::Help => unreachable!("handled above"),
-        Cmd::Check => {
-            let latest = check(&cfg).await?;
-            if latest.newer {
-                println!(
-                    "{} {} is newer than the running {}",
-                    cfg.repo, latest.tag, cfg.running_version
-                );
-            } else {
-                println!(
-                    "up to date: {} {} is not newer than the running {}",
-                    cfg.repo, latest.tag, cfg.running_version
-                );
-            }
-        }
+        Cmd::Check => println!("{}", check(&cfg).await?.describe(&cfg)),
         Cmd::Stage {
             from: Some(from),
             force,
@@ -778,10 +878,9 @@ pub async fn run(data_dir: &Path, args: &[String]) -> anyhow::Result<()> {
         Cmd::Stage { from: None, force } => {
             match stage_release(&cfg, &SystemVerifier, force).await? {
                 StageOutcome::Staged(staged) => print_staged(&staged),
-                StageOutcome::NotNewer(latest) => println!(
-                    "nothing staged: {} {} is not newer than the running {}",
-                    cfg.repo, latest.tag, cfg.running_version
-                ),
+                StageOutcome::NotNewer(latest) => {
+                    println!("nothing staged: {}", latest.describe(&cfg))
+                }
             }
         }
     }

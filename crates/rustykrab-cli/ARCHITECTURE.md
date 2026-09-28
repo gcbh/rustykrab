@@ -86,13 +86,22 @@ daemon; slice 6's supervisor is what swaps a staged version in.
 - `check` reads the latest release of `RUSTYKRAB_UPDATE_REPO` (default
   `gcbh/rustykrab`) from `RUSTYKRAB_UPDATE_API_BASE` (default
   `https://api.github.com`) and says whether its `vX.Y.Z` tag is above the
-  running `VERSION`, compared as numbers. `RUSTYKRAB_GITHUB_TOKEN` is sent
-  when set, for rate limits only.
+  running `VERSION`, compared as numbers. A tag that is not a plain
+  `vX.Y.Z` (a pre-release such as `v5.4.0-rc.1`) is never newer, and
+  `check` says so (`Latest::plain`, `Latest::describe`).
+  `RUSTYKRAB_GITHUB_TOKEN` is sent when set, for rate limits only, and only
+  to the host and port of the API base (`asset_request_sends_token`);
+  `Config`'s `Debug` prints it as `<redacted>`.
 - `stage` does the same, and when the release is newer and not listed in
   `<data>/updates/bad.json` (a JSON array of `{"version": ...}`, written by
   slice 6's rollback; `--force` overrides it) downloads the asset
   `rustykrab-<target>.tar.gz`. The target triple is stamped by `build.rs`
-  as `RUSTYKRAB_TARGET`. The asset's `digest` from the release API must be
+  as `RUSTYKRAB_TARGET`. The asset's declared `size` must be present and
+  at most `MAX_ASSET_BYTES` (256 MiB) before the download starts; its URL
+  must be `https` unless the API base is itself `http` (the tests' local
+  stand-in). The body is read in chunks and refused as soon as it passes
+  the declared size or the cap, or if it ends short of the declared size.
+  The asset's `digest` from the release API must be
   `sha256:<hex>` and equal the SHA-256 of the downloaded bytes; a missing
   or different digest refuses the release before anything is written. The
   hash is rustls's ring provider, already linked for TLS, so no hashing
