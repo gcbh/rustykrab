@@ -258,6 +258,13 @@ All configuration is via environment variables. No plaintext config files.
 | `RUSTYKRAB_COMPUTER_USE` | `false` | `true` or `1` register the computer-use tools. Only in builds with `--features computer-use` |
 | `RUSTYKRAB_COMPUTER_USE_READONLY` | `false` | `true` or `1` register the computer-use tools in read-only mode. Only read when `RUSTYKRAB_COMPUTER_USE` is on |
 | `RUSTYKRAB_MCP_SERVERS` | unset | Comma-separated MCP connector names; each is configured with `RUSTYKRAB_MCP_<NAME>_*`. See [MCP servers: credential refs](#mcp-servers-credential-refs) |
+| `RUSTYKRAB_MCP_<NAME>_TRANSPORT` | `http` | Transport for the MCP server `<NAME>` (its name from `RUSTYKRAB_MCP_SERVERS`, upper-cased): `http` or `stdio` |
+| `RUSTYKRAB_MCP_<NAME>_URL` | unset | Endpoint of an `http` MCP server; required for that transport |
+| `RUSTYKRAB_MCP_<NAME>_TOKEN` | unset | Bearer token sent to an `http` MCP server. May be a `ref:` reference |
+| `RUSTYKRAB_MCP_<NAME>_HEADER_<KEY>` | unset | Extra HTTP header for an `http` MCP server; `<KEY>` becomes the header name with `_` as `-`. May be a `ref:` reference |
+| `RUSTYKRAB_MCP_<NAME>_COMMAND` | unset | Executable spawned for a `stdio` MCP server; required for that transport |
+| `RUSTYKRAB_MCP_<NAME>_ARGS` | unset | Comma-separated arguments for the `stdio` server's command |
+| `RUSTYKRAB_MCP_<NAME>_ENV_<KEY>` | unset | Environment variable `<KEY>` passed to the `stdio` server's process. May be a `ref:` reference |
 | `RUSTYKRAB_PROMPT_LOG` | off | `1`, `true`, `TRUE` or `yes` write every prompt and response to a daily-rolling `prompts.log` — for debugging only, as it records conversation content |
 | `RUSTYKRAB_DEFAULT_CHANNEL` | unset | Fallback delivery channel for a scheduled job whose job and conversation carry none; without it such results are logged and discarded |
 | `RUSTYKRAB_DEFAULT_CHAT_ID` | unset | Fallback chat ID paired with `RUSTYKRAB_DEFAULT_CHANNEL` |

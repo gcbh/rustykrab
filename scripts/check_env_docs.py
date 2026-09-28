@@ -15,8 +15,13 @@ Names read with the build-time `env!` / `option_env!` macros are set by
 build scripts, not by an operator, so they are allowlisted automatically;
 BUILD_TIME_ALLOWLIST covers any a build script reads back itself.
 
-Reads whose name is assembled at runtime (`format!("RUSTYKRAB_MCP_{}_URL")`)
-cannot be resolved statically and are not checked.
+Reads whose name is assembled at runtime (`format!("RUSTYKRAB_MCP_{upper}_URL")`)
+need a pattern row instead: a README row whose name has `<PLACEHOLDER>`
+segments, e.g. `RUSTYKRAB_MCP_<NAME>_URL`. A `format!` template counts as a
+read when it is passed straight to `env::var` / `var_os`, or bound with
+`let key = format!(...)` and that `key` is read in the same file. Each
+`{...}` in the template must fall where the row has a placeholder. Names
+matched by prefix over `env::vars()` are not traced.
 
 Usage: python3 scripts/check_env_docs.py
 """
@@ -57,6 +62,16 @@ HELPER_DEF = re.compile(
 HELPER_BODY_CHARS = 400
 BUILD_MACRO = re.compile(rf"\b(?:option_)?env!\(\s*\"(?P<name>{NAME})\"")
 README_ROW = re.compile(r"^\|\s*`(?P<name>[A-Z0-9_]+)`\s*\|")
+README_PATTERN_ROW = re.compile(
+    r"^\|\s*`(?P<name>RUSTYKRAB_[A-Z0-9_]*<[A-Z0-9_]+>[A-Z0-9_<>]*)`\s*\|"
+)
+# A `format!` template naming a RUSTYKRAB_ variable, with `{...}` holes.
+TEMPLATE = r"format!\(\s*\"(?P<tpl>RUSTYKRAB_[A-Za-z0-9_{}]*\{[A-Za-z0-9_{}]*)\""
+TEMPLATE_READ = re.compile(
+    r"\b(?:env::var(?:_os)?|var_os)\s*\(\s*&?\s*" + TEMPLATE
+)
+TEMPLATE_LET = re.compile(r"\blet\s+(?P<ident>[a-z_][a-z0-9_]*)\s*=\s*" + TEMPLATE)
+HOLE = re.compile(r"\{[^{}]*\}")
 
 
 def rust_sources() -> list[Path]:
@@ -80,6 +95,45 @@ def documented_names() -> set[str]:
             if m:
                 names.add(m.group("name"))
     return names
+
+
+def documented_patterns() -> dict[str, re.Pattern[str]]:
+    """Pattern rows (`RUSTYKRAB_MCP_<NAME>_URL`) in the Configuration table.
+
+    Each maps to a regex over a template whose holes are written as `{}`:
+    a `<PLACEHOLDER>` matches one or more holes or name characters, and
+    literal segments must match exactly.
+    """
+    patterns: dict[str, re.Pattern[str]] = {}
+    in_section = False
+    for line in README.read_text().splitlines():
+        if line.startswith("## "):
+            in_section = line.strip() == "## Configuration"
+            continue
+        if in_section:
+            m = README_PATTERN_ROW.match(line)
+            if m:
+                parts = re.split(r"<[A-Z0-9_]+>", m.group("name"))
+                rx = r"(?:\{\}|[A-Z0-9_])+".join(map(re.escape, parts))
+                patterns[m.group("name")] = re.compile(rx)
+    return patterns
+
+
+def template_reads(path: Path, text: str) -> dict[str, list[str]]:
+    """`format!`-built RUSTYKRAB_ names read in `text`, holes normalised to `{}`."""
+    found: list[tuple[str, int]] = []
+    for m in TEMPLATE_READ.finditer(text):
+        found.append((m.group("tpl"), m.start()))
+    for m in TEMPLATE_LET.finditer(text):
+        ident = re.escape(m.group("ident"))
+        read = rf"\b(?:env::var(?:_os)?|var_os)\s*\(\s*&?\s*{ident}\s*\)"
+        if re.search(read, text[m.end() :]):
+            found.append((m.group("tpl"), m.start()))
+    reads: dict[str, list[str]] = {}
+    for tpl, offset in found:
+        where = f"{path.relative_to(ROOT)}:{line_of(text, offset)}"
+        reads.setdefault(HOLE.sub("{}", tpl), []).append(where)
+    return reads
 
 
 def env_helpers(sources: dict[Path, str]) -> set[str]:
@@ -118,8 +172,11 @@ def main() -> int:
             build_time.add(m.group("name"))
 
     reads: dict[str, list[str]] = {}
+    templates: dict[str, list[str]] = {}
     call = helper_call(env_helpers(sources))
     for path, text in sources.items():
+        for tpl, wheres in template_reads(path, text).items():
+            templates.setdefault(tpl, []).extend(wheres)
         if call is not None:
             for m in call.finditer(text):
                 where = f"{path.relative_to(ROOT)}:{line_of(text, m.start())}"
@@ -138,6 +195,7 @@ def main() -> int:
         print("check_env_docs: no Configuration table rows found in README.md")
         return 1
 
+    failed = False
     missing = sorted(set(reads) - documented_names() - build_time)
     if missing:
         print(
@@ -147,9 +205,32 @@ def main() -> int:
         for name in missing:
             print(f"  {name}  (read at {', '.join(reads[name])})")
         print("Add a `| `NAME` | default | description |` row for each.")
+        failed = True
+
+    patterns = documented_patterns().values()
+    unmatched = sorted(
+        tpl for tpl in templates if not any(p.fullmatch(tpl) for p in patterns)
+    )
+    if unmatched:
+        print(
+            "RUSTYKRAB_ names built at runtime with no pattern row in "
+            "README.md's Configuration table:"
+        )
+        for tpl in unmatched:
+            print(f"  {tpl}  (read at {', '.join(templates[tpl])})")
+        print(
+            "Add a `| `RUSTYKRAB_..._<PLACEHOLDER>_...` | default | description |` "
+            "row with a placeholder for each `{}`."
+        )
+        failed = True
+
+    if failed:
         return 1
 
-    print(f"check_env_docs: {len(reads)} RUSTYKRAB_ variables read, all documented")
+    print(
+        f"check_env_docs: {len(reads)} RUSTYKRAB_ variables and "
+        f"{len(templates)} runtime-built name patterns read, all documented"
+    )
     return 0
 
 
