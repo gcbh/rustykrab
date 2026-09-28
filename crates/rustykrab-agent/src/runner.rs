@@ -523,7 +523,7 @@ const RESULT_REPORT_REMINDER: &str =
      call the next tool.";
 
 /// What a runner notice starts with in a worker run (plan section 12.1).
-const NOTICE_PREFIX: &str = "[System notice] ";
+pub(crate) const NOTICE_PREFIX: &str = "[System notice] ";
 
 /// Whether the current task is running a worker's work item: the caller
 /// scoped [`WORK_RUN_CONTEXT`] around the run. The runner carries the

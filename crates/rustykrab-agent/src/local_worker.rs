@@ -20,7 +20,19 @@
 //!   treat the conversation as a worker run: only a successful
 //!   `result_report` ends it, text is answered with a counted
 //!   `[System notice]` reminder, and no request carries a system message
-//!   after the first (section 12.1).
+//!   after the first (section 12.1);
+//! - the brief's token budget enforced at the provider (`metered.rs`): once
+//!   the run's calls have used it, the next call is refused with a typed
+//!   `budget/tokens` failure, and what the run spent is kept for the
+//!   controller's [`Worker::usage`] (tokens, wall time, iterations and
+//!   completion reminders).
+//!
+//! A run whose id names a conversation the host keeps (a scheduled job's
+//! persistent conversation, [`RunTranscripts::resume`]) continues it
+//! instead: the same one leading system message, with the host's guidance
+//! (the job's SKILL.md body) appended, any later system message it kept
+//! turned into a `[System notice]` user turn, and the brief behind the
+//! host's preface as the run's user turn.
 //!
 //! `run` returns the [`ResultReport`] the run's `result_report` call handed
 //! the injected [`WorkBackend`], exactly as the backend received it. A run
@@ -29,14 +41,15 @@
 //! provider error passes through unchanged; the controller reads either with
 //! [`rustykrab_control::worker::run_failure_input`].
 
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use chrono::Utc;
 use rustykrab_control::errors::{BudgetKind, GapKind, ProviderProblem};
-use rustykrab_control::worker::{Brief, RunFailure, Worker, WorkerCapabilities};
+use rustykrab_control::worker::{Brief, RunFailure, RunUsage, Worker, WorkerCapabilities};
 use rustykrab_core::active_tools::ActiveToolsRegistry;
 use rustykrab_core::model::ModelProvider;
 use rustykrab_core::recall::RecallStore;
@@ -52,7 +65,8 @@ use rustykrab_tools::work_backend::{
 use tokio::sync::Semaphore;
 use uuid::Uuid;
 
-use crate::runner::{AgentConfig, AgentRunner};
+use crate::metered::{Meter, MeteredProvider};
+use crate::runner::{AgentConfig, AgentRunner, NOTICE_PREFIX};
 use crate::sandbox::Sandbox;
 use crate::subagent::profile_for;
 use crate::trace::ExecutionTracer;
@@ -88,7 +102,45 @@ pub trait RunTranscripts: Send + Sync {
     /// Store the run's conversation as it stands, replacing an earlier
     /// save of the same id.
     async fn save(&self, conversation: &Conversation) -> Result<()>;
+
+    /// The kept conversation a run under `id` continues instead of starting
+    /// fresh, if there is one. The controller names such a conversation as
+    /// the run's id only for a scheduled job's firing (the job's persistent
+    /// conversation), so the default, that every run starts fresh, is right
+    /// for a host without scheduled work. An error fails the run rather than
+    /// starting a fresh conversation over the one it could not read.
+    async fn resume(&self, _id: Uuid, _brief: &Brief) -> Result<Option<Resumed>> {
+        Ok(None)
+    }
 }
+
+/// A kept conversation a run continues (see [`RunTranscripts::resume`]),
+/// with what the host adds for this run.
+#[derive(Debug, Clone)]
+pub struct Resumed {
+    pub conversation: Conversation,
+    /// Appended to the definition's system prompt, the one leading system
+    /// message: a scheduled job's SKILL.md body.
+    pub guidance: Option<String>,
+    /// Opens the run's user turn, ahead of the brief: a scheduled job's
+    /// prompt, with where its result is delivered.
+    pub preface: Option<String>,
+}
+
+/// What an ongoing or ended run has spent, until the controller asks
+/// ([`Worker::usage`]).
+struct Spending {
+    meter: Arc<Meter>,
+    tracer: Arc<ExecutionTracer>,
+    started: Instant,
+    /// Set when the run ends; a run stopped mid-way counts until asked.
+    wall: Mutex<Option<Duration>>,
+}
+
+/// Runs whose spend is kept for the controller, at most. A host that never
+/// asks (a test, a caller without a controller) does not grow the map
+/// without bound: the oldest go first.
+const SPENDING_MAX: usize = 64;
 
 /// What one run of a [`LocalWorker`] did, beyond its result: the numbers the
 /// controller cannot read from a [`ResultReport`].
@@ -122,6 +174,8 @@ pub struct LocalWorker {
     /// (plan section 12.1), so workers on one model share one.
     slot: Arc<Semaphore>,
     last_run: Mutex<Option<LocalRun>>,
+    /// Spend per run id, for [`Worker::usage`].
+    spending: Mutex<HashMap<String, Arc<Spending>>>,
 }
 
 impl LocalWorker {
@@ -158,6 +212,7 @@ impl LocalWorker {
             transcripts: None,
             slot: Arc::new(Semaphore::new(1)),
             last_run: Mutex::new(None),
+            spending: Mutex::new(HashMap::new()),
         }
     }
 
@@ -306,6 +361,63 @@ impl LocalWorker {
             channel_thread_id: Some(brief.item.clone()),
         }
     }
+
+    /// A kept conversation, continued by this run: one leading system
+    /// message (the definition's prompt with the host's guidance), every
+    /// later system message the conversation kept as a `[System notice]`
+    /// user turn (section 12.1), then the brief as the run's user turn,
+    /// behind the host's preface. Its channel fields stay the conversation's
+    /// own.
+    fn continued(&self, resumed: Resumed, brief: &Brief) -> Conversation {
+        let mut conv = resumed.conversation;
+        let mut system = self.definition.system_prompt.clone();
+        if let Some(guidance) = resumed.guidance.filter(|g| !g.trim().is_empty()) {
+            system.push_str("\n\n");
+            system.push_str(&guidance);
+        }
+        let lead = conv
+            .messages
+            .iter()
+            .take_while(|m| m.role == Role::System)
+            .count();
+        conv.messages.drain(..lead);
+        for message in conv.messages.iter_mut() {
+            if message.role == Role::System {
+                if let Some(text) = message.content.as_text() {
+                    message.content = MessageContent::Text(format!("{NOTICE_PREFIX}{text}"));
+                }
+                message.role = Role::User;
+            }
+        }
+        conv.messages.insert(
+            0,
+            Message::stamped(Role::System, MessageContent::Text(system)),
+        );
+        let turn = match resumed.preface.filter(|p| !p.trim().is_empty()) {
+            Some(preface) => format!("{preface}\n\n{}", render_brief(brief)),
+            None => render_brief(brief),
+        };
+        conv.messages
+            .push(Message::stamped(Role::User, MessageContent::Text(turn)));
+        conv.updated_at = Utc::now();
+        conv
+    }
+
+    /// Keep `spending` for `run` until the controller asks, dropping the
+    /// oldest past [`SPENDING_MAX`].
+    fn track(&self, run: &str, spending: Arc<Spending>) {
+        let mut map = self.spending.lock().unwrap_or_else(|e| e.into_inner());
+        if map.len() >= SPENDING_MAX {
+            if let Some(oldest) = map
+                .iter()
+                .min_by_key(|(_, s)| s.started)
+                .map(|(k, _)| k.clone())
+            {
+                map.remove(&oldest);
+            }
+        }
+        map.insert(run.to_string(), spending);
+    }
 }
 
 #[async_trait]
@@ -352,6 +464,28 @@ impl Worker for LocalWorker {
         true
     }
 
+    /// The run's tokens (every model call it made, counted at the
+    /// provider), wall time, iterations and completion reminders, taken
+    /// once. A run the controller stopped counts up to where it stopped.
+    fn usage(&self, run: &str) -> Option<RunUsage> {
+        let spending = self
+            .spending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(run)?;
+        let wall = spending
+            .wall
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(|| spending.started.elapsed());
+        Some(RunUsage {
+            tokens: spending.meter.used(),
+            wall_ms: u64::try_from(wall.as_millis()).unwrap_or(u64::MAX),
+            iterations: spending.tracer.iterations(),
+            reminders: spending.tracer.completion_reminders(),
+        })
+    }
+
     async fn run(&self, brief: Brief) -> Result<ResultReport> {
         let activate = self.activation(&brief).map_err(RunFailure::into_error)?;
         let _slot = self
@@ -377,6 +511,23 @@ impl Worker for LocalWorker {
         let active = Arc::new(ActiveToolsRegistry::new());
         active.activate(conv_id, activate);
 
+        // What the run spends, kept for the controller whatever happens to
+        // it, and its token budget enforced at the provider.
+        let spending = Arc::new(Spending {
+            meter: Arc::new(Meter::new(brief.budget.tokens)),
+            tracer: Arc::new(ExecutionTracer::new()),
+            started: Instant::now(),
+            wall: Mutex::new(None),
+        });
+        self.track(
+            brief.run.as_deref().unwrap_or(&conv_id.to_string()),
+            spending.clone(),
+        );
+        let provider: Arc<dyn ModelProvider> = Arc::new(MeteredProvider::new(
+            self.provider.clone(),
+            spending.meter.clone(),
+        ));
+
         let profile = profile_for(&self.definition);
         let max_iterations = profile
             .max_iterations
@@ -388,16 +539,25 @@ impl Worker for LocalWorker {
             soft_iteration_warning: 0,
             ..profile.to_agent_config()
         };
-        let mut runner = AgentRunner::new(self.provider.clone(), tools, self.sandbox.clone())
+        let mut runner = AgentRunner::new(provider, tools, self.sandbox.clone())
             .with_config(config)
             .with_active_tools(active);
         if let Some(recall) = &self.recall {
             runner = runner.with_recall_store(recall.clone());
         }
 
-        let mut conv = self.conversation(conv_id, &brief);
+        // A kept conversation the run continues (a scheduled job's), else a
+        // fresh one.
+        let resumed = match &self.transcripts {
+            Some(t) => t.resume(conv_id, &brief).await?,
+            None => None,
+        };
+        let mut conv = match resumed {
+            Some(resumed) => self.continued(resumed, &brief),
+            None => self.conversation(conv_id, &brief),
+        };
         self.keep(&conv).await;
-        let tracer = ExecutionTracer::new();
+        let tracer = spending.tracer.clone();
         let binding = WorkRunContext {
             item: brief.item.clone(),
             actor: format!("worker:{}", self.name),
@@ -412,6 +572,7 @@ impl Worker for LocalWorker {
                 .ok(),
         };
 
+        *spending.wall.lock().unwrap_or_else(|e| e.into_inner()) = Some(spending.started.elapsed());
         self.keep(&conv).await;
         let reports = recorder.take();
         let stats = LocalRun {
@@ -1306,6 +1467,175 @@ mod tests {
         let calls = stub.calls();
         assert_eq!(calls.len(), 1, "nothing filed, one report: {calls:?}");
         assert!(matches!(&calls[0], WorkCall::Report { report, .. } if report == &got));
+    }
+
+    /// `r` as if it cost `tokens` (prompt and completion together).
+    fn costing(mut r: ModelResponse, tokens: u32) -> ModelResponse {
+        r.usage = Usage {
+            prompt_tokens: tokens - tokens / 10,
+            completion_tokens: tokens / 10,
+            ..Usage::default()
+        };
+        r
+    }
+
+    #[tokio::test]
+    async fn the_token_budget_stops_the_run_at_its_next_model_call() {
+        let provider = Recording::new(vec![
+            costing(call("noop", json!({})), 700),
+            costing(call("noop", json!({})), 700),
+            costing(report("too late"), 700),
+        ]);
+        let (w, stub) = worker(provider.clone(), vec![Arc::new(Named("noop"))]);
+        let mut b = brief("item-20");
+        b.budget.tokens = 1_000;
+        b.run = Some(Uuid::new_v4().to_string());
+        let run = b.run.clone().unwrap();
+
+        let err = w.run(b).await.unwrap_err();
+
+        assert!(
+            matches!(
+                RunFailure::from_error(&err),
+                Some(RunFailure::Budget {
+                    budget: BudgetKind::Tokens,
+                    ..
+                })
+            ),
+            "{err}"
+        );
+        assert_eq!(
+            classified(&err),
+            (ErrorClass::Budget, ErrorSubclass::Tokens)
+        );
+        assert_eq!(
+            provider.requests().len(),
+            2,
+            "the third call never went out"
+        );
+        assert!(stub.calls().is_empty());
+
+        let usage = w.usage(&run).expect("the run's spend");
+        assert_eq!(usage.tokens, 1_400);
+        // The third turn began and was refused at its model call.
+        assert_eq!(usage.iterations, 3);
+        assert_eq!(w.usage(&run), None, "taken once");
+    }
+
+    #[tokio::test]
+    async fn usage_counts_tokens_iterations_and_reminders() {
+        let provider = Recording::new(vec![
+            costing(text("Plan B, I think."), 300),
+            costing(report("B is cheapest."), 200),
+        ]);
+        let (w, _) = worker(provider, Vec::new());
+        let mut b = brief("item-21");
+        b.run = Some("run-21".into());
+        w.run(b).await.unwrap();
+        let usage = w.usage("run-21").unwrap();
+        assert_eq!(usage.tokens, 500);
+        assert_eq!(usage.iterations, 2);
+        assert_eq!(usage.reminders, 1);
+        assert_eq!(w.usage("never-ran"), None);
+    }
+
+    /// A kept conversation every run under its id continues.
+    struct JobConversation {
+        kept: Conversation,
+        saves: Mutex<Vec<Conversation>>,
+    }
+
+    #[async_trait]
+    impl RunTranscripts for JobConversation {
+        async fn save(&self, conversation: &Conversation) -> Result<()> {
+            self.saves.lock().unwrap().push(conversation.clone());
+            Ok(())
+        }
+
+        async fn resume(&self, id: Uuid, _brief: &Brief) -> Result<Option<Resumed>> {
+            Ok((id == self.kept.id).then(|| Resumed {
+                conversation: self.kept.clone(),
+                guidance: Some(
+                    "<skill_instructions name=\"plants\">water them</skill_instructions>".into(),
+                ),
+                preface: Some("[Scheduled task] Your scheduled task is due again.".into()),
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_run_under_a_kept_conversations_id_continues_it() {
+        let id = Uuid::new_v4();
+        let now = Utc::now();
+        let kept = Conversation {
+            id,
+            messages: vec![
+                Message::stamped(Role::System, MessageContent::Text("old prompt".into())),
+                Message::stamped(Role::User, MessageContent::Text("first run".into())),
+                Message::stamped(
+                    Role::System,
+                    MessageContent::Text("You have reached the iteration limit.".into()),
+                ),
+                Message::stamped(Role::Assistant, MessageContent::Text("watered".into())),
+            ],
+            created_at: now,
+            updated_at: now,
+            title: Some("job".into()),
+            summary: None,
+            detected_profile: None,
+            channel_source: Some("telegram".into()),
+            channel_id: Some("42".into()),
+            channel_thread_id: None,
+        };
+        let transcripts = Arc::new(JobConversation {
+            kept,
+            saves: Mutex::new(Vec::new()),
+        });
+        let provider = Recording::new(vec![report("Watered the plants.")]);
+        let (w, _) = worker(provider.clone(), Vec::new());
+        let w = w.with_transcripts(transcripts.clone());
+        let mut b = brief("item-22");
+        b.run = Some(id.to_string());
+
+        w.run(b).await.unwrap();
+
+        let (messages, _) = &provider.requests()[0];
+        assert_eq!(messages[0].role, Role::System);
+        let system = messages[0].content.as_text().unwrap();
+        assert!(system.starts_with("You are pinch"), "{system}");
+        assert!(
+            system.ends_with("water them</skill_instructions>"),
+            "{system}"
+        );
+        assert!(
+            messages[1..].iter().all(|m| m.role != Role::System),
+            "one leading system message: {messages:?}"
+        );
+        assert!(messages.iter().any(|m| m.content.as_text()
+            == Some("[System notice] You have reached the iteration limit.")));
+        assert_eq!(messages[1].content.as_text(), Some("first run"));
+        let turn = messages.last().unwrap().content.as_text().unwrap();
+        assert!(
+            turn.starts_with(
+                "[Scheduled task] Your scheduled task is due again.\n\nwork item: #item-22"
+            ),
+            "{turn}"
+        );
+
+        let saves = transcripts.saves.lock().unwrap().clone();
+        assert!(saves.iter().all(|c| c.id == id), "kept under its own id");
+        assert_eq!(saves[0].channel_source.as_deref(), Some("telegram"));
+        assert!(!saves.iter().any(|c| c
+            .messages
+            .iter()
+            .any(|m| m.content.as_text() == Some("old prompt"))));
+
+        // Any other id starts fresh.
+        let provider = Recording::new(vec![report("done")]);
+        let (w, _) = worker(provider.clone(), Vec::new());
+        let w = w.with_transcripts(transcripts);
+        w.run(brief("item-23")).await.unwrap();
+        assert_eq!(provider.requests()[0].0.len(), 2);
     }
 
     #[test]
