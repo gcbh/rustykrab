@@ -145,7 +145,14 @@ impl ApolloMessage {
         Self {
             id: msg.id.to_string(),
             conversation_id: conv_id.to_string(),
-            role: apollo_role(msg.role),
+            // A runner notice is a user turn only so every model reads it
+            // in place (control plan 12.1); Apollo shows it as the system
+            // line it is.
+            role: if msg.is_system_notice() {
+                ApolloRole::System
+            } else {
+                apollo_role(msg.role)
+            },
             content: render_message_content(&msg.content),
             created_at: epoch_millis(msg.created_at),
         }
@@ -1563,6 +1570,16 @@ mod tests {
             apollo_role(Role::Assistant),
             ApolloRole::Assistant
         ));
+    }
+
+    #[test]
+    fn a_runner_notice_shows_as_a_system_line_in_apollo() {
+        let notice = Message::system_notice("Continue.");
+        let shown = ApolloMessage::from_message(Uuid::nil(), &notice);
+        assert!(matches!(shown.role, ApolloRole::System));
+        let said = Message::stamped(Role::User, MessageContent::Text("Continue.".into()));
+        let shown = ApolloMessage::from_message(Uuid::nil(), &said);
+        assert!(matches!(shown.role, ApolloRole::User));
     }
 
     #[test]

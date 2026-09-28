@@ -622,12 +622,17 @@ fn wire_check(case: &str, records: &[Value]) -> Value {
         let tool_names: Vec<_> = r["wire_request"]["tools"].as_array().into_iter().flatten()
             .filter_map(|t|t["function"]["name"].as_str()).collect();
         let can_discover = tool_names.contains(&"tools_list") && tool_names.contains(&"tools_load");
-        let final_summary = messages.last().is_some_and(|m|m["role"] == "system" &&
-            m["content"].as_str().unwrap_or("").starts_with("You have reached the iteration limit ("));
+        // The cap's notice is a `[System notice]` user turn, like every
+        // runner notice (control plan 12.1); no request carries a system
+        // message after the first.
+        let final_summary = messages.last().is_some_and(|m|m["role"] == "user" &&
+            m["content"].as_str().unwrap_or("").starts_with("[System notice] You have reached the iteration limit ("));
+        let late_system = messages.iter().skip(1).filter(|m| m["role"] == "system").count();
         json!({"sequence":r["sequence"],"messages":messages.len(),"original_exact":contains(ORIGINAL),
             "objective_present":contains("Broadway") && (contains("September 14-16") || contains("September 18-20")),
             "latest_user_exact":latest,"prior_answer_exact":contains(PRIOR),
             "system_first":messages.first().is_some_and(|m|m["role"] == "system"),
+            "non_leading_system_messages":late_system,
             "request_purpose":if final_summary {"iteration_cap_summary"} else {"agent_step"},
             "browser_available_or_discoverable":tool_names.contains(&"browser") || can_discover,
             "configured_tool_seed_honored":(["browser","web_search","web_fetch","code_execution"].iter().all(|t|tool_names.contains(t))),
@@ -666,6 +671,7 @@ fn wire_check(case: &str, records: &[Value]) -> Value {
                 > 0)
         && configured_seed_honored
         && first["system_first"] == true
+        && turns.iter().all(|t| t["non_leading_system_messages"] == 0)
         && task_tools_available
         && if compaction_loss {
             compactions > 0 && latest_all && objective_all
@@ -1108,9 +1114,16 @@ async fn trial(
                 ))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
+        // A runner notice is a user turn (control plan 12.1) the runner
+        // wrote, not input a channel admitted, so it has no journal row.
         let inbound: Vec<_> = canonical_final
             .iter()
             .filter(|m| m["role"] == "user" && !initial.iter().any(|old| old["id"] == m["id"]))
+            .filter(|m| {
+                !m["content"]["data"]
+                    .as_str()
+                    .is_some_and(|t| t.starts_with(rustykrab_core::types::SYSTEM_NOTICE_PREFIX))
+            })
             .collect();
         let mut checks = Vec::new();
         for message in inbound {
@@ -1544,7 +1557,30 @@ mod tests {
                 .iter()
                 .map(|name| json!({"function":{"name":name}}))
                 .collect::<Vec<_>>());
-        assert_eq!(wire_check("broadway-retained", &[record])["passed"], true);
+        assert_eq!(
+            wire_check("broadway-retained", &[record.clone()])["passed"],
+            true
+        );
+
+        // Control plan 12.1: a notice is a `[System notice]` user turn, and
+        // a request that carries a system message after the first fails.
+        let mut late = record.clone();
+        late["wire_request"]["messages"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"role":"system","content":"Continue."}));
+        let check = wire_check("broadway-retained", &[late]);
+        assert_eq!(check["turns"][0]["non_leading_system_messages"], 1);
+        assert_eq!(check["passed"], false);
+        let mut cap = record;
+        cap["wire_request"]["messages"].as_array_mut().unwrap().push(json!({"role":"user",
+            "content":"[System notice] You have reached the iteration limit (4 iterations). Summarize what you accomplished and what remains."}));
+        let check = wire_check("broadway-retained", &[cap]);
+        assert_eq!(
+            check["turns"][0]["request_purpose"],
+            "iteration_cap_summary"
+        );
+        assert_eq!(check["passed"], true);
     }
     #[test]
     fn network_boundary_rejects_remote_and_credential_urls() {

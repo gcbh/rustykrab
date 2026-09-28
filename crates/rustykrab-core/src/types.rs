@@ -124,7 +124,46 @@ impl Message {
     pub fn version_stamp() -> Option<String> {
         Some(crate::VERSION.to_string())
     }
+
+    /// A notice from the host to the model (a nudge, a warning, a
+    /// compaction instruction) in the one shape every model reads in place:
+    /// a user turn that starts with [`SYSTEM_NOTICE_PREFIX`].
+    ///
+    /// Not a system message, because a request carries exactly one of
+    /// those, first (control plan section 12.1). Ollama's Qwen 3.5-family
+    /// template folds a later system message to the top of the prompt, so
+    /// the model never reads the nudge last and the cached prefix is lost,
+    /// and qwen3.8 has answered one with nothing at all. gemma4 and the
+    /// hosted APIs read the user turn just as well.
+    pub fn system_notice(text: impl AsRef<str>) -> Self {
+        Self::stamped(
+            Role::User,
+            MessageContent::Text(format!("{SYSTEM_NOTICE_PREFIX}{}", text.as_ref())),
+        )
+    }
+
+    /// Whether this is a host notice ([`Message::system_notice`]) rather
+    /// than something the user said. Consumers that treat user turns as
+    /// the user's words (memory, distillation, display, compaction's turn
+    /// counting) skip or relabel these.
+    pub fn is_system_notice(&self) -> bool {
+        self.role == Role::User
+            && self
+                .content
+                .as_text()
+                .is_some_and(|t| t.starts_with(SYSTEM_NOTICE_PREFIX))
+    }
+
+    /// Whether this is a turn the user wrote: a user message that is not a
+    /// host notice.
+    pub fn is_user_turn(&self) -> bool {
+        self.role == Role::User && !self.is_system_notice()
+    }
 }
+
+/// What a host notice to the model starts with; see
+/// [`Message::system_notice`].
+pub const SYSTEM_NOTICE_PREFIX: &str = "[System notice] ";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -454,5 +493,22 @@ mod tests {
         let (cleaned, images) = split_tool_result_images(serde_json::json!({ "ok": true }));
         assert_eq!(cleaned, serde_json::json!({ "ok": true }));
         assert!(images.is_empty());
+    }
+
+    #[test]
+    fn a_system_notice_is_a_user_turn_the_user_did_not_write() {
+        let notice = Message::system_notice("Continue.");
+        assert_eq!(notice.role, Role::User);
+        assert_eq!(notice.content.as_text(), Some("[System notice] Continue."));
+        assert!(notice.is_system_notice() && !notice.is_user_turn());
+
+        let said = Message::stamped(Role::User, MessageContent::Text("Continue.".into()));
+        assert!(said.is_user_turn() && !said.is_system_notice());
+        // Only a user turn can be a notice.
+        let system = Message::stamped(
+            Role::System,
+            MessageContent::Text("[System notice] x".into()),
+        );
+        assert!(!system.is_system_notice() && !system.is_user_turn());
     }
 }

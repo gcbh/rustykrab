@@ -33,6 +33,21 @@
 //!    words: `current weather` finds `get_weather` ("Get the current weather
 //!    for a city") and not `get_forecast` ("a multi-day weather forecast"),
 //!    which misses `current`. A query that names a tool exactly finds it.
+//!
+//! # The same need, searched again
+//!
+//! Told nothing matched, both models kept searching until the iteration cap
+//! (scenario 10, 2026-09-28). So `tools_list` keeps a run's misses and
+//! answers a need searched again past the harness profile's limit as final.
+//! A search's *need* is its known terms, stemmed ([`need_terms`]; all its
+//! terms when the catalog knows none), and two searches are the same need
+//! when either's terms all match terms of the other ([`same_need`]): the
+//! same words again, with an argument added (`current weather in Lisbon`),
+//! or with a word dropped or added (`weather`, `current weather
+//! conditions`). A reworded need (`real-time weather`) is a new one. Within
+//! a need, a tool the host has already named a non-match stays one, so a
+//! broader query (`weather`, which one word of `get_forecast` satisfies)
+//! cannot turn a labelled near-miss into a find.
 
 use std::collections::BTreeMap;
 
@@ -284,6 +299,37 @@ pub(crate) fn terms(text: &str) -> BTreeMap<String, String> {
 /// Whether two stemmed terms name the same thing.
 pub(crate) fn terms_match(a: &str, b: &str) -> bool {
     a == b || (a.len().min(b.len()) >= 5 && (a.starts_with(b) || b.starts_with(a)))
+}
+
+/// A search's need: the stems of the query's known terms, sorted, or of
+/// all its terms when the catalog knows none of them (a query no tool
+/// shares a word with is still a need, and can be searched again).
+pub(crate) fn need_terms(query: &str, search: &Search) -> Vec<String> {
+    let all = terms(query);
+    let known: Vec<String> = all
+        .iter()
+        .filter(|(_, spelled)| search.known.contains(spelled))
+        .map(|(stem, _)| stem.clone())
+        .collect();
+    if known.is_empty() {
+        all.into_keys().collect()
+    } else {
+        known
+    }
+}
+
+/// Whether two needs are the same: every term of one matches a term of the
+/// other, in either direction. Two empty needs (queries of filler words
+/// only) are the same; an empty one is no other.
+pub(crate) fn same_need(a: &[String], b: &[String]) -> bool {
+    let within = |x: &[String], y: &[String]| {
+        x.iter()
+            .all(|term| y.iter().any(|other| terms_match(term, other)))
+    };
+    if a.is_empty() || b.is_empty() {
+        return a.is_empty() && b.is_empty();
+    }
+    within(a, b) || within(b, a)
 }
 
 /// The plausibility rule: at least two thirds of the query's known terms,
@@ -673,6 +719,29 @@ mod tests {
         assert!(names(&s.found).contains(&"get_uv_index"));
         let s = search("teleport me", &weather(true));
         assert!(s.found.is_empty() && s.near.is_empty() && s.known.is_empty());
+    }
+
+    #[test]
+    fn a_need_is_the_known_terms_and_rewording_it_is_a_new_one() {
+        let catalog = weather(false);
+        let need = |q: &str| need_terms(q, &search(q, &catalog));
+        let current = need("current weather");
+        assert_eq!(current, ["current", "weather"]);
+        // An argument no tool knows does not make a new need.
+        assert_eq!(need("current weather in Lisbon"), current);
+        assert!(same_need(&current, &need("the current weather")));
+        // Narrower and broader wordings of it are the same need.
+        assert!(same_need(&current, &need("weather")));
+        assert!(same_need(&current, &need("current weather conditions")));
+        // A reworded or different one is not.
+        assert!(!same_need(&current, &need("real-time weather")));
+        assert!(!same_need(&current, &need("air quality")));
+        // Words no tool knows are the need when nothing else is.
+        let teleport = need("teleportation");
+        assert_eq!(teleport, ["teleportation"]);
+        assert!(same_need(&teleport, &need("teleport")));
+        assert!(same_need(&need("find a tool"), &need("the tools")));
+        assert!(!same_need(&need("find a tool"), &teleport));
     }
 
     #[test]

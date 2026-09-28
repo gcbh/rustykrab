@@ -37,8 +37,8 @@ pub mod types;
 pub mod work;
 
 pub use active_tools::{
-    with_session_context, ActiveToolsRegistry, Callable, LateToolBinding, SessionToolContext,
-    SESSION_TOOL_CONTEXT,
+    with_session_context, ActiveToolsRegistry, Callable, LateToolBinding, SearchMiss,
+    SessionToolContext, DEFAULT_SEARCH_MISS_LIMIT, SESSION_TOOL_CONTEXT,
 };
 pub use activity::{ActivityTracker, RunGuard};
 pub use agent_def::{AgentDefinition, AgentRegistry};
@@ -57,7 +57,7 @@ pub use post_condition::{Observation, PostCondition, ProbeRegistry, ProbeWindow}
 pub use probes::{FilePresence, MemoryWritten};
 pub use recall::RecallStore;
 pub use retrieval_log::RetrievalLog;
-pub use schema_validate::validate_tool_args;
+pub use schema_validate::{coerce_tool_args, validate_tool_args, Coercion};
 pub use session::Session;
 pub use timezone::Tz;
 pub use todo::{render_todos, TodoItem, TodoStatus, TodoStore};
