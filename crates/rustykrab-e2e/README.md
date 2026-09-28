@@ -207,13 +207,17 @@ the real tools cannot run because the credential they need is absent.
 
 **Registering a tool is not enough for the model to see it.** Schemas are
 only sent for tools in the conversation's *active* set —
-`DEFAULT_ACTIVE_TOOLS` plus whatever `tools_load` has pulled in — so a
-freshly registered tool is invisible until something activates it. The
+`DEFAULT_ACTIVE_TOOLS` plus whatever was declared before the run. A tool
+found mid-run by `tools_list` reaches a local model as text in the search
+result, never in the tools array (the append path). So a freshly
+registered tool is invisible until something activates or appends it. The
 harness sets `RUSTYKRAB_ACTIVE_TOOLS` to exactly the stubs each scenario
 declares, and the credential suite names the real tool families it reaches
 for. Without that a scenario measures tool discovery instead of the thing
 it is about, and an assertion like "the irrelevant tool was not called"
-passes for the wrong reason.
+passes for the wrong reason. The late binding cases (plan scenario 10) are
+the one place discovery *is* the thing: their catalog stubs carry
+`"visible": false`, which keeps them out of both seeds.
 
 ## How assertions see a run
 

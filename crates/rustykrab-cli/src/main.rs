@@ -1374,7 +1374,7 @@ async fn main() -> anyhow::Result<()> {
     // Applied last, after every real tool has registered, so `replace`
     // means the whole registry rather than whichever part of it had been
     // built by this point.
-    let tools = match std::env::var_os("RUSTYKRAB_TOOL_STUBS") {
+    let (tools, hidden_stubs) = match std::env::var_os("RUSTYKRAB_TOOL_STUBS") {
         Some(path) => {
             let path = std::path::PathBuf::from(path);
             let stubs = rustykrab_tools::StubFile::from_path(&path)?;
@@ -1386,9 +1386,9 @@ async fn main() -> anyhow::Result<()> {
                 "RUSTYKRAB_TOOL_STUBS is set — the tool registry has been replaced with \
                  scripted stubs. This is the evaluation harness switch."
             );
-            stubbed
+            (stubbed, stubs.hidden_names())
         }
-        None => tools,
+        None => (tools, Vec::new()),
     };
 
     // A stubbed registry is a closed world: the harness has already said
@@ -1407,7 +1407,12 @@ async fn main() -> anyhow::Result<()> {
     // secret.
     let mut seed: Vec<String> = Vec::new();
     if std::env::var_os("RUSTYKRAB_TOOL_STUBS").is_some() {
-        seed.extend(tools.iter().map(|t| t.name().to_string()));
+        seed.extend(
+            tools
+                .iter()
+                .map(|t| t.name().to_string())
+                .filter(|n| !hidden_stubs.contains(n)),
+        );
     }
     if let Ok(raw) = std::env::var("RUSTYKRAB_ACTIVE_TOOLS") {
         seed.extend(
