@@ -6,7 +6,8 @@
 //!
 //! - **claude_code**: `claude -p <brief> --output-format stream-json
 //!   --verbose --max-turns <n> --permission-mode <mode> --allowedTools <list>
-//!   --disallowedTools <list>`, plus `--model` and, for a capability build,
+//!   --disallowedTools <list>` (the built-in deny list, then the spec's
+//!   `denied_tools`), plus `--model` and, for a capability build,
 //!   `--add-dir <skills dir>`.
 //! - **codex**: `codex exec --json --skip-git-repo-check --sandbox
 //!   workspace-write --cd <dir> --output-last-message <file> <brief>`, plus
@@ -120,6 +121,17 @@ pub const CLAUDE_DEFAULT_TOOLS: [&str; 14] = [
 /// Never allowed, whatever the spec says: publishing and the network are
 /// not a worker's to use (delivery plan, section 7.5).
 pub const CLAUDE_DENIED_TOOLS: [&str; 3] = ["Bash(git push:*)", "WebFetch", "WebSearch"];
+
+/// Claude Code's `--disallowedTools`: [`CLAUDE_DENIED_TOOLS`], then the
+/// worker's own additions. A spec can deny more, never less.
+fn denied_list(extra: &[String]) -> String {
+    CLAUDE_DENIED_TOOLS
+        .iter()
+        .copied()
+        .chain(extra.iter().map(String::as_str))
+        .collect::<Vec<_>>()
+        .join(",")
+}
 
 /// Environment variables every agent process gets, when the daemon has
 /// them.
@@ -306,6 +318,9 @@ pub struct ExternalConfig {
     pub model: Option<String>,
     /// Claude Code's `--allowedTools`; empty takes [`CLAUDE_DEFAULT_TOOLS`].
     pub allowed_tools: Vec<String>,
+    /// Denied on top of [`CLAUDE_DENIED_TOOLS`] in Claude Code's
+    /// `--disallowedTools`; empty for codex, which has no such flag.
+    pub denied_tools: Vec<String>,
     pub max_turns: u32,
     pub permission_mode: String,
     pub timeout: Duration,
@@ -339,12 +354,28 @@ impl ExternalConfig {
         if let Some(bad) = spec.repos.iter().find(|r| r.trim().is_empty()) {
             return Err(format!("empty repository path {bad:?}"));
         }
+        let denied_tools: Vec<String> = spec
+            .denied_tools
+            .iter()
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+            .collect();
+        let denied_tools = if spec.kind == WorkerKind::Codex && !denied_tools.is_empty() {
+            tracing::warn!(
+                denied_tools = ?denied_tools,
+                "codex has no deny list flag; ignoring the spec's denied_tools"
+            );
+            Vec::new()
+        } else {
+            denied_tools
+        };
         Ok(ExternalConfig {
             kind: spec.kind,
             command: PathBuf::from(spec.command.as_deref().unwrap_or(default_command)),
             repos: spec.repos.iter().map(|r| r.trim().to_string()).collect(),
             model: spec.model.clone(),
             allowed_tools: spec.allowed_tools.clone(),
+            denied_tools,
             max_turns: spec.max_turns.unwrap_or(30),
             permission_mode: spec
                 .permission_mode
@@ -575,7 +606,7 @@ impl ExternalWorker {
                     .args(["--max-turns", &turns])
                     .args(["--permission-mode", &c.permission_mode])
                     .args(["--allowedTools", &allowed])
-                    .args(["--disallowedTools", &CLAUDE_DENIED_TOOLS.join(",")]);
+                    .args(["--disallowedTools", &denied_list(&c.denied_tools)]);
                 if let Some(model) = &c.model {
                     cmd.args(["--model", model]);
                 }
@@ -1560,6 +1591,69 @@ mod tests {
             workspace,
             capability: None,
         }
+    }
+
+    /// The value `--disallowedTools` carries for a worker of `kind` whose
+    /// spec denies `denied`.
+    fn disallowed(kind: WorkerKind, denied: &[&str]) -> Option<String> {
+        let data = tempfile::tempdir().unwrap();
+        let spec = WorkerSpec {
+            kind,
+            repos: vec!["/src/app".into()],
+            denied_tools: denied.iter().map(|t| t.to_string()).collect(),
+            ..WorkerSpec::default()
+        };
+        let worker = ExternalWorker::new(
+            "pinch",
+            ExternalConfig::from_spec(&spec, data.path()).unwrap(),
+        );
+        let cmd = worker.command(
+            "go",
+            data.path(),
+            &brief(None),
+            &data.path().join("last"),
+            None,
+        );
+        let args: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let at = args.iter().position(|a| a == "--disallowedTools")?;
+        args.get(at + 1).cloned()
+    }
+
+    #[test]
+    fn a_spec_s_denied_tools_extend_the_built_in_deny_list() {
+        let built_in = CLAUDE_DENIED_TOOLS.join(",");
+        assert_eq!(
+            disallowed(WorkerKind::ClaudeCode, &[]).as_deref(),
+            Some(built_in.as_str()),
+            "a spec without denied_tools is unchanged"
+        );
+        assert_eq!(
+            disallowed(
+                WorkerKind::ClaudeCode,
+                &[
+                    "Read(~/.config/**)",
+                    " Edit(//Users/someone/secrets/**) ",
+                    ""
+                ]
+            ),
+            Some(format!(
+                "{built_in},Read(~/.config/**),Edit(//Users/someone/secrets/**)"
+            ))
+        );
+        // Codex has no such flag: the list is dropped, not passed on.
+        assert_eq!(disallowed(WorkerKind::Codex, &["Read(~/.config/**)"]), None);
+        let spec = WorkerSpec {
+            kind: WorkerKind::Codex,
+            repos: vec!["/src/app".into()],
+            denied_tools: vec!["Read(~/.config/**)".into()],
+            ..WorkerSpec::default()
+        };
+        let config = ExternalConfig::from_spec(&spec, Path::new("/tmp")).unwrap();
+        assert!(config.denied_tools.is_empty());
     }
 
     /// A Claude Code stand-in: commits in its working directory, prints one

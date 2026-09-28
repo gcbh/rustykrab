@@ -24,9 +24,12 @@ usage: rustykrab workers
   worker add <claude_code|codex> [--name N] --repos PATH[,PATH...]
              [--command PATH] [--model M] [--max-turns N]
              [--permission-mode M] [--timeout SECONDS]
-             [--allowed-tools T[,T...]] [--cost-tier N] [--env VAR[,VAR...]]
+             [--allowed-tools T[,T...]] [--denied-tools T[,T...]]
+             [--cost-tier N] [--env VAR[,VAR...]]
                                  add an external coding worker; the registry
-                                 names it when --name is left out
+                                 names it when --name is left out;
+                                 --denied-tools adds to claude_code's deny
+                                 list (codex ignores it)
   worker add peer --url URL (--pairing-code CODE | --token TOKEN)
              [--name N] [--timeout SECONDS] [--concurrency N] [--cost-tier N]
                                  add a paired node on the tailnet: the code
@@ -162,6 +165,9 @@ fn parse_add(kind: &str, rest: &[&str]) -> Result<WorkerSpec, String> {
             "--allowed-tools" => {
                 spec.allowed_tools = split_list(value(i)?);
             }
+            "--denied-tools" => {
+                spec.denied_tools = split_list(value(i)?);
+            }
             "--env" => spec.env = split_list(value(i)?),
             "--url" => spec.base_url = Some(value(i)?.to_string()),
             "--token" => spec.token = Some(value(i)?.to_string()),
@@ -263,6 +269,9 @@ fn render_one(w: &WorkerView) -> String {
         if let Some(url) = &spec.base_url {
             out.push_str(&format!("  node {url}\n"));
         }
+        if !spec.denied_tools.is_empty() {
+            out.push_str(&format!("  denied {}\n", spec.denied_tools.join(", ")));
+        }
     }
     if let Some(machine) = &w.capabilities.machine {
         out.push_str(&format!("  machine {machine}\n"));
@@ -314,6 +323,16 @@ mod tests {
         );
         assert_eq!(spec.max_turns, Some(12));
         assert_eq!(spec.timeout_seconds, Some(600));
+        assert!(spec.denied_tools.is_empty());
+
+        let Command::Add(spec) = parse(&words(&format!(
+            "worker add claude_code --repos {} --denied-tools Read(~/.config/**),WebFetch",
+            repo.path().display()
+        )))
+        .unwrap() else {
+            panic!("not an add")
+        };
+        assert_eq!(spec.denied_tools, ["Read(~/.config/**)", "WebFetch"]);
 
         let Command::Add(spec) = parse(&words(&format!(
             "worker add codex --repos {} {}",

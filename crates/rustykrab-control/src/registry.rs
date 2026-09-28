@@ -73,6 +73,11 @@ pub struct WorkerSpec {
     /// The agent's own tool allowlist; empty takes the adapter's default.
     #[serde(default)]
     pub allowed_tools: Vec<String>,
+    /// Rules denied on top of the adapter's own deny list, such as
+    /// `Read(~/.config/**)`. Claude Code only; codex has no equivalent and
+    /// ignores them with a warning.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub denied_tools: Vec<String>,
     #[serde(default)]
     pub max_turns: Option<u32>,
     #[serde(default)]
@@ -854,6 +859,57 @@ mod tests {
         assert!(after.get("nipper").is_none());
         assert!(after.remove("pinch").await.unwrap());
         assert!(after.get("pinch").is_none());
+    }
+
+    #[tokio::test]
+    async fn denied_tools_round_trip_through_the_stored_spec() {
+        let (_dir, store) = temp_store();
+        let before = WorkerRegistry::new(store.clone()).with_factory(Arc::new(Factory));
+        let mut guarded = spec(WorkerKind::ClaudeCode, Some("pinch"));
+        guarded.denied_tools = vec![
+            "Read(~/.config/**)".to_string(),
+            "Edit(//Users/someone/secrets/**)".to_string(),
+        ];
+        let view = before.add(guarded.clone()).await.unwrap();
+        assert_eq!(view.spec.unwrap().denied_tools, guarded.denied_tools);
+        before
+            .add(spec(WorkerKind::ClaudeCode, Some("coral")))
+            .await
+            .unwrap();
+        // A spec without the field stores none, as specs did before it.
+        let plain = store.workers().get("coral").await.unwrap().unwrap();
+        assert!(
+            plain.config.get("denied_tools").is_none(),
+            "{}",
+            plain.config
+        );
+
+        let after = WorkerRegistry::new(store.clone()).with_factory(Arc::new(Factory));
+        assert_eq!(after.restore().await.unwrap(), ["pinch", "coral"]);
+        let views = after.views().await.unwrap();
+        let denied = |name: &str| {
+            views
+                .iter()
+                .find(|v| v.name == name)
+                .and_then(|v| v.spec.clone())
+                .unwrap()
+                .denied_tools
+        };
+        assert_eq!(denied("pinch"), guarded.denied_tools);
+        assert!(denied("coral").is_empty());
+    }
+
+    #[test]
+    fn a_stored_spec_from_before_denied_tools_still_reads() {
+        let old = serde_json::json!({
+            "kind": "claude_code",
+            "name": "pinch",
+            "repos": ["/src/app"],
+            "allowed_tools": ["Read"],
+        });
+        let spec: WorkerSpec = serde_json::from_value(old).unwrap();
+        assert!(spec.denied_tools.is_empty());
+        assert_eq!(spec.allowed_tools, ["Read"]);
     }
 
     fn peer(name: &str) -> WorkerSpec {
