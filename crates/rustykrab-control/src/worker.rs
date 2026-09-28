@@ -97,6 +97,13 @@ pub trait Worker: Send + Sync {
     fn healthy(&self) -> bool {
         true
     }
+    /// Why the worker is not healthy, when it is not ("Ollama at ... has
+    /// no model `x`"). The registry records it on the worker's row and in
+    /// `GET /api/workers` as `unhealthy: <reason>`, so an operator sees the
+    /// cause without reading logs. Default: no reason given.
+    fn unhealthy_reason(&self) -> Option<String> {
+        None
+    }
     /// Run one brief to its typed result. The controller verifies the result
     /// before anything counts; a worker never transitions an item.
     async fn run(&self, brief: Brief) -> Result<ResultReport, Error>;

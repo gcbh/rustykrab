@@ -313,7 +313,7 @@ impl WorkerRegistry {
                 capabilities: serde_json::to_value(worker.capabilities())
                     .unwrap_or(serde_json::Value::Null),
                 config,
-                health: health_line(healthy),
+                health: health_line(worker.as_ref()),
                 last_seen: healthy.then(Utc::now),
                 cost_tier: cost_tier.unwrap_or_else(|| default_cost_tier(worker.kind())),
             })
@@ -444,7 +444,11 @@ impl WorkerRegistry {
                     let healthy = worker.healthy();
                     self.store
                         .workers()
-                        .touch(&row.name, &health_line(healthy), healthy.then(Utc::now))
+                        .touch(
+                            &row.name,
+                            &health_line(worker.as_ref()),
+                            healthy.then(Utc::now),
+                        )
                         .await?;
                     self.live.write().unwrap_or_else(lock_err).push(worker);
                     restored.push(row.name);
@@ -471,7 +475,7 @@ impl WorkerRegistry {
             let row = match &live {
                 Some(w) => {
                     let healthy = w.healthy();
-                    let line = health_line(healthy);
+                    let line = health_line(w.as_ref());
                     workers
                         .touch(&row.name, &line, healthy.then(Utc::now))
                         .await?;
@@ -489,7 +493,7 @@ impl WorkerRegistry {
                     kind: w.kind().as_str().to_string(),
                     live: true,
                     healthy: w.healthy(),
-                    health: health_line(w.healthy()),
+                    health: health_line(w.as_ref()),
                     last_seen: None,
                     cost_tier: self.cost_tier(w.as_ref()),
                     concurrency: w.concurrency(),
@@ -534,7 +538,7 @@ impl WorkerRegistry {
                 .advertise(
                     worker.name(),
                     capabilities,
-                    &health_line(healthy),
+                    &health_line(worker.as_ref()),
                     healthy.then(Utc::now),
                 )
                 .await?;
@@ -562,7 +566,7 @@ impl WorkerRegistry {
                     capabilities: serde_json::to_value(w.capabilities())
                         .unwrap_or(serde_json::Value::Null),
                     config: serde_json::json!({}),
-                    health: health_line(w.healthy()),
+                    health: health_line(w.as_ref()),
                     last_seen: None,
                     cost_tier: self.cost_tier(w.as_ref()),
                 })
@@ -610,11 +614,20 @@ async fn peer_spec(
     Ok(spec)
 }
 
-fn health_line(healthy: bool) -> String {
-    if healthy {
-        "healthy".to_string()
-    } else {
-        "unhealthy".to_string()
+/// The health recorded on a worker's row: `healthy`, or `unhealthy` with
+/// the worker's reason when it gives one (`unhealthy: Ollama at ... has no
+/// model `x``).
+fn health_line(worker: &dyn Worker) -> String {
+    if worker.healthy() {
+        return "healthy".to_string();
+    }
+    match worker
+        .unhealthy_reason()
+        .map(|why| why.trim().to_string())
+        .filter(|why| !why.is_empty())
+    {
+        Some(why) => format!("unhealthy: {why}"),
+        None => "unhealthy".to_string(),
     }
 }
 
@@ -927,6 +940,101 @@ mod tests {
             store.secrets().get(&token_secret("krabby")).await,
             Err(Error::NotFound(_))
         ));
+    }
+
+    /// What a local worker's check of its provider's model found.
+    enum ModelCheck {
+        Present,
+        Missing { base_url: String, model: String },
+    }
+
+    struct Local {
+        name: String,
+        check: ModelCheck,
+    }
+
+    #[async_trait]
+    impl Worker for Local {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn kind(&self) -> WorkerKind {
+            WorkerKind::Local
+        }
+        fn capabilities(&self) -> WorkerCapabilities {
+            WorkerCapabilities::default()
+        }
+        fn healthy(&self) -> bool {
+            matches!(self.check, ModelCheck::Present)
+        }
+        fn unhealthy_reason(&self) -> Option<String> {
+            match &self.check {
+                ModelCheck::Present => None,
+                ModelCheck::Missing { base_url, model } => {
+                    Some(format!("Ollama at {base_url} has no model `{model}`"))
+                }
+            }
+        }
+        async fn run(&self, _brief: Brief) -> Result<ResultReport, Error> {
+            Ok(ResultReport::default())
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unhealthy_worker_shows_why_on_its_row_and_view() {
+        let (_dir, store) = temp_store();
+        let registry = WorkerRegistry::new(store.clone());
+        let registered = registry
+            .register(
+                Arc::new(Local {
+                    name: "snapper".to_string(),
+                    check: ModelCheck::Missing {
+                        base_url: "http://127.0.0.1:11434".to_string(),
+                        model: "qwen3-coder:30b".to_string(),
+                    },
+                }),
+                serde_json::json!({}),
+                None,
+            )
+            .await
+            .unwrap();
+        let want = "unhealthy: Ollama at http://127.0.0.1:11434 has no model `qwen3-coder:30b`";
+        assert!(!registered.healthy);
+        assert_eq!(registered.health, want);
+        let row = store.workers().get("snapper").await.unwrap().unwrap();
+        assert_eq!(row.health, want);
+        let view = registry.view("snapper").await.unwrap().unwrap();
+        assert!(view.health.contains("qwen3-coder:30b"), "{}", view.health);
+        assert!(view.last_seen.is_none());
+
+        // A worker with no reason to give keeps the bare line; a healthy one
+        // gives none.
+        let fixed = WorkerRegistry::fixed(
+            store.clone(),
+            vec![
+                Arc::new(Named {
+                    name: "krabby".to_string(),
+                    kind: WorkerKind::Peer,
+                    repos: Vec::new(),
+                    token: None,
+                    refreshes: std::sync::atomic::AtomicUsize::new(0),
+                }),
+                Arc::new(Local {
+                    name: "pinch".to_string(),
+                    check: ModelCheck::Present,
+                }),
+            ],
+        );
+        let views = fixed.views().await.unwrap();
+        let health = |name: &str| {
+            views
+                .iter()
+                .find(|v| v.name == name)
+                .map(|v| v.health.clone())
+                .unwrap()
+        };
+        assert_eq!(health("krabby"), "unhealthy");
+        assert_eq!(health("pinch"), "healthy");
     }
 
     #[test]

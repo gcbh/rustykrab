@@ -362,6 +362,10 @@ impl Worker for PeerWorker {
         self.unavailable().is_none()
     }
 
+    fn unhealthy_reason(&self) -> Option<String> {
+        self.unavailable()
+    }
+
     fn usage(&self, run: &str) -> Option<RunUsage> {
         lock(&self.spent).remove(run)
     }

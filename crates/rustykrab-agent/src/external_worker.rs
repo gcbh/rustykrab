@@ -457,6 +457,20 @@ impl Worker for ExternalWorker {
         self.command_found() && self.config.repos.iter().all(|r| Path::new(r).is_dir())
     }
 
+    fn unhealthy_reason(&self) -> Option<String> {
+        if !self.command_found() {
+            return Some(format!(
+                "command `{}` not found",
+                self.config.command.display()
+            ));
+        }
+        self.config
+            .repos
+            .iter()
+            .find(|r| !Path::new(r).is_dir())
+            .map(|r| format!("repository {r} is not a directory"))
+    }
+
     /// Tokens and turns from the agent's own event stream, and the wall
     /// time of its process.
     fn usage(&self, run: &str) -> Option<RunUsage> {
