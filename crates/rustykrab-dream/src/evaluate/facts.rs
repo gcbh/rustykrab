@@ -101,6 +101,13 @@ pub struct RoutingEntry {
     /// Whether this worker is the class's default tier today.
     #[serde(default)]
     pub default_for_class: bool,
+    /// The cost tier the class's default sits at today, when it is known.
+    #[serde(default)]
+    pub default_tier: Option<u32>,
+    /// The latest items behind the record, oldest first: what a proposal
+    /// citing the record points the reviewer at.
+    #[serde(default)]
+    pub items: Vec<WorkItemId>,
 }
 
 impl RoutingEntry {

@@ -64,6 +64,23 @@ pub const PROPOSALS_FILED: &str = "proposals_filed";
 pub const PROPOSALS_MOVED_METRIC: &str = "proposals_moved_metric_rate";
 pub const BOUND_VIOLATIONS: &str = "bound_violations";
 
+/// The artifact kind a routing proposal names its move with: `<tier>
+/// <class>`, the cost tier the class's default tier moves to (plan section
+/// 10). Dreaming writes it on a `routing:<class>` proposal; accepting the
+/// proposal applies it to the worker registry's `routing_defaults`, and
+/// nothing else moves a default.
+pub const ROUTING_DEFAULT: &str = "routing_default";
+
+/// The move a `routing_default` artifact names: the tier and the class.
+pub fn routing_move(value: &str) -> Option<(u32, String)> {
+    let (tier, class) = value.trim().split_once(' ')?;
+    let class = class.trim();
+    if class.is_empty() {
+        return None;
+    }
+    Some((tier.parse().ok()?, class.to_string()))
+}
+
 /// Section 1.1, one row per metric, in the table's order. Every
 /// expectation has at least one.
 pub const METRICS: &[MetricSpec] = &[
@@ -497,5 +514,17 @@ mod tests {
         let json = serde_json::to_value(&d).unwrap();
         assert_eq!(json["decision"], "decline");
         assert_eq!(serde_json::from_value::<ReviewDecision>(json).unwrap(), d);
+    }
+
+    #[test]
+    fn a_routing_move_reads_its_tier_and_class() {
+        assert_eq!(routing_move("3 code"), Some((3, "code".to_string())));
+        assert_eq!(
+            routing_move(" 2 capability:build "),
+            Some((2, "capability:build".to_string()))
+        );
+        for bad in ["", "code", "x code", "3 ", "3"] {
+            assert_eq!(routing_move(bad), None, "{bad:?}");
+        }
     }
 }

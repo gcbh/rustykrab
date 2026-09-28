@@ -554,7 +554,8 @@ nightly (`RUSTYKRAB_EVALUATION_INTERVAL_SECS`) and on demand
    answered with its recorded default), recurring and unknown fingerprints,
    capability gaps, wasted rungs and plan shape, verification misses, cost and
    latency, coding quality by worker (a routing proposal citing both workers'
-   records), and skill outcomes.
+   records, the items behind them, and the move itself as a typed
+   `routing_default`), and skill outcomes.
 3. **The gate.** A proposal is filed only from verifiable or explicit evidence
    (`SignalClass::is_ground_truth`); the `internal` item for an unknown error is
    the one exception, because its evidence is the raw failure. Skill outcomes are
@@ -572,15 +573,20 @@ nightly (`RUSTYKRAB_EVALUATION_INTERVAL_SECS`) and on demand
    research work is never projected, and appears in a projected item only as an
    opaque `local:#N`.
 6. **Execution and probation.** An accepted proposal becomes a `code` item with
-   a `discovered_from` edge onto it, under verification. The named metric's
+   a `discovered_from` edge onto it, under verification. A routing proposal is
+   the exception: its move is data, so accepting it sets the class's default
+   tier in the worker registry's `routing_defaults`, the only way a default
+   moves, and files no code item. The named metric's
    value at acceptance is its baseline; a probation window after the change
    lands, the pass records whether the metric moved, did not move (itself
    evidence for the next cycle), or regressed, in which case it proposes the
    rollback through review rather than undoing anything itself.
 
 The pass reads the questions (Phase 4) and the routing record (Phase 3)
-through traits of its own; until those tables are wired, the avoidable-
-escalation and coding-quality criteria have nothing to read.
+through traits of its own. The routing record is wired: the daemon's
+`StoreRouting` reads each worker's record, cost tier and the class default
+tiers from the worker registry. The questions are not yet, so the
+avoidable-escalation criterion has nothing to read until Phase 4.
 
 ## What downtime does and does not solve
 

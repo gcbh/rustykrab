@@ -139,12 +139,6 @@ const HELD_BACK: &[(u8, &str)] = &[
          the last check, that the user was never asked, reads GET /api/questions, which \
          the question router of Phase 4 serves",
     ),
-    (
-        17,
-        "the local code item, its routing record and the escalation to claude_code pass; \
-         dreaming reads routing records through StaticRouting until the daemon's reader \
-         over the workers table is wired",
-    ),
     // Phase 6: the avoidable-escalation criterion reads questions through
     // `rustykrab_dream::QuestionReader`, which the daemon wires to nothing
     // until Phase 4's `questions` table and `/api/questions` land.

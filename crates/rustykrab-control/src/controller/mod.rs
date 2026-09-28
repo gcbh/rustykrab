@@ -203,6 +203,10 @@ pub trait Routing: Send + Sync {
     /// Called once a judged result of a routed class is written: verified,
     /// claimed but not verified, or failed.
     async fn record(&self, _judged: &Judged) {}
+
+    /// Called once an accepted routing proposal moved a class's default
+    /// tier in the store, so routing reads the new one from now on.
+    async fn defaults_moved(&self) {}
 }
 
 /// Phase 1 routing: every covering worker qualifies, cheapest tier first.

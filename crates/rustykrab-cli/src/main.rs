@@ -1422,7 +1422,12 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // --- Evaluation and the review surface (control plan, Phase 6) ---
-    let evaluator = evaluation::evaluator(&store, controller.clone()).await;
+    let evaluator = evaluation::evaluator(
+        &store,
+        controller.clone(),
+        Arc::new(evaluation::StoreRouting::new(fleet.registry.clone())),
+    )
+    .await;
 
     // --- Build gateway state ---
     // Clone store handle so we can flush it after the server shuts down.

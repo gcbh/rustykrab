@@ -112,6 +112,25 @@ pub struct ClassRecord {
     pub last_verified_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub last_failed_at: Option<DateTime<Utc>>,
+    /// The latest items judged on this class, oldest first, at most
+    /// [`RECENT_ITEMS`]: the results a routing proposal points a reviewer
+    /// at.
+    #[serde(default)]
+    pub recent_items: Vec<String>,
+}
+
+/// How many item ids a class record keeps.
+pub const RECENT_ITEMS: usize = 10;
+
+impl ClassRecord {
+    /// Note `item` as the latest judged, once, keeping at most
+    /// [`RECENT_ITEMS`].
+    pub fn note_item(&mut self, item: &str) {
+        self.recent_items.retain(|i| i != item);
+        self.recent_items.push(item.to_string());
+        let over = self.recent_items.len().saturating_sub(RECENT_ITEMS);
+        self.recent_items.drain(..over);
+    }
 }
 
 fn default_probation() -> bool {

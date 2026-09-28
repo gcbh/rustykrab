@@ -497,3 +497,58 @@ async fn a_capability_items_facet_decides_its_class_and_its_briefs_mode() {
     assert_eq!(acquired.len(), 1, "the acquisition stayed cheapest");
     assert_eq!(acquired[0].capability, Some(CapabilityMode::Acquire));
 }
+
+/// Section 10: moving a class's default tier is a routing proposal, and
+/// accepting it is what moves the default. The controller routes by the
+/// moved default from then on and files no code item for the move.
+#[tokio::test]
+async fn an_accepted_routing_proposal_moves_the_default_tier() {
+    use rustykrab_core::proposal::{ReviewDecision, ROUTING_DEFAULT};
+    let local = Arc::new(Any {
+        name: "snapper",
+        kind: WorkerKind::Local,
+        briefs: Mutex::new(Vec::new()),
+    });
+    let claude = Arc::new(Any {
+        name: "pinch",
+        kind: WorkerKind::ClaudeCode,
+        briefs: Mutex::new(Vec::new()),
+    });
+    let h = Harness::with_fleet(
+        ControllerConfig::default(),
+        vec![local.clone(), claude.clone()],
+    );
+    let store = h.store().clone();
+    store.workers().seed_default_tier(CODE, 0).await.unwrap();
+
+    let mut routing = draft("routing", "Routing: move the default for code up");
+    routing.kind = Some(WorkKind::Proposal);
+    routing.subject = Some(format!("routing:{CODE}"));
+    routing.artifact_refs = vec![rustykrab_core::work::ArtifactRef {
+        kind: ROUTING_DEFAULT.to_string(),
+        value: format!("3 {CODE}"),
+    }];
+    let proposal = h.file_one(routing).await;
+    let out = crate::handle::ControlHandle::review_decision(
+        &h.ctl,
+        &proposal,
+        ReviewDecision::Accept,
+        "reviewer:github:ada",
+    )
+    .await
+    .unwrap();
+    assert_eq!(out.status, Status::Done);
+    assert!(out.code_item.is_none(), "a routing move is data, not code");
+    let tiers = store.workers().default_tiers().await.unwrap();
+    let code = tiers.iter().find(|d| d.class == CODE).unwrap();
+    assert_eq!((code.tier, code.set_by.as_str()), (3, proposal.as_str()));
+
+    // A code item now starts on the coding agent, not the local worker.
+    let mut helper = draft("code", "Add a helper");
+    helper.kind = Some(WorkKind::Code);
+    let task = h.file_one(helper).await;
+    h.step().await;
+    h.step().await;
+    assert!(local.briefs.lock().unwrap().is_empty());
+    assert!(claude.briefs.lock().unwrap().iter().any(|b| b.item == task));
+}

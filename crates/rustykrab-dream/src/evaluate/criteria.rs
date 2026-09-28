@@ -61,6 +61,12 @@ pub struct Thresholds {
     /// `routing_poor` and another worker's is at least `routing_good`.
     pub routing_poor: f64,
     pub routing_good: f64,
+    /// Claims a routing rate rests on: the default's, and a cheaper
+    /// worker's before a default moves down to it. A default moves up to a
+    /// dearer worker on fewer: one verified result is enough evidence that
+    /// the dearer worker can do the class, and moving up costs money, not
+    /// correctness (plan section 10).
+    pub routing_min_sample: u32,
     /// Occurrences before a plan-shape or wasted-rung pattern is flagged.
     pub pattern: usize,
     /// How much slower a worker must be than the fastest on the same kind.
@@ -76,11 +82,14 @@ impl Default for Thresholds {
             verification_miss_rate: 0.5,
             routing_poor: 0.5,
             routing_good: 0.8,
+            routing_min_sample: 3,
             pattern: 3,
             latency_factor: 2.0,
         }
     }
 }
+
+pub use rustykrab_core::proposal::ROUTING_DEFAULT;
 
 fn item_ref(id: &str) -> ArtifactRef {
     ArtifactRef {
@@ -574,16 +583,24 @@ pub fn coding_quality(routing: &[RoutingEntry], t: Thresholds) -> Vec<Finding> {
         let Some(default) = entries.iter().find(|e| e.default_for_class) else {
             continue;
         };
-        let enough = |e: &RoutingEntry| e.claims() >= t.min_sample;
+        let enough = |e: &RoutingEntry| e.claims() >= t.routing_min_sample;
         let rate = |e: &RoutingEntry| e.verified_rate().unwrap_or(0.0);
-        // Up: the default fails and another worker holds the class.
-        // Down: a cheaper worker holds it as well as the default does.
+        // Up: the default fails and a dearer worker has verified the class.
+        // Down: a cheaper worker holds it as well as the default does, on
+        // as much evidence.
         let better = entries
             .iter()
-            .filter(|e| e.worker != default.worker && enough(e) && rate(e) >= t.routing_good)
+            .filter(|e| e.worker != default.worker && rate(e) >= t.routing_good)
             .filter(|e| {
-                (enough(default) && rate(default) < t.routing_poor)
-                    || (e.cost_tier < default.cost_tier && rate(e) >= rate(default))
+                let up = e.cost_tier > default.cost_tier
+                    && e.verified_done >= 1
+                    && enough(default)
+                    && rate(default) < t.routing_poor;
+                let down = e.cost_tier < default.cost_tier
+                    && enough(e)
+                    && enough(default)
+                    && rate(e) >= rate(default);
+                up || down
             })
             .min_by_key(|e| e.cost_tier);
         let Some(to) = better else {
@@ -614,10 +631,24 @@ pub fn coding_quality(routing: &[RoutingEntry], t: Thresholds) -> Vec<Finding> {
             expectation: "Finish it correctly".to_string(),
             metric: rustykrab_core::proposal::VERIFICATION_GAP.to_string(),
             expected_movement: format!("verified rate on {class} holds or rises at lower cost"),
-            evidence: vec![
-                r("routing_record", format!("{}:{class}", default.worker)),
-                r("routing_record", format!("{}:{class}", to.worker)),
-            ],
+            evidence: {
+                let mut evidence = vec![
+                    r("routing_record", format!("{}:{class}", default.worker)),
+                    r("routing_record", format!("{}:{class}", to.worker)),
+                    // The move itself, typed: an acceptance sets the
+                    // class's default to this tier.
+                    r(ROUTING_DEFAULT, format!("{} {class}", to.cost_tier)),
+                ];
+                // The items behind both records, so a reviewer can open
+                // the results the move rests on.
+                for id in default.items.iter().chain(&to.items) {
+                    let item = item_ref(id);
+                    if !evidence.contains(&item) {
+                        evidence.push(item);
+                    }
+                }
+                evidence
+            },
             counterexamples: Vec::new(),
             risk: "The class's items may differ from those the record was earned on.".to_string(),
             rollback: format!(

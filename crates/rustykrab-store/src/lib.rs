@@ -59,6 +59,7 @@ pub use work_items::{
 };
 pub use workers::{
     ClassCost, ClassRecord, RoutingDefault, RoutingRecord, WorkerRow, WorkerStore, WorkerUpsert,
+    RECENT_ITEMS,
 };
 
 /// Top-level database handle wrapping a SQLite connection.

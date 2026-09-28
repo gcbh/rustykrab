@@ -11,8 +11,9 @@
 //!
 //! The adapters that bridge the pieces live here because only the binary
 //! holds all of them: [`ControlFiler`] files dreaming's drafts through the
-//! controller's validator, and [`GithubIssues`] is the first
-//! [`ReviewSurface`], configured by `RUSTYKRAB_GITHUB_REPO` and
+//! controller's validator, [`StoreRouting`] reads the worker registry's
+//! routing records and class default tiers for dreaming's routing
+//! criterion, and [`GithubIssues`] is the first [`ReviewSurface`], configured by `RUSTYKRAB_GITHUB_REPO` and
 //! `RUSTYKRAB_GITHUB_API_BASE` with its token from the credential store
 //! (`github_token`, overridable by `RUSTYKRAB_GITHUB_TOKEN`). Without a repo
 //! and a token nothing is projected and the rest of the pass runs.
@@ -25,12 +26,15 @@ use chrono::Utc;
 use serde_json::{json, Value};
 
 use rustykrab_control::handle::ControlHandle;
+use rustykrab_control::registry::{WorkerRegistry, WorkerView};
 use rustykrab_control::review::{self, Comment, Issue, Projection, ReviewSurface, LABEL_MANAGED};
 use rustykrab_core::proposal::{EvaluationReport, ProjectionReport};
+use rustykrab_core::work::WorkerKind;
 use rustykrab_core::work::{ArtifactRef, PlanOutcome, WorkError, WorkItemDraft};
 use rustykrab_core::Error;
+use rustykrab_dream::evaluate::RoutingEntry;
 use rustykrab_dream::{
-    Evaluation, EvaluationConfig, ProposalFiler, StaticQuestions, StaticRouting, StoreLedger,
+    Evaluation, EvaluationConfig, ProposalFiler, RoutingRecordReader, StaticQuestions, StoreLedger,
     StoreOutcomeSource, StoreWorkRecords,
 };
 use rustykrab_gateway::evaluate_routes::EvaluationHandle;
@@ -67,6 +71,88 @@ impl ProposalFiler for ControlFiler {
     ) -> rustykrab_core::Result<PlanOutcome> {
         let draft = rustykrab_control::errors::internal_item_draft(error, evidence);
         self.control.file_draft(draft, self.provenance()).await
+    }
+}
+
+// ── the routing record ─────────────────────────────────────────────────
+
+/// Dreaming's view of the worker registry (plan sections 5 and 10): one
+/// entry per worker and class of work from its routing record, with the
+/// worker's cost tier and whether it holds the class's default today.
+///
+/// A class's default tier is the store's `routing_defaults` row; the
+/// worker holding it is the one a new item of the class goes to first: the
+/// cheapest live, healthy worker at or above that tier, the earliest
+/// registered on a tie. `cost` is the mean tokens a judged run of the class
+/// took.
+pub struct StoreRouting {
+    registry: Arc<WorkerRegistry>,
+}
+
+impl StoreRouting {
+    pub fn new(registry: Arc<WorkerRegistry>) -> Self {
+        StoreRouting { registry }
+    }
+}
+
+/// The entries for `workers` (in registration order) under `defaults`.
+pub fn routing_entries(
+    workers: &[WorkerView],
+    defaults: &std::collections::BTreeMap<String, u32>,
+) -> Vec<RoutingEntry> {
+    let holder = |tier: u32| -> Option<&str> {
+        workers
+            .iter()
+            .enumerate()
+            .filter(|(_, w)| w.live && w.healthy && w.cost_tier >= tier)
+            .min_by_key(|(i, w)| (w.cost_tier, *i))
+            .map(|(_, w)| w.name.as_str())
+    };
+    let n = |v: u64| u32::try_from(v).unwrap_or(u32::MAX);
+    let mut out = Vec::new();
+    for w in workers {
+        let kind = WorkerKind::parse(&w.kind).unwrap_or_default();
+        for (class, r) in &w.routing_record {
+            let default_tier = defaults.get(class).copied();
+            out.push(RoutingEntry {
+                worker: w.name.clone(),
+                worker_kind: kind,
+                cost_tier: w.cost_tier,
+                class: class.clone(),
+                verified_done: n(r.verified_done),
+                claimed_not_verified: n(r.claimed_not_verified),
+                escaped_defects: n(r.escaped_defects),
+                review_rejections: 0,
+                repairs: n(r.repairs),
+                cost: if r.cost.runs == 0 {
+                    0.0
+                } else {
+                    r.cost.tokens as f64 / r.cost.runs as f64
+                },
+                probation: r.probation,
+                default_for_class: default_tier.and_then(holder).is_some_and(|h| h == w.name),
+                default_tier,
+                items: r.recent_items.clone(),
+            });
+        }
+    }
+    out
+}
+
+#[async_trait]
+impl RoutingRecordReader for StoreRouting {
+    async fn entries(&self) -> rustykrab_core::Result<Vec<RoutingEntry>> {
+        let workers = self.registry.views().await?;
+        let defaults = self
+            .registry
+            .store()
+            .workers()
+            .default_tiers()
+            .await?
+            .into_iter()
+            .map(|d| (d.class, d.tier))
+            .collect();
+        Ok(routing_entries(&workers, &defaults))
     }
 }
 
@@ -420,7 +506,11 @@ impl EvaluationHandle for Evaluator {
 /// Assemble the pass over this daemon's store and controller. The
 /// questions and routing readers read nothing until Phases 4 and 3 wire
 /// their tables in.
-pub async fn evaluator(store: &Store, control: Arc<dyn ControlHandle>) -> Arc<Evaluator> {
+pub async fn evaluator(
+    store: &Store,
+    control: Arc<dyn ControlHandle>,
+    routing: Arc<dyn RoutingRecordReader>,
+) -> Arc<Evaluator> {
     let config = EvaluationConfig::default();
     let outcomes = store.outcomes_reader().unwrap_or_else(|e| {
         tracing::warn!(error = %e, "evaluation reads outcomes on the shared connection");
@@ -430,7 +520,7 @@ pub async fn evaluator(store: &Store, control: Arc<dyn ControlHandle>) -> Arc<Ev
         work: Arc::new(StoreWorkRecords::new(store.clone())),
         outcomes: Arc::new(StoreOutcomeSource::new(outcomes)),
         questions: Arc::new(StaticQuestions::default()),
-        routing: Arc::new(StaticRouting::default()),
+        routing,
         filer: Arc::new(ControlFiler {
             control: control.clone(),
             actor: config.actor.clone(),
@@ -482,6 +572,90 @@ pub fn spawn_nightly(evaluator: Arc<Evaluator>) -> tokio::task::JoinHandle<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn view(
+        name: &str,
+        kind: &str,
+        tier: u32,
+        live: bool,
+        verified: u64,
+        missed: u64,
+    ) -> WorkerView {
+        let mut record = rustykrab_store::RoutingRecord::new();
+        record.insert(
+            "code".to_string(),
+            rustykrab_store::ClassRecord {
+                verified_done: verified,
+                claimed_not_verified: missed,
+                recent_items: vec![format!("item-{name}")],
+                cost: rustykrab_store::ClassCost {
+                    runs: verified + missed,
+                    wall_seconds: 0,
+                    tokens: 1_000 * (verified + missed),
+                },
+                ..rustykrab_store::ClassRecord::default()
+            },
+        );
+        WorkerView {
+            name: name.into(),
+            kind: kind.into(),
+            live,
+            healthy: live,
+            health: "healthy".into(),
+            last_seen: None,
+            cost_tier: tier,
+            concurrency: 1,
+            capabilities: Default::default(),
+            routing_record: record,
+            spec: None,
+            created_at: Utc::now(),
+        }
+    }
+
+    /// Scenario 17's shape as dreaming reads it: the local worker holds
+    /// code's default (tier 0), with its items and its cost; a gone worker
+    /// never holds a default.
+    #[test]
+    fn routing_entries_name_the_default_holder_and_the_items_behind_a_record() {
+        let workers = vec![
+            view("gone", "local", 0, false, 0, 0),
+            view("snapper", "local", 0, true, 1, 2),
+            view("pinch", "claude_code", 3, true, 1, 0),
+        ];
+        let defaults = std::collections::BTreeMap::from([("code".to_string(), 0)]);
+        let entries = routing_entries(&workers, &defaults);
+        assert_eq!(entries.len(), 3);
+        let snapper = entries.iter().find(|e| e.worker == "snapper").unwrap();
+        assert!(snapper.default_for_class);
+        assert_eq!(snapper.worker_kind, WorkerKind::Local);
+        assert_eq!(
+            (snapper.verified_done, snapper.claimed_not_verified),
+            (1, 2)
+        );
+        assert_eq!(snapper.items, ["item-snapper"]);
+        assert_eq!(snapper.cost, 1_000.0);
+        assert_eq!(snapper.default_tier, Some(0));
+        let pinch = entries.iter().find(|e| e.worker == "pinch").unwrap();
+        assert!(!pinch.default_for_class);
+        assert_eq!(pinch.cost_tier, 3);
+        assert!(!entries
+            .iter()
+            .any(|e| e.worker == "gone" && e.default_for_class));
+
+        // The default moved up: the coding agent holds it.
+        let moved = std::collections::BTreeMap::from([("code".to_string(), 3)]);
+        let entries = routing_entries(&workers, &moved);
+        let holders: Vec<&str> = entries
+            .iter()
+            .filter(|e| e.default_for_class)
+            .map(|e| e.worker.as_str())
+            .collect();
+        assert_eq!(holders, ["pinch"]);
+        // A class with no default row has no holder.
+        assert!(routing_entries(&workers, &Default::default())
+            .iter()
+            .all(|e| !e.default_for_class));
+    }
 
     /// The GitHub stand-in's shapes and the real API's both parse.
     #[test]

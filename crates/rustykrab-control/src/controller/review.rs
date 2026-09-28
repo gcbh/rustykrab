@@ -4,7 +4,11 @@
 //!
 //! A proposal is not work a worker runs: it is a change a human reviews.
 //! Filed, it waits in `blocked(needs_consent)` and is projected to an
-//! issue. Accepted, it becomes a `code` item filed as
+//! issue. Accepted, a routing proposal (one that names its move as a
+//! `routing_default` artifact) moves its class's default tier in the worker
+//! registry's `routing_defaults` and closes `done`: the move is data, not a
+//! change for a worker to make, and the only way a default ever moves
+//! (section 10). Any other accepted proposal becomes a `code` item filed as
 //! `FilingSource::Proposal` (the one path besides the delivery import that
 //! may file code) with a `discovered_from` edge onto the proposal, and the
 //! proposal closes `done`; declined, it closes `cancelled(requested)`; an
@@ -144,6 +148,30 @@ impl Controller {
                     None,
                 ))
             }
+            ReviewDecision::Accept if routing_move_of(&item).is_some() => {
+                let (tier, class) = routing_move_of(&item).unwrap_or_default();
+                self.store
+                    .workers()
+                    .set_default_tier(&class, tier, proposal, Some(item.title.trim()))
+                    .await?;
+                self.routing.defaults_moved().await;
+                let moved = format!("the default tier for {class} moved to {tier}");
+                b.note(
+                    proposal,
+                    EventKind::Review,
+                    actor,
+                    format!("accepted: {moved}"),
+                );
+                let changed = b.close(
+                    proposal,
+                    Status::Done,
+                    actor,
+                    format!("accepted on the review surface; {moved}"),
+                );
+                b.settle(changed);
+                self.commit(b, &mut HashSet::new()).await?;
+                Ok(outcome(Status::Done, None, Some(moved)))
+            }
             ReviewDecision::Accept => {
                 let amendments = self.amendments_of(proposal).await?;
                 let plan = code_plan(&item, &amendments);
@@ -208,6 +236,16 @@ impl Controller {
 }
 
 const CODE_TMP: &str = "accepted";
+
+/// The routing move a proposal names, if it is a routing proposal: its
+/// `routing_default` artifact (`<tier> <class>`).
+fn routing_move_of(proposal: &WorkItem) -> Option<(u32, String)> {
+    proposal
+        .artifact_refs
+        .iter()
+        .filter(|r| r.kind == rustykrab_core::proposal::ROUTING_DEFAULT)
+        .find_map(|r| rustykrab_core::proposal::routing_move(&r.value))
+}
 
 /// The `code` item an accepted proposal becomes (section 10, Execution):
 /// the proposal's objective as the change to make, its constraints and

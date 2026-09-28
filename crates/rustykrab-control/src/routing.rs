@@ -196,6 +196,7 @@ pub fn apply(record: &mut ClassRecord, judged: &Judged, earn_after: u64) {
             record.last_failed_at = Some(judged.at);
         }
     }
+    record.note_item(&judged.item);
     record.cost.runs += 1;
     record.cost.wall_seconds += judged.wall_seconds;
     if let Some(usage) = judged.usage {
@@ -278,6 +279,12 @@ impl Routing for RecordRouting {
 
     fn cost_tier(&self, worker: &dyn Worker) -> u32 {
         self.registry.cost_tier(worker)
+    }
+
+    async fn defaults_moved(&self) {
+        if let Err(e) = self.reload().await {
+            tracing::warn!(error = %e, "routing defaults not reloaded");
+        }
     }
 
     async fn record(&self, judged: &Judged) {
@@ -447,6 +454,14 @@ mod tests {
             record.repairs, 2,
             "repairs count only toward verified results"
         );
+        assert_eq!(record.recent_items, ["i1"], "one item, noted once");
+        for n in 0..12 {
+            let mut other = judged("krabby", Verdict::Verified);
+            other.item = format!("i{n}");
+            apply(&mut record, &other, 2);
+        }
+        assert_eq!(record.recent_items.len(), rustykrab_store::RECENT_ITEMS);
+        assert_eq!(record.recent_items.last().map(String::as_str), Some("i11"));
     }
 
     #[tokio::test]

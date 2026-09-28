@@ -487,6 +487,8 @@ async fn a_routing_proposal_cites_both_workers_records() {
         cost: 0.0,
         probation: false,
         default_for_class: default,
+        default_tier: Some(0),
+        items: vec![format!("item-{worker}")],
     };
     let routing = vec![
         entry("pinch", WorkerKind::Local, 0, 1, 5, true),
@@ -503,6 +505,14 @@ async fn a_routing_proposal_cites_both_workers_records() {
     let cited: Vec<_> = d.artifact_refs.iter().map(|a| a.value.as_str()).collect();
     assert!(cited.contains(&"pinch:code:small") && cited.contains(&"claws:code:small"));
     assert!(d.title.contains("from pinch to claws"));
+    // The items behind both records, and the move itself, typed.
+    assert!(cited.contains(&"item-pinch") && cited.contains(&"item-claws"));
+    assert!(
+        d.artifact_refs
+            .iter()
+            .any(|a| a.kind == crate::evaluate::criteria::ROUTING_DEFAULT
+                && a.value == "2 code:small")
+    );
 }
 
 #[tokio::test]
