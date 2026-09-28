@@ -1,8 +1,9 @@
 use std::convert::Infallible;
 
-use axum::extract::{Extension, Path, State};
+use axum::extract::{Extension, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, Sse};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
@@ -13,10 +14,11 @@ use tokio_stream::StreamExt;
 use uuid::Uuid;
 
 use rustykrab_agent::AgentEvent;
+use rustykrab_control::peer::{CeilingRefused, NodeAdvertisement, TaskSubmission, TaskView};
 use rustykrab_core::types::{
     ContentBlock, Conversation, Message, MessageContent, Role, ToolCall, ToolResult,
 };
-use rustykrab_store::ConversationSummary;
+use rustykrab_store::{ConversationSummary, NewTask};
 
 use crate::logging::TraceId;
 use crate::AppState;
@@ -59,6 +61,7 @@ pub fn api_routes() -> Router<AppState> {
         )
         .route("/api/tasks", post(submit_task).get(list_tasks))
         .route("/api/tasks/{id}", get(get_task).delete(cancel_task))
+        .route("/api/node", get(node_advertisement))
         .route("/api/pair", post(pair_device))
         .route("/api/devices", get(list_devices))
         .route("/api/devices/{id}", axum::routing::delete(revoke_device))
@@ -440,84 +443,50 @@ async fn send_message(
 // and the caller's own tool-call timeout fires long before it returns.
 // ---------------------------------------------------------------------------
 
-#[derive(Deserialize)]
-struct SubmitTaskRequest {
-    /// The instruction to run. Self-contained: this node does not share
-    /// the caller's conversation.
-    message: String,
-    /// Continue an earlier delegated thread instead of opening a fresh
-    /// conversation. Worth passing whenever the work is a follow-up: a
-    /// continued thread reuses its evaluated prompt prefix, where a new
-    /// one re-prefills the whole system prompt and tool schemas.
-    #[serde(default, rename = "conversationId")]
-    conversation_id: Option<String>,
-    /// How many further delegation hops this task may make. Absent or
-    /// zero means the run may not delegate onward at all.
-    #[serde(default, rename = "hopBudget")]
-    hop_budget: Option<i64>,
-    /// Tools the caller wants this task limited to. Intersected with this
-    /// node's own policy, never substituted for it — a peer can ask for
-    /// less than the node allows and never more.
-    #[serde(default, rename = "allowedTools")]
-    allowed_tools: Option<Vec<String>>,
-    /// The caller's trace id, so one delegation is greppable across both
-    /// machines' logs.
-    #[serde(default, rename = "traceId")]
-    trace_id: Option<String>,
-}
-
-#[derive(Serialize)]
-struct TaskResponse {
-    id: String,
-    status: String,
-    #[serde(rename = "conversationId", skip_serializing_if = "Option::is_none")]
-    conversation_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    result: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<String>,
-    #[serde(rename = "createdAt")]
-    created_at: String,
-    #[serde(rename = "startedAt", skip_serializing_if = "Option::is_none")]
-    started_at: Option<String>,
-    #[serde(rename = "finishedAt", skip_serializing_if = "Option::is_none")]
-    finished_at: Option<String>,
-    /// Seconds the task has been alive, so a caller can report progress
-    /// without tracking submission time itself.
-    #[serde(rename = "elapsedSecs")]
-    elapsed_secs: i64,
-}
-
-impl TaskResponse {
-    fn from_task(task: rustykrab_store::DelegatedTask) -> Self {
-        let until = task.finished_at.unwrap_or_else(Utc::now);
-        Self {
-            id: task.id,
-            status: task.status.as_str().to_string(),
-            conversation_id: task.conversation_id,
-            result: task.result,
-            error: task.error,
-            created_at: task.created_at.to_rfc3339(),
-            started_at: task.started_at.map(|t| t.to_rfc3339()),
-            finished_at: task.finished_at.map(|t| t.to_rfc3339()),
-            elapsed_secs: (until - task.created_at).num_seconds().max(0),
-        }
+/// A task as the delegating peer sees it (`rustykrab_control::peer`): the
+/// free-text fields the `nodes` tool reads, and for a structured task its
+/// work item, required tools, run id, attempts, typed result and spend.
+fn task_view(task: rustykrab_store::DelegatedTask) -> TaskView {
+    let until = task.finished_at.unwrap_or_else(Utc::now);
+    TaskView {
+        status: task.status.as_str().to_string(),
+        conversation_id: task.conversation_id,
+        result: task.result,
+        error: task.error,
+        created_at: task.created_at.to_rfc3339(),
+        started_at: task.started_at.map(|t| t.to_rfc3339()),
+        finished_at: task.finished_at.map(|t| t.to_rfc3339()),
+        elapsed_secs: (until - task.created_at).num_seconds().max(0),
+        work_item_id: task.work_item_id,
+        required_tools: task.required_tools,
+        run: task.run_id,
+        attempts: task.attempts,
+        report: task.report,
+        usage: task.usage.and_then(|u| serde_json::from_value(u).ok()),
+        id: task.id,
     }
 }
 
 /// Accept a delegated task and return its handle. Runs nothing inline —
 /// the worker picks it up.
+///
+/// A structured submission (a peer worker's brief) is checked against this
+/// node's delegation ceiling first: a required tool outside it refuses the
+/// whole submission with `422` and every refused tool named with why,
+/// rather than running without it. One naming a run this node already has
+/// returns that task, `200` instead of `202`: a controller that restarted
+/// resubmits and finds its task.
 async fn submit_task(
     State(state): State<AppState>,
     Extension(TraceId(trace_id)): Extension<TraceId>,
     principal: Option<Extension<rustykrab_store::Principal>>,
-    Json(body): Json<SubmitTaskRequest>,
-) -> Result<(StatusCode, Json<TaskResponse>), StatusCode> {
+    Json(body): Json<TaskSubmission>,
+) -> Response {
     if body.message.len() > MAX_MESSAGE_SIZE {
-        return Err(StatusCode::PAYLOAD_TOO_LARGE);
+        return StatusCode::PAYLOAD_TOO_LARGE.into_response();
     }
     if body.message.trim().is_empty() {
-        return Err(StatusCode::BAD_REQUEST);
+        return StatusCode::BAD_REQUEST.into_response();
     }
 
     // Attribute the task to the peer that sent it. Without this a
@@ -532,40 +501,107 @@ async fn submit_task(
         .clone()
         .unwrap_or_else(|| trace_id.to_string());
 
-    let task = state
+    // The typed half. The required tools are the submission's and the
+    // brief's together, so neither can carry one past the check.
+    let mut required = body.required_tools.clone();
+    if let Some(brief) = &body.brief {
+        for tool in &brief.required_tools {
+            if !required.contains(tool) {
+                required.push(tool.clone());
+            }
+        }
+    }
+    let structured = body.brief.is_some() || !required.is_empty();
+    if structured {
+        if state.delegation.is_none() {
+            return (
+                StatusCode::NOT_IMPLEMENTED,
+                Json(serde_json::json!({
+                    "error": "structured_unavailable",
+                    "message": "this node runs free-text tasks only",
+                })),
+            )
+                .into_response();
+        }
+        let available = crate::tasks::available_tool_names(&state);
+        let node_allowlist = crate::tasks::configured_allowlist();
+        let limits = crate::tasks::Limits {
+            node_allowlist: node_allowlist.as_deref(),
+            allowed_tools: body.allowed_tools.as_deref(),
+            hop_budget: body.hop_budget.unwrap_or(0),
+        };
+        let refused = crate::tasks::refusals(&required, &available, &limits);
+        if !refused.is_empty() {
+            let refusal = CeilingRefused::new(refused);
+            tracing::warn!(
+                principal = who.as_deref().unwrap_or("unknown"),
+                refused = %refusal.message,
+                "refused a delegated task outside this node's ceiling"
+            );
+            return (StatusCode::UNPROCESSABLE_ENTITY, Json(refusal)).into_response();
+        }
+    }
+    let brief = match body.brief.as_ref().map(serde_json::to_string).transpose() {
+        Ok(brief) => brief,
+        Err(e) => {
+            tracing::error!(error = %e, "could not serialise a delegated brief");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    let run = body
+        .run
+        .clone()
+        .or_else(|| body.brief.as_ref().and_then(|b| b.run.clone()));
+
+    let submitted = state
         .agent
         .store
         .tasks()
-        .enqueue(
-            &body.message,
-            body.conversation_id.as_deref(),
-            who.as_deref(),
-            body.hop_budget.unwrap_or(0),
-            body.allowed_tools.clone(),
-            Some(&trace),
-        )
-        .await
-        .map_err(|e| {
+        .submit(NewTask {
+            message: body.message,
+            conversation_id: body.conversation_id,
+            principal: who,
+            hop_budget: body.hop_budget.unwrap_or(0),
+            allowed_tools: body.allowed_tools,
+            trace_id: Some(trace),
+            work_item_id: body
+                .work_item_id
+                .or_else(|| body.brief.as_ref().map(|b| b.item.clone())),
+            required_tools: required,
+            brief,
+            run_id: run,
+        })
+        .await;
+    let (task, created) = match submitted {
+        Ok(submitted) => submitted,
+        Err(e) => {
             tracing::error!(error = %e, "could not enqueue delegated task");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
 
+    if !created {
+        tracing::info!(task_id = %task.id, run = task.run_id.as_deref().unwrap_or("-"), "a resubmitted run found its task");
+        return (StatusCode::OK, Json(task_view(task))).into_response();
+    }
     tracing::info!(
         task_id = %task.id,
         principal = task.principal.as_deref().unwrap_or("unknown"),
+        structured = task.is_structured(),
+        work_item = task.work_item_id.as_deref().unwrap_or("-"),
         "accepted delegated task"
     );
     state.task_signal.wake();
 
-    Ok((StatusCode::ACCEPTED, Json(TaskResponse::from_task(task))))
+    (StatusCode::ACCEPTED, Json(task_view(task))).into_response()
 }
 
 async fn get_task(
     State(state): State<AppState>,
     Path(id): Path<String>,
-) -> Result<Json<TaskResponse>, StatusCode> {
+) -> Result<Json<TaskView>, StatusCode> {
     match state.agent.store.tasks().get(&id).await {
-        Ok(Some(task)) => Ok(Json(TaskResponse::from_task(task))),
+        Ok(Some(task)) => Ok(Json(task_view(task))),
         Ok(None) => Err(StatusCode::NOT_FOUND),
         Err(e) => {
             tracing::error!(error = %e, "could not read delegated task");
@@ -574,18 +610,44 @@ async fn get_task(
     }
 }
 
-/// Recent tasks, newest first. Bounded so a long-lived node cannot
-/// return an unbounded history.
-async fn list_tasks(State(state): State<AppState>) -> Result<Json<Vec<TaskResponse>>, StatusCode> {
-    match state.agent.store.tasks().list(50).await {
-        Ok(tasks) => Ok(Json(
-            tasks.into_iter().map(TaskResponse::from_task).collect(),
-        )),
+#[derive(Deserialize)]
+struct TaskQuery {
+    /// Only the task a controller's run submitted.
+    #[serde(default)]
+    run: Option<String>,
+}
+
+/// Recent tasks, newest first, or with `?run=` the one task that run
+/// submitted (none or one). Bounded so a long-lived node cannot return an
+/// unbounded history.
+async fn list_tasks(
+    State(state): State<AppState>,
+    Query(query): Query<TaskQuery>,
+) -> Result<Json<Vec<TaskView>>, StatusCode> {
+    let tasks = match query.run.as_deref() {
+        Some(run) => state
+            .agent
+            .store
+            .tasks()
+            .find_by_run(run)
+            .await
+            .map(|t| t.into_iter().collect()),
+        None => state.agent.store.tasks().list(50).await,
+    };
+    match tasks {
+        Ok(tasks) => Ok(Json(tasks.into_iter().map(task_view).collect())),
         Err(e) => {
             tracing::error!(error = %e, "could not list delegated tasks");
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
+}
+
+/// What a delegated run may use on this node (`rustykrab_control::peer`):
+/// the advertisement a peer worker records on its registry row and
+/// refreshes with its health.
+async fn node_advertisement(State(state): State<AppState>) -> Json<NodeAdvertisement> {
+    Json(crate::tasks::advertisement(&state))
 }
 
 /// Cancel a task. Marks the row terminal, and additionally aborts the
@@ -595,7 +657,7 @@ async fn list_tasks(State(state): State<AppState>) -> Result<Json<Vec<TaskRespon
 async fn cancel_task(
     State(state): State<AppState>,
     Path(id): Path<String>,
-) -> Result<Json<TaskResponse>, StatusCode> {
+) -> Result<Json<TaskView>, StatusCode> {
     let previous = state.agent.store.tasks().cancel(&id).await.map_err(|e| {
         tracing::error!(error = %e, "could not cancel delegated task");
         StatusCode::INTERNAL_SERVER_ERROR
@@ -609,7 +671,7 @@ async fn cancel_task(
     }
 
     match state.agent.store.tasks().get(&id).await {
-        Ok(Some(task)) => Ok(Json(TaskResponse::from_task(task))),
+        Ok(Some(task)) => Ok(Json(task_view(task))),
         Ok(None) => Err(StatusCode::NOT_FOUND),
         Err(e) => {
             tracing::error!(error = %e, "could not read cancelled task");
@@ -1234,6 +1296,11 @@ struct PairResponse {
     /// Shown exactly once. Stored server-side only as a hash.
     #[serde(rename = "deviceToken")]
     device_token: String,
+    /// What a delegated run may use here, when this node takes a peer's
+    /// briefs: a controller pairing as a peer worker records it at once
+    /// (control plan, section 5). Tool names only, never a credential.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    capabilities: Option<NodeAdvertisement>,
 }
 
 /// Exchange a one-time code for a device token.
@@ -1258,9 +1325,14 @@ async fn pair_device(
             StatusCode::FORBIDDEN
         })?;
     tracing::info!(device = %device.name, id = %device.id, "device paired");
+    let capabilities = state
+        .delegation
+        .is_some()
+        .then(|| crate::tasks::advertisement(&state));
     Ok(Json(PairResponse {
         device_id: device.id,
         device_token: token,
+        capabilities,
     }))
 }
 

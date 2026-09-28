@@ -54,6 +54,12 @@ pub struct AppState {
     /// one: that route then answers 503, and `GET /api/work/metrics` still
     /// reads the store.
     pub evaluation: Option<Arc<dyn crate::evaluate_routes::EvaluationHandle>>,
+    /// How this node runs a structured delegated task, a peer's brief
+    /// (control plan, Phase 5). `None` until the composition root wires
+    /// one: the task queue then runs free text only, a structured
+    /// submission is refused, and `GET /api/node` advertises no structured
+    /// delegation.
+    pub delegation: Option<Arc<dyn rustykrab_control::peer::NodeWorkers>>,
 
     // --- Outbound channels, delivered to by the webhook routes ---
     pub telegram: Option<Arc<TelegramChannel>>,
@@ -80,6 +86,7 @@ impl AppState {
             control: None,
             workers: None,
             evaluation: None,
+            delegation: None,
             telegram: None,
             signal: None,
             slack: None,
@@ -215,6 +222,15 @@ impl AppState {
         evaluation: Arc<dyn crate::evaluate_routes::EvaluationHandle>,
     ) -> Self {
         self.evaluation = Some(evaluation);
+        self
+    }
+
+    /// Wire how this node runs a peer's structured task.
+    pub fn with_delegation(
+        mut self,
+        delegation: Arc<dyn rustykrab_control::peer::NodeWorkers>,
+    ) -> Self {
+        self.delegation = Some(delegation);
         self
     }
 

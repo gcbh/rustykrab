@@ -19,6 +19,8 @@ uuid.workspace = true
 chrono.workspace = true
 futures.workspace = true
 regex.workspace = true
+# The peer worker's client for its node's delegated-task API.
+reqwest.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

@@ -58,7 +58,10 @@ rustykrab-e2e         (core, store, tools, agent, providers)
 `rustykrab-control` is the control layer of
 `docs/plans/control-layer-and-worker-fleet.md`: the work-item graph, the
 resolution ladder, the error taxonomy and the controller loop, over the
-store, with the `Worker` trait `rustykrab-agent` implements (`LocalWorker`).
+store, with the `Worker` trait `rustykrab-agent` implements (`LocalWorker`,
+`ExternalWorker`, and `PeerWorker` for a paired node, which reaches the
+node's delegated-task API over HTTP; on the node, `DelegatedRuns` runs a
+peer's brief).
 The gateway depends on it directly for `/api/work` (its `ControlHandle`, the
 reply types and the re-exported `Provenance`, so the gateway needs no direct
 dependency on `rustykrab-tools`), and the CLI for the `work` subcommand and
@@ -108,10 +111,14 @@ main()
  ├─ TaskQueue worker               in-memory mpsc, bounded
  ├─ controller tick loop           work items: lease, run, reconcile, age
  ├─ work notice delivery           the work outbox, to each item's thread
- ├─ delegated-task worker          durable queue in `delegated_tasks`
+ ├─ delegated-task worker          durable queue in `delegated_tasks`: free
+ │                                 text, or a peer's typed brief run as a
+ │                                 local worker inside this node's ceiling
+ ├─ worker refresh                  2s: each peer's advertisement and health
  ├─ control loop                   tick -> lease -> worker runs: a local
- │                                 conversation, or a `claude`/`codex`
- │                                 process in a worktree under the data dir
+ │                                 conversation, a `claude`/`codex`
+ │                                 process in a worktree under the data dir,
+ │                                 or a peer node's task over the tailnet
  ├─ work outbox notifier           one message per parent, from `work_outbox`
  ├─ memory idle lifecycle sweep
  ├─ memory FTS5 index rebuild      once, at boot

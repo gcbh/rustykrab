@@ -10,14 +10,22 @@
 //!
 //! Two kinds of worker live here. The daemon builds its own (the local
 //! worker) and [`WorkerRegistry::register`]s it. External workers
-//! (`claude_code`, `codex`) are described by a [`WorkerSpec`], built by the
-//! injected [`WorkerFactory`], and their spec is stored as the row's
-//! `config`, so [`WorkerRegistry::restore`] rebuilds them after a restart.
+//! (`claude_code`, `codex`) and peers (a paired node, Phase 5) are
+//! described by a [`WorkerSpec`], built by the injected [`WorkerFactory`],
+//! and their spec is stored as the row's `config`, so
+//! [`WorkerRegistry::restore`] rebuilds them after a restart. A peer's spec
+//! names its node's `base_url`; its token (given, or redeemed from a
+//! pairing code by [`WorkerFactory::prepare`]) is kept in the store's
+//! encrypted secrets under [`crate::peer::token_secret`], never in the
+//! stored spec or a [`WorkerView`].
 //!
 //! The registry also caches each worker's cost tier and routing record so
 //! the controller's match step reads them without a store round trip;
 //! [`WorkerRegistry::update_record`] writes the record through the store's
 //! one-transaction update and refreshes the cache.
+//! [`WorkerRegistry::refresh`] asks each worker where it stands and records
+//! a peer's advertisement (models, tools, MCP servers, machine) and health
+//! on its row.
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -25,10 +33,11 @@ use std::sync::{Arc, RwLock};
 use chrono::{DateTime, Utc};
 use rustykrab_core::work::WorkerKind;
 use rustykrab_core::Error;
-use rustykrab_store::{ClassRecord, RoutingRecord, Store, WorkerRow, WorkerUpsert};
+use rustykrab_store::{ClassRecord, RoutingRecord, Store, WorkerRow, WorkerUpsert, WriteAuthority};
 use serde::{Deserialize, Serialize};
 
 use crate::controller::default_cost_tier;
+use crate::peer::token_secret;
 use crate::worker::{Worker, WorkerCapabilities};
 
 /// Names the registry gives out, in order. The local worker, registering
@@ -79,13 +88,34 @@ pub struct WorkerSpec {
     /// name. Nothing else of the daemon's environment is.
     #[serde(default)]
     pub env: Vec<String>,
+    /// A peer's node: its gateway's base URL, reached over the tailnet or a
+    /// tunnel (`https://node.tailnet.ts.net`, `http://127.0.0.1:3100`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    /// A peer's bearer token for its node: a device token from pairing, or
+    /// the node's own. Taken on `add` and kept in the secret store; never
+    /// serialised, so it is in neither the stored spec nor a view.
+    #[serde(default, skip_serializing)]
+    pub token: Option<String>,
+    /// A one-time code the node printed (`rustykrab-cli pair`), redeemed on
+    /// `add` for a device token of this daemon's own. Never serialised.
+    #[serde(default, skip_serializing)]
+    pub pairing_code: Option<String>,
 }
 
 /// Builds the worker a spec describes, under the name the registry gave
 /// it. The composition root implements it over the adapters in
 /// `rustykrab-agent`.
+#[async_trait::async_trait]
 pub trait WorkerFactory: Send + Sync {
     fn build(&self, name: &str, spec: &WorkerSpec) -> Result<Arc<dyn Worker>, String>;
+
+    /// Complete a spec on `add`, before its worker is built and stored,
+    /// with what needs the network: a peer's pairing code redeemed at its
+    /// node for a device token. Default: the spec as given.
+    async fn prepare(&self, _name: &str, spec: WorkerSpec) -> Result<WorkerSpec, String> {
+        Ok(spec)
+    }
 }
 
 /// One worker as `GET /api/workers` and `rustykrab workers` show it.
@@ -297,12 +327,19 @@ impl WorkerRegistry {
         Ok(view(&row, Some(&worker)))
     }
 
-    /// `worker add`: build an external worker from `spec` and register it.
+    /// `worker add`: build an external worker or a peer from `spec` and
+    /// register it. A peer needs its node's `base_url` and a `token` or a
+    /// `pairing_code`; its node need not be up yet, since the worker is
+    /// unhealthy, and takes no lease, until a refresh reads its
+    /// advertisement.
     pub async fn add(&self, spec: WorkerSpec) -> Result<WorkerView, Error> {
-        if !matches!(spec.kind, WorkerKind::ClaudeCode | WorkerKind::Codex) {
+        if !matches!(
+            spec.kind,
+            WorkerKind::ClaudeCode | WorkerKind::Codex | WorkerKind::Peer
+        ) {
             return Err(Error::Config(format!(
-                "`{}` workers are not added by hand: the local worker registers itself and \
-                 peers pair (Phase 5); add claude_code or codex",
+                "`{}` workers are not added by hand: the local worker registers itself; \
+                 add claude_code, codex or peer",
                 spec.kind.as_str()
             )));
         }
@@ -314,21 +351,46 @@ impl WorkerRegistry {
             .ok_or_else(|| Error::Config("this daemon cannot build external workers".into()))?;
         let _naming = self.naming.lock().await;
         let name = self.assign_name(spec.name.as_deref()).await?;
+        let spec = if spec.kind == WorkerKind::Peer {
+            peer_spec(factory.as_ref(), &name, spec).await?
+        } else {
+            spec
+        };
         let worker = factory.build(&name, &spec).map_err(Error::Config)?;
+        if let Some(token) = spec
+            .token
+            .as_deref()
+            .filter(|_| spec.kind == WorkerKind::Peer)
+        {
+            self.store
+                .secrets()
+                .upsert_system(&token_secret(&name), token)
+                .await?;
+        }
+        // Read the node's advertisement now when it answers, so a peer
+        // that is up is leasable as soon as it is added.
+        worker.refresh().await;
         let mut stored = spec.clone();
         stored.name = Some(name);
         let config = serde_json::to_value(&stored).map_err(|e| Error::Internal(e.to_string()))?;
         self.register(worker, config, spec.cost_tier).await
     }
 
-    /// Remove an external worker: it takes no new leases, and its row
-    /// goes. Its history (leases, events) keeps its name.
+    /// Remove an external worker or a peer: it takes no new leases, and its
+    /// row goes, with a peer's token. Its history (leases, events) keeps its
+    /// name.
     pub async fn remove(&self, name: &str) -> Result<bool, Error> {
         let row = self.store.workers().get(name).await?;
         if row.as_ref().and_then(WorkerRow::kind) == Some(WorkerKind::Local) {
             return Err(Error::Config(format!(
                 "{name} is this daemon's local worker, which registers itself"
             )));
+        }
+        if row.as_ref().and_then(WorkerRow::kind) == Some(WorkerKind::Peer) {
+            self.store
+                .secrets()
+                .delete(&token_secret(name), WriteAuthority::System)
+                .await?;
         }
         let was_live = {
             let mut live = self.live.write().unwrap_or_else(lock_err);
@@ -342,23 +404,36 @@ impl WorkerRegistry {
         Ok(removed || was_live)
     }
 
-    /// Rebuild every stored external worker through the factory (at
-    /// start). A spec the factory refuses is recorded as the row's health
-    /// and left out. Returns the names rebuilt.
+    /// Rebuild every stored external worker and peer through the factory
+    /// (at start), a peer with the token kept for it. A spec the factory
+    /// refuses is recorded as the row's health and left out. Returns the
+    /// names rebuilt.
     pub async fn restore(&self) -> Result<Vec<String>, Error> {
         let rows = self.store.workers().list().await?;
         self.cache(&rows);
         let factory = self.factory.read().unwrap_or_else(lock_err).clone();
         let mut restored = Vec::new();
         for row in rows {
-            if !matches!(row.kind(), Some(WorkerKind::ClaudeCode | WorkerKind::Codex)) {
+            if !matches!(
+                row.kind(),
+                Some(WorkerKind::ClaudeCode | WorkerKind::Codex | WorkerKind::Peer)
+            ) {
                 continue;
             }
             if self.get(&row.name).is_some() {
                 continue;
             }
-            let spec: Result<WorkerSpec, String> =
+            let mut spec: Result<WorkerSpec, String> =
                 serde_json::from_value(row.config.clone()).map_err(|e| e.to_string());
+            if let Ok(spec) = spec.as_mut() {
+                if spec.kind == WorkerKind::Peer {
+                    spec.token = match self.store.secrets().get(&token_secret(&row.name)).await {
+                        Ok(token) => Some(token),
+                        Err(Error::NotFound(_)) => None,
+                        Err(e) => return Err(e),
+                    };
+                }
+            }
             let built = match (&factory, spec) {
                 (Some(f), Ok(spec)) => f.build(&row.name, &spec),
                 (None, _) => Err("this daemon cannot build external workers".into()),
@@ -438,6 +513,36 @@ impl WorkerRegistry {
         Ok(self.views().await?.into_iter().find(|v| v.name == name))
     }
 
+    /// Ask every live worker where it stands ([`Worker::refresh`]) and, for
+    /// each that asked, record on its row what it advertises now and how
+    /// healthy it is: a peer's models, tools, MCP servers and machine as its
+    /// node reported them (plan section 5), kept as last seen while the node
+    /// does not answer. The daemon calls this on a timer. Returns the names
+    /// recorded.
+    pub async fn refresh(&self) -> Result<Vec<String>, Error> {
+        let mut recorded = Vec::new();
+        for worker in self.workers() {
+            if !worker.refresh().await {
+                continue;
+            }
+            let healthy = worker.healthy();
+            let capabilities = healthy
+                .then(|| serde_json::to_value(worker.capabilities()).ok())
+                .flatten();
+            self.store
+                .workers()
+                .advertise(
+                    worker.name(),
+                    capabilities,
+                    &health_line(healthy),
+                    healthy.then(Utc::now),
+                )
+                .await?;
+            recorded.push(worker.name().to_string());
+        }
+        Ok(recorded)
+    }
+
     /// Change a worker's routing record in one store transaction and
     /// refresh the cache. A worker with no row (a fixed registry's) gets
     /// one first, so its record is kept.
@@ -470,6 +575,39 @@ impl WorkerRegistry {
             .insert(name.to_string(), record.clone());
         Ok(record)
     }
+}
+
+/// A peer's spec made whole for `add`: a well-formed `base_url`, and a
+/// token, given or redeemed from a pairing code through the factory. The
+/// pairing code goes once used.
+async fn peer_spec(
+    factory: &dyn WorkerFactory,
+    name: &str,
+    mut spec: WorkerSpec,
+) -> Result<WorkerSpec, Error> {
+    let base = spec
+        .base_url
+        .as_deref()
+        .map(|u| u.trim().trim_end_matches('/').to_string())
+        .filter(|u| !u.is_empty())
+        .ok_or_else(|| Error::Config("a peer needs its node's base_url".into()))?;
+    if !(base.starts_with("http://") || base.starts_with("https://")) {
+        return Err(Error::Config(format!(
+            "a peer's base_url is an http or https URL, not `{base}`"
+        )));
+    }
+    spec.base_url = Some(base);
+    spec.token = spec.token.filter(|t| !t.trim().is_empty());
+    if spec.token.is_none() && spec.pairing_code.is_some() {
+        spec = factory.prepare(name, spec).await.map_err(Error::Config)?;
+    }
+    spec.pairing_code = None;
+    if spec.token.as_deref().is_none_or(|t| t.trim().is_empty()) {
+        return Err(Error::Config(
+            "a peer needs a token for its node, or a pairing_code to redeem for one".into(),
+        ));
+    }
+    Ok(spec)
 }
 
 fn health_line(healthy: bool) -> String {
@@ -515,6 +653,10 @@ mod tests {
         name: String,
         kind: WorkerKind,
         repos: Vec<String>,
+        /// What a peer was built with, shown as its machine so a test can
+        /// see it.
+        token: Option<String>,
+        refreshes: std::sync::atomic::AtomicUsize,
     }
 
     #[async_trait]
@@ -528,26 +670,56 @@ mod tests {
         fn capabilities(&self) -> WorkerCapabilities {
             WorkerCapabilities {
                 repos: self.repos.clone(),
+                machine: self.token.clone(),
+                tools: vec!["caldav".to_string()],
                 ..WorkerCapabilities::default()
             }
         }
+        fn healthy(&self) -> bool {
+            self.kind != WorkerKind::Peer
+                || self.refreshes.load(std::sync::atomic::Ordering::SeqCst) > 0
+        }
         async fn run(&self, _brief: Brief) -> Result<ResultReport, Error> {
             Ok(ResultReport::default())
+        }
+        async fn refresh(&self) -> bool {
+            if self.kind != WorkerKind::Peer {
+                return false;
+            }
+            self.refreshes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            true
         }
     }
 
     struct Factory;
 
+    #[async_trait]
     impl WorkerFactory for Factory {
         fn build(&self, name: &str, spec: &WorkerSpec) -> Result<Arc<dyn Worker>, String> {
             if spec.command.as_deref() == Some("missing") {
                 return Err("command missing".into());
             }
+            if spec.kind == WorkerKind::Peer && spec.token.is_none() {
+                return Err("no token stored for this peer".into());
+            }
             Ok(Arc::new(Named {
                 name: name.to_string(),
                 kind: spec.kind,
                 repos: spec.repos.clone(),
+                token: spec.token.clone(),
+                refreshes: std::sync::atomic::AtomicUsize::new(0),
             }))
+        }
+
+        async fn prepare(&self, name: &str, mut spec: WorkerSpec) -> Result<WorkerSpec, String> {
+            match spec.pairing_code.as_deref() {
+                Some("PAIR-OK") => {
+                    spec.token = Some(format!("device-token-for-{name}"));
+                    Ok(spec)
+                }
+                _ => Err("pairing refused".into()),
+            }
         }
     }
 
@@ -579,6 +751,8 @@ mod tests {
                     name: local.clone(),
                     kind: WorkerKind::Local,
                     repos: Vec::new(),
+                    token: None,
+                    refreshes: std::sync::atomic::AtomicUsize::new(0),
                 }),
                 serde_json::json!({}),
                 None,
@@ -666,6 +840,93 @@ mod tests {
         assert!(after.get("nipper").is_none());
         assert!(after.remove("pinch").await.unwrap());
         assert!(after.get("pinch").is_none());
+    }
+
+    fn peer(name: &str) -> WorkerSpec {
+        WorkerSpec {
+            kind: WorkerKind::Peer,
+            name: Some(name.to_string()),
+            base_url: Some("http://127.0.0.1:3100/".to_string()),
+            ..WorkerSpec::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_peer_keeps_its_token_in_the_secret_store_and_comes_back_with_it() {
+        let (_dir, store) = temp_store();
+        let registry = WorkerRegistry::new(store.clone()).with_factory(Arc::new(Factory));
+
+        // A peer needs a node to reach and a way in.
+        let refused = registry.add(peer("krabby")).await;
+        assert!(matches!(refused, Err(Error::Config(_))), "{refused:?}");
+        let mut ftp = peer("krabby");
+        ftp.base_url = Some("ftp://node".to_string());
+        ftp.token = Some("t".to_string());
+        assert!(matches!(registry.add(ftp).await, Err(Error::Config(_))));
+
+        let mut spec = peer("krabby");
+        spec.token = Some("node-token".to_string());
+        let view = registry.add(spec).await.unwrap();
+        assert_eq!(view.kind, "peer");
+        assert_eq!(
+            view.cost_tier, 1,
+            "peers sit between local work and the agents"
+        );
+        assert!(
+            view.healthy,
+            "an added peer is asked for its advertisement at once"
+        );
+        assert_eq!(
+            view.spec.as_ref().and_then(|s| s.base_url.as_deref()),
+            Some("http://127.0.0.1:3100")
+        );
+        assert!(!serde_json::to_string(&view.spec)
+            .unwrap()
+            .contains("node-token"));
+        let row = store.workers().get("krabby").await.unwrap().unwrap();
+        assert!(!row.config.to_string().contains("node-token"));
+        assert_eq!(row.config["base_url"], "http://127.0.0.1:3100");
+        assert_eq!(
+            store.secrets().get(&token_secret("krabby")).await.unwrap(),
+            "node-token"
+        );
+
+        // Pairing redeems the code for a token of this daemon's own.
+        let mut paired = peer("nipper");
+        paired.pairing_code = Some("PAIR-OK".to_string());
+        registry.add(paired).await.unwrap();
+        assert_eq!(
+            store.secrets().get(&token_secret("nipper")).await.unwrap(),
+            "device-token-for-nipper"
+        );
+        let mut bad = peer("kelp");
+        bad.pairing_code = Some("WRONG".to_string());
+        assert!(matches!(registry.add(bad).await, Err(Error::Config(_))));
+
+        // After a restart the peer is rebuilt with the token kept for it.
+        let after = WorkerRegistry::new(store.clone()).with_factory(Arc::new(Factory));
+        assert_eq!(after.restore().await.unwrap(), ["krabby", "nipper"]);
+        let krabby = after.get("krabby").expect("rebuilt");
+        assert_eq!(krabby.capabilities().machine.as_deref(), Some("node-token"));
+        assert!(!krabby.healthy(), "not healthy until it answers again");
+
+        // A refresh records what it advertises on its row.
+        store
+            .workers()
+            .advertise("krabby", Some(serde_json::json!({})), "unhealthy", None)
+            .await
+            .unwrap();
+        assert_eq!(after.refresh().await.unwrap(), ["krabby", "nipper"]);
+        let row = store.workers().get("krabby").await.unwrap().unwrap();
+        assert_eq!(row.health, "healthy");
+        assert_eq!(row.capabilities["tools"], serde_json::json!(["caldav"]));
+        assert!(row.last_seen.is_some());
+
+        assert!(after.remove("krabby").await.unwrap());
+        assert!(matches!(
+            store.secrets().get(&token_secret("krabby")).await,
+            Err(Error::NotFound(_))
+        ));
     }
 
     #[test]

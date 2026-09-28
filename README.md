@@ -207,6 +207,8 @@ All configuration is via environment variables. No plaintext config files.
 | `OPENAI_INCLUDE_USAGE` | `1` | Request usage in the final stream chunk; set `0` for servers that reject `stream_options` |
 | `RUSTYKRAB_NODES` | unset | JSON array of peer instances the `nodes` tool can delegate to: `{id, url, token, description, hop_budget}`. `hop_budget` defaults to `0`, which denies the node onward delegation. See [Delegating to a peer node](#delegating-to-a-peer-node) |
 | `RUSTYKRAB_DELEGATION_TOOLS` | unset | On a *node*: which tools a task delegated by a peer may use. Unset applies the default posture (everything registered except the credential family, `message` and `gateway`); `all` lifts the allowlist but not those fixed denials; a comma-separated list names the only tools a delegated run may touch. Node-authoritative — a submitting peer can narrow this per task but never widen it. The sub-agent tool family is withheld from delegated runs unconditionally |
+| `RUSTYKRAB_MACHINE_NAME` | host name | On a *node*: the machine name it advertises to a controller's peer worker (`GET /api/node`), and the device name it pairs under as a controller |
+| `RUSTYKRAB_DELEGATION_RESOURCES` | unset | On a *node*: the writable resources (a calendar, a mailbox) a peer's work item may claim here, comma separated. Unset advertises none, so an item that writes a resource is never leased to this node |
 | `RUSTYKRAB_NODE_TIMEOUT_SECS` | `900` | HTTP timeout for calls to a peer. Since delegation is asynchronous these calls are short (submit, poll, cancel); the generous default now only covers the fallback path against a peer too old to have the task queue |
 | `CHROME_CDP_URL` | `ws://127.0.0.1:9222` | Chrome DevTools Protocol endpoint |
 | `RUSTYKRAB_AUTH_TOKEN` | auto-generated | Bearer token for API auth |
@@ -585,6 +587,19 @@ it queues for itself rather than spawning further agents. Narrow it further
 with `RUSTYKRAB_DELEGATION_TOOLS`. A submitting peer may request a tighter
 limit still (`allowedTools` on the task), which intersects with the node's
 policy and can never widen it.
+
+**A node is also a worker for the control layer.** Besides the `nodes`
+tool, a primary's controller can lease work items to a paired node as a
+`peer` worker: `rustykrab worker add peer --url <node> --pairing-code
+<code>` redeems a code the node printed for a token of the primary's own,
+kept encrypted in its secret store. The node advertises its models, the
+tools inside its delegation ceiling and its machine (`GET /api/node`), and a
+work item is leased to it only when those cover the item's
+`required_tools`. The node activates those tools before its first model
+call, refuses any outside its ceiling with a typed reason, and returns the
+typed result contract rather than text. A restart on either side fails
+nothing: the node queues an interrupted task again, and a restarted
+controller re-attaches to a task its peer still holds.
 
 See `scripts/setup-delegation-node.md` for standing up a node, exposing it
 safely (Tailscale Serve, not the raw gateway port), and measured latency

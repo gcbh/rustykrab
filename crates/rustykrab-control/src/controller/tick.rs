@@ -274,6 +274,13 @@ impl Controller {
             changed.extend(self.climb(&mut b, &item, &worker, error).await?);
         }
 
+        // A restart does not kill a run that lives outside this process
+        // (a peer's task): one its worker still holds is re-attached before
+        // anything below returns to ready (`reattach.rs`, Phase 5).
+        if first {
+            self.reattach(&b).await;
+        }
+
         // Leases no run of this process holds, past their TTL by the
         // store's own clock (it stamped them): returned to `ready` with a
         // repair note. Nothing fails because a run was lost.
@@ -1577,7 +1584,7 @@ impl Controller {
 
 /// Start `worker` on `brief` under tokio, with the run binding the work
 /// tools read their provenance from.
-fn spawn(worker: Arc<dyn Worker>, brief: Brief, since: DateTime<Utc>) -> Run {
+pub(super) fn spawn(worker: Arc<dyn Worker>, brief: Brief, since: DateTime<Utc>) -> Run {
     let name = worker.name().to_string();
     let run_id = brief.run.clone().unwrap_or_default();
     let binding = WorkRunContext {

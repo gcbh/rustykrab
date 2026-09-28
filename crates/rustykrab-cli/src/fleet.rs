@@ -8,8 +8,9 @@
 //! names the local worker with it, and hands the registry, catalog and
 //! routing to the controller and the registry to the gateway. Everything
 //! else about workers happens through the registry: `rustykrab worker
-//! add` (over `POST /api/workers`) builds an [`ExternalWorker`] through
-//! [`AgentFactory`], and a restart rebuilds every stored one.
+//! add` (over `POST /api/workers`) builds an [`ExternalWorker`] or a peer
+//! (`peers.rs`) through [`AgentFactory`], and a restart rebuilds every
+//! stored one.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -27,15 +28,25 @@ use rustykrab_tools::ToolState;
 
 use crate::RegistryCatalog;
 
-/// Builds `claude_code` and `codex` workers from their registry spec.
+/// Builds `claude_code` and `codex` workers, and peers (`peers.rs`), from
+/// their registry spec.
 pub(crate) struct AgentFactory {
     data_dir: PathBuf,
 }
 
+#[async_trait::async_trait]
 impl WorkerFactory for AgentFactory {
     fn build(&self, name: &str, spec: &WorkerSpec) -> Result<Arc<dyn Worker>, String> {
+        if spec.kind == rustykrab_core::work::WorkerKind::Peer {
+            return crate::peers::build(name, spec);
+        }
         let config = ExternalConfig::from_spec(spec, &self.data_dir)?;
         Ok(Arc::new(ExternalWorker::new(name, config)))
+    }
+
+    /// A peer's pairing code, redeemed at its node.
+    async fn prepare(&self, name: &str, spec: WorkerSpec) -> Result<WorkerSpec, String> {
+        crate::peers::pair(name, spec).await
     }
 }
 

@@ -534,8 +534,12 @@ tables are the next section.
 **Workers are keyed by the registry's name, and nothing points at them.**
 `leases.worker`, a lease event's `worker:<name>` actor and the archive's
 `worker` column name a worker as text, because a worker's history outlives
-its removal. `config` is the spec an external worker was added with (its
-command, repositories and limits), which rebuilds it after a restart.
+its removal. `config` is the spec an external worker or a peer was added with
+(its command, repositories and limits; a peer's node URL), which rebuilds it
+after a restart. A peer's token is never in it: the registry keeps it
+encrypted in `secrets` as `worker.<name>.token`, a name the row implies
+rather than references. A peer's `capabilities` are what its node last
+advertised, refreshed with its health.
 `routing_record` is one JSON object keyed by work class; its shape is
 written out in `rustykrab-store/ARCHITECTURE.md` because dreaming reads it.
 It changes only through a read-modify-write in one transaction

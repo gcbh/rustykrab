@@ -1,10 +1,14 @@
 //! Workers as the controller sees them (plan section 5): a name, a kind,
 //! advertised capabilities, and one way to run a brief. The implementations
-//! live in `rustykrab-agent`: `LocalWorker`, and `ExternalWorker` for the
-//! `claude_code` and `codex` kinds; peers come in Phase 5. A run that ends
-//! without a result returns a [`RunFailure`], which [`run_failure_input`]
-//! turns back into what the classifier reads. [`Worker::usage`] is how a
-//! run's spend and self-counts reach the controller once it ends.
+//! live in `rustykrab-agent`: `LocalWorker`, `ExternalWorker` for the
+//! `claude_code` and `codex` kinds, and `PeerWorker` for a paired node
+//! (Phase 5). A run that ends without a result returns a [`RunFailure`],
+//! which [`run_failure_input`] turns back into what the classifier reads.
+//! [`Worker::usage`] is how a run's spend and self-counts reach the
+//! controller once it ends. Three hooks exist for a run that lives outside
+//! this process: [`Worker::resumable`] (re-attach after the controller
+//! restarts), [`Worker::stop`] (the controller stopped the run) and
+//! [`Worker::refresh`] (re-read the worker's advertisement and health).
 
 use async_trait::async_trait;
 use rustykrab_core::work::{
@@ -105,6 +109,35 @@ pub trait Worker: Send + Sync {
     /// wall time with no token count.
     fn usage(&self, _run: &str) -> Option<RunUsage> {
         None
+    }
+
+    /// Whether the run with this id, given before the controller last
+    /// restarted, is still this worker's to finish (plan 6.7: a leased item
+    /// is re-checked, then resumed or returned to `ready`). A peer's run is
+    /// a task on another machine and outlives the controller that
+    /// submitted it; asked on the first tick, `true` keeps the lease and
+    /// the controller runs the same brief under the same `run` again, which
+    /// the worker must take as a re-attach to the run it has, never a
+    /// second run. Default `false`: the run died with the process.
+    async fn resumable(&self, _run: &str) -> bool {
+        false
+    }
+
+    /// The controller has stopped the run with this id (a cancel, a stall,
+    /// a parent's cascade) and dropped its future. A worker whose run lives
+    /// outside this process ends it there too (a peer cancels its task).
+    /// Not called when the controller itself goes away, so a restart never
+    /// cancels work it will re-attach to. Must not block. Default: nothing
+    /// outlives the dropped future.
+    fn stop(&self, _run: &str) {}
+
+    /// Ask the worker where it stands now, before the registry records
+    /// what [`Worker::capabilities`] and [`Worker::healthy`] say on its row:
+    /// a peer re-reads its node's advertisement and health. Returns whether
+    /// it asked (a worker that knows everything locally, or that asked
+    /// recently, returns `false` and its row is left alone). Default: never.
+    async fn refresh(&self) -> bool {
+        false
     }
 }
 
