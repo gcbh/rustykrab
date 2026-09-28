@@ -87,8 +87,29 @@ called a near-miss (`get_forecast`, `lookup_order`, `list_recent_shipments`)
 after the host said nothing matched, and the runner executed it, because
 dispatch checked only the capability ceiling and the registry, not whether
 the tool was declared or appended in the run. Making "callable" mean
-declared or appended, as plan section 12 intends, is in progress on
+declared or appended, as plan section 12 intends, landed on
 `feat/control-strict-dispatch`.
+
+## After strict dispatch (integration `2c3bdb4`)
+
+The missing-target cases now judge what ran, and count attempts separately.
+
+| Case | gemma4:26b | qwen3.8:27b-mlx |
+|---|---|---|
+| weather, missing | 0/4 (6 near-miss calls, 0 refused) | 0/4 (9 calls, 0 refused) |
+| calendar, missing | 4/4 | 4/4 |
+| package, missing | 1/4 (6 calls, 0 refused) | 0/4 (10 calls, 0 refused) |
+
+No call was refused, so every near-miss was callable when the model called
+it: the near-misses are not in the starting tool block, which means the model
+made each one callable itself, by searching again in broader terms or by
+loading a tool by name after the host had listed it as a non-match. The host
+no longer runs tools that were never offered; what remains is the model
+choosing a near-miss after being told it does not match. For current weather
+that choice (`get_forecast` for today) is defensible; for a tracking number
+(`list_recent_shipments`) it is not. These cases are better read as a
+measured substitution tendency than as pass or fail, and they stay in the
+suite as such.
 
 ## The model suite's window no longer fits
 
