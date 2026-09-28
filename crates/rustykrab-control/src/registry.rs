@@ -296,13 +296,17 @@ impl WorkerRegistry {
 
     /// Make a worker the daemon built itself leasable and record it.
     /// `config` is stored as its row's config; `cost_tier` overrides its
-    /// kind's default.
+    /// kind's default. The worker is asked where it stands first
+    /// ([`Worker::refresh`]), so its row records its health as of now: a
+    /// peer that is up is leasable as soon as it is added, and a local
+    /// worker whose model is missing is unhealthy from the start.
     pub async fn register(
         &self,
         worker: Arc<dyn Worker>,
         config: serde_json::Value,
         cost_tier: Option<u32>,
     ) -> Result<WorkerView, Error> {
+        worker.refresh().await;
         let healthy = worker.healthy();
         let row = self
             .store
@@ -367,9 +371,6 @@ impl WorkerRegistry {
                 .upsert_system(&token_secret(&name), token)
                 .await?;
         }
-        // Read the node's advertisement now when it answers, so a peer
-        // that is up is leasable as soon as it is added.
-        worker.refresh().await;
         let mut stored = spec.clone();
         stored.name = Some(name);
         let config = serde_json::to_value(&stored).map_err(|e| Error::Internal(e.to_string()))?;

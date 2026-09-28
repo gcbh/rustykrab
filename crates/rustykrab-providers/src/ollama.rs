@@ -2,7 +2,9 @@ use crate::backoff::retry_delay;
 use crate::line_buffer::LineBuffer;
 use async_trait::async_trait;
 use rustykrab_core::error::Result;
-use rustykrab_core::model::{ModelProvider, ModelResponse, StopReason, StreamEvent, Usage};
+use rustykrab_core::model::{
+    ModelCheck, ModelProvider, ModelResponse, StopReason, StreamEvent, Usage,
+};
 use rustykrab_core::tool_block::{self, ToolBlockObservation, ToolBlockTracker};
 use rustykrab_core::types::{Message, MessageContent, Role, ToolCall, ToolSchema};
 use rustykrab_core::Error;
@@ -1113,6 +1115,37 @@ impl ModelProvider for OllamaProvider {
     /// harness profile; that is data, not a branch here.
     fn accepts_undeclared_tool_calls(&self) -> bool {
         true
+    }
+
+    /// Asks `/api/show`, which reads the model's metadata without loading
+    /// it. Ollama answers 404 for a model it does not have; any other
+    /// failure (server down, a 500) leaves the answer unknown.
+    async fn check_model(&self) -> ModelCheck {
+        let url = format!("{}/api/show", self.base_url);
+        let resp = match self
+            .client
+            .post(&url)
+            .json(&serde_json::json!({ "model": self.model }))
+            .send()
+            .await
+        {
+            Ok(resp) => resp,
+            Err(e) => {
+                tracing::warn!(model = %self.model, error = %e, "could not ask Ollama about the model");
+                return ModelCheck::Unknown;
+            }
+        };
+        match resp.status() {
+            s if s.is_success() => ModelCheck::Available,
+            reqwest::StatusCode::NOT_FOUND => ModelCheck::Missing(format!(
+                "Ollama at {} has no model `{}`",
+                self.base_url, self.model
+            )),
+            s => {
+                tracing::warn!(model = %self.model, status = %s, "Ollama /api/show did not say whether the model exists");
+                ModelCheck::Unknown
+            }
+        }
     }
 
     async fn chat(&self, messages: &[Message], tools: &[ToolSchema]) -> Result<ModelResponse> {

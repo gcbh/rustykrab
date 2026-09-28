@@ -114,7 +114,8 @@ main()
  ├─ delegated-task worker          durable queue in `delegated_tasks`: free
  │                                 text, or a peer's typed brief run as a
  │                                 local worker inside this node's ceiling
- ├─ worker refresh                  2s: each peer's advertisement and health
+ ├─ worker refresh                  2s: each peer's advertisement and health,
+ │                                 the local worker's model check (30s)
  ├─ control loop                   tick -> lease -> worker runs: a local
  │                                 conversation, a `claude`/`codex`
  │                                 process in a worktree under the data dir,

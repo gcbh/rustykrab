@@ -24,7 +24,7 @@ weight. Counts are `impl X for` occurrences including test doubles.
 | `VideoBackend` | **`tools`** | 1 | Fine — implementation is in the same crate |
 | `SessionManager` | **`tools`** | 1 | Correctly implemented above the consumer |
 | `WorkBackend` | **`tools`** `work_backend.rs` | 1 stub | Correctly placed above the consumer: the `work_file`, `work_status` and `result_report` tools call it; the controller adapter in `rustykrab-cli` implements it (Phase 1, round 2) |
-| `Worker` | **`control`** `worker.rs` | 3 + test doubles | **Earns its keep.** The controller calls it; `LocalWorker`, `ExternalWorker` (the `claude_code` and `codex` kinds) and `PeerWorker` (the `peer` kind, Phase 5) in `rustykrab-agent` implement it above the controller. Its defaulted `usage` carries a run's spend and completion-reminder count back to the controller; its defaulted `resumable`, `stop` and `refresh` exist for a run that lives outside the process (a peer's task: re-attached after a restart, cancelled when the controller stops it, advertised and health-checked on the registry's timer) |
+| `Worker` | **`control`** `worker.rs` | 3 + test doubles | **Earns its keep.** The controller calls it; `LocalWorker`, `ExternalWorker` (the `claude_code` and `codex` kinds) and `PeerWorker` (the `peer` kind, Phase 5) in `rustykrab-agent` implement it above the controller. Its defaulted `usage` carries a run's spend and completion-reminder count back to the controller; its defaulted `resumable`, `stop` and `refresh` exist for a run that lives outside the process (a peer's task: re-attached after a restart, cancelled when the controller stops it, advertised and health-checked on the registry's timer); `LocalWorker` uses `refresh` for its provider's model check |
 | `WorkerFactory` | **`control`** `registry.rs` | 1 + 1 test | Correctly placed: the registry builds external workers and peers through it from a stored spec, and `AgentFactory` in `rustykrab-cli` implements it over `ExternalWorker` and `PeerWorker`, which `control` cannot name; its defaulted async `prepare` redeems a peer's pairing code before the spec is stored |
 | `NodeWorkers` | **`control`** `peer.rs` | 1 | Correctly placed: the gateway's task worker and `GET /api/node` call it to run a peer's brief inside this node's ceiling and to advertise that ceiling; `DelegatedRuns` in `rustykrab-agent` implements it over the local worker, which neither the gateway's traits nor `control` should build |
 | `Routing` | **`control`** `controller/mod.rs` | 2 | Earns its keep: `CheapestFirst` for tests and a bare controller, `RecordRouting` (`control` `routing.rs`) over the registry's routing records and default tiers in the daemon |
@@ -207,10 +207,13 @@ Worth naming, because a review that only lists problems misrepresents the code:
   agent loops get wrong.
 - **`ModelProvider` defaults are correctly chosen.** `context_limit`,
   `supports_vision`, `requires_paired_tool_results`, `chat_with_ctx`,
-  `chat_with_choice` and `accepts_undeclared_tool_calls` all have defaults
-  that degrade safely, so a new provider implements one method. The last is
-  capability data for the append path (control-layer plan, section 12): a
-  provider that says nothing keeps late tools on the re-render path.
+  `chat_with_choice`, `accepts_undeclared_tool_calls` and `check_model` all
+  have defaults that degrade safely, so a new provider implements one
+  method. `accepts_undeclared_tool_calls` is capability data for the append
+  path (control-layer plan, section 12): a provider that says nothing keeps
+  late tools on the re-render path. `check_model` defaults to `Unknown`,
+  which leaves a local worker healthy; Ollama answers `Missing` on a 404
+  from `/api/show`.
 - **The capability model is real.** `Capability::Subagent` and
   `Capability::ComputerUse` are required *in addition to* the per-tool grant,
   and the dangerous ones are gated at four independent layers.

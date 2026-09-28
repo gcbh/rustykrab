@@ -63,11 +63,33 @@ pub enum ToolChoice {
     Any,
 }
 
+/// Whether a provider's configured model exists on its server, as the
+/// server answered [`ModelProvider::check_model`].
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum ModelCheck {
+    /// The server has the model.
+    Available,
+    /// The server answered that it has no such model; the text says which.
+    Missing(String),
+    /// No answer either way: the provider does not check, or the server
+    /// could not be asked. Callers treat this as they did before checking.
+    #[default]
+    Unknown,
+}
+
 /// Trait implemented by every model provider (e.g. Anthropic, OpenAI).
 #[async_trait]
 pub trait ModelProvider: Send + Sync {
     /// Human-readable name of the provider.
     fn name(&self) -> &str;
+
+    /// Ask the provider's server whether the configured model exists,
+    /// without loading it. A local worker keeps the answer as its health,
+    /// so the controller never leases an item to a model that is not
+    /// there. The default does not ask.
+    async fn check_model(&self) -> ModelCheck {
+        ModelCheck::Unknown
+    }
 
     /// Model's context window in tokens, when known.
     ///

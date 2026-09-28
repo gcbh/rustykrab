@@ -6,6 +6,7 @@
 //! return canned [`ResultReport`]s per item title.
 
 mod closeout;
+mod model_check;
 mod paths;
 mod peers;
 mod review;
