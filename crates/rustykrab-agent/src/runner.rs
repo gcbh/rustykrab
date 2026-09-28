@@ -525,8 +525,8 @@ const RESULT_REPORT_REMINDER: &str =
      you cannot finish, call it with `blocked` or `error` set. If more work remains, \
      call the next tool.";
 
-/// What a runner notice starts with in a worker run (plan section 12.1).
-pub(crate) const NOTICE_PREFIX: &str = "[System notice] ";
+/// What a runner notice starts with (plan section 12.1).
+pub(crate) use rustykrab_core::types::SYSTEM_NOTICE_PREFIX as NOTICE_PREFIX;
 
 /// Whether the current task is running a worker's work item: the caller
 /// scoped [`WORK_RUN_CONTEXT`] around the run. The runner carries the
@@ -535,39 +535,58 @@ fn in_worker_run() -> bool {
     with_work_run(|_| ()).is_some()
 }
 
-/// A notice from the runner to the model: a nudge, a warning, a compaction
-/// instruction. Outside a worker run it keeps the system role it has always
-/// had. In a worker run it is a `[System notice]` user turn (plan section
-/// 12.1): Ollama's Qwen 3.5-family template folds a non-leading system
-/// message to the top of the prompt, so the model never sees it last and
-/// the cached prefix is lost, and qwen3.8 has answered a mid-history system
-/// message with nothing at all. A worker's conversation keeps one leading
-/// system message, whatever the model.
+/// A notice from the runner to the model: a nudge, a warning, the
+/// reflection prompt, a compaction instruction, the iteration cap. Always a
+/// `[System notice]` user turn ([`Message::system_notice`]), for every
+/// provider and model, so no request carries a system message after the
+/// first (plan section 12.1): Ollama's Qwen 3.5-family template folds a
+/// non-leading system message to the top of the prompt, so the model never
+/// sees it last and the cached prefix is lost, and qwen3.8 has answered a
+/// mid-history system message with nothing at all.
 fn runner_notice(text: impl Into<String>) -> Message {
-    let text = text.into();
-    if in_worker_run() {
-        Message::stamped(
-            Role::User,
-            MessageContent::Text(format!("{NOTICE_PREFIX}{text}")),
-        )
-    } else {
-        Message::stamped(Role::System, MessageContent::Text(text))
-    }
+    Message::system_notice(text.into())
 }
 
-/// Whether `message` is a completion reminder the runner sent: the system
-/// `task_complete` reminder, or a worker run's `result_report` notice.
+/// Give a conversation the portable shape before a run sends it: every
+/// system message after the first becomes a `[System notice]` user turn,
+/// in place, keeping its id and time. A conversation stored before notices
+/// changed role still carries its old ones (an iteration warning, a
+/// `task_complete` reminder), and the next request would send them as they
+/// are. Returns how many it changed.
+fn portable_shape(conv: &mut Conversation) -> usize {
+    let mut changed = 0;
+    for message in conv.messages.iter_mut().skip(1) {
+        if message.role != Role::System {
+            continue;
+        }
+        let text = match &message.content {
+            MessageContent::Text(text) => text.clone(),
+            // Never written by the runner; flattened rather than kept.
+            _ => AgentRunner::render_message_text(message, false),
+        };
+        message.role = Role::User;
+        message.content = MessageContent::Text(format!("{NOTICE_PREFIX}{text}"));
+        changed += 1;
+    }
+    changed
+}
+
+/// Whether `message` is a completion reminder the runner sent: the
+/// `task_complete` reminder, or a worker run's `result_report` one.
 fn is_completion_reminder(message: &Message) -> bool {
-    let Some(text) = message.content.as_text() else {
+    if !message.is_system_notice() {
+        return false;
+    }
+    let Some(text) = message
+        .content
+        .as_text()
+        .and_then(|t| t.strip_prefix(NOTICE_PREFIX))
+    else {
         return false;
     };
-    match message.role {
-        // Under the append path the reminder carries `task_complete`'s
-        // definition after the fixed text.
-        Role::System => text.starts_with(TASK_COMPLETE_REMINDER),
-        Role::User => text.strip_prefix(NOTICE_PREFIX) == Some(RESULT_REPORT_REMINDER),
-        _ => false,
-    }
+    // Under the append path the `task_complete` reminder carries its
+    // definition after the fixed text.
+    text.starts_with(TASK_COMPLETE_REMINDER) || text == RESULT_REPORT_REMINDER
 }
 
 /// Outcome of `AgentRunner::reprompt_for_completion`: tell the caller
@@ -1701,9 +1720,9 @@ impl AgentRunner {
     }
 
     /// Remind the model of its completion signal after a text-only EndTurn
-    /// mid-task: [`TASK_COMPLETE_REMINDER`] as a system message in an
-    /// ordinary run, [`RESULT_REPORT_REMINDER`] as a `[System notice]` user
-    /// turn in a worker run. Bumps `retries` and returns `GiveUp` once the
+    /// mid-task, as a `[System notice]` user turn: [`TASK_COMPLETE_REMINDER`]
+    /// in an ordinary run, [`RESULT_REPORT_REMINDER`] in a worker run.
+    /// Bumps `retries` and returns `GiveUp` once the
     /// cap is exceeded so the caller can accept the last response rather
     /// than spinning to `max_iterations`.
     fn reprompt_for_completion(
@@ -2071,6 +2090,20 @@ impl AgentRunner {
         // the first model call doesn't get a prompt large enough to trip
         // the provider HTTP timeout.
         self.repair_oversized_summary(conv);
+        // And notices stored as system messages by older builds become the
+        // user turns every notice is now, so no request of this run carries
+        // a system message after the first (plan section 12.1).
+        let reshaped = portable_shape(conv);
+        if reshaped > 0 {
+            tracing::debug!(
+                reshaped,
+                "stored non-leading system messages sent as [System notice] user turns"
+            );
+            // Edited in place: the incremental estimate and the usage
+            // anchor no longer describe this history.
+            self.forget_token_estimate(conv.id);
+            self.forget_usage_anchor(conv.id);
+        }
 
         // How late tools reach the model is fixed before the first request
         // (plan section 12): by append when the provider takes a call to a
@@ -2087,8 +2120,8 @@ impl AgentRunner {
         let mut max_tokens_retries: usize = 0;
         let mut task_complete_retries: usize = 0;
         // A worker run (the caller scoped `WORK_RUN_CONTEXT`) ends only on
-        // its `result_report`: text alone never ends it, `task_complete` is
-        // neither shown nor honoured, and every notice is a user turn.
+        // its `result_report`: text alone never ends it, and `task_complete`
+        // is neither shown nor honoured.
         let worker_run = in_worker_run();
         let mut had_side_effects = false;
         let mut has_called_any_tool = false;
@@ -2107,7 +2140,7 @@ impl AgentRunner {
             .messages
             .iter()
             .rev()
-            .find(|m| m.role == Role::User)
+            .find(|m| m.is_user_turn())
             .cloned();
         while *iterations < self.config.max_iterations {
             let iteration = *iterations;
@@ -2118,7 +2151,7 @@ impl AgentRunner {
                         .messages
                         .iter()
                         .rev()
-                        .find(|m| m.role == Role::User)
+                        .find(|m| m.is_user_turn())
                         .cloned();
                 }
             }
@@ -2674,17 +2707,11 @@ impl AgentRunner {
         );
         self.push_message(
             conv,
-            Message {
-                id: Uuid::new_v4(),
-                role: Role::System,
-                content: MessageContent::Text(format!(
-                    "You have reached the iteration limit ({} iterations). \
-                     Summarize what you accomplished and what remains.",
-                    self.config.max_iterations
-                )),
-                created_at: Utc::now(),
-                agent_version: Message::version_stamp(),
-            },
+            runner_notice(format!(
+                "You have reached the iteration limit ({} iterations). \
+                 Summarize what you accomplished and what remains.",
+                self.config.max_iterations
+            )),
         );
         let stream_callback = |event: StreamEvent| {
             if let StreamEvent::TextDelta(delta) = event {
@@ -3155,13 +3182,18 @@ impl AgentRunner {
     }
 
     fn render_message_text(msg: &Message, elide_tool_output: bool) -> String {
+        // A notice is the host's, not the user's words: the summarizer and
+        // the archive read it as the system line it stands for.
+        let notice = msg.is_system_notice();
         let role = match msg.role {
             Role::System => "system",
+            Role::User if notice => "system",
             Role::User => "user",
             Role::Assistant => "assistant",
             Role::Tool => "tool",
         };
         let body = match &msg.content {
+            MessageContent::Text(t) if notice => t.strip_prefix(NOTICE_PREFIX).unwrap_or(t).into(),
             MessageContent::Text(t) => t.clone(),
             MessageContent::ToolCall(tc) => format!("tool_call {}: {}", tc.name, tc.arguments),
             MessageContent::ToolResult(tr) => {
@@ -3521,7 +3553,7 @@ impl AgentRunner {
             .messages
             .iter()
             .rev()
-            .find(|m| m.role == Role::User)
+            .find(|m| m.is_user_turn())
             .cloned();
         self.compact_history_preserving(conv, tools, latest.as_ref())
             .await
@@ -3538,7 +3570,7 @@ impl AgentRunner {
             .messages
             .iter()
             .rev()
-            .find(|m| m.role == Role::User)
+            .find(|m| m.is_user_turn())
             .cloned();
         self.compact_history_preserving(conv, tools, latest.as_ref())
             .await
@@ -3566,7 +3598,7 @@ impl AgentRunner {
             preserved_ids.insert(message.id);
             head.push(message.clone());
         }
-        if let Some(first) = conv.messages.iter().find(|m| m.role == Role::User) {
+        if let Some(first) = conv.messages.iter().find(|m| m.is_user_turn()) {
             preserved_ids.insert(first.id);
             head.push(first.clone());
         }
@@ -3626,7 +3658,9 @@ impl AgentRunner {
             let mut users = 0;
             for range in groups.into_iter().rev() {
                 let group = &conv.messages[range];
-                users += group.iter().filter(|m| m.role == Role::User).count();
+                // Turns the user wrote: a notice is the host's, and
+                // counting it would shrink the window with every nudge.
+                users += group.iter().filter(|m| m.is_user_turn()).count();
                 if users > 3 {
                     break;
                 }
@@ -3637,7 +3671,7 @@ impl AgentRunner {
                     .sum();
                 if tail_tokens + extra > tail_budget {
                     if !group[0].content.tool_calls().is_empty()
-                        && group.iter().all(|m| m.role != Role::User)
+                        && group.iter().all(|m| !m.is_user_turn())
                     {
                         continue;
                     }
@@ -3653,7 +3687,7 @@ impl AgentRunner {
                 .messages
                 .iter()
                 .enumerate()
-                .filter(|(_, m)| m.role == Role::User)
+                .filter(|(_, m)| m.is_user_turn())
                 .map(|(i, _)| i)
                 .collect();
             let max_turns = if strategy == CompactionStrategy::Extractive {
@@ -3988,16 +4022,11 @@ impl AgentRunner {
         }
         text.push_str("Try a different approach.");
 
-        self.push_message(
-            conv,
-            Message {
-                id: Uuid::new_v4(),
-                role: Role::Assistant,
-                content: MessageContent::Text(text),
-                created_at: Utc::now(),
-                agent_version: Message::version_stamp(),
-            },
-        );
+        // A notice like every other (plan section 12.1). It was an
+        // assistant message, which left the conversation ending on the
+        // assistant: a template takes that as a turn to continue, and
+        // qwen3.8 answered it with nothing (scenario 10, 2026-09-28).
+        self.push_message(conv, runner_notice(text));
     }
 }
 
@@ -7239,7 +7268,9 @@ mod task_complete_tests {
         let continues = conv
             .messages
             .iter()
-            .filter(|m| m.role == Role::System && m.content.as_text() == Some("Continue."))
+            .filter(|m| {
+                m.is_system_notice() && m.content.as_text() == Some("[System notice] Continue.")
+            })
             .count();
         assert_eq!(continues, 3, "only the first three truncations re-prompt");
     }
@@ -7418,9 +7449,9 @@ mod task_complete_tests {
         // All three scripted turns must have been consumed.
         assert_eq!(*provider.chat_count.lock().unwrap(), 3);
 
-        // The reminder must have been injected as a user-role message.
+        // The reminder must have been injected as a user-role notice.
         assert!(
-            conv.messages.iter().any(|m| m.role == Role::System
+            conv.messages.iter().any(|m| m.is_system_notice()
                 && m.content
                     .as_text()
                     .map(|t| t.contains("task_complete"))
@@ -7685,7 +7716,7 @@ mod task_complete_tests {
             .messages
             .iter()
             .filter(|m| {
-                m.role == Role::System
+                m.is_system_notice()
                     && m.content
                         .as_text()
                         .map(|t| t.contains("did not call `task_complete`"))
@@ -7873,6 +7904,32 @@ mod worker_run_tests {
         }
     }
 
+    /// Always fails, and not in a way worth retrying: three calls in a row
+    /// bring the reflection prompt.
+    struct Broken;
+
+    #[async_trait]
+    impl Tool for Broken {
+        fn name(&self) -> &str {
+            "broken"
+        }
+        fn description(&self) -> &str {
+            "always fails"
+        }
+        fn schema(&self) -> ToolSchema {
+            ToolSchema {
+                name: "broken".into(),
+                description: "always fails".into(),
+                parameters: serde_json::json!({"type": "object", "properties": {}}),
+            }
+        }
+        async fn execute(&self, _: serde_json::Value) -> Result<serde_json::Value> {
+            Err(Error::ToolExecution(
+                rustykrab_core::ToolError::invalid_input("broken by design"),
+            ))
+        }
+    }
+
     fn respond(content: MessageContent, stop_reason: StopReason) -> ModelResponse {
         ModelResponse {
             message: Message::stamped(Role::Assistant, content),
@@ -7914,6 +7971,7 @@ mod worker_run_tests {
         let stub = Arc::new(StubWorkBackend::new());
         let tools: Vec<Arc<dyn Tool>> = vec![
             Arc::new(Noop),
+            Arc::new(Broken),
             Arc::new(TaskCompleteTool::new()),
             Arc::new(ResultReportTool::new(stub.clone())),
         ];
@@ -7922,8 +7980,13 @@ mod worker_run_tests {
             .with_active_tools(active.clone())
             .with_config(config);
         let conv_id = Uuid::new_v4();
-        active.activate(conv_id, ["noop", "result_report"]);
-        let caps = CapabilitySet::for_tools_permissive(&["noop", "task_complete", "result_report"]);
+        active.activate(conv_id, ["noop", "broken", "result_report"]);
+        let caps = CapabilitySet::for_tools_permissive(&[
+            "noop",
+            "broken",
+            "task_complete",
+            "result_report",
+        ]);
         let session = Session::with_capabilities(conv_id, caps);
         let mut conv = Conversation {
             id: conv_id,
@@ -8088,9 +8151,14 @@ mod worker_run_tests {
     #[tokio::test]
     async fn no_request_in_a_worker_run_carries_a_non_leading_system_message() {
         let provider = Recording::new(vec![
+            // Three failures in a row: the reflection prompt (the soft
+            // warning fires before the second call).
+            call("broken", serde_json::json!({})),
+            call("broken", serde_json::json!({})),
+            call("broken", serde_json::json!({})),
             // Prose: the completion reminder.
             text("Let me look into the plans."),
-            // Cut off: "Continue." (the soft warning fires before this call).
+            // Cut off: "Continue.".
             respond(
                 MessageContent::Text("Plan A costs".into()),
                 StopReason::MaxTokens,
@@ -8117,7 +8185,22 @@ mod worker_run_tests {
             .unwrap();
 
         let requests = provider.requests();
-        assert_eq!(requests.len(), 6);
+        assert_eq!(requests.len(), 9);
+        assert_one_leading_system_message(&requests);
+        let notices = notices(&conv);
+        assert_eq!(
+            notices.len(),
+            6,
+            "the warning, the reflection, two reminders, Continue and the retry: {notices:?}"
+        );
+        assert!(
+            notices[1].starts_with("[System notice] Multiple consecutive tool calls have failed.")
+        );
+    }
+
+    /// Every request's first message is the system prompt and no later one
+    /// is a system message.
+    fn assert_one_leading_system_message(requests: &[(Vec<Message>, Vec<String>)]) {
         for (i, (messages, _)) in requests.iter().enumerate() {
             assert_eq!(messages[0].role, Role::System, "request {i}");
             let late: Vec<_> = messages[1..]
@@ -8127,25 +8210,92 @@ mod worker_run_tests {
                 .collect();
             assert!(late.is_empty(), "request {i} carries {late:?}");
         }
-        let notices = conv
-            .messages
+    }
+
+    /// The `[System notice]` user turns of a conversation, in order.
+    fn notices(conv: &Conversation) -> Vec<&str> {
+        conv.messages
             .iter()
-            .filter(|m| {
-                m.role == Role::User
-                    && m.content
-                        .as_text()
-                        .is_some_and(|t| t.starts_with(NOTICE_PREFIX))
-            })
-            .count();
+            .filter(|m| m.is_system_notice())
+            .filter_map(|m| m.content.as_text())
+            .collect()
+    }
+
+    /// Plan section 12.1 holds for every run, not only a worker's: the
+    /// same notices in an ordinary run, the iteration cap's among them, and
+    /// one an older build stored as a system message, all reach the model
+    /// as user turns.
+    #[tokio::test]
+    async fn no_request_in_an_ordinary_run_carries_a_non_leading_system_message() {
+        let provider = Recording::new(vec![
+            call("broken", serde_json::json!({})),
+            call("broken", serde_json::json!({})),
+            call("broken", serde_json::json!({})),
+            text("Let me look into the plans."),
+            respond(
+                MessageContent::Text("Plan A costs".into()),
+                StopReason::MaxTokens,
+            ),
+            respond(MessageContent::Text(String::new()), StopReason::ToolUse),
+            call("noop", serde_json::json!({})),
+            call("noop", serde_json::json!({})),
+            // The cap's summary call.
+            text("I compared A and B; C is still to check."),
+        ]);
+        let config = AgentConfig {
+            soft_iteration_warning: 1,
+            max_iterations: 8,
+            ..AgentConfig::default()
+        };
+        let (runner, session, mut conv, _) = worker(provider.clone(), config);
+        // An earlier turn, stored by a build that sent notices as system
+        // messages.
+        let task = conv.messages.pop().unwrap();
+        conv.messages.extend([
+            Message::stamped(Role::User, MessageContent::Text("hello".into())),
+            Message::stamped(Role::Assistant, MessageContent::Text("Hi.".into())),
+            Message::stamped(
+                Role::System,
+                MessageContent::Text("[Warning: 150/200 iterations used.]".into()),
+            ),
+            task,
+        ]);
+        let tracer = ExecutionTracer::new();
+
+        runner
+            .run_traced(&mut conv, &session, &tracer)
+            .await
+            .unwrap();
+
+        assert!(tracer.iteration_limit_reached());
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 9, "eight turns and the cap's summary");
+        assert_one_leading_system_message(&requests);
+        let notices = notices(&conv);
         assert_eq!(
-            notices, 5,
-            "two reminders, the warning, Continue and the retry"
+            notices,
+            [
+                "[System notice] [Warning: 150/200 iterations used.]",
+                "[System notice] [Warning: 1/8 iterations used.]",
+                notices[2],
+                notices[3],
+                "[System notice] Continue.",
+                "[System notice] Your previous response indicated a tool call but none was found. Please retry.",
+                "[System notice] You have reached the iteration limit (8 iterations). Summarize what you accomplished and what remains.",
+            ],
+        );
+        assert!(notices[2].contains("Multiple consecutive tool calls have failed."));
+        assert!(notices[2].contains("broken by design"));
+        assert!(notices[3].contains("did not call `task_complete`"));
+        assert_eq!(
+            last_assistant_text(&conv),
+            Some("I compared A and B; C is still to check.")
         );
     }
 
     /// Outside a worker run an accepted `result_report` (naming its item)
-    /// ends the run as `task_complete` does, and the notices keep the
-    /// system role they have always had.
+    /// ends the run as `task_complete` does; its reminder is the
+    /// `task_complete` one, a user-turn notice like a worker's.
     #[tokio::test]
     async fn an_accepted_report_ends_an_ordinary_run_too() {
         let provider = Recording::new(vec![
@@ -8163,12 +8313,11 @@ mod worker_run_tests {
         assert_eq!(provider.requests().len(), 3);
         assert_eq!(last_assistant_text(&conv), Some("Filed the claim."));
         assert_eq!(stub.calls().len(), 1);
-        assert!(
-            conv.messages
-                .iter()
-                .any(|m| m.role == Role::System
-                    && m.content.as_text() == Some(TASK_COMPLETE_REMINDER))
-        );
+        let reminder = format!("{NOTICE_PREFIX}{TASK_COMPLETE_REMINDER}");
+        assert!(conv
+            .messages
+            .iter()
+            .any(|m| m.role == Role::User && m.content.as_text() == Some(reminder.as_str())));
     }
 }
 

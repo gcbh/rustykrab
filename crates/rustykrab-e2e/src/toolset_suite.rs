@@ -11,6 +11,12 @@
 //! the daemon log: the definition arrived as text, the calls were
 //! dispatched, and every request of the run declared the same tools array.
 //!
+//! A second script checks the portable conversation shape (plan section
+//! 12.1) in an ordinary run: three failed calls bring the reflection
+//! prompt, a text reply the `task_complete` reminder, and both reach the
+//! model as `[System notice]` user turns, with no system message stored
+//! after the first and one tool block for the run.
+//!
 //! Scenario 10 proper, the two default models on the distractor matrix,
 //! is the model suite's (`late_binding.rs`).
 
@@ -24,28 +30,50 @@ use crate::{Ctx, Expected, ScenarioFn};
 const APPEND: &str = "e2e-toolsets: append a late tool";
 /// What the scripted run's `task_complete` says.
 const DONE: &str = "e2e-toolsets: listed the scheduled jobs";
+/// The orchestration message that starts the notices run.
+const NOTICES: &str = "e2e-toolsets: notices are user turns";
+/// What the notices run's `task_complete` says.
+const NOTICES_DONE: &str = "e2e-toolsets: gave up on the bad action";
 
 /// This suite's part of the scripted daemon's script.
 pub(crate) fn agent_script_scenarios() -> Vec<Value> {
     let call = |name: &str, arguments: Value| json!({ "toolCalls": [ { "name": name, "arguments": arguments } ] });
-    vec![json!({
-        "trigger": APPEND,
-        "steps": [
-            call("tools_list", json!({ "query": "scheduled tasks" })),
-            call("tools_load", json!({ "names": ["cron"] })),
-            call("cron", json!({ "action": "list" })),
-            call("task_complete", json!({ "summary": DONE })),
-        ],
-    })]
+    // Rejected by schema validation, which is never retried unchanged.
+    let bad = || call("cron", json!({ "action": "shred" }));
+    vec![
+        json!({
+            "trigger": APPEND,
+            "steps": [
+                call("tools_list", json!({ "query": "scheduled tasks" })),
+                call("tools_load", json!({ "names": ["cron"] })),
+                call("cron", json!({ "action": "list" })),
+                call("task_complete", json!({ "summary": DONE })),
+            ],
+        }),
+        json!({
+            "trigger": NOTICES,
+            "steps": [
+                bad(),
+                bad(),
+                bad(),
+                { "text": "The scheduler rejects that action." },
+                call("task_complete", json!({ "summary": NOTICES_DONE })),
+            ],
+        }),
+    ]
 }
 
 /// The scripted scenarios, in run order.
 pub(crate) fn scenarios() -> Vec<(Expected, (&'static str, ScenarioFn))> {
     let append: ScenarioFn = |ctx| Box::pin(append_path_keeps_the_tool_block(ctx));
-    vec![(
-        Expected::Pass,
-        ("toolsets/append-path-keeps-the-tool-block", append),
-    )]
+    let notices: ScenarioFn = |ctx| Box::pin(notices_are_user_turns(ctx));
+    vec![
+        (
+            Expected::Pass,
+            ("toolsets/append-path-keeps-the-tool-block", append),
+        ),
+        (Expected::Pass, ("toolsets/notices-are-user-turns", notices)),
+    ]
 }
 
 async fn append_path_keeps_the_tool_block(ctx: &Ctx) -> Result<()> {
@@ -93,6 +121,50 @@ async fn append_path_keeps_the_tool_block(ctx: &Ctx) -> Result<()> {
     // One tools array for the whole run.
     let blocks = crate::tool_blocks::read(&ctx.data_dir, &conversation);
     if let Some(why) = crate::tool_blocks::unchanged(&blocks, 4) {
+        bail!("{why}");
+    }
+    Ok(())
+}
+
+/// Plan section 12.1 in an ordinary run: the reflection prompt and the
+/// `task_complete` reminder are `[System notice]` user turns, nothing after
+/// the first message is a system message, and the tool block held.
+async fn notices_are_user_turns(ctx: &Ctx) -> Result<()> {
+    let conversation = ctx.create_conversation().await?;
+    ctx.send(&conversation, NOTICES).await?;
+    let run = Transcript::from_store(&ctx.db_path, &conversation)?;
+
+    let rejected = run.calls_to("cron");
+    ensure!(
+        rejected.len() == 3 && rejected.iter().all(|c| c.failed),
+        "expected three rejected cron calls, got {rejected:?}"
+    );
+    ensure!(
+        run.late_system_messages == 0,
+        "{} system message(s) stored after the first",
+        run.late_system_messages
+    );
+    let reflection = run
+        .notices
+        .iter()
+        .any(|n| n.contains("Multiple consecutive tool calls have failed"));
+    let reminder = run
+        .notices
+        .iter()
+        .any(|n| n.contains("did not call `task_complete`"));
+    ensure!(
+        reflection && reminder,
+        "expected the reflection and the reminder as notices, got {:?}",
+        run.notices
+    );
+    ensure!(
+        run.final_text.contains(NOTICES_DONE),
+        "the run did not end on its task_complete: {:?}",
+        run.final_text
+    );
+
+    let blocks = crate::tool_blocks::read(&ctx.data_dir, &conversation);
+    if let Some(why) = crate::tool_blocks::unchanged(&blocks, 5) {
         bail!("{why}");
     }
     Ok(())

@@ -54,6 +54,11 @@ pub struct Transcript {
     /// the daemon log (`crate::tool_blocks`). Empty unless the caller read
     /// the log; the store does not record it.
     pub tool_blocks: Vec<crate::tool_blocks::ToolBlockSeen>,
+    /// The runner's `[System notice]` user turns, oldest first.
+    pub notices: Vec<String>,
+    /// System messages after the first message: none, since every runner
+    /// notice is a user turn (control plan 12.1).
+    pub late_system_messages: usize,
 }
 
 impl Transcript {
@@ -106,12 +111,21 @@ impl Transcript {
         // when several tools ran in parallel and returned out of order.
         let mut by_call_id: Vec<(String, usize)> = Vec::new();
 
-        for message in messages {
+        let mut notices = Vec::new();
+        let mut late_system_messages = 0;
+        for (index, message) in messages.iter().enumerate() {
             let role = message["role"].as_str().unwrap_or_default();
             let kind = message["content"]["type"].as_str().unwrap_or_default();
             let data = &message["content"]["data"];
 
             match (role, kind) {
+                ("system", _) if index > 0 => late_system_messages += 1,
+                ("user", "text") => {
+                    if let Some(text) = data.as_str().filter(|t| t.starts_with("[System notice] "))
+                    {
+                        notices.push(text.to_string());
+                    }
+                }
                 ("assistant", "text") => {
                     if let Some(text) = data.as_str() {
                         let text = text.trim();
@@ -183,6 +197,8 @@ impl Transcript {
             duration_ms: 0,
             error: None,
             tool_blocks: Vec::new(),
+            notices,
+            late_system_messages,
         }
     }
 
@@ -365,5 +381,24 @@ mod tests {
         ));
         assert!(!t.compacted);
         assert!(t.summary.is_none());
+    }
+
+    #[test]
+    fn reads_notices_and_counts_system_messages_after_the_first() {
+        let t = parse_pair(&conv(
+            json!([
+                { "id": "m0", "role": "system",
+                  "content": { "type": "text", "data": "You are RustyKrab." } },
+                { "id": "m1", "role": "user",
+                  "content": { "type": "text", "data": "hello" } },
+                { "id": "m2", "role": "user",
+                  "content": { "type": "text", "data": "[System notice] Continue." } },
+                { "id": "m3", "role": "system",
+                  "content": { "type": "text", "data": "Continue." } }
+            ]),
+            json!({}),
+        ));
+        assert_eq!(t.notices, ["[System notice] Continue."]);
+        assert_eq!(t.late_system_messages, 1);
     }
 }

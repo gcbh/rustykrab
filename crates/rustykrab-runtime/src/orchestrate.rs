@@ -277,7 +277,9 @@ pub(crate) fn message_to_turn(
 /// writes are async, so each call spawns a detached task.  Failures are
 /// logged but don't block the agent loop — memory is eventual-consistency
 /// relative to the conversation. System messages are skipped; they are
-/// infrastructure (agent prompt, warnings) rather than conversation content.
+/// infrastructure (agent prompt, warnings) rather than conversation content,
+/// and so are the runner's `[System notice]` user turns, which are the same
+/// warnings and nudges in the shape every model reads (control plan 12.1).
 /// Duplicate content is de-duplicated on the memory side via SHA-256 hash,
 /// so re-firing the callback for an already-persisted message is safe.
 fn build_memory_callback(ctx: &AgentContext, conv: &Conversation) -> Option<OnMessageCallback> {
@@ -289,7 +291,7 @@ fn build_memory_callback(ctx: &AgentContext, conv: &Conversation) -> Option<OnMe
     let turn_counter = Arc::new(AtomicU32::new(conv.messages.len() as u32));
 
     Some(Arc::new(move |msg: &Message| {
-        if msg.role == Role::System {
+        if msg.role == Role::System || msg.is_system_notice() {
             return;
         }
         let turn_number = turn_counter.fetch_add(1, Ordering::Relaxed);
