@@ -555,7 +555,7 @@ async fn a_copy_that_reports_another_commit_or_version_is_refused() {
     // A stage that fails its copy checks never takes the daemon down.
     rig.assert_untouched();
     assert!(rig.service.daemon.lock().unwrap().running);
-    assert_eq!(read_journal(&rig.cfg).unwrap(), None);
+    assert_eq!(read_journal(&rig.swap).unwrap(), None);
 
     *rig.verifier.commit_override.lock().unwrap() = None;
     *rig.verifier.version.lock().unwrap() = "9.9.9".to_string();
@@ -857,22 +857,26 @@ fn the_swap_moves_a_bundle_and_restores_it() {
 }
 
 /// The journal an apply of the local build `NEW` over `OLD` writes.
-fn write_journal_at(cfg: &Config, phase: Phase) {
-    write_atomic(
-        cfg,
-        STATE_FILE,
-        &Journal {
-            phase,
-            from_commit: OLD.to_string(),
-            to_commit: NEW.to_string(),
-            bad: BadVersion {
-                version: "5.3.6".to_string(),
-                commit: Some(NEW.to_string()),
-            },
-            at: Utc::now(),
+fn write_journal_at(swap: &dyn SwapRoot, phase: Phase) {
+    write_journal_of(swap, phase, OLD, NEW);
+}
+
+/// A journal of `to` over `from`, beside the install.
+fn write_journal_of(swap: &dyn SwapRoot, phase: Phase, from: &str, to: &str) {
+    write_atomic(swap, STATE_FILE, &journal_of(phase, from, to)).unwrap();
+}
+
+fn journal_of(phase: Phase, from: &str, to: &str) -> Journal {
+    Journal {
+        phase,
+        from_commit: from.to_string(),
+        to_commit: to.to_string(),
+        bad: BadVersion {
+            version: "5.3.6".to_string(),
+            commit: Some(to.to_string()),
         },
-    )
-    .unwrap();
+        at: Utc::now(),
+    }
 }
 
 fn bad_new() -> Vec<BadVersion> {
@@ -882,8 +886,8 @@ fn bad_new() -> Vec<BadVersion> {
     }]
 }
 
-fn failed_file(cfg: &Config) -> PathBuf {
-    cfg.updates_dir().join(FAILED_FILE)
+fn failed_file(swap: &dyn SwapRoot) -> PathBuf {
+    swap.state_path(FAILED_FILE).unwrap()
 }
 
 /// Swap `NEW` in with a healthy apply, then clear the service's calls.
@@ -892,7 +896,7 @@ async fn applied(rig: &Rig) {
     let outcome = apply(&rig.cfg, &rig.host(), true).await.unwrap();
     assert!(matches!(outcome, Outcome::Applied(_)), "{outcome:?}");
     assert_eq!(
-        read_journal(&rig.cfg).unwrap(),
+        read_journal(&rig.swap).unwrap(),
         None,
         "the journal is cleared"
     );
@@ -905,7 +909,7 @@ async fn an_apply_interrupted_after_the_swap_is_rolled_back_by_the_next_run() {
         let rig = Rig::new(NewMode::Healthy, false).await;
         applied(&rig).await;
         // The run was killed with the new version in place.
-        write_journal_at(&rig.cfg, phase);
+        write_journal_at(&rig.swap, phase);
 
         let outcome = apply(&rig.cfg, &rig.host(), true).await.unwrap();
         let Outcome::Recovered(recovery) = outcome else {
@@ -917,8 +921,8 @@ async fn an_apply_interrupted_after_the_swap_is_rolled_back_by_the_next_run() {
         assert_eq!(rig.service.calls(), ["stop", "start"]);
         assert_eq!(rig.installed(), OLD, "{phase:?}: .prev is restored");
         assert_eq!(read_bad(&rig.cfg).unwrap(), bad_new());
-        assert_eq!(read_journal(&rig.cfg).unwrap(), None);
-        assert!(!failed_file(&rig.cfg).exists());
+        assert_eq!(read_journal(&rig.swap).unwrap(), None);
+        assert!(!failed_file(&rig.swap).exists());
 
         // The next run refuses the stage as bad and changes nothing.
         let err = apply(&rig.cfg, &rig.host(), true).await.unwrap_err();
@@ -931,7 +935,7 @@ async fn an_apply_interrupted_after_the_swap_is_rolled_back_by_the_next_run() {
 async fn an_apply_interrupted_while_stopping_starts_the_old_version_again() {
     let rig = Rig::new(NewMode::Healthy, false).await;
     write_stage(&rig.cfg, NEW, None, "binary", false);
-    write_journal_at(&rig.cfg, Phase::Stopping);
+    write_journal_at(&rig.swap, Phase::Stopping);
     std::fs::write(rig.next(), NEW).unwrap();
     rig.service.daemon.lock().unwrap().running = false;
 
@@ -944,7 +948,7 @@ async fn an_apply_interrupted_while_stopping_starts_the_old_version_again() {
     assert_eq!(rig.installed(), OLD);
     assert!(!rig.next().exists(), "the unswapped copy is dropped");
     assert!(read_bad(&rig.cfg).unwrap().is_empty());
-    assert_eq!(read_journal(&rig.cfg).unwrap(), None);
+    assert_eq!(read_journal(&rig.swap).unwrap(), None);
 }
 
 #[tokio::test]
@@ -991,14 +995,14 @@ async fn a_failure_to_record_the_bad_version_does_not_stop_the_rollback() {
     assert_eq!(rig.service.calls(), ["stop", "start", "stop", "start"]);
     assert_eq!(rig.installed(), OLD);
     assert_eq!(rig.prev(), None);
-    assert_eq!(read_journal(&rig.cfg).unwrap(), None);
-    assert!(!failed_file(&rig.cfg).exists());
+    assert_eq!(read_journal(&rig.swap).unwrap(), None);
+    assert!(!failed_file(&rig.swap).exists());
     std::fs::remove_dir(&bad).unwrap();
 
     // In the recovery of an interrupted one.
     let rig = Rig::new(NewMode::Healthy, false).await;
     applied(&rig).await;
-    write_journal_at(&rig.cfg, Phase::Started);
+    write_journal_at(&rig.swap, Phase::Started);
     let bad = rig.cfg.updates_dir().join("bad.json");
     std::fs::create_dir_all(&bad).unwrap();
     let outcome = apply(&rig.cfg, &rig.host(), true).await.unwrap();
@@ -1008,7 +1012,7 @@ async fn a_failure_to_record_the_bad_version_does_not_stop_the_rollback() {
     assert!(recovery.rolled_back);
     assert!(recovery.bad_record_error.is_some());
     assert_eq!(rig.installed(), OLD);
-    assert_eq!(read_journal(&rig.cfg).unwrap(), None);
+    assert_eq!(read_journal(&rig.swap).unwrap(), None);
 }
 
 #[tokio::test]
@@ -1028,12 +1032,12 @@ async fn a_failed_rollback_writes_apply_failed_and_later_runs_refuse() {
     // The service is started last, after the rollback's stop.
     assert_eq!(rig.service.calls(), ["stop", "start", "stop", "start"]);
     let failed: ApplyFailed =
-        serde_json::from_str(&std::fs::read_to_string(failed_file(&rig.cfg)).unwrap()).unwrap();
+        serde_json::from_str(&std::fs::read_to_string(failed_file(&rig.swap)).unwrap()).unwrap();
     assert_eq!(failed.from_commit.as_deref(), Some(OLD));
     assert_eq!(failed.to_commit.as_deref(), Some(NEW));
     assert!(failed.what.contains("restoring"), "{}", failed.what);
     assert_eq!(read_bad(&rig.cfg).unwrap(), bad_new());
-    assert_eq!(read_journal(&rig.cfg).unwrap(), None);
+    assert_eq!(read_journal(&rig.swap).unwrap(), None);
 
     // Every later run prints the file and changes nothing, with or without
     // a new stage.
@@ -1049,7 +1053,7 @@ async fn a_failed_rollback_writes_apply_failed_and_later_runs_refuse() {
 
     // Until a person deletes it. The new version is still installed and
     // does not hold the lock, so the next run refuses for that instead.
-    std::fs::remove_file(failed_file(&rig.cfg)).unwrap();
+    std::fs::remove_file(failed_file(&rig.swap)).unwrap();
     let err = apply(&rig.cfg, &rig.host(), false).await.unwrap_err();
     let text = format!("{err:#}");
     assert!(!text.contains(FAILED_FILE), "{text}");
@@ -1080,7 +1084,7 @@ async fn a_rollback_retries_a_failed_stop_once_and_never_restores_under_a_runnin
     assert_eq!(rig.service.calls(), ["stop", "start", "stop", "stop"]);
     assert_eq!(rig.installed(), NEW, "nothing restored under it");
     assert!(rig.service.daemon.lock().unwrap().running);
-    assert!(failed_file(&rig.cfg).exists());
+    assert!(failed_file(&rig.swap).exists());
 }
 
 #[tokio::test]
@@ -1100,7 +1104,7 @@ async fn a_failed_stop_starts_the_service_again() {
     assert_eq!(rig.installed(), OLD);
     assert_eq!(rig.prev(), None);
     assert!(!rig.next().exists());
-    assert_eq!(read_journal(&rig.cfg).unwrap(), None);
+    assert_eq!(read_journal(&rig.swap).unwrap(), None);
     assert!(read_bad(&rig.cfg).unwrap().is_empty());
 
     // A failed stop that left it up does not start a second one.
@@ -1111,6 +1115,237 @@ async fn a_failed_stop_starts_the_service_again() {
     assert_eq!(rig.service.calls(), ["stop"]);
     assert!(rig.service.daemon.lock().unwrap().running);
     assert_eq!(rig.installed(), OLD);
+}
+
+#[tokio::test]
+async fn a_failed_stop_keeps_the_journal_until_the_old_commit_answers() {
+    let rig = Rig::new(NewMode::Healthy, false).await;
+    write_stage(&rig.cfg, NEW, None, "binary", false);
+    *rig.service.failing_stops.lock().unwrap() = vec![0];
+    *rig.service.failed_stop_takes_it_down.lock().unwrap() = true;
+    let binary = rig.binary.clone();
+    *rig.service.on_start.lock().unwrap() = Some(Box::new(move || {
+        // What comes up answers with some other commit.
+        std::fs::write(&binary, "other55").unwrap();
+    }));
+
+    let err = apply(&rig.cfg, &rig.host(), true).await.unwrap_err();
+    assert!(format!("{err:#}").contains("journal is kept"), "{err:#}");
+    assert_eq!(rig.service.calls(), ["stop", "start"]);
+    assert_eq!(
+        read_journal(&rig.swap).unwrap().map(|j| j.phase),
+        Some(Phase::Stopping)
+    );
+}
+
+#[tokio::test]
+async fn the_journal_and_failure_record_live_beside_the_install_not_in_the_data_dir() {
+    let rig = Rig::new(NewMode::Healthy, false).await;
+    applied(&rig).await;
+    assert_eq!(
+        rig.swap.state_path(STATE_FILE).unwrap().parent(),
+        rig.swap.installed.parent()
+    );
+    // A journal and a failure record written in the data dir, where a
+    // worker can write, are ignored.
+    let updates = rig.cfg.updates_dir();
+    std::fs::write(
+        updates.join(STATE_FILE),
+        serde_json::to_string(&journal_of(Phase::Started, OLD, NEW)).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(updates.join(FAILED_FILE), "{}").unwrap();
+
+    let outcome = apply(&rig.cfg, &rig.host(), true).await.unwrap();
+    assert!(matches!(outcome, Outcome::AlreadyRunning(_)), "{outcome:?}");
+    assert!(rig.service.calls().is_empty(), "{:?}", rig.service.calls());
+    assert_eq!(rig.installed(), NEW);
+    assert!(read_bad(&rig.cfg).unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_journal_that_does_not_match_the_binaries_stops_nothing() {
+    // `.prev` does not report the journal's from_commit.
+    let rig = Rig::new(NewMode::Healthy, false).await;
+    applied(&rig).await;
+    write_journal_of(&rig.swap, Phase::Started, "zzz9999", NEW);
+    let err = apply(&rig.cfg, &rig.host(), false).await.unwrap_err();
+    assert!(format!("{err:#}").contains("do not match"), "{err:#}");
+    assert!(rig.service.calls().is_empty(), "{:?}", rig.service.calls());
+    assert!(rig.service.daemon.lock().unwrap().running);
+    assert_eq!(rig.installed(), NEW);
+    assert!(rig.prev().is_some());
+    assert!(read_bad(&rig.cfg).unwrap().is_empty());
+    let failed: ApplyFailed =
+        serde_json::from_str(&std::fs::read_to_string(failed_file(&rig.swap)).unwrap()).unwrap();
+    assert_eq!(failed.from_commit.as_deref(), Some("zzz9999"));
+
+    // Nothing was swapped and the installed binary is not the journal's
+    // to_commit.
+    let rig = Rig::new(NewMode::Healthy, false).await;
+    write_journal_of(&rig.swap, Phase::Swapped, "zzz9999", "evil999");
+    let err = apply(&rig.cfg, &rig.host(), false).await.unwrap_err();
+    assert!(format!("{err:#}").contains("do not match"), "{err:#}");
+    rig.assert_untouched();
+    assert!(failed_file(&rig.swap).exists());
+}
+
+#[tokio::test]
+async fn a_crash_between_the_renames_and_the_swapped_write_is_rolled_back() {
+    let rig = Rig::new(NewMode::Healthy, false).await;
+    applied(&rig).await;
+    // The renames were done, the journal still says `stopping`, and the
+    // daemon was stopped.
+    write_journal_at(&rig.swap, Phase::Stopping);
+    rig.service.daemon.lock().unwrap().running = false;
+
+    let outcome = apply(&rig.cfg, &rig.host(), false).await.unwrap();
+    let Outcome::Recovered(recovery) = outcome else {
+        panic!("expected a recovery, got {outcome:?}");
+    };
+    assert_eq!(recovery.phase, Some(Phase::Stopping));
+    assert!(recovery.rolled_back);
+    assert_eq!(rig.service.calls(), ["start"]);
+    assert_eq!(rig.installed(), OLD);
+    assert_eq!(rig.prev(), None);
+    assert_eq!(read_bad(&rig.cfg).unwrap(), bad_new());
+    assert_eq!(read_journal(&rig.swap).unwrap(), None);
+    assert!(!failed_file(&rig.swap).exists());
+}
+
+#[tokio::test]
+async fn a_daemon_of_the_staged_commit_waiting_on_the_lock_is_not_already_running() {
+    let rig = Rig::new(NewMode::NoLock, false).await;
+    std::fs::write(&rig.binary, NEW).unwrap();
+    write_stage(&rig.cfg, NEW, None, "binary", false);
+
+    let err = apply(&rig.cfg, &rig.host(), true).await.unwrap_err();
+    assert!(err.to_string().contains("not healthy"), "{err:#}");
+    assert!(rig.service.calls().is_empty(), "{:?}", rig.service.calls());
+}
+
+#[test]
+fn a_launchd_stop_that_errors_while_the_job_drains_waits_for_it() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // bootout errors, the job is loaded for two more polls, then gone.
+    let polls = AtomicUsize::new(0);
+    stop_job(
+        "job",
+        || bail!("bootout: operation in progress"),
+        || polls.fetch_add(1, Ordering::SeqCst) < 2,
+        Duration::from_secs(10),
+    )
+    .unwrap();
+    assert!(polls.load(Ordering::SeqCst) >= 3);
+
+    // Still loaded after the wait: the bootout error is reported.
+    let err = stop_job(
+        "job",
+        || bail!("bootout: operation in progress"),
+        || true,
+        Duration::from_millis(300),
+    )
+    .unwrap_err();
+    let text = format!("{err:#}");
+    assert!(text.contains("operation in progress"), "{text}");
+    assert!(text.contains("did not exit"), "{text}");
+
+    // A clean bootout of a job that never goes is an error too.
+    let err = stop_job("job", || Ok(()), || true, Duration::from_millis(300)).unwrap_err();
+    assert!(err.to_string().contains("did not exit"), "{err:#}");
+}
+
+#[tokio::test]
+async fn an_unparseable_journal_leaves_a_failure_record_and_a_started_service() {
+    let rig = Rig::new(NewMode::Healthy, false).await;
+    std::fs::write(
+        rig.swap.state_path(STATE_FILE).unwrap(),
+        r#"{"phase": "exploded", "from_commit": "a", "to_commit": "b"}"#,
+    )
+    .unwrap();
+    rig.service.daemon.lock().unwrap().running = false;
+
+    let err = apply(&rig.cfg, &rig.host(), false).await.unwrap_err();
+    assert!(format!("{err:#}").contains("parsing"), "{err:#}");
+    assert_eq!(rig.service.calls(), ["start"]);
+    assert!(rig.service.daemon.lock().unwrap().running);
+    assert_eq!(rig.installed(), OLD);
+    let failed: ApplyFailed =
+        serde_json::from_str(&std::fs::read_to_string(failed_file(&rig.swap)).unwrap()).unwrap();
+    assert!(failed.what.contains("parsing"), "{}", failed.what);
+
+    // Later runs refuse.
+    let err = apply(&rig.cfg, &rig.host(), false).await.unwrap_err();
+    assert!(err.to_string().contains(FAILED_FILE), "{err:#}");
+}
+
+#[tokio::test]
+async fn a_rollback_that_crashed_late_is_not_undone_again() {
+    let rig = Rig::new(NewMode::Healthy, false).await;
+    applied(&rig).await;
+    // The rollback restored `.prev` and the old version is up, but the run
+    // died before it cleared the journal.
+    rig.swap.restore().unwrap();
+    write_journal_at(&rig.swap, Phase::Started);
+
+    let outcome = apply(&rig.cfg, &rig.host(), false).await.unwrap();
+    let Outcome::Recovered(recovery) = outcome else {
+        panic!("expected a recovery, got {outcome:?}");
+    };
+    assert!(recovery.rolled_back);
+    assert!(rig.service.calls().is_empty(), "{:?}", rig.service.calls());
+    assert_eq!(rig.installed(), OLD);
+    assert_eq!(read_bad(&rig.cfg).unwrap(), bad_new());
+    assert_eq!(read_journal(&rig.swap).unwrap(), None);
+    assert!(!failed_file(&rig.swap).exists());
+}
+
+/// A swap whose `commit` moves the install to `.prev` and then fails
+/// without putting it back.
+struct LosesInstall<'a>(&'a DirSwap);
+
+impl SwapRoot for LosesInstall<'_> {
+    fn installed(&self) -> &Path {
+        self.0.installed()
+    }
+    fn prepare(&self, staged: &Path, check: &NextCheck<'_>) -> anyhow::Result<()> {
+        self.0.prepare(staged, check)
+    }
+    fn commit(&self) -> anyhow::Result<()> {
+        std::fs::rename(self.installed(), self.prev_path()?)?;
+        bail!("scripted: moving the stage into place failed")
+    }
+    fn discard(&self) -> anyhow::Result<()> {
+        self.0.discard()
+    }
+    fn has_prev(&self) -> bool {
+        self.0.has_prev()
+    }
+    fn restore(&self) -> anyhow::Result<()> {
+        self.0.restore()
+    }
+}
+
+#[tokio::test]
+async fn a_missing_install_after_a_commit_failure_is_reported_loudly() {
+    let rig = Rig::new(NewMode::Healthy, false).await;
+    write_stage(&rig.cfg, NEW, None, "binary", false);
+    let swap = LosesInstall(&rig.swap);
+    let host = Host {
+        swap: &swap,
+        ..rig.host()
+    };
+
+    let err = apply(&rig.cfg, &host, true).await.unwrap_err();
+    let text = format!("{err:#}");
+    assert!(text.contains("left nothing at"), "{text}");
+    assert!(failed_file(&rig.swap).exists());
+    assert_eq!(read_journal(&rig.swap).unwrap(), None);
+    assert_eq!(rig.service.calls(), ["stop", "start"]);
+
+    let err = apply(&rig.cfg, &host, true).await.unwrap_err();
+    assert!(err.to_string().contains(FAILED_FILE), "{err:#}");
 }
 
 #[test]
