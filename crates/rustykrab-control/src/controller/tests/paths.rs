@@ -479,6 +479,47 @@ async fn a_discovered_draft_that_sets_its_repo_and_worker_keeps_them() {
 }
 
 #[tokio::test]
+async fn a_discovered_draft_naming_its_repo_runs_after_an_open_sibling_writing_it() {
+    let h = Harness::new(&["pinch"]);
+    let mut own = code_follow_up("f", "Port the helper");
+    own.writable_resources = vec!["repo:/src/other".to_string()];
+    h.script.push(
+        "Add a status helper",
+        report(ResultReport {
+            discovered: vec![own],
+            ..done("Add a status helper")
+        }),
+    );
+    let mut x = draft("x", "Add a status helper");
+    x.writable_resources = vec!["repo:/src/app".to_string()];
+    // `y` writes the repository the draft names, and is still open when
+    // `x` reports: it waits on `x`.
+    let mut y = draft("y", "Refactor the other repo");
+    y.writable_resources = vec!["repo:/src/other".to_string()];
+    y.edges = vec![on(EdgeKind::Blocks, "x")];
+    let ids = h
+        .file(plan(vec![draft("P", "Status page"), x, y]))
+        .await
+        .ids;
+    h.drain().await;
+    let kids = h.store().work_children(&ids["P"]).await.unwrap();
+    let found = kids
+        .iter()
+        .find(|k| k.title == "Port the helper")
+        .expect("accepted rather than rejected as a single_writer_conflict");
+    assert_eq!(
+        found.writable_resources,
+        vec!["repo:/src/other".to_string()]
+    );
+    let edges = h.store().work_edges_of(&found.id).await.unwrap();
+    assert!(edges
+        .iter()
+        .any(|e| e.kind == EdgeKind::Blocks && e.depends_on == ids["y"]));
+    assert_eq!(found.status, Status::Done);
+    assert_eq!(h.status(&ids["P"]).await, Status::Done);
+}
+
+#[tokio::test]
 async fn a_worker_draft_through_work_file_goes_under_its_parent() {
     let h = Harness::new(&[]);
     // Without spend records a parent's envelope is committed by its open
