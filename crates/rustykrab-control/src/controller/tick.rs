@@ -130,6 +130,63 @@ fn normalise_reported(error: &WorkError, kind: WorkerKind) -> WorkError {
     out
 }
 
+/// A claimed check as the verifier compares it: lower case, whitespace
+/// collapsed, with a trailing parenthetical annotation such as
+/// `(86 passed)` removed.
+fn claimed_check(check: &str) -> String {
+    let mut claim = collapse(check);
+    while claim.ends_with(')') {
+        let mut depth = 0usize;
+        let mut open = None;
+        for (i, ch) in claim.char_indices().rev() {
+            match ch {
+                ')' => depth += 1,
+                '(' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        open = Some(i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        match open {
+            // A claim that is nothing but a parenthetical is not stripped.
+            Some(i) if i > 0 => claim = claim[..i].trim_end().to_string(),
+            _ => break,
+        }
+    }
+    claim
+}
+
+/// Lower case, with every run of whitespace made one space.
+fn collapse(s: &str) -> String {
+    s.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+/// Whether a normalised claimed check ran in `command`: it equals one of
+/// the command's segments (split on `&&`, `||`, `;` and `|`, so a leading
+/// `cd <dir> &&` is its own segment), or it appears in the command as a
+/// whole, which covers a shell wrapper such as `bash -lc '...'` and a claim
+/// that is itself compound.
+fn check_ran_in(wanted: &str, command: &str) -> bool {
+    let command = collapse(command);
+    if command.contains(wanted) {
+        return true;
+    }
+    command
+        .replace("&&", ";")
+        .replace("||", ";")
+        .replace('|', ";")
+        .split(';')
+        .map(|s| s.trim().trim_matches(|c| c == '\'' || c == '"').trim())
+        .any(|s| s == wanted)
+}
+
 impl Controller {
     pub(super) async fn tick_locked(&self) -> Result<TickReport, Error> {
         let now = self.clock.now();
@@ -767,11 +824,11 @@ impl Controller {
             .collect();
         if !ran.is_empty() {
             for check in &result.checks_run {
-                let wanted = check.trim().to_lowercase();
+                let wanted = claimed_check(check);
                 if wanted.is_empty() {
                     continue;
                 }
-                if !ran.iter().any(|c| c.contains(&wanted)) {
+                if !ran.iter().any(|c| check_ran_in(&wanted, c)) {
                     return Ok(Err((
                         VerifierVerdict::ClaimMismatch,
                         format!(
@@ -1609,5 +1666,66 @@ pub(super) fn spawn(worker: Arc<dyn Worker>, brief: Brief, since: DateTime<Utc>)
         handle,
         since,
         reported: false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{check_ran_in, claimed_check};
+
+    fn verifies(claim: &str, commands: &[&str]) -> bool {
+        let wanted = claimed_check(claim);
+        commands.iter().any(|c| check_ran_in(&wanted, c))
+    }
+
+    #[test]
+    fn an_annotated_claim_verifies() {
+        assert_eq!(
+            claimed_check("  cargo test -p rustykrab-e2e --no-default-features (86 passed) "),
+            "cargo test -p rustykrab-e2e --no-default-features"
+        );
+        assert!(verifies(
+            "cargo test -p rustykrab-e2e --no-default-features (86 passed)",
+            &["cargo test -p rustykrab-e2e --no-default-features"],
+        ));
+    }
+
+    #[test]
+    fn a_check_inside_a_compound_command_verifies() {
+        let ran = [
+            "cd /tmp/wt && cargo fmt --all -- --check && cargo clippy --workspace --all-targets \
+             && cargo test -p rustykrab-e2e --no-default-features",
+        ];
+        assert!(verifies(
+            "cargo test -p rustykrab-e2e --no-default-features (86 passed)",
+            &ran,
+        ));
+        assert!(verifies("cargo fmt --all -- --check", &ran));
+        assert!(verifies("cargo clippy --workspace --all-targets", &ran));
+        assert!(verifies("echo done", &["cargo check || true; echo done"]));
+    }
+
+    #[test]
+    fn a_check_inside_a_piped_command_verifies() {
+        let ran = ["cargo test -p rustykrab-control --no-default-features 2>&1 | tail -20"];
+        assert!(verifies(
+            "cargo test -p rustykrab-control --no-default-features (312 passed)",
+            &ran,
+        ));
+        assert!(verifies("tail -20", &ran));
+    }
+
+    #[test]
+    fn a_check_that_never_ran_does_not_verify() {
+        let ran = [
+            "cd /tmp/wt && cargo fmt --all -- --check",
+            "cargo test -p rustykrab-control | tail -5",
+        ];
+        assert!(!verifies("cargo clippy --workspace --all-targets", &ran));
+        assert!(!verifies(
+            "cargo test -p rustykrab-e2e --no-default-features (86 passed)",
+            &ran,
+        ));
+        assert!(!verifies("(86 passed)", &ran));
     }
 }
