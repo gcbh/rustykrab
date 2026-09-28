@@ -68,6 +68,32 @@ async fn checks_run_inside_a_compound_command_are_verified_by_the_command_record
 }
 
 #[tokio::test]
+async fn a_compound_claim_whose_steps_ran_as_separate_commands_is_verified() {
+    let h = Harness::new(&["pinch"]);
+    let claim = "python3 scripts/check_architecture_docs.py --fix && \
+                 python3 scripts/check_architecture_docs.py";
+    h.script.push(
+        "Refresh the docs",
+        checked(
+            &[
+                "python3 scripts/check_architecture_docs.py --fix",
+                "python3 scripts/check_architecture_docs.py",
+            ],
+            &[claim],
+        ),
+    );
+    let id = h.file_one(draft("x", "Refresh the docs")).await;
+    h.drain().await;
+
+    assert_eq!(h.status(&id).await, Status::Done);
+    let checks = check_evidence(&h, &id).await;
+    assert_eq!(checks.len(), 1, "{checks:?}");
+    assert_eq!(checks[0].reference, claim);
+    assert_eq!(checks[0].verified_by.as_deref(), Some(COMMAND_RUN));
+    assert_eq!(h.script.briefs_for("Refresh the docs").len(), 1);
+}
+
+#[tokio::test]
 async fn a_check_that_never_ran_fails_the_report_as_a_claim_mismatch() {
     let h = Harness::new(&["pinch"]);
     h.script.push(
