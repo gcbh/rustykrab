@@ -96,3 +96,28 @@ contract accepts plain-string questions; a daemon without a local model can
 turn its local worker off. The verifier change alters how the builder
 judges its own work, so it gets the review section 10 reserves for changes
 to a system's own measurement before it is merged.
+
+## Second cycle (2026-09-28)
+
+All five items verified and were merged after review, the verifier change
+most closely: a claimed check now verifies when it ran on its own or inside
+a compound command, with a trailing annotation such as `(86 passed)`
+removed, and a check that never ran still fails. The verifier still
+confirms that a check ran, not that it passed; the full gate at merge
+covers that until a trusted merge step does.
+
+The merge surfaced one regression, in a test and not in the product:
+scenario 31 counted only open items, and follow-ups now inherit their
+parent's worker, so they run and close before the count. The scenario now
+counts closed items too.
+
+While the second batch ran, the builder filed eleven more items itself,
+all before the inheritance fix was deployed, so none carried a repository
+and all stalled. Reading them back is instructive: the builder had
+diagnosed its own environment (a local worker with no model, Ollama's 404
+retried as transient, a capability item filed with an empty tool name).
+Five were covered by batch 2 or were noise and were cancelled with the
+reason recorded; six were refiled as the third batch, beside the first
+slice of the update flow (graceful shutdown on SIGTERM with no orphaned
+worker processes, and `GET /api/version`). The builder was redeployed with
+its local worker off, using the switch it built in batch 2.
