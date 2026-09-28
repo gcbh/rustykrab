@@ -6,6 +6,7 @@
 //! return canned [`ResultReport`]s per item title.
 
 mod paths;
+mod review;
 mod scenarios;
 
 use std::collections::{HashMap, VecDeque};

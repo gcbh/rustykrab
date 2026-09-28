@@ -3,6 +3,7 @@
 //! the controller itself is written; `controller::Controller` implements it.
 
 use async_trait::async_trait;
+use rustykrab_core::proposal::{ReviewDecision, ReviewOutcome};
 use rustykrab_core::work::{
     Edge, ItemRef, PlanOutcome, Status, WorkItem, WorkItemDraft, WorkItemId, WorkPlan,
 };
@@ -114,4 +115,24 @@ pub trait ControlHandle: Send + Sync {
     /// The tree under `root` for `work show --graph` and
     /// `GET /api/work/{id}/graph`.
     async fn graph(&self, root: &str) -> Result<GraphView, Error>;
+
+    /// Apply a decision a human took on the review surface to a proposal
+    /// (plan sections 10 and 11), as one transaction with its `review`
+    /// event: an acceptance files the `code` item the proposal becomes
+    /// (`FilingSource::Proposal`, with a `discovered_from` edge onto it)
+    /// and closes the proposal `done`; a decline cancels it; an amendment
+    /// is recorded for the acceptance to carry. A proposal already closed
+    /// is left alone and says so. The default refuses, for a handle that
+    /// takes no decisions.
+    async fn review_decision(
+        &self,
+        proposal: &str,
+        decision: ReviewDecision,
+        actor: &str,
+    ) -> Result<ReviewOutcome, Error> {
+        let _ = (decision, actor);
+        Err(Error::Internal(format!(
+            "this control handle takes no review decisions (proposal {proposal})"
+        )))
+    }
 }

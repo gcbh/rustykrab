@@ -17,6 +17,9 @@
 //! - [`import`]: the delivery import, a `StackManifest` turned into the
 //!   layered `code` graph of section 14.1, filed through the validator.
 //! - [`worker`]: workers as the controller sees them, and the brief they get.
+//! - [`review`]: the review surface of section 11: which items are projected
+//!   to issues and what they say, the adapter trait, and the one-way sync
+//!   that brings decisions back as typed events.
 //! - [`controller`]: the loop itself (section 6), which drives the store
 //!   through the pure modules above.
 //!
@@ -29,4 +32,5 @@ pub mod graph;
 pub mod handle;
 pub mod import;
 pub mod ladder;
+pub mod review;
 pub mod worker;
