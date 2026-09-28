@@ -1057,6 +1057,8 @@ impl OllamaProvider {
         match status.as_u16() {
             400 => Error::ModelBadRequest(format!("Ollama API: {body}")),
             401 | 403 => Error::ModelAuthError(format!("Ollama API: {body}")),
+            // Model not pulled or unknown: retrying will not make it appear.
+            404 => Error::NotFound(format!("Ollama API: {body}")),
             429 => Error::ModelRateLimit(format!("Ollama API: {body}")),
             _ => Error::ModelProvider(format!("Ollama API returned {status}: {body}")),
         }
@@ -1892,6 +1894,16 @@ mod tests {
     /// `TEST_TOOL_TOKENS + FRAMING_OVERHEAD_TOKENS` equals the flat 2048 these
     /// cases were originally written against, keeping their arithmetic intact.
     const TEST_TOOL_TOKENS: u32 = 1536;
+
+    #[test]
+    fn status_404_maps_to_not_found() {
+        let err = OllamaProvider::map_status_error(
+            reqwest::StatusCode::NOT_FOUND,
+            r#"{"error":"model 'llama9' not found"}"#,
+        );
+        assert!(matches!(err, Error::NotFound(ref m) if m.contains("llama9")));
+        assert_eq!(err.kind(), rustykrab_core::ToolErrorKind::NotFound);
+    }
 
     fn user_msg(content: &str) -> OllamaMessage {
         OllamaMessage {
