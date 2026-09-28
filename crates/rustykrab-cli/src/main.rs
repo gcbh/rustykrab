@@ -1889,10 +1889,45 @@ async fn main() -> anyhow::Result<()> {
             .unwrap_or(5)
             .max(1);
         let tick_controller = controller.clone();
+        // One controller per data directory: an old and a new daemon may
+        // overlap during a cutover, and only the holder of controller.lock
+        // ticks. The lock lives in this task, so for the life of the loop.
+        let mut loop_lock = rustykrab_control::lock::LoopLock::in_data_dir(&data_dir);
         infra_handles.push(tokio::spawn(async move {
+            use rustykrab_control::handle::LockState;
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(tick_secs));
+            let mut waiting_logged = false;
+            let mut held = false;
             loop {
                 interval.tick().await;
+                if !held {
+                    match tick_controller.claim_loop_lock(&mut loop_lock) {
+                        (LockState::Held, _) => {
+                            held = true;
+                            tracing::info!(
+                                lock = %loop_lock.path().display(),
+                                "controller lock held; the control loop runs here"
+                            );
+                        }
+                        (LockState::Waiting, error) => {
+                            if !waiting_logged {
+                                waiting_logged = true;
+                                match error {
+                                    Some(e) => tracing::warn!(
+                                        lock = %loop_lock.path().display(),
+                                        error = %e,
+                                        "cannot take the controller lock; no control tick runs until it can"
+                                    ),
+                                    None => tracing::info!(
+                                        lock = %loop_lock.path().display(),
+                                        "another process holds the controller lock; no control tick runs until it is released"
+                                    ),
+                                }
+                            }
+                            continue;
+                        }
+                    }
+                }
                 match tick_controller.tick().await {
                     Ok(report) => {
                         if report.transitions > 0 || report.notices > 0 {

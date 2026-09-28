@@ -30,6 +30,8 @@
 //! - [`review`]: the review surface of section 11: which items are projected
 //!   to issues and what they say, the adapter trait, and the one-way sync
 //!   that brings decisions back as typed events.
+//! - [`lock`]: the exclusive `controller.lock` that keeps a data directory
+//!   to one running loop when two daemons overlap during a cutover.
 //! - [`controller`]: the loop itself (section 6), which drives the store
 //!   through the pure modules above.
 //!
@@ -42,6 +44,7 @@ pub mod graph;
 pub mod handle;
 pub mod import;
 pub mod ladder;
+pub mod lock;
 pub mod peer;
 pub mod registry;
 pub mod review;

@@ -57,6 +57,21 @@ pub struct LoopStatus {
     pub last_tick: Option<DateTime<Utc>>,
     /// Runs live in this process.
     pub runs_in_flight: usize,
+    /// Whether this process holds `controller.lock` and may tick; `None`
+    /// before the loop first tries it, and for a controller no loop drives.
+    #[serde(default)]
+    pub lock: Option<LockState>,
+}
+
+/// The loop's hold on its data directory's `controller.lock`
+/// ([`crate::lock`]): only the holder ticks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LockState {
+    /// This process holds the lock and runs the loop.
+    Held,
+    /// Another process holds it; no tick runs until it is released.
+    Waiting,
 }
 
 /// The controller as its callers see it. Every method is one store
