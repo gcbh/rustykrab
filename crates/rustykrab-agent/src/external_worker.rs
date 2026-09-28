@@ -760,7 +760,8 @@ fn read_codex(stdout: &str) -> Transcript {
 /// fills (fingerprint, observer), and a class, subclass or blocked reason
 /// this build does not know reads as `unknown/unclassified` or
 /// `needs_decision`, so the controller classifies it rather than the run
-/// failing to parse.
+/// failing to parse. A question given as a plain string reads as a question
+/// with that text, an empty class and no options.
 pub fn parse_contract(text: &str) -> std::result::Result<ResultReport, String> {
     let candidates = contract_candidates(text);
     let mut last_error = String::from("no JSON object in the final message");
@@ -771,7 +772,10 @@ pub fn parse_contract(text: &str) -> std::result::Result<ResultReport, String> {
         if !value.is_object() {
             continue;
         }
-        sanitise(&mut value);
+        if let Err(e) = sanitise(&mut value) {
+            last_error = format!("the result contract did not parse: {e}");
+            continue;
+        }
         match serde_json::from_value::<ResultReport>(value) {
             Ok(report) => return Ok(report),
             Err(e) => last_error = format!("the result contract did not parse: {e}"),
@@ -820,7 +824,7 @@ fn contract_candidates(text: &str) -> Vec<String> {
     out
 }
 
-fn sanitise(value: &mut Value) {
+fn sanitise(value: &mut Value) -> std::result::Result<(), String> {
     if value.get("summary").is_none() {
         value["summary"] = Value::String(String::new());
     }
@@ -846,6 +850,24 @@ fn sanitise(value: &mut Value) {
             error["detail"] = Value::String(String::new());
         }
     }
+    // A question given as a plain string is that text with no class or
+    // options. Anything else that is not an object is refused here, since
+    // serde would otherwise read an array as the struct's fields in order.
+    if let Some(Value::Array(questions)) = value.get_mut("questions") {
+        for question in questions.iter_mut() {
+            match question {
+                Value::String(text) => {
+                    *question = serde_json::json!({ "text": std::mem::take(text) });
+                }
+                Value::Object(_) => {}
+                other => {
+                    return Err(format!(
+                        "a question must be an object or a string, not {other}"
+                    ))
+                }
+            }
+        }
+    }
     if let Some(blocked) = value.get_mut("blocked").filter(|b| b.is_object()) {
         let reason = Value::String(blocked["reason"].as_str().unwrap_or_default().to_string());
         if serde_json::from_value::<rustykrab_core::work::BlockedReason>(reason).is_err() {
@@ -855,6 +877,7 @@ fn sanitise(value: &mut Value) {
             blocked["detail"] = Value::String(String::new());
         }
     }
+    Ok(())
 }
 
 // ── the executor brief ────────────────────────────────────────────────────
@@ -1389,5 +1412,62 @@ printf '{"summary":"added status","changed_paths":["src/lib.rs"],"checks_run":["
             rustykrab_core::work::BlockedReason::NeedsDecision
         );
         assert!(parse_contract("no json here").is_err());
+    }
+
+    fn question(text: &str, class: &str, options: &[&str]) -> rustykrab_core::work::Question {
+        rustykrab_core::work::Question {
+            text: text.into(),
+            class: class.into(),
+            options: options.iter().map(|o| o.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn string_questions_read_as_questions_with_no_class_or_options() {
+        let report =
+            parse_contract(r#"{"summary":"ok","questions":["Which port?","Keep the flag?"]}"#)
+                .unwrap();
+        assert_eq!(
+            report.questions,
+            [
+                question("Which port?", "", &[]),
+                question("Keep the flag?", "", &[])
+            ]
+        );
+    }
+
+    #[test]
+    fn object_questions_still_parse() {
+        let report = parse_contract(
+            r#"{"summary":"ok","questions":[{"text":"Which port?","class":"decision","options":["80","443"]}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            report.questions,
+            [question("Which port?", "decision", &["80", "443"])]
+        );
+    }
+
+    #[test]
+    fn a_mix_of_string_and_object_questions_parses() {
+        let report = parse_contract(
+            r#"{"summary":"ok","questions":["Plain?",{"text":"Typed?","class":"preference"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            report.questions,
+            [
+                question("Plain?", "", &[]),
+                question("Typed?", "preference", &[])
+            ]
+        );
+    }
+
+    #[test]
+    fn a_question_that_is_neither_object_nor_string_still_fails() {
+        let err = parse_contract(r#"{"summary":"ok","questions":["fine",42]}"#).unwrap_err();
+        assert!(err.contains("did not parse"), "{err}");
+        assert!(parse_contract(r#"{"summary":"ok","questions":[null]}"#).is_err());
+        assert!(parse_contract(r#"{"summary":"ok","questions":[["nested"]]}"#).is_err());
     }
 }
