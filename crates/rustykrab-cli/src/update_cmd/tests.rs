@@ -81,8 +81,31 @@ enum Digest {
 /// Serve `/repos/gcbh/rustykrab/releases/latest` and the asset; returns
 /// the base URL and a count of asset downloads.
 async fn stand_in(tag: &str, digest: Digest, bytes: Vec<u8>) -> (String, Arc<Mutex<usize>>) {
+    let served = stand_in_with(tag, digest, bytes, None, "127.0.0.1").await;
+    (served.base, served.downloads)
+}
+
+/// What a stand-in saw.
+struct Served {
+    base: String,
+    downloads: Arc<Mutex<usize>>,
+    /// The `Authorization` header of each request, as `"<route>:<header>"`.
+    auth: Arc<Mutex<Vec<String>>>,
+}
+
+/// [`stand_in`], with the asset's declared `size` (the real length when
+/// `None`) and the host its `browser_download_url` names. The listener is
+/// on 127.0.0.1, so `localhost` reaches the same server under another host.
+async fn stand_in_with(
+    tag: &str,
+    digest: Digest,
+    bytes: Vec<u8>,
+    size: Option<u64>,
+    asset_host: &str,
+) -> Served {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let base = format!("http://{}", listener.local_addr().unwrap());
+    let addr = listener.local_addr().unwrap();
+    let base = format!("http://{addr}");
     let name = format!("rustykrab-{TARGET}.tar.gz");
     let digest = match digest {
         Digest::Right => serde_json::json!(format!("sha256:{}", sha256_hex(&bytes))),
@@ -93,30 +116,52 @@ async fn stand_in(tag: &str, digest: Digest, bytes: Vec<u8>) -> (String, Arc<Mut
         "tag_name": tag,
         "assets": [{
             "name": name,
-            "browser_download_url": format!("{base}/download/{name}"),
+            "browser_download_url":
+                format!("http://{asset_host}:{}/download/{name}", addr.port()),
             "digest": digest,
+            "size": size.unwrap_or(bytes.len() as u64),
         }],
     });
     let downloads = Arc::new(Mutex::new(0usize));
     let counter = downloads.clone();
+    let auth = Arc::new(Mutex::new(Vec::new()));
+    let (auth_release, auth_download) = (auth.clone(), auth.clone());
+    let header = |headers: &axum::http::HeaderMap| {
+        headers
+            .get("authorization")
+            .map(|v| v.to_str().unwrap_or("?").to_string())
+            .unwrap_or_else(|| "none".to_string())
+    };
     let app = Router::new()
         .route(
             "/repos/gcbh/rustykrab/releases/latest",
-            get(move || {
+            get(move |headers: axum::http::HeaderMap| {
+                auth_release
+                    .lock()
+                    .unwrap()
+                    .push(format!("release:{}", header(&headers)));
                 let release = release.clone();
                 async move { axum::Json(release) }
             }),
         )
         .route(
             &format!("/download/{name}"),
-            get(move || {
+            get(move |headers: axum::http::HeaderMap| {
                 *counter.lock().unwrap() += 1;
+                auth_download
+                    .lock()
+                    .unwrap()
+                    .push(format!("download:{}", header(&headers)));
                 let bytes = bytes.clone();
                 async move { bytes }
             }),
         );
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    (base, downloads)
+    Served {
+        base,
+        downloads,
+        auth,
+    }
 }
 
 fn config(data_dir: &Path, api_base: &str) -> Config {
@@ -540,4 +585,149 @@ fn a_stage_killed_midway_leaves_no_scratch_behind_the_next() {
     let scratch = Scratch::new(&updates).unwrap();
     assert!(!updates.join(".staging-left-by-a-kill").exists());
     drop(scratch);
+}
+
+#[tokio::test]
+async fn an_asset_declared_over_the_cap_is_refused_without_downloading() {
+    let served = stand_in_with(
+        "v5.4.0",
+        Digest::Right,
+        archive(),
+        Some(MAX_ASSET_BYTES + 1),
+        "127.0.0.1",
+    )
+    .await;
+    let data = tempfile::tempdir().unwrap();
+    let verifier = Scripted::passing("5.4.0");
+    let err = stage_release(&config(data.path(), &served.base), &verifier, false)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("cap"), "{err:#}");
+    assert_eq!(*served.downloads.lock().unwrap(), 0);
+    assert!(updates_entries(data.path()).is_empty());
+    assert!(verifier.calls().is_empty());
+}
+
+#[tokio::test]
+async fn a_body_longer_than_its_declared_size_is_refused() {
+    let bytes = archive();
+    let short = bytes.len() as u64 - 1;
+    let served = stand_in_with("v5.4.0", Digest::Right, bytes, Some(short), "127.0.0.1").await;
+    let data = tempfile::tempdir().unwrap();
+    let verifier = Scripted::passing("5.4.0");
+    let err = stage_release(&config(data.path(), &served.base), &verifier, false)
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("longer than its declared"),
+        "{err:#}"
+    );
+    assert!(updates_entries(data.path()).is_empty());
+    assert!(verifier.calls().is_empty());
+}
+
+#[tokio::test]
+async fn a_body_shorter_than_its_declared_size_is_refused() {
+    let bytes = archive();
+    let long = bytes.len() as u64 + 1;
+    let served = stand_in_with("v5.4.0", Digest::Right, bytes, Some(long), "127.0.0.1").await;
+    let data = tempfile::tempdir().unwrap();
+    let err = stage_release(
+        &config(data.path(), &served.base),
+        &Scripted::passing("5.4.0"),
+        false,
+    )
+    .await
+    .unwrap_err();
+    assert!(err.to_string().contains("the release declares"), "{err:#}");
+    assert!(updates_entries(data.path()).is_empty());
+}
+
+#[tokio::test]
+async fn the_token_goes_to_the_api_host_only() {
+    // The asset names `localhost`, another host than the API's 127.0.0.1.
+    let served = stand_in_with("v5.4.0", Digest::Right, archive(), None, "localhost").await;
+    let data = tempfile::tempdir().unwrap();
+    let cfg = Config {
+        token: Some("ghp_secret".to_string()),
+        ..config(data.path(), &served.base)
+    };
+    let outcome = stage_release(&cfg, &Scripted::passing("5.4.0"), false)
+        .await
+        .unwrap();
+    assert!(matches!(outcome, StageOutcome::Staged(_)));
+    assert_eq!(
+        *served.auth.lock().unwrap(),
+        vec![
+            "release:Bearer ghp_secret".to_string(),
+            "download:none".to_string()
+        ]
+    );
+
+    // On the API's own host it goes with the download too.
+    let served = stand_in_with("v5.4.0", Digest::Right, archive(), None, "127.0.0.1").await;
+    let data = tempfile::tempdir().unwrap();
+    let cfg = Config {
+        token: Some("ghp_secret".to_string()),
+        ..config(data.path(), &served.base)
+    };
+    stage_release(&cfg, &Scripted::passing("5.4.0"), false)
+        .await
+        .unwrap();
+    assert_eq!(
+        *served.auth.lock().unwrap(),
+        vec![
+            "release:Bearer ghp_secret".to_string(),
+            "download:Bearer ghp_secret".to_string()
+        ]
+    );
+}
+
+#[test]
+fn an_asset_url_must_be_https_unless_the_api_is_a_local_http_stand_in() {
+    let api = "https://api.github.com";
+    assert!(!asset_request_sends_token(api, "https://github.com/x/y.tar.gz").unwrap());
+    assert!(asset_request_sends_token(api, "https://api.github.com/x/y.tar.gz").unwrap());
+    assert!(!asset_request_sends_token(api, "https://api.github.com:8443/x").unwrap());
+    let err = asset_request_sends_token(api, "http://api.github.com/x").unwrap_err();
+    assert!(err.to_string().contains("not https"), "{err:#}");
+    assert!(asset_request_sends_token(api, "file:///etc/passwd").is_err());
+    let local = "http://127.0.0.1:4000";
+    assert!(asset_request_sends_token(local, "http://127.0.0.1:4000/x").unwrap());
+    assert!(!asset_request_sends_token(local, "http://127.0.0.1:4001/x").unwrap());
+    assert!(!asset_request_sends_token(local, "http://localhost:4000/x").unwrap());
+}
+
+#[tokio::test]
+async fn a_pre_release_tag_stages_nothing_and_check_says_so() {
+    let (base, downloads) = stand_in("v5.4.0-rc.1", Digest::Right, archive()).await;
+    let data = tempfile::tempdir().unwrap();
+    let cfg = config(data.path(), &base);
+
+    let latest = check(&cfg).await.unwrap();
+    assert!(!latest.plain);
+    assert!(!latest.newer);
+    let said = latest.describe(&cfg);
+    assert!(said.contains("nothing newer"), "{said}");
+    assert!(said.contains("v5.4.0-rc.1"), "{said}");
+    assert!(said.contains("not a plain vX.Y.Z"), "{said}");
+
+    let verifier = Scripted::passing("5.4.0");
+    let outcome = stage_release(&cfg, &verifier, false).await.unwrap();
+    assert!(matches!(outcome, StageOutcome::NotNewer(ref l) if !l.plain));
+    assert_eq!(*downloads.lock().unwrap(), 0);
+    assert!(updates_entries(data.path()).is_empty());
+    assert!(verifier.calls().is_empty());
+}
+
+#[test]
+fn config_debug_redacts_the_token() {
+    let cfg = Config {
+        token: Some("ghp_secret".to_string()),
+        ..config(Path::new("/tmp/data"), DEFAULT_API_BASE)
+    };
+    let shown = format!("{cfg:?}");
+    assert!(!shown.contains("ghp_secret"), "{shown}");
+    assert!(shown.contains("<redacted>"), "{shown}");
+    assert!(shown.contains(DEFAULT_REPO), "{shown}");
 }
