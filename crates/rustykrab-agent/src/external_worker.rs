@@ -39,6 +39,15 @@
 //! `budget/wall`, a failed process `process/<code>`, an unreadable final
 //! message `model/format`.
 //!
+//! **Its turn budget.** The brief tells a Claude Code agent how many turns
+//! it has and asks it to commit and return the contract with a few to
+//! spare. One that still stops at the cap (`error_max_turns`) and printed a
+//! session id is resumed once (`--resume <session>`, the same allowlist,
+//! permission mode and directory, at most [`RESUME_TURNS`] turns) and asked
+//! only for the contract for the work it already committed. That report is
+//! read and attested as usual, with a `known_limits` entry saying it was
+//! recovered; if the resume fails too, the run stays `budget/iterations`.
+//!
 //! **Its environment** is cleared: only the variables an agent CLI needs
 //! (`PATH`, `HOME`, the locale, its own config and key variables) and the
 //! names the spec lists pass through, plus `RUSTYKRAB_DATA_DIR` and
@@ -79,6 +88,15 @@ use serde_json::Value;
 const STDERR_TAIL: usize = 600;
 /// Commands recorded per run; the rest are counted, not kept.
 const COMMANDS_MAX: usize = 64;
+/// Turns a resume after the turn cap gets to return the contract.
+pub const RESUME_TURNS: u32 = 2;
+
+/// The section 5 result contract's shape, as the brief shows it.
+const CONTRACT_SHAPE: &str = "{\"summary\": \"...\", \"artifacts\": [{\"kind\": \"path\", \
+     \"value\": \"...\"}], \"changed_paths\": [\"...\"], \"commit\": \"<sha>\" or null, \
+     \"checks_run\": [\"...\"], \"known_limits\": [], \"blocked\": null, \"error\": null, \
+     \"questions\": [], \"discovered\": [{\"kind\": \"code\", \"title\": \"...\", \
+     \"objective\": \"...\", \"done_when\": \"...\"}]}";
 
 /// Claude Code's tools a worker gets when the spec names none: reading and
 /// editing files, and the local git and build commands a change needs.
@@ -366,6 +384,8 @@ struct Transcript {
     usage: RunUsage,
     /// Set when the agent's own result says it stopped on an error.
     failure: Option<RunFailure>,
+    /// Claude Code's session id, when it printed one.
+    session: Option<String>,
 }
 
 impl ExternalWorker {
@@ -421,14 +441,18 @@ impl ExternalWorker {
     }
 
     /// Read what the agent printed into the result contract, or the typed
-    /// reason there is none; record what it spent and the commands it ran.
+    /// reason there is none; record what it spent and the commands it ran,
+    /// adding to what an earlier invocation of the same run recorded when
+    /// `resumed`. Also returns the session to resume when a Claude Code run
+    /// stopped at its turn cap and printed one.
     fn read_output(
         &self,
         brief: &Brief,
         run: &str,
         output: &std::process::Output,
         last: &Path,
-    ) -> Result<ResultReport> {
+        resumed: bool,
+    ) -> (Result<ResultReport>, Option<String>) {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         let mut transcript = match self.config.kind {
@@ -442,18 +466,36 @@ impl ExternalWorker {
                 }
             }
         }
-        self.usage
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(run.to_string(), transcript.usage);
-        self.commands
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(brief.item.clone(), std::mem::take(&mut transcript.commands));
-        if let Some(failure) = transcript.failure.take() {
-            return Err(failure.into_error());
+        {
+            let mut usage = self.usage.lock().unwrap_or_else(|e| e.into_inner());
+            let entry = usage.entry(run.to_string()).or_default();
+            if resumed {
+                entry.tokens += transcript.usage.tokens;
+                entry.iterations = entry.iterations.saturating_add(transcript.usage.iterations);
+            } else {
+                *entry = transcript.usage;
+            }
         }
-        match &transcript.final_message {
+        {
+            let mut commands = self.commands.lock().unwrap_or_else(|e| e.into_inner());
+            let ran = std::mem::take(&mut transcript.commands);
+            if resumed {
+                commands.entry(brief.item.clone()).or_default().extend(ran);
+            } else {
+                commands.insert(brief.item.clone(), ran);
+            }
+        }
+        if let Some(failure) = transcript.failure.take() {
+            let resume = match failure {
+                RunFailure::Budget {
+                    budget: BudgetKind::Iterations,
+                    ..
+                } if self.config.kind == WorkerKind::ClaudeCode => transcript.session.take(),
+                _ => None,
+            };
+            return (Err(failure.into_error()), resume);
+        }
+        let outcome = match &transcript.final_message {
             Some(text) => parse_contract(text).map_err(|why| {
                 RunFailure::Model {
                     problem: ProviderProblem::Format,
@@ -470,16 +512,28 @@ impl ExternalWorker {
                 ),
             }
             .into_error()),
-        }
+        };
+        (outcome, None)
     }
 
-    /// The process for one run.
+    /// The turns a Claude Code run gets: the worker's cap, or the item's
+    /// iteration budget when that is smaller.
+    fn turn_limit(&self, brief: &Brief) -> u32 {
+        self.config
+            .max_turns
+            .min(brief.budget.iterations.max(1))
+            .max(1)
+    }
+
+    /// The process for one run, or with `resume`, the Claude Code session
+    /// to continue for [`RESUME_TURNS`] turns.
     fn command(
         &self,
         prompt: &str,
         dir: &Path,
         brief: &Brief,
         last: &Path,
+        resume: Option<&str>,
     ) -> tokio::process::Command {
         let c = &self.config;
         let mut cmd = tokio::process::Command::new(&c.command);
@@ -503,19 +557,21 @@ impl ExternalWorker {
                 cmd.arg(prompt);
             }
             _ => {
-                let turns = c
-                    .max_turns
-                    .min(brief.budget.iterations.max(1))
-                    .max(1)
-                    .to_string();
+                let turns = match resume {
+                    Some(_) => RESUME_TURNS,
+                    None => self.turn_limit(brief),
+                }
+                .to_string();
                 let allowed = if c.allowed_tools.is_empty() {
                     CLAUDE_DEFAULT_TOOLS.join(",")
                 } else {
                     c.allowed_tools.join(",")
                 };
-                cmd.arg("-p")
-                    .arg(prompt)
-                    .args(["--output-format", "stream-json", "--verbose"])
+                cmd.arg("-p").arg(prompt);
+                if let Some(session) = resume {
+                    cmd.args(["--resume", session]);
+                }
+                cmd.args(["--output-format", "stream-json", "--verbose"])
                     .args(["--max-turns", &turns])
                     .args(["--permission-mode", &c.permission_mode])
                     .args(["--allowedTools", &allowed])
@@ -555,6 +611,104 @@ impl ExternalWorker {
             .env("RUSTYKRAB_SKILLS_DIR", &c.skills_dir);
         cmd
     }
+
+    /// Start `cmd` in a process group recorded in [`RunGroups`] and wait
+    /// for it, up to `limit`. Whatever it left running in its group is
+    /// killed when this returns. Also says whether daemon shutdown
+    /// ([`RunGroups::terminate_all`]) ended the group, which must be read
+    /// before the group is let go.
+    async fn execute(
+        &self,
+        mut cmd: tokio::process::Command,
+        limit: Duration,
+    ) -> (Result<std::process::Output>, bool) {
+        let child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(e) => {
+                let why = format!("cannot start {}: {e}", self.config.command.display());
+                return (Err(process_failure(None, &why)), false);
+            }
+        };
+        // The agent leads its own group, so the group id is its pid.
+        let group = child
+            .id()
+            .and_then(|pid| i32::try_from(pid).ok())
+            .map(|pid| self.groups.enter(pid));
+        let output = match tokio::time::timeout(limit, child.wait_with_output()).await {
+            // The child was dropped with the future, and killed; the rest
+            // of its group goes when `group` does.
+            Err(_) => Err(RunFailure::Budget {
+                budget: BudgetKind::Wall,
+                detail: format!(
+                    "{}s wall budget spent before {} returned",
+                    limit.as_secs(),
+                    self.config.command.display()
+                ),
+            }
+            .into_error()),
+            Ok(Err(e)) => Err(process_failure(None, &e.to_string())),
+            Ok(Ok(output)) => Ok(output),
+        };
+        let interrupted = group.as_ref().is_some_and(GroupGuard::interrupted);
+        // Whatever the agent left running in its group goes with it.
+        drop(group);
+        (output, interrupted)
+    }
+
+    /// Resume a Claude Code session that stopped at its turn cap and ask
+    /// only for the result contract. `None` when there is no time left or
+    /// the resume did not return one; beside it, whether daemon shutdown
+    /// ended the resume.
+    async fn recover(
+        &self,
+        brief: &Brief,
+        run: &str,
+        session: &str,
+        dir: &Path,
+        last: &Path,
+        limit: Duration,
+    ) -> (Option<ResultReport>, bool) {
+        if limit.is_zero() {
+            return (None, false);
+        }
+        let cmd = self.command(&resume_prompt(), dir, brief, last, Some(session));
+        let (executed, interrupted) = self.execute(cmd, limit).await;
+        let recovered = match executed {
+            Ok(output) => self.read_output(brief, run, &output, last, true).0,
+            Err(e) => Err(e),
+        };
+        let report = match recovered {
+            Ok(mut report) => {
+                report.known_limits.push(format!(
+                    "recovered after the turn cap: the run stopped at its {}-turn limit and this \
+                     report came from resuming its session for at most {RESUME_TURNS} turns",
+                    self.turn_limit(brief)
+                ));
+                Some(report)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    worker = %self.name,
+                    item = %brief.item,
+                    error = %e,
+                    "resume after the turn cap returned no contract"
+                );
+                None
+            }
+        };
+        (report, interrupted)
+    }
+}
+
+/// What a resume after the turn cap is asked.
+fn resume_prompt() -> String {
+    format!(
+        "You ran out of turns before returning the result contract. Do no more work and run \
+         nothing. Return the result contract for the work already committed on this branch: \
+         commit is the sha of your last commit, or null if you committed nothing, and \
+         changed_paths are exactly the files your commits change. End with one JSON object and \
+         nothing after it:\n{CONTRACT_SHAPE}\n"
+    )
 }
 
 /// Whether the brief is a capability build of a tool: its facet says
@@ -692,49 +846,45 @@ impl Worker for ExternalWorker {
             prune_dirs(&self.runs_root(), window);
         }
 
+        let turns = match self.config.kind {
+            WorkerKind::Codex => None,
+            _ => Some(self.turn_limit(&brief)),
+        };
         let prompt = render_executor_brief(
             &brief,
             &self.name,
             self.config.kind,
             &dir,
             &self.config.skills_dir,
+            turns,
         );
         let last = std::env::temp_dir().join(format!("rustykrab-last-{}.txt", short(&run_id)));
-        let mut cmd = self.command(&prompt, &dir, &brief, &last);
+        let cmd = self.command(&prompt, &dir, &brief, &last, None);
         let limit = match brief.budget.wall_seconds {
             0 => self.config.timeout,
             secs => self.config.timeout.min(Duration::from_secs(secs)),
         };
         let started = std::time::Instant::now();
-        let child = cmd.spawn().map_err(|e| {
-            process_failure(
-                None,
-                &format!("cannot start {}: {e}", self.config.command.display()),
-            )
-        })?;
-        // The agent leads its own group, so the group id is its pid.
-        let group = child
-            .id()
-            .and_then(|pid| i32::try_from(pid).ok())
-            .map(|pid| self.groups.enter(pid));
-        let outcome = match tokio::time::timeout(limit, child.wait_with_output()).await {
-            // The child was dropped with the future, and killed; the rest
-            // of its group goes when `group` does.
-            Err(_) => Err(RunFailure::Budget {
-                budget: BudgetKind::Wall,
-                detail: format!(
-                    "{}s wall budget spent before {} returned",
-                    limit.as_secs(),
-                    self.config.command.display()
-                ),
-            }
-            .into_error()),
-            Ok(Err(e)) => Err(process_failure(None, &e.to_string())),
-            Ok(Ok(output)) => self.read_output(&brief, &run_id, &output, &last),
+        let (executed, mut interrupted) = self.execute(cmd, limit).await;
+        let (mut outcome, resume) = match executed {
+            Ok(output) => self.read_output(&brief, &run_id, &output, &last, false),
+            Err(e) => (Err(e), None),
         };
+        // A run that stopped at its turn cap may still have committed its
+        // work: ask the same session for the contract, within what is left
+        // of the wall limit. Not once the daemon is shutting down.
+        if let Some(session) = resume.filter(|_| !interrupted) {
+            let left = limit.saturating_sub(started.elapsed());
+            let (report, stopped) = self
+                .recover(&brief, &run_id, &session, &dir, &last, left)
+                .await;
+            interrupted = stopped;
+            if let Some(report) = report {
+                outcome = Ok(report);
+            }
+        }
         // Shutdown ended the group: whatever the process said, the run was
         // interrupted, not failed. A report it managed to hand in stands.
-        let interrupted = outcome.is_err() && group.as_ref().is_some_and(GroupGuard::interrupted);
         let outcome = match outcome {
             Err(e) if interrupted => Err(RunFailure::Interrupted {
                 detail: tail(
@@ -748,8 +898,6 @@ impl Worker for ExternalWorker {
             .into_error()),
             other => other,
         };
-        // Whatever the agent left running in its group goes with it.
-        drop(group);
         self.usage
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -838,6 +986,9 @@ fn read_claude(stdout: &str) -> Transcript {
         let Ok(event) = serde_json::from_str::<Value>(line.trim()) else {
             continue;
         };
+        if let Some(session) = event["session_id"].as_str().filter(|s| !s.is_empty()) {
+            t.session = Some(session.to_string());
+        }
         match event["type"].as_str() {
             Some("assistant") => {
                 for block in event["message"]["content"].as_array().into_iter().flatten() {
@@ -1112,13 +1263,14 @@ fn sanitise(value: &mut Value) -> std::result::Result<(), String> {
 /// Render a brief as the delivery plan's executor brief (its section 5.2:
 /// the work-item slice, parent SHA, repository context, allowed tools and
 /// prior failed evidence), then the section 5 result contract the final
-/// message must be.
+/// message must be. `turns` is the run's turn limit, when it has one.
 pub fn render_executor_brief(
     brief: &Brief,
     name: &str,
     kind: WorkerKind,
     dir: &Path,
     skills_dir: &Path,
+    turns: Option<u32>,
 ) -> String {
     let mut out = String::new();
     let _ = writeln!(
@@ -1213,6 +1365,13 @@ pub fn render_executor_brief(
     }
     out.push('\n');
     out.push_str("How to finish:\n");
+    if let Some(turns) = turns {
+        let _ = writeln!(
+            out,
+            "- You have {turns} turns in all. Commit and return the result contract with a few \
+             turns to spare; a run that reaches the limit without it loses its work."
+        );
+    }
     if let Some(ws) = &brief.workspace {
         let _ = writeln!(
             out,
@@ -1233,13 +1392,10 @@ pub fn render_executor_brief(
          instead of guessing. \"blocked\" is {\"reason\": \"needs_decision\", \"detail\": \
          \"the question or what you need\", \"needs\": []}, its reason one of needs_tool, \
          needs_credential, needs_decision or needs_consent; the question goes in \"detail\".\n\
-         End with one JSON object and nothing after it, the result contract:\n\
-         {\"summary\": \"...\", \"artifacts\": [{\"kind\": \"path\", \"value\": \"...\"}], \
-         \"changed_paths\": [\"...\"], \"commit\": \"<sha>\" or null, \"checks_run\": [\"...\"], \
-         \"known_limits\": [], \"blocked\": null, \"error\": null, \"questions\": [], \
-         \"discovered\": [{\"kind\": \"code\", \"title\": \"...\", \"objective\": \"...\", \
-         \"done_when\": \"...\"}]}\n",
+         End with one JSON object and nothing after it, the result contract:\n",
     );
+    out.push_str(CONTRACT_SHAPE);
+    out.push('\n');
     out
 }
 
@@ -1631,6 +1787,140 @@ wait
         assert!(!missing.healthy());
     }
 
+    /// A Claude Code stand-in that commits, then stops at its turn cap with
+    /// session `sess-1`. Resumed (`--resume`), it records its arguments and
+    /// runs `on_resume`.
+    fn capped_claude(on_resume: &str) -> String {
+        let first = r#"#!/bin/sh
+resume=""
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "--resume" ]; then resume="$a"; fi
+  prev="$a"
+done
+if [ -z "$resume" ]; then
+  printf '%s\n' "$@" > "$RUSTYKRAB_DATA_DIR/args.txt"
+  echo 'pub fn status() {}' >> src/lib.rs
+  git add src/lib.rs
+  git -c user.name=t -c user.email=t@x.invalid commit -q --no-gpg-sign -m change
+  echo '{"type":"system","subtype":"init","session_id":"sess-1"}'
+  echo '{"type":"assistant","session_id":"sess-1","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"cargo test -p fixture"}}]}}'
+  echo '{"type":"result","subtype":"error_max_turns","is_error":true,"num_turns":25,"session_id":"sess-1","usage":{"input_tokens":100,"output_tokens":20}}'
+  exit 1
+fi
+printf '%s\n' "$@" > "$RUSTYKRAB_DATA_DIR/resume.txt"
+"#;
+        format!("{first}{on_resume}\n")
+    }
+
+    /// The resume answers with the contract for the commit already made.
+    const RESUME_CONTRACT: &str = r#"sha=$(git rev-parse HEAD)
+echo '{"type":"assistant","session_id":"sess-1","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"git log -1"}}]}}'
+contract="{\\\"summary\\\":\\\"added status\\\",\\\"changed_paths\\\":[\\\"src/lib.rs\\\"],\\\"commit\\\":\\\"$sha\\\",\\\"checks_run\\\":[\\\"cargo test -p fixture\\\"]}"
+echo "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"num_turns\":2,\"session_id\":\"sess-1\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5},\"result\":\"$contract\"}""#;
+
+    #[tokio::test]
+    async fn the_brief_names_the_turn_limit() {
+        let f = Fixture::new();
+        let mut worker = f.worker(WorkerKind::ClaudeCode, f.agent("claude", CLAUDE));
+        worker.config.max_turns = 12;
+        worker.run(brief(Some(f.workspace()))).await.unwrap();
+        let args = std::fs::read_to_string(f.data.path().join("args.txt")).unwrap();
+        assert!(args.contains("--max-turns\n12\n"), "{args}");
+        assert!(args.contains("You have 12 turns in all"), "{args}");
+        assert!(args.contains("with a few turns to spare"), "{args}");
+        // Codex has no turn cap to name.
+        let codex = render_executor_brief(
+            &brief(None),
+            "pinch",
+            WorkerKind::Codex,
+            Path::new("/tmp/run"),
+            Path::new("/tmp/skills"),
+            None,
+        );
+        assert!(!codex.contains("turns in all"), "{codex}");
+    }
+
+    #[tokio::test]
+    async fn a_run_at_its_turn_cap_is_resumed_once_for_its_contract() {
+        let f = Fixture::new();
+        let worker = f.worker(
+            WorkerKind::ClaudeCode,
+            f.agent("claude", &capped_claude(RESUME_CONTRACT)),
+        );
+        let ws = f.workspace();
+        let report = worker.run(brief(Some(ws.clone()))).await.unwrap();
+
+        assert_eq!(report.summary, "added status");
+        assert_eq!(report.changed_paths, ["src/lib.rs"]);
+        let sha = report.commit.clone().unwrap();
+        assert_eq!(git(f.repo.path(), &["cat-file", "-t", &sha]), "commit");
+        assert!(
+            report
+                .known_limits
+                .iter()
+                .any(|l| l.contains("recovered after the turn cap")),
+            "{:?}",
+            report.known_limits
+        );
+        // Attested as usual, with what both invocations ran.
+        let ran: Vec<&str> = report
+            .artifacts
+            .iter()
+            .filter(|a| a.kind == COMMAND_RUN)
+            .map(|a| a.value.as_str())
+            .collect();
+        assert_eq!(ran, ["cargo test -p fixture", "git log -1"]);
+        let usage = worker.usage("run-1").unwrap();
+        assert_eq!((usage.tokens, usage.iterations), (135, 27));
+
+        // The same session, allowlist and permission mode, for two turns,
+        // asked only for the contract.
+        let first = std::fs::read_to_string(f.data.path().join("args.txt")).unwrap();
+        let resume = std::fs::read_to_string(f.data.path().join("resume.txt")).unwrap();
+        assert!(resume.contains("--resume\nsess-1\n"), "{resume}");
+        assert!(resume.contains("--max-turns\n2\n"), "{resume}");
+        assert!(
+            resume.contains("--permission-mode\nacceptEdits\n"),
+            "{resume}"
+        );
+        let after = |args: &str, flag: &str| {
+            let mut lines = args.lines();
+            lines.find(|l| *l == flag);
+            lines.next().map(str::to_string)
+        };
+        assert_eq!(
+            after(&resume, "--allowedTools"),
+            after(&first, "--allowedTools")
+        );
+        assert_eq!(
+            after(&resume, "--disallowedTools"),
+            after(&first, "--disallowedTools")
+        );
+        assert!(resume.contains("already committed"), "{resume}");
+        assert!(!ws.path.exists(), "a recovered run gives its worktree back");
+    }
+
+    #[tokio::test]
+    async fn a_failed_resume_leaves_the_run_at_its_turn_cap() {
+        let f = Fixture::new();
+        for on_resume in [
+            "echo 'resume failed' >&2\nexit 1",
+            "echo '{\"type\":\"result\",\"subtype\":\"error_max_turns\",\"is_error\":true,\"num_turns\":2,\"session_id\":\"sess-1\"}'",
+            "echo '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"num_turns\":1,\"result\":\"I could not finish.\"}'",
+        ] {
+            let worker = f.worker(
+                WorkerKind::ClaudeCode,
+                f.agent("claude", &capped_claude(on_resume)),
+            );
+            let err = worker.run(brief(None)).await.unwrap_err();
+            let e = classify(&run_failure_input(&err), &Context::default());
+            assert_eq!(e.subclass, ErrorSubclass::Iterations, "{on_resume}: {err}");
+            assert!(f.data.path().join("resume.txt").exists(), "resumed once");
+            std::fs::remove_file(f.data.path().join("resume.txt")).unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn a_capability_build_is_told_where_the_skills_are() {
         let f = Fixture::new();
@@ -1650,6 +1940,7 @@ wait
             WorkerKind::ClaudeCode,
             Path::new("/tmp/run"),
             &f.data.path().join("skills"),
+            None,
         );
         assert!(!acquiring.contains("SKILL.md"), "{acquiring}");
         b.capability = Some(rustykrab_core::work::CapabilityMode::Build);
@@ -1659,6 +1950,7 @@ wait
             WorkerKind::ClaudeCode,
             Path::new("/tmp/run"),
             &f.data.path().join("skills"),
+            None,
         );
         let skill = f.data.path().join("skills/tide_table/SKILL.md");
         assert!(prompt.contains(&skill.display().to_string()), "{prompt}");
@@ -1777,6 +2069,7 @@ printf '{"summary":"added status","changed_paths":["src/lib.rs"],"checks_run":["
             WorkerKind::ClaudeCode,
             Path::new("/tmp/w"),
             Path::new("/tmp/skills"),
+            Some(80),
         );
         assert!(
             prompt.contains(
