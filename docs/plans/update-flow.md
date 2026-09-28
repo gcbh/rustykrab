@@ -206,6 +206,35 @@ Progress:
     URL too;
   - choose a stage by version rather than by the record's `staged_at`.
 
+- **Part 2 is merged** (batch 8), behind the same gate. The copy's checks
+  now run before the stop, and a journal lets the next run recover.
+  A rollback survives a bad-record failure, and a failed rollback writes
+  a file that blocks later runs. Its review found three more problems:
+  1. The journal and the failure file lived in the data directory, where
+     a worker could write. A forged journal could make the next run, even
+     one without `--yes`, roll a healthy daemon back to `.prev`, and
+     deleting the failure file would hide a failed rollback.
+  2. A crash between the renames and the journal's `swapped` write started
+     the new version unchecked, and later runs then reported nothing to
+     do.
+  3. Under launchd, a `bootout` that returns while the job is still
+     draining made the stop step give up without restarting it.
+
+  Part 2b moves both files beside the install. Before any rollback it
+  checks the installed and `.prev` binaries against the journal's
+  commits, and it fixes the crash window, the launchd stop and the
+  smaller findings.
+
+**The limit of all this.** Workers run as the same macOS user as the
+daemon, so "a worker cannot write it" holds only as far as the worker's
+tool rules go. Claude Code's edit tools stay inside the worktree, but a
+`cargo` build script it may run can write anywhere the user can. These
+checks stop a confused worker and make a determined one leave traces.
+Isolation that holds against a hostile worker needs a separate user or
+sandbox for workers. That is a decision for the owner, and the updater
+should not be installed on the live daemon without it being made
+knowingly.
+
 Also required:
 - The script service stops only a loopback listener whose executable is
   the installed one.
