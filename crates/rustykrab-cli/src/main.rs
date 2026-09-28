@@ -3451,6 +3451,7 @@ mod control_tick_log_tests {
     struct WaitingControl {
         lock: Option<rustykrab_control::handle::LockState>,
         ticks: Mutex<u32>,
+        runs: usize,
     }
 
     #[async_trait::async_trait]
@@ -3494,6 +3495,7 @@ mod control_tick_log_tests {
         fn loop_status(&self) -> Option<LoopStatus> {
             Some(LoopStatus {
                 lock: self.lock,
+                runs_in_flight: self.runs,
                 ..LoopStatus::default()
             })
         }
@@ -3557,6 +3559,48 @@ mod control_tick_log_tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn drain_logs_its_wait_at_most_once_per_report_interval() {
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        // Two runs never finish. The real drain polls every 250 ms and
+        // reports every 5 s over a 20 s grace; scaled down by 20 that is
+        // 12.5 ms polls, 250 ms reports and a 1 s grace, about 80 polls.
+        let control = WaitingControl {
+            runs: 2,
+            ..WaitingControl::default()
+        };
+        let left = drain_polling(
+            &control,
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_micros(12_500),
+            std::time::Duration::from_millis(250),
+        )
+        .await;
+        assert_eq!(left, 2);
+
+        let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        let waits: Vec<&str> = log
+            .lines()
+            .filter(|l| l.contains("draining: waiting for runs in flight"))
+            .collect();
+        // One when draining starts, then at most one per 250 ms after it:
+        // four in all, where logging every poll wrote about eighty.
+        assert!((1..=4).contains(&waits.len()), "{log}");
+        assert!(waits[0].contains("runs=2"), "{log}");
+        assert!(waits[0].contains("secs_left=1"), "{log}");
+        assert!(
+            log.contains("runs still in flight after the drain grace"),
+            "{log}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn failed_final_tick_logs_its_class_and_consecutive_count() {
         let captured = Captured::default();
         let writer = captured.clone();
@@ -3585,15 +3629,35 @@ mod control_tick_log_tests {
 /// the runs in flight to finish (the tick loop keeps reconciling them).
 /// Returns how many are still running.
 async fn drain(control: &dyn ControlHandle, grace: std::time::Duration) -> usize {
+    drain_polling(
+        control,
+        grace,
+        std::time::Duration::from_millis(250),
+        std::time::Duration::from_secs(5),
+    )
+    .await
+}
+
+/// [`drain`] with its intervals spelled out: poll every `poll`, and log the
+/// wait when it starts and then at most once per `report_every`, so a 20 s
+/// grace writes a handful of lines rather than one per poll.
+async fn drain_polling(
+    control: &dyn ControlHandle,
+    grace: std::time::Duration,
+    poll: std::time::Duration,
+    report_every: std::time::Duration,
+) -> usize {
     control.set_draining(true);
     let deadline = tokio::time::Instant::now() + grace;
+    let mut last_report: Option<tokio::time::Instant> = None;
     loop {
         let in_flight = control.loop_status().map_or(0, |s| s.runs_in_flight);
         if in_flight == 0 {
             tracing::info!("controller drained");
             return 0;
         }
-        if tokio::time::Instant::now() >= deadline {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
             tracing::warn!(
                 runs = in_flight,
                 grace_secs = grace.as_secs(),
@@ -3601,8 +3665,15 @@ async fn drain(control: &dyn ControlHandle, grace: std::time::Duration) -> usize
             );
             return in_flight;
         }
-        tracing::info!(runs = in_flight, "draining: waiting for runs in flight");
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        if last_report.is_none_or(|at| now.duration_since(at) >= report_every) {
+            tracing::info!(
+                runs = in_flight,
+                secs_left = deadline.duration_since(now).as_secs_f64().ceil() as u64,
+                "draining: waiting for runs in flight"
+            );
+            last_report = Some(now);
+        }
+        tokio::time::sleep(poll).await;
     }
 }
 
