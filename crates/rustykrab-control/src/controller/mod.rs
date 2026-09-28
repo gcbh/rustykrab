@@ -189,8 +189,9 @@ impl ToolCatalog for StaticCatalog {
 #[async_trait]
 pub trait Routing: Send + Sync {
     /// Whether the worker's record qualifies it for this item's class of
-    /// work.
-    fn qualifies(&self, _worker: &dyn Worker, _item: &WorkItem) -> bool {
+    /// work: `class` is [`crate::routing::work_class`] of the item and its
+    /// capability facet, `None` for work not routed by record.
+    fn qualifies(&self, _worker: &dyn Worker, _item: &WorkItem, _class: Option<&str>) -> bool {
         true
     }
 

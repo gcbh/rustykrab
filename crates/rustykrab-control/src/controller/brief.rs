@@ -209,5 +209,6 @@ pub(super) fn brief_for(
         origin_conversation_id: item.origin_conversation_id.clone(),
         run: None,
         workspace: None,
+        capability: None,
     }
 }

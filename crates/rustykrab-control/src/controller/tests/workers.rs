@@ -427,3 +427,73 @@ async fn a_busy_cheapest_tier_is_waited_for_not_escalated_past() {
         .iter()
         .all(|(worker, _)| worker == "snapper"));
 }
+
+/// A worker of any kind that finishes whatever it gets and keeps the
+/// briefs.
+struct Any {
+    name: &'static str,
+    kind: WorkerKind,
+    briefs: Mutex<Vec<Brief>>,
+}
+
+#[async_trait]
+impl Worker for Any {
+    fn name(&self) -> &str {
+        self.name
+    }
+    fn kind(&self) -> WorkerKind {
+        self.kind
+    }
+    fn capabilities(&self) -> WorkerCapabilities {
+        WorkerCapabilities::default()
+    }
+    async fn run(&self, brief: Brief) -> Result<ResultReport, Error> {
+        self.briefs.lock().unwrap().push(brief.clone());
+        Ok(super::done(&brief.title))
+    }
+}
+
+/// One source of truth for a capability item's mode: its review facet.
+/// A build routes as `capability:build` (above the local worker's tier)
+/// and its brief says build; the same need acquired is ordinary work.
+#[tokio::test]
+async fn a_capability_items_facet_decides_its_class_and_its_briefs_mode() {
+    use rustykrab_core::work::CapabilityMode;
+    let local = Arc::new(Any {
+        name: "snapper",
+        kind: WorkerKind::Local,
+        briefs: Mutex::new(Vec::new()),
+    });
+    let claude = Arc::new(Any {
+        name: "pinch",
+        kind: WorkerKind::ClaudeCode,
+        briefs: Mutex::new(Vec::new()),
+    });
+    let h = Harness::with_fleet(
+        ControllerConfig::default(),
+        vec![local.clone(), claude.clone()],
+    );
+    let need = crate::routing::CapabilityRef {
+        gap: crate::errors::GapKind::Install,
+        subject: "ffmpeg".into(),
+    }
+    .to_ref();
+    for (title, mode) in [
+        ("Build the converter", CapabilityMode::Build),
+        ("Install the converter", CapabilityMode::Acquire),
+    ] {
+        let mut d = draft("cap", title);
+        d.kind = Some(WorkKind::Capability);
+        d.capability = Some(mode);
+        d.artifact_refs = vec![need.clone()];
+        h.file_one(d).await;
+    }
+    h.drain().await;
+    let built = claude.briefs.lock().unwrap().clone();
+    let acquired = local.briefs.lock().unwrap().clone();
+    assert_eq!(built.len(), 1, "the build went up a tier");
+    assert_eq!(built[0].title, "Build the converter");
+    assert_eq!(built[0].capability, Some(CapabilityMode::Build));
+    assert_eq!(acquired.len(), 1, "the acquisition stayed cheapest");
+    assert_eq!(acquired[0].capability, Some(CapabilityMode::Acquire));
+}

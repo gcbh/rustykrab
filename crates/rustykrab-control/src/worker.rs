@@ -65,6 +65,12 @@ pub struct Brief {
     /// removes the directory after; the controller verifies against it.
     #[serde(default)]
     pub workspace: Option<Workspace>,
+    /// For a `capability` item: whether it builds, acquires or requests,
+    /// from its review facet (`work_item_facets`), the one source of truth
+    /// the projection, routing and verification read. An adapter reads it
+    /// to know a build from an acquisition.
+    #[serde(default)]
+    pub capability: Option<rustykrab_core::work::CapabilityMode>,
 }
 
 /// The artifact kind a worker's adapter attests for each command the agent

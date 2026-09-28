@@ -503,10 +503,11 @@ impl Controller {
                         kind: "item".to_string(),
                         value: item.id.clone(),
                     },
-                    // What it is for, typed: the verifier checks a built
-                    // tool exists and routing names the class by it.
+                    // The need it answers. Whether it builds, acquires or
+                    // requests is its facet, below: the one source of
+                    // truth the review projection, routing and the
+                    // verifier all read.
                     crate::routing::CapabilityRef {
-                        rung,
                         gap: need.gap,
                         subject: need.subject.clone(),
                     }

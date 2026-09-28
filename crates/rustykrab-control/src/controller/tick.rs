@@ -21,7 +21,7 @@ use crate::errors::{
 use crate::graph::{self, Effects};
 use crate::handle::TickReport;
 use crate::ladder::{self, Decision, LadderContext, LadderState, SurfaceReason};
-use crate::routing::{work_class, CapabilityRef, Judged, Verdict};
+use crate::routing::{built_tool, work_class, Judged, Verdict};
 use crate::worker::{run_failure_input, Brief, Worker, COMMAND_RUN};
 use crate::workspace::{self, CodeClaim, CodeVerdict, Workspace, WORKSPACE_EVIDENCE};
 
@@ -777,23 +777,48 @@ impl Controller {
                 proofs.push(("check_run".into(), check.clone(), Some(COMMAND_RUN.into())));
             }
         }
-        if let Some(cap) = CapabilityRef::of(item) {
-            if cap.rung == Rung::Build && cap.gap == GapKind::Tool {
+        // A capability build of a tool (its facet mode `build`, its need a
+        // tool): the host must now have the tool.
+        if item.kind == WorkKind::Capability {
+            let mode = self.capability_mode(&item.id).await?;
+            if let Some(tool) = built_tool(mode, &item.artifact_refs) {
                 self.catalog.refresh();
-                if self.catalog.tool_state(&cap.subject) == ToolState::Unknown {
+                if self.catalog.tool_state(&tool) == ToolState::Unknown {
                     return Ok(Err((
                         VerifierVerdict::ClaimMismatch,
                         format!(
                             "the result says the tool is built, but the host has no tool named \
-                             `{}`",
-                            cap.subject
+                             `{tool}`"
                         ),
                     )));
                 }
-                proofs.push(("tool".into(), cap.subject, Some(BY_CATALOG.into())));
+                proofs.push(("tool".into(), tool, Some(BY_CATALOG.into())));
             }
         }
         Ok(Ok(proofs))
+    }
+
+    /// A capability item's mode: its review facet, the one source of
+    /// truth for build, acquisition or request. `None` for any other item
+    /// and for a capability without one.
+    pub(super) async fn capability_mode(
+        &self,
+        item: &str,
+    ) -> Result<Option<rustykrab_core::work::CapabilityMode>, Error> {
+        Ok(self
+            .store
+            .work_facets_get(item)
+            .await?
+            .and_then(|f| f.capability))
+    }
+
+    /// The routed class of `item` (section 10), read with its facet.
+    pub(super) async fn class_of(&self, item: &WorkItem) -> Result<Option<String>, Error> {
+        let mode = match item.kind {
+            WorkKind::Capability => self.capability_mode(&item.id).await?,
+            _ => None,
+        };
+        Ok(work_class(item, mode))
     }
 
     /// The workspace the item's latest run was given, from its lease-time
@@ -818,7 +843,7 @@ impl Controller {
         worker: &str,
         verdict: Verdict,
     ) -> Result<(), Error> {
-        let Some(class) = work_class(item) else {
+        let Some(class) = self.class_of(item).await? else {
             return Ok(());
         };
         let repairs = self.ladder_of(item).await?.used(Rung::Repair);
@@ -1021,6 +1046,7 @@ impl Controller {
             .into_iter()
             .chain(history(&events).floor)
             .max();
+        let class = self.class_of(item).await?;
         let ctx = LadderContext {
             error: &error,
             recurrence_count: seen,
@@ -1043,7 +1069,9 @@ impl Controller {
                     };
                     self.rung(b, &id, &mut state, rung, &error, outcome);
                 }
-                Decision::SwitchWorker if !self.has_alternative(item, &excluded, floor) => {
+                Decision::SwitchWorker
+                    if !self.has_alternative(item, class.as_deref(), &excluded, floor) =>
+                {
                     self.rung(
                         b,
                         &id,
@@ -1283,6 +1311,7 @@ impl Controller {
     fn has_alternative(
         &self,
         item: &WorkItem,
+        class: Option<&str>,
         excluded: &HashSet<String>,
         floor: Option<u32>,
     ) -> bool {
@@ -1290,7 +1319,7 @@ impl Controller {
             !excluded.contains(w.name())
                 && w.healthy()
                 && covers(w.as_ref(), item)
-                && self.routing.qualifies(w.as_ref(), item)
+                && self.routing.qualifies(w.as_ref(), item, class)
                 && floor.is_none_or(|f| self.routing.cost_tier(w.as_ref()) > f)
         })
     }
@@ -1342,7 +1371,19 @@ impl Controller {
             }
             let events = self.store.work_events(&item.id).await?;
             let hist = history(&events);
-            let Some(worker) = self.pick(&item, &hist.excluded, hist.floor, &load, &models) else {
+            let mode = match item.kind {
+                WorkKind::Capability => self.capability_mode(&item.id).await?,
+                _ => None,
+            };
+            let class = work_class(&item, mode);
+            let Some(worker) = self.pick(
+                &item,
+                class.as_deref(),
+                &hist.excluded,
+                hist.floor,
+                &load,
+                &models,
+            ) else {
                 continue;
             };
             let (inputs, more) = self.build_inputs(&snap, &item).await?;
@@ -1358,6 +1399,7 @@ impl Controller {
             };
             brief.run = Some(run_id.clone());
             brief.workspace = self.plan_workspace(&item, &run_id).await;
+            brief.capability = mode;
             if let Err(e) = self
                 .store
                 .work_lease_acquire(
@@ -1479,6 +1521,7 @@ impl Controller {
     fn pick(
         &self,
         item: &WorkItem,
+        class: Option<&str>,
         excluded: &HashSet<String>,
         floor: Option<u32>,
         load: &HashMap<String, usize>,
@@ -1492,7 +1535,7 @@ impl Controller {
                 w.healthy()
                     && !excluded.contains(w.name())
                     && covers(w.as_ref(), item)
-                    && self.routing.qualifies(w.as_ref(), item)
+                    && self.routing.qualifies(w.as_ref(), item, class)
                     && floor.is_none_or(|f| self.routing.cost_tier(w.as_ref()) > f)
             })
             .map(|(i, w)| (self.routing.cost_tier(w.as_ref()), i, w))

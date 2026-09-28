@@ -37,7 +37,9 @@ use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use rustykrab_core::work::{ArtifactRef, Rung, WorkItem, WorkItemId, WorkKind, WorkerKind};
+use rustykrab_core::work::{
+    ArtifactRef, CapabilityMode, WorkItem, WorkItemId, WorkKind, WorkerKind,
+};
 use rustykrab_core::Error;
 use rustykrab_store::ClassRecord;
 use serde::{Deserialize, Serialize};
@@ -49,18 +51,20 @@ use crate::worker::{RunUsage, Worker};
 
 /// The class of a `code` item.
 pub const CODE: &str = "code";
-/// The class of a capability item the build rung filed.
+/// The class of a capability build.
 pub const CAPABILITY_BUILD: &str = "capability:build";
 
-/// The artifact-ref kind a ladder-filed capability item carries: what it
-/// is for, as `<rung> <gap>:<subject>` (`build tool:tide_table`).
+/// The artifact-ref kind a ladder-filed capability item carries: the need
+/// it answers, as `<gap>:<subject>` (`tool:tide_table`).
 pub const CAPABILITY_REF: &str = "capability";
 
-/// What a ladder-filed capability item is for.
+/// The need a ladder-filed capability item answers: which gap, and what is
+/// missing. Whether the item builds, acquires or requests it is not here:
+/// that is the item's review facet ([`CapabilityMode`] in
+/// `work_item_facets`), the one source of truth the review projection,
+/// routing and verification all read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CapabilityRef {
-    /// `acquire`, `build` or `request`.
-    pub rung: Rung,
     pub gap: GapKind,
     pub subject: String,
 }
@@ -69,12 +73,7 @@ impl CapabilityRef {
     pub fn to_ref(&self) -> ArtifactRef {
         ArtifactRef {
             kind: CAPABILITY_REF.to_string(),
-            value: format!(
-                "{} {}:{}",
-                self.rung.as_str(),
-                self.gap.as_str(),
-                self.subject
-            ),
+            value: format!("{}:{}", self.gap.as_str(), self.subject),
         }
     }
 
@@ -83,43 +82,39 @@ impl CapabilityRef {
         if r.kind != CAPABILITY_REF {
             return None;
         }
-        let (rung, rest) = r.value.split_once(' ')?;
-        let (gap, subject) = rest.split_once(':')?;
-        let rung = [Rung::Acquire, Rung::Build, Rung::Request]
-            .into_iter()
-            .find(|x| x.as_str() == rung)?;
+        let (gap, subject) = r.value.split_once(':')?;
         Some(CapabilityRef {
-            rung,
-            gap: GapKind::parse(gap)?,
-            subject: subject.to_string(),
+            gap: GapKind::parse(gap.trim())?,
+            subject: subject.trim().to_string(),
         })
+        .filter(|c| !c.subject.is_empty())
     }
 
-    /// The capability a `capability` item's refs say it is for.
-    pub fn of(item: &WorkItem) -> Option<CapabilityRef> {
-        if item.kind != WorkKind::Capability {
-            return None;
-        }
-        item.artifact_refs.iter().find_map(CapabilityRef::parse)
-    }
-
-    /// The tool a brief's refs ask to be built, if it is a capability build
-    /// of a tool.
-    pub fn tool_build(refs: &[ArtifactRef]) -> Option<String> {
-        refs.iter()
-            .filter_map(CapabilityRef::parse)
-            .find(|c| c.rung == Rung::Build && c.gap == GapKind::Tool)
-            .map(|c| c.subject)
+    /// The need among `refs`, if any.
+    pub fn of_refs(refs: &[ArtifactRef]) -> Option<CapabilityRef> {
+        refs.iter().find_map(CapabilityRef::parse)
     }
 }
 
-/// The routed class `item` belongs to, if any.
-pub fn work_class(item: &WorkItem) -> Option<String> {
+/// The tool a capability item builds: its facet says `build` and its need
+/// is a tool. `None` for anything else.
+pub fn built_tool(mode: Option<CapabilityMode>, refs: &[ArtifactRef]) -> Option<String> {
+    if mode != Some(CapabilityMode::Build) {
+        return None;
+    }
+    CapabilityRef::of_refs(refs)
+        .filter(|c| c.gap == GapKind::Tool)
+        .map(|c| c.subject)
+}
+
+/// The routed class `item` belongs to, if any. `mode` is a capability
+/// item's facet; an item without one is not a build.
+pub fn work_class(item: &WorkItem, mode: Option<CapabilityMode>) -> Option<String> {
     match item.kind {
         WorkKind::Code => Some(CODE.to_string()),
-        WorkKind::Capability => CapabilityRef::of(item)
-            .filter(|c| c.rung == Rung::Build)
-            .map(|_| CAPABILITY_BUILD.to_string()),
+        WorkKind::Capability if mode == Some(CapabilityMode::Build) => {
+            Some(CAPABILITY_BUILD.to_string())
+        }
         _ => None,
     }
 }
@@ -266,18 +261,18 @@ impl RecordRouting {
 
 #[async_trait]
 impl Routing for RecordRouting {
-    fn qualifies(&self, worker: &dyn Worker, item: &WorkItem) -> bool {
-        let Some(class) = work_class(item) else {
+    fn qualifies(&self, worker: &dyn Worker, _item: &WorkItem, class: Option<&str>) -> bool {
+        let Some(class) = class else {
             return true;
         };
-        let Some(floor) = self.default_tier(&class) else {
+        let Some(floor) = self.default_tier(class) else {
             return true;
         };
         if self.cost_tier(worker) >= floor {
             return true;
         }
         self.registry
-            .record_of(worker.name(), &class)
+            .record_of(worker.name(), class)
             .is_some_and(|r| r.verified_done >= self.policy.earn_after && !r.probation)
     }
 
@@ -385,29 +380,49 @@ mod tests {
     }
 
     #[test]
-    fn classes_and_capability_refs_round_trip() {
-        assert_eq!(
-            work_class(&item(WorkKind::Code, vec![])).as_deref(),
-            Some(CODE)
-        );
-        assert_eq!(work_class(&item(WorkKind::Personal, vec![])), None);
-        let build = CapabilityRef {
-            rung: Rung::Build,
+    fn the_mode_is_the_facets_and_the_need_is_the_refs() {
+        let code = item(WorkKind::Code, vec![]);
+        assert_eq!(work_class(&code, None).as_deref(), Some(CODE));
+        assert_eq!(work_class(&item(WorkKind::Personal, vec![]), None), None);
+        let need = CapabilityRef {
             gap: GapKind::Tool,
             subject: "tide_table".to_string(),
         };
-        assert_eq!(build.to_ref().value, "build tool:tide_table");
-        let cap = item(WorkKind::Capability, vec![build.to_ref()]);
-        assert_eq!(CapabilityRef::of(&cap), Some(build));
-        assert_eq!(work_class(&cap).as_deref(), Some(CAPABILITY_BUILD));
-        let acquire = CapabilityRef {
-            rung: Rung::Acquire,
-            gap: GapKind::Credential,
-            subject: "gmail".to_string(),
-        };
-        let cap = item(WorkKind::Capability, vec![acquire.to_ref()]);
-        assert_eq!(CapabilityRef::of(&cap), Some(acquire));
-        assert_eq!(work_class(&cap), None, "only builds are routed by record");
+        assert_eq!(need.to_ref().value, "tool:tide_table");
+        let cap = item(WorkKind::Capability, vec![need.to_ref()]);
+        assert_eq!(CapabilityRef::of_refs(&cap.artifact_refs), Some(need));
+        let build = Some(CapabilityMode::Build);
+        assert_eq!(work_class(&cap, build).as_deref(), Some(CAPABILITY_BUILD));
+        assert_eq!(
+            built_tool(build, &cap.artifact_refs).as_deref(),
+            Some("tide_table")
+        );
+        // The same need acquired, or with no facet, is not a build.
+        for mode in [
+            Some(CapabilityMode::Acquire),
+            Some(CapabilityMode::Request),
+            None,
+        ] {
+            assert_eq!(work_class(&cap, mode), None, "{mode:?}");
+            assert_eq!(built_tool(mode, &cap.artifact_refs), None);
+        }
+        // A build whose need is not a tool builds no tool.
+        let install = item(
+            WorkKind::Capability,
+            vec![CapabilityRef {
+                gap: GapKind::Install,
+                subject: "ffmpeg".into(),
+            }
+            .to_ref()],
+        );
+        assert_eq!(built_tool(build, &install.artifact_refs), None);
+        assert_eq!(
+            CapabilityRef::parse(&ArtifactRef {
+                kind: CAPABILITY_REF.into(),
+                value: "tool:".into()
+            }),
+            None
+        );
     }
 
     #[test]
@@ -446,26 +461,19 @@ mod tests {
         ));
         let routing = RecordRouting::new(registry.clone());
         let code = item(WorkKind::Code, vec![]);
-        let build = item(
-            WorkKind::Capability,
-            vec![CapabilityRef {
-                rung: Rung::Build,
-                gap: GapKind::Tool,
-                subject: "tide_table".into(),
-            }
-            .to_ref()],
-        );
+        let build = item(WorkKind::Capability, vec![]);
         let personal = item(WorkKind::Personal, vec![]);
+        let (code_class, build_class) = (Some(CODE), Some(CAPABILITY_BUILD));
         assert!(
-            routing.qualifies(local.as_ref(), &code),
+            routing.qualifies(local.as_ref(), &code, code_class),
             "code starts at tier 0"
         );
-        assert!(routing.qualifies(local.as_ref(), &personal));
+        assert!(routing.qualifies(local.as_ref(), &personal, None));
         assert!(
-            !routing.qualifies(local.as_ref(), &build),
+            !routing.qualifies(local.as_ref(), &build, build_class),
             "builds start higher"
         );
-        assert!(routing.qualifies(claude.as_ref(), &build));
+        assert!(routing.qualifies(claude.as_ref(), &build, build_class));
 
         let mut earned = judged("krabby", Verdict::Verified);
         earned.class = CAPABILITY_BUILD.to_string();
@@ -473,14 +481,14 @@ mod tests {
             routing.record(&earned).await;
         }
         assert!(
-            routing.qualifies(local.as_ref(), &build),
+            routing.qualifies(local.as_ref(), &build, build_class),
             "earned by record"
         );
         let mut failed = earned.clone();
         failed.verdict = Verdict::NotVerified;
         routing.record(&failed).await;
         assert!(
-            !routing.qualifies(local.as_ref(), &build),
+            !routing.qualifies(local.as_ref(), &build, build_class),
             "a failed verification puts it back on probation"
         );
         let record = registry.record_of("krabby", CAPABILITY_BUILD).unwrap();
@@ -499,7 +507,7 @@ mod tests {
         assert_eq!(seeded.len(), 2, "the policy's prior is in the store");
         assert!(seeded.iter().all(|d| d.set_by == "policy"));
         let code = item(WorkKind::Code, vec![]);
-        assert!(routing.qualifies(local.as_ref(), &code));
+        assert!(routing.qualifies(local.as_ref(), &code, Some(CODE)));
 
         // An accepted proposal moves code up; the controller only reads it.
         store
@@ -509,7 +517,7 @@ mod tests {
             .unwrap();
         routing.reload().await.unwrap();
         assert_eq!(routing.default_tier(CODE), Some(2));
-        assert!(!routing.qualifies(local.as_ref(), &code));
+        assert!(!routing.qualifies(local.as_ref(), &code, Some(CODE)));
         routing.load().await.unwrap();
         assert_eq!(
             routing.default_tier(CODE),

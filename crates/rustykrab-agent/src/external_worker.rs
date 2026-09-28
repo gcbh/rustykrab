@@ -57,7 +57,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use rustykrab_control::errors::{BudgetKind, PolicyStop, ProviderProblem};
 use rustykrab_control::registry::WorkerSpec;
-use rustykrab_control::routing::CapabilityRef;
+use rustykrab_control::routing::built_tool;
 use rustykrab_control::worker::{
     Brief, RunFailure, RunUsage, Worker, WorkerCapabilities, COMMAND_RUN,
 };
@@ -390,9 +390,10 @@ impl ExternalWorker {
     }
 }
 
-/// Whether the brief is a capability build of a tool.
+/// Whether the brief is a capability build of a tool: its facet says
+/// build and its need is a tool.
 fn is_tool_build(brief: &Brief) -> bool {
-    CapabilityRef::tool_build(&brief.artifact_refs).is_some()
+    built_tool(brief.capability, &brief.artifact_refs).is_some()
 }
 
 fn policy_failure(detail: String) -> Error {
@@ -949,7 +950,7 @@ pub fn render_executor_brief(
             let _ = writeln!(out, "working directory: {} (scratch)", dir.display());
         }
     }
-    if let Some(tool) = CapabilityRef::tool_build(&brief.artifact_refs) {
+    if let Some(tool) = built_tool(brief.capability, &brief.artifact_refs) {
         let _ = writeln!(
             out,
             "build: write the `{tool}` tool as a RustyKrab skill at {}/{tool}/SKILL.md: front \
@@ -1141,6 +1142,7 @@ mod tests {
             origin_conversation_id: None,
             run: Some("run-1".into()),
             workspace,
+            capability: None,
         }
     }
 
@@ -1290,12 +1292,22 @@ echo "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"num_turn
         let worker = f.worker(WorkerKind::ClaudeCode, f.agent("claude", CLAUDE));
         let mut b = brief(None);
         b.kind = WorkKind::Capability;
-        b.artifact_refs = vec![CapabilityRef {
-            rung: rustykrab_core::work::Rung::Build,
+        b.artifact_refs = vec![rustykrab_control::routing::CapabilityRef {
             gap: rustykrab_control::errors::GapKind::Tool,
             subject: "tide_table".into(),
         }
         .to_ref()];
+        // An acquisition of the same need is not told to build anything.
+        b.capability = Some(rustykrab_core::work::CapabilityMode::Acquire);
+        let acquiring = render_executor_brief(
+            &b,
+            "pinch",
+            WorkerKind::ClaudeCode,
+            Path::new("/tmp/run"),
+            &f.data.path().join("skills"),
+        );
+        assert!(!acquiring.contains("SKILL.md"), "{acquiring}");
+        b.capability = Some(rustykrab_core::work::CapabilityMode::Build);
         let prompt = render_executor_brief(
             &b,
             "pinch",

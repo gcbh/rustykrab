@@ -192,13 +192,23 @@ async fn scenario_13_a_missing_tool_files_a_capability_build_and_the_original_re
     assert_eq!(caps.len(), 1);
     assert_eq!(caps[0].title, "Build tool: pdf_render");
     assert!(caps[0].parent.is_none(), "not part of the original's chain");
+    // The need is its ref; that it is a build is its facet, which the
+    // projection, routing and the verifier all read.
     assert!(
         caps[0]
             .artifact_refs
             .iter()
-            .any(|r| r.kind == "capability" && r.value == "build tool:pdf_render"),
+            .any(|r| r.kind == "capability" && r.value == "tool:pdf_render"),
         "{:?}",
         caps[0].artifact_refs
+    );
+    assert_eq!(
+        h.store()
+            .work_facets_get(&caps[0].id)
+            .await
+            .unwrap()
+            .and_then(|f| f.capability),
+        Some(rustykrab_core::work::CapabilityMode::Build)
     );
     let edges = h.store().work_edges_of(&x).await.unwrap();
     assert!(edges.contains(&Edge {

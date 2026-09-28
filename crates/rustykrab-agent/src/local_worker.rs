@@ -1189,6 +1189,7 @@ mod tests {
             origin_conversation_id: None,
             run: None,
             workspace: None,
+            capability: None,
         }
     }
 
