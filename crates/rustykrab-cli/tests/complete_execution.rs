@@ -23,6 +23,7 @@ use std::sync::Arc;
 
 use rustykrab_agent::sandbox::NoSandbox;
 use rustykrab_agent::AgentRunner;
+use rustykrab_core::active_tools::ActiveToolsRegistry;
 use rustykrab_core::capability::CapabilitySet;
 use rustykrab_core::dream::CycleStatus;
 use rustykrab_core::outcome::{OutcomeVerdict, SignalClass};
@@ -173,6 +174,7 @@ async fn run_turn(
     );
 
     let runner = AgentRunner::new(provider, tools, Arc::new(NoSandbox))
+        .with_active_tools(declared())
         .with_outcome_sink(outcomes)
         .with_active_skill(SKILL)
         // The declaration under test, and the probes that can check it.
@@ -190,6 +192,15 @@ async fn run_turn(
     let mut conv = conversation(conversation_id);
 
     let _ = runner.run(&mut conv, &session).await;
+}
+
+/// The skill's two tools, declared from turn 0: the runner runs only a tool
+/// the conversation declared or appended (control plan section 12).
+fn declared() -> Arc<ActiveToolsRegistry> {
+    Arc::new(ActiveToolsRegistry::with_seed([
+        "calendar_create",
+        "email_confirm",
+    ]))
 }
 
 fn store() -> rustykrab_store::Store {
@@ -449,6 +460,7 @@ async fn without_a_declaration_the_same_runs_change_nothing() {
             tools,
             Arc::new(NoSandbox),
         )
+        .with_active_tools(declared())
         .with_outcome_sink(outcomes.clone())
         .with_active_skill(SKILL);
 

@@ -73,6 +73,7 @@ pub(crate) fn agent_script_scenarios() -> Vec<Value> {
         json!({
             "trigger": NOTICES,
             "steps": [
+                call("tools_load", json!({ "names": ["cron"] })),
                 bad(),
                 bad(),
                 bad(),

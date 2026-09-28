@@ -87,6 +87,10 @@ pub struct ModelCase {
     pub extra_env: Vec<(String, String)>,
     pub assertions: Vec<Assertion>,
     pub judge: Option<JudgeSpec>,
+    /// Tools whose attempted calls are counted, executed or refused, and
+    /// reported in the case's `classes` without judging it: a tendency to
+    /// measure (scenario 10's near-miss substitution), not a pass mark.
+    pub attempts: Vec<String>,
 }
 
 impl ModelCase {
@@ -106,6 +110,7 @@ impl ModelCase {
             extra_env: Vec::new(),
             assertions: Vec::new(),
             judge: None,
+            attempts: Vec::new(),
         }
     }
 
@@ -155,6 +160,41 @@ impl ModelCase {
         self.judge = Some(j);
         self
     }
+
+    /// Count the attempted calls to `tool` across repetitions, reported
+    /// but never failing the case.
+    pub(crate) fn counting_attempts(mut self, tool: impl Into<String>) -> Self {
+        self.attempts.push(tool.into());
+        self
+    }
+}
+
+/// What the case's counted tools were asked for over its repetitions, as
+/// report classes: attempted calls in all, how many of them the host
+/// refused, and attempts per tool.
+fn attempt_classes(attempts: &[String], runs: &[Transcript]) -> Vec<(String, usize)> {
+    if attempts.is_empty() {
+        return Vec::new();
+    }
+    let calls = || {
+        runs.iter()
+            .flat_map(|t| t.calls.iter())
+            .filter(|c| attempts.contains(&c.tool))
+    };
+    let mut classes = vec![
+        ("attempted_calls".to_string(), calls().count()),
+        (
+            "refused_calls".to_string(),
+            calls().filter(|c| c.refused).count(),
+        ),
+    ];
+    for tool in attempts {
+        let n = calls().filter(|c| &c.tool == tool).count();
+        if n > 0 {
+            classes.push((format!("attempted:{tool}"), n));
+        }
+    }
+    classes
 }
 
 /// A tight agent config: small context so compaction is reachable, few
@@ -715,6 +755,7 @@ pub async fn run_cases(
         let started = Instant::now();
         let mut passes = 0;
         let mut details: Vec<String> = Vec::new();
+        let mut transcripts: Vec<Transcript> = Vec::new();
 
         for _ in 0..reps {
             let transcript = match tokio::time::timeout(
@@ -756,6 +797,9 @@ pub async fn run_cases(
             if passed {
                 passes += 1;
             }
+            if !case.attempts.is_empty() {
+                transcripts.push(transcript.clone());
+            }
             for f in failures {
                 if !details.contains(&f) {
                     details.push(f);
@@ -777,7 +821,8 @@ pub async fn run_cases(
             passes,
             details,
             started.elapsed().as_millis() / reps as u128,
-        );
+        )
+        .with_classes(attempt_classes(&case.attempts, &transcripts));
         eprintln!("{}", r.line());
         reports.push(r);
     }
@@ -957,5 +1002,54 @@ async fn preflight(model: &str, ollama_url: &str) -> Result<()> {
              --ollama-url."
         ),
         Err(e) => anyhow::bail!("the warm-up request failed: {e}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transcript::ToolInvocation;
+
+    fn call(tool: &str, refused: bool) -> ToolInvocation {
+        ToolInvocation {
+            tool: tool.into(),
+            args: json!({}),
+            output: None,
+            failed: refused,
+            refused,
+        }
+    }
+
+    #[test]
+    fn attempts_are_counted_across_repetitions_refused_or_not() {
+        let runs = vec![
+            Transcript {
+                calls: vec![
+                    call("tools_list", false),
+                    call("get_forecast", true),
+                    call("get_forecast", true),
+                ],
+                ..Transcript::default()
+            },
+            Transcript {
+                calls: vec![call("get_uv_index", false)],
+                ..Transcript::default()
+            },
+        ];
+        let counted = vec![
+            "get_forecast".to_string(),
+            "get_uv_index".to_string(),
+            "get_timezone".to_string(),
+        ];
+        assert_eq!(
+            attempt_classes(&counted, &runs),
+            [
+                ("attempted_calls".to_string(), 3),
+                ("refused_calls".to_string(), 2),
+                ("attempted:get_forecast".to_string(), 2),
+                ("attempted:get_uv_index".to_string(), 1),
+            ]
+        );
+        assert!(attempt_classes(&[], &runs).is_empty());
     }
 }

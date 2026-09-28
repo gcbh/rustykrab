@@ -15,8 +15,13 @@
 //! every request of the run declared the same tools array (the provider's
 //! `tool block sent` log). The target never enters the array, so a pass
 //! means it was called by append. A missing case passes when no near-miss
-//! is called in the target's place: the host told the model nothing
-//! matched, and a need searched past the harness profile's
+//! *runs* in the target's place: the host told the model nothing matched,
+//! and a call to a tool no search made callable is refused unrun (plan
+//! section 12), which is the host doing its job. The attempts are still
+//! counted, per near-miss, in the case's report `classes`
+//! (`attempted_calls`, `refused_calls`, `attempted:<tool>`), so the models'
+//! tendency to substitute stays measured without failing the case. A need
+//! searched past the harness profile's
 //! `tool_search_miss_limit` (2) is answered as final, so the run need not
 //! reach its iteration cap. A calendar target sent `duration_minutes` as
 //! text (qwen3.8's XML tool calls) is typed by the host before dispatch.
@@ -378,7 +383,7 @@ pub(crate) fn cases() -> Vec<ModelCase> {
         let mut missing = ModelCase::new(
             id(task.name, "missing"),
             "Scenario 10, host validation: with the target absent the search finds \
-             nothing and no near-miss is called in its place",
+             nothing and no near-miss runs in its place",
         )
         .with_harness(bounded_harness())
         .with_num_ctx(LATE_BINDING_NUM_CTX)
@@ -390,7 +395,8 @@ pub(crate) fn cases() -> Vec<ModelCase> {
         .expect(Assertion::ToolBlockUnchanged { min_requests: 2 });
         for tool in catalog(&task, 5, false) {
             missing = missing
-                .expect(Assertion::ToolNotCalled(name_of(&tool)))
+                .expect(Assertion::ToolNotExecuted(name_of(&tool)))
+                .counting_attempts(name_of(&tool))
                 .with_tool(tool);
         }
         out.push(missing);
@@ -422,6 +428,23 @@ mod tests {
             assert_eq!(tools.len(), n, "{}", case.id);
         }
         // Position 3 of 5 and 6 of 10, as in late_binding_catalog.py.
+        // A missing case judges what ran and counts what was attempted.
+        for case in cases.iter().filter(|c| c.id.contains("-missing-")) {
+            assert_eq!(case.attempts.len(), 5, "{}", case.id);
+            assert!(case
+                .assertions
+                .iter()
+                .all(|a| !matches!(a, Assertion::ToolNotCalled(_))));
+            assert_eq!(
+                case.assertions
+                    .iter()
+                    .filter(|a| matches!(a, Assertion::ToolNotExecuted(_)))
+                    .count(),
+                5,
+                "{}",
+                case.id
+            );
+        }
         let weather5 = &cases[0].stubs["tools"];
         assert_eq!(weather5[2]["name"], "get_weather");
         let weather10 = &cases[1].stubs["tools"];

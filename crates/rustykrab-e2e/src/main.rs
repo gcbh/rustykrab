@@ -65,6 +65,8 @@ const AGENT_SCRIPT: &str = r#"{
     {
       "trigger": "e2e: create credential",
       "steps": [
+        { "toolCalls": [ { "name": "tools_load",
+                           "arguments": { "names": ["credential_write"] } } ] },
         { "toolCalls": [ { "name": "credential_write",
                            "arguments": { "action": "set",
                                           "name": "e2e_scripted_token",
@@ -76,6 +78,8 @@ const AGENT_SCRIPT: &str = r#"{
     {
       "trigger": "e2e: streamed credential",
       "steps": [
+        { "toolCalls": [ { "name": "tools_load",
+                           "arguments": { "names": ["credential_write"] } } ] },
         { "toolCalls": [ { "name": "credential_write",
                            "arguments": { "action": "set",
                                           "name": "e2e_streamed_token",
@@ -87,6 +91,8 @@ const AGENT_SCRIPT: &str = r#"{
     {
       "trigger": "e2e: overwrite credential",
       "steps": [
+        { "toolCalls": [ { "name": "tools_load",
+                           "arguments": { "names": ["credential_write"] } } ] },
         { "toolCalls": [ { "name": "credential_write",
                            "arguments": { "action": "set",
                                           "name": "e2e_guard_token",
@@ -98,6 +104,8 @@ const AGENT_SCRIPT: &str = r#"{
     {
       "trigger": "e2e: delete credential",
       "steps": [
+        { "toolCalls": [ { "name": "tools_load",
+                           "arguments": { "names": ["credential_write"] } } ] },
         { "toolCalls": [ { "name": "credential_write",
                            "arguments": { "action": "delete",
                                           "name": "e2e_delete_token" } } ] },
@@ -269,6 +277,12 @@ impl ScenarioReport {
             classes: Vec::new(),
             rate: None,
         }
+    }
+
+    /// Counts that ride along a judged cell without judging it.
+    fn with_classes(mut self, classes: Vec<(String, usize)>) -> Self {
+        self.classes = classes;
+        self
     }
 
     /// A measured cell: an outcome distribution and a rate, with no

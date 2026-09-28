@@ -28,6 +28,10 @@ pub enum Assertion {
     ToolCalled(String),
     /// The named tool was never called.
     ToolNotCalled(String),
+    /// The named tool never ran: every call to it, if any, was refused by
+    /// the host as not callable in the conversation. Judges what executed;
+    /// a refused call is the host doing its job.
+    ToolNotExecuted(String),
     /// The named tool was called between `min` and `max` times inclusive.
     ToolCallCount {
         tool: String,
@@ -90,6 +94,7 @@ impl Assertion {
             Assertion::FinalMatches(p) => format!("final matches /{p}/"),
             Assertion::ToolCalled(t) => format!("called {t}"),
             Assertion::ToolNotCalled(t) => format!("never called {t}"),
+            Assertion::ToolNotExecuted(t) => format!("never ran {t}"),
             Assertion::ToolCallCount { tool, min, max } => {
                 format!("{tool} called {min}..={max} times")
             }
@@ -180,6 +185,15 @@ impl Assertion {
                     Ok(())
                 } else {
                     Err(format!("{tool} was called {n}x but should not have been"))
+                }
+            }
+
+            Assertion::ToolNotExecuted(tool) => {
+                let n = t.executed(tool).len();
+                if n == 0 {
+                    Ok(())
+                } else {
+                    Err(format!("{tool} ran {n}x but should not have"))
                 }
             }
 
@@ -407,7 +421,25 @@ mod tests {
             args,
             output: None,
             failed,
+            refused: false,
         }
+    }
+
+    #[test]
+    fn not_executed_ignores_calls_the_host_refused() {
+        let mut refused = call("get_forecast", json!({}), true);
+        refused.refused = true;
+        let t = with_calls(vec![refused.clone()]);
+        assert!(Assertion::ToolNotExecuted("get_forecast".into())
+            .check(&t)
+            .is_ok());
+        assert!(Assertion::ToolNotCalled("get_forecast".into())
+            .check(&t)
+            .is_err());
+        let t = with_calls(vec![refused, call("get_forecast", json!({}), false)]);
+        assert!(Assertion::ToolNotExecuted("get_forecast".into())
+            .check(&t)
+            .is_err());
     }
 
     #[test]

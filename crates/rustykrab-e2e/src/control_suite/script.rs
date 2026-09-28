@@ -81,6 +81,13 @@ pub(super) fn succeeded(summary: &str, artifact: (&str, &str)) -> Value {
     }))
 }
 
+/// Loads `names` first, as a model must before it calls a tool its run
+/// did not declare (plan section 12): the host runs only a tool that is
+/// declared or appended.
+pub(super) fn load(names: &[&str]) -> Value {
+    call("tools_load", json!({ "names": names }))
+}
+
 /// Reads the conversation's active tool set without changing what matters:
 /// `tools_load` answers with every active name, and `todo_read` is active
 /// from turn 0 anyway.
@@ -120,12 +127,13 @@ pub(crate) fn agent_script_scenarios() -> Vec<Value> {
     };
     let s18_edge = |item: &str, depends_on: &str| json!({ "item": { "tmp": item }, "kind": "blocks", "depends_on": { "tmp": depends_on } });
     vec![
-        // 1: the orchestration conversation loads what the task needs, then
-        // files it; its worker reports the active set from its first step.
+        // 1: the orchestration conversation loads what the task needs, and
+        // `work_file`, then files it; its worker reports the active set
+        // from its first step.
         script(
             S01_FILE,
             vec![
-                call("tools_load", json!({ "names": ["caldav"] })),
+                load(&["caldav", "work_file"]),
                 call(
                     "work_file",
                     json!({
@@ -156,6 +164,7 @@ pub(crate) fn agent_script_scenarios() -> Vec<Value> {
         script(
             S11_UNLOADED,
             vec![
+                load(&["work_file"]),
                 call(
                     "work_file",
                     json!({
@@ -172,6 +181,7 @@ pub(crate) fn agent_script_scenarios() -> Vec<Value> {
         script(
             S11_MCP,
             vec![
+                load(&["work_file"]),
                 call(
                     "work_file",
                     json!({
@@ -192,6 +202,7 @@ pub(crate) fn agent_script_scenarios() -> Vec<Value> {
         script(
             S18_REQUEST,
             vec![
+                load(&["work_file"]),
                 call(
                     "work_file",
                     json!({
@@ -243,6 +254,7 @@ pub(crate) fn agent_script_scenarios() -> Vec<Value> {
         script(
             S30_TURN,
             vec![
+                load(&["exec"]),
                 call("exec", json!({ "command": "sleep 6", "timeout_secs": 20 })),
                 done("Finished the interactive turn."),
             ],
@@ -263,6 +275,7 @@ pub(crate) fn agent_script_scenarios() -> Vec<Value> {
         script(
             W_HOLD,
             vec![
+                load(&["exec"]),
                 call("exec", json!({ "command": "sleep 3", "timeout_secs": 20 })),
                 succeeded("Held the resource.", evidence),
                 done("Held the resource."),
@@ -271,6 +284,7 @@ pub(crate) fn agent_script_scenarios() -> Vec<Value> {
         script(
             W_SLOW,
             vec![
+                load(&["exec"]),
                 call("exec", json!({ "command": "sleep 20", "timeout_secs": 25 })),
                 succeeded("Worked for twenty seconds.", evidence),
                 done("Worked for twenty seconds."),
@@ -279,6 +293,7 @@ pub(crate) fn agent_script_scenarios() -> Vec<Value> {
         script(
             W_PEER_PAUSE,
             vec![
+                load(&["exec"]),
                 call("exec", json!({ "command": "sleep 8", "timeout_secs": 20 })),
                 succeeded("Worked for eight seconds on the peer.", evidence),
                 done("Worked on the peer."),
@@ -335,6 +350,7 @@ pub(crate) fn agent_script_scenarios() -> Vec<Value> {
         script(
             W_DOC_BETA_SLOW,
             vec![
+                load(&["exec"]),
                 call("exec", json!({ "command": "sleep 4", "timeout_secs": 20 })),
                 succeeded("Attached document beta.", ("path", "e2e-control/beta.md")),
                 done("Attached beta."),
@@ -350,6 +366,7 @@ pub(crate) fn agent_script_scenarios() -> Vec<Value> {
         script(
             W_READ_INPUTS,
             vec![
+                load(&["exec"]),
                 call("exec", json!({ "command": "sleep 3", "timeout_secs": 20 })),
                 succeeded("Chose from the inputs.", evidence),
                 done("Chose."),
@@ -433,6 +450,7 @@ pub(crate) fn agent_script_scenarios() -> Vec<Value> {
         script(
             W_CODE_LOCAL,
             vec![
+                load(&["exec"]),
                 call(
                     "exec",
                     json!({ "command": "echo '// e2e-control local change' >> src/lib.rs && git add src/lib.rs && git -c user.name=e2e -c user.email=e2e@rustykrab.invalid commit -q --no-gpg-sign -m e2e-control-local-change" }),
