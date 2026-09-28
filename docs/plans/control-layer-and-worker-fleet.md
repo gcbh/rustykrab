@@ -83,11 +83,21 @@ Each assumption names the evidence behind it. Sources are listed in section 18.
 - **Split only independent work.** Every multi-agent architecture tested lost
   39–70% on sequential planning and gained up to 81% on parallelisable work;
   errors amplified 4–17x (Kim et al.). Dependent steps stay in one worker.
-- **Workers get their toolset before the first prefill.** On this project's
-  models a front-of-prompt tool change costs one full re-prefill (6.5 s on
-  gemma4:26b, 35 s on qwen3.8:27b at 7K tokens); an append costs under a
-  second. Both models call a tool first seen as JSON in a tool result (144 of
-  144 trials) provided search and load are one contract (section 12).
+- **The front tool block is fixed for the run; late tools arrive by append.**
+  The model does not need its tools up front. qwen3.8 called a tool first seen
+  as JSON in a tool result 12 of 12 times, 12 of 12 again among five or ten
+  near-miss distractors, and 12 of 12 through a generic `call_tool`; gemma4
+  was 72 of 72 until a competing `tools_load` description pulled a third of
+  its late-bound calls into a redundant load (section 12). The engine is what
+  cares. A change to the tools array rewrites the front of the prompt and
+  costs one full re-prefill (6.5 s on gemma4:26b, 35 s on qwen3.8:27b at 7K
+  tokens, growing with history); an append costs under a second. So a worker
+  starts with the tools its item is known to need, which saves a search round
+  trip, and anything found later is delivered as text in a tool result, never
+  by re-rendering the tools array. On qwen3.8, which prefills at about 210
+  tokens a second, a small starting set with appends on demand beats a large
+  set declared just in case: each thousand tokens of schemas costs about five
+  seconds whenever that prefix is not already cached.
 - **Coding is not reserved for frontier agents; evaluation decides who keeps
   it.** A `code` item may run on a local worker, a peer, Claude Code or Codex.
   The verifier judges each result from evidence, and dreaming keeps a routing
@@ -519,8 +529,8 @@ Worker {
 
 Kinds:
 
-- **local**: a `SubagentRunner` conversation on this daemon with a toolset
-  activated before the first prefill (section 12). Serialised on the single KV
+- **local**: a `SubagentRunner` conversation on this daemon whose tool block
+  is fixed at its first model call, with later tools appended (section 12). Serialised on the single KV
   slot unless measurement in Phase 0 shows the RAM prompt cache makes
   interleaving cheap.
 - **peer**: a paired node reached through `delegated_tasks`. The submission
@@ -1153,20 +1163,35 @@ The projection rule and fields are the same; only the adapter differs.
 
 From the September 2026 measurements on this machine:
 
-- **Pre-activate the toolset.** `AgentDefinition` gains `tools` and
-  `mcp_servers` (visible from turn 0) distinct from `allowed_tools` (the
-  ceiling). The runner calls `activate` before the first prefill, so the prefix
-  is stable from turn 0 and the follow-up pays no layout change.
+- **A fixed front block, known tools first.** `AgentDefinition` gains `tools`
+  and `mcp_servers` (visible from turn 0) distinct from `allowed_tools` (the
+  ceiling). The runner activates them, with the item's `required_tools`,
+  before the first model call, and the tools array does not change for the
+  rest of the run. This is a cache rule, not a capability rule: it keeps the
+  prefix stable and saves a search round trip for needs the host already
+  knows. Keep the starting set small on slow-prefill models; qwen3.8 pays
+  about five seconds per thousand tokens of schemas on every uncached prefill,
+  so a tool that is only possibly needed is left to the append path.
 - **File-based definitions.** `~/.rustykrab/agents/<name>.md` (or the data
   dir) with front-matter for tools, MCP servers, profile, model preference and
   writable resources, loaded like `SKILL.md`. The three built-ins move to
   files.
-- **Late needs are appended, not re-rendered.** `tools_load` returns the
-  requested schemas as text in its result and records them as callable without
-  changing the tools array; compaction folds appended tools into the front
-  block because it re-prefills anyway. Search and load become one contract:
-  gemma4 obeyed the `tools_load` description over the result's framing on a
-  third of late-bound calls when both existed.
+- **Late needs are appended, not re-rendered.** Late binding works on both
+  default models: qwen3.8 called a tool first seen as JSON in a tool result 12
+  of 12 times with no distractors, 12 of 12 among five or ten near-misses, and
+  12 of 12 through a generic `call_tool` (late binding experiment,
+  2026-09-24). `tools_load` returns the requested schemas as text in its
+  result and records them as callable without changing the tools array;
+  compaction folds appended tools into the front block because it re-prefills
+  anyway. Search and load become one contract: gemma4 obeyed the `tools_load`
+  description over the result's framing on a third of late-bound calls when
+  both existed. Until the append path ships in Phase 2, today's `tools_load`
+  changes the tools array and pays the full re-prefill; that is an
+  implementation gap, not a limit of the model.
+- **Not yet measured.** The search step was scripted in every trial, so
+  whether a model decides to search on its own is open; a real catalog of
+  about 10K tokens of schemas, and thinking off, were not tested. Phase 0
+  measures the base rate of mid-run loads before either path is tuned.
 - **The host validates catalogs.** Both models substituted a near-miss when the
   catalog lacked the target (a one-day forecast for current weather; a
   shipment list for a tracking number). A search result is labelled "found"
