@@ -11,6 +11,10 @@
 //! add` (over `POST /api/workers`) builds an [`ExternalWorker`] or a peer
 //! (`peers.rs`) through [`AgentFactory`], and a restart rebuilds every
 //! stored one.
+//!
+//! `RUSTYKRAB_LOCAL_WORKER=off` leaves the local worker out: a daemon with
+//! no local model would otherwise hold a cheapest-tier worker that can only
+//! fail, and routing would lease unconstrained items to it.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -176,6 +180,22 @@ impl ToolCatalog for FleetCatalog {
     }
 }
 
+/// The environment variable that turns the local worker off.
+pub(crate) const LOCAL_WORKER_ENV: &str = "RUSTYKRAB_LOCAL_WORKER";
+
+/// Whether the daemon registers its local worker: on unless
+/// `RUSTYKRAB_LOCAL_WORKER` is `off`, `false`, `0` or `no`.
+pub(crate) fn local_worker_enabled() -> bool {
+    local_worker_on(std::env::var(LOCAL_WORKER_ENV).ok().as_deref())
+}
+
+fn local_worker_on(value: Option<&str>) -> bool {
+    !matches!(
+        value.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("off" | "false" | "0" | "no")
+    )
+}
+
 /// The daemon's workers and what the controller needs to use them.
 pub(crate) struct Fleet {
     pub registry: Arc<WorkerRegistry>,
@@ -234,14 +254,38 @@ impl Fleet {
         self.routing.clone()
     }
 
-    /// Register the local worker and rebuild the stored external ones.
-    pub(crate) async fn start(&self, local: Arc<dyn Worker>) -> anyhow::Result<()> {
-        self.registry
-            .register(local, serde_json::json!({}), None)
-            .await?;
+    /// Register the local worker, if there is one, and rebuild the stored
+    /// external ones. With none (`RUSTYKRAB_LOCAL_WORKER=off`) nothing is
+    /// leased to it, and a row a previous run stored for it says so.
+    pub(crate) async fn start(&self, local: Option<Arc<dyn Worker>>) -> anyhow::Result<()> {
+        match local {
+            Some(local) => {
+                self.registry
+                    .register(local, serde_json::json!({}), None)
+                    .await?;
+            }
+            None => {
+                let workers = self.registry.store().workers();
+                if workers
+                    .list()
+                    .await?
+                    .iter()
+                    .any(|r| r.name == self.local_name)
+                {
+                    workers
+                        .touch(
+                            &self.local_name,
+                            &format!("off: {LOCAL_WORKER_ENV}=off"),
+                            None,
+                        )
+                        .await?;
+                }
+            }
+        }
         let restored = self.registry.restore().await?;
         tracing::info!(
             local = %self.local_name,
+            local_on = self.registry.get(&self.local_name).is_some(),
             restored = ?restored,
             "worker registry ready"
         );
@@ -294,5 +338,72 @@ mod tests {
             ToolState::RegisteredUnloaded
         );
         assert_eq!(catalog.tool_state("nothing"), ToolState::Unknown);
+    }
+
+    #[test]
+    fn the_local_worker_is_on_unless_turned_off() {
+        assert!(local_worker_on(None));
+        assert!(local_worker_on(Some("on")));
+        assert!(local_worker_on(Some("")));
+        for off in ["off", "OFF", " off ", "false", "0", "no"] {
+            assert!(!local_worker_on(Some(off)), "{off:?}");
+        }
+    }
+
+    struct Stub(String);
+
+    #[async_trait::async_trait]
+    impl Worker for Stub {
+        fn name(&self) -> &str {
+            &self.0
+        }
+        fn kind(&self) -> rustykrab_core::work::WorkerKind {
+            rustykrab_core::work::WorkerKind::Local
+        }
+        fn capabilities(&self) -> rustykrab_control::worker::WorkerCapabilities {
+            Default::default()
+        }
+        async fn run(
+            &self,
+            _brief: rustykrab_control::worker::Brief,
+        ) -> Result<rustykrab_core::work::ResultReport, rustykrab_core::Error> {
+            unreachable!("never leased in this test")
+        }
+    }
+
+    async fn fleet(dir: &Path) -> Fleet {
+        let store = Store::open(dir.join("db"), vec![7u8; 32]).unwrap();
+        Fleet::open(
+            &store,
+            dir,
+            &dir.join("skills"),
+            Arc::new(SkillRegistry::new()),
+            &[],
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn with_the_local_worker_off_the_registry_has_none_to_lease() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // On (the default): the local worker is registered and leasable.
+        let on = fleet(dir.path()).await;
+        let name = on.local_name.clone();
+        on.start(Some(Arc::new(Stub(name.clone())))).await.unwrap();
+        assert!(on.registry.get(&name).is_some());
+        drop(on);
+
+        // Off, over the same store: no live worker, so nothing can be
+        // leased to one, and the row the earlier run stored says it is off.
+        let off = fleet(dir.path()).await;
+        assert_eq!(off.local_name, name, "the name stays stable");
+        off.start(None).await.unwrap();
+        assert!(off.registry.get(&name).is_none());
+        assert!(off.registry.workers().is_empty());
+        let view = off.registry.view(&name).await.unwrap().unwrap();
+        assert!(!view.live);
+        assert!(view.health.starts_with("off"), "{}", view.health);
     }
 }
