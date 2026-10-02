@@ -26,6 +26,23 @@ On macOS, `make` automatically ad-hoc codesigns the binary with the
 `keychain-access-groups` entitlement required by the Data Protection Keychain.
 You can also run `make codesign` or `make codesign-debug` separately.
 
+### macOS LaunchAgent installation
+
+For a signed release bundle, install the app and register its per-user
+LaunchAgent with:
+
+```bash
+scripts/install.sh /path/to/RustyKrab.app
+```
+
+The installer verifies the bundle signature, installs it under
+`~/Applications/RustyKrab.app`, preserves the previous bundle for rollback,
+and starts `com.gcbh.rustykrab` at login. Use `scripts/uninstall.sh` to remove
+the agent while retaining the app and data, or `scripts/uninstall.sh --purge`
+to remove the app bundle as well. `--allow-adhoc` is available only for local
+development builds; published releases should pass strict signature
+verification.
+
 ## Quick Start
 
 ### Option A: Run with Claude (recommended)
@@ -52,24 +69,144 @@ export RUSTYKRAB_PROVIDER=ollama
 cargo run --release -p rustykrab-cli
 ```
 
+### Option C: Run against any OpenAI-compatible server
+
+Works with `llama-server` (llama.cpp), mistral.rs, vllm-mlx, `mlx_lm.server`,
+LM Studio's headless daemon, exo, and OpenAI-compatible hosted APIs.
+
+```bash
+llama-server -m model.gguf --jinja --cache-reuse 256 -np 1 -c 32768 --port 8080
+
+export RUSTYKRAB_PROVIDER=llama-server
+export OPENAI_BASE_URL=http://localhost:8080
+export OPENAI_MODEL=my-model
+cargo run --release -p rustykrab-cli
+```
+
+Size the context deliberately: the system prompt plus the built-in tool
+schemas is roughly 8k tokens before any conversation, and `-np N` divides the
+context between N slots. `--jinja` is required for tool calling.
+
+Point `OPENAI_BASE_URL` at another machine on the LAN or tailnet to run
+inference on separate hardware — see [Delegating to a peer node](#delegating-to-a-peer-node)
+below to also delegate whole *agent tasks*, not just inference, to that
+machine.
+
+#### Tuning the Ollama server for KV-cache reuse
+
+An agent loop re-sends the whole conversation on every iteration, so almost
+all of its prompt is a prefix Ollama already evaluated on the previous turn.
+Reusing the cached KV for that prefix is the difference between a fast turn
+and one that re-reads the entire history. RustyKrab does its part on the
+client — it pins one `num_ctx` for the process, sends `keep_alive` so the
+runner stays resident, and trims history in infrequent deep cuts rather than
+a little every turn — but three settings on the server side matter just as
+much:
+
+```bash
+# Must be >= RUSTYKRAB_NUM_CTX, or the server silently truncates prompts.
+export OLLAMA_CONTEXT_LENGTH=131072
+
+# One slot keeps a single conversation pinned to a single warm cache.
+# Raising this splits KV memory across slots and round-robins requests, so
+# consecutive turns of one conversation can land on a cold slot.
+export OLLAMA_NUM_PARALLEL=1
+
+# Halves KV-cache memory, buying back the VRAM a larger window costs.
+# q8_0 requires flash attention and is close to lossless; q4_0 is cheaper
+# but degrades quality on long contexts.
+export OLLAMA_FLASH_ATTENTION=1
+export OLLAMA_KV_CACHE_TYPE=q8_0
+```
+
+Keep `OLLAMA_CONTEXT_LENGTH` and `RUSTYKRAB_NUM_CTX` in sync. If the server
+window is the smaller of the two, RustyKrab's own trimming budget is too
+generous and the server truncates from the front of the prompt — which moves
+the truncation point every turn and throws away the cached prefix each time.
+
+#### Where the context window goes
+
+The pinned window is not all available for conversation history. On the 64k
+default, a turn is budgeted roughly like this:
+
+| Reservation | Tokens | Why |
+|---|---|---|
+| `num_predict` (output) | 4,096 | The turn's own response has to fit alongside the prompt |
+| Tool schemas | ~1,800–10,000 | Measured per request; grows as the model loads tools |
+| Template framing | 512 | Role tags, tool preamble, BOS/EOS |
+| **Usable for history** | **~50,000–58,000** | Compaction fires at 85% of this |
+
+Two consequences worth knowing:
+
+- **Compaction runs before trimming, by design.** Compaction summarizes
+  displaced history into the `recall_*` archive, so detail stays reachable;
+  trimming just drops the oldest turns. RustyKrab derives both budgets from
+  the same figure to keep that order. If you see the "history trimming will
+  pre-empt compaction" warning, the loaded tool schemas have grown large
+  enough to invert it — raise `RUSTYKRAB_NUM_CTX` or load fewer tools.
+
+- **Going above ~64k takes two settings, not one.** `RUSTYKRAB_NUM_CTX` sizes
+  the window; `RUSTYKRAB_COMPACTION_CONTEXT_CEILING` caps the budget the agent
+  loop will actually grow into, and defaults to 65,536. Raise only the first
+  and compaction still fires at ~56k — the extra window goes unused. RustyKrab
+  logs a warning when the ceiling is clipping the window, but the pairing is
+  easy to miss:
+
+  ```bash
+  export RUSTYKRAB_NUM_CTX=131072
+  export OLLAMA_CONTEXT_LENGTH=131072
+  export RUSTYKRAB_COMPACTION_CONTEXT_CEILING=131072
+  ```
+
+  The default is deliberately below what a long-context model advertises.
+  A model supporting 256k does not mean 256k is the right operating point:
+  the KV cache is allocated for the whole window up front, and attention cost
+  grows with how much of it is filled. At startup RustyKrab logs the measured
+  footprint for your model and window (`estimated KV cache footprint`, with
+  both f16 and q8_0 figures and what the model's native maximum would cost) —
+  pick a window from those numbers and your free VRAM rather than from the
+  model's advertised limit.
+
+- **Loading tools invalidates the KV cache.** Tool definitions render into the
+  prompt *prefix*, ahead of the conversation, so a tool set that changes
+  mid-run moves every token after it and forces a full prompt re-evaluation.
+  This is the price of the `tools_list` / `tools_load` design, which exists
+  because the full catalog is ~10k tokens and cannot be sent every turn. The
+  cost is per *change*, not per tool, so loading everything a task needs in
+  one `tools_load` call is much cheaper than discovering tools incrementally.
+  The `tool set changed since the last request` log line marks each one.
+
 ## Configuration
 
 All configuration is via environment variables. No plaintext config files.
 
 | Variable | Default | Description |
 |---|---|---|
-| `RUSTYKRAB_PROVIDER` | `anthropic` | Model backend: `anthropic` or `ollama` |
+| `RUSTYKRAB_PROVIDER` | `anthropic` | Model backend: `anthropic`, `ollama`, `scripted` (E2E harness), or an OpenAI-compatible alias (`openai`, `llama-server`, `llamacpp`, `mistralrs`, `lmstudio`, `mlx`, `exo`, `vllm`) |
 | `ANTHROPIC_API_KEY` | — | Anthropic API key (required for Claude) |
 | `ANTHROPIC_MODEL` | `claude-sonnet-4-20250514` | Claude model to use. The Claude 4.X family (Opus 4.7 `claude-opus-4-7`, Sonnet 4.6 `claude-sonnet-4-6`, Haiku 4.5 `claude-haiku-4-5-20251001`) is recommended for new deployments |
 | `ANTHROPIC_CONTEXT_LENGTH` | `200000` | Context window in tokens for the selected Claude model. Anthropic doesn't expose a discovery endpoint, so set this when enabling a non-default window (e.g. the 1M-token beta) so compaction thresholds stay in sync |
+| `RUSTYKRAB_TIMEZONE` | host zone, else `UTC` | IANA zone name (e.g. `America/Los_Angeles`) that human-entered schedules are interpreted in. Cron expressions and offset-less one-shot timestamps passed to the `cron` tool are read as wall-clock times here; everything is still *stored* in UTC. Each job records the zone it was created with, so changing this does not move existing jobs. Use an IANA name, not a fixed offset like `UTC-8` — only the named zone tracks daylight saving |
 | `RUSTYKRAB_MAX_CONTEXT_TOKENS` | `128000` (cloud) / `32000` (ollama) | Context budget used to compute the compaction threshold. Default is provider-aware: 128k for cloud providers (Anthropic) and 32k for local Ollama, where prompt evaluation on consumer GPUs times out long before a 128k window fills. Set to override the default for either provider |
-| `RUSTYKRAB_COMPACTION_CONTEXT_CEILING` | `65536` | Hard upper bound on the context window used to compute the compaction threshold. Keeps compaction firing at a sane size even when the backing model advertises a much larger window |
+| `RUSTYKRAB_COMPACTION_CONTEXT_CEILING` | `131072` | Hard upper bound on the context window used to compute the compaction threshold. Keeps compaction firing at a sane size even when the backing model advertises a much larger window |
 | `RUSTYKRAB_COMPACTION_SUMMARY_MAX_TOKENS` | `8192` | Env-configurable upper bound on the final compaction summary. The effective cap is further bounded by `RUSTYKRAB_MAX_CONTEXT_TOKENS / 4`, so on a 32k local-Ollama deployment the summary stays under 8k regardless of this value. If the summarizer returns a summary larger than the effective cap, it is re-summarized (up to 3 passes) and eventually truncated |
 | `OLLAMA_MODEL` | `gemma4:26b` | Ollama model name |
 | `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama server address |
-| `RUSTYKRAB_NUM_CTX` | — | Explicit client-side `num_ctx` override for local providers. Takes precedence over `OLLAMA_NUM_CTX`. Omitted by default so the server's own `OLLAMA_CONTEXT_LENGTH` (or per-model default) wins |
+| `RUSTYKRAB_NUM_CTX` | `131072` | Context window pinned on every Ollama request. Takes precedence over `OLLAMA_NUM_CTX`. Clamped down to the model's native context length when that is smaller. The whole window is allocated as KV cache when the model loads, so lower this (or enable KV quantization, below) if the model won't fit in VRAM. Set to `server` to omit the field and let the server's `OLLAMA_CONTEXT_LENGTH` decide — this disables client-side trimming, since the client then cannot know what the server allocated |
 | `OLLAMA_NUM_CTX` | — | Legacy alias for `RUSTYKRAB_NUM_CTX`. Used only when `RUSTYKRAB_NUM_CTX` is unset |
+| `OLLAMA_KEEP_ALIVE` | `30m` | How long Ollama keeps the model and its KV cache resident after a request (Ollama duration syntax; `-1` for forever). Ollama's own default is 5 minutes, short enough that a sporadically-used gateway reloads the model on most messages. Set to `server` to omit the field |
+| `OLLAMA_THINK` | `auto` | Whether to request thinking mode: `true`, `false`, or `auto` to ask Ollama what the model supports (falling back to the model tag if it doesn't say). Ollama returns a 400 for `think` against models that don't support it |
+| `OLLAMA_VISION` | `auto` | Whether the model accepts image input: `true`, `false`, or `auto` to ask Ollama what the model supports (falling back to the model tag if it doesn't say) |
 | `OLLAMA_TIMEOUT_SECS` | `900` | HTTP request timeout for Ollama in seconds |
+| `OPENAI_MODEL` | `local-model` | Model name sent to the OpenAI-compatible server |
+| `OPENAI_BASE_URL` | `http://localhost:8080` | OpenAI-compatible server address (with or without a `/v1` suffix) |
+| `OPENAI_API_KEY` | — | Bearer token; optional, ignored by most local servers |
+| `OPENAI_TEMPERATURE` | `0.1` | Sampling temperature |
+| `OPENAI_MAX_TOKENS` | `8192` | Max tokens to generate per response |
+| `OPENAI_INCLUDE_USAGE` | `1` | Request usage in the final stream chunk; set `0` for servers that reject `stream_options` |
+| `RUSTYKRAB_NODES` | unset | JSON array of peer instances the `nodes` tool can delegate to: `{id, url, token, description, hop_budget}`. `hop_budget` defaults to `0`, which denies the node onward delegation. See [Delegating to a peer node](#delegating-to-a-peer-node) |
+| `RUSTYKRAB_DELEGATION_TOOLS` | unset | On a *node*: which tools a task delegated by a peer may use. Unset applies the default posture (everything registered except the credential family, `message` and `gateway`); `all` lifts the allowlist but not those fixed denials; a comma-separated list names the only tools a delegated run may touch. Node-authoritative — a submitting peer can narrow this per task but never widen it. The sub-agent tool family is withheld from delegated runs unconditionally |
+| `RUSTYKRAB_NODE_TIMEOUT_SECS` | `900` | HTTP timeout for calls to a peer. Since delegation is asynchronous these calls are short (submit, poll, cancel); the generous default now only covers the fallback path against a peer too old to have the task queue |
 | `CHROME_CDP_URL` | `ws://127.0.0.1:9222` | Chrome DevTools Protocol endpoint |
 | `RUSTYKRAB_AUTH_TOKEN` | auto-generated | Bearer token for API auth |
 | `RUSTYKRAB_MASTER_KEY` | auto-generated | Encryption key for secrets at rest |
@@ -78,11 +215,18 @@ All configuration is via environment variables. No plaintext config files.
 | `TELEGRAM_WEBHOOK_URL` | — | Public webhook URL (omit for long-polling mode) |
 | `TELEGRAM_WEBHOOK_SECRET` | — | Secret token for webhook validation |
 | `SIGNAL_ACCOUNT` | — | Your Signal phone number (E.164, e.g. `+1234567890`) |
-| `SIGNAL_CLI_URL` | `http://localhost:8080` | signal-cli-rest-api URL |
+| `SIGNAL_CLI_URL` | `http://localhost:8080` | signal-cli-rest-api URL (shares its default port with `OPENAI_BASE_URL` — change one if running both) |
 | `SIGNAL_ALLOWED_NUMBERS` | — | Comma-separated E.164 numbers allowed to message |
 | `SIGNAL_WEBHOOK_URL` | — | Webhook URL (omit for polling mode) |
 | `SIGNAL_WEBHOOK_SECRET` | — | Shared secret for webhook validation |
-| `RUST_LOG` | — | Log level (`info`, `debug`, `rustykrab_gateway=debug`) |
+| `RUST_LOG` | `info` | Log level (`info`, `debug`, `rustykrab_gateway=debug`) |
+| `RUSTYKRAB_LOG_STDOUT` | auto | Force stdout logging on (`1`) or off (`0`). Default: enabled only when stdout is a terminal. The rolling log file under the data directory is always written |
+| `RUSTYKRAB_OUTCOME_CAPTURE` | `0` | Record how each completed run went, and which skill, memories, and tools were in play, into the `outcome_records` table. Observational only — it changes nothing about how the agent behaves. Groundwork for the self-improvement outer loop; see `DREAMING.md` |
+| `RUSTYKRAB_PUBLIC_URL` | unset | Base URL the agent puts in a credential or payment-approval link, e.g. `https://mac.tailnet.ts.net`. Unset, the agent falls back to telling the user a prompt is waiting in the app — so a link is never minted and the failure is silent |
+| `RUSTYKRAB_TAILNET_USERS` | unset | Comma-separated tailnet logins allowed to open a credential or payment-approval page. Empty means any authenticated tailnet user. Requires `tailscale serve` in front to inject `Tailscale-User-Login` |
+| `RUSTYKRAB_PAYMENT_COOLDOWN_SECS` | `30` | Seconds after one payment is pressed before another may be claimed, across every conversation. Not a limit on what the user may buy — each purchase is approved separately — but on how fast the agent can act on approvals it already holds, so a retry loop is caught by a human before it can run. `0` disables the throttle; a value that is not a whole number of seconds is ignored with a warning and the default kept. Independent of the single-spend lock, which is unconditional: one payment may be in flight at a time and each approval is spendable exactly once |
+| `RUSTYKRAB_PAYMENT_DUPLICATE_WINDOW_HOURS` | `24` | Hours back over which a payment counts as a repeat of one being filed now. The same site, amount and currency inside the window is held rather than sent to the user for approval: nothing is paid, the user is told, and the agent is told to stop. `0` disables the hold; a value that is not a whole number of hours is ignored with a warning and the default kept. The key is deliberately the origin, amount and currency — not the merchant name or the description, both of which the model writes and could reword its way past |
+| | | When enabled, this also starts a **downtime analysis worker**: read-only, it aggregates recorded outcomes and logs a digest once the system has been quiet for 10 minutes, abandoning a pass if activity arrives mid-flight. It never writes and never calls a model |
 
 ### Persisting credentials
 
@@ -137,6 +281,59 @@ docker run --rm \
 Per-credential values (Anthropic, Notion, Telegram, etc.) come from their `RUSTYKRAB_*`/service-specific env vars — see the table above and the registry at `crates/rustykrab-store/src/registry.rs`. Anything resolved from an env var is also persisted into the encrypted SQLite store on first run, so subsequent restarts only need `RUSTYKRAB_MASTER_KEY` plus whatever you want to rotate.
 
 The `rustykrab-cli keychain` subcommand is macOS-only; on Linux/Docker use env vars or the gateway's secrets API.
+
+### Serving the credential page over your tailnet
+
+The gateway binds loopback. `tailscale serve` fronts it with a real
+Let's Encrypt certificate so a phone on the tailnet can open the secure
+form the agent links to — a credential form at `/c/…`, or a payment
+approval at `/p/…`, which shows the merchant, site and amount and takes
+the card for that one purchase.
+
+```sh
+# 1. Enable HTTPS certificates for the tailnet, once, in the admin console:
+#    https://login.tailscale.com/admin/dns  ->  HTTPS Certificates  ->  Enable
+
+# 2. Front the gateway (3000 is the default port):
+tailscale serve --bg https / http://127.0.0.1:3000
+tailscale serve status          # confirms the https:// URL it now answers on
+
+# 3. Point the daemon at that name, and say who may answer:
+export RUSTYKRAB_PUBLIC_URL=https://<mac>.<tailnet>.ts.net
+export RUSTYKRAB_TAILNET_USERS=you@example.com
+export RUSTYKRAB_ALLOWED_ORIGINS=https://<mac>.<tailnet>.ts.net
+```
+
+`RUSTYKRAB_ALLOWED_ORIGINS` matters: the form posts back from that origin,
+and the origin check rejects a POST it does not recognise.
+
+### Paying twice for the same thing
+
+Each approval is spendable exactly once, and one payment may be in flight at
+a time. Neither stops the agent buying the *same thing* twice: a turn resumed
+from a stale summary, a cron re-run, or the user asking again because no
+confirmation arrived, and it files a fresh request for a purchase already
+made. The user then sees a perfectly plausible approval page.
+
+So a request that repeats an earlier one — the same origin, amount and
+currency within `RUSTYKRAB_PAYMENT_DUPLICATE_WINDOW_HOURS` (24 h) of a
+payment that is live or already made — is **held**. No approval link is
+minted, nothing is paid, and the user is sent a message saying what was
+stopped and what it looked like a repeat of. The same check runs again at the
+pay button, for a twin paid in between, and refuses the press.
+
+Only the user can override it. If they reply asking to pay a second time, the
+agent files the request again with `confirm_duplicate`, which the store
+honours *only* when a held request for the same purchase already exists in
+that conversation — so the agent cannot set the flag pre-emptively and skip
+the check. The resulting approval page carries a warning that this is a
+second payment, naming the first.
+
+Without `tailscale serve` in front there is no `Tailscale-User-Login`
+header, so the page refuses every request — which is the intended failure.
+`RUSTYKRAB_CREDENTIAL_PAGE_ANONYMOUS=1` turns that check off and exists
+only for loopback development; `scripts/install.sh` deliberately does not
+forward it, so it cannot be inherited into an installed service.
 
 ## Usage
 
@@ -322,9 +519,75 @@ $ rustykrab-cli   # restart the daemon
 The resolver runs entirely inside the connector — the model never sees
 the resolved values, and they are not surfaced through any tool.
 
+### Delegating to a peer node
+
+A RustyKrab instance can hand a self-contained task to another RustyKrab
+instance running on different hardware — useful for a slower machine with a
+stronger local model, or simply more compute you'd like the primary to draw
+on. This is delegation, not shared execution: the task runs entirely on the
+peer, using *its* tools and filesystem, and returns only a text result.
+
+```bash
+export RUSTYKRAB_NODES='[
+  {
+    "id": "m4max",
+    "url": "https://your-node.your-tailnet.ts.net",
+    "token": "<the node auth token>",
+    "description": "M4 Max 32GB — qwen3.8:27b-mlx. Slower but capable; good for self-contained coding tasks with its own checkout at ~/code/rustycrab.",
+    "hop_budget": 0
+  }
+]'
+```
+
+The `nodes` tool (`list`, `discover`, `send`, `check`, `cancel`) is hidden
+from the model until `RUSTYKRAB_NODES` is set.
+
+**Delegation is asynchronous.** `send` submits the task and returns a
+`task_id` in about a second; the node runs it in the background and the
+model collects the result with `check` on a later turn. That split is not a
+convenience — a delegated task on a local model routinely runs for minutes,
+and the agent loop caps a network tool call at 120 seconds, so a synchronous
+delegation would be killed on the caller while the node kept working on a
+result nobody could collect. `cancel` calls one off, aborting it mid-run if
+the node has already started.
+
+Pass the `conversation_id` from a previous `check` back into the next `send`
+to continue the same thread on the node. Worth doing for any follow-up: a
+continued thread reuses the prompt prefix the node already evaluated, where
+a fresh one re-reads the whole system prompt and tool schemas first — a
+measured 79.5s versus 3.3s on the same machine.
+
+`hop_budget` is the recursion guard, and defaults to `0`. A node given zero
+hops runs the task itself and is denied the `nodes` tool outright, so it
+cannot hand any part of the work onward. Without this, two peers that each
+list the other — the natural configuration when the node is another copy of
+the same program — bounce a task between them indefinitely at minutes of
+local inference per hop. The local `subagents` depth counter cannot help,
+because it is process-local.
+
+Prefer a paired token over the node's master token for the `token` field:
+run `rustykrab-cli pair` on the node and redeem the code from the primary
+with `POST /api/pair`. The result is accepted everywhere the master token
+is, but it is attributable in the node's logs and individually revocable.
+
+**A delegated run is scoped on the node, not by the caller.** The task text
+is composed by the *peer's model*, so anything that reached that peer as
+untrusted input — a fetched page, a search result — can arrive here phrased
+as an instruction. So the node withholds the credential family, `message`
+and `gateway` from every delegated run, and withholds the sub-agent tool
+family unconditionally: a node is a sub-agent, and work it needs to break up
+it queues for itself rather than spawning further agents. Narrow it further
+with `RUSTYKRAB_DELEGATION_TOOLS`. A submitting peer may request a tighter
+limit still (`allowedTools` on the task), which intersects with the node's
+policy and can never widen it.
+
+See `scripts/setup-delegation-node.md` for standing up a node, exposing it
+safely (Tailscale Serve, not the raw gateway port), and measured latency
+expectations.
+
 ## Architecture
 
-A Cargo workspace of 10 crates under `crates/`:
+A Cargo workspace of 14 crates under `crates/`:
 
 ```
 rustykrab-cli          Binary entrypoint, daemon management, channel loops
@@ -371,6 +634,8 @@ rustykrab-cli          Binary entrypoint, daemon management, channel loops
   +-- rustykrab-memory     Hybrid retrieval: vector + BM25 + temporal + graph
   |
   +-- rustykrab-skills     SKILL.md loader with ed25519 signature verification
+  |
+  +-- rustykrab-projects   Immutable planning revisions, provenance, graph validation, projections
   |
   +-- rustykrab-core       Shared types, traits, error types
         +-- Tool trait, ModelProvider trait

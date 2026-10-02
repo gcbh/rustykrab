@@ -151,6 +151,9 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
+    use crate::types::{MessageContent, Role};
+
+    #[derive(Default)]
     struct CapturingSink {
         records: Mutex<Vec<TraceRecord>>,
     }
@@ -158,6 +161,44 @@ mod tests {
     impl TraceSink for CapturingSink {
         fn record(&self, record: TraceRecord) {
             self.records.lock().unwrap().push(record);
+        }
+    }
+
+    /// `SINK` is a process-wide `OnceLock`, so the tests below share one
+    /// capturing sink for the whole test binary. Each test scopes its own
+    /// trace id and reads back only its own rows, which keeps them
+    /// independent despite the shared install.
+    static CAPTURED: OnceLock<Arc<CapturingSink>> = OnceLock::new();
+
+    fn install_sink() -> Arc<CapturingSink> {
+        let sink = CAPTURED
+            .get_or_init(|| Arc::new(CapturingSink::default()))
+            .clone();
+        set_sink(sink.clone() as Arc<dyn TraceSink>);
+        sink
+    }
+
+    fn rows_for(trace_id: Uuid) -> Vec<TraceRecord> {
+        install_sink()
+            .records
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| match r {
+                TraceRecord::Prompt { trace_id: t, .. }
+                | TraceRecord::Response { trace_id: t, .. } => *t == trace_id,
+            })
+            .cloned()
+            .collect()
+    }
+
+    fn msg(text: &str) -> Message {
+        Message {
+            id: Uuid::new_v4(),
+            role: Role::User,
+            content: MessageContent::Text(text.to_string()),
+            created_at: Utc::now(),
+            agent_version: None,
         }
     }
 
@@ -176,33 +217,103 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn record_prompt_is_noop_without_trace_id() {
-        // No sink installed in this test, but we also can't install one
-        // (OnceLock) without affecting other tests. So just check the
-        // happy path: outside a scope the helper returns silently.
-        record_prompt("test", "test-model", false, &[], &[]);
+    async fn record_prompt_reaches_the_sink_tagged_with_the_active_trace_id() {
+        install_sink();
+        let id = Uuid::new_v4();
+
+        with_trace_id(id, async {
+            record_prompt("ollama", "gemma4:26b", true, &[msg("hello")], &[]);
+        })
+        .await;
+
+        let rows = rows_for(id);
+        assert_eq!(rows.len(), 1, "expected exactly one row for this trace");
+        match &rows[0] {
+            TraceRecord::Prompt {
+                provider,
+                model,
+                streaming,
+                messages,
+                ..
+            } => {
+                assert_eq!(provider, "ollama");
+                assert_eq!(model, "gemma4:26b");
+                assert!(streaming);
+                // The prompt itself must reach the sink — a row that records
+                // only metadata would make the trace log useless for its one
+                // job, which is correlating a log line with the prompt.
+                assert_eq!(messages.len(), 1);
+                assert_eq!(messages[0].content.as_text(), Some("hello"));
+            }
+            other => panic!("expected a Prompt row, got {other:?}"),
+        }
     }
 
-    #[test]
-    fn capturing_sink_collects_records() {
-        let sink = Arc::new(CapturingSink {
-            records: Mutex::new(Vec::new()),
+    #[tokio::test]
+    async fn record_prompt_outside_a_trace_scope_writes_nothing() {
+        // Untagged rows cannot be correlated with anything, so they are
+        // dropped rather than written with a placeholder id.
+        //
+        // There is no trace id to filter on here, so the probe carries a
+        // unique provider name instead — the sink is shared with the tests
+        // running alongside this one, and a bare row count would race them.
+        let sink = install_sink();
+        let probe = format!("orphan-probe-{}", Uuid::new_v4());
+
+        record_prompt(&probe, "test-model", false, &[msg("orphan")], &[]);
+
+        let wrote_anything = sink.records.lock().unwrap().iter().any(|r| match r {
+            TraceRecord::Prompt { provider, .. } | TraceRecord::Response { provider, .. } => {
+                provider == &probe
+            }
         });
-        let record = TraceRecord::Prompt {
-            trace_id: Uuid::new_v4(),
-            timestamp: Utc::now(),
-            provider: "test".into(),
-            model: "test-model".into(),
-            streaming: false,
-            messages: Vec::new(),
-            tools: Vec::new(),
+        assert!(!wrote_anything, "an untagged prompt must not be recorded");
+    }
+
+    #[tokio::test]
+    async fn record_response_carries_usage_and_stop_reason() {
+        install_sink();
+        let id = Uuid::new_v4();
+        let usage = Usage {
+            prompt_tokens: 120,
+            completion_tokens: 8,
+            cache_read_tokens: 100,
+            cache_creation_tokens: 4,
         };
-        sink.record(record.clone());
-        let stored = sink.records.lock().unwrap();
-        assert_eq!(stored.len(), 1);
-        match &stored[0] {
-            TraceRecord::Prompt { provider, .. } => assert_eq!(provider, "test"),
-            _ => panic!("expected Prompt variant"),
+
+        with_trace_id(id, async {
+            record_response(
+                "anthropic",
+                "claude",
+                false,
+                &msg("the answer"),
+                &usage,
+                &StopReason::EndTurn,
+                1_234,
+            );
+        })
+        .await;
+
+        let rows = rows_for(id);
+        assert_eq!(rows.len(), 1);
+        match &rows[0] {
+            TraceRecord::Response {
+                prompt_tokens,
+                completion_tokens,
+                cache_read_tokens,
+                cache_creation_tokens,
+                stop_reason,
+                duration_ms,
+                ..
+            } => {
+                assert_eq!(*prompt_tokens, 120);
+                assert_eq!(*completion_tokens, 8);
+                assert_eq!(*cache_read_tokens, 100);
+                assert_eq!(*cache_creation_tokens, 4);
+                assert_eq!(stop_reason, "EndTurn");
+                assert_eq!(*duration_ms, 1_234);
+            }
+            other => panic!("expected a Response row, got {other:?}"),
         }
     }
 

@@ -1,36 +1,78 @@
 //! Google Calendar integration via the CalDAV protocol.
 //!
-//! This tool talks to Google's CalDAV endpoint
-//! (`https://apidata.googleusercontent.com/caldav/v2/`) using HTTP Basic
+//! This tool talks to Google's CalDAV endpoint using HTTP Basic
 //! authentication. It deliberately **reuses the same credentials as the Gmail
 //! integration** — the `gmail_email` and `gmail_app_password` secrets — so a
-//! single Google app password unlocks both mail and calendar. Google's CalDAV
-//! endpoint accepts app passwords via Basic auth, exactly like IMAP/SMTP.
+//! single Google app password unlocks both mail and calendar.
 //!
-//! Because the host is fixed to Google, there is no arbitrary-URL / SSRF
-//! surface: every request targets `apidata.googleusercontent.com`.
+//! ## Why the legacy host and not `caldav/v2`
+//!
+//! Google publishes two CalDAV hosts, and only one of them accepts a password.
+//!
+//! `apidata.googleusercontent.com/caldav/v2/` is the documented one and it
+//! requires OAuth 2.0 — "Attempting to connect over HTTP or using Basic
+//! Authentication results in an HTTP `401 Unauthorized` status code" — which
+//! is unconditional. Measured 2026-09-02 against a live account: a valid app
+//! password, that same password carrying Google's display spaces, sixteen
+//! arbitrary characters, and an empty string all returned an identical 401
+//! with a GData `loginRequired` body. The endpoint never inspects the
+//! credential at all, so no stored value can ever satisfy it.
+//!
+//! `www.google.com/calendar/dav/` is documented as no longer supported and
+//! answers anyway. The same measurement returned 207 for the principal, for
+//! the events collection, and for a `calendar-query` REPORT carrying real
+//! events — while sixteen arbitrary characters returned 401, so it is
+//! genuinely authenticating rather than waving everything through.
+//!
+//! This is therefore a bridge, not a destination: an endpoint already past
+//! deprecation has no remaining timeline and can stop without notice. The
+//! replacement is OAuth 2.0, against either `caldav/v2` or the Calendar REST
+//! API v3 on the same token. Until that exists, a documented-dead endpoint
+//! that works beats a documented-live one that cannot authenticate — and the
+//! failure mode of guessing wrong here is a 401 the credential flow reads as
+//! "bad password", which asks the user for a replacement that also cannot
+//! work.
+//!
+//! Moving is a two-constant change: [`CALDAV_HOST`] and [`CALDAV_PATH`] are
+//! the only places the host and path are written down, and
+//! `caldav_base_is_host_plus_path` pins [`CALDAV_BASE`] to them.
+//!
+//! Because the host is fixed, the tool's own arguments carry no
+//! arbitrary-URL / SSRF surface: every request targets [`CALDAV_HOST`]. That
+//! host is now `www.google.com` rather than an API-only name, so a
+//! server-supplied href reaches a broader surface than it used to;
+//! [`absolutize`] is the single place such a path becomes a URL.
+
+use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex};
 
 use async_trait::async_trait;
 use chrono::{DateTime, NaiveDate, NaiveDateTime, SecondsFormat, Utc};
 use regex::Regex;
 use rustykrab_core::types::ToolSchema;
 use rustykrab_core::{Error, Result, SandboxRequirements, Tool};
-use rustykrab_store::SecretStore;
+use rustykrab_store::GuardedSecrets;
 use serde_json::{json, Value};
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
-/// Scheme + host for Google's CalDAV API. All requests target this host.
-const CALDAV_HOST: &str = "https://apidata.googleusercontent.com";
-/// Base path for CalDAV v2 collections.
-const CALDAV_BASE: &str = "https://apidata.googleusercontent.com/caldav/v2/";
+/// Scheme + host for Google's CalDAV endpoint. All requests target this host.
+const CALDAV_HOST: &str = "https://www.google.com";
+/// Path prefix for CalDAV collections under [`CALDAV_HOST`].
+///
+/// Server-supplied hrefs carry this prefix, so the parsing below keys off the
+/// constant rather than a literal — otherwise a host move silently stops
+/// matching hrefs while every request still succeeds.
+const CALDAV_PATH: &str = "/calendar/dav/";
+/// Base URL for CalDAV collections: [`CALDAV_HOST`] + [`CALDAV_PATH`].
+const CALDAV_BASE: &str = "https://www.google.com/calendar/dav/";
 
-// SecretStore keys — shared with the Gmail tool so one app password covers
-// both mail and calendar.
-const KEY_EMAIL: &str = "gmail_email";
-const KEY_APP_PASSWORD: &str = "gmail_app_password";
+// The account credential is shared with the Gmail tool so one app password
+// covers both mail and calendar — and so is the code that reads it and asks
+// for it when it is absent.
+use crate::google_credentials::{describe_password_shape, KEY_APP_PASSWORD, KEY_EMAIL};
 
 /// Maximum events returned from a single `list_events` call.
 const MAX_EVENTS: usize = 200;
@@ -53,52 +95,57 @@ struct DavReq<'a> {
 }
 
 pub struct CalDavTool {
-    secrets: SecretStore,
+    secrets: GuardedSecrets,
     client: reqwest::Client,
+    /// Where to file a request when the credentials are absent. Optional
+    /// so the tool still constructs in tests and anywhere the daemon has
+    /// not assembled a store; without it the tool reports the gap and asks
+    /// nobody, which is the behaviour this exists to end.
+    requests: Option<rustykrab_store::CredentialRequestStore>,
+    /// Where a minted link waits until the turn has finished speaking.
+    /// Without it the request is still filed and answerable in the app,
+    /// there is simply no link to send to a chat surface.
+    pending_links: Option<rustykrab_store::PendingLinks>,
 }
 
 impl CalDavTool {
-    pub fn new(secrets: SecretStore) -> Self {
+    pub fn new(secrets: GuardedSecrets) -> Self {
         Self {
             secrets,
             client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
+            requests: None,
+            pending_links: None,
         }
     }
 
-    /// Fetch the Google email + app password from the shared credential store.
-    fn get_credentials(&self) -> Result<(String, String)> {
-        let email = self.secrets.get(KEY_EMAIL).map_err(|e| {
-            Error::ToolExecution(
-                format!(
-                    "gmail_email not available: {e}. The CalDAV tool reuses your Gmail \
-                     credentials. Store it with: credential_write(action='set', \
-                     name='gmail_email', value='you@gmail.com'), or set it up via the \
-                     gmail tool's setup action."
-                )
-                .into(),
-            )
-        })?;
-        let password = self.secrets.get(KEY_APP_PASSWORD).map_err(|e| {
-            Error::ToolExecution(
-                format!(
-                    "gmail_app_password not available: {e}. The CalDAV tool reuses your \
-                     Gmail app password. Store it with: credential_write(action='set', \
-                     name='gmail_app_password', value='YOUR_APP_PASSWORD'). Generate an \
-                     app password at https://myaccount.google.com/apppasswords."
-                )
-                .into(),
-            )
-        })?;
-        // Google displays app passwords as four space-separated groups
-        // (`abcd efgh ijkl mnop`). Gmail's IMAP/SMTP tolerates the spaces
-        // server-side, but a CalDAV `Basic` auth header base64-encodes them
-        // verbatim and Google's DAV endpoint rejects it with 401. Strip all
-        // whitespace so a password stored in the displayed format still works,
-        // without requiring the user to re-enter it.
-        Ok((email.trim().to_string(), normalize_app_password(&password)))
+    /// Let the tool ask the user for what it is missing.
+    pub fn with_requests(mut self, requests: rustykrab_store::CredentialRequestStore) -> Self {
+        self.requests = Some(requests);
+        self
+    }
+
+    /// Deliver minted links out of band, after the turn.
+    pub fn with_pending_links(mut self, links: rustykrab_store::PendingLinks) -> Self {
+        self.pending_links = Some(links);
+        self
+    }
+
+    /// Fetch the Google email + app password, asking the user when they are
+    /// absent or unusable.
+    ///
+    /// One line, because mail and calendar are one account: see
+    /// [`crate::google_credentials`].
+    async fn get_credentials(&self) -> Result<(String, String)> {
+        crate::google_credentials::load(
+            &self.secrets,
+            self.requests.as_ref(),
+            self.pending_links.as_ref(),
+            "Google Calendar",
+        )
+        .await
     }
 
     /// The events collection URL for a given calendar id (defaults to the
@@ -149,14 +196,28 @@ impl CalDavTool {
 
         if !(200..300).contains(&status) {
             let detail = text.chars().take(500).collect::<String>();
-            let hint = if status == 401 {
-                " (401 Unauthorized — check that gmail_app_password is a Google *app* \
-                 password and that CalDAV access is permitted for the account)"
-            } else {
-                ""
-            };
+            // A 401 here is Google refusing the stored app password —
+            // revoked, expired, or never permitted for DAV. `get_credentials`
+            // cannot see that: the value is present and well formed, so it
+            // passes through, and only this response proves it dead. Telling
+            // the model to "check that the password is an app password" was
+            // advice nobody could act on; ask the user for a new one instead,
+            // the same way an absent one is asked for.
+            if status == 401 {
+                return Err(crate::google_credentials::rejected(
+                    self.requests.as_ref(),
+                    self.pending_links.as_ref(),
+                    "Google Calendar",
+                    format!(
+                        "CalDAV {url} returned HTTP 401 Unauthorized — Google rejected the \
+                         stored {KEY_APP_PASSWORD}, which is {}: {detail}",
+                        describe_password_shape(password)
+                    ),
+                )
+                .await);
+            }
             return Err(Error::ToolExecution(
-                format!("CalDAV {url} returned HTTP {status}{hint}: {detail}").into(),
+                format!("CalDAV {url} returned HTTP {status}: {detail}").into(),
             ));
         }
 
@@ -172,16 +233,20 @@ impl CalDavTool {
         // whatever the Gmail integration already stored.
         if let Some(email) = args["email"].as_str() {
             self.secrets
-                .set(KEY_EMAIL, email)
+                .set_strict(KEY_EMAIL, email)
+                .await
                 .map_err(|e| Error::ToolExecution(format!("failed to store email: {e}").into()))?;
         }
         if let Some(pw) = args["app_password"].as_str() {
-            self.secrets.set(KEY_APP_PASSWORD, pw).map_err(|e| {
-                Error::ToolExecution(format!("failed to store app password: {e}").into())
-            })?;
+            self.secrets
+                .set_strict(KEY_APP_PASSWORD, pw)
+                .await
+                .map_err(|e| {
+                    Error::ToolExecution(format!("failed to store app password: {e}").into())
+                })?;
         }
 
-        let (email, password) = self.get_credentials()?;
+        let (email, password) = self.get_credentials().await?;
 
         // Verify by enumerating calendars.
         let calendars = self.discover_calendars(&email, &password).await?;
@@ -200,7 +265,7 @@ impl CalDavTool {
     // -----------------------------------------------------------------------
 
     async fn action_list_calendars(&self) -> Result<Value> {
-        let (email, password) = self.get_credentials()?;
+        let (email, password) = self.get_credentials().await?;
         let calendars = self.discover_calendars(&email, &password).await?;
         Ok(json!({ "calendars": calendars }))
     }
@@ -233,8 +298,8 @@ impl CalDavTool {
         // The first href inside the response is the calendar-home-set.
         let home_href = extract_hrefs(&home_xml)
             .into_iter()
-            .find(|h| h.contains("/caldav/v2/"))
-            .unwrap_or_else(|| format!("/caldav/v2/{email}/"));
+            .find(|h| h.contains(CALDAV_PATH))
+            .unwrap_or_else(|| format!("{CALDAV_PATH}{email}/"));
         let home_url = absolutize(&home_href);
 
         // Step 2: enumerate child collections, keeping only calendars.
@@ -261,16 +326,13 @@ impl CalDavTool {
             )
             .await?;
 
-        // Heuristic: a calendar resourcetype contains a <...:calendar/> tag.
-        let calendar_re = Regex::new(r"<[^>]*:?calendar\s*/?>").expect("static regex");
-
         let mut calendars = Vec::new();
         for block in split_responses(&list_xml) {
             // Only collections advertising the CalDAV "calendar" resourcetype.
             if !block.contains("calendar") || !block.to_lowercase().contains("resourcetype") {
                 continue;
             }
-            if !calendar_re.is_match(&block) {
+            if !CALENDAR_TYPE_RE.is_match(&block) {
                 continue;
             }
             let href = extract_hrefs(&block).into_iter().next().unwrap_or_default();
@@ -291,7 +353,7 @@ impl CalDavTool {
     // -----------------------------------------------------------------------
 
     async fn action_list_events(&self, args: &Value) -> Result<Value> {
-        let (email, password) = self.get_credentials()?;
+        let (email, password) = self.get_credentials().await?;
         let calendar_id = args["calendar_id"].as_str();
         let collection = self.events_collection(&email, calendar_id);
 
@@ -370,7 +432,7 @@ impl CalDavTool {
     // -----------------------------------------------------------------------
 
     async fn action_get_event(&self, args: &Value) -> Result<Value> {
-        let (email, password) = self.get_credentials()?;
+        let (email, password) = self.get_credentials().await?;
         let url = self.resolve_event_url(args, &email)?;
         let (_, ics) = self
             .dav_request("GET", &url, &email, &password, DavReq::default())
@@ -388,7 +450,7 @@ impl CalDavTool {
     // -----------------------------------------------------------------------
 
     async fn action_create_event(&self, args: &Value) -> Result<Value> {
-        let (email, password) = self.get_credentials()?;
+        let (email, password) = self.get_credentials().await?;
         let calendar_id = args["calendar_id"].as_str();
         let collection = self.events_collection(&email, calendar_id);
 
@@ -432,7 +494,7 @@ impl CalDavTool {
     // -----------------------------------------------------------------------
 
     async fn action_update_event(&self, args: &Value) -> Result<Value> {
-        let (email, password) = self.get_credentials()?;
+        let (email, password) = self.get_credentials().await?;
         let url = self.resolve_event_url(args, &email)?;
 
         // Fetch the existing event so we can preserve its UID and any fields
@@ -503,7 +565,7 @@ impl CalDavTool {
     // -----------------------------------------------------------------------
 
     async fn action_delete_event(&self, args: &Value) -> Result<Value> {
-        let (email, password) = self.get_credentials()?;
+        let (email, password) = self.get_credentials().await?;
         let url = self.resolve_event_url(args, &email)?;
         let etag = args["etag"].as_str();
         self.dav_request(
@@ -546,12 +608,26 @@ impl CalDavTool {
 // Pure helpers (unit-tested, no network)
 // ---------------------------------------------------------------------------
 
-/// Remove all whitespace from a Google app password. Google shows app
-/// passwords as four space-separated groups; the spaces are not part of the
-/// secret and break CalDAV `Basic` auth, so strip them.
-fn normalize_app_password(password: &str) -> String {
-    password.replace(char::is_whitespace, "")
-}
+// WebDAV/CalDAV parsing patterns, compiled once. These run per response
+// fragment, so recompiling them per call would dominate parse time.
+
+/// Heuristic: a calendar resourcetype contains a `<...:calendar/>` tag.
+static CALENDAR_TYPE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"<[^>]*:?calendar\s*/?>").expect("static regex"));
+static CALENDAR_ID_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(&format!(r"{}([^/]+)/", regex::escape(CALDAV_PATH))).expect("static regex")
+});
+static RESPONSE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?si)<[a-z0-9]*:?response[\s>].*?</[a-z0-9]*:?response>").expect("static regex")
+});
+static HREF_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?si)<[a-z0-9]*:?href\s*>(.*?)</[a-z0-9]*:?href>").expect("static regex")
+});
+/// Cache for the per-tag patterns built by [`extract_tag_text`]. The set of
+/// tag names is small and fixed (`displayname`, `getetag`, `calendar-data`),
+/// so this stays tiny while avoiding a recompile per fragment.
+static TAG_TEXT_RES: LazyLock<Mutex<HashMap<String, Regex>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Turn an href (possibly path-only) into an absolute Google CalDAV URL.
 fn absolutize(href: &str) -> String {
@@ -565,12 +641,12 @@ fn absolutize(href: &str) -> String {
     }
 }
 
-/// Extract the calendar id (the segment between `/caldav/v2/` and `/events`)
+/// Extract the calendar id (the segment between [`CALDAV_PATH`] and `/events`)
 /// from an href, percent-decoding `%40` back to `@`.
 fn calendar_id_from_href(href: &str) -> String {
-    let id = Regex::new(r"/caldav/v2/([^/]+)/")
-        .ok()
-        .and_then(|re| re.captures(href).map(|c| c[1].to_string()))
+    let id = CALENDAR_ID_RE
+        .captures(href)
+        .map(|c| c[1].to_string())
         .unwrap_or_default();
     id.replace("%40", "@")
 }
@@ -587,23 +663,35 @@ fn uid_from_url(url: &str) -> String {
 /// Split a WebDAV multistatus document into individual `<response>` blocks,
 /// tolerant of any namespace prefix.
 fn split_responses(xml: &str) -> Vec<String> {
-    let re = Regex::new(r"(?si)<[a-z0-9]*:?response[\s>].*?</[a-z0-9]*:?response>")
-        .expect("static regex");
-    re.find_iter(xml).map(|m| m.as_str().to_string()).collect()
+    RESPONSE_RE
+        .find_iter(xml)
+        .map(|m| m.as_str().to_string())
+        .collect()
 }
 
 /// Extract all `<href>` text values from an XML fragment (any prefix).
 fn extract_hrefs(xml: &str) -> Vec<String> {
-    let re = Regex::new(r"(?si)<[a-z0-9]*:?href\s*>(.*?)</[a-z0-9]*:?href>").expect("static regex");
-    re.captures_iter(xml)
+    HREF_RE
+        .captures_iter(xml)
         .map(|c| unescape_xml(c[1].trim()))
         .collect()
 }
 
 /// Extract the text content of the first element with the given local name.
 fn extract_tag_text(xml: &str, local_name: &str) -> Option<String> {
-    let pattern = format!(r"(?si)<[a-z0-9]*:?{local_name}\s*>(.*?)</[a-z0-9]*:?{local_name}>");
-    let re = Regex::new(&pattern).ok()?;
+    let re = {
+        let mut cache = TAG_TEXT_RES.lock().expect("tag regex cache poisoned");
+        match cache.get(local_name) {
+            Some(re) => re.clone(),
+            None => {
+                let pattern =
+                    format!(r"(?si)<[a-z0-9]*:?{local_name}\s*>(.*?)</[a-z0-9]*:?{local_name}>");
+                let re = Regex::new(&pattern).ok()?;
+                cache.insert(local_name.to_string(), re.clone());
+                re
+            }
+        }
+    };
     re.captures(xml).map(|c| unescape_xml(c[1].trim()))
 }
 
@@ -919,6 +1007,16 @@ impl Tool for CalDavTool {
 mod tests {
     use super::*;
 
+    /// `resolve_event_url` never touches the secret store, but constructing
+    /// the tool needs one — a throwaway on-disk store is the cheapest way to
+    /// exercise the real method rather than a reconstruction of it.
+    fn caldav_tool() -> (tempfile::TempDir, CalDavTool) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = rustykrab_store::Store::open(dir.path(), vec![5u8; 32]).expect("open store");
+        let tool = CalDavTool::new(store.guarded_secrets());
+        (dir, tool)
+    }
+
     #[test]
     fn parse_datetime_to_ical_utc() {
         assert_eq!(
@@ -1021,49 +1119,56 @@ mod tests {
         assert!(parse_vevent("BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n").is_none());
     }
 
+    /// The three constants have to agree, because href matching keys off
+    /// [`CALDAV_PATH`] while requests are built from [`CALDAV_BASE`]. Let them
+    /// drift and every request still succeeds while no href ever matches —
+    /// calendar discovery returns nothing and the tool looks empty, not broken.
     #[test]
-    fn app_password_whitespace_is_stripped() {
-        // Google's displayed format: four space-separated groups.
-        assert_eq!(
-            normalize_app_password("abcd efgh ijkl mnop"),
-            "abcdefghijklmnop"
-        );
-        // Leading/trailing and tab/newline whitespace too.
-        assert_eq!(
-            normalize_app_password("  abcd\tefgh\nijkl mnop  "),
-            "abcdefghijklmnop"
-        );
-        // Already-clean passwords are unchanged.
-        assert_eq!(
-            normalize_app_password("abcdefghijklmnop"),
-            "abcdefghijklmnop"
-        );
+    fn caldav_base_is_host_plus_path() {
+        assert_eq!(CALDAV_BASE, format!("{CALDAV_HOST}{CALDAV_PATH}"));
+    }
+
+    /// Basic auth only works against the legacy host; `caldav/v2` requires
+    /// OAuth and answers 401 to every password, valid or not. See the module
+    /// docs — this pins the endpoint so a "tidy-up" back to the documented
+    /// host cannot land silently.
+    #[test]
+    fn the_endpoint_is_the_one_that_accepts_a_password() {
+        assert_eq!(CALDAV_HOST, "https://www.google.com");
+        assert_eq!(CALDAV_PATH, "/calendar/dav/");
     }
 
     #[test]
     fn absolutize_paths_and_urls() {
         assert_eq!(
-            absolutize("/caldav/v2/me@gmail.com/events/x.ics"),
-            "https://apidata.googleusercontent.com/caldav/v2/me@gmail.com/events/x.ics"
+            absolutize("/calendar/dav/me@gmail.com/events/x.ics"),
+            "https://www.google.com/calendar/dav/me@gmail.com/events/x.ics"
         );
         assert_eq!(
-            absolutize("https://apidata.googleusercontent.com/foo"),
-            "https://apidata.googleusercontent.com/foo"
+            absolutize("https://www.google.com/foo"),
+            "https://www.google.com/foo"
         );
         assert_eq!(
-            absolutize("caldav/v2/x"),
-            "https://apidata.googleusercontent.com/caldav/v2/x"
+            absolutize("calendar/dav/x"),
+            "https://www.google.com/calendar/dav/x"
         );
     }
 
+    /// Both spellings observed from the live server on 2026-09-02: the
+    /// principal href leaves `@` bare, the calendar-home-set and event hrefs
+    /// percent-encode it.
     #[test]
     fn calendar_id_extraction_decodes_at() {
         assert_eq!(
-            calendar_id_from_href("/caldav/v2/me%40gmail.com/events/"),
+            calendar_id_from_href("/calendar/dav/me%40gmail.com/events/"),
             "me@gmail.com"
         );
         assert_eq!(
-            calendar_id_from_href("/caldav/v2/abc123@group.calendar.google.com/events/"),
+            calendar_id_from_href("/calendar/dav/me@gmail.com/user/"),
+            "me@gmail.com"
+        );
+        assert_eq!(
+            calendar_id_from_href("/calendar/dav/abc123@group.calendar.google.com/events/"),
             "abc123@group.calendar.google.com"
         );
     }
@@ -1071,9 +1176,25 @@ mod tests {
     #[test]
     fn uid_from_url_strips_ics() {
         assert_eq!(
-            uid_from_url("https://x/caldav/v2/me/events/the-uid.ics"),
+            uid_from_url("https://x/calendar/dav/me/events/the-uid.ics"),
             "the-uid"
         );
+        // Google returns UIDs that are themselves addresses.
+        assert_eq!(
+            uid_from_url("/calendar/dav/me%40gmail.com/events/abc%40google.com.ics"),
+            "abc%40google.com"
+        );
+    }
+
+    #[test]
+    fn extract_tag_text_caches_per_tag_patterns() {
+        let xml = "<d:displayname>Work</d:displayname><d:getetag>\"abc\"</d:getetag>";
+        // Distinct tags each get their own compiled pattern...
+        assert_eq!(extract_tag_text(xml, "displayname").unwrap(), "Work");
+        assert_eq!(extract_tag_text(xml, "getetag").unwrap(), "\"abc\"");
+        // ...and repeat lookups (the cached path) behave identically.
+        assert_eq!(extract_tag_text(xml, "displayname").unwrap(), "Work");
+        assert_eq!(extract_tag_text(xml, "absent"), None);
     }
 
     #[test]
@@ -1083,7 +1204,7 @@ mod tests {
         let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
 <D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
   <D:response>
-    <D:href>/caldav/v2/me@gmail.com/events/evt-1.ics</D:href>
+    <D:href>/calendar/dav/me@gmail.com/events/evt-1.ics</D:href>
     <D:propstat>
       <D:prop>
         <D:getetag>"etag-123"</D:getetag>
@@ -1104,7 +1225,7 @@ END:VCALENDAR&#13;
         let blocks = split_responses(xml);
         assert_eq!(blocks.len(), 1);
         let href = extract_hrefs(&blocks[0]).into_iter().next().unwrap();
-        assert_eq!(href, "/caldav/v2/me@gmail.com/events/evt-1.ics");
+        assert_eq!(href, "/calendar/dav/me@gmail.com/events/evt-1.ics");
         let etag = extract_tag_text(&blocks[0], "getetag").unwrap();
         assert_eq!(etag, "\"etag-123\"");
         let data = extract_tag_text(&blocks[0], "calendar-data").unwrap();
@@ -1115,13 +1236,55 @@ END:VCALENDAR&#13;
     }
 
     #[test]
-    fn resolve_event_url_prefers_href() {
-        // Build a tool with a throwaway in-memory secret store is overkill for
-        // this pure check; exercise the URL logic via a standalone reconstruction.
-        // href wins:
+    fn resolve_event_url_prefers_href_over_uid() {
+        let (_dir, tool) = caldav_tool();
+        // Both identifiers present: the href wins. It is the server's own
+        // path for the resource, so it needs no reconstruction and stays
+        // correct even for calendars whose layout we would guess wrong.
+        let url = tool
+            .resolve_event_url(
+                &json!({ "href": "/calendar/dav/me@gmail.com/events/x.ics", "uid": "ignored" }),
+                "me@gmail.com",
+            )
+            .unwrap();
         assert_eq!(
-            absolutize("/caldav/v2/me@gmail.com/events/x.ics"),
-            "https://apidata.googleusercontent.com/caldav/v2/me@gmail.com/events/x.ics"
+            url,
+            "https://www.google.com/calendar/dav/me@gmail.com/events/x.ics"
         );
+    }
+
+    #[test]
+    fn resolve_event_url_builds_the_canonical_path_from_a_uid() {
+        let (_dir, tool) = caldav_tool();
+        let resolve = |args| tool.resolve_event_url(&args, "me@gmail.com").unwrap();
+
+        assert_eq!(
+            resolve(json!({ "uid": "evt-1" })),
+            "https://www.google.com/calendar/dav/me@gmail.com/events/evt-1.ics"
+        );
+        assert_eq!(
+            resolve(json!({ "uid": "evt-1.ics" })),
+            "https://www.google.com/calendar/dav/me@gmail.com/events/evt-1.ics",
+            "an extension already on the uid must not be doubled"
+        );
+        // An explicit calendar_id replaces the account's default collection,
+        // which is how shared/group calendars are addressed.
+        assert_eq!(
+            resolve(json!({ "uid": "evt-1", "calendar_id": "team@group.calendar.google.com" })),
+            "https://www.google.com/calendar/dav/\
+             team@group.calendar.google.com/events/evt-1.ics"
+        );
+    }
+
+    #[test]
+    fn resolve_event_url_without_an_identifier_names_both_options() {
+        let (_dir, tool) = caldav_tool();
+        let err = tool
+            .resolve_event_url(&json!({}), "me@gmail.com")
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("missing event identifier"), "got: {msg}");
+        // The model has to be told which arguments would fix the call.
+        assert!(msg.contains("href") && msg.contains("uid"), "got: {msg}");
     }
 }

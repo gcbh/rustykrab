@@ -181,12 +181,14 @@ impl SessionManager for SubagentRunner {
                     role: Role::System,
                     content: MessageContent::Text(def.system_prompt.clone()),
                     created_at: now,
+                    agent_version: Message::version_stamp(),
                 },
                 Message {
                     id: Uuid::new_v4(),
                     role: Role::User,
                     content: MessageContent::Text(task.to_string()),
                     created_at: now,
+                    agent_version: Message::version_stamp(),
                 },
             ],
             created_at: now,
@@ -292,6 +294,7 @@ mod tests {
                 role: Role::Assistant,
                 content: MessageContent::Text(text.to_string()),
                 created_at: Utc::now(),
+                agent_version: None,
             },
             usage: Usage {
                 prompt_tokens: 1,

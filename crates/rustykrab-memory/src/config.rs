@@ -123,3 +123,48 @@ impl Default for MemoryConfig {
         }
     }
 }
+
+#[cfg(test)]
+mod validation_entry_tests {
+    use super::*;
+    use crate::embedding::HashEmbedder;
+    use crate::storage::SqliteMemoryStorage;
+    use crate::MemorySystem;
+    use std::sync::Arc;
+
+    fn parts() -> (Arc<SqliteMemoryStorage>, Arc<HashEmbedder>) {
+        (
+            Arc::new(SqliteMemoryStorage::open_in_memory().unwrap()),
+            Arc::new(HashEmbedder::new(768)),
+        )
+    }
+
+    /// `validate()` existed and guarded exactly the two values that cannot
+    /// be defended against downstream — but nothing called it, so both
+    /// surfaced as a panic on the first query instead of at construction.
+    #[test]
+    fn a_zero_rrf_k_is_refused_at_construction_not_at_query_time() {
+        let (storage, embedder) = parts();
+        let config = MemoryConfig {
+            rrf_k: 0.0,
+            ..MemoryConfig::default()
+        };
+        assert!(MemorySystem::try_new(config, storage, embedder).is_err());
+    }
+
+    #[test]
+    fn a_zero_chunk_size_is_refused_at_construction() {
+        let (storage, embedder) = parts();
+        let config = MemoryConfig {
+            chunk_max_tokens: 0,
+            ..MemoryConfig::default()
+        };
+        assert!(MemorySystem::try_new(config, storage, embedder).is_err());
+    }
+
+    #[test]
+    fn the_default_config_is_valid() {
+        let (storage, embedder) = parts();
+        assert!(MemorySystem::try_new(MemoryConfig::default(), storage, embedder).is_ok());
+    }
+}

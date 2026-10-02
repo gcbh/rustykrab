@@ -6,9 +6,10 @@
 //! self-correct on the next round without re-reading the full schema.
 //!
 //! Only the subset of JSON Schema actually used by tools in this workspace
-//! is implemented: top-level `properties`, `required`, per-field `type`,
-//! and `enum`. Nested object/array validation is intentionally skipped —
-//! tools that need deeper checks keep doing them in `execute()`.
+//! is implemented: top-level `properties`, `required`, per-field `type` and
+//! `enum`, plus `allOf` clauses with `if`/`then` conditional requirements.
+//! Nested object/array validation is intentionally skipped — tools that need
+//! deeper checks keep doing them in `execute()`.
 
 use serde_json::Value;
 
@@ -19,13 +20,12 @@ use crate::error::ToolError;
 /// Returns an `InvalidInput` [`ToolError`] with a message the model can act
 /// on (enumerating valid enum values, naming the expected type, etc.).
 pub fn validate_tool_args(parameters: &Value, args: &Value) -> Result<(), ToolError> {
+    let empty_args = serde_json::Map::new();
     let args_obj = match args {
         Value::Object(map) => map,
-        Value::Null => {
-            // Treat missing args as an empty object so the required-field
-            // check below produces the right message.
-            return validate_required(parameters, &serde_json::Map::new());
-        }
+        // Treat missing args as an empty object so required-field checks
+        // produce the same useful message as an explicit `{}`.
+        Value::Null => &empty_args,
         other => {
             return Err(ToolError::invalid_input(format!(
                 "arguments must be a JSON object, got {}",
@@ -35,6 +35,7 @@ pub fn validate_tool_args(parameters: &Value, args: &Value) -> Result<(), ToolEr
     };
 
     validate_required(parameters, args_obj)?;
+    validate_conditional_requirements(parameters, args_obj)?;
 
     if let Some(properties) = parameters.get("properties").and_then(Value::as_object) {
         for (field_name, field_value) in args_obj {
@@ -52,10 +53,25 @@ fn validate_required(
     parameters: &Value,
     args_obj: &serde_json::Map<String, Value>,
 ) -> Result<(), ToolError> {
-    let Some(required) = parameters.get("required").and_then(Value::as_array) else {
+    validate_required_with_properties(
+        parameters,
+        args_obj,
+        parameters.get("properties").and_then(Value::as_object),
+    )
+}
+
+fn validate_required_with_properties(
+    schema: &Value,
+    args_obj: &serde_json::Map<String, Value>,
+    fallback_properties: Option<&serde_json::Map<String, Value>>,
+) -> Result<(), ToolError> {
+    let Some(required) = schema.get("required").and_then(Value::as_array) else {
         return Ok(());
     };
-    let properties = parameters.get("properties").and_then(Value::as_object);
+    let properties = schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .or(fallback_properties);
 
     for req in required {
         let Some(name) = req.as_str() else { continue };
@@ -75,6 +91,76 @@ fn validate_required(
         return Err(ToolError::invalid_input(msg));
     }
     Ok(())
+}
+
+/// Apply the conditional required-field clauses used by polymorphic tools.
+///
+/// This deliberately implements a small, predictable JSON-Schema subset:
+/// each `allOf` entry may contain `if` plus `then`/`else`, and conditions may
+/// inspect `required`, `properties.const`, `properties.enum`, and
+/// `properties.type`. That covers the schemas currently emitted by the
+/// workspace without turning tool dispatch into a second schema engine.
+fn validate_conditional_requirements(
+    parameters: &Value,
+    args_obj: &serde_json::Map<String, Value>,
+) -> Result<(), ToolError> {
+    let Some(clauses) = parameters.get("allOf").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    let root_properties = parameters.get("properties").and_then(Value::as_object);
+
+    for clause in clauses {
+        if let Some(condition) = clause.get("if") {
+            let branch = if condition_matches(condition, args_obj) {
+                clause.get("then")
+            } else {
+                clause.get("else")
+            };
+            if let Some(branch) = branch {
+                validate_required_with_properties(branch, args_obj, root_properties)?;
+            }
+        } else {
+            validate_required_with_properties(clause, args_obj, root_properties)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn condition_matches(condition: &Value, args_obj: &serde_json::Map<String, Value>) -> bool {
+    if let Some(required) = condition.get("required").and_then(Value::as_array) {
+        for field in required.iter().filter_map(Value::as_str) {
+            if !args_obj.contains_key(field) {
+                return false;
+            }
+        }
+    }
+
+    let Some(properties) = condition.get("properties").and_then(Value::as_object) else {
+        return true;
+    };
+    for (name, field_schema) in properties {
+        // JSON Schema's `properties` keyword does not itself require a field.
+        let Some(value) = args_obj.get(name) else {
+            continue;
+        };
+        if let Some(expected) = field_schema.get("const") {
+            if value != expected {
+                return false;
+            }
+        }
+        if let Some(allowed) = field_schema.get("enum").and_then(Value::as_array) {
+            if !allowed.iter().any(|candidate| candidate == value) {
+                return false;
+            }
+        }
+        if let Some(expected_type) = field_schema.get("type").and_then(Value::as_str) {
+            if !value_matches_type(value, expected_type) {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 fn validate_field(name: &str, field_schema: &Value, value: &Value) -> Result<(), ToolError> {
@@ -284,5 +370,67 @@ mod tests {
     fn valid_call_succeeds() {
         let args = json!({ "action": "create", "schedule": "0 9 * * *" });
         validate_tool_args(&cron_schema(), &args).unwrap();
+    }
+
+    #[test]
+    fn conditional_required_fields_are_enforced() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "action": { "type": "string", "enum": ["act", "evaluate", "snapshot"] },
+                "actAction": { "type": "string", "enum": ["click", "type"] },
+                "expression": { "type": "string" }
+            },
+            "required": ["action"],
+            "allOf": [
+                {
+                    "if": { "properties": { "action": { "const": "act" } }, "required": ["action"] },
+                    "then": { "required": ["actAction"] }
+                },
+                {
+                    "if": { "properties": { "action": { "const": "evaluate" } }, "required": ["action"] },
+                    "then": { "required": ["expression"] }
+                }
+            ]
+        });
+
+        let act_err = validate_tool_args(&schema, &json!({ "action": "act" })).unwrap_err();
+        assert_eq!(act_err.kind, crate::error::ToolErrorKind::InvalidInput);
+        assert!(act_err.message.contains("'actAction'"), "{act_err}");
+        assert!(act_err.message.contains("'click'"), "{act_err}");
+
+        let eval_err = validate_tool_args(&schema, &json!({ "action": "evaluate" })).unwrap_err();
+        assert!(eval_err.message.contains("'expression'"), "{eval_err}");
+
+        validate_tool_args(&schema, &json!({ "action": "snapshot" })).unwrap();
+        validate_tool_args(&schema, &json!({ "action": "act", "actAction": "click" })).unwrap();
+    }
+
+    #[test]
+    fn conditional_enum_matches_multiple_values() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "action": { "type": "string" },
+                "actAction": { "type": "string" },
+                "text": { "type": "string" }
+            },
+            "required": ["action"],
+            "allOf": [{
+                "if": {
+                    "properties": {
+                        "action": { "const": "act" },
+                        "actAction": { "enum": ["type", "fill"] }
+                    },
+                    "required": ["action", "actAction"]
+                },
+                "then": { "required": ["text"] }
+            }]
+        });
+
+        let err = validate_tool_args(&schema, &json!({ "action": "act", "actAction": "fill" }))
+            .unwrap_err();
+        assert!(err.message.contains("'text'"), "{err}");
+        validate_tool_args(&schema, &json!({ "action": "act", "actAction": "click" })).unwrap();
     }
 }

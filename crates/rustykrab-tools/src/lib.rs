@@ -1,8 +1,11 @@
 #![recursion_limit = "512"]
 
 // Security utilities
+pub mod credential_link;
+pub mod origin_key;
 pub mod sanitize;
 pub mod security;
+pub mod stub;
 
 // Sandboxed subprocess execution
 mod sandboxed_spawn;
@@ -77,6 +80,10 @@ mod gmail;
 // Calendar tools
 mod caldav;
 
+// The Google account credential both of them authenticate with, and the
+// one way of asking the user for it.
+pub mod google_credentials;
+
 // Notion integration
 mod notion;
 
@@ -87,8 +94,13 @@ pub(crate) mod obsidian;
 mod wiki;
 
 // Credentials (from main)
+// Which named credentials a request may be redirected onto, so the model
+// cannot invent a name that dedupes against nothing and stores nowhere.
 mod credential_read;
+mod credential_request;
 mod credential_write;
+pub mod known_credential;
+mod payment_request;
 
 // Skill tools
 mod skills;
@@ -139,6 +151,7 @@ pub use memory_delete::MemoryDeleteTool;
 pub use memory_get::MemoryGetTool;
 pub use memory_save::MemorySaveTool;
 pub use memory_search::MemorySearchTool;
+pub use stub::{StubFile, StubMode, StubSpec, StubTool};
 
 // Messaging
 pub use message::MessageTool;
@@ -186,7 +199,12 @@ pub use wiki::WikiTool;
 
 // Credentials
 pub use credential_read::CredentialReadTool;
+pub use credential_request::CredentialRequestTool;
 pub use credential_write::CredentialWriteTool;
+pub use origin_key::{
+    canonical_web_key, origin_credential_key, origin_from_service, PASSWORD, USERNAME,
+};
+pub use payment_request::PaymentRequestTool;
 
 // Skills
 pub use self::skills::{SkillTool, SkillsTool};
@@ -203,10 +221,15 @@ pub use mcp_connector::{mcp_connector_tools, McpRemoteTool};
 
 /// Collect all built-in tools that require no external backend into a Vec.
 ///
-/// Tools that need access to the secret store (credential_read, credential_write)
-/// require a `SecretStore` handle. The remaining tools are stateless or self-contained.
+/// Tools that read credentials take a `SecretStore`; every tool that can
+/// *write* one takes [`GuardedSecrets`] instead, so the create-only policy
+/// is carried by the handle rather than by a check each tool remembers.
 pub fn builtin_tools(
     secrets: rustykrab_store::SecretStore,
+    guarded: rustykrab_store::GuardedSecrets,
+    requests: rustykrab_store::CredentialRequestStore,
+    payments: rustykrab_store::PaymentRequestStore,
+    pending_links: rustykrab_store::PendingLinks,
 ) -> Vec<std::sync::Arc<dyn rustykrab_core::Tool>> {
     vec![
         // Meta — tool discovery and lazy schema loading. Always registered.
@@ -234,7 +257,14 @@ pub fn builtin_tools(
         // Media
         std::sync::Arc::new(ImageTool::new()),
         // UI
-        std::sync::Arc::new(BrowserTool::new()),
+        std::sync::Arc::new(
+            BrowserTool::new()
+                .with_secrets(guarded.clone())
+                .with_payments(payments.clone())
+                // So a payment refused at the pay button as a duplicate
+                // reaches the user even if the model says nothing useful.
+                .with_pending_links(pending_links.clone()),
+        ),
         std::sync::Arc::new(CanvasTool::new()),
         // Devices
         std::sync::Arc::new(NodesTool::new()),
@@ -243,16 +273,33 @@ pub fn builtin_tools(
         // net_scan/net_admin/net_audit/net_discovery tools were removed to
         // cut the tool-schema payload sent to the model.
         // Email
-        std::sync::Arc::new(GmailTool::new(secrets.clone())),
-        // Calendar (CalDAV — reuses Gmail credentials)
-        std::sync::Arc::new(CalDavTool::new(secrets.clone())),
+        std::sync::Arc::new(
+            GmailTool::new(guarded.clone())
+                .with_requests(requests.clone())
+                .with_pending_links(pending_links.clone()),
+        ),
+        // Calendar (CalDAV — reuses Gmail credentials, and asks for them
+        // the same way when they are absent)
+        std::sync::Arc::new(
+            CalDavTool::new(guarded.clone())
+                .with_requests(requests.clone())
+                .with_pending_links(pending_links.clone()),
+        ),
         // Notion
-        std::sync::Arc::new(NotionTool::new(secrets.clone())),
+        std::sync::Arc::new(NotionTool::new(guarded.clone())),
         // Obsidian
-        std::sync::Arc::new(ObsidianTool::new(secrets.clone())),
+        std::sync::Arc::new(ObsidianTool::new(guarded.clone())),
         // Credentials
         std::sync::Arc::new(CredentialReadTool::new(secrets.clone())),
-        std::sync::Arc::new(CredentialWriteTool::new(secrets)),
+        std::sync::Arc::new(CredentialWriteTool::new(guarded)),
+        // Asking for a credential nobody has stored yet — the only one of
+        // the three that produces a prompt on the user's phone.
+        std::sync::Arc::new(
+            CredentialRequestTool::new(requests).with_pending_links(pending_links.clone()),
+        ),
+        // Asking the user to approve a purchase and supply its card. The
+        // browser enters and spends it; this only asks.
+        std::sync::Arc::new(PaymentRequestTool::new(payments).with_pending_links(pending_links)),
     ]
 }
 

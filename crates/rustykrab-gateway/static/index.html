@@ -739,6 +739,19 @@
       </button>
     </div>
     <div class="conversation-list" id="conversationList"></div>
+
+    <!-- Credential changes the agent asked for. Hidden until there is
+         something to decide, so it costs nothing when idle. -->
+    <div id="approvalsSection" style="display:none;border-top:1px solid var(--border);">
+      <div class="sidebar-header">
+        <span class="sidebar-title">
+          Approvals
+          <span id="approvalsBadge" style="display:inline-block;min-width:18px;padding:1px 6px;margin-left:6px;border-radius:9px;background:#d9534f;color:#fff;font-size:11px;text-align:center;">0</span>
+        </span>
+      </div>
+      <div id="approvalsList" style="padding:0 12px 12px;"></div>
+    </div>
+
     <div style="padding:12px;border-top:1px solid var(--border);">
       <button class="btn-icon" id="logoutBtn" title="Logout" style="width:100%;display:flex;align-items:center;gap:8px;padding:8px;border-radius:8px;font-size:13px;color:var(--text-secondary);">
         <svg viewBox="0 0 24 24" style="width:16px;height:16px;"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
@@ -1094,6 +1107,163 @@
     }
     renderConversationList();
   }
+
+  // ── Credential approvals ──────────────────────────────────
+  //
+  // The agent can create a credential under a new name, but replacing or
+  // deleting one files a request that only a user can resolve. This panel
+  // is the WebChat half of that; the Apollo app is the other.
+  //
+  // Values are never shown, because no endpoint returns one — a row is a
+  // name, an action, and the agent's reason.
+  const approvalsSection = $('#approvalsSection');
+  const approvalsList    = $('#approvalsList');
+  const approvalsBadge   = $('#approvalsBadge');
+
+  async function refreshApprovals() {
+    let pending;
+    try {
+      pending = await api('/api/credential-requests?status=pending');
+    } catch (err) {
+      // An older server has no such endpoint; leave the panel hidden
+      // rather than showing an error for a feature it doesn't have.
+      approvalsSection.style.display = 'none';
+      return;
+    }
+    if (!pending || pending.length === 0) {
+      approvalsSection.style.display = 'none';
+      approvalsList.innerHTML = '';
+      return;
+    }
+    approvalsSection.style.display = 'block';
+    approvalsBadge.textContent = pending.length;
+    approvalsList.innerHTML = pending.map((req) => (
+      // A request carrying fields is asking the *user* for a value the
+      // agent does not have, so it needs a form. Approve/Deny is for the
+      // update and delete requests, which are a yes/no about a credential
+      // that already exists — answering those with a form would be asking
+      // for a value nobody was asked for.
+      (req.fields && req.fields.length) ? renderFulfil(req) : renderDecision(req)
+    )).join('');
+  }
+
+  function renderDecision(req) {
+    return `
+      <div style="padding:8px 0;border-bottom:1px solid var(--border);font-size:13px;">
+        <div style="color:var(--text-secondary);">
+          The agent wants to <strong>${escapeHtml(req.action)}</strong>
+          <code>${escapeHtml(req.name)}</code>
+        </div>
+        ${req.reason ? `<div style="margin-top:2px;color:var(--text-secondary);font-size:12px;">${escapeHtml(req.reason)}</div>` : ''}
+        <div style="margin-top:6px;display:flex;gap:6px;">
+          <button data-approve="${escapeHtml(req.id)}" style="flex:1;padding:4px 8px;border-radius:6px;font-size:12px;cursor:pointer;">Approve</button>
+          <button data-deny="${escapeHtml(req.id)}" style="flex:1;padding:4px 8px;border-radius:6px;font-size:12px;cursor:pointer;">Deny</button>
+        </div>
+      </div>
+    `;
+  }
+
+  function renderFulfil(req) {
+    const service = req.service ? escapeHtml(req.service) : escapeHtml(req.name);
+    const inputs = req.fields.map((f) => `
+      <label style="display:block;margin-top:6px;font-size:12px;color:var(--text-secondary);">
+        ${escapeHtml(f.label)}
+        <input
+          data-field="${escapeHtml(f.key)}"
+          type="${f.secret ? 'password' : 'text'}"
+          autocomplete="off"
+          ${f.secret ? 'spellcheck="false"' : ''}
+          placeholder="${f.hint ? escapeHtml(f.hint) : ''}"
+          style="width:100%;margin-top:2px;padding:5px 7px;border-radius:6px;
+                 border:1px solid var(--border);font-size:13px;box-sizing:border-box;" />
+      </label>
+    `).join('');
+    return `
+      <div data-fulfil-for="${escapeHtml(req.id)}"
+           style="padding:8px 0;border-bottom:1px solid var(--border);font-size:13px;">
+        <div style="color:var(--text-secondary);">
+          <strong>${service}</strong> needs a credential
+        </div>
+        ${req.reason ? `<div style="margin-top:2px;color:var(--text-secondary);font-size:12px;">${escapeHtml(req.reason)}</div>` : ''}
+        ${inputs}
+        <div style="margin-top:8px;display:flex;gap:6px;">
+          <button data-submit="${escapeHtml(req.id)}" style="flex:1;padding:4px 8px;border-radius:6px;font-size:12px;cursor:pointer;">Save</button>
+          <button data-deny="${escapeHtml(req.id)}" style="flex:1;padding:4px 8px;border-radius:6px;font-size:12px;cursor:pointer;">Not now</button>
+        </div>
+        <div data-fulfil-error style="display:none;margin-top:6px;font-size:12px;color:#c0392b;"></div>
+      </div>
+    `;
+  }
+
+  async function submitFulfil(id, button) {
+    const card = approvalsList.querySelector(`[data-fulfil-for="${CSS.escape(id)}"]`);
+    if (!card) return;
+    const errorBox = card.querySelector('[data-fulfil-error]');
+    const inputs = Array.from(card.querySelectorAll('[data-field]'));
+
+    const values = {};
+    for (const input of inputs) {
+      const v = input.value.trim();
+      if (!v) {
+        errorBox.textContent = 'Fill in every field.';
+        errorBox.style.display = 'block';
+        input.focus();
+        return;
+      }
+      values[input.getAttribute('data-field')] = v;
+    }
+
+    button.disabled = true;
+    errorBox.style.display = 'none';
+    try {
+      await api(`/api/credential-requests/${id}/fulfil`, {
+        method: 'POST',
+        body: JSON.stringify({ values }),
+      });
+    } catch (err) {
+      button.disabled = false;
+      errorBox.textContent = `Could not save that: ${err}`;
+      errorBox.style.display = 'block';
+      return;
+    } finally {
+      // Clear the values whether or not it worked: a failed save should
+      // not leave a password sitting in the DOM waiting for the next
+      // screenshot or a shoulder.
+      for (const input of inputs) input.value = '';
+    }
+    await refreshApprovals();
+  }
+
+  approvalsList.addEventListener('click', async (event) => {
+    const submitId = event.target.getAttribute('data-submit');
+    if (submitId) {
+      await submitFulfil(submitId, event.target);
+      return;
+    }
+
+    const approveId = event.target.getAttribute('data-approve');
+    const denyId    = event.target.getAttribute('data-deny');
+    const id = approveId || denyId;
+    if (!id) return;
+
+    if (approveId && !confirm('Approve this change? The credential will be replaced.')) return;
+    event.target.disabled = true;
+    try {
+      await api(`/api/credential-requests/${id}/${approveId ? 'approve' : 'deny'}`, { method: 'POST' });
+    } catch (err) {
+      // 409 means the credential moved since the request was filed, so
+      // approving would undo whatever was done in the meantime.
+      alert(String(err).includes('409')
+        ? 'That credential changed since the request was filed, so it was not applied. Refreshing.'
+        : `Could not complete that: ${err}`);
+    }
+    await refreshApprovals();
+  });
+
+  // Poll while the tab is open. Push notification is a later phase; until
+  // then this plus the app's foreground refresh is how a request surfaces.
+  refreshApprovals();
+  setInterval(() => { if (token) refreshApprovals(); }, 15000);
 
   newChatBtn.addEventListener('click', async () => {
     try {

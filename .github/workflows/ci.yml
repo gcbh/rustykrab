@@ -2,9 +2,13 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # Feature branches build too, so cloud agents (which can't run the
+    # macOS/simulator lane) can iterate by pushing and reading checks.
+    branches: [main, 'claude/**']
+  # A stacked PR targets its parent feature branch, not main. Run the same
+  # exact-head checks for every PR base so each layer has independent hosted
+  # evidence instead of inheriting only the bottom PR's checks.
   pull_request:
-    branches: [main]
 
 env:
   CARGO_TERM_COLOR: always
@@ -15,7 +19,7 @@ jobs:
     name: Check & Clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -27,16 +31,27 @@ jobs:
     name: Tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
+
+  docs:
+    name: Architecture Docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # Guards the facts in docs/architecture and crates/*/ARCHITECTURE.md:
+      # generated metrics match the tree, every crate is documented, and the
+      # crate count in prose is right. Two structural docs had already
+      # drifted before this existed. Run `--fix` locally to regenerate.
+      - run: python3 scripts/check_architecture_docs.py
 
   fmt:
     name: Format
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
@@ -45,18 +60,56 @@ jobs:
   audit:
     name: Security Audit
     runs-on: ubuntu-latest
+    # The action publishes its findings as a check run, which the default
+    # read-only token cannot create ("Resource not accessible by
+    # integration").
+    permissions:
+      contents: read
+      checks: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: rustsec/audit-check@v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+
+  e2e:
+    name: E2E Evaluation Harness
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Builds with --no-default-features (no ONNX runtime download), boots
+      # the daemon on a temp dir, runs the exit-criteria scenarios with the
+      # scripted agent. Green = implemented scenarios pass and no Phase 2
+      # target scenario passes unexpectedly.
+      - run: scripts/e2e.sh
+        env:
+          E2E_ARTIFACT_DIR: e2e-artifacts
+      # Uses the real channel/runtime/Ollama adapter, with a loopback
+      # response fixture and inert tools. No model service or accounts.
+      - run: scripts/e2e.sh --mode context --trial-timeout 30
+        env:
+          E2E_ARTIFACT_DIR: e2e-artifacts/context
+          # Exercise the opt-in retention candidate; production still defaults
+          # to legacy. The adversarial summary deliberately omits recent facts.
+          RUSTYKRAB_CONTEXT_COMPACTION_STRATEGY: structured-message-tail
+      - name: Upload scenario evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-report
+          path: |
+            e2e-report.json
+            e2e-artifacts/
+          if-no-files-found: ignore
 
   # Gate job: add this as a required status check in branch protection
   # to block merges when any CI job fails.
   ci-pass:
     name: CI Pass
     if: always()
-    needs: [check, test, fmt, audit]
+    needs: [check, test, fmt, audit, e2e]
     runs-on: ubuntu-latest
     steps:
       - name: Verify all checks passed
@@ -64,11 +117,13 @@ jobs:
           if [[ "${{ needs.check.result }}" != "success" ||
                 "${{ needs.test.result }}" != "success" ||
                 "${{ needs.fmt.result }}" != "success" ||
-                "${{ needs.audit.result }}" != "success" ]]; then
+                "${{ needs.audit.result }}" != "success" ||
+                "${{ needs.e2e.result }}" != "success" ]]; then
             echo "::error::One or more CI jobs failed"
             echo "  check:  ${{ needs.check.result }}"
             echo "  test:   ${{ needs.test.result }}"
             echo "  fmt:    ${{ needs.fmt.result }}"
             echo "  audit:  ${{ needs.audit.result }}"
+            echo "  e2e:    ${{ needs.e2e.result }}"
             exit 1
           fi

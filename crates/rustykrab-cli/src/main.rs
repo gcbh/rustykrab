@@ -11,7 +11,11 @@ use std::sync::Arc;
 
 use chrono::Utc;
 
-const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Re-exported so the version shown by `--version` is the same string
+/// stamped onto persisted messages, job runs, and scheduled jobs. Keep
+/// these from drifting: a `--version` that disagrees with what's in the
+/// database makes the stamps useless for attribution.
+const VERSION: &str = rustykrab_core::VERSION;
 const GIT_HASH: &str = env!("RUSTYKRAB_GIT_HASH");
 const GIT_DIRTY: &str = env!("RUSTYKRAB_GIT_DIRTY");
 const BUILD_DATE: &str = env!("RUSTYKRAB_BUILD_DATE");
@@ -19,22 +23,24 @@ const BUILD_DATE: &str = env!("RUSTYKRAB_BUILD_DATE");
 fn version_string() -> String {
     format!("{VERSION} ({GIT_HASH}{GIT_DIRTY}, {BUILD_DATE})")
 }
-use rustykrab_agent::{
-    AgentEvent, AgentHandle, HarnessProfile, HarnessRouter, ProcessSandbox, SubagentRunner,
-};
+use rustykrab_agent::{AgentHandle, HarnessProfile, HarnessRouter, ProcessSandbox, SubagentRunner};
 use rustykrab_channels::slack::SlackInboundMessage;
 use rustykrab_channels::telegram::ChannelMessage;
 use rustykrab_channels::{SignalChannel, SlackChannel, TelegramChannel, VideoChannel, VideoConfig};
 use rustykrab_core::model::ModelProvider;
 use rustykrab_core::orchestration::OrchestrationConfig;
-use rustykrab_core::types::{ContentPart, MessageContent};
+use rustykrab_core::types::{MessageContent, Role};
 use rustykrab_core::AgentRegistry;
 use rustykrab_gateway::AppState;
 use rustykrab_memory::backend::HybridMemoryBackend;
-use rustykrab_memory::embedding::FastEmbedder;
+#[cfg(not(feature = "embeddings"))]
+use rustykrab_memory::embedding::HashEmbedder;
+#[cfg(feature = "embeddings")]
+use rustykrab_memory::embedding::LazyFastEmbedder;
 use rustykrab_memory::storage::SqliteMemoryStorage;
 use rustykrab_memory::{MemoryConfig, MemorySystem};
 use rustykrab_skills::SkillRegistry;
+use rustykrab_store::Store;
 use rustykrab_tools::{CronBackend, MemoryBackend, MessageBackend};
 use tokio::sync::mpsc;
 use tracing_subscriber::fmt;
@@ -46,34 +52,6 @@ use uuid::Uuid;
 /// Adapter bridging [HybridMemoryBackend] (rustykrab-memory) to the
 /// [MemoryBackend] trait (rustykrab-tools) so the memory tools can use
 /// the hybrid retrieval engine.
-struct MemoryAdapter {
-    inner: HybridMemoryBackend,
-}
-
-#[async_trait::async_trait]
-impl MemoryBackend for MemoryAdapter {
-    async fn search(
-        &self,
-        query: &str,
-        tags: &[String],
-        limit: usize,
-    ) -> rustykrab_core::Result<serde_json::Value> {
-        self.inner.search(query, tags, limit).await
-    }
-    async fn get(&self, memory_id: &str) -> rustykrab_core::Result<serde_json::Value> {
-        self.inner.get(memory_id).await
-    }
-    async fn save(&self, fact: &str, tags: &[String]) -> rustykrab_core::Result<serde_json::Value> {
-        self.inner.save(fact, tags).await
-    }
-    async fn delete(&self, memory_id: &str) -> rustykrab_core::Result<serde_json::Value> {
-        self.inner.delete(memory_id).await
-    }
-    async fn list(&self) -> rustykrab_core::Result<serde_json::Value> {
-        self.inner.list().await
-    }
-}
-
 /// Adapter bridging [rustykrab_store::JobStore] to the [CronBackend] trait
 /// (rustykrab-tools) so the cron tool can manage scheduled jobs.
 struct CronAdapter {
@@ -113,59 +91,77 @@ impl CronBackend for CronAdapter {
         channel: Option<&str>,
         chat_id: Option<&str>,
         thread_id: Option<&str>,
+        timezone: Option<&str>,
+        allow_duplicate: bool,
     ) -> rustykrab_core::Result<serde_json::Value> {
-        let inherited = rustykrab_core::active_tools::with_session_context(|ctx| {
-            self.store.conversations().get(ctx.conversation_id).ok()
-        })
-        .flatten();
+        let session_conv_id =
+            rustykrab_core::active_tools::with_session_context(|ctx| ctx.conversation_id);
+        let inherited = match session_conv_id {
+            Some(conv_id) => self.store.conversations().get(conv_id).await.ok(),
+            None => None,
+        };
         let (ch, cid, tid) =
             inherit_channel_for_create(channel, chat_id, thread_id, inherited.as_ref());
-        let job = self.store.jobs().create_job(
-            schedule,
-            task,
-            ch.as_deref(),
-            cid.as_deref(),
-            tid.as_deref(),
-        )?;
+        // The model rarely knows what zone the user lives in, so an absent
+        // `timezone` means the operator's configured zone rather than UTC.
+        // Resolving it here — not in the store — keeps the store honest
+        // about interpreting exactly the zone it was handed.
+        let tz = match timezone {
+            Some(name) => rustykrab_core::timezone::parse(name)?,
+            None => rustykrab_core::timezone::configured(),
+        };
+        let job = self
+            .store
+            .jobs()
+            .create_job(
+                schedule,
+                task,
+                ch.as_deref(),
+                cid.as_deref(),
+                tid.as_deref(),
+                tz.name(),
+                allow_duplicate,
+            )
+            .await?;
         Ok(serde_json::to_value(&job).expect("ScheduledJob is always serializable"))
     }
 
     async fn list_jobs(&self) -> rustykrab_core::Result<serde_json::Value> {
-        let jobs = self.store.jobs().list_jobs()?;
+        let jobs = self.store.jobs().list_jobs().await?;
         Ok(serde_json::to_value(&jobs).expect("Vec<ScheduledJob> is always serializable"))
     }
 
     async fn delete_job(&self, job_id: &str) -> rustykrab_core::Result<serde_json::Value> {
         // Grab the conversation id (if any) before the row goes away so we
-        // can reap the associated persistent conversation below. Missing
-        // jobs are fine; delete_job returns `false` without error.
-        let conversation_id = match self.store.jobs().get_job(job_id) {
+        // can reap the associated persistent conversation below. A missing
+        // job propagates NotFound from `delete_job`, so the agent learns its
+        // delete matched nothing instead of reading `{"deleted": false}` as
+        // done.
+        let conversation_id = match self.store.jobs().get_job(job_id).await {
             Ok(job) => job.conversation_id,
             Err(rustykrab_core::Error::NotFound(_)) => None,
             Err(e) => return Err(e),
         };
 
-        let deleted = self.store.jobs().delete_job(job_id)?;
+        self.store.jobs().delete_job(job_id).await?;
 
-        if deleted {
-            if let Some(cid) = conversation_id {
-                if let Ok(uuid) = uuid::Uuid::parse_str(&cid) {
-                    // NotFound is fine — the conversation may already be gone.
-                    match self.store.conversations().delete(uuid) {
-                        Ok(()) | Err(rustykrab_core::Error::NotFound(_)) => {}
-                        Err(e) => {
-                            tracing::warn!(
-                                job_id = %job_id,
-                                conv_id = %cid,
-                                "failed to reap conversation for deleted job: {e}"
-                            );
-                        }
+        if let Some(cid) = conversation_id {
+            if let Ok(uuid) = uuid::Uuid::parse_str(&cid) {
+                // NotFound is fine — the conversation may already be gone.
+                match self.store.conversations().delete(uuid).await {
+                    Ok(()) | Err(rustykrab_core::Error::NotFound(_)) => {}
+                    Err(e) => {
+                        tracing::warn!(
+                            job_id = %job_id,
+                            conv_id = %cid,
+                            "failed to reap conversation for deleted job: {e}"
+                        );
                     }
                 }
             }
         }
 
-        Ok(serde_json::json!({ "deleted": deleted, "job_id": job_id }))
+        Ok(serde_json::json!({ "deleted": true, "job_id": job_id }))
     }
 
     async fn list_runs(
@@ -173,7 +169,7 @@ impl CronBackend for CronAdapter {
         job_id: &str,
         limit: u32,
     ) -> rustykrab_core::Result<serde_json::Value> {
-        let runs = self.store.jobs().list_runs(job_id, limit)?;
+        let runs = self.store.jobs().list_runs(job_id, limit).await?;
         Ok(serde_json::to_value(&runs).expect("Vec<JobRun> is always serializable"))
     }
 }
@@ -182,7 +178,7 @@ impl CronBackend for CronAdapter {
 ///
 /// The `message` tool is registered alongside the other built-in tools, before
 /// any channel is constructed (channels are attached to `AppState` later, and
-/// `state.tools` is captured by-value when state is cloned for spawned agent
+/// `state.agent.tools` is captured by-value when state is cloned for spawned agent
 /// loops). The adapter therefore reads its channels through this shared hub,
 /// which is populated in stages as each channel comes up during startup.
 #[derive(Default)]
@@ -299,6 +295,64 @@ impl MessageBackend for MessageAdapter {
     }
 }
 
+/// Build the model handle used to decide what to remember, or `None` to
+/// leave distillation off.
+///
+/// Same model, same base URL, same `num_ctx` as the agent's own provider —
+/// only `think` differs. That matters twice over: a `num_ctx` switch costs a
+/// model reload and a full re-prefill, and thinking turns a sub-second
+/// classification into a multi-second one. Measured on gemma4:26b with
+/// thinking off: 0.4s for a message carrying nothing, 2.6s for one carrying
+/// two facts.
+///
+/// Only wired for Ollama today. Other providers get `None` rather than a
+/// silently thinking distiller, because there is no per-call way to ask them
+/// for the cheap behaviour and a slow one on the inbound path is worse than
+/// none.
+async fn build_distiller(
+    provider_name: &str,
+) -> Option<std::sync::Arc<dyn rustykrab_core::model::ModelProvider>> {
+    let off = matches!(
+        std::env::var("RUSTYKRAB_DISTILL")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "off" | "0" | "false" | "no"
+    );
+    if off {
+        tracing::info!("memory distillation disabled (RUSTYKRAB_DISTILL)");
+        return None;
+    }
+    if provider_name != "ollama" {
+        tracing::info!(
+            provider = provider_name,
+            "memory distillation off: only the Ollama provider can be asked not to think"
+        );
+        return None;
+    }
+
+    let model = std::env::var("OLLAMA_MODEL").unwrap_or_else(|_| "gemma4:26b".to_string());
+    let base_url =
+        std::env::var("OLLAMA_BASE_URL").unwrap_or_else(|_| "http://localhost:11434".to_string());
+    let config = rustykrab_providers::OllamaConfig {
+        think: Some(false),
+        ..Default::default()
+    };
+    let p = rustykrab_providers::OllamaProvider::new(model.clone())
+        .with_base_url(base_url)
+        .with_config(config)
+        .with_detected_context_window()
+        .await;
+    tracing::info!(
+        %model,
+        num_ctx = ?p.num_ctx(),
+        think = p.resolved_think(),
+        "memory distiller ready"
+    );
+    Some(std::sync::Arc::new(p))
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // --- TLS crypto provider (must be set before any rustls usage) ---
@@ -307,9 +361,15 @@ async fn main() -> anyhow::Result<()> {
         .expect("Failed to install rustls crypto provider");
 
     // --- Data directory ---
-    let data_dir = dirs::data_local_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join("rustykrab");
+    // RUSTYKRAB_DATA_DIR overrides the OS default so tests and the E2E
+    // harness can boot on a throwaway directory.
+    let data_dir = std::env::var_os("RUSTYKRAB_DATA_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            dirs::data_local_dir()
+                .unwrap_or_else(|| std::path::PathBuf::from("."))
+                .join("rustykrab")
+        });
     std::fs::create_dir_all(&data_dir)?;
 
     // --- Logging: stdout + rolling file ---
@@ -319,11 +379,25 @@ async fn main() -> anyhow::Result<()> {
     let file_appender = tracing_appender::rolling::daily(&log_dir, "rustykrab.log");
     let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
 
-    let env_filter = EnvFilter::from_default_env();
+    // Default to `info` when RUST_LOG is unset so verbosity doesn't silently
+    // depend on the environment; RUST_LOG still overrides as before.
+    let env_filter = EnvFilter::builder()
+        .with_default_directive(tracing_subscriber::filter::LevelFilter::INFO.into())
+        .from_env_lossy();
+
+    // The stdout layer is only active on a terminal (interactive runs) or
+    // when forced via RUSTYKRAB_LOG_STDOUT=1 — otherwise every event would
+    // be formatted twice (stdout + rolling file) for no reader. Setting
+    // RUSTYKRAB_LOG_STDOUT=0 disables it even on a TTY. The rolling file
+    // layer is always active.
+    let stdout_log_enabled = match std::env::var("RUSTYKRAB_LOG_STDOUT") {
+        Ok(v) => matches!(v.trim(), "1" | "true" | "TRUE" | "True"),
+        Err(_) => std::io::IsTerminal::is_terminal(&std::io::stdout()),
+    };
 
     tracing_subscriber::registry()
         .with(env_filter)
-        .with(fmt::layer().with_writer(std::io::stdout))
+        .with(stdout_log_enabled.then(|| fmt::layer().with_writer(std::io::stdout)))
         .with(fmt::layer().with_writer(non_blocking).with_ansi(false))
         .init();
 
@@ -343,15 +417,31 @@ async fn main() -> anyhow::Result<()> {
         return handle_skill_subcommand(&data_dir, &args[2..]);
     }
     if args.len() >= 2 && args[1] == "keychain" {
-        return handle_keychain_subcommand(&data_dir, &args[2..]);
+        return handle_keychain_subcommand(&data_dir, &args[2..]).await;
     }
     if args.len() >= 2 && args[1] == "chat" {
         return chat::run(&data_dir, &args[2..]).await;
     }
+    if args.len() >= 2 && args[1] == "dream" {
+        return handle_dream_subcommand(&data_dir, &args[2..]).await;
+    }
+    if args.len() >= 2 && args[1] == "pair" {
+        return handle_pair_subcommand(&data_dir).await;
+    }
+    // An unrecognized subcommand must not silently fall through to
+    // "start the daemon" — a typo would boot a full agent instead of
+    // reporting the mistake.
+    if let Some(unknown) = args.get(1).filter(|a| !a.starts_with('-')) {
+        eprintln!("unknown subcommand '{unknown}'");
+        eprintln!("subcommands: skill, keychain, chat, dream, pair");
+        eprintln!("run with no arguments to start the daemon");
+        std::process::exit(2);
+    }
 
     // --- Harness profile ---
     // Load from file or use a preset. Supported: default, coding, research, creative
-    let mut profile = load_harness_profile(&data_dir)?;
+    let (mut profile, profile_context_tokens, pinned_profile_fields) =
+        load_harness_profile(&data_dir)?;
     tracing::info!(profile = %profile.name, "harness profile loaded");
 
     // --- Master key for credential encryption ---
@@ -371,14 +461,69 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    let store = rustykrab_store::Store::open(data_dir.join("db"), master_key)?;
+    // How long after one press the next payment claim is refused, across
+    // every conversation. "How fast is too fast to be spending" belongs to
+    // the household, not to the code; `0` turns the throttle off. An
+    // unparseable value keeps the default rather than failing startup — the
+    // safe direction, since the default is the stricter one.
+    let pay_cooldown = match std::env::var("RUSTYKRAB_PAYMENT_COOLDOWN_SECS") {
+        Ok(raw) => match raw.trim().parse::<u64>() {
+            Ok(secs) => std::time::Duration::from_secs(secs),
+            Err(_) => {
+                tracing::warn!(
+                    value = %raw,
+                    "RUSTYKRAB_PAYMENT_COOLDOWN_SECS is not a whole number of seconds; \
+                     keeping the default payment cooldown"
+                );
+                rustykrab_store::DEFAULT_PAY_COOLDOWN
+            }
+        },
+        Err(_) => rustykrab_store::DEFAULT_PAY_COOLDOWN,
+    };
+    if pay_cooldown.is_zero() {
+        tracing::warn!(
+            "payment cooldown disabled (RUSTYKRAB_PAYMENT_COOLDOWN_SECS=0) — \
+             approvals can be spent back to back"
+        );
+    }
+
+    // How far back a payment counts as a repeat of one being filed now.
+    // Read in hours because that is the unit the decision is made in — "the
+    // same thing twice in a day is a mistake" — and, like the cooldown, an
+    // unparseable value keeps the stricter default rather than failing
+    // startup. `0` turns the duplicate hold off entirely.
+    let duplicate_window_ms = match std::env::var("RUSTYKRAB_PAYMENT_DUPLICATE_WINDOW_HOURS") {
+        Ok(raw) => match raw.trim().parse::<i64>() {
+            Ok(hours) if hours >= 0 => hours.saturating_mul(60 * 60 * 1000),
+            _ => {
+                tracing::warn!(
+                    value = %raw,
+                    "RUSTYKRAB_PAYMENT_DUPLICATE_WINDOW_HOURS is not a whole number of hours; \
+                     keeping the default duplicate window"
+                );
+                rustykrab_store::DEFAULT_DUPLICATE_WINDOW_MS
+            }
+        },
+        Err(_) => rustykrab_store::DEFAULT_DUPLICATE_WINDOW_MS,
+    };
+    if duplicate_window_ms == 0 {
+        tracing::warn!(
+            "duplicate payment hold disabled (RUSTYKRAB_PAYMENT_DUPLICATE_WINDOW_HOURS=0) — \
+             the agent can pay the same site the same amount twice without being stopped"
+        );
+    }
+
+    let store = rustykrab_store::Store::open(data_dir.join("db"), master_key)?
+        .with_credential_backend(credential_backend_from_env())
+        .with_pay_cooldown(pay_cooldown)
+        .with_duplicate_window_ms(duplicate_window_ms);
 
     // --- Validate required secrets (central registry) ---
     // Every credential the app needs is declared in `registry::REGISTRY`.
     // Required secrets that cannot be resolved from any source (env var,
     // OS keychain, or encrypted store) cause a hard startup failure.
     {
-        let missing = rustykrab_store::registry::validate(&store.secrets());
+        let missing = rustykrab_store::registry::validate(&store.secrets()).await;
         let required_missing: Vec<_> = missing.iter().filter(|m| m.spec.required).collect();
 
         if !required_missing.is_empty() {
@@ -415,19 +560,82 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // --- APNs push (optional) ---
+    // Only the non-secret settings come from the environment. The signing
+    // key is resolved on first use, not here: it is a credential, so it
+    // can be stored from the app or the CLI while the daemon is running,
+    // and rotating it does not need a restart.
+    let push_notifier: Option<std::sync::Arc<dyn rustykrab_store::RequestNotifier>> =
+        rustykrab_gateway::ApnsConfig::from_env().map(|config| {
+            tracing::info!(
+                topic = %config.topic,
+                environment = ?config.environment,
+                "APNs push configured (key resolved on first notification)"
+            );
+            std::sync::Arc::new(rustykrab_gateway::PushNotifier::new(
+                config,
+                store.secrets(),
+                store.devices(),
+            )) as std::sync::Arc<dyn rustykrab_store::RequestNotifier>
+        });
+
+    // Both halves of the credential loop go through one notifier: filing
+    // tells the user, fulfilling wakes the agent. It is attached
+    // unconditionally now — the wake half does not depend on APNs being
+    // configured, and gating on it would silently disable resume on any
+    // deployment without push.
+    //
+    // The task queue does not exist yet (it needs `state`, built below),
+    // so it arrives later through this cell.
+    let wake_queue: Arc<std::sync::OnceLock<task_queue::TaskQueue>> =
+        Arc::new(std::sync::OnceLock::new());
+    let store = store.with_request_notifier(Arc::new(CredentialNotifier {
+        push: push_notifier,
+        queue: wake_queue.clone(),
+    }));
+
     // --- Auth token ---
     // Resolution order (via registry):
     // 1. Environment variable (CI, Docker, explicit override)
     // 2. OS credential store (persists across restarts without env var)
     // 3. Encrypted local SecretStore
     // 4. Generate a new token and persist it in Keychain + SecretStore
-    let auth_token = resolve_auth_token(&store);
+    let auth_token = resolve_auth_token(&store).await;
+
+    // --- MCP connector (remote MCP servers as native tools) ---
+    // Kicked off now so per-server connection latency overlaps with the
+    // rest of startup (provider detection, memory init, skill loading);
+    // joined below at tool-registration time. Per-server connect failures
+    // are logged inside and never block startup.
+    let mcp_tools_task = {
+        let secrets = store.secrets();
+        tokio::spawn(async move { rustykrab_tools::mcp_connector_tools(&secrets).await })
+    };
 
     // --- Model provider ---
     let provider_name =
         std::env::var("RUSTYKRAB_PROVIDER").unwrap_or_else(|_| "anthropic".to_string());
     let provider_name = provider_name.trim().to_lowercase();
     let provider: Arc<dyn ModelProvider> = match provider_name.as_str() {
+        // Deterministic replay provider for the E2E harness — no model,
+        // no network. Requires RUSTYKRAB_SCRIPT_PATH; refuses to start
+        // without it rather than silently answering every turn with the
+        // default text.
+        "scripted" => {
+            let path = std::env::var("RUSTYKRAB_SCRIPT_PATH").unwrap_or_else(|_| {
+                eprintln!("ERROR: RUSTYKRAB_PROVIDER=scripted requires RUSTYKRAB_SCRIPT_PATH");
+                std::process::exit(1);
+            });
+            let path = std::path::PathBuf::from(path);
+            tracing::warn!(
+                path = %path.display(),
+                "RUSTYKRAB_PROVIDER=scripted — replaying a fixed script instead of \
+                 calling a model. This is the E2E harness provider and must never \
+                 be set on a real deployment."
+            );
+            let p = rustykrab_providers::ScriptedProvider::from_path(&path)?;
+            Arc::new(p)
+        }
         "ollama" => {
             let model = std::env::var("OLLAMA_MODEL").unwrap_or_else(|_| "gemma4:26b".to_string());
             let base_url = std::env::var("OLLAMA_BASE_URL")
@@ -437,7 +645,8 @@ async fn main() -> anyhow::Result<()> {
                 %model,
                 %base_url,
                 num_ctx = ?config.num_ctx,
-                "using Ollama provider (num_ctx=None defers to server's OLLAMA_CONTEXT_LENGTH)"
+                keep_alive = ?config.keep_alive,
+                "using Ollama provider (set RUSTYKRAB_NUM_CTX=server to defer to OLLAMA_CONTEXT_LENGTH)"
             );
             let p = rustykrab_providers::OllamaProvider::new(model)
                 .with_base_url(base_url)
@@ -447,12 +656,48 @@ async fn main() -> anyhow::Result<()> {
             tracing::info!(
                 num_ctx = ?p.num_ctx(),
                 effective_ctx = ?p.effective_ctx(),
+                keep_alive = ?p.keep_alive(),
+                think = p.resolved_think(),
                 "Ollama client-side context settings"
             );
             Arc::new(p)
         }
+        // Any server exposing an OpenAI-compatible /v1/chat/completions API:
+        // llama-server, mistral.rs, vllm-mlx, mlx_lm.server, LM Studio's
+        // headless daemon, exo, or a hosted OpenAI-compatible endpoint. The
+        // aliases exist so logs and error messages name the actual backend;
+        // they behave identically otherwise.
+        "openai" | "openai-compat" | "llama-server" | "llamacpp" | "mistralrs" | "lmstudio"
+        | "mlx" | "exo" | "vllm" => {
+            let model = std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "local-model".to_string());
+            let base_url = std::env::var("OPENAI_BASE_URL")
+                .unwrap_or_else(|_| "http://localhost:8080".to_string());
+
+            let mut config = rustykrab_providers::OpenAiConfig::default();
+            if let Some(t) = env_parse::<f32>("OPENAI_TEMPERATURE") {
+                config.temperature = t;
+            }
+            if let Some(m) = env_parse::<u32>("OPENAI_MAX_TOKENS") {
+                config.max_tokens = m;
+            }
+            // Escape hatch for servers that reject `stream_options`.
+            if let Ok(v) = std::env::var("OPENAI_INCLUDE_USAGE") {
+                config.include_usage = !matches!(v.trim(), "0" | "false" | "no");
+            }
+
+            tracing::info!(%model, %base_url, provider = %provider_name, "using OpenAI-compatible provider");
+            let mut p = rustykrab_providers::OpenAiProvider::new(model)
+                .with_base_url(base_url)
+                .with_provider_name(provider_name.clone())
+                .with_config(config);
+            // Optional — most local servers ignore it.
+            if let Ok(key) = std::env::var("OPENAI_API_KEY") {
+                p = p.with_api_key(key);
+            }
+            Arc::new(p)
+        }
         _ => {
-            let api_key = resolve_api_key(&store);
+            let api_key = resolve_api_key(&store).await;
             let model = std::env::var("ANTHROPIC_MODEL")
                 .unwrap_or_else(|_| "claude-sonnet-4-20250514".to_string());
             tracing::info!(%model, "using Anthropic provider");
@@ -467,12 +712,17 @@ async fn main() -> anyhow::Result<()> {
     // local Ollama deployments on consumer hardware can't chew through
     // anywhere near that before the HTTP timeout fires, so default to
     // 32k for Ollama and keep the 128k default for everything else.
-    profile.max_context_tokens = resolve_max_context_tokens(&provider_name);
+    profile.max_context_tokens = resolve_max_context_tokens(&provider_name, profile_context_tokens);
     tracing::info!(
         max_context_tokens = profile.max_context_tokens,
         provider = %provider_name,
         "compaction context budget configured"
     );
+
+    // A second handle on the same model, with thinking off, used to decide
+    // what an inbound message is worth remembering. See
+    // `AgentContext::distiller` for why it cannot just be `provider`.
+    let distiller = build_distiller(&provider_name).await;
 
     // --- Skills directory (needed by skill tools and skill loader) ---
     let skills_dir = data_dir.join("skills");
@@ -521,8 +771,20 @@ async fn main() -> anyhow::Result<()> {
     );
     let model_cache_dir = data_dir.join("models");
     std::fs::create_dir_all(&model_cache_dir)?;
-    let embedder =
-        Arc::new(FastEmbedder::new(model_cache_dir).expect("failed to initialize embedding model"));
+    // Lazy: ONNX Runtime init (and a ~275MB model download on first run)
+    // happens off-thread on the first embed() call instead of blocking
+    // boot. Init failures surface as clear errors from the first
+    // embedding operation.
+    #[cfg(feature = "embeddings")]
+    let embedder = Arc::new(LazyFastEmbedder::new(model_cache_dir));
+    // Without the `embeddings` feature there is no ONNX runtime; a
+    // deterministic hash embedder (same 768 dims as Nomic-embed-text-v1.5)
+    // keeps the memory system functional for tests and sandboxed builds.
+    #[cfg(not(feature = "embeddings"))]
+    let embedder = {
+        let _ = &model_cache_dir;
+        Arc::new(HashEmbedder::new(768))
+    };
     let memory_system = Arc::new(MemorySystem::new(
         MemoryConfig::default(),
         memory_storage,
@@ -547,17 +809,43 @@ async fn main() -> anyhow::Result<()> {
         id
     };
 
-    let session_id = Uuid::new_v4();
+    // Scope for memory writes made outside any conversation — a background
+    // task, or a tool invoked with no runner context. A write made while
+    // serving a turn is scoped to that conversation instead.
+    let fallback_memory_scope = Uuid::new_v4();
 
-    // Rebuild FTS5 index from persisted memories (idempotent).
-    let indexed = memory_system.rebuild_indexes(agent_id).await?;
-    if indexed > 0 {
-        tracing::info!(indexed, "FTS5 index rebuilt from stored memories");
-    }
+    // Rebuild FTS5 index from persisted memories (idempotent). Runs in the
+    // background so a large corpus doesn't delay gateway bind; the handle
+    // is pushed into `infra_handles` below for graceful shutdown.
+    let index_rebuild_handle = {
+        let system = Arc::clone(&memory_system);
+        tokio::spawn(async move {
+            match system.rebuild_indexes(agent_id).await {
+                Ok(indexed) => {
+                    if indexed > 0 {
+                        tracing::info!(indexed, "FTS5 index rebuilt from stored memories");
+                    }
+                }
+                Err(e) => tracing::error!(error = %e, "FTS5 index rebuild failed"),
+            }
+        })
+    };
 
-    let memory_backend: Arc<dyn MemoryBackend> = Arc::new(MemoryAdapter {
-        inner: HybridMemoryBackend::new(Arc::clone(&memory_system), agent_id, session_id),
-    });
+    // Outcome instrumentation (see DREAMING.md). Observational only: the
+    // memory backend records which memories it surfaces, and a completed
+    // run credits its outcome to them. Opt-in, off by default.
+    let outcome_capture_enabled = std::env::var("RUSTYKRAB_OUTCOME_CAPTURE")
+        .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "True"))
+        .unwrap_or(false);
+    let retrieval_log = rustykrab_core::retrieval_log::RetrievalLog::new();
+    let activity_tracker = rustykrab_core::activity::ActivityTracker::new();
+
+    // `HybridMemoryBackend` implements `MemoryBackend` itself now, so there is
+    // nothing left for the binary to bridge.
+    let memory_backend: Arc<dyn MemoryBackend> = Arc::new(
+        HybridMemoryBackend::new(Arc::clone(&memory_system), agent_id, fallback_memory_scope)
+            .with_retrieval_log(retrieval_log.clone()),
+    );
     tracing::info!(%agent_id, "memory system initialized");
 
     // --- Idle lifecycle sweep ---
@@ -663,7 +951,13 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // --- Tools ---
-    let mut tools = rustykrab_tools::builtin_tools(store.secrets());
+    let mut tools = rustykrab_tools::builtin_tools(
+        store.secrets(),
+        store.guarded_secrets(),
+        store.credential_requests(),
+        store.payment_requests(),
+        store.pending_links(),
+    );
     tools.extend(rustykrab_tools::memory_tools(memory_backend.clone()));
     tools.extend(rustykrab_tools::skill_tools(
         skills_dir.clone(),
@@ -675,7 +969,12 @@ async fn main() -> anyhow::Result<()> {
     // hybrid memory system so they can be recalled semantically later.
     let wiki_dir = data_dir.join("wiki");
     std::fs::create_dir_all(&wiki_dir)?;
-    tools.extend(rustykrab_tools::wiki_tools(wiki_dir, memory_backend));
+    // Cloned rather than moved: the probe registry below needs the
+    // same backend to observe what a run committed to memory.
+    tools.extend(rustykrab_tools::wiki_tools(
+        wiki_dir,
+        Arc::clone(&memory_backend),
+    ));
     tracing::info!("wiki tool registered");
 
     // --- Message tool (delivers via Telegram/Slack/Signal) ---
@@ -741,11 +1040,13 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // --- MCP connector (remote MCP servers as native tools) ---
+    // --- MCP connector tools (join the task started before provider setup) ---
     // Registered before the sub-agent snapshot below so sub-agents also
     // inherit MCP tools. Per-server connect failures are logged inside
     // and never block startup.
-    let mcp_tools = rustykrab_tools::mcp_connector_tools(&store.secrets()).await;
+    let mcp_tools = mcp_tools_task
+        .await
+        .map_err(|e| anyhow::anyhow!("MCP connector task panicked: {e}"))?;
     if !mcp_tools.is_empty() {
         tracing::info!(count = mcp_tools.len(), "MCP connector tools registered");
         tools.extend(mcp_tools);
@@ -831,23 +1132,132 @@ async fn main() -> anyhow::Result<()> {
         "skill-tools registered"
     );
 
+    // --- Tool stubs (evaluation harness only) ---
+    // RUSTYKRAB_TOOL_STUBS swaps real tools for scripted stand-ins whose
+    // answers the harness controls, so a scenario can reach an upstream
+    // that fails once, or never, or returns more text than the context
+    // window holds. The mirror image of RUSTYKRAB_PROVIDER=scripted, and
+    // like it, must never be set on a real deployment.
+    //
+    // Applied last, after every real tool has registered, so `replace`
+    // means the whole registry rather than whichever part of it had been
+    // built by this point.
+    let tools = match std::env::var_os("RUSTYKRAB_TOOL_STUBS") {
+        Some(path) => {
+            let path = std::path::PathBuf::from(path);
+            let stubs = rustykrab_tools::StubFile::from_path(&path)?;
+            let stubbed = stubs.apply(tools);
+            tracing::warn!(
+                path = %path.display(),
+                mode = ?stubs.mode,
+                tools = ?stubbed.iter().map(|t| t.name()).collect::<Vec<_>>(),
+                "RUSTYKRAB_TOOL_STUBS is set — the tool registry has been replaced with \
+                 scripted stubs. This is the evaluation harness switch."
+            );
+            stubbed
+        }
+        None => tools,
+    };
+
+    // A stubbed registry is a closed world: the harness has already said
+    // "these are the only tools." Progressive disclosure exists to keep a
+    // thirty-tool registry from swamping a small model, and `replace` mode
+    // removes `tools_load` itself — so without this the stubs are
+    // registered but never active, and the model is sent no schemas at
+    // all. Seed them so they are visible from turn 0.
+    //
+    // RUSTYKRAB_ACTIVE_TOOLS seeds names directly, for the case a stub file
+    // cannot express: activating *real* tools. The credential scenarios
+    // need `gmail` and `browser` live from turn 0 — they stub nothing,
+    // because their whole premise is that the real tools cannot run
+    // without a credential — and without the seed they measure whether the
+    // model discovers a tool rather than what it does when it lacks a
+    // secret.
+    let mut seed: Vec<String> = Vec::new();
+    if std::env::var_os("RUSTYKRAB_TOOL_STUBS").is_some() {
+        seed.extend(tools.iter().map(|t| t.name().to_string()));
+    }
+    if let Ok(raw) = std::env::var("RUSTYKRAB_ACTIVE_TOOLS") {
+        seed.extend(
+            raw.split(',')
+                .map(str::trim)
+                .filter(|n| !n.is_empty())
+                .map(str::to_string),
+        );
+    }
+    let active_tools = if seed.is_empty() {
+        Arc::new(rustykrab_core::active_tools::ActiveToolsRegistry::new())
+    } else {
+        tracing::warn!(
+            seeded = ?seed,
+            "tools seeded active from turn 0 — an evaluation switch, not a deployment one"
+        );
+        Arc::new(rustykrab_core::active_tools::ActiveToolsRegistry::with_seed(seed))
+    };
+
     // --- Harness router (auto-selects profile per message) ---
     // Reuses the main provider for classification to avoid model swapping.
     // The classification prompt is ~50 tokens — negligible overhead on any model.
     let classifier: Arc<dyn ModelProvider> = provider.clone();
 
-    let router = Arc::new(HarnessRouter::new(classifier).with_base(profile));
+    // Two separate concerns, both needed.
+    //
+    // Pinning fixes the silent override for everyone: the router swaps in a
+    // preset per message and restores only three of the seven profile
+    // fields, so a harness.toml naming `max_tool_retries` quietly lost it.
+    // The pinned names come from the keys the file actually set.
+    //
+    // RUSTYKRAB_HARNESS_ROUTER=off goes further and pins the whole profile,
+    // which is what an eval wants: one configured profile for every
+    // message, no classification in the loop at all. (From #532.)
+    let routing_enabled = !matches!(
+        std::env::var("RUSTYKRAB_HARNESS_ROUTER")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "off" | "0" | "false" | "no"
+    );
+    let router = routing_enabled.then(|| {
+        Arc::new(
+            HarnessRouter::new(classifier)
+                .with_base(profile.clone())
+                .with_pinned_fields(pinned_profile_fields),
+        )
+    });
+    if !routing_enabled {
+        tracing::info!(
+            profile = %profile.name,
+            "harness routing disabled — using the configured profile for every message"
+        );
+    }
 
     // --- Build gateway state ---
     // Clone store handle so we can flush it after the server shuts down.
     let store_handle = store.clone();
     let mut state = rustykrab_gateway::AppState::new(store, tools, provider, auth_token)
-        .with_harness_router(router)
+        // Loopback is always allowed; this adds the names other clients
+        // reach us by, e.g. the tailnet hostname the phone uses.
+        .with_origin_policy(rustykrab_gateway::OriginPolicy::from_env())
+        // Also the fallback the gateway uses when routing is off, so
+        // `harness.toml` still decides the caps in that mode.
+        .with_harness_profile(profile)
+        .with_harness_router_opt(router)
         .with_orchestration_config(orchestration_config)
         .with_skill_registry(skill_registry)
         .with_memory(Arc::clone(&memory_system), agent_id)
+        .with_distiller_opt(distiller)
         .with_subagents_enabled(subagents_enabled)
-        .with_computer_use_enabled(computer_use_enabled);
+        .with_computer_use_enabled(computer_use_enabled)
+        .with_retrieval_log(retrieval_log)
+        .with_activity_tracker(activity_tracker.clone())
+        .with_outcome_capture(outcome_capture_enabled)
+        .with_probes(Arc::new(build_probe_registry(
+            &data_dir,
+            Arc::clone(&memory_backend),
+        )))
+        .with_credential_page_policy(rustykrab_gateway::PageIdentityPolicy::from_env());
+    state.agent.active_tools = active_tools;
 
     // --- Attach video channel to state ---
     if let Some(vc) = video_channel {
@@ -857,11 +1267,17 @@ async fn main() -> anyhow::Result<()> {
     // Track infrastructure task JoinHandles so panics are surfaced
     // instead of silently swallowed (fixes ASYNC-H4).
     let mut infra_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    infra_handles.push(index_rebuild_handle);
 
     // --- Telegram channel (optional) ---
     // We need to take the inbound_rx before wrapping in Arc, so build in stages.
     let mut telegram_rx: Option<mpsc::Receiver<ChannelMessage>> = None;
     let mut telegram_arc: Option<Arc<TelegramChannel>> = None;
+    // Webhook registration runs concurrently with the rest of channel
+    // setup and is joined below, before the agent loops start. A
+    // registration failure stays fatal, exactly as it was inline.
+    let mut telegram_webhook_task: Option<tokio::task::JoinHandle<rustykrab_core::Result<()>>> =
+        None;
 
     if let Ok(bot_token) = std::env::var("TELEGRAM_BOT_TOKEN") {
         let allowed_chats: HashSet<i64> = std::env::var("TELEGRAM_ALLOWED_CHATS")
@@ -886,14 +1302,36 @@ async fn main() -> anyhow::Result<()> {
         state = state.with_telegram(tg.clone());
 
         if let Ok(webhook_url) = std::env::var("TELEGRAM_WEBHOOK_URL") {
-            tg.set_webhook(&webhook_url).await?;
+            let tg_hook = tg.clone();
+            telegram_webhook_task = Some(tokio::spawn(async move {
+                tg_hook.set_webhook(&webhook_url).await
+            }));
             tracing::info!("Telegram: webhook mode");
         } else {
             let tg_poll = tg.clone();
             // Store handle so panics are not silently swallowed (fixes ASYNC-H4).
+            // Supervised: restart the poller on error with capped exponential
+            // backoff so a transient failure doesn't take the channel dark.
             infra_handles.push(tokio::spawn(async move {
-                if let Err(e) = tg_poll.start_polling().await {
-                    tracing::error!("Telegram polling error: {e}");
+                let mut delay = std::time::Duration::from_secs(1);
+                loop {
+                    let started = tokio::time::Instant::now();
+                    match tg_poll.start_polling().await {
+                        Ok(()) => break, // clean shutdown
+                        Err(e) => {
+                            // A long healthy run means the previous fault was
+                            // transient — start the backoff over.
+                            if started.elapsed() >= std::time::Duration::from_secs(300) {
+                                delay = std::time::Duration::from_secs(1);
+                            }
+                            tracing::error!(
+                                delay_secs = delay.as_secs(),
+                                "Telegram polling error, restarting: {e}"
+                            );
+                            tokio::time::sleep(delay).await;
+                            delay = (delay * 2).min(std::time::Duration::from_secs(60));
+                        }
+                    }
                 }
             }));
             tracing::info!("Telegram: long-polling mode");
@@ -936,25 +1374,55 @@ async fn main() -> anyhow::Result<()> {
         channel_hub.set_signal(sig.clone());
         state = state.with_signal(sig.clone());
 
-        // Health check — verify signal-cli-rest-api is running.
-        match sig.health_check().await {
-            Ok(()) => tracing::info!("signal-cli-rest-api connected"),
-            Err(e) => tracing::error!("signal-cli-rest-api not reachable: {e}"),
+        // Health check — verify signal-cli-rest-api is running. Runs
+        // concurrently with the rest of startup; the outcome is logged
+        // (it was never fatal).
+        {
+            let sig_health = sig.clone();
+            infra_handles.push(tokio::spawn(async move {
+                match sig_health.health_check().await {
+                    Ok(()) => tracing::info!("signal-cli-rest-api connected"),
+                    Err(e) => tracing::error!("signal-cli-rest-api not reachable: {e}"),
+                }
+            }));
         }
 
-        // Webhook or polling mode.
+        // Webhook or polling mode. Webhook registration also runs
+        // concurrently; failures are logged (as before, non-fatal).
         if let Ok(webhook_url) = std::env::var("SIGNAL_WEBHOOK_URL") {
-            if let Err(e) = sig.register_webhook(&webhook_url).await {
-                tracing::error!("failed to register Signal webhook: {e}");
-            } else {
-                tracing::info!("Signal: webhook mode");
-            }
+            let sig_hook = sig.clone();
+            infra_handles.push(tokio::spawn(async move {
+                if let Err(e) = sig_hook.register_webhook(&webhook_url).await {
+                    tracing::error!("failed to register Signal webhook: {e}");
+                } else {
+                    tracing::info!("Signal: webhook mode");
+                }
+            }));
         } else {
             let sig_poll = sig.clone();
             // Store handle so panics are not silently swallowed (fixes ASYNC-H4).
+            // Supervised: restart the poller on error with capped exponential
+            // backoff so a transient failure doesn't take the channel dark.
             infra_handles.push(tokio::spawn(async move {
-                if let Err(e) = sig_poll.start_polling().await {
-                    tracing::error!("Signal polling error: {e}");
+                let mut delay = std::time::Duration::from_secs(1);
+                loop {
+                    let started = tokio::time::Instant::now();
+                    match sig_poll.start_polling().await {
+                        Ok(()) => break, // clean shutdown
+                        Err(e) => {
+                            // A long healthy run means the previous fault was
+                            // transient — start the backoff over.
+                            if started.elapsed() >= std::time::Duration::from_secs(300) {
+                                delay = std::time::Duration::from_secs(1);
+                            }
+                            tracing::error!(
+                                delay_secs = delay.as_secs(),
+                                "Signal polling error, restarting: {e}"
+                            );
+                            tokio::time::sleep(delay).await;
+                            delay = (delay * 2).min(std::time::Duration::from_secs(60));
+                        }
+                    }
                 }
             }));
             tracing::info!("Signal: polling mode");
@@ -971,6 +1439,14 @@ async fn main() -> anyhow::Result<()> {
                 "Signal allowed numbers configured"
             );
         }
+    }
+
+    // --- Join deferred Telegram webhook registration ---
+    // Ran concurrently with the Signal setup above; a failure is still
+    // fatal, exactly as when the call was inline.
+    if let Some(task) = telegram_webhook_task {
+        task.await
+            .map_err(|e| anyhow::anyhow!("Telegram webhook task panicked: {e}"))??;
     }
 
     // --- Spawn Telegram agent loop (after state is fully built) ---
@@ -1014,9 +1490,29 @@ async fn main() -> anyhow::Result<()> {
         state = state.with_slack(sl.clone());
 
         let sl_socket = sl.clone();
+        // Supervised: restart the Socket Mode loop on error with capped
+        // exponential backoff so a transient failure doesn't take the
+        // channel dark.
         infra_handles.push(tokio::spawn(async move {
-            if let Err(e) = sl_socket.start_socket_mode().await {
-                tracing::error!("Slack Socket Mode error: {e}");
+            let mut delay = std::time::Duration::from_secs(1);
+            loop {
+                let started = tokio::time::Instant::now();
+                match sl_socket.start_socket_mode().await {
+                    Ok(()) => break, // clean shutdown
+                    Err(e) => {
+                        // A long healthy run means the previous fault was
+                        // transient — start the backoff over.
+                        if started.elapsed() >= std::time::Duration::from_secs(300) {
+                            delay = std::time::Duration::from_secs(1);
+                        }
+                        tracing::error!(
+                            delay_secs = delay.as_secs(),
+                            "Slack Socket Mode error, restarting: {e}"
+                        );
+                        tokio::time::sleep(delay).await;
+                        delay = (delay * 2).min(std::time::Duration::from_secs(60));
+                    }
+                }
             }
         }));
 
@@ -1051,7 +1547,65 @@ async fn main() -> anyhow::Result<()> {
         store_handle.clone(),
     );
     infra_handles.push(queue_handle);
+    // Close the loop: from here a fulfilled credential can wake the
+    // conversation that asked for it. Requests answered before this point
+    // log and are dropped rather than queueing against a dead channel.
+    let _ = wake_queue.set(task_queue.clone());
     tracing::info!(max_concurrent, "task queue started");
+
+    // --- Downtime outcome analysis (see DREAMING.md) ---
+    // Read-only: it aggregates recorded outcomes and logs a digest. It
+    // starts only after the system has been quiet, and abandons a pass if
+    // activity arrives mid-flight. Gated on the same flag as the capture
+    // that produces its input -- with no records to read there is nothing
+    // for it to say.
+    if outcome_capture_enabled {
+        // Its own read-only connection. The store is a single mutex-guarded
+        // connection, so an analysis pass aggregating the whole outcome
+        // table would otherwise block live traffic for as long as it runs.
+        // WAL readers do not block the writer, so this stops the background
+        // loop competing with the foreground for the shared handle.
+        let outcomes = match store_handle.outcomes_reader() {
+            Ok(reader) => reader,
+            Err(e) => {
+                // Falling back is right: analysis on the shared connection
+                // is worse than analysis on its own, but both beat none,
+                // and the pass only ever runs when the system is quiet.
+                tracing::warn!(
+                    error = %e,
+                    "could not open a dedicated read connection for outcome analysis; \
+                     falling back to the shared one"
+                );
+                store_handle.outcomes()
+            }
+        };
+
+        let worker = rustykrab_dream::DreamWorker::new(
+            std::sync::Arc::new(rustykrab_dream::StoreOutcomeSource::new(outcomes)),
+            activity_tracker,
+            rustykrab_dream::WorkerConfig::new(agent_id),
+        )
+        // Passes are kept, so "have the reports shown anything?" is a
+        // question the `dream` subcommand can answer instead of one that
+        // needs a human reading rotated logs.
+        .with_report_sink(std::sync::Arc::new(rustykrab_dream::StoreReportSink::new(
+            store_handle.dream_reports(),
+        )));
+        infra_handles.push(tokio::spawn(worker.run()));
+    }
+
+    // --- Delegated-task worker (peer delegation) ---
+    // Drains tasks a peer node submitted with POST /api/tasks. One at a
+    // time: this machine's model has a single KV-cache slot, so running
+    // two delegated conversations at once evicts both prompt prefixes and
+    // is slower than running them back to back.
+    {
+        let worker_state = state.clone();
+        infra_handles.push(tokio::spawn(async move {
+            rustykrab_gateway::run_task_worker(worker_state).await;
+        }));
+        tracing::info!("delegated-task worker started");
+    }
 
     // --- Job executor (scheduled task runner) ---
     {
@@ -1069,8 +1623,19 @@ async fn main() -> anyhow::Result<()> {
     // --- Gateway with security middleware ---
     let app = rustykrab_gateway::router(state);
 
-    // Bind to loopback only — never 0.0.0.0.
-    let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
+    // Bind to loopback only — never 0.0.0.0. The port is overridable via
+    // RUSTYKRAB_PORT (the E2E harness boots on an ephemeral port so it
+    // never collides with a live instance); the loopback bind is not.
+    let port: u16 = std::env::var("RUSTYKRAB_PORT")
+        .ok()
+        .map(|p| {
+            p.trim().parse().unwrap_or_else(|_| {
+                eprintln!("ERROR: RUSTYKRAB_PORT must be a port number, got '{p}'");
+                std::process::exit(1);
+            })
+        })
+        .unwrap_or(3000);
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
     tracing::info!(%addr, "RustyKrab gateway listening");
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -1094,11 +1659,17 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // Finalize memory session: Working → Episodic + lifecycle sweep.
+    // Finalize memory: Working → Episodic + lifecycle sweep.
+    //
+    // The whole working set, not one session's. Working memories are scoped
+    // to the conversation that produced them, and at process exit every
+    // conversation has ended — there is no session id here that names any of
+    // them. (This call used to pass the process-boot id, which named a
+    // working set that was always empty.)
     idle_sweep_handle.abort();
-    tracing::info!("finalizing memory session...");
-    if let Err(e) = memory_system.finalize_session(agent_id, session_id).await {
-        tracing::warn!(error = %e, "failed to finalize memory session");
+    tracing::info!("finalizing memory working set...");
+    if let Err(e) = memory_system.finalize_working_set(agent_id).await {
+        tracing::warn!(error = %e, "failed to finalize memory working set");
     }
     if let Err(e) = memory_system.lifecycle_sweep(agent_id).await {
         tracing::warn!(error = %e, "shutdown lifecycle sweep failed");
@@ -1114,6 +1685,7 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("flushing database...");
     store_handle
         .flush()
+        .await
         .map_err(|e| anyhow::anyhow!("flush failed: {e}"))?;
     tracing::info!("shutdown complete");
 
@@ -1129,11 +1701,74 @@ const HEARTBEAT_TIMEOUT_SECS: u64 = 1800; // 30 minutes
 /// Telegram's typing indicator expires after ~5 seconds.
 const TYPING_INTERVAL_SECS: u64 = 4;
 
-fn epoch_millis() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
+/// Load the conversation bound to a channel address, minting a fresh one if
+/// the binding has outlived it.
+///
+/// Deleting a conversation through the API takes its binding with it
+/// (`channel_bindings` cascades), but a channel loop that has already
+/// resolved the id keeps it in an in-process cache and never consults the
+/// binding again. Loading it then fails, and — because the cache is not
+/// invalidated either — it fails identically for every message after this
+/// one, until the user happens to send /reset.
+///
+/// So a conversation that no longer loads is treated as an instruction to
+/// start a new one rather than as an error. Returns the conversation and
+/// whether it replaced a dead id, so the caller can refresh its cache.
+///
+/// Only `NotFound` is healed. A storage failure is a real error and is
+/// propagated: minting a replacement conversation because the disk is
+/// unhappy would silently discard history that is still there.
+async fn load_or_rebind(
+    state: &AppState,
+    address: &rustykrab_store::ChannelAddress,
+    conv_id: Uuid,
+    channel_source: &str,
+    channel_id: Option<String>,
+    channel_thread_id: Option<String>,
+) -> Result<(rustykrab_core::types::Conversation, bool), rustykrab_core::Error> {
+    match state.agent.store.conversations().get(conv_id).await {
+        Ok(conv) => Ok((conv, false)),
+        Err(rustykrab_core::Error::NotFound(_)) => {
+            tracing::warn!(
+                channel = address.channel(),
+                stale_conv_id = %conv_id,
+                "bound conversation no longer exists — starting a new one"
+            );
+            let mut conv = state.agent.store.conversations().create().await?;
+            conv.channel_source = Some(channel_source.to_string());
+            conv.channel_id = channel_id;
+            conv.channel_thread_id = channel_thread_id;
+            state.agent.store.conversations().save_meta(&conv).await?;
+            state
+                .agent
+                .store
+                .channel_bindings()
+                .bind(address, conv.id)
+                .await?;
+            Ok((conv, true))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Address of a Telegram chat (or forum topic) for
+/// [`rustykrab_store::ChannelBindingStore`].
+fn telegram_address(chat_id: i64, thread_id: i64) -> rustykrab_store::ChannelAddress {
+    rustykrab_store::ChannelAddress::Telegram { chat_id, thread_id }
+}
+
+/// Address of a Slack channel or thread for
+/// [`rustykrab_store::ChannelBindingStore`].
+fn slack_address(
+    team_id: &str,
+    channel_id: &str,
+    thread_ts: &str,
+) -> rustykrab_store::ChannelAddress {
+    rustykrab_store::ChannelAddress::Slack {
+        team_id: team_id.to_string(),
+        channel_id: channel_id.to_string(),
+        thread_ts: thread_ts.to_string(),
+    }
 }
 
 /// Per-chat (or per-thread in forum groups) state for tracking conversations
@@ -1141,10 +1776,127 @@ fn epoch_millis() -> u64 {
 /// `thread_id == 0` means a non-forum chat or the implicit "General" topic.
 struct ChatState {
     conv_id: Uuid,
-    /// Handle to the currently-running agent loop, if any.
-    /// Messages arriving while a loop is active are injected via this handle
-    /// instead of being dropped.
-    active_handle: Option<AgentHandle>,
+}
+
+/// One lifecycle per channel address, independent of the conversation binding.
+/// Reset invalidates the generation at receive time, before any spawned task
+/// can race it. The barrier prevents post-reset turns from overtaking unbind;
+/// the gate keeps the old turn's final save ahead of the replacement turn.
+struct ChannelTurnControl {
+    generation: AtomicU64,
+    reset_completed: tokio::sync::watch::Sender<u64>,
+    gate: tokio::sync::Mutex<()>,
+    active: tokio::sync::Mutex<Option<(u64, Uuid, AgentHandle)>>,
+    admitted: std::sync::Mutex<Vec<Uuid>>,
+}
+
+impl Default for ChannelTurnControl {
+    fn default() -> Self {
+        Self {
+            generation: AtomicU64::new(0),
+            reset_completed: tokio::sync::watch::channel(0).0,
+            gate: tokio::sync::Mutex::new(()),
+            active: tokio::sync::Mutex::new(None),
+            admitted: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+}
+
+impl ChannelTurnControl {
+    fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    fn begin_reset(&self) -> u64 {
+        self.generation.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    fn is_current(&self, generation: u64) -> bool {
+        self.generation() == generation
+    }
+
+    fn finish_reset(&self, generation: u64) {
+        self.reset_completed.send_modify(|completed| {
+            *completed = (*completed).max(generation);
+        });
+    }
+
+    async fn enter(&self, generation: u64) -> Option<tokio::sync::MutexGuard<'_, ()>> {
+        let mut completed = self.reset_completed.subscribe();
+        while *completed.borrow_and_update() < generation {
+            if !self.is_current(generation) || completed.changed().await.is_err() {
+                return None;
+            }
+        }
+        let guard = self.gate.lock().await;
+        self.is_current(generation).then_some(guard)
+    }
+
+    fn take_admitted(&self) -> Vec<Uuid> {
+        std::mem::take(&mut *self.admitted.lock().unwrap_or_else(|p| p.into_inner()))
+    }
+
+    fn admit(&self, id: Uuid) {
+        self.admitted
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(id);
+    }
+
+    fn forget(&self, ids: &[Uuid]) {
+        self.admitted
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|id| !ids.contains(id));
+    }
+
+    async fn register(&self, generation: u64, conv_id: Uuid, handle: AgentHandle) {
+        let mut active = self.active.lock().await;
+        if self.is_current(generation) {
+            *active = Some((generation, conv_id, handle));
+        } else {
+            // Reset may arrive during model/profile setup, before there was a
+            // handle to cancel. Registration closes that cancellation race.
+            let _ = handle.cancel().await;
+        }
+    }
+
+    async fn cancel_before(&self, generation: u64) {
+        let handle = self.active.lock().await.clone();
+        if let Some((_, _, handle)) =
+            handle.filter(|(active_generation, _, _)| *active_generation < generation)
+        {
+            let _ = handle.cancel().await;
+        }
+    }
+
+    async fn inject(
+        &self,
+        generation: u64,
+        message: &rustykrab_core::types::Message,
+        store: &Store,
+    ) -> bool {
+        if !self.is_current(generation) || *self.reset_completed.borrow() < generation {
+            return false;
+        }
+        let handle = self.active.lock().await.clone();
+        if let Some((active_generation, conv_id, handle)) = handle.filter(|(_, _, h)| h.is_alive())
+        {
+            if active_generation != generation {
+                return false;
+            }
+            if let Err(error) = store.inbound().assign(message.id, conv_id).await {
+                tracing::error!("cannot assign durable inbound before injection: {error}");
+                return false;
+            }
+            let accepted = handle.send_message_record(message.clone()).await.is_ok();
+            if accepted {
+                tracing::info!(message_id=%message.id, "injected user message into running agent loop");
+            }
+            return accepted;
+        }
+        false
+    }
 }
 
 /// Background task: consume inbound Telegram messages and run the agent.
@@ -1161,6 +1913,9 @@ async fn telegram_agent_loop(
 ) {
     let chat_states: Arc<tokio::sync::Mutex<HashMap<(i64, i64), ChatState>>> =
         Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    // A closed inbox falls back to a new turn only after the previous turn
+    // has saved its history. Also serializes messages arriving during setup.
+    let mut controls = HashMap::<(i64, i64), Arc<ChannelTurnControl>>::new();
 
     while let Some(channel_msg) = rx.recv().await {
         let chat_id = channel_msg.chat_id;
@@ -1169,22 +1924,75 @@ async fn telegram_agent_loop(
         let tg = tg.clone();
         let state = state.clone();
         let chat_states = chat_states.clone();
+        let first_seen = !controls.contains_key(&key);
+        let control = controls.entry(key).or_default().clone();
+        let generation = if channel_msg.reset {
+            control.begin_reset()
+        } else {
+            control.generation()
+        };
+        let reset_ids = if channel_msg.reset {
+            control.take_admitted()
+        } else {
+            Vec::new()
+        };
+        if !channel_msg.reset {
+            let address = telegram_address(chat_id, thread_id);
+            if first_seen
+                && state
+                    .agent
+                    .store
+                    .inbound()
+                    .pending_count(&address)
+                    .await
+                    .unwrap_or(0)
+                    > 0
+            {
+                let _ = tg.send_text(chat_id, "An earlier input was saved but its final checkpoint is missing. I will not replay its actions automatically; please check the previous result before retrying.", thread_id).await;
+            }
+            match state
+                .agent
+                .store
+                .inbound()
+                .accept(&address, &channel_msg.message)
+                .await
+            {
+                Ok(true) => control.admit(channel_msg.message.id),
+                Ok(false) => continue,
+                Err(error) => {
+                    tracing::error!("Telegram inbound journal failed: {error}");
+                    let _ = tg.send_text(chat_id, "I could not save your message, so I have not started acting on it. Please try again.", thread_id).await;
+                    continue;
+                }
+            }
+        }
 
         tokio::spawn(async move {
             // Handle conversation reset via structured flag.
             if channel_msg.reset {
+                control.cancel_before(generation).await;
+                if let Err(error) = state.agent.store.inbound().cancel(&reset_ids).await {
+                    tracing::error!("could not checkpoint cancelled Telegram inputs: {error}");
+                }
+                let _turn = control.gate.lock().await;
+                if !control.is_current(generation) {
+                    control.finish_reset(generation);
+                    return;
+                }
                 {
                     let mut states = chat_states.lock().await;
-                    if let Some(cs) = states.get(&key) {
-                        if let Some(ref handle) = cs.active_handle {
-                            let _ = handle.cancel().await;
-                        }
-                    }
                     states.remove(&key);
                 }
-                if let Err(e) = state.store.chat_map().remove(chat_id, thread_id) {
-                    tracing::warn!(chat_id, thread_id, "failed to remove chat map entry: {e}");
+                if let Err(e) = state
+                    .agent
+                    .store
+                    .channel_bindings()
+                    .unbind(&telegram_address(chat_id, thread_id))
+                    .await
+                {
+                    tracing::warn!(chat_id, thread_id, "failed to remove channel binding: {e}");
                 }
+                control.finish_reset(generation);
                 return;
             }
 
@@ -1195,34 +2003,24 @@ async fn telegram_agent_loop(
 
             // If an agent loop is already running for this chat/thread,
             // inject the new message instead of dropping it.
+            if control
+                .inject(generation, &channel_msg.message, &state.agent.store)
+                .await
             {
-                let states = chat_states.lock().await;
-                if let Some(cs) = states.get(&key) {
-                    if let Some(ref handle) = cs.active_handle {
-                        if handle.is_alive() {
-                            let parts = vec![ContentPart::Text { text: user_text }];
-                            if let Err(e) = handle
-                                .send_channel_message(parts, "telegram".to_string(), None)
-                                .await
-                            {
-                                tracing::warn!(
-                                    chat_id,
-                                    thread_id,
-                                    "failed to inject message into running loop: {e}"
-                                );
-                            } else {
-                                tracing::info!(
-                                    chat_id,
-                                    thread_id,
-                                    "injected user message into running agent loop"
-                                );
-                                let _ = tg.send_typing(chat_id, thread_id).await;
-                            }
-                            return;
-                        }
-                    }
-                }
+                let _ = tg.send_typing(chat_id, thread_id).await;
+                return;
             }
+
+            let Some(_turn) = control.enter(generation).await else {
+                // A reset deliberately cancels queued work from the old branch.
+                let _ = state
+                    .agent
+                    .store
+                    .inbound()
+                    .cancel(&[channel_msg.message.id])
+                    .await;
+                return;
+            };
 
             // Get or create conversation. Check in-memory first, then DB,
             // then create a brand new one.
@@ -1232,55 +2030,51 @@ async fn telegram_agent_loop(
                     Some(cs) => cs.conv_id,
                     None => {
                         let db_id = state
+                            .agent
                             .store
-                            .chat_map()
-                            .lookup(chat_id, thread_id)
+                            .channel_bindings()
+                            .lookup(&telegram_address(chat_id, thread_id))
+                            .await
                             .ok()
                             .flatten();
 
                         match db_id {
                             Some(id) => {
-                                states.insert(
-                                    key,
-                                    ChatState {
-                                        conv_id: id,
-                                        active_handle: None,
-                                    },
-                                );
+                                states.insert(key, ChatState { conv_id: id });
                                 tracing::info!(
                                     chat_id, thread_id, conv_id = %id,
                                     "restored conversation from database"
                                 );
                                 id
                             }
-                            None => match state.store.conversations().create() {
+                            None => match state.agent.store.conversations().create().await {
                                 Ok(mut conv) => {
                                     conv.channel_source = Some("telegram".to_string());
                                     conv.channel_id = Some(chat_id.to_string());
                                     if thread_id != 0 {
                                         conv.channel_thread_id = Some(thread_id.to_string());
                                     }
-                                    if let Err(e) = state.store.conversations().save(&conv) {
+                                    if let Err(e) =
+                                        state.agent.store.conversations().save_meta(&conv).await
+                                    {
                                         tracing::warn!(
                                             chat_id,
                                             "failed to persist channel metadata: {e}"
                                         );
                                     }
                                     let id = conv.id;
-                                    states.insert(
-                                        key,
-                                        ChatState {
-                                            conv_id: id,
-                                            active_handle: None,
-                                        },
-                                    );
-                                    if let Err(e) =
-                                        state.store.chat_map().upsert(chat_id, thread_id, id)
+                                    states.insert(key, ChatState { conv_id: id });
+                                    if let Err(e) = state
+                                        .agent
+                                        .store
+                                        .channel_bindings()
+                                        .bind(&telegram_address(chat_id, thread_id), id)
+                                        .await
                                     {
                                         tracing::warn!(
                                             chat_id,
                                             thread_id,
-                                            "failed to persist chat map: {e}"
+                                            "failed to persist channel binding: {e}"
                                         );
                                     }
                                     tracing::info!(
@@ -1320,20 +2114,38 @@ async fn telegram_agent_loop(
                 &user_text,
                 &chat_states,
                 key,
+                &control,
+                generation,
             )
             .await;
 
             // Clear the active handle.
-            {
-                let mut states = chat_states.lock().await;
-                if let Some(cs) = states.get_mut(&key) {
-                    cs.active_handle = None;
-                }
+            *control.active.lock().await = None;
+            if !control.is_current(generation) {
+                // Old history was saved, but reset must not be followed by an
+                // obsolete response or a credential link from the retired run.
+                return;
             }
 
             // Send response back to Telegram (in the correct thread).
             if let Err(e) = tg.send_text(chat_id, &reply, thread_id).await {
                 tracing::error!(chat_id, thread_id, "failed to send Telegram reply: {e}");
+            }
+
+            // Then any credential link the turn asked for, as its own
+            // message. It goes after the agent's text so the user reads
+            // why before they are handed the form, and it never passed
+            // through the model, so it cannot have been truncated.
+            if !control.is_current(generation) {
+                return;
+            }
+            for link in state.agent.store.pending_links().take(conv_id) {
+                if !control.is_current(generation) {
+                    break;
+                }
+                if let Err(e) = tg.send_text(chat_id, &link, thread_id).await {
+                    tracing::error!(chat_id, thread_id, "failed to send credential link: {e}");
+                }
             }
         });
     }
@@ -1355,15 +2167,49 @@ async fn process_telegram_message(
     user_text: &str,
     chat_states: &Arc<tokio::sync::Mutex<HashMap<(i64, i64), ChatState>>>,
     key: (i64, i64),
+    control: &ChannelTurnControl,
+    generation: u64,
 ) -> String {
-    // Load the conversation.
-    let mut conv = match state.store.conversations().get(conv_id) {
-        Ok(c) => c,
+    // Load the conversation. `persisted_ids` lets the post-run save
+    // append only this turn's messages (full rewrite if the agent
+    // compacted history mid-run).
+    let address = telegram_address(chat_id, thread_id);
+    let (mut conv, rebound) = match load_or_rebind(
+        state,
+        &address,
+        conv_id,
+        "telegram",
+        Some(chat_id.to_string()),
+        (thread_id != 0).then(|| thread_id.to_string()),
+    )
+    .await
+    {
+        Ok(pair) => pair,
         Err(e) => {
             tracing::error!(chat_id, thread_id, %conv_id, "failed to load conversation: {e}");
             return "Internal error — please try again.".to_string();
         }
     };
+    // The cached id is the one that just failed to load; leaving it in place
+    // would send the next message down the same dead path.
+    let conv_id = conv.id;
+    if let Err(error) = state
+        .agent
+        .store
+        .inbound()
+        .assign(message.id, conv_id)
+        .await
+    {
+        tracing::error!("could not associate Telegram inbound with conversation: {error}");
+        return "Your message is in the recovery journal, but I could not attach it to this conversation. I have not started acting on it.".into();
+    }
+    if rebound {
+        let mut states = chat_states.lock().await;
+        if let Some(cs) = states.get_mut(&key) {
+            cs.conv_id = conv_id;
+        }
+    }
+    let mut persisted_ids: Vec<Uuid> = conv.messages.iter().map(|m| m.id).collect();
 
     // Ensure channel metadata is present (backfills conversations created
     // before this field was populated).
@@ -1381,6 +2227,29 @@ async fn process_telegram_message(
     // Append user message.
     conv.messages.push(message);
     conv.updated_at = Utc::now();
+
+    // Make the initial inbound turn durable before provider/setup failures.
+    if let Err(e) = state
+        .agent
+        .store
+        .conversations()
+        .save_turn(&conv, &persisted_ids)
+        .await
+    {
+        tracing::error!(chat_id, %conv_id, "failed to persist inbound conversation: {e}");
+        return "I couldn't save your message, so I haven't started acting on it. Please try again.".into();
+    }
+    persisted_ids = conv.messages.iter().map(|m| m.id).collect();
+
+    // Channels append straight onto `conv.messages`, which never passes
+    // through `AgentRunner::push_message` and so never reaches the
+    // auto-persist hook. Without this call nothing the user types ever
+    // reaches memory — measured on the live store, where the runner's own
+    // synthesised prompts are present repeatedly and the user's are absent
+    // entirely. This is also where distillation starts.
+    if let Some(inbound) = conv.messages.last() {
+        rustykrab_runtime::ingest_inbound(&state.agent, &conv, inbound).await;
+    }
 
     // Send initial typing indicator.
     let _ = tg.send_typing(chat_id, thread_id).await;
@@ -1403,8 +2272,10 @@ async fn process_telegram_message(
     // Telegram message so the prompt log can be matched against this run.
     let trace_id = Uuid::new_v4();
     tracing::info!(%trace_id, chat_id, ?thread_id, "telegram agent run starting");
-    let (handle, mut event_rx, join_handle) =
-        match rustykrab_gateway::run_agent_interactive(state, conv, user_text, trace_id).await {
+    let (handle, event_rx, join_handle) =
+        match rustykrab_runtime::run_agent_interactive(&state.agent, conv, user_text, trace_id)
+            .await
+        {
             Ok(triple) => triple,
             Err(_status) => {
                 typing_active.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -1415,87 +2286,66 @@ async fn process_telegram_message(
 
     // Store the handle so concurrent messages for this chat/thread
     // can be injected into the running loop.
+    control.register(generation, conv_id, handle.clone()).await;
+
+    // Cancellation completes the runner too: always retrieve and save the
+    // partial conversation instead of abandoning the owned history.
+    let reply = match rustykrab_runtime::await_interactive_run(
+        &handle,
+        event_rx,
+        join_handle,
+        std::time::Duration::from_secs(HEARTBEAT_TIMEOUT_SECS),
+    )
+    .await
     {
-        let mut states = chat_states.lock().await;
-        if let Some(cs) = states.get_mut(&key) {
-            cs.active_handle = Some(handle);
+        Ok((completion, timed_out)) => {
+            let final_conv = completion.conversation;
+            // Persist the turn: appends the new messages, or falls
+            // back to a full rewrite if compaction replaced the
+            // persisted prefix.
+            if let Err(e) = state
+                .agent
+                .store
+                .conversations()
+                .save_turn(&final_conv, &persisted_ids)
+                .await
+            {
+                tracing::error!(chat_id, %conv_id, "failed to persist conversation: {e}");
+                typing_active.store(false, std::sync::atomic::Ordering::Relaxed);
+                typing_task.abort();
+                return "The run ended, but I couldn't save its full history. Please inspect the result before retrying any action.".into();
+            }
+            if let Err(e) = completion.result {
+                checkpoint_channel_input(state, &final_conv, control).await;
+                tracing::error!(chat_id, %conv_id, "agent error (partial history saved): {e}");
+                typing_active.store(false, std::sync::atomic::Ordering::Relaxed);
+                typing_task.abort();
+                return if timed_out {
+                    "The agent stalled. I saved the partial history; any interrupted external action needs checking before retrying.".into()
+                } else {
+                    "I encountered an error. I saved the partial history, including pending messages; the task is not complete.".into()
+                };
+            }
+            // Extract last assistant text.
+            checkpoint_channel_input(state, &final_conv, control).await;
+            final_conv
+                .messages
+                .iter()
+                .rev()
+                .find_map(|m| {
+                    if m.role == rustykrab_core::types::Role::Assistant {
+                        m.content.as_text().map(|t| t.to_string())
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_else(|| {
+                    "I processed your message but have no text response.".to_string()
+                })
         }
-    }
-
-    // Heartbeat-based timeout: track activity from agent events.
-    let last_heartbeat = Arc::new(AtomicU64::new(epoch_millis()));
-    let hb = last_heartbeat.clone();
-    let timeout_millis = HEARTBEAT_TIMEOUT_SECS * 1000;
-
-    // Drain events, updating heartbeat on each one.
-    let event_drain = async {
-        while let Some(_event) = event_rx.recv().await {
-            hb.store(epoch_millis(), Ordering::Relaxed);
-        }
-    };
-
-    let heartbeat_monitor = async {
-        loop {
-            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-            let last = last_heartbeat.load(Ordering::Relaxed);
-            if epoch_millis() - last > timeout_millis {
-                break;
-            }
-        }
-    };
-
-    let timed_out = tokio::select! {
-        _ = event_drain => false,
-        _ = heartbeat_monitor => true,
-    };
-
-    let reply = if timed_out {
-        tracing::error!(
-            chat_id, %conv_id,
-            "agent stalled — no activity for {HEARTBEAT_TIMEOUT_SECS}s"
-        );
-        // Cancel the running loop.
-        {
-            let states = chat_states.lock().await;
-            if let Some(cs) = states.get(&key) {
-                if let Some(ref h) = cs.active_handle {
-                    let _ = h.cancel().await;
-                }
-            }
-        }
-        "Sorry, the agent appears to have stalled. Please try again.".to_string()
-    } else {
-        // Await the join handle to get the final conversation.
-        match join_handle.await {
-            Ok(Ok(final_conv)) => {
-                // Persist the final conversation.
-                if let Err(e) = state.store.conversations().save(&final_conv) {
-                    tracing::error!(chat_id, %conv_id, "failed to persist conversation: {e}");
-                }
-                // Extract last assistant text.
-                final_conv
-                    .messages
-                    .iter()
-                    .rev()
-                    .find_map(|m| {
-                        if m.role == rustykrab_core::types::Role::Assistant {
-                            m.content.as_text().map(|t| t.to_string())
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or_else(|| {
-                        "I processed your message but have no text response.".to_string()
-                    })
-            }
-            Ok(Err(e)) => {
-                tracing::error!(chat_id, %conv_id, "agent error: {e}");
-                "Sorry, I encountered an error processing your message.".to_string()
-            }
-            Err(e) => {
-                tracing::error!(chat_id, %conv_id, "agent task panicked: {e}");
-                "Sorry, I encountered an internal error.".to_string()
-            }
+        Err(e) => {
+            tracing::error!(chat_id, %conv_id, "agent task panicked: {e}");
+            "Sorry, I encountered an internal error.".to_string()
         }
     };
 
@@ -1512,7 +2362,6 @@ async fn process_telegram_message(
 /// user's message timestamp so the conversation key is the user's `ts`.
 struct SlackChatState {
     conv_id: Uuid,
-    busy: bool,
 }
 
 /// `(team_id, channel_id, effective_thread_ts)` → per-thread state. The
@@ -1534,6 +2383,7 @@ async fn slack_agent_loop(
 ) {
     let chat_states: Arc<tokio::sync::Mutex<SlackChatStateMap>> =
         Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let mut controls = HashMap::<(String, String, String), Arc<ChannelTurnControl>>::new();
 
     while let Some(inbound) = rx.recv().await {
         // Auto-thread: top-level mentions reply in a new thread off the
@@ -1550,48 +2400,107 @@ async fn slack_agent_loop(
         let sl = sl.clone();
         let state = state.clone();
         let chat_states = chat_states.clone();
-
-        tokio::spawn(async move {
-            // Concurrency guard: serialize within a single thread.
+        let first_seen = !controls.contains_key(&key);
+        let control = controls.entry(key.clone()).or_default().clone();
+        let generation = if inbound.reset {
+            control.begin_reset()
+        } else {
+            control.generation()
+        };
+        let reset_ids = if inbound.reset {
+            control.take_admitted()
+        } else {
+            Vec::new()
+        };
+        if !inbound.reset {
+            let address =
+                slack_address(&inbound.team_id, &inbound.channel_id, &effective_thread_ts);
+            if first_seen
+                && state
+                    .agent
+                    .store
+                    .inbound()
+                    .pending_count(&address)
+                    .await
+                    .unwrap_or(0)
+                    > 0
             {
-                let states = chat_states.lock().await;
-                if let Some(cs) = states.get(&key) {
-                    if cs.busy {
-                        let _ = sl
-                            .send_text(
-                                &inbound.channel_id,
-                                "I'm still working on your previous message. Please wait.",
-                                Some(&effective_thread_ts),
-                            )
-                            .await;
-                        return;
-                    }
+                tracing::warn!(channel_id=%inbound.channel_id, "recovery needed: prior Slack input lacks a final checkpoint; automatic replay disabled");
+                let _ = sl.send_text(&inbound.channel_id, "An earlier input was saved but its final checkpoint is missing. I will not replay its actions automatically; please check the previous result before retrying.", Some(&effective_thread_ts)).await;
+            }
+            match state
+                .agent
+                .store
+                .inbound()
+                .accept(&address, &inbound.message)
+                .await
+            {
+                Ok(true) => control.admit(inbound.message.id),
+                Ok(false) => continue,
+                Err(error) => {
+                    tracing::error!("Slack inbound journal failed; input not dispatched: {error}");
+                    let _ = sl.send_text(&inbound.channel_id, "I could not save your message, so I have not started acting on it. Please try again.", Some(&effective_thread_ts)).await;
+                    continue;
                 }
             }
+        }
 
+        tokio::spawn(async move {
             if inbound.reset {
+                control.cancel_before(generation).await;
+                if let Err(error) = state.agent.store.inbound().cancel(&reset_ids).await {
+                    tracing::error!("could not checkpoint cancelled Slack inputs: {error}");
+                }
+                let _turn = control.gate.lock().await;
+                if !control.is_current(generation) {
+                    control.finish_reset(generation);
+                    return;
+                }
                 {
                     let mut states = chat_states.lock().await;
                     states.remove(&key);
                 }
-                if let Err(e) = state.store.slack_chat_map().remove(
-                    &inbound.team_id,
-                    &inbound.channel_id,
-                    &effective_thread_ts,
-                ) {
+                if let Err(e) = state
+                    .agent
+                    .store
+                    .channel_bindings()
+                    .unbind(&slack_address(
+                        &inbound.team_id,
+                        &inbound.channel_id,
+                        &effective_thread_ts,
+                    ))
+                    .await
+                {
                     tracing::warn!(
                         team_id = %inbound.team_id,
                         channel_id = %inbound.channel_id,
                         thread_ts = %effective_thread_ts,
-                        "failed to remove Slack chat map entry: {e}"
+                        "failed to remove Slack channel binding: {e}"
                     );
                 }
+                control.finish_reset(generation);
                 return;
             }
 
             let user_text = match &inbound.message.content {
                 MessageContent::Text(t) => t.clone(),
                 _ => return,
+            };
+
+            if control
+                .inject(generation, &inbound.message, &state.agent.store)
+                .await
+            {
+                return;
+            }
+            let Some(_turn) = control.enter(generation).await else {
+                let _ = state
+                    .agent
+                    .store
+                    .inbound()
+                    .cancel(&[inbound.message.id])
+                    .await;
+                return;
             };
 
             // Resolve / create the conversation.
@@ -1601,21 +2510,21 @@ async fn slack_agent_loop(
                     Some(cs) => cs.conv_id,
                     None => {
                         let db_id = state
+                            .agent
                             .store
-                            .slack_chat_map()
-                            .lookup(&inbound.team_id, &inbound.channel_id, &effective_thread_ts)
+                            .channel_bindings()
+                            .lookup(&slack_address(
+                                &inbound.team_id,
+                                &inbound.channel_id,
+                                &effective_thread_ts,
+                            ))
+                            .await
                             .ok()
                             .flatten();
 
                         match db_id {
                             Some(id) => {
-                                states.insert(
-                                    key.clone(),
-                                    SlackChatState {
-                                        conv_id: id,
-                                        busy: false,
-                                    },
-                                );
+                                states.insert(key.clone(), SlackChatState { conv_id: id });
                                 tracing::info!(
                                     team_id = %inbound.team_id,
                                     channel_id = %inbound.channel_id,
@@ -1625,36 +2534,40 @@ async fn slack_agent_loop(
                                 );
                                 id
                             }
-                            None => match state.store.conversations().create() {
+                            None => match state.agent.store.conversations().create().await {
                                 Ok(mut conv) => {
                                     conv.channel_source = Some("slack".to_string());
                                     conv.channel_id = Some(inbound.channel_id.clone());
                                     conv.channel_thread_id = Some(effective_thread_ts.clone());
-                                    if let Err(e) = state.store.conversations().save(&conv) {
+                                    if let Err(e) =
+                                        state.agent.store.conversations().save(&conv).await
+                                    {
                                         tracing::warn!(
                                             channel_id = %inbound.channel_id,
                                             "failed to persist Slack channel metadata: {e}"
                                         );
                                     }
                                     let id = conv.id;
-                                    states.insert(
-                                        key.clone(),
-                                        SlackChatState {
-                                            conv_id: id,
-                                            busy: false,
-                                        },
-                                    );
-                                    if let Err(e) = state.store.slack_chat_map().upsert(
-                                        &inbound.team_id,
-                                        &inbound.channel_id,
-                                        &effective_thread_ts,
-                                        id,
-                                    ) {
+                                    states.insert(key.clone(), SlackChatState { conv_id: id });
+                                    if let Err(e) = state
+                                        .agent
+                                        .store
+                                        .channel_bindings()
+                                        .bind(
+                                            &slack_address(
+                                                &inbound.team_id,
+                                                &inbound.channel_id,
+                                                &effective_thread_ts,
+                                            ),
+                                            id,
+                                        )
+                                        .await
+                                    {
                                         tracing::warn!(
                                             team_id = %inbound.team_id,
                                             channel_id = %inbound.channel_id,
                                             thread_ts = %effective_thread_ts,
-                                            "failed to persist Slack chat map: {e}"
+                                            "failed to persist Slack channel binding: {e}"
                                         );
                                     }
                                     tracing::info!(
@@ -1686,30 +2599,32 @@ async fn slack_agent_loop(
                 }
             };
 
-            // Mark busy.
-            {
-                let mut states = chat_states.lock().await;
-                if let Some(cs) = states.get_mut(&key) {
-                    cs.busy = true;
-                }
-            }
-
-            let reply = process_slack_message(
+            let (used_conv_id, reply) = process_slack_message(
                 &state,
                 conv_id,
+                &inbound.team_id,
                 &inbound.channel_id,
                 &effective_thread_ts,
                 inbound.message,
                 &user_text,
+                &control,
+                generation,
             )
             .await;
 
-            // Clear busy.
+            // Adopt the conversation actually used: it
+            // differs when the cached id had outlived its conversation and
+            // a new one was started. Leaving the dead id cached would send
+            // the next message down the same path.
             {
                 let mut states = chat_states.lock().await;
                 if let Some(cs) = states.get_mut(&key) {
-                    cs.busy = false;
+                    cs.conv_id = used_conv_id;
                 }
+            }
+            *control.active.lock().await = None;
+            if !control.is_current(generation) {
+                return;
             }
 
             if let Err(e) = sl
@@ -1722,6 +2637,31 @@ async fn slack_agent_loop(
                     "failed to send Slack reply: {e}"
                 );
             }
+
+            // Then any credential link the turn asked for, as its own
+            // message — same order and same reasoning as the Telegram
+            // loop: the user reads why before being handed the form, and
+            // the link never passed through the model so it cannot have
+            // been truncated. Slack has no app in the loop, so without
+            // this the ask is a dead end here.
+            if !control.is_current(generation) {
+                return;
+            }
+            for link in state.agent.store.pending_links().take(used_conv_id) {
+                if !control.is_current(generation) {
+                    break;
+                }
+                if let Err(e) = sl
+                    .send_text(&inbound.channel_id, &link, Some(&effective_thread_ts))
+                    .await
+                {
+                    tracing::error!(
+                        channel_id = %inbound.channel_id,
+                        thread_ts = %effective_thread_ts,
+                        "failed to send credential link: {e}"
+                    );
+                }
+            }
         });
     }
 
@@ -1729,21 +2669,43 @@ async fn slack_agent_loop(
 }
 
 /// Process a single Slack message: load conversation, run agent, persist.
+/// Returns the conversation id actually used alongside the reply: it differs
+/// from the one passed in when the binding had outlived its conversation and
+/// [`load_or_rebind`] started a new one.
+#[allow(clippy::too_many_arguments)]
 async fn process_slack_message(
     state: &AppState,
     conv_id: Uuid,
+    team_id: &str,
     channel_id: &str,
     thread_ts: &str,
     message: rustykrab_core::types::Message,
     user_text: &str,
-) -> String {
-    let mut conv = match state.store.conversations().get(conv_id) {
-        Ok(c) => c,
+    control: &ChannelTurnControl,
+    generation: u64,
+) -> (Uuid, String) {
+    let address = slack_address(team_id, channel_id, thread_ts);
+    let (mut conv, _rebound) = match load_or_rebind(
+        state,
+        &address,
+        conv_id,
+        "slack",
+        Some(channel_id.to_string()),
+        Some(thread_ts.to_string()),
+    )
+    .await
+    {
+        Ok(pair) => pair,
         Err(e) => {
             tracing::error!(channel_id, thread_ts, %conv_id, "failed to load Slack conversation: {e}");
-            return "Internal error — please try again.".to_string();
+            return (conv_id, "Internal error — please try again.".to_string());
         }
     };
+    let conv_id = conv.id;
+    // Ids of the already-persisted messages: the post-run save appends
+    // only this turn's tail (full rewrite if the agent compacted
+    // history mid-run).
+    let mut persisted_ids: Vec<Uuid> = conv.messages.iter().map(|m| m.id).collect();
 
     if conv.channel_source.is_none() {
         conv.channel_source = Some("slack".to_string());
@@ -1754,59 +2716,128 @@ async fn process_slack_message(
         conv.channel_thread_id = Some(thread_ts.to_string());
     }
 
+    if let Err(error) = state
+        .agent
+        .store
+        .inbound()
+        .assign(message.id, conv_id)
+        .await
+    {
+        tracing::error!("could not associate Slack inbound with conversation: {error}");
+        return (conv_id, "Your message is in the recovery journal, but I could not attach it to this conversation. I have not started acting on it.".into());
+    }
     conv.messages.push(message);
     conv.updated_at = Utc::now();
 
-    // Heartbeat-monitored agent run, mirroring the Telegram path.
-    let last_heartbeat = Arc::new(AtomicU64::new(epoch_millis()));
-    let hb = last_heartbeat.clone();
-    let on_event = move |_event: AgentEvent| {
-        hb.store(epoch_millis(), Ordering::Relaxed);
-    };
+    if let Err(e) = state
+        .agent
+        .store
+        .conversations()
+        .save_turn(&conv, &persisted_ids)
+        .await
+    {
+        tracing::error!(channel_id, %conv_id, "failed to persist Slack inbound conversation: {e}");
+        return (
+            conv_id,
+            "I couldn't save your message, so I haven't started acting on it. Please try again."
+                .into(),
+        );
+    }
+    persisted_ids = conv.messages.iter().map(|m| m.id).collect();
+
+    // Channels append straight onto `conv.messages`, which never passes
+    // through `AgentRunner::push_message` and so never reaches the
+    // auto-persist hook. Without this call nothing the user types ever
+    // reaches memory — measured on the live store, where the runner's own
+    // synthesised prompts are present repeatedly and the user's are absent
+    // entirely. This is also where distillation starts.
+    if let Some(inbound) = conv.messages.last() {
+        rustykrab_runtime::ingest_inbound(&state.agent, &conv, inbound).await;
+    }
 
     let trace_id = Uuid::new_v4();
     tracing::info!(%trace_id, conv_id = %conv.id, "slack agent run starting");
-    let agent_fut =
-        rustykrab_gateway::run_agent_streaming(state, &mut conv, user_text, &on_event, trace_id);
-
-    let timeout_millis = HEARTBEAT_TIMEOUT_SECS * 1000;
-    let heartbeat_monitor = async {
-        loop {
-            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-            let last = last_heartbeat.load(Ordering::Relaxed);
-            if epoch_millis() - last > timeout_millis {
-                break;
+    let (handle, events, task) =
+        match rustykrab_runtime::run_agent_interactive(&state.agent, conv, user_text, trace_id)
+            .await
+        {
+            Ok(started) => started,
+            Err(_) => {
+                return (
+                    conv_id,
+                    "I encountered an error before starting. Your message was saved.".into(),
+                )
             }
-        }
-    };
-
-    let reply = tokio::select! {
-        result = agent_fut => {
-            match result {
-                Ok(assistant_msg) => match &assistant_msg.content {
-                    MessageContent::Text(t) => t.clone(),
-                    _ => "I processed your message but have no text response.".to_string(),
-                },
-                Err(_status) => {
-                    tracing::error!(channel_id, %conv_id, "Slack agent returned error");
-                    "Sorry, I encountered an error processing your message.".to_string()
+        };
+    control.register(generation, conv_id, handle.clone()).await;
+    match rustykrab_runtime::await_interactive_run(
+        &handle,
+        events,
+        task,
+        std::time::Duration::from_secs(HEARTBEAT_TIMEOUT_SECS),
+    )
+    .await
+    {
+        Ok((completion, stalled)) => {
+            if let Err(e) = state
+                .agent
+                .store
+                .conversations()
+                .save_turn(&completion.conversation, &persisted_ids)
+                .await
+            {
+                tracing::error!(channel_id, %conv_id, "failed to persist Slack conversation: {e}");
+                return (conv_id, "The run ended, but I couldn't save its full history. Please inspect the result before retrying any action.".into());
+            }
+            checkpoint_channel_input(state, &completion.conversation, control).await;
+            let reply = match completion.result {
+                Err(e) => {
+                    tracing::error!(channel_id, %conv_id, "Slack agent failed (partial history saved): {e}");
+                    if stalled {
+                        "The agent stalled. I saved the partial history; any interrupted external action needs checking before retrying.".into()
+                    } else {
+                        "I encountered an error. I saved the partial history, including pending messages; the task is not complete.".into()
+                    }
                 }
-            }
+                Ok(()) => completion
+                    .conversation
+                    .messages
+                    .iter()
+                    .rev()
+                    .find_map(|message| {
+                        (message.role == rustykrab_core::types::Role::Assistant)
+                            .then(|| message.content.as_text())
+                            .flatten()
+                            .map(str::to_owned)
+                    })
+                    .unwrap_or_else(|| {
+                        "I processed your message but have no text response.".into()
+                    }),
+            };
+            (conv_id, reply)
         }
-        _ = heartbeat_monitor => {
-            tracing::error!(
-                channel_id, %conv_id,
-                "Slack agent stalled — no activity for {HEARTBEAT_TIMEOUT_SECS}s"
-            );
-            "Sorry, the agent appears to have stalled. Please try again.".to_string()
+        Err(e) => {
+            tracing::error!(channel_id, %conv_id, "Slack agent task failed: {e}");
+            (conv_id, "I encountered an internal error. Your initial message is saved; check any external action before retrying.".into())
         }
-    };
-
-    if let Err(e) = state.store.conversations().save(&conv) {
-        tracing::error!(channel_id, %conv_id, "failed to persist Slack conversation: {e}");
     }
+}
 
-    reply
+async fn checkpoint_channel_input(
+    state: &AppState,
+    conv: &rustykrab_core::types::Conversation,
+    control: &ChannelTurnControl,
+) {
+    let ids: Vec<Uuid> = conv
+        .messages
+        .iter()
+        .filter(|m| m.role == Role::User)
+        .map(|m| m.id)
+        .collect();
+    match state.agent.store.inbound().retained(conv.id, &ids).await {
+        Ok(()) => control.forget(&ids),
+        Err(error) => tracing::error!("conversation saved but inbound checkpoint failed; recovery remains conservative: {error}"),
+    }
 }
 
 async fn shutdown_signal() {
@@ -1814,6 +2845,44 @@ async fn shutdown_signal() {
         .await
         .expect("failed to listen for ctrl+c");
     tracing::info!("shutdown signal received");
+}
+
+#[cfg(test)]
+mod channel_control_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn post_reset_turn_waits_for_its_own_barrier() {
+        let control = ChannelTurnControl::default();
+        let old = control.generation();
+        let first = control.begin_reset();
+        let second = control.begin_reset();
+        assert!(!control.is_current(old));
+        control.finish_reset(first);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), control.enter(second))
+                .await
+                .is_err()
+        );
+        control.finish_reset(second);
+        assert!(control.enter(second).await.is_some());
+        assert!(control.enter(first).await.is_none());
+    }
+
+    #[test]
+    fn reset_cancellation_uses_receive_time_ids_not_later_admissions() {
+        let control = ChannelTurnControl::default();
+        let before = Uuid::new_v4();
+        let after = Uuid::new_v4();
+        control.admit(before);
+        control.begin_reset();
+        let retired = control.take_admitted();
+        control.admit(after);
+        assert_eq!(retired, vec![before]);
+        control.forget(&[before]);
+        assert_eq!(control.take_admitted(), vec![after]);
+    }
 }
 
 /// Background task: poll for due scheduled jobs and submit them to
@@ -1830,7 +2899,7 @@ async fn job_executor_loop(store: rustykrab_store::Store, queue: task_queue::Tas
         interval.tick().await;
 
         let now = Utc::now();
-        let due_jobs = match store.jobs().get_due_jobs(now) {
+        let due_jobs = match store.jobs().get_due_jobs(now).await {
             Ok(jobs) => jobs,
             Err(e) => {
                 tracing::warn!(error = %e, "failed to query due jobs");
@@ -1903,9 +2972,15 @@ fn load_orchestration_config(data_dir: &std::path::Path) -> anyhow::Result<Orche
 ///
 /// Priority:
 /// 1. `RUSTYKRAB_MAX_CONTEXT_TOKENS` env var when set to a positive integer
-/// 2. Provider-aware default: 32k for Ollama (local inference with
+/// 2. `max_context_tokens` named in `harness.toml`, via `profile_set`
+/// 3. Provider-aware default: 32k for Ollama (local inference with
 ///    limited GPU memory), 128k for everything else (cloud models)
-fn resolve_max_context_tokens(provider_name: &str) -> usize {
+///
+/// Step 2 is the one that was missing. A `max_context_tokens` written in
+/// `harness.toml` was loaded and then immediately overwritten by the
+/// provider default — silently, so a profile asking for a small window got
+/// a large one and nothing said why.
+fn resolve_max_context_tokens(provider_name: &str, profile_set: Option<usize>) -> usize {
     if let Some(v) = std::env::var("RUSTYKRAB_MAX_CONTEXT_TOKENS")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
@@ -1913,9 +2988,41 @@ fn resolve_max_context_tokens(provider_name: &str) -> usize {
     {
         return v;
     }
+    if let Some(v) = profile_set.filter(|&v| v > 0) {
+        return v;
+    }
     match provider_name {
         "ollama" => 32_000,
         _ => 128_000,
+    }
+}
+
+/// Choose where live credential values are kept.
+///
+/// The platform's own secure store by default. `RUSTYKRAB_CREDENTIAL_BACKEND=memory`
+/// substitutes an in-process one, which exists so the evaluation harness can
+/// exercise the credential flow without a keychain — the same shape as
+/// `RUSTYKRAB_PROVIDER=scripted` and `RUSTYKRAB_TOOL_STUBS`, and warned about
+/// just as loudly, because a real deployment running this keeps every
+/// credential in memory and loses them all on restart.
+fn credential_backend_from_env(
+) -> std::sync::Arc<dyn rustykrab_store::credential_backend::CredentialBackend> {
+    match std::env::var("RUSTYKRAB_CREDENTIAL_BACKEND")
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "memory" => {
+            tracing::warn!(
+                "RUSTYKRAB_CREDENTIAL_BACKEND=memory — credentials are held in \
+                 memory only, are lost on restart, and are protected by nothing. \
+                 This is the evaluation harness switch and must never be set on a \
+                 real deployment."
+            );
+            std::sync::Arc::new(rustykrab_store::credential_backend::MemoryBackend::new())
+        }
+        _ => rustykrab_store::credential_backend::default_backend(),
     }
 }
 
@@ -1925,12 +3032,33 @@ fn resolve_max_context_tokens(provider_name: &str) -> usize {
 /// 1. `data_dir/harness.toml` — full custom profile
 /// 2. `RUSTYKRAB_HARNESS` env var — one of: default, coding, research, creative
 /// 3. Fallback to default profile
-fn load_harness_profile(data_dir: &std::path::Path) -> anyhow::Result<HarnessProfile> {
+///
+/// Returns the profile, the context budget it named, and every key it
+/// named.
+///
+/// The last two exist because `HarnessProfile` defaults every field, so a
+/// loaded profile alone cannot tell "the operator wants 6000" from "the
+/// operator said nothing and serde filled in a default". The context
+/// resolver and the harness router both need that distinction, and both
+/// were silently overriding stated choices without it.
+fn load_harness_profile(
+    data_dir: &std::path::Path,
+) -> anyhow::Result<(HarnessProfile, Option<usize>, Vec<String>)> {
     let profile_path = data_dir.join("harness.toml");
     if profile_path.exists() {
         let contents = std::fs::read_to_string(&profile_path)?;
         let profile: HarnessProfile = toml::from_str(&contents)?;
-        return Ok(profile);
+        let table = contents.parse::<toml::Table>().ok();
+        let explicit = table
+            .as_ref()
+            .and_then(|t| t.get("max_context_tokens").and_then(|v| v.as_integer()))
+            .map(|v| v as usize);
+        // Every key the file named. The router uses this to tell a stated
+        // choice from a serde default, which it otherwise cannot do.
+        let named = table
+            .map(|t| t.keys().cloned().collect())
+            .unwrap_or_default();
+        return Ok((profile, explicit, named));
     }
 
     let preset = std::env::var("RUSTYKRAB_HARNESS").unwrap_or_else(|_| "default".to_string());
@@ -1941,7 +3069,9 @@ fn load_harness_profile(data_dir: &std::path::Path) -> anyhow::Result<HarnessPro
         _ => HarnessProfile::default(),
     };
 
-    Ok(profile)
+    // A preset names nothing of its own, so the provider default applies
+    // and the router is free to choose.
+    Ok((profile, None, Vec::new()))
 }
 
 /// Handle `skill list` and `skill install <path>` subcommands.
@@ -2017,11 +3147,161 @@ fn handle_skill_subcommand(data_dir: &std::path::Path, args: &[String]) -> anyho
 ///
 /// Uses the registry to check env / keychain / store, then generates
 /// a new token if none exists.
-fn resolve_auth_token(store: &rustykrab_store::Store) -> String {
+/// `rustykrab pair` — mint a one-time code for a phone to redeem.
+///
+/// Prints the code and the QR payload the app scans. Runs against the same
+/// data directory as the daemon; the daemon does not need to be running,
+/// since the code lives in the shared database.
+/// `dream report [N] [--json]` — what the outer loop has been finding.
+///
+/// The phase gate in `DREAMING.md` is "reports show real, actionable
+/// patterns". Without a way to read the passes back, answering that means
+/// grepping rotated daemon logs, so the gate cannot honestly be evaluated
+/// and the loop's most important output is its least accessible one.
+/// The post-condition probes this deployment can actually run.
+///
+/// Which effects a skill *claims* comes from its `SKILL.md`; which effects
+/// this machine can *observe* comes from here. A check naming nothing in
+/// this registry yields no contract at all, so the run falls back to the
+/// behavioural signal — see `rustykrab_core::post_condition` for why that
+/// is the only safe answer.
+///
+/// Deliberately short. A probe has to observe the effect through a path
+/// independent of the run, which rules out the easy version (ask the
+/// tracer whether the tool was called) and means each one is real work.
+/// These two are the ones that can be written honestly today; a calendar
+/// or mailbox probe belongs with the crate that already owns that client.
+fn build_probe_registry(
+    data_dir: &std::path::Path,
+    memory: Arc<dyn rustykrab_core::MemoryBackend>,
+) -> rustykrab_core::ProbeRegistry {
+    rustykrab_core::ProbeRegistry::new()
+        // "the briefing was written to the vault"
+        .with(Arc::new(rustykrab_core::FilePresence::new(
+            "daily_briefing_written",
+            data_dir.join("briefings").join("latest.md"),
+        )))
+        // "the run committed something to memory"
+        .with(Arc::new(rustykrab_core::MemoryWritten::new(
+            "memory_written",
+            memory,
+        )))
+}
+
+async fn handle_dream_subcommand(
+    data_dir: &std::path::Path,
+    args: &[String],
+) -> anyhow::Result<()> {
+    let json = args.iter().any(|a| a == "--json");
+    let limit: u32 = args
+        .iter()
+        .find(|a| !a.starts_with('-'))
+        .and_then(|a| a.parse().ok())
+        .unwrap_or(1);
+
+    let master_key = match rustykrab_store::keychain::resolve_master_key() {
+        Ok(key) => key,
+        Err(e) => {
+            eprintln!("ERROR: {e}");
+            std::process::exit(1);
+        }
+    };
+    let store = rustykrab_store::Store::open(data_dir.join("db"), master_key)?;
+    let reports = store.dream_reports().recent(limit.max(1)).await?;
+
+    if reports.is_empty() {
+        // Distinguish the two ways this is empty, because they call for
+        // opposite responses: one is "wait", the other is "you have not
+        // turned it on".
+        let capture_on = std::env::var("RUSTYKRAB_OUTCOME_CAPTURE")
+            .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "True"))
+            .unwrap_or(false);
+        if capture_on {
+            println!("no analysis passes recorded yet -- the worker runs only after the system has been quiet");
+        } else {
+            println!("outcome capture is off; set RUSTYKRAB_OUTCOME_CAPTURE=1 to enable it");
+            println!("note: the daemon reads this from its environment, so on macOS it must be");
+            println!("      set in the LaunchAgent plist, not just the shell");
+        }
+        return Ok(());
+    }
+
+    for report in &reports {
+        if json {
+            println!("{}", report.report);
+        } else {
+            println!(
+                "{}  ({} records, {})",
+                report.generated_at.to_rfc3339(),
+                report.total_records,
+                report.readiness
+            );
+            println!("{}", report.summary);
+            println!();
+        }
+    }
+    Ok(())
+}
+
+async fn handle_pair_subcommand(data_dir: &std::path::Path) -> anyhow::Result<()> {
+    let master_key = match rustykrab_store::keychain::resolve_master_key() {
+        Ok(key) => key,
+        Err(e) => {
+            eprintln!("ERROR: {e}");
+            std::process::exit(1);
+        }
+    };
+    let store = rustykrab_store::Store::open(data_dir.join("db"), master_key)?;
+    let devices = store.devices();
+    let _ = devices.sweep_expired_codes().await;
+    let code = devices.mint_pairing_code().await?;
+
+    // The URL the app should talk to. On a tailnet this is the ts.net
+    // hostname; there is no way to detect that from here, so it is
+    // overridable and defaults to the loopback the daemon binds.
+    let url = std::env::var("RUSTYKRAB_PUBLIC_URL").unwrap_or_else(|_| {
+        let port = std::env::var("RUSTYKRAB_PORT").unwrap_or_else(|_| "3000".to_string());
+        format!("http://127.0.0.1:{port}")
+    });
+
+    // Bare code on stdout's first line so scripts can read it; the QR
+    // payload follows for the app to scan.
+    println!("{code}");
+    println!();
+    println!("  Pairing code: {code}");
+    println!("  Valid for 5 minutes, single use.");
+    println!();
+    println!(
+        "  QR payload: {}",
+        serde_json::json!({ "url": url, "code": code })
+    );
+    println!();
+    if url.contains("127.0.0.1") {
+        println!(
+            "  Note: that URL is loopback-only. Set RUSTYKRAB_PUBLIC_URL to your\n  \
+             tailnet hostname (https://<mac>.<tailnet>.ts.net) before pairing a phone."
+        );
+    }
+    Ok(())
+}
+
+/// Parse an optional env var, warning (rather than failing) on garbage.
+fn env_parse<T: std::str::FromStr>(key: &str) -> Option<T> {
+    let raw = std::env::var(key).ok()?;
+    match raw.trim().parse::<T>() {
+        Ok(v) => Some(v),
+        Err(_) => {
+            tracing::warn!(%key, value = %raw, "ignoring unparseable env var");
+            None
+        }
+    }
+}
+
+async fn resolve_auth_token(store: &rustykrab_store::Store) -> String {
     let spec = rustykrab_store::registry::lookup("rustykrab_auth_token")
         .expect("rustykrab_auth_token must be in the registry");
 
-    if let Some(token) = rustykrab_store::registry::resolve(spec, &store.secrets()) {
+    if let Some(token) = rustykrab_store::registry::resolve(spec, &store.secrets()).await {
         tracing::info!("auth token resolved via registry");
         return token;
     }
@@ -2035,18 +3315,18 @@ fn resolve_auth_token(store: &rustykrab_store::Store) -> String {
     if rustykrab_store::keychain::keychain_available() {
         let _ = rustykrab_store::keychain::set_credential(svc, spec.keychain_account, &token);
     }
-    let _ = store.secrets().set(spec.store_name, &token);
+    let _ = store.secrets().upsert_system(spec.store_name, &token).await;
     token
 }
 
 /// Resolve the Anthropic API key.
 ///
 /// Uses the registry to check env / keychain / store.
-fn resolve_api_key(store: &rustykrab_store::Store) -> String {
+async fn resolve_api_key(store: &rustykrab_store::Store) -> String {
     let spec = rustykrab_store::registry::lookup("anthropic_api_key")
         .expect("anthropic_api_key must be in the registry");
 
-    if let Some(key) = rustykrab_store::registry::resolve(spec, &store.secrets()) {
+    if let Some(key) = rustykrab_store::registry::resolve(spec, &store.secrets()).await {
         tracing::info!("API key resolved via registry");
         return key;
     }
@@ -2070,7 +3350,10 @@ fn resolve_api_key(store: &rustykrab_store::Store) -> String {
 ///
 /// These let the user verify Keychain connectivity, migrate legacy keychain
 /// items to the Data Protection Keychain, and manually seed credentials.
-fn handle_keychain_subcommand(data_dir: &std::path::Path, args: &[String]) -> anyhow::Result<()> {
+async fn handle_keychain_subcommand(
+    data_dir: &std::path::Path,
+    args: &[String],
+) -> anyhow::Result<()> {
     let sub = args.first().map(|s| s.as_str()).unwrap_or("status");
 
     match sub {
@@ -2185,7 +3468,7 @@ fn handle_keychain_subcommand(data_dir: &std::path::Path, args: &[String]) -> an
                 if db_path.exists() {
                     if let Ok(master_key) = rustykrab_store::keychain::resolve_master_key() {
                         if let Ok(store) = rustykrab_store::Store::open(&db_path, master_key) {
-                            let _ = store.secrets().set(sn, value);
+                            let _ = store.secrets().upsert_system(sn, value).await;
                             println!("Also stored in encrypted store as '{sn}'");
                         }
                     }
@@ -2217,7 +3500,7 @@ fn handle_keychain_subcommand(data_dir: &std::path::Path, args: &[String]) -> an
                     if let Ok(store) = rustykrab_store::Store::open(&db_path, master_key) {
                         let svc = rustykrab_store::registry::keychain_service();
                         for spec in rustykrab_store::registry::REGISTRY {
-                            if let Ok(val) = store.secrets().get(spec.store_name) {
+                            if let Ok(val) = store.secrets().get(spec.store_name).await {
                                 match rustykrab_store::keychain::set_credential(
                                     svc,
                                     spec.keychain_account,
@@ -2285,6 +3568,135 @@ fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> anyhow::R
         }
     }
     Ok(())
+}
+
+/// Carries credential-request events to both parties.
+///
+/// Filing goes outward to the user (APNs, when configured). Fulfilling
+/// goes back inward to the agent, by queueing a wake for the conversation
+/// that asked. Keeping both on one notifier means the store has a single
+/// hook and neither half can be wired without the other.
+struct CredentialNotifier {
+    push: Option<Arc<dyn rustykrab_store::RequestNotifier>>,
+    /// Filled once the task queue exists. `TaskQueue` needs `AppState`,
+    /// which is built after the store, so this cannot be a plain field.
+    queue: Arc<std::sync::OnceLock<task_queue::TaskQueue>>,
+}
+
+impl std::fmt::Debug for CredentialNotifier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CredentialNotifier")
+            .field("push", &self.push.is_some())
+            .field("queue_ready", &self.queue.get().is_some())
+            .finish()
+    }
+}
+
+impl CredentialNotifier {
+    /// Queue a resume of `conversation_id`. Detached for the reason given in
+    /// `request_fulfilled`: the store write that triggered it must not wait.
+    fn wake(&self, conversation_id: &str, what: &str, request: task_queue::TaskRequest) {
+        let Some(queue) = self.queue.get() else {
+            tracing::warn!(
+                what,
+                conversation_id,
+                "answer arrived before the task queue was ready — not resuming"
+            );
+            return;
+        };
+        let queue = queue.clone();
+        let what = what.to_string();
+        tokio::spawn(async move {
+            if let Err(e) = queue.submit(request).await {
+                tracing::error!(what = %what, "could not queue wake: {e}");
+            }
+        });
+    }
+}
+
+impl rustykrab_store::RequestNotifier for CredentialNotifier {
+    fn request_filed(&self, credential_name: &str, action: &str) {
+        if let Some(push) = &self.push {
+            push.request_filed(credential_name, action);
+        }
+    }
+
+    fn request_fulfilled(
+        &self,
+        conversation_id: Option<&str>,
+        credential_name: &str,
+        service: Option<&str>,
+    ) {
+        let Some(conversation_id) = conversation_id else {
+            // Filed outside a runner scope. The credential is stored and
+            // usable; there is simply no turn to return to.
+            tracing::debug!(
+                credential = %credential_name,
+                "credential supplied, but the request recorded no conversation — nothing to wake"
+            );
+            return;
+        };
+        let Some(queue) = self.queue.get() else {
+            tracing::warn!(
+                credential = %credential_name,
+                "credential supplied before the task queue was ready — not resuming"
+            );
+            return;
+        };
+
+        let request = task_queue::TaskRequest {
+            prompt: task_queue::credential_wake_prompt(credential_name, service),
+            source: task_queue::TaskSource::CredentialFulfilled {
+                conversation_id: conversation_id.to_string(),
+                credential_name: credential_name.to_string(),
+            },
+            // One wake per conversation. A request answered with two
+            // fields, or two requests answered together, must not start
+            // two agent runs over the same history.
+            dedupe_key: Some(format!("credential-wake:{conversation_id}")),
+        };
+
+        // `request_fulfilled` is synchronous and must not block the write
+        // that triggered it, so the submit is detached. Losing it costs
+        // the resume, never the credential.
+        let queue = queue.clone();
+        let name = credential_name.to_string();
+        tokio::spawn(async move {
+            if let Err(e) = queue.submit(request).await {
+                tracing::error!(credential = %name, "could not queue credential wake: {e}");
+            }
+        });
+    }
+
+    fn payment_authorized(
+        &self,
+        conversation_id: Option<&str>,
+        request: &rustykrab_store::PaymentRequest,
+    ) {
+        let Some(conversation_id) = conversation_id else {
+            tracing::debug!(
+                request = %request.id,
+                "payment approved, but the request recorded no conversation — nothing to wake"
+            );
+            return;
+        };
+        let task = task_queue::TaskRequest {
+            prompt: task_queue::payment_wake_prompt(
+                &request.merchant,
+                &request.amount.to_string(),
+                &request.origin,
+            ),
+            source: task_queue::TaskSource::PaymentAuthorized {
+                conversation_id: conversation_id.to_string(),
+                request_id: request.id.clone(),
+            },
+            // Shares the credential wake's key: either kind of answer
+            // resumes the same stalled turn, and two runs over one
+            // conversation's history must never start together.
+            dedupe_key: Some(format!("credential-wake:{conversation_id}")),
+        };
+        self.wake(conversation_id, "payment approval", task);
+    }
 }
 
 #[cfg(test)]

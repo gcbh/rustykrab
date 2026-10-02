@@ -72,6 +72,13 @@ pub static REGISTRY: &[SecretSpec] = &[
         required: false,
     },
     SecretSpec {
+        store_name: "apns_auth_key",
+        env_var: "APNS_AUTH_KEY",
+        keychain_account: "apns-auth-key",
+        description: "APNs signing key (.p8 contents) for push notifications",
+        required: false, // push is optional
+    },
+    SecretSpec {
         store_name: "rustykrab_auth_token",
         env_var: "RUSTYKRAB_AUTH_TOKEN",
         keychain_account: "auth-token",
@@ -90,12 +97,14 @@ pub struct MissingSecret {
 ///
 /// This does **not** mutate any store — it is a read-only check suitable for
 /// startup validation.
-pub fn validate(secrets: &SecretStore) -> Vec<MissingSecret> {
-    REGISTRY
-        .iter()
-        .filter(|spec| !is_present(spec, secrets))
-        .map(|spec| MissingSecret { spec })
-        .collect()
+pub async fn validate(secrets: &SecretStore) -> Vec<MissingSecret> {
+    let mut missing = Vec::new();
+    for spec in REGISTRY {
+        if !is_present(spec, secrets).await {
+            missing.push(MissingSecret { spec });
+        }
+    }
+    missing
 }
 
 /// Resolve a secret from all sources in priority order.
@@ -104,38 +113,70 @@ pub fn validate(secrets: &SecretStore) -> Vec<MissingSecret> {
 /// so future runs can find it without the env var.
 ///
 /// Returns `None` only when the secret is absent from every source.
-pub fn resolve(spec: &SecretSpec, secrets: &SecretStore) -> Option<String> {
+pub async fn resolve(spec: &SecretSpec, secrets: &SecretStore) -> Option<String> {
     // 1. Environment variable (highest priority).
     if let Ok(val) = std::env::var(spec.env_var) {
         let val = val.trim().to_string();
         if !val.is_empty() {
-            // Persist downward.
-            if keychain::keychain_available() {
-                let _ = keychain::set_credential(KEYCHAIN_SERVICE, spec.keychain_account, &val);
+            // Seed the secure backend, but not the database: an env-supplied
+            // credential is no less secret than a typed one.
+            let backend = secrets.credential_backend();
+            if backend.available() {
+                let _ = backend.set(spec.keychain_account, &val);
             }
-            let _ = secrets.set(spec.store_name, &val);
             return Some(val);
         }
     }
 
     // 2. OS credential store.
-    if keychain::keychain_available() {
-        if let Ok(Some(cred)) = keychain::get_credential(KEYCHAIN_SERVICE, spec.keychain_account) {
-            let _ = secrets.set(spec.store_name, &cred.value);
-            return Some(cred.value);
+    //
+    // Deliberately does NOT copy the value back into the database. This
+    // used to mirror downward, which meant a credential deposited into
+    // hardware was re-persisted to SQLite by the very next read — undoing
+    // the point of putting it in hardware at all.
+    let backend = secrets.credential_backend();
+    if backend.available() {
+        if let Ok(Some(value)) = backend.get(spec.keychain_account) {
+            return Some(value);
         }
     }
 
     // 3. Encrypted local store.
-    if let Ok(val) = secrets.get(spec.store_name) {
-        // Back-fill into keychain if available.
-        if keychain::keychain_available() {
-            let _ = keychain::set_credential(KEYCHAIN_SERVICE, spec.keychain_account, &val);
+    if let Ok(val) = secrets.get(spec.store_name).await {
+        // Promote it: a credential still in the database predates the
+        // secure backend, and this is the moment it can stop living there.
+        if backend.available() {
+            let _ = backend.set(spec.keychain_account, &val);
         }
         return Some(val);
     }
 
     None
+}
+
+/// The keychain account a credential is deposited under.
+///
+/// Registry entries name their own, so `gmail_app_password` keeps the
+/// `gmail-app-password` slot it has always had. Anything else — a website
+/// login the agent asked for, which no registry entry anticipated — gets a
+/// slot derived from its name, so ad-hoc credentials land in hardware too
+/// rather than falling back to the database.
+pub fn keychain_account_for(store_name: &str) -> String {
+    if let Some(spec) = lookup(store_name) {
+        return spec.keychain_account.to_string();
+    }
+    store_name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string()
 }
 
 /// Look up a [`SecretSpec`] by its store name.
@@ -157,7 +198,7 @@ pub fn keychain_service() -> &'static str {
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-fn is_present(spec: &SecretSpec, secrets: &SecretStore) -> bool {
+async fn is_present(spec: &SecretSpec, secrets: &SecretStore) -> bool {
     // env var
     if let Ok(val) = std::env::var(spec.env_var) {
         if !val.trim().is_empty() {
@@ -171,5 +212,5 @@ fn is_present(spec: &SecretSpec, secrets: &SecretStore) -> bool {
         }
     }
     // store
-    secrets.get(spec.store_name).is_ok()
+    secrets.get(spec.store_name).await.is_ok()
 }

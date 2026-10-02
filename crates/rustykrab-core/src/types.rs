@@ -84,6 +84,46 @@ pub struct Message {
     pub role: Role,
     pub content: MessageContent,
     pub created_at: DateTime<Utc>,
+    /// RustyKrab version that produced this message, for forensic
+    /// attribution ("which build wrote this reply?").
+    ///
+    /// Carried on the message rather than stamped at the storage layer
+    /// on purpose: `write_full` deletes and reinserts every row during
+    /// compaction, so a storage-time stamp would relabel a whole
+    /// conversation's history with whatever build happened to compact
+    /// it. Riding on the message keeps each one's origin intact.
+    ///
+    /// `None` for messages written before this field existed, and for
+    /// messages the caller didn't stamp. `#[serde(default)]` so rows
+    /// serialized by older builds still deserialize.
+    #[serde(default)]
+    pub agent_version: Option<String>,
+}
+
+impl Message {
+    /// Build a message stamped with the running RustyKrab version.
+    ///
+    /// Prefer this over a struct literal for any message that
+    /// represents real conversational content, so the row carries its
+    /// origin build. Literals that deliberately want no stamp (test
+    /// fixtures, provider-wire conversions) can still construct
+    /// directly with `agent_version: None`.
+    pub fn stamped(role: Role, content: MessageContent) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            role,
+            content,
+            created_at: Utc::now(),
+            agent_version: Self::version_stamp(),
+        }
+    }
+
+    /// The running version, for stamping struct literals whose shape
+    /// (multi-line `content` expressions, borrowed locals) doesn't suit
+    /// [`Message::stamped`].
+    pub fn version_stamp() -> Option<String> {
+        Some(crate::VERSION.to_string())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::runner::AgentConfig;
+use crate::CompactionStrategy;
 
 /// A serializable harness profile that bundles all agent behavior parameters
 /// into a single, swappable configuration.
@@ -34,6 +35,8 @@ pub struct HarnessProfile {
     /// Fraction of `max_context_tokens` at which compaction fires (0.0–1.0).
     /// Default is 0.85 per the RLM paper.
     pub compaction_threshold_pct: f64,
+    /// Explicit compaction policy; routing must preserve the operator's choice.
+    pub compaction_strategy: CompactionStrategy,
 }
 
 impl Default for HarnessProfile {
@@ -47,6 +50,7 @@ impl Default for HarnessProfile {
             max_tool_retries: 2,
             max_context_tokens: 128_000,
             compaction_threshold_pct: 0.85,
+            compaction_strategy: CompactionStrategy::default(),
         }
     }
 }
@@ -90,7 +94,32 @@ impl HarnessProfile {
             max_tool_retries: self.max_tool_retries,
             max_context_tokens: self.max_context_tokens,
             compaction_threshold_pct: self.compaction_threshold_pct,
+            compaction_strategy: self.compaction_strategy,
             ..AgentConfig::default()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compaction_policy_roundtrips_and_old_profiles_keep_default() {
+        let old: HarnessProfile = serde_json::from_str("{}").unwrap();
+        assert_eq!(old.compaction_strategy, CompactionStrategy::default());
+        let profile: HarnessProfile =
+            serde_json::from_str(r#"{"compaction_strategy":"structured-message-tail"}"#).unwrap();
+        assert_eq!(
+            profile.to_agent_config().compaction_strategy,
+            CompactionStrategy::StructuredMessageTail
+        );
+        assert_eq!(
+            serde_json::to_value(profile).unwrap()["compaction_strategy"],
+            "structured-message-tail"
+        );
+        assert!(
+            serde_json::from_str::<HarnessProfile>(r#"{"compaction_strategy":"typo"}"#).is_err()
+        );
     }
 }

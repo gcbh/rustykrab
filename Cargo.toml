@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/rustykrab-core",
     "crates/rustykrab-store",
+    "crates/rustykrab-runtime",
     "crates/rustykrab-gateway",
     "crates/rustykrab-agent",
     "crates/rustykrab-providers",
@@ -11,10 +12,13 @@ members = [
     "crates/rustykrab-skills",
     "crates/rustykrab-cli",
     "crates/rustykrab-memory",
+    "crates/rustykrab-dream",
+    "crates/rustykrab-e2e",
+    "crates/rustykrab-projects",
 ]
 
 [workspace.package]
-version = "4.5.5"
+version = "5.3.6"
 edition = "2021"
 rust-version = "1.88"
 license = "MIT"
@@ -26,7 +30,9 @@ tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["rustls-tls-native-roots", "connect"] }
 axum = "0.8"
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "query"] }
+# `http2` is required for APNs, which refuses HTTP/1.1. It was absent, so
+# `h2` was not in the tree at all and a push would have failed at connect.
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "query", "http2"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -53,7 +59,11 @@ uuid = { version = "1", features = ["v4", "serde"] }
 
 # Time
 chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
 croner = "3"
+# Reads the host's IANA zone so a fresh install schedules in the operator's
+# local time without needing RUSTYKRAB_TIMEZONE set.
+iana-time-zone = "0.1"
 
 # Cryptography
 ed25519-dalek = { version = "2", features = ["rand_core", "serde"] }
@@ -62,6 +72,9 @@ hmac = "0.12"
 sha2 = "0.10"
 hex = "0.4"
 base64 = "0.22"
+# ES256 for APNs provider tokens. Already in the tree via rustls, so
+# this adds no new code — only a direct dependency edge.
+ring = "0.17"
 aes-gcm = "0.10"
 argon2 = "0.5"
 security-framework = { version = "3", features = ["OSX_10_15"] }
@@ -92,6 +105,7 @@ rustls-native-certs = "0.8"
 # Internal crates
 rustykrab-core = { path = "crates/rustykrab-core" }
 rustykrab-store = { path = "crates/rustykrab-store" }
+rustykrab-runtime = { path = "crates/rustykrab-runtime" }
 rustykrab-gateway = { path = "crates/rustykrab-gateway" }
 rustykrab-agent = { path = "crates/rustykrab-agent" }
 rustykrab-providers = { path = "crates/rustykrab-providers" }
@@ -100,6 +114,8 @@ rustykrab-channels = { path = "crates/rustykrab-channels" }
 rustykrab-skills = { path = "crates/rustykrab-skills" }
 rustykrab-cli = { path = "crates/rustykrab-cli" }
 rustykrab-memory = { path = "crates/rustykrab-memory" }
+rustykrab-dream = { path = "crates/rustykrab-dream" }
+rustykrab-projects = { path = "crates/rustykrab-projects" }
 
 [profile.release]
 lto = true

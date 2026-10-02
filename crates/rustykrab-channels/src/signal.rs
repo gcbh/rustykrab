@@ -8,7 +8,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
-use uuid::Uuid;
 
 /// An inbound Signal message with sender metadata for reply routing.
 pub struct SignalInboundMessage {
@@ -164,6 +163,14 @@ impl SignalChannel {
             "Signal polling started"
         );
 
+        // signal-cli-rest-api doesn't support long-polling, so we poll on an
+        // interval — ~1s while messages are flowing, backing off (x2 per
+        // empty batch) to a ceiling while idle, and snapping back to 1s on
+        // the first activity.
+        const ACTIVE_POLL_INTERVAL: Duration = Duration::from_secs(1);
+        const IDLE_POLL_CEILING: Duration = Duration::from_secs(15);
+        let mut poll_interval = ACTIVE_POLL_INTERVAL;
+
         loop {
             if self.shutdown_flag.load(Ordering::Relaxed) {
                 tracing::info!("Signal polling shutdown requested");
@@ -174,6 +181,9 @@ impl SignalChannel {
                 Ok(count) => {
                     if count > 0 {
                         tracing::debug!(count, "processed Signal messages");
+                        poll_interval = ACTIVE_POLL_INTERVAL;
+                    } else {
+                        poll_interval = (poll_interval * 2).min(IDLE_POLL_CEILING);
                     }
                 }
                 Err(e) => {
@@ -182,8 +192,7 @@ impl SignalChannel {
                 }
             }
 
-            // signal-cli-rest-api doesn't support long-polling, so we poll on an interval.
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            tokio::time::sleep(poll_interval).await;
         }
     }
 
@@ -293,12 +302,7 @@ impl SignalChannel {
 
         tracing::info!(source = %source, "received Signal message");
 
-        let message = Message {
-            id: Uuid::new_v4(),
-            role: Role::User,
-            content: MessageContent::Text(text),
-            created_at: Utc::now(),
-        };
+        let message = Message::stamped(Role::User, MessageContent::Text(text));
 
         self.inbound_tx
             .send(SignalInboundMessage {

@@ -1,28 +1,34 @@
 //! Accessibility-tree snapshot system modeled after OpenClaw's snapshot/ref pattern,
 //! with browser-use-inspired enhancements.
 //!
-//! Takes a snapshot of the page's accessibility tree, assigns stable numeric
+//! Takes a snapshot of the page's accessibility tree, assigns snapshot-scoped
 //! refs to interactive elements, and returns a structured representation that
-//! the agent can use for targeted actions (click ref 12, type ref 23 "hello").
+//! the agent can use for targeted actions (click ref s4-12, type ref s4-23
+//! "hello").
 //!
 //! Two snapshot modes:
-//! - **ai**: Compact text summary with numeric refs (default)
-//! - **aria**: Full accessibility tree with `e`-prefixed refs (e.g., e12)
+//! - **ai**: Compact text summary with snapshot-scoped refs (default)
+//! - **aria**: Full accessibility tree with `e`-marked refs (e.g., s4-e12)
 //!
 //! Enhancements over the baseline AX-tree extractor:
 //! - Pierces open shadow roots (Web Components, Angular Material, etc.).
-//! - Pierces same-origin iframes.
+//! - Captures each reachable frame in its own execution context, including
+//!   cross-origin frames when Chrome exposes that context through this target.
 //! - Filters out occluded / zero-size / fully transparent elements.
-//! - Prefers stable selectors (`data-testid`, `aria-label`, `name`) over
-//!   fragile nth-of-type chains.
+//! - Uses a preferred attribute selector only when it uniquely identifies the
+//!   element in its document/shadow root; duplicated framework attributes fall
+//!   back to an exact structural path.
 //! - Optional numbered highlight overlay for screenshots.
 
+use chromiumoxide::cdp::browser_protocol::page::FrameId;
+use chromiumoxide::cdp::js_protocol::runtime::{EvaluateParams, ExecutionContextId};
 use chromiumoxide::Page;
 use rustykrab_core::{Error, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use tokio::time::{timeout, Duration, Instant};
 
 /// Maximum depth for accessibility tree traversal.
 ///
@@ -34,6 +40,41 @@ use tokio::sync::Mutex;
 /// is cheap. Callers can still override via the `depth` snapshot parameter.
 const DEFAULT_MAX_DEPTH: usize = 50;
 
+/// Frame traversal is deliberately bounded. Ad-heavy pages can create hundreds
+/// of short-lived frames; a snapshot must remain useful even when some are
+/// detached or unresponsive.
+const MAX_SNAPSHOT_FRAMES: usize = 100;
+const MAX_FRAME_DEPTH: usize = 5;
+const SNAPSHOT_DEADLINE: Duration = Duration::from_secs(10);
+const PER_FRAME_DEADLINE: Duration = Duration::from_secs(2);
+
+/// Include the viewport plus one nearby screenful. This matches browser-use's
+/// default visibility window: the model sees what it can act on now and what a
+/// small scroll will reveal, instead of every laid-out control on an enormous
+/// virtualized page (Google Flights calendars can expose hundreds of months).
+const VIEWPORT_EXPANSION_PX: usize = 1_000;
+
+/// Match browser-use's prompt boundary for clickable/page-state text. Refs for
+/// all captured elements remain in the snapshot store, but only this much
+/// serialized state is returned to the model. Callers can scope a later
+/// snapshot when the needed element fell beyond the boundary.
+const MAX_SNAPSHOT_OUTPUT_CHARS: usize = 40_000;
+
+fn append_bounded_snapshot_element(
+    output: &mut Vec<serde_json::Value>,
+    output_chars: &mut usize,
+    output_truncated: &mut bool,
+    element: serde_json::Value,
+) {
+    let element_chars = element.to_string().len();
+    if output_chars.saturating_add(element_chars) <= MAX_SNAPSHOT_OUTPUT_CHARS {
+        *output_chars += element_chars;
+        output.push(element);
+    } else {
+        *output_truncated = true;
+    }
+}
+
 /// Marker between segments of a shadow-DOM piercing selector.
 #[allow(dead_code)]
 pub(crate) const SHADOW_SEP: &str = " >>> ";
@@ -44,10 +85,21 @@ pub(crate) const IFRAME_SEP: &str = " ||| ";
 /// A single element ref from a snapshot.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ElementRef {
-    /// The ref identifier (numeric for ai mode, e-prefixed for aria mode).
+    /// The ref identifier, including the snapshot generation that produced it.
     pub ref_id: String,
     /// Primary selector, possibly chained via `>>>` (shadow) or `|||` (iframe).
     pub selector: String,
+    /// CDP frame identifier when the element belongs to a child frame. Refs
+    /// remain snapshot-scoped because frame identifiers can change on reload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame_id: Option<String>,
+    /// Frame URL captured for diagnostics and conservative stale-ref healing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame_url: Option<String>,
+    /// OOPIF target that owns this element. Absent for the top-level document
+    /// and in-process frames handled by chromiumoxide directly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_id: Option<String>,
     /// Element role (button, link, textbox, etc.).
     pub role: String,
     /// Human-readable name/label.
@@ -79,6 +131,19 @@ struct SnapshotInner {
     refs: HashMap<String, HashMap<String, ElementRef>>,
     /// Recency order: front = least-recently-used, back = most-recent.
     order: VecDeque<String>,
+    /// Monotonic snapshot generation. Including this in every ref prevents an
+    /// old numeric ref from silently selecting a different element after a
+    /// later snapshot replaces the map for the same tab.
+    next_generation: u64,
+    /// Raw-CDP context for live page snapshots. Standalone tests and helpers
+    /// intentionally remain valid without it.
+    oopif_contexts: HashMap<String, OopifContext>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct OopifContext {
+    pub websocket_url: String,
+    pub policy: super::config::SsrfPolicy,
 }
 
 impl SnapshotInner {
@@ -94,6 +159,7 @@ impl SnapshotInner {
             match self.order.pop_front() {
                 Some(oldest) => {
                     self.refs.remove(&oldest);
+                    self.oopif_contexts.remove(&oldest);
                 }
                 None => break,
             }
@@ -107,8 +173,38 @@ impl SnapshotStore {
             inner: Arc::new(Mutex::new(SnapshotInner {
                 refs: HashMap::new(),
                 order: VecDeque::new(),
+                next_generation: 1,
+                oopif_contexts: HashMap::new(),
             })),
         }
+    }
+
+    pub(crate) async fn register_oopif_context(
+        &self,
+        key: &str,
+        websocket_url: String,
+        policy: super::config::SsrfPolicy,
+    ) {
+        let mut g = self.inner.lock().await;
+        g.oopif_contexts.insert(
+            key.to_string(),
+            OopifContext {
+                websocket_url,
+                policy,
+            },
+        );
+    }
+
+    pub(crate) async fn oopif_context(&self, key: &str) -> Option<OopifContext> {
+        self.inner.lock().await.oopif_contexts.get(key).cloned()
+    }
+
+    /// Allocate a generation for one snapshot.
+    async fn allocate_generation(&self) -> u64 {
+        let mut g = self.inner.lock().await;
+        let generation = g.next_generation;
+        g.next_generation = g.next_generation.saturating_add(1);
+        generation
     }
 
     /// Store refs from a snapshot.
@@ -135,13 +231,23 @@ impl SnapshotStore {
     /// look for the *same logical element* by role+name (ref ids are positional
     /// and change between snapshots, so they can't be reused). The caller heals
     /// only on a unique match and escalates on none or several.
-    pub async fn find_by_identity(&self, key: &str, role: &str, name: &str) -> Vec<ElementRef> {
+    pub async fn find_by_identity(
+        &self,
+        key: &str,
+        role: &str,
+        name: &str,
+        frame_url: Option<&str>,
+    ) -> Vec<ElementRef> {
         let g = self.inner.lock().await;
         g.refs
             .get(key)
             .map(|m| {
                 m.values()
-                    .filter(|r| r.role == role && r.name == name)
+                    .filter(|r| {
+                        r.role == role
+                            && r.name == name
+                            && frame_url.is_none_or(|url| r.frame_url.as_deref() == Some(url))
+                    })
                     .cloned()
                     .collect()
             })
@@ -153,18 +259,38 @@ impl SnapshotStore {
     pub async fn clear(&self, key: &str) {
         let mut g = self.inner.lock().await;
         g.refs.remove(key);
+        g.oopif_contexts.remove(key);
         if let Some(pos) = g.order.iter().position(|k| k == key) {
             g.order.remove(pos);
         }
+    }
+
+    /// Clear every snapshot associated with a browser profile.
+    ///
+    /// Recovering a profile replaces its CDP connection and, for managed
+    /// browsers, the Chrome process itself. Refs held by *other* conversations
+    /// are just as stale as the ref that detected the failure, so invalidating
+    /// only the initiating tab would leave cross-session capabilities pointing
+    /// into a browser that no longer exists.
+    pub async fn clear_profile(&self, profile: &str) {
+        let belongs_to_profile = |key: &str| {
+            key.split_once(':')
+                .and_then(|(_, rest)| rest.split_once(':'))
+                .is_some_and(|(key_profile, _)| key_profile == profile)
+        };
+        let mut g = self.inner.lock().await;
+        g.refs.retain(|key, _| !belongs_to_profile(key));
+        g.oopif_contexts.retain(|key, _| !belongs_to_profile(key));
+        g.order.retain(|key| !belongs_to_profile(key));
     }
 }
 
 /// Snapshot mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SnapshotMode {
-    /// Compact AI-friendly format with numeric refs.
+    /// Compact AI-friendly format with snapshot-scoped refs.
     Ai,
-    /// Full accessibility tree with e-prefixed refs.
+    /// Full accessibility tree with e-marked snapshot-scoped refs.
     Aria,
 }
 
@@ -201,12 +327,14 @@ impl Default for SnapshotOptions {
 
 /// JavaScript that extracts the accessibility tree from a page.
 ///
-/// Walks the document, open shadow roots, and same-origin iframes. Returns an
+/// Walks one document and its open shadow roots. Rust invokes this once per
+/// reachable frame execution context, which avoids the browser same-origin
+/// restriction on `iframe.contentDocument`. Returns an
 /// array of objects with: tag, role, name, value, selector (possibly chained),
 /// interactive, bounds (x, y, w, h), depth.
 ///
-/// Args: [maxDepth, interactiveOnly, scopeSelector, highlight]
-const SNAPSHOT_JS: &str = r#"
+/// Args: [maxDepth, interactiveOnly, scopeSelector, highlight, viewportExpansion]
+pub(crate) const SNAPSHOT_JS: &str = r#"
 (function() {
     var INTERACTIVE_ROLES = new Set([
         'button', 'link', 'textbox', 'checkbox', 'radio', 'combobox',
@@ -218,12 +346,12 @@ const SNAPSHOT_JS: &str = r#"
         'A', 'BUTTON', 'INPUT', 'SELECT', 'TEXTAREA', 'DETAILS', 'SUMMARY'
     ]);
     var SHADOW_SEP = ' >>> ';
-    var IFRAME_SEP = ' ||| ';
 
     var MAX_DEPTH = arguments[0] || 50;
     var INTERACTIVE_ONLY = arguments[1] || false;
     var SCOPE_SELECTOR = arguments[2] || null;
     var HIGHLIGHT = arguments[3] || false;
+    var VIEWPORT_EXPANSION = arguments[4];
 
     // Always clear stale highlights from a previous snapshot, even if we are
     // not painting new ones this call.
@@ -236,21 +364,47 @@ const SNAPSHOT_JS: &str = r#"
         return String(s).replace(/[^a-zA-Z0-9_-]/g, function(c) { return '\\' + c; });
     }
 
+    // A selector is useful only if it names this element and no other one in
+    // its local root. Component frameworks such as Wix deliberately reuse
+    // data-testid="linkElement" across a page; accepting that as an identity
+    // made several different refs click the first link in the document.
+    function uniqueInLocalRoot(el, selector) {
+        try {
+            var root = el.getRootNode ? el.getRootNode() : document;
+            if (!root || !root.querySelectorAll) return false;
+            var matches = root.querySelectorAll(selector);
+            return matches.length === 1 && matches[0] === el;
+        } catch (e) {
+            return false;
+        }
+    }
+
     // Build a CSS selector for an element, scoped to its owner Document or
-    // ShadowRoot. Prefers stable attributes.
+    // ShadowRoot. Stable attributes are preferred only when unique.
     function localSelector(el) {
-        if (el.id && !/^[0-9]/.test(el.id)) return '#' + csqEscape(el.id);
+        if (el.id && !/^[0-9]/.test(el.id)) {
+            var idSelector = '#' + csqEscape(el.id);
+            if (uniqueInLocalRoot(el, idSelector)) return idSelector;
+        }
         var tid = el.getAttribute && el.getAttribute('data-testid');
-        if (tid) return el.tagName.toLowerCase() + '[data-testid="' + cssAttrEscape(tid) + '"]';
+        if (tid) {
+            var testSelector = el.tagName.toLowerCase() + '[data-testid="' + cssAttrEscape(tid) + '"]';
+            if (uniqueInLocalRoot(el, testSelector)) return testSelector;
+        }
         var dataQa = el.getAttribute && el.getAttribute('data-qa');
-        if (dataQa) return el.tagName.toLowerCase() + '[data-qa="' + cssAttrEscape(dataQa) + '"]';
+        if (dataQa) {
+            var qaSelector = el.tagName.toLowerCase() + '[data-qa="' + cssAttrEscape(dataQa) + '"]';
+            if (uniqueInLocalRoot(el, qaSelector)) return qaSelector;
+        }
         var name = el.getAttribute && el.getAttribute('name');
         if (name && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT' || el.tagName === 'BUTTON')) {
-            return el.tagName.toLowerCase() + '[name="' + cssAttrEscape(name) + '"]';
+            var nameSelector = el.tagName.toLowerCase() + '[name="' + cssAttrEscape(name) + '"]';
+            if (uniqueInLocalRoot(el, nameSelector)) return nameSelector;
         }
         var aria = el.getAttribute && el.getAttribute('aria-label');
         if (aria && aria.length < 100) {
-            return el.tagName.toLowerCase() + '[aria-label="' + cssAttrEscape(aria) + '"]';
+            var ariaSelector = el.tagName.toLowerCase() + '[aria-label="' + cssAttrEscape(aria) + '"]';
+            if (uniqueInLocalRoot(el, ariaSelector)) return ariaSelector;
         }
         // Fallback: structural path within the local root.
         return structuralPath(el);
@@ -286,8 +440,8 @@ const SNAPSHOT_JS: &str = r#"
         return parts.join(' > ') || el.tagName.toLowerCase();
     }
 
-    // Compose a chained selector that pierces shadow/iframe boundaries.
-    // chain is an array like [{kind:'doc', el:host}, {kind:'shadow', host:host}, {kind:'iframe', host:iframe}]
+    // Compose a chained selector that pierces shadow boundaries.
+    // Iframes are captured independently by their CDP execution context.
     // Each segment contributes a localSelector(el) plus an appropriate separator.
     function chainedSelector(el, chain) {
         var localPart = localSelector(el);
@@ -299,11 +453,10 @@ const SNAPSHOT_JS: &str = r#"
             if (i === 0) {
                 s = hostSel;
             } else {
-                s = s + (chain[i - 1].kind === 'shadow' ? SHADOW_SEP : IFRAME_SEP) + hostSel;
+                s = s + SHADOW_SEP + hostSel;
             }
         }
-        var lastBoundary = chain[chain.length - 1].kind === 'shadow' ? SHADOW_SEP : IFRAME_SEP;
-        return s + lastBoundary + localPart;
+        return s + SHADOW_SEP + localPart;
     }
 
     function isInteractive(el) {
@@ -328,6 +481,7 @@ const SNAPSHOT_JS: &str = r#"
             var type = (el.type || 'text').toLowerCase();
             if (type === 'checkbox') return 'checkbox';
             if (type === 'radio') return 'radio';
+            if (type === 'file') return 'filechooser';
             if (type === 'submit' || type === 'button') return 'button';
             return 'textbox';
         }
@@ -356,6 +510,13 @@ const SNAPSHOT_JS: &str = r#"
             if (label) return (label.textContent || '').trim().substring(0, 100);
         }
         if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT') {
+            // Native labels covers both explicit for= and implicit wrapping
+            // labels, including controls inside an open shadow root.
+            if (el.labels && el.labels.length) {
+                return Array.from(el.labels).map(function(label) {
+                    return (label.textContent || '').trim();
+                }).join(' ').substring(0, 100);
+            }
             var id = el.id;
             if (id) {
                 var root = el.getRootNode ? el.getRootNode() : document;
@@ -374,16 +535,41 @@ const SNAPSHOT_JS: &str = r#"
         return (el.textContent || '').trim().substring(0, 80);
     }
 
-    // Visibility check: layout box, computed style, opacity, viewport overlap,
-    // and a center-point occlusion probe.
+    // Visibility check: layout box, computed style, opacity, and browser-use's
+    // default one-thousand-pixel expansion around the current viewport.
     function isVisible(el) {
         var style = window.getComputedStyle(el);
         if (style.display === 'none' || style.visibility === 'hidden') return false;
+        if (style.contentVisibility === 'hidden') return false;
         if (parseFloat(style.opacity || '1') === 0) return false;
+        if (el.closest && el.closest('[aria-hidden="true"], [inert]')) return false;
         var rect = el.getBoundingClientRect();
         if (rect.width <= 0 || rect.height <= 0) return false;
-        // Off the document entirely (negative side, beyond doc) — keep, the
-        // page may scroll. We only filter purely degenerate cases above.
+        var vw = window.innerWidth || document.documentElement.clientWidth;
+        var vh = window.innerHeight || document.documentElement.clientHeight;
+        var insideViewportWindow = rect.right > -VIEWPORT_EXPANSION &&
+            rect.left < vw + VIEWPORT_EXPANSION &&
+            rect.bottom > -VIEWPORT_EXPANSION &&
+            rect.top < vh + VIEWPORT_EXPANSION;
+        if (!insideViewportWindow) return false;
+
+        // A virtualized menu/calendar often lays out every option inside a
+        // small overflow container. Viewport filtering alone still includes
+        // controls that are clipped by that container. Require an intersection
+        // with each clipping ancestor; scrolling the container and taking a
+        // new snapshot exposes the next set.
+        var parent = el.parentElement;
+        while (parent) {
+            var parentStyle = window.getComputedStyle(parent);
+            var clipsX = /^(auto|scroll|hidden|clip)$/.test(parentStyle.overflowX);
+            var clipsY = /^(auto|scroll|hidden|clip)$/.test(parentStyle.overflowY);
+            if (clipsX || clipsY) {
+                var parentRect = parent.getBoundingClientRect();
+                if (clipsX && (rect.right <= parentRect.left || rect.left >= parentRect.right)) return false;
+                if (clipsY && (rect.bottom <= parentRect.top || rect.top >= parentRect.bottom)) return false;
+            }
+            parent = parent.parentElement;
+        }
         return true;
     }
 
@@ -410,6 +596,17 @@ const SNAPSHOT_JS: &str = r#"
     var results = [];
     var refCounter = 0;
 
+    function sensitiveValue(el) {
+        if (!['INPUT', 'TEXTAREA', 'SELECT'].includes(el.tagName)) return false;
+        if ((el.type || '').toLowerCase() === 'password') return true;
+        // autocomplete is tokenized: section/billing qualifiers may precede
+        // cc-number, cc-exp, cc-csc, etc. Unknown card fields fail closed.
+        var autocomplete = (el.getAttribute('autocomplete') || '').toLowerCase();
+        if (autocomplete.split(/\s+/).some(function(t) { return t.startsWith('cc-'); })) return true;
+        var identity = [el.id, el.name, el.getAttribute('aria-label'), getName(el)].join(' ').toLowerCase();
+        return /(?:card[\s_-]*(?:number|no|security|verification)|credit[\s_-]*card|\bcvv2?\b|\bcvc2?\b|\bcsc\b|security[\s_-]*code)/.test(identity);
+    }
+
     var rootDoc = SCOPE_SELECTOR ? document.querySelector(SCOPE_SELECTOR) : document.body;
     if (!rootDoc) return JSON.stringify({ elements: [], note: 'scope selector did not match' });
 
@@ -419,10 +616,14 @@ const SNAPSHOT_JS: &str = r#"
         // Element-like node.
         if (node.nodeType !== 1) return;
 
-        if (!isVisible(node)) return;
+        var fileInput = node.tagName === 'INPUT' && (node.type || '').toLowerCase() === 'file';
+        // Hidden file inputs are intentionally retained. Upload controls often
+        // hide the native input behind a styled button, while CDP can still set
+        // files on the input safely without opening the native chooser.
+        if (!fileInput && !isVisible(node)) return;
         // Skip occluded interactive candidates; non-interactive structural nodes
         // we still descend into (their children may be visible).
-        var occluded = isOccluded(node);
+        var occluded = fileInput ? false : isOccluded(node);
 
         var interactive = isInteractive(node);
         var role = getRole(node);
@@ -437,7 +638,9 @@ const SNAPSHOT_JS: &str = r#"
                 tag: node.tagName.toLowerCase(),
                 role: role,
                 name: getName(node),
-                value: (node.tagName === 'INPUT' || node.tagName === 'TEXTAREA' || node.tagName === 'SELECT') ? (node.value || '') : null,
+                value: (fileInput || sensitiveValue(node))
+                    ? null
+                    : ((node.tagName === 'INPUT' || node.tagName === 'TEXTAREA' || node.tagName === 'SELECT') ? (node.value || '') : null),
                 selector: chainedSelector(node, chain),
                 interactive: interactive,
                 bounds: [Math.round(rect.x), Math.round(rect.y), Math.round(rect.width), Math.round(rect.height)],
@@ -451,19 +654,6 @@ const SNAPSHOT_JS: &str = r#"
             for (var i = 0; i < children.length; i++) {
                 walk(children[i], depth + 1, chain.concat([{ kind: 'shadow', host: node }]));
             }
-        }
-
-        // Descend into same-origin iframe contentDocument.
-        if (node.tagName === 'IFRAME') {
-            try {
-                var doc = node.contentDocument;
-                if (doc && doc.body) {
-                    var ic = doc.body.children;
-                    for (var j = 0; j < ic.length; j++) {
-                        walk(ic[j], depth + 1, chain.concat([{ kind: 'iframe', host: node }]));
-                    }
-                }
-            } catch (e) { /* cross-origin: cannot pierce */ }
         }
 
         // Light DOM children.
@@ -521,17 +711,92 @@ const SNAPSHOT_JS: &str = r#"
 
 /// Raw element data from the JS snapshot.
 #[derive(Debug, Deserialize)]
-struct RawElement {
+pub(crate) struct RawElement {
     #[allow(dead_code)]
-    tag: String,
-    role: String,
-    name: String,
-    value: Option<String>,
-    selector: String,
-    interactive: bool,
-    bounds: Option<[f64; 4]>,
+    pub(crate) tag: String,
+    pub(crate) role: String,
+    pub(crate) name: String,
+    pub(crate) value: Option<String>,
+    pub(crate) selector: String,
+    pub(crate) interactive: bool,
+    pub(crate) bounds: Option<[f64; 4]>,
     #[allow(dead_code)]
-    depth: usize,
+    pub(crate) depth: usize,
+}
+
+struct CapturedElement {
+    element: RawElement,
+    frame_id: Option<String>,
+    frame_url: Option<String>,
+    target_id: Option<String>,
+}
+
+async fn evaluate_document_snapshot(
+    page: &Page,
+    eval_js: &str,
+    context_id: Option<ExecutionContextId>,
+) -> Result<Vec<RawElement>> {
+    let mut params = EvaluateParams::builder()
+        .expression(eval_js)
+        .return_by_value(true);
+    if let Some(context_id) = context_id {
+        params = params.context_id(context_id);
+    }
+    let params = params
+        .build()
+        .map_err(|e| Error::ToolExecution(format!("invalid snapshot evaluation: {e}").into()))?;
+    let result = page
+        .evaluate_expression(params)
+        .await
+        .map_err(|e| Error::ToolExecution(format!("snapshot evaluation failed: {e}").into()))?;
+    let raw_json: String = result.into_value().unwrap_or_else(|_| "[]".to_string());
+    serde_json::from_str(&raw_json)
+        .map_err(|e| Error::ToolExecution(format!("invalid snapshot result: {e}").into()))
+}
+
+async fn detect_captcha(page: &Page) -> serde_json::Value {
+    let script = r#"(function() {
+        var providers = new Set();
+        var nodes = document.querySelectorAll('iframe[src], iframe[title], [data-sitekey], .g-recaptcha, .h-captcha, .cf-turnstile');
+        for (var i = 0; i < nodes.length; i++) {
+            var value = ((nodes[i].getAttribute('src') || '') + ' ' +
+                (nodes[i].getAttribute('title') || '') + ' ' +
+                (nodes[i].className || '')).toLowerCase();
+            if (value.includes('recaptcha') || nodes[i].classList.contains('g-recaptcha')) providers.add('recaptcha');
+            if (value.includes('hcaptcha') || nodes[i].classList.contains('h-captcha')) providers.add('hcaptcha');
+            if (value.includes('turnstile') || nodes[i].classList.contains('cf-turnstile')) providers.add('cloudflare-turnstile');
+            if (nodes[i].hasAttribute('data-sitekey') && providers.size === 0) providers.add('unknown');
+        }
+        return {detected: providers.size > 0, providers: Array.from(providers)};
+    })()"#;
+    match timeout(Duration::from_secs(1), page.evaluate(script)).await {
+        Ok(Ok(result)) => result.into_value::<serde_json::Value>().unwrap_or_else(
+            |_| serde_json::json!({"detected":false,"providers":[],"status":"unverified"}),
+        ),
+        _ => serde_json::json!({
+            "detected": false,
+            "providers": [],
+            "status": "unverified",
+        }),
+    }
+}
+
+async fn frame_depth(page: &Page, frame: &FrameId, main: &FrameId) -> Option<usize> {
+    let mut current = frame.clone();
+    for depth in 1..=(MAX_FRAME_DEPTH + 1) {
+        let parent = timeout(
+            Duration::from_millis(250),
+            page.frame_parent(current.clone()),
+        )
+        .await
+        .ok()?
+        .ok()??;
+        if &parent == main {
+            return Some(depth);
+        }
+        current = parent;
+    }
+    Some(MAX_FRAME_DEPTH + 1)
 }
 
 /// Take a snapshot of the page's accessibility tree.
@@ -548,7 +813,7 @@ pub async fn take_snapshot(
         .unwrap_or_else(|| "null".to_string());
 
     let eval_js = format!(
-        "({SNAPSHOT_JS})({}, {}, {}, {})",
+        "({SNAPSHOT_JS})({}, {}, {}, {}, {})",
         options.max_depth,
         if options.interactive_only {
             "true"
@@ -557,31 +822,173 @@ pub async fn take_snapshot(
         },
         selector_arg,
         if options.highlight { "true" } else { "false" },
+        VIEWPORT_EXPANSION_PX,
     );
 
-    let result = page
-        .evaluate(eval_js)
+    let started = Instant::now();
+    let main_elements = timeout(
+        PER_FRAME_DEADLINE,
+        evaluate_document_snapshot(page, &eval_js, None),
+    )
+    .await
+    .map_err(|_| Error::ToolExecution("main-frame snapshot timed out".into()))??;
+    let mut elements: Vec<CapturedElement> = main_elements
+        .into_iter()
+        .map(|element| CapturedElement {
+            element,
+            frame_id: None,
+            frame_url: None,
+            target_id: None,
+        })
+        .collect();
+
+    let main_frame = timeout(Duration::from_secs(1), page.mainframe())
         .await
-        .map_err(|e| Error::ToolExecution(format!("snapshot failed: {e}").into()))?;
+        .ok()
+        .and_then(std::result::Result::ok)
+        .flatten();
+    let frames = timeout(Duration::from_secs(1), page.frames())
+        .await
+        .ok()
+        .and_then(std::result::Result::ok)
+        .unwrap_or_default();
+    let mut page_frame_ids: HashSet<String> = frames
+        .iter()
+        .map(|frame| frame.as_ref().to_string())
+        .collect();
+    page_frame_ids.insert(page.target_id().inner().clone());
+    let mut frames_seen = frames
+        .len()
+        .saturating_sub(usize::from(main_frame.is_some()));
+    let mut frames_included = 0usize;
+    let mut frames_skipped = Vec::new();
+    let mut included_frame_ids = HashSet::new();
 
-    let raw_json: String = result.into_value().unwrap_or_else(|_| "[]".to_string());
-    let elements: Vec<RawElement> = serde_json::from_str(&raw_json).unwrap_or_default();
+    if let Some(main_frame) = main_frame {
+        for frame in frames
+            .into_iter()
+            .filter(|frame| frame != &main_frame)
+            .take(MAX_SNAPSHOT_FRAMES)
+        {
+            if started.elapsed() >= SNAPSHOT_DEADLINE {
+                frames_skipped.push("snapshot deadline reached".to_string());
+                break;
+            }
+            let frame_id = frame.as_ref().to_string();
+            let depth = frame_depth(page, &frame, &main_frame).await;
+            if depth.is_none_or(|depth| depth > MAX_FRAME_DEPTH) {
+                frames_skipped.push(format!("{frame_id}: frame depth unavailable or too deep"));
+                continue;
+            }
+            let context_id = match timeout(
+                Duration::from_millis(750),
+                page.frame_execution_context(frame.clone()),
+            )
+            .await
+            {
+                Ok(Ok(Some(context_id))) => context_id,
+                _ => {
+                    frames_skipped.push(format!("{frame_id}: execution context unavailable"));
+                    continue;
+                }
+            };
+            let frame_url = timeout(Duration::from_millis(500), page.frame_url(frame.clone()))
+                .await
+                .ok()
+                .and_then(std::result::Result::ok)
+                .flatten();
+            match timeout(
+                PER_FRAME_DEADLINE.min(SNAPSHOT_DEADLINE.saturating_sub(started.elapsed())),
+                evaluate_document_snapshot(page, &eval_js, Some(context_id)),
+            )
+            .await
+            {
+                Ok(Ok(frame_elements)) => {
+                    frames_included += 1;
+                    included_frame_ids.insert(frame_id.clone());
+                    elements.extend(frame_elements.into_iter().map(|element| CapturedElement {
+                        element,
+                        frame_id: Some(frame_id.clone()),
+                        frame_url: frame_url.clone(),
+                        target_id: None,
+                    }));
+                }
+                Ok(Err(error)) => frames_skipped.push(format!("{frame_id}: {error}")),
+                Err(_) => frames_skipped.push(format!("{frame_id}: snapshot timed out")),
+            }
+        }
+    }
 
-    // Assign refs and build the output
+    // Site-isolated cross-origin frames have no execution context on the
+    // top-level chromiumoxide Page. Its current target poller ignores `iframe`
+    // targets entirely, so collect those documents through a bounded secondary
+    // CDP session and retain their owning target for subsequent actions.
+    if started.elapsed() < SNAPSHOT_DEADLINE {
+        if let Some(context) = store.oopif_context(store_key).await {
+            let remaining = SNAPSHOT_DEADLINE.saturating_sub(started.elapsed());
+            match timeout(
+                remaining,
+                super::oopif::capture(
+                    &context.websocket_url,
+                    &page_frame_ids,
+                    &eval_js,
+                    &context.policy,
+                ),
+            )
+            .await
+            {
+                Ok(oopif) => {
+                    frames_seen = frames_seen.max(oopif.frames_seen);
+                    frames_skipped.extend(oopif.frames_skipped);
+                    for frame in oopif.frames {
+                        if included_frame_ids.contains(&frame.frame_id) {
+                            continue;
+                        }
+                        frames_included += 1;
+                        included_frame_ids.insert(frame.frame_id.clone());
+                        elements.extend(frame.elements.into_iter().map(|element| {
+                            CapturedElement {
+                                element,
+                                frame_id: Some(frame.frame_id.clone()),
+                                frame_url: Some(frame.frame_url.clone()),
+                                target_id: Some(frame.target_id.clone()),
+                            }
+                        }));
+                    }
+                }
+                Err(_) => frames_skipped.push("OOPIF snapshot deadline reached".to_string()),
+            }
+        }
+    }
+    frames_skipped.retain(|message| {
+        !included_frame_ids
+            .iter()
+            .any(|frame_id| message.starts_with(&format!("{frame_id}:")))
+    });
+
+    // Assign refs and build the output. Ref ids carry a generation so a ref
+    // from an earlier snapshot cannot collide with one from this snapshot.
+    let generation = store.allocate_generation().await;
     let mut ref_map = HashMap::new();
     let mut output_elements = Vec::new();
+    let mut output_chars = 0usize;
+    let mut output_truncated = false;
     let mut ref_counter = 0usize;
 
-    for elem in &elements {
+    for captured in &elements {
+        let elem = &captured.element;
         ref_counter += 1;
         let ref_id = match options.mode {
-            SnapshotMode::Ai => format!("{ref_counter}"),
-            SnapshotMode::Aria => format!("e{ref_counter}"),
+            SnapshotMode::Ai => format!("s{generation}-{ref_counter}"),
+            SnapshotMode::Aria => format!("s{generation}-e{ref_counter}"),
         };
 
         let element_ref = ElementRef {
             ref_id: ref_id.clone(),
             selector: elem.selector.clone(),
+            frame_id: captured.frame_id.clone(),
+            frame_url: captured.frame_url.clone(),
+            target_id: captured.target_id.clone(),
             role: elem.role.clone(),
             name: elem.name.clone(),
             value: elem.value.clone(),
@@ -603,17 +1010,34 @@ pub async fn take_snapshot(
                         line.push_str(&format!(" = \"{}\"", truncate(val, 40)));
                     }
                 }
-                output_elements.push(serde_json::Value::String(line));
+                if let Some(frame_url) = captured.frame_url.as_deref() {
+                    line.push_str(&format!(" [frame: {}]", truncate(frame_url, 60)));
+                }
+                append_bounded_snapshot_element(
+                    &mut output_elements,
+                    &mut output_chars,
+                    &mut output_truncated,
+                    serde_json::Value::String(line),
+                );
             }
         } else {
-            output_elements.push(serde_json::json!({
+            let rendered = serde_json::json!({
                 "ref": ref_id,
                 "role": elem.role,
-                "name": elem.name,
-                "value": elem.value,
+                "name": truncate(&elem.name, 1000),
+                "value": elem.value.as_deref().map(|value| truncate(value, 1000)),
                 "interactive": elem.interactive,
                 "bounds": elem.bounds,
-            }));
+                "frame_id": captured.frame_id,
+                "frame_url": captured.frame_url,
+                "target_id": captured.target_id,
+            });
+            append_bounded_snapshot_element(
+                &mut output_elements,
+                &mut output_chars,
+                &mut output_truncated,
+                rendered,
+            );
         }
     }
 
@@ -622,6 +1046,13 @@ pub async fn take_snapshot(
 
     let url = page.url().await.ok().flatten().unwrap_or_default();
     let title = page.get_title().await.ok().flatten().unwrap_or_default();
+    let captcha = detect_captcha(page).await;
+    let returned_count = output_elements.len();
+    let ref_note = if options.compact {
+        "Use the snapshot identifier shown in brackets with the 'act' action; either s4-12 or [s4-12] is accepted. Refs are valid only for this snapshot."
+    } else {
+        "Use the complete string in each element's ref field with the 'act' action. Refs are valid only for this snapshot."
+    };
 
     Ok(serde_json::json!({
         "url": url,
@@ -629,12 +1060,17 @@ pub async fn take_snapshot(
         "mode": match options.mode { SnapshotMode::Ai => "ai", SnapshotMode::Aria => "aria" },
         "elements": output_elements,
         "count": ref_counter,
-        "interactive_count": elements.iter().filter(|e| e.interactive).count(),
+        "returned_count": returned_count,
+        "output_truncated": output_truncated,
+        "output_char_limit": MAX_SNAPSHOT_OUTPUT_CHARS,
+        "interactive_count": elements.iter().filter(|e| e.element.interactive).count(),
+        "frames_seen": frames_seen,
+        "frames_included": frames_included,
+        "frames_skipped": frames_skipped,
+        "captcha": captcha,
+        "snapshot_generation": generation,
         "highlight": options.highlight,
-        "note": format!(
-            "Use ref numbers with 'act' action to interact with elements (e.g., act click {}1)",
-            if options.mode == SnapshotMode::Aria { "e" } else { "" }
-        )
+        "note": ref_note
     }))
 }
 
@@ -659,6 +1095,9 @@ mod tests {
         ElementRef {
             ref_id: id.to_string(),
             selector: "body > a".to_string(),
+            frame_id: None,
+            frame_url: None,
+            target_id: None,
             role: "link".to_string(),
             name: "x".to_string(),
             value: None,
@@ -671,6 +1110,29 @@ mod tests {
         let mut m = HashMap::new();
         m.insert(id.to_string(), mk_ref(id));
         m
+    }
+
+    #[test]
+    fn snapshot_output_boundary_marks_and_omits_overflow() {
+        let mut output = Vec::new();
+        let mut chars = 0;
+        let mut truncated = false;
+        append_bounded_snapshot_element(
+            &mut output,
+            &mut chars,
+            &mut truncated,
+            serde_json::Value::String("x".repeat(MAX_SNAPSHOT_OUTPUT_CHARS - 2)),
+        );
+        append_bounded_snapshot_element(
+            &mut output,
+            &mut chars,
+            &mut truncated,
+            serde_json::Value::String("overflow".into()),
+        );
+
+        assert_eq!(output.len(), 1);
+        assert!(chars <= MAX_SNAPSHOT_OUTPUT_CHARS);
+        assert!(truncated);
     }
 
     #[test]
@@ -731,6 +1193,9 @@ mod tests {
                 ElementRef {
                     ref_id: id.into(),
                     selector: sel.into(),
+                    frame_id: None,
+                    frame_url: None,
+                    target_id: None,
                     role: role.into(),
                     name: name.into(),
                     value: None,
@@ -742,17 +1207,26 @@ mod tests {
         store.store("k", refs).await;
 
         // Unique match heals; ambiguous and absent both escalate.
-        assert_eq!(store.find_by_identity("k", "link", "Home").await.len(), 1);
         assert_eq!(
-            store.find_by_identity("k", "button", "Submit").await.len(),
+            store
+                .find_by_identity("k", "link", "Home", None)
+                .await
+                .len(),
+            1
+        );
+        assert_eq!(
+            store
+                .find_by_identity("k", "button", "Submit", None)
+                .await
+                .len(),
             2
         );
         assert!(store
-            .find_by_identity("k", "button", "Cancel")
+            .find_by_identity("k", "button", "Cancel", None)
             .await
             .is_empty());
         assert!(store
-            .find_by_identity("missing", "link", "Home")
+            .find_by_identity("missing", "link", "Home", None)
             .await
             .is_empty());
     }
@@ -765,5 +1239,41 @@ mod tests {
         let inner = store.inner.lock().await;
         assert!(!inner.refs.contains_key("a"));
         assert!(!inner.order.iter().any(|k| k == "a"));
+    }
+
+    #[tokio::test]
+    async fn snapshot_generations_are_monotonic() {
+        let store = SnapshotStore::new();
+        assert_eq!(store.allocate_generation().await, 1);
+        assert_eq!(store.allocate_generation().await, 2);
+    }
+
+    #[tokio::test]
+    async fn profile_recovery_invalidates_every_sessions_refs() {
+        let store = SnapshotStore::new();
+        store
+            .store("conversation-a:shared:target-1", mk_refs("s1-1"))
+            .await;
+        store
+            .store("conversation-b:shared:target-2", mk_refs("s2-1"))
+            .await;
+        store
+            .store("conversation-c:other:target-3", mk_refs("s3-1"))
+            .await;
+
+        store.clear_profile("shared").await;
+
+        assert!(store
+            .get_ref("conversation-a:shared:target-1", "s1-1")
+            .await
+            .is_none());
+        assert!(store
+            .get_ref("conversation-b:shared:target-2", "s2-1")
+            .await
+            .is_none());
+        assert!(store
+            .get_ref("conversation-c:other:target-3", "s3-1")
+            .await
+            .is_some());
     }
 }

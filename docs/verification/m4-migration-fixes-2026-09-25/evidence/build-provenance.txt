@@ -1,0 +1,19 @@
+== base 65b5f7d7336734f69adc7b8012fda0cd30326a45 tree 616306217b925f1cecec087835b46661a64c3398 dirty=0
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 32.64s
+rustykrab 5.3.3 (65b5f7d, 2026-09-25)
+  sha256 e5f335047a2f797e
+  contains #661 code (with_task_locals): 0
+  contains #662 code (reminder log line): 0
+== pr661 ab8a35da38bebe177befce03bb9771bcf6f5ce23 tree 4e34ac6ff9e4076ded3cc65f8147207ad9aeb37d dirty=0
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 36.42s
+rustykrab 5.3.3 (ab8a35d, 2026-09-25)
+  sha256 1a7def4fc0174089
+  contains #661 code (with_task_locals): 400
+  contains #662 code (reminder log line): 0
+== pr662 c42fec9ddb6a30f1e35cdd40b3647c8f9465e3fd tree a37edf900a8746abb180fbc6e97588d732cb40f4 dirty=0
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1m 18s
+rustykrab 5.3.3 (c42fec9, 2026-09-25)
+  sha256 4bf7bc6b7fdc452d
+  contains #661 code (with_task_locals): 0
+  contains #662 code (reminder log line): 1
+BUILD-ALL-DONE

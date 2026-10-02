@@ -1,0 +1,13 @@
+# Re-run after fixes, with RUSTYKRAB_PUBLIC_URL=https://verify.invalid injected into the e2e daemon (temporary harness edit, not committed) so links are minted.
+== trial dir 6j8JVw (name|status|field keys|link minted)
+gmail_app_password|pending|["gmail_email","gmail_app_password"]|1
+from=gmail_credentials to=gmail_app_password from_keys=["gmail_email", "gmail_app_password"]
+tool results with status already_requested: 1
+== trial dir tgxn1w (name|status|field keys|link minted)
+gmail_app_password|pending|["gmail_email","gmail_app_password"]|1
+from=gmail_credentials to=gmail_app_password from_keys=["gmail_email", "gmail_app_password"]
+tool results with status already_requested: 1
+== trial dir zHMw6V (name|status|field keys|link minted)
+gmail_app_password|pending|["gmail_email","gmail_app_password"]|1
+from=gmail_credentials to=gmail_app_password from_keys=["gmail_email", "gmail_app_password"]
+tool results with status already_requested: 1

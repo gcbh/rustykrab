@@ -5,7 +5,7 @@ use tokio::sync::{mpsc, Mutex, Semaphore};
 
 use chrono::Utc;
 use rustykrab_agent::AgentEvent;
-use rustykrab_core::types::{Conversation, MessageContent};
+use rustykrab_core::types::{Conversation, Message, MessageContent, Role};
 use rustykrab_gateway::AppState;
 use rustykrab_skills::SkillRegistry;
 use uuid::Uuid;
@@ -23,6 +23,82 @@ pub enum TaskSource {
         /// (numeric string). Slack: thread_ts. `None` posts at top level.
         thread_id: Option<String>,
     },
+    /// A credential the agent asked for has been supplied, and the turn
+    /// that stalled waiting for it can go again.
+    ///
+    /// Carries no channel of its own: the conversation already records
+    /// where it came from, and `resolve_delivery_target` reads it. A wake
+    /// that guessed its own target could answer somewhere the user never
+    /// asked from.
+    CredentialFulfilled {
+        /// The conversation that filed the request — the one to resume.
+        conversation_id: String,
+        /// Store key of the credential, for logs and deduplication.
+        credential_name: String,
+    },
+    /// The user approved a purchase and supplied its card; the turn that
+    /// stopped at checkout can go and pay. Resumed exactly like a credential
+    /// wake, with its own prompt.
+    PaymentAuthorized {
+        /// The conversation that filed the payment request.
+        conversation_id: String,
+        /// The payment request, for logs.
+        request_id: String,
+    },
+}
+
+/// How many iterations a resumed turn may take before it is cut off.
+///
+/// Generous for the work it has to do, and far below the profile default,
+/// so a wake that is going nowhere says so in minutes rather than an hour.
+const WAKE_MAX_ITERATIONS: usize = 25;
+
+/// A bound, not a budget. Enforced at compile time so the reasoning
+/// cannot drift: high enough for snapshot, two fills, submit and read;
+/// far enough below the profile default of 200 that a stuck wake reports
+/// in minutes rather than an hour.
+const _: () = assert!(WAKE_MAX_ITERATIONS >= 10 && WAKE_MAX_ITERATIONS <= 30);
+
+/// The turn appended to a resumed conversation when a credential lands.
+///
+/// Deliberately says only that the value now exists, never what it is:
+/// this text becomes a real user message in the conversation, so anything
+/// put here is in the context window and in every transcript from now on.
+pub fn credential_wake_prompt(credential_name: &str, service: Option<&str>) -> String {
+    let what = service.unwrap_or(credential_name);
+    format!(
+        "The {what} credential you asked for is now stored. Carry on from where \
+         you stopped.\n\n\
+         If this is a website sign-in: take a fresh browser snapshot to get the \
+         current element refs, then fill the form with \
+         browser(action='fill_credential', ref=<ref>, field='username') and \
+         again with field='password', and submit it. That action looks the \
+         value up itself — you do not have the password and must not type one; \
+         anything you type will be wrong.\n\n\
+         Do not ask for the credential again, and do not repeat any value back \
+         to me."
+    )
+}
+
+/// The turn appended when the user approves a purchase.
+///
+/// Names the two browser actions and says the agent holds no card, for the
+/// reasons `credential_wake_prompt` spells out: left unsaid, a resumed model
+/// improvises, and one improvisation at a checkout is typing a made-up card.
+pub fn payment_wake_prompt(merchant: &str, amount: &str, origin: &str) -> String {
+    format!(
+        "The user approved paying {merchant} up to {amount} on {origin}, and the card is \
+         ready. Carry on from where you stopped.\n\n\
+         Take a fresh browser snapshot of the checkout (go back to it on {origin} if you \
+         left). Fill each card field with browser(action='fill_payment', ref=<ref>, \
+         field=...) using field='number', 'expiry' (or 'exp_month' and 'exp_year' for \
+         separate boxes), 'cvc', 'name' and, if asked, 'postal_code'. Then press the \
+         checkout's pay button with browser(action='pay', ref=<ref>). The browser supplies \
+         the card — you do not have it and must not type one. Pay checks the page total \
+         against the approval and can only be pressed once; the approval lasts 15 minutes.\n\n\
+         When it is done, tell me what the confirmation page says. Do not repeat any card \
+         detail back to me."
+    )
 }
 
 /// A unit of work submitted to the task queue.
@@ -66,11 +142,16 @@ impl TaskQueue {
 
     /// Submit a task to the queue. Returns `Err` if the queue is full
     /// or the worker has stopped.
+    ///
+    /// The error is boxed because tokio's `SendError` hands the unsent
+    /// `TaskRequest` back to the caller, which makes the `Err` variant far
+    /// larger than the `Ok` one — every caller would pay for that on the
+    /// success path. Boxing allocates only when the worker is already gone.
     pub async fn submit(
         &self,
         request: TaskRequest,
-    ) -> Result<(), mpsc::error::SendError<TaskRequest>> {
-        self.tx.send(request).await
+    ) -> Result<(), Box<mpsc::error::SendError<TaskRequest>>> {
+        self.tx.send(request).await.map_err(Box::new)
     }
 }
 
@@ -140,7 +221,170 @@ async fn execute_task(task: &TaskRequest, state: &AppState, store: &rustykrab_st
             )
             .await;
         }
+        TaskSource::CredentialFulfilled {
+            conversation_id,
+            credential_name,
+        } => {
+            execute_credential_wake(conversation_id, credential_name, &task.prompt, state).await;
+        }
+        TaskSource::PaymentAuthorized {
+            conversation_id,
+            request_id,
+        } => {
+            let label = format!("payment {request_id}");
+            execute_credential_wake(conversation_id, &label, &task.prompt, state).await;
+        }
     }
+}
+
+/// Resume the conversation that asked for a credential, now that it has
+/// one.
+///
+/// Unlike a scheduled job there is nothing to record and nothing to
+/// disable on failure: the credential is already stored, and the worst
+/// case is that the user asks again by hand. So every failure here logs
+/// and returns rather than trying to repair anything.
+async fn execute_credential_wake(
+    conversation_id: &str,
+    credential_name: &str,
+    prompt: &str,
+    state: &AppState,
+) {
+    let Ok(uuid) = Uuid::parse_str(conversation_id) else {
+        tracing::warn!(
+            credential = %credential_name,
+            conversation_id = %conversation_id,
+            "credential wake has a malformed conversation id; nothing to resume"
+        );
+        return;
+    };
+
+    let mut conv = match state.agent.store.conversations().get(uuid).await {
+        Ok(c) => c,
+        Err(e) => {
+            // The conversation was deleted between asking and answering.
+            // The credential is still stored and usable; only the resume
+            // is lost.
+            tracing::warn!(
+                credential = %credential_name,
+                conversation_id = %conversation_id,
+                "cannot resume conversation for credential wake: {e}"
+            );
+            return;
+        }
+    };
+
+    // Where the answer goes. Read from the conversation, never guessed —
+    // see the note on `TaskSource::CredentialFulfilled`.
+    let (channel, chat_id, thread_id) = resolve_delivery_target(None, None, None, &conv);
+
+    // Message ids as they stand before this turn, so `save_turn` appends
+    // what the resume adds instead of rewriting the history.
+    let persisted: Vec<Uuid> = conv.messages.iter().map(|m| m.id).collect();
+
+    push_scheduled_user_turn(&mut conv, prompt);
+
+    let run_options = rustykrab_runtime::RunOptions {
+        active_skill: None,
+        // The point of waking is to finish the job, so the first move
+        // should be acting rather than announcing that it can now act.
+        force_tool_use_first_iteration: true,
+        // A wake resumes one stalled turn: snapshot, fill two fields,
+        // submit, read the page. The profile default of 200 is a budget,
+        // not a bound — an agent that cannot work out how to proceed
+        // spends all of it. One observed run reached 96 iterations
+        // without ever attempting the login, and would have continued.
+        max_iterations: Some(WAKE_MAX_ITERATIONS),
+        ..rustykrab_runtime::RunOptions::default()
+    };
+
+    let trace_id = Uuid::new_v4();
+    tracing::info!(
+        %trace_id,
+        credential = %credential_name,
+        conversation_id = %conversation_id,
+        "credential supplied — resuming the turn that stalled"
+    );
+
+    let no_op_event = |_event: AgentEvent| {};
+    let response_text = match rustykrab_runtime::run_agent_streaming_with_options(
+        &state.agent,
+        &mut conv,
+        prompt,
+        &no_op_event,
+        trace_id,
+        &run_options,
+    )
+    .await
+    {
+        Ok(msg) => match &msg.content {
+            MessageContent::Text(t) => t.clone(),
+            _ => return,
+        },
+        Err(e) => {
+            tracing::error!(
+                credential = %credential_name,
+                "agent error resuming after credential fulfilment: {e}"
+            );
+            return;
+        }
+    };
+
+    // Persist before delivering. A user who receives an answer the
+    // conversation has no record of will find the agent has forgotten it
+    // on the next turn -- and the resumed turn is exactly the one that
+    // did the work they asked for.
+    if let Err(e) = state
+        .agent
+        .store
+        .conversations()
+        .save_turn(&conv, &persisted)
+        .await
+    {
+        tracing::error!(
+            credential = %credential_name,
+            conversation_id = %conversation_id,
+            "could not persist the resumed turn: {e}"
+        );
+    }
+
+    deliver_response(
+        credential_name,
+        channel.as_deref(),
+        chat_id.as_deref(),
+        thread_id.as_deref(),
+        &response_text,
+        conv.id,
+        state,
+    )
+    .await;
+}
+
+/// Append the scheduled prompt to `conv` as a real user turn.
+///
+/// `run_agent_*` injects only the system prompt and relies on the caller to
+/// have already appended the user message — see the comment in
+/// `orchestrate::prepare_agent` noting that routes.rs pushes the inbound user
+/// message before the runner is constructed. The `user_content` argument only
+/// drives profile routing and system-prompt construction; it never becomes a
+/// message.
+///
+/// Without this, a resumed job conversation reaches the provider carrying only
+/// system/assistant/tool messages. Some model chat templates reject that
+/// outright: verified against Ollama 0.32.14, `qwen3.8:27b` (the deployed
+/// model) returns 500 `{"error":"no user query found in messages"}`, while
+/// gemma4:26b and qwen3:32b accept it. Appending here also
+/// guarantees the newest message is a user turn, so the provider's oldest-first
+/// trimming can never strand the request without one.
+fn push_scheduled_user_turn(conv: &mut Conversation, prompt: &str) {
+    conv.messages.push(Message {
+        id: Uuid::new_v4(),
+        role: Role::User,
+        content: MessageContent::Text(prompt.to_string()),
+        created_at: Utc::now(),
+        agent_version: Message::version_stamp(),
+    });
+    conv.updated_at = Utc::now();
 }
 
 async fn execute_cron_task(
@@ -153,22 +397,27 @@ async fn execute_cron_task(
     store: &rustykrab_store::Store,
 ) {
     let started_at = Utc::now();
-    tracing::info!(job_id = %job_id, task = %task_prompt, "executing scheduled job");
+    // Full task body only at debug — the info-level start marker (with
+    // trace_id) is emitted below once the run actually begins.
+    tracing::debug!(job_id = %job_id, task = %task_prompt, "executing scheduled job");
 
     // Load the job so we can resume its persistent conversation and use
     // last_run_at in the prompt.
-    let job = match store.jobs().get_job(job_id) {
+    let job = match store.jobs().get_job(job_id).await {
         Ok(j) => j,
         Err(e) => {
             tracing::error!(job_id = %job_id, "failed to load scheduled job: {e}");
             let finished_at = Utc::now();
-            let _ = store.jobs().record_run(
-                job_id,
-                "error",
-                Some(&format!("failed to load job: {e}")),
-                started_at,
-                finished_at,
-            );
+            let _ = store
+                .jobs()
+                .record_run(
+                    job_id,
+                    "error",
+                    Some(&format!("failed to load job: {e}")),
+                    started_at,
+                    finished_at,
+                )
+                .await;
             return;
         }
     };
@@ -183,31 +432,39 @@ async fn execute_cron_task(
             job_id = %job_id,
             "scheduled job has an empty task body — disabling so it stops firing"
         );
-        let _ = store.jobs().record_run(
-            job_id,
-            "error",
-            Some("scheduled job has an empty task body; disabled. Recreate with a non-empty task."),
-            started_at,
-            finished_at,
-        );
-        if let Err(e) = store.jobs().set_enabled(job_id, false) {
+        let _ = store
+            .jobs()
+            .record_run(
+                job_id,
+                "error",
+                Some(
+                    "scheduled job has an empty task body; disabled. Recreate with a non-empty task.",
+                ),
+                started_at,
+                finished_at,
+            )
+            .await;
+        if let Err(e) = store.jobs().set_enabled(job_id, false).await {
             tracing::warn!(job_id = %job_id, "failed to disable empty-task job: {e}");
         }
         return;
     }
 
-    let mut conv = match resume_or_create_conversation(&job, state, store) {
+    let mut conv = match resume_or_create_conversation(&job, state, store).await {
         Ok(c) => c,
         Err(e) => {
             tracing::error!(job_id = %job_id, "failed to resume conversation for scheduled job: {e}");
             let finished_at = Utc::now();
-            let _ = store.jobs().record_run(
-                job_id,
-                "error",
-                Some(&format!("failed to resume conversation: {e}")),
-                started_at,
-                finished_at,
-            );
+            let _ = store
+                .jobs()
+                .record_run(
+                    job_id,
+                    "error",
+                    Some(&format!("failed to resume conversation: {e}")),
+                    started_at,
+                    finished_at,
+                )
+                .await;
             return;
         }
     };
@@ -232,7 +489,9 @@ async fn execute_cron_task(
         effective_chat_id.as_deref(),
         effective_thread_id.as_deref(),
     ) {
-        if let Err(e) = state.store.conversations().save(&conv) {
+        // Metadata-only change — the resumed conversation's messages are
+        // untouched here, so skip rewriting them.
+        if let Err(e) = state.agent.store.conversations().save_meta(&conv).await {
             tracing::warn!(
                 job_id = %job_id,
                 "failed to persist channel context onto job conversation: {e}"
@@ -248,7 +507,7 @@ async fn execute_cron_task(
     // content. Operators commonly schedule jobs with `task = "morning-briefing"`,
     // and without the body the model would have to make a tool round-trip
     // before doing any real work.
-    let resolved_skill = resolve_skill_for_task(&state.skill_registry, task_prompt);
+    let resolved_skill = resolve_skill_for_task(&state.agent.skill_registry, task_prompt);
     if let Some((ref name, _)) = resolved_skill {
         tracing::info!(
             job_id = %job_id,
@@ -264,21 +523,37 @@ async fn execute_cron_task(
         effective_chat_id.as_deref(),
     );
 
-    let run_options = rustykrab_gateway::RunOptions {
+    // A scheduled run must contribute its own user turn.
+    push_scheduled_user_turn(&mut conv, &prompt);
+
+    let run_options = rustykrab_runtime::RunOptions {
         active_skill: resolved_skill,
+        // Derived by the runtime from the resolved skill -- see
+        // `contract_for_active_skill`. Supplied here only when a caller
+        // knows something the registry does not.
+        outcome_contract: None,
         // Cron tasks must call a tool on iteration 0 — a bare "I'm ready"
         // reply is never the deliverable, and the model would otherwise
         // burn the slot.
         force_tool_use_first_iteration: true,
+        max_iterations: None,
+        ..rustykrab_runtime::RunOptions::default()
     };
 
     // Run the agent. Mint a fresh trace id per scheduled run so prompt-log
     // rows and agent logs for this job line up.
     let trace_id = Uuid::new_v4();
-    tracing::info!(%trace_id, job_id = %job.id, "scheduled task starting");
+    // `version` here matches what record_run stamps onto the job_runs row,
+    // so a log line and a DB row can be tied to the same build.
+    tracing::info!(
+        %trace_id,
+        job_id = %job.id,
+        version = rustykrab_core::VERSION,
+        "scheduled task starting"
+    );
     let no_op_event = |_event: AgentEvent| {};
-    let result = rustykrab_gateway::run_agent_streaming_with_options(
-        state,
+    let result = rustykrab_runtime::run_agent_streaming_with_options(
+        &state.agent,
         &mut conv,
         &prompt,
         &no_op_event,
@@ -305,92 +580,36 @@ async fn execute_cron_task(
     };
 
     // Route the response to the originating channel.
-    match effective_channel.as_deref() {
-        Some("telegram") => {
-            if let (Some(tg), Some(cid)) = (&state.telegram, effective_chat_id.as_deref()) {
-                if let Ok(chat_id_num) = cid.parse::<i64>() {
-                    let tg_thread = effective_thread_id
-                        .as_deref()
-                        .and_then(|s| s.parse::<i64>().ok())
-                        .unwrap_or(0);
-                    if let Err(e) = tg.send_text(chat_id_num, &response_text, tg_thread).await {
-                        tracing::error!(job_id = %job_id, "failed to send scheduled job result to Telegram: {e}");
-                    }
-                } else {
-                    tracing::error!(job_id = %job_id, chat_id = %cid, "invalid Telegram chat_id");
-                }
-            } else {
-                tracing::warn!(
-                    job_id = %job_id,
-                    has_telegram = state.telegram.is_some(),
-                    has_chat_id = effective_chat_id.is_some(),
-                    "telegram routing unavailable; result discarded: {response_text}"
-                );
-            }
-        }
-        Some("slack") => {
-            if let (Some(sl), Some(channel_id)) = (&state.slack, effective_chat_id.as_deref()) {
-                if let Err(e) = sl
-                    .send_text(channel_id, &response_text, effective_thread_id.as_deref())
-                    .await
-                {
-                    tracing::error!(job_id = %job_id, "failed to send scheduled job result to Slack: {e}");
-                }
-            } else {
-                tracing::warn!(
-                    job_id = %job_id,
-                    has_slack = state.slack.is_some(),
-                    has_chat_id = effective_chat_id.is_some(),
-                    "slack routing unavailable; result discarded: {response_text}"
-                );
-            }
-        }
-        Some("signal") => {
-            if let (Some(sig), Some(number)) = (&state.signal, effective_chat_id.as_deref()) {
-                if let Err(e) = sig.send_text(number, &response_text).await {
-                    tracing::error!(job_id = %job_id, "failed to send scheduled job result to Signal: {e}");
-                }
-            } else {
-                tracing::warn!(
-                    job_id = %job_id,
-                    has_signal = state.signal.is_some(),
-                    has_chat_id = effective_chat_id.is_some(),
-                    "signal routing unavailable; result discarded: {response_text}"
-                );
-            }
-        }
-        Some(other) => {
-            tracing::warn!(
-                job_id = %job_id,
-                channel = %other,
-                "unknown channel for scheduled job; result discarded: {response_text}"
-            );
-        }
-        None => {
-            tracing::warn!(
-                job_id = %job_id,
-                "scheduled job has no delivery channel — set channel/chat_id on the \
-                 job, or set RUSTYKRAB_DEFAULT_CHANNEL + RUSTYKRAB_DEFAULT_CHAT_ID. \
-                 Result discarded: {response_text}"
-            );
-        }
-    }
+    deliver_response(
+        job_id,
+        effective_channel.as_deref(),
+        effective_chat_id.as_deref(),
+        effective_thread_id.as_deref(),
+        &response_text,
+        conv.id,
+        state,
+    )
+    .await;
 
     // Record the run before marking executed so the result is persisted
     // even if mark_executed fails.
     let finished_at = Utc::now();
-    if let Err(e) = store.jobs().record_run(
-        job_id,
-        status,
-        Some(&response_text),
-        started_at,
-        finished_at,
-    ) {
+    if let Err(e) = store
+        .jobs()
+        .record_run(
+            job_id,
+            status,
+            Some(&response_text),
+            started_at,
+            finished_at,
+        )
+        .await
+    {
         tracing::warn!(job_id = %job_id, "failed to record job run: {e}");
     }
 
     // Mark the job as executed (advances next_run_at or disables one-shot).
-    if let Err(e) = store.jobs().mark_executed(job_id) {
+    if let Err(e) = store.jobs().mark_executed(job_id).await {
         tracing::error!(job_id = %job_id, "failed to mark scheduled job as executed: {e}");
     }
 
@@ -402,14 +621,14 @@ async fn execute_cron_task(
 /// Resume this job's persistent conversation, or create one on the first
 /// run. If the stored id points at a conversation that has been deleted
 /// out from under us, silently create a fresh one and re-link.
-fn resume_or_create_conversation(
+async fn resume_or_create_conversation(
     job: &rustykrab_store::ScheduledJob,
     state: &AppState,
     store: &rustykrab_store::Store,
 ) -> Result<Conversation, rustykrab_core::Error> {
     if let Some(cid) = &job.conversation_id {
         if let Ok(uuid) = Uuid::parse_str(cid) {
-            match state.store.conversations().get(uuid) {
+            match state.agent.store.conversations().get(uuid).await {
                 Ok(c) => return Ok(c),
                 Err(rustykrab_core::Error::NotFound(_)) => {
                     tracing::warn!(
@@ -429,10 +648,11 @@ fn resume_or_create_conversation(
         }
     }
 
-    let conv = state.store.conversations().create()?;
+    let conv = state.agent.store.conversations().create().await?;
     store
         .jobs()
-        .set_conversation_id(&job.id, &conv.id.to_string())?;
+        .set_conversation_id(&job.id, &conv.id.to_string())
+        .await?;
     Ok(conv)
 }
 
@@ -472,7 +692,18 @@ fn build_scheduled_prompt(
              Task: {task_prompt}"
         ),
     };
-    format!("{body}\n\n{delivery}")
+    // The task string is all that survives from the conversation where this
+    // job was created — no chat history comes with it. Terse tasks ("daily
+    // briefing") therefore produce generic output unless the model first
+    // recovers the user's standing preferences from memory. Say so
+    // explicitly rather than relying on the soul prompt's general
+    // memory_search guidance.
+    let context_recovery = "You do not have the conversation this job was created in. Before \
+         composing output, call memory_search for the user's standing preferences and any \
+         earlier decisions relevant to this task (recipients, filters, format, tone, things \
+         to exclude), and apply what you find. Prefer concrete specifics you recover over \
+         generic defaults.";
+    format!("{body}\n\n{context_recovery}\n\n{delivery}")
 }
 
 /// If `task_prompt` references a registered SKILL.md skill, return
@@ -496,6 +727,13 @@ fn build_scheduled_prompt(
 /// Operators commonly schedule jobs with natural-language task strings rather
 /// than bare skill names; without substring matching, those tasks never get the
 /// body inlined and the model loops on tool-discovery before giving up.
+/// The checkable claim a skill made about its own effects, if it made one.
+///
+/// Returns `None` unless the skill declared `signal = "verifiable"` *and*
+/// named at least one check: a skill that asked to be judged some other
+/// way must not have its runs promoted to ground truth, and a skill that
+/// named nothing has stated nothing to check. In both cases the run falls
+/// back to the weaker implicit signal rather than inventing evidence.
 fn resolve_skill_for_task(registry: &SkillRegistry, task_prompt: &str) -> Option<(String, String)> {
     let trimmed = task_prompt.trim();
     if trimmed.is_empty() {
@@ -649,6 +887,198 @@ fn resolve_delivery_target(
     (channel, chat_id, thread_id)
 }
 
+/// Route a finished agent response back to the channel it came from.
+///
+/// Shared by the scheduled-job path and the credential-wake path. Both
+/// end the same way — some text, and a `(channel, chat, thread)` triple
+/// resolved from the conversation — and a second copy of this match would
+/// drift the moment one of them gained a channel the other did not.
+///
+/// `target` names the originator in logs: a job id for a scheduled run,
+/// the credential name for a wake. Everything here is best-effort; a
+/// channel that cannot be reached is logged with the text that was lost,
+/// never retried, because the agent has already run and re-running it
+/// would repeat its side effects.
+/// Deliver a turn's text, then any credential link that turn minted.
+///
+/// The link is a second message, after the text, for the same reason the
+/// Telegram inbound loop sends it that way: the user should read *why* they
+/// are being asked before they are handed the form.
+///
+/// `conversation_id` exists solely to drain [`PendingLinks`], which is keyed
+/// by conversation. Before this, only the inbound Telegram loop drained that
+/// queue, so a link minted by a scheduled job or a resumed delegated task was
+/// pushed and never delivered — and `next_step_out_of_band` had already told
+/// the model to say "a secure link is being sent to them right now" and not
+/// to write a URL itself. The user was promised a link that could not arrive
+/// and shown nothing. Draining here rather than at the call sites means a
+/// future delivery path cannot reintroduce that by forgetting a step.
+async fn deliver_response(
+    target: &str,
+    channel: Option<&str>,
+    chat_id: Option<&str>,
+    thread_id: Option<&str>,
+    response_text: &str,
+    conversation_id: Uuid,
+    state: &AppState,
+) {
+    deliver_text(target, channel, chat_id, thread_id, response_text, state).await;
+
+    // Each link goes as its own message and never passed through the model,
+    // so it cannot have been truncated or paraphrased on the way here.
+    for link in state.agent.store.pending_links().take(conversation_id) {
+        deliver_text(target, channel, chat_id, thread_id, &link, state).await;
+    }
+}
+
+/// Send one message to whichever channel this turn belongs to.
+async fn deliver_text(
+    target: &str,
+    channel: Option<&str>,
+    chat_id: Option<&str>,
+    thread_id: Option<&str>,
+    response_text: &str,
+    state: &AppState,
+) {
+    match channel {
+        Some("telegram") => {
+            if let (Some(tg), Some(cid)) = (&state.telegram, chat_id) {
+                if let Ok(chat_id_num) = cid.parse::<i64>() {
+                    let tg_thread = thread_id.and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+                    if let Err(e) = tg.send_text(chat_id_num, response_text, tg_thread).await {
+                        tracing::error!(target = %target, "failed to send result to Telegram: {e}");
+                    }
+                } else {
+                    tracing::error!(target = %target, chat_id = %cid, "invalid Telegram chat_id");
+                }
+            } else {
+                tracing::warn!(
+                    target = %target,
+                    has_telegram = state.telegram.is_some(),
+                    has_chat_id = chat_id.is_some(),
+                    "telegram routing unavailable; result discarded: {response_text}"
+                );
+            }
+        }
+        Some("slack") => {
+            if let (Some(sl), Some(channel_id)) = (&state.slack, chat_id) {
+                if let Err(e) = sl.send_text(channel_id, response_text, thread_id).await {
+                    tracing::error!(target = %target, "failed to send result to Slack: {e}");
+                }
+            } else {
+                tracing::warn!(
+                    target = %target,
+                    has_slack = state.slack.is_some(),
+                    has_chat_id = chat_id.is_some(),
+                    "slack routing unavailable; result discarded: {response_text}"
+                );
+            }
+        }
+        Some("signal") => {
+            if let (Some(sig), Some(number)) = (&state.signal, chat_id) {
+                if let Err(e) = sig.send_text(number, response_text).await {
+                    tracing::error!(target = %target, "failed to send result to Signal: {e}");
+                }
+            } else {
+                tracing::warn!(
+                    target = %target,
+                    has_signal = state.signal.is_some(),
+                    has_chat_id = chat_id.is_some(),
+                    "signal routing unavailable; result discarded: {response_text}"
+                );
+            }
+        }
+        Some(other) => {
+            tracing::warn!(
+                target = %target,
+                channel = %other,
+                "unknown channel; result discarded: {response_text}"
+            );
+        }
+        None => {
+            tracing::warn!(
+                target = %target,
+                "no delivery channel — set channel/chat_id on the originating \
+                 conversation, or set RUSTYKRAB_DEFAULT_CHANNEL + \
+                 RUSTYKRAB_DEFAULT_CHAT_ID. Result discarded: {response_text}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod wake_prompt_tests {
+    use super::*;
+
+    #[test]
+    fn the_payment_wake_names_both_actions_and_holds_no_card() {
+        let p = payment_wake_prompt(
+            "Steamship Authority",
+            "USD 46.00",
+            "https://www.steamshipauthority.com",
+        );
+        for needed in [
+            "fill_payment",
+            "action='pay'",
+            "snapshot",
+            "USD 46.00",
+            "Steamship Authority",
+            "you do not have it and must not type one",
+            "only be pressed once",
+            "Do not repeat any card detail",
+        ] {
+            assert!(p.contains(needed), "missing {needed:?}: {p}");
+        }
+    }
+
+    /// The prompt used to say "retry the tool that failed". Nothing had
+    /// failed — the agent hit a login wall, which is not a tool error —
+    /// so the resumed turn was pointed at something that did not exist
+    /// and left to improvise. One run spent 96 iterations doing so.
+    #[test]
+    fn it_does_not_send_the_agent_after_a_failure_that_never_happened() {
+        let p = credential_wake_prompt("web_example_com_login", Some("example.com"));
+        assert!(
+            !p.contains("retry the tool that failed"),
+            "no tool failed; saying so sends the agent looking for one"
+        );
+    }
+
+    /// Naming the mechanism is what changed behaviour when the same gap
+    /// was fixed in the browser tool description, so the wake says it too.
+    #[test]
+    fn it_names_the_action_that_actually_signs_in() {
+        let p = credential_wake_prompt("web_example_com_login", Some("example.com"));
+        assert!(p.contains("fill_credential"), "{p}");
+        assert!(p.contains("field='username'"), "{p}");
+        assert!(p.contains("field='password'"), "{p}");
+        assert!(p.contains("snapshot"), "refs come from a snapshot: {p}");
+    }
+
+    /// The agent has no password. Left unsaid, it invents one — observed
+    /// typing the credential's own key name into the form.
+    #[test]
+    fn it_says_the_agent_does_not_hold_the_value() {
+        let p = credential_wake_prompt("web_example_com_login", Some("example.com"));
+        assert!(p.contains("do not have the password"), "{p}");
+        assert!(p.contains("must not type one"), "{p}");
+    }
+
+    #[test]
+    fn it_never_repeats_a_value_back() {
+        let p = credential_wake_prompt("gmail_app_password", Some("Gmail"));
+        assert!(p.contains("do not repeat any value back"), "{p}");
+        assert!(p.contains("Do not ask for the credential again"), "{p}");
+    }
+
+    /// Falls back to the store key when there is no friendly name.
+    #[test]
+    fn it_names_the_service_when_there_is_one() {
+        assert!(credential_wake_prompt("k", Some("Gmail")).contains("Gmail"));
+        assert!(credential_wake_prompt("gmail_app_password", None).contains("gmail_app_password"));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -683,6 +1113,45 @@ mod tests {
     }
 
     #[test]
+    fn scheduled_run_appends_a_user_turn_carrying_the_prompt() {
+        let mut conv = empty_conv();
+        let prompt = build_scheduled_prompt("Write the daily briefing.", None, None, None);
+
+        push_scheduled_user_turn(&mut conv, &prompt);
+
+        let last = conv.messages.last().expect("a message was appended");
+        assert_eq!(last.role, Role::User);
+        assert_eq!(last.content.as_text(), Some(prompt.as_str()));
+    }
+
+    /// Some model chat templates reject a request whose message array carries
+    /// no `user` role (qwen3.8:27b does; gemma4:26b does not). A resumed job
+    /// conversation holding only system/assistant/tool turns must still reach
+    /// the provider with a user turn present.
+    #[test]
+    fn scheduled_run_leaves_a_user_role_in_a_conversation_without_one() {
+        let mut conv = channel_conv("telegram", "12345", None);
+        conv.messages.push(Message {
+            id: Uuid::new_v4(),
+            role: Role::Assistant,
+            content: MessageContent::Text("result of the previous run".to_string()),
+            created_at: Utc::now(),
+            agent_version: Message::version_stamp(),
+        });
+        assert!(!conv.messages.iter().any(|m| m.role == Role::User));
+
+        push_scheduled_user_turn(
+            &mut conv,
+            &build_scheduled_prompt("Check the feed.", None, Some("telegram"), Some("12345")),
+        );
+
+        assert!(conv.messages.iter().any(|m| m.role == Role::User));
+        // Newest message being a user turn is what keeps oldest-first
+        // trimming from stranding the request without one.
+        assert_eq!(conv.messages.last().unwrap().role, Role::User);
+    }
+
+    #[test]
     fn scheduled_prompt_first_run_includes_delivery_target() {
         let prompt = build_scheduled_prompt(
             "Write the daily briefing.",
@@ -704,6 +1173,30 @@ mod tests {
         assert!(prompt.contains("Last run was at 2026-04-30 09:00:00 UTC"));
         // No channel info → still tells the model the message IS the deliverable.
         assert!(prompt.contains("IS the deliverable"));
+    }
+
+    #[test]
+    fn scheduled_prompt_tells_model_it_lacks_the_creating_conversation() {
+        // The task string is the only thing carried over from the
+        // conversation where the job was created. Both the first run and
+        // recurring runs must tell the model to recover the user's standing
+        // preferences from memory, otherwise thin task strings ("daily
+        // briefing") yield generic output.
+        let first = build_scheduled_prompt("Daily briefing.", None, Some("telegram"), Some("1"));
+        let last = Utc.with_ymd_and_hms(2026, 4, 30, 9, 0, 0).unwrap();
+        let recurring =
+            build_scheduled_prompt("Daily briefing.", Some(last), Some("telegram"), Some("1"));
+
+        for (label, prompt) in [("first run", &first), ("recurring run", &recurring)] {
+            assert!(
+                prompt.contains("do not have the conversation this job was created in"),
+                "{label} should state the missing-context problem: {prompt}"
+            );
+            assert!(
+                prompt.contains("memory_search"),
+                "{label} should point at memory_search: {prompt}"
+            );
+        }
     }
 
     #[test]
@@ -775,6 +1268,7 @@ mod tests {
                 requires: SkillRequirements::default(),
                 user_invocable: true,
                 emoji: None,
+                outcome: None,
                 extra: HashMap::new(),
             },
             raw_body: body.to_string(),

@@ -85,33 +85,87 @@ pub enum Capability {
 ///
 /// Created when a conversation starts; checked before every tool
 /// execution and resource access.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct CapabilitySet {
+    capabilities: HashSet<Capability>,
+    /// Names from `Capability::Tool` grants, indexed separately so
+    /// [`can_use_tool`](Self::can_use_tool) — which runs for every tool on
+    /// every agent-loop iteration — can look up a `&str` without allocating
+    /// a `Capability::Tool(String)` per check. Kept in sync by
+    /// [`grant`](Self::grant) / [`revoke`](Self::revoke) and rebuilt on
+    /// deserialization.
+    tool_names: HashSet<String>,
+}
+
+/// Serialized form of [`CapabilitySet`]: only the capabilities themselves
+/// go over the wire — the `tool_names` index is derived state, rebuilt on
+/// deserialization so the format stays identical to the previous derive.
+#[derive(Serialize, Deserialize)]
+struct CapabilitySetRepr {
     capabilities: HashSet<Capability>,
 }
 
+impl Serialize for CapabilitySet {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        struct Repr<'a> {
+            capabilities: &'a HashSet<Capability>,
+        }
+        Repr {
+            capabilities: &self.capabilities,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for CapabilitySet {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let repr = CapabilitySetRepr::deserialize(deserializer)?;
+        Ok(Self::from_capabilities(repr.capabilities))
+    }
+}
+
 impl CapabilitySet {
+    /// Build a set from raw capabilities, deriving the tool-name index.
+    fn from_capabilities(capabilities: HashSet<Capability>) -> Self {
+        let tool_names = capabilities
+            .iter()
+            .filter_map(|cap| match cap {
+                Capability::Tool(name) => Some(name.clone()),
+                _ => None,
+            })
+            .collect();
+        Self {
+            capabilities,
+            tool_names,
+        }
+    }
+
     /// Create an empty capability set (deny all).
     pub fn none() -> Self {
-        Self {
-            capabilities: HashSet::new(),
-        }
+        Self::from_capabilities(HashSet::new())
     }
 
     /// Create a default set with safe capabilities only.
     pub fn default_safe() -> Self {
         let mut caps = HashSet::new();
         caps.insert(Capability::HttpRequest);
-        Self { capabilities: caps }
+        Self::from_capabilities(caps)
     }
 
     /// Grant a capability.
     pub fn grant(&mut self, cap: Capability) {
+        if let Capability::Tool(name) = &cap {
+            self.tool_names.insert(name.clone());
+        }
         self.capabilities.insert(cap);
     }
 
     /// Revoke a capability.
     pub fn revoke(&mut self, cap: &Capability) {
+        if let Capability::Tool(name) = cap {
+            self.tool_names.remove(name);
+        }
         self.capabilities.remove(cap);
     }
 
@@ -144,17 +198,12 @@ impl CapabilitySet {
             return false;
         }
 
-        if self
-            .capabilities
-            .contains(&Capability::Tool(trimmed.to_string()))
-        {
+        if self.tool_names.contains(trimmed) {
             return true;
         }
         // Fall back to the base name before any colon separator.
         if base != trimmed {
-            return self
-                .capabilities
-                .contains(&Capability::Tool(base.to_string()));
+            return self.tool_names.contains(base);
         }
         false
     }
@@ -170,7 +219,7 @@ impl CapabilitySet {
         for name in tool_names {
             caps.insert(Capability::Tool(name.to_string()));
         }
-        Self { capabilities: caps }
+        Self::from_capabilities(caps)
     }
 
     /// Create a capability set that grants access to a specific set of tools
@@ -188,7 +237,7 @@ impl CapabilitySet {
         for name in tool_names {
             caps.insert(Capability::Tool(name.to_string()));
         }
-        Self { capabilities: caps }
+        Self::from_capabilities(caps)
     }
 
     /// Return all granted capabilities.
@@ -322,5 +371,35 @@ mod tests {
     fn for_tools_permissive_does_not_grant_computer_use() {
         let caps = CapabilitySet::for_tools_permissive(&["computer"]);
         assert!(!caps.has(&Capability::ComputerUse));
+    }
+
+    #[test]
+    fn grant_and_revoke_keep_tool_lookup_in_sync() {
+        let mut caps = CapabilitySet::none();
+        assert!(!caps.can_use_tool("example_tool"));
+
+        caps.grant(Capability::Tool("example_tool".to_string()));
+        assert!(caps.can_use_tool("example_tool"));
+        assert!(caps.has(&Capability::Tool("example_tool".to_string())));
+
+        caps.revoke(&Capability::Tool("example_tool".to_string()));
+        assert!(!caps.can_use_tool("example_tool"));
+        assert!(!caps.has(&Capability::Tool("example_tool".to_string())));
+    }
+
+    #[test]
+    fn serde_round_trip_preserves_tool_lookup() {
+        let caps = CapabilitySet::for_tools(&["example_tool"]);
+        let json = serde_json::to_string(&caps).unwrap();
+        // Wire format stays `{"capabilities": [...]}` — the derived
+        // tool-name index must not leak into the serialized form.
+        assert!(json.contains("capabilities"));
+        assert!(!json.contains("tool_names"));
+
+        let restored: CapabilitySet = serde_json::from_str(&json).unwrap();
+        assert!(restored.can_use_tool("example_tool"));
+        assert!(restored.can_use_tool("example_tool:subaction"));
+        assert!(!restored.can_use_tool("other_tool"));
+        assert!(restored.has(&Capability::HttpRequest));
     }
 }

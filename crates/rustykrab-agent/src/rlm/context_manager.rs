@@ -1,22 +1,7 @@
-//! Token estimation utility for recursive calls.
+//! Token estimation for recursive calls.
+//!
+//! Re-exported from `rustykrab-core` so recursive sub-calls size context the
+//! same way the runner does. A local copy of the heuristic here would let the
+//! RLM executor and the runner disagree about whether a slice fits.
 
-/// Estimate token count for a string (conservative: ~3.5 chars/token).
-pub fn estimate_tokens(text: &str) -> usize {
-    (text.len() as f64 / 3.5).ceil() as usize
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_estimate_tokens() {
-        // 35 bytes / 3.5 = 10 tokens
-        assert_eq!(estimate_tokens(&"a".repeat(35)), 10);
-    }
-
-    #[test]
-    fn test_estimate_tokens_empty() {
-        assert_eq!(estimate_tokens(""), 0);
-    }
-}
+pub use rustykrab_core::estimate_text_tokens as estimate_tokens;

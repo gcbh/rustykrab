@@ -1,0 +1,767 @@
+//! Assemble and run one agent turn.
+//!
+//! This was `rustykrab-gateway::orchestrate`. Nothing in it is about HTTP —
+//! it builds the system prompt, derives the session's capabilities, installs
+//! the memory write-back hook and drives the runner — but living in the Axum
+//! crate meant a Telegram loop had to depend on a web server to run a turn.
+//!
+//! Errors are a plain enum rather than an HTTP status. The gateway maps them
+//! at its own boundary, which is where that decision belongs.
+
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
+
+use chrono::Utc;
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+use uuid::Uuid;
+
+use crate::context::AgentContext;
+use crate::error::RuntimeError;
+use rustykrab_agent::{
+    AgentEvent, AgentHandle, AgentRunCompletion, AgentRunner, HarnessProfile, OnMessageCallback,
+};
+use rustykrab_core::capability::{Capability, CapabilitySet};
+use rustykrab_core::session::Session;
+use rustykrab_core::types::{Conversation, Message, MessageContent, Role};
+use rustykrab_memory::types::{ConversationTurn, LifecycleStage, TurnMetadata};
+use rustykrab_memory::MemorySystem;
+use rustykrab_skills::SystemPromptBuilder;
+
+/// Optional knobs for an agent run. Most callers (HTTP, channels) use
+/// `RunOptions::default()`; the cron scheduler uses these to inject a
+/// SKILL.md body into the system prompt and force tool use on the first
+/// iteration.
+#[derive(Debug, Clone, Default)]
+pub struct RunOptions {
+    /// When set, `(name, body)` is wrapped in `<skill_instructions>` and
+    /// appended to the system prompt so the model has the full recipe
+    /// from turn 0 without a `skills`-tool round-trip.
+    pub active_skill: Option<(String, String)>,
+    /// What the active skill declared it must actually *do* for the run to
+    /// count as successful, when it declared anything checkable.
+    ///
+    /// Separate from `active_skill` because that pair exists to build the
+    /// prompt: it carries the recipe, not the post-condition. Without this
+    /// the runner knows a skill's name but not its claims, so every run it
+    /// drives is recorded as `Implicit` proxy evidence and no later stage
+    /// is permitted to act on it.
+    pub outcome_contract: Option<rustykrab_core::OutcomeContract>,
+    /// When `true`, the runner makes its first LLM call with
+    /// `tool_choice = "any"`, forcing the model to invoke a tool. Used
+    /// for scheduled tasks so the model can't waste the slot on a
+    /// greeting.
+    pub force_tool_use_first_iteration: bool,
+    /// Ceiling on agent iterations for this run, overriding the profile.
+    ///
+    /// The profile default is 200 (100 on the coding profile), which is a
+    /// budget rather than a safety net: a run that cannot make progress
+    /// spends all of it. Callers that know their work should be short --
+    /// a credential wake resuming one stalled turn -- say so here, so a
+    /// stuck run reports quickly instead of grinding.
+    pub max_iterations: Option<usize>,
+    /// Tools this run may not use, withheld before capabilities are
+    /// granted rather than rejected at call time — a tool the session
+    /// has no capability for is never offered to the model, so it does
+    /// not waste a turn discovering it is forbidden.
+    ///
+    /// Used by the delegated-task worker to deny onward delegation to a
+    /// run whose hop budget is spent.
+    pub denied_tools: Vec<String>,
+}
+
+/// Build the system prompt and inject it as the first message in the conversation.
+///
+/// `profile` is the harness profile already resolved by the caller —
+/// resolving it once and passing it in avoids a second (potentially
+/// LLM-backed) classification per turn.
+async fn build_and_inject_system_prompt(
+    ctx: &AgentContext,
+    conv: &mut Conversation,
+    profile: &HarnessProfile,
+    options: &RunOptions,
+) {
+    // 1. Build the minimal system prompt.
+    //
+    // Date is rendered at day granularity so the system block stays
+    // cache-friendly: it only changes once per UTC day. Models that need
+    // sub-day precision should call a clock tool on demand.
+    let today = Utc::now().format("%Y-%m-%d").to_string();
+    let mut builder = SystemPromptBuilder::new()
+        .with_identity(&profile.agent_name)
+        .with_current_date(&today)
+        .with_security_policy();
+
+    // Inject SKILL.md catalog (only satisfied skills).
+    let all_md = ctx.skill_registry.md_skills();
+    let (satisfied, unsatisfied): (Vec<_>, Vec<_>) = all_md
+        .into_iter()
+        .partition(|s| s.validation.is_satisfied());
+    let included: Vec<&str> = satisfied
+        .iter()
+        .map(|s| s.frontmatter.name.as_str())
+        .collect();
+    let excluded: Vec<String> = unsatisfied
+        .iter()
+        .map(|s| {
+            let mut reasons = Vec::new();
+            if !s.validation.missing_env.is_empty() {
+                reasons.push(format!("missing_env={:?}", s.validation.missing_env));
+            }
+            if !s.validation.missing_bins.is_empty() {
+                reasons.push(format!("missing_bins={:?}", s.validation.missing_bins));
+            }
+            format!("{} ({})", s.frontmatter.name, reasons.join(", "))
+        })
+        .collect();
+    tracing::info!(
+        included_count = included.len(),
+        excluded_count = excluded.len(),
+        included = ?included,
+        excluded = ?excluded,
+        "SKILL.md catalog for system prompt"
+    );
+    if !satisfied.is_empty() {
+        let refs: Vec<&rustykrab_skills::SkillMd> = satisfied.iter().map(|s| s.as_ref()).collect();
+        builder = builder.with_available_skills(&refs);
+    }
+
+    // When the caller (cron) has pre-resolved a SKILL.md for this run,
+    // inline its full body into the system prompt. The skill recipe is
+    // instructions, not data — placing it in `system` rather than the
+    // user message keeps it cached across iterations and clearly framed
+    // as authoritative guidance for the model.
+    if let Some((name, body)) = options.active_skill.as_ref() {
+        tracing::info!(skill = %name, "injecting skill body into system prompt");
+        builder = builder.with_active_skill(name, body);
+    }
+
+    let mut system_prompt = builder.build();
+    system_prompt.push_str(
+        "\n\n## Task continuity\n\
+         Interpret a short follow-up using the active user goal, the most recent \
+         relevant exchange, and any later corrections. Resolve references before \
+         choosing a tool; a familiar phrase by itself is not a new task. Explicit \
+         user task switches override the old goal. Preserve current dates, entities, \
+         constraints and authorization boundaries. Within the same task, a correction \
+         changes only the specified fields; other requirements remain unless withdrawn \
+         or contradicted. Do not transfer unrelated constraints across a task switch. \
+         If the referent is materially \
+         ambiguous, ask a focused question. Your first useful action should advance \
+         that current request. Failed or timed-out actions are not verified results; \
+         inspect current external state before retrying a potentially applied effect.",
+    );
+    // Custom soul files are user-owned and may still name absent tools. The
+    // session's actual schema is authoritative regardless of that wording.
+    system_prompt.push_str(
+        "\n\n## Tool availability\nInvoke only tools whose schemas are currently offered. \
+         References to tool names in general guidance are conditional on availability. \
+         Discover and load other available tools before invoking them; if discovery \
+         says a tool is unknown or forbidden, do not invent a call to it.",
+    );
+
+    // Append channel context so the agent knows where this conversation lives.
+    if let Some(ref source) = conv.channel_source {
+        system_prompt.push_str("\n\n## Channel context\n");
+        system_prompt.push_str(&format!("- Source: {source}\n"));
+        if let Some(ref cid) = conv.channel_id {
+            system_prompt.push_str(&format!("- Chat ID: {cid}\n"));
+        }
+        if let Some(ref tid) = conv.channel_thread_id {
+            system_prompt.push_str(&format!("- Thread ID: {tid}\n"));
+        }
+        tracing::debug!(
+            channel_source = source.as_str(),
+            channel_id = ?conv.channel_id,
+            channel_thread_id = ?conv.channel_thread_id,
+            "injected channel context into system prompt"
+        );
+    } else {
+        tracing::debug!("no channel_source on conversation — skipping channel context");
+    }
+
+    // 2. Inject system prompt as first message.
+    if conv
+        .messages
+        .first()
+        .map(|m| m.role == Role::System)
+        .unwrap_or(false)
+    {
+        conv.messages[0].content = MessageContent::Text(system_prompt);
+    } else {
+        conv.messages.insert(
+            0,
+            Message {
+                id: Uuid::new_v4(),
+                role: Role::System,
+                content: MessageContent::Text(system_prompt),
+                created_at: Utc::now(),
+                agent_version: Message::version_stamp(),
+            },
+        );
+    }
+}
+
+/// Translate an agent `Message` into a memory `ConversationTurn`.
+pub(crate) fn message_to_turn(
+    msg: &Message,
+    session_id: Uuid,
+    turn_number: u32,
+) -> ConversationTurn {
+    let speaker = match msg.role {
+        Role::System => "system",
+        Role::User => "user",
+        Role::Assistant => "assistant",
+        Role::Tool => "tool",
+    };
+    let content = match &msg.content {
+        MessageContent::Text(t) => t.clone(),
+        MessageContent::ToolCall(tc) => {
+            format!("tool_call:{}({})", tc.name, tc.arguments)
+        }
+        MessageContent::MultiToolCall(tcs) => tcs
+            .iter()
+            .map(|tc| format!("tool_call:{}({})", tc.name, tc.arguments))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        MessageContent::ToolResult(tr) => format!("tool_result:{}", tr.output),
+        MessageContent::MultiPart(blocks) => blocks
+            .iter()
+            .filter_map(|b| match b {
+                rustykrab_core::types::ContentBlock::Text { text } => Some(text.clone()),
+                rustykrab_core::types::ContentBlock::Image { media_type, .. } => {
+                    Some(format!("[image:{media_type}]"))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+    };
+    let involves_tool_use = matches!(
+        msg.content,
+        MessageContent::ToolCall(_)
+            | MessageContent::MultiToolCall(_)
+            | MessageContent::ToolResult(_)
+    );
+    // Literally the same estimator the agent runner uses, not a second copy
+    // of it that has to be kept in step.
+    let token_count = Some(rustykrab_core::estimate_message_bytes(content.len()) as u32);
+
+    ConversationTurn {
+        id: msg.id,
+        session_id,
+        turn_number,
+        speaker: speaker.to_string(),
+        content,
+        token_count,
+        metadata: TurnMetadata {
+            involves_tool_use,
+            user_flagged: false,
+            tags: Vec::new(),
+        },
+    }
+}
+
+/// Build an `on_message` callback that auto-persists every conversation
+/// turn into working memory.  Returns `None` when memory isn't wired —
+/// the runner then behaves as it did before (no persistence).
+///
+/// The callback is sync (the agent loop is sync at the hook) but memory
+/// writes are async, so each call spawns a detached task.  Failures are
+/// logged but don't block the agent loop — memory is eventual-consistency
+/// relative to the conversation. System messages are skipped; they are
+/// infrastructure (agent prompt, warnings) rather than conversation content.
+/// Duplicate content is de-duplicated on the memory side via SHA-256 hash,
+/// so re-firing the callback for an already-persisted message is safe.
+fn build_memory_callback(ctx: &AgentContext, conv: &Conversation) -> Option<OnMessageCallback> {
+    let memory: Arc<MemorySystem> = ctx.memory.clone()?;
+    let agent_id = ctx.agent_id?;
+    let session_id = conv.id;
+    // Start the turn counter from the current message count so turns
+    // are numbered consistently across a multi-request conversation.
+    let turn_counter = Arc::new(AtomicU32::new(conv.messages.len() as u32));
+
+    Some(Arc::new(move |msg: &Message| {
+        if msg.role == Role::System {
+            return;
+        }
+        let turn_number = turn_counter.fetch_add(1, Ordering::Relaxed);
+        let turn = message_to_turn(msg, session_id, turn_number);
+        let memory = Arc::clone(&memory);
+        tokio::spawn(async move {
+            if let Err(e) = memory
+                .retain_with_stage(turn, agent_id, LifecycleStage::Working)
+                .await
+            {
+                tracing::warn!(error = %e, "failed to persist turn to working memory");
+            }
+        });
+    }))
+}
+
+/// Shared setup: build system prompt, inject it, create session and runner.
+/// Returns `(AgentRunner, Session)`.
+/// Build the permissive capability set for an ephemeral session, honoring
+/// the gateway's `subagents_enabled` policy. Sub-agent tools require
+/// `Capability::Subagent` in addition to the per-tool grant, so we only
+/// add it when the gateway has been opted in (see
+/// `AppState::with_subagents_enabled`).
+fn build_session_capabilities(ctx: &AgentContext, tool_names: &[&str]) -> CapabilitySet {
+    let mut caps = CapabilitySet::for_tools_permissive(tool_names);
+    if ctx.subagents_enabled {
+        caps.grant(Capability::Subagent);
+    }
+    if ctx.computer_use_enabled {
+        caps.grant(Capability::ComputerUse);
+    }
+    caps
+}
+
+/// The outcome contract declared by whichever skill is driving this turn.
+///
+/// `None` when no skill is active, when the skill declares no `[outcome]`
+/// block, or when it declares a signal other than `verifiable` — in every
+/// one of those cases the run has not asked to be judged as ground truth,
+/// and falls back to the behavioural signal.
+fn contract_for_active_skill(
+    registry: &rustykrab_skills::SkillRegistry,
+    options: &RunOptions,
+) -> Option<rustykrab_core::OutcomeContract> {
+    let (name, _) = options.active_skill.as_ref()?;
+    let md = registry
+        .md_skills()
+        .into_iter()
+        .find(|s| s.frontmatter.name.eq_ignore_ascii_case(name))?;
+    let outcome = md.frontmatter.outcome.as_ref()?;
+    if !outcome.is_verifiable() {
+        return None;
+    }
+    Some(rustykrab_core::OutcomeContract::new(
+        md.frontmatter.name.clone(),
+        outcome.checks.clone(),
+        outcome.signal_class(),
+    ))
+}
+
+async fn prepare_agent(
+    ctx: &AgentContext,
+    conv: &mut Conversation,
+    user_content: &str,
+    options: &RunOptions,
+) -> Result<(AgentRunner, Session), RuntimeError> {
+    // Mark the system busy. Every channel reaches the agent through here,
+    // so this one call covers Telegram, Slack, WebChat and scheduled runs
+    // alike. This advances the "last busy" timestamp; what actually keeps
+    // the downtime worker out for the duration of the turn is the
+    // `RunGuard` the caller holds across the run itself.
+    if let Some(agent_id) = ctx.agent_id {
+        ctx.activity.record(agent_id);
+    }
+
+    // Resolve the harness profile once; it drives both the system prompt
+    // and the agent config below.
+    let profile = ctx.profile_for(user_content).await;
+    tracing::info!(profile = %profile.name, "harness profile selected");
+
+    build_and_inject_system_prompt(ctx, conv, &profile, options).await;
+
+    // Create an ephemeral session with capabilities for available registered tools.
+    let tool_names: Vec<&str> = ctx
+        .tools
+        .iter()
+        .filter(|t| t.available())
+        .map(|t| t.name())
+        .filter(|name| !options.denied_tools.iter().any(|denied| denied == name))
+        .collect();
+    tracing::debug!(
+        tool_count = tool_names.len(),
+        tools = ?tool_names,
+        subagents_enabled = ctx.subagents_enabled,
+        "granting session capabilities for available tools"
+    );
+    let caps = build_session_capabilities(ctx, &tool_names);
+    let session = Session::with_capabilities(conv.id, caps);
+
+    let mut agent_config = profile.to_agent_config();
+    agent_config.force_tool_use_first_iteration = options.force_tool_use_first_iteration;
+    if let Some(cap) = options.max_iterations {
+        agent_config.max_iterations = cap;
+    }
+
+    let mut runner = AgentRunner::new(ctx.provider.clone(), ctx.tools.clone(), ctx.sandbox.clone())
+        .with_config(agent_config)
+        .with_active_tools(ctx.active_tools.clone())
+        .with_recall_store(ctx.recall.clone())
+        .with_todo_store(ctx.todos.clone())
+        .with_retrieval_log(ctx.retrieval_log.clone());
+
+    // Outcome instrumentation (see `DREAMING.md`). Observational only: the
+    // runner records how the run went and to which artifacts it should be
+    // credited. Attributing to the active skill needs its name, which the
+    // runner does not otherwise know.
+    if ctx.outcome_capture_enabled {
+        runner = runner.with_outcome_sink(Arc::new(ctx.store.outcomes()));
+        if let Some((name, _)) = options.active_skill.as_ref() {
+            runner = runner.with_active_skill(name.clone());
+        }
+        // Turns the record from proxy into ground truth when the skill
+        // declared a checkable outcome. Absent one, capture still happens
+        // -- it is simply stamped `Implicit`, as before.
+        // Derived here, from the skill this turn already resolved, rather
+        // than required from each caller. Passing it in meant only the
+        // cron path ever supplied one: ordinary chat and peer-delegated
+        // tasks ran skills whose declared effects nothing checked, so a
+        // skill's evidence depended on which door the turn came through.
+        // An explicit contract on `RunOptions` still wins, for a caller
+        // that knows better than the registry.
+        let contract = options
+            .outcome_contract
+            .clone()
+            .or_else(|| contract_for_active_skill(&ctx.skill_registry, options));
+        if let Some(contract) = contract {
+            runner = runner.with_outcome_contract(contract);
+        }
+        if let Some(probes) = ctx.probes.as_ref() {
+            runner = runner.with_probes(Arc::clone(probes));
+        }
+    }
+
+    if let Some(cb) = build_memory_callback(ctx, conv) {
+        // Channels own initial inbound ingestion. Do not double-retain it
+        // here; this hook covers runner-produced and mid-run injected messages.
+        runner = runner.with_on_message(cb);
+    }
+
+    Ok((runner, session))
+}
+
+/// Extract the last assistant text message from a conversation.
+fn extract_assistant_message(conv: &Conversation) -> Result<Message, RuntimeError> {
+    conv.messages
+        .iter()
+        .rev()
+        .find(|m| m.role == Role::Assistant && m.content.as_text().is_some())
+        .cloned()
+        .ok_or_else(|| {
+            tracing::error!("agent loop completed but no assistant text message found");
+            RuntimeError::Internal
+        })
+}
+
+/// Run the agent loop on a conversation (non-streaming).
+///
+/// `trace_id` correlates every log line and prompt-log row produced by
+/// this run. Callers at HTTP boundaries thread the request's trace id in;
+/// channel/scheduler entry points should mint a fresh one with
+/// [`Uuid::new_v4`].
+pub async fn run_agent(
+    ctx: &AgentContext,
+    conv: &mut Conversation,
+    user_content: &str,
+    trace_id: Uuid,
+) -> Result<Message, RuntimeError> {
+    run_agent_with_options(ctx, conv, user_content, trace_id, &RunOptions::default()).await
+}
+
+/// Like [`run_agent`] but accepts caller-supplied [`RunOptions`].
+pub async fn run_agent_with_options(
+    ctx: &AgentContext,
+    conv: &mut Conversation,
+    user_content: &str,
+    trace_id: Uuid,
+    options: &RunOptions,
+) -> Result<Message, RuntimeError> {
+    rustykrab_core::prompt_trace::with_trace_id(trace_id, async move {
+        let (runner, session) = prepare_agent(ctx, conv, user_content, options).await?;
+
+        // Held for the whole run. Timestamps alone cannot express "busy
+        // right now": a turn that outlasts the idle threshold would read
+        // as quiet while the agent was still working, and a background
+        // pass could start underneath it. Dropping the guard — on the
+        // error path too — also bumps the generation, so any pass that
+        // overlapped this run is preempted rather than returned.
+        let _busy = ctx
+            .agent_id
+            .map(|agent_id| ctx.activity.begin_run(agent_id));
+
+        runner.run(conv, &session).await.map_err(|e| {
+            tracing::error!(%trace_id, "agent error: {e}");
+            RuntimeError::Internal
+        })?;
+
+        extract_assistant_message(conv)
+    })
+    .await
+}
+
+/// Start the event-driven agent loop, returning a handle for injecting
+/// messages mid-run.
+///
+/// Callers (e.g. Telegram) use the `AgentHandle` to submit new user
+/// messages while the agent is already processing, instead of dropping
+/// them. The `Receiver<AgentEvent>` streams real-time progress events,
+/// and the `JoinHandle` resolves to the final conversation.
+pub async fn run_agent_interactive(
+    ctx: &AgentContext,
+    mut conv: Conversation,
+    user_content: &str,
+    trace_id: Uuid,
+) -> std::result::Result<
+    (
+        AgentHandle,
+        mpsc::Receiver<AgentEvent>,
+        JoinHandle<AgentRunCompletion>,
+    ),
+    RuntimeError,
+> {
+    rustykrab_core::prompt_trace::with_trace_id(trace_id, async move {
+        let (runner, session) =
+            prepare_agent(ctx, &mut conv, user_content, &RunOptions::default()).await?;
+        let busy = ctx.agent_id.map(|id| ctx.activity.begin_run(id));
+        // start() carries the task-local prompt trace into the spawned task.
+        // Keep the downtime exclusion alive until that task actually ends.
+        let (handle, events, task) = runner.start(conv, session);
+        let completion = tokio::spawn(async move {
+            let _busy = busy;
+            task.await
+                .expect("interactive runner catches execution panics")
+        });
+        Ok((handle, events, completion))
+    })
+    .await
+}
+
+/// Drain channel progress until completion or inactivity, then retrieve the
+/// owned conversation even on a stall. Cancellation interrupts execution; it
+/// never implies that an already-started external action was rolled back.
+pub async fn await_interactive_run(
+    handle: &AgentHandle,
+    events: mpsc::Receiver<AgentEvent>,
+    task: JoinHandle<AgentRunCompletion>,
+    idle_timeout: std::time::Duration,
+) -> Result<(AgentRunCompletion, bool), tokio::task::JoinError> {
+    let stalled = wait_for_idle_or_close(events, idle_timeout).await;
+    if stalled {
+        let _ = handle.cancel().await;
+    }
+    task.await.map(|completion| (completion, stalled))
+}
+
+async fn wait_for_idle_or_close(
+    mut events: mpsc::Receiver<AgentEvent>,
+    idle_timeout: std::time::Duration,
+) -> bool {
+    loop {
+        match tokio::time::timeout(idle_timeout, events.recv()).await {
+            Ok(Some(_)) => {}
+            Ok(None) => return false,
+            Err(_) => return true,
+        }
+    }
+}
+
+/// Run the agent loop with streaming events.
+pub async fn run_agent_streaming(
+    ctx: &AgentContext,
+    conv: &mut Conversation,
+    user_content: &str,
+    on_event: &(dyn Fn(AgentEvent) + Send + Sync),
+    trace_id: Uuid,
+) -> Result<Message, RuntimeError> {
+    run_agent_streaming_with_options(
+        ctx,
+        conv,
+        user_content,
+        on_event,
+        trace_id,
+        &RunOptions::default(),
+    )
+    .await
+}
+
+/// Like [`run_agent_streaming`] but accepts caller-supplied [`RunOptions`].
+pub async fn run_agent_streaming_with_options(
+    ctx: &AgentContext,
+    conv: &mut Conversation,
+    user_content: &str,
+    on_event: &(dyn Fn(AgentEvent) + Send + Sync),
+    trace_id: Uuid,
+    options: &RunOptions,
+) -> Result<Message, RuntimeError> {
+    rustykrab_core::prompt_trace::with_trace_id(trace_id, async move {
+        let (runner, session) = prepare_agent(ctx, conv, user_content, options).await?;
+
+        // See `run_agent_with_options` -- a long turn must not read as
+        // idle while it is still running.
+        let _busy = ctx
+            .agent_id
+            .map(|agent_id| ctx.activity.begin_run(agent_id));
+
+        runner
+            .run_streaming(conv, &session, on_event)
+            .await
+            .map_err(|e| {
+                tracing::error!(%trace_id, "agent error: {e}");
+                RuntimeError::Internal
+            })?;
+
+        extract_assistant_message(conv)
+    })
+    .await
+}
+
+#[cfg(test)]
+mod outcome_contract_tests {
+    //! Which skills get to be judged as ground truth.
+    //!
+    //! The derivation lives here, rather than at each caller, because a
+    //! skill's claims should not depend on which door the turn came
+    //! through. It used to be wired only into the cron path, so the same
+    //! skill produced verifiable evidence on a schedule and proxy evidence
+    //! in conversation.
+
+    use super::*;
+    use std::sync::Arc;
+
+    fn skill_with_outcome(
+        name: &str,
+        checks: &[&str],
+        signal: Option<&str>,
+    ) -> Arc<rustykrab_skills::skill_md::SkillMd> {
+        use rustykrab_skills::skill_md::{
+            RequirementValidation, SkillMd, SkillMdFrontmatter, SkillOutcome, SkillRequirements,
+        };
+        use std::path::PathBuf;
+
+        Arc::new(SkillMd {
+            path: PathBuf::from(format!("/tmp/{name}/SKILL.md")),
+            frontmatter: SkillMdFrontmatter {
+                name: name.to_string(),
+                description: "test skill".to_string(),
+                version: "1.0".to_string(),
+                requires: SkillRequirements::default(),
+                user_invocable: true,
+                emoji: None,
+                extra: Default::default(),
+                outcome: Some(SkillOutcome {
+                    success: "the meeting is booked".to_string(),
+                    checks: checks.iter().map(|c| c.to_string()).collect(),
+                    signal: signal.map(|s| s.to_string()),
+                }),
+            },
+            raw_body: "body".to_string(),
+            validation: RequirementValidation {
+                missing_env: Vec::new(),
+                missing_bins: Vec::new(),
+            },
+        })
+    }
+
+    fn registry_with(
+        skill: Option<Arc<rustykrab_skills::skill_md::SkillMd>>,
+    ) -> rustykrab_skills::SkillRegistry {
+        let registry = rustykrab_skills::SkillRegistry::new();
+        if let Some(s) = skill {
+            registry.register_md(s);
+        }
+        registry
+    }
+
+    fn options_for(name: &str) -> RunOptions {
+        RunOptions {
+            active_skill: Some((name.to_string(), "body".to_string())),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_verifiable_skill_yields_a_contract() {
+        let registry = registry_with(Some(skill_with_outcome(
+            "calendar-booking",
+            &["calendar_event_created", "email_sent"],
+            Some("verifiable"),
+        )));
+        let contract = contract_for_active_skill(&registry, &options_for("calendar-booking"))
+            .expect("a verifiable skill declares");
+
+        assert_eq!(contract.skill, "calendar-booking");
+        assert_eq!(contract.checks.len(), 2);
+    }
+
+    #[test]
+    fn a_skill_that_asked_for_another_kind_of_judgement_yields_no_contract() {
+        // Checks alone must not buy ground truth, or the loop could promote
+        // a model's opinion of itself to fact.
+        for (name, signal) in [
+            ("judged", Some("judge")),
+            ("implicit", Some("implicit")),
+            ("unstated", None),
+        ] {
+            let registry =
+                registry_with(Some(skill_with_outcome(name, &["did_the_thing"], signal)));
+            assert!(
+                contract_for_active_skill(&registry, &options_for(name)).is_none(),
+                "{name} must not be treated as verifiable"
+            );
+        }
+    }
+
+    #[test]
+    fn a_skill_declaring_no_checks_yields_no_contract() {
+        let registry = registry_with(Some(skill_with_outcome("vague", &[], Some("verifiable"))));
+        assert!(contract_for_active_skill(&registry, &options_for("vague")).is_none());
+    }
+
+    #[test]
+    fn no_active_skill_means_no_contract() {
+        // The overwhelmingly common turn. Nothing declared anything, so
+        // there is nothing to check and nothing to pay for.
+        let registry = registry_with(None);
+        assert!(contract_for_active_skill(&registry, &RunOptions::default()).is_none());
+    }
+
+    #[test]
+    fn an_unknown_skill_name_yields_no_contract() {
+        let registry = registry_with(Some(skill_with_outcome(
+            "known",
+            &["x"],
+            Some("verifiable"),
+        )));
+        assert!(contract_for_active_skill(&registry, &options_for("missing")).is_none());
+    }
+}
+
+#[cfg(test)]
+mod channel_lifecycle_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn closed_progress_is_completion_not_timeout() {
+        let (tx, rx) = mpsc::channel(1);
+        tx.send(AgentEvent::Done).await.unwrap();
+        drop(tx);
+        assert!(!wait_for_idle_or_close(rx, Duration::from_secs(1)).await);
+    }
+
+    #[tokio::test]
+    async fn silent_open_progress_is_a_stall() {
+        let (_tx, rx) = mpsc::channel(1);
+        assert!(wait_for_idle_or_close(rx, Duration::from_millis(10)).await);
+    }
+
+    #[tokio::test]
+    async fn each_progress_event_renews_idle_timeout() {
+        let (tx, rx) = mpsc::channel(1);
+        let progress = tokio::spawn(async move {
+            for _ in 0..4 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                tx.send(AgentEvent::TextDelta("progress".into()))
+                    .await
+                    .unwrap();
+            }
+        });
+        assert!(!wait_for_idle_or_close(rx, Duration::from_millis(60)).await);
+        progress.await.unwrap();
+    }
+}

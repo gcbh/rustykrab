@@ -1,4 +1,3 @@
-use chrono::Utc;
 use hmac::{Hmac, Mac};
 use rustykrab_core::crypto::constant_time_eq;
 use rustykrab_core::types::{Message, MessageContent, Role};
@@ -10,7 +9,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
-use uuid::Uuid;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -71,7 +69,16 @@ impl TelegramChannel {
             .expect("failed to build HTTP client");
         Self {
             client,
-            api_base: format!("https://api.telegram.org/bot{bot_token}"),
+            // `TELEGRAM_API_BASE` redirects the Bot API at a local stand-in so
+            // harnesses can observe what the bot would have sent without
+            // talking to Telegram. Unset in every real deployment, where this
+            // is the documented api.telegram.org endpoint.
+            api_base: match std::env::var("TELEGRAM_API_BASE") {
+                Ok(base) if !base.trim().is_empty() => {
+                    format!("{}/bot{bot_token}", base.trim_end_matches('/'))
+                }
+                _ => format!("https://api.telegram.org/bot{bot_token}"),
+            },
             bot_token,
             allowed_chats,
             webhook_secret: None,
@@ -288,8 +295,8 @@ impl TelegramChannel {
                 continue;
             }
 
-            let raw_text = match resp.text().await {
-                Ok(t) => t,
+            let raw = match resp.bytes().await {
+                Ok(b) => b,
                 Err(e) => {
                     consecutive_errors += 1;
                     let delay = backoff_delay(consecutive_errors);
@@ -303,9 +310,16 @@ impl TelegramChannel {
                 }
             };
 
-            tracing::debug!(raw_json = %raw_text, "raw getUpdates response");
+            // Only render the raw body when debug logging is actually on;
+            // it is a per-poll allocation otherwise.
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                tracing::debug!(
+                    raw_json = %String::from_utf8_lossy(&raw),
+                    "raw getUpdates response"
+                );
+            }
 
-            let body: GetUpdatesResponse = match serde_json::from_str(&raw_text) {
+            let body: GetUpdatesResponse = match serde_json::from_slice(&raw) {
                 Ok(b) => b,
                 Err(e) => {
                     consecutive_errors += 1;
@@ -485,12 +499,7 @@ impl TelegramChannel {
 
         tracing::info!(chat_id, thread_id, %from, "received Telegram message");
 
-        let message = Message {
-            id: Uuid::new_v4(),
-            role: Role::User,
-            content: MessageContent::Text(text),
-            created_at: Utc::now(),
-        };
+        let message = Message::stamped(Role::User, MessageContent::Text(text));
 
         self.inbound_tx
             .send(ChannelMessage {

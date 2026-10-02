@@ -92,14 +92,12 @@ impl ToolErrorKind {
         }
     }
 
-    /// Whether retrying the *same* call unchanged might succeed. Distinct from
-    /// the runner's retry policy: this is a hint to the model. `InvalidInput`
-    /// and `NotFound` are false because the model must change something first.
+    /// Whether retrying the *same* call unchanged might succeed. Timeouts are
+    /// false because a model must narrow the work or explicitly request a
+    /// longer tool timeout; repeating an unchanged call only burns the same
+    /// timeout again.
     pub fn retryable(&self) -> bool {
-        matches!(
-            self,
-            ToolErrorKind::Timeout | ToolErrorKind::RateLimited | ToolErrorKind::Transient
-        )
+        matches!(self, ToolErrorKind::RateLimited | ToolErrorKind::Transient)
     }
 }
 
@@ -132,6 +130,12 @@ pub enum Error {
     #[error("model provider error: {0}")]
     ModelProvider(String),
 
+    /// The model produced nothing at all: no text, no tool calls, zero
+    /// generated tokens. Displayed like `ModelProvider` but typed, so the
+    /// agent loop can tell "nothing more to say" from a failed call.
+    #[error("model provider error: {0}")]
+    ModelEmptyResponse(String),
+
     #[error("model provider rate limited: {0}")]
     ModelRateLimit(String),
 
@@ -140,6 +144,13 @@ pub enum Error {
 
     #[error("model provider bad request: {0}")]
     ModelBadRequest(String),
+
+    /// Refused before dispatch; no messages have been silently removed.
+    #[error("model input requires approximately {estimated_input_tokens} tokens but only {input_budget_tokens} are available; compact history or reduce the active tool schemas")]
+    ContextBudgetExceeded {
+        estimated_input_tokens: usize,
+        input_budget_tokens: usize,
+    },
 
     #[error("model provider overloaded: {0}")]
     ModelOverloaded(String),
@@ -168,6 +179,21 @@ pub enum Error {
     #[error("not found: {0}")]
     NotFound(String),
 
+    /// A create-only write hit an existing name. Distinct from `Storage` so
+    /// callers can offer "overwrite?" instead of reporting a failure.
+    #[error("already exists: {0}")]
+    AlreadyExists(String),
+
+    /// An agent-authored credential change was queued for the user to
+    /// approve rather than applied. Carries the request id so the agent can
+    /// tell the user what to look for.
+    ///
+    /// Not really an error — it is the guard working — but it travels the
+    /// error path so every tool that writes credentials reports it without
+    /// per-tool code.
+    #[error("change to '{name}' needs your approval (request {request_id})")]
+    PendingApproval { request_id: String, name: String },
+
     #[error("{0}")]
     Internal(String),
 }
@@ -182,14 +208,39 @@ impl Error {
             Error::ToolExecution(te) => te.kind,
             Error::ModelRateLimit(_) | Error::ModelOverloaded(_) => ToolErrorKind::RateLimited,
             Error::ModelAuthError(_) | Error::Auth(_) => ToolErrorKind::PermissionDenied,
-            Error::ModelBadRequest(_) => ToolErrorKind::InvalidInput,
+            Error::ModelBadRequest(_) | Error::ContextBudgetExceeded { .. } => {
+                ToolErrorKind::InvalidInput
+            }
             Error::NotFound(_) => ToolErrorKind::NotFound,
-            Error::ModelProvider(_) | Error::Channel(_) => ToolErrorKind::Transient,
+            Error::AlreadyExists(_) => ToolErrorKind::InvalidInput,
+            // The agent asked for something it isn't allowed to do
+            // unilaterally; the user now has to decide.
+            Error::PendingApproval { .. } => ToolErrorKind::PermissionDenied,
+            Error::ModelProvider(_) | Error::ModelEmptyResponse(_) | Error::Channel(_) => {
+                ToolErrorKind::Transient
+            }
             Error::Config(_)
             | Error::Storage(_)
             | Error::Serialization(_)
             | Error::ContentPolicy
             | Error::Internal(_) => ToolErrorKind::Internal,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn context_budget_refusal_requires_a_changed_request() {
+        let error = Error::ContextBudgetExceeded {
+            estimated_input_tokens: 9_000,
+            input_budget_tokens: 4_096,
+        };
+        assert_eq!(error.kind(), ToolErrorKind::InvalidInput);
+        assert!(!error.kind().retryable());
+        assert!(error.to_string().contains("9000"));
+        assert!(error.to_string().contains("4096"));
     }
 }

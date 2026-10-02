@@ -126,7 +126,8 @@ async fn execute_repl_call_impl(
     tracing::info!(
         depth,
         context_chars = context.len(),
-        prompt_preview = &prompt[..prompt.len().min(100)],
+        // Snap to a char boundary — a byte offset can land mid-UTF-8 and panic.
+        prompt_preview = &prompt[..prompt.floor_char_boundary(100)],
         "RLM REPL: executing call"
     );
 
@@ -181,12 +182,14 @@ async fn execute_repl_call_impl(
             role: Role::System,
             content: MessageContent::Text(system),
             created_at: Utc::now(),
+            agent_version: Message::version_stamp(),
         },
         Message {
             id: Uuid::new_v4(),
             role: Role::User,
             content: MessageContent::Text(prompt),
             created_at: Utc::now(),
+            agent_version: Message::version_stamp(),
         },
     ];
 
@@ -195,6 +198,10 @@ async fn execute_repl_call_impl(
     let timeout_secs = config.model_call_timeout_secs;
     let mut empty_tool_use_retries: usize = 0;
     let max_empty_tool_use_retries: usize = 3;
+    // Consecutive MaxTokens responses. A model that truncates every turn
+    // makes no progress from "Continue." — cap it like the other retry
+    // categories instead of burning the remaining rounds.
+    let mut max_tokens_retries: usize = 0;
 
     for round in 0..max_rounds {
         // Acquire a semaphore permit for the LLM call only — released
@@ -228,6 +235,7 @@ async fn execute_repl_call_impl(
         // If the model wants to use tools, execute them and continue.
         if response.message.content.has_tool_calls() {
             empty_tool_use_retries = 0;
+            max_tokens_retries = 0;
             messages.push(response.message.clone());
 
             let calls = response.message.content.tool_calls();
@@ -256,6 +264,7 @@ async fn execute_repl_call_impl(
                     role: Role::Tool,
                     content: MessageContent::ToolResult(result),
                     created_at: Utc::now(),
+                    agent_version: Message::version_stamp(),
                 });
             }
             continue;
@@ -273,6 +282,17 @@ async fn execute_repl_call_impl(
                 return Ok(answer);
             }
             StopReason::MaxTokens => {
+                max_tokens_retries += 1;
+                if max_tokens_retries > 3 {
+                    let answer = response.message.content.as_text().unwrap_or("").to_string();
+                    tracing::warn!(
+                        depth,
+                        round,
+                        answer_len = answer.len(),
+                        "RLM REPL: max-tokens retries exhausted — returning truncated answer"
+                    );
+                    return Ok(answer);
+                }
                 tracing::warn!(
                     depth,
                     round,
@@ -284,6 +304,7 @@ async fn execute_repl_call_impl(
                     role: Role::User,
                     content: MessageContent::Text("Continue.".to_string()),
                     created_at: Utc::now(),
+                    agent_version: Message::version_stamp(),
                 });
                 continue;
             }
@@ -324,6 +345,7 @@ async fn execute_repl_call_impl(
                             .to_string(),
                     ),
                     created_at: Utc::now(),
+                                    agent_version: Message::version_stamp(),
                 });
                 continue;
             }
@@ -387,6 +409,7 @@ async fn direct_call(
             role: Role::System,
             content: MessageContent::Text(format!("Context:\n{context}")),
             created_at: Utc::now(),
+            agent_version: Message::version_stamp(),
         });
     }
     messages.push(Message {
@@ -394,6 +417,7 @@ async fn direct_call(
         role: Role::User,
         content: MessageContent::Text(prompt.to_string()),
         created_at: Utc::now(),
+        agent_version: Message::version_stamp(),
     });
 
     let response = provider.chat(&messages, &[]).await?;
@@ -429,6 +453,7 @@ mod tests {
                     role: Role::Assistant,
                     content: MessageContent::Text(text.to_string()),
                     created_at: Utc::now(),
+                    agent_version: None,
                 },
                 usage: Usage {
                     prompt_tokens: 10,
@@ -452,6 +477,7 @@ mod tests {
                         arguments: args,
                     }),
                     created_at: Utc::now(),
+                    agent_version: None,
                 },
                 usage: Usage {
                     prompt_tokens: 10,

@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use rustykrab_core::types::ToolSchema;
 use rustykrab_core::{Error, Result, SandboxRequirements, Tool};
-use rustykrab_store::SecretStore;
+use rustykrab_store::GuardedSecrets;
 use serde_json::{json, Value};
 
 // ---------------------------------------------------------------------------
@@ -13,17 +13,28 @@ const KEY_API_KEY: &str = "obsidian_api_key";
 const KEY_SYNC_FOLDER: &str = "obsidian_sync_folder";
 const DEFAULT_API_URL: &str = "https://127.0.0.1:27124";
 
+/// Shared client for the free-function sync helpers, built once instead of
+/// per call. The Obsidian Local REST API uses a self-signed certificate by
+/// default, so invalid certs are accepted — this is a localhost-only
+/// connection.
+static SYNC_CLIENT: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(|| {
+    reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .unwrap_or_default()
+});
+
 // ---------------------------------------------------------------------------
 // Tool struct
 // ---------------------------------------------------------------------------
 
 pub struct ObsidianTool {
-    secrets: SecretStore,
+    secrets: GuardedSecrets,
     client: reqwest::Client,
 }
 
 impl ObsidianTool {
-    pub fn new(secrets: SecretStore) -> Self {
+    pub fn new(secrets: GuardedSecrets) -> Self {
         // The Obsidian Local REST API uses a self-signed certificate by default.
         // Accept invalid certs since this is a localhost-only connection.
         let client = reqwest::Client::builder()
@@ -33,14 +44,15 @@ impl ObsidianTool {
         Self { secrets, client }
     }
 
-    fn get_api_url(&self) -> String {
+    async fn get_api_url(&self) -> String {
         self.secrets
             .get(KEY_API_URL)
+            .await
             .unwrap_or_else(|_| DEFAULT_API_URL.to_string())
     }
 
-    fn get_api_key(&self) -> Result<String> {
-        self.secrets.get(KEY_API_KEY).map_err(|_| {
+    async fn get_api_key(&self) -> Result<String> {
+        self.secrets.get(KEY_API_KEY).await.map_err(|_| {
             Error::ToolExecution(
                 "obsidian_api_key not found. Store it with: \
                  obsidian(action='setup', api_key='...') or \
@@ -51,13 +63,13 @@ impl ObsidianTool {
     }
 
     /// Build an authorized request to the Obsidian Local REST API.
-    fn obsidian_request(
+    async fn obsidian_request(
         &self,
         method: reqwest::Method,
         path: &str,
     ) -> Result<reqwest::RequestBuilder> {
-        let api_key = self.get_api_key()?;
-        let base_url = self.get_api_url();
+        let api_key = self.get_api_key().await?;
+        let base_url = self.get_api_url().await;
         let url = format!("{base_url}{path}");
         Ok(self
             .client
@@ -100,26 +112,33 @@ impl ObsidianTool {
             .ok_or_else(|| Error::ToolExecution("missing 'api_key' parameter".into()))?;
 
         self.secrets
-            .set(KEY_API_KEY, api_key)
+            .set_strict(KEY_API_KEY, api_key)
+            .await
             .map_err(|e| Error::ToolExecution(format!("failed to store API key: {e}").into()))?;
 
         if let Some(url) = args["api_url"].as_str() {
-            self.secrets.set(KEY_API_URL, url).map_err(|e| {
-                Error::ToolExecution(format!("failed to store API URL: {e}").into())
-            })?;
+            self.secrets
+                .set_strict(KEY_API_URL, url)
+                .await
+                .map_err(|e| {
+                    Error::ToolExecution(format!("failed to store API URL: {e}").into())
+                })?;
         }
 
         if let Some(folder) = args["sync_folder"].as_str() {
-            self.secrets.set(KEY_SYNC_FOLDER, folder).map_err(|e| {
-                Error::ToolExecution(format!("failed to store sync folder: {e}").into())
-            })?;
+            self.secrets
+                .set_strict(KEY_SYNC_FOLDER, folder)
+                .await
+                .map_err(|e| {
+                    Error::ToolExecution(format!("failed to store sync folder: {e}").into())
+                })?;
         }
 
         // Verify connectivity.
         let base_url = if let Some(url) = args["api_url"].as_str() {
             url.to_string()
         } else {
-            self.get_api_url()
+            self.get_api_url().await
         };
 
         let resp = self
@@ -169,7 +188,8 @@ impl ObsidianTool {
         let path = ensure_md_extension(path);
 
         let req = self
-            .obsidian_request(reqwest::Method::PUT, &format!("/vault/{path}"))?
+            .obsidian_request(reqwest::Method::PUT, &format!("/vault/{path}"))
+            .await?
             .header("Content-Type", "text/markdown")
             .body(content.to_string());
 
@@ -199,7 +219,8 @@ impl ObsidianTool {
         let path = ensure_md_extension(path);
 
         let req = self
-            .obsidian_request(reqwest::Method::GET, &format!("/vault/{path}"))?
+            .obsidian_request(reqwest::Method::GET, &format!("/vault/{path}"))
+            .await?
             .header("Accept", "text/markdown");
 
         let (status, body) = self.send_text(req).await?;
@@ -237,7 +258,8 @@ impl ObsidianTool {
         let path = ensure_md_extension(path);
 
         let req = self
-            .obsidian_request(reqwest::Method::PATCH, &format!("/vault/{path}"))?
+            .obsidian_request(reqwest::Method::PATCH, &format!("/vault/{path}"))
+            .await?
             .header("Content-Type", "text/markdown")
             .header("Content-Insertion-Position", "end")
             .body(content.to_string());
@@ -267,8 +289,8 @@ impl ObsidianTool {
 
         let context_length = args["context_length"].as_u64().unwrap_or(100);
 
-        let api_key = self.get_api_key()?;
-        let base_url = self.get_api_url();
+        let api_key = self.get_api_key().await?;
+        let base_url = self.get_api_url().await;
 
         let resp = self
             .client
@@ -317,7 +339,9 @@ impl ObsidianTool {
 
         let path = ensure_md_extension(path);
 
-        let req = self.obsidian_request(reqwest::Method::DELETE, &format!("/vault/{path}"))?;
+        let req = self
+            .obsidian_request(reqwest::Method::DELETE, &format!("/vault/{path}"))
+            .await?;
 
         let (status, body) = self.send_text(req).await?;
 
@@ -346,7 +370,8 @@ impl ObsidianTool {
         let directory = args["directory"].as_str().unwrap_or("");
 
         let req = self
-            .obsidian_request(reqwest::Method::GET, "/vault/")?
+            .obsidian_request(reqwest::Method::GET, "/vault/")
+            .await?
             .header("Accept", "application/json");
 
         let data = self.send_and_parse(req).await?;
@@ -549,23 +574,24 @@ fn format_synced_note(
 /// Returns `Ok(Some(json))` on success, `Ok(None)` if Obsidian is not configured,
 /// or `Err(message)` if sync was attempted but failed.
 pub async fn try_sync_to_obsidian(
-    secrets: &SecretStore,
+    secrets: &GuardedSecrets,
     title: &str,
     content: Option<&str>,
     notion_id: Option<&str>,
     notion_url: Option<&str>,
 ) -> std::result::Result<Option<Value>, String> {
     // Check if Obsidian is configured.
-    let api_key = match secrets.get(KEY_API_KEY) {
+    let api_key = match secrets.get(KEY_API_KEY).await {
         Ok(key) => key,
         Err(_) => return Ok(None), // Not configured — skip silently.
     };
 
     let api_url = secrets
         .get(KEY_API_URL)
+        .await
         .unwrap_or_else(|_| DEFAULT_API_URL.to_string());
 
-    let sync_folder = secrets.get(KEY_SYNC_FOLDER).ok();
+    let sync_folder = secrets.get(KEY_SYNC_FOLDER).await.ok();
 
     // Build the vault path from the title.
     let filename = sanitize_filename(title);
@@ -579,12 +605,7 @@ pub async fn try_sync_to_obsidian(
 
     let note_content = format_synced_note(title, content, notion_id, notion_url);
 
-    let client = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
-        .build()
-        .map_err(|e| format!("failed to create HTTP client: {e}"))?;
-
-    let resp = client
+    let resp = SYNC_CLIENT
         .put(format!("{api_url}/vault/{vault_path}"))
         .header("Authorization", format!("Bearer {api_key}"))
         .header("Content-Type", "text/markdown")
@@ -609,20 +630,21 @@ pub async fn try_sync_to_obsidian(
 ///
 /// Same return semantics as [`try_sync_to_obsidian`].
 pub async fn try_sync_append_to_obsidian(
-    secrets: &SecretStore,
+    secrets: &GuardedSecrets,
     title: &str,
     content: &str,
 ) -> std::result::Result<Option<Value>, String> {
-    let api_key = match secrets.get(KEY_API_KEY) {
+    let api_key = match secrets.get(KEY_API_KEY).await {
         Ok(key) => key,
         Err(_) => return Ok(None),
     };
 
     let api_url = secrets
         .get(KEY_API_URL)
+        .await
         .unwrap_or_else(|_| DEFAULT_API_URL.to_string());
 
-    let sync_folder = secrets.get(KEY_SYNC_FOLDER).ok();
+    let sync_folder = secrets.get(KEY_SYNC_FOLDER).await.ok();
 
     let filename = sanitize_filename(title);
     let vault_path = match &sync_folder {
@@ -633,12 +655,7 @@ pub async fn try_sync_append_to_obsidian(
         None => format!("{filename}.md"),
     };
 
-    let client = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
-        .build()
-        .map_err(|e| format!("failed to create HTTP client: {e}"))?;
-
-    let resp = client
+    let resp = SYNC_CLIENT
         .patch(format!("{api_url}/vault/{vault_path}"))
         .header("Authorization", format!("Bearer {api_key}"))
         .header("Content-Type", "text/markdown")

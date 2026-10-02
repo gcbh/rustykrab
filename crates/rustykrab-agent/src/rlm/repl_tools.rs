@@ -327,7 +327,8 @@ impl Tool for SubQueryTool {
         tracing::info!(
             depth = self.depth + 1,
             context_slice = format!("[{}..{}]", start, end),
-            question_preview = &question[..question.len().min(80)],
+            // Snap to a char boundary — a byte offset can land mid-UTF-8 and panic.
+            question_preview = &question[..question.floor_char_boundary(80)],
             "RLM REPL: launching sub_query"
         );
 

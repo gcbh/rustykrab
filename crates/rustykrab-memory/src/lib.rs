@@ -51,6 +51,7 @@
 //! # }
 //! ```
 
+pub mod admission;
 pub mod backend;
 pub mod chunking;
 pub mod config;
@@ -66,6 +67,18 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+
+/// Canonical content hash for a memory.
+///
+/// Shared rather than inlined per call site: dedup compares these, so two
+/// implementations that drift apart would silently stop recognising
+/// duplicates.
+pub fn hash_content(content: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(content.as_bytes());
+    hex::encode(hasher.finalize())
+}
 
 pub use config::MemoryConfig;
 
@@ -106,11 +119,31 @@ impl MemorySystem {
     /// - `config`: tuning parameters for chunking, retrieval, and lifecycle.
     /// - `storage`: the backing store (SQLite, PostgreSQL, etc.).
     /// - `embedder`: the text embedding model (fastembed, API-based, etc.).
+    ///
+    /// Validates the config, because the values it guards are ones nothing
+    /// downstream can defend itself against: `rrf_k == 0.0` divides by zero
+    /// inside rank fusion, and `chunk_max_tokens == 0` loops forever. Both
+    /// used to surface as a panic on the first query, arbitrarily far from
+    /// the code that chose the value.
+    ///
+    /// # Panics
+    ///
+    /// If the config is invalid. Use [`Self::try_new`] to handle it.
     pub fn new(
         config: MemoryConfig,
         storage: Arc<dyn MemoryStorage>,
         embedder: Arc<dyn embedding::Embedder>,
     ) -> Self {
+        Self::try_new(config, storage, embedder).expect("invalid MemoryConfig")
+    }
+
+    /// [`Self::new`], returning the validation error instead of panicking.
+    pub fn try_new(
+        config: MemoryConfig,
+        storage: Arc<dyn MemoryStorage>,
+        embedder: Arc<dyn embedding::Embedder>,
+    ) -> std::result::Result<Self, config::ConfigValidationError> {
+        config.validate()?;
         let writer = MemoryWriter::new(Arc::clone(&storage), Arc::clone(&embedder), config.clone());
 
         let retriever =
@@ -119,13 +152,13 @@ impl MemorySystem {
         let lifecycle =
             LifecycleManager::new(Arc::clone(&storage), Arc::clone(&embedder), config.clone());
 
-        Self {
+        Ok(Self {
             writer,
             retriever,
             lifecycle,
             storage,
             config,
-        }
+        })
     }
 
     // ── Write path ──────────────────────────────────────────────
@@ -135,7 +168,7 @@ impl MemorySystem {
         &self,
         turn: ConversationTurn,
         agent_id: Uuid,
-    ) -> rustykrab_core::Result<Uuid> {
+    ) -> rustykrab_core::Result<Option<Uuid>> {
         self.writer.retain(turn, agent_id).await
     }
 
@@ -146,7 +179,7 @@ impl MemorySystem {
         turn: ConversationTurn,
         agent_id: Uuid,
         stage: LifecycleStage,
-    ) -> rustykrab_core::Result<Uuid> {
+    ) -> rustykrab_core::Result<Option<Uuid>> {
         self.writer.retain_with_stage(turn, agent_id, stage).await
     }
 
@@ -166,6 +199,21 @@ impl MemorySystem {
         limit: usize,
     ) -> rustykrab_core::Result<Vec<RetrievalResult>> {
         self.retriever.recall(query, agent_id, limit).await
+    }
+
+    /// [`Self::recall`] restricted to memories written during one
+    /// conversation. The filter runs inside retrieval, before access
+    /// recording, so out-of-session memories get no phantom access boost.
+    pub async fn recall_in_session(
+        &self,
+        query: &str,
+        agent_id: Uuid,
+        limit: usize,
+        session_id: Uuid,
+    ) -> rustykrab_core::Result<Vec<RetrievalResult>> {
+        self.retriever
+            .recall_filtered(query, agent_id, limit, Some(session_id))
+            .await
     }
 
     // ── Lifecycle management ────────────────────────────────────
@@ -188,6 +236,12 @@ impl MemorySystem {
         session_id: Uuid,
     ) -> rustykrab_core::Result<u32> {
         self.lifecycle.finalize_session(agent_id, session_id).await
+    }
+
+    /// Promote every Working memory for an agent to Episodic. For shutdown —
+    /// see [`lifecycle::LifecycleManager::finalize_working_set`].
+    pub async fn finalize_working_set(&self, agent_id: Uuid) -> rustykrab_core::Result<u32> {
+        self.lifecycle.finalize_working_set(agent_id).await
     }
 
     /// Detect near-duplicate memories and create similarity links.

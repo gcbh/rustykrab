@@ -1,9 +1,7 @@
 use async_trait::async_trait;
-use chrono::Utc;
 use rustykrab_core::types::{Message, MessageContent, Role};
 use rustykrab_core::Result;
 use tokio::sync::mpsc;
-use uuid::Uuid;
 
 use crate::Channel;
 
@@ -65,11 +63,6 @@ impl WebChatChannel {
             .recv()
             .await
             .ok_or_else(|| rustykrab_core::Error::Channel("channel closed".into()))?;
-        Ok(Message {
-            id: Uuid::new_v4(),
-            role: Role::User,
-            content: MessageContent::Text(text),
-            created_at: Utc::now(),
-        })
+        Ok(Message::stamped(Role::User, MessageContent::Text(text)))
     }
 }

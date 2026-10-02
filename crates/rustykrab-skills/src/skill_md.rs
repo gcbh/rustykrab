@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use rustykrab_core::outcome::SignalClass;
 use rustykrab_core::types::ToolSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -20,9 +21,65 @@ pub struct SkillMdFrontmatter {
     pub user_invocable: bool,
     #[serde(default)]
     pub emoji: Option<String>,
+    /// Declared definition of done. Absent means the skill is *frozen*:
+    /// it runs normally, but the self-improvement outer loop will never
+    /// propose edits to it. See `DREAMING.md`.
+    #[serde(default)]
+    pub outcome: Option<SkillOutcome>,
     /// Forward-compatible catch-all for unknown fields.
     #[serde(flatten)]
     pub extra: HashMap<String, toml::Value>,
+}
+
+/// What success means for a skill, and what evidence should establish it.
+///
+/// A skill exists only to cause an outcome in the world, so "better
+/// instructions" is undefined except relative to that outcome. Declaring it
+/// is what makes a skill eligible for automated improvement at all — an
+/// undeclared skill can only be mutated blindly, which is drift rather than
+/// improvement.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SkillOutcome {
+    /// Natural-language definition of done.
+    #[serde(default)]
+    pub success: String,
+    /// Optional machine-checkable post-conditions, when the skill's effect
+    /// is verifiable (e.g. `"calendar.event_created"`).
+    #[serde(default)]
+    pub checks: Vec<String>,
+    /// Which class of evidence to trust for this skill: `verifiable`,
+    /// `explicit`, `implicit`, or `judge`.
+    #[serde(default)]
+    pub signal: Option<String>,
+}
+
+impl SkillOutcome {
+    /// The declared signal class, defaulting to the weakest interpretation.
+    ///
+    /// An unset or unparseable `signal` yields [`SignalClass::Implicit`]
+    /// rather than something stronger: mistakenly treating a proxy as
+    /// ground truth is the failure that lets a loop optimize its own
+    /// measurement, so an unclear declaration must not buy authority.
+    pub fn signal_class(&self) -> SignalClass {
+        self.signal
+            .as_deref()
+            .and_then(SignalClass::parse)
+            .unwrap_or(SignalClass::Implicit)
+    }
+
+    /// Whether this declaration is complete enough to optimize against.
+    ///
+    /// A `[outcome]` block with an empty `success` states nothing, and is
+    /// treated as if it were absent.
+    pub fn is_declared(&self) -> bool {
+        !self.success.trim().is_empty()
+    }
+
+    /// Whether outcomes for this skill can be established mechanically
+    /// rather than inferred.
+    pub fn is_verifiable(&self) -> bool {
+        self.signal_class() == SignalClass::Verifiable && !self.checks.is_empty()
+    }
 }
 
 /// Environment and binary requirements for a skill.
@@ -56,6 +113,32 @@ pub struct SkillMd {
     /// Raw markdown body (everything after the second `---`).
     pub raw_body: String,
     pub validation: RequirementValidation,
+}
+
+impl SkillMd {
+    /// Whether the self-improvement outer loop may propose changes to this
+    /// skill.
+    ///
+    /// The rule is deliberately conservative: no declared outcome means
+    /// frozen. A skill that cannot be measured can still be used — it just
+    /// cannot be optimized, because there would be no way to tell an
+    /// improvement from a regression.
+    pub fn is_optimizable(&self) -> bool {
+        self.frontmatter
+            .outcome
+            .as_ref()
+            .is_some_and(|o| o.is_declared())
+    }
+
+    /// The evidence class this skill's outcomes should be judged by, or
+    /// `None` if it has declared no outcome at all.
+    pub fn signal_class(&self) -> Option<SignalClass> {
+        self.frontmatter
+            .outcome
+            .as_ref()
+            .filter(|o| o.is_declared())
+            .map(|o| o.signal_class())
+    }
 }
 
 /// Parse a SKILL.md string into its frontmatter and body.
@@ -162,5 +245,140 @@ Use these instructions carefully.
     fn parse_missing_delimiter() {
         let content = "name = \"no-delimiters\"\nBody text\n";
         assert!(parse_skill_md(content).is_err());
+    }
+
+    fn skill_from(content: &str) -> SkillMd {
+        let (frontmatter, raw_body) = parse_skill_md(content).unwrap();
+        SkillMd {
+            path: PathBuf::from("/tmp/test-skill"),
+            frontmatter,
+            raw_body,
+            validation: RequirementValidation {
+                missing_env: Vec::new(),
+                missing_bins: Vec::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn parses_outcome_block() {
+        let skill = skill_from(
+            r#"---
+name = "calendar"
+
+[outcome]
+success = "The requested event exists and the user confirmed the details."
+checks = ["calendar.event_created", "user.confirmed"]
+signal = "verifiable"
+---
+Body
+"#,
+        );
+        let outcome = skill.frontmatter.outcome.as_ref().unwrap();
+        assert_eq!(
+            outcome.success,
+            "The requested event exists and the user confirmed the details."
+        );
+        assert_eq!(outcome.checks.len(), 2);
+        assert_eq!(outcome.signal_class(), SignalClass::Verifiable);
+        assert!(outcome.is_verifiable());
+        assert!(skill.is_optimizable());
+        assert_eq!(skill.signal_class(), Some(SignalClass::Verifiable));
+    }
+
+    #[test]
+    fn skill_without_outcome_is_frozen() {
+        let skill = skill_from("---\nname = \"legacy\"\n---\nBody\n");
+        assert!(skill.frontmatter.outcome.is_none());
+        assert!(!skill.is_optimizable());
+        assert_eq!(skill.signal_class(), None);
+    }
+
+    #[test]
+    fn empty_success_is_treated_as_undeclared() {
+        // An [outcome] block that states nothing must not buy eligibility.
+        let skill = skill_from(
+            r#"---
+name = "vague"
+
+[outcome]
+success = "   "
+signal = "verifiable"
+---
+Body
+"#,
+        );
+        assert!(!skill.is_optimizable());
+        assert_eq!(skill.signal_class(), None);
+    }
+
+    #[test]
+    fn unparseable_signal_falls_back_to_weakest_class() {
+        // An unclear declaration must not be read as ground truth.
+        let skill = skill_from(
+            r#"---
+name = "odd"
+
+[outcome]
+success = "Something happened."
+signal = "wishful-thinking"
+---
+Body
+"#,
+        );
+        assert_eq!(skill.signal_class(), Some(SignalClass::Implicit));
+        assert!(!skill
+            .frontmatter
+            .outcome
+            .as_ref()
+            .unwrap()
+            .signal_class()
+            .is_ground_truth());
+    }
+
+    #[test]
+    fn verifiable_requires_checks() {
+        // Claiming a verifiable signal without post-conditions to check
+        // leaves nothing to verify against.
+        let skill = skill_from(
+            r#"---
+name = "claims-too-much"
+
+[outcome]
+success = "It worked."
+signal = "verifiable"
+---
+Body
+"#,
+        );
+        let outcome = skill.frontmatter.outcome.as_ref().unwrap();
+        assert_eq!(outcome.signal_class(), SignalClass::Verifiable);
+        assert!(!outcome.is_verifiable());
+    }
+
+    #[test]
+    fn outcome_block_does_not_disturb_existing_fields() {
+        let skill = skill_from(
+            r#"---
+name = "full"
+description = "Has everything"
+version = "2.0"
+user_invocable = true
+
+[requires]
+env = ["KEY"]
+
+[outcome]
+success = "Done."
+---
+Body
+"#,
+        );
+        assert_eq!(skill.frontmatter.name, "full");
+        assert_eq!(skill.frontmatter.description, "Has everything");
+        assert_eq!(skill.frontmatter.version, "2.0");
+        assert!(skill.frontmatter.user_invocable);
+        assert_eq!(skill.frontmatter.requires.env, vec!["KEY"]);
+        assert!(skill.is_optimizable());
     }
 }

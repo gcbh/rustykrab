@@ -200,13 +200,31 @@ pub fn delete_master_key() -> Result<(), Error> {
 #[cfg(target_os = "macos")]
 pub fn resolve_master_key() -> Result<Vec<u8>, Error> {
     // Priority 1: environment variable (for CI, Docker, non-macOS deployments).
+    // An empty/whitespace value is treated as unset rather than decoding to
+    // a zero-length key — matching the non-macOS branch below.
     if let Ok(env_key) = std::env::var("RUSTYKRAB_MASTER_KEY") {
-        tracing::info!("using master key from RUSTYKRAB_MASTER_KEY env var");
-        return hex::decode(env_key.trim()).map_err(|e| {
-            Error::Storage(format!(
-                "RUSTYKRAB_MASTER_KEY must be a hex-encoded string: {e}"
-            ))
-        });
+        let trimmed = env_key.trim();
+        if !trimmed.is_empty() {
+            tracing::info!("using master key from RUSTYKRAB_MASTER_KEY env var");
+            return hex::decode(trimmed).map_err(|e| {
+                Error::Storage(format!(
+                    "RUSTYKRAB_MASTER_KEY must be a hex-encoded string: {e}"
+                ))
+            });
+        }
+        tracing::warn!("RUSTYKRAB_MASTER_KEY is set but empty — ignoring it");
+    }
+
+    // With the Keychain disabled (E2E harness) the env var is the only
+    // source — refuse to start rather than read or write the real
+    // Keychain, mirroring the non-macOS behaviour.
+    if keychain_disabled_by_env() {
+        return Err(Error::Storage(
+            "RUSTYKRAB_DISABLE_KEYCHAIN is set but RUSTYKRAB_MASTER_KEY is not — \
+             provide the master key via the environment (generate one with \
+             `openssl rand -hex 32`)."
+                .to_string(),
+        ));
     }
 
     // Priority 2: macOS Data Protection Keychain (no password prompt).
@@ -295,9 +313,29 @@ pub struct KeychainCredential {
 }
 
 /// Returns `true` on macOS (Data Protection Keychain), `false` elsewhere.
+///
+/// `RUSTYKRAB_DISABLE_KEYCHAIN=1` forces `false` on macOS too. The E2E
+/// harness sets it when booting a throwaway daemon with dummy secrets so
+/// the registry's persist-downward writes can never touch the real user
+/// Keychain.
 #[cfg(target_os = "macos")]
 pub fn keychain_available() -> bool {
-    true
+    !keychain_disabled_by_env()
+}
+
+/// A safety switch must fail **safe**: setting it to anything at all
+/// (`1`, `yes`, `on`, …) disables the Keychain. Only an absent, empty, or
+/// explicitly negative value keeps it enabled, so a typo can never
+/// silently leave the real Keychain live for a run that meant to avoid it.
+#[cfg(target_os = "macos")]
+fn keychain_disabled_by_env() -> bool {
+    match std::env::var("RUSTYKRAB_DISABLE_KEYCHAIN") {
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "" | "0" | "false" | "no" | "off"
+        ),
+        Err(_) => false,
+    }
 }
 
 /// No OS credential store on this platform.

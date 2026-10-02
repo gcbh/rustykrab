@@ -1,0 +1,579 @@
+[
+  {
+    "run": "base-http-batch-cred",
+    "http_status": 200,
+    "reply": "batch credential done",
+    "tool_results": 3,
+    "tool_results_outside_context_error": 1,
+    "credential_request_conversation_id_matches": [
+      false
+    ],
+    "health_after": 200,
+    "daemon_alive_after": true,
+    "log_markers": {
+      "invoked outside of an agent session context": 1
+    }
+  },
+  {
+    "run": "base-http-batch-todo",
+    "http_status": 200,
+    "reply": "batch todo done",
+    "tool_results": 3,
+    "tool_results_outside_context_error": 1,
+    "credential_request_conversation_id_matches": [],
+    "health_after": 200,
+    "daemon_alive_after": true,
+    "log_markers": {
+      "invoked outside of an agent session context": 1
+    }
+  },
+  {
+    "run": "base-http-batch-tools",
+    "http_status": 200,
+    "reply": "batch tools_list done",
+    "tool_results": 3,
+    "tool_results_outside_context_error": 2,
+    "credential_request_conversation_id_matches": [],
+    "health_after": 200,
+    "daemon_alive_after": true,
+    "log_markers": {
+      "invoked outside of an agent session context": 2
+    }
+  },
+  {
+    "run": "base-http-silence",
+    "http_status": 500,
+    "reply": null,
+    "tool_results": 1,
+    "tool_results_outside_context_error": 0,
+    "credential_request_conversation_id_matches": [],
+    "health_after": 200,
+    "daemon_alive_after": true,
+    "log_markers": {
+      "EndTurn without task_complete after tool use": 1,
+      "Ollama returned an empty response": 1
+    }
+  },
+  {
+    "run": "base-http-silent-first",
+    "http_status": 500,
+    "reply": null,
+    "tool_results": 0,
+    "tool_results_outside_context_error": 0,
+    "credential_request_conversation_id_matches": [],
+    "health_after": 200,
+    "daemon_alive_after": true,
+    "log_markers": {
+      "Ollama returned an empty response": 1
+    }
+  },
+  {
+    "run": "base-tg-batch-cred-r1",
+    "telegram_messages": [
+      "batch credential done"
+    ],
+    "credential_link_delivered": false,
+    "reply_delivered": true,
+    "credential_request_conversation_id_null": [
+      true
+    ],
+    "credential_request_link_minted": [
+      true
+    ],
+    "daemon_alive_after": true,
+    "log_markers": {
+      "invoked outside of an agent session context": 1
+    }
+  },
+  {
+    "run": "base-tg-batch-cred-r2",
+    "telegram_messages": [
+      "batch credential done"
+    ],
+    "credential_link_delivered": false,
+    "reply_delivered": true,
+    "credential_request_conversation_id_null": [
+      true
+    ],
+    "credential_request_link_minted": [
+      true
+    ],
+    "daemon_alive_after": true,
+    "log_markers": {
+      "invoked outside of an agent session context": 1
+    }
+  },
+  {
+    "run": "base-tg-batch-cred-r3",
+    "telegram_messages": [
+      "batch credential done"
+    ],
+    "credential_link_delivered": false,
+    "reply_delivered": true,
+    "credential_request_conversation_id_null": [
+      true
+    ],
+    "credential_request_link_minted": [
+      true
+    ],
+    "daemon_alive_after": true,
+    "log_markers": {
+      "invoked outside of an agent session context": 1
+    }
+  },
+  {
+    "run": "base-tg-cron-cred-r1",
+    "telegram_messages": [
+      "scheduled",
+      "batch credential done"
+    ],
+    "credential_link_delivered": false,
+    "reply_delivered": true,
+    "credential_request_conversation_id_null": [
+      true
+    ],
+    "credential_request_link_minted": [
+      true
+    ],
+    "daemon_alive_after": true,
+    "log_markers": {
+      "invoked outside of an agent session context": 1
+    }
+  },
+  {
+    "run": "base-tg-cron-cred-r2",
+    "telegram_messages": [
+      "scheduled",
+      "batch credential done"
+    ],
+    "credential_link_delivered": false,
+    "reply_delivered": true,
+    "credential_request_conversation_id_null": [
+      true
+    ],
+    "credential_request_link_minted": [
+      true
+    ],
+    "daemon_alive_after": true,
+    "log_markers": {
+      "invoked outside of an agent session context": 1
+    }
+  },
+  {
+    "run": "base-tg-silence-r1",
+    "telegram_messages": [
+      "I encountered an error. I saved the partial history, including pending messages;"
+    ],
+    "credential_link_delivered": false,
+    "reply_delivered": true,
+    "credential_request_conversation_id_null": [],
+    "credential_request_link_minted": [],
+    "daemon_alive_after": true,
+    "log_markers": {}
+  },
+  {
+    "run": "base-tg-silence-r2",
+    "telegram_messages": [
+      "I encountered an error. I saved the partial history, including pending messages;"
+    ],
+    "credential_link_delivered": false,
+    "reply_delivered": true,
+    "credential_request_conversation_id_null": [],
+    "credential_request_link_minted": [],
+    "daemon_alive_after": true,
+    "log_markers": {}
+  },
+  {
+    "run": "base-tg-silence-r3",
+    "telegram_messages": [
+      "I encountered an error. I saved the partial history, including pending messages;"
+    ],
+    "credential_link_delivered": false,
+    "reply_delivered": true,
+    "credential_request_conversation_id_null": [],
+    "credential_request_link_minted": [],
+    "daemon_alive_after": true,
+    "log_markers": {}
+  },
+  {
+    "run": "pr661-http-batch-cred",
+    "http_status": 200,
+    "reply": "batch credential done",
+    "tool_results": 3,
+    "tool_results_outside_context_error": 0,
+    "credential_request_conversation_id_matches": [
+      true
+    ],
+    "health_after": 200,
+    "daemon_alive_after": true,
+    "log_markers": {}
+  },
+  {
+    "run": "pr661-http-batch-todo",
+    "http_status": 200,
+    "reply": "batch todo done",
+    "tool_results": 3,
+    "tool_results_outside_context_error": 0,
+    "credential_request_conversation_id_matches": [],
+    "health_after": 200,
+    "daemon_alive_after": true,
+    "log_markers": {}
+  },
+  {
+    "run": "pr661-http-batch-tools",
+    "http_status": 200,
+    "reply": "batch tools_list done",
+    "tool_results": 3,
+    "tool_results_outside_context_error": 0,
+    "credential_request_conversation_id_matches": [],
+    "health_after": 200,
+    "daemon_alive_after": true,
+    "log_markers": {}
+  },
+  {
+    "run": "pr661-http-silence",
+    "http_status": 500,
+    "reply": null,
+    "tool_results": 1,
+    "tool_results_outside_context_error": 0,
+    "credential_request_conversation_id_matches": [],
+    "health_after": 200,
+    "daemon_alive_after": true,
+    "log_markers": {
+      "EndTurn without task_complete after tool use": 1,
+      "Ollama returned an empty response": 1
+    }
+  },
+  {
+    "run": "pr661-http-silent-first",
+    "http_status": 500,
+    "reply": null,
+    "tool_results": 0,
+    "tool_results_outside_context_error": 0,
+    "credential_request_conversation_id_matches": [],
+    "health_after": 200,
+    "daemon_alive_after": true,
+    "log_markers": {
+      "Ollama returned an empty response": 1
+    }
+  },
+  {
+    "run": "pr661-tg-batch-cred-r1",
+    "telegram_messages": [
+      "batch credential done",
+      "<credential link /c/<redacted>>"
+    ],
+    "credential_link_delivered": true,
+    "reply_delivered": true,
+    "credential_request_conversation_id_null": [
+      false
+    ],
+    "credential_request_link_minted": [
+      true
+    ],
+    "daemon_alive_after": true,
+    "log_markers": {}
+  },
+  {
+    "run": "pr661-tg-batch-cred-r2",
+    "telegram_messages": [
+      "batch credential done",
+      "<credential link /c/<redacted>>"
+    ],
+    "credential_link_delivered": true,
+    "reply_delivered": true,
+    "credential_request_conversation_id_null": [
+      false
+    ],
+    "credential_request_link_minted": [
+      true
+    ],
+    "daemon_alive_after": true,
+    "log_markers": {}
+  },
+  {
+    "run": "pr661-tg-batch-cred-r3",
+    "telegram_messages": [
+      "batch credential done",
+      "<credential link /c/<redacted>>"
+    ],
+    "credential_link_delivered": true,
+    "reply_delivered": true,
+    "credential_request_conversation_id_null": [
+      false
+    ],
+    "credential_request_link_minted": [
+      true
+    ],
+    "daemon_alive_after": true,
+    "log_markers": {}
+  },
+  {
+    "run": "pr661-tg-cron-cred-r1",
+    "telegram_messages": [
+      "scheduled",
+      "batch credential done",
+      "<credential link /c/<redacted>>"
+    ],
+    "credential_link_delivered": true,
+    "reply_delivered": true,
+    "credential_request_conversation_id_null": [
+      false
+    ],
+    "credential_request_link_minted": [
+      true
+    ],
+    "daemon_alive_after": true,
+    "log_markers": {}
+  },
+  {
+    "run": "pr661-tg-cron-cred-r2",
+    "telegram_messages": [
+      "scheduled",
+      "batch credential done",
+      "<credential link /c/<redacted>>"
+    ],
+    "credential_link_delivered": true,
+    "reply_delivered": true,
+    "credential_request_conversation_id_null": [
+      false
+    ],
+    "credential_request_link_minted": [
+      true
+    ],
+    "daemon_alive_after": true,
+    "log_markers": {}
+  },
+  {
+    "run": "pr661-tg-silence-r1",
+    "telegram_messages": [
+      "I encountered an error. I saved the partial history, including pending messages;"
+    ],
+    "credential_link_delivered": false,
+    "reply_delivered": true,
+    "credential_request_conversation_id_null": [],
+    "credential_request_link_minted": [],
+    "daemon_alive_after": true,
+    "log_markers": {}
+  },
+  {
+    "run": "pr661-tg-silence-r2",
+    "telegram_messages": [
+      "I encountered an error. I saved the partial history, including pending messages;"
+    ],
+    "credential_link_delivered": false,
+    "reply_delivered": true,
+    "credential_request_conversation_id_null": [],
+    "credential_request_link_minted": [],
+    "daemon_alive_after": true,
+    "log_markers": {}
+  },
+  {
+    "run": "pr661-tg-silence-r3",
+    "telegram_messages": [
+      "I encountered an error. I saved the partial history, including pending messages;"
+    ],
+    "credential_link_delivered": false,
+    "reply_delivered": true,
+    "credential_request_conversation_id_null": [],
+    "credential_request_link_minted": [],
+    "daemon_alive_after": true,
+    "log_markers": {}
+  },
+  {
+    "run": "pr662-http-batch-cred",
+    "http_status": 200,
+    "reply": "batch credential done",
+    "tool_results": 3,
+    "tool_results_outside_context_error": 1,
+    "credential_request_conversation_id_matches": [
+      false
+    ],
+    "health_after": 200,
+    "daemon_alive_after": true,
+    "log_markers": {
+      "invoked outside of an agent session context": 1
+    }
+  },
+  {
+    "run": "pr662-http-batch-todo",
+    "http_status": 200,
+    "reply": "batch todo done",
+    "tool_results": 3,
+    "tool_results_outside_context_error": 1,
+    "credential_request_conversation_id_matches": [],
+    "health_after": 200,
+    "daemon_alive_after": true,
+    "log_markers": {
+      "invoked outside of an agent session context": 1
+    }
+  },
+  {
+    "run": "pr662-http-batch-tools",
+    "http_status": 200,
+    "reply": "batch tools_list done",
+    "tool_results": 3,
+    "tool_results_outside_context_error": 2,
+    "credential_request_conversation_id_matches": [],
+    "health_after": 200,
+    "daemon_alive_after": true,
+    "log_markers": {
+      "invoked outside of an agent session context": 2
+    }
+  },
+  {
+    "run": "pr662-http-silence",
+    "http_status": 200,
+    "reply": "The answer is forty-two.",
+    "tool_results": 1,
+    "tool_results_outside_context_error": 0,
+    "credential_request_conversation_id_matches": [],
+    "health_after": 200,
+    "daemon_alive_after": true,
+    "log_markers": {
+      "EndTurn without task_complete after tool use": 1,
+      "empty response to the task_complete reminder": 1
+    }
+  },
+  {
+    "run": "pr662-http-silent-first",
+    "http_status": 500,
+    "reply": null,
+    "tool_results": 0,
+    "tool_results_outside_context_error": 0,
+    "credential_request_conversation_id_matches": [],
+    "health_after": 200,
+    "daemon_alive_after": true,
+    "log_markers": {
+      "Ollama returned an empty response": 1
+    }
+  },
+  {
+    "run": "pr662-tg-batch-cred-r1",
+    "telegram_messages": [
+      "batch credential done"
+    ],
+    "credential_link_delivered": false,
+    "reply_delivered": true,
+    "credential_request_conversation_id_null": [
+      true
+    ],
+    "credential_request_link_minted": [
+      true
+    ],
+    "daemon_alive_after": true,
+    "log_markers": {
+      "invoked outside of an agent session context": 1
+    }
+  },
+  {
+    "run": "pr662-tg-batch-cred-r2",
+    "telegram_messages": [
+      "batch credential done"
+    ],
+    "credential_link_delivered": false,
+    "reply_delivered": true,
+    "credential_request_conversation_id_null": [
+      true
+    ],
+    "credential_request_link_minted": [
+      true
+    ],
+    "daemon_alive_after": true,
+    "log_markers": {
+      "invoked outside of an agent session context": 1
+    }
+  },
+  {
+    "run": "pr662-tg-batch-cred-r3",
+    "telegram_messages": [
+      "batch credential done"
+    ],
+    "credential_link_delivered": false,
+    "reply_delivered": true,
+    "credential_request_conversation_id_null": [
+      true
+    ],
+    "credential_request_link_minted": [
+      true
+    ],
+    "daemon_alive_after": true,
+    "log_markers": {
+      "invoked outside of an agent session context": 1
+    }
+  },
+  {
+    "run": "pr662-tg-cron-cred-r1",
+    "telegram_messages": [
+      "scheduled",
+      "batch credential done"
+    ],
+    "credential_link_delivered": false,
+    "reply_delivered": true,
+    "credential_request_conversation_id_null": [
+      true
+    ],
+    "credential_request_link_minted": [
+      true
+    ],
+    "daemon_alive_after": true,
+    "log_markers": {
+      "invoked outside of an agent session context": 1
+    }
+  },
+  {
+    "run": "pr662-tg-cron-cred-r2",
+    "telegram_messages": [
+      "scheduled",
+      "batch credential done"
+    ],
+    "credential_link_delivered": false,
+    "reply_delivered": true,
+    "credential_request_conversation_id_null": [
+      true
+    ],
+    "credential_request_link_minted": [
+      true
+    ],
+    "daemon_alive_after": true,
+    "log_markers": {
+      "invoked outside of an agent session context": 1
+    }
+  },
+  {
+    "run": "pr662-tg-silence-r1",
+    "telegram_messages": [
+      "The answer is forty-two."
+    ],
+    "credential_link_delivered": false,
+    "reply_delivered": true,
+    "credential_request_conversation_id_null": [],
+    "credential_request_link_minted": [],
+    "daemon_alive_after": true,
+    "log_markers": {}
+  },
+  {
+    "run": "pr662-tg-silence-r2",
+    "telegram_messages": [
+      "The answer is forty-two."
+    ],
+    "credential_link_delivered": false,
+    "reply_delivered": true,
+    "credential_request_conversation_id_null": [],
+    "credential_request_link_minted": [],
+    "daemon_alive_after": true,
+    "log_markers": {}
+  },
+  {
+    "run": "pr662-tg-silence-r3",
+    "telegram_messages": [
+      "The answer is forty-two."
+    ],
+    "credential_link_delivered": false,
+    "reply_delivered": true,
+    "credential_request_conversation_id_null": [],
+    "credential_request_link_minted": [],
+    "daemon_alive_after": true,
+    "log_markers": {}
+  }
+]

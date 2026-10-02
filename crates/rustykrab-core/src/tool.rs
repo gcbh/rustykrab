@@ -67,6 +67,26 @@ pub trait Tool: Send + Sync {
         SandboxRequirements::default()
     }
 
+    /// Whether a successful call leaves the turn waiting on someone else.
+    ///
+    /// The agent loop does not trust a bare `EndTurn` once tools have been
+    /// called — providers map any text-only reply to it regardless of
+    /// intent — so it re-prompts for `task_complete`. That is right for a
+    /// model that stopped early, and wrong for one that stopped because it
+    /// is blocked: the task is not complete, cannot be completed, and no
+    /// amount of nudging changes that. The model then either churns to the
+    /// iteration cap or invents progress it has not made.
+    ///
+    /// A tool that returns `true` here says the correct next move is to
+    /// tell the user and stop. The loop lets the following `EndTurn` end
+    /// the turn instead of re-prompting.
+    ///
+    /// Only consulted when the call *succeeded*. A tool that failed to
+    /// block on anything has not blocked anything.
+    fn blocks_turn(&self) -> bool {
+        false
+    }
+
     /// Execute the tool with the given arguments, returning a JSON result.
     async fn execute(&self, args: Value) -> Result<Value>;
 }

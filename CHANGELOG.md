@@ -7,6 +7,416 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.3.6] - 2026-09-25
+
+- fix(agent): an empty reply to the task_complete reminder keeps the answer (#662)
+
+## [5.3.5] - 2026-09-25
+
+- fix(install): forward context-budget, Ollama timeout and outcome-capture env (#659)
+
+## [5.3.4] - 2026-09-25
+
+- fix(agent): keep session context and trace id in batched tool calls (#661)
+
+## [5.3.3] - 2026-09-25
+
+- fix(store): report an unreadable keychain as unreadable, not as a bad credential (#660)
+
+## [5.3.2] - 2026-09-25
+
+- fix(credentials): file a request for a known service under the name it is known by (#658)
+
+## [5.3.1] - 2026-09-24
+
+- Dreaming evals: say what the loop still owes, and prove it nightly (#633)
+
+## [5.3.0] - 2026-09-16
+
+- fix(browser): close three bypasses in the browser payment path [9/9] (#657)
+
+## [5.2.40] - 2026-09-15
+
+- fix(compaction): stop one opaque tool result from wedging a conversation (#654)
+
+## [5.2.39] - 2026-09-12
+
+- fix(browser): bind credential fills to verified origins and inputs (#645)
+
+## [5.2.38] - 2026-09-05
+
+- test(browser): add production journey evaluations (#640)
+
+## [5.2.37] - 2026-09-04
+
+- feat(browser): add CDP-native browser-use parity (#639)
+
+## [5.2.36] - 2026-09-04
+
+- feat(cron): show each job's next run in its own zone (#630)
+
+## [5.2.35] - 2026-09-04
+
+- fix(cron): let the caller name a zone, and stop the model converting by hand (#629)
+
+## [5.2.34] - 2026-09-04
+
+- fix(store): schedule in the operator's zone, not Greenwich (#628)
+
+## [5.2.33] - 2026-09-04
+
+- feat(browser): harden interactive browser workflows (#638)
+
+## [5.2.32] - 2026-09-04
+
+- ci(release): remove remaining Node 20 actions (#637)
+
+## [5.2.31] - 2026-09-04
+
+- ci(actions): move workflow runtime to Node 24 (#636)
+
+## [5.2.30] - 2026-09-04
+
+- fix(release): keep lockfile reproducible after version bump (#635)
+
+## [5.2.29] - 2026-09-04
+
+- feat(gateway): expose durable project planning (#609)
+
+## [5.2.28] - 2026-09-03
+
+- fix(store): refuse a second recurring job for the same task and target (#624)
+
+## [5.2.27] - 2026-09-03
+
+- fix(store): distinguish "deleted it" from "nothing to delete" (#623)
+
+## [5.2.26] - 2026-09-03
+
+- feat(memory): capture what the user says, and distil what is durable (#621)
+
+## [5.2.25] - 2026-09-02
+
+- fix(caldav): use the endpoint that accepts an app password (#620)
+
+## [5.2.24] - 2026-09-02
+
+- Dreaming P0/P1: make the outer loop's measurement readable and honest (#615)
+
+## [5.2.23] - 2026-09-02
+
+- Replace six tests that could not fail (#612)
+
+## [5.2.22] - 2026-09-02
+
+- fix(browser): validate action-specific arguments (#611)
+
+## [5.2.21] - 2026-09-02
+
+- docs(architecture): record the structural review, and audit the dead code (#596)
+
+## [5.2.20] - 2026-09-02
+
+- fix(memory): validate the config at construction, and fix a cap warning that could never fire (#604)
+
+## [5.2.19] - 2026-09-02
+
+- fix(credentials): preserve origin on form submission (#605)
+
+## [5.2.18] - 2026-09-02
+
+- refactor(core): one token estimator instead of five copies of the constant (#593)
+
+## [5.2.17] - 2026-09-02
+
+- refactor(core): move MemoryBackend to core, delete the adapter it forced (#592)
+
+## [5.2.16] - 2026-09-01
+
+- fix(context): anchor compaction to actual token usage, and stop the MaxTokens spiral (#599)
+
+- fix(context): anchor compaction to actual token usage, and stop the MaxTokens spiral
+
+## [5.2.15] - 2026-09-01
+
+- perf(agent): keep the tool block on the compaction call (#600)
+
+## [5.2.14] - 2026-09-01
+
+- feat(store): enforce the foreign keys the schema already claimed (#590)
+
+## [5.2.13] - 2026-09-01
+
+- fix(browser): bound the renderer round trips that decorate a result (#587)
+
+## [5.2.12] - 2026-09-01
+
+- refactor(browser): make the isolated root a config field, read once (#586)
+
+## [5.2.11] - 2026-09-01
+
+- fix(credentials): ask for a new app password when Google rejects the stored one (#597)
+
+## [5.2.10] - 2026-09-01
+
+- fix(browser): bound element lookups, and say what went wrong (#581)
+
+## [5.2.9] - 2026-09-01
+
+- fix(browser): address tabs by Chrome target ID, not list position (#583)
+
+## [5.2.8] - 2026-09-01
+
+- fix(credentials): stop telling the agent a stored credential is empty (#575)
+
+## [5.2.7] - 2026-08-31
+
+- fix(credentials): derive website credential keys instead of trusting the spelling (#574)
+
+## [5.2.6] - 2026-08-31
+
+- fix(credentials): one Google credential, one way of asking for it (#573)
+
+## [5.2.5] - 2026-08-31
+
+- fix(credentials): tell the resumed turn how to sign in, and bound it (#572)
+
+## [5.2.4] - 2026-08-31
+
+- feat(credentials): send the link as its own message, not through the model (#571)
+
+## [5.2.3] - 2026-08-31
+
+- docs(nodes): pair the primary instead of sharing the node's master token (#569)
+
+## [5.2.2] - 2026-08-31
+
+- fix(tools): stop the nodes tests racing over a process-global env var (#565)
+
+## [5.2.1] - 2026-08-31
+
+- feat(security): let the operator name hosts the SSRF guard may reach (#560)
+
+## [5.2.0] - 2026-08-31
+
+- feat(credentials): resume the stalled turn when a credential arrives (#556)
+
+## [5.1.41] - 2026-08-30
+
+- fix(credentials): record which conversation asked for a credential (#555)
+
+## [5.1.40] - 2026-08-27
+
+- docs: fleet config and local-model benchmark script (#554)
+
+## [5.1.39] - 2026-08-27
+
+- feat(tools): real peer delegation for the nodes tool (#552)
+
+## [5.1.38] - 2026-08-27
+
+- fix(ci): skip notarization when Apple secrets are absent (#550)
+
+## [5.1.37] - 2026-08-27
+
+- build: app-bundle signing for Data Protection Keychain access (#549)
+
+## [5.1.36] - 2026-08-27
+
+- feat(providers): OpenAI-compatible model provider (#526)
+
+## [5.1.35] - 2026-08-26
+
+- feat: default to a 128k context window, with the ablation that justifies it (#547)
+
+## [5.1.34] - 2026-08-26
+
+- fix(ci): correct shasum paths in Package artifact step (#546)
+
+## [5.1.33] - 2026-08-25
+
+- e2e: live login scenarios, split from the credential ask (#542)
+
+## [5.1.32] - 2026-08-25
+
+- fix(webchat): make the client run, and answer credential requests (#544)
+
+## [5.1.31] - 2026-08-25
+
+- fix(agent): let the agent ask for a credential without tripping over one (#543)
+
+## [5.1.30] - 2026-08-25
+
+- feat: hand over a credential through a tailnet-only page (#545)
+
+## [5.1.29] - 2026-08-23
+
+- fix(providers): ask Ollama what a model can do instead of guessing (#541)
+
+## [5.1.28] - 2026-08-23
+
+- fix(providers): fail loudly when Ollama generates nothing (#530)
+
+## [5.1.27] - 2026-08-23
+
+- e2e: adopt the better mechanisms from the parallel investigation (#532) (#540)
+
+## [5.1.26] - 2026-08-23
+
+- fix(agent): the router preserved three of the seven fields it claimed to (#535)
+
+## [5.1.25] - 2026-08-23
+
+- fix(ollama): a window swallowed by its reserves silently killed compaction (#533)
+
+## [5.1.24] - 2026-08-23
+
+- tools: scripted stand-in tools for the evaluation harness (#524)
+
+## [5.1.23] - 2026-08-23
+
+- Let the agent ask for credentials it does not have (#521)
+
+## [5.1.22] - 2026-08-22
+
+- fix(agent): stop retrying deterministic exec failures (#514)
+
+## [5.1.21] - 2026-08-22
+
+- Dreaming P1 (3/3): run analysis in downtime, yielding to real work (#511)
+
+## [5.1.20] - 2026-08-22
+
+- Dreaming P1 (1/3): track when the system was last busy (#509)
+
+## [5.1.19] - 2026-08-22
+
+- Dreaming P0 (6/6): wire outcome capture into the gateway, memory, and CLI (#508)
+
+## [5.1.18] - 2026-08-22
+
+- Dreaming P0 (5/6): record how each run went, and to what it is attributable (#507)
+
+## [5.1.17] - 2026-08-22
+
+- Dreaming P0 (4/6): let a SKILL.md declare what success means (#515)
+
+## [5.1.16] - 2026-08-22
+
+- fix(tools): parse quoted shell operators safely (#513)
+
+## [5.1.15] - 2026-08-22
+
+- Dreaming P0 (3/6): persist outcome records and their attributions (#505)
+
+## [5.1.14] - 2026-08-22
+
+- chore: sync Cargo.lock with the workspace manifests (#512)
+
+## [5.1.13] - 2026-08-22
+
+- Dreaming P0 (2/6): retrieval log linking recalled memories to a conversation (#504)
+
+## [5.1.12] - 2026-08-22
+
+- Dreaming P0 (1/6): core outcome vocabulary (#503)
+
+## [5.1.11] - 2026-08-21
+
+- feat: add official macOS install flow (#501)
+
+## [5.1.10] - 2026-08-21
+
+- Dreaming (stack base): design for the self-improvement outer loop (#472)
+
+## [5.1.9] - 2026-08-21
+
+- test(memory): executable harness for every lifecycle stage transition (#499)
+
+## [5.1.8] - 2026-08-21
+
+- feat(memory): admission control, duplicate-write counter split, and scoped recall (#498)
+
+## [5.1.7] - 2026-08-21
+
+- Phase 4 (E): APNs push for pending credential requests (#493)
+
+## [5.1.6] - 2026-08-20
+
+- Phase 2 (C): origin allowlist + WebChat approvals panel — completes Phase 2 (#491)
+
+## [5.1.5] - 2026-08-20
+
+- Phase 2 (B): device pairing, per-device tokens, revocation — suite reaches 16/16 (#490)
+
+## [5.1.4] - 2026-08-20
+
+- fix(caldav): reject clobbered credentials before issuing a request (#496)
+
+## [5.1.3] - 2026-08-20
+
+- fix(cron): append a user turn to scheduled job runs (#494)
+
+## [5.1.2] - 2026-08-20
+
+- fix: repair two lint failures from the Rust 1.98 toolchain bump (#495)
+
+## [5.1.1] - 2026-08-20
+
+- Phase 2 (A): the agent can no longer overwrite or delete a credential (#489)
+
+## [5.1.0] - 2026-08-20
+
+- perf(providers): make Ollama requests KV-cache friendly (#488)
+
+## [5.0.0] - 2026-08-20
+
+- Phase 1: evaluation harness for the credential guard (#487)
+
+## [4.6.0] - 2026-08-20
+
+- fix(cron): carry real context into scheduled runs (#486)
+
+## [4.5.15] - 2026-07-06
+
+- perf(tools): reuse IMAP sessions and HTTP clients, hoist regexes, stream file reads (#478)
+
+## [4.5.14] - 2026-07-06
+
+- perf(store): normalize conversation storage — append messages instead of rewriting the blob (#485)
+
+## [4.5.13] - 2026-07-06
+
+- chore: sync Cargo.lock with workspace version 4.5.7 (#479)
+
+## [4.5.12] - 2026-07-06
+
+- perf(cli): lazy embedder, background index rebuild, concurrent startup (#483)
+
+## [4.5.11] - 2026-07-06
+
+- perf(gateway,channels): shard rate limiter, single-pass routing, cheaper SSE and channel loops (#480)
+
+## [4.5.10] - 2026-07-06
+
+- perf(agent): stop re-serializing history and rebuilding schemas every iteration (#477)
+
+## [4.5.9] - 2026-07-06
+
+- perf(store): run SQLite work on blocking threads, tune pragmas (#476)
+
+## [4.5.8] - 2026-07-06
+
+- perf(providers): linear stream buffering, fix UTF-8 chunk-boundary corruption (#475)
+
+## [4.5.7] - 2026-07-06
+
+- fix: resolve cargo-audit vulnerabilities in CI (#481)
+
+## [4.5.6] - 2026-06-07
+
+- chore: sync Cargo.lock workspace versions to 4.5.5 (#473)
+
 ## [4.5.5] - 2026-06-07
 
 - Computer-use Phase 5: capability gate + read-only mode (security hardening) (#471)

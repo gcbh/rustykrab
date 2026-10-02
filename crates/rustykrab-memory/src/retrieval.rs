@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use chrono::{Duration, Utc};
@@ -8,7 +8,7 @@ use uuid::Uuid;
 use crate::config::MemoryConfig;
 use crate::embedding::{self, Embedder};
 use crate::scoring::rrf_fuse_with_sources;
-use crate::storage::MemoryStorage;
+use crate::storage::{EmbeddingSet, MemoryStorage};
 use crate::types::RetrievalResult;
 use crate::types::RetrievalSource;
 
@@ -51,6 +51,22 @@ impl MemoryRetriever {
         agent_id: Uuid,
         limit: usize,
     ) -> rustykrab_core::Result<Vec<RetrievalResult>> {
+        self.recall_filtered(query, agent_id, limit, None).await
+    }
+
+    /// [`Self::recall`] with an optional session (conversation) filter.
+    ///
+    /// The filter is applied BEFORE access recording: memories excluded by
+    /// it must not receive an access bump or a decay-clock reset, otherwise
+    /// every scoped search would grant a phantom relevance boost to other
+    /// conversations' memories.
+    pub async fn recall_filtered(
+        &self,
+        query: &str,
+        agent_id: Uuid,
+        limit: usize,
+        session_id: Option<Uuid>,
+    ) -> rustykrab_core::Result<Vec<RetrievalResult>> {
         let candidates = self.config.retrieval_candidates_per_arm;
 
         // ── Stage 1: Query preprocessing ────────────────────────
@@ -61,7 +77,8 @@ impl MemoryRetriever {
         };
 
         // ── Stage 2: Fetch embeddings once, then dispatch ──────
-        // Shared embedding fetch avoids duplicate full-table scans (#106).
+        // Served from the per-agent cache after the first recall; the shared
+        // snapshot also avoids duplicate full-table scans (#106).
         let chunk_embeddings = self.storage.get_all_chunk_embeddings(agent_id).await?;
 
         let (semantic_results, keyword_results, graph_results, temporal_results) = tokio::join!(
@@ -115,6 +132,11 @@ impl MemoryRetriever {
 
         for (memory_id, rrf_score, sources) in &fused {
             if let Some(mem) = memories.iter().find(|m| m.id == *memory_id) {
+                if let Some(sid) = session_id {
+                    if mem.session_id != Some(sid) {
+                        continue;
+                    }
+                }
                 if !mem.is_valid || !mem.lifecycle_stage.is_retrievable() {
                     continue;
                 }
@@ -153,15 +175,10 @@ impl MemoryRetriever {
         results.truncate(limit);
 
         // ── Stage 5: Record access on returned results ──────────
-        // Batch access updates instead of spawning unbounded tasks (#110).
-        for result in &results {
-            if let Err(e) = self.storage.record_access(result.memory_id).await {
-                tracing::warn!(
-                    memory_id = %result.memory_id,
-                    error = %e,
-                    "failed to record access"
-                );
-            }
+        // One batched UPDATE instead of a round-trip per result (#110).
+        let accessed: Vec<Uuid> = results.iter().map(|r| r.memory_id).collect();
+        if let Err(e) = self.storage.record_access_batch(&accessed).await {
+            tracing::warn!(error = %e, "failed to record access");
         }
 
         debug!(
@@ -178,7 +195,7 @@ impl MemoryRetriever {
     async fn retrieve_semantic(
         &self,
         query_vec: &[f32],
-        chunk_embeddings: &[(Uuid, Vec<f32>)],
+        chunk_embeddings: &EmbeddingSet,
         limit: usize,
     ) -> rustykrab_core::Result<Vec<(Uuid, usize)>> {
         if query_vec.is_empty() || query_vec.iter().all(|v| *v == 0.0) {
@@ -217,7 +234,7 @@ impl MemoryRetriever {
     async fn retrieve_graph(
         &self,
         query_vec: &[f32],
-        chunk_embeddings: &[(Uuid, Vec<f32>)],
+        chunk_embeddings: &EmbeddingSet,
         limit: usize,
     ) -> rustykrab_core::Result<Vec<(Uuid, usize)>> {
         if query_vec.is_empty() || query_vec.iter().all(|v| *v == 0.0) {
@@ -227,15 +244,24 @@ impl MemoryRetriever {
         // Seed: top-5 from semantic search.
         let seeds = embedding::top_k_similar(query_vec, chunk_embeddings, 5);
 
+        // Fetch all seed links in one query instead of one per seed.
+        let seed_ids: Vec<Uuid> = seeds.iter().map(|(id, _)| *id).collect();
+        let mut links_by_source: HashMap<Uuid, Vec<(Uuid, f64)>> = HashMap::new();
+        for link in self.storage.get_links_from_many(&seed_ids).await? {
+            links_by_source
+                .entry(link.source_id)
+                .or_default()
+                .push((link.target_id, link.weight));
+        }
+
         let mut seen = HashSet::new();
         let mut linked = Vec::new();
 
         for (seed_id, _sim) in &seeds {
             seen.insert(*seed_id);
-            let links = self.storage.get_links_from(*seed_id).await?;
-            for link in links {
-                if seen.insert(link.target_id) {
-                    linked.push((link.target_id, link.weight));
+            for (target_id, weight) in links_by_source.get(seed_id).into_iter().flatten() {
+                if seen.insert(*target_id) {
+                    linked.push((*target_id, *weight));
                 }
             }
         }

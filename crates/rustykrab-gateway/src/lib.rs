@@ -1,22 +1,30 @@
 pub mod auth;
+mod credential_page;
 pub mod logging;
-mod orchestrate;
 pub mod origin;
+mod payment_page;
+mod project_routes;
+pub mod push;
 pub mod rate_limit;
 mod routes;
 mod signal_webhook;
 mod state;
+pub mod tasks;
 mod telegram_webhook;
 mod webchat;
 
 pub use auth::generate_token;
-pub use orchestrate::{
-    run_agent, run_agent_interactive, run_agent_streaming, run_agent_streaming_with_options,
-    run_agent_with_options, RunOptions,
-};
+pub mod run;
 pub use origin::OriginPolicy;
+pub use push::{ApnsClient, ApnsConfig, ApnsEnvironment, PushNotifier};
 pub use rate_limit::RateLimitConfig;
+pub use run::{
+    run_agent, run_agent_interactive, run_agent_streaming, run_agent_streaming_with_options,
+    run_agent_with_options,
+};
+pub use rustykrab_runtime::{AgentContext, RunOptions, RuntimeError};
 pub use state::AppState;
+pub use tasks::{run_task_worker, TaskQueueSignal};
 
 use axum::extract::Request;
 use axum::http::header;
@@ -29,17 +37,23 @@ use axum::Router;
 async fn security_headers_middleware(request: Request, next: Next) -> Response {
     let mut response = next.run(request).await;
     let headers = response.headers_mut();
-    headers.insert(header::X_FRAME_OPTIONS, "DENY".parse().unwrap());
-    headers.insert(header::X_CONTENT_TYPE_OPTIONS, "nosniff".parse().unwrap());
+    headers.insert(
+        header::X_FRAME_OPTIONS,
+        header::HeaderValue::from_static("DENY"),
+    );
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        header::HeaderValue::from_static("nosniff"),
+    );
     headers.insert(
         header::HeaderName::from_static("x-xss-protection"),
-        "1; mode=block".parse().unwrap(),
+        header::HeaderValue::from_static("1; mode=block"),
     );
     headers.insert(
         header::CONTENT_SECURITY_POLICY,
-        "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:"
-            .parse()
-            .unwrap(),
+        header::HeaderValue::from_static(
+            "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:",
+        ),
     );
     response
 }
@@ -51,8 +65,11 @@ async fn security_headers_middleware(request: Request, next: Next) -> Response {
 pub fn router(state: AppState) -> Router {
     Router::new()
         .merge(routes::api_routes())
+        .merge(project_routes::routes())
         .merge(telegram_webhook::telegram_routes())
         .merge(signal_webhook::signal_routes())
+        .merge(credential_page::routes())
+        .merge(payment_page::routes())
         .merge(webchat::static_routes())
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -70,3 +87,5 @@ pub fn router(state: AppState) -> Router {
         .layer(middleware::from_fn(security_headers_middleware))
         .with_state(state)
 }
+
+pub use credential_page::PageIdentityPolicy;

@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use rustykrab_core::types::ToolSchema;
 use rustykrab_core::{Error, Result, SandboxRequirements, Tool};
-use rustykrab_store::SecretStore;
+use rustykrab_store::GuardedSecrets;
 use serde_json::{json, Value};
 
 // ---------------------------------------------------------------------------
@@ -23,21 +23,24 @@ const MAX_BLOCKS_PER_REQUEST: usize = 100;
 // ---------------------------------------------------------------------------
 
 pub struct NotionTool {
-    secrets: SecretStore,
+    secrets: GuardedSecrets,
     client: reqwest::Client,
 }
 
 impl NotionTool {
-    pub fn new(secrets: SecretStore) -> Self {
+    pub fn new(secrets: GuardedSecrets) -> Self {
         Self {
             secrets,
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
         }
     }
 
     /// Get the stored Notion API token.
-    fn get_token(&self) -> Result<String> {
-        self.secrets.get(KEY_API_TOKEN).map_err(|_| {
+    async fn get_token(&self) -> Result<String> {
+        self.secrets.get(KEY_API_TOKEN).await.map_err(|_| {
             Error::ToolExecution(
                 "notion_api_token not found. Store it with: \
                  notion(action='setup', api_token='ntn_...') or \
@@ -48,17 +51,17 @@ impl NotionTool {
     }
 
     /// Get the optional default parent page ID.
-    fn get_default_parent(&self) -> Option<String> {
-        self.secrets.get(KEY_DEFAULT_PARENT).ok()
+    async fn get_default_parent(&self) -> Option<String> {
+        self.secrets.get(KEY_DEFAULT_PARENT).await.ok()
     }
 
     /// Build an authorized request to the Notion API.
-    fn notion_request(
+    async fn notion_request(
         &self,
         method: reqwest::Method,
         path: &str,
     ) -> Result<reqwest::RequestBuilder> {
-        let token = self.get_token()?;
+        let token = self.get_token().await?;
         let url = format!("{NOTION_API_BASE}{path}");
         Ok(self
             .client
@@ -101,13 +104,15 @@ impl NotionTool {
             .ok_or_else(|| Error::ToolExecution("missing 'api_token' parameter".into()))?;
 
         self.secrets
-            .set(KEY_API_TOKEN, api_token)
+            .set_strict(KEY_API_TOKEN, api_token)
+            .await
             .map_err(|e| Error::ToolExecution(format!("failed to store API token: {e}").into()))?;
 
         // Optionally store a default parent page ID.
         if let Some(parent_id) = args["default_parent_page_id"].as_str() {
             self.secrets
-                .set(KEY_DEFAULT_PARENT, parent_id)
+                .set_strict(KEY_DEFAULT_PARENT, parent_id)
+                .await
                 .map_err(|e| {
                     Error::ToolExecution(format!("failed to store default parent: {e}").into())
                 })?;
@@ -169,7 +174,8 @@ impl NotionTool {
         }
 
         let req = self
-            .notion_request(reqwest::Method::POST, "/search")?
+            .notion_request(reqwest::Method::POST, "/search")
+            .await?
             .json(&body);
 
         let data = self.send_and_parse(req).await?;
@@ -219,7 +225,9 @@ impl NotionTool {
         let include_content = args["include_content"].as_bool().unwrap_or(true);
 
         // Fetch page properties.
-        let req = self.notion_request(reqwest::Method::GET, &format!("/pages/{page_id}"))?;
+        let req = self
+            .notion_request(reqwest::Method::GET, &format!("/pages/{page_id}"))
+            .await?;
         let page = self.send_and_parse(req).await?;
 
         let title = extract_title(&page);
@@ -252,15 +260,16 @@ impl NotionTool {
             .ok_or_else(|| Error::ToolExecution("missing 'title' parameter".into()))?;
 
         // Determine parent: explicit > default stored > error.
-        let parent_id = args["parent_page_id"]
-            .as_str()
-            .map(|s| s.to_string())
-            .or_else(|| self.get_default_parent())
-            .ok_or_else(|| {
-                Error::ToolExecution(
-                    "missing 'parent_page_id'. Provide one or set a default via setup.".into(),
-                )
-            })?;
+        let explicit_parent = args["parent_page_id"].as_str().map(|s| s.to_string());
+        let parent_id = match explicit_parent {
+            Some(id) => Some(id),
+            None => self.get_default_parent().await,
+        }
+        .ok_or_else(|| {
+            Error::ToolExecution(
+                "missing 'parent_page_id'. Provide one or set a default via setup.".into(),
+            )
+        })?;
 
         let icon = args["icon"].as_str();
         let cover_url = args["cover_url"].as_str();
@@ -297,7 +306,8 @@ impl NotionTool {
         }
 
         let req = self
-            .notion_request(reqwest::Method::POST, "/pages")?
+            .notion_request(reqwest::Method::POST, "/pages")
+            .await?
             .json(&body);
 
         let page = self.send_and_parse(req).await?;
@@ -376,16 +386,18 @@ impl NotionTool {
 
         // Sync append to Obsidian if content was provided as markdown.
         if let Some(markdown) = args["content"].as_str() {
-            if self.secrets.get("obsidian_api_key").is_ok() {
+            if self.secrets.get("obsidian_api_key").await.is_ok() {
                 // Look up the page title to derive the Obsidian vault path.
-                let title =
-                    match self.notion_request(reqwest::Method::GET, &format!("/pages/{page_id}")) {
-                        Ok(req) => match self.send_and_parse(req).await {
-                            Ok(page) => extract_title(&page),
-                            Err(_) => String::new(),
-                        },
+                let title = match self
+                    .notion_request(reqwest::Method::GET, &format!("/pages/{page_id}"))
+                    .await
+                {
+                    Ok(req) => match self.send_and_parse(req).await {
+                        Ok(page) => extract_title(&page),
                         Err(_) => String::new(),
-                    };
+                    },
+                    Err(_) => String::new(),
+                };
 
                 if !title.is_empty() {
                     match crate::obsidian::try_sync_append_to_obsidian(
@@ -420,15 +432,16 @@ impl NotionTool {
             .as_str()
             .ok_or_else(|| Error::ToolExecution("missing 'title' parameter".into()))?;
 
-        let parent_id = args["parent_page_id"]
-            .as_str()
-            .map(|s| s.to_string())
-            .or_else(|| self.get_default_parent())
-            .ok_or_else(|| {
-                Error::ToolExecution(
-                    "missing 'parent_page_id'. Provide one or set a default via setup.".into(),
-                )
-            })?;
+        let explicit_parent = args["parent_page_id"].as_str().map(|s| s.to_string());
+        let parent_id = match explicit_parent {
+            Some(id) => Some(id),
+            None => self.get_default_parent().await,
+        }
+        .ok_or_else(|| {
+            Error::ToolExecution(
+                "missing 'parent_page_id'. Provide one or set a default via setup.".into(),
+            )
+        })?;
 
         let properties = args.get("properties").cloned().unwrap_or_else(|| {
             // Sensible default for a trip-planning database.
@@ -461,7 +474,8 @@ impl NotionTool {
         }
 
         let req = self
-            .notion_request(reqwest::Method::POST, "/databases")?
+            .notion_request(reqwest::Method::POST, "/databases")
+            .await?
             .json(&body);
 
         let db = self.send_and_parse(req).await?;
@@ -501,7 +515,8 @@ impl NotionTool {
         }
 
         let req = self
-            .notion_request(reqwest::Method::POST, "/pages")?
+            .notion_request(reqwest::Method::POST, "/pages")
+            .await?
             .json(&body);
 
         let page = self.send_and_parse(req).await?;
@@ -541,7 +556,8 @@ impl NotionTool {
         }
 
         let req = self
-            .notion_request(reqwest::Method::PATCH, &format!("/pages/{page_id}"))?
+            .notion_request(reqwest::Method::PATCH, &format!("/pages/{page_id}"))
+            .await?
             .json(&body);
 
         let page = self.send_and_parse(req).await?;
@@ -562,7 +578,9 @@ impl NotionTool {
             .as_str()
             .ok_or_else(|| Error::ToolExecution("missing 'block_id' parameter".into()))?;
 
-        let req = self.notion_request(reqwest::Method::DELETE, &format!("/blocks/{block_id}"))?;
+        let req = self
+            .notion_request(reqwest::Method::DELETE, &format!("/blocks/{block_id}"))
+            .await?;
         self.send_and_parse(req).await?;
 
         Ok(json!({
@@ -592,7 +610,7 @@ impl NotionTool {
                     path.push_str(&format!("&start_cursor={c}"));
                 }
 
-                let req = self.notion_request(reqwest::Method::GET, &path)?;
+                let req = self.notion_request(reqwest::Method::GET, &path).await?;
                 let data = self.send_and_parse(req).await?;
 
                 if let Some(results) = data["results"].as_array() {
@@ -630,7 +648,8 @@ impl NotionTool {
                 .notion_request(
                     reqwest::Method::PATCH,
                     &format!("/blocks/{page_id}/children"),
-                )?
+                )
+                .await?
                 .json(&body);
             self.send_and_parse(req).await?;
         }

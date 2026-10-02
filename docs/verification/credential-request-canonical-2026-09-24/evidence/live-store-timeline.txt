@@ -1,0 +1,14 @@
+# Read-only query of the live store (~/Library/Application Support/rustykrab/db/store.db), 2026-09-24.
+# Columns: id prefix | name | action | status | created (UTC) | has conversation | link minted
+15d1157a|gmail_email|update|pending|2026-09-23 23:33:00|0|0
+45c72242|gmail_credentials|fulfil|expired|2026-09-20 23:35:35|1|1
+f05a6fe1|gmail_app_password|fulfil|expired|2026-09-20 22:34:43|1|1
+ce6b945d|gmail_credentials|fulfil|superseded|2026-09-18 18:52:18|1|1
+ee2c4036|gmail_app_password|fulfil|superseded|2026-09-18 18:51:43|1|1
+8fe591f6|gmail_credentials|fulfil|superseded|2026-09-18 14:31:38|1|1
+5da938b3|gmail_app_password|fulfil|superseded|2026-09-18 14:31:15|1|1
+ab76a070|gmail_credentials|fulfil|superseded|2026-09-18 02:02:08|1|1
+b669dbde|gmail_app_password|fulfil|superseded|2026-09-17 21:58:10|1|1
+d4de10d1|gmail_email|update|superseded|2026-09-14 23:31:36|0|0
+8767872d|gmail_credentials|fulfil|superseded|2026-09-13 19:14:55|1|1
+fbfcec78|gmail_app_password|fulfil|superseded|2026-09-13 19:14:49|1|1

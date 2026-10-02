@@ -1,79 +1,180 @@
+use crate::backoff::retry_delay;
+use crate::line_buffer::LineBuffer;
 use async_trait::async_trait;
-use chrono::Utc;
 use rustykrab_core::error::Result;
 use rustykrab_core::model::{ModelProvider, ModelResponse, StopReason, StreamEvent, Usage};
 use rustykrab_core::types::{Message, MessageContent, Role, ToolCall, ToolSchema};
 use rustykrab_core::Error;
 use serde::{Deserialize, Serialize};
+use std::collections::{hash_map::DefaultHasher, HashSet};
+use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use uuid::Uuid;
 
 /// Maximum number of retries for transient errors (429, 5xx).
 const MAX_RETRIES: u32 = 3;
-/// Base delay for exponential backoff (doubles each retry).
+/// Base delay for exponential backoff (doubles each retry, with jitter).
 const RETRY_BASE_DELAY: Duration = Duration::from_secs(1);
+
+/// Context window RustyKrab pins by default when the operator hasn't chosen
+/// one.
+///
+/// Pinning matters for KV-cache reuse. Ollama sizes a model runner's KV cache
+/// from the `num_ctx` of the request that loads it; a later request asking for
+/// a different `num_ctx` forces the scheduler to tear the runner down and
+/// reload it, discarding every cached prefix. Omitting `num_ctx` entirely is
+/// worse still: the client then has no idea how much context the server
+/// actually allocated, so its own input budget (below) is a guess, and a
+/// prompt that overshoots gets silently truncated server-side — which moves
+/// the truncation point every turn and defeats prefix caching completely.
+///
+/// 128k matches `DEFAULT_COMPACTION_CONTEXT_CEILING` in the agent runner, so
+/// the provider's window and the compaction budget agree instead of one
+/// silently capping the other. It is clamped down to the model's own native
+/// length at startup, so a smaller model still gets a sane value.
+///
+/// This costs VRAM — but far less than the linear intuition suggests, at
+/// least for the architectures we target. Measured on gemma4:26b (Q4_K_M,
+/// M1 Max), resident size against window:
+///
+/// ```text
+///   4k → 17.38 GB     32k → 17.66 GB     128k → 18.57 GB
+///   8k → 17.61 GB     64k → 18.30 GB
+/// ```
+///
+/// 32× the context for 1.2 GB, because Gemma interleaves local and global
+/// attention and only the global layers hold a full-length cache. Generation
+/// throughput was flat at ~51 t/s across that whole range; the only cost that
+/// grows is prompt processing on proportionally larger prompts (~517 → ~413
+/// tokens/s). A dense-attention model will not be this cheap.
+///
+/// Lower it with `RUSTYKRAB_NUM_CTX` if the model won't fit, or halve the
+/// cache with `OLLAMA_KV_CACHE_TYPE=q8_0` (see README).
+const DEFAULT_NUM_CTX: u32 = 131_072;
+
+/// Default `keep_alive` sent with every request: how long Ollama keeps the
+/// model (and its KV cache) resident after the request finishes. Ollama's own
+/// default is 5 minutes, which is far too short for a chat gateway that sees
+/// sporadic traffic — every message after a quiet spell pays a full model
+/// reload plus a cold-cache prompt eval. Override with `OLLAMA_KEEP_ALIVE`.
+const DEFAULT_KEEP_ALIVE: &str = "30m";
 
 /// Configuration for Ollama model inference.
 #[derive(Debug, Clone)]
 pub struct OllamaConfig {
     /// Temperature for sampling (0.0 = deterministic, 0.7 = creative).
     pub temperature: f32,
-    /// Explicit context-window size to send to the Ollama server as
-    /// `options.num_ctx`. When `None` (the default), the value is omitted
-    /// from the request so the server's own configuration is used — e.g.
-    /// its `OLLAMA_CONTEXT_LENGTH` env var or the per-model default.
-    /// Set `OLLAMA_NUM_CTX` on the client to force a specific override.
+    /// Explicit context-window size sent to the Ollama server as
+    /// `options.num_ctx`. Defaults to [`DEFAULT_NUM_CTX`] so client and
+    /// server agree on one stable window; see that constant for why pinning
+    /// beats deferring. `None` restores the old behaviour of omitting the
+    /// field so the server's `OLLAMA_CONTEXT_LENGTH` (or the per-model
+    /// default) wins — select it with `RUSTYKRAB_NUM_CTX=server`.
     pub num_ctx: Option<u32>,
-    /// Number of parallel inference slots.
-    pub num_parallel: u32,
+    /// How long Ollama should keep the model resident after a request, in
+    /// Ollama's duration syntax (`"30m"`, `"1h"`, `"-1"` for forever).
+    /// `None` omits the field and takes the server's 5-minute default.
+    pub keep_alive: Option<String>,
     /// Top-p nucleus sampling threshold.
     pub top_p: f32,
     /// Number of tokens to predict (-1 = unlimited, 0 = fill context).
     pub num_predict: i32,
-    /// Enable thinking mode for models that support it (e.g. Gemma 4).
-    /// When enabled, the model produces `<think>…</think>` reasoning
-    /// blocks before its answer, improving tool-calling accuracy.
-    pub think: bool,
+    /// Enable thinking mode. `None` (the default) decides per model via
+    /// [`think_support`]; `Some(_)` forces the answer. Ollama rejects
+    /// `think` outright for models that don't support it, so this must not
+    /// be sent unconditionally.
+    pub think: Option<bool>,
 }
 
-/// Read `num_ctx` from the environment. Checks `RUSTYKRAB_NUM_CTX` first
-/// (the canonical RustyKrab-namespaced name), then falls back to
-/// `OLLAMA_NUM_CTX` for backward compatibility. Returns `None` when
-/// neither var is set or parseable, so the request omits `num_ctx` and
-/// the Ollama server's own configuration (e.g. `OLLAMA_CONTEXT_LENGTH`)
-/// wins.
+/// Resolve the `num_ctx` to pin from the environment.
+///
+/// Checks `RUSTYKRAB_NUM_CTX` first (the canonical RustyKrab-namespaced
+/// name), then falls back to `OLLAMA_NUM_CTX`. A numeric value pins that
+/// window; `server`/`default`/`0` defers to the Ollama server's own
+/// configuration (returning `None`); anything unset falls back to
+/// [`DEFAULT_NUM_CTX`].
 fn num_ctx_from_env() -> Option<u32> {
-    std::env::var("RUSTYKRAB_NUM_CTX")
+    let raw = std::env::var("RUSTYKRAB_NUM_CTX")
         .ok()
-        .and_then(|v| v.parse::<u32>().ok())
-        .or_else(|| {
-            std::env::var("OLLAMA_NUM_CTX")
-                .ok()
-                .and_then(|v| v.parse::<u32>().ok())
-        })
+        .or_else(|| std::env::var("OLLAMA_NUM_CTX").ok());
+
+    let Some(raw) = raw else {
+        return Some(DEFAULT_NUM_CTX);
+    };
+    let trimmed = raw.trim();
+
+    if matches!(
+        trimmed.to_ascii_lowercase().as_str(),
+        "server" | "default" | "0" | ""
+    ) {
+        return None;
+    }
+
+    match trimmed.parse::<u32>() {
+        Ok(v) => Some(v),
+        Err(_) => {
+            tracing::warn!(
+                value = %raw,
+                default_num_ctx = DEFAULT_NUM_CTX,
+                "could not parse num_ctx override; falling back to the default"
+            );
+            Some(DEFAULT_NUM_CTX)
+        }
+    }
 }
 
-/// Rough characters-per-token ratio used for client-side context budgeting.
-/// Real tokenization varies by model (English prose ≈ 4, code ≈ 3, CJK ≈ 1-2);
-/// 4 is a conservative middle ground that errs toward keeping more history.
+/// Resolve `keep_alive` from `OLLAMA_KEEP_ALIVE`. An empty value or the
+/// literal `server` omits the field and takes Ollama's own default.
+fn keep_alive_from_env() -> Option<String> {
+    match std::env::var("OLLAMA_KEEP_ALIVE") {
+        Ok(v) => {
+            let trimmed = v.trim();
+            if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("server") {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        }
+        Err(_) => Some(DEFAULT_KEEP_ALIVE.to_string()),
+    }
+}
+
+/// Rough UTF-8 bytes-per-token ratio used for client-side context budgeting.
+/// This is a heuristic, not the model's tokenizer. Count bytes, not Unicode
+/// characters: treating every four CJK characters as one token badly understates
+/// their cost. The runner additionally anchors its estimates on actual usage.
 const CHARS_PER_TOKEN: usize = 4;
 
 /// Per-message overhead (role tag, framing) the server adds on top of content.
 const PER_MESSAGE_OVERHEAD_TOKENS: u32 = 4;
 
-/// Tokens reserved for tool schemas in the prompt and other framing the
-/// client can't easily measure (chat template, system tool preamble, etc.).
-const SAFETY_OVERHEAD_TOKENS: u32 = 2048;
+/// Tokens reserved for chat-template framing the client can't measure:
+/// role tags, the tool-call preamble most templates emit, BOS/EOS scaffolding.
+///
+/// Tool schemas used to be lumped in here at a flat 2048. They aren't any
+/// more — they're measured per request, because the real figure moves by an
+/// order of magnitude as the model loads tools (~1.8k tokens for the set
+/// seeded at turn 0, ~10k with the full catalog loaded). A flat guess
+/// over-reserved on a fresh conversation and badly under-reserved on a
+/// tool-heavy one, which is how a "trimmed" prompt could still overflow.
+const FRAMING_OVERHEAD_TOKENS: u32 = 512;
+
+/// Stand-in for the tool-schema block used by [`OllamaProvider::context_limit`],
+/// which is called without knowing the conversation's active tool set. Sized
+/// for a typical mid-conversation set; the per-request path measures the real
+/// thing instead.
+const ASSUMED_TOOL_TOKENS: u32 = 2048;
 
 impl Default for OllamaConfig {
     fn default() -> Self {
         Self {
             temperature: 0.1,
             num_ctx: num_ctx_from_env(),
-            num_parallel: 6,
+            keep_alive: keep_alive_from_env(),
             top_p: 0.9,
-            num_predict: 8192,
-            think: true,
+            num_predict: 4096,
+            think: None,
         }
     }
 }
@@ -83,23 +184,23 @@ impl OllamaConfig {
     pub fn tool_calling() -> Self {
         Self {
             temperature: 0.0,
-            num_ctx: num_ctx_from_env(),
-            num_parallel: 6,
-            top_p: 0.9,
             num_predict: 4096,
-            think: true,
+            ..Self::default()
         }
     }
 
     /// Configuration for creative drafting (higher temperature).
+    ///
+    /// Note that `num_predict` is a sampling parameter, so varying it
+    /// between presets does not force Ollama to reload the model runner —
+    /// unlike `num_ctx`, which is deliberately shared across all presets so
+    /// a process that mixes them keeps hitting the same warm KV cache.
     pub fn creative() -> Self {
         Self {
             temperature: 0.7,
-            num_ctx: num_ctx_from_env(),
-            num_parallel: 6,
             top_p: 0.95,
             num_predict: 16384,
-            think: true,
+            ..Self::default()
         }
     }
 }
@@ -110,10 +211,20 @@ pub struct OllamaProvider {
     base_url: String,
     model: String,
     config: OllamaConfig,
-    /// Model's native context length discovered from `/api/show`.  Used
-    /// only as a client-side prompt-trimming budget when the user hasn't
-    /// set an explicit `num_ctx`; never sent to the server.
+    /// Model's native context length discovered from `/api/show`.  Used to
+    /// clamp the pinned `num_ctx` down to something the model can actually
+    /// serve, and as the client-side input budget when `num_ctx`
+    /// has been explicitly set to defer to the server.
     detected_ctx: Option<u32>,
+    /// What Ollama itself reports the model can do, from `/api/show`.
+    /// `None` when it could not be read (server unreachable, or a release
+    /// predating the `capabilities` field), in which case the tag-matching
+    /// heuristics stand in.
+    detected_caps: Option<ModelCapabilities>,
+    /// Fingerprint of the tool block sent on the previous request, so a
+    /// change can be reported.  See [`OllamaProvider::note_tool_block`].
+    /// `0` means "nothing sent yet".
+    last_tool_fingerprint: AtomicU64,
 }
 
 impl OllamaProvider {
@@ -136,6 +247,8 @@ impl OllamaProvider {
             model: model.into(),
             config: OllamaConfig::default(),
             detected_ctx: None,
+            detected_caps: None,
+            last_tool_fingerprint: AtomicU64::new(0),
         }
     }
 
@@ -165,9 +278,232 @@ impl OllamaProvider {
         self.config.num_ctx
     }
 
-    /// Effective context window used for client-side prompt trimming.
+    /// Get the `keep_alive` that will be sent with each request, if any.
+    pub fn keep_alive(&self) -> Option<&str> {
+        self.config.keep_alive.as_deref()
+    }
+
+    /// Whether the model will be asked to think.
+    ///
+    /// An explicit `config.think` wins, then `OLLAMA_THINK`, then what Ollama
+    /// reports for the model, and only then the model-tag heuristic.
+    pub fn resolved_think(&self) -> bool {
+        self.config
+            .think
+            .unwrap_or_else(|| think_support(&self.model, self.detected_caps))
+    }
+
+    /// The value of the `think` field to send with a request, or `None` to
+    /// omit it.
+    ///
+    /// Omitting is not the same as disabling. Ollama defaults a
+    /// thinking-capable model to thinking, so leaving the field out asks for
+    /// thinking; only an explicit `false` turns it off. Sending `false` to a
+    /// model that cannot think is a 400, so it is omitted there — where
+    /// omission genuinely does mean off.
+    ///
+    /// This is why `OLLAMA_THINK=false` used to be silently ineffective: the
+    /// send sites read `if resolved_think() { think = true }`, so "off"
+    /// produced no field at all and the model went on thinking.
+    fn think_field(&self) -> Option<bool> {
+        let wanted = self.resolved_think();
+        if wanted {
+            // `resolved_think` is only true when the model can think, or when
+            // the operator forced it; either way, ask.
+            Some(true)
+        } else if model_can_think(&self.model, self.detected_caps) {
+            // Capable, but told not to. This is the case that has to be
+            // explicit.
+            Some(false)
+        } else {
+            // Incapable: the field would be rejected, and omitting it is
+            // already off.
+            None
+        }
+    }
+
+    /// Effective context window used for client-side input validation.
     /// Prefers the user's explicit `num_ctx`, then the value detected from
-    /// the model via `/api/show`, else `None` (no trimming).
+    /// the model via `/api/show`, else `None` (budget unknown).
+    /// The real chat implementation. `window_override` serves this one
+    /// call at a different context window: both the client-side validation and
+    /// the `num_ctx` sent to the server use it, so an expanded
+    /// summarization call is not incorrectly refused against the everyday
+    /// window before the model ever sees it.
+    async fn chat_at(
+        &self,
+        messages: &[Message],
+        tools: &[ToolSchema],
+        window_override: Option<u32>,
+    ) -> Result<ModelResponse> {
+        let window = window_override.or(self.effective_ctx());
+        Self::validate_tool_history(messages)?;
+        let ollama_messages = Self::build_messages(messages, self.supports_vision())?;
+        // Fix #200: validate non-empty messages.
+        if ollama_messages.is_empty() {
+            return Err(Error::ModelBadRequest(
+                "cannot call Ollama API with an empty message list".into(),
+            ));
+        }
+
+        let ollama_tools = Self::build_tools(tools);
+        let tool_tokens = estimate_tool_tokens(&ollama_tools);
+        self.note_tool_block(&ollama_tools, tool_tokens);
+
+        let num_predict = clamp_num_predict(window, self.config.num_predict);
+        Self::validate_input_budget(&ollama_messages, window, num_predict, tool_tokens)?;
+
+        let mut options = serde_json::json!({
+            "temperature": self.config.temperature,
+            "top_p": self.config.top_p,
+            "num_predict": num_predict,
+        });
+        // Only override the server's context length when the user has asked
+        // for it explicitly — otherwise leave `num_ctx` out so `OLLAMA_CONTEXT_LENGTH`
+        // (or the model default) wins.
+        if let Some(num_ctx) = window_override.or(self.config.num_ctx) {
+            options["num_ctx"] = serde_json::json!(num_ctx);
+        }
+
+        let mut body = serde_json::json!({
+            "model": self.model,
+            "messages": ollama_messages,
+            "stream": false,
+            "options": options,
+        });
+        // `think` is rejected outright by models that don't support it, so
+        // the field is omitted there. For a capable model both polarities are
+        // sent explicitly — omitting it would leave thinking on.
+        if let Some(think) = self.think_field() {
+            body["think"] = serde_json::json!(think);
+        }
+        // Keep the model — and with it the KV cache built from this prompt —
+        // resident between turns. Without this Ollama evicts after five idle
+        // minutes and the next message pays a reload plus a cold prompt eval.
+        if let Some(keep_alive) = &self.config.keep_alive {
+            body["keep_alive"] = serde_json::json!(keep_alive);
+        }
+
+        if !ollama_tools.is_empty() {
+            body["tools"] = serde_json::to_value(&ollama_tools).map_err(Error::Serialization)?;
+        }
+
+        tracing::debug!(
+            model = %self.model,
+            base_url = %self.base_url,
+            num_messages = ollama_messages.len(),
+            num_ctx = ?self.config.num_ctx,
+            num_tools = ollama_tools.len(),
+            tool_tokens,
+            trace_id = ?rustykrab_core::prompt_trace::current_trace_id(),
+            "calling Ollama chat API"
+        );
+        rustykrab_core::prompt_trace::record_prompt(
+            self.name(),
+            &self.model,
+            false,
+            messages,
+            tools,
+        );
+
+        let url = format!("{}/api/chat", self.base_url);
+
+        let request_start = std::time::Instant::now();
+        let mut last_err = None;
+        for attempt in 0..=MAX_RETRIES {
+            if attempt > 0 {
+                let delay = retry_delay(RETRY_BASE_DELAY, attempt);
+                tracing::warn!(attempt, "retrying Ollama API after {delay:?}");
+                tokio::time::sleep(delay).await;
+            }
+
+            let resp = match self.client.post(&url).json(&body).send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    // Don't retry timeouts: retrying the same 99K-token prompt
+                    // would just burn another 15-minute budget for the same
+                    // failure.  The caller (agent loop) needs to reduce context
+                    // or abort before re-trying.
+                    if e.is_timeout() {
+                        tracing::warn!(
+                            model = %self.model,
+                            num_messages = ollama_messages.len(),
+                            num_ctx = ?self.config.num_ctx,
+                            "Ollama request timed out — not retrying (reduce context or raise OLLAMA_TIMEOUT_SECS)"
+                        );
+                        return Err(Error::ModelProvider(format!(
+                            "Ollama request timed out after the configured HTTP timeout. \
+                             Reduce prompt size or raise OLLAMA_TIMEOUT_SECS: {e}"
+                        )));
+                    }
+                    last_err = Some(Error::ModelProvider(format!(
+                        "failed to connect to Ollama at {}: {e}. Is Ollama running?",
+                        self.base_url
+                    )));
+                    continue;
+                }
+            };
+
+            let status = resp.status();
+            if status.is_success() {
+                let raw_body = resp.text().await.map_err(|e| {
+                    Error::ModelProvider(format!("failed to read Ollama response body: {e}"))
+                })?;
+                let ollama_resp: OllamaResponse = serde_json::from_str(&raw_body).map_err(|e| {
+                    Error::ModelProvider(format!("failed to parse Ollama response: {e}"))
+                })?;
+                let response = Self::parse_response(&self.model, ollama_resp)?;
+
+                // Debug: dump raw response when message text is empty
+                // despite having completion tokens.
+                if response.usage.completion_tokens > 0
+                    && !response.message.content.has_tool_calls()
+                    && response
+                        .message
+                        .content
+                        .as_text()
+                        .is_none_or(|t| t.is_empty())
+                {
+                    tracing::warn!(
+                        completion_tokens = response.usage.completion_tokens,
+                        ?response.stop_reason,
+                        "empty message text with completion tokens — dumping raw response"
+                    );
+                    tracing::warn!(raw_body = %raw_body, "raw Ollama API response");
+                }
+
+                rustykrab_core::prompt_trace::record_response(
+                    self.name(),
+                    &self.model,
+                    false,
+                    &response.message,
+                    &response.usage,
+                    &response.stop_reason,
+                    request_start.elapsed().as_millis() as u64,
+                );
+                return Ok(response);
+            }
+
+            let error_body = resp.text().await.unwrap_or_default();
+            tracing::warn!(
+                status = %status,
+                num_ctx = ?self.config.num_ctx,
+                num_messages = ollama_messages.len(),
+                error_body = %error_body,
+                "Ollama API error"
+            );
+            let is_retryable = matches!(status.as_u16(), 429 | 500 | 502 | 503 | 529);
+            // Fix #186: map status codes to specific error variants.
+            last_err = Some(Self::map_status_error(status, &error_body));
+
+            if !is_retryable {
+                break;
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| Error::ModelProvider("request failed".into())))
+    }
+
     pub fn effective_ctx(&self) -> Option<u32> {
         self.config.num_ctx.or(self.detected_ctx)
     }
@@ -177,6 +513,13 @@ impl OllamaProvider {
     /// unfamiliar (e.g. an architecture we don't recognize).  Network and
     /// HTTP errors are propagated so the caller can decide how to react.
     pub async fn detect_context_window(&self) -> Result<Option<u32>> {
+        Ok(self.detect_model_shape().await?.ctx)
+    }
+
+    /// Query `/api/show` for the model's native context length, the
+    /// attention geometry needed to size its KV cache, and the capabilities
+    /// Ollama reports for it.
+    async fn detect_model_shape(&self) -> Result<ModelShape> {
         let url = format!("{}/api/show", self.base_url);
         let resp = self
             .client
@@ -195,7 +538,39 @@ impl OllamaProvider {
         let raw: serde_json::Value = resp.json().await.map_err(|e| {
             Error::ModelProvider(format!("failed to parse /api/show response: {e}"))
         })?;
-        Ok(parse_context_length_from_show(&raw))
+        Ok(ModelShape {
+            ctx: parse_context_length_from_show(&raw),
+            geometry: parse_kv_geometry_from_show(&raw),
+            caps: parse_capabilities_from_show(&raw),
+        })
+    }
+
+    /// Report what the pinned window will cost in KV cache.
+    ///
+    /// Choosing `num_ctx` is a VRAM decision, and without this the operator
+    /// has no way to make it except trial and error against an OOM. Logged at
+    /// startup for the window actually in use, plus the model's native
+    /// maximum so the gap between "what it supports" and "what it costs" is
+    /// visible in one place.
+    fn log_kv_cache_estimate(&self, geometry: KvGeometry, native_ctx: Option<u32>) {
+        let Some(window) = self.effective_ctx() else {
+            return;
+        };
+        // f16 is Ollama's default; OLLAMA_KV_CACHE_TYPE=q8_0 halves it.
+        const F16: u64 = 2;
+        let gib = |bytes: u64| bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+
+        tracing::info!(
+            num_ctx = window,
+            layers = geometry.layers,
+            kv_heads = geometry.kv_heads,
+            kv_cache_gib_f16 = format!("{:.1}", gib(geometry.cache_bytes(window, F16))),
+            kv_cache_gib_q8_0 = format!("{:.1}", gib(geometry.cache_bytes(window, 1))),
+            native_ctx_kv_cache_gib_f16 = native_ctx
+                .map(|n| format!("{:.1}", gib(geometry.cache_bytes(n, F16))))
+                .unwrap_or_else(|| "unknown".to_string()),
+            "estimated KV cache footprint (upper bound; sliding-window layers cost less)"
+        );
     }
 
     /// Detect the model's native context length and cache it for client-side
@@ -205,41 +580,12 @@ impl OllamaProvider {
     /// is logged — startup must not fail just because Ollama is momentarily
     /// unreachable.
     pub async fn with_detected_context_window(mut self) -> Self {
-        match self.detect_context_window().await {
-            Ok(Some(detected)) => {
-                self.detected_ctx = Some(detected);
-                if let Some(requested) = self.config.num_ctx {
-                    if requested > detected {
-                        tracing::info!(
-                            model = %self.model,
-                            requested_num_ctx = requested,
-                            detected_num_ctx = detected,
-                            "clamping explicit num_ctx to model's native context length"
-                        );
-                        self.config.num_ctx = Some(detected);
-                    } else {
-                        tracing::debug!(
-                            model = %self.model,
-                            num_ctx = requested,
-                            detected_num_ctx = detected,
-                            "explicit num_ctx fits within model's native context length"
-                        );
-                    }
-                } else {
-                    tracing::debug!(
-                        model = %self.model,
-                        detected_num_ctx = detected,
-                        "no explicit num_ctx set; deferring to server while using detected value for client-side trimming"
-                    );
-                }
-            }
-            Ok(None) => {
-                tracing::warn!(
-                    model = %self.model,
-                    num_ctx = ?self.config.num_ctx,
-                    "could not detect model context length from /api/show"
-                );
-            }
+        let ModelShape {
+            ctx: detected,
+            geometry,
+            caps,
+        } = match self.detect_model_shape().await {
+            Ok(shape) => shape,
             Err(e) => {
                 tracing::warn!(
                     model = %self.model,
@@ -247,7 +593,69 @@ impl OllamaProvider {
                     error = %e,
                     "failed to query /api/show"
                 );
+                return self;
             }
+        };
+
+        match detected {
+            Some(detected) => {
+                self.detected_ctx = Some(detected);
+                match self.config.num_ctx {
+                    Some(requested) if requested > detected => {
+                        tracing::info!(
+                            model = %self.model,
+                            requested_num_ctx = requested,
+                            detected_num_ctx = detected,
+                            "clamping num_ctx to model's native context length"
+                        );
+                        self.config.num_ctx = Some(detected);
+                    }
+                    Some(requested) => {
+                        tracing::debug!(
+                            model = %self.model,
+                            num_ctx = requested,
+                            detected_num_ctx = detected,
+                            "num_ctx fits within model's native context length"
+                        );
+                    }
+                    None => {
+                        tracing::debug!(
+                            model = %self.model,
+                            detected_num_ctx = detected,
+                            "no explicit num_ctx set; deferring to server while using detected value for client-side trimming"
+                        );
+                    }
+                }
+            }
+            None => {
+                tracing::warn!(
+                    model = %self.model,
+                    num_ctx = ?self.config.num_ctx,
+                    "could not detect model context length from /api/show"
+                );
+            }
+        }
+
+        match geometry {
+            Some(geometry) => self.log_kv_cache_estimate(geometry, detected),
+            None => tracing::debug!(
+                model = %self.model,
+                "could not read attention geometry from /api/show; skipping KV cache estimate"
+            ),
+        }
+
+        self.detected_caps = caps;
+        match caps {
+            Some(caps) => tracing::info!(
+                model = %self.model,
+                vision = caps.vision,
+                thinking = caps.thinking,
+                "capabilities reported by Ollama"
+            ),
+            None => tracing::debug!(
+                model = %self.model,
+                "Ollama reported no capability list; falling back to model-tag heuristics"
+            ),
         }
         self
     }
@@ -437,7 +845,7 @@ impl OllamaProvider {
         args
     }
 
-    fn parse_response(resp: OllamaResponse) -> Result<ModelResponse> {
+    fn parse_response(model: &str, resp: OllamaResponse) -> Result<ModelResponse> {
         let msg = resp.message;
 
         // Fix #192: parse done_reason to detect truncation.
@@ -465,12 +873,7 @@ impl OllamaProvider {
                 };
 
                 return Ok(ModelResponse {
-                    message: Message {
-                        id: Uuid::new_v4(),
-                        role: Role::Assistant,
-                        content,
-                        created_at: Utc::now(),
-                    },
+                    message: Message::stamped(Role::Assistant, content),
                     usage: Usage {
                         prompt_tokens: resp.prompt_eval_count.unwrap_or(0),
                         completion_tokens: resp.eval_count.unwrap_or(0),
@@ -482,13 +885,17 @@ impl OllamaProvider {
             }
         }
 
+        let text = msg.content.unwrap_or_default();
+        if is_empty_generation(&text, resp.eval_count) {
+            return Err(empty_response_error(
+                model,
+                resp.prompt_eval_count,
+                resp.done_reason.as_deref(),
+            ));
+        }
+
         Ok(ModelResponse {
-            message: Message {
-                id: Uuid::new_v4(),
-                role: Role::Assistant,
-                content: MessageContent::Text(msg.content.unwrap_or_default()),
-                created_at: Utc::now(),
-            },
+            message: Message::stamped(Role::Assistant, MessageContent::Text(text)),
             usage: Usage {
                 prompt_tokens: resp.prompt_eval_count.unwrap_or(0),
                 completion_tokens: resp.eval_count.unwrap_or(0),
@@ -499,59 +906,151 @@ impl OllamaProvider {
         })
     }
 
-    /// Trim oldest non-system messages until the estimated prompt fits the
-    /// budget derived from `total_ctx` minus `num_predict` and a safety margin
-    /// for tool schemas / chat-template framing.  Tool-result messages are
-    /// dropped along with any preceding orphaned tool-call assistant turn so
-    /// the request stays well-formed.  When `total_ctx` is `None` we have no
-    /// budget to enforce so messages pass through unchanged.
-    fn trim_to_budget(
-        messages: Vec<OllamaMessage>,
+    /// Enforce the negotiated budget without changing the conversation.
+    ///
+    /// The former oldest-first trimmer could discard the objective, a date
+    /// correction, or a tool call's matching result while the runner believed
+    /// all of them were still present. Only the runner owns semantic compaction
+    /// and durable recall; the wire adapter must either send the whole prepared
+    /// request or refuse it before HTTP. In particular, it must not send an
+    /// oversized last-user turn and rely on Ollama's silent truncation.
+    ///
+    /// Estimates are not native tokenizer counts, and images have model-specific
+    /// costs not measured here. An unknown window cannot be enforced locally.
+    fn validate_input_budget(
+        messages: &[OllamaMessage],
         total_ctx: Option<u32>,
         num_predict: i32,
-    ) -> Vec<OllamaMessage> {
+        tool_tokens: u32,
+    ) -> Result<()> {
         let Some(total_ctx) = total_ctx else {
-            return messages;
+            return Ok(());
         };
-        let reserved_output = num_predict.max(0) as u32;
-        let budget = total_ctx
-            .saturating_sub(reserved_output)
-            .saturating_sub(SAFETY_OVERHEAD_TOKENS);
+        let budget = input_budget(total_ctx, num_predict, tool_tokens);
+        let estimated = messages.iter().fold(0u32, |total, message| {
+            total.saturating_add(estimate_message_tokens(message))
+        });
+        if budget == 0 || estimated > budget {
+            tracing::warn!(
+                num_ctx = total_ctx,
+                tool_tokens,
+                budget,
+                estimated_input_tokens = estimated,
+                messages = messages.len(),
+                "refusing oversized Ollama request without dropping history; runner must compact"
+            );
+            return Err(Error::ContextBudgetExceeded {
+                estimated_input_tokens: estimated as usize,
+                input_budget_tokens: budget as usize,
+            });
+        }
+        Ok(())
+    }
 
-        let total: u32 = messages.iter().map(estimate_message_tokens).sum();
-        if total <= budget {
-            return messages;
+    /// Validate pairing while core call ids are still available. Ollama's wire
+    /// format omits ids, so validating after conversion cannot distinguish two
+    /// parallel calls with identical names. Never repair by silently deleting
+    /// an orphan result: it may be the only evidence of a completed action.
+    fn validate_tool_history(messages: &[Message]) -> Result<()> {
+        let mut pending = HashSet::new();
+        for (index, message) in messages.iter().enumerate() {
+            if let MessageContent::ToolResult(result) = &message.content {
+                if message.role != Role::Tool || !pending.remove(result.call_id.as_str()) {
+                    return Err(Error::ModelBadRequest(format!(
+                        "Ollama tool history has an unmatched or duplicate result at message {index}"
+                    )));
+                }
+                continue;
+            }
+            if !pending.is_empty() {
+                return Err(Error::ModelBadRequest(format!(
+                    "Ollama tool history has {} unresolved call(s) before message {index}",
+                    pending.len()
+                )));
+            }
+            let calls = message.content.tool_calls();
+            if !calls.is_empty() && message.role != Role::Assistant {
+                return Err(Error::ModelBadRequest(format!(
+                    "Ollama tool calls must have assistant role at message {index}"
+                )));
+            }
+            for call in calls {
+                if call.id.is_empty() || !pending.insert(call.id.as_str()) {
+                    return Err(Error::ModelBadRequest(format!(
+                        "Ollama tool history has empty or duplicate call ids at message {index}"
+                    )));
+                }
+            }
+            if message.role == Role::Tool {
+                return Err(Error::ModelBadRequest(format!(
+                    "Ollama tool message {index} does not carry a paired tool result"
+                )));
+            }
+        }
+        if !pending.is_empty() {
+            return Err(Error::ModelBadRequest(format!(
+                "Ollama tool history ends with {} unresolved call(s)",
+                pending.len()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Record the tool block about to be sent, and report when it differs
+    /// from the previous request's.
+    ///
+    /// This is not bookkeeping for its own sake. Chat templates render tool
+    /// definitions into the prompt *prefix*, ahead of the conversation, so
+    /// changing the tool set moves every subsequent token — the cached prefix
+    /// stops matching at the tool block and the server re-evaluates the whole
+    /// prompt. On a long conversation that is by far the most expensive thing
+    /// that can happen to a turn, and it is invisible without this log line.
+    ///
+    /// The set is driven by the `tools_load` meta-tool, so it changes when the
+    /// model discovers and loads new tools. That is the intended design — the
+    /// full catalog is far too large to send every turn — but it means tool
+    /// loading is best done in one batch early, not drip-fed across a run.
+    fn note_tool_block(&self, tools: &[OllamaTool], tool_tokens: u32) {
+        // Names alone, in order: that is what the prompt prefix is sensitive
+        // to, and it avoids re-hashing the (much larger) parameter schemas.
+        let mut hasher = DefaultHasher::new();
+        for t in tools {
+            t.function.name.hash(&mut hasher);
+        }
+        // Reserve 0 for "nothing sent yet" so the first request isn't
+        // mistaken for a change.
+        let fingerprint = hasher.finish() | 1;
+
+        let previous = self
+            .last_tool_fingerprint
+            .swap(fingerprint, Ordering::Relaxed);
+        if previous != 0 && previous != fingerprint {
+            tracing::info!(
+                num_tools = tools.len(),
+                tool_tokens,
+                "tool set changed since the last request — Ollama must re-evaluate                  the whole prompt, since tool definitions sit in the cached prefix"
+            );
         }
 
-        let system_count = messages.iter().take_while(|m| m.role == "system").count();
-        let mut trimmed = messages;
-        let mut current = total;
-        let mut dropped = 0usize;
-
-        while current > budget && trimmed.len() > system_count {
-            let removed = trimmed.remove(system_count);
-            current = current.saturating_sub(estimate_message_tokens(&removed));
-            dropped += 1;
+        // The runner uses context_limit_for_tools() for this exact tool set.
+        // Keep a diagnostic when schema loading materially reduces the older
+        // tool-independent budget; this is now compaction pressure, never
+        // permission for the provider to discard history.
+        if let Some(window) = self.effective_ctx() {
+            let reserve = clamp_num_predict(Some(window), self.config.num_predict);
+            let assumed = input_budget(window, reserve, ASSUMED_TOOL_TOKENS);
+            let actual = input_budget(window, reserve, tool_tokens);
+            let compaction_threshold = assumed / 100 * 85;
+            if actual < compaction_threshold {
+                tracing::warn!(
+                    num_ctx = window,
+                    tool_tokens,
+                    input_budget = actual,
+                    assumed_compaction_threshold = compaction_threshold,
+                    "loaded tool schemas materially reduce context available for history"
+                );
+            }
         }
-
-        // If trimming left a leading orphan tool-result (no preceding
-        // assistant tool_call), drop it so Ollama doesn't reject the request.
-        while trimmed.len() > system_count && trimmed[system_count].role == "tool" {
-            let removed = trimmed.remove(system_count);
-            current = current.saturating_sub(estimate_message_tokens(&removed));
-            dropped += 1;
-        }
-
-        tracing::warn!(
-            num_ctx = total_ctx,
-            budget,
-            estimated_tokens_before = total,
-            estimated_tokens_after = current,
-            messages_dropped = dropped,
-            "trimmed conversation history to fit Ollama context window"
-        );
-
-        trimmed
     }
 
     /// Map an HTTP status code to a specific error variant (#186).
@@ -571,168 +1070,53 @@ impl ModelProvider for OllamaProvider {
         "ollama"
     }
 
+    /// A tool-independent input budget for callers without a concrete tool set.
+    /// Actual turns use context_limit_for_tools(), including the same output
+    /// clamp and schema reservation as the send path. Zero means no usable
+    /// input budget; an invented floor would advertise space that cannot fit.
     fn context_limit(&self) -> Option<usize> {
-        self.effective_ctx().map(|v| v as usize)
+        self.effective_ctx().map(|window| {
+            let reserve = clamp_num_predict(Some(window), self.config.num_predict);
+            input_budget(window, reserve, ASSUMED_TOOL_TOKENS) as usize
+        })
+    }
+
+    fn context_limit_for_tools(&self, tools: &[ToolSchema]) -> Option<usize> {
+        self.effective_ctx().map(|window| {
+            let reserve = clamp_num_predict(Some(window), self.config.num_predict);
+            let schema_tokens = estimate_tool_tokens(&Self::build_tools(tools));
+            input_budget(window, reserve, schema_tokens) as usize
+        })
+    }
+
+    /// The raw pinned window, as distinct from the input budget above.
+    /// Actual usage (`prompt_eval_count` + `eval_count`) is measured
+    /// against this figure — Ollama reports the *full* prompt token count
+    /// even on a prefix-cache hit, so callers can anchor context
+    /// accounting to it.
+    fn total_context_window(&self) -> Option<usize> {
+        self.effective_ctx().map(|w| w as usize)
+    }
+
+    fn output_reserve_tokens(&self) -> usize {
+        clamp_num_predict(self.effective_ctx(), self.config.num_predict).max(0) as usize
     }
 
     fn supports_vision(&self) -> bool {
-        vision_support(&self.model)
+        vision_support(&self.model, self.detected_caps)
     }
 
     async fn chat(&self, messages: &[Message], tools: &[ToolSchema]) -> Result<ModelResponse> {
-        let ollama_messages = Self::build_messages(messages, self.supports_vision())?;
+        self.chat_at(messages, tools, None).await
+    }
 
-        // Fix #200: validate non-empty messages.
-        if ollama_messages.is_empty() {
-            return Err(Error::ModelBadRequest(
-                "cannot call Ollama API with an empty message list".into(),
-            ));
-        }
-
-        let ollama_messages = Self::trim_to_budget(
-            ollama_messages,
-            self.effective_ctx(),
-            self.config.num_predict,
-        );
-
-        let ollama_tools = Self::build_tools(tools);
-
-        let mut options = serde_json::json!({
-            "temperature": self.config.temperature,
-            "top_p": self.config.top_p,
-            "num_predict": self.config.num_predict,
-        });
-        // Only override the server's context length when the user has asked
-        // for it explicitly — otherwise leave `num_ctx` out so `OLLAMA_CONTEXT_LENGTH`
-        // (or the model default) wins.
-        if let Some(num_ctx) = self.config.num_ctx {
-            options["num_ctx"] = serde_json::json!(num_ctx);
-        }
-
-        let mut body = serde_json::json!({
-            "model": self.model,
-            "messages": ollama_messages,
-            "stream": false,
-            "think": self.config.think,
-            "options": options,
-        });
-
-        if !ollama_tools.is_empty() {
-            body["tools"] = serde_json::to_value(&ollama_tools).map_err(Error::Serialization)?;
-        }
-
-        tracing::debug!(
-            model = %self.model,
-            base_url = %self.base_url,
-            num_messages = ollama_messages.len(),
-            num_ctx = ?self.config.num_ctx,
-            trace_id = ?rustykrab_core::prompt_trace::current_trace_id(),
-            "calling Ollama chat API"
-        );
-        rustykrab_core::prompt_trace::record_prompt(
-            self.name(),
-            &self.model,
-            false,
-            messages,
-            tools,
-        );
-
-        let url = format!("{}/api/chat", self.base_url);
-
-        let request_start = std::time::Instant::now();
-        let mut last_err = None;
-        for attempt in 0..=MAX_RETRIES {
-            if attempt > 0 {
-                let delay = RETRY_BASE_DELAY * 2u32.pow(attempt - 1);
-                tracing::warn!(attempt, "retrying Ollama API after {delay:?}");
-                tokio::time::sleep(delay).await;
-            }
-
-            let resp = match self.client.post(&url).json(&body).send().await {
-                Ok(r) => r,
-                Err(e) => {
-                    // Don't retry timeouts: retrying the same 99K-token prompt
-                    // would just burn another 15-minute budget for the same
-                    // failure.  The caller (agent loop) needs to reduce context
-                    // or abort before re-trying.
-                    if e.is_timeout() {
-                        tracing::warn!(
-                            model = %self.model,
-                            num_messages = ollama_messages.len(),
-                            num_ctx = ?self.config.num_ctx,
-                            "Ollama request timed out — not retrying (reduce context or raise OLLAMA_TIMEOUT_SECS)"
-                        );
-                        return Err(Error::ModelProvider(format!(
-                            "Ollama request timed out after the configured HTTP timeout. \
-                             Reduce prompt size or raise OLLAMA_TIMEOUT_SECS: {e}"
-                        )));
-                    }
-                    last_err = Some(Error::ModelProvider(format!(
-                        "failed to connect to Ollama at {}: {e}. Is Ollama running?",
-                        self.base_url
-                    )));
-                    continue;
-                }
-            };
-
-            let status = resp.status();
-            if status.is_success() {
-                let raw_body = resp.text().await.map_err(|e| {
-                    Error::ModelProvider(format!("failed to read Ollama response body: {e}"))
-                })?;
-                let ollama_resp: OllamaResponse = serde_json::from_str(&raw_body).map_err(|e| {
-                    Error::ModelProvider(format!("failed to parse Ollama response: {e}"))
-                })?;
-                let response = Self::parse_response(ollama_resp)?;
-
-                // Debug: dump raw response when message text is empty
-                // despite having completion tokens.
-                if response.usage.completion_tokens > 0
-                    && !response.message.content.has_tool_calls()
-                    && response
-                        .message
-                        .content
-                        .as_text()
-                        .is_none_or(|t| t.is_empty())
-                {
-                    tracing::warn!(
-                        completion_tokens = response.usage.completion_tokens,
-                        ?response.stop_reason,
-                        "empty message text with completion tokens — dumping raw response"
-                    );
-                    tracing::warn!(raw_body = %raw_body, "raw Ollama API response");
-                }
-
-                rustykrab_core::prompt_trace::record_response(
-                    self.name(),
-                    &self.model,
-                    false,
-                    &response.message,
-                    &response.usage,
-                    &response.stop_reason,
-                    request_start.elapsed().as_millis() as u64,
-                );
-                return Ok(response);
-            }
-
-            let error_body = resp.text().await.unwrap_or_default();
-            tracing::warn!(
-                status = %status,
-                num_ctx = ?self.config.num_ctx,
-                num_messages = ollama_messages.len(),
-                error_body = %error_body,
-                "Ollama API error"
-            );
-            let is_retryable = matches!(status.as_u16(), 429 | 500 | 502 | 503 | 529);
-            // Fix #186: map status codes to specific error variants.
-            last_err = Some(Self::map_status_error(status, &error_body));
-
-            if !is_retryable {
-                break;
-            }
-        }
-
-        Err(last_err.unwrap_or_else(|| Error::ModelProvider("request failed".into())))
+    async fn chat_with_ctx(
+        &self,
+        messages: &[Message],
+        tools: &[ToolSchema],
+        num_ctx: u32,
+    ) -> Result<ModelResponse> {
+        self.chat_at(messages, tools, Some(num_ctx)).await
     }
 
     /// Fix #175: streaming implementation using Ollama NDJSON.
@@ -742,6 +1126,7 @@ impl ModelProvider for OllamaProvider {
         tools: &[ToolSchema],
         on_event: &(dyn Fn(StreamEvent) + Send + Sync),
     ) -> Result<ModelResponse> {
+        Self::validate_tool_history(messages)?;
         let ollama_messages = Self::build_messages(messages, self.supports_vision())?;
 
         if ollama_messages.is_empty() {
@@ -750,18 +1135,24 @@ impl ModelProvider for OllamaProvider {
             ));
         }
 
-        let ollama_messages = Self::trim_to_budget(
-            ollama_messages,
-            self.effective_ctx(),
-            self.config.num_predict,
-        );
-
         let ollama_tools = Self::build_tools(tools);
+        let tool_tokens = estimate_tool_tokens(&ollama_tools);
+        self.note_tool_block(&ollama_tools, tool_tokens);
+
+        // Same clamp as chat_at and context_limit_for_tools.
+        let num_predict = clamp_num_predict(self.effective_ctx(), self.config.num_predict);
+
+        Self::validate_input_budget(
+            &ollama_messages,
+            self.effective_ctx(),
+            num_predict,
+            tool_tokens,
+        )?;
 
         let mut options = serde_json::json!({
             "temperature": self.config.temperature,
             "top_p": self.config.top_p,
-            "num_predict": self.config.num_predict,
+            "num_predict": num_predict,
         });
         if let Some(num_ctx) = self.config.num_ctx {
             options["num_ctx"] = serde_json::json!(num_ctx);
@@ -771,9 +1162,20 @@ impl ModelProvider for OllamaProvider {
             "model": self.model,
             "messages": ollama_messages,
             "stream": true,
-            "think": self.config.think,
             "options": options,
         });
+        // `think` is rejected outright by models that don't support it, so
+        // the field is omitted there. For a capable model both polarities are
+        // sent explicitly — omitting it would leave thinking on.
+        if let Some(think) = self.think_field() {
+            body["think"] = serde_json::json!(think);
+        }
+        // Keep the model — and with it the KV cache built from this prompt —
+        // resident between turns. Without this Ollama evicts after five idle
+        // minutes and the next message pays a reload plus a cold prompt eval.
+        if let Some(keep_alive) = &self.config.keep_alive {
+            body["keep_alive"] = serde_json::json!(keep_alive);
+        }
 
         if !ollama_tools.is_empty() {
             body["tools"] = serde_json::to_value(&ollama_tools).map_err(Error::Serialization)?;
@@ -784,6 +1186,8 @@ impl ModelProvider for OllamaProvider {
             base_url = %self.base_url,
             num_messages = ollama_messages.len(),
             num_ctx = ?self.config.num_ctx,
+            num_tools = ollama_tools.len(),
+            tool_tokens,
             trace_id = ?rustykrab_core::prompt_trace::current_trace_id(),
             "calling Ollama chat API (streaming)"
         );
@@ -802,7 +1206,7 @@ impl ModelProvider for OllamaProvider {
         let mut resp = None;
         for attempt in 0..=MAX_RETRIES {
             if attempt > 0 {
-                let delay = RETRY_BASE_DELAY * 2u32.pow(attempt - 1);
+                let delay = retry_delay(RETRY_BASE_DELAY, attempt);
                 tracing::warn!(attempt, "retrying Ollama streaming API after {delay:?}");
                 tokio::time::sleep(delay).await;
             }
@@ -856,8 +1260,10 @@ impl ModelProvider for OllamaProvider {
             last_err.unwrap_or_else(|| Error::ModelProvider("request failed".into()))
         })?;
 
-        // Parse newline-delimited JSON chunks.
-        let mut buffer = String::new();
+        // Parse newline-delimited JSON chunks. Raw bytes are buffered and
+        // split on `\n` before UTF-8 decoding, so multi-byte codepoints
+        // that span network chunks are reassembled instead of corrupted.
+        let mut buffer = LineBuffer::new();
         let mut full_text = String::new();
         let mut tool_calls: Vec<ToolCall> = Vec::new();
         let mut prompt_eval_count: u32 = 0;
@@ -891,17 +1297,16 @@ impl ModelProvider for OllamaProvider {
             };
             chunks_received += 1;
             bytes_received += chunk.len() as u64;
-            buffer.push_str(&String::from_utf8_lossy(&chunk));
+            buffer.push_chunk(&chunk);
 
-            while let Some(newline_pos) = buffer.find('\n') {
-                let line = buffer[..newline_pos].trim().to_string();
-                buffer = buffer[newline_pos + 1..].to_string();
+            while let Some(line) = buffer.next_line() {
+                let line = line.trim();
 
                 if line.is_empty() {
                     continue;
                 }
 
-                let stream_chunk: OllamaStreamChunk = serde_json::from_str(&line).map_err(|e| {
+                let stream_chunk: OllamaStreamChunk = serde_json::from_str(line).map_err(|e| {
                     Error::ModelProvider(format!("failed to parse Ollama stream chunk: {e}"))
                 })?;
 
@@ -956,16 +1361,20 @@ impl ModelProvider for OllamaProvider {
                 MessageContent::MultiToolCall(tool_calls)
             }
         } else {
+            // Same silent-empty failure as the non-streaming path; a stream
+            // that yields nothing must not read as a successful empty turn.
+            if is_empty_generation(&full_text, Some(eval_count)) {
+                return Err(empty_response_error(
+                    &self.model,
+                    Some(prompt_eval_count),
+                    done_reason.as_deref(),
+                ));
+            }
             MessageContent::Text(full_text)
         };
 
         let response = ModelResponse {
-            message: Message {
-                id: Uuid::new_v4(),
-                role: Role::Assistant,
-                content,
-                created_at: Utc::now(),
-            },
+            message: Message::stamped(Role::Assistant, content),
             usage: Usage {
                 prompt_tokens: prompt_eval_count,
                 completion_tokens: eval_count,
@@ -1082,6 +1491,47 @@ struct OllamaStreamMessage {
     tool_calls: Option<Vec<OllamaToolCall>>,
 }
 
+/// Clamp oversized positive generation reservations to half the window, so
+/// input is not crowded out by the output setting alone. The same effective
+/// reservation is used by context_limit and the request budget validator;
+/// tool schemas and framing can still leave zero usable input, reported as such.
+///
+/// Negative and zero values are Ollama sentinels (unlimited / fill) and
+/// pass through untouched.
+fn clamp_num_predict(window: Option<u32>, configured: i32) -> i32 {
+    match (window, configured) {
+        (Some(w), p) if p > 0 && p as u32 >= w / 2 => {
+            tracing::warn!(
+                num_ctx = w,
+                configured_num_predict = p,
+                clamped_num_predict = w / 2,
+                "num_predict does not fit the context window; clamping to half"
+            );
+            (w / 2) as i32
+        }
+        (_, p) => p,
+    }
+}
+
+fn input_budget(window: u32, num_predict: i32, tool_tokens: u32) -> u32 {
+    window
+        .saturating_sub(num_predict.max(0) as u32)
+        .saturating_sub(tool_tokens)
+        .saturating_sub(FRAMING_OVERHEAD_TOKENS)
+}
+
+/// Measure the tool-schema block exactly as it will be serialized into the
+/// request body. Tool definitions are rendered into the prompt *prefix* by
+/// essentially every chat template Ollama ships, so this is both a real cost
+/// against the window and — when the set changes mid-conversation — the point
+/// at which the cached prefix stops matching.
+fn estimate_tool_tokens(tools: &[OllamaTool]) -> u32 {
+    let mut w = CountingWriter(0);
+    // Serializing into an infallible sink cannot fail.
+    let _ = serde_json::to_writer(&mut w, tools);
+    w.0.div_ceil(CHARS_PER_TOKEN) as u32
+}
+
 /// Approximate the number of prompt tokens an `OllamaMessage` will cost.
 /// Errs on the high side so trimming converges instead of oscillating.
 fn estimate_message_tokens(msg: &OllamaMessage) -> u32 {
@@ -1093,17 +1543,198 @@ fn estimate_message_tokens(msg: &OllamaMessage) -> u32 {
         for tc in tcs {
             tokens = tokens.saturating_add(8);
             tokens = tokens.saturating_add(estimate_text_tokens(&tc.function.name));
-            tokens =
-                tokens.saturating_add(estimate_text_tokens(&tc.function.arguments.to_string()));
+            tokens = tokens.saturating_add(estimate_json_tokens(&tc.function.arguments));
         }
     }
     tokens
 }
 
+/// `io::Write` sink that counts bytes without storing them, so a JSON
+/// value's serialized size can be measured without allocating the string.
+struct CountingWriter(usize);
+
+impl std::io::Write for CountingWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0 += buf.len();
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Estimate tokens for a JSON value from its serialized byte length.
+/// Bytes ≥ chars, so multibyte content is over-counted slightly — this
+/// errs on the high side, consistent with the trimming policy above.
+fn estimate_json_tokens(v: &serde_json::Value) -> u32 {
+    let mut w = CountingWriter(0);
+    // Serializing a `Value` into an infallible sink cannot fail.
+    let _ = serde_json::to_writer(&mut w, v);
+    w.0.div_ceil(CHARS_PER_TOKEN) as u32
+}
+
 fn estimate_text_tokens(s: &str) -> u32 {
-    // chars().count() (not len()) so multibyte characters aren't over-counted.
-    let chars = s.chars().count();
-    chars.div_ceil(CHARS_PER_TOKEN) as u32
+    s.len().div_ceil(CHARS_PER_TOKEN).min(u32::MAX as usize) as u32
+}
+
+/// Whether a finished response carries no assistant output whatsoever:
+/// no text, no tool calls (checked by the caller), and zero generated
+/// tokens.
+///
+/// The token count is what makes this safe to treat as a failure. A
+/// thinking model legitimately returns empty `content` while spending
+/// tokens on reasoning, and a tool call legitimately has no text — both
+/// report `eval_count > 0`. Zero generated tokens means the server
+/// produced nothing at all.
+fn is_empty_generation(text: &str, eval_count: Option<u32>) -> bool {
+    text.trim().is_empty() && eval_count.unwrap_or(0) == 0
+}
+
+/// Ollama can answer HTTP 200 with no output at all — no content, no tool
+/// calls, zero generated tokens.
+///
+/// Observed on Ollama 0.32.15 with `qwen3.8:27b-mlx` whenever the prompt
+/// overruns the server's context window: the MLX runner truncates, finds
+/// no user turn left, and returns `done_reason: "stop"` with an absent
+/// `eval_count`. The llama.cpp runner rejects the same request outright
+/// with `no user query found in messages`, so which failure you get is a
+/// property of the runner, not of the conversation.
+///
+/// Passing the empty string on as an assistant turn makes a failed call
+/// indistinguishable from a successful one: the agent loop records an
+/// empty reply, and a scheduled job "completes" having done nothing. Fail
+/// loudly instead, matching the llama.cpp path.
+fn empty_response_error(
+    model: &str,
+    prompt_tokens: Option<u32>,
+    done_reason: Option<&str>,
+) -> Error {
+    Error::ModelEmptyResponse(format!(
+        "Ollama returned an empty response from {model}: no content, no tool calls, \
+         and zero generated tokens (prompt_eval_count={}, done_reason={}). The prompt \
+         most likely overran the model's context window — lower the prompt size or \
+         raise num_ctx (RUSTYKRAB_NUM_CTX / OLLAMA_NUM_CTX).",
+        prompt_tokens
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "absent".to_string()),
+        done_reason.unwrap_or("absent"),
+    ))
+}
+
+/// What Ollama reports a model can do, from `/api/show`'s `capabilities`.
+///
+/// Ollama knows this authoritatively — it is derived from the model's own
+/// files rather than guessed from its name — so it beats any tag-matching
+/// heuristic. Notably it distinguishes builds that share a tag prefix,
+/// which a substring match cannot: `qwen3.8:27b-mlx` reports `vision`
+/// while the plain `qwen3.8` family match says it has none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ModelCapabilities {
+    pub vision: bool,
+    pub thinking: bool,
+}
+
+/// Everything worth reading out of one `/api/show` call.
+#[derive(Debug, Clone, Copy, Default)]
+struct ModelShape {
+    ctx: Option<u32>,
+    geometry: Option<KvGeometry>,
+    caps: Option<ModelCapabilities>,
+}
+
+/// Pull the reported capability list out of an `/api/show` response.
+/// Returns `None` when the field is absent, so the caller can tell
+/// "Ollama says this model has no vision" apart from "Ollama did not say".
+fn parse_capabilities_from_show(raw: &serde_json::Value) -> Option<ModelCapabilities> {
+    let listed = raw.get("capabilities")?.as_array()?;
+    let has = |name: &str| {
+        listed
+            .iter()
+            .filter_map(|c| c.as_str())
+            .any(|c| c.eq_ignore_ascii_case(name))
+    };
+    Some(ModelCapabilities {
+        vision: has("vision"),
+        thinking: has("thinking"),
+    })
+}
+
+/// Attention geometry needed to size a model's KV cache, read from
+/// `/api/show`'s `model_info` (which surfaces the GGUF metadata).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KvGeometry {
+    /// Number of transformer blocks (layers).
+    pub layers: u32,
+    /// Key/value heads per layer. Smaller than the query head count on any
+    /// model using grouped-query attention, which is what makes long
+    /// contexts affordable at all.
+    pub kv_heads: u32,
+    /// Per-head key dimension.
+    pub key_length: u32,
+    /// Per-head value dimension.
+    pub value_length: u32,
+}
+
+impl KvGeometry {
+    /// Bytes of KV cache a context of `num_ctx` tokens needs, at
+    /// `bytes_per_element` per stored scalar (2 for the f16 default, 1 for
+    /// `OLLAMA_KV_CACHE_TYPE=q8_0`).
+    ///
+    /// This is an **upper bound**. Models that interleave sliding-window
+    /// local attention with global attention — Gemma's architecture does
+    /// exactly this — only allocate the full window for the global layers,
+    /// so their real footprint is a fraction of this figure. Treat it as
+    /// "no more than", not "exactly".
+    pub fn cache_bytes(&self, num_ctx: u32, bytes_per_element: u64) -> u64 {
+        let per_token = self.layers as u64
+            * self.kv_heads as u64
+            * (self.key_length as u64 + self.value_length as u64)
+            * bytes_per_element;
+        per_token * num_ctx as u64
+    }
+}
+
+/// Read a `model_info` field that may be stored as a scalar or as a
+/// per-layer array. Arrays take the maximum, so the estimate stays an
+/// upper bound for models with heterogeneous layers.
+fn model_info_u32(info: &serde_json::Map<String, serde_json::Value>, key: &str) -> Option<u32> {
+    let v = info.get(key)?;
+    let n = match v {
+        serde_json::Value::Array(items) => items.iter().filter_map(|i| i.as_u64()).max()?,
+        other => other.as_u64()?,
+    };
+    u32::try_from(n).ok().filter(|&n| n > 0)
+}
+
+/// Pull the attention geometry out of a `/api/show` response, so the KV
+/// cache cost of a given window can be reported rather than guessed at.
+/// Returns `None` when the metadata doesn't carry enough to compute it.
+fn parse_kv_geometry_from_show(raw: &serde_json::Value) -> Option<KvGeometry> {
+    let info = raw.get("model_info")?.as_object()?;
+    let arch = info.get("general.architecture")?.as_str()?;
+
+    let layers = model_info_u32(info, &format!("{arch}.block_count"))?;
+    let kv_heads = model_info_u32(info, &format!("{arch}.attention.head_count_kv"))?;
+
+    // `key_length`/`value_length` are optional in GGUF; when absent the head
+    // dimension is embedding_length / head_count.
+    let fallback_head_dim = || {
+        let embedding = model_info_u32(info, &format!("{arch}.embedding_length"))?;
+        let heads = model_info_u32(info, &format!("{arch}.attention.head_count"))?;
+        Some(embedding / heads).filter(|&d| d > 0)
+    };
+    let key_length =
+        model_info_u32(info, &format!("{arch}.attention.key_length")).or_else(fallback_head_dim)?;
+    let value_length = model_info_u32(info, &format!("{arch}.attention.value_length"))
+        .or_else(fallback_head_dim)?;
+
+    Some(KvGeometry {
+        layers,
+        kv_heads,
+        key_length,
+        value_length,
+    })
 }
 
 /// Pull a context-length value out of a `/api/show` response.  Ollama reports
@@ -1138,20 +1769,81 @@ fn parse_context_length_from_show(raw: &serde_json::Value) -> Option<u32> {
 /// Decide whether the configured Ollama model can accept image input.
 ///
 /// Vision is a per-model property in Ollama (the same provider serves both
-/// text-only and multimodal models), so we key off the model tag. The
-/// `OLLAMA_VISION` env var overrides the heuristic: `true`/`1`/`on` force it
-/// on, `false`/`0`/`off` force it off, and `auto` (the default) falls back to
-/// `model_supports_vision`.
-fn vision_support(model: &str) -> bool {
-    match std::env::var("OLLAMA_VISION").ok().as_deref() {
-        Some(v) => match v.trim().to_ascii_lowercase().as_str() {
-            "true" | "1" | "on" | "yes" => true,
-            "false" | "0" | "off" | "no" => false,
-            // "auto" or anything unrecognized: fall through to the heuristic.
-            _ => model_supports_vision(model),
-        },
-        None => model_supports_vision(model),
+/// text-only and multimodal models). Resolution order, most to least
+/// authoritative: the `OLLAMA_VISION` env var (`true`/`1`/`on` force it on,
+/// `false`/`0`/`off` force it off, `auto` defers), then the capability list
+/// Ollama reports for the model, then the `model_supports_vision` tag
+/// heuristic for servers that report nothing.
+fn vision_support(model: &str, reported: Option<ModelCapabilities>) -> bool {
+    capability_override("OLLAMA_VISION")
+        .or_else(|| reported.map(|c| c.vision))
+        .unwrap_or_else(|| model_supports_vision(model))
+}
+
+/// Read a `true`/`false`/`auto` capability override from the environment.
+/// `None` means "not set, or set to auto" — defer to whatever comes next in
+/// the resolution order.
+fn capability_override(var: &str) -> Option<bool> {
+    match std::env::var(var)
+        .ok()?
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "true" | "1" | "on" | "yes" => Some(true),
+        "false" | "0" | "off" | "no" => Some(false),
+        // "auto" or anything unrecognized: defer.
+        _ => None,
     }
+}
+
+/// Whether the model is *able* to think, ignoring whether we want it to.
+///
+/// Ollama returns a 400 for a `think` field of either polarity against a
+/// model with no thinking capability, so this gates whether the field can be
+/// sent at all. Reported capabilities first, then the tag heuristic.
+///
+/// Deliberately does not consult `OLLAMA_THINK`: that is a preference, not a
+/// capability, and conflating the two is what made the off switch
+/// unreachable — "the operator said no" was indistinguishable from "the model
+/// cannot", and both produced an omitted field.
+fn model_can_think(model: &str, reported: Option<ModelCapabilities>) -> bool {
+    reported
+        .map(|c| c.thinking)
+        .unwrap_or_else(|| model_supports_thinking(model))
+}
+
+/// Decide whether to ask the configured Ollama model to think.
+///
+/// Resolved the same way as vision: `OLLAMA_THINK` first (same
+/// `true`/`false`/`auto` vocabulary as `OLLAMA_VISION`), then Ollama's
+/// reported capabilities, then the tag heuristic.
+fn think_support(model: &str, reported: Option<ModelCapabilities>) -> bool {
+    capability_override("OLLAMA_THINK")
+        .or_else(|| reported.map(|c| c.thinking))
+        .unwrap_or_else(|| model_supports_thinking(model))
+}
+
+/// Heuristic match against known thinking-capable Ollama model families.
+///
+/// Thinking costs output tokens on every turn and its reasoning is stripped
+/// from history before the next call, so it is worth enabling only where it
+/// measurably helps tool-call accuracy. Users can force the answer either
+/// way with `OLLAMA_THINK`.
+fn model_supports_thinking(model: &str) -> bool {
+    let m = model.to_ascii_lowercase();
+    const THINKING_FAMILIES: &[&str] = &[
+        "gemma4",
+        "deepseek-r1",
+        "deepseek-v3.1",
+        "qwen3",
+        "qwq",
+        "gpt-oss",
+        "magistral",
+        "cogito",
+        "smallthinker",
+    ];
+    THINKING_FAMILIES.iter().any(|fam| m.contains(fam))
 }
 
 /// Heuristic match against known vision-capable Ollama model families.
@@ -1185,6 +1877,12 @@ fn model_supports_vision(model: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
+
+    /// Tool-block size used by the trimming tests. Chosen so that
+    /// `TEST_TOOL_TOKENS + FRAMING_OVERHEAD_TOKENS` equals the flat 2048 these
+    /// cases were originally written against, keeping their arithmetic intact.
+    const TEST_TOOL_TOKENS: u32 = 1536;
 
     fn user_msg(content: &str) -> OllamaMessage {
         OllamaMessage {
@@ -1246,6 +1944,7 @@ mod tests {
                 },
             ]),
             created_at: Utc::now(),
+            agent_version: None,
         };
 
         let built = OllamaProvider::build_messages(&[msg], true).expect("build_messages");
@@ -1265,6 +1964,7 @@ mod tests {
             role: Role::User,
             content: MessageContent::Text("hello".to_string()),
             created_at: Utc::now(),
+            agent_version: None,
         };
         let built = OllamaProvider::build_messages(&[msg], false).expect("build_messages");
         assert!(built[0].images.is_none());
@@ -1288,6 +1988,7 @@ mod tests {
                 }],
             }),
             created_at: Utc::now(),
+            agent_version: None,
         }
     }
 
@@ -1341,6 +2042,85 @@ mod tests {
     }
 
     #[test]
+    fn parses_kv_geometry_from_explicit_key_value_lengths() {
+        let raw = serde_json::json!({
+            "model_info": {
+                "general.architecture": "gemma4",
+                "gemma4.block_count": 62u64,
+                "gemma4.attention.head_count_kv": 8u64,
+                "gemma4.attention.key_length": 256u64,
+                "gemma4.attention.value_length": 256u64,
+            }
+        });
+        assert_eq!(
+            parse_kv_geometry_from_show(&raw),
+            Some(KvGeometry {
+                layers: 62,
+                kv_heads: 8,
+                key_length: 256,
+                value_length: 256,
+            })
+        );
+    }
+
+    #[test]
+    fn kv_geometry_falls_back_to_embedding_over_head_count() {
+        // key_length/value_length are optional in GGUF; the head dimension
+        // is then embedding_length / head_count.
+        let raw = serde_json::json!({
+            "model_info": {
+                "general.architecture": "llama",
+                "llama.block_count": 32u64,
+                "llama.attention.head_count_kv": 8u64,
+                "llama.attention.head_count": 32u64,
+                "llama.embedding_length": 4096u64,
+            }
+        });
+        let geo = parse_kv_geometry_from_show(&raw).expect("geometry");
+        assert_eq!(geo.key_length, 128);
+        assert_eq!(geo.value_length, 128);
+    }
+
+    #[test]
+    fn kv_geometry_takes_the_max_of_per_layer_arrays() {
+        // Some GGUFs store head_count_kv per layer. Taking the max keeps the
+        // estimate an upper bound rather than an optimistic one.
+        let raw = serde_json::json!({
+            "model_info": {
+                "general.architecture": "novel",
+                "novel.block_count": 4u64,
+                "novel.attention.head_count_kv": [2u64, 8u64, 2u64, 4u64],
+                "novel.attention.key_length": 64u64,
+                "novel.attention.value_length": 64u64,
+            }
+        });
+        assert_eq!(parse_kv_geometry_from_show(&raw).unwrap().kv_heads, 8);
+    }
+
+    #[test]
+    fn kv_geometry_is_none_without_enough_metadata() {
+        let raw = serde_json::json!({
+            "model_info": { "general.architecture": "llama", "llama.block_count": 32u64 }
+        });
+        assert_eq!(parse_kv_geometry_from_show(&raw), None);
+    }
+
+    #[test]
+    fn kv_cache_bytes_scale_linearly_with_window_and_element_size() {
+        let geo = KvGeometry {
+            layers: 62,
+            kv_heads: 8,
+            key_length: 256,
+            value_length: 256,
+        };
+        // 62 layers * 8 heads * 512 dims * 2 bytes = 507,904 bytes per token.
+        assert_eq!(geo.cache_bytes(1, 2), 507_904);
+        assert_eq!(geo.cache_bytes(1024, 2), 507_904 * 1024);
+        // q8_0 halves it.
+        assert_eq!(geo.cache_bytes(1024, 1), 507_904 * 512);
+    }
+
+    #[test]
     fn returns_none_when_no_context_length_present() {
         let raw = serde_json::json!({
             "model_info": {
@@ -1356,100 +2136,925 @@ mod tests {
         assert_eq!(parse_context_length_from_show(&raw), None);
     }
 
-    #[test]
-    fn trim_returns_unchanged_when_under_budget() {
-        let msgs = vec![system_msg("sys"), user_msg("hi")];
-        let original_len = msgs.len();
-        let trimmed = OllamaProvider::trim_to_budget(msgs, Some(8192), 1024);
-        assert_eq!(trimmed.len(), original_len);
-    }
-
-    #[test]
-    fn trim_is_noop_when_num_ctx_is_none() {
-        // No budget means defer entirely to the server; the client leaves
-        // the history untouched.
-        let big = "x".repeat(40_000);
-        let msgs = vec![system_msg("sys"), user_msg(&big), user_msg("latest")];
-        let original_len = msgs.len();
-        let trimmed = OllamaProvider::trim_to_budget(msgs, None, 256);
-        assert_eq!(trimmed.len(), original_len);
-    }
-
-    #[test]
-    fn trim_drops_oldest_messages_first_and_preserves_system() {
-        // Build a conversation where each user message is ~1000 chars (~250 tokens).
-        let big = "x".repeat(4000); // ~1000 tokens
-        let msgs = vec![
-            system_msg("you are an agent"),
-            user_msg(&big),
-            user_msg(&big),
-            user_msg(&big),
-            user_msg(&big),
-            user_msg("latest"),
-        ];
-        // budget = 4096 - 256 - SAFETY_OVERHEAD_TOKENS(2048) = 1792 tokens
-        let trimmed = OllamaProvider::trim_to_budget(msgs, Some(4096), 256);
-        // System message must survive.
-        assert_eq!(trimmed[0].role, "system");
-        // Latest message must survive.
-        assert_eq!(trimmed.last().unwrap().content.as_deref(), Some("latest"));
-        // Some big messages were dropped.
-        assert!(trimmed.len() < 6);
-    }
-
-    #[test]
-    fn trim_drops_orphan_tool_results_after_truncation() {
-        let big = "y".repeat(20_000); // ~5000 tokens
-        let msgs = vec![
-            system_msg("sys"),
-            user_msg(&big),
-            tool_msg("orphaned tool result"),
-            user_msg("latest"),
-        ];
-        let trimmed = OllamaProvider::trim_to_budget(msgs, Some(4096), 256);
-        // Orphan tool result must not become the first non-system message.
-        assert_ne!(trimmed.get(1).map(|m| m.role.as_str()), Some("tool"));
-        // System and latest user message survive.
-        assert_eq!(trimmed[0].role, "system");
-        assert_eq!(trimmed.last().unwrap().content.as_deref(), Some("latest"));
-    }
-
-    #[test]
-    fn default_config_omits_num_ctx_when_env_unset() {
-        // Guard: when neither RUSTYKRAB_NUM_CTX nor OLLAMA_NUM_CTX is set,
-        // constructors leave num_ctx as None so the server's own
-        // OLLAMA_CONTEXT_LENGTH wins.
-        //
-        // std::env is process-global; restore it after the test so we don't
-        // contaminate sibling tests that may set it themselves.
-        let saved_ollama = std::env::var("OLLAMA_NUM_CTX").ok();
-        let saved_rk = std::env::var("RUSTYKRAB_NUM_CTX").ok();
-        // SAFETY: single-threaded section of this test. `cargo test` runs
-        // tests on separate threads by default but we're only reading/writing
-        // our own var and restoring it.
-        unsafe {
-            std::env::remove_var("OLLAMA_NUM_CTX");
-            std::env::remove_var("RUSTYKRAB_NUM_CTX");
+    fn assistant_msg(content: &str) -> OllamaMessage {
+        OllamaMessage {
+            role: "assistant".into(),
+            content: Some(content.into()),
+            tool_calls: None,
+            images: None,
         }
-        assert_eq!(OllamaConfig::default().num_ctx, None);
-        assert_eq!(OllamaConfig::tool_calling().num_ctx, None);
-        assert_eq!(OllamaConfig::creative().num_ctx, None);
+    }
+
+    #[test]
+    fn budget_guard_preserves_fitting_messages() {
+        let messages = vec![
+            system_msg("sys"),
+            user_msg("objective"),
+            assistant_msg("direction"),
+            user_msg("latest correction"),
+        ];
+        let before = serde_json::to_value(&messages).unwrap();
+        OllamaProvider::validate_input_budget(&messages, Some(8192), 1024, TEST_TOOL_TOKENS)
+            .unwrap();
+        assert_eq!(serde_json::to_value(&messages).unwrap(), before);
+    }
+
+    #[test]
+    fn unknown_window_does_not_claim_budget_enforcement() {
+        let messages = vec![user_msg(&"x".repeat(40000))];
+        OllamaProvider::validate_input_budget(&messages, None, 1024, TEST_TOOL_TOKENS).unwrap();
+    }
+
+    #[test]
+    fn oversized_history_refuses_without_discarding_objective_or_correction() {
+        let messages = vec![
+            system_msg("sys"),
+            user_msg("original objective"),
+            assistant_msg(&"x".repeat(40000)),
+            user_msg("latest correction"),
+            tool_msg("terminal evidence"),
+        ];
+        let before = serde_json::to_value(&messages).unwrap();
+        assert!(matches!(
+            OllamaProvider::validate_input_budget(&messages, Some(4096), 1024, TEST_TOOL_TOKENS),
+            Err(Error::ContextBudgetExceeded { .. })
+        ));
+        assert_eq!(serde_json::to_value(&messages).unwrap(), before);
+    }
+
+    #[test]
+    fn oversized_latest_message_is_never_sent_anyway() {
+        let messages = vec![system_msg("sys"), user_msg(&"x".repeat(40000))];
+        assert!(matches!(
+            OllamaProvider::validate_input_budget(&messages, Some(4096), 1024, TEST_TOOL_TOKENS),
+            Err(Error::ContextBudgetExceeded { .. })
+        ));
+    }
+
+    #[test]
+    fn zero_usable_budget_is_not_a_fictitious_floor() {
+        assert!(matches!(
+            OllamaProvider::validate_input_budget(&[], Some(1024), 512, 4096),
+            Err(Error::ContextBudgetExceeded {
+                input_budget_tokens: 0,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn unicode_estimate_counts_utf8_bytes_not_scalars() {
+        assert_eq!(estimate_text_tokens("日本語"), 3);
+        assert_eq!(estimate_text_tokens("abcd"), 1);
+    }
+
+    fn history_message(role: Role, content: MessageContent) -> Message {
+        Message {
+            id: Uuid::new_v4(),
+            role,
+            content,
+            created_at: Utc::now(),
+            agent_version: None,
+        }
+    }
+
+    #[test]
+    fn parallel_tool_pairs_are_validated_before_ids_are_erased() {
+        use rustykrab_core::types::ToolResult;
+        let call = |id: &str| ToolCall {
+            id: id.into(),
+            name: "browser".into(),
+            arguments: serde_json::json!({}),
+        };
+        let result = |id: &str| {
+            history_message(
+                Role::Tool,
+                MessageContent::ToolResult(ToolResult {
+                    call_id: id.into(),
+                    output: serde_json::json!({"outcome":"unknown"}),
+                    is_error: true,
+                    images: vec![],
+                }),
+            )
+        };
+        let calls = history_message(
+            Role::Assistant,
+            MessageContent::MultiToolCall(vec![call("a"), call("b")]),
+        );
+        let complete = vec![calls.clone(), result("b"), result("a")];
+        OllamaProvider::validate_tool_history(&complete).unwrap();
+        for invalid in [
+            vec![calls.clone()],
+            vec![result("a")],
+            vec![calls.clone(), result("a"), result("a")],
+            vec![
+                calls,
+                result("a"),
+                history_message(Role::User, MessageContent::Text("followup".into())),
+                result("b"),
+            ],
+        ] {
+            assert!(OllamaProvider::validate_tool_history(&invalid).is_err());
+        }
+    }
+
+    // ---- Empty-generation guard ------------------------------------------
+
+    fn parse_raw(v: serde_json::Value) -> Result<ModelResponse> {
+        OllamaProvider::parse_response("test-model", serde_json::from_value(v).unwrap())
+    }
+
+    /// The exact shape `qwen3.8:27b-mlx` returns when the prompt overruns
+    /// its context window: 200 OK, `done_reason: "stop"`, no content and no
+    /// `eval_count`. It must not become a successful empty assistant turn.
+    #[test]
+    fn empty_generation_is_an_error_not_an_empty_turn() {
+        let err = parse_raw(serde_json::json!({
+            "message": { "content": "" },
+            "prompt_eval_count": 15045,
+            "done_reason": "stop",
+        }))
+        .expect_err("a response with zero generated tokens must be an error");
+
+        assert!(
+            matches!(err, rustykrab_core::Error::ModelEmptyResponse(_)),
+            "typed so the agent loop can tell silence from a failed call: {err:?}"
+        );
+        let text = err.to_string();
+        assert!(text.contains("empty response"), "got: {text}");
+        assert!(
+            text.contains("15045"),
+            "prompt size must be reported: {text}"
+        );
+    }
+
+    /// A tool call carries no text by design — the guard must not fire on it.
+    #[test]
+    fn tool_call_without_text_is_not_treated_as_empty() {
+        let resp = parse_raw(serde_json::json!({
+            "message": {
+                "content": "",
+                "tool_calls": [{ "function": { "name": "get_weather",
+                                               "arguments": { "city": "Paris" } } }]
+            },
+            "prompt_eval_count": 100,
+            "eval_count": 75,
+            "done_reason": "stop",
+        }))
+        .expect("a tool call is real output");
+        assert_eq!(resp.stop_reason, StopReason::ToolUse);
+    }
+
+    /// A thinking model can spend its whole budget reasoning and emit no
+    /// visible text. Tokens were generated, so this is a truncation, not the
+    /// silent-empty failure — it must still come back as a response.
+    #[test]
+    fn empty_text_with_generated_tokens_is_not_treated_as_empty() {
+        let resp = parse_raw(serde_json::json!({
+            "message": { "content": "" },
+            "prompt_eval_count": 100,
+            "eval_count": 8,
+            "done_reason": "length",
+        }))
+        .expect("tokens were generated, so this is not the empty-response failure");
+        assert_eq!(resp.stop_reason, StopReason::MaxTokens);
+    }
+
+    #[test]
+    fn is_empty_generation_predicate() {
+        assert!(is_empty_generation("", None));
+        assert!(is_empty_generation("", Some(0)));
+        assert!(is_empty_generation("   \n ", Some(0)));
+        assert!(!is_empty_generation("hi", Some(0))); // text without a count
+        assert!(!is_empty_generation("", Some(1))); // count without text
+    }
+
+    // ---- Reported capabilities -------------------------------------------
+
+    /// Run `f` with `var` set to `value` (or removed when `None`).
+    /// `std::env` is process-global and `cargo test` is multi-threaded, so
+    /// these serialise on one mutex and restore the prior value on the way
+    /// out.
+    fn with_env<T>(var: &str, value: Option<&str>, f: impl FnOnce() -> T) -> T {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved = std::env::var(var).ok();
+        // SAFETY: all writers of these vars hold ENV_LOCK for the duration.
         unsafe {
-            match saved_ollama {
+            match value {
+                Some(v) => std::env::set_var(var, v),
+                None => std::env::remove_var(var),
+            }
+        }
+        let out = f();
+        unsafe {
+            match saved {
+                Some(v) => std::env::set_var(var, v),
+                None => std::env::remove_var(var),
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn capabilities_are_read_from_show() {
+        let caps = parse_capabilities_from_show(&serde_json::json!({
+            "capabilities": ["completion", "vision", "tools", "thinking"]
+        }))
+        .expect("a capability list must parse");
+        assert!(caps.vision);
+        assert!(caps.thinking);
+
+        let caps = parse_capabilities_from_show(&serde_json::json!({
+            "capabilities": ["completion", "tools", "thinking"]
+        }))
+        .expect("a capability list must parse");
+        assert!(!caps.vision);
+        assert!(caps.thinking);
+    }
+
+    /// An Ollama release predating `capabilities` must be distinguishable
+    /// from one reporting no vision, so the heuristic can stand in.
+    #[test]
+    fn absent_capability_list_is_none_not_empty() {
+        assert!(parse_capabilities_from_show(&serde_json::json!({ "model_info": {} })).is_none());
+    }
+
+    /// The two real cases that motivated reading capabilities at all. Both
+    /// tags are misclassified by the substring heuristic, in opposite
+    /// directions — verified against Ollama 0.32.15.
+    #[test]
+    fn reported_vision_overrules_the_tag_heuristic_both_ways() {
+        with_env("OLLAMA_VISION", None, || {
+            // qwen3.8:27b-mlx accepts images; the heuristic says it does not.
+            let seen = ModelCapabilities {
+                vision: true,
+                thinking: true,
+            };
+            assert!(!model_supports_vision("qwen3.8:27b-mlx"));
+            assert!(vision_support("qwen3.8:27b-mlx", Some(seen)));
+
+            // The other direction, which is why extending the family list
+            // would not have been enough: a build can report *less* than
+            // its family implies. `gemma4:26b-mlx` rejects images with
+            // "this model does not support image input" while the `gemma4`
+            // family match says it accepts them. (Not a deployed model —
+            // it is the cheapest reproduction of the false positive.)
+            let seen = ModelCapabilities {
+                vision: false,
+                thinking: true,
+            };
+            assert!(model_supports_vision("gemma4:26b-mlx"));
+            assert!(!vision_support("gemma4:26b-mlx", Some(seen)));
+        });
+    }
+
+    /// The supported `gemma4:26b` build is not affected by any of this:
+    /// what Ollama reports and what the tag heuristic concludes already
+    /// agree, so reading capabilities changes nothing for it. Asserted so
+    /// the fix cannot start moving the default model's behaviour.
+    #[test]
+    fn supported_gemma4_behaviour_is_unchanged() {
+        // Exactly what `/api/show` returns for gemma4:26b on Ollama 0.32.15.
+        let reported = ModelCapabilities {
+            vision: true,
+            thinking: true,
+        };
+        with_env("OLLAMA_VISION", None, || {
+            assert_eq!(
+                vision_support("gemma4:26b", Some(reported)),
+                model_supports_vision("gemma4:26b")
+            );
+            assert!(vision_support("gemma4:26b", Some(reported)));
+        });
+        with_env("OLLAMA_THINK", None, || {
+            assert_eq!(
+                think_support("gemma4:26b", Some(reported)),
+                model_supports_thinking("gemma4:26b")
+            );
+            assert!(think_support("gemma4:26b", Some(reported)));
+        });
+    }
+
+    #[test]
+    fn tag_heuristic_stands_in_when_nothing_is_reported() {
+        with_env("OLLAMA_VISION", None, || {
+            assert!(vision_support("gemma4:26b", None));
+            assert!(!vision_support("llama3.1:8b", None));
+        });
+    }
+
+    #[test]
+    fn env_override_beats_reported_capabilities() {
+        let no_vision = ModelCapabilities {
+            vision: false,
+            thinking: false,
+        };
+        with_env("OLLAMA_VISION", Some("true"), || {
+            assert!(vision_support("gemma4:26b-mlx", Some(no_vision)));
+        });
+        let vision = ModelCapabilities {
+            vision: true,
+            thinking: true,
+        };
+        with_env("OLLAMA_VISION", Some("false"), || {
+            assert!(!vision_support("qwen3.8:27b-mlx", Some(vision)));
+        });
+        // "auto" defers to the reported list.
+        with_env("OLLAMA_VISION", Some("auto"), || {
+            assert!(vision_support("gemma4:26b-mlx", Some(vision)));
+        });
+    }
+
+    #[test]
+    fn reported_thinking_resolves_the_same_way() {
+        with_env("OLLAMA_THINK", None, || {
+            let no_think = ModelCapabilities {
+                vision: false,
+                thinking: false,
+            };
+            assert!(model_supports_thinking("qwen3.8:27b-mlx"));
+            assert!(!think_support("qwen3.8:27b-mlx", Some(no_think)));
+            assert!(think_support("qwen3.8:27b-mlx", None));
+        });
+    }
+
+    // ---- Live tests against a real Ollama daemon -------------------------
+    //
+    // Ignored by default: they need a running Ollama and the model named by
+    // RK_LIVE_MODEL (default qwen3.8:27b-mlx, the deployed build). Run with:
+    //
+    //   cargo test -p rustykrab-providers --  --ignored --test-threads=1
+    //
+    // These exist because the failure they cover is not reproducible in a
+    // unit test: it lives in the model's chat template, server-side. Note
+    // that the rejection is template-specific, NOT a blanket Ollama
+    // behaviour — both qwen3.8:27b builds reject a user-less message array
+    // while gemma4:26b, qwen3:32b and qwen3:30b-a3b all accept one.
+    //
+    // The runner matters as well as the template: on the GGUF build an
+    // over-budget prompt is rejected outright, while the MLX build returns
+    // 200 with nothing generated. Tests that turn on the difference say so.
+
+    fn live_model() -> String {
+        std::env::var("RK_LIVE_MODEL").unwrap_or_else(|_| "qwen3.8:27b-mlx".to_string())
+    }
+
+    fn live_provider() -> OllamaProvider {
+        let mut cfg = OllamaConfig {
+            num_predict: 8,
+            ..Default::default()
+        };
+        cfg.num_ctx = Some(8192);
+        OllamaProvider::new(live_model())
+            .with_base_url("http://127.0.0.1:11434")
+            .with_config(cfg)
+    }
+
+    fn core_msg(role: Role, text: &str) -> Message {
+        Message {
+            id: Uuid::new_v4(),
+            role,
+            content: MessageContent::Text(text.to_string()),
+            created_at: Utc::now(),
+            agent_version: None,
+        }
+    }
+
+    /// Negative control. The exact array a resumed job conversation produced
+    /// before the fix — system + assistant, no user turn — must still be
+    /// rejected by the live model. If this ever starts passing, the premise
+    /// behind the fix has changed and the other live tests prove nothing.
+    #[tokio::test]
+    #[ignore = "requires a live Ollama daemon"]
+    async fn live_resumed_job_shape_without_a_user_turn_is_rejected() {
+        let provider = live_provider();
+        let msgs = vec![
+            core_msg(Role::System, "You are a helpful assistant."),
+            core_msg(Role::Assistant, "result of the previous scheduled run"),
+        ];
+
+        let err = provider
+            .chat(&msgs, &[])
+            .await
+            .expect_err("a user-less array must be rejected by the live model");
+
+        let text = err.to_string();
+        assert!(
+            text.contains("no user query found in messages"),
+            "expected the documented provider rejection, got: {text}"
+        );
+    }
+
+    /// Fix 1, end to end: the same conversation with the scheduled prompt
+    /// appended as a real user turn goes through the live model.
+    #[tokio::test]
+    #[ignore = "requires a live Ollama daemon"]
+    async fn live_resumed_job_shape_with_a_user_turn_succeeds() {
+        let provider = live_provider();
+        let msgs = vec![
+            core_msg(Role::System, "You are a helpful assistant."),
+            core_msg(Role::Assistant, "result of the previous scheduled run"),
+            core_msg(
+                Role::User,
+                "[Scheduled task] Execute it and reply concisely.",
+            ),
+        ];
+
+        provider
+            .chat(&msgs, &[])
+            .await
+            .expect("appending the scheduled user turn must make the request valid");
+    }
+
+    /// A long history whose newest message is a scheduled user turn must be
+    /// refused without deleting older input. No live request should occur.
+    #[tokio::test]
+    async fn overlong_history_ending_in_a_user_turn_is_refused() {
+        let provider = live_provider();
+        let big = "x".repeat(40_000); // ~10k tokens each
+
+        let mut msgs = vec![core_msg(Role::System, "You are a helpful assistant.")];
+        msgs.push(core_msg(Role::User, "an old user turn"));
+        for _ in 0..3 {
+            msgs.push(core_msg(Role::Assistant, &big));
+        }
+        // Fix 1 puts the scheduled prompt last; this is the live shape.
+        msgs.push(core_msg(
+            Role::User,
+            "[Scheduled task] Execute it and reply concisely.",
+        ));
+
+        let error = provider
+            .chat(&msgs, &[])
+            .await
+            .expect_err("oversized history must be refused before HTTP");
+        assert!(matches!(error, Error::ContextBudgetExceeded { .. }));
+    }
+
+    /// The point of reading capabilities: whether an image reaches the
+    /// model must follow what Ollama says the model can do.
+    ///
+    /// The agent gates images on `supports_vision()` before they ever reach
+    /// the provider (`MessageContent::from_parts`), so this drives both
+    /// halves through that gate rather than around it.
+    ///
+    /// Skips when the server reports no capability list at all (Ollama
+    /// releases predating the field), since there is then nothing to check.
+    #[tokio::test]
+    #[ignore = "requires a live Ollama daemon"]
+    async fn live_images_follow_the_reported_vision_capability() {
+        use rustykrab_core::types::{ContentBlock, ContentPart};
+
+        let provider = live_provider().with_detected_context_window().await;
+        let Some(caps) = provider.detected_caps else {
+            eprintln!("server reported no capabilities; nothing to verify");
+            return;
+        };
+        assert_eq!(
+            provider.supports_vision(),
+            caps.vision,
+            "the provider must honour what Ollama reports"
+        );
+
+        // 8x8 solid red PNG.
+        const RED_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAIAAABLbSncAAAAEklEQVR4nGP4\
+                                   z8CAFWEXHbQSACj/P8Fu7N9hAAAAAElFTkSuQmCC";
+        let red_png = {
+            use base64::engine::general_purpose::STANDARD;
+            use base64::Engine;
+            STANDARD
+                .decode(RED_PNG_B64.replace(char::is_whitespace, ""))
+                .expect("the fixture is valid base64")
+        };
+
+        let parts = vec![
+            ContentPart::Text {
+                text: "What is in this image? Answer in one word.".to_string(),
+            },
+            ContentPart::Image {
+                media_type: "image/png".to_string(),
+                data: red_png,
+            },
+        ];
+        let content = MessageContent::from_parts(&parts, provider.supports_vision());
+        let carries_image = matches!(&content, MessageContent::MultiPart(blocks)
+            if blocks.iter().any(|b| matches!(b, ContentBlock::Image { .. })));
+        assert_eq!(
+            carries_image, caps.vision,
+            "the image must survive the gate for a vision model and be dropped otherwise"
+        );
+
+        let msg = Message {
+            id: Uuid::new_v4(),
+            role: Role::User,
+            content,
+            created_at: Utc::now(),
+            agent_version: None,
+        };
+
+        // Either way the request must go through: with the image for a model
+        // that can see, without it for one that cannot. Before capabilities
+        // were read, qwen3.8:27b-mlx silently lost every image a user sent.
+        provider
+            .chat(&[msg], &[])
+            .await
+            .expect("the gated request must be accepted by the model");
+    }
+
+    /// Regression: refuse an oversized old-user history locally instead of
+    /// silently truncating it or relying on a server's missing-user error.
+    #[tokio::test]
+    async fn old_user_turn_followed_by_bulk_is_explicitly_refused() {
+        let provider = live_provider();
+        let big = "x".repeat(40_000);
+
+        let mut msgs = vec![
+            core_msg(Role::System, "You are a helpful assistant."),
+            core_msg(Role::User, "the only user turn"),
+        ];
+        for _ in 0..3 {
+            msgs.push(core_msg(Role::Assistant, &big));
+        }
+
+        let err = provider
+            .chat(&msgs, &[])
+            .await
+            .expect_err("oversized history must fail before dispatch");
+        assert!(matches!(err, Error::ContextBudgetExceeded { .. }), "{err}");
+    }
+
+    /// Run `f` with the two num_ctx env vars set to `rk` / `ollama`.
+    ///
+    /// `std::env` is process-global and `cargo test` is multi-threaded, so
+    /// every test that touches these vars serialises on one mutex and
+    /// restores the prior values on the way out.
+    fn with_num_ctx_env<T>(rk: Option<&str>, ollama: Option<&str>, f: impl FnOnce() -> T) -> T {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let saved_rk = std::env::var("RUSTYKRAB_NUM_CTX").ok();
+        let saved_ollama = std::env::var("OLLAMA_NUM_CTX").ok();
+        // SAFETY: all writers of these vars hold ENV_LOCK for the duration.
+        unsafe {
+            match rk {
+                Some(v) => std::env::set_var("RUSTYKRAB_NUM_CTX", v),
+                None => std::env::remove_var("RUSTYKRAB_NUM_CTX"),
+            }
+            match ollama {
                 Some(v) => std::env::set_var("OLLAMA_NUM_CTX", v),
                 None => std::env::remove_var("OLLAMA_NUM_CTX"),
             }
+        }
+        let out = f();
+        unsafe {
             match saved_rk {
                 Some(v) => std::env::set_var("RUSTYKRAB_NUM_CTX", v),
                 None => std::env::remove_var("RUSTYKRAB_NUM_CTX"),
             }
+            match saved_ollama {
+                Some(v) => std::env::set_var("OLLAMA_NUM_CTX", v),
+                None => std::env::remove_var("OLLAMA_NUM_CTX"),
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn default_config_pins_num_ctx_when_env_unset() {
+        // Pinning one stable window is what lets Ollama keep a warm runner
+        // across requests, so every preset must land on the same value.
+        with_num_ctx_env(None, None, || {
+            assert_eq!(OllamaConfig::default().num_ctx, Some(DEFAULT_NUM_CTX));
+            assert_eq!(OllamaConfig::tool_calling().num_ctx, Some(DEFAULT_NUM_CTX));
+            assert_eq!(OllamaConfig::creative().num_ctx, Some(DEFAULT_NUM_CTX));
+        });
+    }
+
+    #[test]
+    fn num_ctx_env_override_is_honoured_with_rustykrab_taking_precedence() {
+        with_num_ctx_env(Some("16384"), None, || {
+            assert_eq!(num_ctx_from_env(), Some(16384));
+        });
+        with_num_ctx_env(None, Some("8192"), || {
+            assert_eq!(num_ctx_from_env(), Some(8192));
+        });
+        with_num_ctx_env(Some("16384"), Some("8192"), || {
+            assert_eq!(num_ctx_from_env(), Some(16384));
+        });
+    }
+
+    #[test]
+    fn num_ctx_server_sentinel_defers_to_ollama() {
+        for sentinel in ["server", "SERVER", "default", "0", " "] {
+            with_num_ctx_env(Some(sentinel), None, || {
+                assert_eq!(num_ctx_from_env(), None, "sentinel {sentinel:?}");
+            });
         }
     }
 
     #[test]
+    fn unparseable_num_ctx_falls_back_to_default_rather_than_deferring() {
+        with_num_ctx_env(Some("thirty-two thousand"), None, || {
+            assert_eq!(num_ctx_from_env(), Some(DEFAULT_NUM_CTX));
+        });
+    }
+
+    #[test]
+    fn model_supports_thinking_matches_known_families() {
+        assert!(model_supports_thinking("gemma4:26b"));
+        assert!(model_supports_thinking("qwen3:32b"));
+        assert!(model_supports_thinking("DeepSeek-R1:14b")); // case-insensitive
+
+        // Sending `think` to these would be a 400 from Ollama.
+        assert!(!model_supports_thinking("llama3.1:8b"));
+        assert!(!model_supports_thinking("mistral:7b"));
+        assert!(!model_supports_thinking("qwen2.5:7b"));
+    }
+
+    #[test]
+    fn compaction_threshold_sits_below_the_refusal_budget() {
+        // The regression this guards: compaction (summarize + archive) must
+        // fire before the provider's unchanged-input refusal. The runner
+        // compacts at 85% of what `context_limit()` reports, so that figure
+        // has to be the *usable* budget, not the raw window — otherwise the
+        // threshold would otherwise land above the provider's input budget.
+        for window in [8_192u32, 16_384, 32_768, 65_536, 131_072] {
+            let provider = OllamaProvider::new("probe").with_config(OllamaConfig {
+                num_ctx: Some(window),
+                num_predict: 4096,
+                ..OllamaConfig::default()
+            });
+
+            let reported = provider.context_limit().expect("limit") as u32;
+            let compaction_threshold = (reported as f64 * 0.85) as u32;
+            let trim_budget = input_budget(window, 4096, ASSUMED_TOOL_TOKENS);
+
+            assert!(
+                compaction_threshold < trim_budget,
+                "window {window}: compaction at {compaction_threshold} must precede \
+                 trimming at {trim_budget}"
+            );
+        }
+    }
+
+    #[test]
+    fn context_limit_excludes_output_and_overhead_reservations() {
+        let provider = OllamaProvider::new("probe").with_config(OllamaConfig {
+            num_ctx: Some(32_768),
+            num_predict: 4096,
+            ..OllamaConfig::default()
+        });
+        let expected = 32_768 - 4096 - ASSUMED_TOOL_TOKENS - FRAMING_OVERHEAD_TOKENS;
+        assert_eq!(provider.context_limit(), Some(expected as usize));
+    }
+
+    #[test]
+    fn context_limit_reports_zero_when_reservations_exceed_the_window() {
+        // Neither None nor an invented floor can honestly represent this
+        // known window: there is no remaining input budget.
+        let provider = OllamaProvider::new("probe").with_config(OllamaConfig {
+            num_ctx: Some(1024),
+            num_predict: 4096,
+            ..OllamaConfig::default()
+        });
+        let limit = provider
+            .context_limit()
+            .expect("a configured window reports something");
+        assert_eq!(limit, 0, "no usable budget must be reported honestly");
+    }
+
+    #[test]
+    fn context_limit_uses_the_clamped_output_reservation() {
+        let provider = OllamaProvider::new("probe").with_config(OllamaConfig {
+            num_ctx: Some(6144),
+            num_predict: 4096,
+            ..OllamaConfig::default()
+        });
+        assert_eq!(
+            provider.context_limit(),
+            Some(input_budget(
+                6144,
+                clamp_num_predict(Some(6144), 4096),
+                ASSUMED_TOOL_TOKENS
+            ) as usize)
+        );
+    }
+
+    #[test]
+    fn input_budget_shrinks_as_the_tool_block_grows() {
+        // Tool schemas are part of the prompt, so loading more tools has to
+        // leave less room for history. The old flat 2048 reservation missed
+        // this entirely: a conversation with the full catalog loaded could be
+        // "trimmed" and still overflow the window.
+        let big = "x".repeat(4000); // ~1000 tokens each
+        let build = || {
+            let mut msgs = vec![system_msg("sys")];
+            for _ in 0..10 {
+                msgs.push(user_msg(&big));
+            }
+            msgs.push(user_msg("latest"));
+            msgs
+        };
+
+        OllamaProvider::validate_input_budget(&build(), Some(16_384), 1024, 500).unwrap();
+        assert!(matches!(
+            OllamaProvider::validate_input_budget(&build(), Some(16_384), 1024, 10_000),
+            Err(Error::ContextBudgetExceeded { .. })
+        ));
+    }
+
+    #[test]
+    fn estimate_tool_tokens_tracks_serialized_size() {
+        let tools = vec![OllamaTool {
+            r#type: "function".to_string(),
+            function: OllamaToolDef {
+                name: "read".to_string(),
+                description: "Read a file".to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": { "path": { "type": "string" } },
+                    "required": ["path"],
+                }),
+            },
+        }];
+        let serialized_len = serde_json::to_string(&tools).unwrap().len();
+        assert_eq!(
+            estimate_tool_tokens(&tools),
+            serialized_len.div_ceil(CHARS_PER_TOKEN) as u32
+        );
+    }
+
+    #[test]
     fn estimate_handles_multibyte_characters() {
-        // 4 multibyte chars should count as ceil(4/4) = 1 token, not 12 (their byte length).
+        // Ten UTF-8 bytes, not four scalar values: ceil(10/4) = 3.
         let tokens = estimate_text_tokens("日本語x");
-        assert_eq!(tokens, 1);
+        assert_eq!(tokens, 3);
+    }
+
+    #[test]
+    fn estimate_json_tokens_matches_serialized_length_without_allocating() {
+        let v = serde_json::json!({ "path": "/tmp/file.txt", "recursive": true });
+        let serialized_len = v.to_string().len();
+        assert_eq!(
+            estimate_json_tokens(&v),
+            serialized_len.div_ceil(CHARS_PER_TOKEN) as u32
+        );
+    }
+
+    #[test]
+    fn ndjson_stream_survives_chunk_split_inside_multibyte_char() {
+        // Two NDJSON chunks whose content contains multi-byte characters,
+        // delivered with a network-chunk boundary inside a codepoint. The
+        // byte-level line buffer must reassemble it without U+FFFD.
+        let payload = "{\"message\":{\"content\":\"héllo\"},\"done\":false}\n\
+                       {\"message\":{\"content\":\" wörld\"},\"done\":true,\"done_reason\":\"stop\"}\n";
+        let bytes = payload.as_bytes();
+        // Split one byte into the "é" (0xC3 0xA9).
+        let split = payload.find('é').unwrap() + 1;
+
+        let mut buffer = LineBuffer::new();
+        let mut full_text = String::new();
+        let mut done_reason: Option<String> = None;
+        for chunk in [&bytes[..split], &bytes[split..]] {
+            buffer.push_chunk(chunk);
+            while let Some(line) = buffer.next_line() {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                let stream_chunk: OllamaStreamChunk = serde_json::from_str(line).expect("parse");
+                if let Some(content) = stream_chunk.message.content {
+                    full_text.push_str(&content);
+                }
+                if stream_chunk.done {
+                    done_reason = stream_chunk.done_reason;
+                }
+            }
+        }
+        assert_eq!(full_text, "héllo wörld");
+        assert_eq!(done_reason.as_deref(), Some("stop"));
+    }
+
+    #[test]
+    fn ndjson_multiple_lines_in_one_chunk_parse_in_order() {
+        let payload = "{\"message\":{\"content\":\"a\"},\"done\":false}\n\
+                       {\"message\":{\"content\":\"b\"},\"done\":false}\n\
+                       {\"message\":{\"content\":\"c\"},\"done\":true}\n";
+        let mut buffer = LineBuffer::new();
+        buffer.push_chunk(payload.as_bytes());
+
+        let mut full_text = String::new();
+        let mut saw_done = false;
+        while let Some(line) = buffer.next_line() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let stream_chunk: OllamaStreamChunk = serde_json::from_str(line).expect("parse");
+            if let Some(content) = stream_chunk.message.content {
+                full_text.push_str(&content);
+            }
+            saw_done |= stream_chunk.done;
+        }
+        assert_eq!(full_text, "abc");
+        assert!(saw_done);
+        assert_eq!(buffer.len(), 0);
+    }
+}
+
+#[cfg(test)]
+mod num_predict_clamp_tests {
+    use super::*;
+
+    #[test]
+    fn a_num_predict_that_cannot_fit_is_clamped_to_half_the_window() {
+        // 4096 predict in a 4096 window leaves zero input budget; the trim
+        // then strips the conversation while the server truncates the rest.
+        assert_eq!(clamp_num_predict(Some(4096), 4096), 2048);
+        assert_eq!(clamp_num_predict(Some(4096), 8192), 2048);
+    }
+
+    #[test]
+    fn a_num_predict_that_fits_passes_through() {
+        assert_eq!(clamp_num_predict(Some(65536), 4096), 4096);
+        assert_eq!(clamp_num_predict(None, 4096), 4096);
+    }
+
+    #[test]
+    fn ollama_sentinels_are_never_clamped() {
+        // -1 = unlimited, 0 = fill-context; both are server-side semantics
+        // the clamp must not reinterpret.
+        assert_eq!(clamp_num_predict(Some(4096), -1), -1);
+        assert_eq!(clamp_num_predict(Some(4096), 0), 0);
+    }
+}
+
+#[cfg(test)]
+mod think_field_tests {
+    use super::*;
+
+    fn provider_with(model: &str, think: Option<bool>) -> OllamaProvider {
+        let config = OllamaConfig {
+            think,
+            ..OllamaConfig::default()
+        };
+        OllamaProvider::new(model).with_config(config)
+    }
+
+    /// The bug: the send sites read `if resolved_think() { think = true }`,
+    /// so asking for no thinking produced a request with no `think` field.
+    /// Ollama defaults a thinking-capable model to thinking, so that request
+    /// still thought — and `OLLAMA_THINK=false` looked like it did nothing.
+    #[test]
+    fn a_capable_model_told_not_to_think_is_told_explicitly() {
+        let p = provider_with("qwen3:8b", Some(false));
+        assert_eq!(
+            p.think_field(),
+            Some(false),
+            "off must be sent, not implied by omission"
+        );
+    }
+
+    #[test]
+    fn a_capable_model_asked_to_think_is_asked() {
+        let p = provider_with("qwen3:8b", Some(true));
+        assert_eq!(p.think_field(), Some(true));
+    }
+
+    /// Ollama 400s on a `think` field of either polarity for a model without
+    /// the capability, and for such a model omission genuinely is off.
+    #[test]
+    fn an_incapable_model_is_sent_no_think_field_at_all() {
+        let p = provider_with("llama3.1:8b", Some(false));
+        assert_eq!(p.think_field(), None);
+        let p = provider_with("llama3.1:8b", None);
+        assert_eq!(p.think_field(), None);
+    }
+
+    /// With no opinion expressed, a capable model still thinks — this change
+    /// is about making "off" reachable, not about changing the default.
+    #[test]
+    fn the_default_for_a_capable_model_is_unchanged() {
+        let p = provider_with("qwen3:8b", None);
+        assert_eq!(p.think_field(), Some(true));
+    }
+
+    /// Capability detection must not consult the preference variable, or the
+    /// two collapse back together and off becomes unreachable again.
+    #[test]
+    fn capability_detection_ignores_the_preference_variable() {
+        let capable = ModelCapabilities {
+            vision: false,
+            thinking: true,
+        };
+        assert!(model_can_think("llama3.1:8b", Some(capable)));
+        assert!(!model_can_think(
+            "qwen3:8b",
+            Some(ModelCapabilities {
+                vision: false,
+                thinking: false,
+            })
+        ));
     }
 }

@@ -12,4 +12,31 @@ ignore = [
     # actionable upstream fix available; revisit when tokenizers releases a
     # version that drops the dependency.
     "RUSTSEC-2024-0436",
+
+    # quick-xml < 0.41.0 has two DoS advisories (quadratic attribute-name
+    # checking and unbounded namespace-declaration allocation). It is pulled
+    # in transitively, at two different versions, only via the `xcap`
+    # (screenshot capture) dependency used by the optional computer-use
+    # backend:
+    #   - `xcb` 1.7.0 depends on quick-xml ^0.30.0, used solely in its build
+    #     script to parse the crate's own bundled XCB protocol XML files
+    #     (crates.io xcb-1.7.0/build/*.rs) — not attacker-controlled input.
+    #   - `wayland-scanner` 0.31.10 depends on quick-xml ^0.39, used solely
+    #     at compile time to codegen bindings from bundled Wayland protocol
+    #     XML — likewise not attacker-controlled input.
+    # Neither xcb (latest: 1.7.0) nor wayland-scanner (latest: 0.31.10) has
+    # released a version depending on quick-xml >=0.41.0 yet. Revisit when
+    # either does.
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
+
+    # number_prefix 0.4.0 is unmaintained (the crate is archived; the
+    # advisory recommends `unit-prefix`). No vulnerability is reported
+    # against it — it only formats byte counts as "1.2 KiB". It reaches us
+    # transitively and is not selectable: indicatif 0.17 -> hf-hub ->
+    # fastembed, i.e. progress bars for the embedding-model download.
+    # Nothing calls it outside that path, and it disappears entirely from
+    # `--no-default-features` builds (the E2E lane). Revisit when indicatif
+    # switches to unit-prefix.
+    "RUSTSEC-2025-0119",
 ]

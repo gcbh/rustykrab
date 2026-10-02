@@ -66,6 +66,7 @@ struct TracerInner {
 /// Sanitize a tool name to prevent prompt injection via trace summaries.
 /// Only allows alphanumeric characters, underscores, and hyphens,
 /// and limits length to 64 characters.
+///
 fn sanitize_tool_name(name: &str) -> String {
     name.chars()
         .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
@@ -124,6 +125,16 @@ impl ExecutionTracer {
     /// Get aggregated stats for all tools.
     pub fn tool_stats(&self) -> HashMap<String, ToolStats> {
         self.lock_inner().stats.clone()
+    }
+
+    /// Iterations completed this run.
+    pub fn iterations(&self) -> u32 {
+        self.lock_inner().iterations
+    }
+
+    /// Compactions triggered this run.
+    pub fn compressions(&self) -> u32 {
+        self.lock_inner().compressions
     }
 
     /// Get the full trace log.

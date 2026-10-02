@@ -1,5 +1,6 @@
+use crate::backoff::retry_delay;
+use crate::line_buffer::LineBuffer;
 use async_trait::async_trait;
-use chrono::Utc;
 use rustykrab_core::error::Result;
 use rustykrab_core::model::{
     ModelProvider, ModelResponse, StopReason, StreamEvent, ToolChoice, Usage,
@@ -11,7 +12,6 @@ use rustykrab_core::Error;
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
-use uuid::Uuid;
 
 /// Maximum number of retries for transient errors (429, 5xx).
 const MAX_RETRIES: u32 = 3;
@@ -93,7 +93,20 @@ impl AnthropicProvider {
             match msg.role {
                 Role::System => {
                     if let MessageContent::Text(ref text) = msg.content {
-                        system_prompt = Some(text.clone());
+                        if system_prompt.is_none() {
+                            system_prompt = Some(text.clone());
+                        } else {
+                            // A mid-conversation System message (iteration
+                            // warning, harness notice) must not REPLACE the
+                            // real system prompt — render it as an inline
+                            // user-role note instead.
+                            api_messages.push(ApiMessage {
+                                role: "user".to_string(),
+                                content: ApiContent::Blocks(vec![ContentBlock::Text {
+                                    text: format!("[System notice]\n{text}"),
+                                }]),
+                            });
+                        }
                     }
                 }
                 Role::User => match &msg.content {
@@ -283,12 +296,7 @@ impl AnthropicProvider {
             };
 
             return Ok(ModelResponse {
-                message: Message {
-                    id: Uuid::new_v4(),
-                    role: Role::Assistant,
-                    content,
-                    created_at: Utc::now(),
-                },
+                message: Message::stamped(Role::Assistant, content),
                 usage,
                 stop_reason,
                 text: if text.is_empty() { None } else { Some(text) },
@@ -296,12 +304,7 @@ impl AnthropicProvider {
         }
 
         Ok(ModelResponse {
-            message: Message {
-                id: Uuid::new_v4(),
-                role: Role::Assistant,
-                content: MessageContent::Text(text),
-                created_at: Utc::now(),
-            },
+            message: Message::stamped(Role::Assistant, MessageContent::Text(text)),
             usage,
             stop_reason,
             text: None,
@@ -374,7 +377,7 @@ impl AnthropicProvider {
         let mut last_err = None;
         for attempt in 0..=MAX_RETRIES {
             if attempt > 0 {
-                let delay = RETRY_BASE_DELAY * 2u32.pow(attempt - 1);
+                let delay = retry_delay(RETRY_BASE_DELAY, attempt);
                 tracing::warn!(attempt, "retrying Anthropic API after {delay:?}");
                 tokio::time::sleep(delay).await;
             }
@@ -474,6 +477,14 @@ impl ModelProvider for AnthropicProvider {
 
     fn context_limit(&self) -> Option<usize> {
         Some(self.context_limit)
+    }
+
+    fn total_context_window(&self) -> Option<usize> {
+        Some(self.context_limit)
+    }
+
+    fn output_reserve_tokens(&self) -> usize {
+        self.max_tokens as usize
     }
 
     fn supports_vision(&self) -> bool {
@@ -576,7 +587,7 @@ impl AnthropicProvider {
         let mut resp = None;
         for attempt in 0..=MAX_RETRIES {
             if attempt > 0 {
-                let delay = RETRY_BASE_DELAY * 2u32.pow(attempt - 1);
+                let delay = retry_delay(RETRY_BASE_DELAY, attempt);
                 tracing::warn!(attempt, "retrying Anthropic streaming API after {delay:?}");
                 tokio::time::sleep(delay).await;
             }
@@ -616,8 +627,10 @@ impl AnthropicProvider {
             last_err.unwrap_or_else(|| Error::ModelProvider("request failed".into()))
         })?;
 
-        // Parse SSE events from the response body.
-        let mut buffer = String::new();
+        // Parse SSE events from the response body. Raw bytes are buffered
+        // and split on `\n` before UTF-8 decoding, so multi-byte codepoints
+        // that span network chunks are reassembled instead of corrupted.
+        let mut buffer = LineBuffer::new();
         let mut current_event_type = String::new();
         let mut full_text = String::new();
         let mut tool_calls: Vec<ToolCall> = Vec::new();
@@ -662,11 +675,10 @@ impl AnthropicProvider {
             };
             chunks_received += 1;
             bytes_received += chunk.len() as u64;
-            buffer.push_str(&String::from_utf8_lossy(&chunk));
+            buffer.push_chunk(&chunk);
 
-            while let Some(newline_pos) = buffer.find('\n') {
-                let line = buffer[..newline_pos].trim_end().to_string();
-                buffer = buffer[newline_pos + 1..].to_string();
+            while let Some(line) = buffer.next_line() {
+                let line = line.trim_end();
 
                 if let Some(event_type) = line.strip_prefix("event: ") {
                     current_event_type = event_type.to_string();
@@ -808,12 +820,7 @@ impl AnthropicProvider {
         };
 
         let response = ModelResponse {
-            message: Message {
-                id: Uuid::new_v4(),
-                role: Role::Assistant,
-                content,
-                created_at: Utc::now(),
-            },
+            message: Message::stamped(Role::Assistant, content),
             usage,
             stop_reason,
             text: text_field,
@@ -1036,6 +1043,66 @@ mod tests {
     }
 
     #[test]
+    fn sse_text_delta_survives_chunk_split_inside_multibyte_char() {
+        // A text_delta whose JSON contains multi-byte characters, delivered
+        // in two network chunks with the boundary inside a codepoint. The
+        // byte-level line buffer must reassemble it without U+FFFD.
+        let payload = "event: content_block_delta\n\
+                       data: {\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"日本語\"}}\n";
+        let bytes = payload.as_bytes();
+        // Split one byte into the first multi-byte character.
+        let split = payload.find('日').unwrap() + 1;
+
+        let mut buffer = LineBuffer::new();
+        let mut current_event_type = String::new();
+        let mut text = String::new();
+        for chunk in [&bytes[..split], &bytes[split..]] {
+            buffer.push_chunk(chunk);
+            while let Some(line) = buffer.next_line() {
+                let line = line.trim_end();
+                if let Some(event_type) = line.strip_prefix("event: ") {
+                    current_event_type = event_type.to_string();
+                } else if let Some(data) = line.strip_prefix("data: ") {
+                    assert_eq!(current_event_type, "content_block_delta");
+                    let evt: SseContentBlockDelta = serde_json::from_str(data).expect("parse");
+                    if let SseDelta::TextDelta { text: t } = evt.delta {
+                        text.push_str(&t);
+                    }
+                }
+            }
+        }
+        assert_eq!(text, "日本語");
+    }
+
+    #[test]
+    fn sse_multiple_lines_in_one_chunk_parse_in_order() {
+        let payload = "event: content_block_delta\n\
+                       data: {\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"a\"}}\n\
+                       \n\
+                       event: content_block_delta\n\
+                       data: {\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"b\"}}\n";
+        let mut buffer = LineBuffer::new();
+        buffer.push_chunk(payload.as_bytes());
+
+        let mut current_event_type = String::new();
+        let mut text = String::new();
+        while let Some(line) = buffer.next_line() {
+            let line = line.trim_end();
+            if let Some(event_type) = line.strip_prefix("event: ") {
+                current_event_type = event_type.to_string();
+            } else if let Some(data) = line.strip_prefix("data: ") {
+                assert_eq!(current_event_type, "content_block_delta");
+                let evt: SseContentBlockDelta = serde_json::from_str(data).expect("parse");
+                if let SseDelta::TextDelta { text: t } = evt.delta {
+                    text.push_str(&t);
+                }
+            }
+        }
+        assert_eq!(text, "ab");
+        assert_eq!(buffer.len(), 0);
+    }
+
+    #[test]
     fn tool_result_without_images_serializes_as_string() {
         use rustykrab_core::types::ToolResult;
         let msg = Message {
@@ -1048,6 +1115,7 @@ mod tests {
                 images: Vec::new(),
             }),
             created_at: chrono::Utc::now(),
+            agent_version: None,
         };
         let (_sys, api) = AnthropicProvider::build_messages(&[msg]).expect("build");
         let json = serde_json::to_value(&api).unwrap();
@@ -1077,6 +1145,7 @@ mod tests {
                 }],
             }),
             created_at: chrono::Utc::now(),
+            agent_version: None,
         };
         let (_sys, api) = AnthropicProvider::build_messages(&[msg]).expect("build");
         let json = serde_json::to_value(&api).unwrap();

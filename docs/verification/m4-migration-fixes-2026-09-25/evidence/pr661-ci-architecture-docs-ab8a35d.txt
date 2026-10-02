@@ -1,0 +1,8 @@
+# CI 'Architecture Docs' on PR #661 head ab8a35d (merge ref f66460f): 108140726881 failure https://github.com/gcbh/rustykrab/actions/runs/36156046676/job/108140726881
+##[group]Run python3 scripts/check_architecture_docs.py
+[36;1mpython3 scripts/check_architecture_docs.py[0m
+##[endgroup]
+Stale generated metrics (run with --fix):
+  crates/rustykrab-agent/ARCHITECTURE.md
+##[error]Process completed with exit code 1.
+Post job cleanup.

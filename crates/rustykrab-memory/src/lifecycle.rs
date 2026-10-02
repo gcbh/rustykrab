@@ -10,6 +10,10 @@ use crate::embedding::{cosine_similarity, Embedder};
 use crate::storage::MemoryStorage;
 use crate::types::{LifecycleStage, LinkType, Memory, MemoryLink};
 
+/// Days a tombstoned memory is retained before the sweep hard-deletes it
+/// together with its chunks, extracted facts, links, and FTS rows.
+const TOMBSTONE_RETENTION_DAYS: i64 = 30;
+
 /// Statistics from a lifecycle sweep operation.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LifecycleSweepStats {
@@ -18,6 +22,9 @@ pub struct LifecycleSweepStats {
     pub demoted_to_archival: u32,
     pub tombstoned: u32,
     pub near_duplicates_found: u32,
+    /// Tombstoned memories hard-deleted after the retention window.
+    #[serde(default)]
+    pub purged: u32,
 }
 
 /// Lifecycle manager: handles promotion, demotion, consolidation,
@@ -139,12 +146,22 @@ impl LifecycleManager {
             stats.tombstoned = self.storage.batch_update_stages(&tombstones).await?;
         }
 
+        // ── Purge: hard-delete tombstones past retention ────────
+        // Without this, soft-deleted memories (and their chunks/facts)
+        // accumulate forever.
+        let purge_cutoff = now - Duration::days(TOMBSTONE_RETENTION_DAYS);
+        stats.purged = self
+            .storage
+            .purge_tombstones(agent_id, purge_cutoff)
+            .await?;
+
         info!(
             agent_id = %agent_id,
             working_promoted = stats.promoted_to_episodic,
             promoted = stats.promoted_to_semantic,
             demoted = stats.demoted_to_archival,
             tombstoned = stats.tombstoned,
+            purged = stats.purged,
             "lifecycle sweep complete"
         );
 
@@ -187,6 +204,39 @@ impl LifecycleManager {
         Ok(count)
     }
 
+    /// Promote every Working memory for an agent to Episodic.
+    ///
+    /// For shutdown. [`Self::finalize_session`] promotes one conversation's
+    /// working set, which is right when a conversation ends; at process exit
+    /// every conversation has ended, and nothing will be added to any of
+    /// their working sets again. Waiting for the idle sweep to notice would
+    /// leave them Working until well after the next boot.
+    pub async fn finalize_working_set(&self, agent_id: Uuid) -> rustykrab_core::Result<u32> {
+        let working = self
+            .storage
+            .list_by_stage(agent_id, LifecycleStage::Working)
+            .await?;
+
+        if working.is_empty() {
+            return Ok(0);
+        }
+
+        let promotions: Vec<(Uuid, LifecycleStage)> = working
+            .iter()
+            .map(|m| (m.id, LifecycleStage::Episodic))
+            .collect();
+
+        let count = self.storage.batch_update_stages(&promotions).await?;
+
+        info!(
+            agent_id = %agent_id,
+            promoted = count,
+            "working set finalized: working → episodic"
+        );
+
+        Ok(count)
+    }
+
     /// Detect near-duplicate memories and create links between them.
     ///
     /// Thresholds (from production systems):
@@ -215,7 +265,11 @@ impl LifecycleManager {
             }
         }
 
-        if mem_embeddings.len() > MAX_DEDUP_MEMORIES {
+        // `memories.len()`, not `mem_embeddings.len()`. The latter is built
+        // by `.take(MAX_DEDUP_MEMORIES)` above, so it can never exceed the
+        // cap and this warning could never fire — the one case operators
+        // needed to hear about was the only one it stayed silent for.
+        if memories.len() > MAX_DEDUP_MEMORIES {
             tracing::warn!(
                 agent_id = %agent_id,
                 total = memories.len(),

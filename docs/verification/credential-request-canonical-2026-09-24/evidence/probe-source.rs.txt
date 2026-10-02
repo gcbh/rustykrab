@@ -1,0 +1,53 @@
+//! Throwaway verification probes (not committed as code).
+use crate::credential_request::CredentialRequestTool;
+use crate::google_credentials::{KEY_APP_PASSWORD, KEY_EMAIL};
+use rustykrab_core::tool::Tool;
+use rustykrab_store::RequestedField;
+use serde_json::json;
+
+fn f(k: &str) -> RequestedField {
+    RequestedField { key: k.into(), label: k.into(), secret: true, hint: None }
+}
+
+#[test]
+fn probe_false_positives() {
+    let cases: &[(&str, &str, &[&str])] = &[
+        ("google_maps_api_key", "Google Maps", &["google_maps_api_key"]),
+        ("gemini_api_key", "Google AI Studio", &["gemini_api_key"]),
+        ("google_cloud_service_account", "Google Cloud", &["gcp_sa_json"]),
+        ("youtube_api_key", "YouTube (Google)", &["youtube_api_key"]),
+        ("claude_ai_session", "Claude.ai", &["session_cookie"]),
+        ("notion_calendar_login", "Notion Calendar", &["email", "password"]),
+    ];
+    for (name, service, keys) in cases {
+        let fields: Vec<_> = keys.iter().map(|k| f(k)).collect();
+        let (got, gf) = crate::known_credential::canonicalize(name, Some(service), fields);
+        println!("PROBE {name:32} | {service:20} -> {got} {:?}", gf.iter().map(|x| x.key.clone()).collect::<Vec<_>>());
+    }
+}
+
+#[tokio::test]
+async fn probe_tool_supersedes_live_canonical_link() {
+    std::env::set_var("RUSTYKRAB_PUBLIC_URL", "https://probe.invalid");
+    let dir = tempfile::tempdir().unwrap();
+    let store = rustykrab_store::Store::open(dir.path(), vec![7u8; 32]).unwrap()
+        .with_credential_backend(std::sync::Arc::new(
+            rustykrab_store::credential_backend::MemoryBackend::new()));
+    let requests = store.credential_requests();
+    crate::google_credentials::ask(Some(&requests), None, "Gmail", "your app password").await;
+    let first = requests.pending().await.unwrap();
+    let first_url = crate::credential_link::mint_link(&requests, &first[0].id).await.unwrap();
+    let first_token = first_url.rsplit('/').next().unwrap().to_string();
+    println!("PROBE before tool: live_link={} first_link_resolves={}",
+        requests.has_live_link(KEY_APP_PASSWORD).await.unwrap(),
+        requests.find_by_link(&first_token).await.unwrap().is_some());
+    CredentialRequestTool::new(requests.clone()).execute(json!({
+        "name": "gmail_credentials", "service": "Gmail", "reason": "r",
+        "fields": [{"key": KEY_EMAIL, "label": "e"}, {"key": KEY_APP_PASSWORD, "label": "p"}]
+    })).await.unwrap();
+    let after = requests.pending().await.unwrap();
+    println!("PROBE after tool: pending={} name={} first_link_resolves={} new_id_differs={}",
+        after.len(), after[0].name,
+        requests.find_by_link(&first_token).await.unwrap().is_some(),
+        after[0].id != first[0].id);
+}
