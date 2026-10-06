@@ -25,7 +25,18 @@ pub const LINK_TTL: Duration = Duration::from_secs(15 * 60);
 /// not failure to ask — the request is already filed and answerable in
 /// the app, so this logs and returns `None` rather than propagating.
 pub async fn mint_link(requests: &CredentialRequestStore, request_id: &str) -> Option<String> {
-    let base = public_base()?;
+    mint_link_at(requests, request_id, public_base()).await
+}
+
+/// [`mint_link`] against a base URL the caller read once, the way
+/// [`mint_payment_link`] takes one: the control layer reads
+/// [`public_base`] when it starts, and its tests pass their own.
+pub async fn mint_link_at(
+    requests: &CredentialRequestStore,
+    request_id: &str,
+    base: Option<String>,
+) -> Option<String> {
+    let base = base?;
 
     match requests.issue_link(request_id, LINK_TTL).await {
         Ok(token) => Some(format!("{base}/c/{token}")),

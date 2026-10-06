@@ -18,6 +18,42 @@ const TELEGRAM_MAX_LENGTH: usize = 4096;
 /// Maximum retries for sending a message before giving up.
 const SEND_MAX_RETRIES: u32 = 3;
 
+/// Commands the host answers before a message reaches the agent: the work
+/// surface's `/work`, `/approve`, `/reject`, `/cancel` and `/answer` (plan
+/// `docs/plans/control-layer-and-worker-fleet.md`, section 14.2). A command
+/// handled here never enters a conversation, so an answer resumes the work
+/// item that asked, not the chat.
+#[async_trait::async_trait]
+pub trait CommandHook: Send + Sync {
+    /// The reply to `text` from `chat_id`, or `None` when the hook does not
+    /// handle it and the message goes on to the agent.
+    async fn handle(&self, text: &str, chat_id: i64, thread_id: i64) -> Option<String>;
+
+    /// The commands it adds to `/help`, one line each.
+    fn help(&self) -> Vec<String> {
+        Vec::new()
+    }
+}
+
+/// A row of inline buttons: `(label, callback data)` per button.
+pub type ButtonRow = Vec<(String, String)>;
+
+/// The command a button press stands for: `approve:<id>` is `/approve <id>`,
+/// `reject:<id>` is `/reject <id>`, `answer:<question>:<option>` is
+/// `/answer <question> <option>`. Anything else is ignored.
+pub fn command_for_button(data: &str) -> Option<String> {
+    let (verb, rest) = data.split_once(':')?;
+    match verb {
+        "approve" | "reject" | "cancel" if !rest.is_empty() => Some(format!("/{verb} {rest}")),
+        "answer" => {
+            let (question, option) = rest.split_once(':')?;
+            (!question.is_empty() && !option.is_empty())
+                .then(|| format!("/answer {question} {option}"))
+        }
+        _ => None,
+    }
+}
+
 /// An inbound message with channel-specific routing metadata.
 pub struct ChannelMessage {
     pub chat_id: i64,
@@ -53,6 +89,9 @@ pub struct TelegramChannel {
     inbound_rx: Option<mpsc::Receiver<ChannelMessage>>,
     /// Graceful shutdown flag.
     shutdown_flag: Arc<AtomicBool>,
+    /// The host's commands (the work surface), consulted before a message
+    /// reaches the agent.
+    commands: Option<Arc<dyn CommandHook>>,
 }
 
 impl TelegramChannel {
@@ -85,7 +124,14 @@ impl TelegramChannel {
             inbound_tx: tx,
             inbound_rx: Some(rx),
             shutdown_flag: Arc::new(AtomicBool::new(false)),
+            commands: None,
         }
+    }
+
+    /// Answer the host's commands before the agent sees a message.
+    pub fn with_command_hook(mut self, hook: Arc<dyn CommandHook>) -> Self {
+        self.commands = Some(hook);
+        self
     }
 
     /// Set a webhook secret for HMAC validation of incoming updates.
@@ -147,6 +193,68 @@ impl TelegramChannel {
             self.send_single_message(chat_id, chunk, thread_id).await?;
         }
         Ok(())
+    }
+
+    /// Send `text` with rows of inline buttons under it (plan previews'
+    /// approve and reject, a question's options). Plain text, so ids and
+    /// underscores in it are never read as Markdown. A text too long for one
+    /// message goes out without buttons, with the commands it already
+    /// carries.
+    pub async fn send_text_with_buttons(
+        &self,
+        chat_id: i64,
+        text: &str,
+        thread_id: i64,
+        buttons: &[ButtonRow],
+    ) -> Result<()> {
+        if buttons.is_empty() || text.len() > TELEGRAM_MAX_LENGTH {
+            return self.send_text(chat_id, text, thread_id).await;
+        }
+        let keyboard: Vec<Vec<serde_json::Value>> = buttons
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(
+                        |(label, data)| serde_json::json!({ "text": label, "callback_data": data }),
+                    )
+                    .collect()
+            })
+            .collect();
+        let mut body = serde_json::json!({
+            "chat_id": chat_id,
+            "text": text,
+            "reply_markup": { "inline_keyboard": keyboard },
+        });
+        if thread_id > 0 {
+            body["message_thread_id"] = serde_json::json!(thread_id);
+        }
+        let url = format!("{}/sendMessage", self.api_base);
+        let resp = self
+            .client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| Error::Channel(format!("Telegram API error: {e}")))?;
+        if resp.status().is_success() {
+            return Ok(());
+        }
+        let status = resp.status();
+        let err = resp.text().await.unwrap_or_default();
+        tracing::debug!(%status, %err, "buttons refused; sending the text alone");
+        self.send_text(chat_id, text, thread_id).await
+    }
+
+    /// Acknowledge a button press, so the client stops its spinner.
+    async fn answer_callback(&self, callback_id: &str, text: &str) {
+        let url = format!("{}/answerCallbackQuery", self.api_base);
+        let body = serde_json::json!({
+            "callback_query_id": callback_id,
+            "text": text.chars().take(190).collect::<String>(),
+        });
+        if let Err(e) = self.client.post(&url).json(&body).send().await {
+            tracing::debug!("answerCallbackQuery failed (non-critical): {e}");
+        }
     }
 
     /// Send a single message chunk with retry and Markdown fallback.
@@ -416,9 +524,12 @@ impl TelegramChannel {
 
     /// Process a single Telegram update.
     async fn handle_update(&self, update: Update) -> Result<()> {
+        if let Some(press) = update.callback_query {
+            return self.handle_button(press).await;
+        }
         let msg = match update.message {
             Some(m) => m,
-            None => return Ok(()), // Ignore non-message updates (edits, callbacks, etc.)
+            None => return Ok(()), // Ignore non-message updates (edits, etc.)
         };
 
         let chat_id = msg.chat.id;
@@ -486,7 +597,7 @@ impl TelegramChannel {
         };
 
         // Handle bot commands before forwarding to the agent.
-        if let Some(reply) = self.handle_command(&text, chat_id).await {
+        if let Some(reply) = self.handle_command(&text, chat_id, thread_id).await {
             let _ = self.send_text(chat_id, &reply, thread_id).await;
             return Ok(());
         }
@@ -514,9 +625,37 @@ impl TelegramChannel {
         Ok(())
     }
 
-    /// Handle built-in bot commands. Returns Some(reply) if the command
-    /// was handled, None if the message should be forwarded to the agent.
-    async fn handle_command(&self, text: &str, _chat_id: i64) -> Option<String> {
+    /// A button press: its command, from an allowed chat, answered like the
+    /// command typed.
+    async fn handle_button(&self, press: CallbackQuery) -> Result<()> {
+        let Some(msg) = press.message else {
+            return Ok(());
+        };
+        let chat_id = msg.chat.id;
+        if !self.allowed_chats.is_empty() && !self.allowed_chats.contains(&chat_id) {
+            tracing::warn!(chat_id, "button press from disallowed chat, ignoring");
+            return Ok(());
+        }
+        let thread_id = msg.message_thread_id.unwrap_or(0);
+        let Some(command) = press.data.as_deref().and_then(command_for_button) else {
+            self.answer_callback(&press.id, "Unknown button.").await;
+            return Ok(());
+        };
+        let reply = match &self.commands {
+            Some(hook) => hook.handle(&command, chat_id, thread_id).await,
+            None => None,
+        };
+        let reply = reply.unwrap_or_else(|| "That button is not available here.".to_string());
+        self.answer_callback(&press.id, reply.lines().next().unwrap_or(""))
+            .await;
+        let _ = self.send_text(chat_id, &reply, thread_id).await;
+        Ok(())
+    }
+
+    /// Handle built-in bot commands, then the host's. Returns Some(reply) if
+    /// the command was handled, None if the message should be forwarded to
+    /// the agent.
+    async fn handle_command(&self, text: &str, chat_id: i64, thread_id: i64) -> Option<String> {
         let cmd = text.split_whitespace().next()?;
         match cmd {
             "/start" => Some(
@@ -524,23 +663,32 @@ impl TelegramChannel {
                  Use /help to see available commands."
                     .to_string(),
             ),
-            "/help" => Some(
-                "Available commands:\n\
+            "/help" => {
+                let mut help = "Available commands:\n\
                  /start — Introduction\n\
                  /help — Show this help\n\
                  /ping — Check if the bot is alive\n\
-                 /reset — Start a new conversation\n\n\
-                 Any other message will be processed by the AI agent."
-                    .to_string(),
-            ),
+                 /reset — Start a new conversation\n"
+                    .to_string();
+                if let Some(hook) = &self.commands {
+                    for line in hook.help() {
+                        help.push_str(&line);
+                        help.push('\n');
+                    }
+                }
+                help.push_str("\nAny other message will be processed by the AI agent.");
+                Some(help)
+            }
             "/ping" => Some("Pong! Bot is running.".to_string()),
             "/reset" => Some(
                 "Conversation reset. Send a new message to start fresh.".to_string(),
             ),
-            _ if cmd.starts_with('/') => {
-                // Unknown command — let it pass through to the agent.
-                None
-            }
+            _ if cmd.starts_with('/') => match &self.commands {
+                // The host's commands; anything it does not know passes
+                // through to the agent.
+                Some(hook) => hook.handle(text, chat_id, thread_id).await,
+                None => None,
+            },
             _ => None,
         }
     }
@@ -661,6 +809,19 @@ struct GetUpdatesResponse {
 pub struct Update {
     pub update_id: i64,
     pub message: Option<TelegramMessage>,
+    /// A press of an inline button the bot sent.
+    #[serde(default)]
+    pub callback_query: Option<CallbackQuery>,
+}
+
+#[derive(Deserialize)]
+pub struct CallbackQuery {
+    pub id: String,
+    #[serde(default)]
+    pub data: Option<String>,
+    /// The message the button was on, which names the chat.
+    #[serde(default)]
+    pub message: Option<TelegramMessage>,
 }
 
 #[derive(Deserialize)]
@@ -715,6 +876,25 @@ pub struct User {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn buttons_stand_for_the_commands_they_show() {
+        assert_eq!(
+            command_for_button("approve:abc-123").as_deref(),
+            Some("/approve abc-123")
+        );
+        assert_eq!(
+            command_for_button("reject:abc").as_deref(),
+            Some("/reject abc")
+        );
+        assert_eq!(
+            command_for_button("answer:q1:2").as_deref(),
+            Some("/answer q1 2")
+        );
+        assert_eq!(command_for_button("answer:q1:"), None);
+        assert_eq!(command_for_button("approve:"), None);
+        assert_eq!(command_for_button("delete:everything"), None);
+    }
 
     #[test]
     fn test_split_message_short() {

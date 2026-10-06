@@ -21,7 +21,7 @@ is derived against base `0b565fd` plus its recorded working-tree changes.
 ```
 rustykrab-core        (no internal deps — the contract layer)
    ^  ^  ^  ^  ^
-   |  |  |  |  +-- rustykrab-providers   anthropic, openai, ollama, scripted
+   |  |  |  |  +-- rustykrab-providers   anthropic, openai, ollama, scripted, claude-cli
    |  |  |  +----- rustykrab-memory      hybrid retrieval, own SQLite db
    |  |  +-------- rustykrab-skills      SKILL.md + agents/*.md loader, ed25519 verify
    |  +----------- rustykrab-channels    telegram, slack, signal, video, mcp
@@ -30,12 +30,13 @@ rustykrab-core        (no internal deps — the contract layer)
    rustykrab-tools  ----+      +---- rustykrab-dream
         ^
         |
-   rustykrab-control (core, store, tools)   work-item graph, ladder, Worker,
+   rustykrab-control (core, store, tools, projects)   work-item graph, ladder, Worker,
                                             worker registry, routing, worktrees,
                                             review surface (issue projection)
+                                            question router, standing judgment
         ^
         |
-   rustykrab-agent   (core, tools, control, skills)
+   rustykrab-agent   (core, tools, control, skills, providers)
         ^
         |
    rustykrab-runtime (core, store, agent, memory, skills)   <-- NEW
@@ -183,3 +184,47 @@ home for it and does not yet contain it.
 
 **Two databases, still no joins across them.** `outcome_attributions` rows
 with `kind = 'memory'` name a row in `memory.db`. Unchanged.
+
+## Context and monitoring continuation
+
+This continuation starts from `feat/control-layer-phase1` at `5cae23b` and
+integrates `feat/control-p4-questions` at `030dce6`. The controller keeps the
+newer routing, spend, drain and lock mechanisms alongside question routing,
+standing judgment, planning and progress-ledger repair. Planner work is a
+separate definition in the shared local model slot.
+
+The monitor is a transport observer, not a second scheduler:
+`Store::work_monitor_snapshot` → read-only `WorkerRegistry` views and
+`ControlHandle::loop_status` → `/api/monitor`, `/api/monitor/metrics`,
+`rustykrab monitor` and the static browser dashboard. Durable work counts
+and assignments cover all rows, while histories are bounded. Verification
+and cost come from judged evidence and finalized run records. Nightly
+evaluation now reads the actual question record through `StoreQuestions`.
+
+## Native subscription runtime follow-up (2026-10-02)
+
+The `claude-cli` model provider hands Rust model turns to a selected Max
+login with native tools disabled, then returns structured calls to the
+existing Rust harness. Native execution workers select a Max profile each
+and use Claude's own tools in isolated worktrees. `agent -> providers` is a
+new dependency for shared native login isolation/verification; `control`
+still owns only the worker/spec contract. With local execution disabled and
+the planner explicitly enabled, the fleet needs no Ollama model. Account
+and observed quota state reach the existing monitor, not a second dashboard.
+
+Codex subscription executors use the same external-worker path. Their
+`CODEX_HOME` and ChatGPT-only requirement are stored independently per worker;
+shared auth verification and quota sanitization stay in `providers`, with no
+new crate edge or controller dependency. An owned native CLI runs the work
+under its workspace sandbox; the Rust controller checks its result and
+records native usage. Claude planning and execution can coexist with Codex
+execution without an Ollama worker or an API fallback. Multiple profiles for
+the same account share quota; profile count does not multiply subscriptions.
+
+
+Project continuity now crosses the same `Brief` boundary. The controller loads
+a durable project revision plus work/question history, freezes it with the lease
+and pins coding work to its project's verified commit chain. Native adapters
+render it without depending on Claude/Codex chat state. Archive compaction keeps
+receipts and evidence, and the monitor shows the delivered revision and base.
+This changes no crate dependency and introduces no second scheduler or ledger.

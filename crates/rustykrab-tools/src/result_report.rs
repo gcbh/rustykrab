@@ -55,6 +55,33 @@ pub fn run_end_summary(tool_name: &str, output: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
+/// The calls that end a worker run on success: its report, the planner's
+/// accepted `work_plan` (its output is one accepted graph, plan section
+/// 6.1), and a question or capability request that parked the item (section
+/// 7). Each succeeds with `{"ok": true, "summary"}`; a rejected plan or an
+/// answered question does not carry it, so the run goes on.
+pub const WORKER_RUN_ENDING_TOOLS: [&str; 4] = [
+    "result_report",
+    "work_plan",
+    "ask_user",
+    "capability_request",
+];
+
+/// [`run_end_summary`] for a worker run: `Some(summary)` when `tool_name` is
+/// one of [`WORKER_RUN_ENDING_TOOLS`] and `output` is the success shape.
+pub fn worker_run_end_summary(tool_name: &str, output: &Value) -> Option<String> {
+    if !WORKER_RUN_ENDING_TOOLS.contains(&tool_name) || output.get("ok") != Some(&Value::Bool(true))
+    {
+        return None;
+    }
+    output
+        .get("summary")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
 const SUMMARY_MAX: usize = 1_500;
 const DETAIL_MAX: usize = 600;
 const ARTIFACTS_MAX: usize = 20;

@@ -95,17 +95,63 @@ pub struct ApprovalPolicy {
     /// filesystem access by writing a skill that sent later workers to read
     /// outside their worktrees.
     pub hold_discovered: bool,
+    /// Side effects the policy names (section 6.1, scenario 29): an item
+    /// writing a resource listed here, exactly or under it as a `name:`
+    /// prefix (`message` covers `message:third_party`), is held with what
+    /// depends on it. Standing judgment adds and removes entries.
+    pub consent_resources: BTreeSet<String>,
+}
+
+impl ApprovalPolicy {
+    /// Whether writing `resource` is a side effect this policy names.
+    pub fn names_side_effect(&self, resource: &str) -> Option<&str> {
+        self.consent_resources
+            .iter()
+            .find(|r| resource == r.as_str() || resource.starts_with(&format!("{r}:")))
+            .map(String::as_str)
+    }
+
+    /// Whether any trigger is configured at all, so an accepted filing that
+    /// fired none was a decision the policy made.
+    pub fn evaluates(&self) -> bool {
+        self.max_items.is_some()
+            || self.max_total_tokens.is_some()
+            || self.delegated_resources.is_some()
+            || self.authorized_slices.is_some()
+            || !self.consent_resources.is_empty()
+    }
 }
 
 /// An approval trigger that fired (6.1).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApprovalTrigger {
-    ItemCount { items: u32, threshold: u32 },
-    Budget { tokens: u64, threshold: u64 },
-    UndelegatedResource { item: WorkItemId, resource: String },
-    CodeOutsideSlice { item: WorkItemId },
-    Discovered { items: u32 },
-    Ladder { items: u32 },
+    ItemCount {
+        items: u32,
+        threshold: u32,
+    },
+    Budget {
+        tokens: u64,
+        threshold: u64,
+    },
+    UndelegatedResource {
+        item: WorkItemId,
+        resource: String,
+    },
+    CodeOutsideSlice {
+        item: WorkItemId,
+    },
+    Discovered {
+        items: u32,
+    },
+    Ladder {
+        items: u32,
+    },
+    /// The item writes a resource the policy names as a side effect that
+    /// needs consent (a payment, a message to a third party).
+    NamedSideEffect {
+        item: WorkItemId,
+        resource: String,
+    },
 }
 
 /// Everything [`validate`] needs besides the snapshot and the filing.
@@ -1579,6 +1625,11 @@ impl<'a> Run<'a> {
             if work.has_children(&up.id) || work.has_children(&down.id) {
                 continue;
             }
+            // The gate onto a planning item is the controller's, not a
+            // split the planner made (section 6.1).
+            if super::is_planning(up) {
+                continue;
+            }
             let sole_upstream = work
                 .edges_held_by(&down.id)
                 .filter(|e| e.kind.is_ordering())
@@ -1689,6 +1740,15 @@ fn approve(
                     });
                     super::push_unique(&mut seeds, item.id.clone());
                 }
+            }
+        }
+        for resource in &item.writable_resources {
+            if policy.names_side_effect(resource).is_some() {
+                triggers.push(ApprovalTrigger::NamedSideEffect {
+                    item: item.id.clone(),
+                    resource: resource.clone(),
+                });
+                super::push_unique(&mut seeds, item.id.clone());
             }
         }
         if let Some(slices) = &policy.authorized_slices {

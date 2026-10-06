@@ -175,6 +175,10 @@ impl ToolCatalog for FleetCatalog {
         ToolCatalog::mcp_server_configured(self.boot.as_ref(), name)
     }
 
+    fn credential_available(&self, name: &str) -> bool {
+        self.boot.credential_available(name)
+    }
+
     fn refresh(&self) {
         self.skills.refresh();
     }
@@ -187,6 +191,13 @@ pub(crate) const LOCAL_WORKER_ENV: &str = "RUSTYKRAB_LOCAL_WORKER";
 /// `RUSTYKRAB_LOCAL_WORKER` is `off`, `false`, `0` or `no`.
 pub(crate) fn local_worker_enabled() -> bool {
     local_worker_on(std::env::var(LOCAL_WORKER_ENV).ok().as_deref())
+}
+
+/// Planning can use a subscription CLI while local execution is disabled.
+pub(crate) fn planner_worker_enabled(local_enabled: bool) -> bool {
+    std::env::var("RUSTYKRAB_PLANNER_WORKER")
+        .ok()
+        .map_or(local_enabled, |value| local_worker_on(Some(&value)))
 }
 
 fn local_worker_on(value: Option<&str>) -> bool {

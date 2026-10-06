@@ -16,6 +16,10 @@
 //! - [`handle`]: the controller as the gateway, the CLI and the tools see it.
 //! - [`import`]: the delivery import, a `StackManifest` turned into the
 //!   layered `code` graph of section 14.1, filed through the validator.
+//! - [`questions`]: the question router and the standing-judgment compiler
+//!   (section 7), as pure functions.
+//! - [`progress`]: the progress ledger that calls a run stalled (section 6,
+//!   step 7).
 //! - [`worker`]: workers as the controller sees them, and the brief they get.
 //! - [`registry`]: the named workers (section 5), persisted in the store's
 //!   `workers` table, and the factory that builds external ones and peers.
@@ -42,10 +46,13 @@ pub mod controller;
 pub mod errors;
 pub mod graph;
 pub mod handle;
+pub mod handoff;
 pub mod import;
 pub mod ladder;
 pub mod lock;
 pub mod peer;
+pub mod progress;
+pub mod questions;
 pub mod registry;
 pub mod review;
 pub mod routing;

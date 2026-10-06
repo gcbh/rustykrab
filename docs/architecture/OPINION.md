@@ -36,17 +36,18 @@ That is rare and it is what makes 84k lines reviewable at all.
 Ranked by how much I want each addressed. No live user-facing bug survives
 from the first pass.
 
-### 1. The turn sequence is written out six times — **structural, measured**
+### 1. The turn sequence remains duplicated across five entry points — **structural, measured**
 
 Follow-up against `0b565fd`: shared interactive setup, Telegram/Slack admission
 journaling and reset generations, and partial HTTP/SSE persistence now address
 specific lifecycle defects; see [outcome history](05-first-pass-outcome.md#interactive-continuity-follow-up).
-The broader six-copy finding remains open: the channel transaction is not unified.
+The broader duplication finding remains open: the channel transaction is not unified.
+The 2026-10-02 review finds five entry points; the old task_queue module is gone.
 
 Load conversation → snapshot persisted ids → append user message → run with a
 heartbeat → `save_turn` → extract the reply → map failure to a user string.
 It appears in `process_telegram_message`, `process_slack_message`,
-`send_message`, `send_message_stream`, and twice in `task_queue.rs`.
+`send_message`, `send_message_stream`, and the delegated-task worker in `gateway/src/tasks.rs`.
 
 This is the highest-value remaining item, and unlike most duplication
 findings it has already produced a defect rather than merely threatening to:
@@ -66,9 +67,11 @@ likely thing to be "fixed" by someone tidying up.
 
 ### 2. Ambient configuration — **structural, measured, unchanged**
 
-There are 48 direct environment reads inside library crates rather than the
-composition root: 26 `tools`, 8 `providers`, 5 `gateway`, 4 `agent`, 3 `store`,
-and one each in `channels` and `skills`.
+The 2026-10-02 measurement finds 56 literal-key environment reads in library
+src files: 30 tools, 8 providers, 5 gateway, 5 agent, 3 store, 3 dream, and
+one each in channels and skills. This includes test code (the three dream
+reads are test fixtures) and excludes dynamic keys. The original 48-site
+snapshot was against fd1f1e2; these counts are source sites, not call frequency.
 
 Each read is individually defensible. Collectively they mean a library's
 behaviour depends on process state its caller did not pass, two tests cannot
@@ -129,7 +132,9 @@ proof is mechanical rather than rhetorical: `cargo tree -p rustykrab-runtime
 -e normal | grep -c axum` returns `0`, and the CLI's channel loops call the
 runtime directly.
 
-`AppState` went from 26 fields to 10, with 18 in `AgentContext`. The split
+The extraction originally reduced AppState from 26 fields to 10. The
+2026-10-02 checkout has 15 transport/composition fields in AppState and 20
+in AgentContext after control, delegation and continuity wiring. The split
 followed a seam that was already there — `orchestrate` used 16 fields, the
 HTTP handlers used 5, and only 3 overlapped.
 
@@ -158,16 +163,16 @@ than ±3 integers; that is the version of this abstraction worth keeping.
 
 ### Size, where it matters and where it does not
 
-`runner.rs` is 6,171 lines — larger than at the first pass, despite the
-unification removing 375, because the compaction work added ~580. Removing
+The original second pass measured runner.rs at 6,171 lines. On 2026-10-02
+it is 9,214 lines including tests; the unification remains intact. Removing
 the duplicate loop was necessary and not sufficient. Compaction, response
 classification and tool execution are three coherent modules sharing little
 but `&self`, and splitting them is now easier than it was.
 
-`main.rs` at 3,180 lines still holds a ~1,200-line `main()` whose ordering
-constraints are enforced by comments rather than types.
+main.rs is now 4,769 lines including tests (3,180 in the original review);
+the composition root still relies on initialization order.
 
-`ollama.rs` at 3,229 is *not* a problem — it manages the model server, and
+ollama.rs at 3,210 lines (2026-10-02) is *not* a problem — it manages the model server, and
 that capability is what makes per-call window resizing and thinking control
 possible at all.
 
@@ -195,3 +200,25 @@ Static review again. The measurements are real; the severity ordering is
 judgement, and the first pass got severity wrong three times out of eleven.
 If any item here matters enough to act on, the cheapest validation is to
 implement it — that is what caught the errors last time.
+
+## Context and monitor integration review (2026-10-02)
+
+The integrated planner requires an explicit planning-only worker role;
+advertising work_plan on a peer does not reserve the peer for planning.
+The real peer-restart scenario exposed that distinction. Phase 4 question
+answers now feed the store-backed evaluator. Registry observation does not
+refresh last_seen: reads cannot conceal worker health-check staleness.
+Monitoring projects existing durable rows; it adds no parallel state ledger.
+Authentication/origin, bounded counts, lease faults, normal waits, verification
+evidence and event replay are checked against the real router and store.
+The scripted daemon suite proves lifecycle wiring; it does not establish
+model reasoning quality or implement the separate PR delivery system.
+
+
+The project handoff follow-up derives from `24dc038`: `plan_workspace` selected
+HEAD for every native run, and `Brief` carried no planning revision. The verified
+branch history therefore did not supply the next agent's files or project state.
+The existing worker boundary now carries durable project context and verified
+code ancestry; real git/SQLite tests exercise the loss path. The 128 KiB fail-closed
+context bound is an explicit scale limitation. Automatic integration of divergent
+verified branches and promotion of unverified mid-run changes remain separate.

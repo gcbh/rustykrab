@@ -11,10 +11,8 @@
 //! the calls the GitHub stand-in logged.
 //!
 //! Every scenario is written to pass once its phase ships and is marked
-//! `XFail` until then. Phases 1, 3, 5 and 6 have shipped (see [`PROMOTED`]
-//! and [`HELD_BACK`]); the routes of Phase 4 do not exist, so its scenarios
-//! fail at their first request, on a status code rather than a panic or a
-//! hang.
+//! `XFail` until then. Phases 1, 3, 4, 5 and 6 have shipped (see [`PROMOTED`]
+//! and [`HELD_BACK`]). Every promoted scenario is required to pass.
 //!
 //! # Promotion
 //!
@@ -135,6 +133,7 @@ const PROMOTED: &[Phase] = &[
     Phase::One,
     Phase::Three,
     Phase::ThreeExit,
+    Phase::Four,
     Phase::Five,
     Phase::Six,
 ];
@@ -143,23 +142,7 @@ const PROMOTED: &[Phase] = &[
 /// entry here is a known gap in a shipped phase, named rather than hidden;
 /// the report still runs it, and it turns the suite red the day it passes,
 /// so it leaves this list the same day.
-const HELD_BACK: &[(u8, &str)] = &[
-    (
-        13,
-        "Phase 4: the build, the verified tool and the resumed run with it active all pass; \
-         the last check, that the user was never asked, reads GET /api/questions, which \
-         the question router of Phase 4 serves",
-    ),
-    // Phase 6: the avoidable-escalation criterion reads questions through
-    // `rustykrab_dream::QuestionReader`, which the daemon wires to nothing
-    // until Phase 4's `questions` table and `/api/questions` land.
-    (
-        15,
-        "waits for Phase 4: the scenario asks through GET /api/questions and answers through \
-         POST /api/questions/{id}/answer, and dreaming reads the surfaced question and its \
-         recorded default through QuestionReader, wired to the questions table at merge",
-    ),
-];
+const HELD_BACK: &[(u8, &str)] = &[];
 
 /// Plan scenarios another suite owns, with where. Read by the catalog
 /// test that holds every plan number to exactly one home.
@@ -266,6 +249,13 @@ fn fleet_scenarios() -> Vec<(Expected, (&'static str, ScenarioFn))> {
         (
             Expected::Pass,
             (
+                "control/agent-monitor-verification-metrics-and-cli",
+                |ctx| Box::pin(agent_monitor(ctx)),
+            ),
+        ),
+        (
+            Expected::Pass,
+            (
                 "control/local-worker-off-leases-to-the-external-worker",
                 |ctx| Box::pin(local_worker_off(ctx)),
             ),
@@ -277,6 +267,91 @@ fn fleet_scenarios() -> Vec<(Expected, (&'static str, ScenarioFn))> {
             }),
         ),
     ]
+}
+
+/// The monitor must report the daemon's verified outcome, rather than treating a
+/// worker's completion claim as evidence. It also exercises the actual CLI.
+async fn agent_monitor(ctx: &Ctx) -> Result<()> {
+    let task = file(
+        ctx,
+        draft("personal", "Monitor verified work", &tag(0), W_SUCCEED),
+    )
+    .await?;
+    let detail = wait_status(ctx, &task, Status::Done).await?;
+    let snapshot = get(ctx, "/api/monitor?limit=500").await?;
+    let rows = snapshot["work"]["items"]
+        .as_array()
+        .context("monitor items")?;
+    let row = rows
+        .iter()
+        .find(|r| r["item"]["id"] == task)
+        .context("completed task visible")?;
+    ensure!(
+        row["item"]["status"]["status"] == "done",
+        "monitor reports durable status"
+    );
+    ensure!(
+        row["last_worker"].is_string(),
+        "monitor keeps worker after lease release"
+    );
+    ensure!(row["lease"].is_null(), "completed work has no live lease");
+    ensure!(
+        row["evidence_count"].as_u64().unwrap_or(0) > 0,
+        "monitor keeps result evidence"
+    );
+    ensure!(
+        row["verified_evidence_count"].as_u64().unwrap_or(0) > 0,
+        "monitor distinguishes verification from a claim: {row}"
+    );
+    ensure!(
+        !detail["evidence"].as_array().unwrap().is_empty(),
+        "detail also contains evidence"
+    );
+    ensure!(
+        snapshot["controller"]["last_tick"].is_string(),
+        "monitor observes real controller execution"
+    );
+    ensure!(
+        !snapshot["workers"]
+            .as_array()
+            .context("workers")?
+            .is_empty(),
+        "monitor observes agents"
+    );
+    let output = ctx.cli(&["monitor", "--json", "--check"])?;
+    let cli: Value = serde_json::from_slice(&output.stdout)?;
+    ensure!(
+        output.status.success() == (cli["health"] == "healthy"),
+        "health-check exit agrees with its observation"
+    );
+    ensure!(
+        cli["work"]["captured_at"].is_string(),
+        "monitor CLI reads a real snapshot"
+    );
+    let metrics = ctx
+        .client
+        .get(ctx.url("/api/monitor/metrics"))
+        .bearer_auth(crate::AUTH_TOKEN)
+        .header("Origin", &ctx.base)
+        .send()
+        .await?;
+    ensure!(metrics.status().is_success(), "metrics returns success");
+    let text = metrics.text().await?;
+    ensure!(
+        text.contains("rustykrab_work_items") && text.contains("rustykrab_controller_runs"),
+        "machine monitoring exposes work and execution"
+    );
+    let shell = ctx.client.get(ctx.url("/monitor.html")).send().await?;
+    ensure!(
+        shell.status().is_success() && shell.text().await?.contains("Agent monitor"),
+        "dashboard is served"
+    );
+    let script = ctx.client.get(ctx.url("/monitor.js")).send().await?;
+    ensure!(
+        script.status().is_success() && script.text().await?.contains("/api/monitor"),
+        "dashboard script is served"
+    );
+    Ok(())
 }
 
 // ── Phase 1: work items and the controller skeleton ──────────────────

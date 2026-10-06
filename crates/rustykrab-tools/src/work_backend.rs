@@ -1,6 +1,7 @@
-//! The contract the control-layer tools call: `work_file`, `work_status` and
-//! `result_report` (plan `docs/plans/control-layer-and-worker-fleet.md`,
-//! sections 5, 6.1, 6.5 and 14).
+//! The contract the control-layer tools call: `work_file`, `work_status`,
+//! `result_report`, `work_plan`, `ask_user` and `capability_request` (plan
+//! `docs/plans/control-layer-and-worker-fleet.md`, sections 5, 6.1, 6.5, 7
+//! and 14).
 //!
 //! The tools are the model's side of the control layer: they parse and check
 //! what a model sends, fill in who sent it, and render the answer compactly
@@ -26,11 +27,12 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use chrono::Utc;
 use rustykrab_core::active_tools::with_session_context;
+use rustykrab_core::questions::{QuestionClass, QuestionKind};
 use rustykrab_core::work::{
     BlockedReason, Edge, EdgeKind, ItemRef, PlanAccepted, PlanOutcome, ResultReport, Status,
-    WorkItem, WorkItemDraft, WorkItemId, WorkKind,
+    WorkItem, WorkItemDraft, WorkItemId, WorkKind, WorkPlan,
 };
-use rustykrab_core::{Error, Result};
+use rustykrab_core::{Error, Result, ToolError};
 use serde::{Deserialize, Serialize};
 
 /// Actor recorded when no worker run is bound: a model in an ordinary
@@ -109,6 +111,62 @@ pub enum ToolState {
     Unknown,
 }
 
+/// A typed question a worker asks through `ask_user` (plan sections 7 and
+/// 14). The router classifies it; `class` is only the asker's claim.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AskRequest {
+    pub text: String,
+    #[serde(default)]
+    pub class: Option<String>,
+    #[serde(default)]
+    pub kind: QuestionKind,
+    #[serde(default)]
+    pub options: Vec<String>,
+    /// A recorded default, for a question that has one.
+    #[serde(default)]
+    pub default: Option<String>,
+}
+
+/// What a worker cannot proceed without, through `capability_request`: a
+/// credential or consent only the user can give, or a tool, install,
+/// compute or knowledge gap the ladder's order 2 acquires (plan sections 7
+/// and 8). Generalises `credential_request`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapabilityAsk {
+    /// `credential | consent | tool | install | compute | knowledge`.
+    pub kind: String,
+    /// The credential, tool, resource or topic, by name.
+    pub name: String,
+    #[serde(default)]
+    pub reason: String,
+}
+
+/// What the router did with a question.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AskOutcome {
+    pub question: String,
+    pub class: QuestionClass,
+    /// The answer, when the router could give one now: a recorded default
+    /// or a decision standing judgment covers.
+    #[serde(default)]
+    pub answer: Option<String>,
+    /// `default`, `policy:<id>`.
+    #[serde(default)]
+    pub answered_by: Option<String>,
+    /// The item parks and this run should end: it resumes with the answer.
+    #[serde(default)]
+    pub parked: bool,
+    /// One line for the model.
+    #[serde(default)]
+    pub note: String,
+}
+
+fn unsupported(what: &str) -> Error {
+    Error::ToolExecution(ToolError::internal(format!(
+        "{what} is not supported by this host's control layer"
+    )))
+}
+
 /// The control layer as the model-facing work tools see it.
 #[async_trait]
 pub trait WorkBackend: Send + Sync {
@@ -139,6 +197,33 @@ pub trait WorkBackend: Send + Sync {
 
     /// Whether an MCP server is configured on this host.
     fn mcp_server_configured(&self, name: &str) -> bool;
+
+    /// File a whole graph (`work_plan`, section 14.1): the planner's and the
+    /// orchestration conversation's one call.
+    async fn plan(&self, _plan: WorkPlan, _provenance: Provenance) -> Result<PlanOutcome> {
+        Err(unsupported("work_plan"))
+    }
+
+    /// Route a worker's typed question (section 7).
+    async fn ask(
+        &self,
+        _item: WorkItemId,
+        _request: AskRequest,
+        _provenance: Provenance,
+    ) -> Result<AskOutcome> {
+        Err(unsupported("ask_user"))
+    }
+
+    /// Park a worker on a capability it cannot proceed without (sections 7
+    /// and 8).
+    async fn request_capability(
+        &self,
+        _item: WorkItemId,
+        _request: CapabilityAsk,
+        _provenance: Provenance,
+    ) -> Result<AskOutcome> {
+        Err(unsupported("capability_request"))
+    }
 }
 
 // ── the run binding ───────────────────────────────────────────────────────
@@ -201,6 +286,20 @@ pub enum WorkCall {
     Report {
         item: WorkItemId,
         report: ResultReport,
+        provenance: Provenance,
+    },
+    Plan {
+        plan: WorkPlan,
+        provenance: Provenance,
+    },
+    Ask {
+        item: WorkItemId,
+        request: AskRequest,
+        provenance: Provenance,
+    },
+    Capability {
+        item: WorkItemId,
+        request: CapabilityAsk,
         provenance: Provenance,
     },
 }
@@ -376,6 +475,81 @@ impl WorkBackend for StubWorkBackend {
 
     fn mcp_server_configured(&self, name: &str) -> bool {
         self.lock().mcp_servers.contains(name)
+    }
+
+    async fn plan(&self, plan: WorkPlan, provenance: Provenance) -> Result<PlanOutcome> {
+        let mut state = self.lock();
+        state.calls.push(WorkCall::Plan {
+            plan: plan.clone(),
+            provenance,
+        });
+        if let Some(outcome) = state.outcomes.pop_front() {
+            return Ok(outcome);
+        }
+        let mut ids = std::collections::BTreeMap::new();
+        for draft in &plan.items {
+            state.next_id += 1;
+            if let Some(tmp) = &draft.tmp {
+                ids.insert(tmp.clone(), format!("stub-{}", state.next_id));
+            }
+        }
+        let root = match &plan.root {
+            ItemRef::Id(id) => id.clone(),
+            ItemRef::Tmp { tmp } => ids.get(tmp).cloned().unwrap_or_default(),
+        };
+        Ok(PlanOutcome::Accepted(PlanAccepted {
+            root,
+            ids,
+            held: Vec::new(),
+            policy: None,
+            warnings: Vec::new(),
+        }))
+    }
+
+    async fn ask(
+        &self,
+        item: WorkItemId,
+        request: AskRequest,
+        provenance: Provenance,
+    ) -> Result<AskOutcome> {
+        let mut state = self.lock();
+        state.calls.push(WorkCall::Ask {
+            item,
+            request: request.clone(),
+            provenance,
+        });
+        state.next_id += 1;
+        Ok(AskOutcome {
+            question: format!("q-{}", state.next_id),
+            class: QuestionClass::BlockingNow,
+            answer: None,
+            answered_by: None,
+            parked: true,
+            note: "asked the user".to_string(),
+        })
+    }
+
+    async fn request_capability(
+        &self,
+        item: WorkItemId,
+        request: CapabilityAsk,
+        provenance: Provenance,
+    ) -> Result<AskOutcome> {
+        let mut state = self.lock();
+        state.calls.push(WorkCall::Capability {
+            item,
+            request,
+            provenance,
+        });
+        state.next_id += 1;
+        Ok(AskOutcome {
+            question: format!("q-{}", state.next_id),
+            class: QuestionClass::BlockingNow,
+            answer: None,
+            answered_by: None,
+            parked: true,
+            note: "parked on the capability".to_string(),
+        })
     }
 }
 

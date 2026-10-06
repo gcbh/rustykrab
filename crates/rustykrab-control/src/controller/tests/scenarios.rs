@@ -666,7 +666,13 @@ async fn scenario_24_expiry_holds_blocks_releases_waits_for_and_a_parent_expiry_
         Status::Blocked(BlockedReason::UpstreamExpired)
     );
     assert_eq!(h.origin(b).await.as_deref(), Some(a.as_str()));
-    assert_eq!(h.status(c).await, Status::Ready, "expiry is terminal");
+    // Expiry is terminal: the waits_for edge releases. No worker is
+    // registered here, so the released item waits for one (section 7).
+    assert_eq!(
+        h.status(c).await,
+        Status::Blocked(BlockedReason::WorkerUnavailable),
+        "expiry is terminal"
+    );
     let outbox = h.outbox().await;
     assert_eq!(outbox.len(), 1, "told once: {outbox:#?}");
     assert_eq!(&outbox[0].parent, pid);

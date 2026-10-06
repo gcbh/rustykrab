@@ -48,14 +48,14 @@ pub static REGISTRY: &[SecretSpec] = &[
         env_var: "NOTION_API_TOKEN",
         keychain_account: "notion-api-token",
         description: "Notion integration API token",
-        required: true,
+        required: false, // optional integration; resolve or request when used
     },
     SecretSpec {
         store_name: "obsidian_api_key",
         env_var: "OBSIDIAN_API_KEY",
         keychain_account: "obsidian-api-key",
         description: "Obsidian Local REST API key",
-        required: true,
+        required: false, // optional integration; resolve or request when used
     },
     SecretSpec {
         store_name: "gmail_email",

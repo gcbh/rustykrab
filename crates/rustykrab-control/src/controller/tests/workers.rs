@@ -267,7 +267,10 @@ async fn a_code_item_without_a_repository_never_goes_to_a_coding_worker() {
     bare.writable_resources.clear();
     let unleased = h.file_one(bare).await;
     h.drain().await;
-    assert_eq!(h.status(&unleased).await, Status::Ready);
+    assert_eq!(
+        h.status(&unleased).await,
+        Status::Blocked(rustykrab_core::work::BlockedReason::WorkerUnavailable)
+    );
     assert_eq!((claude.runs(), codex.runs()), (0, 0));
 
     // The same item with its repository leases and gets its worktree.
@@ -282,7 +285,10 @@ async fn a_code_item_without_a_repository_never_goes_to_a_coding_worker() {
         .find_map(|w| w.briefs.lock().unwrap().first().cloned())
         .expect("a brief");
     assert_eq!(brief.workspace.expect("a workspace").repo, repo.path());
-    assert_eq!(h.status(&unleased).await, Status::Ready);
+    assert_eq!(
+        h.status(&unleased).await,
+        Status::Blocked(rustykrab_core::work::BlockedReason::WorkerUnavailable)
+    );
 }
 
 #[tokio::test]

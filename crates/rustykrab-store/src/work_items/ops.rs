@@ -77,6 +77,13 @@ pub(super) fn apply(
         }
         WorkOp::ReleaseHold(item) => release_hold(conn, item, now),
         WorkOp::AddArtifactRef { item, artifact } => add_artifact_ref(conn, item, artifact, now),
+        WorkOp::Question(write) => crate::questions::apply_question(conn, write),
+        WorkOp::Notice(notice) => {
+            applied
+                .outbox_ids
+                .push(crate::questions::apply_notice(conn, notice, now)?);
+            Ok(())
+        }
     }
 }
 
@@ -904,14 +911,17 @@ pub(super) fn enqueue_outbox(
     Ok(id)
 }
 
+/// Undelivered notices that are due: a notice with a `not_before` still in
+/// the future is waiting for its coalescing window (section 6.6).
 pub(super) fn outbox_pending(conn: &Connection) -> Result<Vec<OutboxRow>, WorkStoreError> {
     collect(
         conn,
         &format!(
             "SELECT {OUTBOX_COLUMNS} FROM work_outbox WHERE delivered_at IS NULL
+                AND (not_before IS NULL OR not_before <= ?1)
               ORDER BY created_at, rowid"
         ),
-        [],
+        params![ts(&Utc::now())],
         outbox_from_row,
     )
 }

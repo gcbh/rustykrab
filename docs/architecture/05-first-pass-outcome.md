@@ -89,3 +89,21 @@ at judging severity; the severity claims are the ones that needed the code
 run at them. Worth remembering when reading
 [`OPINION.md`](OPINION.md) — its confidence labels are the least reliable
 part of it.
+
+## Context and monitoring integration (2026-10-02)
+
+The old WorkBackend stub description is retired: the controller implements
+filing, planning and question answers, with recording/deferred adapters in
+agent/CLI. QuestionReader now has a durable StoreQuestions implementation,
+including answer-window selection. The runtime zero-test wording in the
+reusability table was stale and is corrected; direct assembly coverage is
+still a narrower open issue. Five interactive/task entry points still own
+turn persistence; consolidation is not claimed by this integration.
+
+
+Project-runtime continuity found against `24dc038`: the controller always pinned
+repository HEAD, leaving prior verified native changes on unreachable-to-the-next
+run work branches. Project-scoped rehydration now chooses their verified ancestry
+chain, freezes context with the lease and refuses missing/divergent bases. Real
+git/SQLite tests confirm code and corrected decisions survive a runtime switch,
+fresh controller and archived task rows. Repository HEAD remains untouched.

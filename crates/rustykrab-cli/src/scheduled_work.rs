@@ -67,11 +67,13 @@ const ACTOR: &str = "scheduler";
 const LINK_MARGIN: TimeDelta = TimeDelta::seconds(2);
 
 /// A firing's budget: a job run has always had the profile's iterations and
-/// no token or time cap of its own, so the budget is generous.
+/// no token or time cap of its own. Keep a generous but finite envelope
+/// within the default standing judgment, so every normal firing does not
+/// create a fresh plan approval. A tighter user policy still applies.
 fn firing_budget() -> Budget {
     Budget {
         iterations: 200,
-        tokens: 2_000_000,
+        tokens: 1_000_000,
         wall_seconds: 3_600,
         ..Budget::default()
     }

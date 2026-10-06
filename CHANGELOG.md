@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.3.8] - 2026-10-06
+
+- Add project handoffs, native CLI profiles and remote agent monitoring (#665)
+
 ## [5.3.7] - 2026-10-06
 
 - Add durable work control and verified worker execution (#664)

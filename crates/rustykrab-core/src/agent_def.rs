@@ -34,6 +34,8 @@ pub struct AgentDefinition {
     pub system_prompt: String,
     /// Harness profile name: `coding`, `research`, `creative`, or `default`.
     pub profile: String,
+    /// Reserved for planning work. Tool availability alone never assigns a role.
+    pub planning_only: bool,
     /// Tools the sub-agent may call. `None` means inherit the parent's
     /// active capability set unchanged.
     pub allowed_tools: Option<Vec<String>>,
@@ -56,6 +58,7 @@ impl Default for AgentDefinition {
             description: String::new(),
             system_prompt: String::new(),
             profile: "default".into(),
+            planning_only: false,
             allowed_tools: None,
             tools: Vec::new(),
             mcp_servers: Vec::new(),

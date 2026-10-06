@@ -26,7 +26,9 @@ use rustykrab_core::types::{
 };
 use rustykrab_core::{Error, Result, SandboxRequirements, Tool};
 use rustykrab_tools::work_backend::with_work_run;
-use rustykrab_tools::{run_end_summary, WorkRunContext, RUN_ENDING_TOOLS, WORK_RUN_CONTEXT};
+use rustykrab_tools::{
+    run_end_summary, worker_run_end_summary, WorkRunContext, RUN_ENDING_TOOLS, WORK_RUN_CONTEXT,
+};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
@@ -2501,14 +2503,14 @@ impl AgentRunner {
                 // back to the model as an ordinary tool result so it can
                 // fix every line and call again. A worker run ends on its
                 // report only; any other run on either run-ending tool.
-                let run_ending: &[&str] = if worker_run {
-                    &[WORKER_COMPLETION_TOOL]
-                } else {
-                    &RUN_ENDING_TOOLS
-                };
+                // A worker run also ends on the planner's accepted
+                // `work_plan` and on a question that parked its item
+                // (`WORKER_RUN_ENDING_TOOLS`), each only on success.
                 let reported_summary = results.iter().find_map(|(tool_name, _, result)| {
                     let output = &result.as_ref().ok()?.output;
-                    if run_ending.contains(&tool_name.as_str()) {
+                    if worker_run {
+                        worker_run_end_summary(tool_name, output)
+                    } else if RUN_ENDING_TOOLS.contains(&tool_name.as_str()) {
                         run_end_summary(tool_name, output)
                     } else {
                         None

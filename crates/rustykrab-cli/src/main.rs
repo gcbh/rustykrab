@@ -1,15 +1,18 @@
 mod agent_defs;
+mod ask_cmd;
 mod chat;
 #[cfg(feature = "computer-use")]
 mod computer_backend;
 mod daemon_client;
 mod evaluation;
 mod fleet;
+mod monitor_cmd;
 mod peers;
 mod prompt_log;
 mod scheduled_work;
 mod task_queue;
 mod update_cmd;
+mod work_channel;
 mod work_cmd;
 mod work_host;
 mod worker_cmd;
@@ -295,6 +298,35 @@ impl rustykrab_tools::WorkBackend for DeferredWorkBackend {
             .map(|b| b.mcp_server_configured(name))
             .unwrap_or(false)
     }
+
+    // Phase 4: the planner's `work_plan` and a worker's typed questions.
+    async fn plan(
+        &self,
+        plan: rustykrab_core::work::WorkPlan,
+        provenance: rustykrab_tools::Provenance,
+    ) -> rustykrab_core::Result<rustykrab_core::work::PlanOutcome> {
+        self.bound()?.plan(plan, provenance).await
+    }
+
+    async fn ask(
+        &self,
+        item: rustykrab_core::work::WorkItemId,
+        request: rustykrab_tools::AskRequest,
+        provenance: rustykrab_tools::Provenance,
+    ) -> rustykrab_core::Result<rustykrab_tools::AskOutcome> {
+        self.bound()?.ask(item, request, provenance).await
+    }
+
+    async fn request_capability(
+        &self,
+        item: rustykrab_core::work::WorkItemId,
+        request: rustykrab_tools::CapabilityAsk,
+        provenance: rustykrab_tools::Provenance,
+    ) -> rustykrab_core::Result<rustykrab_tools::AskOutcome> {
+        self.bound()?
+            .request_capability(item, request, provenance)
+            .await
+    }
 }
 
 /// The controller's view of the host's tool registry (plan section 7,
@@ -305,9 +337,13 @@ impl rustykrab_tools::WorkBackend for DeferredWorkBackend {
 /// knows the tool exists. An MCP server counts as configured when it is
 /// named in `RUSTYKRAB_MCP_SERVERS` (connected or not) or its tools are
 /// registered. Filled once the registry is final, after the stub switch.
+/// whatever path it was stored (`credentials`, refreshed by
+/// `work_channel::refresh_credentials`): `on_credential` triggers fire and
+/// an item parked on it wakes.
 #[derive(Default)]
 struct RegistryCatalog {
     inner: std::sync::RwLock<rustykrab_control::controller::StaticCatalog>,
+    credentials: Arc<rustykrab_control::controller::StoredCredentials>,
 }
 
 impl RegistryCatalog {
@@ -356,6 +392,10 @@ impl rustykrab_control::controller::ToolCatalog for RegistryCatalog {
             &*self.read(),
             &name.to_lowercase(),
         )
+    }
+
+    fn credential_available(&self, name: &str) -> bool {
+        self.credentials.available(name)
     }
 }
 
@@ -580,15 +620,22 @@ async fn main() -> anyhow::Result<()> {
     if args.len() >= 2 && (args[1] == "workers" || args[1] == "worker") {
         return worker_cmd::run(&data_dir, &args[1..]).await;
     }
+    if args.len() >= 2 && args[1] == "monitor" {
+        return monitor_cmd::run(&data_dir, &args[2..]).await;
+    }
     if args.len() >= 2 && args[1] == "update" {
         return update_cmd::run(&data_dir, &args[2..]).await;
+    }
+
+    if args.len() >= 2 && matches!(args[1].as_str(), "questions" | "answer" | "judgment") {
+        return ask_cmd::run(&data_dir, &args[1], &args[2..]).await;
     }
     // An unrecognized subcommand must not silently fall through to
     // "start the daemon" — a typo would boot a full agent instead of
     // reporting the mistake.
     if let Some(unknown) = args.get(1).filter(|a| !a.starts_with('-')) {
         eprintln!("unknown subcommand '{unknown}'");
-        eprintln!("subcommands: skill, keychain, chat, dream, pair, work, workers, worker, update");
+        eprintln!("subcommands: skill, keychain, chat, dream, pair, work, workers, worker, update, monitor, questions, answer, judgment");
         eprintln!("run with no arguments to start the daemon");
         std::process::exit(2);
     }
@@ -790,6 +837,27 @@ async fn main() -> anyhow::Result<()> {
             );
             let p = rustykrab_providers::ScriptedProvider::from_path(&path)?;
             Arc::new(p)
+        }
+        "claude-cli" => {
+            let command = std::env::var_os("RUSTYKRAB_CLAUDE_COMMAND")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| "claude".into());
+            let config_dir =
+                std::env::var_os("RUSTYKRAB_CLAUDE_CONFIG_DIR").map(std::path::PathBuf::from);
+            let model = std::env::var("RUSTYKRAB_CLAUDE_MODEL").unwrap_or_else(|_| "sonnet".into());
+            let timeout = std::time::Duration::from_secs(
+                env_parse::<u64>("RUSTYKRAB_CLAUDE_TIMEOUT_SECS").unwrap_or(900),
+            );
+            let budget = env_parse::<usize>("RUSTYKRAB_CLAUDE_INPUT_BUDGET").unwrap_or(100_000);
+            tracing::info!(%model, "using Claude CLI with a Max subscription login and no API billing");
+            Arc::new(rustykrab_providers::ClaudeCliProvider::new(
+                command,
+                config_dir,
+                model,
+                data_dir.join("claude-turns"),
+                timeout,
+                budget,
+            ))
         }
         "ollama" => {
             let model = std::env::var("OLLAMA_MODEL").unwrap_or_else(|_| "gemma4:26b".to_string());
@@ -1358,13 +1426,16 @@ async fn main() -> anyhow::Result<()> {
         tools: tools.clone(),
         store: store.clone(),
         late: fleet.skills.clone(),
-        slot: model_slot,
+        slot: model_slot.clone(),
     });
     // Filled below, once the registry is final (the work tools added) and
     // the active-tools seed is known.
     let control_catalog = Arc::new(RegistryCatalog::default());
     let mut control_config = fleet.config(rustykrab_control::controller::ControllerConfig {
         notice_channel: control_notice_channel.to_string(),
+        // Phase 4: standing judgment's baseline, and notices coalesced.
+        approval: rustykrab_control::questions::baseline(),
+        coalesce_window: chrono::TimeDelta::seconds(2),
         ..Default::default()
     });
     // How long aging may wait for an idle tick before it runs anyway
@@ -1384,8 +1455,10 @@ async fn main() -> anyhow::Result<()> {
         control_config.approval.hold_discovered = true;
         tracing::info!("RUSTYKRAB_HOLD_DISCOVERED: workers' follow-up items wait for approval");
     }
+    let control_links = rustykrab_control::controller::CredentialLinks::from_env();
     let controller = Arc::new(
         rustykrab_control::controller::Controller::new(store.clone(), Vec::new(), control_config)
+            .with_credential_links(control_links.clone())
             .with_registry(fleet.registry.clone())
             .with_routing(fleet.routing())
             .with_catalog(fleet.catalog(control_catalog.clone()))
@@ -1395,8 +1468,26 @@ async fn main() -> anyhow::Result<()> {
             )),
     );
     fleet.start(local_worker).await?;
+    if fleet::planner_worker_enabled(local_worker_on) {
+        fleet
+            .registry
+            .register(
+                work_channel::planner_worker(
+                    agent_defs::planner_definition(&agent_definitions),
+                    provider.clone(),
+                    tools.clone(),
+                    deferred_work_backend.clone() as Arc<dyn rustykrab_tools::WorkBackend>,
+                    scheduled_work::transcripts(&store, skill_registry.clone()),
+                    model_slot.clone(),
+                ),
+                serde_json::json!({ "role": "planner" }),
+                None,
+            )
+            .await?;
+    }
     deferred_work_backend.bind(controller.clone());
     let work_tool_names = work_host::add_work_tools(&mut tools, controller.clone());
+    tools.extend(rustykrab_tools::plan_tools(controller.clone()));
     tracing::info!(
         worker = %fleet.local_name,
         local_worker = if local_worker_on { "on" } else { "off" },
@@ -1552,7 +1643,13 @@ async fn main() -> anyhow::Result<()> {
 
         let webhook_secret = std::env::var("TELEGRAM_WEBHOOK_SECRET").ok();
 
-        let mut tg = TelegramChannel::new(bot_token, allowed_chats.clone());
+        let mut tg = TelegramChannel::new(bot_token, allowed_chats.clone()).with_command_hook(
+            Arc::new(work_channel::WorkCommands::new(
+                controller.clone(),
+                store_handle.clone(),
+                "user:telegram",
+            )),
+        );
         if let Some(secret) = webhook_secret {
             tg = tg.with_webhook_secret(secret);
         }
@@ -1941,7 +2038,16 @@ async fn main() -> anyhow::Result<()> {
             }
         }));
         let outbox_store = store_handle.clone();
-        let outbox_backend = message_backend.clone();
+        let outbox_backend = work_channel::notice_backend(
+            message_backend.clone(),
+            channel_hub.telegram(),
+            Some(control_links.clone()),
+        );
+        infra_handles.push(tokio::spawn(work_channel::refresh_credentials(
+            store_handle.clone(),
+            control_catalog.credentials.clone(),
+            tick_secs,
+        )));
         let default_chat = std::env::var("TELEGRAM_ALLOWED_CHATS").ok().and_then(|v| {
             v.split(',')
                 .map(|c| c.trim().to_string())

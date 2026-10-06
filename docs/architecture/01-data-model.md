@@ -510,7 +510,8 @@ work_spend(id AUTOINC, item, run, worker, tokens, wall_ms, iterations, at)
    INDEX idx_work_spend_item (item)
 work_plans(id PK, root, filed_by, rationale, approval_question, policy,
            created_at)
-work_outbox(id PK, parent, origin, channel, body, created_at, delivered_at)
+work_outbox(id PK, parent, origin, channel, body, created_at, delivered_at,
+            not_before)
    INDEX idx_work_outbox_pending (created_at) WHERE delivered_at IS NULL
 work_item_archive(id PK, kind, title, parent, status, status_reason, worker,
                   cost JSON, closed_at, archived_at, summary, edges JSON)
@@ -528,7 +529,7 @@ and roll-up there, and writes each decision back through the store. The row
 types are `rustykrab_core::work` (`WorkItem`, `Edge`, `WorkEvent`, `Evidence`,
 `Lease`), so the store, the controller, the tools and the CLI share one
 vocabulary. `workers` arrived with Phase 3; the `questions` and
-`judgment_policies` tables of section 13 arrive with later phases; Phase 6's
+`judgment_policies` tables of section 13 are Phase 4; Phase 6's
 tables are the next section.
 
 **Workers are keyed by the registry's name, and nothing points at them.**
@@ -625,8 +626,60 @@ recorded any.
 `work_outbox` holds the notices a transition causes, written in the same
 transaction and delivered from here, so a restart neither drops nor repeats
 one; `delivered_at` is set once and `idx_work_outbox_pending` is the
-notifier's queue. `work_plans` records each accepted `work_plan` call for
+notifier's queue. `not_before` (Phase 4, section 6.6) is when a notice may go:
+NULL or a past time is due now; a notice written while an earlier one for the
+same parent is still waiting for its time replaces that row in place, and only
+while it is still waiting, so child transitions inside the coalescing window
+reach the user as one message and nothing is lost to a race with delivery. A
+question goes at once. `work_plans` records each accepted `work_plan` call for
 `work plan <id>`; a rejected call writes no row, only a rejection event.
+
+### Questions and standing judgment (control layer, Phase 4)
+
+```
+questions(id PK, item, root, kind, class, text, options JSON,
+          default_answer, asked_class, rule, asked_by, status,
+          delivered_via, answer, answered_by, answered_at,
+          research_item, decision JSON, created_at)
+   INDEX idx_questions_item    (item, created_at)
+   INDEX idx_questions_waiting (status, created_at)
+         WHERE status IN ('open', 'recorded', 'researching')
+judgment_policies(id PK, scope, text, checks JSON, policy JSON,
+                  unrecognised JSON, granted_by, granted_at, revoked_at)
+```
+
+Section 7 of the control-layer plan, code in `rustykrab-store/src/questions.rs`.
+Every question a worker asked is a row, as the router in `rustykrab-control`
+classified it: `class` is the router's verdict (`blocking_now`,
+`blocking_later`, `researchable`, `defaultable`, `delegated`, `obsolete`),
+`asked_class` what the asking model claimed, `rule` which router rule decided,
+`kind` what it asks for (`decision`, `consent`, `credential`, `capability`,
+or a plan's `approval`, whose id is the `held_by` of the items it holds).
+`status` moves once from waiting (`open`, `recorded` for a question kept for
+a later message or held back while a plan B runs, `researching`) to settled
+(`answered`, `defaulted`, `delegated`, `obsolete`); a settle on a settled
+question is refused, so an answer is given once. `answered_by` is
+`user:<principal>`, `default`, `policy:<grant id>` or `research:<item>`;
+`decision` is the delegated-decision record (chosen, alternatives, rationale,
+why it fell inside authority, how to revisit it); `delivered_via` names the
+channel an open question was sent on. Rows are never deleted: the settled
+record is what the evaluation of section 10 reads for avoidable escalations
+(Phase 6: a surfaced question whose answer equals `default_answer`, or a
+blocking-now question answered with its first option, is a candidate).
+Unreadable values parse to the conservative case: an unknown class reads as
+`blocking_now`, an unknown status as `open`.
+
+`judgment_policies` keeps standing judgment in the user's words (`text`),
+what it compiled to (`checks`, the controller's inspectable checklist), the
+same grant in the projects crate's `JudgmentPolicy` shape (`policy`:
+statement, delegated scopes, reserved decisions), and the sentences that
+compiled to nothing (`unrecognised`), which are reported back rather than
+guessed at. A revoked grant keeps its row with `revoked_at` set. A checklist
+that no longer parses reads as empty, so an unreadable grant delegates no
+authority.
+
+Unenforced on purpose: `questions.item`, `root` and `research_item` name work
+items that may since have been archived, and the question outlives them.
 
 Unenforced on purpose, and the DDL says so:
 
@@ -770,6 +823,7 @@ purpose*, and the DDL now says which is which.
 | `work_items.status_origin`, `plan_id`, `held_by`, `origin_conversation_id` | No, deliberate | provenance |
 | `work_item_events.item`, `work_item_evidence.item` | No, deliberate | history outlives compaction |
 | `work_outbox`, `work_plans`, `work_item_archive` item ids | No, deliberate | records about items that may be archived |
+| `questions.item`, `root`, `research_item` | No, deliberate | a question's record outlives the items it names |
 | `scheduled_jobs.work_item_id`, `delegated_tasks.work_item_id` | No, deliberate | the item may be archived; the row keeps working |
 | `work_item_facets.item`, `proposals.item`, `proposals.code_item`, `work_projections.item` | No, deliberate | records about items that may be archived |
 | `proposal_evidence.ref` | No, deliberate | names rows in several tables, and a memory in another database |
@@ -832,3 +886,31 @@ that fails on it.
 - No schema version table. The guarded-ALTER approach is idempotent and works,
   but "what shape is this database" is only answerable by reading 250 lines of
   Rust and mentally replaying every guard.
+
+## Monitoring reads
+
+The monitoring suite introduces no persistence. `work_items/monitor.rs`
+takes one read transaction across existing work rows, leases, lease history,
+events, evidence, finalized spend, archive counts, questions and the outbox.
+The latest event row id is captured with the work snapshot so a consumer can
+resume the existing event stream without missing a later event. Counts and
+per-worker active assignments cover all rows even when the displayed item
+limit is reached. Outbox delay is measured from `not_before` when present,
+rather than penalizing intentionally scheduled delivery.
+
+## Project handoff receipts (2026-10-02)
+
+No table is added. `work_item_evidence.kind = 'project_context'` stores the exact
+provider-neutral project/work/question snapshot supplied at lease time, with the
+revision id in `hash` and `verified_by = 'controller'` establishing its source.
+Its planning facts retain their own provenance; that marker does not verify a
+worker's summary. `workspace` records pin the corresponding verified code base.
+`work_lease_acquire_recorded` commits these and the run pointer with the lease.
+Receipts, questions and verified evidence outlive archive compaction. A new run
+joins those records to immutable project revisions and live/archive statuses;
+only done work's git-verified commits become continuation candidates.
+
+Unfinished-attempt records point to controller-owned run/workspace evidence and
+classified errors, not model-written workspace artifacts. Monitor, verifier and
+reattachment reads likewise select the controller's pinned workspace records.
+These pointers permit inspection and never establish completed code or effects.

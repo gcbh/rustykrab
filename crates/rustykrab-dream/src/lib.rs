@@ -33,7 +33,7 @@ pub mod worker;
 pub use cluster_source::MemoryClusterSource;
 pub use consolidation::{run_consolidation_cycle, ConsolidationContext, CycleOutcome};
 pub use engine::{promote, rollback, rollback_blockers, CyclePolicy, Promotion, PromotionRefusal};
-pub use evaluate::store::{StoreLedger, StoreWorkRecords};
+pub use evaluate::store::{StoreLedger, StoreQuestions, StoreWorkRecords};
 pub use evaluate::{
     Evaluation, EvaluationConfig, EvaluationLedger, ProposalFiler, QuestionReader,
     RoutingRecordReader, StaticQuestions, StaticRouting, WorkRecordSource,

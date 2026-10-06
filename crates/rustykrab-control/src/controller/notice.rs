@@ -11,9 +11,12 @@
 
 use std::collections::HashMap;
 
+use rustykrab_core::questions::QuestionKind;
 use rustykrab_core::work::{ArtifactRef, EdgeKind, Status, Trigger, WorkItem, WorkItemId};
+use rustykrab_tools::credential_link::LINK_TTL;
 
-use crate::graph::Snapshot;
+use super::credentials::CredentialPage;
+use crate::graph::{is_planning, Snapshot};
 use crate::ladder::{summary, LadderState};
 
 /// Why a notice is owed. Closes and expiries are read off the transaction;
@@ -26,11 +29,26 @@ pub(super) enum Cause {
     Expired(WorkItemId),
     /// Something needs the user: a surfaced ladder, a parked question.
     Asked { item: WorkItemId, text: String },
-    /// A filing held items for approval (6.1).
+    /// A filing held items for approval (6.1): the pushed plan preview.
     Approval {
         held: Vec<WorkItemId>,
         triggers: Vec<String>,
+        /// The planner's rationale line.
+        rationale: String,
+        /// The policy that required approval.
+        policy: Option<String>,
     },
+    /// A blocking-now question routed to the user (section 7).
+    Question {
+        item: WorkItemId,
+        /// The question's id.
+        id: String,
+        kind: QuestionKind,
+        text: String,
+        options: Vec<String>,
+    },
+    /// A chain still open past the digest window (6.6).
+    Digest,
 }
 
 impl Cause {
@@ -38,10 +56,53 @@ impl Cause {
     pub fn item(&self) -> Option<&str> {
         match self {
             Cause::Closed(id) | Cause::Expired(id) => Some(id),
-            Cause::Asked { item, .. } => Some(item),
+            Cause::Asked { item, .. } | Cause::Question { item, .. } => Some(item),
             Cause::Approval { held, .. } => held.first().map(String::as_str),
+            Cause::Digest => None,
         }
     }
+
+    /// Whether the notice goes at once: something needs the user now (a
+    /// question, a surfaced ladder, a plan waiting for approval). The rest
+    /// wait for the coalescing window (6.6).
+    pub fn urgent(&self) -> bool {
+        matches!(
+            self,
+            Cause::Asked { .. } | Cause::Question { .. } | Cause::Approval { .. }
+        )
+    }
+}
+
+/// Lines a later notice for the same parent must keep when it replaces a
+/// waiting one: what each cause said, which the new state no longer shows.
+const CAUSE_PREFIXES: [&str; 6] = [
+    "Asked:",
+    "Question ",
+    "Expired:",
+    "Needs your approval",
+    "Waiting on your answer",
+    "Still open",
+];
+
+/// Merge a notice still waiting for its send time into the one replacing
+/// it (6.6): the new body describes the parent as it is now, and every
+/// cause line of the old one it does not repeat is kept, so one message
+/// carries both.
+pub(super) fn merge(old: &str, new: &str) -> String {
+    let mut out = new.to_string();
+    for line in old.lines() {
+        let cause = CAUSE_PREFIXES.iter().any(|p| line.starts_with(p));
+        if cause && !new.lines().any(|l| l == line) {
+            out.push('\n');
+            out.push_str(line);
+        }
+    }
+    out
+}
+
+/// `/answer <id>` takes the first eight characters of a question's id.
+pub(super) fn short_question(id: &str) -> String {
+    id.chars().take(8).collect()
 }
 
 /// What rendering needs beyond the snapshot, read from the store first.
@@ -56,6 +117,9 @@ pub(super) struct NoticeData {
     pub evidence: HashMap<WorkItemId, Vec<ArtifactRef>>,
     /// The one-line result summary of each done leaf.
     pub summaries: HashMap<WorkItemId, String>,
+    /// The credential page of each credential question sent, by question
+    /// id (section 7).
+    pub credentials: HashMap<String, CredentialPage>,
 }
 
 /// How many items a list names before it says "and N more".
@@ -127,33 +191,35 @@ pub(super) fn render(snap: &Snapshot, root: &str, data: &NoticeData, causes: &[C
     let mut lines: Vec<String> = Vec::new();
 
     if is_parent {
-        let done = leaves.iter().filter(|i| i.status == Status::Done).count();
+        // Planning items are not work the user asked for (6.6).
+        let work: Vec<&&WorkItem> = leaves.iter().filter(|i| !is_planning(i)).collect();
+        let done = work.iter().filter(|i| i.status == Status::Done).count();
         lines.push(format!(
             "{}: {}; {} of {} done.",
             label(r),
             phrase(r.status),
             done,
-            leaves.len()
+            work.len()
         ));
     } else {
         lines.push(format!("{}: {}.", label(r), phrase(r.status)));
     }
 
     for cause in causes {
-        if let Cause::Approval { held, triggers } = cause {
-            let names: Vec<String> = held
-                .iter()
-                .filter_map(|h| snap.item(h))
-                .map(label)
-                .collect();
+        if let Cause::Approval {
+            held,
+            triggers,
+            rationale,
+            policy,
+        } = cause
+        {
             lines.push(format!(
-                "Needs your approval ({}): {} held: {}. Reply /approve {} or /reject {}.",
+                "Needs your approval ({}): {} held.",
                 triggers.join("; "),
-                held.len(),
-                names.join(", "),
-                short(root),
-                short(root)
+                held.len()
             ));
+            lines.extend(preview(snap, root, held, rationale, policy.as_deref()));
+            lines.push(format!("Reply /approve {root} or /reject {root} [reason]."));
         }
     }
 
@@ -242,6 +308,17 @@ pub(super) fn render(snap: &Snapshot, root: &str, data: &NoticeData, causes: &[C
                 }
             }
             Cause::Asked { text, .. } => lines.push(format!("Asked: {}", clip(text, 400))),
+            Cause::Question {
+                item,
+                id,
+                kind,
+                text,
+                options,
+            } => lines.extend(question_lines(snap, data, item, id, *kind, text, options)),
+            Cause::Digest => lines.push(format!(
+                "Still open: {} has been waiting a while; this is its digest.",
+                label(r)
+            )),
             _ => {}
         }
     }
@@ -264,6 +341,115 @@ pub(super) fn render(snap: &Snapshot, root: &str, data: &NoticeData, causes: &[C
         lines.push(format!("Expires {}.", at.format("%Y-%m-%d %H:%M UTC")));
     }
     lines.join("\n")
+}
+
+/// The pushed plan preview (14.2, `work plan <id>`): each held item with
+/// its budget, worker kind, trigger and writable resources, the budget
+/// total against the root's, the planner's rationale and the policy.
+fn preview(
+    snap: &Snapshot,
+    root: &str,
+    held: &[WorkItemId],
+    rationale: &str,
+    policy: Option<&str>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut total: u64 = 0;
+    for id in held.iter().take(LIST_MAX * 2) {
+        let Some(item) = snap.item(id) else {
+            continue;
+        };
+        if snap.has_children(id) {
+            out.push(format!("- {} (a group)", label(item)));
+            continue;
+        }
+        total = total.saturating_add(item.budget.tokens);
+        let mut line = format!(
+            "- {}: {} tokens, worker {}",
+            label(item),
+            item.budget.tokens,
+            item.worker_kind.as_str()
+        );
+        if !item.writable_resources.is_empty() {
+            line.push_str(&format!(", writes {}", item.writable_resources.join(", ")));
+        }
+        if item.trigger != Trigger::Now {
+            line.push_str(&format!(" {}", why_waiting(snap, item)));
+        }
+        out.push(line);
+    }
+    if let Some(r) = snap.item(root) {
+        out.push(format!(
+            "Held budget: {total} tokens of the root's {}.",
+            r.budget.tokens
+        ));
+    }
+    if !rationale.trim().is_empty() {
+        out.push(format!("Rationale: {}", clip(rationale, 200)));
+    }
+    if let Some(p) = policy {
+        out.push(format!("Policy: {p}."));
+    }
+    out
+}
+
+/// A question as the user reads it, with its options, how to answer, and
+/// what the item already tried (section 8: surfacing carries the ladder).
+fn question_lines(
+    snap: &Snapshot,
+    data: &NoticeData,
+    item: &str,
+    id: &str,
+    kind: QuestionKind,
+    text: &str,
+    options: &[String],
+) -> Vec<String> {
+    let whose = snap.item(item).map(label).unwrap_or_else(|| short(item));
+    let short_id = short_question(id);
+    let mut out = vec![
+        format!("Asked: {}", clip(text, 400)),
+        format!("Question {short_id} is for {whose}."),
+    ];
+    if !options.is_empty() {
+        let listed: Vec<String> = options
+            .iter()
+            .enumerate()
+            .map(|(i, o)| format!("{}) {}", i + 1, clip(o, 80)))
+            .collect();
+        out.push(format!("Options: {}.", listed.join("  ")));
+    }
+    out.push(match kind {
+        QuestionKind::Consent | QuestionKind::Approval => {
+            format!("Answer with /answer {short_id} yes, or /answer {short_id} no.")
+        }
+        QuestionKind::Credential => {
+            let resume = format!(
+                "The item resumes once it is stored; or /answer {short_id} with another way."
+            );
+            match data.credentials.get(id) {
+                Some(CredentialPage::Link) => format!(
+                    "Store it on the credential page: a one-time link follows this message \
+                     and works for {} minutes. {resume}",
+                    LINK_TTL.as_secs() / 60
+                ),
+                Some(CredentialPage::SentBefore) => format!(
+                    "Store it on the credential page, with the link already sent for it. \
+                     {resume}"
+                ),
+                Some(CredentialPage::Filed) => {
+                    format!("Store it from the request waiting in the app. {resume}")
+                }
+                None => format!(
+                    "Store the credential, then /answer {short_id} done; or /answer {short_id} \
+                     with another way."
+                ),
+            }
+        }
+        _ => format!("Answer with /answer {short_id} <your answer> (or the option number)."),
+    });
+    // The ladder rides on the item's "Not done" line above (section 8:
+    // surfacing carries the ladder), so it is not repeated here.
+    out
 }
 
 /// Why a queued item waits: its trigger, its approval, or its upstreams.

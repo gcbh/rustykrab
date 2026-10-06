@@ -1206,3 +1206,115 @@ async fn adding_an_artifact_ref_appends_once_and_refuses_unknown_ids() {
         refs
     );
 }
+
+#[tokio::test]
+async fn monitoring_is_bounded_keeps_counts_and_replays_every_later_event() {
+    let store = seeded(
+        vec![
+            item("waiting", Status::Queued),
+            item("active", Status::Ready),
+            item("old", Status::Done),
+        ],
+        vec![],
+    )
+    .await;
+    store
+        .work_lease_acquire("active", "pinch", 90, vec![])
+        .await
+        .unwrap();
+    store
+        .work_evidence_add(Evidence {
+            item: "active".into(),
+            kind: "command".into(),
+            reference: "cargo test".into(),
+            hash: None,
+            verified_by: Some("controller".into()),
+            at: Utc::now(),
+        })
+        .await
+        .unwrap();
+    let snap = store.work_monitor_snapshot(1, 1).await.unwrap();
+    assert_eq!(snap.total_live, 3);
+    assert_eq!(snap.counts["leased"], 1);
+    assert_eq!(snap.active_by_worker["pinch"], 1);
+    assert_eq!(snap.counts["queued"], 1);
+    assert!(snap.items_truncated);
+    assert_eq!(snap.items[0].item.id, "active");
+    assert_eq!(snap.items[0].lease.as_ref().unwrap().worker, "pinch");
+    assert_eq!(snap.items[0].verified_evidence_count, 1);
+    assert_eq!(snap.events.len(), 1);
+    assert_eq!(snap.events[0].cursor, snap.event_cursor);
+    // Observation adds no event and changes no item or lease.
+    assert_eq!(
+        store.work_events_last_id().await.unwrap(),
+        snap.event_cursor
+    );
+    assert_eq!(
+        store.work_get("active").await.unwrap().unwrap().status,
+        Status::Leased
+    );
+    store
+        .work_event_append(&WorkEvent {
+            item: "active".into(),
+            at: Utc::now(),
+            kind: EventKind::Warning,
+            from: None,
+            to: None,
+            actor: "controller".into(),
+            reason: Some("later".into()),
+            upstream: None,
+            origin: None,
+            evidence_ref: None,
+        })
+        .await
+        .unwrap();
+    let later = store
+        .work_events_after(snap.event_cursor, 10)
+        .await
+        .unwrap();
+    assert_eq!(later.len(), 1);
+    assert_eq!(later[0].1.reason.as_deref(), Some("later"));
+}
+
+#[tokio::test]
+async fn a_handoff_receipt_and_lease_roll_back_together() {
+    let store = seeded(vec![item("work", Status::Ready)], vec![]).await;
+    let ev = Evidence {
+        item: "another-item".into(),
+        kind: "project_context".into(),
+        reference: "{}".into(),
+        hash: None,
+        verified_by: Some("controller".into()),
+        at: at(0),
+    };
+    assert!(store
+        .work_lease_acquire_recorded("work", "codex", 60, vec![], vec![ev])
+        .await
+        .is_err());
+    assert_eq!(status_of(&store, "work").await, Status::Ready);
+    assert!(store.work_lease_get("work").await.unwrap().is_none());
+    assert!(store.work_events("work").await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn monitoring_workspace_comes_from_the_controller_not_a_model_artifact() {
+    let store = seeded(vec![item("work", Status::Ready)], vec![]).await;
+    for (reference, hash, verified_by) in [
+        ("{\"base\":\"actual\"}", Some("actual".into()), None),
+        ("{\"base\":\"forged\"}", None, Some("result_report".into())),
+    ] {
+        store
+            .work_evidence_add(Evidence {
+                item: "work".into(),
+                kind: "workspace".into(),
+                reference: reference.into(),
+                hash,
+                verified_by,
+                at: at(0),
+            })
+            .await
+            .unwrap();
+    }
+    let snap = store.work_monitor_snapshot(1, 1).await.unwrap();
+    assert_eq!(snap.items[0].workspace.as_ref().unwrap()["base"], "actual");
+}

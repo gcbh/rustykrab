@@ -9,6 +9,7 @@ use rustykrab_core::work::{
     Edge, ItemRef, PlanOutcome, Status, WorkItem, WorkItemDraft, WorkItemId, WorkPlan,
 };
 use rustykrab_core::Error;
+use rustykrab_store::{JudgmentRow, QuestionRow};
 use rustykrab_tools::work_backend::Provenance;
 use serde::{Deserialize, Serialize};
 
@@ -87,6 +88,34 @@ pub enum LockState {
     Held,
     /// Another process holds it; no tick runs until it is released.
     Waiting,
+}
+
+/// What an answer did (`POST /api/questions/{id}/answer`, `/answer`,
+/// `work answer`; plan section 7).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AnswerReply {
+    pub question: QuestionRow,
+    /// Items that resumed on it: the item, not the conversation.
+    #[serde(default)]
+    pub resumed: Vec<WorkItemId>,
+    /// Items an approval released.
+    #[serde(default)]
+    pub released: Vec<WorkItemId>,
+    /// Items a rejection or a declined consent cancelled.
+    #[serde(default)]
+    pub cancelled: Vec<WorkItemId>,
+}
+
+/// The standing judgment in force (plan section 7): every active grant with
+/// what it compiled to, and the rules they add up to, one line each.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct JudgmentView {
+    pub grants: Vec<JudgmentRow>,
+    pub rules: Vec<String>,
+}
+
+fn unsupported(what: &str) -> Error {
+    Error::Internal(format!("{what} is not supported by this controller"))
 }
 
 /// The controller as its callers see it. Every method is one store
@@ -186,5 +215,38 @@ pub trait ControlHandle: Send + Sync {
         Err(Error::Internal(format!(
             "this control handle takes no review decisions (proposal {proposal})"
         )))
+    }
+
+    /// Answer a question (plan section 7): its id, or the first eight
+    /// characters of it. The answer resumes the item that asked; a plan's
+    /// approval question takes approve or reject.
+    async fn answer(
+        &self,
+        _question: &str,
+        _answer: &str,
+        _actor: &str,
+    ) -> Result<AnswerReply, Error> {
+        Err(unsupported("answering questions"))
+    }
+
+    /// Grant standing judgment in ordinary language; it is compiled to a
+    /// checklist and in force from the next filing or question.
+    async fn grant_judgment(
+        &self,
+        _text: &str,
+        _scope: &str,
+        _actor: &str,
+    ) -> Result<JudgmentRow, Error> {
+        Err(unsupported("standing judgment"))
+    }
+
+    /// Revoke a grant. `false` when it was already revoked.
+    async fn revoke_judgment(&self, _id: &str, _actor: &str) -> Result<bool, Error> {
+        Err(unsupported("standing judgment"))
+    }
+
+    /// The standing judgment in force.
+    async fn judgment(&self) -> Result<JudgmentView, Error> {
+        Err(unsupported("standing judgment"))
     }
 }

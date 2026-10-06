@@ -442,6 +442,8 @@ pub struct Precondition {
 /// A pointer to evidence or an artifact: a message id, path, URL or commit
 /// SHA. Pointers, never bodies (section 12).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// A `project` reference binds work to a durable project id. The controller
+/// also reads ancestors' bindings and freezes that project's revision at lease time.
 pub struct ArtifactRef {
     /// `message | path | url | commit | item | other`
     pub kind: String,
@@ -641,6 +643,11 @@ pub enum EventKind {
     /// A worker run ended: what it spent and what the worker reports about
     /// itself (its completion-reminder count). Changes no status.
     Run,
+    /// A delegated decision: what standing judgment decided alone, with
+    /// its record (section 7). Written by `policy`.
+    Decision,
+    /// A question asked, routed or answered (section 7).
+    Question,
 }
 
 impl EventKind {
@@ -656,6 +663,8 @@ impl EventKind {
             EventKind::Warning => "warning",
             EventKind::Review => "review",
             EventKind::Run => "run",
+            EventKind::Decision => "decision",
+            EventKind::Question => "question",
         }
     }
 
@@ -671,6 +680,8 @@ impl EventKind {
             "warning" => Some(EventKind::Warning),
             "review" => Some(EventKind::Review),
             "run" => Some(EventKind::Run),
+            "decision" => Some(EventKind::Decision),
+            "question" => Some(EventKind::Question),
             _ => None,
         }
     }

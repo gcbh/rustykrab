@@ -82,12 +82,31 @@ impl Controller {
         // is what it would resubmit if its node had lost the task.
         let hist = history(&self.store.work_events(&item.id).await?);
         let prior = if hist.repair.is_some() {
-            evidence
+            evidence.clone()
         } else {
             Vec::new()
         };
         let mut brief = brief_for(item, lease.inputs.clone(), Vec::new(), prior, &hist);
         brief.run = Some(run.clone());
+        brief.workspace = evidence
+            .iter()
+            .rev()
+            .find(|e| {
+                e.kind == crate::workspace::WORKSPACE_EVIDENCE
+                    && e.verified_by.is_none()
+                    && e.hash.is_some()
+            })
+            .and_then(|e| serde_json::from_str(&e.reference).ok());
+        brief.project_context = evidence
+            .iter()
+            .rev()
+            .find(|e| {
+                e.kind == crate::handoff::PROJECT_CONTEXT
+                    && e.verified_by.as_deref() == Some(crate::handoff::CONTROLLER)
+            })
+            .map(|e| serde_json::from_str(&e.reference))
+            .transpose()
+            .map_err(|e| Error::Internal(format!("recorded project context is unreadable: {e}")))?;
         brief.capability = match item.kind {
             WorkKind::Capability => self.capability_mode(&item.id).await?,
             _ => None,

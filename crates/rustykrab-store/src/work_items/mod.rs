@@ -61,6 +61,8 @@ use rustykrab_core::Error;
 
 use crate::{with_conn, Store};
 
+mod monitor;
+pub use monitor::{MonitorEvent, MonitorItem, WorkMonitorSnapshot};
 mod ops;
 mod rows;
 #[cfg(test)]
@@ -385,6 +387,12 @@ pub enum WorkOp {
         item: WorkItemId,
         artifact: rustykrab_core::work::ArtifactRef,
     },
+    /// A question row written with the transition that parks or resumes
+    /// its item (plan section 7; `questions.rs`).
+    Question(crate::QuestionWrite),
+    /// A notice with a send time, merged into a waiting one for the same
+    /// parent when it names it (plan section 6.6; `questions.rs`).
+    Notice(crate::NoticeDraft),
 }
 
 /// What a [`Store::work_apply`] batch wrote, in op order.
@@ -635,10 +643,34 @@ impl Store {
         ttl_seconds: u64,
         inputs: Vec<InputRef>,
     ) -> Result<Lease, WorkStoreError> {
+        self.work_lease_acquire_recorded(item, worker, ttl_seconds, inputs, Vec::new())
+            .await
+    }
+
+    /// Lease and its controller-owned run/context/workspace evidence in one transaction.
+    pub async fn work_lease_acquire_recorded(
+        &self,
+        item: &str,
+        worker: &str,
+        ttl_seconds: u64,
+        inputs: Vec<InputRef>,
+        evidence: Vec<Evidence>,
+    ) -> Result<Lease, WorkStoreError> {
         let (item, worker) = (item.to_string(), worker.to_string());
         let now = Utc::now();
-        self.work_tx(move |conn| ops::lease_acquire(conn, &item, &worker, ttl_seconds, inputs, now))
-            .await
+        self.work_tx(move |conn| {
+            let lease = ops::lease_acquire(conn, &item, &worker, ttl_seconds, inputs, now)?;
+            for ev in evidence {
+                if ev.item != item {
+                    return Err(WorkStoreError::Storage(
+                        "lease evidence belongs to another item".into(),
+                    ));
+                }
+                ops::add_evidence(conn, &ev)?;
+            }
+            Ok(lease)
+        })
+        .await
     }
 
     /// Record a heartbeat on the item's lease and return it.

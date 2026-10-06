@@ -14,6 +14,7 @@ mod payment_request;
 mod projects;
 // The control plan's Phase 6: facets, proposals, metrics and projections.
 mod proposals;
+mod questions;
 mod recall_archive;
 pub mod registry;
 mod secret;
@@ -50,6 +51,9 @@ pub use payment_request::{
 pub use pending_links::PendingLinks;
 pub use projects::{ApplyRevisionResult, ProjectStore};
 pub use proposals::{ProjectionRow, ProposalEvidence, ProposalRow};
+pub use questions::{
+    JudgmentRow, NoticeDraft, QuestionFilter, QuestionRow, QuestionWrite, WaitingNotice,
+};
 pub use recall_archive::RecallArchiveStore;
 pub use secret::{SecretMeta, SecretStore, WriteAuthority};
 pub use tasks::{
@@ -57,8 +61,9 @@ pub use tasks::{
     UNREADABLE_TOOLS,
 };
 pub use work_items::{
-    ArchivedItem, LeaseRecord, OutboxDraft, OutboxRow, RepointSpec, RunSpend, Spend,
-    TransitionSpec, WorkApplied, WorkFilter, WorkOp, WorkPlanRow, WorkStoreError,
+    ArchivedItem, LeaseRecord, MonitorEvent, MonitorItem, OutboxDraft, OutboxRow, RepointSpec,
+    RunSpend, Spend, TransitionSpec, WorkApplied, WorkFilter, WorkMonitorSnapshot, WorkOp,
+    WorkPlanRow, WorkStoreError,
 };
 pub use workers::{
     ClassCost, ClassRecord, RoutingDefault, RoutingRecord, WorkerRow, WorkerStore, WorkerUpsert,
@@ -781,6 +786,11 @@ impl Store {
 
         // Phase 3 of the control layer: the worker registry (`workers.rs`).
         workers::migrate(conn)?;
+        // Phase 4 of the control layer (plan sections 6.6, 7 and 13): the
+        // `questions` and `judgment_policies` tables and the outbox's
+        // `not_before`, kept in `questions.rs` beside the code that reads
+        // them.
+        questions::migrate(conn)?;
 
         // Additive migrations for pre-existing databases. `PRAGMA table_info`
         // lists current columns; only ALTER if a column is missing.

@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use axum::extract::Request;
-use axum::http::{header, HeaderValue, StatusCode};
+use axum::http::{header, HeaderValue, Method, StatusCode, Uri};
 use axum::middleware::Next;
 use axum::response::Response;
 
@@ -16,8 +16,8 @@ pub struct OriginPolicy {
 
 impl OriginPolicy {
     /// Create a policy that only allows the given origins.
-    /// An empty set means *no* cross-origin requests are permitted
-    /// (only same-origin / missing Origin header from non-browser clients).
+    /// An empty set adds no non-loopback origins. API requests still need
+    /// an allowed Origin or the bounded same-origin browser-read proof.
     pub fn new(allowed: impl IntoIterator<Item = String>) -> Self {
         Self {
             allowed: allowed.into_iter().collect(),
@@ -116,11 +116,43 @@ impl OriginPolicy {
     }
 }
 
+/// Browsers omit Origin on same-origin GETs. Fetch Metadata's Sec-* headers
+/// are browser-controlled: https://www.w3.org/TR/fetch-metadata/
+/// Accept only an authenticated
+/// read whose browser-controlled Fetch Metadata and referrer agree with this
+/// gateway's authority and allowed origin. Commands still require Origin.
+/// Sec-* headers cannot be set by page JavaScript:
+/// https://www.w3.org/TR/fetch-metadata/#sec-prefix
+fn same_origin_browser_read(request: &Request, policy: &OriginPolicy) -> bool {
+    if !matches!(*request.method(), Method::GET | Method::HEAD) {
+        return false;
+    }
+    let headers = request.headers();
+    let value = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+    if value("sec-fetch-site") != Some("same-origin")
+        || !matches!(value("sec-fetch-mode"), Some("cors" | "same-origin"))
+        || value("sec-fetch-dest") != Some("empty")
+    {
+        return false;
+    }
+    let Some(referer) = value("referer").and_then(|s| s.parse::<Uri>().ok()) else {
+        return false;
+    };
+    let (Some(scheme), Some(authority), Some(host)) =
+        (referer.scheme_str(), referer.authority(), value("host"))
+    else {
+        return false;
+    };
+    matches!(scheme, "http" | "https")
+        && authority.as_str().eq_ignore_ascii_case(host)
+        && policy.is_allowed(&format!("{scheme}://{authority}"))
+}
+
 /// Axum middleware that validates the Origin header and adds CORS response headers.
 ///
 /// For sensitive endpoints (/api/ and /webhook/), the Origin header is
-/// mandatory. This prevents non-browser tools from bypassing origin
-/// protection by simply omitting the header.
+/// mandatory except for same-origin browser reads proven by Fetch Metadata
+/// and a matching allowed referrer. Omitting both proofs remains a refusal.
 ///
 /// When the origin is allowed, CORS headers are added to the response
 /// so that legitimate cross-origin requests from browsers succeed.
@@ -146,6 +178,7 @@ pub async fn origin_check_middleware(
             // cheaper than re-parsing the origin string per response.
             Some(origin.clone())
         }
+        None if is_sensitive && same_origin_browser_read(&request, &state.origin_policy) => None,
         None if is_sensitive => {
             tracing::warn!(
                 path = %path,
@@ -178,6 +211,82 @@ pub async fn origin_check_middleware(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn browser_read_requires_metadata_allowed_referrer_and_matching_authority() {
+        fn request(method: &str, site: &str, referer: &str, mode: &str, dest: &str) -> Request {
+            Request::builder()
+                .method(method)
+                .uri("/api/monitor")
+                .header("Host", "127.0.0.1:3000")
+                .header("Sec-Fetch-Site", site)
+                .header("Sec-Fetch-Mode", mode)
+                .header("Sec-Fetch-Dest", dest)
+                .header("Referer", referer)
+                .body(axum::body::Body::empty())
+                .unwrap()
+        }
+        let policy = OriginPolicy::default();
+        assert!(same_origin_browser_read(
+            &request(
+                "GET",
+                "same-origin",
+                "http://127.0.0.1:3000/monitor.html",
+                "cors",
+                "empty"
+            ),
+            &policy
+        ));
+        assert!(same_origin_browser_read(
+            &request(
+                "HEAD",
+                "same-origin",
+                "http://127.0.0.1:3000/",
+                "same-origin",
+                "empty"
+            ),
+            &policy
+        ));
+        for method in ["POST", "PUT", "PATCH", "DELETE"] {
+            assert!(!same_origin_browser_read(
+                &request(
+                    method,
+                    "same-origin",
+                    "http://127.0.0.1:3000/",
+                    "cors",
+                    "empty"
+                ),
+                &policy
+            ));
+        }
+        for site in ["cross-site", "same-site", "none", ""] {
+            assert!(!same_origin_browser_read(
+                &request("GET", site, "http://127.0.0.1:3000/", "cors", "empty"),
+                &policy
+            ));
+        }
+        for referer in [
+            "http://outside.example/",
+            "http://127.0.0.1:4000/",
+            "not a uri",
+            "",
+        ] {
+            assert!(!same_origin_browser_read(
+                &request("GET", "same-origin", referer, "cors", "empty"),
+                &policy
+            ));
+        }
+        assert!(!same_origin_browser_read(
+            &request(
+                "GET",
+                "same-origin",
+                "http://127.0.0.1:3000/",
+                "navigate",
+                "document"
+            ),
+            &policy
+        ));
+    }
 
     /// Guards against a regression that would silently expose the gateway:
     /// with no configuration, only loopback is allowed.

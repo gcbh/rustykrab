@@ -48,8 +48,8 @@ echo
 # Keep this in sync with REGISTRY in crates/rustykrab-store/src/registry.rs.
 # -----------------------------------------------------------------------
 SECRETS=(
-    "notion-api-token|NOTION_API_TOKEN|Notion integration API token (ntn_...)|yes"
-    "obsidian-api-key|OBSIDIAN_API_KEY|Obsidian Local REST API key|yes"
+    "notion-api-token|NOTION_API_TOKEN|Notion integration API token (ntn_...)|no"
+    "obsidian-api-key|OBSIDIAN_API_KEY|Obsidian Local REST API key|no"
     "anthropic-api-key|ANTHROPIC_API_KEY|Anthropic Claude API key|no"
     "auth-token|RUSTYKRAB_AUTH_TOKEN|Gateway bearer auth token (auto-generated if empty)|no"
 )

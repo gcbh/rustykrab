@@ -4,13 +4,14 @@
 
 use std::collections::HashSet;
 
+use chrono::{TimeDelta, Utc};
 use rustykrab_core::work::{ArtifactRef, Status, WorkItemId};
 use rustykrab_core::Error;
-use rustykrab_store::{OutboxDraft, WorkOp};
+use rustykrab_store::{NoticeDraft, OutboxDraft, QuestionWrite, WorkOp};
 
 use super::batch::Batch;
 use super::brief::{first_line, ERROR, SUMMARY};
-use super::notice::{render, NoticeData};
+use super::notice::{merge, render, Cause, NoticeData};
 use super::Controller;
 
 /// What a written batch did, for the tick report.
@@ -34,9 +35,13 @@ impl Controller {
         if roots.iter().any(|(root, _)| noticed.contains(root)) {
             return Ok(None);
         }
-        if b.ops.is_empty() && b.evidence.is_empty() {
+        if b.ops.is_empty() && b.evidence.is_empty() && roots.is_empty() {
             return Ok(Some(Written::default()));
         }
+        // A credential question's page (section 7): its request filed and
+        // its link held before the notice can be sent, so the link is
+        // there to follow it.
+        let pages = self.credential_pages(&b).await;
         let mut written = Written::default();
         for op in &b.ops {
             if let WorkOp::Transition(t) = op {
@@ -47,21 +52,67 @@ impl Controller {
             }
         }
         for (root, causes) in &roots {
-            let data = self.notice_data(&b, root).await?;
+            let mut data = self.notice_data(&b, root).await?;
+            data.credentials = pages.clone();
             let body = render(&b.snap, root, &data, causes);
             let origin = causes.iter().find_map(|c| c.item()).map(str::to_string);
-            b.ops.push(WorkOp::Outbox(OutboxDraft {
-                parent: root.clone(),
-                origin,
-                channel: self.config.notice_channel.clone(),
-                body,
+            // When it may go (6.6): a question at once; anything else waits
+            // out the coalescing window, and a notice still waiting for the
+            // same parent takes this one's news instead of a second message.
+            let window = self.config.coalesce_window;
+            let urgent = causes.iter().any(Cause::urgent);
+            let now = Utc::now();
+            let not_before = (!urgent && window > TimeDelta::zero()).then(|| now + window);
+            let channel = self.config.notice_channel.clone();
+            // Report-carried questions and ask_user questions both enter
+            // this path. Keep the notification provenance with the durable
+            // question so evaluation can audit the user's subsequent answer.
+            for cause in causes {
+                if let Cause::Question { id, .. } = cause {
+                    b.ops.push(WorkOp::Question(QuestionWrite::Delivered {
+                        id: id.clone(),
+                        via: channel.clone(),
+                    }));
+                }
+            }
+
+            let waiting = if window > TimeDelta::zero() {
+                self.store.work_outbox_waiting(root, &channel, now).await?
+            } else {
+                None
+            };
+            let (body, replace, not_before) = match waiting {
+                Some(w) => (
+                    merge(&w.body, &body),
+                    Some(w.id),
+                    not_before.map(|t| t.min(w.not_before)),
+                ),
+                None => (body, None, not_before),
+            };
+            b.ops.push(WorkOp::Notice(NoticeDraft {
+                draft: OutboxDraft {
+                    parent: root.clone(),
+                    origin,
+                    channel,
+                    body,
+                },
+                not_before,
+                replace,
             }));
             written.notices += 1;
         }
         for evidence in std::mem::take(&mut b.evidence) {
             self.store.work_evidence_add(evidence).await?;
         }
-        self.store.work_apply(std::mem::take(&mut b.ops)).await?;
+        if let Err(e) = self.store.work_apply(std::mem::take(&mut b.ops)).await {
+            // The notice was not written: its links go with it.
+            if let Some(links) = &self.links {
+                for id in pages.keys() {
+                    links.take(id);
+                }
+            }
+            return Err(e.into());
+        }
 
         let stopped = self.apply_in_memory(&mut b);
         // A stopped run spent what it spent: recorded like one that ended.

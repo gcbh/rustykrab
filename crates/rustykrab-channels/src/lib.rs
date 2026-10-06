@@ -12,6 +12,6 @@ pub use mcp::McpClient;
 pub use mcp_http::McpHttpClient;
 pub use signal::{SignalChannel, SignalInboundMessage};
 pub use slack::{SlackChannel, SlackInboundMessage};
-pub use telegram::TelegramChannel;
+pub use telegram::{ButtonRow, CommandHook, TelegramChannel};
 pub use video::{VideoChannel, VideoConfig};
 pub use webchat::{web_chat_pair, WebChatChannel, WebChatHandle};

@@ -33,7 +33,16 @@
 //! transition, [`cascade`] (4.5), then [`settle`] (readiness, then the
 //! roll-up of every touched ancestor). [`step`] does all three.
 
-use rustykrab_core::work::{Edge, EdgeKind, EventKind, Status, WorkItemId};
+use rustykrab_core::work::{Edge, EdgeKind, EventKind, Status, WorkItem, WorkItemId};
+
+/// The tool that defines a planning item: only a worker holding it (the
+/// `planner`) covers one, and a graph it files waits on it (section 6.1).
+pub const PLAN_TOOL: &str = "work_plan";
+
+/// Whether `item` is a planning item: it requires [`PLAN_TOOL`].
+pub fn is_planning(item: &WorkItem) -> bool {
+    item.required_tools.iter().any(|t| t == PLAN_TOOL)
+}
 
 mod aging;
 mod cascade;

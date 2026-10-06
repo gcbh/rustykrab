@@ -430,7 +430,10 @@ mod tests {
             .iter()
             .filter_map(|a| a.get("id").and_then(|i| i.as_str()))
             .collect();
-        assert_eq!(ids, vec!["coder", "planner", "researcher", "worker"]);
+        assert_eq!(
+            ids,
+            vec!["coder", "planner", "researcher", "work-planner", "worker"]
+        );
         let coder = agents.iter().find(|a| a["id"] == "coder").unwrap();
         assert_eq!(coder["tools"][0], "read");
     }
