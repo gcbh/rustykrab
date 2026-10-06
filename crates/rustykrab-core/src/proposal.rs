@@ -226,10 +226,11 @@ pub enum Criterion {
     CostLatency,
     CodingQuality,
     SkillOutcome,
+    ProjectOpportunity,
 }
 
 impl Criterion {
-    pub const ALL: [Criterion; 10] = [
+    pub const ALL: [Criterion; 11] = [
         Criterion::ExpectationRegression,
         Criterion::AvoidableEscalation,
         Criterion::RecurringFingerprint,
@@ -240,6 +241,7 @@ impl Criterion {
         Criterion::CostLatency,
         Criterion::CodingQuality,
         Criterion::SkillOutcome,
+        Criterion::ProjectOpportunity,
     ];
 
     pub fn as_str(&self) -> &'static str {
@@ -254,6 +256,7 @@ impl Criterion {
             Criterion::CostLatency => "cost_latency",
             Criterion::CodingQuality => "coding_quality",
             Criterion::SkillOutcome => "skill_outcome",
+            Criterion::ProjectOpportunity => "project_opportunity",
         }
     }
 

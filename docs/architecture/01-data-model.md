@@ -914,3 +914,13 @@ Unfinished-attempt records point to controller-owned run/workspace evidence and
 classified errors, not model-written workspace artifacts. Monitor, verifier and
 reattachment reads likewise select the controller's pinned workspace records.
 These pointers permit inspection and never establish completed code or effects.
+
+## Project dreaming reviews
+
+`dream_project_reviews(id, project, stage, version, created_at, data)` keeps
+versioned ProjectReview receipts. Immutable input and mutable progress live
+in typed JSON; project/creation/stage/version support scheduling and CAS.
+An index orders creation and a partial unique expression index allows only
+one nonterminal cycle. Work/proposal pointers deliberately have no FK so
+archival preserves auditability. Published proposals use the existing
+proposals/proposal_evidence/expectation_metrics and probation tables.

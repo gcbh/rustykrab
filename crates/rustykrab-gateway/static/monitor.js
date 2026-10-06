@@ -66,7 +66,7 @@
     $('pairCode').value = ''; $('pairError').textContent = '';
     if ($('detail').open) $('detail').close();
     $('detailBody').replaceChildren(); $('workRows').replaceChildren(); $('agents').replaceChildren();
-    $('projectRows').replaceChildren(); $('events').replaceChildren(); $('quality').replaceChildren(); $('questionRows').replaceChildren();
+    $('dreamRows').replaceChildren(); $('dreamMetrics').replaceChildren(); $('projectRows').replaceChildren(); $('events').replaceChildren(); $('quality').replaceChildren(); $('questionRows').replaceChildren();
   }
   async function connect(value) {
     token = value.trim();
@@ -86,8 +86,47 @@
     card.append(node('div', num(value), 'number'), node('p', title), node('p', caption, 'caption'));
     return card;
   }
+  function renderDreaming(d) {
+    $('dreamRows').replaceChildren(); $('dreamMetrics').replaceChildren();
+    $('dreamNow').disabled = !d?.enabled;
+    $('dreamStatus').textContent = d ? (d.enabled ? 'Project reviews enabled · Interval ' + num(d.interval_seconds / 3600) + ' hours' : 'Project reviews are not configured') + ' · Expectation pass ' + age(d.last_evaluation) + ' · Outcome analysis ' + age(d.last_analysis) : 'Dreaming status unavailable';
+    if (!d) return;
+    const m = d.metrics;
+    $('dreamMetrics').append(node('p', m.completed + ' completed reviews (' + m.calibrated_reviews + ' calibrated) · ' + m.pending + ' in progress · ' + m.failed + ' failed · ' + m.reviewed_projects + '/' + m.eligible_projects + ' projects reviewed this interval'));
+    $('dreamMetrics').append(node('p', m.proposal_count + ' proposals · ' + m.pending_decisions + ' awaiting review · Acceptance ' + (m.acceptance_rate === null ? 'not yet measured' : Math.round(m.acceptance_rate * 100) + '%') + ' · Improvement ' + (m.improvement_rate === null ? 'not yet measured' : Math.round(m.improvement_rate * 100) + '%') + ' (' + m.measured_outcomes + ' measured outcomes)'));
+    $('dreamMetrics').append(node('p', num(m.tokens) + ' recorded tokens · ' + num(m.wall_seconds) + ' run seconds · ' + num(d.outcome_records) + ' captured turn outcomes', 'note'));
+    for (const warning of m.warnings) $('dreamMetrics').append(node('p', warning, 'note'));
+    for (const r of d.reviews) {
+      const card = node('article', undefined, 'agent');
+      card.append(badge(r.stage), node('p', 'Project ' + r.project_id + ' · Revision ' + r.revision.slice(0, 12) + ' · ' + at(r.created_at)));
+      if (r.generator_item) card.append(itemButton(r.generator_item, 'Generator run'));
+      if (r.evaluator_item) card.append(itemButton(r.evaluator_item, 'Meta-evaluator run'));
+      if (r.error) card.append(node('p', r.error, 'error'));
+      if (r.generated?.abstention) card.append(node('p', 'Abstained: ' + r.generated.abstention));
+      for (const [i, idea] of (r.generated?.ideas || []).entries()) {
+        card.append(node('h3', idea.title), node('p', idea.change), node('p', 'Experiment: ' + idea.experiment));
+        const a = r.meta?.assessments.find(a => a.index === i);
+        if (a) card.append(node('p', 'Reviewer judgment /4: evidence ' + a.evidence + ' · usefulness ' + a.usefulness + ' · novelty ' + a.novelty + ' · testability ' + a.testability), node('p', a.reason));
+      }
+      if (r.meta) {
+        card.append(node('p', 'Calibration: ' + r.meta.calibration.length + '/3 negative controls passed. This checks basic grading behavior; real utility remains separate.', 'note'));
+        card.append(node('p', 'Coverage: ' + r.meta.coverage));
+        for (const text of r.meta.blind_spots) card.append(node('p', 'Blind spot: ' + text));
+        for (const text of r.meta.improvements) card.append(node('p', 'Suggested evaluation improvement: ' + text));
+      }
+      for (const text of r.skipped) card.append(node('p', text, 'note'));
+      for (const id of r.filed) card.append(itemButton(id, 'Review proposal'));
+      const receipt = node('button', 'Frozen input and full receipt');
+      receipt.addEventListener('click', async () => {
+        const g = generation, request = ++detailRequest;
+        try { const data = await api('/api/dreaming/reviews/' + encodeURIComponent(r.id)); if (g !== generation || request !== detailRequest) return; $('detailTitle').textContent = 'Dreaming receipt'; $('detailBody').replaceChildren(node('pre', JSON.stringify(data, null, 2))); if (!$('detail').open) $('detail').showModal(); }
+        catch (e) { if (g === generation && request === detailRequest) { $('error').hidden = false; $('error').textContent = e.message; } }
+      }); card.append(receipt); $('dreamRows').append(card);
+    }
+  }
   function render(reply) {
     const w = reply.work, counts = w.counts, c = reply.controller;
+    renderDreaming(reply.dreaming);
     $('login').hidden = true; $('dashboard').hidden = false; $('logout').hidden = false;
     $('error').hidden = true;
     $('health').textContent = human(reply.health); $('health').className = 'badge ' + reply.health;
@@ -278,6 +317,14 @@
       if (g !== generation || request !== detailRequest || !$('detail').open) return;
       $('detailTitle').textContent = d.item.title;
       const body = $('detailBody'); body.replaceChildren(badge(status(d.item)), node('p', id, 'note'));
+      if (d.item.kind === 'proposal' && !closed.has(status(d.item))) {
+        const controls = node('div', undefined, 'controls');
+        for (const [label, decision] of [['Accept for implementation', 'accept'], ['Decline', 'decline']]) {
+          const b = node('button', label);
+          b.addEventListener('click', async () => { b.disabled = true; try { await api('/api/work/' + encodeURIComponent(id) + '/review', { decision }); await refresh(); await showDetail(id); } catch (e) { b.disabled = false; body.append(node('p', e.message, 'error')); } });
+          controls.append(b);
+        } body.append(controls);
+      }
       const section = (title, value) => { body.append(node('h3', title), node('pre', value)); };
       section('Objective', d.item.objective);
       section('Done when', d.item.done_when);
@@ -322,6 +369,12 @@
   });
   $('loginForm').addEventListener('submit', e => { e.preventDefault(); if (!$('pairButton').disabled) connect($('token').value); });
   $('logout').addEventListener('click', () => disconnect());
+  $('dreamNow').addEventListener('click', async () => {
+    const g = generation;
+    $('dreamNow').disabled = true;
+    try { const d = await api('/api/dreaming', {}); if (g !== generation) return; renderDreaming(d); await refresh(); }
+    catch (e) { $('error').hidden = false; $('error').textContent = e.message; }
+  });
   $('refresh').addEventListener('click', refresh);
   $('pause').addEventListener('click', () => {
     paused = !paused; $('pause').setAttribute('aria-pressed', String(paused));

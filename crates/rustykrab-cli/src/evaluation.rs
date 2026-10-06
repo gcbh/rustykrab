@@ -447,6 +447,7 @@ pub struct Evaluator {
     evaluation: Evaluation,
     surface: Option<Arc<dyn ReviewSurface>>,
     running: tokio::sync::Mutex<()>,
+    dreaming: crate::dreaming::Dreaming,
 }
 
 impl Evaluator {
@@ -472,6 +473,7 @@ impl Evaluator {
             }
         }
         let mut report = self.evaluation.run(Utc::now()).await?;
+        self.dreaming.advance(false).await?;
         report.decisions = decisions;
         if let Some(surface) = &self.surface {
             let mut out = projection.unwrap_or_default();
@@ -497,9 +499,25 @@ impl Evaluator {
     }
 }
 
+impl Evaluator {
+    async fn advance_dreaming(
+        &self,
+        force: bool,
+    ) -> Result<rustykrab_core::dream_review::DreamingView, Error> {
+        let _one_at_a_time = self.running.lock().await;
+        self.dreaming.advance(force).await?;
+        self.dreaming.view().await
+    }
+}
 impl EvaluationHandle for Evaluator {
     fn evaluate(&self) -> rustykrab_gateway::evaluate_routes::EvaluationFuture<'_> {
         Box::pin(self.run())
+    }
+    fn dreaming_status(&self) -> rustykrab_gateway::evaluate_routes::DreamingFuture<'_> {
+        Box::pin(self.dreaming.view())
+    }
+    fn dreaming_run(&self) -> rustykrab_gateway::evaluate_routes::DreamingFuture<'_> {
+        Box::pin(self.advance_dreaming(true))
     }
 }
 
@@ -529,6 +547,11 @@ pub async fn evaluator(
     };
     Arc::new(Evaluator {
         store: store.clone(),
+        dreaming: crate::dreaming::Dreaming::new(
+            store.clone(),
+            control.clone(),
+            crate::dreaming::Config::from_env(),
+        ),
         control,
         evaluation,
         surface: review_surface(store).await,
@@ -550,6 +573,23 @@ pub fn spawn_nightly(evaluator: Arc<Evaluator>) -> tokio::task::JoinHandle<()> {
             tracing::info!("nightly evaluation off (RUSTYKRAB_EVALUATION_INTERVAL_SECS=0)");
             return;
         }
+        let driver = evaluator.clone();
+        let progress = tokio::spawn(async move {
+            let mut timer = tokio::time::interval(Duration::from_secs(15));
+            loop {
+                timer.tick().await;
+                if let Err(e) = driver.advance_dreaming(false).await {
+                    tracing::warn!(error=%e, "project dreaming driver failed");
+                }
+            }
+        });
+        struct Abort(tokio::task::JoinHandle<()>);
+        impl Drop for Abort {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
+        let _progress = Abort(progress);
         let mut timer = tokio::time::interval(Duration::from_secs(secs));
         timer.tick().await;
         loop {

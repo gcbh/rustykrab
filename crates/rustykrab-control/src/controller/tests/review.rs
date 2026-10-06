@@ -453,3 +453,25 @@ async fn an_acceptance_on_the_issue_becomes_a_code_item_once() {
     assert!(later.decisions.is_empty());
     assert_eq!(h.of_kind(WorkKind::Code).await.len(), 1);
 }
+
+#[tokio::test]
+async fn accepting_project_proposal_preserves_its_native_runtime_and_repository() {
+    let h = Harness::new(&["pinch"]);
+    let mut draft = proposal(
+        "Complete project intake",
+        Some("project:intake"),
+        Some(ReviewTier::Highest),
+    );
+    draft.worker_kind = WorkerKind::Codex;
+    draft.writable_resources = vec!["repo:/tmp/project-review-fixture".into()];
+    let id = accepted_root(file_rest(&h, draft).await);
+    let result = ControlHandle::review_decision(&h.ctl, &id, ReviewDecision::Accept, "user:master")
+        .await
+        .unwrap();
+    let code = h.item(&result.code_item.unwrap()).await;
+    assert_eq!(code.worker_kind, WorkerKind::Codex);
+    assert_eq!(
+        code.writable_resources,
+        ["repo:/tmp/project-review-fixture"]
+    );
+}

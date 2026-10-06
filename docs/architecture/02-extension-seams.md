@@ -241,3 +241,9 @@ quota reads; execution remains an owned headless CLI process.
 work/question history across `Worker`. It is data on the existing seam, not a
 provider-specific memory interface. Peer reattachment keeps the frozen revision;
 a new worker run loads the current revision and verified project code chain.
+
+
+Project dreaming extends EvaluationHandle with defaulted observational status
+and bounded advancement on the existing serialized evaluator. Generation and
+meta-evaluation reuse Worker/ControlHandle with Research work, budgets, leases
+and native CLI adapters; no model executor or execution queue is added.

@@ -15,7 +15,7 @@
 use std::future::Future;
 use std::pin::Pin;
 
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -37,14 +37,75 @@ pub type EvaluationFuture<'a> =
 
 /// One evaluation pass on demand, as the composition root assembles it
 /// (the review surface's decisions, dreaming's pass, the projection).
+pub type DreamingFuture<'a> = Pin<
+    Box<dyn Future<Output = Result<rustykrab_core::dream_review::DreamingView, Error>> + Send + 'a>,
+>;
 pub trait EvaluationHandle: Send + Sync {
     fn evaluate(&self) -> EvaluationFuture<'_>;
+    fn dreaming_status(&self) -> DreamingFuture<'_> {
+        Box::pin(async { Err(Error::NotFound("Project dreaming is unavailable".into())) })
+    }
+    fn dreaming_run(&self) -> DreamingFuture<'_> {
+        self.dreaming_status()
+    }
 }
 
 pub(crate) fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/work/evaluate", post(evaluate))
         .route("/api/work/metrics", get(metrics))
+        .route("/api/dreaming", get(dreaming_status).post(dreaming_run))
+        .route("/api/dreaming/reviews/{id}", get(dreaming_receipt))
+}
+
+async fn dreaming_status(State(state): State<AppState>) -> Response {
+    let Some(h) = state.evaluation.as_ref() else {
+        return failure(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "dreaming_unavailable",
+            "Dreaming is unavailable".into(),
+        );
+    };
+    match h.dreaming_status().await {
+        Ok(v) => ([(axum::http::header::CACHE_CONTROL, "no-store")], Json(v)).into_response(),
+        Err(e) => failure(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "dreaming_unavailable",
+            e.to_string(),
+        ),
+    }
+}
+async fn dreaming_run(State(state): State<AppState>) -> Response {
+    let Some(h) = state.evaluation.as_ref() else {
+        return failure(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "dreaming_unavailable",
+            "Dreaming is unavailable".into(),
+        );
+    };
+    match h.dreaming_run().await {
+        Ok(v) => (StatusCode::ACCEPTED, Json(v)).into_response(),
+        Err(e) => failure(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "dreaming_failed",
+            e.to_string(),
+        ),
+    }
+}
+async fn dreaming_receipt(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    match state.agent.store.dream_review_get(&id).await {
+        Ok(Some(v)) => ([(axum::http::header::CACHE_CONTROL, "no-store")], Json(v)).into_response(),
+        Ok(None) => failure(
+            StatusCode::NOT_FOUND,
+            "review_not_found",
+            "Review not found".into(),
+        ),
+        Err(e) => failure(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "review_unavailable",
+            e.to_string(),
+        ),
+    }
 }
 
 /// `GET /api/work/metrics`.

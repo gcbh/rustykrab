@@ -677,6 +677,11 @@ impl ExternalWorker {
         let c = &self.config;
         let mut cmd = tokio::process::Command::new(&c.command);
         let build = is_tool_build(brief);
+        let review = brief.kind == rustykrab_core::work::WorkKind::Research
+            && brief
+                .artifact_refs
+                .iter()
+                .any(|r| r.kind == rustykrab_core::dream_review::REVIEW_ONLY && r.value == "true");
         match c.kind {
             WorkerKind::Codex => {
                 if c.require_chatgpt {
@@ -699,10 +704,13 @@ impl ExternalWorker {
                         "model_provider=\"openai\"",
                         "-c",
                         "web_search=\"disabled\"",
-                        "--approve-for-me",
                     ]);
                 }
-                if !c.require_chatgpt {
+                if review {
+                    cmd.args(["--sandbox", "read-only", "-c", "approval_policy=\"never\""]);
+                } else if c.require_chatgpt {
+                    cmd.arg("--approve-for-me");
+                } else {
                     cmd.args(["--sandbox", "workspace-write"]);
                 }
                 if let Some(model) = &c.model {
@@ -725,6 +733,9 @@ impl ExternalWorker {
                     c.allowed_tools.join(",")
                 };
                 cmd.arg("-p").arg(prompt);
+                if review {
+                    cmd.args(["--tools", ""]);
+                }
                 if let Some(session) = resume {
                     cmd.args(["--resume", session]);
                 }
@@ -1219,9 +1230,25 @@ impl Worker for ExternalWorker {
             .unwrap_or_else(|e| e.into_inner())
             .remove(&brief.item)
             .unwrap_or_default();
-        let outcome = outcome.map(|mut report| {
+        let outcome = outcome.and_then(|mut report| {
+            let review = brief.kind == rustykrab_core::work::WorkKind::Research
+                && brief.artifact_refs.iter().any(|r| {
+                    r.kind == rustykrab_core::dream_review::REVIEW_ONLY && r.value == "true"
+                });
+            if review
+                && (!report.discovered.is_empty()
+                    || report.commit.is_some()
+                    || !report.changed_paths.is_empty())
+            {
+                return Err(RunFailure::Model {
+                    problem: ProviderProblem::Format,
+                    detail: "Read-only review returned executable follow-ups or code changes"
+                        .into(),
+                }
+                .into_error());
+            }
             attest(&mut report, &commands);
-            report
+            Ok(report)
         });
 
         // Retention: a run with a result gives its directory back; one
@@ -2974,6 +3001,40 @@ else:
                 codex_command(&serde_json::json!(unrelated)).as_deref(),
                 Some(unrelated)
             );
+        }
+    }
+    #[test]
+    fn frozen_research_reviews_use_enforced_native_read_only_modes() {
+        let f = Fixture::new();
+        let cli = f.agent("read-only-review", "#!/bin/sh\nexit 0\n");
+        let mut b = brief(None);
+        b.kind = rustykrab_core::work::WorkKind::Research;
+        b.artifact_refs.push(rustykrab_core::work::ArtifactRef {
+            kind: rustykrab_core::dream_review::REVIEW_ONLY.into(),
+            value: "true".into(),
+        });
+        for kind in [WorkerKind::Codex, WorkerKind::ClaudeCode] {
+            let mut worker = f.worker(kind, cli.clone());
+            worker.config.require_chatgpt = kind == WorkerKind::Codex;
+            let command = worker.command(
+                "review",
+                f.data.path(),
+                &b,
+                &f.data.path().join("last"),
+                None,
+            );
+            let args: Vec<_> = command
+                .as_std()
+                .get_args()
+                .map(|s| s.to_string_lossy().into_owned())
+                .collect();
+            if kind == WorkerKind::Codex {
+                assert!(args.windows(2).any(|a| a == ["--sandbox", "read-only"]));
+                assert!(args.contains(&"approval_policy=\"never\"".into()));
+                assert!(!args.contains(&"--approve-for-me".into()));
+            } else {
+                assert!(args.windows(2).any(|a| a == ["--tools", ""]));
+            }
         }
     }
 }

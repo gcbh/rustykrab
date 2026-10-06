@@ -13,6 +13,7 @@ mod outcomes;
 mod payment_request;
 mod projects;
 // The control plan's Phase 6: facets, proposals, metrics and projections.
+mod dream_reviews;
 mod proposals;
 mod questions;
 mod recall_archive;
@@ -1120,6 +1121,7 @@ impl Store {
         // item id without a foreign key so they outlive compaction; see
         // `proposals.rs`.
         proposals::migrate(conn)?;
+        dream_reviews::migrate(conn)?;
 
         // Adopt the foreign keys the fresh-database DDL declares onto
         // databases created before it did. Runs after the additive column
