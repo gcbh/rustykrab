@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="referrer" content="same-origin">
+<title>Agent monitor · RustyKrab</title>
+<link rel="stylesheet" href="/monitor.css">
+<script src="/monitor.js" defer></script>
+</head>
+<body>
+<header><a class="brand" href="/">◉ <span>RustyKrab</span></a><nav><a href="/">Chat</a><span class="selected">Agent monitor</span></nav><button id="logout" hidden>Disconnect</button></header>
+<main>
+<section id="login" class="login card">
+<p class="eyebrow">LOCAL OPERATIONS</p><h1>Your agents, in view.</h1>
+<p>Connect to see agent health, active work, and the evidence behind results.</p>
+<form id="pairForm"><label for="pairCode">One-time pairing code</label><input id="pairCode" type="text" autocomplete="off" autocapitalize="characters" spellcheck="false" maxlength="8" pattern="[A-Za-z2-9]{8}" required placeholder="8-character code"><label for="deviceName">Device name</label><input id="deviceName" maxlength="128" value="Remote agent dashboard" required><button id="pairButton" class="primary">Pair and connect</button></form>
+<p class="note">Enter a code issued by your daemon operator. Codes expire after five minutes and can be used once. Your browser receives its own revocable access token.</p>
+<p id="pairError" role="alert"></p>
+<details id="tokenLogin"><summary>Already have an authentication token?</summary><form id="loginForm"><label for="token">Authentication token</label><input id="token" type="password" autocomplete="off" required placeholder="Enter your daemon or device token"><button class="primary">Connect</button></form></details>
+<p id="loginError" role="alert"></p>
+</section>
+<div id="dashboard" hidden>
+<div class="heading"><div><p class="eyebrow">OPERATIONS</p><h1>Agent monitor</h1><p id="updated">Connecting…</p></div><div class="controls"><span id="health" class="badge">Connecting</span><button id="refresh">Refresh</button><button id="pause" aria-pressed="false">Pause updates</button></div></div>
+<div id="error" class="error" role="alert" hidden></div>
+<div class="stats" id="stats"></div>
+<section id="alerts" class="card" aria-labelledby="alertsTitle"><h2 id="alertsTitle">Attention</h2><div id="alertRows"></div></section>
+<div class="columns"><section aria-labelledby="agentsTitle"><div class="section-heading"><h2 id="agentsTitle">Agents</h2><span id="agentCount"></span></div><div id="agents"></div></section>
+<section aria-labelledby="workTitle"><div class="section-heading"><h2 id="workTitle">Work</h2><span id="workCount"></span></div><div class="card work">
+<div class="filters"><label class="sr-only" for="search">Search work</label><input id="search" placeholder="Search title, agent, or item ID"><label class="sr-only" for="status">Filter status</label><select id="status"><option value="open">Open work</option><option value="all">All displayed work</option><option>running</option><option>verifying</option><option>blocked</option><option>done</option><option>failed</option></select></div>
+<div class="table-wrap"><table><thead><tr><th>Work item</th><th>Status</th><th>Agent</th><th>Evidence</th><th>Recorded usage</th></tr></thead><tbody id="workRows"></tbody></table></div><p id="workNote" class="note"></p>
+</div></section></div>
+<section class="card"><h2>Project handoffs</h2><p class="note">Context delivered to the latest runs in this view. Revisions, verified code bases, and producing agents survive a runtime switch.</p><div id="projectRows"></div></section>
+<section id="questions" class="card" hidden><h2>Questions waiting on you</h2><div id="questionRows"></div></section>
+<div class="bottom"><section class="card"><h2>Recent activity</h2><ol id="events" class="timeline"></ol></section><section class="card"><h2>Quality over time</h2><p class="note">From the latest evaluation. Values include their sample size and observation window.</p><div id="quality"></div></section></div>
+<footer id="build"></footer>
+</div>
+</main>
+<dialog id="detail"><div class="detail-heading"><h2 id="detailTitle"></h2><button id="closeDetail" aria-label="Close detail">Close</button></div><div id="detailBody"></div></dialog>
+</body></html>

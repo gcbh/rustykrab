@@ -39,6 +39,7 @@ const BUILTIN: &[(&str, &str)] = &[
     ("coder", include_str!("../agents/coder.md")),
     ("planner", include_str!("../agents/planner.md")),
     ("researcher", include_str!("../agents/researcher.md")),
+    ("work-planner", include_str!("../agents/work-planner.md")),
     ("worker", include_str!("../agents/worker.md")),
 ];
 
@@ -55,6 +56,8 @@ struct Frontmatter {
     description: String,
     #[serde(default = "default_profile")]
     profile: String,
+    #[serde(default)]
+    planning_only: bool,
     #[serde(default)]
     tools: Vec<String>,
     #[serde(default)]
@@ -111,6 +114,7 @@ pub fn parse_agent_md(id: &str, content: &str) -> Result<AgentDefinition, String
         description: front.description,
         system_prompt,
         profile: front.profile,
+        planning_only: front.planning_only,
         allowed_tools: front.allowed_tools,
         tools: front.tools,
         mcp_servers: front.mcp_servers,
@@ -199,7 +203,10 @@ mod tests {
     #[test]
     fn every_builtin_parses_and_the_coder_starts_with_its_workbench() {
         let ids: Vec<String> = builtin_definitions().into_iter().map(|d| d.id).collect();
-        assert_eq!(ids, ["coder", "planner", "researcher", "worker"]);
+        assert_eq!(
+            ids,
+            ["coder", "planner", "researcher", "work-planner", "worker"]
+        );
 
         let coder = builtin("coder").unwrap();
         assert_eq!(coder.profile, "coding");
@@ -317,9 +324,9 @@ mod tests {
             .system_prompt
             .starts_with("You are {name}"));
         assert!(registry.get("scout").is_some());
-        assert_eq!(registry.list().len(), 5);
+        assert_eq!(registry.list().len(), 6);
 
-        assert_eq!(agent_registry(None).list().len(), 4);
+        assert_eq!(agent_registry(None).list().len(), 5);
         assert!(load_agent_dir(&dir.join("missing")).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -25,6 +25,8 @@ use crate::routing::{built_tool, work_class, Judged, Verdict};
 use crate::worker::{run_failure_input, Brief, RunFailure, Worker, COMMAND_RUN};
 use crate::workspace::{self, CodeClaim, CodeVerdict, Workspace, WORKSPACE_EVIDENCE};
 
+use rustykrab_core::questions::QuestionKind;
+
 use super::batch::{has_open_plan_b, Batch};
 use super::brief::{brief_for, first_line, ERROR, RESULT_REPORT, RUN, SUMMARY};
 use super::commit::Written;
@@ -33,6 +35,7 @@ use super::filing::{
 };
 use super::load::{history, ladder_from, ESCALATING_ABOVE, REPLAYED, SWITCHED};
 use super::notice::{label, Cause};
+use super::questions::NewQuestion;
 use super::{Controller, Finished, Run, RunResult};
 
 /// Moves the ladder may make on one failure before it must surface: the
@@ -74,7 +77,10 @@ fn absorb(report: &mut TickReport, written: Written) {
 pub(super) fn covers(worker: &dyn Worker, item: &WorkItem) -> bool {
     let caps = worker.capabilities();
     let has = |list: &[String], want: &String| list.iter().any(|x| x == want || x == "*");
-    (item.worker_kind == WorkerKind::Any || item.worker_kind == worker.kind())
+    // A planning item matches only a planner, and a planner takes only
+    // planning items (6, step 2).
+    graph::is_planning(item) == super::planning::plans(worker)
+        && (item.worker_kind == WorkerKind::Any || item.worker_kind == worker.kind())
         && !lacks_checkout(worker.kind(), item)
         && item.required_tools.iter().all(|t| has(&caps.tools, t))
         && item
@@ -314,6 +320,7 @@ impl Controller {
             self.load_recurrence(now).await?;
             self.load_learned().await?;
         }
+        self.judgment().await?;
         let mut report = TickReport::default();
         let mut noticed: HashSet<WorkItemId> = HashSet::new();
         self.sweep(now, first, &mut report, &mut noticed).await?;
@@ -528,6 +535,23 @@ impl Controller {
             changed.extend(b.cancel_unneeded(&id, &origin));
         }
 
+        // Questions (section 7): research that landed answers its
+        // question, a plan B that ran closes the question held for it, a
+        // closed item's question is obsolete, and a stored credential wakes
+        // the item parked on it.
+        let waiting = self.waiting_questions().await?;
+        self.sweep_questions(&mut b, &waiting).await?;
+        changed.extend(self.wake_on_credentials(&mut b, &waiting));
+
+        // Items waiting for a worker: requeued when one can take them,
+        // climbing their ladder once the wait is past its TTL (section 7).
+        changed.extend(self.worker_waits(&mut b, &waiting).await?);
+
+        // Step 7 for subtrees: a stalled parent re-plans, then surfaces
+        // once; a chain open past the digest window gets its digest (6.6).
+        changed.extend(self.stalled_subtrees(&mut b, now, &waiting).await?);
+        self.digests(&mut b, now).await?;
+
         // Readiness (time triggers that fired), roll-ups and verification.
         changed.extend(all);
         b.settle(changed);
@@ -649,7 +673,10 @@ impl Controller {
             Ok(result) => self.judge(b, &item, worker, result).await?,
         };
         if let Ok(result) = &finished.outcome {
-            changed.extend(self.file_discovered(b, &item, worker, &result.discovered));
+            changed.extend(
+                self.file_discovered(b, &item, worker, &result.discovered)
+                    .await,
+            );
         }
         b.settle(changed);
         Ok(())
@@ -679,6 +706,24 @@ impl Controller {
         if let Some(error) = &result.error {
             let error = normalise_reported(error, kind);
             return self.fail(b, item, worker, error, &result.artifacts).await;
+        }
+        if let Some(blocked) = result.blocked.as_ref().filter(|bl| bl.reason.is_cascade()) {
+            let error = classify(
+                &FailureInput::Verifier {
+                    verdict: VerifierVerdict::ClaimMismatch,
+                    detail: format!(
+                        "the worker reported {}, which only the controller's cascade sets",
+                        Status::Blocked(blocked.reason)
+                    ),
+                },
+                &ctx,
+            );
+            return self.fail(b, item, worker, error, &result.artifacts).await;
+        }
+        // Questions and blocks only the user can meet go through the
+        // router (section 7).
+        if let Some(changed) = self.judge_questions(b, item, worker, result).await? {
+            return Ok(changed);
         }
         if let Some(blocked) = &result.blocked {
             if blocked.reason.is_cascade() {
@@ -731,23 +776,6 @@ impl Controller {
                 format!("{detail} (needs {})", blocked.needs.join(", "))
             };
             return self.park(b, item, blocked.reason, &text).await;
-        }
-        if !result.questions.is_empty() {
-            let text = result
-                .questions
-                .iter()
-                .map(|q| {
-                    if q.options.is_empty() {
-                        q.text.clone()
-                    } else {
-                        format!("{} [{}]", q.text, q.options.join(" / "))
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join(" ");
-            return self
-                .park(b, item, BlockedReason::NeedsDecision, &text)
-                .await;
         }
         if result.summary.trim().is_empty() {
             let error = classify(
@@ -1041,7 +1069,7 @@ impl Controller {
             .await?
             .iter()
             .rev()
-            .find(|e| e.kind == WORKSPACE_EVIDENCE)
+            .find(|e| e.kind == WORKSPACE_EVIDENCE && e.verified_by.is_none() && e.hash.is_some())
             .and_then(|e| serde_json::from_str(&e.reference).ok()))
     }
 
@@ -1093,7 +1121,7 @@ impl Controller {
 
     /// A failed run: its partial artifacts and its error as evidence, then
     /// the ladder.
-    async fn fail(
+    pub(super) async fn fail(
         &self,
         b: &mut Batch,
         item: &WorkItem,
@@ -1156,7 +1184,7 @@ impl Controller {
     /// A block or a question only the user can answer (section 7): the
     /// item's plan B runs first when it has one (6.4); otherwise the item
     /// parks in its typed state and its root's notice asks.
-    async fn park(
+    pub(super) async fn park(
         &self,
         b: &mut Batch,
         item: &WorkItem,
@@ -1272,6 +1300,27 @@ impl Controller {
         for _ in 0..MAX_CLIMB {
             let decision = ladder::next(&state, &ctx);
             let rung = decision.rung();
+            // A planning run whose ladder is spent fails quietly: a planned
+            // request's plan B then runs it as one item, and a re-plan's
+            // parent surfaces once, with the stalled subtree (6.1, 6.4).
+            if graph::is_planning(item)
+                && matches!(decision, Decision::Replan | Decision::Surface(_))
+            {
+                self.rung(
+                    b,
+                    &id,
+                    &mut state,
+                    rung,
+                    &error,
+                    "the planning run ended without an accepted graph".into(),
+                );
+                return Ok(b.close(
+                    &id,
+                    Status::Failed,
+                    "controller",
+                    "planning ended without an accepted graph",
+                ));
+            }
             match decision {
                 Decision::Improve { .. } => {
                     let outcome = match self.file_internal(b, item, &error) {
@@ -1343,17 +1392,23 @@ impl Controller {
                                 format!("filed capability item {capability}"),
                             );
                             if reason.needs_user() {
-                                b.notify(
-                                    &id,
-                                    Cause::Asked {
-                                        item: id.clone(),
-                                        text: format!(
-                                            "{} needs the {} {}",
-                                            label(item),
-                                            need.gap.as_str(),
-                                            need.subject
-                                        ),
-                                    },
+                                let kind = QuestionKind::for_blocked(reason);
+                                let text = match kind {
+                                    QuestionKind::Credential => format!(
+                                        "{} needs the credential `{}`",
+                                        label(item),
+                                        need.subject
+                                    ),
+                                    _ => format!(
+                                        "{} needs the {} {}",
+                                        label(item),
+                                        need.gap.as_str(),
+                                        need.subject
+                                    ),
+                                };
+                                self.record_question(
+                                    b,
+                                    NewQuestion::open(&id, kind, text, "capability"),
                                 );
                             }
                             changed.push(capability);
@@ -1387,10 +1442,62 @@ impl Controller {
                         "ladder spent; plan B runs",
                     ));
                 }
+                Decision::Replan if self.config.replan && self.has_planner() => {
+                    // The item fails, the cascade holds what is behind it,
+                    // and the parent re-plans (6.4, step 3): a planning
+                    // item under it, briefed with this ladder.
+                    self.rung(
+                        b,
+                        &id,
+                        &mut state,
+                        rung,
+                        &error,
+                        "failed; the parent re-plans".into(),
+                    );
+                    let mut changed = b.close(
+                        &id,
+                        Status::Failed,
+                        "controller",
+                        "ladder spent; the parent re-plans",
+                    );
+                    let parent = item.parent.as_deref().and_then(|p| b.snap.item(p)).cloned();
+                    let filed = match parent {
+                        Some(parent) => {
+                            let why = format!(
+                                "{} failed after its ladder ({}/{}).",
+                                label(item),
+                                error.class.as_str(),
+                                error.subclass.as_str()
+                            );
+                            self.file_replan(b, &parent, Some(item), why, Some(&error))
+                                .await
+                        }
+                        None => Err("no parent".to_string()),
+                    };
+                    match filed {
+                        Ok(replan) => changed.push(replan),
+                        Err(why) => {
+                            tracing::warn!(item = %id, %why, "re-plan not filed; surfacing");
+                            b.notify(
+                                &id,
+                                Cause::Asked {
+                                    item: id.clone(),
+                                    text: format!(
+                                        "{} failed after its ladder ({}/{}). How should the \
+                                         rest go on?",
+                                        label(item),
+                                        error.class.as_str(),
+                                        error.subclass.as_str()
+                                    ),
+                                },
+                            );
+                        }
+                    }
+                    return Ok(changed);
+                }
                 Decision::Replan => {
-                    // The parent's re-plan is Phase 4: the item fails, the
-                    // cascade holds what is behind it, and the parent
-                    // surfaces once (6.4, step 4).
+                    // No planner: the item fails, the cascade holds what is
+                    // behind it, and the parent surfaces once (6.4, step 4).
                     self.rung(
                         b,
                         &id,
@@ -1435,12 +1542,16 @@ impl Controller {
                         "controller",
                         surfacing.ask.clone(),
                     );
-                    b.notify(
-                        &id,
-                        Cause::Asked {
-                            item: id.clone(),
-                            text: surfacing.ask,
-                        },
+                    // Surfacing is a question: the answer resumes the item
+                    // with the user's guidance in its brief (section 7).
+                    self.record_question(
+                        b,
+                        NewQuestion::open(
+                            &id,
+                            QuestionKind::for_blocked(reason),
+                            surfacing.ask,
+                            "surfaced",
+                        ),
                     );
                     return Ok(changed);
                 }
@@ -1459,12 +1570,14 @@ impl Controller {
                         "controller",
                         error.detail.clone(),
                     );
-                    b.notify(
-                        &id,
-                        Cause::Asked {
-                            item: id.clone(),
-                            text: format!("{} {}: {}", label(item), reason.as_str(), error.detail),
-                        },
+                    self.record_question(
+                        b,
+                        NewQuestion::open(
+                            &id,
+                            QuestionKind::for_blocked(reason),
+                            format!("{} {}: {}", label(item), reason.as_str(), error.detail),
+                            "only_the_user",
+                        ),
                     );
                     return Ok(changed);
                 }
@@ -1519,7 +1632,7 @@ impl Controller {
 
     /// Whether a healthy worker other than `excluded`, and above `floor`'s
     /// cost tier when one is set, could take `item`.
-    fn has_alternative(
+    pub(super) fn has_alternative(
         &self,
         item: &WorkItem,
         class: Option<&str>,
@@ -1602,6 +1715,9 @@ impl Controller {
                          worker that needs no checkout"
                     );
                 }
+                if !self.has_alternative(&item, class.as_deref(), &hist.excluded, hist.floor) {
+                    report.transitions += self.await_worker(&item.id, &events).await?;
+                }
                 continue;
             };
             let (inputs, more) = self.build_inputs(&snap, &item).await?;
@@ -1611,60 +1727,74 @@ impl Controller {
                 Vec::new()
             };
             let mut brief = brief_for(&item, inputs.clone(), more, prior, &hist);
+            // Answers resume the item, not the conversation (section 7):
+            // the next run's brief carries them as decisions.
+            let root = snap
+                .ancestors(&item.id)
+                .last()
+                .cloned()
+                .unwrap_or_else(|| item.id.clone());
+            brief
+                .decisions_made
+                .extend(self.answers_for(&item, &root).await?);
             let run_id = match self.continued_conversation(&item.id).await {
                 Some(conversation) => conversation,
                 None => uuid::Uuid::new_v4().to_string(),
             };
             brief.run = Some(run_id.clone());
-            brief.workspace = self.plan_workspace(&item, &run_id).await;
+            brief.project_context = match self.project_context(&snap, &item).await {
+                Ok(context) => context,
+                Err(why) => {
+                    report.transitions += self.hold_context(&item, why.to_string()).await?;
+                    continue;
+                }
+            };
+            brief.workspace = match self
+                .plan_workspace(&item, &run_id, brief.project_context.as_mut())
+                .await
+            {
+                Ok(workspace) => workspace,
+                Err(why) => {
+                    report.transitions += self.hold_context(&item, why).await?;
+                    continue;
+                }
+            };
             brief.capability = mode;
+            let mut lease_evidence = vec![rustykrab_core::work::Evidence {
+                item: item.id.clone(),
+                kind: RUN.into(),
+                reference: run_id,
+                hash: None,
+                verified_by: None,
+                at: Utc::now(),
+            }];
+            if let Some(context) = &brief.project_context {
+                lease_evidence.push(Self::context_evidence(&item.id, context)?);
+            }
+            if let Some(ws) = &brief.workspace {
+                lease_evidence.push(rustykrab_core::work::Evidence {
+                    item: item.id.clone(),
+                    kind: WORKSPACE_EVIDENCE.into(),
+                    reference: serde_json::to_string(ws)
+                        .map_err(|e| Error::Internal(e.to_string()))?,
+                    hash: Some(ws.base.clone()),
+                    verified_by: None,
+                    at: Utc::now(),
+                });
+            }
             if let Err(e) = self
                 .store
-                .work_lease_acquire(
+                .work_lease_acquire_recorded(
                     &item.id,
                     worker.name(),
                     self.config.lease_ttl_seconds,
                     inputs,
+                    lease_evidence,
                 )
                 .await
             {
                 tracing::warn!(item = %item.id, error = %e, "lease refused");
                 continue;
-            }
-            // The run's pointer, before it starts: whatever happens to the
-            // run (a cancel, a restart), the item keeps where its partial
-            // work is.
-            if let Err(e) = self
-                .store
-                .work_evidence_add(rustykrab_core::work::Evidence {
-                    item: item.id.clone(),
-                    kind: RUN.to_string(),
-                    reference: run_id,
-                    hash: None,
-                    verified_by: None,
-                    at: Utc::now(),
-                })
-                .await
-            {
-                tracing::warn!(item = %item.id, error = %e, "run pointer not recorded");
-            }
-            // The workspace the controller pinned, which verification reads
-            // back: the parent commit is the controller's, not the worker's.
-            if let Some(ws) = &brief.workspace {
-                let recorded = self
-                    .store
-                    .work_evidence_add(rustykrab_core::work::Evidence {
-                        item: item.id.clone(),
-                        kind: WORKSPACE_EVIDENCE.to_string(),
-                        reference: serde_json::to_string(ws).unwrap_or_default(),
-                        hash: Some(ws.base.clone()),
-                        verified_by: None,
-                        at: Utc::now(),
-                    })
-                    .await;
-                if let Err(e) = recorded {
-                    tracing::warn!(item = %item.id, error = %e, "workspace not recorded");
-                }
             }
             let name = worker.name().to_string();
             let run = spawn(worker.clone(), brief, self.clock.now());
@@ -1689,27 +1819,46 @@ impl Controller {
         Ok(())
     }
 
-    /// The workspace a `code` run of `item` gets (section 5): its
-    /// repository's `HEAD` pinned as the parent commit, a new branch and a
-    /// worktree under the configured root. `None` for other items, without
-    /// a root, or when the repository has no commit to start from.
-    async fn plan_workspace(&self, item: &WorkItem, run: &str) -> Option<Workspace> {
+    /// Pin project code to the newest verified ancestor chain, otherwise repository HEAD.
+    async fn plan_workspace(
+        &self,
+        item: &WorkItem,
+        run: &str,
+        context: Option<&mut crate::handoff::ProjectContext>,
+    ) -> Result<Option<Workspace>, String> {
         if item.kind != WorkKind::Code {
-            return None;
+            return Ok(None);
         }
-        let root = self.config.worktree_root.clone()?;
-        let repo = Workspace::repo_of(&item.writable_resources)?;
+        let Some(root) = self.config.worktree_root.clone() else {
+            return Ok(None);
+        };
+        let Some(repo) = Workspace::repo_of(&item.writable_resources) else {
+            return Ok(None);
+        };
+        let commits: Vec<(String, String)> = context
+            .as_ref()
+            .into_iter()
+            .flat_map(|ctx| &ctx.work)
+            .filter(|w| w.status == Status::Done && w.repository.as_deref() == repo.to_str())
+            .flat_map(|w| {
+                w.evidence
+                    .iter()
+                    .filter(|e| e.kind == "commit")
+                    .map(|e| (w.item.clone(), e.value.clone()))
+            })
+            .collect();
         let at = repo.clone();
-        let base = tokio::task::spawn_blocking(move || workspace::head(&at))
-            .await
-            .ok()?;
-        match base {
-            Ok(base) => Some(Workspace::plan(&root, &repo, &base, &item.id, run)),
-            Err(why) => {
-                tracing::warn!(item = %item.id, %why, "no workspace: the repository has no commit");
-                None
-            }
+        let candidates: Vec<String> = commits.iter().map(|(_, commit)| commit.clone()).collect();
+        let base = tokio::task::spawn_blocking(move || {
+            let head = workspace::head(&at)?;
+            workspace::continuation_base(&at, &head, &candidates)
+        })
+        .await
+        .map_err(|e| e.to_string())??;
+        if let Some(context) = context {
+            context.base_sources = commits.into_iter().map(|(item, _)| item).collect();
         }
+        Ok(Some(Workspace::plan(&root, &repo, &base, &item.id, run)))
     }
 
     /// Live runs per worker, and the models local runs occupy.

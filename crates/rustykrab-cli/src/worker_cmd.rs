@@ -23,6 +23,8 @@ usage: rustykrab workers
   worker show <name>             one worker
   worker add <claude_code|codex> [--name N] --repos PATH[,PATH...]
              [--command PATH] [--model M] [--max-turns N]
+             [--claude-config-dir PATH] [--require-max]
+             [--codex-home PATH] [--require-chatgpt]
              [--permission-mode M] [--timeout SECONDS]
              [--allowed-tools T[,T...]] [--denied-tools T[,T...]]
              [--cost-tier N] [--env VAR[,VAR...]]
@@ -158,6 +160,18 @@ fn parse_add(kind: &str, rest: &[&str]) -> Result<WorkerSpec, String> {
             "--name" => spec.name = Some(value(i)?.to_string()),
             "--command" => spec.command = Some(absolute_if_path(value(i)?)),
             "--model" => spec.model = Some(value(i)?.to_string()),
+            "--claude-config-dir" => spec.claude_config_dir = Some(absolute(value(i)?)),
+            "--require-max" => {
+                spec.require_max = true;
+                i += 1;
+                continue;
+            }
+            "--codex-home" => spec.codex_home = Some(absolute(value(i)?)),
+            "--require-chatgpt" => {
+                spec.require_chatgpt = true;
+                i += 1;
+                continue;
+            }
             "--permission-mode" => spec.permission_mode = Some(value(i)?.to_string()),
             "--max-turns" => spec.max_turns = Some(number(value(i)?)? as u32),
             "--timeout" => spec.timeout_seconds = Some(number(value(i)?)?),
@@ -176,6 +190,12 @@ fn parse_add(kind: &str, rest: &[&str]) -> Result<WorkerSpec, String> {
             other => return Err(format!("unknown flag {other}")),
         }
         i += 2;
+    }
+    if kind != WorkerKind::ClaudeCode && (spec.require_max || spec.claude_config_dir.is_some()) {
+        return Err("Claude login options apply only to claude_code workers".into());
+    }
+    if kind != WorkerKind::Codex && (spec.require_chatgpt || spec.codex_home.is_some()) {
+        return Err("Codex login options apply only to codex workers".into());
     }
     if kind == WorkerKind::Peer {
         if spec.base_url.is_none() {
@@ -399,5 +419,60 @@ mod tests {
         assert!(parse(&words("worker add claude_code")).is_err(), "no repos");
         assert!(parse(&words("worker add claude_code --repos /tmp --bogus")).is_err());
         assert!(parse(&words("worker add claude_code --repos /tmp --max-turns x")).is_err());
+    }
+
+    #[test]
+    fn max_profile_flags_survive_cli_parsing_and_spec_serialization() {
+        let dir = tempfile::tempdir().unwrap();
+        let line = format!(
+            "worker add claude_code --require-max --name max-one --claude-config-dir {} --repos {}",
+            dir.path().display(),
+            dir.path().display()
+        );
+        let Command::Add(spec) = parse(&words(&line)).unwrap() else {
+            panic!("not add")
+        };
+        assert!(spec.require_max);
+        assert!(spec.claude_config_dir.is_some());
+        let restored: WorkerSpec =
+            serde_json::from_value(serde_json::to_value(&spec).unwrap()).unwrap();
+        assert_eq!(*spec, restored);
+        assert!(parse(&words(&line.replace("claude_code", "codex"))).is_err());
+    }
+    #[test]
+    fn codex_chatgpt_profile_flags_round_trip_and_reject_other_kinds() {
+        let args = |words: &[&str]| words.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let Command::Add(spec) = parse(&args(&[
+            "worker",
+            "add",
+            "codex",
+            "--repos",
+            ".",
+            "--codex-home",
+            ".",
+            "--require-chatgpt",
+        ]))
+        .unwrap() else {
+            panic!("add")
+        };
+        assert!(spec.require_chatgpt);
+        assert!(Path::new(spec.codex_home.as_ref().unwrap()).is_absolute());
+        let encoded = serde_json::to_value(&spec).unwrap();
+        assert!(
+            serde_json::from_value::<WorkerSpec>(encoded)
+                .unwrap()
+                .require_chatgpt
+        );
+        for kind in ["claude_code", "peer"] {
+            assert!(parse(&args(&[
+                "worker",
+                "add",
+                kind,
+                "--repos",
+                ".",
+                "--require-chatgpt"
+            ]))
+            .is_err());
+        }
     }
 }

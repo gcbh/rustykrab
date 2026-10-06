@@ -75,6 +75,9 @@ pub struct Brief {
     /// to know a build from an acquisition.
     #[serde(default)]
     pub capability: Option<rustykrab_core::work::CapabilityMode>,
+    /// Durable, provider-neutral project state frozen at lease time.
+    #[serde(default)]
+    pub project_context: Option<crate::handoff::ProjectContext>,
 }
 
 /// The artifact kind a worker's adapter attests for each command the agent
@@ -90,6 +93,11 @@ pub trait Worker: Send + Sync {
     fn name(&self) -> &str;
     fn kind(&self) -> WorkerKind;
     fn capabilities(&self) -> WorkerCapabilities;
+    /// This worker is reserved for planning work. Merely advertising the
+    /// work_plan tool (for example on a peer node) does not reserve a worker.
+    fn planning_only(&self) -> bool {
+        false
+    }
     /// How many items it may run at once.
     fn concurrency(&self) -> usize {
         1
@@ -102,6 +110,10 @@ pub trait Worker: Send + Sync {
     /// `GET /api/workers` as `unhealthy: <reason>`, so an operator sees the
     /// cause without reading logs. Default: no reason given.
     fn unhealthy_reason(&self) -> Option<String> {
+        None
+    }
+    /// Live observations from a native runtime, without credentials or emails.
+    fn runtime_status(&self) -> Option<serde_json::Value> {
         None
     }
     /// Run one brief to its typed result. The controller verifies the result

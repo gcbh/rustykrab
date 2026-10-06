@@ -30,10 +30,12 @@ use crate::graph::{
 };
 use crate::handle::{GraphNode, GraphView};
 use crate::ladder::CapabilityNeed;
+use rustykrab_core::questions::QuestionKind;
 
 use super::batch::Batch;
 use super::load::approval_marker;
 use super::notice::{short, Cause};
+use super::questions::NewQuestion;
 use super::{Controller, Finished};
 
 /// One line per failed check, for events and ladder outcomes.
@@ -72,6 +74,12 @@ fn describe_trigger(t: &ApprovalTrigger) -> String {
         }
         ApprovalTrigger::Ladder { items } => {
             format!("{items} items the ladder filed, which the policy holds for a person")
+        }
+        ApprovalTrigger::NamedSideEffect { item, resource } => {
+            format!(
+                "{} writes {resource}, which needs your consent",
+                short(item)
+            )
         }
     }
 }
@@ -202,6 +210,33 @@ pub(super) fn unneeded_capabilities(snap: &Snapshot) -> Vec<(WorkItemId, WorkIte
 }
 
 impl Controller {
+    /// The approval policy a filing from `source` answers to (6.1): the
+    /// standing judgment in force. The ladder's own filings are system work
+    /// under policy, not a plan the user approves (section 8), and the
+    /// delivery import's slice was approved on the delivery's own path, so
+    /// only its code trigger applies.
+    pub(super) fn approval_for(&self, source: FilingSource) -> ApprovalPolicy {
+        let base = self
+            .state()
+            .judgment
+            .as_ref()
+            .map(|j| j.approval.clone())
+            .unwrap_or_else(|| self.config.approval.clone());
+        match source {
+            FilingSource::Ladder => ApprovalPolicy {
+                hold_discovered: self.config.approval.hold_discovered,
+                ..ApprovalPolicy::default()
+            },
+            FilingSource::Proposal => ApprovalPolicy::default(),
+            FilingSource::DeliveryImport => ApprovalPolicy {
+                id: base.id,
+                authorized_slices: base.authorized_slices,
+                ..ApprovalPolicy::default()
+            },
+            _ => base,
+        }
+    }
+
     /// The filing context for `source` from the configuration and the
     /// caller's provenance: a worker's scope is its own parent's subtree
     /// and its items carry `discovered_from` on its item (6.5).
@@ -220,19 +255,12 @@ impl Controller {
         ctx.supersede_limit = self.config.supersede_limit;
         ctx.remaining_budget = self.remaining_budgets(snap);
         ctx.origin_conversation_id = provenance.conversation_id.clone();
-        // The ladder's own filings are system work under policy, not a plan
-        // the user approves (section 8), except that `hold_discovered` holds
-        // its `internal` items as it holds a worker's follow-ups; an
-        // accepted proposal's work was approved on the review surface
-        // (section 10).
-        ctx.approval = match source {
-            FilingSource::Ladder => ApprovalPolicy {
-                hold_discovered: self.config.approval.hold_discovered,
-                ..ApprovalPolicy::default()
-            },
-            FilingSource::Proposal => ApprovalPolicy::default(),
-            _ => self.config.approval.clone(),
-        };
+        ctx.approval = self.approval_for(source);
+        // A planned request's envelope is not a plan: the planner's graph
+        // under it is what the approval policy reads (6.1).
+        if source == FilingSource::WorkFile && plan.items.iter().any(|d| d.plan) {
+            ctx.approval = ApprovalPolicy::default();
+        }
         let caller = provenance
             .filed_by_item
             .as_deref()
@@ -290,14 +318,53 @@ impl Controller {
                     }
                 }
                 self.hold_for_mcp(b, &accepted);
-                if !accepted.held.is_empty() {
+                if let (false, Some(question)) = (accepted.held.is_empty(), &accepted.question) {
+                    // One `needs_consent` question covers the whole graph at
+                    // acceptance (6.1): answered by /approve, /reject or
+                    // `/answer <id> approve`.
+                    let triggers: Vec<String> =
+                        accepted.triggers.iter().map(describe_trigger).collect();
+                    let title = b
+                        .snap
+                        .item(&accepted.root)
+                        .map(|r| r.title.clone())
+                        .unwrap_or_default();
+                    self.record_question(
+                        b,
+                        NewQuestion {
+                            options: vec!["approve".to_string(), "reject".to_string()],
+                            notify: false,
+                            id: Some(question.clone()),
+                            rule: "approval",
+                            asked_by: actor_of(provenance),
+                            ..NewQuestion::open(
+                                &accepted.root,
+                                QuestionKind::Approval,
+                                format!(
+                                    "Approve the plan \"{}\" ({})? {} item(s) held.",
+                                    title.trim(),
+                                    triggers.join("; "),
+                                    accepted.held.len()
+                                ),
+                                "approval",
+                            )
+                        },
+                    );
                     b.notify(
                         &accepted.root,
                         Cause::Approval {
                             held: accepted.held.clone(),
-                            triggers: accepted.triggers.iter().map(describe_trigger).collect(),
+                            triggers,
+                            rationale: plan.rationale.clone(),
+                            policy: accepted.policy.clone(),
                         },
                     );
+                } else if accepted.items.len() > 1
+                    && matches!(source, FilingSource::Planner | FilingSource::WorkFile)
+                    && ctx.approval.evaluates()
+                {
+                    // Nothing asked: the policy decided, and says so (7).
+                    self.plan_decision(b, &accepted, &ctx.approval);
                 }
                 Ok(accepted)
             }
@@ -338,12 +405,40 @@ impl Controller {
         source: FilingSource,
     ) -> Result<PlanOutcome, Error> {
         let now = self.clock.now();
+        self.judgment().await?;
         let mut b = Batch::new(self.load().await?, now);
+        let plan = self.shape_filing(&b.snap, plan, &provenance, source);
         match self.file_into(&mut b, &plan, &provenance, source) {
             Ok(accepted) => {
                 let outcome = PlanOutcome::Accepted(accepted.to_core());
-                b.settle(accepted.changed());
+                let mut changed = accepted.changed();
+                let planned =
+                    source == FilingSource::WorkFile && plan.items.len() == 1 && plan.items[0].plan;
+                if planned {
+                    // A planned request (6.1): a parent with one planning
+                    // child, and the request as one item behind it.
+                    match self.plan_request(&mut b, &accepted, &provenance) {
+                        Ok(more) => changed.extend(more),
+                        Err(rejection) => b.note(
+                            &accepted.root,
+                            EventKind::Rejection,
+                            "controller",
+                            format!(
+                                "planning item not filed: {}",
+                                describe_rejection(&rejection)
+                            ),
+                        ),
+                    }
+                }
+                b.settle(changed);
                 self.commit(b, &mut HashSet::new()).await?;
+                if source == FilingSource::Planner {
+                    if let (Some(filer), PlanOutcome::Accepted(a)) =
+                        (provenance.filed_by_item.as_deref(), &outcome)
+                    {
+                        self.planned_by_run(filer, a);
+                    }
+                }
                 Ok(outcome)
             }
             Err(rejection) => {
@@ -416,7 +511,7 @@ impl Controller {
     /// ([`order_after_open_writers`]), whether it inherited the repository or
     /// named it. A rejection is recorded on the item. Returns the ids to
     /// settle.
-    pub(super) fn file_discovered(
+    pub(super) async fn file_discovered(
         &self,
         b: &mut Batch,
         item: &WorkItem,
@@ -464,15 +559,25 @@ impl Controller {
         for plan in plans {
             match self.file_into(b, &plan, &provenance, FilingSource::Discovered) {
                 Ok(accepted) => changed.extend(accepted.changed()),
-                Err(rejection) => b.note(
-                    &item.id,
-                    EventKind::Rejection,
-                    "controller",
-                    format!(
-                        "discovered drafts rejected: {}",
-                        describe_rejection(&rejection)
-                    ),
-                ),
+                Err(rejection) => {
+                    b.note(
+                        &item.id,
+                        EventKind::Rejection,
+                        "controller",
+                        format!(
+                            "discovered drafts rejected: {}",
+                            describe_rejection(&rejection)
+                        ),
+                    );
+                    // A rejected set becomes a planning item briefed with
+                    // the drafts and the reasons (6.5).
+                    if let Some(replan) = self
+                        .replan_rejected_drafts(b, item, &plan.items, &rejection)
+                        .await
+                    {
+                        changed.push(replan);
+                    }
+                }
             }
         }
         changed
@@ -725,6 +830,9 @@ impl Controller {
             return Err(Error::NotFound(format!("work item {root}")));
         }
         let held = self.held_under(&b.snap, root).await?;
+        let questions: BTreeSet<String> = held.iter().filter_map(|i| i.held_by.clone()).collect();
+        self.settle_approval(&mut b, &questions, "approved", actor)
+            .await?;
         let mut released = Vec::new();
         for item in held {
             let question = item.held_by.clone().unwrap_or_default();
@@ -759,6 +867,9 @@ impl Controller {
         }
         let held = self.held_under(&b.snap, root).await?;
         let reason = reason.unwrap_or_else(|| "the plan was declined".to_string());
+        let questions: BTreeSet<String> = held.iter().filter_map(|i| i.held_by.clone()).collect();
+        self.settle_approval(&mut b, &questions, &format!("rejected: {reason}"), actor)
+            .await?;
         let mut changed = Vec::new();
         let mut cancelled = Vec::new();
         for item in held {
@@ -969,6 +1080,19 @@ fn inherit_from(filer: &WorkItem, draft: &WorkItemDraft) -> WorkItemDraft {
         if !d.constraints.contains(c) {
             d.constraints.push(c.clone());
         }
+    }
+    if !d
+        .artifact_refs
+        .iter()
+        .any(|r| r.kind == crate::handoff::PROJECT_REF)
+    {
+        d.artifact_refs.extend(
+            filer
+                .artifact_refs
+                .iter()
+                .filter(|r| r.kind == crate::handoff::PROJECT_REF)
+                .cloned(),
+        );
     }
     d
 }

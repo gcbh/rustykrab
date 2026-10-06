@@ -12,8 +12,11 @@ mod loop_status;
 mod model_check;
 mod paths;
 mod peers;
+mod project_context;
+mod questions;
 mod review;
 mod scenarios;
+mod waits;
 mod workers;
 
 use std::collections::{HashMap, VecDeque};

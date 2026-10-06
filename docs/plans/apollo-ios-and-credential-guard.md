@@ -430,8 +430,8 @@ Claude environment; scripted mode is the default everywhere).
 ### F3. E2E runner (`scripts/e2e.sh` + `crates/rustykrab-e2e`)
 Builds the daemon (`--no-default-features`), boots it on a temp data dir with
 `RUSTYKRAB_MASTER_KEY`, `RUSTYKRAB_AUTH_TOKEN`, and dummy values for the
-registry's `required` secrets (Notion, Obsidian — startup validation refuses
-to boot without them), waits for `/api/health`, then drives scenarios over
+optional Notion and Obsidian integrations (historically mandatory at startup;
+now fixtures for scenarios that use those tools), waits for `/api/health`, then drives scenarios over
 HTTP and asserts on responses **and** on store state:
 
 1. pair a device (mint code → exchange → call API with device token)

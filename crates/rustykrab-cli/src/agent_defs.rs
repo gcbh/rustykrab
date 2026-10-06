@@ -10,6 +10,7 @@ use rustykrab_core::{AgentDefinition, AgentRegistry};
 
 /// The definition the control layer's local workers run.
 const WORKER: &str = "worker";
+const WORK_PLANNER: &str = "work-planner";
 
 /// Every definition: the built-ins, then the data dir's files.
 pub fn load(data_dir: &Path) -> AgentRegistry {
@@ -21,7 +22,11 @@ pub fn load(data_dir: &Path) -> AgentRegistry {
 /// does not hold.
 pub fn subagents(all: &AgentRegistry) -> AgentRegistry {
     let mut out = AgentRegistry::new();
-    for def in all.list().into_iter().filter(|d| d.id != WORKER) {
+    for def in all
+        .list()
+        .into_iter()
+        .filter(|d| d.id != WORKER && d.id != WORK_PLANNER)
+    {
         out.insert((*def).clone());
     }
     out
@@ -34,6 +39,17 @@ pub fn worker_definition(all: &AgentRegistry, name: &str) -> AgentDefinition {
         Some(def) => rustykrab_agent::LocalWorker::named_definition(&def, name),
         None => rustykrab_agent::LocalWorker::default_definition(name),
     }
+}
+
+/// Controller-only planner, kept separate from the read-only planning subagent.
+pub fn planner_definition(all: &AgentRegistry) -> AgentDefinition {
+    let mut definition = match all.get(WORK_PLANNER) {
+        Some(def) => rustykrab_agent::LocalWorker::named_definition(&def, "planner"),
+        None => rustykrab_agent::LocalWorker::planner_definition(),
+    };
+    // The host assigns this role, including to older data-dir overrides.
+    definition.planning_only = true;
+    definition
 }
 
 #[cfg(test)]
@@ -51,7 +67,18 @@ mod tests {
         )
         .unwrap();
 
+        std::fs::write(
+            agents.join("work-planner.md"),
+            "---\ndescription = \"Mine.\"\ntools = [\"work_plan\", \"work_status\"]\nallowed_tools = [\"work_plan\", \"work_status\"]\n---\nYou are {name}, my planner.",
+        ).unwrap();
         let all = load(&dir);
+        let planner = planner_definition(&all);
+        assert_eq!(planner.id, "planner");
+        assert!(planner.planning_only);
+        assert_eq!(planner.system_prompt, "You are planner, my planner.");
+        assert_eq!(planner.tools, ["work_plan", "work_status"]);
+        assert_eq!(planner.allowed_tools.unwrap(), ["work_plan", "work_status"]);
+
         let worker = worker_definition(&all, "pinch");
         assert_eq!(worker.id, "pinch");
         assert_eq!(worker.system_prompt, "You are pinch, mine.");

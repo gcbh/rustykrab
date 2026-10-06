@@ -163,20 +163,40 @@ impl Controller {
                 item.held_by = None;
             }
         }
+        // `on_answer` fires once its question is settled with an answer
+        // (section 7).
+        let asked: Vec<String> = items
+            .iter()
+            .filter(|i| !i.status.is_closed())
+            .filter_map(|i| match &i.trigger {
+                Trigger::OnAnswer(q) => Some(q.clone()),
+                _ => None,
+            })
+            .collect();
+        let answered = if asked.is_empty() {
+            Default::default()
+        } else {
+            self.store.questions_answered_among(asked).await?
+        };
         let fired: Vec<WorkItemId> = items
             .iter()
-            .filter(|i| self.trigger_fired(&i.trigger))
+            .filter(|i| self.trigger_fired(&i.trigger, &answered))
             .map(|i| i.id.clone())
             .collect();
         Ok(Snapshot::new(items, edges).with_fired(fired))
     }
 
     /// `on_mcp` and `on_credential` fire when the host has the server or
-    /// the credential. `on_answer` waits for the question router (Phase 4).
-    fn trigger_fired(&self, trigger: &Trigger) -> bool {
+    /// the credential; `on_answer` when its question has an answer.
+    fn trigger_fired(
+        &self,
+        trigger: &Trigger,
+        answered: &std::collections::BTreeSet<String>,
+    ) -> bool {
         match trigger {
             Trigger::OnMcp(server) => self.catalog.mcp_server_configured(server),
             Trigger::OnCredential(name) => self.catalog.credential_available(name),
+            Trigger::OnAnswer(q) => answered.contains(q),
             _ => false,
         }
     }

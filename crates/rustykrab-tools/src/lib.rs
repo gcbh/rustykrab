@@ -116,9 +116,11 @@ mod task_complete;
 
 // Control-layer work tools: file one discovered item, read items, and end a
 // worker run with its typed result. The backend is the controller.
+mod ask_user;
 mod result_report;
 pub mod work_backend;
 mod work_file;
+mod work_plan;
 mod work_status;
 
 // MCP connector (remote MCP servers exposed as native tools)
@@ -225,12 +227,18 @@ pub use tools_load::ToolsLoadTool;
 pub use task_complete::TaskCompleteTool;
 
 // Control-layer work tools
-pub use result_report::{run_end_summary, ResultReportTool, RUN_ENDING_TOOLS};
+pub use ask_user::{AskUserTool, CapabilityRequestTool};
+pub use result_report::{
+    run_end_summary, worker_run_end_summary, ResultReportTool, RUN_ENDING_TOOLS,
+    WORKER_RUN_ENDING_TOOLS,
+};
 pub use work_backend::{
-    Principal, Provenance, StatusQuery, StatusSelector, StubWorkBackend, ToolState, WorkBackend,
-    WorkCall, WorkRunContext, WorkStatusView, WORK_RUN_CONTEXT,
+    AskOutcome, AskRequest, CapabilityAsk, Principal, Provenance, StatusQuery, StatusSelector,
+    StubWorkBackend, ToolState, WorkBackend, WorkCall, WorkRunContext, WorkStatusView,
+    WORK_RUN_CONTEXT,
 };
 pub use work_file::WorkFileTool;
+pub use work_plan::WorkPlanTool;
 pub use work_status::WorkStatusTool;
 
 // MCP connector
@@ -372,6 +380,26 @@ pub fn work_tools(
         std::sync::Arc::new(WorkFileTool::new(backend.clone())),
         std::sync::Arc::new(WorkStatusTool::new(backend.clone())),
         std::sync::Arc::new(ResultReportTool::new(backend)),
+    ]
+}
+
+/// `work_plan` over a [`WorkBackend`] (plan sections 6.1 and 14.1): for the
+/// orchestration conversation, and for a worker run whose definition names
+/// it (the `planner`).
+pub fn plan_tools(
+    backend: std::sync::Arc<dyn WorkBackend>,
+) -> Vec<std::sync::Arc<dyn rustykrab_core::Tool>> {
+    vec![std::sync::Arc::new(WorkPlanTool::new(backend))]
+}
+
+/// `ask_user` and `capability_request` over a [`WorkBackend`] (plan section
+/// 7): a worker's typed questions. Worker runs only.
+pub fn question_tools(
+    backend: std::sync::Arc<dyn WorkBackend>,
+) -> Vec<std::sync::Arc<dyn rustykrab_core::Tool>> {
+    vec![
+        std::sync::Arc::new(AskUserTool::new(backend.clone())),
+        std::sync::Arc::new(CapabilityRequestTool::new(backend)),
     ]
 }
 

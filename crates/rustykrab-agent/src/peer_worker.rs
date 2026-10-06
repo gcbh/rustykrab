@@ -729,6 +729,7 @@ mod tests {
             run: None,
             workspace: None,
             capability: None,
+            project_context: None,
         }
     }
 

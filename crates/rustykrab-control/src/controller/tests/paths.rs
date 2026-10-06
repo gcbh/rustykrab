@@ -174,10 +174,15 @@ async fn a_question_parks_the_item_as_needs_decision_and_asks_through_the_parent
     let outbox = h.outbox().await;
     assert_eq!(outbox.len(), 1);
     assert_eq!(outbox[0].parent, ids["P"]);
+    let body = &outbox[0].body;
+    assert!(body.contains("Asked: Which one?"), "{body}");
     assert!(
-        outbox[0].body.contains("Which one? [Tasca / Cervejaria]"),
-        "{}",
-        outbox[0].body
+        body.contains("1) Tasca") && body.contains("2) Cervejaria"),
+        "{body}"
+    );
+    assert!(
+        body.contains("/answer "),
+        "the message says how to answer: {body}"
     );
 }
 

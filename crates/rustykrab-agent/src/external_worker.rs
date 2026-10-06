@@ -343,6 +343,10 @@ pub struct ExternalConfig {
     /// Repositories it may work in, as given (`repo:<path>` resources).
     pub repos: Vec<String>,
     pub model: Option<String>,
+    pub claude_config_dir: Option<PathBuf>,
+    pub require_max: bool,
+    pub codex_home: Option<PathBuf>,
+    pub require_chatgpt: bool,
     /// Claude Code's `--allowedTools`; empty takes [`CLAUDE_DEFAULT_TOOLS`].
     pub allowed_tools: Vec<String>,
     /// Denied on top of [`CLAUDE_DENIED_TOOLS`] in Claude Code's
@@ -381,6 +385,41 @@ impl ExternalConfig {
         if let Some(bad) = spec.repos.iter().find(|r| r.trim().is_empty()) {
             return Err(format!("empty repository path {bad:?}"));
         }
+        if (spec.require_max || spec.claude_config_dir.is_some())
+            && spec.kind != WorkerKind::ClaudeCode
+        {
+            return Err("Claude login options apply only to claude_code workers".into());
+        }
+        if let Some(dir) = &spec.claude_config_dir {
+            if !Path::new(dir).is_absolute() || !Path::new(dir).is_dir() {
+                return Err("claude_config_dir must be an existing absolute directory".into());
+            }
+        }
+        if spec.require_max
+            && spec
+                .env
+                .iter()
+                .any(|name| name.starts_with("ANTHROPIC_") || name.starts_with("CLAUDE_"))
+        {
+            return Err("Max runtimes refuse Claude/Anthropic environment overrides; select claude_config_dir instead".into());
+        }
+        if (spec.require_chatgpt || spec.codex_home.is_some()) && spec.kind != WorkerKind::Codex {
+            return Err("Codex login options apply only to codex workers".into());
+        }
+        if let Some(dir) = &spec.codex_home {
+            if !Path::new(dir).is_absolute() || !Path::new(dir).is_dir() {
+                return Err("codex_home must be an existing absolute directory".into());
+            }
+        }
+        if spec.require_chatgpt
+            && spec.env.iter().any(|name| {
+                name.starts_with("OPENAI_")
+                    || name.starts_with("CODEX_")
+                    || name.starts_with("AZURE_")
+            })
+        {
+            return Err("ChatGPT runtimes refuse OpenAI/Codex/Azure environment overrides; select codex_home instead".into());
+        }
         let denied_tools: Vec<String> = spec
             .denied_tools
             .iter()
@@ -401,6 +440,10 @@ impl ExternalConfig {
             command: PathBuf::from(spec.command.as_deref().unwrap_or(default_command)),
             repos: spec.repos.iter().map(|r| r.trim().to_string()).collect(),
             model: spec.model.clone(),
+            claude_config_dir: spec.claude_config_dir.as_ref().map(PathBuf::from),
+            require_max: spec.require_max,
+            codex_home: spec.codex_home.as_ref().map(PathBuf::from),
+            require_chatgpt: spec.require_chatgpt,
             allowed_tools: spec.allowed_tools.clone(),
             denied_tools,
             max_turns: spec.max_turns.unwrap_or(30),
@@ -423,6 +466,8 @@ impl ExternalConfig {
 pub struct ExternalWorker {
     name: String,
     config: ExternalConfig,
+    max_runtime: Option<rustykrab_providers::ClaudeMaxRuntime>,
+    codex_runtime: Option<rustykrab_providers::CodexChatGptRuntime>,
     /// What each run spent, by the brief's run id ([`Worker::usage`]).
     usage: Mutex<HashMap<String, RunUsage>>,
     /// The commands the last run of each item was seen to run, handed from
@@ -450,6 +495,18 @@ impl ExternalWorker {
     pub fn new(name: impl Into<String>, config: ExternalConfig) -> ExternalWorker {
         ExternalWorker {
             name: name.into(),
+            max_runtime: config.require_max.then(|| {
+                rustykrab_providers::ClaudeMaxRuntime::new(
+                    config.command.clone(),
+                    config.claude_config_dir.clone(),
+                )
+            }),
+            codex_runtime: config.require_chatgpt.then(|| {
+                rustykrab_providers::CodexChatGptRuntime::new(
+                    config.command.clone(),
+                    config.codex_home.clone(),
+                )
+            }),
             config,
             usage: Mutex::new(HashMap::new()),
             commands: Mutex::new(HashMap::new()),
@@ -543,6 +600,30 @@ impl ExternalWorker {
                 commands.insert(brief.item.clone(), ran);
             }
         }
+        if self
+            .max_runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.observe_quota(&output.stdout))
+        {
+            return (
+                Err(Error::ModelRateLimit(
+                    "Claude Max usage limit reached; no API fallback attempted".into(),
+                )),
+                None,
+            );
+        }
+        if self
+            .codex_runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.observe_quota(&output.stdout))
+        {
+            return (
+                Err(Error::ModelRateLimit(
+                    "Codex subscription usage limit reached; no API fallback attempted".into(),
+                )),
+                None,
+            );
+        }
         if let Some(failure) = transcript.failure.take() {
             let resume = match failure {
                 RunFailure::Budget {
@@ -598,14 +679,32 @@ impl ExternalWorker {
         let build = is_tool_build(brief);
         match c.kind {
             WorkerKind::Codex => {
+                if c.require_chatgpt {
+                    cmd.arg("--no-daemon");
+                }
                 cmd.arg("exec")
                     .arg("--json")
                     .arg("--skip-git-repo-check")
-                    .args(["--sandbox", "workspace-write"])
                     .arg("--cd")
                     .arg(dir)
                     .arg("--output-last-message")
                     .arg(last);
+                if c.require_chatgpt {
+                    cmd.args([
+                        "--ignore-user-config",
+                        "--ephemeral",
+                        "-c",
+                        "forced_login_method=\"chatgpt\"",
+                        "-c",
+                        "model_provider=\"openai\"",
+                        "-c",
+                        "web_search=\"disabled\"",
+                        "--approve-for-me",
+                    ]);
+                }
+                if !c.require_chatgpt {
+                    cmd.args(["--sandbox", "workspace-write"]);
+                }
                 if let Some(model) = &c.model {
                     cmd.args(["--model", model]);
                 }
@@ -664,6 +763,35 @@ impl ExternalWorker {
             if let Some(v) = std::env::var_os(name) {
                 cmd.env(name, v);
             }
+        }
+        if let Some(runtime) = &self.max_runtime {
+            runtime.isolate(&mut cmd);
+            // Profile settings may contain apiKeyHelper/provider overrides.
+            // Max-only runtimes use native tools but no inherited MCP/settings.
+            cmd.args([
+                "--setting-sources",
+                "",
+                "--strict-mcp-config",
+                "--mcp-config",
+                "{\"mcpServers\":{}}",
+            ]);
+            for name in &c.env {
+                if let Some(value) = std::env::var_os(name) {
+                    cmd.env(name, value);
+                }
+            }
+        } else if let Some(dir) = &c.claude_config_dir {
+            cmd.env("CLAUDE_CONFIG_DIR", dir);
+        }
+        if let Some(runtime) = &self.codex_runtime {
+            runtime.isolate(&mut cmd);
+            for name in &c.env {
+                if let Some(value) = std::env::var_os(name) {
+                    cmd.env(name, value);
+                }
+            }
+        } else if let Some(dir) = &c.codex_home {
+            cmd.env("CODEX_HOME", dir);
         }
         cmd.env("RUSTYKRAB_DATA_DIR", &c.data_dir)
             .env("RUSTYKRAB_SKILLS_DIR", &c.skills_dir);
@@ -894,7 +1022,16 @@ impl Worker for ExternalWorker {
 
     /// The command resolves and every repository is there.
     fn healthy(&self) -> bool {
-        self.command_found() && self.config.repos.iter().all(|r| Path::new(r).is_dir())
+        self.command_found()
+            && self.config.repos.iter().all(|r| Path::new(r).is_dir())
+            && self
+                .max_runtime
+                .as_ref()
+                .is_none_or(|runtime| runtime.health_error().is_none())
+            && self
+                .codex_runtime
+                .as_ref()
+                .is_none_or(|runtime| runtime.health_error().is_none())
     }
 
     fn unhealthy_reason(&self) -> Option<String> {
@@ -909,6 +1046,45 @@ impl Worker for ExternalWorker {
             .iter()
             .find(|r| !Path::new(r).is_dir())
             .map(|r| format!("repository {r} is not a directory"))
+            .or_else(|| {
+                self.max_runtime
+                    .as_ref()
+                    .and_then(|runtime| runtime.health_error())
+            })
+            .or_else(|| {
+                self.codex_runtime
+                    .as_ref()
+                    .and_then(|runtime| runtime.health_error())
+            })
+    }
+
+    fn runtime_status(&self) -> Option<Value> {
+        self.max_runtime
+            .as_ref()
+            .and_then(|runtime| serde_json::to_value(runtime.status()).ok())
+            .or_else(|| {
+                self.codex_runtime
+                    .as_ref()
+                    .and_then(|runtime| serde_json::to_value(runtime.status()).ok())
+            })
+    }
+
+    async fn refresh(&self) -> bool {
+        if let Some(runtime) = &self.max_runtime {
+            if !runtime.needs_refresh() {
+                return false;
+            }
+            let _ = runtime.verify_login(true).await;
+            return true;
+        }
+        if let Some(runtime) = &self.codex_runtime {
+            if !runtime.needs_refresh() {
+                return false;
+            }
+            let _ = runtime.verify_login(true).await;
+            return true;
+        }
+        false
     }
 
     /// Tokens and turns from the agent's own event stream, and the wall
@@ -922,6 +1098,12 @@ impl Worker for ExternalWorker {
     }
 
     async fn run(&self, brief: Brief) -> Result<ResultReport> {
+        if let Some(runtime) = &self.max_runtime {
+            runtime.verify_login(true).await?;
+        }
+        if let Some(runtime) = &self.codex_runtime {
+            runtime.verify_login(true).await?;
+        }
         let run_id = brief
             .run
             .clone()
@@ -1198,9 +1380,40 @@ fn claude_tokens(usage: &Value) -> u64 {
 /// commands it ran; agent messages are its text, the last one its final
 /// message (the `--output-last-message` file wins when it is written).
 /// Reads both the `item.*` event shape and the older `msg` one.
+/// Codex displays a shell argv as a quoted command string. Decode only an
+/// exact `<known shell> -c/-lc <one command>` invocation, never arbitrary
+/// strings or compound wrappers. Preserve the command argument byte-for-byte:
+/// its quoting and heredocs are the check evidence, not display escapes.
+fn codex_command(value: &Value) -> Option<String> {
+    let (display, argv) = match value {
+        Value::String(display) => (display.clone(), shlex::split(display)),
+        Value::Array(parts) => {
+            let argv = parts
+                .iter()
+                .map(|p| p.as_str().map(str::to_owned))
+                .collect::<Option<Vec<_>>>()?;
+            (argv.join(" "), Some(argv))
+        }
+        _ => return None,
+    };
+    if let Some(argv) = argv {
+        if argv.len() == 3
+            && matches!(
+                Path::new(&argv[0]).file_name().and_then(|n| n.to_str()),
+                Some("sh" | "bash" | "zsh" | "dash")
+            )
+            && matches!(argv[1].as_str(), "-c" | "-lc")
+        {
+            return Some(argv[2].clone());
+        }
+    }
+    Some(display)
+}
+
 fn read_codex(stdout: &str) -> Transcript {
     let mut t = Transcript::default();
     let mut turns = 0u32;
+    let mut started = 0u32;
     for line in stdout.lines() {
         let Ok(event) = serde_json::from_str::<Value>(line.trim()) else {
             continue;
@@ -1213,8 +1426,8 @@ fn read_codex(stdout: &str) -> Transcript {
             msg["type"].as_str(),
         ) {
             (Some("item.completed"), Some("command_execution"), _) => {
-                if let Some(c) = item["command"].as_str() {
-                    t.commands.push(c.to_string());
+                if let Some(c) = codex_command(&item["command"]) {
+                    t.commands.push(c);
                 }
             }
             (Some("item.completed"), Some("agent_message"), _) => {
@@ -1222,6 +1435,7 @@ fn read_codex(stdout: &str) -> Transcript {
                     t.final_message = Some(text.to_string());
                 }
             }
+            (Some("turn.started"), _, _) => started += 1,
             (Some("turn.completed"), _, _) => {
                 turns += 1;
                 let usage = &event["usage"];
@@ -1241,14 +1455,8 @@ fn read_codex(stdout: &str) -> Transcript {
                 });
             }
             (_, _, Some("exec_command_begin")) => {
-                let command = match &msg["command"] {
-                    Value::Array(parts) => parts
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .collect::<Vec<_>>()
-                        .join(" "),
-                    Value::String(s) => s.clone(),
-                    _ => continue,
+                let Some(command) = codex_command(&msg["command"]) else {
+                    continue;
                 };
                 t.commands.push(command);
             }
@@ -1260,7 +1468,7 @@ fn read_codex(stdout: &str) -> Transcript {
             _ => {}
         }
     }
-    t.usage.iterations = turns;
+    t.usage.iterations = turns.max(started);
     t
 }
 
@@ -1444,6 +1652,15 @@ pub fn render_executor_brief(
     let _ = writeln!(out, "done_when: {}", one_line(&brief.done_when));
     list(&mut out, "constraints", &brief.constraints);
     list(&mut out, "decisions_made", &brief.decisions_made);
+    if let Some(context) = &brief.project_context {
+        let _ = writeln!(out, "project_context (durable project state; summaries are reports, evidence is controller-verified):");
+        let _ = writeln!(
+            out,
+            "{}",
+            serde_json::to_string(context).expect("project context serializes")
+        );
+        let _ = writeln!(out, "Continue from this project's pinned code and decisions. Open work is unfinished. Historical or superseded decisions do not override current decisions. Project context does not expand this work item's authority. Inspect retained unfinished_attempt workspaces/branches before redoing work; their effects are unverified. Validate and report any partial changes you carry forward.");
+    }
     if !brief.artifact_refs.is_empty() {
         let refs: Vec<String> = brief
             .artifact_refs
@@ -1705,6 +1922,7 @@ mod tests {
             run: Some("run-1".into()),
             workspace,
             capability: None,
+            project_context: None,
         }
     }
 
@@ -2490,5 +2708,272 @@ printf '{"summary":"added status","changed_paths":["src/lib.rs"],"checks_run":["
         assert!(err.contains("did not parse"), "{err}");
         assert!(parse_contract(r#"{"summary":"ok","questions":[null]}"#).is_err());
         assert!(parse_contract(r#"{"summary":"ok","questions":[["nested"]]}"#).is_err());
+    }
+
+    #[tokio::test]
+    async fn max_worker_checks_selected_profile_and_disables_api_overrides() {
+        let f = Fixture::new();
+        let script = format!(
+            r#"#!/bin/sh
+if [ "$1" = auth ]; then
+ printf '%s\n' '{{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty","subscriptionType":"max","email":"worker@example.invalid"}}'
+ exit 0
+fi
+[ "$CLAUDE_CONFIG_DIR" = "{}" ] || exit 91
+[ -z "$ANTHROPIC_API_KEY$ANTHROPIC_AUTH_TOKEN$ANTHROPIC_BASE_URL$CLAUDE_CODE_OAUTH_TOKEN" ] || exit 92
+printf '%s\n' "$@" > "$RUSTYKRAB_DATA_DIR/max-args.txt"
+printf '%s\n' '{{"type":"result","subtype":"success","is_error":false,"result":"{{\"summary\":\"native runtime executed\"}}","usage":{{"input_tokens":20,"output_tokens":5}},"num_turns":1}}'
+"#,
+            f.bin.path().display()
+        );
+        let cli = f.agent("max-cli", &script);
+        let spec = WorkerSpec {
+            kind: WorkerKind::ClaudeCode,
+            command: Some(cli.display().to_string()),
+            claude_config_dir: Some(f.bin.path().display().to_string()),
+            require_max: true,
+            ..WorkerSpec::default()
+        };
+        let worker = ExternalWorker::new(
+            "max-one",
+            ExternalConfig::from_spec(&spec, f.data.path()).unwrap(),
+        );
+        assert!(!worker.healthy());
+        assert!(worker.refresh().await);
+        assert!(worker.healthy());
+        assert!(!worker.refresh().await);
+        assert_eq!(worker.runtime_status().unwrap()["subscription"], "max");
+        let report = worker.run(brief(None)).await.unwrap();
+        assert_eq!(report.summary, "native runtime executed");
+        let args = std::fs::read_to_string(f.data.path().join("max-args.txt")).unwrap();
+        assert!(args.contains("--setting-sources\n\n"));
+        assert!(args.contains("--strict-mcp-config"));
+        let mut bad = spec.clone();
+        bad.env = vec!["ANTHROPIC_API_KEY".into()];
+        assert!(ExternalConfig::from_spec(&bad, f.data.path()).is_err());
+        bad = spec.clone();
+        bad.kind = WorkerKind::Codex;
+        assert!(ExternalConfig::from_spec(&bad, f.data.path()).is_err());
+        let wrong = f.agent("api-cli", "#!/bin/sh\nprintf '%s\\n' '{\"loggedIn\":true,\"authMethod\":\"api_key\",\"apiProvider\":\"firstParty\",\"subscriptionType\":\"max\"}'\n");
+        bad = spec;
+        bad.command = Some(wrong.display().to_string());
+        let worker = ExternalWorker::new(
+            "wrong",
+            ExternalConfig::from_spec(&bad, f.data.path()).unwrap(),
+        );
+        worker.refresh().await;
+        assert!(!worker.healthy());
+        assert!(matches!(
+            worker.run(brief(None)).await,
+            Err(Error::ModelAuthError(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn max_worker_observed_quota_is_unavailable_and_typed() {
+        let f = Fixture::new();
+        let script = r#"#!/bin/sh
+if [ "$1" = auth ]; then
+ printf '%s\n' '{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty","subscriptionType":"max","email":"worker@example.invalid"}'
+else
+ printf '%s\n' '{"type":"result","subtype":"success","is_error":true,"result":"You have hit your weekly limit","usage":{"input_tokens":0,"output_tokens":0},"num_turns":1}'
+fi
+"#;
+        let cli = f.agent("quota-cli", script);
+        let spec = WorkerSpec {
+            kind: WorkerKind::ClaudeCode,
+            command: Some(cli.display().to_string()),
+            require_max: true,
+            ..WorkerSpec::default()
+        };
+        let worker = ExternalWorker::new(
+            "limited",
+            ExternalConfig::from_spec(&spec, f.data.path()).unwrap(),
+        );
+        worker.refresh().await;
+        assert!(matches!(
+            worker.run(brief(None)).await,
+            Err(Error::ModelRateLimit(_))
+        ));
+        assert!(!worker.healthy());
+        assert!(worker.runtime_status().unwrap()["rate_limited_until"].is_string());
+        assert!(matches!(
+            worker.run(brief(None)).await,
+            Err(Error::ModelRateLimit(_))
+        ));
+    }
+    #[tokio::test]
+    async fn chatgpt_codex_profile_execution_quota_and_login_switch() {
+        let f = Fixture::new();
+        let script = r#"#!/usr/bin/env python3
+import os,sys,json
+state=json.load(open(os.path.join(os.environ['CODEX_HOME'],'probe-state.json')))
+if 'app-server' in sys.argv:
+ for line in sys.stdin:
+  r=json.loads(line)
+  if 'id' not in r: continue
+  method=r['method']
+  if method=='initialize': result={}
+  elif method=='account/read': result={'requiresOpenaiAuth':True,'account':state['account']}
+  elif method=='account/rateLimits/read':
+   if state.get('quota_failure'):
+    print(json.dumps({'id':r['id'],'error':{'message':'private account detail'}}),flush=True);continue
+   result={'ordinaryUsageAllowed':state.get('allowed',True),'accountId':'private-uuid','rateLimitsByLimitId':{'codex':{'primary':{'usedPercent':state.get('used',12),'windowDurationMins':300,'resetsAt':2000000000},'secondary':None}}}
+  print(json.dumps({'id':r['id'],'result':result}),flush=True)
+else:
+ assert not any(k.startswith(('OPENAI_','AZURE_')) for k in os.environ)
+ assert '--ignore-user-config' in sys.argv and '--no-daemon' in sys.argv and '--approve-for-me' in sys.argv
+ assert 'model_provider="openai"' in sys.argv and 'forced_login_method="chatgpt"' in sys.argv
+ assert '--sandbox' not in sys.argv # --approve-for-me already selects workspace-write
+ assert '--dangerously-bypass-approvals-and-sandbox' not in sys.argv
+ open(os.path.join(os.environ['RUSTYKRAB_DATA_DIR'],'codex-executed'),'w').write('yes')
+ if state.get('infer_limit'):
+  print(json.dumps({'type':'turn.failed','error':{'message':'Usage limit reached'}}));sys.exit(1)
+ print(json.dumps({'type':'item.completed','item':{'type':'command_execution','command':'cargo check','status':'completed'}}))
+ print(json.dumps({'type':'item.completed','item':{'type':'agent_message','text':json.dumps({'summary':'Codex ran','checks_run':['cargo check']})}}))
+ print(json.dumps({'type':'turn.completed','usage':{'input_tokens':20,'cached_input_tokens':10,'output_tokens':5}}))
+"#;
+        let cli = f.agent("codex-chatgpt", script);
+        let state_file = f.bin.path().join("probe-state.json");
+        let account =
+            serde_json::json!({"type":"chatgpt","planType":"pro","email":"one@example.invalid"});
+        let write = |value: Value| {
+            std::fs::write(&state_file, serde_json::to_vec(&value).unwrap()).unwrap()
+        };
+        write(serde_json::json!({"account":account}));
+        let spec = WorkerSpec {
+            kind: WorkerKind::Codex,
+            command: Some(cli.display().to_string()),
+            codex_home: Some(f.bin.path().display().to_string()),
+            require_chatgpt: true,
+            ..WorkerSpec::default()
+        };
+        let worker = ExternalWorker::new(
+            "codex-one",
+            ExternalConfig::from_spec(&spec, f.data.path()).unwrap(),
+        );
+        assert!(!worker.healthy());
+        assert!(worker.refresh().await);
+        assert!(worker.healthy());
+        assert!(!worker.refresh().await);
+        let runtime = worker.runtime_status().unwrap();
+        assert_eq!(runtime["subscription"], "pro");
+        assert_eq!(
+            runtime["rate_limits"]["codex"]["primary"]["used_percent"],
+            12.0
+        );
+        let sanitized = runtime.to_string();
+        assert!(!sanitized.contains("example.invalid") && !sanitized.contains("private-uuid"));
+        let report = worker.run(brief(None)).await.unwrap();
+        assert_eq!(report.summary, "Codex ran");
+        assert!(report
+            .artifacts
+            .iter()
+            .any(|a| a.kind == COMMAND_RUN && a.value == "cargo check"));
+        {
+            let usage = worker.usage.lock().unwrap();
+            assert_eq!(usage.values().next().unwrap().tokens, 25);
+        }
+        write(serde_json::json!({"account":account,"infer_limit":true}));
+        assert!(matches!(
+            worker.run(brief(None)).await,
+            Err(Error::ModelRateLimit(_))
+        ));
+        assert!(!worker.healthy());
+        assert!(matches!(
+            worker.run(brief(None)).await,
+            Err(Error::ModelRateLimit(_))
+        ));
+        // A new login clears the previous account's cooldown. Failed quota
+        // reads still report the verified account with unknown capacity.
+        let other =
+            serde_json::json!({"type":"chatgpt","planType":"plus","email":"two@example.invalid"});
+        write(serde_json::json!({"account":other,"quota_failure":true}));
+        worker
+            .codex_runtime
+            .as_ref()
+            .unwrap()
+            .verify_login(true)
+            .await
+            .unwrap();
+        assert!(worker.healthy());
+        assert!(worker.runtime_status().unwrap()["quota_error"].is_string());
+        assert!(worker.runtime_status().unwrap()["quota_checked_at"].is_null());
+        // The server's exhausted quota prevents process execution altogether.
+        write(serde_json::json!({"account":other,"allowed":false,"used":100}));
+        assert!(matches!(
+            worker.run(brief(None)).await,
+            Err(Error::ModelRateLimit(_))
+        ));
+        std::fs::remove_file(f.data.path().join("codex-executed")).unwrap();
+        write(serde_json::json!({"account":{"type":"apiKey"}}));
+        assert!(matches!(
+            worker.run(brief(None)).await,
+            Err(Error::ModelAuthError(_))
+        ));
+        assert!(!f.data.path().join("codex-executed").exists());
+        for env in [
+            "OPENAI_API_KEY",
+            "CODEX_API_KEY",
+            "CODEX_HOME",
+            "AZURE_OPENAI_API_KEY",
+        ] {
+            let mut bad = spec.clone();
+            bad.env = vec![env.into()];
+            assert!(ExternalConfig::from_spec(&bad, f.data.path()).is_err());
+        }
+        let mut bad = spec.clone();
+        bad.kind = WorkerKind::ClaudeCode;
+        assert!(ExternalConfig::from_spec(&bad, f.data.path()).is_err());
+        let mut bad = spec;
+        bad.codex_home = Some("relative".into());
+        assert!(ExternalConfig::from_spec(&bad, f.data.path()).is_err());
+    }
+    #[test]
+    fn codex_failed_started_turn_is_recorded_without_inventing_tokens() {
+        let transcript = read_codex(
+            r#"{"type":"turn.started"}
+{"type":"turn.failed","error":{"message":"Usage limit reached"}}"#,
+        );
+        assert_eq!(transcript.usage.iterations, 1);
+        assert_eq!(transcript.usage.tokens, 0);
+        assert!(transcript.failure.is_some());
+    }
+    #[test]
+    fn codex_attestation_decodes_shell_display_quotes_without_rewriting_commands() {
+        // This exact display shape was emitted by the installed native CLI.
+        let inner = r#"python3 -c 'from pathlib import Path; assert Path("proof.txt").read_bytes() == ("nonce" + chr(10)).encode(); print("Proof content verified exactly.")'"#;
+        let displayed = r#"/bin/bash -c "python3 -c 'from pathlib import Path; assert Path(\"proof.txt\").read_bytes() == (\"nonce\" + chr(10)).encode(); print(\"Proof content verified exactly.\")'""#;
+        assert_eq!(
+            codex_command(&serde_json::json!(displayed)).as_deref(),
+            Some(inner)
+        );
+        let event = serde_json::json!({"type":"item.completed","item":{"type":"command_execution","command":displayed}});
+        assert_eq!(read_codex(&event.to_string()).commands, [inner]);
+        assert_eq!(
+            codex_command(&serde_json::json!(["/bin/zsh", "-lc", inner])).as_deref(),
+            Some(inner)
+        );
+        let heredoc = "python3 - <<'PY'\nprint('Unicode: 水; literal: \\n')\nPY";
+        let displayed = format!("/bin/bash -c {}", shlex::try_quote(heredoc).unwrap());
+        assert_eq!(
+            codex_command(&serde_json::json!(displayed)).as_deref(),
+            Some(heredoc)
+        );
+        // A heredoc stays a heredoc; no claim to a rewritten python -c is attested.
+        assert!(!codex_command(&serde_json::json!(displayed))
+            .unwrap()
+            .starts_with("python3 -c"));
+        for unrelated in [
+            "echo bash -c 'cargo test'",
+            "bash -lc cargo test",
+            "/bin/bash -c 'cargo test' && echo done",
+            "malformed '",
+        ] {
+            assert_eq!(
+                codex_command(&serde_json::json!(unrelated)).as_deref(),
+                Some(unrelated)
+            );
+        }
     }
 }

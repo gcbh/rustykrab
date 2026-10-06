@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 rustykrab-core.workspace = true
+rustykrab-providers.workspace = true
 rustykrab-tools.workspace = true
 rustykrab-control.workspace = true
 rustykrab-skills.workspace = true
@@ -19,6 +20,8 @@ uuid.workspace = true
 chrono.workspace = true
 futures.workspace = true
 regex.workspace = true
+# Decode the CLI's POSIX shell argv display, preserving the actual command.
+shlex = "1.3"
 # The peer worker's client for its node's delegated-task API.
 reqwest.workspace = true
 

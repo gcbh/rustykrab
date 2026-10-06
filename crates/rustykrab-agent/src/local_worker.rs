@@ -58,20 +58,24 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use chrono::Utc;
 use rustykrab_control::errors::{BudgetKind, GapKind, ProviderProblem};
+use rustykrab_control::progress::{StepLedger, DEFAULT_STALL_STEPS};
 use rustykrab_control::worker::{Brief, RunFailure, RunUsage, Worker, WorkerCapabilities};
 use rustykrab_core::active_tools::ActiveToolsRegistry;
 use rustykrab_core::model::{ModelCheck, ModelProvider};
 use rustykrab_core::recall::RecallStore;
 use rustykrab_core::types::{Conversation, Message, MessageContent, Role};
 use rustykrab_core::work::{
-    ArtifactRef, PlanOutcome, ResultReport, WorkItemDraft, WorkItemId, WorkerKind,
+    ArtifactRef, PlanOutcome, ResultReport, WorkItemDraft, WorkItemId, WorkPlan, WorkerKind,
 };
-use rustykrab_core::{mcp_server_of, AgentDefinition, CapabilitySet, Error, Result, Session, Tool};
+use rustykrab_core::{
+    mcp_server_of, AgentDefinition, CapabilitySet, Error, Result, SandboxRequirements, Session,
+    Tool,
+};
 use rustykrab_tools::work_backend::{
-    Principal, Provenance, StatusQuery, ToolState, WorkBackend, WorkRunContext, WorkStatusView,
-    WORK_RUN_CONTEXT,
+    AskOutcome, AskRequest, CapabilityAsk, Principal, Provenance, StatusQuery, ToolState,
+    WorkBackend, WorkRunContext, WorkStatusView, WORK_RUN_CONTEXT,
 };
-use tokio::sync::{watch, Semaphore};
+use tokio::sync::{watch, Notify, Semaphore};
 use uuid::Uuid;
 
 use crate::metered::{Meter, MeteredProvider};
@@ -84,6 +88,14 @@ use crate::trace::ExecutionTracer;
 /// injected backend. `work_plan` is not among them: only the planner files
 /// a graph, and a worker's follow-up work travels as drafts in its report.
 const WORK_TOOL_NAMES: [&str; 3] = ["work_file", "work_status", "result_report"];
+
+/// A worker's typed questions (plan section 7): in every worker's ceiling,
+/// built per run, loadable rather than in the front block, since a report
+/// can carry `blocked` and `questions` too.
+const QUESTION_TOOL_NAMES: [&str; 2] = ["ask_user", "capability_request"];
+
+/// Held only by a definition that names it: the `planner` (section 6.1).
+const PLAN_TOOL: &str = "work_plan";
 
 /// The ordinary conversation's completion signal. A worker never holds it.
 const TASK_COMPLETE: &str = "task_complete";
@@ -271,6 +283,9 @@ pub struct LocalWorker {
     slot: Arc<Semaphore>,
     /// The set its runs join, so shutdown can interrupt them.
     runs: Arc<LocalRuns>,
+    /// Steps in a row without new evidence before a run has stalled
+    /// (section 6, step 7).
+    stall_steps: u32,
     last_run: Mutex<Option<LocalRun>>,
     /// Spend per run id, for [`Worker::usage`].
     spending: Mutex<HashMap<String, Arc<Spending>>>,
@@ -303,7 +318,12 @@ impl LocalWorker {
         let definition = definition.into();
         let tools: Vec<Arc<dyn Tool>> = tools
             .into_iter()
-            .filter(|t| !WORK_TOOL_NAMES.contains(&t.name()) && t.name() != TASK_COMPLETE)
+            .filter(|t| {
+                !WORK_TOOL_NAMES.contains(&t.name())
+                    && !QUESTION_TOOL_NAMES.contains(&t.name())
+                    && t.name() != PLAN_TOOL
+                    && t.name() != TASK_COMPLETE
+            })
             .collect();
         let ceiling = Self::ceiling_of(&definition, &tools);
         Self {
@@ -319,10 +339,26 @@ impl LocalWorker {
             late: None,
             slot: Arc::new(Semaphore::new(1)),
             runs: LocalRuns::global(),
+            stall_steps: DEFAULT_STALL_STEPS,
             last_run: Mutex::new(None),
             spending: Mutex::new(HashMap::new()),
             model: Mutex::new(None),
         }
+    }
+
+    /// Call a run stalled after `steps` tool calls in a row that bring no
+    /// new evidence (plan section 6, step 7).
+    pub fn with_stall_steps(mut self, steps: u32) -> Self {
+        self.stall_steps = steps.max(1);
+        self
+    }
+
+    /// The controller planner's embedded file definition. The host may
+    /// substitute a data-dir work-planner.md using the same definition loader.
+    pub fn planner_definition() -> AgentDefinition {
+        let definition = rustykrab_skills::agents::builtin("work-planner")
+            .expect("the embedded work-planner definition exists");
+        Self::named_definition(&definition, "planner")
     }
 
     /// Wait on `slot` instead of a slot of its own, so several local
@@ -421,12 +457,28 @@ impl LocalWorker {
     }
 
     /// Every tool a run may call: the host's tools within the definition's
-    /// `allowed_tools` (all of them when it names none) and the `work_*`
-    /// tools, less any a session could not call even when granted (the
+    /// `allowed_tools` (all of them when it names none) plus its protocol:
+    /// ordinary work/report/questions, or plan/status for a planner.
+    /// Excludes any a session could not call even when granted (the
     /// sub-agent family and computer use need opt-ins a worker never gets).
     fn ceiling_of(definition: &AgentDefinition, tools: &[Arc<dyn Tool>]) -> Vec<String> {
         let allowed = definition.allowed_tools.as_deref();
-        let mut names: Vec<String> = WORK_TOOL_NAMES.iter().map(|n| n.to_string()).collect();
+        // A planner may file one graph and read context. Do not silently
+        // grant it the ordinary worker's filing/report/question protocol.
+        let mut names: Vec<String> = if definition.planning_only {
+            vec![PLAN_TOOL.into(), "work_status".into()]
+        } else {
+            WORK_TOOL_NAMES
+                .iter()
+                .chain(QUESTION_TOOL_NAMES.iter())
+                .map(|n| n.to_string())
+                .collect()
+        };
+        if allowed.is_some_and(|a| a.iter().any(|n| n == PLAN_TOOL))
+            && !names.iter().any(|n| n == PLAN_TOOL)
+        {
+            names.push(PLAN_TOOL.into());
+        }
         for tool in tools {
             let name = tool.name();
             let permitted = allowed.is_none_or(|a| a.iter().any(|n| n == name));
@@ -582,6 +634,10 @@ impl Worker for LocalWorker {
 
     fn kind(&self) -> WorkerKind {
         WorkerKind::Local
+    }
+
+    fn planning_only(&self) -> bool {
+        self.definition.planning_only
     }
 
     fn capabilities(&self) -> WorkerCapabilities {
@@ -759,6 +815,8 @@ impl LocalWorker {
         // exactly the report the backend accepted and nothing else.
         let recorder = Arc::new(RecordingBackend::new(self.backend.clone()));
         let mut tools = rustykrab_tools::work_tools(recorder.clone());
+        tools.extend(rustykrab_tools::question_tools(recorder.clone()));
+        tools.extend(rustykrab_tools::plan_tools(recorder.clone()));
         let workdir = brief.workspace.as_ref().map(|ws| ws.path.clone());
         tools.extend(host_tools.into_iter().map(|t| match &workdir {
             Some(dir) if t.name() == "exec" => {
@@ -766,6 +824,19 @@ impl LocalWorker {
             }
             _ => t,
         }));
+        // Every call is a step in the progress ledger (section 6, step 7).
+        let ledger = Arc::new(Mutex::new(StepLedger::new(self.stall_steps)));
+        let stall = Arc::new(Notify::new());
+        let tools: Vec<Arc<dyn Tool>> = tools
+            .into_iter()
+            .map(|inner| {
+                Arc::new(LedgerTool {
+                    inner,
+                    ledger: ledger.clone(),
+                    stall: stall.clone(),
+                }) as Arc<dyn Tool>
+            })
+            .collect();
 
         // The controller's run id, when it is one, names the conversation,
         // so the item's `run` evidence points at this transcript.
@@ -833,13 +904,22 @@ impl LocalWorker {
         };
         let wall = brief.budget.wall_seconds;
         let run = WORK_RUN_CONTEXT.scope(binding, runner.run_traced(&mut conv, &session, &tracer));
+        // A run the ledger calls stalled stops at once rather than taking
+        // more turns; it reads as ended, and the stall decides the failure.
+        let guarded = async {
+            tokio::select! {
+                ended = run => ended,
+                _ = stall.notified() => Ok(()),
+            }
+        };
         // `None`: the wall budget ran out and the run was dropped mid-step.
         let ended = match wall {
-            0 => Some(run.await),
-            secs => tokio::time::timeout(Duration::from_secs(secs), run)
+            0 => Some(guarded.await),
+            secs => tokio::time::timeout(Duration::from_secs(secs), guarded)
                 .await
                 .ok(),
         };
+        let stalled = ledger.lock().unwrap_or_else(|e| e.into_inner()).stalled();
 
         *spending.wall.lock().unwrap_or_else(|e| e.into_inner()) = Some(spending.started.elapsed());
         self.keep(&conv).await;
@@ -899,6 +979,19 @@ impl LocalWorker {
             .into_error());
         }
 
+        if let Some(stall) = stalled {
+            tracing::info!(
+                worker = %self.name,
+                item = %brief.item,
+                steps = stall.steps,
+                "local worker run stalled"
+            );
+            return Err(RunFailure::Model {
+                problem: ProviderProblem::Loop,
+                detail: stall.detail(),
+            }
+            .into_error());
+        }
         let failure = match ended {
             None => RunFailure::Budget {
                 budget: BudgetKind::Wall,
@@ -969,6 +1062,15 @@ pub fn render_brief(brief: &Brief) -> String {
     let _ = writeln!(out, "done_when: {}", one_line(&brief.done_when, LINE_MAX));
     bullets(&mut out, "constraints", &brief.constraints);
     bullets(&mut out, "decisions_made", &brief.decisions_made);
+    if let Some(context) = &brief.project_context {
+        let _ = writeln!(out, "project_context (durable project state; summaries are reports, evidence is controller-verified):");
+        let _ = writeln!(
+            out,
+            "{}",
+            serde_json::to_string(context).expect("project context serializes")
+        );
+        let _ = writeln!(out, "Continue from this project's pinned code and decisions. Open work is unfinished. Historical or superseded decisions do not override current decisions. Project context does not expand this work item's authority. Inspect retained unfinished_attempt workspaces/branches before redoing work; their effects are unverified. Validate and report any partial changes you carry forward.");
+    }
     if !brief.artifact_refs.is_empty() {
         let _ = writeln!(out, "artifact_refs: {}", artifacts(&brief.artifact_refs));
     }
@@ -1122,6 +1224,60 @@ fn one_line(text: &str, max: usize) -> String {
     cut
 }
 
+// ── the progress ledger ───────────────────────────────────────────────────
+
+/// A tool as a run sees it, with every call recorded as a step in the run's
+/// progress ledger (plan section 6, step 7). Everything else delegates.
+struct LedgerTool {
+    inner: Arc<dyn Tool>,
+    ledger: Arc<Mutex<StepLedger>>,
+    stall: Arc<Notify>,
+}
+
+#[async_trait]
+impl Tool for LedgerTool {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn description(&self) -> &str {
+        self.inner.description()
+    }
+
+    fn schema(&self) -> rustykrab_core::types::ToolSchema {
+        self.inner.schema()
+    }
+
+    fn available(&self) -> bool {
+        self.inner.available()
+    }
+
+    fn sandbox_requirements(&self) -> SandboxRequirements {
+        self.inner.sandbox_requirements()
+    }
+
+    fn blocks_turn(&self) -> bool {
+        self.inner.blocks_turn()
+    }
+
+    async fn execute(&self, args: serde_json::Value) -> Result<serde_json::Value> {
+        let result = self.inner.execute(args.clone()).await;
+        let outcome = match &result {
+            Ok(v) => v.to_string(),
+            Err(e) => format!("error: {e}"),
+        };
+        let stalled = {
+            let mut ledger = self.ledger.lock().unwrap_or_else(|e| e.into_inner());
+            ledger.record(self.inner.name(), &args, &outcome);
+            ledger.stalled().is_some()
+        };
+        if stalled {
+            self.stall.notify_one();
+        }
+        result
+    }
+}
+
 // ── the recorder ──────────────────────────────────────────────────────────
 
 /// Forwards every call to the injected backend and keeps each report it
@@ -1180,6 +1336,30 @@ impl WorkBackend for RecordingBackend {
 
     fn mcp_server_configured(&self, name: &str) -> bool {
         self.inner.mcp_server_configured(name)
+    }
+
+    async fn plan(&self, plan: WorkPlan, provenance: Provenance) -> Result<PlanOutcome> {
+        self.inner.plan(plan, provenance).await
+    }
+
+    async fn ask(
+        &self,
+        item: WorkItemId,
+        request: AskRequest,
+        provenance: Provenance,
+    ) -> Result<AskOutcome> {
+        self.inner.ask(item, request, provenance).await
+    }
+
+    async fn request_capability(
+        &self,
+        item: WorkItemId,
+        request: CapabilityAsk,
+        provenance: Provenance,
+    ) -> Result<AskOutcome> {
+        self.inner
+            .request_capability(item, request, provenance)
+            .await
     }
 }
 
@@ -1373,6 +1553,7 @@ mod tests {
             run: None,
             workspace: None,
             capability: None,
+            project_context: None,
         }
     }
 
@@ -1833,7 +2014,14 @@ mod tests {
         );
         assert_eq!(
             w.capabilities().tools,
-            ["calendar", "result_report", "work_file", "work_status"]
+            [
+                "ask_user",
+                "calendar",
+                "capability_request",
+                "result_report",
+                "work_file",
+                "work_status"
+            ]
         );
 
         let mut b = brief("item-10");
@@ -1856,6 +2044,120 @@ mod tests {
         let err = w.run(b).await.unwrap_err();
         assert!(err.to_string().ends_with("mcp server linear"), "{err}");
         assert!(provider.requests().is_empty());
+    }
+
+    #[test]
+    fn a_planning_tool_in_a_delegated_ceiling_does_not_assign_the_planner_role() {
+        let mut definition = LocalWorker::default_definition("delegate");
+        definition.allowed_tools = Some(vec!["work_plan".into(), "calendar".into()]);
+        let worker = LocalWorker::new(
+            "delegate",
+            definition,
+            Recording::new(Vec::new()),
+            vec![Arc::new(Named("calendar"))],
+            Arc::new(NoSandbox),
+            Arc::new(StubWorkBackend::new()),
+        );
+        assert!(!worker.planning_only());
+        let tools = worker.capabilities().tools;
+        for name in [
+            "result_report",
+            "work_file",
+            "ask_user",
+            "work_plan",
+            "calendar",
+        ] {
+            assert!(tools.iter().any(|n| n == name), "{name}: {tools:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_planner_starts_with_its_tools_and_ends_on_an_accepted_plan() {
+        let plan = json!({
+            "root": { "tmp": "trip" },
+            "items": [
+                { "tmp": "trip", "title": "Trip", "objective": "o", "done_when": "d" },
+                { "tmp": "flights", "parent": { "tmp": "trip" }, "title": "Flights",
+                  "objective": "o", "done_when": "d" }
+            ],
+            "rationale": "book it"
+        });
+        let provider = Recording::new(vec![call("work_plan", plan), report("never reached")]);
+        let stub = Arc::new(StubWorkBackend::new());
+        let tools: Vec<Arc<dyn Tool>> = vec![
+            Arc::new(Named("recall_search")),
+            Arc::new(Named("memory_search")),
+            Arc::new(Named("browser")),
+        ];
+        let w = LocalWorker::new(
+            "planner",
+            LocalWorker::planner_definition(),
+            provider.clone(),
+            tools,
+            Arc::new(NoSandbox),
+            stub.clone(),
+        );
+        let caps = w.capabilities();
+        assert_eq!(
+            caps.tools,
+            ["memory_search", "recall_search", "work_plan", "work_status"]
+        );
+        for tool in ["work_plan", "work_status", "recall_search", "memory_search"] {
+            assert!(
+                caps.tools.iter().any(|t| t == tool),
+                "{tool}: {:?}",
+                caps.tools
+            );
+        }
+        assert!(
+            !caps.tools.iter().any(|t| t == "browser"),
+            "no write access"
+        );
+
+        let mut b = brief("plan-1");
+        b.required_tools = vec!["work_plan".into()];
+        let err = w.run(b).await.unwrap_err();
+        // The planner's output is the accepted plan, which the controller
+        // turns into its report; the run itself returns none.
+        assert!(RunFailure::from_error(&err).is_some(), "{err}");
+        assert_eq!(
+            provider.requests().len(),
+            1,
+            "the accepted plan ended the run"
+        );
+        let (_, first) = &provider.requests()[0];
+        for tool in ["work_plan", "work_status", "recall_search", "memory_search"] {
+            assert!(
+                first.iter().any(|t| t == tool),
+                "{tool} at the first prefill: {first:?}"
+            );
+        }
+        assert!(matches!(stub.calls()[0], WorkCall::Plan { .. }));
+
+        // An ordinary worker never holds work_plan.
+        let (pinch, _) = worker(Recording::new(vec![]), Vec::new());
+        assert!(!pinch.capabilities().tools.iter().any(|t| t == "work_plan"));
+    }
+
+    #[tokio::test]
+    async fn a_run_that_repeats_itself_stalls_into_a_loop_failure() {
+        let provider = Recording::new((0..12).map(|_| call("noop", json!({}))).collect());
+        let (w, stub) = worker(provider.clone(), vec![Arc::new(Named("noop"))]);
+        let w = w.with_stall_steps(3);
+        let mut b = brief("item-stall");
+        b.required_tools = vec!["noop".into()];
+        let err = w.run(b).await.unwrap_err();
+        assert_eq!(classified(&err), (ErrorClass::Model, ErrorSubclass::Loop));
+        assert!(
+            err.to_string().contains("stalled") && err.to_string().contains("progress ledger"),
+            "{err}"
+        );
+        assert!(
+            provider.requests().len() <= 5,
+            "the stall stopped the run, not the budget: {} calls",
+            provider.requests().len()
+        );
+        assert!(stub.calls().is_empty());
     }
 
     /// Scenario 31's shape: the worker keeps its own scratch list, and the

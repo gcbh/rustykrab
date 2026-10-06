@@ -2,10 +2,12 @@ pub mod auth;
 mod credential_page;
 pub mod evaluate_routes;
 pub mod logging;
+pub mod monitor_routes;
 pub mod origin;
 mod payment_page;
 mod project_routes;
 pub mod push;
+pub mod question_routes;
 pub mod rate_limit;
 mod routes;
 mod signal_webhook;
@@ -70,10 +72,12 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .merge(routes::api_routes())
         .merge(version_route::routes())
+        .merge(monitor_routes::routes())
         .merge(project_routes::routes())
         .merge(work_routes::routes())
         .merge(worker_routes::routes())
         .merge(evaluate_routes::routes())
+        .merge(question_routes::routes())
         .merge(telegram_webhook::telegram_routes())
         .merge(signal_webhook::signal_routes())
         .merge(credential_page::routes())

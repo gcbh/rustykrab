@@ -34,8 +34,8 @@ use rustykrab_core::work::{ArtifactRef, PlanOutcome, WorkError, WorkItemDraft};
 use rustykrab_core::Error;
 use rustykrab_dream::evaluate::RoutingEntry;
 use rustykrab_dream::{
-    Evaluation, EvaluationConfig, ProposalFiler, RoutingRecordReader, StaticQuestions, StoreLedger,
-    StoreOutcomeSource, StoreWorkRecords,
+    Evaluation, EvaluationConfig, ProposalFiler, RoutingRecordReader, StoreLedger,
+    StoreOutcomeSource, StoreQuestions, StoreWorkRecords,
 };
 use rustykrab_gateway::evaluate_routes::EvaluationHandle;
 use rustykrab_store::Store;
@@ -504,8 +504,7 @@ impl EvaluationHandle for Evaluator {
 }
 
 /// Assemble the pass over this daemon's store and controller. The
-/// questions and routing readers read nothing until Phases 4 and 3 wire
-/// their tables in.
+/// questions and routing readers observe the durable question and worker tables.
 pub async fn evaluator(
     store: &Store,
     control: Arc<dyn ControlHandle>,
@@ -519,7 +518,7 @@ pub async fn evaluator(
     let evaluation = Evaluation {
         work: Arc::new(StoreWorkRecords::new(store.clone())),
         outcomes: Arc::new(StoreOutcomeSource::new(outcomes)),
-        questions: Arc::new(StaticQuestions::default()),
+        questions: Arc::new(StoreQuestions::new(store.clone())),
         routing,
         filer: Arc::new(ControlFiler {
             control: control.clone(),
@@ -608,6 +607,7 @@ mod tests {
             capabilities: Default::default(),
             routing_record: record,
             spec: None,
+            runtime: None,
             created_at: Utc::now(),
         }
     }

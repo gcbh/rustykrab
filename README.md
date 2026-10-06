@@ -178,12 +178,23 @@ Two consequences worth knowing:
 
 ## Configuration
 
+Notion and Obsidian credentials are optional. A standalone agent service can
+start without them; configure credentials when enabling those integrations.
+See [agent monitoring](docs/agent-monitoring.md) for private Tailscale access
+and a separate local service.
+
 All configuration is via environment variables. No plaintext config files.
 
 | Variable | Default | Description |
 |---|---|---|
-| `RUSTYKRAB_PROVIDER` | `anthropic` | Model backend: `anthropic`, `ollama`, `scripted` (E2E harness), or an OpenAI-compatible alias (`openai`, `llama-server`, `llamacpp`, `mistralrs`, `lmstudio`, `mlx`, `exo`, `vllm`) |
-| `ANTHROPIC_API_KEY` | — | Anthropic API key (required for Claude) |
+| `RUSTYKRAB_PROVIDER` | `anthropic` | Model backend: `claude-cli` (Max subscription via native CLI), `anthropic`, `ollama`, `scripted` (E2E harness), or an OpenAI-compatible alias (`openai`, `llama-server`, `llamacpp`, `mistralrs`, `lmstudio`, `mlx`, `exo`, `vllm`) |
+| `RUSTYKRAB_CLAUDE_COMMAND` | `claude` | Native Claude CLI executable for `RUSTYKRAB_PROVIDER=claude-cli` |
+| `RUSTYKRAB_CLAUDE_CONFIG_DIR` | unset | Selected signed-in Max profile. Unset uses the CLI default login, which can differ from explicitly setting `~/.claude`. Each other account needs its own profile and login |
+| `RUSTYKRAB_CLAUDE_MODEL` | `sonnet` | Claude CLI model alias for interactive turns and the planner |
+| `RUSTYKRAB_CLAUDE_TIMEOUT_SECS` | `900` | Wall timeout for one Claude CLI model turn |
+| `RUSTYKRAB_CLAUDE_INPUT_BUDGET` | `100000` | Conservative input-token estimate cap. Oversized requests are refused without deleting history; the runner owns compaction |
+| `RUSTYKRAB_PLANNER_WORKER` | follows local worker | Explicit `on` enables the planner with local execution disabled; `off`, `false`, `0`, `no` disable it |
+| `ANTHROPIC_API_KEY` | — | Anthropic API key (required for the `anthropic` API provider; excluded from Max CLI runtimes) |
 | `ANTHROPIC_MODEL` | `claude-sonnet-4-20250514` | Claude model to use. The Claude 4.X family (Opus 4.7 `claude-opus-4-7`, Sonnet 4.6 `claude-sonnet-4-6`, Haiku 4.5 `claude-haiku-4-5-20251001`) is recommended for new deployments |
 | `ANTHROPIC_CONTEXT_LENGTH` | `200000` | Context window in tokens for the selected Claude model. Anthropic doesn't expose a discovery endpoint, so set this when enabling a non-default window (e.g. the 1M-token beta) so compaction thresholds stay in sync |
 | `RUSTYKRAB_TIMEZONE` | host zone, else `UTC` | IANA zone name (e.g. `America/Los_Angeles`) that human-entered schedules are interpreted in. Cron expressions and offset-less one-shot timestamps passed to the `cron` tool are read as wall-clock times here; everything is still *stored* in UTC. Each job records the zone it was created with, so changing this does not move existing jobs. Use an IANA name, not a fixed offset like `UTC-8` — only the named zone tracks daylight saving |
@@ -634,6 +645,43 @@ $ rustykrab-cli   # restart the daemon
 The resolver runs entirely inside the connector — the model never sees
 the resolved values, and they are not surfaced through any tool.
 
+### Claude Max CLI runtimes
+
+For a fleet using Claude subscriptions, select the native CLI provider for
+planning/chat and disable local execution:
+
+```sh
+export RUSTYKRAB_PROVIDER=claude-cli
+export RUSTYKRAB_CLAUDE_COMMAND="$HOME/.local/bin/claude"
+export RUSTYKRAB_CLAUDE_CONFIG_DIR="$HOME/.claude-max-one"
+export RUSTYKRAB_LOCAL_WORKER=off
+export RUSTYKRAB_PLANNER_WORKER=on
+```
+
+Sign in normally with `CLAUDE_CONFIG_DIR="$HOME/.claude-max-one" claude auth login`.
+Add each distinct Max account as a native execution worker:
+
+```sh
+rustykrab-cli worker add claude_code --name max-one --repos /absolute/repo \
+  --command "$HOME/.local/bin/claude" --model opus \
+  --claude-config-dir "$HOME/.claude-max-one" --require-max
+```
+
+Repeat with another profile signed into another account. Two profiles signed
+into the same account share its subscription limits. Credentials stay with
+Claude CLI; worker specs contain only the profile path. Max-only runtimes
+clear API/provider environment overrides and disable inherited settings/MCP,
+so there is no paid API fallback. The planner's CLI bridge disables native
+tools and returns structured calls for the RustyKrab permission-controlled
+harness; execution workers use native Claude tools in managed worktrees.
+The turn bridge currently supports text/tool history, not image input.
+
+The monitor shows the verified Max subscription, a hashed account identifier,
+and observed quota cooldowns. Login status does not expose remaining quota.
+A native usage-limit result makes the runtime unavailable for five minutes,
+then eligible for another attempt; that is a retry delay, not a subscription
+reset prediction. Observations are local to the running process.
+
 ### Delegating to a peer node
 
 A RustyKrab instance can hand a self-contained task to another RustyKrab
@@ -812,3 +860,39 @@ cargo test -p rustykrab-core
 ## License
 
 MIT
+
+### Native Codex subscription workers
+
+Sign in separately to each account using Codex's own login flow, then register
+its profile with the separate agent daemon:
+
+```sh
+CODEX_HOME=/absolute/path/to/profile codex login
+rustykrab-cli worker add codex --name codex-one --repos /absolute/path/to/repo \
+  --command /absolute/path/to/codex --codex-home /absolute/path/to/profile \
+  --require-chatgpt
+```
+
+The daemon client must target that service's gateway and bearer credentials.
+Each profile requires its own Sign in with ChatGPT login; multiple directories
+for one account share limits. ChatGPT mode clears API credentials, ignores
+user provider settings and keeps the normal workspace sandbox and automatic
+approval review. It requires a CLI supporting `--ignore-user-config`,
+`--no-daemon` and `--approve-for-me` (verified with 0.159.3). The authenticated
+monitor shows the account fingerprint, plan, available quota windows, work
+assignments and verified results. Quota failures stop that worker without an
+API fallback. Claude and Codex workers can coexist; the planner provider is
+selected separately.
+
+### Project continuity between CLI runtimes
+
+Bind work to its durable project using `artifact_refs: [{"kind":"project",
+"value":"<project UUID>"}]`, or create one project with its exact repository
+path so new work matches it automatically. Children and discovered follow-ups
+keep that binding. Each fresh Claude/Codex run receives project intent, current
+constraints/decisions, answered questions and durable work progress, and starts
+coding from the project's verified commit chain. A new revision reaches later
+runs while old receipts remain immutable. `/monitor.html` shows delivered
+context revisions, code bases and inherited agents. See
+[project handoff operation](docs/agent-monitoring.md#continuing-a-project-with-another-runtime)
+for bounds and missing/divergent-history handling.

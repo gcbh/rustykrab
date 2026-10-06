@@ -43,7 +43,9 @@ pub(crate) const PRIORITY_MAX: i64 = 100;
 
 const WORK_KINDS: [&str; 4] = ["personal", "research", "capability", "internal"];
 const WORKER_KINDS: [&str; 5] = ["any", "local", "peer", "claude_code", "codex"];
-pub(crate) const ARTIFACT_KINDS: [&str; 6] = ["message", "path", "url", "commit", "item", "other"];
+pub(crate) const ARTIFACT_KINDS: [&str; 7] = [
+    "message", "path", "url", "commit", "item", "project", "other",
+];
 const EDGE_KINDS: [&str; 3] = ["blocks", "waits_for", "conditional_on_failure"];
 const TRIGGER_KINDS: [&str; 5] = ["now", "at", "on_credential", "on_mcp", "on_answer"];
 
@@ -848,7 +850,7 @@ pub(crate) fn draft_properties(nested: bool) -> Map<String, Value> {
         "artifact_refs".into(),
         json!({
             "type": "array",
-            "description": "Pointers, never content.",
+            "description": "Pointers, never content. A project ref names the durable project UUID for context handoff.",
             "items": {
                 "type": "object",
                 "properties": {
@@ -1277,6 +1279,17 @@ mod tests {
             .as_array()
             .unwrap()
             .contains(&json!("code")));
+    }
+
+    #[tokio::test]
+    async fn a_project_binding_reaches_the_work_backend() {
+        let stub = Arc::new(StubWorkBackend::new());
+        let out = tool(&stub).execute(json!({
+            "title": "Continue project", "objective": "Build the next part", "done_when": "Verified",
+            "artifact_refs": [{ "kind": "project", "value": "d88d4600-0000-4000-8000-000000000001" }]
+        })).await.unwrap();
+        assert_eq!(out["outcome"], "accepted", "{out}");
+        assert_eq!(files(&stub)[0].0.artifact_refs[0].kind, "project");
     }
 
     #[tokio::test]

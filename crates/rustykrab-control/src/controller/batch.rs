@@ -467,6 +467,16 @@ impl Batch {
         if to == Status::Cancelled(CancelReason::Cascade) && row.kind == WorkKind::Capability {
             return false;
         }
+        // Research the question router filed answers the item that asked,
+        // not the user (section 7).
+        if to == Status::Done
+            && row
+                .constraints
+                .iter()
+                .any(|c| c.starts_with(super::questions::RESEARCH_MARK))
+        {
+            return false;
+        }
         !(to == Status::Failed && has_open_plan_b(&self.snap, item))
     }
 

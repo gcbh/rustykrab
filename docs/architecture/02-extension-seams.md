@@ -1,43 +1,45 @@
 # Extension Seams and Reusability
 
 Every trait in the workspace, who implements it, and whether it is carrying its
-weight. Counts are `impl X for` occurrences including test doubles.
+weight. Counts are impl occurrences (including qualified names and test doubles) in
+all workspace Rust files, remeasured on 2026-10-02 after context/monitor integration.
 
 ## Inventory
 
 | Trait | Defined in | Impls | Verdict |
 |---|---|---|---|
-| `Tool` | `core/tool.rs` | 65 | **Load-bearing.** The system's spine |
-| `ModelProvider` | `core/model.rs` | 4 real + 12 test | **Load-bearing.** Genuinely swappable backends |
+| `Tool` | `core/tool.rs` | 90 | **Load-bearing.** The system's spine |
+| `ModelProvider` | `core/model.rs` | 36 | **Load-bearing.** Genuinely swappable backends |
 | `MemoryStorage` | `memory/storage.rs` | 1 | Fine — used for test injection and a real seam |
 | `Embedder` | `memory/embedding.rs` | 4 | **Earns its keep.** Hash/FastEmbed/lazy variants |
 | `Sandbox` | `agent/sandbox.rs` | 2 | Earns its keep |
-| `CredentialBackend` | `store/credential_backend.rs` | 4 | **Earns its keep.** Keychain / encrypted-file / env |
-| `OutcomeSink` / `OutcomeSource` | `core`, `dream` | 2 / 4 | Correct inversion between writer and analyser |
+| `CredentialBackend` | `store/credential_backend.rs` | 7 | **Earns its keep.** Keychain / encrypted-file / env |
+| `OutcomeSink` / `OutcomeSource` | `core`, `dream` | 3 / 5 | Correct inversion between writer and analyser |
 | `RecallPersistence` | `core/recall.rs` | 2 | Fine |
 | `TraceSink` | `core/prompt_trace.rs` | 2 | Fine |
-| `RequestNotifier` | `store/credential_request.rs` | 1 | Fine — breaks store→push dependency |
-| `MemoryBackend` | **`core`** | 2 | **Moved.** The one that was blocked |
+| `RequestNotifier` | `store/credential_request.rs` | 4 | Fine — breaks store→push dependency |
+| `MemoryBackend` | **`core`** | 3 | **Moved.** The one that was blocked |
 | `CronBackend` | **`tools`** | 2 | Correctly implemented above the consumer |
-| `MessageBackend` | **`tools`** | 1 | Correctly implemented above the consumer |
+| `MessageBackend` | **`tools`** | 4 | Correctly implemented above the consumer |
 | `ComputerBackend` | **`tools`** | 2 | Correctly implemented above the consumer |
 | `VideoBackend` | **`tools`** | 1 | Fine — implementation is in the same crate |
 | `SessionManager` | **`tools`** | 1 | Correctly implemented above the consumer |
-| `WorkBackend` | **`tools`** `work_backend.rs` | 1 stub | Correctly placed above the consumer: the `work_file`, `work_status` and `result_report` tools call it; the controller adapter in `rustykrab-cli` implements it (Phase 1, round 2) |
-| `Worker` | **`control`** `worker.rs` | 3 + test doubles | **Earns its keep.** The controller calls it; `LocalWorker`, `ExternalWorker` (the `claude_code` and `codex` kinds) and `PeerWorker` (the `peer` kind, Phase 5) in `rustykrab-agent` implement it above the controller. Its defaulted `usage` carries a run's spend and completion-reminder count back to the controller; its defaulted `resumable`, `stop` and `refresh` exist for a run that lives outside the process (a peer's task: re-attached after a restart, cancelled when the controller stops it, advertised and health-checked on the registry's timer); `LocalWorker` uses `refresh` for its provider's model check; its defaulted `unhealthy_reason` puts the cause of an unhealthy worker in the health line the registry records |
-| `WorkerFactory` | **`control`** `registry.rs` | 1 + 1 test | Correctly placed: the registry builds external workers and peers through it from a stored spec, and `AgentFactory` in `rustykrab-cli` implements it over `ExternalWorker` and `PeerWorker`, which `control` cannot name; its defaulted async `prepare` redeems a peer's pairing code before the spec is stored |
+| `WorkBackend` | **`tools`** `work_backend.rs` | 5 | The work and question tools call this seam; `Controller` in `control` owns filing and answering, `LocalWorker` wraps it for per-run recording, and the CLI binds a deferred backend at boot |
+| `Worker` | **`control`** `worker.rs` | 16 | **Earns its keep.** The controller calls it; `LocalWorker`, `ExternalWorker` (the `claude_code` and `codex` kinds) and `PeerWorker` (the `peer` kind, Phase 5) in `rustykrab-agent` implement it above the controller. Its defaulted `planning_only` reserves a worker for planner work independently of a broad node advertisement; its defaulted `usage` carries a run's spend and completion-reminder count back to the controller; its defaulted `resumable`, `stop` and `refresh` exist for a run that lives outside the process (a peer's task: re-attached after a restart, cancelled when the controller stops it, advertised and health-checked on the registry's timer); `LocalWorker` uses `refresh` for its provider's model check; its defaulted `runtime_status` exposes sanitized native login/quota observations without importing a provider into the contract; its defaulted `unhealthy_reason` puts the cause of an unhealthy worker in the health line the registry records |
+| `WorkerFactory` | **`control`** `registry.rs` | 3 | Correctly placed: the registry builds external workers and peers through it from a stored spec, and `AgentFactory` in `rustykrab-cli` implements it over `ExternalWorker` and `PeerWorker`, which `control` cannot name; its defaulted async `prepare` redeems a peer's pairing code before the spec is stored |
 | `NodeWorkers` | **`control`** `peer.rs` | 1 | Correctly placed: the gateway's task worker and `GET /api/node` call it to run a peer's brief inside this node's ceiling and to advertise that ceiling; `DelegatedRuns` in `rustykrab-agent` implements it over the local worker, which neither the gateway's traits nor `control` should build |
 | `Routing` | **`control`** `controller/mod.rs` | 2 | Earns its keep: `CheapestFirst` for tests and a bare controller, `RecordRouting` (`control` `routing.rs`) over the registry's routing records and default tiers in the daemon |
-| `ToolCatalog` | **`control`** `controller/mod.rs` | 4 | Earns its keep: `StaticCatalog` for tests, `RegistryCatalog` in `rustykrab-cli` over the final tool registry and the active-tools seed (registered but unloaded tools, MCP servers named in `RUSTYKRAB_MCP_SERVERS` or with registered tools), and `FleetCatalog` over that plus the skills written at run time, whose `refresh` rescans them |
-| `ModelActivity` | **`control`** `controller/mod.rs` | 1 + 1 test | Earns its keep: plan 12.1's busy signal, the controller's only view of interactive turns; `TurnActivity` in `rustykrab-cli` implements it over the gateway's `ActivityTracker`, which the controller does not depend on |
-| `ReviewSurface` | **`control`** `review/mod.rs` | 1 + 1 test | Earns its keep: the review-surface decision (GitHub or Linear) is still open, so the projection and sync are written once against it; `GithubIssues` in `rustykrab-cli` is the first implementation, an in-memory surface in the controller tests the second |
-| `WorkRecordSource`, `QuestionReader`, `RoutingRecordReader`, `ProposalFiler`, `EvaluationLedger` | **`dream`** `evaluate/mod.rs` | 1-2 + test fakes each | Correct inversion, as `OutcomeSource`: the pass reads the store, Phases 3 and 4 and files through the controller without depending on any of them; the store-backed impls are in `dream`, the routing reader (`StoreRouting`, over the worker registry) and the filer in `rustykrab-cli` |
-| `EvaluationHandle` | **`gateway`** `evaluate_routes.rs` | 1 + 1 test | Correctly placed above the consumer: `POST /api/work/evaluate` calls it, and the CLI's `Evaluator` implements it with a boxed future |
-| `LateTools` | **`agent`** `local_worker.rs` | 1 + 1 test | Correctly placed: `LocalWorker` asks it for tools that appeared while the daemon ran, and `RuntimeSkills` in `rustykrab-cli` implements it over the skills directory and the skill registry, which `agent` does not depend on |
-| `RunTranscripts` | **`agent`** `local_worker.rs` | 1 + 2 test | Correctly placed: `LocalWorker` keeps each run's conversation through it and, through its defaulted `resume`, continues a kept one; `JobTranscripts` in `rustykrab-cli` implements it over the conversation store (which `agent` does not depend on) and resumes a scheduled firing's job conversation with its SKILL.md and prompt |
+| `ToolCatalog` | **`control`** `controller/mod.rs` | 5 | Earns its keep: `StaticCatalog` for tests, `RegistryCatalog` in `rustykrab-cli` over the final tool registry and the active-tools seed (registered but unloaded tools, MCP servers named in `RUSTYKRAB_MCP_SERVERS` or with registered tools), and `FleetCatalog` over that plus the skills written at run time, whose `refresh` rescans them |
+| `ModelActivity` | **`control`** `controller/mod.rs` | 3 | Earns its keep: plan 12.1's busy signal, the controller's only view of interactive turns; `TurnActivity` in `rustykrab-cli` implements it over the gateway's `ActivityTracker`, which the controller does not depend on |
+| `ReviewSurface` | **`control`** `review/mod.rs` | 2 | Earns its keep: the review-surface decision (GitHub or Linear) is still open, so the projection and sync are written once against it; `GithubIssues` in `rustykrab-cli` is the first implementation, an in-memory surface in the controller tests the second |
+| `WorkRecordSource`, `QuestionReader`, `RoutingRecordReader`, `ProposalFiler`, `EvaluationLedger` | **`dream`** `evaluate/mod.rs` | 2 each | Correct inversion, as `OutcomeSource`: the pass reads the store, Phases 3 and 4 and files through the controller without depending on any of them; the store-backed impls are in `dream`, the routing reader (`StoreRouting`, over the worker registry) and the filer in `rustykrab-cli` |
+| `EvaluationHandle` | **`gateway`** `evaluate_routes.rs` | 2 | Correctly placed above the consumer: `POST /api/work/evaluate` calls it, and the CLI's `Evaluator` implements it with a boxed future |
+| `LateTools` | **`agent`** `local_worker.rs` | 2 | Correctly placed: `LocalWorker` asks it for tools that appeared while the daemon ran, and `RuntimeSkills` in `rustykrab-cli` implements it over the skills directory and the skill registry, which `agent` does not depend on |
+| `RunTranscripts` | **`agent`** `local_worker.rs` | 4 | Correctly placed: `LocalWorker` keeps each run's conversation through it and, through its defaulted `resume`, continues a kept one; `JobTranscripts` in `rustykrab-cli` implements it over the conversation store (which `agent` does not depend on) and resumes a scheduled firing's job conversation with its SKILL.md and prompt |
+| `CommandHook` | **`channels`** `telegram.rs` | 1 | Correctly placed: Telegram offers the commands it does not know to the host before the agent sees them; `WorkCommands` in `rustykrab-cli` answers the work surface's (`/work`, `/approve`, `/reject`, `/cancel`, `/answer`) over the controller, which `channels` does not depend on |
 | `Skill` | `skills/skill.rs` | 1 | Thin — `SkillMd` is the only shape |
-| `Channel` | `channels/channel.rs` | **1** | **Not earning its keep** |
-| `GatewayBackend` | `tools/gateway_backend.rs` | **0** | **Dead** |
+| `Channel` | `channels/channel.rs` | 1 | **Not earning its keep** |
+| `GatewayBackend` | `tools/gateway_backend.rs` | 0 | **Dead** |
 
 ## Backend trait placement is resolved
 
@@ -65,7 +67,7 @@ Which traits are actually blocked, by where their real implementor lives:
 | `VideoBackend` | `VideoChannelAdapter` | `rustykrab-tools` | no, same crate |
 | `CronBackend` | `CronAdapter` | `rustykrab-cli` | no, above |
 | `MessageBackend` | `MessageAdapter` | `rustykrab-cli` | no, above |
-| `WorkBackend` | controller adapter (round 2) | `rustykrab-cli` | no, above |
+| `WorkBackend` | `Controller` | `rustykrab-control` | no, above |
 | `ReviewSurface` | `GithubIssues` | `rustykrab-cli` | no, above |
 | `ProposalFiler` | `ControlFiler` | `rustykrab-cli` | no, above |
 
@@ -122,11 +124,11 @@ merge is validated by symbol counts rather than by inspection: the symbols
 that had been written twice halved (`max_tokens_retries` 8→4,
 `compact_history(conv, tools)` 2→1) and the shared ones did not move.
 
-**The turn sequence is still written out six times.** Load conversation →
+**The turn sequence remains duplicated across five entry points (2026-10-02).** Load conversation →
 snapshot persisted ids → append → run with heartbeat → `save_turn` → extract
 reply → map failure to a user string, in `process_telegram_message`,
-`process_slack_message`, `send_message`, `send_message_stream`, and twice in
-`task_queue.rs`. The first pass counted three.
+`process_slack_message`, `send_message`, `send_message_stream`, and the delegated-task worker in `gateway/src/tasks.rs`.
+The original second-pass count was six; the old task_queue module is gone.
 
 This one has a defect to its name rather than a hypothesis: the
 `PendingLinks` drain existed in the Telegram copy and not the Slack one, so a
@@ -154,16 +156,16 @@ Could each crate be lifted into a different program?
 | Crate | Reusable? | Blocker |
 |---|---|---|
 | `core` | **Yes** | None. Clean contract crate, no internal deps |
-| `providers` | **Yes** | 8 direct env reads (`OLLAMA_NUM_CTX`, `ANTHROPIC_CONTEXT_LENGTH`, …) override explicit config |
+| `providers` | **Yes** | 8 literal-key env reads (`OLLAMA_NUM_CTX`, `ANTHROPIC_CONTEXT_LENGTH`, …) override explicit config |
 | `memory` | **Yes** | Zero env reads, own storage trait, own config struct. The most portable crate here |
 | `skills` | **Yes** | Near-standalone |
-| `store` | **Mostly** | 3 env reads; single-connection design is an embedding constraint |
+| `store` | **Mostly** | 3 literal-key env reads; single-connection design is an embedding constraint |
 | `channels` | **Mostly** | Concrete types, no unifying trait, so the consumer inherits the coupling |
-| `dream` | **Yes** | Depends only on `OutcomeSource`. Textbook |
-| `tools` | **No** | 25 env reads; direct `rustykrab_store` coupling in 12 files |
-| `agent` | **Partly** | 4 env reads inside compaction tuning; depends on all of `tools` to get 16 of its own tools registered |
-| `runtime` | **Yes** | 0 env reads, no axum. Untested, which is its own problem |
-| `gateway` | **Mostly** | Transport only now; `AppState` down to 10 fields |
+| `dream` | **Yes** | Reads through OutcomeSource and evaluation traits; store-backed adapters depend on store/control/core |
+| `tools` | **No** | 30 literal-key env reads; direct `rustykrab_store` coupling in 12 files |
+| `agent` | **Partly** | 5 literal-key env reads, including compaction tuning; depends on tools for agent-tool registration |
+| `runtime` | **Yes** | 0 env reads, no axum. Distillation/lifecycle tests exist; direct assembly coverage remains limited |
+| `gateway` | **Mostly** | Transport and composition handles; AppState has 15 fields after control/evaluation/delegation wiring |
 | `cli` | N/A | Composition root by definition |
 
 Trait placement is resolved. Ambient configuration is not: `agent` and
@@ -172,17 +174,21 @@ able to be, for that one reason.
 
 ## Ambient configuration
 
-Direct environment reads outside the composition root and E2E harness:
+Literal-key environment reads in library src files, including test code
+(2026-10-02); dynamic keys are excluded. This is a source-site count, not
+execution frequency. The prior second-pass snapshot counted 48; this one
+counts 56:
 
 | Crate | Reads | Examples |
 |---|---|---|
-| `tools` | 26 | `BROWSER_HEADLESS`, `CHROME_CDP_URL`, `RUSTYKRAB_BROWSER_DOWNLOAD_ROOT`, `X_API_BEARER_TOKEN`, `RUSTYKRAB_MCP_SERVERS`, `RUSTYKRAB_NODES` |
+| `tools` | 30 | `BROWSER_HEADLESS`, `CHROME_CDP_URL`, `RUSTYKRAB_BROWSER_DOWNLOAD_ROOT`, `X_API_BEARER_TOKEN`, `RUSTYKRAB_MCP_SERVERS`, `RUSTYKRAB_NODES` |
 | `providers` | 8 | `OLLAMA_NUM_CTX`, `OLLAMA_KEEP_ALIVE`, `ANTHROPIC_CONTEXT_LENGTH` |
 | `gateway` | 5 | `RUSTYKRAB_ALLOWED_ORIGINS`, `RUSTYKRAB_PUBLIC_URL` |
-| `agent` | 4 | `RUSTYKRAB_COMPACTION_*` |
+| `agent` | 5 | `RUSTYKRAB_COMPACTION_*` |
 | `store` | 3 | `RUSTYKRAB_MASTER_KEY`, `RUSTYKRAB_DISABLE_KEYCHAIN` |
 | `channels` | 1 | `TELEGRAM_API_BASE` |
-| `skills` | 1 | dynamic skill requirements / prompt path |
+| `skills` | 1 | literal prompt-path lookup; dynamic skill requirements are excluded |
+| `dream` | 3 | test credential fixtures; production uses the source traits |
 
 Each read is individually defensible — it is the escape hatch for an operator
 knob. Collectively they mean a library crate's behaviour depends on process
@@ -223,3 +229,15 @@ Worth naming, because a review that only lists problems misrepresents the code:
   why `http2` had to be added to reqwest's features. This is unusually good and
   it is what makes the codebase reviewable at all at 80k lines.
 
+
+Codex ChatGPT profiles reuse `Worker::refresh`, `healthy`, `runtime_status`
+and `usage`; no new trait is needed. The external adapter invokes the provider
+crate's native account helper, while control persists only spec options and
+sanitized observations. Codex app-server is used only for bounded account and
+quota reads; execution remains an owned headless CLI process.
+
+
+`Brief.project_context` carries a provider-neutral project snapshot and durable
+work/question history across `Worker`. It is data on the existing seam, not a
+provider-specific memory interface. Peer reattachment keeps the frozen revision;
+a new worker run loads the current revision and verified project code chain.

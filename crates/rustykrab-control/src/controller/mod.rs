@@ -54,13 +54,21 @@
 mod batch;
 mod brief;
 mod commit;
+mod credentials;
 mod filing;
 mod load;
 mod notice;
+mod planning;
+mod project_context;
+mod questions;
 mod reattach;
 mod review;
 mod spend;
 mod tick;
+mod unavailable;
+
+pub use credentials::{credential_key, stored_under, CredentialLinks, StoredCredentials};
+pub use planning::stalled_parents;
 
 #[cfg(test)]
 mod tests;
@@ -78,20 +86,24 @@ use std::time::Duration;
 use async_trait::async_trait;
 use chrono::{DateTime, TimeDelta, Utc};
 use rustykrab_core::work::{
-    Budget, GraphCaps, PlanOutcome, Precondition, ResultReport, WorkItem, WorkItemDraft,
-    WorkItemId, WorkKind, WorkPlan, WorkerKind,
+    Budget, GraphCaps, PlanOutcome, Precondition, ResultReport, RungBudgets, WorkItem,
+    WorkItemDraft, WorkItemId, WorkKind, WorkPlan, WorkerKind,
 };
 use rustykrab_core::Error;
-use rustykrab_store::{Spend, Store};
+use rustykrab_store::{JudgmentRow, Spend, Store};
 use rustykrab_tools::work_backend::{
-    Principal, Provenance, StatusQuery, ToolState, WorkBackend, WorkStatusView,
+    AskOutcome, AskRequest, CapabilityAsk, Principal, Provenance, StatusQuery, ToolState,
+    WorkBackend, WorkStatusView,
 };
 use tokio::task::JoinHandle;
 
 use crate::errors::{LearnedRule, Recurrence, DEFAULT_PROMOTE_THRESHOLD};
 use crate::graph::{ApprovalPolicy, FilingSource, SplitMode};
-use crate::handle::{ControlHandle, GraphView, LockState, LoopStatus, TickReport};
+use crate::handle::{
+    AnswerReply, ControlHandle, GraphView, JudgmentView, LockState, LoopStatus, TickReport,
+};
 use crate::lock::{LoopLock, LOCK_FILE};
+use crate::questions::Judgment;
 use crate::registry::WorkerRegistry;
 use crate::routing::Judged;
 use crate::worker::Worker;
@@ -312,6 +324,21 @@ pub struct ControllerConfig {
     /// `<data dir>/worktrees`. `None`: no workspace is planned, and a
     /// `code` result's claims cannot be checked against git.
     pub worktree_root: Option<PathBuf>,
+    /// Child transitions within this window reach the user as one message
+    /// (6.6); a question goes at once. Zero (the default) sends every
+    /// notice as soon as it is written; the daemon sets a window.
+    pub coalesce_window: TimeDelta,
+    /// A chain open this long with no message about it gets a digest (6.6).
+    pub digest_window: TimeDelta,
+    /// The budget of a planning item (6.1, 6.4).
+    pub plan_budget: Budget,
+    /// Re-plan at the parent when a chain fails or stalls (6.4), when a
+    /// `planner` worker is registered.
+    pub replan: bool,
+    /// How long an item no healthy worker can take waits for the registry
+    /// in `blocked(worker_unavailable)` before its ladder climbs (section
+    /// 7). Thirty minutes, the lease TTL, until Phase 0 measures it.
+    pub worker_wait: TimeDelta,
 }
 
 impl Default for ControllerConfig {
@@ -333,6 +360,17 @@ impl Default for ControllerConfig {
             promote_threshold: DEFAULT_PROMOTE_THRESHOLD,
             recurrence_window: month,
             worktree_root: None,
+            coalesce_window: TimeDelta::zero(),
+            digest_window: TimeDelta::hours(24),
+            plan_budget: Budget {
+                iterations: 12,
+                tokens: 60_000,
+                wall_seconds: 900,
+                repairs: 2,
+                rungs: RungBudgets::default(),
+            },
+            replan: true,
+            worker_wait: TimeDelta::minutes(30),
         }
     }
 }
@@ -401,6 +439,9 @@ struct State {
     fail_next_tick: Option<Error>,
     /// The loop's hold on `controller.lock`, as it last found it.
     lock: Option<LockState>,
+    /// The standing judgment in force (section 7), reloaded after a grant
+    /// changes.
+    judgment: Option<Arc<Judgment>>,
 }
 
 /// The loop of plan section 6 over one store and the workers of a
@@ -415,6 +456,9 @@ pub struct Controller {
     routing: Arc<dyn Routing>,
     ledger: Arc<dyn ProgressLedger>,
     activity: Arc<dyn ModelActivity>,
+    /// Where a credential question's page link waits for its notice
+    /// (section 7). `None`: a credential question files no request.
+    links: Option<CredentialLinks>,
     /// Serialises the loop's writers: a tick, a filing, an approval, a
     /// cancel. Never held while a worker runs.
     loop_lock: tokio::sync::Mutex<()>,
@@ -439,6 +483,7 @@ impl Controller {
             routing: Arc::new(CheapestFirst),
             ledger: Arc::new(NoLedger),
             activity: Arc::new(NoActivity),
+            links: None,
             loop_lock: tokio::sync::Mutex::new(()),
             state: Mutex::new(State {
                 runs: HashMap::new(),
@@ -457,6 +502,7 @@ impl Controller {
                 #[cfg(test)]
                 fail_next_tick: None,
                 lock: None,
+                judgment: None,
             }),
             draining: AtomicBool::new(false),
         }
@@ -497,6 +543,14 @@ impl Controller {
     /// says their model serves work outside the controller.
     pub fn with_activity(mut self, activity: Arc<dyn ModelActivity>) -> Self {
         self.activity = activity;
+        self
+    }
+
+    /// Send a credential question's user to the credential page (section
+    /// 7): its notice files a `fulfil` request and `links` holds the
+    /// minted link until the notice is sent.
+    pub fn with_credential_links(mut self, links: CredentialLinks) -> Self {
+        self.links = Some(links);
         self
     }
 
@@ -693,6 +747,35 @@ impl ControlHandle for Controller {
         let _loop = self.loop_lock.lock().await;
         self.review_decision_locked(proposal, decision, actor).await
     }
+
+    async fn answer(
+        &self,
+        question: &str,
+        answer: &str,
+        actor: &str,
+    ) -> Result<AnswerReply, Error> {
+        let _loop = self.loop_lock.lock().await;
+        self.answer_locked(question, answer, actor).await
+    }
+
+    async fn grant_judgment(
+        &self,
+        text: &str,
+        scope: &str,
+        actor: &str,
+    ) -> Result<JudgmentRow, Error> {
+        let _loop = self.loop_lock.lock().await;
+        self.grant_locked(text, scope, actor).await
+    }
+
+    async fn revoke_judgment(&self, id: &str, _actor: &str) -> Result<bool, Error> {
+        let _loop = self.loop_lock.lock().await;
+        self.revoke_locked(id).await
+    }
+
+    async fn judgment(&self) -> Result<JudgmentView, Error> {
+        self.judgment_view().await
+    }
 }
 
 #[async_trait]
@@ -730,5 +813,34 @@ impl WorkBackend for Controller {
 
     fn mcp_server_configured(&self, name: &str) -> bool {
         self.catalog.mcp_server_configured(name)
+    }
+
+    async fn plan(
+        &self,
+        plan: WorkPlan,
+        provenance: Provenance,
+    ) -> rustykrab_core::Result<PlanOutcome> {
+        self.file_plan(plan, provenance, FilingSource::Planner)
+            .await
+    }
+
+    async fn ask(
+        &self,
+        item: WorkItemId,
+        request: AskRequest,
+        provenance: Provenance,
+    ) -> rustykrab_core::Result<AskOutcome> {
+        let _loop = self.loop_lock.lock().await;
+        self.ask_locked(&item, request, provenance).await
+    }
+
+    async fn request_capability(
+        &self,
+        item: WorkItemId,
+        request: CapabilityAsk,
+        provenance: Provenance,
+    ) -> rustykrab_core::Result<AskOutcome> {
+        let _loop = self.loop_lock.lock().await;
+        self.capability_locked(&item, request, provenance).await
     }
 }

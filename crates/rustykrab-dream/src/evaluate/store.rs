@@ -5,10 +5,10 @@ use chrono::{DateTime, Utc};
 
 use rustykrab_core::proposal::{MetricValue, ProposalOutcome, ReviewState};
 use rustykrab_core::Result;
-use rustykrab_store::{ProposalEvidence, ProposalRow, Store, WorkFilter};
+use rustykrab_store::{ProposalEvidence, ProposalRow, QuestionFilter, Store, WorkFilter};
 
-use super::facts::{ItemRecord, WorkRecords};
-use super::{EvaluationLedger, WorkRecordSource};
+use super::facts::{ItemRecord, SurfacedQuestion, WorkRecords};
+use super::{EvaluationLedger, QuestionReader, WorkRecordSource};
 
 /// Work records from the store: the live rows, the archive's summary
 /// lines, the event log and the facets.
@@ -73,6 +73,39 @@ impl WorkRecordSource for StoreWorkRecords {
         out.events = self.store.work_events_since(since).await?;
         out.facets = self.store.work_facets_all().await?;
         Ok(out)
+    }
+}
+
+/// The question router's durable record, including defaults and delivery provenance.
+#[derive(Clone)]
+pub struct StoreQuestions {
+    store: Store,
+}
+impl StoreQuestions {
+    pub fn new(store: Store) -> Self {
+        Self { store }
+    }
+}
+#[async_trait]
+impl QuestionReader for StoreQuestions {
+    async fn questions(&self, since: DateTime<Utc>) -> Result<Vec<SurfacedQuestion>> {
+        Ok(self
+            .store
+            .questions_list(&QuestionFilter::default())
+            .await?
+            .into_iter()
+            .filter(|q| q.created_at >= since || q.answered_at.is_some_and(|at| at >= since))
+            .map(|q| SurfacedQuestion {
+                id: q.id,
+                item: q.item,
+                class: q.class.as_str().into(),
+                options: q.options,
+                recorded_default: q.default_answer,
+                delivered_via: q.delivered_via,
+                answer: q.answer,
+                answered_at: q.answered_at,
+            })
+            .collect())
     }
 }
 
@@ -161,6 +194,57 @@ mod tests {
     fn open() -> Store {
         let dir = std::env::temp_dir().join(format!("rk-evaluate-{}", uuid::Uuid::new_v4()));
         Store::open(&dir, vec![3u8; 32]).expect("store opens")
+    }
+
+    #[tokio::test]
+    async fn questions_reader_preserves_delivery_and_default_evidence_in_the_window() {
+        use rustykrab_core::questions::{QuestionClass, QuestionKind, QuestionStatus};
+        use rustykrab_store::{QuestionRow, QuestionWrite};
+        let store = open();
+        let now = Utc::now();
+        let mut q = QuestionRow {
+            id: "q1".into(),
+            item: "task1".into(),
+            root: "task1".into(),
+            kind: QuestionKind::Decision,
+            class: QuestionClass::BlockingNow,
+            text: "Choose?".into(),
+            options: vec!["fast".into(), "thorough".into()],
+            default_answer: Some("fast".into()),
+            asked_class: None,
+            rule: "reserved".into(),
+            asked_by: "worker:pinch".into(),
+            status: QuestionStatus::Answered,
+            delivered_via: Some("outbox:notice".into()),
+            answer: Some("fast".into()),
+            answered_by: Some("user:owner".into()),
+            answered_at: Some(now),
+            research_item: None,
+            decision: None,
+            created_at: now - chrono::Duration::days(30),
+        };
+        store
+            .work_apply(vec![WorkOp::Question(QuestionWrite::Insert(Box::new(
+                q.clone(),
+            )))])
+            .await
+            .unwrap();
+        q.id = "old".into();
+        q.answered_at = Some(q.created_at);
+        store
+            .work_apply(vec![WorkOp::Question(QuestionWrite::Insert(Box::new(q)))])
+            .await
+            .unwrap();
+        let rows = StoreQuestions::new(store)
+            .questions(now - chrono::Duration::days(7))
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "q1");
+        assert!(
+            rows[0].is_avoidable(),
+            "the real router record must feed the evaluation criterion"
+        );
     }
 
     fn item(id: &str, kind: WorkKind) -> WorkItem {

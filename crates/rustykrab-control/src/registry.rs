@@ -70,6 +70,18 @@ pub struct WorkerSpec {
     pub command: Option<String>,
     #[serde(default)]
     pub model: Option<String>,
+    /// Native Claude login profile; None selects the CLI default login.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_config_dir: Option<String>,
+    /// Require a first-party claude.ai Max login, excluding API billing.
+    #[serde(default)]
+    pub require_max: bool,
+    /// Native Codex login profile. None uses the CLI default ~/.codex.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_home: Option<String>,
+    /// Require Sign in with ChatGPT and exclude API/provider fallback.
+    #[serde(default)]
+    pub require_chatgpt: bool,
     /// The agent's own tool allowlist; empty takes the adapter's default.
     #[serde(default)]
     pub allowed_tools: Vec<String>,
@@ -141,6 +153,9 @@ pub struct WorkerView {
     /// The spec an external worker was added with.
     #[serde(default)]
     pub spec: Option<WorkerSpec>,
+    /// Live runtime observations (subscription, hashed account, cooldown).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<serde_json::Value>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -293,7 +308,10 @@ impl WorkerRegistry {
     pub async fn local_name(&self) -> Result<String, Error> {
         let _naming = self.naming.lock().await;
         let rows = self.store.workers().list().await?;
-        if let Some(row) = rows.iter().find(|r| r.kind() == Some(WorkerKind::Local)) {
+        if let Some(row) = rows
+            .iter()
+            .find(|r| r.kind() == Some(WorkerKind::Local) && r.config["role"] != "planner")
+        {
             return Ok(row.name.clone());
         }
         self.assign_name(None).await
@@ -478,24 +496,13 @@ impl WorkerRegistry {
         Ok(restored)
     }
 
-    /// Every worker with its row, health checked now: a healthy live
-    /// worker's `last_seen` moves to now.
+    /// Read every worker without touching its last_seen timestamp.
+    /// Only registration and successful refreshes attest that a worker answered.
     pub async fn views(&self) -> Result<Vec<WorkerView>, Error> {
         let workers = self.store.workers();
         let mut out = Vec::new();
         for row in workers.list().await? {
             let live = self.get(&row.name);
-            let row = match &live {
-                Some(w) => {
-                    let healthy = w.healthy();
-                    let line = health_line(w.as_ref());
-                    workers
-                        .touch(&row.name, &line, healthy.then(Utc::now))
-                        .await?;
-                    workers.get(&row.name).await?.unwrap_or(row)
-                }
-                None => row,
-            };
             out.push(view(&row, live.as_ref()));
         }
         // Workers built in memory only (a fixed registry) have no row.
@@ -519,6 +526,7 @@ impl WorkerRegistry {
                         .cloned()
                         .unwrap_or_default(),
                     spec: None,
+                    runtime: w.runtime_status(),
                     created_at: Utc::now(),
                 });
             }
@@ -654,7 +662,7 @@ fn view(row: &WorkerRow, live: Option<&Arc<dyn Worker>>) -> WorkerView {
         kind: row.kind.clone(),
         live: live.is_some(),
         healthy: live.is_some_and(|w| w.healthy()),
-        health: row.health.clone(),
+        health: live.map_or_else(|| row.health.clone(), |w| health_line(w.as_ref())),
         last_seen: row.last_seen,
         cost_tier: row.cost_tier,
         concurrency: live.map_or(1, |w| w.concurrency()),
@@ -663,6 +671,7 @@ fn view(row: &WorkerRow, live: Option<&Arc<dyn Worker>>) -> WorkerView {
         spec: serde_json::from_value(row.config.clone())
             .ok()
             .filter(|s: &WorkerSpec| s.kind != WorkerKind::Any),
+        runtime: live.and_then(|w| w.runtime_status()),
         created_at: row.created_at,
     }
 }
@@ -1130,5 +1139,43 @@ mod tests {
         for bad in ["", "9lives", "a b", "a/b", &"x".repeat(33)] {
             assert!(!valid_name(bad), "{bad}");
         }
+    }
+    #[tokio::test]
+    async fn observing_workers_does_not_advance_their_probe_time() {
+        let (_dir, store) = temp_store();
+        let registry = WorkerRegistry::new(store.clone()).with_factory(Arc::new(Factory));
+        registry
+            .add(spec(WorkerKind::ClaudeCode, Some("pinch")))
+            .await
+            .unwrap();
+        let before = store.workers().get("pinch").await.unwrap().unwrap();
+        registry.views().await.unwrap();
+        registry.view("pinch").await.unwrap();
+        let after = store.workers().get("pinch").await.unwrap().unwrap();
+        assert_eq!(after.last_seen, before.last_seen);
+        assert_eq!(after.health, before.health);
+    }
+
+    #[tokio::test]
+    async fn a_standalone_planner_does_not_take_the_local_execution_name() {
+        let (_dir, store) = temp_store();
+        let registry = WorkerRegistry::new(store.clone());
+        registry
+            .register(
+                Arc::new(Named {
+                    name: "planner".into(),
+                    kind: WorkerKind::Local,
+                    repos: Vec::new(),
+                    token: None,
+                    refreshes: std::sync::atomic::AtomicUsize::new(0),
+                }),
+                serde_json::json!({"role":"planner"}),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(registry.local_name().await.unwrap(), "snapper");
+        let restarted = WorkerRegistry::new(store);
+        assert_eq!(restarted.local_name().await.unwrap(), "snapper");
     }
 }

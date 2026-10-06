@@ -330,7 +330,31 @@ pub fn prune_older_than(root: &Path, older_than: Duration) -> Vec<PathBuf> {
     removed
 }
 
-fn is_ancestor(repo: &Path, ancestor: &str, descendant: &str) -> Result<bool, String> {
+/// Choose the newest commit only when all candidates form one ancestry chain.
+/// Incomparable verified branches need integration; silently choosing loses work.
+pub fn continuation_base(repo: &Path, head: &str, commits: &[String]) -> Result<String, String> {
+    let mut base = head.to_owned();
+    for commit in commits {
+        let resolved = git(
+            repo,
+            &["rev-parse", "--verify", &format!("{commit}^{{commit}}")],
+        )?;
+        if !resolved.status.success() {
+            return Err(format!(
+                "verified project commit {commit} is no longer available"
+            ));
+        }
+        let commit = stdout(&resolved);
+        if is_ancestor(repo, &base, &commit)? {
+            base = commit;
+        } else if !is_ancestor(repo, &commit, &base)? {
+            return Err(format!("project history diverges at {base} and {commit}; integrate these branches before continuing"));
+        }
+    }
+    Ok(base)
+}
+
+pub fn is_ancestor(repo: &Path, ancestor: &str, descendant: &str) -> Result<bool, String> {
     let out = git(repo, &["merge-base", "--is-ancestor", ancestor, descendant])?;
     match out.status.code() {
         Some(0) => Ok(true),
@@ -626,6 +650,33 @@ pub(crate) mod tests {
             Some(PathBuf::from("/src/app"))
         );
         assert_eq!(Workspace::repo_of(&["calendar".into()]), None);
+    }
+
+    #[test]
+    fn a_continuation_preserves_all_verified_commits_or_refuses_divergence() {
+        let repo = Repo::new();
+        let root = tempfile::tempdir().unwrap();
+        let ws = workspace(&repo, root.path());
+        ws.create().unwrap();
+        std::fs::write(ws.path.join("first.txt"), "first").unwrap();
+        let first = commit_all(&ws.path, "first");
+        std::fs::write(ws.path.join("second.txt"), "second").unwrap();
+        let second = commit_all(&ws.path, "second");
+        assert_eq!(
+            continuation_base(repo.path(), &ws.base, &[second.clone(), first.clone()]).unwrap(),
+            second
+        );
+        std::fs::write(repo.path().join("other.txt"), "other").unwrap();
+        let divergent = commit_all(repo.path(), "other branch");
+        assert!(
+            continuation_base(repo.path(), &ws.base, &[first, divergent])
+                .unwrap_err()
+                .contains("diverges")
+        );
+        assert!(continuation_base(repo.path(), &ws.base, &["f".repeat(40)])
+            .unwrap_err()
+            .contains("no longer available"));
+        ws.remove().unwrap();
     }
 
     #[test]

@@ -24,6 +24,7 @@ pub mod post_condition;
 pub mod probes;
 pub mod prompt_trace;
 pub mod proposal;
+pub mod questions;
 pub mod recall;
 pub mod retrieval_log;
 pub mod schema_validate;

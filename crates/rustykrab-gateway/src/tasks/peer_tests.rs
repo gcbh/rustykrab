@@ -185,6 +185,7 @@ fn brief(required: &[&str]) -> Brief {
         run: Some(Uuid::new_v4().to_string()),
         workspace: None,
         capability: None,
+        project_context: None,
     }
 }
 
