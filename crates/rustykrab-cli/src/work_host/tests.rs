@@ -327,3 +327,73 @@ fn replace_stubs_keep_the_work_tools_and_a_stub_of_one_wins() {
     let status = tools.iter().find(|t| t.name() == "work_status").unwrap();
     assert_eq!(status.description(), "scripted", "the stub is kept");
 }
+
+#[tokio::test]
+async fn background_dreaming_notices_stay_in_the_dashboard_without_external_sends() {
+    use rustykrab_core::work::{ArtifactRef, BlockedReason};
+    let t = temp_store();
+    let s = &t.store;
+    let review_refs = vec![
+        ArtifactRef {
+            kind: rustykrab_core::dream_review::REVIEW_ONLY.into(),
+            value: "true".into(),
+        },
+        ArtifactRef {
+            kind: "dream_review_job".into(),
+            value: "cycle:generator".into(),
+        },
+    ];
+    let mut review = item("review", Status::Done, None);
+    review.kind = WorkKind::Research;
+    review.artifact_refs = review_refs.clone();
+    let review_row = notice(s, review, "telegram").await;
+    assert_eq!(route(s, &review_row, Some("999")).await, Route::Consumed);
+    let mut proposal = item(
+        "proposal",
+        Status::Blocked(BlockedReason::NeedsConsent),
+        None,
+    );
+    proposal.kind = WorkKind::Proposal;
+    proposal.artifact_refs.push(ArtifactRef {
+        kind: "dream_project_review".into(),
+        value: "cycle".into(),
+    });
+    let proposal_row = notice(s, proposal, "telegram").await;
+    assert_eq!(route(s, &proposal_row, Some("999")).await, Route::Consumed);
+    let backend = Sent::default();
+    deliver_pending(s, &backend, Some("999")).await;
+    assert!(backend.sent.lock().unwrap().is_empty());
+    assert!(s.work_outbox_pending().await.unwrap().is_empty());
+    assert_eq!(
+        s.work_get("proposal").await.unwrap().unwrap().status,
+        Status::Blocked(BlockedReason::NeedsConsent)
+    );
+    assert!(s.work_outbox_latest("review").await.unwrap().is_some());
+
+    // Read-only research alone is ordinary work, and a conversation explicitly
+    // attached to an internal-looking item still receives its own notice.
+    let mut ordinary = item("ordinary", Status::Done, None);
+    ordinary.kind = WorkKind::Research;
+    ordinary.artifact_refs = vec![review_refs[0].clone()];
+    let row = notice(s, ordinary, "telegram").await;
+    assert!(matches!(
+        route(s, &row, Some("999")).await,
+        Route::Send { .. }
+    ));
+    let conversation = bound(
+        s,
+        &ChannelAddress::Telegram {
+            chat_id: 4242,
+            thread_id: 7,
+        },
+    )
+    .await;
+    let mut explicit = item("explicit", Status::Done, Some(conversation));
+    explicit.kind = WorkKind::Research;
+    explicit.artifact_refs = review_refs;
+    let row = notice(s, explicit, "telegram").await;
+    assert_eq!(
+        route(s, &row, Some("999")).await,
+        send("telegram", Some("4242".into()), Some("7".into()))
+    );
+}

@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 use rustykrab_control::controller::ModelActivity;
 use rustykrab_core::activity::ActivityTracker;
-use rustykrab_core::work::Status;
+use rustykrab_core::work::{Status, WorkKind};
 use rustykrab_core::Tool;
 use rustykrab_store::{ChannelAddress, OutboxRow, Store};
 use rustykrab_tools::{MessageBackend, WorkBackend};
@@ -117,8 +117,9 @@ pub(crate) enum Route {
         chat: Option<String>,
         thread: Option<String>,
     },
-    /// Already delivered another way: a `done` scheduled firing's result
-    /// goes out as its job's own message (`scheduled_work.rs`).
+    /// Available on its owning surface: a `done` scheduled firing's result
+    /// goes out as its job's own message; internal dreaming work is in the
+    /// authenticated dashboard, with no external notification destination.
     Consumed,
 }
 
@@ -157,6 +158,25 @@ fn to_address(address: ChannelAddress) -> Route {
 /// notice, the first allowed chat; else the row's channel with no address.
 pub(crate) async fn route(store: &Store, row: &OutboxRow, default_chat: Option<&str>) -> Route {
     let parent = store.work_get(&row.parent).await.ok().flatten();
+
+    // These jobs and proposals originate in the dashboard's background loop.
+    // Keep their durable notices, but do not send them to an unrelated fallback
+    // chat or leave them indefinitely waiting for an absent channel. An explicit
+    // conversation still follows its usual delivery route.
+    if parent.as_ref().is_some_and(|p| {
+        p.origin_conversation_id.is_none()
+            && ((p.kind == WorkKind::Research
+                && p.artifact_refs.iter().any(|a| {
+                    a.kind == rustykrab_core::dream_review::REVIEW_ONLY && a.value == "true"
+                })
+                && p.artifact_refs.iter().any(|a| a.kind == "dream_review_job"))
+                || (p.kind == WorkKind::Proposal
+                    && p.artifact_refs
+                        .iter()
+                        .any(|a| a.kind == "dream_project_review")))
+    }) {
+        return Route::Consumed;
+    }
 
     if let Ok(Some(job)) = store.jobs().job_for_work_item(&row.parent).await {
         if parent.as_ref().is_some_and(|p| p.status == Status::Done) {

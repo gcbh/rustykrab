@@ -75,6 +75,7 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/api/work/{id}/events", get(item_events))
         .route("/api/work/{id}/evidence", get(item_evidence))
         .route("/api/work/{id}/plan", get(plan_preview))
+        .route("/api/work/{id}/review", post(review_proposal))
         .route("/api/work/{id}/approve", post(approve))
         .route("/api/work/{id}/reject", post(reject))
         .route("/api/work/{id}/cancel", post(cancel))
@@ -188,6 +189,19 @@ pub struct PlanPreview {
     pub plan: WorkPlanRow,
     pub graph: GraphView,
     pub held: Vec<WorkItemId>,
+}
+
+async fn review_proposal(
+    State(state): State<AppState>,
+    principal: Option<Extension<Principal>>,
+    Path(id): Path<String>,
+    Json(decision): Json<rustykrab_core::proposal::ReviewDecision>,
+) -> Result<Json<rustykrab_core::proposal::ReviewOutcome>, WorkApiError> {
+    let c = control(&state)?;
+    c.review_decision(&id, decision, &actor_of(principal))
+        .await
+        .map(Json)
+        .map_err(Into::into)
 }
 
 /// `POST /api/work/{id}/approve`.

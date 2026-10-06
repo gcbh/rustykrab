@@ -57,6 +57,8 @@ pub struct MonitorReply {
     pub workers: Vec<WorkerView>,
     pub work: WorkMonitorSnapshot,
     pub expectation_metrics: Vec<MetricValue>,
+    #[serde(default)]
+    pub dreaming: Option<rustykrab_core::dream_review::DreamingView>,
     /// Healthy, degraded (warnings), or critical. Expected waits are informational.
     pub health: String,
     pub alerts: Vec<Alert>,
@@ -291,7 +293,45 @@ async fn observe(state: &AppState, query: MonitorQuery) -> Result<MonitorReply, 
         None => Vec::new(),
     };
     let controller = state.control.as_ref().and_then(|c| c.loop_status());
-    let alerts = assess(controller.as_ref(), &workers, &work, Utc::now());
+    let mut alerts = assess(controller.as_ref(), &workers, &work, Utc::now());
+    let dreaming = match state.evaluation.as_ref() {
+        Some(h) => h.dreaming_status().await.ok(),
+        None => None,
+    };
+    if let Some(d) = &dreaming {
+        if let Some(r) = d
+            .reviews
+            .first()
+            .filter(|r| r.stage == rustykrab_core::dream_review::ReviewStage::Failed)
+        {
+            alerts.push(alert(
+                "warning",
+                "dreaming_review_failed",
+                "The latest project dreaming review failed; inspect its receipt.",
+                r.generator_item.as_deref(),
+                None,
+            ));
+        }
+        if d.reviews.iter().any(|r| {
+            !r.stage.terminal()
+                && work.items.iter().any(|w| {
+                    r.generator_item
+                        .iter()
+                        .chain(&r.evaluator_item)
+                        .any(|id| id == &w.item.id)
+                        && !w.item.status.is_closed()
+                        && Utc::now() - w.item.created_at > chrono::Duration::minutes(30)
+                })
+        }) {
+            alerts.push(alert(
+                "warning",
+                "dreaming_stalled",
+                "A native dreaming job is past its pending-job deadline.",
+                None,
+                None,
+            ));
+        }
+    }
     let health = health_of(&alerts).into();
     Ok(MonitorReply {
         version: state.build.version.clone(),
@@ -302,6 +342,7 @@ async fn observe(state: &AppState, query: MonitorQuery) -> Result<MonitorReply, 
         alerts,
         health,
         stale_after_seconds: STALE_SECONDS,
+        dreaming,
         expectation_metrics: state
             .agent
             .store
@@ -338,6 +379,9 @@ fn exposition(reply: &MonitorReply) -> String {
         "rustykrab_monitor_healthy {}\n",
         u8::from(reply.health == "healthy")
     ));
+    if let Some(d) = &reply.dreaming {
+        s.push_str(&format!("rustykrab_dreaming_enabled {}\nrustykrab_dreaming_reviews_completed {}\nrustykrab_dreaming_reviews_failed {}\nrustykrab_dreaming_reviews_pending {}\nrustykrab_dreaming_projects_eligible {}\nrustykrab_dreaming_projects_reviewed {}\nrustykrab_dreaming_proposals {}\nrustykrab_dreaming_outcomes_measured {}\nrustykrab_dreaming_tokens {}\n",u8::from(d.enabled),d.metrics.completed,d.metrics.failed,d.metrics.pending,d.metrics.eligible_projects,d.metrics.reviewed_projects,d.metrics.proposal_count,d.metrics.measured_outcomes,d.metrics.tokens));
+    }
     s.push_str("# TYPE rustykrab_work_items gauge\n");
     for (status, count) in &reply.work.counts {
         s.push_str(&format!(

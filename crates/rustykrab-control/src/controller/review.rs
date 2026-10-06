@@ -279,6 +279,8 @@ fn code_plan(proposal: &WorkItem, amendments: &[String]) -> WorkPlan {
         done_when: proposal.done_when.clone(),
         constraints,
         decisions_made: proposal.decisions_made.clone(),
+        worker_kind: proposal.worker_kind,
+        writable_resources: proposal.writable_resources.clone(),
         artifact_refs,
         edges: vec![DraftEdge {
             kind: EdgeKind::DiscoveredFrom,

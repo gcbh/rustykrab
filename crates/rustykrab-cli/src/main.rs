@@ -4,6 +4,7 @@ mod chat;
 #[cfg(feature = "computer-use")]
 mod computer_backend;
 mod daemon_client;
+mod dreaming;
 mod evaluation;
 mod fleet;
 mod monitor_cmd;

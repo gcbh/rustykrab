@@ -672,3 +672,24 @@ avoidable-escalation criterion has nothing to read until Phase 4.
 See `MEMORY_ARCHITECTURE.md` for the memory subsystem this builds on, and
 `crates/rustykrab-memory/DEFERRED.md` for previously-deferred consolidation work
 that the outer loop would finally drive.
+
+## Project reviews and review of dreaming (2026-10-05)
+
+Explicit projects now enter the existing outer loop for bounded native CLI
+review. A frozen project revision, committed excerpts, work receipts and
+operational evidence feed a generator, then a separate fresh meta-evaluator.
+The latter assesses evidence, usefulness, novelty, testability, coverage and
+blind spots. Deterministic citation/schema gates and existing proposal limits
+apply before publication. Human review precedes implementation.
+
+The monitor separates operational facts, proxy model grades, user decisions
+and measured probation results. Unknown utility remains unmeasured. The rubric
+is versioned; self-evaluation never modifies it or authorizes its own changes.
+These additions do not arm memory consolidation or complete the remaining
+conversational delivery/intake pipeline.
+
+The meta reviewer also grades three fixed negative controls: fabricated
+evidence, duplicate implemented work and an unfalsifiable improvement. All
+three must be rejected on the relevant dimension before any recommendation
+is published. These calibration receipts measure basic rubric behavior; they
+do not validate real-world usefulness or remove shared-model bias.

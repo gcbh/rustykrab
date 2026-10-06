@@ -26,6 +26,7 @@ pub mod evaluate;
 pub mod memory_mutator;
 pub mod mutation;
 pub mod planner;
+pub mod project_review;
 pub mod report;
 pub mod store_source;
 pub mod worker;

@@ -14,6 +14,7 @@ pub mod agent_def;
 pub mod capability;
 pub mod crypto;
 pub mod dream;
+pub mod dream_review;
 pub mod error;
 pub mod memory_backend;
 pub mod model;
