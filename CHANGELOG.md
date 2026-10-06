@@ -7,6 +7,93 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### RustyKrab 6.0 — Native agent work system
+
+This major release brings the durable work controller, project context layer,
+native subscription-backed runtimes, remote monitoring and project dreaming
+into one recorded milestone. It includes the implementations merged in
+[#664](https://github.com/gcbh/rustykrab/pull/664),
+[#665](https://github.com/gcbh/rustykrab/pull/665) and
+[#666](https://github.com/gcbh/rustykrab/pull/666). Their earlier automatic patch
+releases remain in the history below.
+
+### Added
+
+- **Durable execution:** a SQLite work graph, controller ownership lock, worker
+  leases and heartbeats, dependency scheduling, explicit completion criteria,
+  bounded recovery and controller verification before work is accepted as done.
+  Work, questions, decisions, evidence and finalized usage persist across restarts.
+- **Project continuity:** immutable project revisions carry intent, constraints,
+  decisions, answered questions and verified progress into each new run. Fresh
+  Claude or Codex workers continue from the verified commit chain. Controller-owned
+  pointers make unfinished attempts inspectable without accepting their code.
+- **Native Claude and Codex workers:** isolated CLI profiles and managed worktrees
+  run Claude Max and Codex ChatGPT subscriptions. Distinct authenticated accounts
+  can provide separate subscription capacity; profiles on the same account share
+  its limits. Account fingerprints, subscription checks and observed cooldowns
+  inform availability. Subscription-only profiles do not fall back to paid APIs.
+- **Planning and review:** planner identity is separate from execution; durable
+  questions, defaults, answers, plan approvals and consent gates resume blocked
+  work through the existing control policy.
+- **Agent monitoring:** an authenticated dashboard, bounded JSON observations,
+  protected Prometheus metrics and `monitor --check` show agent health, actual
+  assignments, controller activity, blocked work, recovery, usage, handoff context
+  and verification evidence. Disconnection and stale observations are visible.
+- **Private remote access:** Tailscale Serve can expose the loopback gateway over
+  HTTPS. One-time pairing creates revocable device tokens; tokens stay out of URLs.
+  Separate instances retain their own data, credentials and fleet observations.
+- **Project dreaming:** explicitly opted-in projects receive bounded background
+  reviews when the controller is idle. A native generator reads a frozen project
+  revision, committed excerpts and operational evidence; recommendations become
+  proposals awaiting human consent. Daily budgets, intervals, deduplication,
+  stale-context checks and durable recovery constrain the loop.
+- **Review of dreaming:** a separate fresh evaluator grades evidence, usefulness,
+  novelty and testability, plus coverage and blind spots. Literal citations and
+  strict output bounds gate publication. Fabricated evidence, already-built work
+  and unfalsifiable improvements must all fail fixed negative controls. Monitoring
+  separates operating facts, model grades, human decisions and measured outcomes.
+
+### Fixed
+
+- Updated `async-trait` to 0.1.92 for Rust 1.99 Clippy compatibility and `tar` to
+  0.4.46 for the PAX parsing advisory in the ONNX build dependency.
+- Corrected planner identity, question notification provenance, approval-budget
+  handling, same-origin dashboard reads, mobile overflow and internal dreaming
+  notification delivery during execution verification.
+
+### Upgrade and operation
+
+- Register projects with exact repository paths and bind work explicitly when a
+  repository belongs to more than one project. Configure and authenticate native
+  CLI profiles on the daemon host; additional accounts require separate logins.
+- A native-only fleet disables local execution with `RUSTYKRAB_LOCAL_WORKER=off`.
+  Claude CLI planning and native execution setup are described in the
+  [configuration guide](https://github.com/gcbh/rustykrab/blob/v6.0.0/README.md#claude-max-cli-runtimes).
+- Remote monitoring, browser pairing, project handoffs and instance isolation are
+  documented in the [monitoring guide](https://github.com/gcbh/rustykrab/blob/v6.0.0/docs/agent-monitoring.md). Project reviews
+  require explicit project opt-in; see [DREAMING.md](https://github.com/gcbh/rustykrab/blob/v6.0.0/DREAMING.md).
+- The separately deployed agent service uses its own data and Tailscale port.
+  Installing this release is an explicit deployment step; publishing it does not
+  replace another running daemon or discover unrelated local CLI sessions.
+
+### Verification and remaining scope
+
+- The integrated implementation passed 2,067 workspace tests with zero failures
+  and 31 intentionally ignored tests. All seven CI jobs passed for each of
+  #664–#666. The final scripted daemon suite passed 63 scenarios, with seven known
+  expected failures for remaining planning/delivery and consolidation contracts.
+- Live checks verified fresh Codex-to-Codex project continuation, persistence over
+  daemon restart, Tailscale HTTPS, device authentication and protected monitoring.
+  Claude-to-Codex handoff has controller integration coverage; live Claude model
+  execution was not part of those checks.
+- A real native Codex generator/evaluator pair rejected all three calibration
+  controls and produced a proposal awaiting consent. Its actual usefulness remains
+  unmeasured until implementation and subsequent outcomes provide evidence;
+  calibration does not eliminate shared-model bias.
+- Memory consolidation remains unarmed. The remaining conversational intake and
+  delivery contracts, PR delivery integration and full self-deployment are later
+  phases, not completed by this release.
+
 ## [5.3.9] - 2026-10-06
 
 - Add native project dreaming and calibrated meta-evaluation (#666)
