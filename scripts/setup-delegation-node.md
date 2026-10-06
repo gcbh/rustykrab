@@ -50,8 +50,10 @@ Three things follow from that shape:
   spent 3.3s.
 
 Tasks survive a restart of either machine: the queue is persisted, and a task
-the node was mid-way through when it died is reported as failed rather than
-left pending forever.
+the node was mid-way through when it died goes back to the queue and runs
+again when the node comes back, rather than being failed by the restart
+alone. A task interrupted three times is failed instead, with the reason, so
+one that takes the node down each time it runs stops doing so.
 
 ## Recursion
 
@@ -189,6 +191,37 @@ If the primary runs as an installed LaunchAgent rather than from a shell,
 re-run `scripts/install.sh` after exporting these: the installer copies a fixed
 list of variables into the plist, and a daemon started by launchd sees only
 what is in there.
+
+## 3b. Or: make it a worker for the primary's controller
+
+The `nodes` tool hands a node free text. The control layer can instead lease
+whole work items to it, as a `peer` worker
+(`docs/plans/control-layer-and-worker-fleet.md`, Phase 5). On the node run
+`rustykrab-cli pair`; on the primary:
+
+```bash
+rustykrab worker add peer --name krabby \
+  --url https://your-node.your-tailnet.ts.net --pairing-code <the code>
+```
+
+The primary redeems the code for a device token of its own and keeps it in
+its encrypted secret store; `rustykrab workers` never shows it. The node
+advertises what a delegated run may use there (`GET /api/node`: its model,
+the tools and MCP servers inside its `RUSTYKRAB_DELEGATION_TOOLS` ceiling,
+`RUSTYKRAB_MACHINE_NAME`, and the writable resources named in
+`RUSTYKRAB_DELEGATION_RESOURCES`, none by default), and the primary's
+registry records it and re-reads it with the node's health. An item is
+leased to the node only when that advertisement covers its
+`required_tools`; the node activates them before its first model call,
+refuses a tool outside its ceiling with a typed reason rather than running
+without it, and returns the typed result contract, which the primary
+verifies like any other worker's. Credentials stay on the node: a
+submission carries the item's brief, never a secret, and a tool that needs
+the node's own credentials uses them there.
+
+A restart on either side fails nothing. The node queues an interrupted task
+again; a primary that restarts asks the node for the task by its run id and
+re-attaches to it instead of submitting it twice.
 
 ## 4. Verify
 

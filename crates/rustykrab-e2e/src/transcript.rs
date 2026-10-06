@@ -24,6 +24,11 @@ pub struct ToolInvocation {
     /// before a result arrived.
     pub output: Option<Value>,
     pub failed: bool,
+    /// The host refused the call without running it: the tool was neither
+    /// declared nor appended in the conversation (plan section 12,
+    /// `rustykrab_agent::NOT_CALLABLE`). A refused call is an attempt, not
+    /// an execution.
+    pub refused: bool,
 }
 
 /// A conversation, parsed into the shape assertions need.
@@ -50,6 +55,15 @@ pub struct Transcript {
     pub duration_ms: u128,
     /// Set when the run itself failed rather than merely scoring badly.
     pub error: Option<String>,
+    /// The tool block each of the conversation's requests declared, from
+    /// the daemon log (`crate::tool_blocks`). Empty unless the caller read
+    /// the log; the store does not record it.
+    pub tool_blocks: Vec<crate::tool_blocks::ToolBlockSeen>,
+    /// The runner's `[System notice]` user turns, oldest first.
+    pub notices: Vec<String>,
+    /// System messages after the first message: none, since every runner
+    /// notice is a user turn (control plan 12.1).
+    pub late_system_messages: usize,
 }
 
 impl Transcript {
@@ -102,12 +116,21 @@ impl Transcript {
         // when several tools ran in parallel and returned out of order.
         let mut by_call_id: Vec<(String, usize)> = Vec::new();
 
-        for message in messages {
+        let mut notices = Vec::new();
+        let mut late_system_messages = 0;
+        for (index, message) in messages.iter().enumerate() {
             let role = message["role"].as_str().unwrap_or_default();
             let kind = message["content"]["type"].as_str().unwrap_or_default();
             let data = &message["content"]["data"];
 
             match (role, kind) {
+                ("system", _) if index > 0 => late_system_messages += 1,
+                ("user", "text") => {
+                    if let Some(text) = data.as_str().filter(|t| t.starts_with("[System notice] "))
+                    {
+                        notices.push(text.to_string());
+                    }
+                }
                 ("assistant", "text") => {
                     if let Some(text) = data.as_str() {
                         let text = text.trim();
@@ -149,6 +172,10 @@ impl Transcript {
                         // agent loop itself decides a call went wrong.
                         invocation.failed = data["is_error"].as_bool().unwrap_or(false)
                             || data["output"].get("error").is_some();
+                        invocation.refused = data["is_error"].as_bool().unwrap_or(false)
+                            && data["output"]["error"]
+                                .as_str()
+                                .is_some_and(|e| e.contains(rustykrab_agent::NOT_CALLABLE));
                     }
                 }
                 _ => {}
@@ -178,6 +205,9 @@ impl Transcript {
             live_messages: messages.len(),
             duration_ms: 0,
             error: None,
+            tool_blocks: Vec::new(),
+            notices,
+            late_system_messages,
         }
     }
 
@@ -196,12 +226,21 @@ impl Transcript {
         self.calls.iter().filter(|c| c.tool == tool).collect()
     }
 
+    /// Calls to `tool` that ran: every call less the ones the host refused.
+    pub fn executed(&self, tool: &str) -> Vec<&ToolInvocation> {
+        self.calls
+            .iter()
+            .filter(|c| c.tool == tool && !c.refused)
+            .collect()
+    }
+
     /// Every tool result for `tool`, rendered as text. Used to assert on
     /// what a tool actually returned to the model — memory recall, most
     /// importantly, where the question is whether retrieval found the fact
-    /// at all, separately from whether the model then used it.
+    /// at all, separately from whether the model then used it. Only calls
+    /// that ran: a refusal is the host's answer, not the tool's output.
     pub fn outputs_of(&self, tool: &str) -> String {
-        self.calls_to(tool)
+        self.executed(tool)
             .iter()
             .filter_map(|c| c.output.as_ref())
             .map(|o| o.to_string())
@@ -219,6 +258,7 @@ fn push_call(calls: &mut Vec<ToolInvocation>, by_call_id: &mut Vec<(String, usiz
         args: data["arguments"].clone(),
         output: None,
         failed: false,
+        refused: false,
     });
 }
 
@@ -360,5 +400,62 @@ mod tests {
         ));
         assert!(!t.compacted);
         assert!(t.summary.is_none());
+    }
+
+    #[test]
+    fn reads_notices_and_counts_system_messages_after_the_first() {
+        let t = parse_pair(&conv(
+            json!([
+                { "id": "m0", "role": "system",
+                  "content": { "type": "text", "data": "You are RustyKrab." } },
+                { "id": "m1", "role": "user",
+                  "content": { "type": "text", "data": "hello" } },
+                { "id": "m2", "role": "user",
+                  "content": { "type": "text", "data": "[System notice] Continue." } },
+                { "id": "m3", "role": "system",
+                  "content": { "type": "text", "data": "Continue." } }
+            ]),
+            json!({}),
+        ));
+        assert_eq!(t.notices, ["[System notice] Continue."]);
+        assert_eq!(t.late_system_messages, 1);
+    }
+
+    #[test]
+    fn a_call_the_host_refused_is_an_attempt_not_an_execution() {
+        let refusal = format!(
+            "tool execution error: tool 'get_forecast' {}: it did not run.",
+            rustykrab_agent::NOT_CALLABLE
+        );
+        let t = parse_pair(&conv(
+            json!([
+                { "id": "m1", "role": "assistant",
+                  "content": { "type": "tool_call",
+                               "data": { "id": "c1", "name": "get_forecast", "arguments": {} } } },
+                { "id": "m2", "role": "tool",
+                  "content": { "type": "tool_result",
+                               "data": { "call_id": "c1", "is_error": true,
+                                         "output": { "error": refusal } } } },
+                { "id": "m3", "role": "assistant",
+                  "content": { "type": "tool_call",
+                               "data": { "id": "c2", "name": "get_forecast", "arguments": {} } } },
+                { "id": "m4", "role": "tool",
+                  "content": { "type": "tool_result",
+                               "data": { "call_id": "c2", "is_error": true,
+                                         "output": { "error": "upstream down" } } } }
+            ]),
+            json!({}),
+        ));
+        assert_eq!(t.calls_to("get_forecast").len(), 2);
+        assert!(t.calls[0].refused && t.calls[0].failed);
+        assert!(!t.calls[1].refused && t.calls[1].failed);
+        assert_eq!(t.executed("get_forecast").len(), 1);
+        // The refusal is the host's answer, not the tool's output.
+        let outputs = t.outputs_of("get_forecast");
+        assert!(outputs.contains("upstream down"), "{outputs}");
+        assert!(
+            !outputs.contains(rustykrab_agent::NOT_CALLABLE),
+            "{outputs}"
+        );
     }
 }

@@ -5,12 +5,31 @@ off-cycle process -- "dreaming" -- that continuously improves how the system
 executes by reviewing what has already happened and reconciling it into durable
 knowledge (memory and, eventually, skills).
 
-Status: **Phase 0 implemented; Phases 1-3 proposed.** Outcome instrumentation
-and credit assignment are in the tree, opt-in behind
-`RUSTYKRAB_OUTCOME_CAPTURE` and observational only -- see
-[Phase 0 as built](#phase-0-as-built). Everything downstream of that is still
-design. The [Revision history](#revision-history) records how the design
-evolved so the discarded reasoning survives.
+Status (2026-09-27): **Phases 0 and 1 implemented; Phase 2 built but unarmed;
+Phase 3's proposals and review surface implemented, skill promotion not.**
+
+- **Phase 0** (Monitor): outcome instrumentation and credit assignment, opt-in
+  behind `RUSTYKRAB_OUTCOME_CAPTURE` and observational only, with skills'
+  declared checks verified by registered probes so their runs carry
+  `Verifiable` evidence (see [Phase 0 as built](#phase-0-as-built)).
+- **Phase 1** (Analyze): the idle-gated, report-only `DreamWorker` runs when
+  capture is on, keeps every pass (`dream_reports`), and `rustykrab dream`
+  reads them back.
+- **Phase 2** (memory consolidation): stage-then-promote with a manifest and a
+  real reversal path, as a library. Nothing calls it in production:
+  `Readiness::permits_mutation()` stays shut until a skill declares checkable
+  post-conditions. Nightly evals state what it still owes.
+- **Phase 3** (skills), through the control layer's Phase 6
+  (`docs/plans/control-layer-and-worker-fleet.md`, sections 1.1, 10 and 11):
+  the evaluation pass files a skill-delta *proposal* when a skill's
+  ground-truth record is poor, and proposals have their review surface:
+  GitHub issues, decided there and synced back. An accepted proposal becomes
+  a `code` item under verification with probation on its named metric; a
+  skill or prompt change does not yet go through a stage-then-promote path of
+  its own. See [Evaluation and proposals](#evaluation-and-proposals-control-plan-phase-6).
+
+The [Revision history](#revision-history) records how the design evolved so
+the discarded reasoning survives.
 
 ## Motivation
 
@@ -431,10 +450,13 @@ hot-registers skills**. It writes proposals to a staging area; promotion into
 `SkillRegistry` is gated behind review and/or the existing-but-unused Ed25519
 verification path (`crates/rustykrab-skills/src/verify.rs`).
 
-**Open dependency:** proposals are useless without a **review surface**. If the
-loop runs unattended, proposals must be pushed somewhere a human sees them (a
-digest to a channel, or a review prompt on next interaction). Without that
-surface, the skill tier is theater and should be cut from scope honestly.
+**Resolved dependency:** proposals are useless without a **review surface**.
+It now exists: the control layer projects every proposal to a GitHub issue
+labelled `rustykrab-proposal`, tells the user on their channel when one is
+filed, and applies the decision taken on the issue (see
+[Evaluation and proposals](#evaluation-and-proposals-control-plan-phase-6)).
+What remains is the promotion half: an accepted skill delta is carried out as
+a `code` item, not staged and promoted into `SkillRegistry` by the loop.
 
 ## Build order
 
@@ -443,7 +465,7 @@ surface, the skill tier is theater and should be cut from scope honestly.
 | **0 -- Instrument outcomes (Monitor)** | *(implemented)* Outcome records + credit assignment; `[outcome]` in `SKILL.md`. Pure data collection, opt-in via `RUSTYKRAB_OUTCOME_CAPTURE`. | None | Outcome data flowing for at least verifiable-signal skills. |
 | **1 -- Downtime read-only analysis (Analyze)** | Trigger + queue + idle-gated worker running *report-only* jobs; abort-and-requeue on activity. | None (no writes) | Reports show real, actionable patterns. |
 | **2 -- Memory mutation (Plan+Execute)** | Consolidation that writes memory via stage-then-promote + manifest + probation-window rollback; low gain, rate-limited. | Medium | Consolidations measurably improve retrieval and are reliably reversible. |
-| **3 -- Skill improvement** | Per-skill optimization from logged outcomes; proposal-only with a review surface. | Higher | Per-skill measurable outcomes + a working review/promotion surface. |
+| **3 -- Skill improvement** | Per-skill optimization from logged outcomes; proposal-only with a review surface. *(Proposals and the review surface implemented through the control plan's Phase 6; promotion not.)* | Higher | Per-skill measurable outcomes + a working review/promotion surface. |
 
 Notably **not** required, thanks to staging + soft-delete: a DB snapshot engine,
 a job-state machine for pausing, conversation versioning, or a preemption bus.
@@ -511,6 +533,61 @@ Two deliberate deviations from the plan above:
    `Verifiable` evidence; nothing yet notices a user *saying* the run was
    wrong, so `Explicit` remains unused.
 
+## Evaluation and proposals (control plan Phase 6)
+
+The control layer gives dreaming an objective and a place to put what it
+finds (`docs/plans/control-layer-and-worker-fleet.md`, sections 1.1, 10 and
+11). `rustykrab_dream::evaluate` is one deterministic pass, no model, run
+nightly (`RUSTYKRAB_EVALUATION_INTERVAL_SECS`) and on demand
+(`POST /api/work/evaluate`):
+
+1. **Metrics.** The twelve expectation metrics of section 1.1 (done without
+   intervention, the verification gap, escaped defects, rungs per escalation,
+   escalations per completed item, avoidable escalations, typed and unknown
+   error rates, capabilities later used, proposals filed and the fraction that
+   moved their metric, bound violations), computed from the work items' stored
+   events over a trailing week, stored per pass (`expectation_metrics`) and
+   served at `GET /api/work/metrics`. A regression is a comparison of two
+   stored passes.
+2. **Criteria.** Section 10's table, one function per row: expectation
+   regressions, avoidable escalations (a question that reached the user and was
+   answered with its recorded default), recurring and unknown fingerprints,
+   capability gaps, wasted rungs and plan shape, verification misses, cost and
+   latency, coding quality by worker (a routing proposal citing both workers'
+   records, the items behind them, and the move itself as a typed
+   `routing_default`), and skill outcomes.
+3. **The gate.** A proposal is filed only from verifiable or explicit evidence
+   (`SignalClass::is_ground_truth`); the `internal` item for an unknown error is
+   the one exception, because its evidence is the raw failure. Skill outcomes are
+   read ground-truth-only, and what proxy evidence alone would have flagged is
+   reported as skipped rather than filed.
+4. **Limits.** One live proposal per subject, a daily cap, a cool-down after a
+   decline, and every proposal at the review tier its subject requires: nothing
+   touching policy, credentials, the controller, the ladder budgets or the
+   system's own measurement below the highest tier, which the controller's
+   validator enforces on every filing path.
+5. **Review.** Proposals wait in `blocked(needs_consent)` and are projected to
+   GitHub issues (`rustykrab_control::review`); a `rustykrab-accepted` or
+   `rustykrab-declined` label, or an `/accept`, `/decline` or `/amend` comment
+   from a collaborator, comes back as a typed `review` event. Personal and
+   research work is never projected, and appears in a projected item only as an
+   opaque `local:#N`.
+6. **Execution and probation.** An accepted proposal becomes a `code` item with
+   a `discovered_from` edge onto it, under verification. A routing proposal is
+   the exception: its move is data, so accepting it sets the class's default
+   tier in the worker registry's `routing_defaults`, the only way a default
+   moves, and files no code item. The named metric's
+   value at acceptance is its baseline; a probation window after the change
+   lands, the pass records whether the metric moved, did not move (itself
+   evidence for the next cycle), or regressed, in which case it proposes the
+   rollback through review rather than undoing anything itself.
+
+The pass reads the questions (Phase 4) and the routing record (Phase 3)
+through traits of its own. The routing record is wired: the daemon's
+`StoreRouting` reads each worker's record, cost tier and the class default
+tiers from the worker registry. The questions are not yet, so the
+avoidable-escalation criterion has nothing to read until Phase 4.
+
 ## What downtime does and does not solve
 
 - **Solves:** latency. Session-end cost is an INSERT; thinking happens when idle;
@@ -539,8 +616,10 @@ Two deliberate deviations from the plan above:
 - **Ground-truth coverage.** Verifiable post-conditions cover only some skills.
   For subjective skills, is gated/audited LLM-as-judge acceptable, or do they
   stay frozen?
-- **Review surface.** Which channel / UX surfaces skill (and risky memory)
-  proposals for human approval?
+- **Review surface.** Proposals now surface as GitHub issues with a channel
+  notice (control plan section 11); whether Linear replaces GitHub is still
+  open, and the adapter is a trait so it can. Risky memory changes have no
+  review path yet.
 
 ## Key file references
 
@@ -556,10 +635,17 @@ Two deliberate deviations from the plan above:
 | Cron / scheduled jobs (queue lives near here) | `crates/rustykrab-store/src/jobs.rs` |
 | Skill registry, disk loading, `SKILL.md`, verification | `crates/rustykrab-skills/src/` |
 | Orchestration (where the enqueue hook attaches) | `crates/rustykrab-gateway/src/orchestrate.rs` |
+| Evaluation pass: metrics, criteria, proposals, probation | `crates/rustykrab-dream/src/evaluate/` |
+| Review surface: projection rule, adapter trait, sync | `crates/rustykrab-control/src/review/` |
+| Proposal records, metrics, projections | `crates/rustykrab-store/src/proposals.rs` |
 
 ## Revision history
 
-- **v4 (this revision).** Added the ACE prior-art analysis (arXiv 2510.04618,
+- **v5.** Status refreshed after #615 to #633 and the control plan's Phase 6:
+  the evaluation pass, proposals and their review surface are built; the
+  open review-surface dependency of "Skills are proposal-only" is resolved
+  for proposals, not for promotion.
+- **v4.** Added the ACE prior-art analysis (arXiv 2510.04618,
   ICLR 2026) after verifying its mechanism and results against the paper text
   and the authors' open-source implementation. ACE independently validates two
   first-principles choices here (context collapse -> no monolithic rewrites /

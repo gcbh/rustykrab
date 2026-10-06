@@ -187,6 +187,7 @@ All configuration is via environment variables. No plaintext config files.
 | `ANTHROPIC_MODEL` | `claude-sonnet-4-20250514` | Claude model to use. The Claude 4.X family (Opus 4.7 `claude-opus-4-7`, Sonnet 4.6 `claude-sonnet-4-6`, Haiku 4.5 `claude-haiku-4-5-20251001`) is recommended for new deployments |
 | `ANTHROPIC_CONTEXT_LENGTH` | `200000` | Context window in tokens for the selected Claude model. Anthropic doesn't expose a discovery endpoint, so set this when enabling a non-default window (e.g. the 1M-token beta) so compaction thresholds stay in sync |
 | `RUSTYKRAB_TIMEZONE` | host zone, else `UTC` | IANA zone name (e.g. `America/Los_Angeles`) that human-entered schedules are interpreted in. Cron expressions and offset-less one-shot timestamps passed to the `cron` tool are read as wall-clock times here; everything is still *stored* in UTC. Each job records the zone it was created with, so changing this does not move existing jobs. Use an IANA name, not a fixed offset like `UTC-8` — only the named zone tracks daylight saving |
+| `RUSTYKRAB_CRON_WORK_ITEMS` | `0` | `1` fires each scheduled job as a work item the control layer runs (a local worker, in the job's own conversation, with its SKILL.md and delivery target, and never while an interactive turn holds the model) instead of as a task-queue conversation. The run ends with `result_report`, whose summary is the message delivered. Off by default while the local-model suites have not measured that path; the e2e daemon turns it on |
 | `RUSTYKRAB_MAX_CONTEXT_TOKENS` | `128000` (cloud) / `32000` (ollama) | Context budget used to compute the compaction threshold. Default is provider-aware: 128k for cloud providers (Anthropic) and 32k for local Ollama, where prompt evaluation on consumer GPUs times out long before a 128k window fills. Set to override the default for either provider |
 | `RUSTYKRAB_COMPACTION_CONTEXT_CEILING` | `131072` | Hard upper bound on the context window used to compute the compaction threshold. Keeps compaction firing at a sane size even when the backing model advertises a much larger window |
 | `RUSTYKRAB_COMPACTION_SUMMARY_MAX_TOKENS` | `8192` | Env-configurable upper bound on the final compaction summary. The effective cap is further bounded by `RUSTYKRAB_MAX_CONTEXT_TOKENS / 4`, so on a 32k local-Ollama deployment the summary stays under 8k regardless of this value. If the summarizer returns a summary larger than the effective cap, it is re-summarized (up to 3 passes) and eventually truncated |
@@ -206,6 +207,8 @@ All configuration is via environment variables. No plaintext config files.
 | `OPENAI_INCLUDE_USAGE` | `1` | Request usage in the final stream chunk; set `0` for servers that reject `stream_options` |
 | `RUSTYKRAB_NODES` | unset | JSON array of peer instances the `nodes` tool can delegate to: `{id, url, token, description, hop_budget}`. `hop_budget` defaults to `0`, which denies the node onward delegation. See [Delegating to a peer node](#delegating-to-a-peer-node) |
 | `RUSTYKRAB_DELEGATION_TOOLS` | unset | On a *node*: which tools a task delegated by a peer may use. Unset applies the default posture (everything registered except the credential family, `message` and `gateway`); `all` lifts the allowlist but not those fixed denials; a comma-separated list names the only tools a delegated run may touch. Node-authoritative — a submitting peer can narrow this per task but never widen it. The sub-agent tool family is withheld from delegated runs unconditionally |
+| `RUSTYKRAB_MACHINE_NAME` | host name | On a *node*: the machine name it advertises to a controller's peer worker (`GET /api/node`), and the device name it pairs under as a controller |
+| `RUSTYKRAB_DELEGATION_RESOURCES` | unset | On a *node*: the writable resources (a calendar, a mailbox) a peer's work item may claim here, comma separated. Unset advertises none, so an item that writes a resource is never leased to this node |
 | `RUSTYKRAB_NODE_TIMEOUT_SECS` | `900` | HTTP timeout for calls to a peer. Since delegation is asynchronous these calls are short (submit, poll, cancel); the generous default now only covers the fallback path against a peer too old to have the task queue |
 | `CHROME_CDP_URL` | `ws://127.0.0.1:9222` | Chrome DevTools Protocol endpoint |
 | `RUSTYKRAB_AUTH_TOKEN` | auto-generated | Bearer token for API auth |
@@ -222,11 +225,78 @@ All configuration is via environment variables. No plaintext config files.
 | `RUST_LOG` | `info` | Log level (`info`, `debug`, `rustykrab_gateway=debug`) |
 | `RUSTYKRAB_LOG_STDOUT` | auto | Force stdout logging on (`1`) or off (`0`). Default: enabled only when stdout is a terminal. The rolling log file under the data directory is always written |
 | `RUSTYKRAB_OUTCOME_CAPTURE` | `0` | Record how each completed run went, and which skill, memories, and tools were in play, into the `outcome_records` table. Observational only — it changes nothing about how the agent behaves. Groundwork for the self-improvement outer loop; see `DREAMING.md` |
+| | | When enabled, this also starts a **downtime analysis worker**: read-only, it aggregates recorded outcomes and logs a digest once the system has been quiet for 10 minutes, abandoning a pass if activity arrives mid-flight. It never writes and never calls a model |
 | `RUSTYKRAB_PUBLIC_URL` | unset | Base URL the agent puts in a credential or payment-approval link, e.g. `https://mac.tailnet.ts.net`. Unset, the agent falls back to telling the user a prompt is waiting in the app — so a link is never minted and the failure is silent |
 | `RUSTYKRAB_TAILNET_USERS` | unset | Comma-separated tailnet logins allowed to open a credential or payment-approval page. Empty means any authenticated tailnet user. Requires `tailscale serve` in front to inject `Tailscale-User-Login` |
 | `RUSTYKRAB_PAYMENT_COOLDOWN_SECS` | `30` | Seconds after one payment is pressed before another may be claimed, across every conversation. Not a limit on what the user may buy — each purchase is approved separately — but on how fast the agent can act on approvals it already holds, so a retry loop is caught by a human before it can run. `0` disables the throttle; a value that is not a whole number of seconds is ignored with a warning and the default kept. Independent of the single-spend lock, which is unconditional: one payment may be in flight at a time and each approval is spendable exactly once |
 | `RUSTYKRAB_PAYMENT_DUPLICATE_WINDOW_HOURS` | `24` | Hours back over which a payment counts as a repeat of one being filed now. The same site, amount and currency inside the window is held rather than sent to the user for approval: nothing is paid, the user is told, and the agent is told to stop. `0` disables the hold; a value that is not a whole number of hours is ignored with a warning and the default kept. The key is deliberately the origin, amount and currency — not the merchant name or the description, both of which the model writes and could reword its way past |
-| | | When enabled, this also starts a **downtime analysis worker**: read-only, it aggregates recorded outcomes and logs a digest once the system has been quiet for 10 minutes, abandoning a pass if activity arrives mid-flight. It never writes and never calls a model |
+| `RUSTYKRAB_EVALUATION_INTERVAL_SECS` | `86400` | How often the control layer's evaluation pass runs (`docs/plans/control-layer-and-worker-fleet.md`, sections 1.1, 10 and 11): the expectation metrics from stored events, the review surface's decisions synced back, proposals filed from ground-truth evidence only, and engineering items projected to issues. The first pass waits one interval; `0` turns the timer off and leaves `POST /api/work/evaluate`. It never calls a model |
+| `RUSTYKRAB_CONTROL_TICK_SECS` | `5` | Seconds between the control loop's ticks, which advance the work-item graph, reconcile runs and deliver the work outbox's notices. With `RUSTYKRAB_CRON_WORK_ITEMS=1` it is also how often scheduled jobs are checked for firing. Values below `1` are raised to `1`; a value that is not a whole number keeps the default. Only the daemon holding `controller.lock` in the data directory ticks |
+| `RUSTYKRAB_LOCAL_WORKER` | on | `off`, `false`, `0` or `no` register no local worker, so routing never leases a work item to one. For a daemon with no local model: the local worker sits on the cheapest tier, so every unconstrained item would otherwise go to it and fail. External workers and peers run as before |
+| `RUSTYKRAB_HOLD_DISCOVERED` | off | `1`, `true`, `on` or `yes` hold every graph of follow-up items a worker reports as `discovered` for a person: they are filed as `blocked(needs_consent)` and released through `POST /api/work/{id}/approve`. For a daemon that builds its own repository, whose follow-ups would otherwise run at once on a base lacking their siblings' unmerged work |
+| `RUSTYKRAB_DRAIN_SECS` | `20` | On shutdown, seconds the controller waits for the runs in flight to finish, leasing nothing new, before it ends them. A value that is not a whole number of seconds is ignored with a warning and the default kept |
+| `RUSTYKRAB_AGING_MAX_GAP_SECS` | `900` | Longest the control layer's aging pass (compaction of what may age) waits for an idle tick before it runs anyway, so steady load cannot starve it. Values below `1` are raised to `1`; a value that is not a whole number keeps the default. The evaluation harness shortens it |
+| `RUSTYKRAB_GITHUB_REPO` | unset | `owner/name` of the repository whose issues are the review surface. `code`, `proposal`, `internal` and capability-build items are projected there under the `rustykrab` label; personal and research work never is. Unset, nothing is projected |
+| `RUSTYKRAB_GITHUB_TOKEN` | unset | Token for the review surface, overriding the `github_token` entry in the credential store (`rustykrab keychain`); it needs issues read and write on the repository. `rustykrab update` also sends it, when set, to the releases API, for rate limits only |
+| `RUSTYKRAB_UPDATE_REPO` | `gcbh/rustykrab` | `owner/name` whose latest GitHub release `rustykrab update check` and `rustykrab update stage` read. See [Updating (`update` subcommand)](#updating-update-subcommand) |
+| `RUSTYKRAB_UPDATE_API_BASE` | `https://api.github.com` | GitHub API base for `rustykrab update` (a GitHub Enterprise host, or a test stand-in) |
+| `RUSTYKRAB_UPDATE_AUTO` | unset | `1` lets `rustykrab update apply` swap without `--yes`; otherwise it only prints its plan |
+| `RUSTYKRAB_UPDATE_TEAM_ID` | `3RRX845C4X` | Apple team a staged `RustyKrab.app` must be signed by. The team is pinned, so a correctly signed bundle from anyone else is refused; set this for a fork signed by another team |
+| `RUSTYKRAB_GITHUB_API_BASE` | `https://api.github.com` | GitHub API base for the review surface (a GitHub Enterprise host, or the e2e harness's stand-in) |
+| `RUSTYKRAB_DATA_DIR` | OS local data dir + `/rustykrab` | Data directory (store, logs, `soul.md`, `harness.toml`, agent definitions). Falls back to `./rustykrab` when the OS has no local data dir. The E2E harness points it at a throwaway directory |
+| `RUSTYKRAB_MODEL_CACHE_DIR` | `<data dir>/models` | Where the fastembed ONNX embedding model is downloaded and cached. Unused in builds without the `embeddings` feature. The E2E harness points it at one shared directory so its throwaway boots download the model once |
+| `RUSTYKRAB_PORT` | `3000` | Gateway port. The bind address is always loopback (`127.0.0.1`) and is not configurable. `rustykrab pair` also uses it to build the default pairing URL when `RUSTYKRAB_PUBLIC_URL` is unset. A value that is not a port number is fatal |
+| `RUSTYKRAB_GATEWAY_URL` | `http://127.0.0.1:3000` | Daemon base URL the client subcommands (`chat`, `work`, `worker`) talk to. Must be an http(s) URL with a host |
+| `RUSTYKRAB_SOUL_PATH` | `<data dir>/soul.md` | Soul file loaded into the system prompt; seeded with the built-in default if missing |
+| `RUSTYKRAB_HARNESS` | `default` | Harness profile preset: `default`, `coding`, `research` or `creative` (anything else means `default`). Ignored when `<data dir>/harness.toml` exists |
+| `RUSTYKRAB_HARNESS_ROUTER` | on | `off`, `0`, `false` or `no` disable the per-message harness router and pin the configured profile for every message |
+| `RUSTYKRAB_MAX_CONCURRENT_TASKS` | `4` | Background task-queue concurrency. A value that does not parse keeps the default |
+| `RUSTYKRAB_ENABLE_SUBAGENTS` | `false` | `1` or `true` register the sub-agent tools |
+| `RUSTYKRAB_DISTILL` | on | `off`, `0`, `false` or `no` disable memory distillation |
+| `RUSTYKRAB_VIDEO` | `false` | `true` or `1` enable the video channel, which keeps its projects under `<data dir>/video` |
+| `RUSTYKRAB_NPX_PATH` | `npx` | `npx` executable the video channel runs |
+| `RUSTYKRAB_COMPUTER_USE` | `false` | `true` or `1` register the computer-use tools. Only in builds with `--features computer-use` |
+| `RUSTYKRAB_COMPUTER_USE_READONLY` | `false` | `true` or `1` register the computer-use tools in read-only mode. Only read when `RUSTYKRAB_COMPUTER_USE` is on |
+| `RUSTYKRAB_MCP_SERVERS` | unset | Comma-separated MCP connector names; each is configured with `RUSTYKRAB_MCP_<NAME>_*`. See [MCP servers: credential refs](#mcp-servers-credential-refs) |
+| `RUSTYKRAB_MCP_<NAME>_TRANSPORT` | `http` | Transport for the MCP server `<NAME>` (its name from `RUSTYKRAB_MCP_SERVERS`, upper-cased): `http` or `stdio` |
+| `RUSTYKRAB_MCP_<NAME>_URL` | unset | Endpoint of an `http` MCP server; required for that transport |
+| `RUSTYKRAB_MCP_<NAME>_TOKEN` | unset | Bearer token sent to an `http` MCP server. May be a `ref:` reference |
+| `RUSTYKRAB_MCP_<NAME>_HEADER_<KEY>` | unset | Extra HTTP header for an `http` MCP server; `<KEY>` becomes the header name with `_` as `-`. May be a `ref:` reference |
+| `RUSTYKRAB_MCP_<NAME>_COMMAND` | unset | Executable spawned for a `stdio` MCP server; required for that transport |
+| `RUSTYKRAB_MCP_<NAME>_ARGS` | unset | Comma-separated arguments for the `stdio` server's command |
+| `RUSTYKRAB_MCP_<NAME>_ENV_<KEY>` | unset | Environment variable `<KEY>` passed to the `stdio` server's process. May be a `ref:` reference |
+| `RUSTYKRAB_PROMPT_LOG` | off | `1`, `true`, `TRUE` or `yes` write every prompt and response to a daily-rolling `prompts.log` — for debugging only, as it records conversation content |
+| `RUSTYKRAB_DEFAULT_CHANNEL` | unset | Fallback delivery channel for a scheduled job whose job and conversation carry none; without it such results are logged and discarded |
+| `RUSTYKRAB_DEFAULT_CHAT_ID` | unset | Fallback chat ID paired with `RUSTYKRAB_DEFAULT_CHANNEL` |
+| `RUSTYKRAB_DEFAULT_THREAD_ID` | unset | Fallback thread ID paired with `RUSTYKRAB_DEFAULT_CHANNEL` |
+| `RUSTYKRAB_CREDENTIAL_BACKEND` | platform secure store | `memory` keeps credentials in process memory, lost on restart. Evaluation harness only; never set it on a real deployment |
+| `RUSTYKRAB_SCRIPT_PATH` | unset | Script file for `RUSTYKRAB_PROVIDER=scripted` (E2E harness); required by that provider, which refuses to start without it |
+| `RUSTYKRAB_TOOL_STUBS` | unset | Path to a tool-stub file that swaps real tools for scripted stand-ins, all active from turn 0. Evaluation harness only |
+| `RUSTYKRAB_ACTIVE_TOOLS` | unset | Comma-separated tool names to seed active from turn 0. Evaluation harness only |
+| `RUSTYKRAB_ALLOWED_ORIGINS` | unset | Comma-separated extra origins the gateway accepts browser requests from, e.g. the tailnet URL the credential page is served on. A malformed entry is skipped with a warning. See [Serving the credential page over your tailnet](#serving-the-credential-page-over-your-tailnet) |
+| `RUSTYKRAB_CREDENTIAL_PAGE_ANONYMOUS` | off | `1`, `true`, `on` or `yes` let the credential and payment-approval pages answer without a `Tailscale-User-Login` identity. Never set it on a page reachable from beyond this machine |
+| `RUSTYKRAB_DISABLE_KEYCHAIN` | off | macOS: any value but empty, `0`, `false`, `no` or `off` keeps the daemon off the real Keychain. The evaluation harness sets it on every throwaway boot |
+| `RUSTYKRAB_APNS_KEY_ID` | unset | 10-character APNs signing key identifier. Push is off unless this, `RUSTYKRAB_APNS_TEAM_ID` and `RUSTYKRAB_APNS_TOPIC` are all set; the signing key itself lives in the encrypted store |
+| `RUSTYKRAB_APNS_TEAM_ID` | unset | 10-character Apple team identifier that owns the APNs key |
+| `RUSTYKRAB_APNS_TOPIC` | unset | The app's bundle id, sent as `apns-topic` |
+| `RUSTYKRAB_RATE_LIMIT_MAX` | `20` | Requests one IP may make per window before it is locked out. Zero or unparseable values keep the default |
+| `RUSTYKRAB_RATE_LIMIT_WINDOW_SECS` | `60` | Length of the rate-limit window in seconds. Zero or unparseable values keep the default |
+| `RUSTYKRAB_RATE_LIMIT_LOCKOUT_SECS` | `300` | Seconds an IP stays locked out after exceeding the limit. Zero or unparseable values keep the default |
+| `RUSTYKRAB_APNS_ENVIRONMENT` | `sandbox` | APNs host for push notifications: `production` (or `prod`) sends to `api.push.apple.com`; anything else uses the sandbox |
+| `RUSTYKRAB_WORKSPACE` | current directory | Base directory the file tools are confined to |
+| `RUSTYKRAB_SSRF_ALLOW_HOSTS` | unset | Comma-separated host names exempt from the web tools' private-address block. Exact, case-insensitive, no wildcards. The evaluation harness forwards it to the daemons it boots |
+| `RUSTYKRAB_COMPACTION_INPUT_BUDGET_RATIO` | `0.5` | Fraction of the effective context limit a single compaction call may take as input. Values are clamped to (0, 1]; one that does not parse keeps the default |
+| `RUSTYKRAB_COMPACTION_EXPAND_CTX` | unset | A positive integer runs every summarization call at that context window; anything else leaves compaction at the everyday window. Each switch costs a KV-cache resize on local servers |
+| `RUSTYKRAB_BROWSER_ISOLATED_ROOT` | unset | Directory the browser tool isolates its profiles under, instead of redirecting `HOME`. The evaluation harness sets it per boot |
+| `RUSTYKRAB_BROWSER_BORROW_SYSTEM_PROFILE` | off | `1` symlinks the account's active system-Chrome profile into RustyKrab's user-data directory to reuse its sessions. Unsafe while that Chrome is running |
+| `RUSTYKRAB_BROWSER_DOWNLOAD_ROOT` | unset | Root for browser downloads, one subdirectory per profile. Unset, downloads stay under the profile's user-data directory |
+| `RUSTYKRAB_BROWSER_SWEEP` | off | `1` kills stale Chromium processes whose user-data directory is RustyKrab's when the browser manager starts |
+| `RUSTYKRAB_UPDATE_APPLY_UNREVIEWED` | unset | `1` lets `rustykrab update apply` run with the launchd service, which is held until what it still needs is built (`docs/plans/update-flow.md`, "Slice 6: status"); otherwise it refuses and exits 3. It does not gate `--service script:<cmd>`, which is only for a bare binary launchd does not run and refuses an `--installed` inside a `.app` or under `~/Applications`, and a staged app |
+| `RUSTYKRAB_BIN` | `target/debug/rustykrab-cli` | Daemon binary the evaluation harness (`rustykrab-e2e`) boots. Harness only |
+| `RUSTYKRAB_E2E_SOURCE_REVISION` | `unrecorded` | Source revision recorded in the evaluation harness's report. Harness only |
+| `RUSTYKRAB_COMPACTION_STUDY_ARM` | unset | `message-tail` runs only the structured message-tail arm of the harness's compaction study. Harness only |
+| `RUSTYKRAB_CONTEXT_BROWSER_READY` | unset | `1` tells the harness's context eval that its browser fixture is ready. Harness only |
+| `RUSTYKRAB_CONTEXT_COMPACTION_STRATEGY` | default strategy | Compaction strategy the harness's context eval runs under, by its serialized name. Harness only |
 
 ### Persisting credentials
 
@@ -454,6 +524,51 @@ cargo run --release -p rustykrab-cli
 
 Open `http://127.0.0.1:3000` in a browser for the embedded WebChat interface.
 
+### Updating (`update` subcommand)
+
+```bash
+rustykrab-cli update check                      # is the latest release newer?
+rustykrab-cli update stage                      # download, verify and stage it
+rustykrab-cli update stage --from path/to/RustyKrab.app   # stage a local build
+rustykrab-cli update apply                      # print what apply would do
+rustykrab-cli update apply --yes                # swap the staged version in
+rustykrab-cli update apply --yes --service 'script:./start.sh' \
+  --installed /path/to/rustykrab-cli --url http://127.0.0.1:3000   # no launchd
+```
+
+`check` and `stage` do not touch the running daemon. `stage` downloads
+`rustykrab-<target>.tar.gz` from the latest release of
+`RUSTYKRAB_UPDATE_REPO` and refuses it unless the release API's `digest`
+for the asset is present and equals the SHA-256 of the bytes downloaded.
+Only then is it extracted, with the system `tar`. On macOS the bundle must
+pass `codesign --verify --deep --strict` and be signed as
+`com.gcbh.rustykrab` by team `RUSTYKRAB_UPDATE_TEAM_ID`; only after that
+does the staged binary run once, with `--version`, and it must print the
+release's version. The result lands in `<data dir>/updates/<version>/`
+with a `staged.json` record. A release that is not newer stages nothing,
+and a version recorded as bad in `<data dir>/updates/bad.json` is refused
+unless `--force`. `--from` takes a `RustyKrab.app` or a bare binary; it has
+no digest, but a bundle still goes through the signature check. A local
+build has no tag and reports the package version, so a rollback records it
+in `bad.json` by its commit: a later build of the same version with another
+commit still stages.
+
+`apply` swaps in the newest staged version. It reads the running version
+from `GET /api/version` (bearer token from `RUSTYKRAB_AUTH_TOKEN`, URL from
+`--url` or `RUSTYKRAB_GATEWAY_URL`), stops the daemon and waits for it to
+exit, renames the installed `RustyKrab.app` (default
+`~/Applications/RustyKrab.app`) or binary to `.prev` and moves the stage
+into its place, and starts it again. Within 90 s the new daemon must report
+the staged commit, hold `controller.lock`, tick twice and have no failed
+ticks. Otherwise `apply` stops it, restores `.prev`, starts and verifies
+the old one, records the new one as bad and exits non-zero. The default
+`--service launchd` uses `launchctl bootout` and `bootstrap` on the
+`com.gcbh.rustykrab` LaunchAgent and only takes a bundle whose Developer ID
+signature was verified at stage time; `--service script:<start-command>`
+sends SIGTERM to the process listening on the daemon's port and runs the
+command detached, and needs `--installed`. Without `--yes` or
+`RUSTYKRAB_UPDATE_AUTO=1`, `apply` prints the plan and changes nothing.
+
 ### Terminal chat (`chat` subcommand)
 
 A small REPL client that talks to the running daemon over loopback. Useful
@@ -581,13 +696,26 @@ with `RUSTYKRAB_DELEGATION_TOOLS`. A submitting peer may request a tighter
 limit still (`allowedTools` on the task), which intersects with the node's
 policy and can never widen it.
 
+**A node is also a worker for the control layer.** Besides the `nodes`
+tool, a primary's controller can lease work items to a paired node as a
+`peer` worker: `rustykrab worker add peer --url <node> --pairing-code
+<code>` redeems a code the node printed for a token of the primary's own,
+kept encrypted in its secret store. The node advertises its models, the
+tools inside its delegation ceiling and its machine (`GET /api/node`), and a
+work item is leased to it only when those cover the item's
+`required_tools`. The node activates those tools before its first model
+call, refuses any outside its ceiling with a typed reason, and returns the
+typed result contract rather than text. A restart on either side fails
+nothing: the node queues an interrupted task again, and a restarted
+controller re-attaches to a task its peer still holds.
+
 See `scripts/setup-delegation-node.md` for standing up a node, exposing it
 safely (Tailscale Serve, not the raw gateway port), and measured latency
 expectations.
 
 ## Architecture
 
-A Cargo workspace of 14 crates under `crates/`:
+A Cargo workspace of 15 crates under `crates/`:
 
 ```
 rustykrab-cli          Binary entrypoint, daemon management, channel loops

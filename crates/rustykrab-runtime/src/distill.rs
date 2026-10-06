@@ -203,9 +203,11 @@ pub(crate) fn parse_statements(raw: &str) -> Option<Vec<(String, FactKind)>> {
 /// comes from, and the runner's synthesised prompts ("Continue from the
 /// summary above", "You produced text but did not call `task_complete`")
 /// arrive with `Role::User` too — they are the single largest contributor to
-/// the existing store and carry nothing about the person.
+/// the existing store and carry nothing about the person. Today every
+/// runner notice is a `[System notice]` user turn (control plan 12.1); the
+/// prefixes below still catch the ones older builds stored without it.
 pub(crate) fn worth_classifying(msg: &Message) -> bool {
-    if msg.role != Role::User {
+    if !msg.is_user_turn() {
         return false;
     }
     let MessageContent::Text(text) = &msg.content else {
@@ -498,6 +500,9 @@ mod tests {
             let msg = text_message(Role::User, text.to_string());
             assert!(!worth_classifying(&msg), "should be skipped: {text:?}");
         }
+        // Today's notices carry their marker, whatever they say.
+        let notice = Message::system_notice("Multiple consecutive tool calls have failed.");
+        assert!(!worth_classifying(&notice));
     }
 
     #[test]

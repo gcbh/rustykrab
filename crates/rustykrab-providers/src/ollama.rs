@@ -2,13 +2,14 @@ use crate::backoff::retry_delay;
 use crate::line_buffer::LineBuffer;
 use async_trait::async_trait;
 use rustykrab_core::error::Result;
-use rustykrab_core::model::{ModelProvider, ModelResponse, StopReason, StreamEvent, Usage};
+use rustykrab_core::model::{
+    ModelCheck, ModelProvider, ModelResponse, StopReason, StreamEvent, Usage,
+};
+use rustykrab_core::tool_block::{self, ToolBlockObservation, ToolBlockTracker};
 use rustykrab_core::types::{Message, MessageContent, Role, ToolCall, ToolSchema};
 use rustykrab_core::Error;
 use serde::{Deserialize, Serialize};
-use std::collections::{hash_map::DefaultHasher, HashSet};
-use std::hash::{Hash, Hasher};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::HashSet;
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -221,10 +222,10 @@ pub struct OllamaProvider {
     /// predating the `capabilities` field), in which case the tag-matching
     /// heuristics stand in.
     detected_caps: Option<ModelCapabilities>,
-    /// Fingerprint of the tool block sent on the previous request, so a
-    /// change can be reported.  See [`OllamaProvider::note_tool_block`].
-    /// `0` means "nothing sent yet".
-    last_tool_fingerprint: AtomicU64,
+    /// The tool block each conversation sent last, so a change can be
+    /// reported against the conversation that made it. See
+    /// [`OllamaProvider::note_tool_block`].
+    tool_blocks: ToolBlockTracker,
 }
 
 impl OllamaProvider {
@@ -248,7 +249,7 @@ impl OllamaProvider {
             config: OllamaConfig::default(),
             detected_ctx: None,
             detected_caps: None,
-            last_tool_fingerprint: AtomicU64::new(0),
+            tool_blocks: ToolBlockTracker::new(),
         }
     }
 
@@ -996,8 +997,9 @@ impl OllamaProvider {
         Ok(())
     }
 
-    /// Record the tool block about to be sent, and report when it differs
-    /// from the previous request's.
+    /// Record the tool block about to be sent, log its fingerprint against
+    /// the conversation sending it, and report when it differs from that
+    /// conversation's previous request.
     ///
     /// This is not bookkeeping for its own sake. Chat templates render tool
     /// definitions into the prompt *prefix*, ahead of the conversation, so
@@ -1006,26 +1008,24 @@ impl OllamaProvider {
     /// prompt. On a long conversation that is by far the most expensive thing
     /// that can happen to a turn, and it is invisible without this log line.
     ///
-    /// The set is driven by the `tools_load` meta-tool, so it changes when the
-    /// model discovers and loads new tools. That is the intended design — the
-    /// full catalog is far too large to send every turn — but it means tool
-    /// loading is best done in one batch early, not drip-fed across a run.
-    fn note_tool_block(&self, tools: &[OllamaTool], tool_tokens: u32) {
-        // Names alone, in order: that is what the prompt prefix is sensitive
-        // to, and it avoids re-hashing the (much larger) parameter schemas.
-        let mut hasher = DefaultHasher::new();
-        for t in tools {
-            t.function.name.hash(&mut hasher);
-        }
-        // Reserve 0 for "nothing sent yet" so the first request isn't
-        // mistaken for a change.
-        let fingerprint = hasher.finish() | 1;
-
-        let previous = self
-            .last_tool_fingerprint
-            .swap(fingerprint, Ordering::Relaxed);
-        if previous != 0 && previous != fingerprint {
+    /// Every request logs `tool block sent` with a fingerprint of the tools
+    /// array it carries (`rustykrab_core::tool_block`), its conversation and
+    /// trace ids, so "no tool-block change after turn 0" can be checked per
+    /// run. The comparison is per conversation: a provider-wide one could not
+    /// tell a mid-run load from runs interleaving on one model. Since the
+    /// append path (plan section 12) a run's block is fixed from its first
+    /// request; a change within a conversation is compaction folding its
+    /// appended tools in, or a provider without the append capability.
+    fn note_tool_block(&self, tools: &[OllamaTool], tool_tokens: u32) -> ToolBlockObservation {
+        let seen = self.tool_blocks.observe(tool_block::fingerprint(tools));
+        crate::log_tool_block("ollama", &seen, tools.len(), Some(tool_tokens));
+        if seen.changed() {
+            // Message text kept as it was, so older logs stay comparable.
             tracing::info!(
+                conversation_id = %tool_block::display_id(seen.conversation_id),
+                trace_id = %tool_block::display_id(
+                    rustykrab_core::prompt_trace::current_trace_id()
+                ),
                 num_tools = tools.len(),
                 tool_tokens,
                 "tool set changed since the last request — Ollama must re-evaluate                  the whole prompt, since tool definitions sit in the cached prefix"
@@ -1051,6 +1051,7 @@ impl OllamaProvider {
                 );
             }
         }
+        seen
     }
 
     /// Map an HTTP status code to a specific error variant (#186).
@@ -1058,6 +1059,8 @@ impl OllamaProvider {
         match status.as_u16() {
             400 => Error::ModelBadRequest(format!("Ollama API: {body}")),
             401 | 403 => Error::ModelAuthError(format!("Ollama API: {body}")),
+            // Model not pulled or unknown: retrying will not make it appear.
+            404 => Error::NotFound(format!("Ollama API: {body}")),
             429 => Error::ModelRateLimit(format!("Ollama API: {body}")),
             _ => Error::ModelProvider(format!("Ollama API returned {status}: {body}")),
         }
@@ -1104,6 +1107,50 @@ impl ModelProvider for OllamaProvider {
 
     fn supports_vision(&self) -> bool {
         vision_support(&self.model, self.detected_caps)
+    }
+
+    /// Ollama's gemma4 and qwen3.5-family parsers return a call to any
+    /// name, declared or not, and both default models called a tool first
+    /// seen as JSON in a tool result 12 of 12 times (late binding
+    /// experiment, 2026-09-24). A model whose template path rejects
+    /// undeclared names sets `late_tool_binding = "rerender"` in its
+    /// harness profile; that is data, not a branch here.
+    fn accepts_undeclared_tool_calls(&self) -> bool {
+        true
+    }
+
+    /// Asks `/api/show`, which reads the model's metadata without loading
+    /// it. Ollama answers 404 for a model it does not have; any other
+    /// failure (server down, a 500) leaves the answer unknown.
+    async fn check_model(&self) -> ModelCheck {
+        let url = format!("{}/api/show", self.base_url);
+        // The chat client's timeout is sized for generation; a health probe
+        // on a wedged Ollama must not hold the registry's refresh or startup.
+        let resp = match self
+            .client
+            .post(&url)
+            .timeout(std::time::Duration::from_secs(5))
+            .json(&serde_json::json!({ "model": self.model }))
+            .send()
+            .await
+        {
+            Ok(resp) => resp,
+            Err(e) => {
+                tracing::warn!(model = %self.model, error = %e, "could not ask Ollama about the model");
+                return ModelCheck::Unknown;
+            }
+        };
+        match resp.status() {
+            s if s.is_success() => ModelCheck::Available,
+            reqwest::StatusCode::NOT_FOUND => ModelCheck::Missing(format!(
+                "Ollama at {} has no model `{}`",
+                self.base_url, self.model
+            )),
+            s => {
+                tracing::warn!(model = %self.model, status = %s, "Ollama /api/show did not say whether the model exists");
+                ModelCheck::Unknown
+            }
+        }
     }
 
     async fn chat(&self, messages: &[Message], tools: &[ToolSchema]) -> Result<ModelResponse> {
@@ -1883,6 +1930,16 @@ mod tests {
     /// `TEST_TOOL_TOKENS + FRAMING_OVERHEAD_TOKENS` equals the flat 2048 these
     /// cases were originally written against, keeping their arithmetic intact.
     const TEST_TOOL_TOKENS: u32 = 1536;
+
+    #[test]
+    fn status_404_maps_to_not_found() {
+        let err = OllamaProvider::map_status_error(
+            reqwest::StatusCode::NOT_FOUND,
+            r#"{"error":"model 'llama9' not found"}"#,
+        );
+        assert!(matches!(err, Error::NotFound(ref m) if m.contains("llama9")));
+        assert_eq!(err.kind(), rustykrab_core::ToolErrorKind::NotFound);
+    }
 
     fn user_msg(content: &str) -> OllamaMessage {
         OllamaMessage {
@@ -3056,5 +3113,98 @@ mod think_field_tests {
                 thinking: false,
             })
         ));
+    }
+}
+
+#[cfg(test)]
+mod tool_block_tests {
+    use super::*;
+    use rustykrab_core::active_tools::{
+        ActiveToolsRegistry, SessionToolContext, SESSION_TOOL_CONTEXT,
+    };
+    use rustykrab_core::tool_block::ToolBlockObservation;
+    use rustykrab_core::{CapabilitySet, RecallStore, TodoStore};
+    use std::sync::Arc;
+
+    fn wire(names: &[&str]) -> Vec<OllamaTool> {
+        OllamaProvider::build_tools(&schemas(names))
+    }
+
+    fn schemas(names: &[&str]) -> Vec<ToolSchema> {
+        names
+            .iter()
+            .map(|n| ToolSchema {
+                name: (*n).into(),
+                description: format!("{n} tool"),
+                parameters: serde_json::json!({"type": "object", "properties": {}}),
+            })
+            .collect()
+    }
+
+    /// Note a block as a request from inside `conversation`'s runner does.
+    async fn send(
+        provider: &OllamaProvider,
+        conversation: Uuid,
+        tools: &[OllamaTool],
+    ) -> ToolBlockObservation {
+        let ctx = SessionToolContext {
+            conversation_id: conversation,
+            capabilities: Arc::new(CapabilitySet::default_safe()),
+            all_tools: Arc::new(Vec::new()),
+            active_tools: Arc::new(ActiveToolsRegistry::new()),
+            recall: Arc::new(RecallStore::new()),
+            todos: Arc::new(TodoStore::new()),
+        };
+        SESSION_TOOL_CONTEXT
+            .scope(ctx, async {
+                provider.note_tool_block(tools, estimate_tool_tokens(tools))
+            })
+            .await
+    }
+
+    #[tokio::test]
+    async fn a_change_is_attributed_to_the_conversation_that_made_it() {
+        let provider = OllamaProvider::new("gemma4:26b");
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let base = wire(&["tools_list", "memory_search"]);
+        let other = wire(&["read", "write"]);
+        let grown = wire(&["tools_list", "memory_search", "browser"]);
+
+        // Two runs interleaving on one model, each with its own fixed
+        // block: no change for either, where the old provider-wide
+        // comparison reported one on every request.
+        for _ in 0..3 {
+            let seen = send(&provider, a, &base).await;
+            assert_eq!(seen.conversation_id, Some(a));
+            assert!(!seen.changed());
+            assert!(!send(&provider, b, &other).await.changed());
+        }
+        // A genuine change within `a` is reported, against `a`, naming the
+        // block it replaced.
+        let changed = send(&provider, a, &grown).await;
+        assert_eq!(changed.conversation_id, Some(a));
+        assert_eq!(changed.changed_from, Some(tool_block::fingerprint(&base)));
+        assert!(!send(&provider, b, &other).await.changed());
+        // Outside a runner (the router, title generation) nothing is
+        // attributed or compared.
+        let loose = provider.note_tool_block(&base, 0);
+        assert_eq!(loose.conversation_id, None);
+        assert!(!loose.changed());
+    }
+
+    #[test]
+    fn the_fingerprint_is_of_the_wire_array() {
+        let tools = wire(&["tools_list", "get_weather"]);
+        assert_eq!(
+            tool_block::fingerprint(&tools),
+            tool_block::fingerprint(&wire(&["tools_list", "get_weather"]))
+        );
+        let mut described = schemas(&["tools_list", "get_weather"]);
+        described[1].description = "Get the current weather.".into();
+        assert_ne!(
+            tool_block::fingerprint(&OllamaProvider::build_tools(&described)),
+            tool_block::fingerprint(&tools),
+            "a description change moves the prefix too, so it moves the print"
+        );
     }
 }

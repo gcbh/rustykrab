@@ -85,6 +85,13 @@ pub static REGISTRY: &[SecretSpec] = &[
         description: "Gateway bearer auth token",
         required: false, // auto-generated when absent
     },
+    SecretSpec {
+        store_name: "github_token",
+        env_var: "RUSTYKRAB_GITHUB_TOKEN",
+        keychain_account: "github-token",
+        description: "GitHub token for the review surface (issues on RUSTYKRAB_GITHUB_REPO)",
+        required: false, // without it nothing is projected
+    },
 ];
 
 /// A secret that could not be found in any resolution source.

@@ -15,10 +15,11 @@ members = [
     "crates/rustykrab-dream",
     "crates/rustykrab-e2e",
     "crates/rustykrab-projects",
+    "crates/rustykrab-control",
 ]
 
 [workspace.package]
-version = "5.3.6"
+version = "5.3.7"
 edition = "2021"
 rust-version = "1.88"
 license = "MIT"
@@ -116,6 +117,7 @@ rustykrab-cli = { path = "crates/rustykrab-cli" }
 rustykrab-memory = { path = "crates/rustykrab-memory" }
 rustykrab-dream = { path = "crates/rustykrab-dream" }
 rustykrab-projects = { path = "crates/rustykrab-projects" }
+rustykrab-control = { path = "crates/rustykrab-control" }
 
 [profile.release]
 lto = true

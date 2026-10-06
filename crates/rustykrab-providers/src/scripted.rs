@@ -108,11 +108,17 @@ fn default_text() -> String {
 
 pub struct ScriptedProvider {
     script: Script,
+    /// The tool block each conversation sent last, logged like Ollama's so
+    /// a scripted run can check its block stayed fixed.
+    tool_blocks: rustykrab_core::ToolBlockTracker,
 }
 
 impl ScriptedProvider {
     pub fn new(script: Script) -> Self {
-        Self { script }
+        Self {
+            script,
+            tool_blocks: rustykrab_core::ToolBlockTracker::new(),
+        }
     }
 
     pub fn from_json(json: &str) -> Result<Self> {
@@ -200,7 +206,18 @@ impl ModelProvider for ScriptedProvider {
         "scripted"
     }
 
-    async fn chat(&self, messages: &[Message], _tools: &[ToolSchema]) -> Result<ModelResponse> {
+    /// A script emits whatever call it names, declared or not. It stands in
+    /// for the default local path (Ollama), so the scripted daemon runs the
+    /// append path the way a local model does.
+    fn accepts_undeclared_tool_calls(&self) -> bool {
+        true
+    }
+
+    async fn chat(&self, messages: &[Message], tools: &[ToolSchema]) -> Result<ModelResponse> {
+        let seen = self
+            .tool_blocks
+            .observe(rustykrab_core::tool_block::fingerprint_schemas(tools));
+        crate::log_tool_block("scripted", &seen, tools.len(), None);
         // Anchor on the most recent user message that matches a trigger,
         // then count the assistant turns after it — those are the steps
         // already replayed.

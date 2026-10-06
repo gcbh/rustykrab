@@ -21,31 +21,15 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::time::Duration;
 
-use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, ORIGIN};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use uuid::Uuid;
 
-const DEFAULT_GATEWAY_URL: &str = "http://127.0.0.1:3000";
+use crate::daemon_client;
 
 pub async fn run(data_dir: &Path, _args: &[String]) -> anyhow::Result<()> {
-    let gateway_url =
-        std::env::var("RUSTYKRAB_GATEWAY_URL").unwrap_or_else(|_| DEFAULT_GATEWAY_URL.to_string());
-
-    let token = resolve_auth_token(data_dir).await?;
-
-    let mut auth_headers = HeaderMap::new();
-    auth_headers.insert(
-        AUTHORIZATION,
-        HeaderValue::from_str(&format!("Bearer {token}"))
-            .map_err(|e| anyhow::anyhow!("invalid auth token: {e}"))?,
-    );
-    auth_headers.insert(ORIGIN, gateway_origin(&gateway_url)?);
-
-    let client = reqwest::Client::builder()
-        .default_headers(auth_headers)
-        .timeout(Duration::from_secs(600))
-        .build()?;
+    let (base, client) = daemon_client::connect(data_dir, Duration::from_secs(600)).await?;
+    let gateway_url = base.as_str().trim_end_matches('/').to_string();
 
     // Probe the daemon and start a conversation before printing anything,
     // so a failure mode is obvious.
@@ -87,23 +71,6 @@ pub async fn run(data_dir: &Path, _args: &[String]) -> anyhow::Result<()> {
             Err(e) => eprintln!("  error: {e}\n"),
         }
     }
-}
-
-/// Return the HTTP origin expected by the gateway's CSRF boundary.
-///
-/// The gateway deliberately requires `Origin` on sensitive `/api` routes,
-/// including requests from non-browser clients.  Supplying the configured
-/// gateway's own origin preserves that boundary while allowing this trusted
-/// loopback client to use the API.
-fn gateway_origin(base: &str) -> anyhow::Result<HeaderValue> {
-    let url = reqwest::Url::parse(base)
-        .map_err(|e| anyhow::anyhow!("invalid RUSTYKRAB_GATEWAY_URL `{base}`: {e}"))?;
-    if !matches!(url.scheme(), "http" | "https") || url.host().is_none() {
-        anyhow::bail!("RUSTYKRAB_GATEWAY_URL must be an http(s) URL with a host");
-    }
-
-    HeaderValue::from_str(&url.origin().ascii_serialization())
-        .map_err(|e| anyhow::anyhow!("invalid gateway origin: {e}"))
 }
 
 enum ControlFlow {
@@ -361,56 +328,6 @@ async fn delete_secret(client: &reqwest::Client, base: &str, name: &str) -> anyh
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Auth-token resolution
-// ---------------------------------------------------------------------------
-//
-// The chat client must hold the same bearer token the daemon accepts.
-// We use the same registry chain the daemon does: env → keychain → store.
-// If the store is locked (daemon holds it), we fall back to env/keychain
-// only; the user can also set RUSTYKRAB_AUTH_TOKEN explicitly.
-
-async fn resolve_auth_token(data_dir: &Path) -> anyhow::Result<String> {
-    if let Ok(v) = std::env::var("RUSTYKRAB_AUTH_TOKEN") {
-        let v = v.trim();
-        if !v.is_empty() {
-            return Ok(v.to_string());
-        }
-    }
-
-    let spec = rustykrab_store::registry::lookup("rustykrab_auth_token")
-        .ok_or_else(|| anyhow::anyhow!("auth-token spec missing from registry"))?;
-
-    if rustykrab_store::keychain::keychain_available() {
-        if let Ok(Some(cred)) = rustykrab_store::keychain::get_credential(
-            rustykrab_store::registry::keychain_service(),
-            spec.keychain_account,
-        ) {
-            return Ok(cred.value);
-        }
-    }
-
-    // Last resort: try opening the store. Will fail if the daemon holds
-    // an exclusive lock on it — that's fine, we already told the user
-    // to set RUSTYKRAB_AUTH_TOKEN above.
-    let db_path = data_dir.join("db");
-    if db_path.exists() {
-        if let Ok(master_key) = rustykrab_store::keychain::resolve_master_key() {
-            if let Ok(store) = rustykrab_store::Store::open(&db_path, master_key) {
-                if let Ok(v) = store.secrets().get(spec.store_name).await {
-                    return Ok(v);
-                }
-            }
-        }
-    }
-
-    anyhow::bail!(
-        "could not resolve auth token. Set RUSTYKRAB_AUTH_TOKEN to the value \
-         the daemon printed at startup, or run `rustykrab-cli keychain status` \
-         to inspect what's stored."
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -450,33 +367,5 @@ mod tests {
     fn render_content_handles_plain_string() {
         let v = serde_json::json!("hello");
         assert_eq!(render_content(&v), "hello");
-    }
-
-    #[test]
-    fn gateway_origin_uses_only_scheme_authority_and_port() {
-        assert_eq!(
-            gateway_origin("https://Example.COM:8443/a/path")
-                .unwrap()
-                .to_str()
-                .unwrap(),
-            "https://example.com:8443"
-        );
-    }
-
-    #[test]
-    fn gateway_origin_accepts_the_default_loopback_url() {
-        assert_eq!(
-            gateway_origin(DEFAULT_GATEWAY_URL)
-                .unwrap()
-                .to_str()
-                .unwrap(),
-            DEFAULT_GATEWAY_URL
-        );
-    }
-
-    #[test]
-    fn gateway_origin_rejects_non_http_urls() {
-        let error = gateway_origin("file:///tmp/rustykrab.sock").unwrap_err();
-        assert!(error.to_string().contains("must be an http(s) URL"));
     }
 }

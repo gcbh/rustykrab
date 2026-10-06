@@ -1,13 +1,25 @@
+mod agent_defs;
 mod chat;
 #[cfg(feature = "computer-use")]
 mod computer_backend;
+mod daemon_client;
+mod evaluation;
+mod fleet;
+mod peers;
 mod prompt_log;
+mod scheduled_work;
 mod task_queue;
+mod update_cmd;
+mod work_cmd;
+mod work_host;
+mod worker_cmd;
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+
+use rustykrab_control::handle::ControlHandle;
 
 use chrono::Utc;
 
@@ -23,6 +35,15 @@ const BUILD_DATE: &str = env!("RUSTYKRAB_BUILD_DATE");
 fn version_string() -> String {
     format!("{VERSION} ({GIT_HASH}{GIT_DIRTY}, {BUILD_DATE})")
 }
+
+/// The facts `version_string` prints, for `GET /api/version`.
+fn build_info() -> rustykrab_gateway::BuildInfo {
+    rustykrab_gateway::BuildInfo {
+        version: VERSION.to_string(),
+        commit: Some(format!("{GIT_HASH}{GIT_DIRTY}")),
+        build_date: Some(BUILD_DATE.to_string()),
+    }
+}
 use rustykrab_agent::{AgentHandle, HarnessProfile, HarnessRouter, ProcessSandbox, SubagentRunner};
 use rustykrab_channels::slack::SlackInboundMessage;
 use rustykrab_channels::telegram::ChannelMessage;
@@ -30,7 +51,6 @@ use rustykrab_channels::{SignalChannel, SlackChannel, TelegramChannel, VideoChan
 use rustykrab_core::model::ModelProvider;
 use rustykrab_core::orchestration::OrchestrationConfig;
 use rustykrab_core::types::{MessageContent, Role};
-use rustykrab_core::AgentRegistry;
 use rustykrab_gateway::AppState;
 use rustykrab_memory::backend::HybridMemoryBackend;
 #[cfg(not(feature = "embeddings"))]
@@ -213,6 +233,132 @@ impl ChannelHub {
 /// trait so the `message` tool can deliver to Telegram, Slack, or Signal
 /// without resorting to shell `curl` (which is sandbox-restricted and would
 /// also bypass the channel allowlist / retry / chunking logic).
+/// The work tools' backend, bound once the controller exists. The local
+/// worker is built before the controller, because the controller takes its
+/// worker list at construction, and the tools that worker runs need the
+/// controller as their backend; this breaks the cycle. Unbound calls fail
+/// closed.
+#[derive(Default)]
+struct DeferredWorkBackend {
+    inner: std::sync::OnceLock<Arc<dyn rustykrab_tools::WorkBackend>>,
+}
+
+impl DeferredWorkBackend {
+    fn bind(&self, backend: Arc<dyn rustykrab_tools::WorkBackend>) {
+        let _ = self.inner.set(backend);
+    }
+
+    fn bound(&self) -> rustykrab_core::Result<&Arc<dyn rustykrab_tools::WorkBackend>> {
+        self.inner.get().ok_or_else(|| {
+            rustykrab_core::Error::Internal("the work backend is not bound yet".into())
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl rustykrab_tools::WorkBackend for DeferredWorkBackend {
+    async fn file(
+        &self,
+        draft: rustykrab_core::work::WorkItemDraft,
+        provenance: rustykrab_tools::Provenance,
+    ) -> rustykrab_core::Result<rustykrab_core::work::PlanOutcome> {
+        self.bound()?.file(draft, provenance).await
+    }
+
+    async fn status(
+        &self,
+        query: rustykrab_tools::StatusQuery,
+        principal: &rustykrab_tools::Principal,
+    ) -> rustykrab_core::Result<Vec<rustykrab_tools::WorkStatusView>> {
+        self.bound()?.status(query, principal).await
+    }
+
+    async fn report(
+        &self,
+        item: rustykrab_core::work::WorkItemId,
+        report: rustykrab_core::work::ResultReport,
+        provenance: rustykrab_tools::Provenance,
+    ) -> rustykrab_core::Result<()> {
+        self.bound()?.report(item, report, provenance).await
+    }
+
+    fn tool_state(&self, name: &str) -> rustykrab_tools::ToolState {
+        self.inner
+            .get()
+            .map(|b| b.tool_state(name))
+            .unwrap_or(rustykrab_tools::ToolState::Unknown)
+    }
+
+    fn mcp_server_configured(&self, name: &str) -> bool {
+        self.inner
+            .get()
+            .map(|b| b.mcp_server_configured(name))
+            .unwrap_or(false)
+    }
+}
+
+/// The controller's view of the host's tool registry (plan section 7,
+/// scenario 11). A tool every conversation starts with active (the
+/// active-tools seed) is `Loaded`; any other registered tool is
+/// `RegisteredUnloaded`, so a `work_file` outside a session answers "load
+/// it" instead of filing work the caller could do itself, and the ladder
+/// knows the tool exists. An MCP server counts as configured when it is
+/// named in `RUSTYKRAB_MCP_SERVERS` (connected or not) or its tools are
+/// registered. Filled once the registry is final, after the stub switch.
+#[derive(Default)]
+struct RegistryCatalog {
+    inner: std::sync::RwLock<rustykrab_control::controller::StaticCatalog>,
+}
+
+impl RegistryCatalog {
+    fn fill(&self, tools: &[Arc<dyn rustykrab_core::Tool>], seed: &[String]) {
+        let catalog = rustykrab_control::controller::StaticCatalog {
+            tools: tools
+                .iter()
+                .map(|t| {
+                    let state = if seed.iter().any(|s| s == t.name()) {
+                        rustykrab_tools::ToolState::Loaded
+                    } else {
+                        rustykrab_tools::ToolState::RegisteredUnloaded
+                    };
+                    (t.name().to_string(), state)
+                })
+                .collect(),
+            // Every server the host is configured with, connected or not,
+            // and every server whose tools registered; tool names carry the
+            // server lowercased, so both are kept lowercased.
+            mcp_servers: tools
+                .iter()
+                .filter_map(|t| {
+                    let rest = t.name().strip_prefix("mcp__")?;
+                    rest.split_once("__").map(|(server, _)| server.to_string())
+                })
+                .chain(rustykrab_tools::configured_mcp_servers())
+                .map(|server| server.to_lowercase())
+                .collect(),
+            credentials: HashSet::new(),
+        };
+        *self.inner.write().unwrap_or_else(|e| e.into_inner()) = catalog;
+    }
+
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, rustykrab_control::controller::StaticCatalog> {
+        self.inner.read().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+impl rustykrab_control::controller::ToolCatalog for RegistryCatalog {
+    fn tool_state(&self, name: &str) -> rustykrab_tools::ToolState {
+        rustykrab_control::controller::ToolCatalog::tool_state(&*self.read(), name)
+    }
+
+    fn mcp_server_configured(&self, name: &str) -> bool {
+        rustykrab_control::controller::ToolCatalog::mcp_server_configured(
+            &*self.read(),
+            &name.to_lowercase(),
+        )
+    }
+}
+
 struct MessageAdapter {
     hub: Arc<ChannelHub>,
 }
@@ -428,12 +574,21 @@ async fn main() -> anyhow::Result<()> {
     if args.len() >= 2 && args[1] == "pair" {
         return handle_pair_subcommand(&data_dir).await;
     }
+    if args.len() >= 2 && args[1] == "work" {
+        return work_cmd::run(&data_dir, &args[2..]).await;
+    }
+    if args.len() >= 2 && (args[1] == "workers" || args[1] == "worker") {
+        return worker_cmd::run(&data_dir, &args[1..]).await;
+    }
+    if args.len() >= 2 && args[1] == "update" {
+        return update_cmd::run(&data_dir, &args[2..]).await;
+    }
     // An unrecognized subcommand must not silently fall through to
     // "start the daemon" — a typo would boot a full agent instead of
     // reporting the mistake.
     if let Some(unknown) = args.get(1).filter(|a| !a.starts_with('-')) {
         eprintln!("unknown subcommand '{unknown}'");
-        eprintln!("subcommands: skill, keychain, chat, dream, pair");
+        eprintln!("subcommands: skill, keychain, chat, dream, pair, work, workers, worker, update");
         eprintln!("run with no arguments to start the daemon");
         std::process::exit(2);
     }
@@ -769,7 +924,12 @@ async fn main() -> anyhow::Result<()> {
     let memory_storage = Arc::new(
         SqliteMemoryStorage::open(&memory_db_path).expect("failed to open memory database"),
     );
-    let model_cache_dir = data_dir.join("models");
+    // RUSTYKRAB_MODEL_CACHE_DIR lets several data dirs (the E2E harness's
+    // throwaway boots) share one embedding-model download.
+    let model_cache_dir = std::env::var_os("RUSTYKRAB_MODEL_CACHE_DIR")
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| data_dir.join("models"));
     std::fs::create_dir_all(&model_cache_dir)?;
     // Lazy: ONNX Runtime init (and a ~275MB model download on first run)
     // happens off-thread on the first embed() call instead of blocking
@@ -985,7 +1145,7 @@ async fn main() -> anyhow::Result<()> {
     let message_backend: Arc<dyn MessageBackend> = Arc::new(MessageAdapter {
         hub: channel_hub.clone(),
     });
-    tools.extend(rustykrab_tools::message_tools(message_backend));
+    tools.extend(rustykrab_tools::message_tools(message_backend.clone()));
     tracing::info!("message tool registered");
 
     // --- Cron tool (task scheduling) ---
@@ -1066,6 +1226,7 @@ async fn main() -> anyhow::Result<()> {
     // `Capability::Subagent` (granted by the gateway via
     // `AppState::subagents_enabled`) before the model can actually call
     // them.
+    let agent_definitions = agent_defs::load(&data_dir);
     let subagents_enabled = std::env::var("RUSTYKRAB_ENABLE_SUBAGENTS")
         .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "True"))
         .unwrap_or(false);
@@ -1075,7 +1236,7 @@ async fn main() -> anyhow::Result<()> {
         // about to add — that prevents a sub-agent from re-spawning itself
         // through the same registry. The per-tool depth guard inside
         // `SubagentsTool` is the second line of defence.
-        let agent_registry = Arc::new(AgentRegistry::with_defaults());
+        let agent_registry = Arc::new(agent_defs::subagents(&agent_definitions));
         let subagent_runner: Arc<dyn rustykrab_tools::SessionManager> =
             Arc::new(SubagentRunner::new(
                 provider.clone(),
@@ -1132,32 +1293,116 @@ async fn main() -> anyhow::Result<()> {
         "skill-tools registered"
     );
 
+    // --- Control layer: work items, a local worker and the controller ---
+    // See docs/plans/control-layer-and-worker-fleet.md. The local worker
+    // runs with the work tools, whose backend is the controller, and the
+    // controller takes its worker list at construction: the deferred
+    // backend breaks that cycle and is bound as soon as the controller
+    // exists. Host wiring around the controller is in work_host.rs.
+    let deferred_work_backend = Arc::new(DeferredWorkBackend::default());
+    let control_notice_channel = if std::env::var_os("TELEGRAM_BOT_TOKEN").is_some() {
+        "telegram"
+    } else {
+        "webchat"
+    };
     // --- Tool stubs (evaluation harness only) ---
     // RUSTYKRAB_TOOL_STUBS swaps real tools for scripted stand-ins whose
-    // answers the harness controls, so a scenario can reach an upstream
-    // that fails once, or never, or returns more text than the context
-    // window holds. The mirror image of RUSTYKRAB_PROVIDER=scripted, and
-    // like it, must never be set on a real deployment.
-    //
-    // Applied last, after every real tool has registered, so `replace`
-    // means the whole registry rather than whichever part of it had been
-    // built by this point.
-    let tools = match std::env::var_os("RUSTYKRAB_TOOL_STUBS") {
-        Some(path) => {
-            let path = std::path::PathBuf::from(path);
-            let stubs = rustykrab_tools::StubFile::from_path(&path)?;
-            let stubbed = stubs.apply(tools);
-            tracing::warn!(
-                path = %path.display(),
-                mode = ?stubs.mode,
-                tools = ?stubbed.iter().map(|t| t.name()).collect::<Vec<_>>(),
-                "RUSTYKRAB_TOOL_STUBS is set — the tool registry has been replaced with \
-                 scripted stubs. This is the evaluation harness switch."
-            );
-            stubbed
-        }
-        None => tools,
+    // answers the harness controls; like RUSTYKRAB_PROVIDER=scripted, it
+    // must never be set on a real deployment. Applied after every real
+    // tool has registered, so `replace` means the whole registry, and
+    // before the local worker takes its list, so the worker runs the same
+    // stubs; the work tools register after it, so `replace` keeps them.
+    let (mut tools, hidden_stubs) = work_host::apply_tool_stubs(tools)?;
+    // The registry names the local worker (plan section 5) and holds the
+    // external ones `rustykrab worker add` builds; see `fleet.rs`.
+    let fleet = fleet::Fleet::open(
+        &store,
+        &data_dir,
+        &skills_dir,
+        skill_registry.clone(),
+        &tools,
+    )
+    .await?;
+    // One KV slot per model (plan 12.1): the local worker and the runs of
+    // a peer's briefs on this node (peers.rs) wait on the same one.
+    let model_slot = Arc::new(tokio::sync::Semaphore::new(1));
+    // RUSTYKRAB_LOCAL_WORKER=off: a daemon with no local model registers no
+    // local worker, so routing never leases an item to one (fleet.rs).
+    let local_worker_on = fleet::local_worker_enabled();
+    let local_worker: Option<Arc<dyn rustykrab_control::worker::Worker>> = if local_worker_on {
+        Some(Arc::new(
+            rustykrab_agent::LocalWorker::new(
+                fleet.local_name.clone(),
+                agent_defs::worker_definition(&agent_definitions, &fleet.local_name),
+                provider.clone(),
+                tools.clone(),
+                Arc::new(ProcessSandbox::new()),
+                deferred_work_backend.clone() as Arc<dyn rustykrab_tools::WorkBackend>,
+            )
+            .with_transcripts(scheduled_work::transcripts(&store, skill_registry.clone()))
+            .with_late_tools(fleet.skills.clone())
+            .with_slot(model_slot.clone()),
+        ))
+    } else {
+        tracing::info!(
+            worker = %fleet.local_name,
+            "local worker off ({}=off): none registered or leased to",
+            fleet::LOCAL_WORKER_ENV
+        );
+        None
     };
+    let delegated_runs = peers::delegated_runs(peers::NodeParts {
+        name: fleet.local_name.clone(),
+        definition: agent_defs::worker_definition(&agent_definitions, &fleet.local_name),
+        provider: provider.clone(),
+        tools: tools.clone(),
+        store: store.clone(),
+        late: fleet.skills.clone(),
+        slot: model_slot,
+    });
+    // Filled below, once the registry is final (the work tools added) and
+    // the active-tools seed is known.
+    let control_catalog = Arc::new(RegistryCatalog::default());
+    let mut control_config = fleet.config(rustykrab_control::controller::ControllerConfig {
+        notice_channel: control_notice_channel.to_string(),
+        ..Default::default()
+    });
+    // How long aging may wait for an idle tick before it runs anyway
+    // (plan 4.6); the evaluation harness shortens it.
+    if let Some(secs) = std::env::var("RUSTYKRAB_AGING_MAX_GAP_SECS")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+    {
+        control_config.aging_max_gap = chrono::TimeDelta::seconds(secs.max(1));
+    }
+    // A self-building daemon holds its workers' follow-up items for a
+    // person (plan 6.1's approval hold), so they never run on a base that
+    // lacks their siblings' unmerged work.
+    if std::env::var("RUSTYKRAB_HOLD_DISCOVERED")
+        .is_ok_and(|v| matches!(v.trim(), "1" | "true" | "on" | "yes"))
+    {
+        control_config.approval.hold_discovered = true;
+        tracing::info!("RUSTYKRAB_HOLD_DISCOVERED: workers' follow-up items wait for approval");
+    }
+    let controller = Arc::new(
+        rustykrab_control::controller::Controller::new(store.clone(), Vec::new(), control_config)
+            .with_registry(fleet.registry.clone())
+            .with_routing(fleet.routing())
+            .with_catalog(fleet.catalog(control_catalog.clone()))
+            .with_activity(work_host::turn_activity(
+                activity_tracker.clone(),
+                provider.name(),
+            )),
+    );
+    fleet.start(local_worker).await?;
+    deferred_work_backend.bind(controller.clone());
+    let work_tool_names = work_host::add_work_tools(&mut tools, controller.clone());
+    tracing::info!(
+        worker = %fleet.local_name,
+        local_worker = if local_worker_on { "on" } else { "off" },
+        notices = control_notice_channel,
+        "control layer registered"
+    );
 
     // A stubbed registry is a closed world: the harness has already said
     // "these are the only tools." Progressive disclosure exists to keep a
@@ -1175,7 +1420,12 @@ async fn main() -> anyhow::Result<()> {
     // secret.
     let mut seed: Vec<String> = Vec::new();
     if std::env::var_os("RUSTYKRAB_TOOL_STUBS").is_some() {
-        seed.extend(tools.iter().map(|t| t.name().to_string()));
+        seed.extend(
+            tools
+                .iter()
+                .map(|t| t.name().to_string())
+                .filter(|n| !hidden_stubs.contains(n) && !work_tool_names.contains(n)),
+        );
     }
     if let Ok(raw) = std::env::var("RUSTYKRAB_ACTIVE_TOOLS") {
         seed.extend(
@@ -1185,6 +1435,7 @@ async fn main() -> anyhow::Result<()> {
                 .map(str::to_string),
         );
     }
+    control_catalog.fill(&tools, &seed);
     let active_tools = if seed.is_empty() {
         Arc::new(rustykrab_core::active_tools::ActiveToolsRegistry::new())
     } else {
@@ -1232,10 +1483,23 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
+    // --- Evaluation and the review surface (control plan, Phase 6) ---
+    let evaluator = evaluation::evaluator(
+        &store,
+        controller.clone(),
+        Arc::new(evaluation::StoreRouting::new(fleet.registry.clone())),
+    )
+    .await;
+
     // --- Build gateway state ---
     // Clone store handle so we can flush it after the server shuts down.
     let store_handle = store.clone();
     let mut state = rustykrab_gateway::AppState::new(store, tools, provider, auth_token)
+        .with_control(controller.clone() as Arc<dyn rustykrab_control::handle::ControlHandle>)
+        .with_workers(fleet.registry.clone())
+        .with_delegation(delegated_runs)
+        .with_evaluation(evaluator.clone())
+        .with_build_info(build_info())
         // Loopback is always allowed; this adds the names other clients
         // reach us by, e.g. the tailnet hostname the phone uses.
         .with_origin_policy(rustykrab_gateway::OriginPolicy::from_env())
@@ -1606,15 +1870,89 @@ async fn main() -> anyhow::Result<()> {
         }));
         tracing::info!("delegated-task worker started");
     }
+    // Peers' advertisements and health, recorded on their registry rows.
+    infra_handles.push(peers::spawn_refresh(fleet.registry.clone()));
 
     // --- Job executor (scheduled task runner) ---
-    {
+    // With RUSTYKRAB_CRON_WORK_ITEMS=1 each firing is a work item the
+    // controller runs (scheduled_work.rs); otherwise the task queue runs it.
+    if let Some(handle) = scheduled_work::start(state.clone()) {
+        infra_handles.push(handle);
+    } else {
         let executor_store = store_handle.clone();
         let executor_queue = task_queue.clone();
         infra_handles.push(tokio::spawn(async move {
             job_executor_loop(executor_store, executor_queue).await;
         }));
         tracing::info!("job executor started (30s poll interval)");
+    }
+
+    // --- Control layer: the tick loop and notice delivery ---
+    // One pass of the controller per tick (plan section 6); notices the
+    // controller wrote to the work outbox go out through the message
+    // backend, one per parent, and stay pending until a send succeeds.
+    {
+        let tick_secs: u64 = std::env::var("RUSTYKRAB_CONTROL_TICK_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(5)
+            .max(1);
+        let tick_controller = controller.clone();
+        // One controller per data directory: an old and a new daemon may
+        // overlap during a cutover, and only the holder of controller.lock
+        // ticks. The lock lives in this task, so for the life of the loop.
+        let mut loop_lock = rustykrab_control::lock::LoopLock::in_data_dir(&data_dir);
+        infra_handles.push(tokio::spawn(async move {
+            use rustykrab_control::handle::LockState;
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(tick_secs));
+            let mut waiting_logged = false;
+            let mut held = false;
+            loop {
+                interval.tick().await;
+                if !held {
+                    match tick_controller.claim_loop_lock(&mut loop_lock) {
+                        (LockState::Held, _) => {
+                            held = true;
+                            tracing::info!(
+                                lock = %loop_lock.path().display(),
+                                "controller lock held; the control loop runs here"
+                            );
+                        }
+                        (LockState::Waiting, error) => {
+                            if !waiting_logged {
+                                waiting_logged = true;
+                                match error {
+                                    Some(e) => tracing::warn!(
+                                        lock = %loop_lock.path().display(),
+                                        error = %e,
+                                        "cannot take the controller lock; no control tick runs until it can"
+                                    ),
+                                    None => tracing::info!(
+                                        lock = %loop_lock.path().display(),
+                                        "another process holds the controller lock; no control tick runs until it is released"
+                                    ),
+                                }
+                            }
+                            continue;
+                        }
+                    }
+                }
+                run_control_tick(tick_controller.as_ref()).await;
+            }
+        }));
+        let outbox_store = store_handle.clone();
+        let outbox_backend = message_backend.clone();
+        let default_chat = std::env::var("TELEGRAM_ALLOWED_CHATS").ok().and_then(|v| {
+            v.split(',')
+                .map(|c| c.trim().to_string())
+                .find(|c| !c.is_empty())
+        });
+        infra_handles.push(tokio::spawn(async move {
+            work_host::deliver_work_notices(outbox_store, outbox_backend, default_chat, tick_secs)
+                .await;
+        }));
+        infra_handles.push(evaluation::spawn_nightly(evaluator));
+        tracing::info!(tick_secs, "control layer started");
     }
 
     // Save a reference to the video channel for shutdown.
@@ -1643,9 +1981,37 @@ async fn main() -> anyhow::Result<()> {
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown_signal());
+    .with_graceful_shutdown({
+        // Drain before the server stops, so `/api/version` reports it: the
+        // controller leases nothing new and the runs in flight get
+        // RUSTYKRAB_DRAIN_SECS to finish while the tick loop reconciles them.
+        let control = controller.clone() as Arc<dyn ControlHandle>;
+        let grace = drain_grace();
+        async move {
+            shutdown_signal().await;
+            drain(control.as_ref(), grace).await;
+        }
+    });
 
     server.await?;
+
+    // End every live external worker run (its whole process group) while
+    // the runtime can still reap them, before the tasks driving them are
+    // aborted. Their worktrees stay for retention, and each reports an
+    // interruption: one more tick returns their items to `ready` with no
+    // rung, so the next daemon runs them again. Local runs in this process
+    // are interrupted the same way instead of dying with their tasks.
+    let external = rustykrab_agent::RunGroups::global()
+        .terminate_all(std::time::Duration::from_secs(5))
+        .await;
+    let local = rustykrab_agent::LocalRuns::global().interrupt_all("daemon shutting down");
+    if external + local > 0 {
+        tracing::info!(external, local, "worker runs ended for shutdown");
+        controller
+            .wait_for_runs(std::time::Duration::from_secs(5))
+            .await;
+        run_final_control_tick(controller.as_ref()).await;
+    }
 
     // Abort infrastructure tasks and log any panics.
     for handle in &infra_handles {
@@ -2840,11 +3206,545 @@ async fn checkpoint_channel_input(
     }
 }
 
-async fn shutdown_signal() {
-    tokio::signal::ctrl_c()
-        .await
-        .expect("failed to listen for ctrl+c");
-    tracing::info!("shutdown signal received");
+/// Resolves on Ctrl-C or, on unix, SIGTERM (what `launchctl stop` and
+/// `kill` send), so both run the same graceful shutdown. The SIGTERM
+/// handler is installed when this is called, not when it is first polled.
+fn shutdown_signal() -> impl std::future::Future<Output = ()> {
+    #[cfg(unix)]
+    let terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .map_err(|e| {
+            tracing::warn!(error = %e, "cannot listen for SIGTERM; only Ctrl-C shuts down");
+        });
+    async move {
+        let ctrl_c = async {
+            tokio::signal::ctrl_c()
+                .await
+                .expect("failed to listen for ctrl+c");
+        };
+        #[cfg(unix)]
+        let terminate = async move {
+            match terminate {
+                Ok(mut signal) => {
+                    signal.recv().await;
+                }
+                Err(()) => std::future::pending::<()>().await,
+            }
+        };
+        #[cfg(not(unix))]
+        let terminate = std::future::pending::<()>();
+        let which = tokio::select! {
+            _ = ctrl_c => "ctrl-c",
+            _ = terminate => "SIGTERM",
+        };
+        tracing::info!(signal = which, "shutdown signal received");
+    }
+}
+
+/// How long shutdown waits for the controller's runs in flight to finish
+/// before it ends them: `RUSTYKRAB_DRAIN_SECS`, 20 by default.
+fn drain_grace() -> std::time::Duration {
+    parse_drain_secs(std::env::var("RUSTYKRAB_DRAIN_SECS").ok().as_deref())
+}
+
+fn parse_drain_secs(value: Option<&str>) -> std::time::Duration {
+    const DEFAULT: u64 = 20;
+    let secs = match value.map(str::trim) {
+        None | Some("") => DEFAULT,
+        Some(v) => v.parse().unwrap_or_else(|_| {
+            tracing::warn!(
+                value = v,
+                "RUSTYKRAB_DRAIN_SECS is not whole seconds; using {DEFAULT}"
+            );
+            DEFAULT
+        }),
+    };
+    std::time::Duration::from_secs(secs)
+}
+
+/// One pass of the daemon's tick timer. A failed tick is logged with the
+/// class and consecutive count the controller recorded for it, read back
+/// from `loop_status`, so the log says what `GET /api/version` says. A
+/// refusal because another process holds `controller.lock` is not a
+/// failure and is logged as the lock.
+async fn run_control_tick(control: &dyn ControlHandle) {
+    match control.tick().await {
+        Err(rustykrab_core::Error::LockWaiting(message)) => tracing::info!(
+            %message,
+            "control tick skipped: another process holds controller.lock"
+        ),
+        Ok(report) => {
+            if report.transitions > 0 || report.notices > 0 {
+                tracing::info!(
+                    leased = report.leased.len(),
+                    reconciled = report.reconciled.len(),
+                    transitions = report.transitions,
+                    notices = report.notices,
+                    "control tick"
+                );
+            }
+        }
+        Err(e) => {
+            let (class, consecutive) = tick_failure(control);
+            tracing::warn!(
+                error = %e,
+                class = %class,
+                consecutive,
+                "control tick failed"
+            );
+        }
+    }
+}
+
+/// The one tick run at shutdown to reconcile the runs just interrupted.
+/// A failure is logged with its class and consecutive count, the same way
+/// `run_control_tick` logs one, and a `controller.lock` refusal likewise
+/// as the lock, not a failure. A daemon whose loop last found the lock
+/// `Waiting` never ticked, so it skips the tick rather than ask for one the
+/// controller would refuse.
+async fn run_final_control_tick(control: &dyn ControlHandle) {
+    use rustykrab_control::handle::LockState;
+    if control.loop_status().and_then(|s| s.lock) == Some(LockState::Waiting) {
+        tracing::info!(
+            "final control tick skipped: another process holds controller.lock and this daemon never ticked"
+        );
+        return;
+    }
+    match control.tick().await {
+        Err(rustykrab_core::Error::LockWaiting(message)) => tracing::info!(
+            %message,
+            "final control tick skipped: another process holds controller.lock"
+        ),
+        Ok(report) => tracing::info!(
+            reconciled = report.reconciled.len(),
+            "interrupted runs reconciled"
+        ),
+        Err(e) => {
+            let (class, consecutive) = tick_failure(control);
+            tracing::warn!(
+                error = %e,
+                class = %class,
+                consecutive,
+                "final control tick failed"
+            );
+        }
+    }
+}
+
+/// The class and consecutive count the controller recorded for the tick
+/// that just failed, read back from `loop_status`.
+fn tick_failure(control: &dyn ControlHandle) -> (String, u32) {
+    let status = control.loop_status();
+    let class = status
+        .as_ref()
+        .and_then(|s| s.last_failure_class.clone())
+        .unwrap_or_else(|| "unknown".to_string());
+    let consecutive = status.map_or(0, |s| s.consecutive_failed_ticks);
+    (class, consecutive)
+}
+
+#[cfg(test)]
+mod control_tick_log_tests {
+    use super::*;
+    use rustykrab_control::graph::FilingSource;
+    use rustykrab_control::handle::{GraphView, LoopStatus, TickReport};
+    use rustykrab_control::Provenance;
+    use rustykrab_core::work::{PlanOutcome, WorkItemId, WorkPlan};
+    use rustykrab_core::Error;
+    use std::sync::Mutex;
+
+    /// A controller whose every tick fails with a storage error, counting
+    /// the failures the way the real one does.
+    #[derive(Default)]
+    struct FailingControl(Mutex<u32>);
+
+    fn unused() -> Error {
+        Error::Internal("not used by these tests".into())
+    }
+
+    #[async_trait::async_trait]
+    impl ControlHandle for FailingControl {
+        async fn file_plan(
+            &self,
+            _: WorkPlan,
+            _: Provenance,
+            _: FilingSource,
+        ) -> Result<PlanOutcome, Error> {
+            Err(unused())
+        }
+        async fn approve(&self, _: &str, _: &str) -> Result<Vec<WorkItemId>, Error> {
+            Err(unused())
+        }
+        async fn reject(
+            &self,
+            _: &str,
+            _: Option<String>,
+            _: &str,
+        ) -> Result<Vec<WorkItemId>, Error> {
+            Err(unused())
+        }
+        async fn cancel(
+            &self,
+            _: &str,
+            _: Option<String>,
+            _: &str,
+        ) -> Result<Vec<WorkItemId>, Error> {
+            Err(unused())
+        }
+        async fn tick(&self) -> Result<TickReport, Error> {
+            *self.0.lock().unwrap() += 1;
+            Err(Error::Storage("database is locked".into()))
+        }
+        async fn graph(&self, _: &str) -> Result<GraphView, Error> {
+            Err(unused())
+        }
+        fn loop_status(&self) -> Option<LoopStatus> {
+            Some(LoopStatus {
+                last_failure_class: Some("storage".into()),
+                consecutive_failed_ticks: *self.0.lock().unwrap(),
+                ..LoopStatus::default()
+            })
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_tick_logs_its_class_and_consecutive_count() {
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let control = FailingControl::default();
+        run_control_tick(&control).await;
+        run_control_tick(&control).await;
+
+        let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(lines.len(), 2, "{log}");
+        for (line, count) in lines.iter().zip(1..) {
+            assert!(line.contains("control tick failed"), "{line}");
+            assert!(line.contains("class=storage"), "{line}");
+            assert!(line.contains(&format!("consecutive={count}")), "{line}");
+            assert!(line.contains("database is locked"), "{line}");
+        }
+    }
+
+    /// A controller whose loop is waiting on `controller.lock`: its tick
+    /// refuses the way the real one does and records no failure. `lock` is
+    /// what `loop_status` reports; `ticks` counts the calls to `tick`.
+    #[derive(Default)]
+    struct WaitingControl {
+        lock: Option<rustykrab_control::handle::LockState>,
+        ticks: Mutex<u32>,
+        runs: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl ControlHandle for WaitingControl {
+        async fn file_plan(
+            &self,
+            _: WorkPlan,
+            _: Provenance,
+            _: FilingSource,
+        ) -> Result<PlanOutcome, Error> {
+            Err(unused())
+        }
+        async fn approve(&self, _: &str, _: &str) -> Result<Vec<WorkItemId>, Error> {
+            Err(unused())
+        }
+        async fn reject(
+            &self,
+            _: &str,
+            _: Option<String>,
+            _: &str,
+        ) -> Result<Vec<WorkItemId>, Error> {
+            Err(unused())
+        }
+        async fn cancel(
+            &self,
+            _: &str,
+            _: Option<String>,
+            _: &str,
+        ) -> Result<Vec<WorkItemId>, Error> {
+            Err(unused())
+        }
+        async fn tick(&self) -> Result<TickReport, Error> {
+            *self.ticks.lock().unwrap() += 1;
+            Err(Error::LockWaiting(
+                "another process holds controller.lock; this controller is waiting on it and does not tick".into(),
+            ))
+        }
+        async fn graph(&self, _: &str) -> Result<GraphView, Error> {
+            Err(unused())
+        }
+        fn loop_status(&self) -> Option<LoopStatus> {
+            Some(LoopStatus {
+                lock: self.lock,
+                runs_in_flight: self.runs,
+                ..LoopStatus::default()
+            })
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn waiting_tick_logs_the_lock_not_a_failure() {
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        // No loop status yet: the final tick asks and meets the refusal.
+        let control = WaitingControl::default();
+        run_control_tick(&control).await;
+        run_final_control_tick(&control).await;
+        assert_eq!(*control.ticks.lock().unwrap(), 2);
+
+        let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(lines.len(), 2, "{log}");
+        assert!(lines[0].contains("control tick skipped"), "{log}");
+        assert!(lines[1].contains("final control tick skipped"), "{log}");
+        for line in lines {
+            assert!(line.contains("INFO"), "{line}");
+            assert!(
+                line.contains("another process holds controller.lock"),
+                "{line}"
+            );
+            assert!(!line.contains("failed"), "{line}");
+            assert!(!line.contains("class="), "{line}");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn final_tick_is_skipped_when_the_loop_is_waiting() {
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let control = WaitingControl {
+            lock: Some(rustykrab_control::handle::LockState::Waiting),
+            ..WaitingControl::default()
+        };
+        run_final_control_tick(&control).await;
+
+        assert_eq!(*control.ticks.lock().unwrap(), 0, "tick was called");
+        let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(lines.len(), 1, "{log}");
+        assert!(lines[0].contains("INFO"), "{log}");
+        assert!(lines[0].contains("final control tick skipped"), "{log}");
+        assert!(!lines[0].contains("failed"), "{log}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn drain_logs_its_wait_at_most_once_per_report_interval() {
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        // Two runs never finish. The real drain polls every 250 ms and
+        // reports every 5 s over a 20 s grace; scaled down by 20 that is
+        // 12.5 ms polls, 250 ms reports and a 1 s grace, about 80 polls.
+        let control = WaitingControl {
+            runs: 2,
+            ..WaitingControl::default()
+        };
+        let left = drain_polling(
+            &control,
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_micros(12_500),
+            std::time::Duration::from_millis(250),
+        )
+        .await;
+        assert_eq!(left, 2);
+
+        let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        let waits: Vec<&str> = log
+            .lines()
+            .filter(|l| l.contains("draining: waiting for runs in flight"))
+            .collect();
+        // One when draining starts, then at most one per 250 ms after it:
+        // four in all, where logging every poll wrote about eighty.
+        assert!((1..=4).contains(&waits.len()), "{log}");
+        assert!(waits[0].contains("runs=2"), "{log}");
+        assert!(waits[0].contains("secs_left=1"), "{log}");
+        assert!(
+            log.contains("runs still in flight after the drain grace"),
+            "{log}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_final_tick_logs_its_class_and_consecutive_count() {
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        // Two timer ticks failed before shutdown; the final one is the third.
+        let control = FailingControl(Mutex::new(2));
+        run_final_control_tick(&control).await;
+
+        let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(lines.len(), 1, "{log}");
+        let line = lines[0];
+        assert!(line.contains("final control tick failed"), "{line}");
+        assert!(line.contains("class=storage"), "{line}");
+        assert!(line.contains("consecutive=3"), "{line}");
+        assert!(line.contains("database is locked"), "{line}");
+    }
+}
+
+/// Put the controller in its draining state and wait, up to `grace`, for
+/// the runs in flight to finish (the tick loop keeps reconciling them).
+/// Returns how many are still running.
+async fn drain(control: &dyn ControlHandle, grace: std::time::Duration) -> usize {
+    drain_polling(
+        control,
+        grace,
+        std::time::Duration::from_millis(250),
+        std::time::Duration::from_secs(5),
+    )
+    .await
+}
+
+/// [`drain`] with its intervals spelled out: poll every `poll`, and log the
+/// wait when it starts and then at most once per `report_every`, so a 20 s
+/// grace writes a handful of lines rather than one per poll.
+async fn drain_polling(
+    control: &dyn ControlHandle,
+    grace: std::time::Duration,
+    poll: std::time::Duration,
+    report_every: std::time::Duration,
+) -> usize {
+    control.set_draining(true);
+    let deadline = tokio::time::Instant::now() + grace;
+    let mut last_report: Option<tokio::time::Instant> = None;
+    loop {
+        let in_flight = control.loop_status().map_or(0, |s| s.runs_in_flight);
+        if in_flight == 0 {
+            tracing::info!("controller drained");
+            return 0;
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            tracing::warn!(
+                runs = in_flight,
+                grace_secs = grace.as_secs(),
+                "runs still in flight after the drain grace; ending them"
+            );
+            return in_flight;
+        }
+        if last_report.is_none_or(|at| now.duration_since(at) >= report_every) {
+            tracing::info!(
+                runs = in_flight,
+                secs_left = deadline.duration_since(now).as_secs_f64().ceil() as u64,
+                "draining: waiting for runs in flight"
+            );
+            last_report = Some(now);
+        }
+        tokio::time::sleep(poll).await;
+    }
+}
+
+#[cfg(test)]
+mod drain_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn drain_grace_defaults_to_twenty_seconds() {
+        assert_eq!(parse_drain_secs(None), Duration::from_secs(20));
+        assert_eq!(parse_drain_secs(Some(" ")), Duration::from_secs(20));
+        assert_eq!(parse_drain_secs(Some("soon")), Duration::from_secs(20));
+        assert_eq!(parse_drain_secs(Some("45")), Duration::from_secs(45));
+        assert_eq!(parse_drain_secs(Some("0")), Duration::ZERO);
+    }
+
+    #[tokio::test]
+    async fn drain_sets_draining_and_returns_once_nothing_runs() {
+        let dir = std::env::temp_dir().join(format!("rk-drain-{}", uuid::Uuid::new_v4()));
+        let store = rustykrab_store::Store::open(&dir, vec![9u8; 32]).expect("store opens");
+        let controller = rustykrab_control::controller::Controller::new(
+            store,
+            Vec::new(),
+            rustykrab_control::controller::ControllerConfig::default(),
+        );
+        let started = std::time::Instant::now();
+        assert_eq!(drain(&controller, Duration::from_secs(20)).await, 0);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let status = controller.loop_status().unwrap();
+        assert!(status.draining);
+        let report = controller.tick().await.unwrap();
+        assert!(report.leased.is_empty());
+        drop(controller);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod shutdown_signal_tests {
+    use super::shutdown_signal;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn sigterm_resolves_the_shutdown_signal() {
+        let signal = shutdown_signal();
+        let sent = std::process::Command::new("kill")
+            .args(["-TERM", &std::process::id().to_string()])
+            .status()
+            .unwrap();
+        assert!(sent.success());
+        tokio::time::timeout(Duration::from_secs(10), signal)
+            .await
+            .expect("SIGTERM starts graceful shutdown");
+    }
+}
+
+#[cfg(test)]
+mod version_tests {
+    use super::*;
+
+    #[test]
+    fn api_version_reports_what_dash_dash_version_prints() {
+        let info = build_info();
+        let commit = info.commit.expect("the build script stamps a commit");
+        let date = info.build_date.expect("the build script stamps a date");
+        assert_eq!(
+            version_string(),
+            format!("{} ({commit}, {date})", info.version)
+        );
+    }
 }
 
 #[cfg(test)]

@@ -11,6 +11,7 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets
 cargo test --workspace
 python3 scripts/check_architecture_docs.py
+python3 scripts/check_env_docs.py
 ```
 
 Fix formatting automatically with `cargo fmt --all`.
@@ -46,7 +47,7 @@ the scenario gets promoted. See
 
 ## Project structure
 
-Workspace with 14 crates under `crates/`:
+Workspace with 15 crates under `crates/`:
 
 - **rustykrab-cli** — Binary entrypoint, daemon management, channel loops
 - **rustykrab-core** — Shared traits (`Tool`, `ModelProvider`), error types
@@ -62,6 +63,7 @@ Workspace with 14 crates under `crates/`:
 - **rustykrab-skills** — SKILL.md loader and Ed25519 verification
 - **rustykrab-e2e** — Black-box evaluation harness (see above)
 - **rustykrab-dream** — Off-cycle self-improvement: read-only outcome analysis (see `DREAMING.md`)
+- **rustykrab-control** — Control layer: work-item graph engine, error taxonomy, resolution ladder, controller loop (see `docs/plans/control-layer-and-worker-fleet.md`)
 
 ## Architecture docs — keep them current
 

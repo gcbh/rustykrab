@@ -151,10 +151,37 @@ impl SkillMd {
 /// ---
 /// Markdown instructions here...
 /// ```
+///
+/// The frontmatter is TOML. A flat `key: value` block, the form Claude Code
+/// and other agents write a SKILL.md in, is read too when it does not parse
+/// as TOML: every line must be a simple `key: value` scalar, which is
+/// rewritten as a TOML string (or `true`/`false`), so a capability build
+/// an external worker wrote loads without a YAML parser. Anything nested
+/// in that form is refused with the TOML error.
 pub fn parse_skill_md(content: &str) -> Result<(SkillMdFrontmatter, String), String> {
+    let (toml_str, body) = split_frontmatter(content, "SKILL.md")?;
+    let frontmatter: SkillMdFrontmatter = match toml::from_str(toml_str) {
+        Ok(frontmatter) => frontmatter,
+        Err(e) => flat_colon_frontmatter(toml_str)
+            .and_then(|as_toml| toml::from_str(&as_toml).ok())
+            .ok_or_else(|| format!("invalid SKILL.md frontmatter: {e}"))?,
+    };
+
+    Ok((frontmatter, body.to_string()))
+}
+
+/// Split a `---`-fenced TOML front-matter block from the markdown body
+/// after it. Shared by `SKILL.md` and agent definition files, which use the
+/// same layout; `kind` names the file in errors.
+pub(crate) fn split_frontmatter<'a>(
+    content: &'a str,
+    kind: &str,
+) -> Result<(&'a str, &'a str), String> {
     let trimmed = content.trim_start();
     if !trimmed.starts_with("---") {
-        return Err("SKILL.md must begin with `---` frontmatter delimiter".into());
+        return Err(format!(
+            "{kind} must begin with `---` frontmatter delimiter"
+        ));
     }
 
     // Skip the opening `---` line.
@@ -174,11 +201,46 @@ pub fn parse_skill_md(content: &str) -> Result<(SkillMdFrontmatter, String), Str
     } else {
         ""
     };
+    Ok((toml_str, body))
+}
 
-    let frontmatter: SkillMdFrontmatter =
-        toml::from_str(toml_str).map_err(|e| format!("invalid SKILL.md frontmatter: {e}"))?;
-
-    Ok((frontmatter, body.to_string()))
+/// A flat `key: value` frontmatter rewritten as TOML, or `None` when any
+/// line is not one.
+fn flat_colon_frontmatter(raw: &str) -> Option<String> {
+    let mut out = String::new();
+    for line in raw.lines() {
+        let line = line.trim_end();
+        if line.trim().is_empty() || line.trim_start().starts_with('#') {
+            continue;
+        }
+        if line.starts_with(char::is_whitespace) {
+            return None;
+        }
+        let (key, value) = line.split_once(':')?;
+        let key = key.trim();
+        if key.is_empty()
+            || !key
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            return None;
+        }
+        let value = value.trim();
+        if value.is_empty() || value.starts_with(['[', '{', '|', '>']) {
+            return None;
+        }
+        let unquoted = value
+            .strip_prefix('"')
+            .and_then(|v| v.strip_suffix('"'))
+            .or_else(|| value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))
+            .unwrap_or(value);
+        let rendered = match unquoted {
+            "true" | "false" => unquoted.to_string(),
+            text => format!("{:?}", text),
+        };
+        out.push_str(&format!("{key} = {rendered}\n"));
+    }
+    Some(out)
 }
 
 #[async_trait]
@@ -203,6 +265,21 @@ impl Skill for SkillMd {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_flat_colon_frontmatter_reads_as_toml_would() {
+        let content = "---\nname: tide_table\ndescription: Tide times for a port (e2e: stand-in)\nuser_invocable: true\n---\nReturn high and low water.\n";
+        let (fm, body) = parse_skill_md(content).unwrap();
+        assert_eq!(fm.name, "tide_table");
+        assert_eq!(fm.description, "Tide times for a port (e2e: stand-in)");
+        assert!(fm.user_invocable);
+        assert_eq!(body, "Return high and low water.\n");
+        let quoted = "---\nname: \"quoted\"\n---\nbody";
+        assert_eq!(parse_skill_md(quoted).unwrap().0.name, "quoted");
+        // Nested structure is not flat: the TOML error stands.
+        let nested = "---\nname: x\nrequires:\n  bins: [git]\n---\nbody";
+        assert!(parse_skill_md(nested).is_err());
+    }
 
     #[test]
     fn parse_valid_skill_md() {

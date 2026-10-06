@@ -17,6 +17,8 @@ rustykrab-skills.workspace = true
 rustykrab-providers.workspace = true
 rustykrab-memory.workspace = true
 rustykrab-dream.workspace = true
+# `rustykrab work` reads the controller's graph and tick reply shapes.
+rustykrab-control.workspace = true
 axum.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
@@ -33,6 +35,8 @@ dirs = "6"
 toml.workspace = true
 reqwest.workspace = true
 rpassword = "7"
+# `update apply` reads a listener's executable with `proc_pidpath` on macOS.
+libc.workspace = true
 
 # Computer-use backend (optional): screen capture + input synthesis.
 # Off by default — pulls in X11/Wayland system dependencies. Enable with
@@ -49,3 +53,6 @@ default = ["embeddings"]
 embeddings = ["rustykrab-memory/fastembed"]
 # Concrete enigo + xcap implementation of the computer-use backend.
 computer-use = ["dep:enigo", "dep:xcap"]
+
+[dev-dependencies]
+tempfile = "3"

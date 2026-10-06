@@ -482,6 +482,8 @@ impl OpenAiProvider {
         match status.as_u16() {
             400 => Error::ModelBadRequest(format!("{name} API: {body}")),
             401 | 403 => Error::ModelAuthError(format!("{name} API: {body}")),
+            // An unknown model id; retrying the same request cannot succeed.
+            404 => Error::NotFound(format!("{name} API: {body}")),
             429 => Error::ModelRateLimit(format!("{name} API: {body}")),
             503 => Error::ModelOverloaded(format!("{name} API: {body}")),
             _ => Error::ModelProvider(format!("{name} API returned {status}: {body}")),
@@ -919,6 +921,18 @@ mod tests {
             is_error: false,
             images: Vec::new(),
         }
+    }
+
+    #[test]
+    fn status_404_maps_to_not_found_not_transient() {
+        let provider = OpenAiProvider::new("no-such-model");
+        let err = provider.map_status_error(
+            reqwest::StatusCode::NOT_FOUND,
+            r#"{"error":{"message":"The model `no-such-model` does not exist"}}"#,
+        );
+        assert!(matches!(err, Error::NotFound(_)), "got {err:?}");
+        assert_eq!(err.kind(), rustykrab_core::error::ToolErrorKind::NotFound);
+        assert!(!err.kind().retryable());
     }
 
     #[test]

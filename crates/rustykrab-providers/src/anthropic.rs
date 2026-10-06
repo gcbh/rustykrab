@@ -462,6 +462,8 @@ impl AnthropicProvider {
         match status.as_u16() {
             400 => Error::ModelBadRequest(format!("Anthropic API: {body}")),
             401 | 403 => Error::ModelAuthError(format!("Anthropic API: {body}")),
+            // An unknown model id; retrying the same request cannot succeed.
+            404 => Error::NotFound(format!("Anthropic API: {body}")),
             429 => Error::ModelRateLimit(format!("Anthropic API: {body}")),
             529 => Error::ModelOverloaded(format!("Anthropic API: {body}")),
             _ => Error::ModelProvider(format!("Anthropic API returned {status}: {body}")),
@@ -1030,6 +1032,17 @@ struct SseDeltaUsage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn status_404_maps_to_not_found_not_transient() {
+        let err = AnthropicProvider::map_status_error(
+            reqwest::StatusCode::NOT_FOUND,
+            r#"{"type":"error","error":{"type":"not_found_error","message":"model: claude-nope"}}"#,
+        );
+        assert!(matches!(err, Error::NotFound(_)), "got {err:?}");
+        assert_eq!(err.kind(), rustykrab_core::error::ToolErrorKind::NotFound);
+        assert!(!err.kind().retryable());
+    }
 
     #[test]
     fn tool_choice_auto_emits_no_field() {

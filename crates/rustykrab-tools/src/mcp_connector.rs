@@ -179,6 +179,21 @@ fn render_content(content: &[McpContent]) -> String {
     out
 }
 
+/// The MCP servers this host is configured with: the names in
+/// `RUSTYKRAB_MCP_SERVERS`, in order, whether or not they connected. A
+/// server that is configured but down is not a missing capability (the
+/// control layer's `needs_tool` is only for one never configured), so the
+/// control layer's catalog reads these names, not just the tools that
+/// registered.
+pub fn configured_mcp_servers() -> Vec<String> {
+    std::env::var("RUSTYKRAB_MCP_SERVERS")
+        .unwrap_or_default()
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
 /// Connect to every configured MCP server and return their tools.
 ///
 /// Returns an empty Vec if `RUSTYKRAB_MCP_SERVERS` is unset or empty.
@@ -187,16 +202,10 @@ fn render_content(content: &[McpContent]) -> String {
 /// `secrets` is used to resolve `ref:store:...` values; pass the daemon's
 /// shared [`SecretStore`].
 pub async fn mcp_connector_tools(secrets: &SecretStore) -> Vec<Arc<dyn Tool>> {
-    let raw = match std::env::var("RUSTYKRAB_MCP_SERVERS") {
-        Ok(v) if !v.trim().is_empty() => v,
-        _ => return Vec::new(),
-    };
-
-    let names: Vec<String> = raw
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
+    let names = configured_mcp_servers();
+    if names.is_empty() {
+        return Vec::new();
+    }
 
     // Connect to all servers concurrently — startup latency is the slowest
     // server, not the sum. `join_all` preserves input order, so tool

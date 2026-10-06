@@ -8,6 +8,8 @@ license.workspace = true
 [dependencies]
 rustykrab-core.workspace = true
 rustykrab-tools.workspace = true
+rustykrab-control.workspace = true
+rustykrab-skills.workspace = true
 async-trait.workspace = true
 tokio.workspace = true
 serde_json.workspace = true
@@ -17,3 +19,8 @@ uuid.workspace = true
 chrono.workspace = true
 futures.workspace = true
 regex.workspace = true
+# The peer worker's client for its node's delegated-task API.
+reqwest.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

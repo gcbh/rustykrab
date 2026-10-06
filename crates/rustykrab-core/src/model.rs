@@ -63,11 +63,33 @@ pub enum ToolChoice {
     Any,
 }
 
+/// Whether a provider's configured model exists on its server, as the
+/// server answered [`ModelProvider::check_model`].
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum ModelCheck {
+    /// The server has the model.
+    Available,
+    /// The server answered that it has no such model; the text says which.
+    Missing(String),
+    /// No answer either way: the provider does not check, or the server
+    /// could not be asked. Callers treat this as they did before checking.
+    #[default]
+    Unknown,
+}
+
 /// Trait implemented by every model provider (e.g. Anthropic, OpenAI).
 #[async_trait]
 pub trait ModelProvider: Send + Sync {
     /// Human-readable name of the provider.
     fn name(&self) -> &str;
+
+    /// Ask the provider's server whether the configured model exists,
+    /// without loading it. A local worker keeps the answer as its health,
+    /// so the controller never leases an item to a model that is not
+    /// there. The default does not ask.
+    async fn check_model(&self) -> ModelCheck {
+        ModelCheck::Unknown
+    }
 
     /// Model's context window in tokens, when known.
     ///
@@ -115,6 +137,22 @@ pub trait ModelProvider: Send + Sync {
     /// matching tool_result before the next chat call.
     fn requires_paired_tool_results(&self) -> bool {
         true
+    }
+
+    /// Whether the model can call a tool whose schema it has seen only as
+    /// text in the conversation (a tool result), not in the request's
+    /// declared tools array.
+    ///
+    /// Capability data, never a branch on a model name (plan
+    /// `docs/plans/control-layer-and-worker-fleet.md`, section 12.1). When
+    /// `true` the runner delivers tools found mid-run by append, leaving the
+    /// tools array, and with it the cached prompt prefix, unchanged
+    /// ([`crate::LateToolBinding::Append`]); otherwise it re-renders the
+    /// array. The default is the safe answer: an API that validates tool
+    /// calls against the declared array would reject the append path's
+    /// calls. A harness profile can override either way.
+    fn accepts_undeclared_tool_calls(&self) -> bool {
+        false
     }
 
     /// Send a conversation to the model and get back the next message.

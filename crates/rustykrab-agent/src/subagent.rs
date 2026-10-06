@@ -14,10 +14,10 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::Utc;
-use rustykrab_core::active_tools::SESSION_TOOL_CONTEXT;
+use rustykrab_core::active_tools::{ActiveToolsRegistry, SESSION_TOOL_CONTEXT};
 use rustykrab_core::model::ModelProvider;
 use rustykrab_core::types::{Conversation, Message, MessageContent, Role};
-use rustykrab_core::{AgentRegistry, CapabilitySet, Error, Result, Session, Tool};
+use rustykrab_core::{AgentDefinition, AgentRegistry, CapabilitySet, Error, Result, Session, Tool};
 use rustykrab_tools::SessionManager;
 use serde_json::{json, Value};
 use tokio::sync::Semaphore;
@@ -26,6 +26,18 @@ use uuid::Uuid;
 use crate::harness::HarnessProfile;
 use crate::runner::AgentRunner;
 use crate::sandbox::Sandbox;
+
+/// The harness profile an [`AgentDefinition`] names; an unknown name gets
+/// the default. Shared with [`crate::LocalWorker`], which runs a definition
+/// the same way for the controller.
+pub(crate) fn profile_for(def: &AgentDefinition) -> HarnessProfile {
+    match def.profile.as_str() {
+        "coding" => HarnessProfile::coding(),
+        "research" => HarnessProfile::research(),
+        "creative" => HarnessProfile::creative(),
+        _ => HarnessProfile::default(),
+    }
+}
 
 /// Runs sub-agents against an [`AgentRegistry`] using a fresh
 /// [`AgentRunner`] per call.
@@ -139,6 +151,8 @@ impl SessionManager for SubagentRunner {
                     "id": d.id,
                     "description": d.description,
                     "profile": d.profile,
+                    "tools": d.tools,
+                    "mcp_servers": d.mcp_servers,
                     "allowed_tools": d.allowed_tools,
                 })
             })
@@ -161,12 +175,7 @@ impl SessionManager for SubagentRunner {
             .await
             .map_err(|_| Error::Internal("subagent semaphore closed".into()))?;
 
-        let profile = match def.profile.as_str() {
-            "coding" => HarnessProfile::coding(),
-            "research" => HarnessProfile::research(),
-            "creative" => HarnessProfile::creative(),
-            _ => HarnessProfile::default(),
-        };
+        let profile = profile_for(&def);
 
         let caps = self.derive_capabilities(def.allowed_tools.as_deref());
         let conv_id = Uuid::new_v4();
@@ -201,12 +210,23 @@ impl SessionManager for SubagentRunner {
             channel_thread_id: None,
         };
 
+        // The definition's visible set is declared before the first model
+        // call, so the sub-agent starts with the tools its kind of work
+        // needs and its tools array stays fixed for the run; anything else
+        // it finds arrives by append (plan section 12).
+        let active = Arc::new(ActiveToolsRegistry::new());
+        active.activate(
+            conv_id,
+            def.visible_set(self.tools.iter().map(|t| t.name())),
+        );
+
         let runner = AgentRunner::new(
             self.provider.clone(),
             self.tools.clone(),
             self.sandbox.clone(),
         )
-        .with_config(profile.to_agent_config());
+        .with_config(profile.to_agent_config())
+        .with_active_tools(active);
 
         runner.run(&mut conv, &session).await.map_err(|e| {
             Error::ToolExecution(format!("subagent '{}' failed: {e}", def.id).into())
@@ -248,12 +268,15 @@ mod tests {
 
     struct ScriptedProvider {
         responses: Mutex<Vec<ModelResponse>>,
+        /// The tool names each request declared, in order.
+        declared: Mutex<Vec<Vec<String>>>,
     }
 
     impl ScriptedProvider {
         fn new(responses: Vec<ModelResponse>) -> Self {
             Self {
                 responses: Mutex::new(responses),
+                declared: Mutex::new(Vec::new()),
             }
         }
     }
@@ -264,11 +287,10 @@ mod tests {
             "scripted"
         }
 
-        async fn chat(
-            &self,
-            _messages: &[Message],
-            _tools: &[ToolSchema],
-        ) -> Result<ModelResponse> {
+        async fn chat(&self, _messages: &[Message], tools: &[ToolSchema]) -> Result<ModelResponse> {
+            let mut names: Vec<String> = tools.iter().map(|t| t.name.clone()).collect();
+            names.sort();
+            self.declared.lock().unwrap().push(names);
             let mut q = self.responses.lock().unwrap();
             if q.is_empty() {
                 Ok(text_response("(no more responses)"))
@@ -307,13 +329,94 @@ mod tests {
     }
 
     fn make_runner(provider: Arc<dyn ModelProvider>) -> SubagentRunner {
+        make_runner_with(provider, Vec::new())
+    }
+
+    fn make_runner_with(
+        provider: Arc<dyn ModelProvider>,
+        tools: Vec<Arc<dyn Tool>>,
+    ) -> SubagentRunner {
         SubagentRunner::new(
             provider,
-            Vec::new(),
+            tools,
             Arc::new(NoSandbox),
-            Arc::new(AgentRegistry::with_defaults()),
+            Arc::new(rustykrab_skills::agent_registry(None)),
             1,
         )
+    }
+
+    /// A tool that does nothing, under any name.
+    struct Named(&'static str);
+
+    #[async_trait]
+    impl Tool for Named {
+        fn name(&self) -> &str {
+            self.0
+        }
+        fn description(&self) -> &str {
+            "test tool"
+        }
+        fn schema(&self) -> ToolSchema {
+            ToolSchema {
+                name: self.0.into(),
+                description: "test tool".into(),
+                parameters: json!({"type": "object", "properties": {}}),
+            }
+        }
+        async fn execute(&self, _: Value) -> Result<Value> {
+            Ok(json!({"ok": true}))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_coder_starts_with_its_filesystem_and_runtime_tools_declared() {
+        let provider = Arc::new(ScriptedProvider::new(vec![text_response("done")]));
+        let tools: Vec<Arc<dyn Tool>> = [
+            "read",
+            "write",
+            "edit",
+            "apply_patch",
+            "exec",
+            "process",
+            "code_execution",
+            "browser",
+            "gmail",
+        ]
+        .into_iter()
+        .map(|n| Arc::new(Named(n)) as Arc<dyn Tool>)
+        .collect();
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        // The parent session's grant, which a definition without a ceiling
+        // inherits.
+        let parent = rustykrab_core::SessionToolContext {
+            conversation_id: Uuid::new_v4(),
+            capabilities: Arc::new(CapabilitySet::for_tools(&names)),
+            all_tools: Arc::new(tools.clone()),
+            active_tools: Arc::new(ActiveToolsRegistry::new()),
+            recall: Arc::new(rustykrab_core::RecallStore::new()),
+            todos: Arc::new(rustykrab_core::TodoStore::new()),
+        };
+        let runner = make_runner_with(provider.clone(), tools);
+
+        SESSION_TOOL_CONTEXT
+            .scope(parent, runner.run_subagent("coder", "fix the bug"))
+            .await
+            .unwrap();
+
+        let declared = provider.declared.lock().unwrap().clone();
+        assert_eq!(
+            declared[0],
+            [
+                "apply_patch",
+                "code_execution",
+                "edit",
+                "exec",
+                "process",
+                "read",
+                "write"
+            ],
+            "the coder's visible set, and nothing it was not given"
+        );
     }
 
     #[tokio::test]
@@ -327,7 +430,9 @@ mod tests {
             .iter()
             .filter_map(|a| a.get("id").and_then(|i| i.as_str()))
             .collect();
-        assert_eq!(ids, vec!["coder", "planner", "researcher"]);
+        assert_eq!(ids, vec!["coder", "planner", "researcher", "worker"]);
+        let coder = agents.iter().find(|a| a["id"] == "coder").unwrap();
+        assert_eq!(coder["tools"][0], "read");
     }
 
     #[tokio::test]

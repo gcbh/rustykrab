@@ -23,6 +23,18 @@ weight. Counts are `impl X for` occurrences including test doubles.
 | `ComputerBackend` | **`tools`** | 2 | Correctly implemented above the consumer |
 | `VideoBackend` | **`tools`** | 1 | Fine — implementation is in the same crate |
 | `SessionManager` | **`tools`** | 1 | Correctly implemented above the consumer |
+| `WorkBackend` | **`tools`** `work_backend.rs` | 1 stub | Correctly placed above the consumer: the `work_file`, `work_status` and `result_report` tools call it; the controller adapter in `rustykrab-cli` implements it (Phase 1, round 2) |
+| `Worker` | **`control`** `worker.rs` | 3 + test doubles | **Earns its keep.** The controller calls it; `LocalWorker`, `ExternalWorker` (the `claude_code` and `codex` kinds) and `PeerWorker` (the `peer` kind, Phase 5) in `rustykrab-agent` implement it above the controller. Its defaulted `usage` carries a run's spend and completion-reminder count back to the controller; its defaulted `resumable`, `stop` and `refresh` exist for a run that lives outside the process (a peer's task: re-attached after a restart, cancelled when the controller stops it, advertised and health-checked on the registry's timer); `LocalWorker` uses `refresh` for its provider's model check; its defaulted `unhealthy_reason` puts the cause of an unhealthy worker in the health line the registry records |
+| `WorkerFactory` | **`control`** `registry.rs` | 1 + 1 test | Correctly placed: the registry builds external workers and peers through it from a stored spec, and `AgentFactory` in `rustykrab-cli` implements it over `ExternalWorker` and `PeerWorker`, which `control` cannot name; its defaulted async `prepare` redeems a peer's pairing code before the spec is stored |
+| `NodeWorkers` | **`control`** `peer.rs` | 1 | Correctly placed: the gateway's task worker and `GET /api/node` call it to run a peer's brief inside this node's ceiling and to advertise that ceiling; `DelegatedRuns` in `rustykrab-agent` implements it over the local worker, which neither the gateway's traits nor `control` should build |
+| `Routing` | **`control`** `controller/mod.rs` | 2 | Earns its keep: `CheapestFirst` for tests and a bare controller, `RecordRouting` (`control` `routing.rs`) over the registry's routing records and default tiers in the daemon |
+| `ToolCatalog` | **`control`** `controller/mod.rs` | 4 | Earns its keep: `StaticCatalog` for tests, `RegistryCatalog` in `rustykrab-cli` over the final tool registry and the active-tools seed (registered but unloaded tools, MCP servers named in `RUSTYKRAB_MCP_SERVERS` or with registered tools), and `FleetCatalog` over that plus the skills written at run time, whose `refresh` rescans them |
+| `ModelActivity` | **`control`** `controller/mod.rs` | 1 + 1 test | Earns its keep: plan 12.1's busy signal, the controller's only view of interactive turns; `TurnActivity` in `rustykrab-cli` implements it over the gateway's `ActivityTracker`, which the controller does not depend on |
+| `ReviewSurface` | **`control`** `review/mod.rs` | 1 + 1 test | Earns its keep: the review-surface decision (GitHub or Linear) is still open, so the projection and sync are written once against it; `GithubIssues` in `rustykrab-cli` is the first implementation, an in-memory surface in the controller tests the second |
+| `WorkRecordSource`, `QuestionReader`, `RoutingRecordReader`, `ProposalFiler`, `EvaluationLedger` | **`dream`** `evaluate/mod.rs` | 1-2 + test fakes each | Correct inversion, as `OutcomeSource`: the pass reads the store, Phases 3 and 4 and files through the controller without depending on any of them; the store-backed impls are in `dream`, the routing reader (`StoreRouting`, over the worker registry) and the filer in `rustykrab-cli` |
+| `EvaluationHandle` | **`gateway`** `evaluate_routes.rs` | 1 + 1 test | Correctly placed above the consumer: `POST /api/work/evaluate` calls it, and the CLI's `Evaluator` implements it with a boxed future |
+| `LateTools` | **`agent`** `local_worker.rs` | 1 + 1 test | Correctly placed: `LocalWorker` asks it for tools that appeared while the daemon ran, and `RuntimeSkills` in `rustykrab-cli` implements it over the skills directory and the skill registry, which `agent` does not depend on |
+| `RunTranscripts` | **`agent`** `local_worker.rs` | 1 + 2 test | Correctly placed: `LocalWorker` keeps each run's conversation through it and, through its defaulted `resume`, continues a kept one; `JobTranscripts` in `rustykrab-cli` implements it over the conversation store (which `agent` does not depend on) and resumes a scheduled firing's job conversation with its SKILL.md and prompt |
 | `Skill` | `skills/skill.rs` | 1 | Thin — `SkillMd` is the only shape |
 | `Channel` | `channels/channel.rs` | **1** | **Not earning its keep** |
 | `GatewayBackend` | `tools/gateway_backend.rs` | **0** | **Dead** |
@@ -53,6 +65,9 @@ Which traits are actually blocked, by where their real implementor lives:
 | `VideoBackend` | `VideoChannelAdapter` | `rustykrab-tools` | no, same crate |
 | `CronBackend` | `CronAdapter` | `rustykrab-cli` | no, above |
 | `MessageBackend` | `MessageAdapter` | `rustykrab-cli` | no, above |
+| `WorkBackend` | controller adapter (round 2) | `rustykrab-cli` | no, above |
+| `ReviewSurface` | `GithubIssues` | `rustykrab-cli` | no, above |
+| `ProposalFiler` | `ControlFiler` | `rustykrab-cli` | no, above |
 
 `CronAdapter` and `MessageAdapter` are also not pass-throughs — `CronAdapter`
 merges the calling conversation's channel context into cron arguments, which
@@ -192,8 +207,13 @@ Worth naming, because a review that only lists problems misrepresents the code:
   agent loops get wrong.
 - **`ModelProvider` defaults are correctly chosen.** `context_limit`,
   `supports_vision`, `requires_paired_tool_results`, `chat_with_ctx`,
-  `chat_with_choice` all have defaults that degrade safely, so a new provider
-  implements one method.
+  `chat_with_choice`, `accepts_undeclared_tool_calls` and `check_model` all
+  have defaults that degrade safely, so a new provider implements one
+  method. `accepts_undeclared_tool_calls` is capability data for the append
+  path (control-layer plan, section 12): a provider that says nothing keeps
+  late tools on the re-render path. `check_model` defaults to `Unknown`,
+  which leaves a local worker healthy; Ollama answers `Missing` on a 404
+  from `/api/show`.
 - **The capability model is real.** `Capability::Subagent` and
   `Capability::ComputerUse` are required *in addition to* the per-tool grant,
   and the dangerous ones are gated at four independent layers.
@@ -202,3 +222,4 @@ Worth naming, because a review that only lists problems misrepresents the code:
   the current version, why `""` and not `NULL` is the Slack no-thread sentinel,
   why `http2` had to be added to reqwest's features. This is unusually good and
   it is what makes the codebase reviewable at all at 80k lines.
+

@@ -1,5 +1,6 @@
 use rustykrab_agent::{HarnessProfile, HarnessRouter, Sandbox};
 use rustykrab_channels::{SignalChannel, SlackChannel, TelegramChannel, VideoChannel};
+use rustykrab_control::handle::ControlHandle;
 use rustykrab_core::activity::ActivityTracker;
 use rustykrab_core::model::ModelProvider;
 use rustykrab_core::orchestration::OrchestrationConfig;
@@ -14,6 +15,27 @@ use uuid::Uuid;
 use crate::origin::OriginPolicy;
 use crate::rate_limit::{RateLimitConfig, RateLimiter};
 
+/// The running build, as `rustykrab --version` prints it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildInfo {
+    /// The package version.
+    pub version: String,
+    /// The source commit, with `-dirty` when the tree had local changes.
+    pub commit: Option<String>,
+    /// The date the binary was built.
+    pub build_date: Option<String>,
+}
+
+impl Default for BuildInfo {
+    fn default() -> Self {
+        Self {
+            version: rustykrab_core::VERSION.to_string(),
+            commit: None,
+            build_date: None,
+        }
+    }
+}
+
 /// Shared application state threaded through axum handlers.
 ///
 /// Two halves, deliberately separated. `agent` is everything a turn needs
@@ -21,7 +43,8 @@ use crate::rate_limit::{RateLimitConfig, RateLimiter};
 /// with no HTTP in sight — a Telegram loop, a scheduled job, a test — can
 /// hold one without constructing a web server's state. The rest of this
 /// struct is the web server: auth, rate limiting, origin policy, the
-/// credential page, and the channel handles the webhook routes deliver to.
+/// credential page, the controller handle `/api/work` calls, and the channel
+/// handles the webhook routes deliver to.
 #[derive(Clone)]
 pub struct AppState {
     /// Everything needed to run a turn. See [`AgentContext`].
@@ -38,6 +61,30 @@ pub struct AppState {
     /// queue. Shared between the `/api/tasks` handlers, which enqueue and
     /// cancel, and the worker, which drains.
     pub task_signal: crate::tasks::TaskQueueSignal,
+    /// The control layer's handle, for `/api/work` (plan section 14). `None`
+    /// until the composition root wires a controller: the `/api/work` read
+    /// routes then answer from `agent.store` alone, and every route that
+    /// needs the controller answers 503.
+    pub control: Option<Arc<dyn ControlHandle>>,
+    /// The worker registry, for `/api/workers` (plan sections 5 and 14).
+    /// `None` until the composition root wires one; those routes then
+    /// answer 503.
+    pub workers: Option<Arc<rustykrab_control::registry::WorkerRegistry>>,
+    /// The control plan's evaluation pass (Phase 6), for
+    /// `POST /api/work/evaluate`. `None` until the composition root wires
+    /// one: that route then answers 503, and `GET /api/work/metrics` still
+    /// reads the store.
+    pub evaluation: Option<Arc<dyn crate::evaluate_routes::EvaluationHandle>>,
+    /// How this node runs a structured delegated task, a peer's brief
+    /// (control plan, Phase 5). `None` until the composition root wires
+    /// one: the task queue then runs free text only, a structured
+    /// submission is refused, and `GET /api/node` advertises no structured
+    /// delegation.
+    pub delegation: Option<Arc<dyn rustykrab_control::peer::NodeWorkers>>,
+    /// What `GET /api/version` reports about the running build. The
+    /// binary's build script stamps the commit and date, so only the
+    /// composition root can fill them in; until it does they read `None`.
+    pub build: BuildInfo,
 
     // --- Outbound channels, delivered to by the webhook routes ---
     pub telegram: Option<Arc<TelegramChannel>>,
@@ -61,6 +108,11 @@ impl AppState {
             origin_policy: OriginPolicy::default(),
             credential_page_policy: crate::PageIdentityPolicy::default(),
             task_signal: crate::tasks::TaskQueueSignal::new(),
+            control: None,
+            workers: None,
+            evaluation: None,
+            delegation: None,
+            build: BuildInfo::default(),
             telegram: None,
             signal: None,
             slack: None,
@@ -171,6 +223,46 @@ impl AppState {
 
     pub fn with_rate_limit(mut self, config: RateLimitConfig) -> Self {
         self.rate_limiter = Arc::new(RateLimiter::new(config));
+        self
+    }
+
+    /// Wire the controller the `/api/work` routes call. It should run over
+    /// the same store as `agent.store`, which those routes read.
+    pub fn with_control(mut self, control: Arc<dyn ControlHandle>) -> Self {
+        self.control = Some(control);
+        self
+    }
+
+    /// Wire the worker registry the `/api/workers` routes read and grow.
+    pub fn with_workers(
+        mut self,
+        workers: Arc<rustykrab_control::registry::WorkerRegistry>,
+    ) -> Self {
+        self.workers = Some(workers);
+        self
+    }
+
+    /// Wire the evaluation pass `POST /api/work/evaluate` runs on demand.
+    pub fn with_evaluation(
+        mut self,
+        evaluation: Arc<dyn crate::evaluate_routes::EvaluationHandle>,
+    ) -> Self {
+        self.evaluation = Some(evaluation);
+        self
+    }
+
+    /// Wire how this node runs a peer's structured task.
+    pub fn with_delegation(
+        mut self,
+        delegation: Arc<dyn rustykrab_control::peer::NodeWorkers>,
+    ) -> Self {
+        self.delegation = Some(delegation);
+        self
+    }
+
+    /// Report `build` from `GET /api/version`.
+    pub fn with_build_info(mut self, build: BuildInfo) -> Self {
+        self.build = build;
         self
     }
 

@@ -1,3 +1,4 @@
+use rustykrab_core::LateToolBinding;
 use serde::{Deserialize, Serialize};
 
 use crate::runner::AgentConfig;
@@ -37,6 +38,23 @@ pub struct HarnessProfile {
     pub compaction_threshold_pct: f64,
     /// Explicit compaction policy; routing must preserve the operator's choice.
     pub compaction_strategy: CompactionStrategy,
+
+    // --- Tool delivery ---
+    /// How a tool found mid-run reaches the model: `"append"` (its schema
+    /// as text in a tool result, the tools array fixed) or `"rerender"`
+    /// (added to the tools array). Unset takes the provider's capability
+    /// data. Set it for a model whose chat template rejects calls to
+    /// undeclared tools although its provider usually accepts them: a
+    /// model difference expressed as data, never as a code path (plan
+    /// section 12.1).
+    pub late_tool_binding: Option<LateToolBinding>,
+    /// How many `tools_list` searches for one need may find nothing in a
+    /// run before the host answers the next as final (no tool provides it;
+    /// tell the user, or in a worker run report `needs_tool`) and records a
+    /// `capability_gap/tool`. Told nothing matched, both default local
+    /// models kept searching until the iteration cap (scenario 10,
+    /// 2026-09-28).
+    pub tool_search_miss_limit: usize,
 }
 
 impl Default for HarnessProfile {
@@ -51,6 +69,8 @@ impl Default for HarnessProfile {
             max_context_tokens: 128_000,
             compaction_threshold_pct: 0.85,
             compaction_strategy: CompactionStrategy::default(),
+            late_tool_binding: None,
+            tool_search_miss_limit: rustykrab_core::DEFAULT_SEARCH_MISS_LIMIT,
         }
     }
 }
@@ -95,6 +115,8 @@ impl HarnessProfile {
             max_context_tokens: self.max_context_tokens,
             compaction_threshold_pct: self.compaction_threshold_pct,
             compaction_strategy: self.compaction_strategy,
+            late_tool_binding: self.late_tool_binding,
+            tool_search_miss_limit: self.tool_search_miss_limit,
             ..AgentConfig::default()
         }
     }
@@ -121,5 +143,29 @@ mod tests {
         assert!(
             serde_json::from_str::<HarnessProfile>(r#"{"compaction_strategy":"typo"}"#).is_err()
         );
+    }
+
+    #[test]
+    fn late_tool_binding_is_profile_data_and_unset_by_default() {
+        let old: HarnessProfile = serde_json::from_str("{}").unwrap();
+        assert_eq!(old.late_tool_binding, None);
+        assert_eq!(old.to_agent_config().late_tool_binding, None);
+        let profile: HarnessProfile =
+            serde_json::from_str(r#"{"late_tool_binding":"rerender"}"#).unwrap();
+        assert_eq!(
+            profile.to_agent_config().late_tool_binding,
+            Some(LateToolBinding::Rerender)
+        );
+        assert!(serde_json::from_str::<HarnessProfile>(r#"{"late_tool_binding":"x"}"#).is_err());
+    }
+
+    #[test]
+    fn the_search_miss_limit_is_profile_data_defaulting_to_two() {
+        let old: HarnessProfile = serde_json::from_str("{}").unwrap();
+        assert_eq!(old.tool_search_miss_limit, 2);
+        assert_eq!(old.to_agent_config().tool_search_miss_limit, 2);
+        let profile: HarnessProfile =
+            serde_json::from_str(r#"{"tool_search_miss_limit":4}"#).unwrap();
+        assert_eq!(profile.to_agent_config().tool_search_miss_limit, 4);
     }
 }

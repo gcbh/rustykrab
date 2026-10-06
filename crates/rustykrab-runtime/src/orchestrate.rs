@@ -152,12 +152,19 @@ async fn build_and_inject_system_prompt(
          inspect current external state before retrying a potentially applied effect.",
     );
     // Custom soul files are user-owned and may still name absent tools. The
-    // session's actual schema is authoritative regardless of that wording.
+    // session's actual tools are authoritative regardless of that wording.
+    // "Given" covers both kinds a local model gets (plan section 12): the
+    // tools array, and a tool whose definition a `tools_list` search
+    // delivered as text. An instruction that only the array counts would
+    // contradict the search result's "callable now", the conflict that cost
+    // gemma4 a third of its late-bound calls.
     system_prompt.push_str(
-        "\n\n## Tool availability\nInvoke only tools whose schemas are currently offered. \
-         References to tool names in general guidance are conditional on availability. \
-         Discover and load other available tools before invoking them; if discovery \
-         says a tool is unknown or forbidden, do not invent a call to it.",
+        "\n\n## Tool availability\nInvoke only tools you have been given: the ones in \
+         your tool list, and any whose definition a tools_list or tools_load result \
+         delivered, which are callable at once. References to tool names in general \
+         guidance are conditional on availability. Find other tools with tools_list \
+         before invoking them; if a search finds nothing, or says a tool is unknown or \
+         forbidden, do not invent a call to it.",
     );
 
     // Append channel context so the agent knows where this conversation lives.
@@ -270,7 +277,9 @@ pub(crate) fn message_to_turn(
 /// writes are async, so each call spawns a detached task.  Failures are
 /// logged but don't block the agent loop — memory is eventual-consistency
 /// relative to the conversation. System messages are skipped; they are
-/// infrastructure (agent prompt, warnings) rather than conversation content.
+/// infrastructure (agent prompt, warnings) rather than conversation content,
+/// and so are the runner's `[System notice]` user turns, which are the same
+/// warnings and nudges in the shape every model reads (control plan 12.1).
 /// Duplicate content is de-duplicated on the memory side via SHA-256 hash,
 /// so re-firing the callback for an already-persisted message is safe.
 fn build_memory_callback(ctx: &AgentContext, conv: &Conversation) -> Option<OnMessageCallback> {
@@ -282,7 +291,7 @@ fn build_memory_callback(ctx: &AgentContext, conv: &Conversation) -> Option<OnMe
     let turn_counter = Arc::new(AtomicU32::new(conv.messages.len() as u32));
 
     Some(Arc::new(move |msg: &Message| {
-        if msg.role == Role::System {
+        if msg.role == Role::System || msg.is_system_notice() {
             return;
         }
         let turn_number = turn_counter.fetch_add(1, Ordering::Relaxed);

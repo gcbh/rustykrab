@@ -128,11 +128,24 @@ const ALLOWED_COMMANDS: &[&str] = &[
 /// Security: Commands are validated against an allowlist to prevent
 /// arbitrary command injection. Shell metacharacters in arguments are
 /// handled safely by parsing the command into parts.
-pub struct ExecTool;
+///
+/// Commands run in the daemon's working directory, or in `dir` for an
+/// instance a worker run built with [`ExecTool::in_dir`]: a `code` run's
+/// isolated worktree (control-layer plan section 5).
+pub struct ExecTool {
+    dir: Option<std::path::PathBuf>,
+}
 
 impl ExecTool {
     pub fn new() -> Self {
-        Self
+        Self { dir: None }
+    }
+
+    /// An `exec` whose commands run in `dir`.
+    pub fn in_dir(dir: impl Into<std::path::PathBuf>) -> Self {
+        Self {
+            dir: Some(dir.into()),
+        }
     }
 }
 
@@ -335,14 +348,18 @@ impl Tool for ExecTool {
         let path = std::env::var("PATH")
             .unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin".to_string());
 
-        let future = tokio::process::Command::new("sh")
+        let mut process = tokio::process::Command::new("sh");
+        process
             .arg("-c")
             .arg(command)
             .env_clear()
             .env("PATH", &path)
             .env("HOME", "/tmp/rustykrab-home")
-            .env("LANG", "C.UTF-8")
-            .output();
+            .env("LANG", "C.UTF-8");
+        if let Some(dir) = &self.dir {
+            process.current_dir(dir);
+        }
+        let future = process.output();
 
         let output = timeout(Duration::from_secs(timeout_secs), future)
             .await
@@ -414,6 +431,20 @@ mod error_typing_tests {
             .unwrap_err();
 
         assert_eq!(error.kind(), ToolErrorKind::InvalidInput);
+    }
+
+    #[tokio::test]
+    async fn an_exec_bound_to_a_directory_runs_there() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = ExecTool::in_dir(dir.path())
+            .execute(json!({"command": "pwd"}))
+            .await
+            .unwrap();
+        let pwd = std::path::PathBuf::from(out["stdout"].as_str().unwrap().trim());
+        assert_eq!(
+            pwd.canonicalize().unwrap(),
+            dir.path().canonicalize().unwrap()
+        );
     }
 
     #[tokio::test]

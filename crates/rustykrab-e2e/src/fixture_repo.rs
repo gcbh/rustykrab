@@ -144,6 +144,11 @@ impl FixtureRepo {
         &self.head_sha
     }
 
+    /// Run git in the fixture and return its trimmed stdout.
+    pub fn git(&self, args: &[&str]) -> Result<String> {
+        git_stdout(self.path(), args)
+    }
+
     /// Verify the facts on which planning scenarios rely.
     pub fn verify(&self) -> Result<()> {
         let branch = git_stdout(self.path(), &["branch", "--show-current"])?;
@@ -228,6 +233,144 @@ fn require_success(operation: &str, output: Output) -> Result<()> {
     )
 }
 
+/// A recorded delivery `StackManifest`, the stand-in for the delivery
+/// compiler until the control plan's Phase 7 (scenario 26). Layers run
+/// bottom to top; each layer's `acceptance` becomes its parent item's
+/// `done_when`, and `delivery_dependencies` become `blocks` edges between
+/// the `code` items of a layer. `cyclic` adds the one dependency that closes
+/// a cycle (`wi-1` on `wi-2`), which the import must reject whole.
+pub fn stack_manifest(slice_title: &str, cyclic: bool) -> serde_json::Value {
+    let first_dependencies = if cyclic { vec!["wi-2"] } else { vec![] };
+    serde_json::json!({
+        "slice": {
+            "id": "slice-e2e-control-001",
+            "title": slice_title,
+            "objective": "Persist work items and list them over REST",
+        },
+        "layers": [
+            {
+                "id": "layer-1",
+                "title": "Persist work items",
+                "acceptance": "work items survive a daemon restart",
+                "parent_layer": null,
+                "work_items": [
+                    {
+                        "id": "wi-1",
+                        "title": "Add the work_items table",
+                        "objective": "Create the table and its migration",
+                        "done_when": "the migration runs twice without error",
+                        "delivery_dependencies": first_dependencies,
+                    },
+                    {
+                        "id": "wi-2",
+                        "title": "Add the store API over the table",
+                        "objective": "Insert, read and list work items",
+                        "done_when": "the store round-trips an item",
+                        "delivery_dependencies": ["wi-1"],
+                    },
+                ],
+            },
+            {
+                "id": "layer-2",
+                "title": "List work items over REST",
+                "acceptance": "GET /api/work lists open items",
+                "parent_layer": "layer-1",
+                "work_items": [
+                    {
+                        "id": "wi-3",
+                        "title": "Add the list route",
+                        "objective": "Serve open items as JSON",
+                        "done_when": "the route returns the open items",
+                        "delivery_dependencies": [],
+                    },
+                ],
+            },
+        ],
+    })
+}
+
+/// Markers a prompt can carry to steer the [`ClaudeCodeStandIn`].
+pub const CLAIM_WRONGLY: &str = "e2e-control-claim-wrongly";
+pub const KEEPS_ITS_OWN_TRACKER: &str = "e2e-control-keeps-its-own-tracker";
+/// What the stand-in reports after building the `tide_table` capability;
+/// the resumed item's brief carries it as an input line.
+pub const TIDE_TABLE_BUILT: &str =
+    "e2e-control capability: the tide_table tool is built and verified";
+
+/// A stand-in for `claude -p <prompt> --output-format json` (the control
+/// plan's `claude_code` worker, Phases 3 and later). It commits one line in
+/// its working directory and prints Claude Code's result envelope whose
+/// `result` is the section 5 result contract. The prompt steers it:
+/// [`CLAIM_WRONGLY`] claims a path the commit did not touch;
+/// [`KEEPS_ITS_OWN_TRACKER`] writes a Beads file and a task list into the
+/// worktree and returns one `discovered` draft; `tide_table` writes a
+/// `SKILL.md` into the daemon's data dir and reports [`TIDE_TABLE_BUILT`].
+pub struct ClaudeCodeStandIn {
+    dir: tempfile::TempDir,
+}
+
+impl ClaudeCodeStandIn {
+    pub fn create() -> Result<Self> {
+        let dir = tempfile::Builder::new()
+            .prefix("rustykrab-claude-code-stand-in-")
+            .tempdir()?;
+        let script = CLAUDE_CODE_STAND_IN
+            .replace("{CLAIM_WRONGLY}", CLAIM_WRONGLY)
+            .replace("{KEEPS_ITS_OWN_TRACKER}", KEEPS_ITS_OWN_TRACKER)
+            .replace("{TIDE_TABLE_BUILT}", TIDE_TABLE_BUILT);
+        let path = dir.path().join("claude");
+        std::fs::write(&path, script)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
+        }
+        Ok(Self { dir })
+    }
+
+    /// The executable to register as the worker's command.
+    pub fn path(&self) -> std::path::PathBuf {
+        self.dir.path().join("claude")
+    }
+}
+
+const CLAUDE_CODE_STAND_IN: &str = r##"#!/bin/sh
+# Stand-in for `claude -p <prompt> --output-format json`, written by the
+# RustyKrab e2e harness. No model, no network.
+set -e
+prompt="$*"
+summary="Touched src/lib.rs"
+claimed="src/lib.rs"
+discovered="[]"
+case "$prompt" in
+  *tide_table*)
+    mkdir -p "$RUSTYKRAB_DATA_DIR/skills/tide_table"
+    printf '%s\n' '---' 'name: tide_table' 'description: Tide times for a port (e2e stand-in)' '---' \
+      'Return high and low water for the named port.' > "$RUSTYKRAB_DATA_DIR/skills/tide_table/SKILL.md"
+    summary="{TIDE_TABLE_BUILT}"
+    ;;
+esac
+case "$prompt" in *{CLAIM_WRONGLY}*) claimed="src/elsewhere.rs" ;; esac
+case "$prompt" in
+  *{KEEPS_ITS_OWN_TRACKER}*)
+    mkdir -p .beads .claude
+    echo '{"id":"bd-1","title":"e2e-control beads task"}' > .beads/issues.jsonl
+    echo '[{"content":"e2e-control claude task"}]' > .claude/tasks.json
+    discovered='[{"kind":"code","title":"Add a changelog entry [e2e-control s31]","objective":"Record the stand-in change in CHANGELOG.md","done_when":"CHANGELOG.md names the change"}]'
+    ;;
+esac
+commit="null"
+if git rev-parse --git-dir >/dev/null 2>&1; then
+  echo "// touched by the e2e claude_code stand-in" >> src/lib.rs
+  git add src/lib.rs
+  git -c user.name=e2e -c user.email=e2e@rustykrab.invalid commit -q --no-gpg-sign -m "e2e: stand-in change"
+  commit="\"$(git rev-parse HEAD)\""
+fi
+contract=$(printf '{"summary":"%s","artifacts":[],"changed_paths":["%s"],"commit":%s,"checks_run":[],"known_limits":[],"blocked":null,"error":null,"questions":[],"discovered":%s}' "$summary" "$claimed" "$commit" "$discovered")
+escaped=$(printf '%s' "$contract" | sed 's/\\/\\\\/g; s/"/\\"/g')
+printf '{"type":"result","subtype":"success","is_error":false,"result":"%s"}\n' "$escaped"
+"##;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -253,6 +396,67 @@ mod tests {
             .collect();
         assert_eq!(resumed[0].message_id, "message-004-correction");
         assert_eq!(resumed.len(), 2);
+    }
+
+    /// Kahn's algorithm over one manifest's work items: `Some(order)` for a
+    /// DAG, `None` when a cycle remains.
+    fn delivery_order(manifest: &serde_json::Value) -> Option<Vec<String>> {
+        let items: Vec<serde_json::Value> = manifest["layers"]
+            .as_array()?
+            .iter()
+            .flat_map(|layer| layer["work_items"].as_array().cloned().unwrap_or_default())
+            .collect();
+        let mut done: Vec<String> = Vec::new();
+        while done.len() < items.len() {
+            let next = items.iter().find(|item| {
+                let id = item["id"].as_str().unwrap_or_default();
+                !done.iter().any(|d| d == id)
+                    && item["delivery_dependencies"]
+                        .as_array()
+                        .is_some_and(|deps| deps.iter().all(|d| done.iter().any(|x| d == x)))
+            })?;
+            done.push(next["id"].as_str()?.to_string());
+        }
+        Some(done)
+    }
+
+    #[test]
+    fn stack_manifest_is_a_dag_and_its_cyclic_twin_is_not() {
+        let manifest = stack_manifest("slice", false);
+        assert_eq!(
+            delivery_order(&manifest).unwrap(),
+            vec!["wi-1", "wi-2", "wi-3"]
+        );
+        assert_eq!(manifest["layers"][1]["parent_layer"], "layer-1");
+        assert!(delivery_order(&stack_manifest("slice", true)).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_code_stand_in_commits_and_reports_the_result_contract() {
+        let repo = FixtureRepo::create().unwrap();
+        let stand_in = ClaudeCodeStandIn::create().unwrap();
+        let output = Command::new(stand_in.path())
+            .args(["-p", KEEPS_ITS_OWN_TRACKER, "--output-format", "json"])
+            .current_dir(repo.path())
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let contract: serde_json::Value =
+            serde_json::from_str(envelope["result"].as_str().unwrap()).unwrap();
+        let head = git_stdout(repo.path(), &["rev-parse", "HEAD"]).unwrap();
+        assert_eq!(contract["commit"], head.as_str());
+        assert_ne!(head, repo.head_sha());
+        assert_eq!(contract["changed_paths"][0], "src/lib.rs");
+        assert_eq!(contract["discovered"].as_array().unwrap().len(), 1);
+        assert!(repo.path().join(".beads/issues.jsonl").exists());
     }
 
     #[test]

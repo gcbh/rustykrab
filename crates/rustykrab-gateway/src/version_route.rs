@@ -1,0 +1,393 @@
+//! `GET /api/version`: which build is running and whether its controller is
+//! alive, for an updater verifying a cutover. `GET /api/health` stays the
+//! bare `ok` install scripts read; this route sits behind the same auth and
+//! origin rules as the rest of `/api`.
+
+use axum::extract::State;
+use axum::routing::get;
+use axum::{Json, Router};
+use chrono::{DateTime, Utc};
+use rustykrab_control::handle::LockState;
+use serde::Serialize;
+
+use crate::AppState;
+
+pub(crate) fn routes() -> Router<AppState> {
+    Router::new().route("/api/version", get(version))
+}
+
+#[derive(Debug, Serialize)]
+struct VersionReply {
+    version: String,
+    commit: Option<String>,
+    build_date: Option<String>,
+    controller: ControllerReply,
+}
+
+/// The controller's state. Every field but `wired` is `None` when no
+/// controller is wired, or when the wired handle runs no loop. A failing
+/// loop shows `consecutive_failed_ticks` climbing with a fresh
+/// `last_failed_tick`; a stuck one shows neither `last_tick` nor
+/// `last_failed_tick` moving. `lock` is `"held"` when this process holds
+/// the data directory's `controller.lock` and ticks, `"waiting"` while
+/// another process holds it, and `None` before the loop first tries it.
+/// `draining` is set once the daemon is shutting down: nothing new is
+/// leased while the runs in flight finish.
+#[derive(Debug, Serialize)]
+struct ControllerReply {
+    wired: bool,
+    last_tick: Option<DateTime<Utc>>,
+    runs_in_flight: Option<usize>,
+    last_failed_tick: Option<DateTime<Utc>>,
+    last_failure_class: Option<String>,
+    consecutive_failed_ticks: Option<u32>,
+    lock: Option<LockState>,
+    draining: Option<bool>,
+}
+
+async fn version(State(state): State<AppState>) -> Json<VersionReply> {
+    let status = state.control.as_ref().and_then(|c| c.loop_status());
+    Json(VersionReply {
+        version: state.build.version.clone(),
+        commit: state.build.commit.clone(),
+        build_date: state.build.build_date.clone(),
+        controller: ControllerReply {
+            wired: state.control.is_some(),
+            last_tick: status.as_ref().and_then(|s| s.last_tick),
+            runs_in_flight: status.as_ref().map(|s| s.runs_in_flight),
+            draining: status.as_ref().map(|s| s.draining),
+            lock: status.as_ref().and_then(|s| s.lock),
+            last_failed_tick: status.as_ref().and_then(|s| s.last_failed_tick),
+            consecutive_failed_ticks: status.as_ref().map(|s| s.consecutive_failed_ticks),
+            last_failure_class: status.and_then(|s| s.last_failure_class),
+        },
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    //! A real router on a loopback port, behind the real auth, origin and
+    //! rate-limit middleware.
+
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use chrono::{DateTime, Utc};
+    use reqwest::header::ORIGIN;
+    use reqwest::StatusCode as Http;
+    use serde_json::Value;
+    use uuid::Uuid;
+
+    use rustykrab_control::graph::FilingSource;
+    use rustykrab_control::handle::{ControlHandle, GraphView, LoopStatus, TickReport};
+    use rustykrab_control::Provenance;
+    use rustykrab_core::model::{ModelProvider, ModelResponse};
+    use rustykrab_core::types::{Message, ToolSchema};
+    use rustykrab_core::work::{PlanOutcome, WorkItemId, WorkPlan};
+    use rustykrab_core::Error;
+    use rustykrab_store::Store;
+
+    use crate::{AppState, BuildInfo};
+
+    const TOKEN: &str = "version-route-test-token";
+
+    struct UnusedProvider;
+
+    #[async_trait]
+    impl ModelProvider for UnusedProvider {
+        fn name(&self) -> &str {
+            "unused"
+        }
+
+        async fn chat(
+            &self,
+            _: &[Message],
+            _: &[ToolSchema],
+        ) -> rustykrab_core::Result<ModelResponse> {
+            Err(Error::ModelProvider("not used by these tests".into()))
+        }
+    }
+
+    /// A controller that only reports its loop.
+    struct StubControl(Option<LoopStatus>);
+
+    fn unused() -> Error {
+        Error::Internal("not used by these tests".into())
+    }
+
+    #[async_trait]
+    impl ControlHandle for StubControl {
+        async fn file_plan(
+            &self,
+            _: WorkPlan,
+            _: Provenance,
+            _: FilingSource,
+        ) -> Result<PlanOutcome, Error> {
+            Err(unused())
+        }
+
+        async fn approve(&self, _: &str, _: &str) -> Result<Vec<WorkItemId>, Error> {
+            Err(unused())
+        }
+
+        async fn reject(
+            &self,
+            _: &str,
+            _: Option<String>,
+            _: &str,
+        ) -> Result<Vec<WorkItemId>, Error> {
+            Err(unused())
+        }
+
+        async fn cancel(
+            &self,
+            _: &str,
+            _: Option<String>,
+            _: &str,
+        ) -> Result<Vec<WorkItemId>, Error> {
+            Err(unused())
+        }
+
+        async fn tick(&self) -> Result<TickReport, Error> {
+            Err(unused())
+        }
+
+        async fn graph(&self, _: &str) -> Result<GraphView, Error> {
+            Err(unused())
+        }
+
+        fn loop_status(&self) -> Option<LoopStatus> {
+            self.0.clone()
+        }
+    }
+
+    fn at() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-09-28T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    /// Serve `state` and return its base URL.
+    async fn serve(state: AppState) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = crate::router(state);
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    fn state() -> AppState {
+        let dir = std::env::temp_dir().join(format!("rk-version-route-{}", Uuid::new_v4()));
+        let store = Store::open(&dir, vec![9u8; 32]).expect("store opens");
+        AppState::new(store, vec![], Arc::new(UnusedProvider), TOKEN.into())
+    }
+
+    async fn get_version(base: &str) -> (Http, Value) {
+        let response = reqwest::Client::new()
+            .get(format!("{base}/api/version"))
+            .bearer_auth(TOKEN)
+            .header(ORIGIN, base)
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        (status, response.json().await.unwrap_or(Value::Null))
+    }
+
+    #[tokio::test]
+    async fn version_reports_the_build_and_the_controller_loop() {
+        let base = serve(
+            state()
+                .with_build_info(BuildInfo {
+                    version: "1.2.3".into(),
+                    commit: Some("abc1234-dirty".into()),
+                    build_date: Some("2026-09-27".into()),
+                })
+                .with_control(Arc::new(StubControl(Some(LoopStatus {
+                    last_tick: Some(at()),
+                    runs_in_flight: 2,
+                    ..LoopStatus::default()
+                })))),
+        )
+        .await;
+        let (status, body) = get_version(&base).await;
+        assert_eq!(status, Http::OK, "{body}");
+        assert_eq!(body["version"], "1.2.3");
+        assert_eq!(body["commit"], "abc1234-dirty");
+        assert_eq!(body["build_date"], "2026-09-27");
+        assert_eq!(body["controller"]["wired"], true);
+        assert_eq!(body["controller"]["runs_in_flight"], 2);
+        assert_eq!(body["controller"]["draining"], false);
+        let last: DateTime<Utc> = body["controller"]["last_tick"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(last, at());
+        assert_eq!(body["controller"]["last_failed_tick"], Value::Null);
+        assert_eq!(body["controller"]["last_failure_class"], Value::Null);
+        assert_eq!(body["controller"]["consecutive_failed_ticks"], 0);
+    }
+
+    #[tokio::test]
+    async fn version_reports_the_controller_failed_ticks() {
+        let failed_at = at() + chrono::TimeDelta::seconds(30);
+        let base = serve(state().with_control(Arc::new(StubControl(Some(LoopStatus {
+            last_tick: Some(at()),
+            runs_in_flight: 0,
+            last_failed_tick: Some(failed_at),
+            last_failure_class: Some("storage".into()),
+            consecutive_failed_ticks: 3,
+            ..LoopStatus::default()
+        })))))
+        .await;
+        let (status, body) = get_version(&base).await;
+        assert_eq!(status, Http::OK, "{body}");
+        let controller = &body["controller"];
+        assert_eq!(controller["wired"], true);
+        assert_eq!(controller["consecutive_failed_ticks"], 3);
+        assert_eq!(controller["last_failure_class"], "storage");
+        let failed: DateTime<Utc> = controller["last_failed_tick"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(failed, failed_at);
+        let last: DateTime<Utc> = controller["last_tick"].as_str().unwrap().parse().unwrap();
+        assert_eq!(last, at());
+    }
+
+    #[tokio::test]
+    async fn version_without_a_controller_says_so() {
+        let base = serve(state()).await;
+        let (status, body) = get_version(&base).await;
+        assert_eq!(status, Http::OK, "{body}");
+        assert_eq!(body["version"], rustykrab_core::VERSION);
+        assert_eq!(body["commit"], Value::Null);
+        assert_eq!(body["controller"]["wired"], false);
+        assert_eq!(body["controller"]["last_tick"], Value::Null);
+        assert_eq!(body["controller"]["runs_in_flight"], Value::Null);
+        assert_eq!(body["controller"]["last_failed_tick"], Value::Null);
+        assert_eq!(body["controller"]["last_failure_class"], Value::Null);
+        assert_eq!(body["controller"]["consecutive_failed_ticks"], Value::Null);
+        assert_eq!(body["controller"]["lock"], Value::Null);
+        assert_eq!(body["controller"]["draining"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn a_draining_controller_says_so() {
+        let base = serve(state().with_control(Arc::new(StubControl(Some(LoopStatus {
+            last_tick: Some(at()),
+            runs_in_flight: 1,
+            draining: true,
+            ..LoopStatus::default()
+        })))))
+        .await;
+        let (status, body) = get_version(&base).await;
+        assert_eq!(status, Http::OK, "{body}");
+        assert_eq!(body["controller"]["wired"], true);
+        assert_eq!(body["controller"]["draining"], true);
+        assert_eq!(body["controller"]["runs_in_flight"], 1);
+    }
+
+    #[tokio::test]
+    async fn a_controller_before_its_first_tick_reports_no_tick() {
+        let base =
+            serve(state().with_control(Arc::new(StubControl(Some(LoopStatus::default()))))).await;
+        let (_, body) = get_version(&base).await;
+        assert_eq!(body["controller"]["wired"], true);
+        assert_eq!(body["controller"]["last_tick"], Value::Null);
+        assert_eq!(body["controller"]["runs_in_flight"], 0);
+        assert_eq!(body["controller"]["draining"], false);
+        assert_eq!(body["controller"]["lock"], Value::Null);
+    }
+
+    /// A real controller whose loop lock another holder has taken reports
+    /// `waiting`, and `held` once the other lets go.
+    #[tokio::test]
+    async fn version_reports_the_controller_lock_waiting_then_held() {
+        use rustykrab_control::controller::{Controller, ControllerConfig};
+        use rustykrab_control::handle::LockState;
+        use rustykrab_control::lock::{ControllerLock, LoopLock};
+
+        let data_dir = std::env::temp_dir().join(format!("rk-version-lock-{}", Uuid::new_v4()));
+        let store = Store::open(&data_dir, vec![9u8; 32]).expect("store opens");
+        let controller = Arc::new(Controller::new(
+            store.clone(),
+            Vec::new(),
+            ControllerConfig::default(),
+        ));
+        let base = serve(
+            AppState::new(store, vec![], Arc::new(UnusedProvider), TOKEN.into())
+                .with_control(controller.clone()),
+        )
+        .await;
+
+        let (_, body) = get_version(&base).await;
+        assert_eq!(body["controller"]["lock"], Value::Null, "{body}");
+
+        let mut ours = LoopLock::in_data_dir(&data_dir);
+        let other = ControllerLock::try_acquire(ours.path())
+            .unwrap()
+            .expect("the other daemon takes the lock first");
+        let (state, error) = controller.claim_loop_lock(&mut ours);
+        assert!(error.is_none(), "{error:?}");
+        assert_eq!(state, LockState::Waiting);
+        let (_, body) = get_version(&base).await;
+        assert_eq!(body["controller"]["lock"], "waiting", "{body}");
+
+        drop(other);
+        // A process another test forks in parallel shares the lock's
+        // descriptor until it execs, so the release can take a moment.
+        let started = std::time::Instant::now();
+        while controller.claim_loop_lock(&mut ours).0 == LockState::Waiting {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(5),
+                "the lock is granted once the other holder lets go"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let (_, body) = get_version(&base).await;
+        assert_eq!(body["controller"]["lock"], "held", "{body}");
+    }
+
+    #[tokio::test]
+    async fn version_needs_auth_and_a_trusted_origin_while_health_stays_ok() {
+        let base = serve(state()).await;
+        let client = reqwest::Client::new();
+
+        let anonymous = client
+            .get(format!("{base}/api/version"))
+            .header(ORIGIN, &base)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(anonymous.status(), Http::UNAUTHORIZED);
+
+        let foreign = client
+            .get(format!("{base}/api/version"))
+            .bearer_auth(TOKEN)
+            .header(ORIGIN, "https://evil.example")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(foreign.status(), Http::FORBIDDEN);
+
+        let health = client
+            .get(format!("{base}/api/health"))
+            .header(ORIGIN, &base)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(health.status(), Http::OK);
+        assert_eq!(health.text().await.unwrap(), "ok");
+    }
+}

@@ -3,9 +3,28 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-/// A named sub-agent definition: system prompt, harness profile, and the
-/// tool subset the sub-agent is allowed to use.
+use crate::tool::mcp_server_of;
+
+/// A named agent definition: system prompt, harness profile, the tools
+/// visible from its first turn, and the ceiling of tools it may use.
+///
+/// Definitions are files (`<data dir>/agents/<name>.md`, loaded by
+/// `rustykrab-skills`; the built-ins are embedded defaults of the same
+/// format), used by sub-agents and by the control layer's local workers.
+/// Construct one in code with `..Default::default()` so a field added here
+/// does not break every literal.
+///
+/// Two tool lists, deliberately distinct (plan
+/// `docs/plans/control-layer-and-worker-fleet.md`, section 12):
+///
+/// - `tools` and `mcp_servers` are the *visible set*: declared in the tools
+///   array from turn 0, because the host already knows the work needs them.
+///   The array then stays fixed for the run; anything found later arrives by
+///   append. Keep it small on slow-prefill models: every thousand tokens of
+///   schemas costs about five seconds of uncached prefill on qwen3.8.
+/// - `allowed_tools` is the *ceiling*: what the agent may ever call.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AgentDefinition {
     /// Stable identifier referenced by the `subagents` tool.
     pub id: String,
@@ -18,9 +37,70 @@ pub struct AgentDefinition {
     /// Tools the sub-agent may call. `None` means inherit the parent's
     /// active capability set unchanged.
     pub allowed_tools: Option<Vec<String>>,
+    /// Tools visible from turn 0 (declared before the first model call).
+    pub tools: Vec<String>,
+    /// MCP servers whose tools are visible from turn 0.
+    pub mcp_servers: Vec<String>,
+    /// Preferred model, when the definition has one. Advisory: routing by
+    /// model is the worker registry's (Phase 3), not the runner's.
+    pub model: Option<String>,
+    /// Resources the agent may write, for the controller's single-writer
+    /// rule. Empty means the definition does not narrow it.
+    pub writable_resources: Vec<String>,
 }
 
-/// Read-only catalog of [`AgentDefinition`]s.
+impl Default for AgentDefinition {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            description: String::new(),
+            system_prompt: String::new(),
+            profile: "default".into(),
+            allowed_tools: None,
+            tools: Vec::new(),
+            mcp_servers: Vec::new(),
+            model: None,
+            writable_resources: Vec::new(),
+        }
+    }
+}
+
+impl AgentDefinition {
+    /// The names to declare from turn 0, out of `registered` (the host's
+    /// tool names): every named tool that is registered, and every
+    /// registered tool of a named MCP server (`mcp__<server>__*`, server
+    /// matched without regard to case), within `allowed_tools` when it is
+    /// set. Sorted and deduplicated. A named tool the host does not have is
+    /// left out rather than failing the run: the definition describes what
+    /// the agent starts with, not what the item requires.
+    pub fn visible_set<'a>(&self, registered: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+        let within = |name: &str| {
+            self.allowed_tools
+                .as_ref()
+                .is_none_or(|allowed| allowed.iter().any(|a| a == name))
+        };
+        let mut names: Vec<String> = registered
+            .into_iter()
+            .filter(|name| {
+                self.tools.iter().any(|t| t == name)
+                    || mcp_server_of(name).is_some_and(|server| {
+                        self.mcp_servers
+                            .iter()
+                            .any(|s| s.eq_ignore_ascii_case(server))
+                    })
+            })
+            .filter(|name| within(name))
+            .map(str::to_string)
+            .collect();
+        names.sort();
+        names.dedup();
+        names
+    }
+}
+
+/// Read-only catalog of [`AgentDefinition`]s. Filled from definition files
+/// by `rustykrab_skills::agents`: the embedded built-ins first, then the
+/// data dir's files, which replace a built-in of the same id.
 #[derive(Debug, Default, Clone)]
 pub struct AgentRegistry {
     by_id: HashMap<String, Arc<AgentDefinition>>,
@@ -31,6 +111,7 @@ impl AgentRegistry {
         Self::default()
     }
 
+    /// Add a definition, replacing any with the same id.
     pub fn insert(&mut self, def: AgentDefinition) {
         self.by_id.insert(def.id.clone(), Arc::new(def));
     }
@@ -44,56 +125,83 @@ impl AgentRegistry {
         defs.sort_by(|a, b| a.id.cmp(&b.id));
         defs
     }
-
-    /// Built-in catalog: researcher, coder, planner.
-    pub fn with_defaults() -> Self {
-        let mut reg = Self::new();
-        reg.insert(AgentDefinition {
-            id: "researcher".into(),
-            description: "Investigates a question using web/search/memory tools and returns a synthesized answer.".into(),
-            system_prompt: "You are a focused research sub-agent. Answer the user's question by gathering evidence with the available tools, then return a concise synthesis with citations or sources where applicable. Do not ask follow-up questions; produce a final answer in one turn loop.".into(),
-            profile: "research".into(),
-            allowed_tools: None,
-        });
-        reg.insert(AgentDefinition {
-            id: "coder".into(),
-            description: "Reads, edits, and runs code to implement a change or diagnose a bug.".into(),
-            system_prompt: "You are a focused coding sub-agent. Implement the requested change end-to-end: read relevant files, apply edits, and verify with tests or a build. Return a short summary of what you changed.".into(),
-            profile: "coding".into(),
-            allowed_tools: None,
-        });
-        reg.insert(AgentDefinition {
-            id: "planner".into(),
-            description: "Drafts a step-by-step implementation plan without making changes.".into(),
-            system_prompt: "You are a planning sub-agent. Read enough of the codebase to ground your reasoning, then produce a concrete, ordered plan with file paths and named functions. Do not modify any files.".into(),
-            profile: "default".into(),
-            allowed_tools: None,
-        });
-        reg
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn def(id: &str) -> AgentDefinition {
+        AgentDefinition {
+            id: id.into(),
+            ..Default::default()
+        }
+    }
+
     #[test]
-    fn defaults_contain_three_agents() {
-        let reg = AgentRegistry::with_defaults();
+    fn registry_lists_by_id_and_later_inserts_replace() {
+        let mut reg = AgentRegistry::new();
+        reg.insert(def("researcher"));
+        reg.insert(def("coder"));
+        let mut coder = def("coder");
+        coder.profile = "coding".into();
+        reg.insert(coder);
         let ids: Vec<String> = reg.list().iter().map(|d| d.id.clone()).collect();
-        assert_eq!(ids, vec!["coder", "planner", "researcher"]);
-    }
-
-    #[test]
-    fn get_returns_definition_by_id() {
-        let reg = AgentRegistry::with_defaults();
-        let def = reg.get("coder").expect("coder agent exists");
-        assert_eq!(def.profile, "coding");
-    }
-
-    #[test]
-    fn unknown_id_returns_none() {
-        let reg = AgentRegistry::with_defaults();
+        assert_eq!(ids, ["coder", "researcher"]);
+        assert_eq!(reg.get("coder").unwrap().profile, "coding");
         assert!(reg.get("nonexistent").is_none());
+    }
+
+    #[test]
+    fn a_literal_with_defaults_stays_constructible() {
+        let planner = AgentDefinition {
+            id: "planner".into(),
+            tools: vec!["work_plan".into()],
+            ..Default::default()
+        };
+        assert_eq!(planner.profile, "default");
+        assert!(planner.allowed_tools.is_none() && planner.mcp_servers.is_empty());
+        // Old serialized definitions, without the new fields, still load.
+        let old: AgentDefinition = serde_json::from_str(
+            r#"{"id":"x","description":"d","system_prompt":"p","profile":"coding","allowed_tools":null}"#,
+        )
+        .unwrap();
+        assert!(old.tools.is_empty() && old.model.is_none());
+    }
+
+    #[test]
+    fn the_visible_set_is_named_tools_and_server_tools_within_the_ceiling() {
+        let registered = [
+            "read",
+            "write",
+            "exec",
+            "mcp__linear__create_issue",
+            "mcp__linear__search",
+            "mcp__jira__search",
+            "browser",
+        ];
+        let mut coder = AgentDefinition {
+            tools: vec!["read".into(), "write".into(), "exec".into(), "gone".into()],
+            mcp_servers: vec!["Linear".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            coder.visible_set(registered),
+            [
+                "exec",
+                "mcp__linear__create_issue",
+                "mcp__linear__search",
+                "read",
+                "write"
+            ]
+        );
+        coder.allowed_tools = Some(vec!["read".into(), "mcp__linear__search".into()]);
+        assert_eq!(
+            coder.visible_set(registered),
+            ["mcp__linear__search", "read"]
+        );
+        assert!(AgentDefinition::default()
+            .visible_set(registered)
+            .is_empty());
     }
 }

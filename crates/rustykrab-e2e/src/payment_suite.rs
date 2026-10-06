@@ -171,6 +171,22 @@ fn status_of(ctx: &Ctx, request_id: &str) -> Result<(String, Option<String>, Opt
     )?)
 }
 
+/// Whether `secret` appears in `haystack`. A digit-only secret counts only
+/// when it stands alone, with a non-digit or the start/end on both sides, so
+/// a postal code inside a timestamp's fractional seconds is not a leak.
+fn leaks(haystack: &str, secret: &str) -> bool {
+    if secret.is_empty() || !secret.bytes().all(|b| b.is_ascii_digit()) {
+        return haystack.contains(secret);
+    }
+    let bytes = haystack.as_bytes();
+    haystack.match_indices(secret).any(|(at, _)| {
+        let end = at + secret.len();
+        let before = at == 0 || !bytes[at - 1].is_ascii_digit();
+        let after = end == bytes.len() || !bytes[end].is_ascii_digit();
+        before && after
+    })
+}
+
 async fn payment_approval_resumes_the_turn(ctx: &Ctx) -> Result<()> {
     let (conv_id, request_id) =
         file_payment(ctx, "e2e: pay for the ferry", 4600, "pending").await?;
@@ -258,7 +274,7 @@ async fn payment_approval_resumes_the_turn(ctx: &Ctx) -> Result<()> {
     }
     let on_disk = String::from_utf8_lossy(&on_disk);
     for leaked in [TEST_CARD, HOLDER, "02554"] {
-        if on_disk.contains(leaked) {
+        if leaks(&on_disk, leaked) {
             bail!("{leaked:?} was written to the daemon's database files");
         }
     }
@@ -416,5 +432,31 @@ async fn payment_duplicate_is_held_and_user_alerted(ctx: &Ctx) -> Result<()> {
             bail!("the held payment was never reported back to the user: {messages}");
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn digit_secret_inside_a_longer_digit_run_is_not_a_leak() {
+        let row = r#"{"updated_at":"2026-09-28T12:00:30.025547Z"}"#;
+        assert!(!leaks(row, "02554"));
+        assert!(!leaks("card 42424242424242420", TEST_CARD));
+    }
+
+    #[test]
+    fn standalone_digit_secret_is_a_leak() {
+        assert!(leaks(r#"{"postal_code":"02554"}"#, "02554"));
+        assert!(leaks("02554", "02554"));
+        assert!(leaks("zip 02554\n", "02554"));
+        assert!(leaks(&format!("number={TEST_CARD}"), TEST_CARD));
+    }
+
+    #[test]
+    fn non_digit_secret_still_matches_as_a_substring() {
+        assert!(leaks(&format!("xx{HOLDER}yy"), HOLDER));
+        assert!(!leaks("Ada Lovelace", HOLDER));
     }
 }

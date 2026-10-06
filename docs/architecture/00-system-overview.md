@@ -12,7 +12,7 @@ of long-polling channel loops. A message arriving on any surface becomes a
 *turn*: the agent loop calls the model, executes the tools it asks for, and
 repeats until the model signals completion.
 
-**Second-pass snapshot: 14 crates, ~90,200 lines, 949 tests.** Current mechanical
+**Second-pass snapshot: 15 crates, ~90,200 lines, 949 tests.** Current mechanical
 counts live in the generated crate summaries; the continuity follow-up below
 is derived against base `0b565fd` plus its recorded working-tree changes.
 
@@ -23,22 +23,27 @@ rustykrab-core        (no internal deps — the contract layer)
    ^  ^  ^  ^  ^
    |  |  |  |  +-- rustykrab-providers   anthropic, openai, ollama, scripted
    |  |  |  +----- rustykrab-memory      hybrid retrieval, own SQLite db
-   |  |  +-------- rustykrab-skills      SKILL.md loader + ed25519 verify
+   |  |  +-------- rustykrab-skills      SKILL.md + agents/*.md loader, ed25519 verify
    |  +----------- rustykrab-channels    telegram, slack, signal, video, mcp
    +-------------- rustykrab-store       SQLite: conversations, secrets, jobs
                         ^      ^
    rustykrab-tools  ----+      +---- rustykrab-dream
         ^
         |
-   rustykrab-agent   (core, tools)
+   rustykrab-control (core, store, tools)   work-item graph, ladder, Worker,
+                                            worker registry, routing, worktrees,
+                                            review surface (issue projection)
+        ^
+        |
+   rustykrab-agent   (core, tools, control, skills)
         ^
         |
    rustykrab-runtime (core, store, agent, memory, skills)   <-- NEW
         ^      ^
         |      |
-        |      +-- rustykrab-gateway  (+ channels)
+        |      +-- rustykrab-gateway  (+ channels, control)
         |               ^
-        +---------------+-- rustykrab-cli
+        +---------------+-- rustykrab-cli  (+ control)
 
 rustykrab-projects    (no internal deps — immutable planning domain)
    ^                  ^
@@ -49,6 +54,19 @@ rustykrab-projects    (no internal deps — immutable planning domain)
 rustykrab-e2e         (core, store, tools, agent, providers)
                      daemon boundary tests + direct production-compactor ablation
 ```
+
+`rustykrab-control` is the control layer of
+`docs/plans/control-layer-and-worker-fleet.md`: the work-item graph, the
+resolution ladder, the error taxonomy and the controller loop, over the
+store, with the `Worker` trait `rustykrab-agent` implements (`LocalWorker`,
+`ExternalWorker`, and `PeerWorker` for a paired node, which reaches the
+node's delegated-task API over HTTP; on the node, `DelegatedRuns` runs a
+peer's brief).
+The gateway depends on it directly for `/api/work` (its `ControlHandle`, the
+reply types and the re-exported `Provenance`, so the gateway needs no direct
+dependency on `rustykrab-tools`), and the CLI for the `work` subcommand and
+the composition root, which builds the controller, its local worker and its
+host wiring (tick loop, notice delivery, scheduled firings).
 
 `rustykrab-runtime` is new since the first pass and is the significant change
 to the shape of the system. The turn-running layer used to live inside the
@@ -63,11 +81,11 @@ no axum in its dependency tree.
 | Contracts | `core` | `Tool`, `ModelProvider`, `MemoryBackend`, `Capability`, `Session`, token estimation |
 | Planning domain | `projects` | Immutable revisions, provenance rules, validated planning graph, deterministic projections |
 | Capability providers | `providers`, `store`, `memory`, `skills`, `channels` | Each owns one external dependency |
-| Behaviour | `tools`, `agent` | Tool implementations; the model-call/tool-exec loop |
+| Behaviour | `tools`, `control`, `agent` | Tool implementations; the control layer (work items, ladder, controller loop); the model-call/tool-exec loop and the local worker |
 | Application service | **`runtime`** | Assemble a turn: prompt, session, capabilities, memory hooks |
 | Transport | `gateway`, channel loops in `cli` | HTTP/SSE, Telegram polling, Slack events |
 | Composition | `cli` | Read env, build everything, spawn background tasks |
-| Verification | `e2e`, `dream` | Black-box scenarios, direct compactor ablation; offline outcome analysis |
+| Verification | `e2e`, `dream` | Black-box scenarios, direct compactor ablation; offline outcome analysis, and the control layer's evaluation pass (expectation metrics, proposals filed through the controller's validator) |
 
 The context evaluator also links `core` and `tools` to reuse production tool
 schemas and argument validation for inert replacements. Turn execution still
@@ -88,8 +106,21 @@ main()
  ├─ slack_agent_loop               events     -> process_slack_message
  ├─ signal receive loop
  ├─ job_executor_loop              30s tick   -> due cron jobs -> TaskQueue
+ │   (or, with RUSTYKRAB_CRON_WORK_ITEMS=1, scheduled_work: each firing
+ │    filed as a work item the controller runs)
  ├─ TaskQueue worker               in-memory mpsc, bounded
- ├─ delegated-task worker          durable queue in `delegated_tasks`
+ ├─ controller tick loop           work items: lease, run, reconcile, age
+ ├─ work notice delivery           the work outbox, to each item's thread
+ ├─ delegated-task worker          durable queue in `delegated_tasks`: free
+ │                                 text, or a peer's typed brief run as a
+ │                                 local worker inside this node's ceiling
+ ├─ worker refresh                  2s: each peer's advertisement and health,
+ │                                 the local worker's model check (30s)
+ ├─ control loop                   tick -> lease -> worker runs: a local
+ │                                 conversation, a `claude`/`codex`
+ │                                 process in a worktree under the data dir,
+ │                                 or a peer node's task over the tailnet
+ ├─ work outbox notifier           one message per parent, from `work_outbox`
  ├─ memory idle lifecycle sweep
  ├─ memory FTS5 index rebuild      once, at boot
  └─ DreamWorker                    read-only outcome analysis, idle-gated

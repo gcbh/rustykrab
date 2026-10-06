@@ -52,7 +52,7 @@ const TIGHT_CONTEXT_TOKENS: usize = 6_000;
 /// running. At 6144 the compaction threshold lands near 5.2k tokens,
 /// which two bulky turns reach, and every other scenario stays far below
 /// it.
-const TIGHT_NUM_CTX: u32 = 6_144;
+pub(crate) const TIGHT_NUM_CTX: u32 = 6_144;
 
 pub struct ModelCase {
     pub id: &'static str,
@@ -87,6 +87,10 @@ pub struct ModelCase {
     pub extra_env: Vec<(String, String)>,
     pub assertions: Vec<Assertion>,
     pub judge: Option<JudgeSpec>,
+    /// Tools whose attempted calls are counted, executed or refused, and
+    /// reported in the case's `classes` without judging it: a tendency to
+    /// measure (scenario 10's near-miss substitution), not a pass mark.
+    pub attempts: Vec<String>,
 }
 
 impl ModelCase {
@@ -106,6 +110,7 @@ impl ModelCase {
             extra_env: Vec::new(),
             assertions: Vec::new(),
             judge: None,
+            attempts: Vec::new(),
         }
     }
 
@@ -155,6 +160,41 @@ impl ModelCase {
         self.judge = Some(j);
         self
     }
+
+    /// Count the attempted calls to `tool` across repetitions, reported
+    /// but never failing the case.
+    pub(crate) fn counting_attempts(mut self, tool: impl Into<String>) -> Self {
+        self.attempts.push(tool.into());
+        self
+    }
+}
+
+/// What the case's counted tools were asked for over its repetitions, as
+/// report classes: attempted calls in all, how many of them the host
+/// refused, and attempts per tool.
+fn attempt_classes(attempts: &[String], runs: &[Transcript]) -> Vec<(String, usize)> {
+    if attempts.is_empty() {
+        return Vec::new();
+    }
+    let calls = || {
+        runs.iter()
+            .flat_map(|t| t.calls.iter())
+            .filter(|c| attempts.contains(&c.tool))
+    };
+    let mut classes = vec![
+        ("attempted_calls".to_string(), calls().count()),
+        (
+            "refused_calls".to_string(),
+            calls().filter(|c| c.refused).count(),
+        ),
+    ];
+    for tool in attempts {
+        let n = calls().filter(|c| &c.tool == tool).count();
+        if n > 0 {
+            classes.push((format!("attempted:{tool}"), n));
+        }
+    }
+    classes
 }
 
 /// A tight agent config: small context so compaction is reachable, few
@@ -296,8 +336,8 @@ pub fn cases() -> Vec<ModelCase> {
         ))
         .ask("What is the weather in Reykjavik right now? Use the tool, then tell me.")
         .expect(Assertion::NoRunError)
-        .expect(Assertion::ToolCalled("weather_lookup".into()))
-        .expect(Assertion::ToolArgContains {
+        .expect(Assertion::ToolExecuted("weather_lookup".into()))
+        .expect(Assertion::ToolExecutedArgContains {
             tool: "weather_lookup".into(),
             pointer: "/city".into(),
             needle: "reykjavik".into(),
@@ -325,17 +365,17 @@ pub fn cases() -> Vec<ModelCase> {
              confirmation code.",
         )
         .expect(Assertion::NoRunError)
-        .expect(Assertion::ToolArgContains {
+        .expect(Assertion::ToolExecutedArgContains {
             tool: "book_room".into(),
             pointer: "/room".into(),
             needle: "kelvin".into(),
         })
-        .expect(Assertion::ToolArgContains {
+        .expect(Assertion::ToolExecutedArgContains {
             tool: "book_room".into(),
             pointer: "/date".into(),
             needle: "2026-09-09".into(),
         })
-        .expect(Assertion::ToolArgContains {
+        .expect(Assertion::ToolExecutedArgContains {
             tool: "book_room".into(),
             pointer: "/start_time".into(),
             needle: "15:30".into(),
@@ -359,6 +399,7 @@ pub fn cases() -> Vec<ModelCase> {
         ))
         .ask("How many millilitres are in a litre? Just answer.")
         .expect(Assertion::NoRunError)
+        // Attempts count: reaching for an irrelevant tool is the failure.
         .expect(Assertion::ToolNotCalled("send_invoice".into()))
         .expect(Assertion::FinalContainsNone(s(&["invoice"])))
         .expect(Assertion::FinalContainsAny(s(&[
@@ -393,7 +434,7 @@ pub fn cases() -> Vec<ModelCase> {
         // count here would be counting the wrong thing; that the right
         // answer came back at all is what proves the retry ran, since the
         // first invocation returned nothing but an error.
-        .expect(Assertion::ToolCallCount {
+        .expect(Assertion::ToolExecutedCount {
             tool: "weather_lookup".into(),
             min: 1,
             max: 3,
@@ -450,7 +491,8 @@ pub fn cases() -> Vec<ModelCase> {
         ))
         .ask("What is the current share price of NVDA? Use the tool.")
         .expect(Assertion::NoRunError)
-        .expect(Assertion::ToolCalled("stock_quote".into()))
+        .expect(Assertion::ToolExecuted("stock_quote".into()))
+        // Attempts count: looping is the failure, refused or not.
         .expect(Assertion::RetriesAtMost {
             tool: "stock_quote".into(),
             max: 8,
@@ -477,7 +519,8 @@ pub fn cases() -> Vec<ModelCase> {
         ))
         .ask("Find my orders for a titanium kettle. Use the tool and tell me what you find.")
         .expect(Assertion::NoRunError)
-        .expect(Assertion::ToolCalled("search_orders".into()))
+        .expect(Assertion::ToolExecuted("search_orders".into()))
+        // Attempts count: looping is the failure, refused or not.
         .expect(Assertion::RetriesAtMost {
             tool: "search_orders".into(),
             max: 3,
@@ -512,8 +555,11 @@ pub fn cases() -> Vec<ModelCase> {
              You will need both tools.",
         )
         .expect(Assertion::NoRunError)
-        .expect(Assertion::ToolCallOrder(s(&["find_order", "order_status"])))
-        .expect(Assertion::ToolArgContains {
+        .expect(Assertion::ToolExecutedOrder(s(&[
+            "find_order",
+            "order_status",
+        ])))
+        .expect(Assertion::ToolExecutedArgContains {
             tool: "order_status".into(),
             pointer: "/order_id".into(),
             needle: "ORD-51993".into(),
@@ -613,7 +659,7 @@ pub fn cases() -> Vec<ModelCase> {
              Save it to memory, then confirm you have.",
         )
         .expect(Assertion::NoRunError)
-        .expect(Assertion::ToolCalled("memory_save".into())),
+        .expect(Assertion::ToolExecuted("memory_save".into())),
         ModelCase::new(
             "memory-round-trip",
             "A fact saved in one conversation is recalled in a different one",
@@ -643,7 +689,7 @@ pub fn cases() -> Vec<ModelCase> {
              memory, say so — do not guess.",
         )
         .expect(Assertion::NoRunError)
-        .expect(Assertion::ToolCalled("memory_search".into()))
+        .expect(Assertion::ToolExecuted("memory_search".into()))
         // Asserts retrieval actually returned the fact, separately from
         // whether the model then used it well.
         .expect(Assertion::ToolOutputContainsAny {
@@ -663,7 +709,7 @@ pub fn cases() -> Vec<ModelCase> {
              If it is not there, say so plainly.",
         )
         .expect(Assertion::NoRunError)
-        .expect(Assertion::ToolCalled("memory_search".into()))
+        .expect(Assertion::ToolExecuted("memory_search".into()))
         .expect(Assertion::FinalNonEmpty)
         .judged(JudgeSpec::new(
             "The answer says no bicycle serial number is stored in memory. Any answer that \
@@ -671,6 +717,10 @@ pub fn cases() -> Vec<ModelCase> {
             0.7,
         )),
     ]
+    .into_iter()
+    // ── late binding (plan scenario 10) ──────────────────────────────
+    .chain(crate::late_binding::cases())
+    .collect()
 }
 
 /// Run the model suite. Returns the reports and the judge that graded.
@@ -711,6 +761,7 @@ pub async fn run_cases(
         let started = Instant::now();
         let mut passes = 0;
         let mut details: Vec<String> = Vec::new();
+        let mut transcripts: Vec<Transcript> = Vec::new();
 
         for _ in 0..reps {
             let transcript = match tokio::time::timeout(
@@ -752,6 +803,9 @@ pub async fn run_cases(
             if passed {
                 passes += 1;
             }
+            if !case.attempts.is_empty() {
+                transcripts.push(transcript.clone());
+            }
             for f in failures {
                 if !details.contains(&f) {
                     details.push(f);
@@ -773,7 +827,8 @@ pub async fn run_cases(
             passes,
             details,
             started.elapsed().as_millis() / reps as u128,
-        );
+        )
+        .with_classes(attempt_classes(&case.attempts, &transcripts));
         eprintln!("{}", r.line());
         reports.push(r);
     }
@@ -846,6 +901,7 @@ async fn run_once(
             // Model scenarios already own their one-shot daemon directly;
             // only the scripted planning suite exercises in-scenario restarts.
             daemon: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+            stand_ins: None,
         };
 
         let started = Instant::now();
@@ -866,6 +922,8 @@ async fn run_once(
         let mut transcript =
             Transcript::from_store(&data_dir.join("db").join("store.db"), &conv_id)?;
         transcript.duration_ms = started.elapsed().as_millis();
+        // The provider logs each request's tool block; the store does not.
+        transcript.tool_blocks = crate::tool_blocks::read(&data_dir, &conv_id);
         Ok::<_, anyhow::Error>(transcript)
     }
     .await;
@@ -950,5 +1008,54 @@ async fn preflight(model: &str, ollama_url: &str) -> Result<()> {
              --ollama-url."
         ),
         Err(e) => anyhow::bail!("the warm-up request failed: {e}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transcript::ToolInvocation;
+
+    fn call(tool: &str, refused: bool) -> ToolInvocation {
+        ToolInvocation {
+            tool: tool.into(),
+            args: json!({}),
+            output: None,
+            failed: refused,
+            refused,
+        }
+    }
+
+    #[test]
+    fn attempts_are_counted_across_repetitions_refused_or_not() {
+        let runs = vec![
+            Transcript {
+                calls: vec![
+                    call("tools_list", false),
+                    call("get_forecast", true),
+                    call("get_forecast", true),
+                ],
+                ..Transcript::default()
+            },
+            Transcript {
+                calls: vec![call("get_uv_index", false)],
+                ..Transcript::default()
+            },
+        ];
+        let counted = vec![
+            "get_forecast".to_string(),
+            "get_uv_index".to_string(),
+            "get_timezone".to_string(),
+        ];
+        assert_eq!(
+            attempt_classes(&counted, &runs),
+            [
+                ("attempted_calls".to_string(), 3),
+                ("refused_calls".to_string(), 2),
+                ("attempted:get_forecast".to_string(), 2),
+                ("attempted:get_uv_index".to_string(), 1),
+            ]
+        );
+        assert!(attempt_classes(&[], &runs).is_empty());
     }
 }
