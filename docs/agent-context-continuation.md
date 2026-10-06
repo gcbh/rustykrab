@@ -29,7 +29,7 @@ unverified records from evidence the controller has verified.
 ## Verification and boundaries
 
 Required formatting, Clippy, workspace tests and architecture checks run
-against this isolated checkout: 2,035 workspace tests pass, with 31
+against this isolated checkout: 2,067 workspace tests pass, with 31
 intentionally ignored tests. Formatting, Clippy and architecture checks pass.
 The full daemon suite passes 63 scenarios with zero failures and seven
 expected failures: six separate project-planning targets and the existing
@@ -48,8 +48,11 @@ separate model/measurement runs.
 The original rustykrab checkout and the live builder daemon are untouched.
 The new system runs separately as com.gcbh.rustykrab.agents, with its own
 data directory and Tailscale HTTPS port 8443 (see the monitoring guide).
-The main daemon remains on its existing build and port 443. No main merge
-or external review publication has been performed.
+The main daemon remains on its existing build and port 443. The integrated
+foundation, native runtime/context layer and project dreaming are merged in
+GitHub PRs #664, #665 and #666, respectively. Each PR passed all seven hosted
+CI jobs. RustyKrab 6.0 records these changes as one major release milestone;
+see [CHANGELOG.md](../CHANGELOG.md) for release scope and verification limits.
 The separate PR delivery implementation is still required for Phase 7;
 delivery Phase 12 is still required for full Phase 8 self-management. Existing
 update-supervisor code does not satisfy those missing delivery contracts.
