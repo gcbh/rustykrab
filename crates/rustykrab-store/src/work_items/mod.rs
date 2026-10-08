@@ -827,6 +827,18 @@ impl Store {
         self.work_call(ops::outbox_pending).await
     }
 
+    /// WebChat notices for live work belonging to one conversation, oldest
+    /// first within the newest bounded window. Consumed rows remain readable.
+    pub async fn work_outbox_for_conversation(
+        &self,
+        conversation: &str,
+        limit: usize,
+    ) -> Result<Vec<OutboxRow>, WorkStoreError> {
+        let conversation = conversation.to_string();
+        self.work_call(move |conn| ops::outbox_for_conversation(conn, &conversation, limit))
+            .await
+    }
+
     /// Mark a notice delivered. `false` if it already was, so a notifier
     /// racing a restart can tell it lost.
     pub async fn work_outbox_mark_delivered(&self, id: &str) -> Result<bool, WorkStoreError> {

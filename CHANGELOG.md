@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- WebChat displays durable work updates from the originating conversation's outbox instead of attempting an unsupported message transport. Dashboard-only actions remain visible in their receipts, and completion notices no longer accumulate as undelivered.
+- Infrastructure worker health timestamps refresh periodically instead of producing a stale-worker dashboard warning after two minutes. Refresh reuses fresh host observations and performs no lifecycle action; an absent service can still be recovered.
+
 ## [6.1.2] - 2026-10-08
 
 - fix: return host requests from Claude CLI manager turns (#670)

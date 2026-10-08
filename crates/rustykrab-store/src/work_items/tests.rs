@@ -1318,3 +1318,54 @@ async fn monitoring_workspace_comes_from_the_controller_not_a_model_artifact() {
     let snap = store.work_monitor_snapshot(1, 1).await.unwrap();
     assert_eq!(snap.items[0].workspace.as_ref().unwrap()["base"], "actual");
 }
+
+#[tokio::test]
+async fn conversation_notice_history_is_bounded_and_remains_readable_after_consumption() {
+    let mut own = item("own-notice", Status::Done);
+    own.origin_conversation_id = Some("conversation-one".into());
+    let mut other = item("other-notice", Status::Done);
+    other.origin_conversation_id = Some("conversation-two".into());
+    let store = seeded(vec![own, other], vec![]).await;
+    let first = store
+        .work_outbox_enqueue("own-notice", None, "webchat", "first")
+        .await
+        .unwrap();
+    let last = store
+        .work_outbox_enqueue("own-notice", None, "webchat", "last")
+        .await
+        .unwrap();
+    store
+        .work_outbox_enqueue("other-notice", None, "webchat", "other conversation")
+        .await
+        .unwrap();
+    store
+        .work_outbox_enqueue("own-notice", None, "telegram", "external transport")
+        .await
+        .unwrap();
+    let rows = store
+        .work_outbox_for_conversation("conversation-one", 100)
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+        [first.as_str(), last.as_str()]
+    );
+    assert_eq!(
+        store.work_outbox_pending().await.unwrap().len(),
+        4,
+        "observation does not deliver"
+    );
+    store.work_outbox_mark_delivered(&last).await.unwrap();
+    let rows = store
+        .work_outbox_for_conversation("conversation-one", 1)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id, last);
+    assert!(rows[0].delivered_at.is_some());
+    assert!(store
+        .work_outbox_for_conversation("unknown", 100)
+        .await
+        .unwrap()
+        .is_empty());
+}
