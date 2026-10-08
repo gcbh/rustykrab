@@ -161,9 +161,15 @@ impl Overseer {
         .map_err(|e| Error::Internal(e.to_string()))
     }
     async fn probe(&self, s: &ServiceSpec) -> ServiceObservation {
+        // Health is public but the gateway still checks the request origin.
+        let origin = reqwest::Url::parse(&s.health_url)
+            .expect("validated health URL")
+            .origin()
+            .ascii_serialization();
         let healthy = self
             .client
             .get(&s.health_url)
+            .header(reqwest::header::ORIGIN, origin)
             .send()
             .await
             .is_ok_and(|r| r.status().is_success());
@@ -591,11 +597,22 @@ mod tests {
         std::fs::set_permissions(&launch, std::fs::Permissions::from_mode(0o700)).unwrap();
         let plist = dir.path().join("fixture.plist");
         std::fs::write(&plist, "fixture").unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let expected_origin = format!("http://127.0.0.1:{port}");
         let app = axum::Router::new().route(
             "/api/health",
-            axum::routing::get(move || {
+            axum::routing::get(move |headers: axum::http::HeaderMap| {
                 let state = state.clone();
+                let expected_origin = expected_origin.clone();
                 async move {
+                    if headers
+                        .get(axum::http::header::ORIGIN)
+                        .and_then(|v| v.to_str().ok())
+                        != Some(expected_origin.as_str())
+                    {
+                        return axum::http::StatusCode::FORBIDDEN;
+                    }
                     if state.is_file() {
                         axum::http::StatusCode::OK
                     } else {
@@ -604,8 +621,6 @@ mod tests {
                 }
             }),
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
         let server = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
@@ -640,6 +655,8 @@ mod tests {
     async fn infrastructure_executes_a_tracked_action_and_verifies_health_without_taking_generic_work(
     ) {
         let f = fixture().await;
+        let unscoped = reqwest::get(&f.owner.specs[0].health_url).await.unwrap();
+        assert_eq!(unscoped.status(), reqwest::StatusCode::FORBIDDEN);
         let store = Store::open(f.dir.path().join("db"), vec![7; 32]).unwrap();
         let worker = Arc::new(InfrastructureWorker(f.owner.clone()));
         let controller = Controller::new(store.clone(), vec![worker], ControllerConfig::default());
