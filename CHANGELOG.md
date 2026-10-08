@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [6.1.2] - 2026-10-08
+
+- fix: return host requests from Claude CLI manager turns (#670)
+
+### Fixed
+
+- Claude CLI model turns return explicit `host_requests` for RustyKrab to execute, distinguishing host tool schemas from native CLI tools. The bridge disables native tools and limits internal CLI turns instead of allowing unavailable-tool loops. A real Claude Max protocol probe exposed and verified this boundary.
+
 ## [6.1.1] - 2026-10-08
 
 - fix: send registered Origin on service health probes (#669)
