@@ -47,7 +47,7 @@ Health must be `http://127.0.0.1:PORT/api/health` or IPv6 loopback on an explici
 port different from the manager. Binary and plist paths must be absolute files.
 Only register the intended existing launchd job. Keep config directories private.
 
-Every fifteen seconds, the host checks health, kernel executable identity and
+Every fifteen seconds, the host checks health with the registered loopback Origin, kernel executable identity and
 launchd PID ownership. The dashboard displays the installed binary's version,
 probe time and supervision. Ensure running/Restart files a work item; only the
 infrastructure adapter performs the fixed launchctl action, serially, and records

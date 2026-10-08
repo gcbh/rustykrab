@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [6.1.1] - 2026-10-08
+
+- fix: send registered Origin on service health probes (#669)
+
+### Fixed
+
+- Service overseer health probes include the registered loopback Origin so gateway policy does not misclassify healthy main and builder services. The controller-backed lifecycle fixture now rejects missing Origin.
+
 ## [6.1.0] - 2026-10-08
 
 - feat: v6 work manager for agent assignments, cron and service oversight (#668)
