@@ -66,6 +66,7 @@
     $('pairCode').value = ''; $('pairError').textContent = '';
     if ($('detail').open) $('detail').close();
     $('detailBody').replaceChildren(); $('workRows').replaceChildren(); $('agents').replaceChildren();
+    $('serviceRows').replaceChildren(); $('scheduleRows').replaceChildren();
     $('dreamRows').replaceChildren(); $('dreamMetrics').replaceChildren(); $('projectRows').replaceChildren(); $('events').replaceChildren(); $('quality').replaceChildren(); $('questionRows').replaceChildren();
   }
   async function connect(value) {
@@ -124,9 +125,49 @@
       }); card.append(receipt); $('dreamRows').append(card);
     }
   }
+  function renderResources(reply) {
+    $('managerMode').textContent = reply.work_manager ? 'v6 manages conversational assignments and scheduled work through the durable controller.' : 'Work-manager mode is disabled on this instance.';
+    $('serviceRows').replaceChildren();
+    if (!reply.services?.length) $('serviceRows').append(node('p', 'No constituent services registered.', 'note'));
+    for (const s of reply.services || []) {
+      const card = node('article', undefined, 'agent');
+      card.append(node('h3', s.id), badge(s.healthy === true && s.supervised ? 'healthy' : s.healthy === false ? 'degraded' : 'unknown'), node('p', s.role + ' · ' + (s.version || 'Version unavailable')), node('p', s.detail + ' · Checked ' + age(s.checked_at)), node('p', 'Supervisor ' + s.supervisor + (s.process_id ? ' · PID ' + s.process_id : '') + (s.ensure_running ? ' · Automatic recovery enabled' : ' · Manual recovery')));
+      for (const [action, title] of [['ensure_running', 'Ensure running'], ['restart', 'Restart']]) {
+        const b = node('button', title); b.type = 'button'; b.disabled = !s.lifecycle_safe;
+        b.addEventListener('click', async () => {
+          const g = generation; b.disabled = true;
+          try { const receipt = await api('/api/resources/' + encodeURIComponent(s.id) + '/actions', {action}); if (g !== generation) return; card.append(node('p', 'Service action queued; follow its work item for verification.'), itemButton(receipt.root, 'Track action')); }
+          catch (e) { if (g === generation) { $('error').hidden = false; $('error').textContent = e.message; } }
+          finally { if (g === generation) b.disabled = false; }
+        }); card.append(b);
+      }
+      $('serviceRows').append(card);
+    }
+    $('scheduleRows').replaceChildren();
+    if (!reply.schedules?.length) $('scheduleRows').append(node('p', 'No schedules in this manager.', 'note'));
+    for (const job of reply.schedules || []) {
+      const card = node('article', undefined, 'agent');
+      card.append(node('h3', job.task.length > 120 ? job.task.slice(0, 120) + '…' : job.task), badge(job.enabled ? 'scheduled' : 'paused'), node('p', job.schedule + ' · ' + job.timezone + ' · Next ' + at(job.next_run_at)), node('p', 'Execution ' + human(job.execution?.worker_kind || 'any') + (job.execution?.required_tools?.length ? ' · Tools ' + job.execution.required_tools.join(', ') : '') + (job.execution?.writable_resources?.length ? ' · Resources ' + job.execution.writable_resources.join(', ') : '')));
+      const history = node('button', 'Run history');
+      history.addEventListener('click', async () => {
+        const g = generation, request = ++detailRequest;
+        try { const d = await api('/api/schedules/' + encodeURIComponent(job.id)); if (g !== generation || request !== detailRequest) return; $('detailTitle').textContent = 'Schedule history'; $('detailBody').replaceChildren(node('pre', JSON.stringify(d, null, 2))); if (d.work_item_id) $('detailBody').prepend(itemButton(d.work_item_id, 'Latest work item')); if (!$('detail').open) $('detail').showModal(); }
+        catch (e) { if (g === generation && request === detailRequest) { $('error').hidden = false; $('error').textContent = e.message; } }
+      }); card.append(history);
+      const toggle = node('button', job.enabled ? 'Pause schedule' : 'Resume schedule');
+      toggle.disabled = !reply.work_manager;
+      toggle.addEventListener('click', async () => {
+        const g = generation; toggle.disabled = true;
+        try { await api('/api/schedules/' + encodeURIComponent(job.id) + '/enabled', {enabled: !job.enabled}); if (g === generation) await refresh(); }
+        catch (e) { if (g === generation) { $('error').hidden = false; $('error').textContent = e.message; } }
+        finally { if (g === generation) toggle.disabled = false; }
+      }); card.append(toggle); $('scheduleRows').append(card);
+    }
+  }
   function render(reply) {
     const w = reply.work, counts = w.counts, c = reply.controller;
     renderDreaming(reply.dreaming);
+    renderResources(reply);
     $('login').hidden = true; $('dashboard').hidden = false; $('logout').hidden = false;
     $('error').hidden = true;
     $('health').textContent = human(reply.health); $('health').className = 'badge ' + reply.health;

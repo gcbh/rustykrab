@@ -228,3 +228,21 @@ and pins coding work to its project's verified commit chain. Native adapters
 render it without depending on Claude/Codex chat state. Archive compaction keeps
 receipts and evidence, and the monitor shows the delivered revision and base.
 This changes no crate dependency and introduces no second scheduler or ledger.
+
+## Work-manager composition (base 3e85f48, 2026-10-08)
+
+An opt-in v6 manager is the conversational control plane: it captures goals
+and resource requirements, files durable work and lets the existing controller
+lease a native Claude/Codex worker or a registered infrastructure adapter.
+Each managed cron firing follows that same path, carrying persisted execution
+requirements and retaining a work link and run history. No model-only manager
+claim counts as completion. The runtime grants management tools without direct
+shell/write/message execution.
+
+The CLI owns service probing and launchd lifecycle execution; gateway reads
+consume cached observations through ResourceObserver. Service recovery is a
+tracked work item, bounded and restricted to registered services with verified
+ownership. Native CLI workers and service executors are separate resources.
+The existing main and builder instances are not automatically made executors
+or migrated by enabling the manager. Private Tailscale access keeps the gateway's
+normal bearer, Origin and revocable device-token controls.

@@ -217,6 +217,7 @@ impl Store {
                 -- of next_run_at re-reads the offset from the zone database
                 -- and the job holds its wall-clock time across DST.
                 timezone        TEXT NOT NULL DEFAULT 'UTC',
+                execution_json  TEXT,
                 -- The work item a firing becomes (control-layer plan,
                 -- section 13). Not a foreign key: the item may be archived
                 -- while the job keeps its schedule.
@@ -843,6 +844,14 @@ impl Store {
             // decision for whoever owns the job, not for a migration.
             conn.execute(
                 "ALTER TABLE scheduled_jobs ADD COLUMN timezone TEXT NOT NULL DEFAULT 'UTC'",
+                [],
+            )
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        }
+
+        if !existing.iter().any(|c| c == "execution_json") {
+            conn.execute(
+                "ALTER TABLE scheduled_jobs ADD COLUMN execution_json TEXT",
                 [],
             )
             .map_err(|e| Error::Storage(e.to_string()))?;

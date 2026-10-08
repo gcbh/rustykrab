@@ -124,11 +124,11 @@ merge is validated by symbol counts rather than by inspection: the symbols
 that had been written twice halved (`max_tokens_retries` 8→4,
 `compact_history(conv, tools)` 2→1) and the shared ones did not move.
 
-**The turn sequence remains duplicated across five entry points (2026-10-02).** Load conversation →
+**The turn sequence remains duplicated across six entry points (rechecked against 3e85f48).** Load conversation →
 snapshot persisted ids → append → run with heartbeat → `save_turn` → extract
 reply → map failure to a user string, in `process_telegram_message`,
 `process_slack_message`, `send_message`, `send_message_stream`, and the delegated-task worker in `gateway/src/tasks.rs`.
-The original second-pass count was six; the old task_queue module is gone.
+The CLI task_queue worker remains the sixth entry point; its credential and legacy cron turns share one persistence path.
 
 This one has a defect to its name rather than a hypothesis: the
 `PendingLinks` drain existed in the Telegram copy and not the Slack one, so a
@@ -247,3 +247,14 @@ Project dreaming extends EvaluationHandle with defaulted observational status
 and bounded advancement on the existing serialized evaluator. Generation and
 meta-evaluation reuse Worker/ControlHandle with Research work, budgets, leases
 and native CLI adapters; no model executor or execution queue is added.
+
+## Work-manager additions (base 3e85f48, 2026-10-08)
+
+`ResourceObserver` lives in gateway and is implemented by CLI Overseer, above
+its consumer. It exposes cached service observations and membership only; the
+transport cannot request arbitrary probes or host commands. InfrastructureWorker
+reuses Worker, adding adapter eligibility through defaulted `accepts`, while
+process identity reuses update_cmd::apply::Processes and its kernel inspection.
+CronBackend's defaulted create_managed_job rejects unsupported requirements.
+The manager work_assign variant reuses WorkBackend and task-local host provenance.
+These changes add no crate, dependency edge or separate execution queue.

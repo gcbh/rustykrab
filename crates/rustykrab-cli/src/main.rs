@@ -8,6 +8,7 @@ mod dreaming;
 mod evaluation;
 mod fleet;
 mod monitor_cmd;
+mod overseer;
 mod peers;
 mod prompt_log;
 mod scheduled_work;
@@ -118,6 +119,35 @@ impl CronBackend for CronAdapter {
         timezone: Option<&str>,
         allow_duplicate: bool,
     ) -> rustykrab_core::Result<serde_json::Value> {
+        self.create_managed_job(
+            schedule,
+            task,
+            channel,
+            chat_id,
+            thread_id,
+            timezone,
+            allow_duplicate,
+            None,
+        )
+        .await
+    }
+    async fn create_managed_job(
+        &self,
+        schedule: &str,
+        task: &str,
+        channel: Option<&str>,
+        chat_id: Option<&str>,
+        thread_id: Option<&str>,
+        timezone: Option<&str>,
+        allow_duplicate: bool,
+        execution: Option<rustykrab_core::work::CronExecution>,
+    ) -> rustykrab_core::Result<serde_json::Value> {
+        if execution.is_some() && !scheduled_work::enabled() {
+            return Err(rustykrab_core::Error::Config(
+                "resource-aware schedules require the work manager or RUSTYKRAB_CRON_WORK_ITEMS=1"
+                    .into(),
+            ));
+        }
         let session_conv_id =
             rustykrab_core::active_tools::with_session_context(|ctx| ctx.conversation_id);
         let inherited = match session_conv_id {
@@ -137,7 +167,7 @@ impl CronBackend for CronAdapter {
         let job = self
             .store
             .jobs()
-            .create_job(
+            .create_managed_job(
                 schedule,
                 task,
                 ch.as_deref(),
@@ -145,6 +175,7 @@ impl CronBackend for CronAdapter {
                 tid.as_deref(),
                 tz.name(),
                 allow_duplicate,
+                execution,
             )
             .await?;
         Ok(serde_json::to_value(&job).expect("ScheduledJob is always serializable"))
@@ -1487,8 +1518,46 @@ async fn main() -> anyhow::Result<()> {
             .await?;
     }
     deferred_work_backend.bind(controller.clone());
+    let port: u16 = std::env::var("RUSTYKRAB_PORT")
+        .ok()
+        .map(|p| {
+            p.trim().parse().unwrap_or_else(|_| {
+                eprintln!("ERROR: RUSTYKRAB_PORT must be a port number, got '{p}'");
+                std::process::exit(1);
+            })
+        })
+        .unwrap_or(3000);
+    let overseer = overseer::Overseer::from_env(port)?;
+    if !rustykrab_gateway::resources::ResourceObserver::services(overseer.as_ref()).is_empty() {
+        fleet
+            .registry
+            .register(
+                Arc::new(overseer::InfrastructureWorker(overseer.clone())),
+                serde_json::json!({"role":"infrastructure"}),
+                None,
+            )
+            .await?;
+    }
+    if overseer::manager_enabled()
+        || !rustykrab_gateway::resources::ResourceObserver::services(overseer.as_ref()).is_empty()
+    {
+        tools.push(Arc::new(overseer::ResourcesTool {
+            store: store.clone(),
+            registry: fleet.registry.clone(),
+            overseer: overseer.clone(),
+        }));
+        tools.push(Arc::new(overseer::ServiceTool {
+            control: controller.clone(),
+            overseer: overseer.clone(),
+        }));
+    }
     let work_tool_names = work_host::add_work_tools(&mut tools, controller.clone());
     tools.extend(rustykrab_tools::plan_tools(controller.clone()));
+    if overseer::manager_enabled() {
+        tools.push(Arc::new(rustykrab_tools::WorkFileTool::manager(
+            controller.clone(),
+        )));
+    }
     tracing::info!(
         worker = %fleet.local_name,
         local_worker = if local_worker_on { "on" } else { "off" },
@@ -1527,13 +1596,20 @@ async fn main() -> anyhow::Result<()> {
                 .map(str::to_string),
         );
     }
+    if overseer::manager_enabled() {
+        seed.extend(
+            ["work_assign", "work_resources", "work_status", "cron"]
+                .into_iter()
+                .map(str::to_string),
+        );
+    }
     control_catalog.fill(&tools, &seed);
     let active_tools = if seed.is_empty() {
         Arc::new(rustykrab_core::active_tools::ActiveToolsRegistry::new())
     } else {
         tracing::warn!(
             seeded = ?seed,
-            "tools seeded active from turn 0 — an evaluation switch, not a deployment one"
+            "tools seeded active from turn 0"
         );
         Arc::new(rustykrab_core::active_tools::ActiveToolsRegistry::with_seed(seed))
     };
@@ -1614,6 +1690,8 @@ async fn main() -> anyhow::Result<()> {
         )))
         .with_credential_page_policy(rustykrab_gateway::PageIdentityPolicy::from_env());
     state.agent.active_tools = active_tools;
+    state.agent.work_manager = overseer::manager_enabled();
+    state.resources = Some(overseer.clone());
 
     // --- Attach video channel to state ---
     if let Some(vc) = video_channel {
@@ -1624,6 +1702,7 @@ async fn main() -> anyhow::Result<()> {
     // instead of silently swallowed (fixes ASYNC-H4).
     let mut infra_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     infra_handles.push(index_rebuild_handle);
+    infra_handles.push(overseer.start(store_handle.clone(), controller.clone()));
 
     // --- Telegram channel (optional) ---
     // We need to take the inbound_rx before wrapping in Arc, so build in stages.
@@ -2071,15 +2150,6 @@ async fn main() -> anyhow::Result<()> {
     // Bind to loopback only — never 0.0.0.0. The port is overridable via
     // RUSTYKRAB_PORT (the E2E harness boots on an ephemeral port so it
     // never collides with a live instance); the loopback bind is not.
-    let port: u16 = std::env::var("RUSTYKRAB_PORT")
-        .ok()
-        .map(|p| {
-            p.trim().parse().unwrap_or_else(|_| {
-                eprintln!("ERROR: RUSTYKRAB_PORT must be a port number, got '{p}'");
-                std::process::exit(1);
-            })
-        })
-        .unwrap_or(3000);
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     tracing::info!(%addr, "RustyKrab gateway listening");
 
@@ -3915,6 +3985,10 @@ async fn job_executor_loop(store: rustykrab_store::Store, queue: task_queue::Tas
         };
 
         for job in due_jobs {
+            if job.execution.is_some() {
+                tracing::warn!(job_id=%job.id,"managed schedule withheld: durable cron executor is disabled");
+                continue;
+            }
             let request = task_queue::TaskRequest {
                 prompt: job.task.clone(),
                 source: task_queue::TaskSource::Cron {

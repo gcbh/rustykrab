@@ -83,10 +83,10 @@ impl Tool for CronTool {
                         "description": concat!(
                             "Required for create. The prompt that will be executed when the schedule fires.\n",
                             "\n",
-                            "CRITICAL: this string is the ONLY thing carried forward from this conversation. ",
+                            "CRITICAL: retain self-contained instructions here and explicit resource requirements in execution. ",
                             "When the job fires — possibly days later — a fresh agent run receives this text and ",
-                            "nothing else: no chat history, no memory of what the user just told you, no access ",
-                            "to what you and the user worked out together. A short label like 'daily briefing' ",
+                            "no implicit conversational history or integration access. Do not rely on ",
+                            "what you and the user worked out together. A short label like 'daily briefing' ",
                             "or 'check emails' will produce a generic, useless result.\n",
                             "\n",
                             "Write a self-contained brief. Fold in everything the user told you that the future ",
@@ -107,10 +107,25 @@ impl Tool for CronTool {
                             "each one line, no preamble or sign-off. If nothing qualifies, reply exactly ",
                             "\"Nothing needing attention.\"'\n",
                             "\n",
-                            "Exception: if the task is exactly a registered SKILL.md skill name (e.g. ",
-                            "'morning-briefing'), the bare name is fine — the skill body is injected ",
-                            "automatically at fire time.",
+                            "A registered skill name is sufficient only when the selected execution resource ",
+                            "supports and loads that skill. Local scheduled workers inject SKILL.md; ",
+                            "native CLI workers do not automatically inherit daemon skills or integrations.",
                         )
+                    },
+                    "execution": {
+                        "type":"object", "additionalProperties":false,
+                        "description":"Optional durable resource requirements for every firing. Use registered tools and repo resources; the controller allocates a suitable worker. Include a project artifact reference to continue its context.",
+                        "properties": {
+                            "budget":{"type":"object","required":["iterations","tokens","wall_seconds","repairs"],"additionalProperties":false,"properties":{"iterations":{"type":"integer","minimum":1},"tokens":{"type":"integer","minimum":1},"wall_seconds":{"type":"integer","minimum":1},"repairs":{"type":"integer","minimum":0}}},
+                            "kind":{"enum":["personal","research","code"]},
+                            "done_when":{"type":"string"},
+                            "worker_kind":{"enum":["any","local","claude_code","codex","peer"]},
+                            "required_tools":{"type":"array","items":{"type":"string"}},
+                            "required_mcp_servers":{"type":"array","items":{"type":"string"}},
+                            "writable_resources":{"type":"array","items":{"type":"string"}},
+                            "constraints":{"type":"array","items":{"type":"string"}},
+                            "artifact_refs":{"type":"array","items":{"type":"object","required":["kind","value"],"properties":{"kind":{"type":"string"},"value":{"type":"string"}}}}
+                        }
                     },
                     "channel": {
                         "type": "string",
@@ -196,9 +211,16 @@ impl Tool for CronTool {
                 let timezone = args["timezone"].as_str();
                 let allow_duplicate = args["allow_duplicate"].as_bool().unwrap_or(false);
 
+                let execution = args
+                    .get("execution")
+                    .map(|v| {
+                        serde_json::from_value::<rustykrab_core::work::CronExecution>(v.clone())
+                    })
+                    .transpose()
+                    .map_err(|e| rustykrab_core::Error::Config(e.to_string()))?;
                 let result = self
                     .backend
-                    .create_job(
+                    .create_managed_job(
                         schedule,
                         task,
                         channel,
@@ -206,6 +228,7 @@ impl Tool for CronTool {
                         thread_id,
                         timezone,
                         allow_duplicate,
+                        execution,
                     )
                     .await
                     .map_err(|e| rustykrab_core::Error::ToolExecution(e.to_string().into()))?;
@@ -405,8 +428,8 @@ mod tests {
 
     #[test]
     fn task_schema_demands_a_self_contained_brief() {
-        // The task string is the only context that survives into the
-        // scheduled run — no chat history travels with it. If the schema
+        // The task and explicit execution requirements survive into the
+        // scheduled run; chat history is not implicit context. If the schema
         // doesn't say so, models write short topic labels ("daily
         // briefing") and the fired job produces generic output.
         let (_, tool) = spy();
@@ -416,11 +439,12 @@ mod tests {
             .expect("task description should be a string");
 
         assert!(
-            task_desc.contains("ONLY thing carried forward"),
-            "schema must warn that task is the sole surviving context: {task_desc}"
+            task_desc.contains("self-contained instructions")
+                && task_desc.contains("explicit resource requirements"),
+            "schema must require durable instructions and execution requirements: {task_desc}"
         );
         assert!(
-            task_desc.contains("no chat history"),
+            task_desc.contains("no implicit conversational history"),
             "schema must state that chat history is not carried over: {task_desc}"
         );
         // A worked BAD/GOOD pair moves models off one-line labels far more
@@ -432,8 +456,8 @@ mod tests {
         // Bare skill names must stay explicitly legal — resolve_skill_for_task
         // relies on exact-name tasks and there is no minimum-length gate.
         assert!(
-            task_desc.contains("SKILL.md skill name"),
-            "schema must keep the bare-skill-name path legal: {task_desc}"
+            task_desc.contains("selected execution resource supports and loads that skill"),
+            "schema must qualify skill execution by the selected resource: {task_desc}"
         );
     }
 

@@ -70,6 +70,47 @@ pub struct RunOptions {
     pub denied_tools: Vec<String>,
 }
 
+/// The manager's ceiling is enforced before granting capabilities, including
+/// dynamically disclosed tools. Workers retain their separate execution ceiling.
+pub(crate) fn manager_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "work_assign"
+            | "work_file"
+            | "work_plan"
+            | "work_status"
+            | "cron"
+            | "work_resources"
+            | "service_control"
+            | "task_complete"
+            | "tools_list"
+            | "tools_load"
+    ) || name.starts_with("recall_")
+        || name.starts_with("memory_")
+        || name.starts_with("todo_")
+}
+
+const WORK_MANAGER_PROMPT: &str = "\n\n## Work manager\n\
+You manage the user's work through the durable controller. Converse about goals, \
+requirements and corrections. Before assigning work, call work_resources to inspect \
+registered agents, their health, capabilities, repositories, projects and schedules. \
+File actionable work with work_assign; use plan=true when it needs decomposition. \
+Give every item an observable done_when, bounded budget, relevant constraints and \
+a project artifact reference when continuing that project. For code, select a \
+registered Claude Code or Codex runtime and its exact repo: writable resource. \
+Select required tools/resources from advertisements; do not invent infrastructure \
+or assume an unavailable resource can execute. Let the controller choose a suitable \
+available worker when no particular runtime is required. A busy worker is a wait, \
+not permission to bypass the queue. Use work_status to resume or explain existing \
+work; do not file the same request twice after a timeout. Corrections affect future \
+work and must not silently change the acceptance of a running item.\n\
+Use cron for recurring or future work: each firing becomes a controller-managed \
+work item, with assignment, verification and history. Service actions also go \
+through service_control and produce tracked work. Report the accepted item ID \
+and whether it is waiting for approval or a resource. Filing or starting is not \
+completion: only controller-verified done results are complete. You do not \
+execute project changes directly or send work to an independent task queue.";
+
 /// Build the system prompt and inject it as the first message in the conversation.
 ///
 /// `profile` is the harness profile already resolved by the caller —
@@ -166,6 +207,10 @@ async fn build_and_inject_system_prompt(
          before invoking them; if a search finds nothing, or says a tool is unknown or \
          forbidden, do not invent a call to it.",
     );
+
+    if ctx.work_manager {
+        system_prompt.push_str(WORK_MANAGER_PROMPT);
+    }
 
     // Append channel context so the agent knows where this conversation lives.
     if let Some(ref source) = conv.channel_source {
@@ -379,6 +424,7 @@ async fn prepare_agent(
         .tools
         .iter()
         .filter(|t| t.available())
+        .filter(|t| !ctx.work_manager || manager_tool(t.name()))
         .map(|t| t.name())
         .filter(|name| !options.denied_tools.iter().any(|denied| denied == name))
         .collect();
@@ -772,5 +818,105 @@ mod channel_lifecycle_tests {
         });
         assert!(!wait_for_idle_or_close(rx, Duration::from_millis(60)).await);
         progress.await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod work_manager_tests {
+    use super::*;
+    use async_trait::async_trait;
+    use rustykrab_core::{
+        model::{ModelProvider, ModelResponse},
+        types::ToolSchema,
+        Tool,
+    };
+    struct Never;
+    #[async_trait]
+    impl ModelProvider for Never {
+        fn name(&self) -> &str {
+            "unused"
+        }
+        async fn chat(
+            &self,
+            _: &[Message],
+            _: &[ToolSchema],
+        ) -> rustykrab_core::Result<ModelResponse> {
+            panic!("preparation must not run inference")
+        }
+    }
+    struct Named(&'static str);
+    #[async_trait]
+    impl Tool for Named {
+        fn name(&self) -> &str {
+            self.0
+        }
+        fn description(&self) -> &str {
+            "fixture"
+        }
+        fn schema(&self) -> ToolSchema {
+            ToolSchema {
+                name: self.0.into(),
+                description: "fixture".into(),
+                parameters: serde_json::json!({"type":"object"}),
+            }
+        }
+        async fn execute(&self, _: serde_json::Value) -> rustykrab_core::Result<serde_json::Value> {
+            panic!("preparation must not execute")
+        }
+    }
+    #[tokio::test]
+    async fn manager_turn_grants_assignment_and_schedule_capabilities_but_denies_direct_execution()
+    {
+        let dir = std::env::temp_dir().join(format!("rk-manager-{}", Uuid::new_v4()));
+        let store = rustykrab_store::Store::open(&dir, vec![7; 32]).unwrap();
+        let tools: Vec<Arc<dyn Tool>> = [
+            "work_assign",
+            "work_resources",
+            "cron",
+            "fs_write",
+            "shell",
+            "message",
+            "result_report",
+            "tools_load",
+        ]
+        .into_iter()
+        .map(|n| Arc::new(Named(n)) as Arc<dyn Tool>)
+        .collect();
+        let mut ctx = AgentContext::new(store, tools, Arc::new(Never));
+        ctx.work_manager = true;
+        let now = Utc::now();
+        let mut conv = Conversation {
+            id: Uuid::new_v4(),
+            messages: vec![],
+            created_at: now,
+            updated_at: now,
+            title: None,
+            summary: None,
+            detected_profile: None,
+            channel_source: None,
+            channel_id: None,
+            channel_thread_id: None,
+        };
+        let (_, session) = prepare_agent(
+            &ctx,
+            &mut conv,
+            "Assign a project task",
+            &RunOptions::default(),
+        )
+        .await
+        .unwrap();
+        for allowed in ["work_assign", "work_resources", "cron", "tools_load"] {
+            assert!(session.capabilities.can_use_tool(allowed));
+        }
+        for denied in ["fs_write", "shell", "message", "result_report"] {
+            assert!(!session.capabilities.can_use_tool(denied));
+        }
+        assert!(conv.messages[0]
+            .content
+            .as_text()
+            .unwrap()
+            .contains("## Work manager"));
+        drop(ctx);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

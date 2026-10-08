@@ -85,6 +85,8 @@ pub struct AppState {
     /// binary's build script stamps the commit and date, so only the
     /// composition root can fill them in; until it does they read `None`.
     pub build: BuildInfo,
+    /// Host-cached registered infrastructure observations.
+    pub resources: Option<Arc<dyn crate::resources::ResourceObserver>>,
 
     // --- Outbound channels, delivered to by the webhook routes ---
     pub telegram: Option<Arc<TelegramChannel>>,
@@ -113,6 +115,7 @@ impl AppState {
             evaluation: None,
             delegation: None,
             build: BuildInfo::default(),
+            resources: None,
             telegram: None,
             signal: None,
             slack: None,

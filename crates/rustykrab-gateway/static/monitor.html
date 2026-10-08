@@ -3,12 +3,12 @@
 <head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="referrer" content="same-origin">
-<title>Agent monitor · RustyKrab</title>
+<title>Work manager · RustyKrab</title>
 <link rel="stylesheet" href="/monitor.css">
 <script src="/monitor.js" defer></script>
 </head>
 <body>
-<header><a class="brand" href="/">◉ <span>RustyKrab</span></a><nav><a href="/">Chat</a><span class="selected">Agent monitor</span></nav><button id="logout" hidden>Disconnect</button></header>
+<header><a class="brand" href="/">◉ <span>RustyKrab</span></a><nav><a href="/">Chat</a><span class="selected">Work manager</span></nav><button id="logout" hidden>Disconnect</button></header>
 <main>
 <section id="login" class="login card">
 <p class="eyebrow">LOCAL OPERATIONS</p><h1>Your agents, in view.</h1>
@@ -20,10 +20,12 @@
 <p id="loginError" role="alert"></p>
 </section>
 <div id="dashboard" hidden>
-<div class="heading"><div><p class="eyebrow">OPERATIONS</p><h1>Agent monitor</h1><p id="updated">Connecting…</p></div><div class="controls"><span id="health" class="badge">Connecting</span><button id="refresh">Refresh</button><button id="pause" aria-pressed="false">Pause updates</button></div></div>
+<div class="heading"><div><p class="eyebrow">OPERATIONS</p><h1>Work manager</h1><p id="updated">Connecting…</p></div><div class="controls"><span id="health" class="badge">Connecting</span><button id="refresh">Refresh</button><button id="pause" aria-pressed="false">Pause updates</button></div></div>
 <div id="error" class="error" role="alert" hidden></div>
 <div class="stats" id="stats"></div>
 <section id="alerts" class="card" aria-labelledby="alertsTitle"><h2 id="alertsTitle">Attention</h2><div id="alertRows"></div></section>
+<section class="card"><div class="section-heading"><h2>Infrastructure</h2><a href="/">Assign work in chat</a></div><p id="managerMode" class="note"></p><div id="serviceRows"></div></section>
+<section class="card"><h2>Scheduled work</h2><p class="note">Ask the manager in chat to schedule a task. Each firing enters the work queue and is assigned using its resource requirements.</p><div id="scheduleRows"></div></section>
 <div class="columns"><section aria-labelledby="agentsTitle"><div class="section-heading"><h2 id="agentsTitle">Agents</h2><span id="agentCount"></span></div><div id="agents"></div></section>
 <section aria-labelledby="workTitle"><div class="section-heading"><h2 id="workTitle">Work</h2><span id="workCount"></span></div><div class="card work">
 <div class="filters"><label class="sr-only" for="search">Search work</label><input id="search" placeholder="Search title, agent, or item ID"><label class="sr-only" for="status">Filter status</label><select id="status"><option value="open">Open work</option><option value="all">All displayed work</option><option>running</option><option>verifying</option><option>blocked</option><option>done</option><option>failed</option></select></div>

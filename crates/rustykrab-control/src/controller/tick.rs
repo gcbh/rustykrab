@@ -79,7 +79,8 @@ pub(super) fn covers(worker: &dyn Worker, item: &WorkItem) -> bool {
     let has = |list: &[String], want: &String| list.iter().any(|x| x == want || x == "*");
     // A planning item matches only a planner, and a planner takes only
     // planning items (6, step 2).
-    graph::is_planning(item) == super::planning::plans(worker)
+    worker.accepts(item)
+        && graph::is_planning(item) == super::planning::plans(worker)
         && (item.worker_kind == WorkerKind::Any || item.worker_kind == worker.kind())
         && !lacks_checkout(worker.kind(), item)
         && item.required_tools.iter().all(|t| has(&caps.tools, t))

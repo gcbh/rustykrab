@@ -283,7 +283,7 @@ expiry. Nothing to change.
 ```
 scheduled_jobs(id PK, schedule, task, channel, chat_id, thread_id, one_shot,
                enabled, next_run_at, last_run_at, created_at, conversation_id,
-               created_version, timezone, work_item_id)
+               created_version, timezone, work_item_id, execution_json)
    INDEX (next_run_at) WHERE enabled = 1
 job_runs(id PK, job_id, status, output, started_at, finished_at,
          rustykrab_version)
@@ -327,6 +327,12 @@ controller reads it (`job_for_work_item`) to run a firing in the job's own
 `conversation_id`, a column no model writes, so no filing can point a run at
 a conversation of its choosing. With the switch off (the default) nothing
 writes it and jobs run through the task queue as before.
+
+`execution_json` is an additive nullable resource-requirement contract. Older
+rows remain NULL. `create_managed_job` validates and inserts it atomically with
+the job; malformed JSON fails a read instead of selecting an unconstrained
+worker. Enabling `RUSTYKRAB_WORK_MANAGER` also enables the durable firing path.
+The execution contract is not a credential or a writable work-item status.
 
 The remaining duplication is `(channel, chat_id, thread_id)` on
 `scheduled_jobs`: it repeats addressing information that can also live in

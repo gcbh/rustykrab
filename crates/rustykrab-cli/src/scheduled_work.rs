@@ -81,9 +81,10 @@ fn firing_budget() -> Budget {
 
 /// Whether the switch is on.
 pub(crate) fn enabled() -> bool {
-    std::env::var(FLAG)
-        .map(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "True"))
-        .unwrap_or(false)
+    crate::overseer::manager_enabled()
+        || std::env::var(FLAG)
+            .map(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "True"))
+            .unwrap_or(false)
 }
 
 /// Start the firing loop when the switch is on, polling every control
@@ -266,19 +267,27 @@ async fn file(
         }
     }
 
+    let execution = job.execution.clone().unwrap_or_default();
+    let mut refs = execution.artifact_refs;
+    refs.push(ArtifactRef {
+        kind: JOB_REF.into(),
+        value: job.id.clone(),
+    });
     let draft = WorkItemDraft {
-        kind: Some(WorkKind::Personal),
+        kind: Some(execution.kind.unwrap_or(WorkKind::Personal)),
         title: format!("Scheduled: {}", one_line(&job.task, 80)),
         objective: job.task.trim().to_string(),
-        done_when: "The scheduled task is done, and result_report's summary holds the \
-                    message its recipient receives."
-            .to_string(),
-        artifact_refs: vec![ArtifactRef {
-            kind: JOB_REF.to_string(),
-            value: job.id.clone(),
-        }],
+        done_when: execution.done_when.unwrap_or_else(|| {
+            "The scheduled task is done, and the result summary holds the full deliverable.".into()
+        }),
+        artifact_refs: refs,
+        worker_kind: execution.worker_kind,
+        required_tools: execution.required_tools,
+        required_mcp_servers: execution.required_mcp_servers,
+        writable_resources: execution.writable_resources,
+        constraints: execution.constraints,
         trigger: Trigger::At(job.next_run_at.max(now + LINK_MARGIN)),
-        budget: Some(firing_budget()),
+        budget: Some(execution.budget.unwrap_or_else(firing_budget)),
         ..WorkItemDraft::default()
     };
     let provenance = Provenance {

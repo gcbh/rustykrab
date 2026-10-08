@@ -98,6 +98,11 @@ pub trait Worker: Send + Sync {
     fn planning_only(&self) -> bool {
         false
     }
+    /// Adapter-specific eligibility; infrastructure executors accept only their
+    /// registered typed actions. Ordinary agents accept all covered work.
+    fn accepts(&self, _item: &rustykrab_core::work::WorkItem) -> bool {
+        true
+    }
     /// How many items it may run at once.
     fn concurrency(&self) -> usize {
         1
