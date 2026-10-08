@@ -1532,7 +1532,7 @@ async fn main() -> anyhow::Result<()> {
         fleet
             .registry
             .register(
-                Arc::new(overseer::InfrastructureWorker(overseer.clone())),
+                Arc::new(overseer::InfrastructureWorker::new(overseer.clone())),
                 serde_json::json!({"role":"infrastructure"}),
                 None,
             )

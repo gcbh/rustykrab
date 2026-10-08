@@ -40,6 +40,10 @@ pub fn api_routes() -> Router<AppState> {
             get(list_messages).post(send_message),
         )
         .route(
+            "/api/conversations/{id}/work-notices",
+            get(list_work_notices),
+        )
+        .route(
             "/api/conversations/{id}/messages/stream",
             post(send_message_stream),
         )
@@ -345,6 +349,35 @@ async fn list_messages(
         .map(|m| ApolloMessage::from_message(conv.id, m))
         .collect();
     Ok(Json(msgs))
+}
+
+/// Work notifications are a separate read projection, preserving model history.
+async fn list_work_notices(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Response, StatusCode> {
+    state
+        .agent
+        .store
+        .conversations()
+        .get(id)
+        .await
+        .map_err(|e| match e {
+            rustykrab_core::Error::NotFound(_) => StatusCode::NOT_FOUND,
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        })?;
+    let rows = state
+        .agent
+        .store
+        .work_outbox_for_conversation(&id.to_string(), 100)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let mut response = Json(rows).into_response();
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    Ok(response)
 }
 
 /// Response body for `POST /api/conversations/{id}/messages`.

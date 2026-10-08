@@ -217,6 +217,12 @@ pub(crate) async fn route(store: &Store, row: &OutboxRow, default_chat: Option<&
         }
     }
 
+    // WebChat reads durable notices through the conversation endpoint, or
+    // the dashboard for work filed without a conversation. No transport send.
+    if row.channel == "webchat" {
+        return Route::Consumed;
+    }
+
     let chat = (row.channel == "telegram")
         .then(|| default_chat.map(str::to_string))
         .flatten();

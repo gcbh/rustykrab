@@ -23,7 +23,7 @@ use std::{
     collections::HashSet,
     path::PathBuf,
     sync::{Arc, RwLock},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 pub(crate) fn manager_enabled() -> bool {
@@ -284,7 +284,7 @@ impl Overseer {
     ) -> tokio::task::JoinHandle<()> {
         let own = self.clone();
         tokio::spawn(async move {
-            let mut timer = tokio::time::interval(Duration::from_secs(15));
+            let mut timer = tokio::time::interval(SERVICE_CHECK_EVERY);
             timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 timer.tick().await;
@@ -378,7 +378,13 @@ fn recovery_allowed(
             < 3
 }
 
-pub(crate) struct InfrastructureWorker(pub Arc<Overseer>);
+pub(crate) struct InfrastructureWorker(Arc<Overseer>, tokio::sync::Mutex<Option<Instant>>);
+impl InfrastructureWorker {
+    pub(crate) fn new(overseer: Arc<Overseer>) -> Self {
+        Self(overseer, tokio::sync::Mutex::new(None))
+    }
+}
+const SERVICE_CHECK_EVERY: Duration = Duration::from_secs(15);
 #[async_trait]
 impl Worker for InfrastructureWorker {
     fn name(&self) -> &str {
@@ -399,6 +405,29 @@ impl Worker for InfrastructureWorker {
             machine: Some("local-services".into()),
             ..Default::default()
         }
+    }
+    async fn refresh(&self) -> bool {
+        let mut checked = self.1.lock().await;
+        if checked.is_some_and(|at| at.elapsed() < SERVICE_CHECK_EVERY) {
+            return false;
+        }
+        // The adapter must remain available to recover an absent service.
+        // Service health is reported separately; this heartbeat confirms that
+        // the registered resources have a current host observation.
+        let rows = self.0.services();
+        let fresh = !rows.is_empty()
+            && rows.iter().all(|row| {
+                row.checked_at.is_some_and(|at| {
+                    (Utc::now() - at)
+                        .to_std()
+                        .is_ok_and(|age| age < SERVICE_CHECK_EVERY)
+                })
+            });
+        if !fresh {
+            self.0.observe().await;
+        }
+        *checked = Some(Instant::now());
+        true
     }
     async fn run(&self, brief: Brief) -> Result<ResultReport> {
         let _guard = self.0.actions.lock().await;
@@ -658,7 +687,7 @@ mod tests {
         let unscoped = reqwest::get(&f.owner.specs[0].health_url).await.unwrap();
         assert_eq!(unscoped.status(), reqwest::StatusCode::FORBIDDEN);
         let store = Store::open(f.dir.path().join("db"), vec![7; 32]).unwrap();
-        let worker = Arc::new(InfrastructureWorker(f.owner.clone()));
+        let worker = Arc::new(InfrastructureWorker::new(f.owner.clone()));
         let controller = Controller::new(store.clone(), vec![worker], ControllerConfig::default());
         let plain = controller
             .file_draft(
@@ -721,6 +750,51 @@ mod tests {
             f.owner.services()[0].checked_at,
             before,
             "reading must not advance probe time"
+        );
+    }
+    #[tokio::test]
+    async fn infrastructure_refresh_updates_registry_health_without_running_lifecycle_actions() {
+        let f = fixture().await;
+        let store = Store::open(f.dir.path().join("db"), vec![7; 32]).unwrap();
+        let registry = WorkerRegistry::new(store.clone());
+        let worker = Arc::new(InfrastructureWorker::new(f.owner.clone()));
+        registry
+            .register(worker.clone(), json!({"role":"infrastructure"}), None)
+            .await
+            .unwrap();
+        let first_probe = f.owner.services()[0].checked_at;
+        assert!(first_probe.is_some());
+        assert_eq!(f.owner.services()[0].healthy, Some(false));
+        assert!(
+            registry.refresh().await.unwrap().is_empty(),
+            "recent checks are throttled"
+        );
+        store
+            .workers()
+            .advertise(
+                "infrastructure",
+                None,
+                "healthy",
+                Some(Utc::now() - TimeDelta::minutes(3)),
+            )
+            .await
+            .unwrap();
+        *worker.1.lock().await = Some(Instant::now() - SERVICE_CHECK_EVERY);
+        assert_eq!(registry.refresh().await.unwrap(), ["infrastructure"]);
+        let view = registry.view("infrastructure").await.unwrap().unwrap();
+        assert!(
+            view.healthy,
+            "an absent managed service must remain recoverable"
+        );
+        assert!(Utc::now() - view.last_seen.unwrap() < TimeDelta::seconds(5));
+        assert_eq!(
+            f.owner.services()[0].checked_at,
+            first_probe,
+            "fresh cached probes are reused"
+        );
+        assert!(
+            !f.dir.path().join("running").exists(),
+            "health refresh must not apply a lifecycle action"
         );
     }
     #[tokio::test]
@@ -789,7 +863,7 @@ mod tests {
         let store = Store::open(f.dir.path().join("db"), vec![7; 32]).unwrap();
         let ctl = Controller::new(
             store.clone(),
-            vec![Arc::new(InfrastructureWorker(f.owner.clone()))],
+            vec![Arc::new(InfrastructureWorker::new(f.owner.clone()))],
             ControllerConfig::default(),
         );
         let PlanOutcome::Accepted(a) = ctl

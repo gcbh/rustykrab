@@ -163,14 +163,7 @@ async fn a_notice_goes_to_the_thread_its_item_came_from() {
         );
     }
     let row = notice(s, item("f", Status::Done, None), "webchat").await;
-    assert_eq!(
-        route(s, &row, Some("999")).await,
-        Route::Send {
-            channel: "webchat".into(),
-            chat: None,
-            thread: None,
-        }
-    );
+    assert_eq!(route(s, &row, Some("999")).await, Route::Consumed);
 }
 
 #[tokio::test]
@@ -395,5 +388,48 @@ async fn background_dreaming_notices_stay_in_the_dashboard_without_external_send
     assert_eq!(
         route(s, &row, Some("999")).await,
         send("telegram", Some("4242".into()), Some("7".into()))
+    );
+}
+
+#[tokio::test]
+async fn webchat_notices_are_consumed_without_external_sends_and_remain_in_the_conversation_view() {
+    let t = temp_store();
+    let s = &t.store;
+    let conv = s.conversations().create().await.unwrap();
+    let row = notice(
+        s,
+        item("web-work", Status::Done, Some(conv.id.to_string())),
+        "webchat",
+    )
+    .await;
+    let backend = Sent {
+        down: Some("webchat"),
+        ..Sent::default()
+    };
+    deliver_pending(s, &backend, None).await;
+    assert!(backend.sent.lock().unwrap().is_empty());
+    assert!(s.work_outbox_pending().await.unwrap().is_empty());
+    let read = s
+        .work_outbox_for_conversation(&conv.id.to_string(), 100)
+        .await
+        .unwrap();
+    assert_eq!(read.len(), 1);
+    assert_eq!(read[0].id, row.id);
+    assert!(read[0].delivered_at.is_some());
+    deliver_pending(s, &backend, None).await;
+    assert_eq!(
+        s.work_outbox_for_conversation(&conv.id.to_string(), 100)
+            .await
+            .unwrap(),
+        read
+    );
+    assert!(
+        s.conversations()
+            .get(conv.id)
+            .await
+            .unwrap()
+            .messages
+            .is_empty(),
+        "notice reads must not rewrite model history"
     );
 }

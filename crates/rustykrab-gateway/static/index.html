@@ -812,6 +812,7 @@
   let conversations = [];        // [{id, created_at, updated_at, preview}]
   let activeConvId = null;
   let activeMessages = [];
+  let activeWorkNotices = [];
   let isSending = false;
   let streamBuffer = '';
 
@@ -1084,17 +1085,39 @@
 
   async function selectConversation(id) {
     activeConvId = id;
+    activeMessages = [];
+    activeWorkNotices = [];
     renderConversationList();
+    renderMessages();
     try {
       // Messages now live on a dedicated endpoint and arrive in
       // Apollo's flat shape: `{id, conversationId, role, content, createdAt}`.
-      activeMessages = await api(`/api/conversations/${id}/messages`);
+      const messages = await api(`/api/conversations/${id}/messages`);
+      if (id !== activeConvId) return;
+      activeMessages = messages;
       renderMessages();
+      await refreshWorkNotices();
     } catch {
+      if (id !== activeConvId) return;
       activeMessages = [];
+      activeWorkNotices = [];
       renderMessages();
     }
   }
+
+  async function refreshWorkNotices() {
+    if (!token || !activeConvId || isSending || document.hidden) return;
+    const id = activeConvId;
+    try {
+      const rows = await api(`/api/conversations/${id}/work-notices`);
+      if (id !== activeConvId || isSending) return;
+      // Delivery timestamps can change without creating a new visible notice.
+      if (JSON.stringify(rows.map(({id, body}) => ({id, body}))) === JSON.stringify(activeWorkNotices.map(({id, body}) => ({id, body})))) return;
+      activeWorkNotices = rows;
+      renderMessages();
+    } catch { /* Keep the last successful notice view for a retry. */ }
+  }
+  setInterval(refreshWorkNotices, 5000);
 
   async function deleteConversation(id) {
     try {
@@ -1104,6 +1127,7 @@
     if (activeConvId === id) {
       activeConvId = null;
       activeMessages = [];
+      activeWorkNotices = [];
       showEmptyState();
     }
     renderConversationList();
@@ -1292,7 +1316,10 @@
   }
 
   function renderMessages() {
-    if (activeMessages.length === 0) {
+    const displayed = [...activeMessages, ...activeWorkNotices.map(r => ({
+      role: 'assistant', content: '[Work update]\n' + r.body, createdAt: Date.parse(r.created_at)
+    }))].sort((a, b) => new Date(a.createdAt || a.created_at) - new Date(b.createdAt || b.created_at));
+    if (displayed.length === 0) {
       emptyState.style.display = 'flex';
       msgContainer.style.display = 'none';
     } else {
@@ -1303,7 +1330,7 @@
     toolbarTitle.textContent = activeConvId ? 'Conversation' : 'RustyKrab';
 
     msgContainer.innerHTML = '';
-    for (const msg of activeMessages) {
+    for (const msg of displayed) {
       if (msg.role === 'system' || msg.role === 'tool') continue;
       // Apollo messages carry plain-string content; tool calls and
       // tool results are rendered as `[tool_call:name(...)]` /

@@ -930,3 +930,8 @@ An index orders creation and a partial unique expression index allows only
 one nonterminal cycle. Work/proposal pointers deliberately have no FK so
 archival preserves auditability. Published proposals use the existing
 proposals/proposal_evidence/expectation_metrics and probation tables.
+
+WebChat work notices reuse `work_outbox`: a bounded read joins each live parent
+work item's `origin_conversation_id`, includes due consumed rows, and keeps the
+model transcript separate. No table or column is added. The history window is
+100 notices for live work; archived work remains on its archive receipt surface.

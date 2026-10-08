@@ -926,6 +926,27 @@ pub(super) fn outbox_pending(conn: &Connection) -> Result<Vec<OutboxRow>, WorkSt
     )
 }
 
+/// Bounded WebChat notice history for work owned by this conversation.
+/// Reads include consumed notices, and never deliver or advance work.
+pub(super) fn outbox_for_conversation(
+    conn: &Connection,
+    conversation: &str,
+    limit: usize,
+) -> Result<Vec<OutboxRow>, WorkStoreError> {
+    let mut rows = collect(
+        conn,
+        "SELECT o.id,o.parent,o.origin,o.channel,o.body,o.created_at,o.delivered_at
+         FROM work_outbox o JOIN work_items w ON w.id=o.parent
+         WHERE w.origin_conversation_id=?1 AND o.channel='webchat'
+           AND (o.not_before IS NULL OR o.not_before<=?2)
+         ORDER BY o.created_at DESC,o.rowid DESC LIMIT ?3",
+        params![conversation, ts(&Utc::now()), limit.min(100) as i64],
+        outbox_from_row,
+    )?;
+    rows.reverse();
+    Ok(rows)
+}
+
 pub(super) fn outbox_mark_delivered(
     conn: &Connection,
     id: &str,
