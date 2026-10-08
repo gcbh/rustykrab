@@ -107,3 +107,14 @@ run work branches. Project-scoped rehydration now chooses their verified ancestr
 chain, freezes context with the lease and refuses missing/divergent bases. Real
 git/SQLite tests confirm code and corrected decisions survive a runtime switch,
 fresh controller and archived task rows. Repository HEAD remains untouched.
+
+
+## Work-manager review (2026-10-08)
+
+Against v6 base `3e85f48`, the five-entry-point claim was an undercount:
+`rustykrab-cli/src/task_queue.rs::process_task` still calls `save_turn`. The
+current count is six, and centralizing new managed work does not remove the
+legacy turn paths. A direct runtime `prepare_agent` test now covers the manager's
+capability ceiling; this narrows rather than closes the prompt-assembly coverage
+finding. Service observations use cached host probes and controller-owned work
+receipts; no second scheduling or completion authority is added.

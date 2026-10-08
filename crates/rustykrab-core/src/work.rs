@@ -1055,6 +1055,61 @@ pub struct WorkItemDraft {
     pub review_tier: Option<ReviewTier>,
 }
 
+/// Resource requirements frozen with a schedule, then validated by the same
+/// controller as conversational work at every firing. No credential or executable
+/// command lives here: registered adapters own execution.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CronExecution {
+    pub budget: Option<Budget>,
+    pub kind: Option<WorkKind>,
+    pub done_when: Option<String>,
+    #[serde(default)]
+    pub worker_kind: WorkerKind,
+    #[serde(default)]
+    pub required_tools: Vec<String>,
+    #[serde(default)]
+    pub required_mcp_servers: Vec<String>,
+    #[serde(default)]
+    pub writable_resources: Vec<String>,
+    #[serde(default)]
+    pub artifact_refs: Vec<ArtifactRef>,
+    #[serde(default)]
+    pub constraints: Vec<String>,
+}
+impl CronExecution {
+    pub fn validate(&self) -> crate::Result<()> {
+        if self
+            .budget
+            .is_some_and(|b| b.iterations == 0 || b.tokens == 0 || b.wall_seconds == 0)
+        {
+            return Err(crate::Error::Config(
+                "Scheduled execution budget must be finite and positive.".into(),
+            ));
+        }
+
+        if !matches!(
+            self.kind,
+            None | Some(WorkKind::Personal | WorkKind::Research | WorkKind::Code)
+        ) {
+            return Err(crate::Error::Config(
+                "scheduled execution kind must be personal, research or code".into(),
+            ));
+        }
+        let bytes = serde_json::to_vec(self).map_err(|e| crate::Error::Config(e.to_string()))?;
+        if bytes.len() > 16_384
+            || self.required_tools.len() > 64
+            || self.artifact_refs.len() > 32
+            || self.writable_resources.len() > 32
+        {
+            return Err(crate::Error::Config(
+                "scheduled resource requirements exceed their bound".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// An edge in a `work_plan` call, in `work_item_deps` row shape.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlanEdge {

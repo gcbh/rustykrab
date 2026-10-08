@@ -25,7 +25,29 @@ impl ModelProvider for Unused {
     }
 }
 
+struct ResourceFixture;
+impl crate::resources::ResourceObserver for ResourceFixture {
+    fn services(&self) -> Vec<crate::resources::ServiceObservation> {
+        vec![]
+    }
+    fn registered(&self, id: &str) -> bool {
+        id == "fixture"
+    }
+}
+
 async fn serve() -> (
+    String,
+    reqwest::Client,
+    rustykrab_store::Store,
+    Arc<Controller>,
+    tokio::task::JoinHandle<()>,
+) {
+    serve_mode(false).await
+}
+
+async fn serve_mode(
+    manager: bool,
+) -> (
     String,
     reqwest::Client,
     rustykrab_store::Store,
@@ -40,15 +62,18 @@ async fn serve() -> (
         ControllerConfig::default(),
     ));
     control.tick().await.unwrap();
-    let app = crate::router(
-        AppState::new(
-            store.clone(),
-            vec![],
-            Arc::new(Unused),
-            "test-monitor-token".into(),
-        )
-        .with_control(control.clone()),
-    );
+    let mut state = AppState::new(
+        store.clone(),
+        vec![],
+        Arc::new(Unused),
+        "test-monitor-token".into(),
+    )
+    .with_control(control.clone());
+    state.agent.work_manager = manager;
+    if manager {
+        state.resources = Some(Arc::new(ResourceFixture));
+    }
+    let app = crate::router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     let task = tokio::spawn(async move {
@@ -301,5 +326,113 @@ async fn old_or_absent_worker_checks_do_not_read_as_current_health() {
         assert_eq!(health_of(&alerts), "degraded");
         assert!(alerts.iter().any(|a| a.code == "worker_check_stale"));
     }
+    task.abort();
+}
+
+#[tokio::test]
+async fn manager_schedule_and_service_commands_share_auth_origin_and_durable_queue() {
+    let (base, client, store, control, task) = serve_mode(true).await;
+    let schedule = format!("{base}/api/schedules");
+    assert_eq!(
+        client
+            .get(&schedule)
+            .header("Origin", &base)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let body = json!({"schedule":"0 9 * * *","task":"Perform the scheduled task","timezone":"America/Los_Angeles","execution":{"kind":"research","worker_kind":"codex"}});
+    assert_eq!(
+        client
+            .post(&schedule)
+            .bearer_auth("test-monitor-token")
+            .header("Origin", "https://outside.example")
+            .json(&body)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    let r = client
+        .post(&schedule)
+        .bearer_auth("test-monitor-token")
+        .header("Origin", &base)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::CREATED);
+    let job: rustykrab_store::ScheduledJob = r.json().await.unwrap();
+    assert_eq!(
+        job.execution.as_ref().unwrap().worker_kind,
+        rustykrab_core::work::WorkerKind::Codex
+    );
+    assert!(
+        store.jobs().work_item_id(&job.id).await.unwrap().is_none(),
+        "Creating a schedule must not immediately execute it"
+    );
+    let before = control.loop_status().unwrap();
+    let r = client
+        .get(format!("{schedule}/{}", job.id))
+        .bearer_auth("test-monitor-token")
+        .header("Origin", &base)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    assert_eq!(control.loop_status().unwrap(), before);
+    let r = client
+        .post(format!("{schedule}/{}/enabled", job.id))
+        .bearer_auth("test-monitor-token")
+        .header("Origin", &base)
+        .json(&json!({"enabled":false}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    assert!(!store.jobs().get_job(&job.id).await.unwrap().enabled);
+    let actions = format!("{base}/api/resources/fixture/actions");
+    assert_eq!(
+        client
+            .post(&actions)
+            .bearer_auth("test-monitor-token")
+            .json(&json!({"action":"restart"}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    let r = client
+        .post(&actions)
+        .bearer_auth("test-monitor-token")
+        .header("Origin", &base)
+        .json(&json!({"action":"ensure_running"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::ACCEPTED);
+    let receipt: rustykrab_core::work::PlanOutcome = r.json().await.unwrap();
+    let rustykrab_core::work::PlanOutcome::Accepted(a) = receipt else {
+        panic!("refused")
+    };
+    let saved = store.work_get(&a.root).await.unwrap().unwrap();
+    assert!(!saved.status.is_closed());
+    assert!(store.work_lease_history(&a.root).await.unwrap().is_empty());
+    assert_eq!(
+        client
+            .post(&actions)
+            .bearer_auth("test-monitor-token")
+            .header("Origin", &base)
+            .json(&json!({"action":"shell","command":"touch /tmp/file"}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
     task.abort();
 }

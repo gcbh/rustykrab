@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Opt-in conversational work manager with resource census, native Claude/Codex
+  coding assignments, questions and durable project references.
+- Resource-aware cron execution requirements persisted with each schedule;
+  managed firings use the existing controller, leases, verification and run history.
+- Registered launchd infrastructure monitoring and tracked recovery/restart work,
+  verified against fresh health, kernel executable identity and supervisor ownership.
+- Protected schedule/resource APIs, dashboard controls and Prometheus service and
+  schedule gauges, accessible through the existing private Tailscale gateway.
+
+### Operation
+
+- Enable `RUSTYKRAB_WORK_MANAGER=1` on the manager instance. Service registration
+  is explicit through `RUSTYKRAB_SERVICE_RESOURCES`; other instances retain their
+  schedules, integrations and channel ownership until deliberately migrated.
+- Manager turns can assign work but cannot execute shell/write/message tools.
+  Prior cron outputs remain in authenticated run history and are not copied into
+  new external-runtime briefs.
+
 ## [6.0.0] - 2026-10-06
 
 - Release RustyKrab 6.0 native agent work system (#667)

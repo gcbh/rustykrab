@@ -10,6 +10,7 @@ pub mod push;
 pub mod question_routes;
 pub mod rate_limit;
 mod routes;
+mod schedule_routes;
 mod signal_webhook;
 mod state;
 pub mod tasks;
@@ -20,6 +21,7 @@ pub mod work_routes;
 pub mod worker_routes;
 
 pub use auth::generate_token;
+pub mod resources;
 pub mod run;
 pub use origin::OriginPolicy;
 pub use push::{ApnsClient, ApnsConfig, ApnsEnvironment, PushNotifier};
@@ -73,6 +75,8 @@ pub fn router(state: AppState) -> Router {
         .merge(routes::api_routes())
         .merge(version_route::routes())
         .merge(monitor_routes::routes())
+        .merge(resources::routes())
+        .merge(schedule_routes::routes())
         .merge(project_routes::routes())
         .merge(work_routes::routes())
         .merge(worker_routes::routes())

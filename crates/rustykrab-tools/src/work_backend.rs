@@ -251,7 +251,7 @@ where
 }
 
 /// Provenance as the host sees it for the current call.
-pub(crate) fn host_provenance() -> Provenance {
+pub fn host_provenance() -> Provenance {
     let run = with_work_run(WorkRunContext::clone);
     Provenance {
         conversation_id: with_session_context(|ctx| ctx.conversation_id.to_string()),

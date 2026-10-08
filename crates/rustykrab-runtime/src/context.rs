@@ -27,6 +27,8 @@ use uuid::Uuid;
 /// Cheap to clone — every field is an `Arc`, a handle, or a flag.
 #[derive(Clone)]
 pub struct AgentContext {
+    /// Interactive turns manage durable work instead of executing it directly.
+    pub work_manager: bool,
     pub store: Store,
     pub tools: Vec<Arc<dyn rustykrab_core::Tool>>,
     pub provider: Arc<dyn ModelProvider>,
@@ -105,6 +107,7 @@ impl AgentContext {
             store.recall_archive(),
         )));
         Self {
+            work_manager: false,
             store,
             tools,
             provider,

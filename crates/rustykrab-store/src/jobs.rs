@@ -19,6 +19,8 @@ const MAX_RUNS_PER_JOB: u32 = 100;
 /// A persisted scheduled job.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScheduledJob {
+    #[serde(default)]
+    pub execution: Option<rustykrab_core::work::CronExecution>,
     pub id: String,
     pub schedule: String,
     pub task: String,
@@ -125,12 +127,47 @@ impl JobStore {
         timezone: &str,
         allow_duplicate: bool,
     ) -> Result<ScheduledJob, Error> {
+        self.create_managed_job(
+            schedule,
+            task,
+            channel,
+            chat_id,
+            thread_id,
+            timezone,
+            allow_duplicate,
+            None,
+        )
+        .await
+    }
+
+    /// Create the schedule and its resource requirements in the same INSERT.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_managed_job(
+        &self,
+        schedule: &str,
+        task: &str,
+        channel: Option<&str>,
+        chat_id: Option<&str>,
+        thread_id: Option<&str>,
+        timezone: &str,
+        allow_duplicate: bool,
+        execution: Option<rustykrab_core::work::CronExecution>,
+    ) -> Result<ScheduledJob, Error> {
+        if let Some(e) = &execution {
+            e.validate()?;
+        }
+        let execution_json = execution
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|e| Error::Config(e.to_string()))?;
         let now = Utc::now();
         let tz = timezone::parse(timezone)?;
         let (one_shot, next_run_at) = parse_schedule(schedule, now, tz)?;
 
         let id = Uuid::new_v4().to_string();
         let job = ScheduledJob {
+            execution,
             id: id.clone(),
             schedule: schedule.to_string(),
             task: task.to_string(),
@@ -162,8 +199,8 @@ impl JobStore {
             }
 
             conn.execute(
-                "INSERT INTO scheduled_jobs (id, schedule, task, channel, chat_id, thread_id, one_shot, enabled, next_run_at, last_run_at, created_at, conversation_id, created_version, timezone)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                "INSERT INTO scheduled_jobs (id, schedule, task, channel, chat_id, thread_id, one_shot, enabled, next_run_at, last_run_at, created_at, conversation_id, created_version, timezone, execution_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
                 params![
                     row.id,
                     row.schedule,
@@ -179,6 +216,7 @@ impl JobStore {
                     row.conversation_id,
                     row.created_version,
                     row.timezone,
+                    execution_json,
                 ],
             )
             .map_err(|e| Error::Storage(e.to_string()))?;
@@ -515,11 +553,24 @@ impl JobStore {
 /// Column list for `SELECT`s against `scheduled_jobs`. Kept in sync with
 /// [`row_to_job`].
 const JOB_COLUMNS: &str = "id, schedule, task, channel, chat_id, thread_id, one_shot, enabled, \
-     next_run_at, last_run_at, created_at, conversation_id, created_version, timezone";
+     next_run_at, last_run_at, created_at, conversation_id, created_version, timezone, execution_json";
 
 /// Decode a row produced by a `SELECT {JOB_COLUMNS}` into a [`ScheduledJob`].
 fn row_to_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<ScheduledJob> {
+    let execution = row
+        .get::<_, Option<String>>(14)?
+        .map(|v| {
+            serde_json::from_str::<rustykrab_core::work::CronExecution>(&v).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    14,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })
+        })
+        .transpose()?;
     Ok(ScheduledJob {
+        execution,
         id: row.get(0)?,
         schedule: row.get(1)?,
         task: row.get(2)?,
@@ -1436,5 +1487,88 @@ mod tests {
             runs[0].finished_at.timestamp(),
             (base + chrono::Duration::seconds((MAX_RUNS_PER_JOB + 9) as i64)).timestamp()
         );
+    }
+}
+
+#[cfg(test)]
+mod managed_schedule_tests {
+    use super::*;
+    use rustykrab_core::work::{CronExecution, WorkKind, WorkerKind};
+    #[tokio::test]
+    async fn scheduled_requirements_survive_reopen_and_conflicting_creation_preserves_original() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let execution = CronExecution {
+            kind: Some(WorkKind::Code),
+            worker_kind: WorkerKind::Codex,
+            writable_resources: vec!["repo:/project".into()],
+            ..Default::default()
+        };
+        let id = {
+            let store = crate::Store::open(&path, vec![7; 32]).unwrap();
+            let job = store
+                .jobs()
+                .create_managed_job(
+                    "0 9 * * *",
+                    "Build next authorized slice",
+                    None,
+                    None,
+                    None,
+                    "America/Los_Angeles",
+                    false,
+                    Some(execution.clone()),
+                )
+                .await
+                .unwrap();
+            assert!(matches!(
+                store
+                    .jobs()
+                    .create_managed_job(
+                        "0 10 * * *",
+                        "Build next authorized slice",
+                        None,
+                        None,
+                        None,
+                        "UTC",
+                        false,
+                        Some(CronExecution::default())
+                    )
+                    .await,
+                Err(Error::AlreadyExists(_))
+            ));
+            job.id
+        };
+        let store = crate::Store::open(&path, vec![7; 32]).unwrap();
+        let saved = store.jobs().get_job(&id).await.unwrap();
+        assert_eq!(saved.execution, Some(execution));
+        assert_eq!(saved.schedule, "0 9 * * *");
+        assert_eq!(saved.timezone, "America/Los_Angeles");
+    }
+    #[tokio::test]
+    async fn malformed_requirements_fail_closed_instead_of_using_an_unconstrained_worker() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::Store::open(dir.path(), vec![7; 32]).unwrap();
+        let job = store
+            .jobs()
+            .create_job("0 9 * * *", "task", None, None, None, "UTC", false)
+            .await
+            .unwrap();
+        let id = job.id.clone();
+        with_conn(&store.jobs().conn, move |c| {
+            c.execute(
+                "UPDATE scheduled_jobs SET execution_json='broken' WHERE id=?1",
+                [id],
+            )
+            .map_err(|e| Error::Storage(e.to_string()))?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert!(store.jobs().get_job(&job.id).await.is_err());
+        assert!(store
+            .jobs()
+            .get_due_jobs(Utc::now() + chrono::TimeDelta::days(2))
+            .await
+            .is_err());
     }
 }

@@ -308,10 +308,11 @@ impl WorkerRegistry {
     pub async fn local_name(&self) -> Result<String, Error> {
         let _naming = self.naming.lock().await;
         let rows = self.store.workers().list().await?;
-        if let Some(row) = rows
-            .iter()
-            .find(|r| r.kind() == Some(WorkerKind::Local) && r.config["role"] != "planner")
-        {
+        if let Some(row) = rows.iter().find(|r| {
+            r.kind() == Some(WorkerKind::Local)
+                && r.config["role"] != "planner"
+                && r.config["role"] != "infrastructure"
+        }) {
             return Ok(row.name.clone());
         }
         self.assign_name(None).await

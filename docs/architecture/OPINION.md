@@ -36,18 +36,21 @@ That is rare and it is what makes 84k lines reviewable at all.
 Ranked by how much I want each addressed. No live user-facing bug survives
 from the first pass.
 
-### 1. The turn sequence remains duplicated across five entry points — **structural, measured**
+### 1. The turn sequence remains duplicated across six entry points — **structural, measured**
 
 Follow-up against `0b565fd`: shared interactive setup, Telegram/Slack admission
 journaling and reset generations, and partial HTTP/SSE persistence now address
 specific lifecycle defects; see [outcome history](05-first-pass-outcome.md#interactive-continuity-follow-up).
 The broader duplication finding remains open: the channel transaction is not unified.
-The 2026-10-02 review finds five entry points; the old task_queue module is gone.
+Correction against v6 base `3e85f48`: the earlier five-entry-point measurement omitted
+`rustykrab-cli/src/task_queue.rs::process_task`, which still persists a turn.
+There are six entry points; the task queue was not removed.
 
 Load conversation → snapshot persisted ids → append user message → run with a
 heartbeat → `save_turn` → extract the reply → map failure to a user string.
 It appears in `process_telegram_message`, `process_slack_message`,
-`send_message`, `send_message_stream`, and the delegated-task worker in `gateway/src/tasks.rs`.
+`send_message`, `send_message_stream`, the delegated-task worker in `gateway/src/tasks.rs`,
+and the CLI task-queue worker.
 
 This is the highest-value remaining item, and unlike most duplication
 findings it has already produced a defect rather than merely threatening to:
@@ -90,8 +93,10 @@ That is not a coincidence.
 
 The original zero-test finding is retired in the [outcome history](05-first-pass-outcome.md#interactive-continuity-follow-up):
 base `0b565fd` already had 14 distillation tests, and this follow-up adds three
-channel lifecycle tests. Prompt assembly and capability derivation still rely
-on indirect gateway/evaluation coverage. That narrower gap remains open.
+channel lifecycle tests. The work-manager follow-up adds a direct `prepare_agent` test of capability
+derivation, including denial of dynamically disclosed execution tools. Other
+prompt-assembly behaviour still relies on indirect gateway/evaluation coverage.
+That narrower gap remains open.
 
 ### 4. `memory_links` has no foreign keys — **minor, unchanged**
 

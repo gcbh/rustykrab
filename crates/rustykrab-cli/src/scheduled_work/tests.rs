@@ -474,3 +474,133 @@ fn the_firing_prompt_says_where_the_summary_goes() {
     assert!(again.contains("due again"));
     assert!(again.contains("result_report summary IS the deliverable"));
 }
+
+struct NativeJobWorker {
+    briefs: Arc<Mutex<Vec<Brief>>>,
+}
+#[async_trait]
+impl rustykrab_control::worker::Worker for NativeJobWorker {
+    fn name(&self) -> &str {
+        "native-codex"
+    }
+    fn kind(&self) -> rustykrab_core::work::WorkerKind {
+        rustykrab_core::work::WorkerKind::Codex
+    }
+    fn capabilities(&self) -> rustykrab_control::worker::WorkerCapabilities {
+        Default::default()
+    }
+    async fn run(&self, b: Brief) -> rustykrab_core::Result<rustykrab_core::work::ResultReport> {
+        self.briefs.lock().unwrap().push(b);
+        Ok(rustykrab_core::work::ResultReport {
+            summary: "Scheduled result verified by controller".into(),
+            ..Default::default()
+        })
+    }
+}
+#[tokio::test]
+async fn a_managed_cron_routes_to_its_required_runtime_and_records_once_across_restart() {
+    use rustykrab_core::work::{CronExecution, WorkerKind};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), vec![7; 32]).unwrap();
+    let briefs = Arc::new(Mutex::new(vec![]));
+    let worker = Arc::new(NativeJobWorker {
+        briefs: briefs.clone(),
+    });
+    let clock = Arc::new(ManualClock::new(Utc::now() + TimeDelta::seconds(30)));
+    let control = Arc::new(
+        Controller::new(
+            store.clone(),
+            vec![worker.clone()],
+            ControllerConfig::default(),
+        )
+        .with_clock(clock.clone()),
+    );
+    let state = AppState::new(
+        store.clone(),
+        vec![],
+        Replay::new(vec![]),
+        "test-token".into(),
+    )
+    .with_control(control.clone());
+    let job = store
+        .jobs()
+        .create_managed_job(
+            &(Utc::now() + TimeDelta::seconds(1)).to_rfc3339(),
+            "Complete the explicitly scheduled task",
+            None,
+            None,
+            None,
+            "UTC",
+            true,
+            Some(CronExecution {
+                worker_kind: WorkerKind::Codex,
+                done_when: Some("Return the requested result".into()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+    store
+        .jobs()
+        .record_run(
+            &job.id,
+            "ok",
+            Some("private old output that must not be exported"),
+            Utc::now(),
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+    poll(
+        &state,
+        control.as_ref(),
+        job.next_run_at,
+        TimeDelta::seconds(5),
+    )
+    .await
+    .unwrap();
+    let id = store.jobs().work_item_id(&job.id).await.unwrap().unwrap();
+    poll(
+        &state,
+        control.as_ref(),
+        job.next_run_at,
+        TimeDelta::seconds(5),
+    )
+    .await
+    .unwrap();
+    for _ in 0..100 {
+        control.tick().await.unwrap();
+        if store.work_get(&id).await.unwrap().unwrap().status == Status::Done {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        store.work_get(&id).await.unwrap().unwrap().status,
+        Status::Done
+    );
+    assert_eq!(
+        store.work_lease_history(&id).await.unwrap()[0].lease.worker,
+        "native-codex"
+    );
+    poll(&state, control.as_ref(), Utc::now(), TimeDelta::seconds(5))
+        .await
+        .unwrap();
+    assert!(!store.jobs().get_job(&job.id).await.unwrap().enabled);
+    drop(control);
+    let restarted =
+        Controller::new(store.clone(), vec![worker], ControllerConfig::default()).with_clock(clock);
+    poll(
+        &state,
+        &restarted,
+        Utc::now() + TimeDelta::days(1),
+        TimeDelta::seconds(5),
+    )
+    .await
+    .unwrap();
+    assert_eq!(briefs.lock().unwrap().len(), 1);
+    assert!(!briefs.lock().unwrap()[0]
+        .objective
+        .contains("private old output"));
+    assert_eq!(store.jobs().list_runs(&job.id, 10).await.unwrap().len(), 2);
+}

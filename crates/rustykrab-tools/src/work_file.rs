@@ -17,8 +17,8 @@ use chrono::{DateTime, Utc};
 use rustykrab_core::active_tools::with_session_context;
 use rustykrab_core::types::ToolSchema;
 use rustykrab_core::work::{
-    ArtifactRef, DraftEdge, EdgeKind, FailedCheck, ItemRef, PlanOutcome, RejectionReason, Trigger,
-    WorkItemDraft, WorkKind, WorkerKind,
+    ArtifactRef, Budget, DraftEdge, EdgeKind, FailedCheck, ItemRef, PlanOutcome, RejectionReason,
+    Trigger, WorkItemDraft, WorkKind, WorkerKind,
 };
 use rustykrab_core::{validate_tool_args, Error, Result, Tool, ToolError};
 use serde_json::{json, Map, Value};
@@ -401,6 +401,8 @@ fn take_trigger(obj: &Map<String, Value>, path: &str, out: &mut Vec<Problem>) ->
 /// How a draft may name other items.
 #[derive(Clone, Copy)]
 pub(crate) enum DraftMode<'a> {
+    /// Interactive work manager; code still passes controller authorization.
+    Manager,
     /// `work_file`: one draft, existing items by id only.
     File,
     /// A `discovered` draft in a result: existing items by id, sibling
@@ -417,7 +419,7 @@ fn parse_ref(
     out: &mut Vec<Problem>,
 ) -> Option<ItemRef> {
     let tmps = match mode {
-        DraftMode::File => None,
+        DraftMode::File | DraftMode::Manager => None,
         DraftMode::Discovered { tmps } => Some(tmps),
     };
     match v {
@@ -528,10 +530,13 @@ pub(crate) fn parse_draft(
     if matches!(mode, DraftMode::Discovered { .. }) {
         allowed.push("tmp");
     }
+    if matches!(mode, DraftMode::Manager) {
+        allowed.push("budget");
+    }
     check_keys(obj, &allowed, path, out);
 
     let tmp = match mode {
-        DraftMode::File => None,
+        DraftMode::File | DraftMode::Manager => None,
         DraftMode::Discovered { .. } => take_opt_text(obj, "tmp", path, NAME_MAX, out),
     };
 
@@ -545,6 +550,7 @@ pub(crate) fn parse_draft(
     let kind = match take_opt_text(obj, "kind", path, NAME_MAX, out) {
         None => None,
         Some(raw) => match WorkKind::parse(&raw) {
+            Some(WorkKind::Code) if matches!(mode, DraftMode::Manager) => Some(WorkKind::Code),
             Some(WorkKind::Code) => {
                 out.push(Problem {
                     reason: RejectionReason::KindNotAllowed,
@@ -782,6 +788,15 @@ pub(crate) fn parse_draft(
         }
     };
 
+    let budget = if matches!(mode, DraftMode::Manager) {
+        obj.get("budget").and_then(|v| match serde_json::from_value::<Budget>(v.clone()) {
+            Ok(b) if b.iterations > 0 && b.tokens > 0 && b.wall_seconds > 0 => Some(b),
+            _ => { out.push(Problem::invalid(path,"budget","requires positive iterations, tokens and wall_seconds, plus non-negative repairs")); None }
+        })
+    } else {
+        None
+    };
+
     WorkItemDraft {
         tmp,
         kind,
@@ -800,7 +815,7 @@ pub(crate) fn parse_draft(
         trigger,
         preconditions: Vec::new(),
         expires_at,
-        budget: None,
+        budget,
         priority,
         edges,
         supersedes,
@@ -1000,11 +1015,24 @@ fn reach(backend: &dyn WorkBackend, name: &str) -> Reach {
 /// Files one discovered work item through a [`WorkBackend`].
 pub struct WorkFileTool {
     backend: Arc<dyn WorkBackend>,
+    manager: bool,
 }
 
 impl WorkFileTool {
     pub fn new(backend: Arc<dyn WorkBackend>) -> Self {
-        Self { backend }
+        Self {
+            backend,
+            manager: false,
+        }
+    }
+
+    /// Only the host exposes this tool to the interactive manager. Execution
+    /// workers keep work_file and cannot widen its code-filing contract.
+    pub fn manager(backend: Arc<dyn WorkBackend>) -> Self {
+        Self {
+            backend,
+            manager: true,
+        }
     }
 
     /// Host checks that need the backend: required tools and MCP servers.
@@ -1013,6 +1041,7 @@ impl WorkFileTool {
         for name in &draft.required_tools {
             match reach(self.backend.as_ref(), name) {
                 Reach::Fine => {}
+                Reach::LoadIt if self.manager => {}
                 Reach::LoadIt => out.push(Problem::invalid(
                     "",
                     "required_tools",
@@ -1123,10 +1152,17 @@ fn rejected(failed: Vec<String>) -> Value {
 #[async_trait]
 impl Tool for WorkFileTool {
     fn name(&self) -> &str {
-        "work_file"
+        if self.manager {
+            "work_assign"
+        } else {
+            "work_file"
+        }
     }
 
     fn description(&self) -> &str {
+        if self.manager {
+            return "Assign ONE durable work item to the controller. It selects a suitable available registered worker and verifies the result. Code requires an authorized repository resource and keeps all approval gates. Include project references, observable done_when and explicit constraints. The result is an assignment receipt, not completion.";
+        }
         "File ONE work item that should not be done in this run: follow-up work you found \
          that needs another time, tool, person or worker. Give title, objective and \
          done_when; constraints, decisions and refs are separate short entries, and refs are \
@@ -1137,12 +1173,17 @@ impl Tool for WorkFileTool {
     }
 
     fn schema(&self) -> ToolSchema {
+        let mut properties = draft_properties(false);
+        if self.manager {
+            properties.insert("budget".into(), json!({"type":"object","required":["iterations","tokens","wall_seconds","repairs"],"additionalProperties":false,"properties":{"iterations":{"type":"integer","minimum":1},"tokens":{"type":"integer","minimum":1},"wall_seconds":{"type":"integer","minimum":1},"repairs":{"type":"integer","minimum":0}},"description":"Explicit finite execution envelope; controller approval and caps still apply."}));
+            properties.insert("kind".into(),json!({"type":"string","enum":["personal","research","code","capability","internal"]}));
+        }
         ToolSchema {
             name: self.name().to_string(),
             description: self.description().to_string(),
             parameters: json!({
                 "type": "object",
-                "properties": draft_properties(false),
+                "properties": properties,
                 "required": ["title", "objective", "done_when"],
                 "additionalProperties": false
             }),
@@ -1154,7 +1195,16 @@ impl Tool for WorkFileTool {
         validate_tool_args(&schema.parameters, &args).map_err(Error::ToolExecution)?;
 
         let mut problems = Vec::new();
-        let draft = parse_draft(&args, DraftMode::File, "", &mut problems);
+        let draft = parse_draft(
+            &args,
+            if self.manager {
+                DraftMode::Manager
+            } else {
+                DraftMode::File
+            },
+            "",
+            &mut problems,
+        );
         let waiting_mcp = self.check_capabilities(&draft, &mut problems);
         if !problems.is_empty() {
             return Ok(rejected(problems.iter().map(Problem::line).collect()));
@@ -1605,5 +1655,31 @@ mod tests {
         let tools = crate::work_tools(Arc::new(StubWorkBackend::new()));
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert_eq!(names, ["work_file", "work_status", "result_report"]);
+    }
+}
+
+#[cfg(test)]
+mod manager_assignment_tests {
+    use super::*;
+    use crate::work_backend::{StubWorkBackend, WorkCall};
+    #[tokio::test]
+    async fn manager_assigns_code_but_execution_workers_keep_their_existing_ceiling() {
+        let args = json!({"title":"Implement the change","objective":"Build it","done_when":"Repository checks pass","kind":"code","worker_kind":"codex","writable_resources":["repo:/approved/project"],"budget":{"iterations":10,"tokens":7000,"wall_seconds":60,"repairs":0}});
+        let backend = Arc::new(StubWorkBackend::new());
+        let manager = WorkFileTool::manager(backend.clone());
+        assert_eq!(manager.name(), "work_assign");
+        manager.execute(args.clone()).await.unwrap();
+        assert!(backend.calls().iter().any(|c| matches!(c,WorkCall::File { draft,.. } if draft.kind==Some(WorkKind::Code) && draft.worker_kind==rustykrab_core::work::WorkerKind::Codex && draft.budget.is_some_and(|b| b.tokens == 7000))));
+        let worker = WorkFileTool::new(backend.clone());
+        let before = backend.calls().len();
+        assert!(worker.execute(args).await.is_err());
+        assert_eq!(backend.calls().len(), before);
+        let before = backend.calls().len();
+        let rejected = manager
+            .execute(json!({"title":"t","objective":"o","done_when":"d","status":"done"}))
+            .await
+            .unwrap();
+        assert_eq!(rejected["outcome"], "rejected");
+        assert_eq!(backend.calls().len(), before);
     }
 }

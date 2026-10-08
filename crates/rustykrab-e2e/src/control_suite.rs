@@ -343,7 +343,7 @@ async fn agent_monitor(ctx: &Ctx) -> Result<()> {
     );
     let shell = ctx.client.get(ctx.url("/monitor.html")).send().await?;
     ensure!(
-        shell.status().is_success() && shell.text().await?.contains("Agent monitor"),
+        shell.status().is_success() && shell.text().await?.contains("Work manager"),
         "dashboard is served"
     );
     let script = ctx.client.get(ctx.url("/monitor.js")).send().await?;

@@ -116,4 +116,4 @@ or explicitly state why the change does not affect documented architecture.
 - **Adapter structs** (`rustykrab-cli/src/main.rs`): Bridge concrete implementations to tool backend traits where the binary genuinely adds something — `CronAdapter` merges the calling conversation's channel context into cron args, `MessageAdapter` routes by channel name. A pure pass-through is a sign the trait is in the wrong crate.
 - **Background tasks**: `tokio::spawn` with handles stored in `infra_handles` for graceful shutdown.
 - **Database**: SQLite with WAL mode via `rusqlite`. Schema created idempotently in `Store::run_migrations()`.
-- **Config**: Environment variables only (no config files). See README.md for the full list.
+- **Config**: Environment variables select settings; operator-owned files supply harness, profile and optional service resource definitions. See README.md for the full list.

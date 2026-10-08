@@ -51,6 +51,12 @@ pub struct Alert {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct MonitorReply {
+    #[serde(default)]
+    pub work_manager: bool,
+    #[serde(default)]
+    pub services: Vec<crate::resources::ServiceObservation>,
+    #[serde(default)]
+    pub schedules: Vec<rustykrab_store::ScheduledJob>,
     pub version: String,
     pub commit: Option<String>,
     pub controller: Option<LoopStatus>,
@@ -332,8 +338,45 @@ async fn observe(state: &AppState, query: MonitorQuery) -> Result<MonitorReply, 
             ));
         }
     }
+    let services = state
+        .resources
+        .as_ref()
+        .map(|r| r.services())
+        .unwrap_or_default();
+    for service in &services {
+        let stale = service
+            .checked_at
+            .is_none_or(|t| Utc::now() - t > chrono::Duration::seconds(STALE_SECONDS));
+        if service.healthy != Some(true) || !service.supervised || stale {
+            alerts.push(alert(
+                "warning",
+                "service_unhealthy",
+                format!(
+                    "Service {}: {}{}",
+                    service.id,
+                    service.detail,
+                    if stale {
+                        " (observation stale or absent)"
+                    } else {
+                        ""
+                    }
+                ),
+                None,
+                None,
+            ));
+        }
+    }
     let health = health_of(&alerts).into();
     Ok(MonitorReply {
+        work_manager: state.agent.work_manager,
+        services,
+        schedules: state
+            .agent
+            .store
+            .jobs()
+            .list_jobs()
+            .await
+            .map_err(|e| e.to_string())?,
         version: state.build.version.clone(),
         commit: state.build.commit.clone(),
         controller,
@@ -381,6 +424,24 @@ fn exposition(reply: &MonitorReply) -> String {
     ));
     if let Some(d) = &reply.dreaming {
         s.push_str(&format!("rustykrab_dreaming_enabled {}\nrustykrab_dreaming_reviews_completed {}\nrustykrab_dreaming_reviews_failed {}\nrustykrab_dreaming_reviews_pending {}\nrustykrab_dreaming_projects_eligible {}\nrustykrab_dreaming_projects_reviewed {}\nrustykrab_dreaming_proposals {}\nrustykrab_dreaming_outcomes_measured {}\nrustykrab_dreaming_tokens {}\n",u8::from(d.enabled),d.metrics.completed,d.metrics.failed,d.metrics.pending,d.metrics.eligible_projects,d.metrics.reviewed_projects,d.metrics.proposal_count,d.metrics.measured_outcomes,d.metrics.tokens));
+    }
+    s.push_str(&format!(
+        "rustykrab_work_manager_enabled {}\n",
+        u8::from(reply.work_manager)
+    ));
+    for service in &reply.services {
+        let id = label(&service.id);
+        s.push_str(&format!("rustykrab_service_healthy{{service=\"{id}\"}} {}\nrustykrab_service_supervised{{service=\"{id}\"}} {}\nrustykrab_service_identity_verified{{service=\"{id}\"}} {}\n", u8::from(service.healthy == Some(true)), u8::from(service.supervised), u8::from(service.identity_verified)));
+        if let Some(at) = service.checked_at {
+            s.push_str(&format!(
+                "rustykrab_service_last_check_seconds{{service=\"{id}\"}} {}\n",
+                at.timestamp()
+            ));
+        }
+    }
+    for job in &reply.schedules {
+        let id = label(&job.id);
+        s.push_str(&format!("rustykrab_schedule_enabled{{schedule=\"{id}\"}} {}\nrustykrab_schedule_next_run_seconds{{schedule=\"{id}\"}} {}\n", u8::from(job.enabled), job.next_run_at.timestamp()));
     }
     s.push_str("# TYPE rustykrab_work_items gauge\n");
     for (status, count) in &reply.work.counts {
