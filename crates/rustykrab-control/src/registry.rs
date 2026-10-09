@@ -312,6 +312,7 @@ impl WorkerRegistry {
             r.kind() == Some(WorkerKind::Local)
                 && r.config["role"] != "planner"
                 && r.config["role"] != "infrastructure"
+                && r.config["role"] != "integrations"
         }) {
             return Ok(row.name.clone());
         }
@@ -1158,23 +1159,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_standalone_planner_does_not_take_the_local_execution_name() {
+    async fn reserved_adapters_do_not_take_the_local_execution_name() {
         let (_dir, store) = temp_store();
         let registry = WorkerRegistry::new(store.clone());
-        registry
-            .register(
-                Arc::new(Named {
-                    name: "planner".into(),
-                    kind: WorkerKind::Local,
-                    repos: Vec::new(),
-                    token: None,
-                    refreshes: std::sync::atomic::AtomicUsize::new(0),
-                }),
-                serde_json::json!({"role":"planner"}),
-                None,
-            )
-            .await
-            .unwrap();
+        for role in ["planner", "infrastructure", "integrations"] {
+            registry
+                .register(
+                    Arc::new(Named {
+                        name: role.into(),
+                        kind: WorkerKind::Local,
+                        repos: Vec::new(),
+                        token: None,
+                        refreshes: std::sync::atomic::AtomicUsize::new(0),
+                    }),
+                    serde_json::json!({"role":role}),
+                    None,
+                )
+                .await
+                .unwrap();
+        }
         assert_eq!(registry.local_name().await.unwrap(), "snapper");
         let restarted = WorkerRegistry::new(store);
         assert_eq!(restarted.local_name().await.unwrap(), "snapper");

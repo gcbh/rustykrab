@@ -942,3 +942,20 @@ Automatic browser access through explicitly allowed Tailscale Serve owners uses
 Principal::Tailnet and existing string actor/author audit fields. It adds no
 session, token, cookie, table or migration. Device pairing rows and revocation
 remain the bearer-client fallback. View disconnect clears browser access only.
+
+## Instance consolidation receipts
+
+`store.db.instance_imports`: `source TEXT PRIMARY KEY`, `fingerprint TEXT`,
+`report TEXT`, `imported_at TEXT`, all required. One receipt guards a whole
+source merge and records disabled schedule intent, inserted/reused counts,
+integer-ID offsets, retired notices and re-encrypted payload counts.
+
+`work_outbox.retired_at` is nullable and separate from `delivered_at`. Historical
+imported notices remain inspectable but are excluded from pending delivery,
+coalescing and backlog metrics. Retirement does not attest a delivery.
+
+`memory.db.memory_imports`: `source TEXT PRIMARY KEY`, `fingerprint TEXT`,
+`report TEXT`, all required. It records the destination agent and per-table
+counts. Imported memories retain IDs and lifecycle/validity, with source and
+original agent in metadata. Both ledgers reject changed replays. Runtime worker
+registrations, routing defaults, live leases and pairing codes are not merged.

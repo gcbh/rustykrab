@@ -387,7 +387,7 @@ impl GmailTool {
         select_mailbox(session, mailbox).await?;
 
         let fetches: Vec<async_imap::types::Fetch> = session
-            .uid_fetch(uid.to_string(), "(UID RFC822 FLAGS ENVELOPE)")
+            .uid_fetch(uid.to_string(), "(UID BODY.PEEK[] FLAGS ENVELOPE)")
             .await
             .map_err(|e| Error::ToolExecution(format!("fetch uid {uid} failed: {e}").into()))?
             .try_collect()
@@ -742,7 +742,7 @@ impl GmailTool {
         select_mailbox(session, mailbox).await?;
 
         let fetches: Vec<async_imap::types::Fetch> = session
-            .uid_fetch(uid.to_string(), "(UID RFC822)")
+            .uid_fetch(uid.to_string(), "(UID BODY.PEEK[])")
             .await
             .map_err(|e| Error::ToolExecution(format!("fetch uid {uid} failed: {e}").into()))?
             .try_collect()
@@ -924,7 +924,7 @@ impl GmailTool {
         select_mailbox(session, mailbox).await?;
 
         let fetches: Vec<async_imap::types::Fetch> = session
-            .uid_fetch(uid.to_string(), "(UID RFC822)")
+            .uid_fetch(uid.to_string(), "(UID BODY.PEEK[])")
             .await
             .map_err(|e| Error::ToolExecution(format!("fetch uid {uid} failed: {e}").into()))?
             .try_collect()

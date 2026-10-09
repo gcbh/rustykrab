@@ -55,7 +55,7 @@ pub(super) const PLAN_COLUMNS: &str =
     "id, root, filed_by, rationale, approval_question, policy, created_at";
 
 pub(super) const OUTBOX_COLUMNS: &str =
-    "id, parent, origin, channel, body, created_at, delivered_at";
+    "id, parent, origin, channel, body, created_at, delivered_at, retired_at";
 
 pub(super) const ARCHIVE_COLUMNS: &str = "id, kind, title, parent, status, status_reason, \
      worker, cost, closed_at, archived_at, summary, edges";
@@ -263,6 +263,9 @@ pub(super) fn outbox_from_row(row: &Row) -> rusqlite::Result<OutboxRow> {
         // A delivery stamp that does not parse still means delivered: a
         // notice must not be sent twice because a timestamp is damaged.
         delivered_at: delivered_raw.map(|raw| parse_ts(&raw).unwrap_or_default()),
+        retired_at: row
+            .get::<_, Option<String>>("retired_at")?
+            .map(|raw| parse_ts(&raw).unwrap_or_default()),
     })
 }
 

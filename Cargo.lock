@@ -4178,6 +4178,7 @@ dependencies = [
  "chrono",
  "dirs",
  "enigo",
+ "hex",
  "libc",
  "reqwest 0.13.3",
  "rpassword",
@@ -4204,6 +4205,7 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "xcap",
+ "zeroize",
 ]
 
 [[package]]

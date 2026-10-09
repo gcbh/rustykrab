@@ -121,7 +121,7 @@ impl Store {
             events.reverse();
             let total_live = count(conn, "SELECT COUNT(*) FROM work_items")?;
             let oldest: Option<String> = conn.query_row(
-                "SELECT MIN(COALESCE(not_before, created_at)) FROM work_outbox WHERE delivered_at IS NULL", [], |r| r.get(0)
+                "SELECT MIN(COALESCE(not_before, created_at)) FROM work_outbox WHERE delivered_at IS NULL AND retired_at IS NULL", [], |r| r.get(0)
             )?;
             Ok(WorkMonitorSnapshot {
                 captured_at: Utc::now(),
@@ -135,7 +135,7 @@ impl Store {
                 items, events,
                 event_cursor: ops::events_last_id(conn)?,
                 pending_questions: count(conn, "SELECT COUNT(*) FROM questions WHERE status = 'open'")?,
-                pending_notices: count(conn, "SELECT COUNT(*) FROM work_outbox WHERE delivered_at IS NULL")?,
+                pending_notices: count(conn, "SELECT COUNT(*) FROM work_outbox WHERE delivered_at IS NULL AND retired_at IS NULL")?,
                 oldest_pending_notice: oldest.as_deref().and_then(rows::parse_ts),
             })
         }).await

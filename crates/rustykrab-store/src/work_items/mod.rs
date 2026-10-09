@@ -280,6 +280,9 @@ pub struct OutboxRow {
     pub body: String,
     pub created_at: DateTime<Utc>,
     pub delivered_at: Option<DateTime<Utc>>,
+    /// Imported history deliberately excluded from delivery; never a delivery claim.
+    #[serde(default)]
+    pub retired_at: Option<DateTime<Utc>>,
 }
 
 /// One `work_item_archive` row: what is left of a compacted item.

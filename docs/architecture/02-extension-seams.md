@@ -258,3 +258,12 @@ process identity reuses update_cmd::apply::Processes and its kernel inspection.
 CronBackend's defaulted create_managed_job rejects unsupported requirements.
 The manager work_assign variant reuses WorkBackend and task-local host provenance.
 These changes add no crate, dependency edge or separate execution queue.
+
+## Offline instance consolidation
+
+The composition root stages normalized private snapshots and calls Store and
+Memory's owned import methods. Neither crate depends on the other. Extending
+the store's recognized table list is explicit and tested; unknown tables stop
+the merge. The integration worker uses the existing Worker and Tool seams,
+with action-level restrictions and execution observations in the host adapter.
+It adds no scheduler, channel loop or credential transport.
