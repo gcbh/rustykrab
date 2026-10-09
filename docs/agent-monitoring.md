@@ -1,28 +1,43 @@
-# Agent monitoring
+# Viewing your systems
 
-Run the daemon from this checkout and open `/monitor.html` on its gateway
-(default `http://127.0.0.1:3000/monitor.html`). The Chat page also links to
-Agent monitor. A new remote browser can connect with a one-time pairing code.
-An operator runs `rustykrab pair` on the daemon host (for the separate M4
-service, `~/.local/bin/rustykrab-agents pair`) and gives the eight-character
-code to the user. Enter it under **One-time pairing code**, name the device,
-and choose **Pair and connect**. The code expires in five minutes and is
-consumed once. The browser exchanges it at the existing `/api/pair` route
-and stores its revocable device token in session storage before loading the
-monitor; no token is put in a URL or shown in page text. An operator can revoke
-the device through `DELETE /api/devices/{id}`. Pairing still requires an
-allowed Origin and is rate-limited.
+Open the work manager's private Tailscale HTTPS address on your phone or computer.
+Turn on Tailscale using the account your operator has allowed. Chat and
+**Work manager** connect automatically and show “Connected with Tailscale”
+plus that account. Navigate between them with the header links. No daemon token,
+pairing code, browser credential, or new session is needed for this access mode.
 
-Under **Already have an authentication token?**, a daemon, device, or existing
-Chat token can also be used. Tokens stay in session storage and request headers.
+If the connection cannot be verified, the page explains how to connect Tailscale
+and offers **Connect** to retry. A rejected identity never receives system data.
+Tagged Tailscale devices do not supply user identity; use device pairing there.
+**Disconnect this view** hides the browser view and clears its saved access.
+It does not stop agents, revoke other clients, or rotate the daemon's master
+token. **Connect** opens the view again using your verified identity.
 
-The dashboard refreshes every five seconds while visible. It shows registered
-agents, actual assignments, controller ticks, missed heartbeats, blocked
-reasons, recent events, finalized run usage, verified evidence and the latest
-nightly evaluation. Open a work item for its objective, done criteria,
-constraints, errors, recovery attempts and evidence. Pending decisions,
-consents and plan approvals can be answered there. Credentials use their
-existing secure notification page.
+Operators enable this only behind Tailscale Serve, with a pinned private HTTPS
+origin and explicit owners:
+
+    RUSTYKRAB_TAILNET_AUTH_ORIGIN=https://machine.tailnet.ts.net:8443
+    RUSTYKRAB_ALLOWED_ORIGINS=https://machine.tailnet.ts.net:8443
+    RUSTYKRAB_TAILNET_USERS=you@example.com
+
+The CLI listener is always loopback. Auth also checks the actual socket peer,
+the pinned Host authority and one allowed Tailscale-User-Login header. Forwarded
+IP headers cannot establish this trust. Serve strips incoming identity headers
+and supplies the authenticated user; Funnel and tagged-device requests do not
+supply user identity. Only local processes on the Serve host are inside this
+proxy trust boundary. See [Tailscale's identity-header documentation](https://tailscale.com/docs/features/tailscale-serve#identity-headers).
+Empty owner lists fail startup rather than granting access to every tailnet
+member or a shared-device recipient. Commands retain mandatory Origin checks.
+
+## Device pairing fallback
+
+When automatic Tailscale access is unavailable, open **Use a pairing code or
+access token** on either chat or monitoring. Enter the operator-issued,
+five-minute, single-use pairing code and a name for this browser. Both views
+share the returned revocable device token in session storage; no token appears
+in a URL, DOM text or console. Previously saved chat/monitor tokens are migrated
+to that shared session key. Successful Tailscale access removes old token copies
+so an expired pasted token cannot prevent automatic connection.
 
 ## Tailscale HTTPS access
 

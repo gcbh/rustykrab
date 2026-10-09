@@ -5,18 +5,22 @@
 <meta name="referrer" content="same-origin">
 <title>Work manager · RustyKrab</title>
 <link rel="stylesheet" href="/monitor.css">
+<script src="/access.js" defer></script>
 <script src="/monitor.js" defer></script>
 </head>
 <body>
-<header><a class="brand" href="/">◉ <span>RustyKrab</span></a><nav><a href="/">Chat</a><span class="selected">Work manager</span></nav><button id="logout" hidden>Disconnect</button></header>
+<header><a class="brand" href="/">◉ <span>RustyKrab</span></a><nav><a href="/">Chat</a><span class="selected">Work manager</span></nav><span id="accessStatus" role="status"></span><button id="logout" hidden>Disconnect this view</button></header>
 <main>
 <section id="login" class="login card">
 <p class="eyebrow">LOCAL OPERATIONS</p><h1>Your agents, in view.</h1>
-<p>Connect to see agent health, active work, and the evidence behind results.</p>
+<p id="accessMessage" role="status">Checking your Tailscale connection…</p>
+<button id="accessConnect" class="primary">Connect</button>
+<details id="manualAccess"><summary>Use a pairing code or access token</summary>
 <form id="pairForm"><label for="pairCode">One-time pairing code</label><input id="pairCode" type="text" autocomplete="off" autocapitalize="characters" spellcheck="false" maxlength="8" pattern="[A-Za-z2-9]{8}" required placeholder="8-character code"><label for="deviceName">Device name</label><input id="deviceName" maxlength="128" value="Remote agent dashboard" required><button id="pairButton" class="primary">Pair and connect</button></form>
 <p class="note">Enter a code issued by your daemon operator. Codes expire after five minutes and can be used once. Your browser receives its own revocable access token.</p>
 <p id="pairError" role="alert"></p>
 <details id="tokenLogin"><summary>Already have an authentication token?</summary><form id="loginForm"><label for="token">Authentication token</label><input id="token" type="password" autocomplete="off" required placeholder="Enter your daemon or device token"><button class="primary">Connect</button></form></details>
+</details>
 <p id="loginError" role="alert"></p>
 </section>
 <div id="dashboard" hidden>

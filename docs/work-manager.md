@@ -63,9 +63,10 @@ Launchd continues supervising the manager itself.
 
 ## Private access and migration
 
-Expose the manager's loopback port using Tailscale Serve. Use its existing
-revocable device token or one-time pairing; the dashboard keeps tokens in headers
-and browser session storage. Monitoring, resources, schedules and command routes
+Expose the manager's loopback port using Tailscale Serve. Configure automatic browser access with a pinned HTTPS Serve origin and explicit
+Tailscale owners (see docs/agent-monitoring.md). Chat and monitoring then use
+the verified tailnet identity without a browser token. Revocable device tokens
+and one-time pairing remain available as a shared session-storage fallback. Monitoring, resources, schedules and command routes
 retain the gateway's bearer and Origin checks. Prometheus is protected too.
 
 Enabling manager mode does not migrate another instance's cron database,

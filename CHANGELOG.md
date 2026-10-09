@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [6.2.0] - 2026-10-09
+
+- feat: use Tailscale identity for shared browser access (#672)
+
 ## [6.1.3] - 2026-10-08
 
 - fix: refresh infrastructure health and surface WebChat work notices (#671)

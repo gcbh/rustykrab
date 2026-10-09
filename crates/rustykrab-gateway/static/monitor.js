@@ -3,8 +3,8 @@
 (() => {
   const $ = id => document.getElementById(id);
   const closed = new Set(['done', 'failed', 'cancelled', 'expired']);
-  const storageKey = 'rustykrab_monitor_token';
-  let token = '', snapshot = null, pending = false, paused = false, interval = null, generation = 0;
+  const access = window.RustyKrabAccess;
+  let snapshot = null, pending = false, paused = false, interval = null, generation = 0;
   let lastQuestions = '', detailRequest = 0;
   const node = (tag, text, cls) => {
     const e = document.createElement(tag);
@@ -33,20 +33,16 @@
     b.addEventListener('click', () => showDetail(id));
     return b;
   };
-  const safeRead = (storage, key) => { try { return storage.getItem(key) || ''; } catch (_) { return ''; } };
-  const safeWrite = (key, value) => {
-    try { if (value) sessionStorage.setItem(key, value); else sessionStorage.removeItem(key); } catch (_) {}
-  };
   async function api(path, body) {
     const response = await fetch(path, {
       method: body === undefined ? 'GET' : 'POST',
-      headers: { Authorization: 'Bearer ' + token, ...(body === undefined ? {} : { 'Content-Type': 'application/json' }) },
+      headers: { ...access.headers(), ...(body === undefined ? {} : { 'Content-Type': 'application/json' }) },
       body: body === undefined ? undefined : JSON.stringify(body),
       cache: 'no-store',
       signal: AbortSignal.timeout(12000)
     });
     if (response.status === 401) {
-      disconnect('The token was rejected. Connect with your current daemon token.');
+      disconnect('Access has changed. Check Tailscale and reconnect.');
       throw new Error('Authentication required.');
     }
     let data;
@@ -60,7 +56,8 @@
   function disconnect(message = '') {
     generation++; detailRequest++; pending = false;
     clearInterval(interval); interval = null;
-    token = ''; snapshot = null; safeWrite(storageKey, ''); lastQuestions = '';
+    access.disconnect(); snapshot = null; lastQuestions = '';
+    $('accessStatus').textContent = ''; $('accessMessage').textContent = access.message({disconnected: true});
     $('dashboard').hidden = true; $('logout').hidden = true; $('login').hidden = false;
     $('loginError').textContent = message; $('token').value = '';
     $('pairCode').value = ''; $('pairError').textContent = '';
@@ -69,18 +66,26 @@
     $('serviceRows').replaceChildren(); $('scheduleRows').replaceChildren();
     $('dreamRows').replaceChildren(); $('dreamMetrics').replaceChildren(); $('projectRows').replaceChildren(); $('events').replaceChildren(); $('quality').replaceChildren(); $('questionRows').replaceChildren();
   }
-  async function connect(value) {
-    token = value.trim();
-    if (!token) return;
-    generation++; pending = false; lastQuestions = ''; paused = false; $('pause').textContent = 'Pause updates';
-    $('pause').setAttribute('aria-pressed', 'false');
-    $('loginError').textContent = '';
-    clearInterval(interval);
-    await refresh();
-    if (snapshot) {
-      safeWrite(storageKey, token); $('token').value = '';
-      interval = setInterval(() => { if (!paused && !document.hidden) refresh(); }, 5000);
-    }
+  async function connect(automatic = false, operation = () => access.connect(automatic)) {
+    $('accessConnect').disabled = true; $('loginError').textContent = '';
+    try {
+      const result = await operation();
+      $('accessMessage').textContent = access.message(result);
+      if (!result.authenticated) {
+        if (!result.tailscale_enabled && !result.disconnected) $('manualAccess').open = true;
+        return;
+      }
+      $('accessStatus').textContent = access.message(result);
+      generation++; pending = false; lastQuestions = ''; paused = false;
+      $('pause').textContent = 'Pause updates'; $('pause').setAttribute('aria-pressed', 'false');
+      clearInterval(interval);
+      await refresh();
+      if (snapshot) {
+        $('token').value = ''; $('pairCode').value = '';
+        interval = setInterval(() => { if (!paused && !document.hidden) refresh(); }, 5000);
+      }
+    } catch (error) { $('loginError').textContent = error.message; }
+    finally { $('accessConnect').disabled = false; }
   }
   function stat(value, title, caption) {
     const card = node('div', undefined, 'card stat');
@@ -326,7 +331,7 @@
         $('questionRows').append(row);
       }
     } catch (e) {
-      if (requestGeneration === generation && token) {
+      if (requestGeneration === generation && access.connected) {
         $('questions').hidden = false;
         $('questionRows').replaceChildren(node('p', 'Questions could not be refreshed: ' + e.message, 'error'));
         lastQuestions = '';
@@ -334,7 +339,7 @@
     }
   }
   async function refresh() {
-    if (pending || !token) return;
+    if (pending || !access.connected) return;
     pending = true; const g = generation; $('refresh').disabled = true;
     try {
       const reply = await api('/api/monitor');
@@ -385,30 +390,12 @@
   $('pairForm').addEventListener('submit', async e => {
     e.preventDefault();
     if ($('pairButton').disabled) return;
-    $('pairButton').disabled = true; $('pairError').textContent = ''; $('loginError').textContent = '';
-    try {
-      const response = await fetch('/api/pair', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ code: $('pairCode').value.trim().toUpperCase(), deviceName: $('deviceName').value.trim() }),
-        cache: 'no-store', signal: AbortSignal.timeout(12000)
-      });
-      if (!response.ok) throw new Error(response.status === 403
-        ? 'Pairing was refused. The code may have expired or already been used; request a new code.'
-        : 'Pairing could not complete (' + response.status + '). Try again.');
-      const paired = await response.json();
-      if (!/^[0-9a-f]{64}$/.test(paired.deviceToken || '')) throw new Error('The daemon returned an unreadable pairing response.');
-      // Persist before the monitor read: a consumed code cannot return the token again.
-      // The token never enters a URL, DOM text, or console output.
-      safeWrite(storageKey, paired.deviceToken); $('pairCode').value = '';
-      await connect(paired.deviceToken);
-      if (!snapshot && token) $('pairError').textContent = 'Device paired. Refresh this page to retry connecting with its saved token.';
-    } catch (error) {
-      $('pairError').textContent = error.name === 'TimeoutError'
-        ? 'Pairing timed out. If the code was consumed, request a new code.'
-        : error.message;
-    } finally { $('pairButton').disabled = false; }
+    $('pairButton').disabled = true; $('pairError').textContent = '';
+    await connect(false, () => access.pair($('pairCode').value, $('deviceName').value));
+    $('pairButton').disabled = false;
   });
-  $('loginForm').addEventListener('submit', e => { e.preventDefault(); if (!$('pairButton').disabled) connect($('token').value); });
+  $('loginForm').addEventListener('submit', e => { e.preventDefault(); connect(false, () => access.connectToken($('token').value)); });
+  $('accessConnect').addEventListener('click', () => connect());
   $('logout').addEventListener('click', () => disconnect());
   $('dreamNow').addEventListener('click', async () => {
     const g = generation;
@@ -426,6 +413,5 @@
   $('search').addEventListener('input', renderWork); $('status').addEventListener('change', renderWork);
   $('closeDetail').addEventListener('click', () => $('detail').close());
   document.addEventListener('visibilitychange', () => { if (!document.hidden && !paused) refresh(); });
-  const saved = safeRead(sessionStorage, storageKey) || safeRead(localStorage, 'rustykrab_token');
-  if (saved) connect(saved);
+  connect(true);
 })();

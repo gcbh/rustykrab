@@ -246,3 +246,13 @@ ownership. Native CLI workers and service executors are separate resources.
 The existing main and builder instances are not automatically made executors
 or migrated by enabling the manager. Private Tailscale access keeps the gateway's
 normal bearer, Origin and revocable device-token controls.
+
+## Browser access boundary
+
+The gateway can optionally authenticate an explicitly allowed Tailscale Serve
+owner instead of a bearer credential. The composition root pins one HTTPS
+.ts.net origin and nonempty owner allowlist. Kernel-observed loopback peer,
+exact authority and Serve identity must agree; forwarded IPs are not proof.
+Existing Origin/CSRF guards still apply. Chat and monitoring share a static
+browser access helper; network identity needs no token or session table.
+There is no change to channel intake, scheduling or native agent execution.

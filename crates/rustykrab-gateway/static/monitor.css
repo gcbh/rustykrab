@@ -6,3 +6,14 @@ header{height:72px;display:flex;align-items:center;gap:40px;padding:0 5vw;border
 @media(prefers-color-scheme:dark){:root{--bg:#121a21;--card:#1a242d;--text:#ebf0f3;--muted:#a0adb8;--line:#2c3945;--accent:#74d6c4;--soft:#203c36;--warn:#e9c66b;--bad:#f295a0}.primary{background:#267d70;color:white}.badge.critical,.badge.failed,.badge.expired{background:#472931}.badge.degraded,.badge.blocked{background:#443c24}}
 
 .login details{margin-top:20px;padding-top:16px;border-top:1px solid var(--line)}.login summary{cursor:pointer;font-size:13px;font-weight:600}.login button:disabled{opacity:.6;cursor:wait}#pairCode{text-transform:uppercase;letter-spacing:2px}
+
+header{height:auto;min-height:72px;gap:24px;flex-wrap:wrap;padding:14px 5vw}
+#accessStatus{font-size:12px;line-height:1.4;max-width:280px;overflow-wrap:anywhere}
+#accessStatus:empty{display:none}
+@media(max-width:600px){
+ header{display:grid;grid-template-columns:auto minmax(0,1fr) auto;gap:10px 16px;min-height:62px;padding:12px 5vw}
+ header>.brand{grid-column:1;grid-row:1}
+ header>nav{grid-column:2;grid-row:1}
+ header>#logout{grid-column:3;grid-row:1;font-size:12px;max-width:110px;padding:7px 10px}
+ header>#accessStatus{grid-column:1/-1;grid-row:2;max-width:none}
+}

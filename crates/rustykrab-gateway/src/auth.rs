@@ -6,12 +6,12 @@ use rustykrab_core::crypto::constant_time_eq;
 
 use crate::AppState;
 
-/// Bearer-token authentication middleware.
+/// Bearer credentials or opt-in trusted Tailscale owner authentication.
 ///
 /// Validates the `Authorization: Bearer <token>` header against the
 /// server's configured token using constant-time comparison.
 ///
-/// Security: All endpoints except /api/health and static assets require
+/// Security: All endpoints except /api/health, access discovery and static assets require
 /// authentication. Webhook endpoints use their own auth mechanism.
 pub async fn require_auth(
     state: axum::extract::State<AppState>,
@@ -42,7 +42,7 @@ pub async fn require_auth(
         return Ok(next.run(request).await);
     }
 
-    // All /api/ endpoints require Bearer token.
+    // Protected APIs require a bearer credential or the configured Serve owner.
     let token = request
         .headers()
         .get(header::AUTHORIZATION)
@@ -71,8 +71,13 @@ pub async fn require_auth(
             }
         }
     } else {
-        None
+        crate::tailnet_auth::principal(&state, &request)
     };
+
+    // Access discovery exposes only connection metadata, never system data.
+    if principal.is_none() && request.uri().path() == "/api/access" {
+        return Ok(next.run(request).await);
+    }
 
     match principal {
         Some(principal) => {
