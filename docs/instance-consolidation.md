@@ -94,7 +94,9 @@ delivers it once; recipes must not call message themselves.
 
 Verify a real firing, successful host tool observations, the saved note when
 required, exactly one new job-run record and successful delivery to the
-existing target. Failed or unavailable integrations remain incomplete and
+existing target. Check persisted tool_observation evidence on the work item;
+a run transcript or model summary alone does not establish host attestation.
+Failed or unavailable integrations remain incomplete and
 visible; do not label a model claim as proof. Verify Telegram intake continues
 its binding and files work through the v6 manager. Then enable the original
 recurrences, disable the retired launchd owners and remap their private Serve

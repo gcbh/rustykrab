@@ -488,3 +488,7 @@ for dated briefing get/create/append operations. Other actions fail in this mode
 no REST API credentials or ambient fallback are used. Unconfigured instances
 retain the existing Obsidian REST integration. The store owns path validation,
 private files and atomic replacement, and tool I/O runs on the blocking pool.
+
+The CLI integration worker wraps WorkBackend report forwarding with host attestation
+before controller acceptance. The tool parses a model report; the host replaces
+claimed tool observations and checks required successful execution at that boundary.

@@ -273,3 +273,7 @@ The manager may persist dated reports in a bounded Markdown vault shared by
 host tools and authenticated monitor reads. Telegram send acknowledgements
 and scheduled delivery evidence separate executed work from delivered results.
 Paused work waiting for a user no longer prevents idle project dreaming.
+
+Integration completion passes through a CLI-owned WorkBackend wrapper before the
+controller receives result_report. Host tool observations cannot be deferred until
+Worker::run returns: the model-facing report call can already close the item.
