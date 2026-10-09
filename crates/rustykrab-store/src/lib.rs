@@ -1,3 +1,4 @@
+pub mod briefing_vault;
 mod channel_binding;
 mod conversation;
 pub mod credential_backend;

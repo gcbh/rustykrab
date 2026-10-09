@@ -54,8 +54,8 @@ pub(crate) const FLAG: &str = "RUSTYKRAB_CRON_WORK_ITEMS";
 /// The artifact ref naming a firing's job.
 const JOB_REF: &str = "scheduled_job";
 
-/// The evidence a firing gets once its result is delivered and recorded as
-/// the job's run: the job id. Present means done with, for the schedule.
+/// The pre-delivery completion marker: the job id. Present means done with
+/// for the schedule; separate evidence records attempted and acknowledged delivery.
 const JOB_RUN: &str = "job_run";
 
 /// Who files firings.
@@ -385,16 +385,46 @@ async fn finish(
         job.thread_id.as_deref(),
         &conv,
     );
-    task_queue::deliver_response(
-        &job.id,
+    let attempt = serde_json::json!({"channel":channel,"chat_id":chat,"thread_id":thread,"status":"attempted"});
+    store
+        .work_evidence_add(Evidence {
+            item: item.id.clone(),
+            kind: "scheduled_delivery_attempt".into(),
+            reference: attempt.to_string(),
+            hash: None,
+            verified_by: Some("scheduler".into()),
+            at: Utc::now(),
+        })
+        .await?;
+    let receipt = task_queue::deliver_text_receipt(
         channel.as_deref(),
         chat.as_deref(),
         thread.as_deref(),
         &text,
-        conv.id,
         state,
     )
     .await;
+    store
+        .work_evidence_add(Evidence {
+            item: item.id.clone(),
+            kind: "scheduled_delivery".into(),
+            reference: receipt.to_string(),
+            hash: None,
+            verified_by: Some("channel_adapter".into()),
+            at: Utc::now(),
+        })
+        .await?;
+    // Links stay host-only and are not included in persisted delivery evidence.
+    for link in store.pending_links().take(conv.id) {
+        let _ = task_queue::deliver_text_receipt(
+            channel.as_deref(),
+            chat.as_deref(),
+            thread.as_deref(),
+            &link,
+            state,
+        )
+        .await;
+    }
     Ok(())
 }
 

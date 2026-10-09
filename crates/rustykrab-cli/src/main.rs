@@ -1223,6 +1223,19 @@ async fn main() -> anyhow::Result<()> {
         store.payment_requests(),
         store.pending_links(),
     );
+    let briefing_vault = std::env::var_os("RUSTYKRAB_BRIEFING_VAULT")
+        .map(|path| {
+            rustykrab_store::briefing_vault::BriefingVault::open(std::path::PathBuf::from(path))
+                .map(Arc::new)
+        })
+        .transpose()?;
+    if let Some(vault) = &briefing_vault {
+        tools.retain(|t| t.name() != "obsidian");
+        tools.push(Arc::new(
+            rustykrab_tools::ObsidianTool::new(store.guarded_secrets())
+                .with_managed_vault(vault.clone()),
+        ));
+    }
     tools.extend(rustykrab_tools::memory_tools(memory_backend.clone()));
     tools.extend(rustykrab_tools::skill_tools(
         skills_dir.clone(),
@@ -1689,6 +1702,7 @@ async fn main() -> anyhow::Result<()> {
         .with_delegation(delegated_runs)
         .with_evaluation(evaluator.clone())
         .with_build_info(build_info())
+        .with_briefing_vault(briefing_vault)
         // Loopback is always allowed; this adds the names other clients
         // reach us by, e.g. the tailnet hostname the phone uses.
         .with_origin_policy(rustykrab_gateway::OriginPolicy::from_env())

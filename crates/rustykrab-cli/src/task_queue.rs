@@ -953,75 +953,57 @@ pub(crate) async fn deliver_response(
 async fn deliver_text(
     target: &str,
     channel: Option<&str>,
-    chat_id: Option<&str>,
-    thread_id: Option<&str>,
-    response_text: &str,
+    chat: Option<&str>,
+    thread: Option<&str>,
+    text: &str,
     state: &AppState,
 ) {
+    let receipt = deliver_text_receipt(channel, chat, thread, text, state).await;
+    if receipt["status"] != "acknowledged" {
+        tracing::warn!(%target, channel, "Result delivery failed or has no external destination");
+    }
+}
+/// Content-free acknowledgement, persisted by the durable scheduler.
+pub(crate) async fn deliver_text_receipt(
+    channel: Option<&str>,
+    chat: Option<&str>,
+    thread: Option<&str>,
+    text: &str,
+    state: &AppState,
+) -> serde_json::Value {
+    let mut receipt = serde_json::json!({"channel":channel,"chat_id":chat,"thread_id":thread,"status":"failed","message_ids":[],"partial_delivery_possible":false});
+    let Some(chat) = chat else {
+        return receipt;
+    };
     match channel {
         Some("telegram") => {
-            if let (Some(tg), Some(cid)) = (&state.telegram, chat_id) {
-                if let Ok(chat_id_num) = cid.parse::<i64>() {
-                    let tg_thread = thread_id.and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
-                    if let Err(e) = tg.send_text(chat_id_num, response_text, tg_thread).await {
-                        tracing::error!(target = %target, "failed to send result to Telegram: {e}");
-                    }
-                } else {
-                    tracing::error!(target = %target, chat_id = %cid, "invalid Telegram chat_id");
+            if let (Some(tg), Ok(cid)) = (&state.telegram, chat.parse::<i64>()) {
+                let tid = thread.and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+                receipt["partial_delivery_possible"] = serde_json::json!(true);
+                if let Ok(ids) = tg.send_text_with_receipts(cid, text, tid).await {
+                    receipt["status"] = serde_json::json!("acknowledged");
+                    receipt["partial_delivery_possible"] = serde_json::json!(false);
+                    receipt["message_ids"] = serde_json::json!(ids);
                 }
-            } else {
-                tracing::warn!(
-                    target = %target,
-                    has_telegram = state.telegram.is_some(),
-                    has_chat_id = chat_id.is_some(),
-                    "telegram routing unavailable; result discarded: {response_text}"
-                );
             }
         }
         Some("slack") => {
-            if let (Some(sl), Some(channel_id)) = (&state.slack, chat_id) {
-                if let Err(e) = sl.send_text(channel_id, response_text, thread_id).await {
-                    tracing::error!(target = %target, "failed to send result to Slack: {e}");
+            if let Some(sl) = &state.slack {
+                if sl.send_text(chat, text, thread).await.is_ok() {
+                    receipt["status"] = serde_json::json!("acknowledged");
                 }
-            } else {
-                tracing::warn!(
-                    target = %target,
-                    has_slack = state.slack.is_some(),
-                    has_chat_id = chat_id.is_some(),
-                    "slack routing unavailable; result discarded: {response_text}"
-                );
             }
         }
         Some("signal") => {
-            if let (Some(sig), Some(number)) = (&state.signal, chat_id) {
-                if let Err(e) = sig.send_text(number, response_text).await {
-                    tracing::error!(target = %target, "failed to send result to Signal: {e}");
+            if let Some(sig) = &state.signal {
+                if sig.send_text(chat, text).await.is_ok() {
+                    receipt["status"] = serde_json::json!("acknowledged");
                 }
-            } else {
-                tracing::warn!(
-                    target = %target,
-                    has_signal = state.signal.is_some(),
-                    has_chat_id = chat_id.is_some(),
-                    "signal routing unavailable; result discarded: {response_text}"
-                );
             }
         }
-        Some(other) => {
-            tracing::warn!(
-                target = %target,
-                channel = %other,
-                "unknown channel; result discarded: {response_text}"
-            );
-        }
-        None => {
-            tracing::warn!(
-                target = %target,
-                "no delivery channel — set channel/chat_id on the originating \
-                 conversation, or set RUSTYKRAB_DEFAULT_CHANNEL + \
-                 RUSTYKRAB_DEFAULT_CHAT_ID. Result discarded: {response_text}"
-            );
-        }
+        _ => {}
     }
+    receipt
 }
 
 #[cfg(test)]

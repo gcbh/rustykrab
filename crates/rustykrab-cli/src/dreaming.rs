@@ -265,11 +265,7 @@ impl Dreaming {
                     ..Default::default()
                 })
                 .await?;
-            if !force
-                && work
-                    .iter()
-                    .any(|w| !w.status.is_closed() && w.kind != WorkKind::Proposal)
-            {
+            if !force && work.iter().any(foreground_needs_agent) {
                 return Ok(());
             }
             let projects = self.store.projects().list().await?;
@@ -333,11 +329,7 @@ impl Dreaming {
                     ..Default::default()
                 })
                 .await?;
-            if status.runs_in_flight > 0
-                || work
-                    .iter()
-                    .any(|w| !w.status.is_closed() && w.kind != WorkKind::Proposal)
-            {
+            if status.runs_in_flight > 0 || work.iter().any(foreground_needs_agent) {
                 return Ok(());
             }
         }
@@ -810,6 +802,16 @@ async fn git(repo: &str, args: &[&str]) -> Result<String, Error> {
     String::from_utf8(output.stdout).map_err(err)
 }
 
+// User-held work waits for a decision, not for a free runtime. It must not
+// suppress background review indefinitely after legacy history is imported.
+fn foreground_needs_agent(w: &rustykrab_core::work::WorkItem) -> bool {
+    w.kind != WorkKind::Proposal
+        && matches!(
+            w.status,
+            Status::Queued | Status::Ready | Status::Leased | Status::Running | Status::Verifying
+        )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -878,6 +880,51 @@ mod tests {
             },
         );
         (dir, store, control, dream, lock)
+    }
+    #[tokio::test]
+    async fn held_legacy_work_does_not_silence_dreaming_but_ready_work_does() {
+        let (_dir, store, control, dream, _lock) = setup(false).await;
+        let item = control
+            .file_draft(
+                rustykrab_core::work::WorkItemDraft {
+                    title: "Foreground fixture".into(),
+                    objective: "Wait for user".into(),
+                    done_when: "User decides".into(),
+                    ..Default::default()
+                },
+                Provenance {
+                    actor: "user:test".into(),
+                    conversation_id: None,
+                    filed_by_item: None,
+                },
+            )
+            .await
+            .unwrap();
+        let PlanOutcome::Accepted(a) = item else {
+            panic!("fixture filing refused")
+        };
+        let id = a.root;
+        dream.advance(false).await.unwrap();
+        assert!(store.dream_reviews_recent(10).await.unwrap().is_empty());
+        let mut work = store.work_get(&id).await.unwrap().unwrap();
+        let previous = work.status;
+        work.status = Status::Blocked(BlockedReason::NeedsConsent);
+        // Store transition is the same guarded path used by controller holds.
+        store
+            .work_transition(
+                &id,
+                Some(previous),
+                work.status,
+                "test",
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        dream.advance(false).await.unwrap();
+        assert_eq!(store.dream_reviews_recent(10).await.unwrap().len(), 1);
     }
     #[tokio::test]
     async fn queued_generation_fresh_meta_and_crash_recovery_publish_once() {

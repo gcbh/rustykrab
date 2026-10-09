@@ -31,6 +31,7 @@ static SYNC_CLIENT: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::
 pub struct ObsidianTool {
     secrets: GuardedSecrets,
     client: reqwest::Client,
+    managed_vault: Option<std::sync::Arc<rustykrab_store::briefing_vault::BriefingVault>>,
 }
 
 impl ObsidianTool {
@@ -41,9 +42,41 @@ impl ObsidianTool {
             .danger_accept_invalid_certs(true)
             .build()
             .unwrap_or_default();
-        Self { secrets, client }
+        Self {
+            secrets,
+            client,
+            managed_vault: None,
+        }
     }
 
+    pub fn with_managed_vault(
+        mut self,
+        vault: std::sync::Arc<rustykrab_store::briefing_vault::BriefingVault>,
+    ) -> Self {
+        self.managed_vault = Some(vault);
+        self
+    }
+    async fn managed(&self, args: &Value) -> Result<Value> {
+        let vault = self.managed_vault.as_ref().expect("configured").clone();
+        let action = args["action"].as_str().unwrap_or("").to_string();
+        if !matches!(
+            action.as_str(),
+            "get_note" | "create_note" | "append_content"
+        ) {
+            return Err(Error::ToolExecution(
+                "Managed vault only supports dated briefing reads, creates and appends".into(),
+            ));
+        }
+        let date = rustykrab_store::briefing_vault::BriefingVault::date_from_path(
+            args["path"].as_str().unwrap_or(""),
+        )?
+        .to_string();
+        let content = args["content"].as_str().unwrap_or("").to_string();
+        tokio::task::spawn_blocking(move || {
+            let n = if action == "get_note" { vault.read(&date)? } else { vault.write(&date, &content, action == "append_content")? };
+            Ok(json!({"backend":"managed_markdown","path":n.path,"content":n.content,"bytes":n.bytes,"sha256":n.sha256}))
+        }).await.map_err(|_| Error::ToolExecution("Briefing vault operation failed".into()))?
+    }
     async fn get_api_url(&self) -> String {
         self.secrets
             .get(KEY_API_URL)
@@ -416,7 +449,7 @@ impl Tool for ObsidianTool {
     }
 
     fn description(&self) -> &str {
-        "Create and manage Obsidian vault notes via the Local REST API plugin. \
+        "Create and manage dated Markdown briefings in an operator-configured managed vault, or Obsidian vault notes via the Local REST API plugin. \
          Supports creating, reading, updating, searching, and deleting markdown notes. \
          Documents synced from Notion are automatically stored in the configured sync folder. \
          Requires the Obsidian Local REST API community plugin."
@@ -488,6 +521,9 @@ impl Tool for ObsidianTool {
     }
 
     async fn execute(&self, args: Value) -> Result<Value> {
+        if self.managed_vault.is_some() {
+            return self.managed(&args).await;
+        }
         let action = args["action"]
             .as_str()
             .ok_or_else(|| Error::ToolExecution("missing 'action' parameter".into()))?;
@@ -675,4 +711,36 @@ pub async fn try_sync_append_to_obsidian(
         "obsidian_path": vault_path,
         "message": format!("Appended to Obsidian note: {vault_path}"),
     })))
+}
+
+#[cfg(test)]
+mod managed_tests {
+    use super::*;
+    #[tokio::test]
+    async fn managed_tool_writes_and_reads_without_an_api_key_and_refuses_other_paths() {
+        let d = tempfile::tempdir().unwrap();
+        let store = rustykrab_store::Store::open(d.path(), vec![7; 32]).unwrap();
+        let vault = std::sync::Arc::new(
+            rustykrab_store::briefing_vault::BriefingVault::open(
+                d.path().canonicalize().unwrap().join("vault"),
+            )
+            .unwrap(),
+        );
+        let t = ObsidianTool::new(store.guarded_secrets()).with_managed_vault(vault);
+        let n = t.execute(json!({"action":"create_note","path":"Daily Briefings/Briefing_2026-10-09.md","content":"# Fixture"})).await.unwrap();
+        assert_eq!(n["backend"], "managed_markdown");
+        let r = t
+            .execute(json!({"action":"get_note","path":"Daily Briefings/Briefing_2026-10-09.md"}))
+            .await
+            .unwrap();
+        assert_eq!(r["content"], "# Fixture");
+        assert_eq!(r["sha256"], n["sha256"]);
+        for a in [
+            json!({"action":"setup","api_key":"fixture"}),
+            json!({"action":"delete_note","path":"Daily Briefings/Briefing_2026-10-09.md"}),
+            json!({"action":"create_note","path":"../outside","content":"bad"}),
+        ] {
+            assert!(t.execute(a).await.is_err());
+        }
+    }
 }

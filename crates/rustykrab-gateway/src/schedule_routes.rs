@@ -80,7 +80,32 @@ async fn create(State(s): State<AppState>, Json(b): Json<Create>) -> Response {
 async fn detail(State(s): State<AppState>, Path(id): Path<String>) -> Response {
     let jobs = s.agent.store.jobs();
     match jobs.get_job(&id).await {
-        Ok(j)=>match jobs.list_runs(&id,20).await { Ok(r)=>Json(json!({"schedule":j,"work_item_id":jobs.work_item_id(&id).await.ok().flatten(),"runs":r})).into_response(),Err(e)=>failure(e) },Err(e)=>failure(e)
+        Ok(j) => match jobs.list_runs(&id, 20).await {
+            Ok(r) => {
+                let item = jobs.work_item_id(&id).await.ok().flatten();
+                let delivery = match &item {
+                    Some(i) => s
+                        .agent
+                        .store
+                        .work_evidence_list(i)
+                        .await
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|e| {
+                            matches!(
+                                e.kind.as_str(),
+                                "scheduled_delivery_attempt" | "scheduled_delivery"
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                    None => vec![],
+                };
+                Json(json!({"schedule":j,"work_item_id":item,"runs":r,"delivery":delivery}))
+                    .into_response()
+            }
+            Err(e) => failure(e),
+        },
+        Err(e) => failure(e),
     }
 }
 #[derive(Deserialize)]

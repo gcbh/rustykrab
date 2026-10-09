@@ -266,3 +266,10 @@ The optional Claude CLI integration adapter executes personal tasks through
 the same fleet/controller as native coding work. Operators hand channel and
 schedule ownership to one daemon after verifying the stage, as documented in
 [`instance-consolidation.md`](../instance-consolidation.md).
+
+## Consolidated briefing and delivery observations
+
+The manager may persist dated reports in a bounded Markdown vault shared by
+host tools and authenticated monitor reads. Telegram send acknowledgements
+and scheduled delivery evidence separate executed work from delivered results.
+Paused work waiting for a user no longer prevents idle project dreaming.

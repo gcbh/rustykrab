@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Add private managed Markdown briefings with authenticated monitoring reads.
+- Validate Telegram message acknowledgements and persist scheduled delivery evidence separately from execution.
+- Allow idle dreaming while legacy work waits for user decisions.
+
 ## [6.3.0] - 2026-10-09
 
 - feat: consolidate legacy work under the v6 manager (#673)
