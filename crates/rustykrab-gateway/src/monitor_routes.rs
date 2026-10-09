@@ -57,6 +57,8 @@ pub struct MonitorReply {
     pub services: Vec<crate::resources::ServiceObservation>,
     #[serde(default)]
     pub schedules: Vec<rustykrab_store::ScheduledJob>,
+    #[serde(default)]
+    pub scheduled_deliveries: Vec<serde_json::Value>,
     pub version: String,
     pub commit: Option<String>,
     pub controller: Option<LoopStatus>,
@@ -366,17 +368,71 @@ async fn observe(state: &AppState, query: MonitorQuery) -> Result<MonitorReply, 
             ));
         }
     }
+    let schedules = state
+        .agent
+        .store
+        .jobs()
+        .list_jobs()
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut scheduled_deliveries = vec![];
+    for job in schedules.iter().take(100) {
+        let Some(item) = state
+            .agent
+            .store
+            .jobs()
+            .work_item_id(&job.id)
+            .await
+            .map_err(|e| e.to_string())?
+        else {
+            continue;
+        };
+        let evidence = state
+            .agent
+            .store
+            .work_evidence_list(&item)
+            .await
+            .map_err(|e| e.to_string())?;
+        let outcome = evidence
+            .iter()
+            .rev()
+            .find(|e| e.kind == "scheduled_delivery");
+        let attempt = evidence
+            .iter()
+            .rev()
+            .find(|e| e.kind == "scheduled_delivery_attempt");
+        if let Some(e) = outcome.or(attempt) {
+            let receipt = serde_json::from_str::<serde_json::Value>(&e.reference).ok();
+            let status = if outcome.is_some() {
+                receipt
+                    .as_ref()
+                    .and_then(|r| r["status"].as_str())
+                    .unwrap_or("uncertain")
+            } else {
+                "uncertain"
+            };
+            scheduled_deliveries.push(
+                json!({"job_id":job.id,"item_id":item,"status":status,"at":e.at,"receipt":receipt}),
+            );
+            if status != "acknowledged"
+                && (outcome.is_some() || Utc::now() - e.at > chrono::Duration::minutes(2))
+            {
+                alerts.push(alert(
+                    "warning",
+                    "scheduled_delivery_unconfirmed",
+                    "A scheduled result has failed or uncertain delivery; inspect its run history.",
+                    Some(&item),
+                    None,
+                ));
+            }
+        }
+    }
     let health = health_of(&alerts).into();
     Ok(MonitorReply {
         work_manager: state.agent.work_manager,
         services,
-        schedules: state
-            .agent
-            .store
-            .jobs()
-            .list_jobs()
-            .await
-            .map_err(|e| e.to_string())?,
+        schedules,
+        scheduled_deliveries,
         version: state.build.version.clone(),
         commit: state.build.commit.clone(),
         controller,

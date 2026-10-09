@@ -71,29 +71,29 @@ Funnel is needed. Remove only this route with `tailscale serve --https=8443 off`
 
 A remote CLI or collector uses that HTTPS base URL as `RUSTYKRAB_GATEWAY_URL`
 and this service's own token as `RUSTYKRAB_AUTH_TOKEN`; the CLI supplies Origin.
-A separate instance needs its own `RUSTYKRAB_DATA_DIR`, workspace, encryption
-key and token. It observes its own registered fleet and work; starting it does
-not import another daemon's work or discover unrelated Claude/Codex sessions.
+After [instance consolidation](instance-consolidation.md), v6 owns the shared
+work history, schedules and Telegram polling. Legacy services are disabled and
+their protected data and service files remain available for rollback. Their
+automatic recovery registrations are removed before v6 resumes. The existing
+macOS credential backend remains available for hardware-backed integration
+credentials; CLI subscription profiles keep their separate native logins.
 
-The local M4 installation uses `com.gcbh.rustykrab.agents`, loopback port 3311,
-and `https://m4-32gb.tail84017e.ts.net:8443/monitor.html`. Its data and private
-service environment live under `~/.local/share/rustykrab-agents` (directory
-0700, environment and token files 0600). It starts at login and restarts after
-a crash. `~/.local/bin/rustykrab-agents monitor --check` uses its own token and
-loopback endpoint. The bearer token is in that data directory's `auth-token`
-file; do not copy the service environment, which also contains the encryption
-key. This local build keeps the shared macOS Keychain disabled to isolate it
-from the installed main daemon. Credential integration writes require a
-separately configured secure backend; unavailable integrations remain absent.
-Planning uses the selected Claude Max CLI profile. Execution uses isolated
-Claude Max and Codex ChatGPT CLI workers; local/Ollama execution is disabled.
-Native workers edit only their configured repositories in isolated worktrees.
+For the unified deployment, Serve port 443 routes to v6 on loopback 3311.
+A previously used 8443 route can remain as a token/pairing fallback; pin the
+canonical port-443 origin for automatic owner access.
 
-To stop the agent service use
-`launchctl bootout gui/$(id -u)/com.gcbh.rustykrab.agents`. Remove its
-`~/Library/LaunchAgents/com.gcbh.rustykrab.agents.plist` to prevent the next
-login from starting it. Retain the data directory and encryption key for
-recovery. The main daemon and its port-443 Serve route are independent.
+Set `RUSTYKRAB_BRIEFING_VAULT` to an absolute private directory under the v6
+data directory when the old Obsidian service is unavailable. **Saved briefings**
+in monitoring lists dated Markdown reports and opens their content and hash.
+The scoped integration tool can only create, read and append dated briefings.
+No public file server or second daemon is involved.
+
+Schedule **Run history** shows execution runs, the latest work item and delivery
+evidence. A completed execution can still have failed or uncertain delivery.
+Telegram acknowledgement evidence includes message IDs and the destination topic.
+An attempt without a final acknowledgement is uncertain; do not infer delivery
+from an `ok` execution record. Restart behavior remains at most one scheduler
+delivery attempt, so ambiguous sends are not automatically replayed.
 
 ## Terminal and automation
 

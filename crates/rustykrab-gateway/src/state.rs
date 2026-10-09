@@ -87,6 +87,7 @@ pub struct AppState {
     /// binary's build script stamps the commit and date, so only the
     /// composition root can fill them in; until it does they read `None`.
     pub build: BuildInfo,
+    pub briefing_vault: Option<Arc<rustykrab_store::briefing_vault::BriefingVault>>,
     /// Host-cached registered infrastructure observations.
     pub resources: Option<Arc<dyn crate::resources::ResourceObserver>>,
 
@@ -99,6 +100,14 @@ pub struct AppState {
 }
 
 impl AppState {
+    pub fn with_briefing_vault(
+        mut self,
+        vault: Option<Arc<rustykrab_store::briefing_vault::BriefingVault>>,
+    ) -> Self {
+        self.briefing_vault = vault;
+        self
+    }
+
     pub fn new(
         store: Store,
         tools: Vec<Arc<dyn rustykrab_core::Tool>>,
@@ -118,6 +127,7 @@ impl AppState {
             evaluation: None,
             delegation: None,
             build: BuildInfo::default(),
+            briefing_vault: None,
             resources: None,
             telegram: None,
             signal: None,

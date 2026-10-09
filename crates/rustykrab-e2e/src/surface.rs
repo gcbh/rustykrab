@@ -92,6 +92,11 @@ pub async fn start_capture_server(captured: Captured) -> Result<String> {
             Json(json!([]))
         } else if path.contains("getUpdates") {
             Json(json!({"ok": true, "result": []}))
+        } else if path.ends_with("sendMessage") {
+            let v: Value = serde_json::from_slice(&body).unwrap_or_default();
+            Json(
+                json!({"ok":true,"result":{"message_id":1,"chat":{"id":v["chat_id"]},"message_thread_id":v["message_thread_id"]}}),
+            )
         } else {
             Json(json!({"ok": true, "result": {}, "versions": ["v0.0-credeval"]}))
         }

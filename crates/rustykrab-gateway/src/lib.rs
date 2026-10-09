@@ -1,4 +1,5 @@
 pub mod auth;
+mod briefing_routes;
 mod credential_page;
 pub mod evaluate_routes;
 pub mod logging;
@@ -80,6 +81,7 @@ pub fn router(state: AppState) -> Router {
         .merge(monitor_routes::routes())
         .merge(resources::routes())
         .merge(schedule_routes::routes())
+        .merge(briefing_routes::routes())
         .merge(project_routes::routes())
         .merge(work_routes::routes())
         .merge(worker_routes::routes())

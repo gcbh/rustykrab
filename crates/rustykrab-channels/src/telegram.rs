@@ -188,11 +188,24 @@ impl TelegramChannel {
     /// Uses Markdown parse mode with automatic plain-text fallback if
     /// Telegram rejects the formatting.
     pub async fn send_text(&self, chat_id: i64, text: &str, thread_id: i64) -> Result<()> {
-        let chunks = split_message(text, TELEGRAM_MAX_LENGTH);
-        for chunk in &chunks {
-            self.send_single_message(chat_id, chunk, thread_id).await?;
+        self.send_text_with_receipts(chat_id, text, thread_id)
+            .await
+            .map(|_| ())
+    }
+
+    /// Bot-acknowledged message IDs for all chunks. An incomplete or malformed
+    /// acknowledgement is an error; callers must not interpret HTTP 200 as delivery.
+    pub async fn send_text_with_receipts(
+        &self,
+        chat_id: i64,
+        text: &str,
+        thread_id: i64,
+    ) -> Result<Vec<i64>> {
+        let mut ids = Vec::new();
+        for chunk in split_message(text, TELEGRAM_MAX_LENGTH) {
+            ids.push(self.send_single_message(chat_id, &chunk, thread_id).await?);
         }
-        Ok(())
+        Ok(ids)
     }
 
     /// Send `text` with rows of inline buttons under it (plan previews'
@@ -237,7 +250,10 @@ impl TelegramChannel {
             .await
             .map_err(|e| Error::Channel(format!("Telegram API error: {e}")))?;
         if resp.status().is_success() {
-            return Ok(());
+            let value: serde_json::Value = resp.json().await.map_err(|_| {
+                Error::Channel("Telegram acknowledgement unreadable; delivery uncertain".into())
+            })?;
+            return acknowledged_message(&value, chat_id, thread_id).map(|_| ());
         }
         let status = resp.status();
         let err = resp.text().await.unwrap_or_default();
@@ -258,13 +274,13 @@ impl TelegramChannel {
     }
 
     /// Send a single message chunk with retry and Markdown fallback.
-    async fn send_single_message(&self, chat_id: i64, text: &str, thread_id: i64) -> Result<()> {
+    async fn send_single_message(&self, chat_id: i64, text: &str, thread_id: i64) -> Result<i64> {
         // First attempt: with Markdown.
         match self
             .try_send(chat_id, text, Some("Markdown"), SEND_MAX_RETRIES, thread_id)
             .await
         {
-            Ok(()) => Ok(()),
+            Ok(id) => Ok(id),
             Err(e) => {
                 // If Markdown parsing failed (400 Bad Request), retry as plain text.
                 let err_str = format!("{e}");
@@ -288,7 +304,7 @@ impl TelegramChannel {
         parse_mode: Option<&str>,
         max_retries: u32,
         thread_id: i64,
-    ) -> Result<()> {
+    ) -> Result<i64> {
         let url = format!("{}/sendMessage", self.api_base);
         let mut body = serde_json::json!({
             "chat_id": chat_id,
@@ -311,7 +327,12 @@ impl TelegramChannel {
             match self.client.post(&url).json(&body).send().await {
                 Ok(resp) => {
                     if resp.status().is_success() {
-                        return Ok(());
+                        let value: serde_json::Value = resp.json().await.map_err(|_| {
+                            Error::Channel(
+                                "Telegram acknowledgement unreadable; delivery uncertain".into(),
+                            )
+                        })?;
+                        return acknowledged_message(&value, chat_id, thread_id);
                     }
                     let status = resp.status();
                     let err_text = resp.text().await.unwrap_or_default();
@@ -333,7 +354,10 @@ impl TelegramChannel {
                     )));
                 }
                 Err(e) => {
-                    last_err = Some(Error::Channel(format!("Telegram API error: {e}")));
+                    last_err = Some(Error::Channel(format!(
+                        "Telegram API error: {}",
+                        e.without_url()
+                    )));
                 }
             }
 
@@ -932,5 +956,50 @@ mod tests {
         let chunks = split_message(&text, 4096);
         assert_eq!(chunks.len(), 2);
         assert_eq!(chunks[0].len(), 4096);
+    }
+}
+
+/// Validate the Bot API envelope and intended address without logging content.
+fn acknowledged_message(value: &serde_json::Value, chat: i64, thread: i64) -> Result<i64> {
+    if value["ok"] != true {
+        let code = value["error_code"].as_i64().unwrap_or(0);
+        let parse = value["description"]
+            .as_str()
+            .is_some_and(|s| s.contains("parse"));
+        return Err(Error::Channel(format!(
+            "Telegram sendMessage rejected ({code}){}",
+            if parse { ": parse formatting" } else { "" }
+        )));
+    }
+    let result = &value["result"];
+    let id = result["message_id"].as_i64().filter(|id| *id > 0);
+    if result["chat"]["id"].as_i64() != Some(chat)
+        || (thread > 0 && result["message_thread_id"].as_i64() != Some(thread))
+    {
+        return Err(Error::Channel(
+            "Telegram acknowledgement address mismatch; delivery uncertain".into(),
+        ));
+    }
+    id.ok_or_else(|| {
+        Error::Channel("Telegram acknowledgement has no message ID; delivery uncertain".into())
+    })
+}
+#[cfg(test)]
+mod acknowledgement_tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn http_success_is_not_delivery_without_a_valid_bot_receipt() {
+        for v in [
+            json!({"ok":false,"error_code":400}),
+            json!({"ok":true}),
+            json!({"ok":true,"result":{"message_id":1,"chat":{"id":2}}}),
+            json!({"ok":true,"result":{"message_id":0,"chat":{"id":1}}}),
+        ] {
+            assert!(acknowledged_message(&v, 1, 0).is_err());
+        }
+        let v = json!({"ok":true,"result":{"message_id":42,"chat":{"id":1},"message_thread_id":7}});
+        assert_eq!(acknowledged_message(&v, 1, 7).unwrap(), 42);
+        assert!(acknowledged_message(&v, 1, 8).is_err());
     }
 }

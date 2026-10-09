@@ -63,7 +63,7 @@
     $('pairCode').value = ''; $('pairError').textContent = '';
     if ($('detail').open) $('detail').close();
     $('detailBody').replaceChildren(); $('workRows').replaceChildren(); $('agents').replaceChildren();
-    $('serviceRows').replaceChildren(); $('scheduleRows').replaceChildren();
+    $('serviceRows').replaceChildren(); $('scheduleRows').replaceChildren(); $('briefingRows').replaceChildren();
     $('dreamRows').replaceChildren(); $('dreamMetrics').replaceChildren(); $('projectRows').replaceChildren(); $('events').replaceChildren(); $('quality').replaceChildren(); $('questionRows').replaceChildren();
   }
   async function connect(automatic = false, operation = () => access.connect(automatic)) {
@@ -153,6 +153,8 @@
     for (const job of reply.schedules || []) {
       const card = node('article', undefined, 'agent');
       card.append(node('h3', job.task.length > 120 ? job.task.slice(0, 120) + '…' : job.task), badge(job.enabled ? 'scheduled' : 'paused'), node('p', job.schedule + ' · ' + job.timezone + ' · Next ' + at(job.next_run_at)), node('p', 'Execution ' + human(job.execution?.worker_kind || 'any') + (job.execution?.required_tools?.length ? ' · Tools ' + job.execution.required_tools.join(', ') : '') + (job.execution?.writable_resources?.length ? ' · Resources ' + job.execution.writable_resources.join(', ') : '')));
+      const delivery = reply.scheduled_deliveries?.find(d => d.job_id === job.id);
+      if (delivery) card.append(node('p', 'Last delivery: ' + delivery.status + ' · ' + at(delivery.at), 'note'));
       const history = node('button', 'Run history');
       history.addEventListener('click', async () => {
         const g = generation, request = ++detailRequest;
@@ -169,10 +171,27 @@
       }); card.append(toggle); $('scheduleRows').append(card);
     }
   }
+  async function renderBriefings(g) {
+    try {
+      const d = await api('/api/briefings'); if (g !== generation) return;
+      $('briefingRows').replaceChildren();
+      if (!d.configured) $('briefingRows').append(node('p', 'Managed vault is not configured.', 'note'));
+      else if (!d.notes.length) $('briefingRows').append(node('p', 'No saved briefings yet.', 'note'));
+      for (const n of d.notes) {
+        const button = node('button', n.date + ' · ' + num(n.bytes) + ' bytes');
+        button.addEventListener('click', async () => {
+          const request = ++detailRequest;
+          try { const note = await api('/api/briefings/' + encodeURIComponent(n.date)); if (g !== generation || request !== detailRequest) return; $('detailTitle').textContent = note.path; $('detailBody').replaceChildren(node('p', 'SHA-256 ' + note.sha256, 'note'), node('pre', note.content)); if (!$('detail').open) $('detail').showModal(); }
+          catch (e) { if (g === generation) { $('error').hidden = false; $('error').textContent = e.message; } }
+        }); $('briefingRows').append(button);
+      }
+    } catch (e) { if (g === generation) $('briefingRows').replaceChildren(node('p', 'Briefings unavailable: ' + e.message, 'note')); }
+  }
   function render(reply) {
     const w = reply.work, counts = w.counts, c = reply.controller;
     renderDreaming(reply.dreaming);
     renderResources(reply);
+    void renderBriefings(generation);
     $('login').hidden = true; $('dashboard').hidden = false; $('logout').hidden = false;
     $('error').hidden = true;
     $('health').textContent = human(reply.health); $('health').className = 'badge ' + reply.health;

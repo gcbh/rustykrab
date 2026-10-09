@@ -69,6 +69,15 @@ async fn serve_mode(
         "test-monitor-token".into(),
     )
     .with_control(control.clone());
+    let root = std::env::temp_dir()
+        .canonicalize()
+        .unwrap()
+        .join(format!("rk-briefing-{}", uuid::Uuid::new_v4()));
+    let vault = Arc::new(rustykrab_store::briefing_vault::BriefingVault::open(root).unwrap());
+    vault
+        .write("2026-10-09", "# Private fixture briefing", false)
+        .unwrap();
+    state = state.with_briefing_vault(Some(vault));
     state.agent.work_manager = manager;
     if manager {
         state.resources = Some(Arc::new(ResourceFixture));
@@ -434,5 +443,138 @@ async fn manager_schedule_and_service_commands_share_auth_origin_and_durable_que
             .status(),
         StatusCode::UNPROCESSABLE_ENTITY
     );
+    task.abort();
+}
+
+#[tokio::test]
+async fn briefing_reads_require_auth_and_origin_and_writes_are_not_exposed() {
+    let (base, client, _store, _control, task) = serve().await;
+    let url = format!("{base}/api/briefings/2026-10-09");
+    assert_eq!(
+        client
+            .get(&url)
+            .header("Origin", &base)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        client
+            .get(&url)
+            .bearer_auth("test-monitor-token")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::FORBIDDEN
+    );
+    let reply = client
+        .get(&url)
+        .bearer_auth("test-monitor-token")
+        .header("Origin", &base)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reply.status(), reqwest::StatusCode::OK);
+    assert_eq!(reply.headers()["cache-control"], "no-store");
+    let note: serde_json::Value = reply.json().await.unwrap();
+    assert_eq!(note["content"], "# Private fixture briefing");
+    assert_eq!(note["sha256"].as_str().unwrap().len(), 64);
+    let list: serde_json::Value = client
+        .get(format!("{base}/api/briefings"))
+        .bearer_auth("test-monitor-token")
+        .header("Origin", &base)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(list["notes"].as_array().unwrap().len(), 1);
+    assert!(list["notes"][0].get("content").is_none());
+    assert_eq!(
+        client
+            .post(&url)
+            .bearer_auth("test-monitor-token")
+            .header("Origin", &base)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::METHOD_NOT_ALLOWED
+    );
+    task.abort();
+}
+
+#[tokio::test]
+async fn scheduled_work_with_failed_delivery_is_visible_as_a_monitor_warning() {
+    let (base, client, store, control, task) = serve_mode(true).await;
+    let job = store
+        .jobs()
+        .create_job(
+            "0 9 * * *",
+            "Fixture scheduled report",
+            Some("telegram"),
+            Some("1"),
+            Some("7"),
+            "UTC",
+            true,
+        )
+        .await
+        .unwrap();
+    let outcome = control
+        .file_draft(
+            rustykrab_core::work::WorkItemDraft {
+                title: "Fixture scheduled report".into(),
+                objective: "Produce fixture".into(),
+                done_when: "Report exists".into(),
+                ..Default::default()
+            },
+            rustykrab_control::Provenance {
+                actor: "user:fixture".into(),
+                conversation_id: None,
+                filed_by_item: None,
+            },
+        )
+        .await
+        .unwrap();
+    let rustykrab_core::work::PlanOutcome::Accepted(a) = outcome else {
+        panic!("fixture refused")
+    };
+    store
+        .jobs()
+        .set_work_item_id(&job.id, &a.root)
+        .await
+        .unwrap();
+    store.work_evidence_add(rustykrab_core::work::Evidence { item: a.root.clone(), kind: "scheduled_delivery".into(), reference: json!({"channel":"telegram","chat_id":"1","thread_id":"7","status":"failed","message_ids":[]}).to_string(), hash: None, verified_by: Some("channel_adapter".into()), at: Utc::now() }).await.unwrap();
+    let reply: serde_json::Value = client
+        .get(format!("{base}/api/monitor"))
+        .bearer_auth("test-monitor-token")
+        .header("Origin", &base)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(reply["alerts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|a| a["code"] == "scheduled_delivery_unconfirmed"));
+    assert_eq!(reply["scheduled_deliveries"][0]["status"], "failed");
+    let detail: serde_json::Value = client
+        .get(format!("{base}/api/schedules/{}", job.id))
+        .bearer_auth("test-monitor-token")
+        .header("Origin", &base)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(detail["delivery"].as_array().unwrap().len(), 1);
     task.abort();
 }

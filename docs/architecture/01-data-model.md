@@ -959,3 +959,13 @@ coalescing and backlog metrics. Retirement does not attest a delivery.
 counts. Imported memories retain IDs and lifecycle/validity, with source and
 original agent in metadata. Both ledgers reject changed replays. Runtime worker
 registrations, routing defaults, live leases and pairing codes are not merged.
+
+## Scheduled delivery observations and saved notes
+
+`work_item_evidence` kinds `scheduled_delivery_attempt` and `scheduled_delivery`
+retain content-free channel/chat/topic and acknowledgement status; successful
+Telegram sends include message IDs. They are separate from `job_runs.status`,
+which describes execution. An attempt without final evidence has an uncertain
+outcome. Neither is a durable retry queue. Optional dated briefing Markdown
+files live in an operator-selected private vault with SHA-256 read receipts;
+no SQLite schema change accompanies this filesystem store.
