@@ -38,6 +38,8 @@ pub struct Device {
 pub enum Principal {
     /// The master token from the environment or keychain.
     Master,
+    /// An owner allowlisted by the trusted Tailscale Serve front end.
+    Tailnet { login: String },
     /// A paired device.
     Device { id: String, name: String },
 }
@@ -47,6 +49,7 @@ impl Principal {
     pub fn describe(&self) -> String {
         match self {
             Principal::Master => "master".to_string(),
+            Principal::Tailnet { login } => format!("tailscale:{login}"),
             Principal::Device { name, .. } => name.clone(),
         }
     }

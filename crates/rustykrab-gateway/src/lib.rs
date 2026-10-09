@@ -13,6 +13,7 @@ mod routes;
 mod schedule_routes;
 mod signal_webhook;
 mod state;
+mod tailnet_auth;
 pub mod tasks;
 mod telegram_webhook;
 mod version_route;
@@ -32,6 +33,7 @@ pub use run::{
 };
 pub use rustykrab_runtime::{AgentContext, RunOptions, RuntimeError};
 pub use state::{AppState, BuildInfo};
+pub use tailnet_auth::TailnetAuthPolicy;
 pub use tasks::{run_task_worker, TaskQueueSignal};
 
 use axum::extract::Request;
@@ -73,6 +75,7 @@ async fn security_headers_middleware(request: Request, next: Next) -> Response {
 pub fn router(state: AppState) -> Router {
     Router::new()
         .merge(routes::api_routes())
+        .merge(tailnet_auth::routes())
         .merge(version_route::routes())
         .merge(monitor_routes::routes())
         .merge(resources::routes())

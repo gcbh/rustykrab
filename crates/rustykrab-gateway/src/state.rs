@@ -54,6 +54,8 @@ pub struct AppState {
     pub auth_token: Arc<RwLock<String>>,
     pub rate_limiter: Arc<RateLimiter>,
     pub origin_policy: OriginPolicy,
+    /// Opt-in trusted Serve owner authentication. None means bearer only.
+    pub tailnet_auth: Option<crate::TailnetAuthPolicy>,
     /// Who may open the link pages: credentials at `/c/{token}`, payment
     /// approvals at `/p/{token}`.
     pub credential_page_policy: crate::PageIdentityPolicy,
@@ -108,6 +110,7 @@ impl AppState {
             auth_token: Arc::new(RwLock::new(auth_token)),
             rate_limiter: Arc::new(RateLimiter::new(RateLimitConfig::from_env())),
             origin_policy: OriginPolicy::default(),
+            tailnet_auth: None,
             credential_page_policy: crate::PageIdentityPolicy::default(),
             task_signal: crate::tasks::TaskQueueSignal::new(),
             control: None,

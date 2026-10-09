@@ -935,3 +935,10 @@ WebChat work notices reuse `work_outbox`: a bounded read joins each live parent
 work item's `origin_conversation_id`, includes due consumed rows, and keeps the
 model transcript separate. No table or column is added. The history window is
 100 notices for live work; archived work remains on its archive receipt surface.
+
+## Browser identity follow-up
+
+Automatic browser access through explicitly allowed Tailscale Serve owners uses
+Principal::Tailnet and existing string actor/author audit fields. It adds no
+session, token, cookie, table or migration. Device pairing rows and revocation
+remain the bearer-client fallback. View disconnect clears browser access only.

@@ -292,7 +292,8 @@ pub async fn rate_limit_middleware(
         return Ok(next.run(request).await);
     }
 
-    // A request carrying a token this gateway accepts is not what this
+    // A request carrying an accepted token or verified Serve owner identity
+    // is not what this
     // limiter defends against. Its purpose is brute-force and
     // unauthenticated abuse (CVE-2026-32025); a caller that already holds
     // the secret has full agent access on this machine, up to and
@@ -313,7 +314,9 @@ pub async fn rate_limit_middleware(
     // type is not Sync.
     let bearer = bearer_token(request.headers());
 
-    if is_authenticated(&state, bearer.as_deref()).await {
+    if crate::tailnet_auth::principal(&state, &request).is_some()
+        || is_authenticated(&state, bearer.as_deref()).await
+    {
         return Ok(next.run(request).await);
     }
 

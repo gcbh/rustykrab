@@ -717,13 +717,22 @@
   <!-- Auth Modal -->
   <div class="modal-backdrop" id="authModal">
     <div class="modal">
-      <h2>Welcome to RustyKrab</h2>
-      <p>Enter your authentication token to continue. You can find it in your terminal output.</p>
-      <input type="password" id="tokenInput" placeholder="Bearer token" autocomplete="off" spellcheck="false">
-      <div class="error-text" id="authError">Invalid token. Please try again.</div>
-      <div class="modal-actions">
-        <button class="btn-primary" id="authSubmit">Connect</button>
-      </div>
+      <h2>Connect to your systems</h2>
+      <p id="accessMessage" role="status">Checking your Tailscale connection…</p>
+      <button class="btn-primary" id="accessConnect">Connect</button>
+      <details id="manualAccess" style="margin-top:20px;">
+        <summary>Use a pairing code or access token</summary>
+        <p>Pairing codes are issued by your system operator and expire after five minutes.</p>
+        <label for="chatPairCode">One-time pairing code</label>
+        <input id="chatPairCode" autocomplete="off" autocapitalize="characters" spellcheck="false" maxlength="8" placeholder="8-character code">
+        <label for="chatDeviceName">Device name</label>
+        <input id="chatDeviceName" maxlength="128" value="My browser">
+        <button class="btn-primary" id="chatPairSubmit">Pair and connect</button>
+        <p>Already have an access token?</p>
+        <input type="password" id="tokenInput" placeholder="Access token" autocomplete="off" spellcheck="false">
+        <button class="btn-primary" id="authSubmit">Connect with token</button>
+      </details>
+      <div class="error-text" id="authError" role="alert"></div>
     </div>
   </div>
 
@@ -753,9 +762,10 @@
     </div>
 
     <div style="padding:12px;border-top:1px solid var(--border);">
-      <button class="btn-icon" id="logoutBtn" title="Logout" style="width:100%;display:flex;align-items:center;gap:8px;padding:8px;border-radius:8px;font-size:13px;color:var(--text-secondary);">
+      <p id="accessStatus" role="status" style="font-size:12px;color:var(--text-secondary);overflow-wrap:anywhere;"></p>
+      <button class="btn-icon" id="logoutBtn" title="Disconnect this view" style="width:100%;display:flex;align-items:center;gap:8px;padding:8px;border-radius:8px;font-size:13px;color:var(--text-secondary);">
         <svg viewBox="0 0 24 24" style="width:16px;height:16px;"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
-        Logout
+        Disconnect this view
       </button>
     </div>
   </nav>
@@ -803,12 +813,13 @@
   </main>
 </div>
 
+<script src="/access.js"></script>
 <script>
 (function() {
   'use strict';
 
   // ── State ─────────────────────────────────────────────────
-  let token = localStorage.getItem('rustykrab_token') || '';
+  const access = window.RustyKrabAccess;
   let conversations = [];        // [{id, created_at, updated_at, preview}]
   let activeConvId = null;
   let activeMessages = [];
@@ -840,7 +851,7 @@
       ...opts,
       headers: {
         'Content-Type': 'application/json',
-        'Authorization': `Bearer ${token}`,
+        ...access.headers(),
         ...(opts.headers || {}),
       },
     });
@@ -854,48 +865,41 @@
   };
 
   function forceReauth() {
-    token = '';
-    localStorage.removeItem('rustykrab_token');
+    access.disconnect();
     authModal.style.display = 'flex';
     authError.style.display = 'none';
     tokenInput.value = '';
-    tokenInput.focus();
+    $('#accessMessage').textContent = access.message({disconnected: true});
+    $('#accessStatus').textContent = '';
   }
 
-  // ── Auth ──────────────────────────────────────────────────
-  function checkAuth() {
-    if (token) {
-      authModal.style.display = 'none';
-      init();
-    } else {
-      authModal.style.display = 'flex';
-      tokenInput.focus();
-    }
-  }
-
-  authSubmit.addEventListener('click', async () => {
-    const val = tokenInput.value.trim();
-    if (!val) return;
-    token = val;
+  // Browser disconnect never rotates the daemon's credentials.
+  async function checkAuth(automatic = false, operation = () => access.connect(automatic)) {
+    if ($('#accessConnect').disabled) return;
+    $('#accessConnect').disabled = true; authSubmit.disabled = true; $('#chatPairSubmit').disabled = true;
+    authError.style.display = 'none';
     try {
-      await api('/api/conversations');
-      localStorage.setItem('rustykrab_token', token);
-      authModal.style.display = 'none';
-      init();
-    } catch {
-      authError.style.display = 'block';
-      token = '';
-    }
-  });
-
-  tokenInput.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') authSubmit.click();
-  });
-
-  $('#logoutBtn').addEventListener('click', async () => {
-    try { await api('/api/logout', { method: 'POST' }); } catch {}
-    forceReauth();
-  });
+      const result = await operation();
+      $('#accessMessage').textContent = access.message(result);
+      if (result.authenticated) {
+        tokenInput.value = ''; $('#chatPairCode').value = '';
+        authModal.style.display = 'none';
+        $('#accessStatus').textContent = access.message(result);
+        await init();
+      } else {
+        authModal.style.display = 'flex';
+        if (!result.tailscale_enabled && !result.disconnected) $('#manualAccess').open = true;
+      }
+    } catch (error) {
+      authModal.style.display = 'flex';
+      authError.textContent = error.message; authError.style.display = 'block';
+    } finally { $('#accessConnect').disabled = false; authSubmit.disabled = false; $('#chatPairSubmit').disabled = false; }
+  }
+  $('#accessConnect').addEventListener('click', () => checkAuth());
+  authSubmit.addEventListener('click', () => checkAuth(false, () => access.connectToken(tokenInput.value)));
+  $('#chatPairSubmit').addEventListener('click', () => checkAuth(false, () => access.pair($('#chatPairCode').value, $('#chatDeviceName').value)));
+  tokenInput.addEventListener('keydown', e => { if (e.key === 'Enter') authSubmit.click(); });
+  $('#logoutBtn').addEventListener('click', forceReauth);
 
   // ── Init ──────────────────────────────────────────────────
   async function init() {
@@ -1106,7 +1110,7 @@
   }
 
   async function refreshWorkNotices() {
-    if (!token || !activeConvId || isSending || document.hidden) return;
+    if (!access.connected || !activeConvId || isSending || document.hidden) return;
     const id = activeConvId;
     try {
       const rows = await api(`/api/conversations/${id}/work-notices`);
@@ -1288,7 +1292,7 @@
   // Poll while the tab is open. Push notification is a later phase; until
   // then this plus the app's foreground refresh is how a request surfaces.
   refreshApprovals();
-  setInterval(() => { if (token) refreshApprovals(); }, 15000);
+  setInterval(() => { if (access.connected) refreshApprovals(); }, 15000);
 
   newChatBtn.addEventListener('click', async () => {
     try {
@@ -1470,11 +1474,12 @@
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Authorization': `Bearer ${token}`,
+          ...access.headers(),
         },
         body: JSON.stringify({ content: text }),
       });
 
+      if (res.status === 401) forceReauth();
       if (!res.ok) {
         throw new Error(`HTTP ${res.status}`);
       }
@@ -1776,7 +1781,7 @@
   }
 
   // ── Boot ──────────────────────────────────────────────────
-  checkAuth();
+  checkAuth(true);
 })();
 </script>
 </body>
