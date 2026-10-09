@@ -339,7 +339,7 @@ async fn handle_request(
                 state.replies.lock().unwrap().push(s.to_owned());
             }
         }
-        return (StatusCode::OK, "application/json", json!({"ok":true,"result":{"message_id":1,"date":1,"chat":{"id":TG_CHAT_ID,"type":"private"}}}).to_string());
+        return (StatusCode::OK, "application/json", json!({"ok":true,"result":{"message_id":1,"date":1,"chat":{"id":body["chat_id"],"type":"private"},"message_thread_id":body["message_thread_id"]}}).to_string());
     }
     if !matches!(path, "/api/chat" | "/api/show") {
         return (StatusCode::NOT_FOUND, "application/json", "{}".into());
