@@ -286,6 +286,7 @@ pub struct LocalWorker {
     /// Steps in a row without new evidence before a run has stalled
     /// (section 6, step 7).
     stall_steps: u32,
+    full_reports: bool,
     last_run: Mutex<Option<LocalRun>>,
     /// Spend per run id, for [`Worker::usage`].
     spending: Mutex<HashMap<String, Arc<Spending>>>,
@@ -340,10 +341,18 @@ impl LocalWorker {
             slot: Arc::new(Semaphore::new(1)),
             runs: LocalRuns::global(),
             stall_steps: DEFAULT_STALL_STEPS,
+            full_reports: false,
             last_run: Mutex::new(None),
             spending: Mutex::new(HashMap::new()),
             model: Mutex::new(None),
         }
+    }
+
+    /// Accept complete bounded report content for a host-owned deliverable.
+    /// Default workers continue to use compact result summaries.
+    pub fn with_full_reports(mut self) -> Self {
+        self.full_reports = true;
+        self
     }
 
     /// Call a run stalled after `steps` tool calls in a row that bring no
@@ -555,7 +564,10 @@ impl LocalWorker {
                     Role::System,
                     MessageContent::Text(self.definition.system_prompt.clone()),
                 ),
-                Message::stamped(Role::User, MessageContent::Text(render_brief(brief))),
+                Message::stamped(
+                    Role::User,
+                    MessageContent::Text(render_brief_for_report(brief, self.full_reports)),
+                ),
             ],
             created_at: now,
             updated_at: now,
@@ -600,8 +612,11 @@ impl LocalWorker {
             Message::stamped(Role::System, MessageContent::Text(system)),
         );
         let turn = match resumed.preface.filter(|p| !p.trim().is_empty()) {
-            Some(preface) => format!("{preface}\n\n{}", render_brief(brief)),
-            None => render_brief(brief),
+            Some(preface) => format!(
+                "{preface}\n\n{}",
+                render_brief_for_report(brief, self.full_reports)
+            ),
+            None => render_brief_for_report(brief, self.full_reports),
         };
         conv.messages
             .push(Message::stamped(Role::User, MessageContent::Text(turn)));
@@ -815,6 +830,12 @@ impl LocalWorker {
         // exactly the report the backend accepted and nothing else.
         let recorder = Arc::new(RecordingBackend::new(self.backend.clone()));
         let mut tools = rustykrab_tools::work_tools(recorder.clone());
+        if self.full_reports {
+            tools.retain(|tool| tool.name() != "result_report");
+            tools.push(Arc::new(
+                rustykrab_tools::ResultReportTool::for_full_report(recorder.clone()),
+            ));
+        }
         tools.extend(rustykrab_tools::question_tools(recorder.clone()));
         tools.extend(rustykrab_tools::plan_tools(recorder.clone()));
         let workdir = brief.workspace.as_ref().map(|ws| ws.path.clone());
@@ -1050,6 +1071,10 @@ fn last_assistant_text(conv: &Conversation) -> Option<&str> {
 /// their closed status, refs and one line of summary, never a transcript,
 /// and the last lines say how the run ends.
 pub fn render_brief(brief: &Brief) -> String {
+    render_brief_for_report(brief, false)
+}
+
+fn render_brief_for_report(brief: &Brief, full_report: bool) -> String {
     let mut out = String::new();
     let _ = writeln!(
         out,
@@ -1167,11 +1192,13 @@ pub fn render_brief(brief: &Brief) -> String {
         let _ = writeln!(out, "origin_conversation: {origin}");
     }
     out.push('\n');
-    out.push_str(
-        "End this run with one result_report call, as your last call. Put pointers in it \
-         (paths, URLs, ids), not content. If you cannot finish, set blocked or error (what \
-         failed). ",
-    );
+    out.push_str("End this run with one result_report call, as your last call. ");
+    if full_report {
+        out.push_str("Put the complete deliverable in summary, including source links and coverage limits, within the report tool's stated bound. ");
+    } else {
+        out.push_str("Put pointers in it (paths, URLs, ids), not content. ");
+    }
+    out.push_str("If you cannot finish, set blocked or error (what failed). ");
     out.push_str(&rustykrab_core::work::BLOCKED_SHAPE_GUIDANCE);
     out.push_str(" Follow-up work goes in discovered. Text alone does not end this run.");
     out

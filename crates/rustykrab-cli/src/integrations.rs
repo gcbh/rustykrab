@@ -320,6 +320,7 @@ impl IntegrationWorker {
                 backend,
             )
             .with_transcripts(transcripts)
+            .with_full_reports()
             .with_slot(slot),
             observations,
             serial: AsyncMutex::new(()),
@@ -607,9 +608,24 @@ mod tests {
         }
         async fn chat(
             &self,
-            _: &[rustykrab_core::types::Message],
-            _: &[ToolSchema],
+            messages: &[rustykrab_core::types::Message],
+            tools: &[ToolSchema],
         ) -> Result<rustykrab_core::model::ModelResponse> {
+            let brief = messages
+                .iter()
+                .find(|m| m.role == rustykrab_core::types::Role::User)
+                .and_then(|m| m.content.as_text())
+                .unwrap();
+            assert!(brief.contains("Put the complete deliverable in summary"));
+            assert!(
+                !brief.contains("not content"),
+                "ordinary pointer guidance must not contradict full delivery"
+            );
+            let report = tools.iter().find(|t| t.name == "result_report").unwrap();
+            assert!(report.parameters["properties"]["summary"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("32000"));
             self.0
                 .lock()
                 .unwrap()
@@ -646,6 +662,12 @@ mod tests {
     #[tokio::test]
     async fn controller_receives_attestation_before_a_local_worker_report_can_close_work() {
         use rustykrab_tools::work_backend::{StubWorkBackend, WorkCall};
+        let complete = format!(
+            "# Complete fixture report\n{}",
+            "verified finding and source link\n".repeat(100)
+        )
+        .trim_end()
+        .to_owned();
         for executed in [false, true] {
             let mut replies = std::collections::VecDeque::new();
             if executed {
@@ -656,7 +678,7 @@ mod tests {
             }
             replies.push_back(fixture_call(
                 "result_report",
-                serde_json::json!({"summary":"claimed completion"}),
+                serde_json::json!({"summary":complete}),
             ));
             let backend = Arc::new(StubWorkBackend::new());
             let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -711,6 +733,10 @@ mod tests {
                 "check what the controller received, not only the later Worker return"
             );
             assert_eq!(returned, *received);
+            assert_eq!(
+                received.summary, complete,
+                "full content must survive the real worker/report/attestation path"
+            );
             assert!(!received
                 .artifacts
                 .iter()
