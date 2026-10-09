@@ -24,7 +24,7 @@ all workspace Rust files, remeasured on 2026-10-02 after context/monitor integra
 | `ComputerBackend` | **`tools`** | 2 | Correctly implemented above the consumer |
 | `VideoBackend` | **`tools`** | 1 | Fine — implementation is in the same crate |
 | `SessionManager` | **`tools`** | 1 | Correctly implemented above the consumer |
-| `WorkBackend` | **`tools`** `work_backend.rs` | 5 | The work and question tools call this seam; `Controller` in `control` owns filing and answering, `LocalWorker` wraps it for per-run recording, and the CLI binds a deferred backend at boot |
+| `WorkBackend` | **`tools`** `work_backend.rs` | 6 | The work and question tools call this seam; `Controller` in `control` owns filing and answering, `LocalWorker` wraps it for per-run recording, and the CLI binds a deferred backend at boot |
 | `Worker` | **`control`** `worker.rs` | 16 | **Earns its keep.** The controller calls it; `LocalWorker`, `ExternalWorker` (the `claude_code` and `codex` kinds) and `PeerWorker` (the `peer` kind, Phase 5) in `rustykrab-agent` implement it above the controller. Its defaulted `planning_only` reserves a worker for planner work independently of a broad node advertisement; its defaulted `usage` carries a run's spend and completion-reminder count back to the controller; its defaulted `resumable`, `stop` and `refresh` exist for a run that lives outside the process (a peer's task: re-attached after a restart, cancelled when the controller stops it, advertised and health-checked on the registry's timer); `LocalWorker` uses `refresh` for its provider's model check; its defaulted `runtime_status` exposes sanitized native login/quota observations without importing a provider into the contract; its defaulted `unhealthy_reason` puts the cause of an unhealthy worker in the health line the registry records |
 | `WorkerFactory` | **`control`** `registry.rs` | 3 | Correctly placed: the registry builds external workers and peers through it from a stored spec, and `AgentFactory` in `rustykrab-cli` implements it over `ExternalWorker` and `PeerWorker`, which `control` cannot name; its defaulted async `prepare` redeems a peer's pairing code before the spec is stored |
 | `NodeWorkers` | **`control`** `peer.rs` | 1 | Correctly placed: the gateway's task worker and `GET /api/node` call it to run a peer's brief inside this node's ceiling and to advertise that ceiling; `DelegatedRuns` in `rustykrab-agent` implements it over the local worker, which neither the gateway's traits nor `control` should build |
@@ -267,3 +267,7 @@ the store's recognized table list is explicit and tested; unknown tables stop
 the merge. The integration worker uses the existing Worker and Tool seams,
 with action-level restrictions and execution observations in the host adapter.
 It adds no scheduler, channel loop or credential transport.
+
+The CLI AttestingBackend checks integration reports before forwarding to the
+controller. Recording a result inside LocalWorker precedes Worker::run returning;
+attestation only on that return is too late to gate controller completion.
