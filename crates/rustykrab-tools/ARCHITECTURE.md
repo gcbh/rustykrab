@@ -472,3 +472,11 @@ single code items, explicit finite budgets and registered-but-unloaded resource 
 The default implementation rejects nonempty requirements for legacy adapters;
 it never drops them. The CLI adapter validates durable scheduling is enabled
 and inherits the calling conversation's channel context as before.
+
+## Read-only mail retrieval
+
+Gmail body and thread fetches use `BODY.PEEK[]` rather than `RFC822`, so
+briefing retrieval does not set the IMAP Seen flag. The CLI's optional
+integration adapter restricts the existing tool actions and note paths above
+this crate. General tools retain their explicit write operations for other
+authorized surfaces; no second credential or notification transport is added.

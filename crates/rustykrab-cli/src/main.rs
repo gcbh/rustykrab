@@ -3,10 +3,12 @@ mod ask_cmd;
 mod chat;
 #[cfg(feature = "computer-use")]
 mod computer_backend;
+mod consolidate;
 mod daemon_client;
 mod dreaming;
 mod evaluation;
 mod fleet;
+mod integrations;
 mod monitor_cmd;
 mod overseer;
 mod peers;
@@ -631,6 +633,9 @@ async fn main() -> anyhow::Result<()> {
         println!("rustykrab {}", version_string());
         return Ok(());
     }
+    if args.len() >= 2 && args[1] == "consolidate" {
+        return consolidate::run(&args[2..]).await;
+    }
     if args.len() >= 2 && args[1] == "skill" {
         return handle_skill_subcommand(&data_dir, &args[2..]);
     }
@@ -667,7 +672,7 @@ async fn main() -> anyhow::Result<()> {
     // reporting the mistake.
     if let Some(unknown) = args.get(1).filter(|a| !a.starts_with('-')) {
         eprintln!("unknown subcommand '{unknown}'");
-        eprintln!("subcommands: skill, keychain, chat, dream, pair, work, workers, worker, update, monitor, questions, answer, judgment");
+        eprintln!("subcommands: skill, keychain, chat, dream, pair, work, workers, worker, update, monitor, questions, answer, judgment, consolidate");
         eprintln!("run with no arguments to start the daemon");
         std::process::exit(2);
     }
@@ -1513,6 +1518,22 @@ async fn main() -> anyhow::Result<()> {
                     model_slot.clone(),
                 ),
                 serde_json::json!({ "role": "planner" }),
+                None,
+            )
+            .await?;
+    }
+    if integrations::enabled() {
+        fleet
+            .registry
+            .register(
+                Arc::new(integrations::IntegrationWorker::new(
+                    provider.clone(),
+                    tools.clone(),
+                    deferred_work_backend.clone() as Arc<dyn rustykrab_tools::WorkBackend>,
+                    scheduled_work::transcripts(&store, skill_registry.clone()),
+                    model_slot.clone(),
+                )?),
+                serde_json::json!({"role":"integrations"}),
                 None,
             )
             .await?;

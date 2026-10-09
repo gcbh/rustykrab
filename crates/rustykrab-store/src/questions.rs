@@ -477,7 +477,7 @@ pub(crate) fn apply_notice(
     if let Some(id) = &notice.replace {
         let updated = conn.execute(
             "UPDATE work_outbox SET body = ?2, origin = COALESCE(?3, origin), not_before = ?4 \
-             WHERE id = ?1 AND delivered_at IS NULL AND not_before IS NOT NULL \
+             WHERE id = ?1 AND delivered_at IS NULL AND retired_at IS NULL AND not_before IS NOT NULL \
                AND not_before > ?5",
             params![
                 id,
@@ -517,7 +517,7 @@ fn waiting_notice(
     Ok(conn
         .query_row(
             "SELECT id, parent, channel, body, not_before FROM work_outbox \
-             WHERE parent = ?1 AND channel = ?2 AND delivered_at IS NULL \
+             WHERE parent = ?1 AND channel = ?2 AND delivered_at IS NULL AND retired_at IS NULL \
                AND not_before IS NOT NULL AND not_before > ?3 \
              ORDER BY created_at DESC, rowid DESC LIMIT 1",
             params![parent, channel, ts(&now)],

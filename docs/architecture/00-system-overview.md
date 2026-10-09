@@ -256,3 +256,13 @@ exact authority and Serve identity must agree; forwarded IPs are not proof.
 Existing Origin/CSRF guards still apply. Chat and monitoring share a static
 browser access helper; network identity needs no token or session table.
 There is no change to channel intake, scheduling or native agent execution.
+
+## Single-owner consolidation
+
+`consolidate stage` merges operator-owned legacy snapshots into the v6 data
+model with receipts, conflict refusal, credential re-encryption and memory
+provenance. It is offline staging, not concurrent sharing among old schedulers.
+The optional Claude CLI integration adapter executes personal tasks through
+the same fleet/controller as native coding work. Operators hand channel and
+schedule ownership to one daemon after verifying the stage, as documented in
+[`instance-consolidation.md`](../instance-consolidation.md).

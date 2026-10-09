@@ -1,3 +1,6 @@
+mod instance_import;
+pub use instance_import::MemoryImportReport;
+
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -454,6 +457,7 @@ impl SqliteMemoryStorage {
         .map_err(storage_err)?;
 
         Self::run_migrations(&conn)?;
+        instance_import::migrate(&conn)?;
 
         Ok(Self {
             conn: Arc::new(tokio::sync::Mutex::new(conn)),

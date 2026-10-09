@@ -897,7 +897,7 @@ pub(super) fn enqueue_outbox(
     let id = Uuid::new_v4().to_string();
     conn.execute(
         &format!(
-            "INSERT INTO work_outbox ({OUTBOX_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)"
+            "INSERT INTO work_outbox ({OUTBOX_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL)"
         ),
         params![
             id,
@@ -917,7 +917,7 @@ pub(super) fn outbox_pending(conn: &Connection) -> Result<Vec<OutboxRow>, WorkSt
     collect(
         conn,
         &format!(
-            "SELECT {OUTBOX_COLUMNS} FROM work_outbox WHERE delivered_at IS NULL
+            "SELECT {OUTBOX_COLUMNS} FROM work_outbox WHERE delivered_at IS NULL AND retired_at IS NULL
                 AND (not_before IS NULL OR not_before <= ?1)
               ORDER BY created_at, rowid"
         ),
@@ -935,7 +935,7 @@ pub(super) fn outbox_for_conversation(
 ) -> Result<Vec<OutboxRow>, WorkStoreError> {
     let mut rows = collect(
         conn,
-        "SELECT o.id,o.parent,o.origin,o.channel,o.body,o.created_at,o.delivered_at
+        "SELECT o.id,o.parent,o.origin,o.channel,o.body,o.created_at,o.delivered_at,o.retired_at
          FROM work_outbox o JOIN work_items w ON w.id=o.parent
          WHERE w.origin_conversation_id=?1 AND o.channel='webchat'
            AND (o.not_before IS NULL OR o.not_before<=?2)
@@ -953,7 +953,7 @@ pub(super) fn outbox_mark_delivered(
     now: DateTime<Utc>,
 ) -> Result<bool, WorkStoreError> {
     let marked = conn.execute(
-        "UPDATE work_outbox SET delivered_at = ?2 WHERE id = ?1 AND delivered_at IS NULL",
+        "UPDATE work_outbox SET delivered_at = ?2 WHERE id = ?1 AND delivered_at IS NULL AND retired_at IS NULL",
         params![id, ts(&now)],
     )?;
     if marked == 1 {

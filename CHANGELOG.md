@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [6.3.0] - 2026-10-09
+
+- feat: consolidate legacy work under the v6 manager (#673)
+
+### Added
+
+- Offline instance consolidation stages committed SQLite snapshots, merges conversations, channel bindings, schedules, work history, project state and memory, and re-encrypts credential history for the destination key. Import receipts prevent replay; conflicting IDs abort instead of overwriting current v6 state. Imported schedules remain disabled for an explicit integration handoff.
+- A restricted personal integration worker uses the existing Claude Max CLI provider, shared model slot and durable controller. Gmail/calendar reads, web research and dated Obsidian briefing notes carry adapter-observed tool evidence; missing execution cannot be reported as completed. Native Claude and Codex coding workers retain their existing repository boundaries.
+- Historical outbox notices have an explicit retired stamp, preserving their history without replaying old notifications or claiming they were delivered.
+
+### Fixed
+
+- Gmail body and thread reads use IMAP `BODY.PEEK[]`, preserving read flags during automated briefings.
+
 ## [6.2.0] - 2026-10-09
 
 - feat: use Tailscale identity for shared browser access (#672)

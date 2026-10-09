@@ -7,6 +7,7 @@ mod dream_cycles;
 mod dream_reports;
 mod guarded;
 mod inbound;
+mod instance_import;
 mod jobs;
 pub mod keychain;
 mod outcomes;
@@ -42,6 +43,7 @@ pub use dream_cycles::DreamCycleStore;
 pub use dream_reports::{DreamReportStore, StoredReport};
 pub use guarded::{GuardedSecrets, WriteOutcome};
 pub use inbound::InboundStore;
+pub use instance_import::InstanceImportReport;
 pub use jobs::{JobRun, JobStore, ScheduledJob};
 pub use outcomes::OutcomeStore;
 pub use payment_request::{
@@ -788,6 +790,7 @@ impl Store {
 
         // Phase 3 of the control layer: the worker registry (`workers.rs`).
         workers::migrate(conn)?;
+        instance_import::migrate(conn)?;
         // Phase 4 of the control layer (plan sections 6.6, 7 and 13): the
         // `questions` and `judgment_policies` tables and the outbox's
         // `not_before`, kept in `questions.rs` beside the code that reads
