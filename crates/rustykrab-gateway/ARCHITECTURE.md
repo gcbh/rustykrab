@@ -404,6 +404,14 @@ introduced. Real-router tests cover default-off, owner writes/read metadata,
 anonymous and wrong-account refusals, invalid credentials, existing paired
 devices, CSRF, kernel-peer checks and polling after anonymous lockout.
 
+WebChat sends an explicit JSON object when creating a conversation, including
+automatic creation for the first message. Creation failures preserve the draft
+and surface a composer alert. Submission is guarded while creation is pending;
+HTTP errors, SSE errors and a stream ending without a terminal event restore
+the controls and report failure. The browser submission regression harness
+(`scripts/test_webchat_submit.mjs`) runs the embedded handlers with transport
+fixtures in CI; live checks also verify the actual gateway and native reply.
+
 ## Private saved briefings and delivery receipts
 
 `briefing_routes.rs` serves authenticated `GET /api/briefings` metadata and

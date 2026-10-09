@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [6.4.3] - 2026-10-09
+
+- fix: restore WebChat conversation creation and submission (#677)
+
 ## [6.4.2] - 2026-10-09
 
 - fix: preserve complete integration deliverables (#676)

@@ -805,10 +805,11 @@
             spellcheck="true"
           ></textarea>
         </div>
-        <button class="btn-send" id="sendBtn" title="Send">
+        <button class="btn-send" id="sendBtn" title="Send" aria-label="Send" disabled>
           <svg viewBox="0 0 24 24"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
         </button>
       </div>
+      <div class="error-text" id="composerError" role="alert"></div>
     </div>
   </main>
 </div>
@@ -844,6 +845,7 @@
   const msgContainer  = $('#messagesContainer');
   const messageInput  = $('#messageInput');
   const sendBtn       = $('#sendBtn');
+  const composerError = $('#composerError');
 
   // ── API helpers ───────────────────────────────────────────
   const api = async (path, opts = {}) => {
@@ -929,10 +931,8 @@
       removeAgentStatus();
       finalizeStreamingMessage(data.message);
     } else if (data.type === 'error') {
-      removeAgentStatus();
-      removeTypingIndicator();
-      isSending = false;
-      updateSendButton();
+      showComposerError('The reply failed. Please try again.');
+      finalizeStreamingMessage();
     }
   }
 
@@ -1295,8 +1295,12 @@
   setInterval(() => { if (access.connected) refreshApprovals(); }, 15000);
 
   newChatBtn.addEventListener('click', async () => {
+    if (isSending) return;
+    isSending = true;
+    showComposerError('');
+    updateSendButton();
     try {
-      const conv = await api('/api/conversations', { method: 'POST' });
+      const conv = await api('/api/conversations', { method: 'POST', body: JSON.stringify({}) });
       conversations.unshift({
         id: conv.id,
         created_at: conv.createdAt,
@@ -1304,11 +1308,14 @@
         preview: (conv.title && conv.title.length > 0 ? conv.title : 'New conversation').slice(0, 60),
       });
       renderConversationList();
-      selectConversation(conv.id);
+      await selectConversation(conv.id);
       closeSidebar();
       messageInput.focus();
     } catch (e) {
-      console.error('Failed to create conversation:', e);
+      showComposerError('Could not start a conversation. Please try again.');
+    } finally {
+      isSending = false;
+      updateSendButton();
     }
   });
 
@@ -1427,11 +1434,14 @@
   async function sendMessage() {
     const text = messageInput.value.trim();
     if (!text || isSending) return;
+    isSending = true;
+    showComposerError('');
+    updateSendButton();
 
     // Auto-create conversation if none selected
     if (!activeConvId) {
       try {
-        const conv = await api('/api/conversations', { method: 'POST' });
+        const conv = await api('/api/conversations', { method: 'POST', body: JSON.stringify({}) });
         conversations.unshift({
           id: conv.id,
           created_at: conv.createdAt,
@@ -1440,10 +1450,14 @@
         });
         activeConvId = conv.id;
         renderConversationList();
-      } catch { return; }
+      } catch {
+        showComposerError('Could not start a conversation. Your message is still here. Please try again.');
+        isSending = false;
+        updateSendButton();
+        return;
+      }
     }
 
-    isSending = true;
     messageInput.value = '';
     autoResizeInput();
     updateSendButton();
@@ -1487,6 +1501,7 @@
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
       let buffer = '';
+      let receivedTerminalEvent = false;
 
       while (true) {
         const { done, value } = await reader.read();
@@ -1503,19 +1518,21 @@
             if (raw) {
               try {
                 const data = JSON.parse(raw);
+                if (data.type === 'done' || data.type === 'error') receivedTerminalEvent = true;
                 handleStreamEvent(data);
               } catch { /* ignore malformed JSON */ }
             }
           }
         }
       }
+      if (!receivedTerminalEvent) throw new Error('Reply stream ended before completion');
     } catch (e) {
       removeTypingIndicator();
+      removeAgentStatus();
       // If stream didn't finalize, clean up
       if (isSending) {
-        appendMessageBubble('assistant', 'Something went wrong. Please try again.');
-        isSending = false;
-        updateSendButton();
+        showComposerError('The reply was interrupted. Please try again.');
+        finalizeStreamingMessage();
       }
     }
   }
@@ -1540,9 +1557,16 @@
     messageInput.style.height = Math.min(messageInput.scrollHeight, 160) + 'px';
   }
 
+  function showComposerError(message) {
+    composerError.textContent = message;
+    composerError.style.display = message ? 'block' : 'none';
+  }
+
   function updateSendButton() {
     const hasText = messageInput.value.trim().length > 0;
-    sendBtn.classList.toggle('active', hasText && !isSending);
+    sendBtn.disabled = !hasText || isSending;
+    sendBtn.classList.toggle('active', !sendBtn.disabled);
+    newChatBtn.disabled = isSending;
   }
 
   // ── Sidebar toggle (mobile) ───────────────────────────────
