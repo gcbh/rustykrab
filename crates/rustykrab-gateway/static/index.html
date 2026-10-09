@@ -932,10 +932,7 @@
       finalizeStreamingMessage(data.message);
     } else if (data.type === 'error') {
       showComposerError('The reply failed. Please try again.');
-      removeAgentStatus();
-      removeTypingIndicator();
-      isSending = false;
-      updateSendButton();
+      finalizeStreamingMessage();
     }
   }
 
@@ -1535,8 +1532,7 @@
       // If stream didn't finalize, clean up
       if (isSending) {
         showComposerError('The reply was interrupted. Please try again.');
-        isSending = false;
-        updateSendButton();
+        finalizeStreamingMessage();
       }
     }
   }

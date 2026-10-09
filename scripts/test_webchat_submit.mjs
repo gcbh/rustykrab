@@ -17,6 +17,7 @@ const handlers = [
   section('  const api = async', '  function forceReauth'),
   section('  function handleStreamEvent', '  const STATUS_ICONS'),
   section("  newChatBtn.addEventListener('click'", '  // ── Messages rendering'),
+  section('  function finalizeStreamingMessage', '  // ── Send Message'),
   section('  // ── Send Message', '  // ── Sidebar toggle'),
 ].join('\n');
 
@@ -30,7 +31,7 @@ function element() {
     focus() {},
   };
 }
-function reply(events = [{ type: 'done', message: { role: 'assistant', content: 'Chat is working' } }]) {
+function reply(events = [{ type: 'text', delta: 'Chat is working' }, { type: 'done', message: { role: 'assistant', content: 'Chat is working' } }]) {
   // Deliberately split frames across reads, including inside the terminal event.
   const payload = events.map(e => `data: ${JSON.stringify(e)}\n\n`).join('');
   const chunks = [payload.slice(0, 9), payload.slice(9)];
@@ -50,10 +51,10 @@ function client({ createStatus = 200, stream = () => reply(), createGate } = {})
     selectConversation: async id => { c.activeConvId = id; selected.push(id); },
     appendMessageBubble: (role, text) => bubbles.push({ role, text }),
     showTypingIndicator() { c.typing = true; }, removeTypingIndicator() { c.typing = false; },
-    showAgentStatus() {}, removeAgentStatus() {}, updateStreamingMessage() {},
-    finalizeStreamingMessage(message) {
-      if (message) bubbles.push({ role: message.role, text: message.content });
-      c.typing = false; c.isSending = false; c.updateSendButton();
+    showAgentStatus() {}, removeAgentStatus() {}, extractText: text => text,
+    updateStreamingMessage(text) {
+      c.streaming = true;
+      if (!bubbles.some(b => b.role === 'assistant')) bubbles.push({ role: 'assistant', text });
     },
     fetch: async (path, options) => {
       calls.push({ path, options });
@@ -72,6 +73,9 @@ function client({ createStatus = 200, stream = () => reply(), createGate } = {})
       return stream();
     },
   };
+  c.msgContainer.querySelector = () => c.streaming ? {
+    classList: { remove(name) { assert.equal(name, 'streaming-message'); c.streaming = false; } },
+  } : null;
   vm.createContext(c); vm.runInContext(handlers, c);
   c.messageInput.value = 'Connection check';
   c.messageInput.dispatch('input');
@@ -138,6 +142,8 @@ for (const [name, stream, expected] of [
     await c.sendBtn.dispatch('click');
     assert.equal(c.isSending, false);
     assert.equal(c.typing, false);
+    assert.equal(c.streamBuffer, '');
+    assert(!c.streaming, 'A failed partial reply must not consume the next reply');
     assert.match(c.composerError.textContent, expected);
     c.messageInput.value = 'Connection check'; c.messageInput.dispatch('input');
     assert.equal(c.sendBtn.disabled, false);
