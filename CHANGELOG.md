@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [6.4.2] - 2026-10-09
+
+- fix: preserve complete integration deliverables (#676)
+
+### Fixed
+
+- Allow the integration worker to report complete bounded briefings and listing details, preserving source links through controller attestation and scheduled delivery instead of forcing the ordinary 1,500-character work summary.
+
 ## [6.4.1] - 2026-10-09
 
 - fix: attest integration reports before controller completion (#675)

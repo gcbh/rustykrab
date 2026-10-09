@@ -83,6 +83,7 @@ pub fn worker_run_end_summary(tool_name: &str, output: &Value) -> Option<String>
 }
 
 const SUMMARY_MAX: usize = 1_500;
+const FULL_REPORT_MAX: usize = 32_000;
 const DETAIL_MAX: usize = 600;
 const ARTIFACTS_MAX: usize = 20;
 
@@ -404,14 +405,18 @@ fn parse_discovered(v: &Value, out: &mut Vec<Problem>) -> Vec<rustykrab_core::wo
 
 /// Parse and check a report. Returns the `item` argument and the report;
 /// only meaningful when no problem was added.
-fn parse_report(args: &Value, out: &mut Vec<Problem>) -> (Option<String>, ResultReport) {
+fn parse_report(
+    args: &Value,
+    out: &mut Vec<Problem>,
+    summary_max: usize,
+) -> (Option<String>, ResultReport) {
     let empty = Map::new();
     let obj = args.as_object().unwrap_or(&empty);
     check_keys(obj, &REPORT_KEYS, "", out);
 
     let item = take_opt_text(obj, "item", "", POINTER_MAX, out)
         .map(|s| s.trim_start_matches('#').trim().to_string());
-    let summary = take_text(obj, "summary", "", SUMMARY_MAX, true, out);
+    let summary = take_text(obj, "summary", "", summary_max, true, out);
     let artifacts = take_artifacts_of(
         obj,
         "artifacts",
@@ -470,11 +475,24 @@ fn parse_report(args: &Value, out: &mut Vec<Problem>) -> (Option<String>, Result
 /// Reports a worker run's typed result through a [`WorkBackend`].
 pub struct ResultReportTool {
     backend: Arc<dyn WorkBackend>,
+    summary_max: usize,
 }
 
 impl ResultReportTool {
     pub fn new(backend: Arc<dyn WorkBackend>) -> Self {
-        Self { backend }
+        Self {
+            backend,
+            summary_max: SUMMARY_MAX,
+        }
+    }
+
+    /// A bounded complete deliverable for a host that sends the report as content.
+    /// Ordinary coding/planning reports retain the compact default.
+    pub fn for_full_report(backend: Arc<dyn WorkBackend>) -> Self {
+        Self {
+            backend,
+            summary_max: FULL_REPORT_MAX,
+        }
     }
 }
 
@@ -490,6 +508,13 @@ static DESCRIPTION: LazyLock<String> = LazyLock::new(|| {
     )
 });
 
+static FULL_REPORT_DESCRIPTION: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "End your work item with its typed result, as your LAST call. summary is the complete deliverable that the host sends to the configured destination, up to {FULL_REPORT_MAX} characters. Include every verified finding, source link and coverage limit; do not omit required content to fit the ordinary short work-summary format. If you cannot finish, set blocked or error. {} The run ends when this call succeeds.",
+        *BLOCKED_SHAPE_GUIDANCE
+    )
+});
+
 #[async_trait]
 impl Tool for ResultReportTool {
     fn name(&self) -> &str {
@@ -497,7 +522,11 @@ impl Tool for ResultReportTool {
     }
 
     fn description(&self) -> &str {
-        &DESCRIPTION
+        if self.summary_max == FULL_REPORT_MAX {
+            &FULL_REPORT_DESCRIPTION
+        } else {
+            &DESCRIPTION
+        }
     }
 
     fn schema(&self) -> ToolSchema {
@@ -508,6 +537,14 @@ impl Tool for ResultReportTool {
             .map(|c| format!("{}: {}", c.as_str(), subclasses_of(*c)))
             .collect::<Vec<_>>()
             .join("; ");
+        let summary_description = if self.summary_max == FULL_REPORT_MAX {
+            format!("The complete deliverable, including source links and coverage limits (max {} chars). The first line is what later steps see.", self.summary_max)
+        } else {
+            format!(
+                "What you did and found (max {} chars). The first line is what later steps see.",
+                self.summary_max
+            )
+        };
         ToolSchema {
             name: self.name().to_string(),
             description: self.description().to_string(),
@@ -520,7 +557,7 @@ impl Tool for ResultReportTool {
                     },
                     "summary": {
                         "type": "string",
-                        "description": format!("What you did and found (max {SUMMARY_MAX} chars). The first line is what later steps see.")
+                        "description": summary_description
                     },
                     "artifacts": {
                         "type": "array",
@@ -614,7 +651,7 @@ impl Tool for ResultReportTool {
         validate_tool_args(&schema.parameters, &args).map_err(Error::ToolExecution)?;
 
         let mut problems = Vec::new();
-        let (asked, report) = parse_report(&args, &mut problems);
+        let (asked, report) = parse_report(&args, &mut problems, self.summary_max);
         let bound = with_work_run(|r| r.item.clone());
         let item = match (bound, asked) {
             (Some(held), Some(named)) if held != named => {
@@ -706,6 +743,41 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.kind(), ToolErrorKind::InvalidInput);
         err.to_string()
+    }
+
+    #[tokio::test]
+    async fn full_reports_preserve_content_and_reject_overflow_without_recording() {
+        let stub = Arc::new(StubWorkBackend::new());
+        let full = ResultReportTool::for_full_report(stub.clone());
+        let content = "é".repeat(FULL_REPORT_MAX);
+        let args = json!({"summary": content});
+        assert!(WORK_RUN_CONTEXT
+            .scope(run("item-1"), tool(&stub).execute(args.clone()))
+            .await
+            .is_err());
+        assert!(
+            reports(&stub).is_empty(),
+            "default workers must retain their compact bound"
+        );
+        let response = WORK_RUN_CONTEXT
+            .scope(run("item-1"), full.execute(args))
+            .await
+            .unwrap();
+        assert_eq!(response["summary"], content);
+        assert_eq!(reports(&stub)[0].1.summary, content);
+        let overflow = WORK_RUN_CONTEXT
+            .scope(
+                run("item-1"),
+                full.execute(json!({"summary":"é".repeat(FULL_REPORT_MAX + 1)})),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(overflow.kind(), ToolErrorKind::InvalidInput);
+        assert_eq!(
+            reports(&stub).len(),
+            1,
+            "an over-limit report must not reach the backend"
+        );
     }
 
     #[test]

@@ -106,3 +106,8 @@ Rollback requires stopping v6 first and restoring the frozen original v6
 state/config/binary and old route/owners. Never resume old and new schedulers
 or Telegram pollers simultaneously. Keep rollback material protected, outside
 source control and agent briefs.
+
+Integration result_report accepts a complete deliverable up to 32,000 characters.
+Its host-selected schema states this content contract; ordinary workers keep the
+1,500-character summary bound. Verify the delivered report includes every listed
+source and required section, rather than treating a concise status as the report.

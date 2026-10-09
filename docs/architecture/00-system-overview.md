@@ -277,3 +277,8 @@ Paused work waiting for a user no longer prevents idle project dreaming.
 Integration completion passes through a CLI-owned WorkBackend wrapper before the
 controller receives result_report. Host tool observations cannot be deferred until
 Worker::run returns: the model-facing report call can already close the item.
+
+The integration host explicitly selects complete result reports bounded to
+32,000 characters. This permits full briefing sections and listing links through
+the same controller and scheduled delivery path; default work summaries remain
+compact and out-of-bound content is rejected rather than truncated.
