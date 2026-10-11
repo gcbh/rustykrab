@@ -15,8 +15,8 @@
 //!   bindings of the item's `origin_conversation_id`; a scheduled firing's
 //!   notice goes to its job's delivery target, and a `done` firing's notice
 //!   is its job's own delivery; only with neither does a Telegram notice
-//!   fall back to the first allowed chat. Where a notice goes changes here,
-//!   never what it says.
+//!   fall back to the first allowed chat. The controller supplies the update;
+//!   the host adds the authenticated execution-detail link.
 
 use std::sync::Arc;
 
@@ -229,18 +229,6 @@ pub(crate) async fn route(store: &Store, row: &OutboxRow, default_chat: Option<&
     send(&row.channel, chat, None)
 }
 
-/// A work notification is a brief pointer to execution, never a transcript.
-/// The byte budget also keeps multibyte text below Telegram's single-message cap.
-const NOTICE_MAX_BYTES: usize = 2000;
-
-fn clip_notice(text: &str, budget: usize) -> String {
-    if text.len() <= budget {
-        return text.to_string();
-    }
-    let end = text.floor_char_boundary(budget.saturating_sub(3));
-    format!("{}...", &text[..end])
-}
-
 fn notice_details(parent: &str, public_url: Option<&str>) -> String {
     if let Some(mut url) = public_url.and_then(|base| reqwest::Url::parse(base).ok()) {
         if matches!(url.scheme(), "http" | "https")
@@ -252,80 +240,15 @@ fn notice_details(parent: &str, public_url: Option<&str>) -> String {
             url.set_query(None);
             url.set_fragment(None);
             url.query_pairs_mut().append_pair("work", parent);
-            let details = format!("Details: {url}");
-            if details.len() <= 512 {
-                return details;
-            }
+            return format!("Details: {url}");
         }
     }
-    format!("Details: /work {}", clip_notice(parent, 128))
+    format!("Details: /work {parent}")
 }
 
-/// Render at delivery too, so older queued notices cannot replay giant snapshots.
-/// Keep one status/result, the first question and its reply controls. The full
-/// record and any further questions remain available through the details link.
-fn brief_notice(row: &OutboxRow, public_url: Option<&str>) -> String {
-    let details = notice_details(&row.parent, public_url);
-    let mut lines = vec![clip_notice(
-        row.body.lines().next().unwrap_or("Work update"),
-        180,
-    )];
-    let mut summary = false;
-    let mut asked = false;
-    let mut question = false;
-    let mut options = false;
-    let mut answer = false;
-    let mut approval = false;
-    for line in row.body.lines().skip(1) {
-        let budget = if !summary
-            && [
-                "Result",
-                "Done",
-                "Running:",
-                "Not done:",
-                "Queued:",
-                "Held:",
-            ]
-            .iter()
-            .any(|prefix| line.starts_with(prefix))
-        {
-            summary = true;
-            240
-        } else if !asked && line.starts_with("Asked:") {
-            asked = true;
-            300
-        } else if !question && line.starts_with("Question ") {
-            question = true;
-            120
-        } else if !options && line.starts_with("Options:") {
-            options = true;
-            320
-        } else if !answer
-            && (line.starts_with("Answer with /answer ") || line.starts_with("Store "))
-        {
-            answer = true;
-            160
-        } else if !approval && line.starts_with("Reply /approve ") {
-            approval = true;
-            160
-        } else {
-            continue;
-        };
-        // Legacy parent notices inline evidence after the completed child's
-        // summary. Those receipts belong in the detail view as well.
-        let display = if line.starts_with("Done:") {
-            line.split(" [").next().unwrap_or(line)
-        } else {
-            line
-        };
-        let clipped = clip_notice(display, budget);
-        let used = lines.iter().map(|line| line.len() + 1).sum::<usize>();
-        if used + clipped.len() + 1 + details.len() <= NOTICE_MAX_BYTES {
-            lines.push(clipped);
-        }
-    }
-    lines.push(details);
-    lines.join("\n")
+/// The controller supplies the concise update; the host adds its execution link.
+fn notice_with_details(row: &OutboxRow, public_url: Option<&str>) -> String {
+    format!("{}\n{}", row.body, notice_details(&row.parent, public_url))
 }
 
 /// One pass over the pending notices: each is routed and sent, and marked
@@ -363,7 +286,7 @@ async fn deliver_pending_with_details(
             } => match backend
                 .send_message(
                     &channel,
-                    &brief_notice(&row, public_url),
+                    &notice_with_details(&row, public_url),
                     chat.as_deref(),
                     thread.as_deref(),
                 )

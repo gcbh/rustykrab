@@ -36,6 +36,27 @@ async fn scenario_01_a_personal_task_is_leased_run_verified_and_reported_once_wi
         "the lease event names the worker"
     );
 
+    // Reproduce host-attested receipts that contain execution state rather than
+    // a short reference. These must remain durable without becoming message text.
+    let context = format!(r#"{{"snapshot":"{}"}}"#, "private state ".repeat(15000));
+    let observation = "tool result ".repeat(15000);
+    for (kind, reference) in [
+        ("project_context", &context),
+        ("tool_observation", &observation),
+    ] {
+        h.store()
+            .work_evidence_add(Evidence {
+                item: id.clone(),
+                kind: kind.into(),
+                reference: reference.clone(),
+                hash: None,
+                verified_by: Some("host:test".into()),
+                at: h.clock.now(),
+            })
+            .await
+            .unwrap();
+    }
+
     let t = h.drain().await;
     assert!(t.reconciled.contains(&id));
     assert_eq!(h.status(&id).await, Status::Done);
@@ -53,8 +74,14 @@ async fn scenario_01_a_personal_task_is_leased_run_verified_and_reported_once_wi
         && e.reference == "/tmp/book-the-dentist.txt"
         && e.verified_by.as_deref() == Some("result_report")));
     assert!(evidence.iter().any(|e| e.kind == "summary"));
+    assert!(evidence
+        .iter()
+        .any(|e| e.kind == "project_context" && e.reference == context));
+    assert!(evidence
+        .iter()
+        .any(|e| e.kind == "tool_observation" && e.reference == observation));
 
-    // One notice, for the item as its own parent, with the evidence.
+    // One notice, for the item as its own parent; receipts stay in execution details.
     let outbox = h.outbox().await;
     assert_eq!(outbox.len(), 1, "{outbox:#?}");
     assert_eq!(outbox[0].parent, id);
@@ -63,7 +90,14 @@ async fn scenario_01_a_personal_task_is_leased_run_verified_and_reported_once_wi
     let body = &outbox[0].body;
     assert!(body.contains("\"Book the dentist\""), "{body}");
     assert!(body.contains(": done."), "{body}");
-    assert!(body.contains("path:/tmp/book-the-dentist.txt"), "{body}");
+    assert!(body.contains("Evidence: 3 records."), "{body}");
+    assert!(!body.contains("private state"), "{body}");
+    assert!(!body.contains("tool result"), "{body}");
+    assert!(!body.contains("/tmp/book-the-dentist.txt"), "{body}");
+    assert!(
+        body.len() < 400,
+        "receipts must not enlarge the notification"
+    );
 }
 
 // ── 6 ──────────────────────────────────────────────────────────────────

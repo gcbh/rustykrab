@@ -124,8 +124,6 @@ pub(super) struct NoticeData {
 
 /// How many items a list names before it says "and N more".
 const LIST_MAX: usize = 6;
-/// How many evidence refs a done line shows.
-const REFS_MAX: usize = 4;
 
 /// `#` and the first eight characters of an id.
 pub(super) fn short(id: &str) -> String {
@@ -134,7 +132,7 @@ pub(super) fn short(id: &str) -> String {
 
 /// `"title" (#abcd1234)`.
 pub(super) fn label(item: &WorkItem) -> String {
-    format!("\"{}\" ({})", clip(item.title.trim(), 120), short(&item.id))
+    format!("\"{}\" ({})", item.title.trim(), short(&item.id))
 }
 
 fn phrase(status: Status) -> String {
@@ -166,17 +164,9 @@ fn list(title: &str, entries: Vec<String>) -> Option<String> {
 }
 
 fn refs(refs: &[ArtifactRef]) -> String {
-    refs.iter()
-        .take(REFS_MAX)
-        .map(|r| {
-            // Project context is a frozen execution payload, not notification text.
-            if r.kind == "project_context" {
-                return "project context recorded".to_string();
-            }
-            clip(&format!("{}:{}", r.kind, r.value), 120)
-        })
-        .collect::<Vec<_>>()
-        .join(", ")
+    // Execution receipts can contain full snapshots. The detail view owns them.
+    let noun = if refs.len() == 1 { "record" } else { "records" };
+    format!("{} {noun}", refs.len())
 }
 
 /// The message for `root`.
@@ -526,34 +516,4 @@ fn not_done(snap: &Snapshot, item: &WorkItem, data: &NoticeData) -> String {
         line.push('.');
     }
     line
-}
-
-#[cfg(test)]
-mod notification_tests {
-    use super::*;
-
-    #[test]
-    fn serialized_execution_context_never_enters_notification_evidence() {
-        let context = format!(r#"{{"snapshot":"{}"}}"#, "private state ".repeat(15000));
-        let evidence = vec![
-            ArtifactRef {
-                kind: "project_context".into(),
-                value: context.clone(),
-            },
-            ArtifactRef {
-                kind: "commit".into(),
-                value: "abc123".into(),
-            },
-            ArtifactRef {
-                kind: "tool_observation".into(),
-                value: "x".repeat(150000),
-            },
-        ];
-        let text = refs(&evidence);
-        assert!(text.contains("project context recorded"));
-        assert!(text.contains("commit:abc123"));
-        assert!(!text.contains("snapshot"));
-        assert!(text.len() < 300);
-        assert_eq!(evidence[0].value, context, "durable evidence is preserved");
-    }
 }

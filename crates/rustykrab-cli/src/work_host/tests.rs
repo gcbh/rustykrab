@@ -435,7 +435,7 @@ async fn webchat_notices_are_consumed_without_external_sends_and_remain_in_the_c
 }
 
 #[tokio::test]
-async fn an_old_oversized_notification_sends_once_with_a_link_and_keeps_its_evidence() {
+async fn a_notification_sends_once_with_its_execution_link_and_origin() {
     let t = temp_store();
     let s = &t.store;
     let conv = bound(
@@ -450,7 +450,7 @@ async fn an_old_oversized_notification_sends_once_with_a_link_and_keeps_its_evid
     s.work_insert_graph(&[item(&id, Status::Done, Some(conv.clone()))], &[], None)
         .await
         .unwrap();
-    let body = format!("\"Payment route\" (#{id}): done.\nResult: Verified the route.\nEvidence: project_context:{}", "private snapshot ".repeat(12000));
+    let body = format!("\"Payment route\" (#{id}): done.\nResult: Verified the route.");
     s.work_outbox_enqueue(&id, Some(&id), "telegram", &body)
         .await
         .unwrap();
@@ -469,60 +469,37 @@ async fn an_old_oversized_notification_sends_once_with_a_link_and_keeps_its_evid
     deliver_pending_with_details(s, &sent, Some("999"), Some("https://example.test:8443")).await;
     let sends = sent.sent.lock().unwrap().clone();
     assert_eq!(sends.len(), 1);
-    assert!(sends[0].1.len() <= NOTICE_MAX_BYTES);
     assert!(sends[0].1.contains("Result: Verified the route."));
     assert!(sends[0].1.contains(&format!(
         "Details: https://example.test:8443/monitor.html?work={id}"
     )));
-    assert!(!sends[0].1.contains("private snapshot"));
     assert_eq!(sends[0].2.as_deref(), Some("4242"));
     assert_eq!(sends[0].3.as_deref(), Some("7"));
     assert!(s.work_outbox_pending().await.unwrap().is_empty());
 }
 
 #[tokio::test]
-async fn compact_question_and_approval_notifications_keep_their_controls() {
+async fn execution_links_preserve_questions_and_approval_controls() {
     let t = temp_store();
     let row = notice(&t.store, item("abcd1234", Status::Ready, None), "telegram").await;
     let mut question = row.clone();
-    question.body = format!(
-        "\"Choose execution\" (#abcd1234): blocked.\nEvidence: {}\nAsked: Choose a worker.\nQuestion 12345678 is for \"Choose execution\" (#abcd1234).\nOptions: 1) Claude  2) Codex.\nAnswer with /answer 12345678 <your answer> (or the option number).",
-        "private snapshot ".repeat(12000)
-    );
-    let brief = brief_notice(&question, Some("https://example.test"));
-    assert!(brief.len() <= NOTICE_MAX_BYTES);
-    assert!(!brief.contains("private snapshot"));
-    let buttons = crate::work_channel::notice_buttons(&brief);
+    question.body = "\"Choose execution\" (#abcd1234): blocked.\nAsked: Choose a worker.\nQuestion 12345678 is for \"Choose execution\" (#abcd1234).\nOptions: 1) Claude  2) Codex.\nAnswer with /answer 12345678 <your answer> (or the option number).".into();
+    let text = notice_with_details(&question, Some("https://example.test"));
+    assert!(text.starts_with(&question.body));
+    let buttons = crate::work_channel::notice_buttons(&text);
     assert_eq!(buttons[0][0].1, "answer:12345678:1");
     assert_eq!(buttons[0][1].1, "answer:12345678:2");
-    assert!(brief.contains("Answer with /answer 12345678"));
 
     let mut approval = row;
-    approval.body = format!("\"Approve\" (#abcd1234): blocked.\n{}\nReply /approve abcd1234 or /reject abcd1234 [reason].", "plan detail ".repeat(10000));
-    let brief = brief_notice(&approval, None);
-    assert!(brief.len() <= NOTICE_MAX_BYTES);
+    approval.body =
+        "\"Approve\" (#abcd1234): blocked.\nReply /approve abcd1234 or /reject abcd1234 [reason]."
+            .into();
+    let text = notice_with_details(&approval, None);
+    assert!(text.starts_with(&approval.body));
     assert_eq!(
-        crate::work_channel::notice_buttons(&brief)[0][0].1,
+        crate::work_channel::notice_buttons(&text)[0][0].1,
         "approve:abcd1234"
     );
-}
-
-#[tokio::test]
-async fn unicode_and_unbounded_fields_still_fit_one_notification() {
-    let t = temp_store();
-    let mut row = notice(&t.store, item("a", Status::Ready, None), "telegram").await;
-    row.body = format!("{}\nResult: {}\nAsked: {}\nQuestion abcdef12 is for {}.\nOptions: 1) {}\nAnswer with /answer abcdef12 yes, or /answer abcdef12 no.\nReply /approve a or /reject a [reason].",
-        "🦀".repeat(5000), "🦀".repeat(5000), "🦀".repeat(5000), "🦀".repeat(5000), "🦀".repeat(5000));
-    let brief = brief_notice(&row, Some("https://example.test"));
-    assert!(brief.len() <= NOTICE_MAX_BYTES);
-    assert!(brief.ends_with("Details: https://example.test/monitor.html?work=a"));
-    assert!(brief.contains("Answer with /answer abcdef12"));
-
-    let long_origin = format!("https://{}.test", "a".repeat(430));
-    let brief = brief_notice(&row, Some(&long_origin));
-    assert!(brief.len() <= NOTICE_MAX_BYTES);
-    assert!(brief.contains("Answer with /answer abcdef12"));
-    assert!(brief.contains("Reply /approve a"));
 }
 
 #[test]
