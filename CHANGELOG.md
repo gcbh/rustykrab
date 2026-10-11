@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [6.4.4] - 2026-10-11
+
+- fix: keep work notices brief and respect Telegram cooldowns (#678)
+
 ## [6.4.3] - 2026-10-09
 
 - fix: restore WebChat conversation creation and submission (#677)

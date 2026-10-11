@@ -8,7 +8,7 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -92,6 +92,9 @@ pub struct TelegramChannel {
     /// The host's commands (the work surface), consulted before a message
     /// reaches the agent.
     commands: Option<Arc<dyn CommandHook>>,
+    /// Serialize message requests and preserve flood-control waits across callers
+    /// and exhausted retry batches. A new outbox pass cannot bypass the wait.
+    send_cooldown: Mutex<Option<tokio::time::Instant>>,
 }
 
 impl TelegramChannel {
@@ -125,6 +128,7 @@ impl TelegramChannel {
             inbound_rx: Some(rx),
             shutdown_flag: Arc::new(AtomicBool::new(false)),
             commands: None,
+            send_cooldown: Mutex::new(None),
         }
     }
 
@@ -241,24 +245,17 @@ impl TelegramChannel {
         if thread_id > 0 {
             body["message_thread_id"] = serde_json::json!(thread_id);
         }
-        let url = format!("{}/sendMessage", self.api_base);
-        let resp = self
-            .client
-            .post(&url)
-            .json(&body)
-            .send()
+        match self
+            .try_send_body(&body, SEND_MAX_RETRIES, chat_id, thread_id)
             .await
-            .map_err(|e| Error::Channel(format!("Telegram API error: {e}")))?;
-        if resp.status().is_success() {
-            let value: serde_json::Value = resp.json().await.map_err(|_| {
-                Error::Channel("Telegram acknowledgement unreadable; delivery uncertain".into())
-            })?;
-            return acknowledged_message(&value, chat_id, thread_id).map(|_| ());
+        {
+            Ok(_) => Ok(()),
+            Err(error) if error.to_string().contains("400") => {
+                tracing::debug!("buttons refused; sending the text alone");
+                self.send_text(chat_id, text, thread_id).await
+            }
+            Err(error) => Err(error),
         }
-        let status = resp.status();
-        let err = resp.text().await.unwrap_or_default();
-        tracing::debug!(%status, %err, "buttons refused; sending the text alone");
-        self.send_text(chat_id, text, thread_id).await
     }
 
     /// Acknowledge a button press, so the client stops its spinner.
@@ -305,7 +302,6 @@ impl TelegramChannel {
         max_retries: u32,
         thread_id: i64,
     ) -> Result<i64> {
-        let url = format!("{}/sendMessage", self.api_base);
         let mut body = serde_json::json!({
             "chat_id": chat_id,
             "text": text,
@@ -317,6 +313,18 @@ impl TelegramChannel {
             body["message_thread_id"] = serde_json::json!(thread_id);
         }
 
+        self.try_send_body(&body, max_retries, chat_id, thread_id)
+            .await
+    }
+
+    /// The shared send path also protects inline-button sends from flooding.
+    async fn try_send_body(
+        &self,
+        body: &serde_json::Value,
+        max_retries: u32,
+        chat_id: i64,
+        thread_id: i64,
+    ) -> Result<i64> {
         let mut last_err = None;
         for attempt in 0..=max_retries {
             if attempt > 0 {
@@ -324,18 +332,18 @@ impl TelegramChannel {
                 tokio::time::sleep(delay).await;
             }
 
-            match self.client.post(&url).json(&body).send().await {
-                Ok(resp) => {
-                    if resp.status().is_success() {
-                        let value: serde_json::Value = resp.json().await.map_err(|_| {
-                            Error::Channel(
-                                "Telegram acknowledgement unreadable; delivery uncertain".into(),
-                            )
-                        })?;
+            match self.send_once(body).await {
+                Ok((status, err_text)) => {
+                    if status.is_success() {
+                        let value: serde_json::Value =
+                            serde_json::from_str(&err_text).map_err(|_| {
+                                Error::Channel(
+                                    "Telegram acknowledgement unreadable; delivery uncertain"
+                                        .into(),
+                                )
+                            })?;
                         return acknowledged_message(&value, chat_id, thread_id);
                     }
-                    let status = resp.status();
-                    let err_text = resp.text().await.unwrap_or_default();
 
                     // Don't retry client errors (except 429 rate limit).
                     if status.is_client_error() && status.as_u16() != 429 {
@@ -344,21 +352,11 @@ impl TelegramChannel {
                         )));
                     }
 
-                    // Rate limited — respect Retry-After if present.
-                    if status.as_u16() == 429 {
-                        tracing::warn!("Telegram rate limited, backing off");
-                    }
-
                     last_err = Some(Error::Channel(format!(
                         "Telegram sendMessage failed ({status}): {err_text}"
                     )));
                 }
-                Err(e) => {
-                    last_err = Some(Error::Channel(format!(
-                        "Telegram API error: {}",
-                        e.without_url()
-                    )));
-                }
+                Err(e) => last_err = Some(e),
             }
 
             if attempt < max_retries {
@@ -367,6 +365,47 @@ impl TelegramChannel {
         }
 
         Err(last_err.unwrap_or_else(|| Error::Channel("send failed after retries".into())))
+    }
+
+    /// Hold the send gate through the response so parallel callers see a 429
+    /// before sending. Keep the deadline even when the final retry fails.
+    async fn send_once(&self, body: &serde_json::Value) -> Result<(reqwest::StatusCode, String)> {
+        let mut cooldown = self.send_cooldown.lock().await;
+        if let Some(until) = *cooldown {
+            tokio::time::sleep_until(until).await;
+        }
+        let url = format!("{}/sendMessage", self.api_base);
+        let response = self
+            .client
+            .post(&url)
+            .json(body)
+            .send()
+            .await
+            .map_err(|e| Error::Channel(format!("Telegram API error: {}", e.without_url())))?;
+        let status = response.status();
+        let retry_header = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let text = response.text().await.map_err(|e| {
+            Error::Channel(format!("Telegram response unreadable: {}", e.without_url()))
+        })?;
+        if status.as_u16() == 429 {
+            let delay = retry_delay(retry_header.as_deref(), &text);
+            *cooldown = Some(
+                tokio::time::Instant::now()
+                    .checked_add(delay)
+                    .ok_or_else(|| {
+                        Error::Channel("Telegram retry delay exceeds the clock range".into())
+                    })?,
+            );
+            tracing::warn!(
+                delay_secs = delay.as_secs(),
+                "Telegram rate limited, backing off"
+            );
+        }
+        Ok((status, text))
     }
 
     /// Start long-polling for updates. Runs forever — spawn this as a task.
@@ -959,6 +998,40 @@ mod tests {
     }
 }
 
+/// Telegram publishes seconds in parameters.retry_after. Honor the greater
+/// of that value and the HTTP Retry-After header; malformed/missing waits get
+/// a conservative fallback rather than a tight loop.
+fn retry_delay(header: Option<&str>, body: &str) -> Duration {
+    let json: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
+    let body_seconds = json["parameters"]["retry_after"]
+        .as_u64()
+        .filter(|n| *n > 0);
+    let header_delay = header.and_then(|value| {
+        value
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .filter(|n| *n > 0)
+            .map(Duration::from_secs)
+            .or_else(|| {
+                chrono::DateTime::parse_from_rfc2822(value)
+                    .ok()
+                    .and_then(|date| {
+                        (date.with_timezone(&chrono::Utc) - chrono::Utc::now())
+                            .to_std()
+                            .ok()
+                    })
+                    .filter(|delay| !delay.is_zero())
+            })
+    });
+    body_seconds
+        .map(Duration::from_secs)
+        .into_iter()
+        .chain(header_delay)
+        .max()
+        .unwrap_or(Duration::from_secs(5))
+}
+
 /// Validate the Bot API envelope and intended address without logging content.
 fn acknowledged_message(value: &serde_json::Value, chat: i64, thread: i64) -> Result<i64> {
     if value["ok"] != true {
@@ -1001,5 +1074,143 @@ mod acknowledgement_tests {
         let v = json!({"ok":true,"result":{"message_id":42,"chat":{"id":1},"message_thread_id":7}});
         assert_eq!(acknowledged_message(&v, 1, 7).unwrap(), 42);
         assert!(acknowledged_message(&v, 1, 8).is_err());
+    }
+}
+
+#[cfg(test)]
+mod rate_limit_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    #[test]
+    fn retry_delays_use_the_server_wait_and_handle_bad_responses() {
+        assert_eq!(
+            retry_delay(None, r#"{"parameters":{"retry_after":60}}"#),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            retry_delay(Some("120"), r#"{"parameters":{"retry_after":60}}"#),
+            Duration::from_secs(120)
+        );
+        assert_eq!(
+            retry_delay(Some("10"), r#"{"parameters":{"retry_after":60}}"#),
+            Duration::from_secs(60)
+        );
+        for body in [
+            "not json",
+            "{}",
+            r#"{"parameters":{"retry_after":-1}}"#,
+            r#"{"parameters":{"retry_after":0}}"#,
+        ] {
+            assert_eq!(
+                retry_delay(Some("bad header"), body),
+                Duration::from_secs(5)
+            );
+        }
+        let date = (chrono::Utc::now() + chrono::Duration::seconds(30)).to_rfc2822();
+        let wait = retry_delay(Some(&date), "{}");
+        assert!(wait >= Duration::from_secs(28) && wait <= Duration::from_secs(30));
+    }
+
+    // A local HTTP stand-in records actual arrival times and bodies. No bot
+    // token, live Telegram calls, model or environment mutation is involved.
+    async fn server(
+        replies: Vec<(u16, &'static str, &'static str)>,
+    ) -> (
+        TelegramChannel,
+        tokio::task::JoinHandle<Vec<(std::time::Instant, serde_json::Value)>>,
+    ) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let mut arrivals = Vec::new();
+            for (status, header, body) in replies {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let (end, length) = loop {
+                    let mut buffer = [0; 4096];
+                    let n = socket.read(&mut buffer).await.unwrap();
+                    assert!(n > 0);
+                    request.extend_from_slice(&buffer[..n]);
+                    if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&request[..end]);
+                        let length = headers
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().unwrap())
+                            })
+                            .unwrap();
+                        if request.len() >= end + 4 + length {
+                            break (end + 4, length);
+                        }
+                    }
+                };
+                arrivals.push((
+                    std::time::Instant::now(),
+                    serde_json::from_slice(&request[end..end + length]).unwrap(),
+                ));
+                let reply = format!("HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n{header}\r\n{body}", body.len());
+                socket.write_all(reply.as_bytes()).await.unwrap();
+                socket.shutdown().await.unwrap();
+            }
+            arrivals
+        });
+        let mut channel = TelegramChannel::new("fixture-token".into(), [1].into_iter().collect());
+        channel.api_base = format!("http://{address}/botfixture-token");
+        (channel, handle)
+    }
+
+    const OK: &str = r#"{"ok":true,"result":{"message_id":42,"chat":{"id":1}}}"#;
+    const LIMITED: &str = r#"{"ok":false,"error_code":429,"parameters":{"retry_after":1}}"#;
+
+    #[tokio::test]
+    async fn text_retry_waits_for_telegram_before_sending_again() {
+        let (channel, server) = server(vec![(429, "", LIMITED), (200, "", OK)]).await;
+        channel
+            .send_text(1, "A brief notification", 0)
+            .await
+            .unwrap();
+        let requests = server.await.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].0.duration_since(requests[0].0) >= Duration::from_secs(1));
+        assert_eq!(requests[0].1["text"], requests[1].1["text"]);
+    }
+
+    #[tokio::test]
+    async fn button_retry_preserves_buttons_and_honors_the_header() {
+        let (channel, server) =
+            server(vec![(429, "Retry-After: 2\r\n", LIMITED), (200, "", OK)]).await;
+        let buttons = vec![vec![("Approve".into(), "approve:item".into())]];
+        channel
+            .send_text_with_buttons(1, "Approve this work", 0, &buttons)
+            .await
+            .unwrap();
+        let requests = server.await.unwrap();
+        assert!(requests[1].0.duration_since(requests[0].0) >= Duration::from_secs(2));
+        assert_eq!(requests[0].1["reply_markup"], requests[1].1["reply_markup"]);
+        assert!(requests[1].1["reply_markup"].is_object());
+    }
+
+    #[tokio::test]
+    async fn exhausted_retry_cooldown_applies_to_other_concurrent_senders() {
+        let (channel, server) =
+            server(vec![(429, "", LIMITED), (200, "", OK), (200, "", OK)]).await;
+        assert!(channel
+            .try_send(1, "Failed batch", None, 0, 0)
+            .await
+            .is_err());
+        let buttons = vec![vec![("Approve".into(), "approve:item".into())]];
+        let (first, second) = tokio::join!(
+            channel.send_text(1, "Next outbox pass", 0),
+            channel.send_text_with_buttons(1, "Another sender", 0, &buttons),
+        );
+        first.unwrap();
+        second.unwrap();
+        let requests = server.await.unwrap();
+        assert!(requests[1].0.duration_since(requests[0].0) >= Duration::from_secs(1));
+        assert!(requests[2].0.duration_since(requests[0].0) >= Duration::from_secs(1));
     }
 }

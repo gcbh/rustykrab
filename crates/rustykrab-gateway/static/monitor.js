@@ -6,6 +6,7 @@
   const access = window.RustyKrabAccess;
   let snapshot = null, pending = false, paused = false, interval = null, generation = 0;
   let lastQuestions = '', detailRequest = 0;
+  const linkedWork = new URLSearchParams(window.location.search).get('work');
   const node = (tag, text, cls) => {
     const e = document.createElement(tag);
     if (text !== undefined) e.textContent = text;
@@ -83,6 +84,7 @@
       if (snapshot) {
         $('token').value = ''; $('pairCode').value = '';
         interval = setInterval(() => { if (!paused && !document.hidden) refresh(); }, 5000);
+        if (linkedWork) await showDetail(linkedWork);
       }
     } catch (error) { $('loginError').textContent = error.message; }
     finally { $('accessConnect').disabled = false; }

@@ -124,8 +124,6 @@ pub(super) struct NoticeData {
 
 /// How many items a list names before it says "and N more".
 const LIST_MAX: usize = 6;
-/// How many evidence refs a done line shows.
-const REFS_MAX: usize = 4;
 
 /// `#` and the first eight characters of an id.
 pub(super) fn short(id: &str) -> String {
@@ -166,11 +164,9 @@ fn list(title: &str, entries: Vec<String>) -> Option<String> {
 }
 
 fn refs(refs: &[ArtifactRef]) -> String {
-    refs.iter()
-        .take(REFS_MAX)
-        .map(|r| format!("{}:{}", r.kind, r.value))
-        .collect::<Vec<_>>()
-        .join(", ")
+    // Execution receipts can contain full snapshots. The detail view owns them.
+    let noun = if refs.len() == 1 { "record" } else { "records" };
+    format!("{} {noun}", refs.len())
 }
 
 /// The message for `root`.

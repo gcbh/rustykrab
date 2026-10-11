@@ -268,7 +268,7 @@ async fn a_notice_is_marked_delivered_only_once_it_is_sent() {
         up.sent.lock().unwrap().clone(),
         vec![(
             "telegram".to_string(),
-            "a notice".to_string(),
+            "a notice\nDetails: /work a".to_string(),
             Some("4242".to_string()),
             Some("7".to_string())
         )]
@@ -432,4 +432,90 @@ async fn webchat_notices_are_consumed_without_external_sends_and_remain_in_the_c
             .is_empty(),
         "notice reads must not rewrite model history"
     );
+}
+
+#[tokio::test]
+async fn a_notification_sends_once_with_its_execution_link_and_origin() {
+    let t = temp_store();
+    let s = &t.store;
+    let conv = bound(
+        s,
+        &ChannelAddress::Telegram {
+            chat_id: 4242,
+            thread_id: 7,
+        },
+    )
+    .await;
+    let id = Uuid::new_v4().to_string();
+    s.work_insert_graph(&[item(&id, Status::Done, Some(conv.clone()))], &[], None)
+        .await
+        .unwrap();
+    let body = format!("\"Payment route\" (#{id}): done.\nResult: Verified the route.");
+    s.work_outbox_enqueue(&id, Some(&id), "telegram", &body)
+        .await
+        .unwrap();
+    let down = Sent {
+        down: Some("telegram"),
+        ..Sent::default()
+    };
+    deliver_pending_with_details(s, &down, Some("999"), Some("https://example.test:8443")).await;
+    assert_eq!(
+        s.work_outbox_pending().await.unwrap()[0].body,
+        body,
+        "failed delivery preserves the original"
+    );
+    let sent = Sent::default();
+    deliver_pending_with_details(s, &sent, Some("999"), Some("https://example.test:8443")).await;
+    deliver_pending_with_details(s, &sent, Some("999"), Some("https://example.test:8443")).await;
+    let sends = sent.sent.lock().unwrap().clone();
+    assert_eq!(sends.len(), 1);
+    assert!(sends[0].1.contains("Result: Verified the route."));
+    assert!(sends[0].1.contains(&format!(
+        "Details: https://example.test:8443/monitor.html?work={id}"
+    )));
+    assert_eq!(sends[0].2.as_deref(), Some("4242"));
+    assert_eq!(sends[0].3.as_deref(), Some("7"));
+    assert!(s.work_outbox_pending().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn execution_links_preserve_questions_and_approval_controls() {
+    let t = temp_store();
+    let row = notice(&t.store, item("abcd1234", Status::Ready, None), "telegram").await;
+    let mut question = row.clone();
+    question.body = "\"Choose execution\" (#abcd1234): blocked.\nAsked: Choose a worker.\nQuestion 12345678 is for \"Choose execution\" (#abcd1234).\nOptions: 1) Claude  2) Codex.\nAnswer with /answer 12345678 <your answer> (or the option number).".into();
+    let text = notice_with_details(&question, Some("https://example.test"));
+    assert!(text.starts_with(&question.body));
+    let buttons = crate::work_channel::notice_buttons(&text);
+    assert_eq!(buttons[0][0].1, "answer:12345678:1");
+    assert_eq!(buttons[0][1].1, "answer:12345678:2");
+
+    let mut approval = row;
+    approval.body =
+        "\"Approve\" (#abcd1234): blocked.\nReply /approve abcd1234 or /reject abcd1234 [reason]."
+            .into();
+    let text = notice_with_details(&approval, None);
+    assert!(text.starts_with(&approval.body));
+    assert_eq!(
+        crate::work_channel::notice_buttons(&text)[0][0].1,
+        "approve:abcd1234"
+    );
+}
+
+#[test]
+fn detail_links_encode_ids_and_never_carry_credentials() {
+    assert_eq!(
+        notice_details(
+            "a&token=private",
+            Some("https://example.test/path?token=secret#other")
+        ),
+        "Details: https://example.test/monitor.html?work=a%26token%3Dprivate"
+    );
+    for base in [
+        "javascript:alert(1)",
+        "https://user:secret@example.test",
+        "not a url",
+    ] {
+        assert_eq!(notice_details("a", Some(base)), "Details: /work a");
+    }
 }

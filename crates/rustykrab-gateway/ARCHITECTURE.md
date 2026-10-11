@@ -425,3 +425,9 @@ acknowledgement evidence separately from execution runs.
 The monitor reads delivery evidence for at most 100 schedules, exposes latest
 receipt metadata, and warns on failed delivery or an attempt left uncertain for
 more than two minutes. This does not send or retry messages.
+
+Notification URLs select a work item with the work query parameter. After a
+successful authenticated monitor connection, the browser opens its existing
+detail dialog through GET /api/work/{id}, even when that item is absent from
+the bounded overview. The link contains an item identifier, never a token.
+scripts/test_monitor_links.mjs exercises the shipped connection handler in CI.

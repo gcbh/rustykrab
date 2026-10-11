@@ -1787,6 +1787,9 @@ pub fn render_executor_brief(
          - Each checks_run entry is a shell command you actually ran via Bash, copied \
          exactly, with no results or descriptions. Checks done with Grep, Read or Glob belong \
          in the summary or known_limits, not checks_run.\n\
+         - Your summary becomes a notification that links to the detailed execution. Write \
+         one or two sentences stating the outcome or what needs the user's attention. Put \
+         supporting detail in artifacts, changed_paths, checks_run and known_limits.\n\
          - Follow-up work you notice goes in \"discovered\", one draft each; do not do it.\n\
          - If you cannot finish, set \"blocked\" or \"error\" (class, subclass, detail) \
          instead of guessing. ",

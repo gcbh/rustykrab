@@ -1196,7 +1196,7 @@ fn render_brief_for_report(brief: &Brief, full_report: bool) -> String {
     if full_report {
         out.push_str("Put the complete deliverable in summary, including source links and coverage limits, within the report tool's stated bound. ");
     } else {
-        out.push_str("Put pointers in it (paths, URLs, ids), not content. ");
+        out.push_str("The summary becomes a notification that links to the detailed execution. Write one or two sentences stating the outcome or what needs the user's attention. Keep supporting detail in artifacts (paths, URLs, ids), changed_paths and checks_run. ");
     }
     out.push_str("If you cannot finish, set blocked or error (what failed). ");
     out.push_str(&rustykrab_core::work::BLOCKED_SHAPE_GUIDANCE);

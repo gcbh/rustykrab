@@ -15,8 +15,8 @@
 //!   bindings of the item's `origin_conversation_id`; a scheduled firing's
 //!   notice goes to its job's delivery target, and a `done` firing's notice
 //!   is its job's own delivery; only with neither does a Telegram notice
-//!   fall back to the first allowed chat. Where a notice goes changes here,
-//!   never what it says.
+//!   fall back to the first allowed chat. The controller supplies the update;
+//!   the host adds the authenticated execution-detail link.
 
 use std::sync::Arc;
 
@@ -229,13 +229,45 @@ pub(crate) async fn route(store: &Store, row: &OutboxRow, default_chat: Option<&
     send(&row.channel, chat, None)
 }
 
+fn notice_details(parent: &str, public_url: Option<&str>) -> String {
+    if let Some(mut url) = public_url.and_then(|base| reqwest::Url::parse(base).ok()) {
+        if matches!(url.scheme(), "http" | "https")
+            && url.host_str().is_some()
+            && url.username().is_empty()
+            && url.password().is_none()
+        {
+            url.set_path("/monitor.html");
+            url.set_query(None);
+            url.set_fragment(None);
+            url.query_pairs_mut().append_pair("work", parent);
+            return format!("Details: {url}");
+        }
+    }
+    format!("Details: /work {parent}")
+}
+
+/// The controller supplies the concise update; the host adds its execution link.
+fn notice_with_details(row: &OutboxRow, public_url: Option<&str>) -> String {
+    format!("{}\n{}", row.body, notice_details(&row.parent, public_url))
+}
+
 /// One pass over the pending notices: each is routed and sent, and marked
 /// delivered only once the send succeeds, so a channel outage delays a
 /// notice rather than losing it.
+#[cfg(test)]
 pub(crate) async fn deliver_pending(
     store: &Store,
     backend: &dyn MessageBackend,
     default_chat: Option<&str>,
+) {
+    deliver_pending_with_details(store, backend, default_chat, None).await;
+}
+
+async fn deliver_pending_with_details(
+    store: &Store,
+    backend: &dyn MessageBackend,
+    default_chat: Option<&str>,
+    public_url: Option<&str>,
 ) {
     let pending = match store.work_outbox_pending().await {
         Ok(rows) => rows,
@@ -252,7 +284,12 @@ pub(crate) async fn deliver_pending(
                 chat,
                 thread,
             } => match backend
-                .send_message(&channel, &row.body, chat.as_deref(), thread.as_deref())
+                .send_message(
+                    &channel,
+                    &notice_with_details(&row, public_url),
+                    chat.as_deref(),
+                    thread.as_deref(),
+                )
                 .await
             {
                 Ok(_) => true,
@@ -277,11 +314,18 @@ pub(crate) async fn deliver_work_notices(
     backend: Arc<dyn MessageBackend>,
     default_chat: Option<String>,
     every_secs: u64,
+    public_url: Option<String>,
 ) {
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(every_secs.max(1)));
     loop {
         interval.tick().await;
-        deliver_pending(&store, backend.as_ref(), default_chat.as_deref()).await;
+        deliver_pending_with_details(
+            &store,
+            backend.as_ref(),
+            default_chat.as_deref(),
+            public_url.as_deref(),
+        )
+        .await;
     }
 }
 
