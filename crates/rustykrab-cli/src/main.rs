@@ -2180,9 +2180,16 @@ async fn main() -> anyhow::Result<()> {
                 .map(|c| c.trim().to_string())
                 .find(|c| !c.is_empty())
         });
+        let notice_public_url = std::env::var("RUSTYKRAB_PUBLIC_URL").ok();
         infra_handles.push(tokio::spawn(async move {
-            work_host::deliver_work_notices(outbox_store, outbox_backend, default_chat, tick_secs)
-                .await;
+            work_host::deliver_work_notices(
+                outbox_store,
+                outbox_backend,
+                default_chat,
+                tick_secs,
+                notice_public_url,
+            )
+            .await;
         }));
         infra_handles.push(evaluation::spawn_nightly(evaluator));
         tracing::info!(tick_secs, "control layer started");

@@ -35,6 +35,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: node scripts/test_webchat_submit.mjs
+      - run: node scripts/test_monitor_links.mjs
       - run: cargo test --workspace
 
   docs:

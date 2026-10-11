@@ -134,7 +134,7 @@ pub(super) fn short(id: &str) -> String {
 
 /// `"title" (#abcd1234)`.
 pub(super) fn label(item: &WorkItem) -> String {
-    format!("\"{}\" ({})", item.title.trim(), short(&item.id))
+    format!("\"{}\" ({})", clip(item.title.trim(), 120), short(&item.id))
 }
 
 fn phrase(status: Status) -> String {
@@ -168,7 +168,13 @@ fn list(title: &str, entries: Vec<String>) -> Option<String> {
 fn refs(refs: &[ArtifactRef]) -> String {
     refs.iter()
         .take(REFS_MAX)
-        .map(|r| format!("{}:{}", r.kind, r.value))
+        .map(|r| {
+            // Project context is a frozen execution payload, not notification text.
+            if r.kind == "project_context" {
+                return "project context recorded".to_string();
+            }
+            clip(&format!("{}:{}", r.kind, r.value), 120)
+        })
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -520,4 +526,34 @@ fn not_done(snap: &Snapshot, item: &WorkItem, data: &NoticeData) -> String {
         line.push('.');
     }
     line
+}
+
+#[cfg(test)]
+mod notification_tests {
+    use super::*;
+
+    #[test]
+    fn serialized_execution_context_never_enters_notification_evidence() {
+        let context = format!(r#"{{"snapshot":"{}"}}"#, "private state ".repeat(15000));
+        let evidence = vec![
+            ArtifactRef {
+                kind: "project_context".into(),
+                value: context.clone(),
+            },
+            ArtifactRef {
+                kind: "commit".into(),
+                value: "abc123".into(),
+            },
+            ArtifactRef {
+                kind: "tool_observation".into(),
+                value: "x".repeat(150000),
+            },
+        ];
+        let text = refs(&evidence);
+        assert!(text.contains("project context recorded"));
+        assert!(text.contains("commit:abc123"));
+        assert!(!text.contains("snapshot"));
+        assert!(text.len() < 300);
+        assert_eq!(evidence[0].value, context, "durable evidence is preserved");
+    }
 }
