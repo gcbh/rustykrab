@@ -271,3 +271,10 @@ It adds no scheduler, channel loop or credential transport.
 The CLI AttestingBackend checks integration reports before forwarding to the
 controller. Recording a result inside LocalWorker precedes Worker::run returning;
 attestation only on that return is too late to gate controller completion.
+
+The existing Brief/ProjectContext seam now distinguishes full durable history
+from its execution view. Selection is controller-owned and frozen with the lease;
+native/local renderers share the same typed projection. Native adapters expose
+the full snapshot through a private per-run file, without a daemon-auth capability.
+Post-tasks remain WorkItemDraft records in ResultReport.discovered and use the
+ordinary graph validator and scheduler. No new trait or crate edge is introduced.

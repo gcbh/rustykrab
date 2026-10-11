@@ -19,6 +19,39 @@ pub struct ProjectContext {
     /// Project-scoped work questions and their answers, retained after work compaction.
     #[serde(default)]
     pub questions: Vec<rustykrab_store::QuestionRow>,
+    /// Work relevant to this execution slice. The complete history remains in this receipt.
+    #[serde(default)]
+    pub execution_items: Vec<String>,
+}
+
+/// The prompt view: exact project intent and the current task's dependencies,
+/// rather than every earlier task's detailed history.
+#[derive(Serialize)]
+pub struct ProjectExecutionContext<'a> {
+    pub snapshot: &'a ProjectSnapshot,
+    pub work: Vec<&'a ProjectWork>,
+    pub base_sources: &'a [String],
+    pub questions: Vec<&'a rustykrab_store::QuestionRow>,
+    pub history_items: usize,
+}
+
+impl ProjectContext {
+    pub fn execution_view(&self) -> ProjectExecutionContext<'_> {
+        let relevant = |id: &str| {
+            self.execution_items.is_empty() || self.execution_items.iter().any(|item| item == id)
+        };
+        ProjectExecutionContext {
+            snapshot: &self.snapshot,
+            work: self.work.iter().filter(|w| relevant(&w.item)).collect(),
+            base_sources: &self.base_sources,
+            questions: self
+                .questions
+                .iter()
+                .filter(|q| relevant(&q.item))
+                .collect(),
+            history_items: self.work.len(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

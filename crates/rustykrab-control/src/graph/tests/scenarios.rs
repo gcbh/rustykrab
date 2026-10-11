@@ -154,6 +154,14 @@ fn scenario_19_blocks_chain_that_adds_nothing_warns_sequential_split() {
         vec![pe(tmp("b"), EdgeKind::Blocks, tmp("a"))],
     );
     let accepted = accept(&mut s, &p, &ctx(FilingSource::Planner));
+    assert!(
+        accepted.warnings.is_empty(),
+        "small sequential slices are allowed by default"
+    );
+    let mut warning_policy = ctx(FilingSource::Planner);
+    warning_policy.sequential_split = SplitMode::Warn;
+    let mut s = planned_root();
+    let accepted = accept(&mut s, &p, &warning_policy);
     let [a, b] = ids(&accepted, &["a", "b"]).try_into().unwrap();
     assert_eq!(accepted.warnings.len(), 1);
     assert_eq!(accepted.warnings[0].check, WarningCheck::SequentialSplit);

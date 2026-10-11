@@ -83,9 +83,11 @@ impl Tool for WorkPlanTool {
         "File the WHOLE graph for a multi-step request in ONE call: items (each with a tmp \
          name, title, objective, done_when, and a budget), typed edges ({item, kind: blocks | \
          waits_for | conditional_on_failure | supersedes, depends_on}) and parent links. Refer \
-         to new items as {\"tmp\": name} and existing ones by id. A step is its own item only \
-         for a wait on the world, independent fan-out, a different worker or writable \
-         resource, an approval point, or a plan B; everything else stays inside one item. The \
+         to new items as {\"tmp\": name} and existing ones by id. Break large work into small, \
+         verifiable execution slices within each run's context and budget. Use blocks and \
+         inputs_from for dependent slices; independent tasks may run in parallel, while \
+         tasks sharing writable resources stay ordered. The parent retains the whole \
+         request's done_when. The \
          controller accepts the graph whole or rejects it whole with every failed check."
     }
 

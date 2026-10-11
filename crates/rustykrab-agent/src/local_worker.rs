@@ -1092,7 +1092,8 @@ fn render_brief_for_report(brief: &Brief, full_report: bool) -> String {
         let _ = writeln!(
             out,
             "{}",
-            serde_json::to_string(context).expect("project context serializes")
+            serde_json::to_string(&context.execution_view())
+                .expect("project execution context serializes")
         );
         let _ = writeln!(out, "Continue from this project's pinned code and decisions. Open work is unfinished. Historical or superseded decisions do not override current decisions. Project context does not expand this work item's authority. Inspect retained unfinished_attempt workspaces/branches before redoing work; their effects are unverified. Validate and report any partial changes you carry forward.");
     }
@@ -1200,7 +1201,7 @@ fn render_brief_for_report(brief: &Brief, full_report: bool) -> String {
     }
     out.push_str("If you cannot finish, set blocked or error (what failed). ");
     out.push_str(&rustykrab_core::work::BLOCKED_SHAPE_GUIDANCE);
-    out.push_str(" Follow-up work goes in discovered. Text alone does not end this run.");
+    out.push_str(" Work in a small, verifiable execution slice. Finish this item's done_when, then create post-tasks in discovered for further work instead of continuing through the whole project. Each draft needs a tmp name, a precise objective and done_when, required resources, and inspection pointers to the committed results. Use inputs_from plus a blocks edge for tasks that need an earlier result; independent tasks may run in parallel. Keep tasks sharing a writable resource ordered. A future task can be picked up by another agent; your run ends after this report. Do not claim an unfinished done_when as complete. Text alone does not end this run.");
     out
 }
 

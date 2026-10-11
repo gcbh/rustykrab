@@ -359,3 +359,8 @@ released lease, evidence, controller activity, CLI JSON and health exit,
 Prometheus output and served dashboard assets against the real daemon.
 Scripted stand-ins verify execution plumbing; model quality measurements
 remain distinct.
+
+The over-decomposition scenario continues to verify item caps, finite parent
+budgets and code authorization against the real daemon, while now requiring
+small sequential chunks to be accepted without anti-split warning events.
+Explicit legacy split warning/rejection policies remain covered by graph tests.

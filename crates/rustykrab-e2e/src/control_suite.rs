@@ -550,8 +550,8 @@ async fn s14(ctx: &Ctx) -> Result<()> {
 /// Scenario 19: Validation bounds over-decomposition: twelve items for a three-step
 /// errand, children over the root's budget and a `code` item are each
 /// rejected, each rejection an event; two `blocks`-chained steps that add
-/// nothing to each other are accepted with a `sequential_split` warning
-/// recorded as an event. Driven by a scripted caller until the planner
+/// nothing to each other are accepted as small execution slices without
+/// a split warning. Driven by a scripted caller until the planner
 /// exists.
 async fn s19(ctx: &Ctx) -> Result<()> {
     let tag = tag(19);
@@ -632,11 +632,11 @@ async fn s19(ctx: &Ctx) -> Result<()> {
     });
     let split = accepted(plan(ctx, chained).await?)?;
     ensure!(
-        split
+        !split
             .warnings
             .iter()
             .any(|w| w.check == rustykrab_core::work::WarningCheck::SequentialSplit),
-        "a split made only for sequence is accepted with a sequential_split warning: {:?}",
+        "small sequential execution slices are allowed without a split warning: {:?}",
         split.warnings
     );
     let mut warned = events_of(&item(ctx, &parcels).await?, EventKind::Warning);
@@ -644,10 +644,10 @@ async fn s19(ctx: &Ctx) -> Result<()> {
         warned.extend(events_of(&item(ctx, id).await?, EventKind::Warning));
     }
     ensure!(
-        Value::Array(warned)
+        !Value::Array(warned)
             .to_string()
             .contains("sequential_split"),
-        "the sequential_split warning is recorded as an event"
+        "ordinary sequential chunks do not produce a split warning event"
     );
     Ok(())
 }

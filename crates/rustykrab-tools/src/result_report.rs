@@ -502,8 +502,11 @@ static DESCRIPTION: LazyLock<String> = LazyLock::new(|| {
         "End your work item with its typed result, as your LAST call. summary: what you did, \
          in a few lines. Pointers, not content: artifacts, changed_paths, commit, checks_run. \
          If you could not finish, set blocked or error (what failed). {} \
-         Follow-up work goes in discovered, one draft per item: the controller files it, you \
-         do not. The run ends when this call succeeds.",
+         Finish this item's done_when and put further execution slices in discovered as \
+         post-tasks for another agent: one draft per item, with tmp names, objectives, \
+         done_when and result pointers. Use inputs_from and blocks edges for dependencies; \
+         independent tasks can run in parallel. Do not claim unfinished acceptance criteria \
+         as complete. The controller files the graph and this run ends on success.",
         *BLOCKED_SHAPE_GUIDANCE
     )
 });

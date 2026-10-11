@@ -105,3 +105,10 @@ work. It defaults to false for older files/JSON. The controller planner is
 assigned this role by the host; a delegated execution worker can inherit
 work_plan in its tool ceiling while retaining work/report/question tools.
 Tool availability cannot assign the planning role.
+
+The built-in work-planner now treats context, tokens and turns as reasons to
+create small execution slices, including sequential slices for the same worker.
+Its parent retains the request's full acceptance criteria; dependencies use blocks
+and inputs_from, independent work may run in parallel, and shared writable
+resources remain ordered. Operator definition overrides retain their existing
+precedence; execution briefs also state the post-task handoff policy.

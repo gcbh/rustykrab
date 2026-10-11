@@ -537,8 +537,9 @@ fn code_outside_an_authorized_slice_is_held_and_is_an_approval_point() {
         Status::Blocked(BlockedReason::NeedsConsent)
     );
 
-    // Without the trigger the same link is a plain sequential split.
+    // Explicit legacy warning policy can still report an unneeded split.
     c.approval = ApprovalPolicy::default();
+    c.sequential_split = crate::graph::SplitMode::Warn;
     let accepted = accept(&mut two_parents(), &p, &c);
     assert_eq!(accepted.warnings.len(), 1);
 }

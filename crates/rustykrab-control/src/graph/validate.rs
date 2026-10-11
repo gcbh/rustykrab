@@ -55,11 +55,13 @@ pub enum FilingSource {
     DeliveryImport,
 }
 
-/// How `sequential_split` reports (14.1): a warning until Phase 1 has
-/// measured its false-positive rate, a rejection after.
+/// Sequential chunks are allowed by default. Legacy deployments may explicitly
+/// retain warning or rejection policy for their own plans.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SplitMode {
+    /// Sequential chunks are valid execution slices.
     #[default]
+    Allow,
     Warn,
     Reject,
 }
@@ -199,7 +201,7 @@ impl FilingContext {
     /// Defaults: the plan's placeholder caps, no scope beyond the root,
     /// everything visible, `code` only for the delivery import and an
     /// accepted proposal,
-    /// `sequential_split` as a warning, two supersede filings per window,
+    /// sequential execution slices allowed, two supersede filings per window,
     /// no approval triggers.
     pub fn new(source: FilingSource, now: DateTime<Utc>) -> FilingContext {
         FilingContext {
@@ -219,7 +221,7 @@ impl FilingContext {
                     | FilingSource::Discovered
                     | FilingSource::Proposal
             ),
-            sequential_split: SplitMode::Warn,
+            sequential_split: SplitMode::Allow,
             supersedes_in_window: 0,
             supersede_limit: 2,
             already_planned: false,
@@ -442,7 +444,7 @@ pub fn review_scope_violation(draft: &rustykrab_core::work::WorkItemDraft) -> Op
 /// | no two unordered items write the same resource | `single_writer_conflict` |
 /// | one accepted graph per planning run | `already_planned` |
 /// | supersede filings within the policy rate | `rate_limited` |
-/// | no `blocks` link joins steps that belong in one worker | `sequential_split`, a warning by default |
+/// | sequential execution slices | allowed by default; optional legacy `sequential_split` warning/rejection |
 pub fn validate(snap: &Snapshot, plan: &WorkPlan, ctx: &FilingContext) -> Validation {
     let now = ctx.now;
     let mut run = Run::new(snap, plan, ctx);
@@ -1656,6 +1658,7 @@ impl<'a> Run<'a> {
                 continue;
             }
             match self.ctx.sequential_split {
+                SplitMode::Allow => {}
                 SplitMode::Warn => warnings.push(PlanWarning {
                     check: WarningCheck::SequentialSplit,
                     items: vec![up.id.clone(), down.id.clone()],

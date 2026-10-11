@@ -969,3 +969,13 @@ which describes execution. An attempt without final evidence has an uncertain
 outcome. Neither is a durable retry queue. Optional dated briefing Markdown
 files live in an operator-selected private vault with SHA-256 read receipts;
 no SQLite schema change accompanies this filesystem store.
+
+### Execution-scope context receipts
+
+The existing project_context evidence JSON gains a default-empty execution_items
+list naming the current item, ancestors and dependency inputs. Older receipts
+deserialize unchanged. Full work history and the exact immutable planning
+snapshot remain in the receipt; worker prompts project only those selected work
+records plus pinned-base sources and related questions. No table, index or
+migration is added. Standalone multi-draft post-tasks use an ordinary parent work
+row and the existing dependency/input relations, inserted as one validated batch.

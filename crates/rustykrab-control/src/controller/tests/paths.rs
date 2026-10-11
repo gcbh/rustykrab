@@ -1152,3 +1152,80 @@ async fn a_catalog_tool_that_exists_is_acquired_not_built() {
         "Acquire tool: pdf_render"
     );
 }
+
+/// A standalone chunk's post-tasks are one atomic graph, not independent filings
+/// that lose temporary references to their sibling results.
+#[tokio::test]
+async fn root_post_tasks_preserve_sequence_and_independent_parallel_work() {
+    let h = Harness::new(&["pinch", "claw", "shell"]);
+    let gate = Arc::new(Notify::new());
+    let parallel_gate = Arc::new(Notify::new());
+    let first = draft("first", "First next slice");
+    let mut second = draft("second", "Dependent next slice");
+    second.edges.push(on(EdgeKind::Blocks, "first"));
+    second.inputs_from.push(tmp("first"));
+    let parallel = draft("parallel", "Independent next slice");
+    h.script.push(
+        "Current slice",
+        report(ResultReport {
+            discovered: vec![first, second, parallel],
+            ..done("Current slice")
+        }),
+    );
+    h.script.push(
+        "First next slice",
+        Step::Wait(gate.clone(), Box::new(done("First next slice"))),
+    );
+    h.script.push(
+        "Independent next slice",
+        Step::Wait(
+            parallel_gate.clone(),
+            Box::new(done("Independent next slice")),
+        ),
+    );
+    let original = h.file_one(draft("original", "Current slice")).await;
+    h.drain().await;
+    assert_eq!(h.status(&original).await, Status::Done);
+    let briefs = h.script.briefs();
+    assert!(briefs.iter().any(|(_, b)| b.title == "First next slice"));
+    assert!(briefs
+        .iter()
+        .any(|(_, b)| b.title == "Independent next slice"));
+    assert!(!briefs
+        .iter()
+        .any(|(_, b)| b.title == "Dependent next slice"));
+    let first = briefs
+        .iter()
+        .find(|(_, b)| b.title == "First next slice")
+        .unwrap()
+        .1
+        .item
+        .clone();
+    let group = h.item(&first).await.parent.unwrap();
+    assert_eq!(h.status(&group).await, Status::Running);
+    gate.notify_one();
+    h.drain().await;
+    let second = h
+        .script
+        .briefs()
+        .into_iter()
+        .find(|(_, b)| b.title == "Dependent next slice")
+        .unwrap()
+        .1;
+    assert_eq!(second.inputs.len(), 1);
+    assert_eq!(second.inputs[0].item, first);
+    assert_eq!(second.inputs[0].status, Status::Done);
+    assert_eq!(
+        h.status(&group).await,
+        Status::Running,
+        "the group waits for the parallel slice"
+    );
+    parallel_gate.notify_one();
+    h.drain().await;
+    assert_eq!(h.status(&group).await, Status::Done);
+    assert!(h
+        .events(&original)
+        .await
+        .iter()
+        .all(|e| e.kind != EventKind::Rejection));
+}

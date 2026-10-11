@@ -944,7 +944,7 @@ pub(crate) fn draft_properties(nested: bool) -> Map<String, Value> {
     );
     p.insert(
         "plan".into(),
-        json!({ "type": "boolean", "description": "true only for several deliverables, a wait on the world between steps, or independent parts: a planning step then builds the graph." }),
+        json!({ "type": "boolean", "description": "true for large work needing small execution slices, several deliverables, a wait between steps, or independent parts: a planning step then builds the graph." }),
     );
     if nested {
         p.insert(
@@ -1161,13 +1161,13 @@ impl Tool for WorkFileTool {
 
     fn description(&self) -> &str {
         if self.manager {
-            return "Assign ONE durable work item to the controller. It selects a suitable available registered worker and verifies the result. Code requires an authorized repository resource and keeps all approval gates. Include project references, observable done_when and explicit constraints. The result is an assignment receipt, not completion.";
+            return "Assign ONE durable work item to the controller. It selects a suitable available registered worker and verifies the result. Code requires an authorized repository resource and keeps all approval gates. Include project references, observable done_when and explicit constraints. For large work, set plan: true so the planner breaks the request into small, verifiable execution slices within each run's context, token and turn budgets. The result is an assignment receipt, not completion.";
         }
         "File ONE work item that should not be done in this run: follow-up work you found \
          that needs another time, tool, person or worker. Give title, objective and \
          done_when; constraints, decisions and refs are separate short entries, and refs are \
-         pointers, not content. Set plan: true only for several deliverables, a wait on the \
-         world between steps, or independent parts. You never set status, ids or budget; \
+         pointers, not content. Set plan: true for large work that needs small execution \
+         slices, several deliverables, a wait between steps, or independent parts. You never set status, ids or budget; \
          the result gives the new id. If a required tool is merely not loaded, load it and \
          do the work yourself."
     }

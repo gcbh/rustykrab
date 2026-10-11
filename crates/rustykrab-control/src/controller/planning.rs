@@ -182,9 +182,11 @@ impl Controller {
                     "At most {} items and {} levels; budgets sum within the root's.",
                     caps.max_items, caps.max_depth
                 ),
-                "A step is its own item only for a wait on the world, independent fan-out, a \
-                 different worker or writable resource, an approval point, or a plan B; \
-                 everything else stays inside one item."
+                "Break large work into small, verifiable execution slices that fit one run. \
+                 A context, token or turn budget is a reason to split even when the same \
+                 worker could do every step. Give each slice a precise done_when and \
+                 inspection pointers; order dependent slices with blocks and inputs_from, \
+                 leave independent work parallel, and keep shared writable resources ordered."
                     .to_string(),
             ]
             .into_iter()
