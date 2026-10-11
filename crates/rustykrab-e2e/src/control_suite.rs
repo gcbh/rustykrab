@@ -357,7 +357,7 @@ async fn agent_monitor(ctx: &Ctx) -> Result<()> {
 // ── Phase 1: work items and the controller skeleton ──────────────────
 
 /// Scenario 1: A personal task is filed, leased to a local worker with its toolset
-/// pre-activated, completed, and reported through Telegram with evidence.
+/// pre-activated, completed, and reported through Telegram with an execution pointer.
 async fn s01(ctx: &Ctx) -> Result<()> {
     let progress = EventStream::open(ctx).await?;
     let conversation = telegram_thread(ctx, 101).await?;
@@ -394,9 +394,23 @@ async fn s01(ctx: &Ctx) -> Result<()> {
         evidence_text(&finished)
     );
     let reports = wait_told(ctx, "Book the dentist").await?;
+    let pointer = format!("Details: /work {task}");
+    let notification = reports
+        .iter()
+        .find(|m| m.contains(&pointer))
+        .ok_or_else(|| anyhow!("the Telegram notification links to its execution: {reports:?}"))?;
     ensure!(
-        reports.iter().any(|m| m.contains(S01_EVIDENCE)),
-        "the Telegram report carries the evidence: {reports:?}"
+        notification.contains("Booked the dentist"),
+        "the notification explains the outcome: {notification}"
+    );
+    ensure!(
+        !notification.contains(S01_EVIDENCE),
+        "receipts belong in execution details: {notification}"
+    );
+    let detail = get(ctx, &format!("{WORK}/{task}")).await?;
+    ensure!(
+        evidence_text(&detail).contains(S01_EVIDENCE),
+        "the notification's work pointer resolves to its full evidence"
     );
     let frames = progress.about(&task);
     ensure!(
