@@ -118,3 +118,23 @@ legacy turn paths. A direct runtime `prepare_agent` test now covers the manager'
 capability ceiling; this narrows rather than closes the prompt-assembly coverage
 finding. Service observations use cached host probes and controller-owned work
 receipts; no second scheduling or completion authority is added.
+
+## Work execution slices (base 102cbbc, 2026-10-10)
+
+The prior whole-project 128 KiB bound stopped small tasks once history accumulated.
+Incident inspection found 58 tasks contributing 112,165 bytes of work history
+against a 4,373-byte planning snapshot. Execution views now keep exact project
+intent, the task's dependencies and pinned-base evidence; complete history remains
+durable and is available to native workers through a private per-run file.
+Workspace selection still checks every completed verified commit before projection.
+The regression carries more than 128 KiB of historical reports through SQLite
+while the next execution view is below 16 KiB.
+
+Planner and worker instructions now support small sequential chunks and post-tasks.
+The default anti-split warning is retired for ordinary plans; explicit legacy
+warning/rejection policies remain available. Root-level report drafts previously
+became separate filings, so temporary references to sibling drafts could not
+resolve. They now form one atomic post-task graph. Gated-worker tests exercise
+independent parallel work, ordered verified inputs, current-slice completion and
+the follow-up group's final roll-up. Native process tests check selective context
+rendering and full-history file inspection for both Claude and Codex.

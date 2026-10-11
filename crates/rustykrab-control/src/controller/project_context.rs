@@ -127,20 +127,47 @@ impl Controller {
             .into_iter()
             .filter(|q| ids.contains(q.item.as_str()))
             .collect();
+        let mut execution_items = std::collections::BTreeSet::from([item.id.clone()]);
+        execution_items.extend(snap.ancestors(&item.id));
+        let mut pending: Vec<_> = execution_items.iter().cloned().collect();
+        while let Some(id) = pending.pop() {
+            let inputs = snap
+                .item(&id)
+                .into_iter()
+                .flat_map(|w| w.inputs_from.iter());
+            let upstream = snap
+                .edges_held_by(&id)
+                .filter(|e| e.kind.is_ordering())
+                .map(|e| &e.depends_on);
+            for input in inputs.chain(upstream) {
+                if execution_items.insert(input.clone()) {
+                    pending.push(input.clone());
+                }
+            }
+        }
         let context = ProjectContext {
             snapshot,
             work,
             base_sources: Vec::new(),
             questions,
+            execution_items: execution_items.into_iter().collect(),
         };
-        if serde_json::to_vec(&context)
+        Ok(Some(context))
+    }
+
+    /// Check the actual prompt view after the workspace base has been pinned.
+    pub(super) fn check_execution_context(context: &ProjectContext) -> Result<(), Error> {
+        if serde_json::to_vec(&context.execution_view())
             .map_err(|e| Error::Internal(e.to_string()))?
             .len()
             > CONTEXT_BYTES
         {
-            return Err(Error::Internal("project context exceeds the handoff limit; narrow the execution slice before continuing".into()));
+            return Err(Error::Internal(
+                "the execution slice exceeds the handoff limit; split this task into smaller items"
+                    .into(),
+            ));
         }
-        Ok(Some(context))
+        Ok(())
     }
 
     async fn project_work(

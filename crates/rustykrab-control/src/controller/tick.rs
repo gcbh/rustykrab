@@ -1760,6 +1760,12 @@ impl Controller {
                     continue;
                 }
             };
+            if let Some(context) = &brief.project_context {
+                if let Err(why) = Self::check_execution_context(context) {
+                    report.transitions += self.hold_context(&item, why.to_string()).await?;
+                    continue;
+                }
+            }
             brief.capability = mode;
             let mut lease_evidence = vec![rustykrab_core::work::Evidence {
                 item: item.id.clone(),
@@ -1857,6 +1863,14 @@ impl Controller {
         .await
         .map_err(|e| e.to_string())??;
         if let Some(context) = context {
+            context.execution_items.extend(
+                commits
+                    .iter()
+                    .filter(|(_, commit)| commit == &base)
+                    .map(|(item, _)| item.clone()),
+            );
+            context.execution_items.sort();
+            context.execution_items.dedup();
             context.base_sources = commits.into_iter().map(|(item, _)| item).collect();
         }
         Ok(Some(Workspace::plan(&root, &repo, &base, &item.id, run)))
