@@ -502,8 +502,9 @@ impl Controller {
     }
 
     /// A worker's `discovered` drafts (section 5 and 6.5): under the item's
-    /// parent they file as one graph, scoped to that subtree; an item with
-    /// no parent files each draft as its own root. Each draft inherits the
+    /// parent they file as one graph, scoped to that subtree; multiple drafts
+    /// from a standalone item form one post-task graph so sibling references
+    /// remain valid. One standalone draft stays its own root. Each draft inherits the
     /// item's `repo:` resources and worker constraint unless it sets its own
     /// ([`inherit_from`]), drafts sharing a repository are ordered among
     /// themselves ([`order_repo_writers`]), and every draft runs after the
@@ -542,18 +543,42 @@ impl Controller {
                     rationale,
                 }]
             }
-            None => drafts
-                .into_iter()
-                .map(|d| {
-                    let tmp = d.tmp.clone().unwrap_or_default();
-                    WorkPlan {
-                        root: ItemRef::Tmp { tmp },
-                        items: vec![d],
-                        edges: Vec::new(),
-                        rationale: rationale.clone(),
-                    }
-                })
-                .collect(),
+            None if drafts.len() == 1 => {
+                let tmp = drafts[0].tmp.clone().unwrap_or_default();
+                vec![WorkPlan {
+                    root: ItemRef::Tmp { tmp },
+                    items: drafts,
+                    edges: Vec::new(),
+                    rationale,
+                }]
+            }
+            None => {
+                order_repo_writers(&mut drafts);
+                let mut tmp = "post_tasks".to_string();
+                while drafts.iter().any(|d| d.tmp.as_deref() == Some(&tmp)) {
+                    tmp.push('_');
+                }
+                let parent = WorkItemDraft {
+                    tmp: Some(tmp.clone()),
+                    kind: (item.kind == WorkKind::Code).then_some(WorkKind::Code),
+                    title: format!("Post-tasks: {}", item.title),
+                    objective:
+                        "Complete the follow-up execution slices reported by the preceding task."
+                            .into(),
+                    done_when: "Every required post-task is verified complete.".into(),
+                    artifact_refs: item.artifact_refs.clone(),
+                    constraints: item.constraints.clone(),
+                    decisions_made: item.decisions_made.clone(),
+                    ..WorkItemDraft::default()
+                };
+                drafts.insert(0, parent);
+                vec![WorkPlan {
+                    root: ItemRef::Tmp { tmp },
+                    items: drafts,
+                    edges: Vec::new(),
+                    rationale,
+                }]
+            }
         };
         let mut changed = Vec::new();
         for plan in plans {

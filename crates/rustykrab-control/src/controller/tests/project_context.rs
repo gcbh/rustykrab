@@ -369,3 +369,66 @@ async fn unfinished_attempts_have_inspection_pointers_and_never_supply_the_code_
     assert!(attempt.run.is_some() && attempt.workspace.is_some() && attempt.error.is_some());
     assert!(!previous.evidence.iter().any(|e| e.kind == "commit"));
 }
+
+#[tokio::test]
+async fn accumulated_project_history_does_not_overflow_a_small_execution_slice() {
+    let repo = Repo::new();
+    let root = tempfile::tempdir().unwrap();
+    let config = ControllerConfig {
+        worktree_root: Some(root.path().to_owned()),
+        ..Default::default()
+    };
+    let mut h = Harness::with(config, super::StaticCatalog::default(), &["history"]);
+    let project = project(&h, &repo).await;
+    for i in 0..8 {
+        let title = format!("Earlier report {i}");
+        h.script.push(
+            &title,
+            super::report(ResultReport {
+                summary: format!("Historical report {i}: {}", "detail ".repeat(4_000)),
+                ..Default::default()
+            }),
+        );
+        let mut old = draft("old", &title);
+        old.artifact_refs.push(ArtifactRef {
+            kind: "project".into(),
+            value: project.project.id.to_string(),
+        });
+        h.file_one(old).await;
+        h.drain().await;
+    }
+    let coder = Coder::new(WorkerKind::Codex, &repo);
+    h.ctl = Controller::new(h.store().clone(), vec![coder.clone()], h.config.clone())
+        .with_clock(h.clock.clone());
+    let next = h
+        .file_one(code(
+            &repo,
+            WorkerKind::Codex,
+            "small slice",
+            Some(project.project.id),
+        ))
+        .await;
+    h.drain().await;
+    assert_eq!(h.status(&next).await, Status::Done);
+    let brief = coder.received.lock().unwrap()[0].clone();
+    let context = brief.project_context.unwrap();
+    assert!(serde_json::to_vec(&context).unwrap().len() > 128 * 1024);
+    let view = context.execution_view();
+    assert_eq!(view.work.len(), 1);
+    assert_eq!(view.work[0].item, next);
+    assert_eq!(view.history_items, 9);
+    assert_eq!(view.snapshot, &project);
+    assert!(serde_json::to_vec(&view).unwrap().len() < 16 * 1024);
+    let frozen = h
+        .store()
+        .work_evidence_list(&next)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|e| e.kind == PROJECT_CONTEXT)
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<crate::handoff::ProjectContext>(&frozen.reference).unwrap(),
+        context
+    );
+}

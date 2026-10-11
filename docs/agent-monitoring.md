@@ -189,7 +189,10 @@ its code base, inherited producing agents and the supplied progress counts. Open
 the work item for its exact context evidence and verification record. A correction
 creates a new project revision for later runs; old receipts stay immutable.
 Missing commits, divergent verified branches, ambiguous project identity and
-contexts larger than 128 KiB park work with a recorded resolution question.
+execution views larger than 128 KiB park work with a recorded resolution question.
+Accumulated project history stays in the full frozen receipt rather than being
+inlined into every task's prompt. Native workers can inspect that history in a
+private per-run file; the prompt preserves the complete current planning snapshot.
 The controller never changes the repository's HEAD during a handoff.
 
 Unfinished attempts carry controller-owned run/workspace/branch pointers and

@@ -352,7 +352,7 @@ impl Default for ControllerConfig {
             aging_max_gap: TimeDelta::minutes(15),
             notice_channel: "default".to_string(),
             approval: ApprovalPolicy::default(),
-            split_mode: SplitMode::Warn,
+            split_mode: SplitMode::Allow,
             supersede_limit: caps.max_replans_per_parent,
             supersede_window: TimeDelta::hours(1),
             serialise_local: true,

@@ -270,15 +270,15 @@ Rules:
 - **Follow-ups carry provenance.** A `discovered_from` edge and
   `origin_conversation_id` let a worker read the originating conversation's
   recall archive, which is already durable and keyed by conversation id.
-- **The graph is for ordering, waiting and fan-out, not for sequences.** An
-  edge earns its place when the downstream waits on the world (a trigger, a
-  date, a person's answer), needs a different worker kind, tool or writable
-  resource, sits behind an approval point, joins independent branches, or is
-  a plan B (section 6.1). A sequence one worker can finish in one run stays
-  one item (section 2); `work_plan` flags the plainest split with a
-  `sequential_split` warning (section 14.1), a rejection once Phase 1 has
-  measured its false-positive rate, and section 17 watches repair rates on
-  chained items.
+- **The graph supports small execution slices, ordering, waiting and fan-out.**
+  Context, token and turn budgets are reasons to split large work, including a
+  sequence the same worker could otherwise perform. Each slice has a verifiable
+  done_when; the parent retains the complete request's acceptance criteria.
+  Use blocks and inputs_from when a later task requires an earlier result.
+  Independent work may run in parallel, while shared writable resources remain
+  ordered. A worker finishes its current slice and returns post-tasks in discovered
+  for another agent. Default validation allows sequential chunks; legacy
+  sequential_split warning/rejection policies remain explicitly selectable.
 - **Code slices remain code slices.** A `code` item that belongs to a delivery
   is a projection of the delivery plan's work item, not a competitor; the
   controller leases it the same way and the delivery verifier decides `done`.
@@ -684,7 +684,7 @@ ids or every failed check with a typed reason:
 | depth and item count within policy caps (for example 3 levels, 12 items) | `depth_exceeded`, `too_many_items` |
 | children's budgets sum to no more than the parent's remaining budget | `over_budget` |
 | two items in the subtree that write the same resource are ordered by a path of `blocks` or `waits_for` edges | `single_writer_conflict` |
-| no edge split only for sequence: sole downstream of its upstream, sole upstream of its downstream, same worker kind and writable resources, no approval point, downstream trigger `now` | `sequential_split`: a warning event on the plan, not a rejection, until Phase 1 has measured its false-positive rate |
+| no edge split only for sequence: sole downstream of its upstream, sole upstream of its downstream, same worker kind and writable resources, no approval point, downstream trigger `now` | accepted by default as small execution slices; explicit legacy policy may warn or reject with `sequential_split` |
 | a `conditional_on_failure` item has no other upstream edge | `plan_b_edges` |
 | an ordering edge onto an existing item only while that item is waiting; every `inputs_from` entry an item the downstream is ordered after; no filing of an item already cancelled or held (4.3, 4.4) | `edge_onto_active`, `input_unordered`, `dead_filing` |
 | `supersedes` targets are queued, ready or blocked, inside the submitter's subtree (4.4) | `supersedes_active`, `supersedes_closed`, `out_of_scope` |
@@ -1438,7 +1438,7 @@ with its reason, so the planner can fix the graph in one pass.
 | parent tree depth and item count within the policy caps | `depth_exceeded`, `too_many_items` |
 | children's budgets sum within the root's budget (or an existing parent's remaining budget) | `over_budget` |
 | no two unordered items in the graph write the same resource | `single_writer_conflict` |
-| no `blocks` link joins steps that belong in one worker: the downstream has no other upstream, the upstream no other downstream, and the downstream adds no kind, trigger, precondition, worker constraint or writable resource the upstream lacks | `sequential_split`: a warning recorded as an event on the plan and counted by dreaming (section 10), a rejection once Phase 1 has measured its false-positive rate |
+| no `blocks` link joins steps that belong in one worker: the downstream has no other upstream, the upstream no other downstream, and the downstream adds no kind, trigger, precondition, worker constraint or writable resource the upstream lacks | accepted by default as small execution slices; explicit legacy policy may warn or reject with `sequential_split` |
 | a `conditional_on_failure` item has no other upstream edge | `plan_b_edges` |
 | an ordering edge onto an existing item only while that item is `queued`, `ready` or `blocked` | `edge_onto_active` |
 | every `inputs_from` entry is an item the downstream is ordered after (section 4.3) | `input_unordered` |
@@ -1558,9 +1558,8 @@ Added as `xfail` first, in the existing e2e harness:
     only then is any item leased.
 19. Validation bounds over-decomposition: a twelve-item plan for a three-step
     errand is rejected with `too_many_items`; two `blocks`-chained steps that
-    add nothing to each other are accepted with a `sequential_split` warning
-    recorded as an event (a rejection once its false-positive rate is
-    measured); children
+    fit one worker are accepted as small execution slices without a split
+    warning; children
     whose budgets exceed the root's are rejected with `over_budget`; a `code`
     item in a planner's graph is rejected with `kind_not_allowed`. Each
     rejection is an event dreaming can count.
@@ -1916,3 +1915,15 @@ long-running agents" (2025) and "Advanced tool use" (2025); TheAgentCompany
 boundary metadata (2026 preprint); Factory, "Evaluating compression" (2025);
 Beads (steveyegge/beads); Magentic-One (Microsoft, 2024); Cognition, "Don't
 build multi-agents" (2025).
+
+### Execution-slice continuation (2026-10-10)
+
+This continuation replaces the original Phase 0/1 anti-sequential-split default
+where historical implementation notes below describe warning measurements.
+Both the validator and controller now default to allowing sequential chunks;
+explicit legacy Warn/Reject modes remain available. The manager requests a
+planning step for large work, and planner/worker instructions use budgets as a
+reason to create small tasks. Root-level multi-draft post-tasks are one atomic
+graph under a follow-up group, preserving sibling temporary references and
+verified input dependencies. Existing code authorization, graph caps, finite
+budgets and writable-resource ordering still apply.
