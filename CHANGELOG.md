@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [6.4.8] - 2026-10-12
+
+- fix: preserve user direction in work handoffs (#682)
+
 ## [6.4.7] - 2026-10-12
 
 - feat: centralize work item discussions and decisions (#681)
