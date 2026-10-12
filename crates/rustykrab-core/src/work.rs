@@ -648,6 +648,8 @@ pub enum EventKind {
     Decision,
     /// A question asked, routed or answered (section 7).
     Question,
+    /// A persistent work-item comment, attributed by the host. Changes no status.
+    Comment,
 }
 
 impl EventKind {
@@ -665,6 +667,7 @@ impl EventKind {
             EventKind::Run => "run",
             EventKind::Decision => "decision",
             EventKind::Question => "question",
+            EventKind::Comment => "comment",
         }
     }
 
@@ -682,6 +685,7 @@ impl EventKind {
             "run" => Some(EventKind::Run),
             "decision" => Some(EventKind::Decision),
             "question" => Some(EventKind::Question),
+            "comment" => Some(EventKind::Comment),
             _ => None,
         }
     }

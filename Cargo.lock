@@ -1410,7 +1410,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3590,9 +3590,9 @@ dependencies = [
 
 [[package]]
 name = "quinn-proto"
-version = "0.11.16"
+version = "0.11.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2f4bfc015262b9df63c8845072ce59068853ff5872180c2ce2f13038b970e560"
+checksum = "a9746dbde176634f4f2f1faf2404e30a31b2bc1e9cafb5329c95d8177a18c9fc"
 dependencies = [
  "aws-lc-rs",
  "bytes",
@@ -4038,7 +4038,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4097,7 +4097,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4126,7 +4126,7 @@ checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
 
 [[package]]
 name = "rustykrab-agent"
-version = "6.4.6"
+version = "6.4.7"
 dependencies = [
  "async-trait",
  "chrono",
@@ -4149,7 +4149,7 @@ dependencies = [
 
 [[package]]
 name = "rustykrab-channels"
-version = "6.4.6"
+version = "6.4.7"
 dependencies = [
  "async-trait",
  "chrono",
@@ -4170,7 +4170,7 @@ dependencies = [
 
 [[package]]
 name = "rustykrab-cli"
-version = "6.4.6"
+version = "6.4.7"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4210,7 +4210,7 @@ dependencies = [
 
 [[package]]
 name = "rustykrab-control"
-version = "6.4.6"
+version = "6.4.7"
 dependencies = [
  "async-trait",
  "chrono",
@@ -4231,7 +4231,7 @@ dependencies = [
 
 [[package]]
 name = "rustykrab-core"
-version = "6.4.6"
+version = "6.4.7"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -4247,7 +4247,7 @@ dependencies = [
 
 [[package]]
 name = "rustykrab-dream"
-version = "6.4.6"
+version = "6.4.7"
 dependencies = [
  "async-trait",
  "chrono",
@@ -4263,7 +4263,7 @@ dependencies = [
 
 [[package]]
 name = "rustykrab-e2e"
-version = "6.4.6"
+version = "6.4.7"
 dependencies = [
  "anyhow",
  "axum",
@@ -4288,7 +4288,7 @@ dependencies = [
 
 [[package]]
 name = "rustykrab-gateway"
-version = "6.4.6"
+version = "6.4.7"
 dependencies = [
  "async-trait",
  "axum",
@@ -4320,7 +4320,7 @@ dependencies = [
 
 [[package]]
 name = "rustykrab-memory"
-version = "6.4.6"
+version = "6.4.7"
 dependencies = [
  "async-trait",
  "chrono",
@@ -4341,7 +4341,7 @@ dependencies = [
 
 [[package]]
 name = "rustykrab-projects"
-version = "6.4.6"
+version = "6.4.7"
 dependencies = [
  "chrono",
  "hex",
@@ -4354,7 +4354,7 @@ dependencies = [
 
 [[package]]
 name = "rustykrab-providers"
-version = "6.4.6"
+version = "6.4.7"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -4374,7 +4374,7 @@ dependencies = [
 
 [[package]]
 name = "rustykrab-runtime"
-version = "6.4.6"
+version = "6.4.7"
 dependencies = [
  "async-trait",
  "chrono",
@@ -4393,7 +4393,7 @@ dependencies = [
 
 [[package]]
 name = "rustykrab-skills"
-version = "6.4.6"
+version = "6.4.7"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4409,7 +4409,7 @@ dependencies = [
 
 [[package]]
 name = "rustykrab-store"
-version = "6.4.6"
+version = "6.4.7"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -4436,7 +4436,7 @@ dependencies = [
 
 [[package]]
 name = "rustykrab-tools"
-version = "6.4.6"
+version = "6.4.7"
 dependencies = [
  "async-imap",
  "async-trait",
@@ -5015,7 +5015,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -6035,7 +6035,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

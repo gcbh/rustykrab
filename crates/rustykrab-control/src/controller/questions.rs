@@ -274,7 +274,32 @@ impl Controller {
 
     /// Record one question in the batch, with its event, and when it is
     /// open and `notify`, the root's message carrying it. Returns its id.
-    pub(super) fn record_question(&self, b: &mut Batch, q: NewQuestion) -> String {
+    pub(super) async fn record_question(
+        &self,
+        b: &mut Batch,
+        q: NewQuestion,
+    ) -> Result<String, Error> {
+        if q.status == QuestionStatus::Open && q.id.is_none() {
+            let prior = self.questions_of(&q.item).await?;
+            let pending = b.ops.iter().filter_map(|op| match op {
+                WorkOp::Question(QuestionWrite::Insert(row)) => Some(row.as_ref()),
+                _ => None,
+            });
+            if let Some(existing) = prior.iter().chain(pending).find(|p| {
+                p.status == QuestionStatus::Open
+                    && p.kind == q.kind
+                    && p.class == q.class
+                    && p.options == q.options
+                    && p.default_answer == q.default
+                    && same_question(&p.text, &q.text)
+            }) {
+                return Ok(existing.id.clone());
+            }
+        }
+        Ok(self.record_question_sync(b, q))
+    }
+
+    pub(super) fn record_question_sync(&self, b: &mut Batch, q: NewQuestion) -> String {
         let id = q.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let root = b.root_of(&q.item);
         let (answer, answered_by, decision) = match q.answer {
@@ -282,6 +307,7 @@ impl Controller {
             None => (None, None, None),
         };
         let row = QuestionRow {
+            superseded_by: None,
             id: id.clone(),
             item: q.item.clone(),
             root,
@@ -607,9 +633,11 @@ impl Controller {
                 Route::Repeat { .. } => unreachable!("handled above"),
             }
             let status = q.status;
-            let id = self.record_question(b, q);
+            let id = self.record_question(b, q).await?;
             if for_user {
-                asks.push((id, a.kind, a.text.clone(), a.options.clone()));
+                if !asks.iter().any(|(existing, _, _, _)| existing == &id) {
+                    asks.push((id, a.kind, a.text.clone(), a.options.clone()));
+                }
             } else if status == QuestionStatus::Researching {
                 research.push((id, a.text.clone()));
             }
@@ -660,6 +688,9 @@ impl Controller {
             );
             // One message for the subtree, every question in it.
             for (id, kind, text, options) in asks {
+                if prior.iter().any(|p| p.id == id && p.status.is_waiting()) {
+                    continue;
+                }
                 b.notify(
                     &item.id,
                     Cause::Question {
@@ -1021,7 +1052,7 @@ impl Controller {
         }
         let kind = q.kind;
         let text = q.text.clone();
-        let id = self.record_question(&mut b, q);
+        let id = self.record_question(&mut b, q).await?;
         outcome.question = id.clone();
         outcome.parked = park;
         self.commit(b, &mut HashSet::new()).await?;
@@ -1156,12 +1187,18 @@ impl Controller {
     async fn resolve_question(&self, id: &str) -> Result<QuestionRow, Error> {
         let id = id.trim().trim_start_matches('#');
         if let Some(q) = self.store.question_get(id).await? {
+            if let Some(canonical) = q.superseded_by.as_deref() {
+                return self
+                    .store
+                    .question_get(canonical)
+                    .await?
+                    .ok_or_else(|| Error::NotFound(format!("question {canonical}")));
+            }
             return Ok(q);
         }
         let waiting = self
             .store
             .questions_list(&QuestionFilter {
-                waiting: true,
                 ..QuestionFilter::default()
             })
             .await?;
@@ -1170,7 +1207,17 @@ impl Controller {
             .filter(|q| !id.is_empty() && q.id.starts_with(id))
             .collect();
         match matches.len() {
-            1 => Ok(matches.into_iter().next().expect("one match")),
+            1 => {
+                let q = matches.into_iter().next().expect("one match");
+                if let Some(canonical) = q.superseded_by.as_deref() {
+                    self.store
+                        .question_get(canonical)
+                        .await?
+                        .ok_or_else(|| Error::NotFound(format!("question {canonical}")))
+                } else {
+                    Ok(q)
+                }
+            }
             0 => Err(Error::NotFound(format!("question {id}"))),
             _ => Err(invalid(format!(
                 "question {id} is ambiguous: give more of its id"
@@ -1244,9 +1291,26 @@ impl Controller {
             actor,
             format!("question {} answered", short_question(&q.id)),
         );
-        // `on_answer` triggers naming the question fire with this batch.
+        let related = self.questions_of(&q.item).await?;
+        let mut answered_ids = HashSet::from([q.id.clone()]);
+        for other in &related {
+            let alias = other.superseded_by.as_deref() == Some(q.id.as_str());
+            let equivalent = equivalent_question(other, &q);
+            if alias || (other.status.is_waiting() && equivalent) {
+                answered_ids.insert(other.id.clone());
+                if other.id != q.id && other.status.is_waiting() {
+                    b.ops.push(WorkOp::Question(QuestionWrite::Supersede {
+                        id: other.id.clone(),
+                        canonical: q.id.clone(),
+                        at: now,
+                    }));
+                }
+            }
+        }
+        // Old duplicate IDs remain valid trigger references and notification links.
         for i in b.snap.items().to_vec() {
-            if i.trigger == rustykrab_core::work::Trigger::OnAnswer(q.id.clone()) {
+            if matches!(&i.trigger, rustykrab_core::work::Trigger::OnAnswer(id) if answered_ids.contains(id))
+            {
                 b.snap.fire(&i.id);
             }
         }
@@ -1254,15 +1318,13 @@ impl Controller {
             .snap
             .items()
             .iter()
-            .filter(|i| i.trigger == rustykrab_core::work::Trigger::OnAnswer(q.id.clone()))
+            .filter(|i| matches!(&i.trigger, rustykrab_core::work::Trigger::OnAnswer(id) if answered_ids.contains(id)))
             .map(|i| i.id.clone())
             .collect();
         let declined = q.kind == QuestionKind::Consent && is_no(&answer);
-        let still_open = self
-            .questions_of(&q.item)
-            .await?
-            .into_iter()
-            .any(|o| o.id != q.id && o.status == QuestionStatus::Open);
+        let still_open = related
+            .iter()
+            .any(|o| !answered_ids.contains(&o.id) && o.status == QuestionStatus::Open);
         let parked = matches!(
             b.status(&q.item),
             Some(Status::Blocked(
@@ -1348,7 +1410,37 @@ impl Controller {
         b: &mut Batch,
         waiting: &[QuestionRow],
     ) -> Result<(), Error> {
+        let mut canonical: Vec<&QuestionRow> = Vec::new();
+        let mut duplicate_ids = HashSet::new();
+        for q in waiting
+            .iter()
+            .rev()
+            .filter(|q| q.status == QuestionStatus::Open && q.kind != QuestionKind::Approval)
+        {
+            if let Some(previous) = canonical.iter().find(|p| equivalent_question(p, q)) {
+                duplicate_ids.insert(q.id.clone());
+                b.ops.push(WorkOp::Question(QuestionWrite::Supersede {
+                    id: q.id.clone(),
+                    canonical: previous.id.clone(),
+                    at: b.now,
+                }));
+                b.note(
+                    &q.item,
+                    EventKind::Question,
+                    "controller",
+                    format!(
+                        "Duplicate question {} consolidated into {}; no decision supplied.",
+                        q.id, previous.id
+                    ),
+                );
+            } else {
+                canonical.push(q);
+            }
+        }
         for q in waiting {
+            if duplicate_ids.contains(&q.id) {
+                continue;
+            }
             let settle = |status: QuestionStatus, answer: Option<String>, by: Option<String>| {
                 WorkOp::Question(QuestionWrite::Settle {
                     id: q.id.clone(),
@@ -1460,4 +1552,13 @@ impl Controller {
         }
         Ok(())
     }
+}
+
+fn equivalent_question(a: &QuestionRow, b: &QuestionRow) -> bool {
+    a.item == b.item
+        && a.kind == b.kind
+        && a.class == b.class
+        && a.options == b.options
+        && a.default_answer == b.default_answer
+        && same_question(&a.text, &b.text)
 }

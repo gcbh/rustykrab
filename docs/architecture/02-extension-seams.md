@@ -283,3 +283,8 @@ LocalWorker now fills the existing command_run artifact seam from host exec
 observations before report forwarding. It adds no callback trait or persistence
 table. The controller's existing claim matcher verifies recorded check execution;
 process exit results and test success remain distinct facts.
+
+
+## Work-item discussions (base 54f82f3)
+
+ControlHandle exposes comment/discussion to authenticated transports; WorkBackend exposes the same seam to the model-facing work_discuss tool. Host provenance binds the author and a worker’s current lease. Brief.discussion is provider-neutral context, with a bounded prompt excerpt and a full private native snapshot. Comments grant no lifecycle or acceptance-changing authority.

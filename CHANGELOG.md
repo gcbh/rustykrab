@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [6.4.7] - 2026-10-12
+
+- feat: centralize work item discussions and decisions (#681)
+
 ## [6.4.6] - 2026-10-12
 
 - feat: prioritize local Ollama coding and integration resources (#680)

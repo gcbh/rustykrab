@@ -87,6 +87,14 @@ impl Controller {
             Vec::new()
         };
         let mut brief = brief_for(item, lease.inputs.clone(), Vec::new(), prior, &hist);
+        brief.discussion = evidence
+            .iter()
+            .rev()
+            .find(|e| e.kind == "work_discussion" && e.verified_by.as_deref() == Some("controller"))
+            .map(|e| serde_json::from_str(&e.reference))
+            .transpose()
+            .map_err(|e| Error::Internal(format!("Recorded work discussion is unreadable: {e}")))?
+            .unwrap_or_default();
         brief.run = Some(run.clone());
         brief.workspace = evidence
             .iter()

@@ -57,7 +57,7 @@
   function disconnect(message = '') {
     generation++; detailRequest++; pending = false;
     clearInterval(interval); interval = null;
-    access.disconnect(); snapshot = null; lastQuestions = '';
+    access.disconnect(); snapshot = null; lastQuestions = ''; discussionDrafts.clear();
     $('accessStatus').textContent = ''; $('accessMessage').textContent = access.message({disconnected: true});
     $('dashboard').hidden = true; $('logout').hidden = true; $('login').hidden = false;
     $('loginError').textContent = message; $('token').value = '';
@@ -204,7 +204,7 @@
       stat(open, 'Open work', num(w.total_archived) + ' archived'),
       stat(active, 'Active items', num(c?.runs_in_flight) + ' runs in this daemon'),
       stat(counts.blocked || 0, 'Blocked items', Object.entries(w.blocked_reasons).map(([k,v]) => num(v) + ' ' + human(k)).join(' · ') || 'No blocked work'),
-      stat(w.pending_questions, 'Questions for you', num(w.pending_notices) + ' notices awaiting delivery')
+      stat(0, 'Work needing direction', 'Loading pending decisions')
     );
     $('alertRows').replaceChildren();
     if (!reply.alerts.length) $('alertRows').append(node('p', 'No warning or critical condition observed.', 'note'));
@@ -316,48 +316,105 @@
       const tr = node('tr'), td = node('td', 'No work matches this view.', 'empty'); td.colSpan = 5;
       tr.append(td); $('workRows').append(tr);
     }
-    $('workNote').textContent = 'Counts cover all work. ' + (w.items_truncated ? 'Showing ' + num(w.items.length) + ' of ' + num(w.total_live) + ' items, with active work first. ' : '') + 'Open an item to inspect its objective, evidence, and activity.';
+    $('workNote').textContent = 'Counts cover all work. ' + (w.items_truncated ? 'Showing ' + num(w.items.length) + ' of ' + num(w.total_live) + ' items, with active work first. ' : '') + 'Open an item to discuss direction, answer decisions, and inspect progress.';
+  }
+  const discussionDrafts = new Map();
+  function questionsByWork(questions) {
+    const groups = new Map();
+    for (const q of questions) {
+      if (!groups.has(q.item)) groups.set(q.item, []);
+      groups.get(q.item).push(q);
+    }
+    return groups;
   }
   async function refreshQuestions(requestGeneration) {
     try {
       const data = await api('/api/questions?status=open');
       if (requestGeneration !== generation) return;
+      const groups = questionsByWork(data.questions);
+      const card = $('stats').lastElementChild;
+      if (card) { card.querySelector('.number').textContent = num(groups.size); card.querySelector('.caption').textContent = num(data.questions.length) + ' pending decisions · Open an item to respond'; }
       const signature = JSON.stringify(data.questions);
-      if (signature === lastQuestions) return; // Preserve an answer being typed between refreshes.
+      if (signature === lastQuestions) return;
       lastQuestions = signature;
-      $('questions').hidden = !data.questions.length; $('questionRows').replaceChildren();
-      for (const q of [...data.questions].reverse()) {
-        const row = node('div', undefined, 'question');
-        row.append(node('p', q.text), node('small', q.item.slice(0, 8) + ' · ' + human(q.kind)), itemButton(q.item, 'View work'));
-        if (q.kind === 'credential') {
-          row.append(node('p', 'Use the secure credential request in your notification to provide this credential.', 'note'));
-        } else {
-          if (q.options.length) row.append(node('p', q.options.map((o,i) => (i + 1) + '. ' + o).join(' · '), 'note'));
-          const form = node('form'), input = node('input'), button = node('button', 'Answer', 'primary');
-          input.required = true; input.autocomplete = 'off'; input.setAttribute('aria-label', 'Answer: ' + q.text);
-          input.placeholder = q.kind === 'approval' ? 'approve or reject' : q.kind === 'consent' ? 'yes or no' : 'Your answer';
-          const error = node('p', '', 'note'); error.setAttribute('role', 'alert');
-          form.append(input, button); row.append(form, error);
-          form.addEventListener('submit', async event => {
-            event.preventDefault(); button.disabled = true;
-            const g = generation;
-            try {
-              await api('/api/questions/' + encodeURIComponent(q.id) + '/answer', { answer: input.value });
-              if (g !== generation) return;
-              error.textContent = 'Answer recorded.'; input.value = ''; lastQuestions = ''; await refresh();
-            } catch (e) { if (g === generation) error.textContent = e.message; }
-            finally { button.disabled = false; }
-          });
-        }
+      $('questions').hidden = !groups.size; $('questionRows').replaceChildren();
+      for (const [id, questions] of groups) {
+        const item = snapshot?.work.items.find(r => r.item.id === id)?.item;
+        const row = node('article', undefined, 'question');
+        row.append(itemButton(id, item?.title || 'Work ' + id.slice(0, 8)), node('p', questions.length + (questions.length === 1 ? ' pending decision' : ' pending decisions') + ' · ' + human(item ? status(item) : 'blocked'), 'note'));
+        row.append(node('p', questions[0].text), node('small', 'Questions and replies stay in this work item’s discussion.'));
         $('questionRows').append(row);
       }
     } catch (e) {
       if (requestGeneration === generation && access.connected) {
-        $('questions').hidden = false;
-        $('questionRows').replaceChildren(node('p', 'Questions could not be refreshed: ' + e.message, 'error'));
-        lastQuestions = '';
+        $('questions').hidden = false; $('questionRows').replaceChildren(node('p', 'Decisions could not be refreshed: ' + e.message, 'error')); lastQuestions = '';
       }
     }
+  }
+  async function renderDiscussion(id, body, g, request) {
+    const data = await api('/api/work/' + encodeURIComponent(id) + '/discussion');
+    if (g !== generation || request !== detailRequest || !$('detail').open) return;
+    const section = node('section', undefined, 'discussion');
+    section.append(node('h3', 'Discussion and decisions'), node('p', 'Comments reach the next agent run. Answer pending decisions explicitly to unblock work.', 'note'));
+    const refreshButton = node('button', 'Refresh discussion');
+    refreshButton.addEventListener('click', () => showDetail(id)); section.append(refreshButton);
+    const repeated = data.questions.filter(q => q.superseded_by).length;
+    if (repeated) section.append(node('p', repeated + ' repeated requests consolidated; their history is retained.', 'note'));
+    const entries = data.comments.map(e => ({ at: e.at, author: e.actor, text: e.reason, type: 'comment' }));
+    for (const e of data.activity || []) {
+      if (e.kind === 'transition' && e.to) entries.push({ at: e.at, author: e.actor, text: 'Work status: ' + human(typeof e.to === 'string' ? e.to : e.to.status), type: 'status' });
+    }
+    for (const q of data.questions) {
+      if (q.superseded_by) continue;
+      entries.push({ at: q.created_at, author: q.asked_by, text: q.text, type: 'question', question: q });
+      if (q.answer) entries.push({ at: q.answered_at, author: q.answered_by, text: q.answer, type: 'answer' });
+    }
+    entries.sort((a,b) => new Date(a.at) - new Date(b.at));
+    const timeline = node('div', undefined, 'discussion-timeline'); section.append(timeline);
+    if (!entries.length) timeline.append(node('p', 'Start the discussion with direction or a comment.', 'note'));
+    for (const entry of entries) {
+      const row = node('article', undefined, 'discussion-entry');
+      row.append(node('small', (entry.author?.startsWith('user:') ? 'You' : entry.author?.startsWith('worker:') ? entry.author.slice(7) : entry.author === 'agent' ? 'Manager' : entry.author) + ' · ' + at(entry.at) + ' · ' + human(entry.type)), node('p', entry.text));
+      const q = entry.question;
+      if (q?.status === 'open') {
+        if (q.kind === 'credential') row.append(node('p', 'Provide credentials through the secure request linked in your notification.', 'note'));
+        else {
+          if (q.options.length) row.append(node('p', q.options.map((o,i) => (i+1) + '. ' + o).join(' · '), 'note'));
+          const form = node('form'), input = node('textarea'), button = node('button', 'Record decision', 'primary'), error = node('p', '', 'note');
+          const key = 'answer:' + q.id; input.required = true; input.value = discussionDrafts.get(key) || ''; input.setAttribute('aria-label', 'Decision: ' + q.text);
+          input.placeholder = q.kind === 'approval' ? 'approve or reject' : q.kind === 'consent' ? 'yes or no' : 'Your decision'; input.addEventListener('input', () => discussionDrafts.set(key, input.value)); error.setAttribute('role', 'alert');
+          form.append(input, button); row.append(form, error);
+          form.addEventListener('submit', async event => {
+            event.preventDefault(); button.disabled = true;
+            try { await api('/api/questions/' + encodeURIComponent(q.id) + '/answer', { answer: input.value }); if (g !== generation || request !== detailRequest) return; discussionDrafts.delete(key); lastQuestions = ''; await refresh(); await showDetail(id); }
+            catch (e) { if (g === generation && request === detailRequest) error.textContent = e.message; }
+            finally { button.disabled = false; }
+          });
+        }
+      } else if (q) row.append(node('small', human(q.status), 'note'));
+      timeline.append(row);
+    }
+    if (data.total_comments > data.comments.length) {
+      const older = node('button', 'Load earlier comments');
+      older.addEventListener('click', async () => {
+        older.disabled = true;
+        try {
+          const page = await api('/api/work/' + encodeURIComponent(id) + '/discussion?offset=' + timeline.dataset.offset + '&limit=100');
+          if (g !== generation || request !== detailRequest) return;
+          for (const e of page.comments) { const row = node('article', undefined, 'discussion-entry'); row.append(node('small', e.actor + ' · ' + at(e.at)), node('p', e.reason)); timeline.prepend(row); }
+          timeline.dataset.offset = Number(timeline.dataset.offset) + page.comments.length; older.hidden = Number(timeline.dataset.offset) >= page.total_comments;
+        } catch (e) { section.append(node('p', e.message, 'error')); } finally { older.disabled = false; }
+      }); timeline.dataset.offset = data.comments.length; section.append(older);
+    }
+    const form = node('form'), label = node('label', 'Leave direction or a comment'), input = node('textarea'), button = node('button', 'Post comment', 'primary'), error = node('p', '', 'note');
+    const key = 'comment:' + id; input.required = true; input.maxLength = 4096; input.value = discussionDrafts.get(key) || ''; input.setAttribute('aria-label', 'Work item comment'); input.addEventListener('input', () => discussionDrafts.set(key, input.value)); error.setAttribute('role', 'alert'); form.append(label, input, button, error);
+    form.addEventListener('submit', async event => {
+      event.preventDefault(); button.disabled = true;
+      try { await api('/api/work/' + encodeURIComponent(id) + '/discussion', { text: input.value }); if (g !== generation || request !== detailRequest) return; discussionDrafts.delete(key); await showDetail(id); }
+      catch (e) { if (g === generation && request === detailRequest) error.textContent = e.message; }
+      finally { button.disabled = false; }
+    }); section.append(form); body.append(section);
+    timeline.scrollTop = timeline.scrollHeight;
   }
   async function refresh() {
     if (pending || !access.connected) return;
@@ -384,6 +441,7 @@
       if (g !== generation || request !== detailRequest || !$('detail').open) return;
       $('detailTitle').textContent = d.item.title;
       const body = $('detailBody'); body.replaceChildren(badge(status(d.item)), node('p', id, 'note'));
+      if (d.item.parent) body.append(itemButton(d.item.parent, 'View parent work'));
       if (d.item.kind === 'proposal' && !closed.has(status(d.item))) {
         const controls = node('div', undefined, 'controls');
         for (const [label, decision] of [['Accept for implementation', 'accept'], ['Decline', 'decline']]) {
@@ -396,16 +454,19 @@
       section('Objective', d.item.objective);
       section('Done when', d.item.done_when);
       if (d.item.constraints.length) section('Constraints', d.item.constraints.join('\n'));
+      await renderDiscussion(id, body, g, request);
+      if (g !== generation || request !== detailRequest || !$('detail').open) return;
       if (d.item.summary) section('Summary', d.item.summary);
       if (d.lease) section('Current assignment', d.lease.worker + '\nHeartbeat: ' + at(d.lease.heartbeat_at));
       if (d.last_error) section('Last error', JSON.stringify(d.last_error, null, 2));
       if (d.ladder.length) section('Recovery attempts', JSON.stringify(d.ladder, null, 2));
-      body.append(node('h3', 'Evidence'));
-      if (!d.evidence.length) body.append(node('p', 'No evidence recorded.', 'note'));
+      const evidenceDetails = node('details'), evidenceBody = node('div');
+      evidenceDetails.append(node('summary', 'Execution evidence (' + d.evidence.length + ' records)'), evidenceBody); body.append(evidenceDetails);
+      if (!d.evidence.length) evidenceBody.append(node('p', 'No evidence recorded.', 'note'));
       for (const e of d.evidence) {
-        body.append(node('p', e.verified_by ? 'Verified by ' + e.verified_by : 'Unverified record', 'note'), node('pre', JSON.stringify(e, null, 2)));
+        evidenceBody.append(node('p', e.kind === 'work_discussion' ? 'Frozen discussion input' : e.verified_by ? 'Verified by ' + e.verified_by : 'Unverified record', 'note'), node('pre', JSON.stringify(e, null, 2)));
       }
-      section('Activity', d.events.map(e => at(e.at) + ' · ' + human(e.kind) + ' · ' + e.actor + '\n' + (e.reason || '')).join('\n\n') || 'No activity recorded.');
+      const activityDetails = node('details'); activityDetails.append(node('summary', 'Full activity history'), node('pre', d.events.map(e => at(e.at) + ' · ' + human(e.kind) + ' · ' + e.actor + '\n' + (e.reason || '')).join('\n\n') || 'No activity recorded.')); body.append(activityDetails);
     } catch (e) { if (g === generation && request === detailRequest) $('detailBody').replaceChildren(node('p', e.message, 'error')); }
   }
   $('pairForm').addEventListener('submit', async e => {

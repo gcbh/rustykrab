@@ -295,6 +295,26 @@ impl DeferredWorkBackend {
 
 #[async_trait::async_trait]
 impl rustykrab_tools::WorkBackend for DeferredWorkBackend {
+    async fn comment(
+        &self,
+        item: &str,
+        text: &str,
+        provenance: rustykrab_tools::work_backend::Provenance,
+    ) -> rustykrab_core::Result<rustykrab_core::work::WorkEvent> {
+        self.bound()?.comment(item, text, provenance).await
+    }
+    async fn discussion(
+        &self,
+        item: &str,
+        offset: usize,
+        limit: usize,
+        principal: &rustykrab_tools::work_backend::Principal,
+    ) -> rustykrab_core::Result<rustykrab_tools::work_discuss::WorkDiscussion> {
+        self.bound()?
+            .discussion(item, offset, limit, principal)
+            .await
+    }
+
     async fn file(
         &self,
         draft: rustykrab_core::work::WorkItemDraft,

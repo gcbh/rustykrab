@@ -197,6 +197,24 @@ struct AttestingBackend {
 }
 #[async_trait]
 impl WorkBackend for AttestingBackend {
+    async fn comment(
+        &self,
+        item: &str,
+        text: &str,
+        provenance: rustykrab_tools::work_backend::Provenance,
+    ) -> rustykrab_core::Result<rustykrab_core::work::WorkEvent> {
+        self.inner.comment(item, text, provenance).await
+    }
+    async fn discussion(
+        &self,
+        item: &str,
+        offset: usize,
+        limit: usize,
+        principal: &rustykrab_tools::work_backend::Principal,
+    ) -> rustykrab_core::Result<rustykrab_tools::work_discuss::WorkDiscussion> {
+        self.inner.discussion(item, offset, limit, principal).await
+    }
+
     async fn file(&self, draft: WorkItemDraft, provenance: Provenance) -> Result<PlanOutcome> {
         self.inner.file(draft, provenance).await
     }
@@ -739,6 +757,7 @@ mod tests {
                 done_when: "fixture".into(),
                 constraints: vec![],
                 decisions_made: vec![],
+                discussion: Vec::new(),
                 artifact_refs: vec![],
                 required_tools: vec!["gmail".into()],
                 required_mcp_servers: vec![],

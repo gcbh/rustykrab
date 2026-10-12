@@ -75,7 +75,8 @@ pub struct RunOptions {
 pub(crate) fn manager_tool(name: &str) -> bool {
     matches!(
         name,
-        "work_assign"
+        "work_discuss"
+            | "work_assign"
             | "work_file"
             | "work_plan"
             | "work_status"
@@ -107,7 +108,9 @@ native coding fallback; select them only when the task actually needs them. \
 Select required tools/resources from advertisements; do not invent infrastructure \
 or assume an unavailable resource can execute. Let the controller choose a suitable \
 available worker when no particular runtime is required. A busy worker is a wait, \
-not permission to bypass the queue. Use work_status to resume or explain existing \
+not permission to bypass the queue. Use work_discuss to read the work item discussion and record direction or updates. \
+Comments persist for the next run, but never count as consent or a question answer. \
+Use work_status to resume or explain existing \
 work; do not file the same request twice after a timeout. Corrections affect future \
 work and must not silently change the acceptance of a running item.\n\
 Use cron for recurring or future work: each firing becomes a controller-managed \

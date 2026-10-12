@@ -14,6 +14,7 @@ use rustykrab_tools::work_backend::Provenance;
 use serde::{Deserialize, Serialize};
 
 use crate::graph::FilingSource;
+pub use rustykrab_tools::work_discuss::WorkDiscussion;
 
 /// One node of a `work show --graph` tree (plan section 14.2).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -231,6 +232,25 @@ pub trait ControlHandle: Send + Sync {
 
     /// Grant standing judgment in ordinary language; it is compiled to a
     /// checklist and in force from the next filing or question.
+    /// Append an attributed comment for future execution without releasing holds.
+    async fn comment(
+        &self,
+        _item: &str,
+        _text: &str,
+        _actor: &str,
+    ) -> Result<rustykrab_core::work::WorkEvent, Error> {
+        Err(unsupported("work comments"))
+    }
+
+    async fn discussion(
+        &self,
+        _item: &str,
+        _offset: usize,
+        _limit: usize,
+    ) -> Result<rustykrab_tools::work_discuss::WorkDiscussion, Error> {
+        Err(unsupported("work discussion"))
+    }
+
     async fn grant_judgment(
         &self,
         _text: &str,

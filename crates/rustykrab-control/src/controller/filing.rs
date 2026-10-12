@@ -329,7 +329,7 @@ impl Controller {
                         .item(&accepted.root)
                         .map(|r| r.title.clone())
                         .unwrap_or_default();
-                    self.record_question(
+                    self.record_question_sync(
                         b,
                         NewQuestion {
                             options: vec!["approve".to_string(), "reject".to_string()],

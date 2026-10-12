@@ -646,7 +646,7 @@ question goes at once. `work_plans` records each accepted `work_plan` call for
 questions(id PK, item, root, kind, class, text, options JSON,
           default_answer, asked_class, rule, asked_by, status,
           delivered_via, answer, answered_by, answered_at,
-          research_item, decision JSON, created_at)
+          research_item, decision JSON, created_at, superseded_by FK → questions.id)
    INDEX idx_questions_item    (item, created_at)
    INDEX idx_questions_waiting (status, created_at)
          WHERE status IN ('open', 'recorded', 'researching')
@@ -979,3 +979,10 @@ snapshot remain in the receipt; worker prompts project only those selected work
 records plus pinned-base sources and related questions. No table, index or
 migration is added. Standalone multi-draft post-tasks use an ordinary parent work
 row and the existing dependency/input relations, inserted as one validated batch.
+
+
+## Work discussion and repeated decisions (base 54f82f3)
+
+Comments are work_item_events rows with kind=comment, host actor, timestamp and text in reason. They are append-only and change no status. No separate comments table exists. questions.superseded_by is an optional enforced foreign key to a canonical question; it is added idempotently to legacy schemas. Consolidation marks a repetition obsolete, preserves its words/history, and supplies no answer. A duplicate ID resolves to its canonical decision; on_answer references to that ID become satisfied only after the canonical question receives an answer. Scope/choices/default/class differences prevent consolidation.
+
+Nonempty discussion is frozen as controller-authored work_discussion input evidence on the lease; reattachment restores that snapshot rather than injecting comments added during the run. This attests the input record, not the truth of an agent’s claims. Reconciled worker summaries append bounded, explicitly labeled agent-report comments with the actual worker actor, including native Claude/Codex reports.

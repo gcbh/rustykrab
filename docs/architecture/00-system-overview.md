@@ -291,3 +291,8 @@ configured provider. Local roles share one model slot, scoped tools and existing
 worktree/attestation verification. The existing cost-tier router prefers them
 and escalates failures to compatible retained CLI resources. This adds no
 crate dependency, scheduler, channel owner or durable work ledger.
+
+
+## Work-item discussions (base 54f82f3)
+
+Work-item discussions reuse the controller event ledger. The work item owns comments, questions and explicit answers; the monitor attention inbox is a grouped projection of those items. No second queue or comment store was introduced. Host-authored user direction and agent reports travel in future bounded worker handoffs; native execution retains a full frozen discussion file for selective reading.

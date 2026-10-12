@@ -110,6 +110,17 @@ impl WorkCommands {
         }
     }
 
+    async fn comment(&self, raw: &str, text: &str) -> String {
+        let item = match self.resolve(raw).await {
+            Ok(i) => i,
+            Err(e) => return e,
+        };
+        match self.control.comment(&item.id, text, &self.actor).await {
+            Ok(_) => format!("Comment saved on {} for the next agent run. Pending decisions still need an explicit answer.", short(&item.id)),
+            Err(e) => format!("Could not save comment: {e}"),
+        }
+    }
+
     async fn list(&self) -> String {
         let open = match self.store.work_list(&WorkFilter::default()).await {
             Ok(items) => items,
@@ -393,6 +404,7 @@ impl CommandHook for WorkCommands {
             }
             "/cancel" => self.cancel(first).await,
             "/answer" => self.answer(first, &rest).await,
+            "/comment" => self.comment(first, &rest).await,
             "/questions" => self.questions().await,
             "/judgment" => self.judgment().await,
             "/grant" => {
@@ -411,6 +423,7 @@ impl CommandHook for WorkCommands {
             "/approve <id>, /reject <id> [reason]: answer a plan's approval".to_string(),
             "/cancel <id>: cancel an item and what is open under it".to_string(),
             "/questions, /answer <question> <answer>: questions waiting on you".to_string(),
+            "/comment <work id> <text>: leave direction on a work item".to_string(),
             "/judgment, /grant <words>, /revoke <id>: standing judgment".to_string(),
         ]
     }

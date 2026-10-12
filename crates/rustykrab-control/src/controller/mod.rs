@@ -55,6 +55,7 @@ mod batch;
 mod brief;
 mod commit;
 mod credentials;
+mod discussion;
 mod filing;
 mod load;
 mod notice;
@@ -657,6 +658,23 @@ pub(crate) fn merge(total: &mut TickReport, add: TickReport) {
 
 #[async_trait]
 impl ControlHandle for Controller {
+    async fn comment(
+        &self,
+        item: &str,
+        text: &str,
+        actor: &str,
+    ) -> Result<rustykrab_core::work::WorkEvent, Error> {
+        let _loop = self.loop_lock.lock().await;
+        self.comment_locked(item, text, actor, None).await
+    }
+    async fn discussion(
+        &self,
+        item: &str,
+        offset: usize,
+        limit: usize,
+    ) -> Result<rustykrab_tools::work_discuss::WorkDiscussion, Error> {
+        self.discussion_view(item, offset, limit).await
+    }
     async fn file_plan(
         &self,
         plan: WorkPlan,
@@ -780,6 +798,42 @@ impl ControlHandle for Controller {
 
 #[async_trait]
 impl WorkBackend for Controller {
+    async fn comment(
+        &self,
+        item: &str,
+        text: &str,
+        provenance: Provenance,
+    ) -> Result<rustykrab_core::work::WorkEvent, Error> {
+        let _loop = self.loop_lock.lock().await;
+        self.comment_locked(
+            item,
+            text,
+            &provenance.actor,
+            provenance.filed_by_item.as_deref(),
+        )
+        .await
+    }
+    async fn discussion(
+        &self,
+        item: &str,
+        offset: usize,
+        limit: usize,
+        principal: &Principal,
+    ) -> Result<rustykrab_tools::work_discuss::WorkDiscussion, Error> {
+        if principal.item.as_deref().is_some_and(|held| held != item) {
+            let allowed = self
+                .discussion_for(principal.item.as_deref().unwrap())
+                .await?
+                .iter()
+                .any(|e| e.item == item);
+            if !allowed {
+                return Err(questions::invalid(
+                    "Read the current work item or its parent discussion.",
+                ));
+            }
+        }
+        self.discussion_view(item, offset, limit).await
+    }
     async fn file(
         &self,
         draft: WorkItemDraft,

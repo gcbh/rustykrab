@@ -416,6 +416,7 @@ mod tests {
             let question = Uuid::new_v4().to_string();
             self.store
                 .question_write(QuestionWrite::Insert(Box::new(QuestionRow {
+                    superseded_by: None,
                     id: question.clone(),
                     item: item.clone(),
                     root: item.clone(),

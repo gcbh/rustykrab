@@ -671,7 +671,20 @@ impl Controller {
                 );
                 self.fail(b, &item, worker, error, &[]).await?
             }
-            Ok(result) => self.judge(b, &item, worker, result).await?,
+            Ok(result) => {
+                if !result.summary.trim().is_empty() {
+                    b.note(
+                        &item.id,
+                        rustykrab_core::work::EventKind::Comment,
+                        &format!("worker:{worker}"),
+                        format!(
+                            "Agent reported: {}",
+                            result.summary.trim().chars().take(900).collect::<String>()
+                        ),
+                    );
+                }
+                self.judge(b, &item, worker, result).await?
+            }
         };
         if let Ok(result) = &finished.outcome {
             changed.extend(
@@ -1410,7 +1423,8 @@ impl Controller {
                                 self.record_question(
                                     b,
                                     NewQuestion::open(&id, kind, text, "capability"),
-                                );
+                                )
+                                .await?;
                             }
                             changed.push(capability);
                             return Ok(changed);
@@ -1553,7 +1567,8 @@ impl Controller {
                             surfacing.ask,
                             "surfaced",
                         ),
-                    );
+                    )
+                    .await?;
                     return Ok(changed);
                 }
                 Decision::Park(reason) => {
@@ -1579,7 +1594,8 @@ impl Controller {
                             format!("{} {}: {}", label(item), reason.as_str(), error.detail),
                             "only_the_user",
                         ),
-                    );
+                    )
+                    .await?;
                     return Ok(changed);
                 }
             }
@@ -1738,6 +1754,7 @@ impl Controller {
             brief
                 .decisions_made
                 .extend(self.answers_for(&item, &root).await?);
+            brief.discussion = self.discussion_for(&item.id).await?;
             let run_id = match self.continued_conversation(&item.id).await {
                 Some(conversation) => conversation,
                 None => uuid::Uuid::new_v4().to_string(),
@@ -1775,6 +1792,17 @@ impl Controller {
                 verified_by: None,
                 at: Utc::now(),
             }];
+            if !brief.discussion.is_empty() {
+                lease_evidence.push(rustykrab_core::work::Evidence {
+                    item: item.id.clone(),
+                    kind: "work_discussion".into(),
+                    reference: serde_json::to_string(&brief.discussion)
+                        .map_err(|e| Error::Internal(e.to_string()))?,
+                    hash: None,
+                    verified_by: Some("controller".into()),
+                    at: Utc::now(),
+                });
+            }
             if let Some(context) = &brief.project_context {
                 lease_evidence.push(Self::context_evidence(&item.id, context)?);
             }

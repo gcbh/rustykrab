@@ -111,3 +111,12 @@ claims; the command record alone does not establish that a test passed.
 The local coding brief specifies a per-command bot author for Git commits.
 Exec has a sanitized HOME and does not inherit the operator's global Git identity;
 the worker must not change shared repository/global Git configuration to commit.
+
+
+## Work-item discussions and decisions
+
+Open an item in the monitor to read its objective, discussion and pending decisions. The attention inbox counts work items needing direction and links to them. Questions are blockers attached to that item; they are not additional work assignments. Exact unresolved repetitions are consolidated while preserving their history and old notification links. Different questions on the same item retain separate explicit answers.
+
+Use **Post comment** to leave direction or context. User/agent authorship is recorded by the host; comments are available to future agents on the same item and its descendants. Comments do not resume a blocked item, change its acceptance contract or authorize a new resource. Use **Record decision** on the question to answer it; the controller resumes the item when its other blocking questions are resolved. Consent and approval retain their explicit yes/no or approve/reject paths.
+
+Agents can read or comment with work_discuss. In Telegram, use `/comment <work id> <text>`; `/answer <question id> <answer>` records a decision. The next worker receives recent discussion in a bounded prompt, with full native discussion retained in a private file for selective reading. Refresh the discussion to see new updates; drafts are preserved on refresh and errors.
