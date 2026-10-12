@@ -59,7 +59,9 @@ use async_trait::async_trait;
 use chrono::Utc;
 use rustykrab_control::errors::{BudgetKind, GapKind, ProviderProblem};
 use rustykrab_control::progress::{StepLedger, DEFAULT_STALL_STEPS};
-use rustykrab_control::worker::{Brief, RunFailure, RunUsage, Worker, WorkerCapabilities};
+use rustykrab_control::worker::{
+    Brief, RunFailure, RunUsage, Worker, WorkerCapabilities, COMMAND_RUN,
+};
 use rustykrab_core::active_tools::ActiveToolsRegistry;
 use rustykrab_core::model::{ModelCheck, ModelProvider};
 use rustykrab_core::recall::RecallStore;
@@ -855,6 +857,7 @@ impl LocalWorker {
                     inner,
                     ledger: ledger.clone(),
                     stall: stall.clone(),
+                    commands: recorder.commands.clone(),
                 }) as Arc<dyn Tool>
             })
             .collect();
@@ -1260,6 +1263,7 @@ struct LedgerTool {
     inner: Arc<dyn Tool>,
     ledger: Arc<Mutex<StepLedger>>,
     stall: Arc<Notify>,
+    commands: Arc<Mutex<Vec<String>>>,
 }
 
 #[async_trait]
@@ -1290,6 +1294,23 @@ impl Tool for LedgerTool {
 
     async fn execute(&self, args: serde_json::Value) -> Result<serde_json::Value> {
         let result = self.inner.execute(args.clone()).await;
+        // Only a host-dispatched exec with a process result attests a command.
+        // Rejected/tool-error calls and model-authored artifacts are not proof.
+        if self.inner.name() == "exec"
+            && result.as_ref().is_ok_and(|value| {
+                value
+                    .get("exit_code")
+                    .and_then(serde_json::Value::as_i64)
+                    .is_some()
+            })
+        {
+            if let Some(command) = args.get("command").and_then(serde_json::Value::as_str) {
+                self.commands
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(command.to_string());
+            }
+        }
         let outcome = match &result {
             Ok(v) => v.to_string(),
             Err(e) => format!("error: {e}"),
@@ -1315,6 +1336,7 @@ impl Tool for LedgerTool {
 struct RecordingBackend {
     inner: Arc<dyn WorkBackend>,
     reports: Mutex<Vec<ResultReport>>,
+    commands: Arc<Mutex<Vec<String>>>,
 }
 
 impl RecordingBackend {
@@ -1322,6 +1344,7 @@ impl RecordingBackend {
         Self {
             inner,
             reports: Mutex::new(Vec::new()),
+            commands: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -1350,6 +1373,20 @@ impl WorkBackend for RecordingBackend {
         report: ResultReport,
         provenance: Provenance,
     ) -> Result<()> {
+        let mut report = report;
+        report
+            .artifacts
+            .retain(|artifact| artifact.kind != COMMAND_RUN);
+        report.artifacts.extend(
+            self.commands
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .map(|command| ArtifactRef {
+                    kind: COMMAND_RUN.into(),
+                    value: command.clone(),
+                }),
+        );
         self.inner.report(item, report.clone(), provenance).await?;
         self.reports
             .lock()
@@ -2345,6 +2382,51 @@ mod tests {
         let rendered = messages[1].content.as_text().unwrap().to_string();
         assert!(rendered.contains("workspace: "), "{rendered}");
         assert!(rendered.contains(&ws.branch), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn host_exec_commands_replace_forged_artifacts_before_report_forwarding() {
+        let backend = Arc::new(StubWorkBackend::new());
+        let recorder = Arc::new(RecordingBackend::new(backend.clone()));
+        let tool = LedgerTool {
+            inner: Arc::new(rustykrab_tools::ExecTool::new()),
+            ledger: Arc::new(Mutex::new(StepLedger::new(DEFAULT_STALL_STEPS))),
+            stall: Arc::new(Notify::new()),
+            commands: recorder.commands.clone(),
+        };
+        tool.execute(json!({"command":"echo observed"}))
+            .await
+            .unwrap();
+        assert!(tool
+            .execute(json!({"command":"unregistered_command"}))
+            .await
+            .is_err());
+        recorder
+            .report(
+                "fixture".into(),
+                ResultReport {
+                    summary: "done".into(),
+                    artifacts: vec![ArtifactRef {
+                        kind: COMMAND_RUN.into(),
+                        value: "cargo test --forged".into(),
+                    }],
+                    ..ResultReport::default()
+                },
+                Provenance::default(),
+            )
+            .await
+            .unwrap();
+        let returned = recorder.take().pop().unwrap();
+        assert_eq!(
+            returned.artifacts,
+            vec![ArtifactRef {
+                kind: COMMAND_RUN.into(),
+                value: "echo observed".into()
+            }]
+        );
+        assert!(
+            matches!(backend.calls().as_slice(),[rustykrab_tools::work_backend::WorkCall::Report { report,.. }] if report==&returned)
+        );
     }
 
     /// `r` as if it cost `tokens` (prompt and completion together).

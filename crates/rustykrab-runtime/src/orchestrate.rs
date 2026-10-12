@@ -97,7 +97,13 @@ registered agents, their health, capabilities, repositories, projects and schedu
 File actionable work with work_assign; use plan=true when it needs decomposition. \
 Give every item an observable done_when, bounded budget, relevant constraints and \
 a project artifact reference when continuing that project. For code, select a \
-registered Claude Code or Codex runtime and its exact repo: writable resource. \
+registered coding resource and its exact repo: writable resource. Prefer a healthy \
+local Ollama resource for bounded basic coding, routine email/calendar checks, \
+news and other covered lightweight work. Leave worker_kind as any for basic code \
+so the controller can choose the cheap resource and escalate on verified failure. \
+Use Claude Code or Codex explicitly for complex architecture, broad changes or \
+work the local resource cannot cover. Host-only required tools must not prevent \
+native coding fallback; select them only when the task actually needs them. \
 Select required tools/resources from advertisements; do not invent infrastructure \
 or assume an unavailable resource can execute. Let the controller choose a suitable \
 available worker when no particular runtime is required. A busy worker is a wait, \

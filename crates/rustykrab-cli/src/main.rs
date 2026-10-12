@@ -9,6 +9,7 @@ mod dreaming;
 mod evaluation;
 mod fleet;
 mod integrations;
+mod local_resources;
 mod monitor_cmd;
 mod overseer;
 mod peers;
@@ -1441,6 +1442,7 @@ async fn main() -> anyhow::Result<()> {
         &tools,
     )
     .await?;
+    let local_resources = local_resources::Config::from_env()?;
     // One KV slot per model (plan 12.1): the local worker and the runs of
     // a peer's briefs on this node (peers.rs) wait on the same one.
     let model_slot = Arc::new(tokio::sync::Semaphore::new(1));
@@ -1547,10 +1549,36 @@ async fn main() -> anyhow::Result<()> {
                     model_slot.clone(),
                 )?),
                 serde_json::json!({"role":"integrations"}),
-                None,
+                local_resources.as_ref().map(|_| 1),
             )
             .await?;
     }
+    if let Some(config) = &local_resources {
+        let local_provider = config.provider().await;
+        let local_slot = Arc::new(tokio::sync::Semaphore::new(1));
+        fleet
+            .registry
+            .register(
+                Arc::new(local_resources::CodingWorker::new(
+                    config,
+                    local_provider.clone(),
+                    tools.clone(),
+                    deferred_work_backend.clone(),
+                    scheduled_work::transcripts(&store, skill_registry.clone()),
+                    local_slot.clone(),
+                )),
+                serde_json::json!({"role":"local-code", "preferred_for":"basic coding"}),
+                Some(0),
+            )
+            .await?;
+        if integrations::enabled() {
+            fleet.registry.register(
+                Arc::new(integrations::IntegrationWorker::new_named(local_resources::INTEGRATION_NAME, Some(config.model.clone()), local_provider, tools.clone(), deferred_work_backend.clone(), scheduled_work::transcripts(&store, skill_registry.clone()), local_slot)?),
+                serde_json::json!({"role":"integrations", "preferred_for":"routine email, calendar, news"}), Some(0),
+            ).await?;
+        }
+    }
+
     deferred_work_backend.bind(controller.clone());
     let port: u16 = std::env::var("RUSTYKRAB_PORT")
         .ok()
