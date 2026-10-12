@@ -282,3 +282,12 @@ The integration host explicitly selects complete result reports bounded to
 32,000 characters. This permits full briefing sections and listing links through
 the same controller and scheduled delivery path; default work summaries remain
 compact and out-of-bound content is rejected rather than truncated.
+
+## Local inference beside subscription workers
+
+The opt-in CLI local-resource configuration adds an independent Ollama provider
+for coding and restricted integrations. Manager/planner inference retains its
+configured provider. Local roles share one model slot, scoped tools and existing
+worktree/attestation verification. The existing cost-tier router prefers them
+and escalates failures to compatible retained CLI resources. This adds no
+crate dependency, scheduler, channel owner or durable work ledger.

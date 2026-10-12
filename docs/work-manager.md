@@ -74,3 +74,40 @@ Telegram polling or integrations. Transfer these deliberately, preserving their
 execution resource and delivery route, and disable the old schedule owner before
 starting the replacement. Keep the main and builder data/queues intact. Never
 run two Telegram pollers for one bot or duplicate a legacy cron firing.
+
+## Prefer a local model for lighter work
+
+Set `RUSTYKRAB_LOCAL_RESOURCES` to an absolute operator-owned JSON path:
+
+```json
+{
+  "model": "qwen3.8:27b-mlx",
+  "url": "http://127.0.0.1:11434",
+  "context_tokens": 32768,
+  "repositories": ["/absolute/registered/repository"]
+}
+```
+
+This adds `qwen-code` at tier zero, independently of the conversational provider.
+With `RUSTYKRAB_INTEGRATION_WORKER=1`, it also adds `qwen-integrations` at tier
+zero and retains the subscription integration worker at tier one. Both local
+roles share one inference slot. Model identity, health, assignment, finalized
+usage and verified outcomes appear in the ordinary monitoring view.
+
+Use `worker_kind: any` with the exact registered repository for basic coding.
+The local coding worker exposes exec in its isolated worktree; required host
+tool names should be omitted when native CLI fallback is desired. Integration
+work explicitly requires its host tools and retains read-only Gmail/calendar,
+HTTPS research and dated-note restrictions. The controller chooses the cheapest
+compatible worker; failure escalation can choose a compatible higher tier. A
+busy local worker causes a wait. Complex coding can explicitly require Claude
+Code or Codex. Historical approval, budget and decision holds are not released
+by registering a model.
+
+Local coding check claims now carry host-observed command_run evidence before
+completion. Monitoring distinguishes verified command execution from model
+claims; the command record alone does not establish that a test passed.
+
+The local coding brief specifies a per-command bot author for Git commits.
+Exec has a sanitized HOME and does not inherit the operator's global Git identity;
+the worker must not change shared repository/global Git configuration to commit.

@@ -278,3 +278,8 @@ native/local renderers share the same typed projection. Native adapters expose
 the full snapshot through a private per-run file, without a daemon-auth capability.
 Post-tasks remain WorkItemDraft records in ResultReport.discovered and use the
 ordinary graph validator and scheduler. No new trait or crate edge is introduced.
+
+LocalWorker now fills the existing command_run artifact seam from host exec
+observations before report forwarding. It adds no callback trait or persistence
+table. The controller's existing claim matcher verifies recorded check execution;
+process exit results and test success remain distinct facts.
