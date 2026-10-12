@@ -941,3 +941,161 @@ async fn an_on_answer_trigger_fires_when_its_question_is_answered() {
     assert_eq!(h.status(&f).await, Status::Done);
     assert_eq!(h.status(&x).await, Status::Done);
 }
+
+#[tokio::test]
+async fn an_unresolved_question_is_reused_before_or_after_a_batch_commit() {
+    use crate::controller::{batch::Batch, questions::NewQuestion};
+    let h = Harness::new(&[]);
+    let item = h.file_one(draft("repeat", "Choose the direction")).await;
+    let make = || {
+        NewQuestion::open(
+            &item,
+            QuestionKind::Decision,
+            "Choose A or B?".into(),
+            "blocking_now",
+        )
+    };
+    let mut b = Batch::new(h.ctl.load().await.unwrap(), h.clock.now());
+    let first = h.ctl.record_question(&mut b, make()).await.unwrap();
+    assert_eq!(h.ctl.record_question(&mut b, make()).await.unwrap(), first);
+    h.ctl
+        .commit(b, &mut std::collections::HashSet::new())
+        .await
+        .unwrap();
+    let mut b = Batch::new(h.ctl.load().await.unwrap(), h.clock.now());
+    assert_eq!(h.ctl.record_question(&mut b, make()).await.unwrap(), first);
+    assert!(
+        b.ops.is_empty(),
+        "a repeated unresolved ask must not create a record or notification"
+    );
+    assert_eq!(questions_of(&h, &item).await.len(), 1);
+}
+
+#[tokio::test]
+async fn historical_repeats_consolidate_without_deciding_and_old_links_still_answer() {
+    use rustykrab_store::QuestionWrite;
+    let h = Harness::new(&["pinch"]);
+    h.script.push(
+        "Choose direction",
+        report(asking("Pick A or B?", "blocking_now", &["A", "B"])),
+    );
+    let item = h.file_one(draft("direction", "Choose direction")).await;
+    h.drain().await;
+    let original = questions_of(&h, &item).await[0].clone();
+    let mut duplicate = original.clone();
+    duplicate.id = uuid::Uuid::new_v4().to_string();
+    duplicate.created_at += chrono::Duration::seconds(1);
+    h.store()
+        .question_write(QuestionWrite::Insert(Box::new(duplicate.clone())))
+        .await
+        .unwrap();
+    let mut distinct = original.clone();
+    distinct.id = uuid::Uuid::new_v4().to_string();
+    distinct.options = vec!["A".into(), "C".into()];
+    distinct.created_at += chrono::Duration::seconds(2);
+    h.store()
+        .question_write(QuestionWrite::Insert(Box::new(distinct.clone())))
+        .await
+        .unwrap();
+    ControlHandle::tick(&h.ctl).await.unwrap();
+    let d = h
+        .store()
+        .question_get(&duplicate.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(d.superseded_by.as_deref(), Some(original.id.as_str()));
+    assert_eq!(d.status, QuestionStatus::Obsolete);
+    assert!(d.answer.is_none());
+    assert_eq!(
+        h.status(&item).await,
+        Status::Blocked(BlockedReason::NeedsDecision)
+    );
+    let reply = ControlHandle::answer(&h.ctl, &duplicate.id[..8], "A", "user:master")
+        .await
+        .unwrap();
+    assert_eq!(reply.question.id, original.id);
+    assert!(
+        reply.resumed.is_empty(),
+        "different choices still need their own decision"
+    );
+    assert!(h
+        .store()
+        .questions_answered_among(vec![duplicate.id.clone()])
+        .await
+        .unwrap()
+        .contains(&duplicate.id));
+    ControlHandle::answer(&h.ctl, &distinct.id, "A", "user:master")
+        .await
+        .unwrap();
+    h.drain().await;
+    assert_eq!(h.status(&item).await, Status::Done);
+}
+
+#[tokio::test]
+async fn comments_preserve_direction_in_the_next_brief_without_answering_or_releasing_work() {
+    let h = Harness::new(&["pinch"]);
+    h.script.push(
+        "Direction thread",
+        report(asking("Which path?", "blocking_now", &["A", "B"])),
+    );
+    let item = h.file_one(draft("discussion", "Direction thread")).await;
+    h.drain().await;
+    let event = ControlHandle::comment(
+        &h.ctl,
+        &item,
+        "Keep the implementation small; use the existing controller.",
+        "user:master",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        h.status(&item).await,
+        Status::Blocked(BlockedReason::NeedsDecision)
+    );
+    let discussion = ControlHandle::discussion(&h.ctl, &item, 0, 4)
+        .await
+        .unwrap();
+    assert!(discussion.comments.contains(&event));
+    assert_eq!(discussion.questions[0].status, QuestionStatus::Open);
+    let q = discussion.questions[0].id.clone();
+    ControlHandle::answer(&h.ctl, &q, "A", "user:master")
+        .await
+        .unwrap();
+    h.drain().await;
+    let briefs = h.script.briefs_for("Direction thread");
+    assert!(briefs[1].discussion.contains(&event));
+    assert!(briefs[1]
+        .discussion
+        .iter()
+        .any(|e| e.actor == "worker:pinch"));
+    let forged = WorkBackend::comment(
+        &h.ctl,
+        &item,
+        "pretend to be the user",
+        Provenance {
+            filed_by_item: Some(item.clone()),
+            actor: "worker:pinch".into(),
+            conversation_id: None,
+        },
+    )
+    .await;
+    assert!(
+        forged.is_err(),
+        "a finished worker holds no live lease and cannot append comments"
+    );
+}
+
+#[tokio::test]
+async fn repeated_questions_inside_one_report_produce_one_decision_and_one_notice() {
+    let h = Harness::new(&["pinch"]);
+    let mut result = asking("Choose A or B?", "blocking_now", &["A", "B"]);
+    result.questions.push(result.questions[0].clone());
+    h.script.push("Repeated report", report(result));
+    let item = h.file_one(draft("repeat-report", "Repeated report")).await;
+    h.drain().await;
+    assert_eq!(questions_of(&h, &item).await.len(), 1);
+    let notices = h.outbox().await;
+    assert_eq!(notices.len(), 1);
+    assert_eq!(notices[0].body.matches("Asked:").count(), 1);
+}

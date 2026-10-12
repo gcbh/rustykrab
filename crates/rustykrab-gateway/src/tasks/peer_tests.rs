@@ -172,6 +172,7 @@ fn brief(required: &[&str]) -> Brief {
         done_when: "Saturday is listed".into(),
         constraints: Vec::new(),
         decisions_made: Vec::new(),
+        discussion: Vec::new(),
         artifact_refs: Vec::new(),
         required_tools: required.iter().map(|t| t.to_string()).collect(),
         required_mcp_servers: Vec::new(),

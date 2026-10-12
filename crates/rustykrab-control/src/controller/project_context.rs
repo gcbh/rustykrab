@@ -281,7 +281,8 @@ impl Controller {
                 format!("Project handoff needs resolution: {why}"),
                 "project_context",
             ),
-        );
+        )
+        .await?;
         b.settle(vec![item.id.clone()]);
         self.commit(b, &mut Default::default()).await?;
         Ok(1)

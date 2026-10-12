@@ -181,6 +181,24 @@ pub trait WorkBackend: Send + Sync {
         principal: &Principal,
     ) -> Result<Vec<WorkStatusView>>;
 
+    async fn comment(
+        &self,
+        _item: &str,
+        _text: &str,
+        _provenance: Provenance,
+    ) -> Result<rustykrab_core::work::WorkEvent> {
+        Err(unsupported("work comments"))
+    }
+    async fn discussion(
+        &self,
+        _item: &str,
+        _offset: usize,
+        _limit: usize,
+        _principal: &Principal,
+    ) -> Result<crate::work_discuss::WorkDiscussion> {
+        Err(unsupported("work discussion"))
+    }
+
     /// Hand a worker's typed result to the controller. Its `discovered`
     /// drafts travel inside the report; the controller validates them as
     /// one graph (section 6.5).

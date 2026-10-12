@@ -1651,10 +1651,13 @@ mod tests {
     }
 
     #[test]
-    fn work_tools_registers_the_three_tools() {
+    fn work_tools_registers_the_work_protocol() {
         let tools = crate::work_tools(Arc::new(StubWorkBackend::new()));
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
-        assert_eq!(names, ["work_file", "work_status", "result_report"]);
+        assert_eq!(
+            names,
+            ["work_file", "work_status", "work_discuss", "result_report"]
+        );
     }
 }
 

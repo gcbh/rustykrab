@@ -716,6 +716,7 @@ mod tests {
             done_when: "Saturday is listed".into(),
             constraints: Vec::new(),
             decisions_made: Vec::new(),
+            discussion: Vec::new(),
             artifact_refs: Vec::new(),
             required_tools: vec!["caldav".into()],
             required_mcp_servers: Vec::new(),

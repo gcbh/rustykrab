@@ -17,3 +17,7 @@ header{height:auto;min-height:72px;gap:24px;flex-wrap:wrap;padding:14px 5vw}
  header>#logout{grid-column:3;grid-row:1;font-size:12px;max-width:110px;padding:7px 10px}
  header>#accessStatus{grid-column:1/-1;grid-row:2;max-width:none}
 }
+
+.discussion{border-bottom:1px solid var(--line);padding-bottom:20px}.discussion-entry{border-top:1px solid var(--line);padding:14px 0}.discussion-entry p{white-space:pre-wrap;overflow-wrap:anywhere;font-size:13px}.discussion-entry small{color:var(--muted)}.discussion form{display:flex;flex-direction:column;gap:10px}.discussion textarea{width:100%;min-height:80px;resize:vertical;font:inherit;font-size:14px;padding:10px;border:1px solid var(--line);border-radius:8px;color:var(--text);background:var(--card)}.discussion button{align-self:flex-start}.discussion label{font-size:13px;font-weight:600}
+
+.discussion-timeline{max-height:360px;overflow:auto;margin-top:12px;padding-right:8px}#detailBody details{margin-top:18px}#detailBody summary{cursor:pointer;font-size:13px;font-weight:600}

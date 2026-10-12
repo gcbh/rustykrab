@@ -203,6 +203,7 @@ mod tests {
         let store = open();
         let now = Utc::now();
         let mut q = QuestionRow {
+            superseded_by: None,
             id: "q1".into(),
             item: "task1".into(),
             root: "task1".into(),

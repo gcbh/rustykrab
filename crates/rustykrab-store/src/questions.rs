@@ -63,7 +63,8 @@ pub(crate) fn migrate(conn: &Connection) -> Result<(), Error> {
             answered_at    TEXT,
             research_item  TEXT,
             decision       TEXT,
-            created_at     TEXT NOT NULL
+            created_at     TEXT NOT NULL,
+            superseded_by  TEXT REFERENCES questions(id)
         );
 
         CREATE INDEX IF NOT EXISTS idx_questions_item
@@ -89,6 +90,20 @@ pub(crate) fn migrate(conn: &Connection) -> Result<(), Error> {
     )
     .map_err(|e| Error::Storage(e.to_string()))?;
 
+    let columns: Vec<String> = conn
+        .prepare("PRAGMA table_info(questions)")
+        .map_err(|e| Error::Storage(e.to_string()))?
+        .query_map([], |r| r.get(1))
+        .map_err(|e| Error::Storage(e.to_string()))?
+        .collect::<Result<_, _>>()
+        .map_err(|e| Error::Storage(e.to_string()))?;
+    if !columns.iter().any(|c| c == "superseded_by") {
+        conn.execute(
+            "ALTER TABLE questions ADD COLUMN superseded_by TEXT REFERENCES questions(id)",
+            [],
+        )
+        .map_err(|e| Error::Storage(e.to_string()))?;
+    }
     let mut stmt = conn
         .prepare("PRAGMA table_info(work_outbox)")
         .map_err(|e| Error::Storage(e.to_string()))?;
@@ -169,11 +184,14 @@ pub struct QuestionRow {
     #[serde(default)]
     pub decision: Option<DelegatedDecision>,
     pub created_at: DateTime<Utc>,
+    /// Canonical unresolved question when this row was consolidated; no answer implied.
+    #[serde(default)]
+    pub superseded_by: Option<String>,
 }
 
 const QUESTION_COLUMNS: &str = "id, item, root, kind, class, text, options, default_answer, \
      asked_class, rule, asked_by, status, delivered_via, answer, answered_by, answered_at, \
-     research_item, decision, created_at";
+     research_item, decision, created_at, superseded_by";
 
 /// Map a `SELECT {QUESTION_COLUMNS}` row. Conservative: an unreadable kind
 /// reads as `decision`, an unreadable class as `blocking_now` and an
@@ -207,6 +225,7 @@ fn question_from_row(row: &Row) -> rusqlite::Result<QuestionRow> {
         research_item: row.get("research_item")?,
         decision: decision.and_then(|raw| serde_json::from_str(&raw).ok()),
         created_at: parse_ts(&created_at).unwrap_or_default(),
+        superseded_by: row.get("superseded_by")?,
     })
 }
 
@@ -217,6 +236,12 @@ fn question_from_row(row: &Row) -> rusqlite::Result<QuestionRow> {
 #[derive(Debug, Clone, PartialEq)]
 pub enum QuestionWrite {
     Insert(Box<QuestionRow>),
+    /// Consolidate a waiting repetition into another question on the same item.
+    Supersede {
+        id: String,
+        canonical: String,
+        at: DateTime<Utc>,
+    },
     /// Settle a waiting question: answered by the user, defaulted,
     /// delegated, or obsolete. Refused with `AlreadyExists` when it is
     /// already settled: an answer is given once.
@@ -265,7 +290,7 @@ pub(crate) fn insert_question(conn: &Connection, q: &QuestionRow) -> Result<(), 
     conn.execute(
         &format!(
             "INSERT INTO questions ({QUESTION_COLUMNS}) VALUES \
-             (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)"
+             (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)"
         ),
         params![
             q.id,
@@ -287,6 +312,7 @@ pub(crate) fn insert_question(conn: &Connection, q: &QuestionRow) -> Result<(), 
             q.research_item,
             q.decision.as_ref().map(json).transpose()?,
             ts(&q.created_at),
+            q.superseded_by,
         ],
     )?;
     Ok(())
@@ -309,6 +335,23 @@ pub(crate) fn apply_question(
 ) -> Result<(), WorkStoreError> {
     match write {
         QuestionWrite::Insert(q) => insert_question(conn, q),
+        QuestionWrite::Supersede { id, canonical, at } => {
+            let q = get_question(conn, id)?
+                .ok_or_else(|| WorkStoreError::NotFound(format!("question {id}")))?;
+            let target = get_question(conn, canonical)?
+                .ok_or_else(|| WorkStoreError::NotFound(format!("question {canonical}")))?;
+            if !q.status.is_waiting()
+                || id == canonical
+                || q.item != target.item
+                || target.superseded_by.is_some()
+            {
+                return Err(WorkStoreError::AlreadyExists(
+                    "invalid question consolidation".into(),
+                ));
+            }
+            conn.execute("UPDATE questions SET status = 'obsolete', superseded_by = ?2, answered_at = ?3 WHERE id = ?1", params![id, canonical, ts(at)])?;
+            Ok(())
+        }
         QuestionWrite::Settle {
             id,
             status,
@@ -571,8 +614,16 @@ impl Store {
         self.question_call(move |conn| {
             let mut out = BTreeSet::new();
             for id in ids {
-                if get_question(conn, &id)?.is_some_and(|q| q.status.has_answer()) {
-                    out.insert(id);
+                if let Some(q) = get_question(conn, &id)? {
+                    let answered = q.status.has_answer()
+                        || match q.superseded_by {
+                            Some(canonical) => get_question(conn, &canonical)?
+                                .is_some_and(|q| q.status.has_answer()),
+                            None => false,
+                        };
+                    if answered {
+                        out.insert(id);
+                    }
                 }
             }
             Ok(out)
@@ -718,6 +769,7 @@ mod tests {
 
     fn question(id: &str, item: &str) -> QuestionRow {
         QuestionRow {
+            superseded_by: None,
             id: id.into(),
             item: item.into(),
             root: item.into(),
@@ -894,5 +946,84 @@ mod tests {
         .unwrap();
         assert_eq!(s.work_outbox_pending().await.unwrap().len(), 2);
         assert!(s.work_outbox_latest("p").await.unwrap().is_some());
+    }
+}
+
+#[cfg(test)]
+mod consolidation_tests {
+    use super::*;
+    #[tokio::test]
+    async fn canonical_links_preserve_answer_triggers_and_reject_cross_item_consolidation() {
+        let store = Store::open_in_memory();
+        let now = Utc::now();
+        let row = |id: &str, item: &str| QuestionRow {
+            id: id.into(),
+            item: item.into(),
+            root: item.into(),
+            kind: QuestionKind::Decision,
+            class: QuestionClass::BlockingNow,
+            text: "A or B?".into(),
+            options: vec![],
+            default_answer: None,
+            asked_class: None,
+            rule: "blocking_now".into(),
+            asked_by: "controller".into(),
+            status: QuestionStatus::Open,
+            delivered_via: None,
+            answer: None,
+            answered_by: None,
+            answered_at: None,
+            research_item: None,
+            decision: None,
+            created_at: now,
+            superseded_by: None,
+        };
+        for q in [
+            row("canonical", "item"),
+            row("repeat", "item"),
+            row("other", "other-item"),
+        ] {
+            store
+                .question_write(QuestionWrite::Insert(Box::new(q)))
+                .await
+                .unwrap();
+        }
+        assert!(store
+            .question_write(QuestionWrite::Supersede {
+                id: "other".into(),
+                canonical: "canonical".into(),
+                at: now
+            })
+            .await
+            .is_err());
+        store
+            .question_write(QuestionWrite::Supersede {
+                id: "repeat".into(),
+                canonical: "canonical".into(),
+                at: now,
+            })
+            .await
+            .unwrap();
+        assert!(store
+            .questions_answered_among(vec!["repeat".into()])
+            .await
+            .unwrap()
+            .is_empty());
+        store
+            .question_write(QuestionWrite::Settle {
+                id: "canonical".into(),
+                status: QuestionStatus::Answered,
+                answer: Some("B".into()),
+                by: Some("user:master".into()),
+                decision: None,
+                at: now,
+            })
+            .await
+            .unwrap();
+        assert!(store
+            .questions_answered_among(vec!["repeat".into()])
+            .await
+            .unwrap()
+            .contains("repeat"));
     }
 }

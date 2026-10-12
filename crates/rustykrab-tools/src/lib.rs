@@ -119,6 +119,7 @@ mod task_complete;
 mod ask_user;
 mod result_report;
 pub mod work_backend;
+pub mod work_discuss;
 mod work_file;
 mod work_plan;
 mod work_status;
@@ -379,6 +380,7 @@ pub fn work_tools(
     vec![
         std::sync::Arc::new(WorkFileTool::new(backend.clone())),
         std::sync::Arc::new(WorkStatusTool::new(backend.clone())),
+        std::sync::Arc::new(work_discuss::WorkDiscussTool::new(backend.clone())),
         std::sync::Arc::new(ResultReportTool::new(backend)),
     ]
 }

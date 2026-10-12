@@ -89,7 +89,7 @@ use crate::trace::ExecutionTracer;
 /// The control-layer tools every worker run holds, built per run over the
 /// injected backend. `work_plan` is not among them: only the planner files
 /// a graph, and a worker's follow-up work travels as drafts in its report.
-const WORK_TOOL_NAMES: [&str; 3] = ["work_file", "work_status", "result_report"];
+const WORK_TOOL_NAMES: [&str; 4] = ["work_file", "work_status", "work_discuss", "result_report"];
 
 /// A worker's typed questions (plan section 7): in every worker's ceiling,
 /// built per run, loadable rather than in the front block, since a report
@@ -1090,6 +1090,13 @@ fn render_brief_for_report(brief: &Brief, full_report: bool) -> String {
     let _ = writeln!(out, "done_when: {}", one_line(&brief.done_when, LINE_MAX));
     bullets(&mut out, "constraints", &brief.constraints);
     bullets(&mut out, "decisions_made", &brief.decisions_made);
+    if !brief.discussion.is_empty() {
+        let _ = writeln!(
+            out,
+            "work discussion:\n{}",
+            rustykrab_control::worker::discussion_excerpt(brief)
+        );
+    }
     if let Some(context) = &brief.project_context {
         let _ = writeln!(out, "project_context (durable project state; summaries are reports, evidence is controller-verified):");
         let _ = writeln!(
@@ -1355,6 +1362,24 @@ impl RecordingBackend {
 
 #[async_trait]
 impl WorkBackend for RecordingBackend {
+    async fn comment(
+        &self,
+        item: &str,
+        text: &str,
+        provenance: rustykrab_tools::work_backend::Provenance,
+    ) -> rustykrab_core::Result<rustykrab_core::work::WorkEvent> {
+        self.inner.comment(item, text, provenance).await
+    }
+    async fn discussion(
+        &self,
+        item: &str,
+        offset: usize,
+        limit: usize,
+        principal: &rustykrab_tools::work_backend::Principal,
+    ) -> rustykrab_core::Result<rustykrab_tools::work_discuss::WorkDiscussion> {
+        self.inner.discussion(item, offset, limit, principal).await
+    }
+
     async fn file(&self, draft: WorkItemDraft, provenance: Provenance) -> Result<PlanOutcome> {
         self.inner.file(draft, provenance).await
     }
@@ -1605,6 +1630,7 @@ mod tests {
             done_when: "The cheapest plan is named with its monthly price".into(),
             constraints: vec!["UK plans only".into()],
             decisions_made: Vec::new(),
+            discussion: Vec::new(),
             artifact_refs: Vec::new(),
             required_tools: Vec::new(),
             required_mcp_servers: Vec::new(),
@@ -1975,6 +2001,7 @@ mod tests {
                 "mcp__linear__create_issue",
                 "mcp__linear__search",
                 "result_report",
+                "work_discuss",
                 "work_file",
                 "work_status",
             ]
@@ -2027,6 +2054,7 @@ mod tests {
                 "mcp__linear__search",
                 "read",
                 "result_report",
+                "work_discuss",
                 "work_file",
                 "work_status"
             ],
@@ -2084,6 +2112,7 @@ mod tests {
                 "calendar",
                 "capability_request",
                 "result_report",
+                "work_discuss",
                 "work_file",
                 "work_status"
             ]

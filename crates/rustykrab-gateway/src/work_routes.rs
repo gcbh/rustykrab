@@ -71,6 +71,10 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/api/work/archive", get(archive_list))
         .route("/api/work/archive/{id}", get(archive_get))
         .route("/api/work/{id}", get(item_detail))
+        .route(
+            "/api/work/{id}/discussion",
+            get(item_discussion).post(comment),
+        )
         .route("/api/work/{id}/graph", get(item_graph))
         .route("/api/work/{id}/events", get(item_events))
         .route("/api/work/{id}/evidence", get(item_evidence))
@@ -328,6 +332,61 @@ impl From<WorkStoreError> for WorkApiError {
     fn from(error: WorkStoreError) -> Self {
         Error::from(error).into()
     }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CommentBody {
+    text: String,
+}
+
+#[derive(Deserialize)]
+struct DiscussionQuery {
+    #[serde(default)]
+    offset: usize,
+    #[serde(default = "discussion_limit")]
+    limit: usize,
+}
+fn discussion_limit() -> usize {
+    100
+}
+
+async fn item_discussion(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<DiscussionQuery>,
+) -> Result<Json<rustykrab_control::handle::WorkDiscussion>, WorkApiError> {
+    Ok(Json(
+        control(&state)?.discussion(&id, q.offset, q.limit).await?,
+    ))
+}
+
+async fn comment(
+    State(state): State<AppState>,
+    principal: Option<Extension<Principal>>,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> Result<Json<WorkEvent>, WorkApiError> {
+    let body = parse_comment(&body)?;
+    Ok(Json(
+        control(&state)?
+            .comment(&id, &body.text, &actor_of(principal))
+            .await?,
+    ))
+}
+
+fn parse_comment(bytes: &Bytes) -> Result<CommentBody, WorkApiError> {
+    let body: CommentBody = serde_json::from_slice(bytes)
+        .map_err(|e| WorkApiError::bad_request(format!("Invalid comment: {e}")))?;
+    if body.text.trim().is_empty() {
+        return Err(WorkApiError::bad_request("Write a comment before posting."));
+    }
+    if body.text.trim().len() > 4096 {
+        return Err(WorkApiError::bad_request(
+            "Comment is too long. Please shorten it.",
+        ));
+    }
+    Ok(body)
 }
 
 // ── request parsing ────────────────────────────────────────────────────
@@ -1069,3 +1128,26 @@ async fn tick(State(state): State<AppState>) -> Result<Json<TickReport>, WorkApi
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod discussion_input_tests {
+    use super::*;
+    #[test]
+    fn a_comment_cannot_spoof_authorship_or_control_state_and_size_errors_are_client_errors() {
+        for value in [
+            json!({"text":" "}),
+            json!({"text":"x".repeat(4097)}),
+            json!({"text":"hello","actor":"user:owner"}),
+            json!({"text":"hello","status":"done"}),
+        ] {
+            let error = parse_comment(&Bytes::from(value.to_string()))
+                .err()
+                .expect("invalid input refused");
+            assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        }
+        assert!(parse_comment(&Bytes::from(
+            json!({"text":"Keep the change small."}).to_string()
+        ))
+        .is_ok());
+    }
+}

@@ -197,6 +197,7 @@ pub(super) fn brief_for(
         done_when: item.done_when.clone(),
         constraints: item.constraints.clone(),
         decisions_made: item.decisions_made.clone(),
+        discussion: Vec::new(),
         artifact_refs: item.artifact_refs.clone(),
         required_tools,
         required_mcp_servers: item.required_mcp_servers.clone(),
