@@ -152,3 +152,19 @@ and required tools/MCP, trigger and preconditions. Controller tests demonstrate
 one-time approvals, changed scopes, daily limits and revocation remain held while
 matching automatic proposals use an audited policy actor. These tests establish
 permission behavior, not the usefulness of future self-generated work.
+
+## Project-handoff recovery (base f1affb8)
+
+An October 13 read-only audit found 34 open legacy whole-history size questions
+and 10 open branch-divergence questions in the active manager store. The size
+projection fix had shipped, but the sweep never revalidated its old holds.
+One verified documentation commit on an independent branch prevented all later
+project coding work from starting; answering continue repeated the question.
+
+The workspace helper now retains a conflict-free integration of the verified
+parents without touching repository HEAD or the checkout. The sweep rechecks
+controller-owned technical handoffs every 30 seconds and obsoletes resolved
+questions without inventing user answers. Real-Git/SQLite regression tests cover
+history preservation and replay, legacy-hold recovery, retained oversized current
+requirements and independent user decisions. Actual conflicts and missing commits
+remain unresolved. No table, execution backend or permission grant is added.

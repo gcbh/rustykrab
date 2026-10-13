@@ -430,6 +430,8 @@ struct State {
     spent: Option<HashMap<WorkItemId, Spend>>,
     /// When the last aging pass ran, for `aging_max_gap`.
     last_aged: Option<DateTime<Utc>>,
+    /// Avoid rebuilding every parked project's history on every loop tick.
+    last_handoff_recheck: Option<DateTime<Utc>>,
     /// When the last tick that completed finished.
     last_tick: Option<DateTime<Utc>>,
     /// When the last failed tick gave up, and its error class.
@@ -498,6 +500,7 @@ impl Controller {
                 learned: Vec::new(),
                 spent: None,
                 last_aged: None,
+                last_handoff_recheck: None,
                 last_tick: None,
                 last_failure: None,
                 consecutive_failures: 0,

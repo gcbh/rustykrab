@@ -224,7 +224,9 @@ the same account share quota; profile count does not multiply subscriptions.
 
 Project continuity now crosses the same `Brief` boundary. The controller loads
 a durable project revision plus work/question history, freezes it with the lease
-and pins coding work to its project's verified commit chain. Native adapters
+and pins coding work to its project's verified commit history. Cleanly divergent
+history is integrated in retained Git objects; resolved technical handoff holds
+are periodically revalidated without supplying a human decision. Native adapters
 render it without depending on Claude/Codex chat state. Archive compaction keeps
 receipts and evidence, and the monitor shows the delivered revision and base.
 This changes no crate dependency and introduces no second scheduler or ledger.

@@ -915,6 +915,12 @@ Receipts, questions and verified evidence outlive archive compaction. A new run
 joins those records to immutable project revisions and live/archive statuses;
 only done work's git-verified commits become continuation candidates.
 
+Cleanly merged continuation candidates are retained as namespaced Git refs,
+not new work rows or a claim that the combined code passed checks. The existing
+workspace receipt pins that integration base. Revalidation settles a repaired
+controller handoff question as obsolete (no answer or delegated decision) and
+queues its work in the same work transaction; other open decisions remain held.
+
 Unfinished-attempt records point to controller-owned run/workspace evidence and
 classified errors, not model-written workspace artifacts. Monitor, verifier and
 reattachment reads likewise select the controller's pinned workspace records.

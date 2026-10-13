@@ -544,6 +544,19 @@ impl Controller {
         let waiting = self.waiting_questions().await?;
         self.sweep_questions(&mut b, &waiting).await?;
         changed.extend(self.wake_on_credentials(&mut b, &waiting));
+        let recheck_handoffs = {
+            let mut state = self.state();
+            let due = state
+                .last_handoff_recheck
+                .is_none_or(|last| now.signed_duration_since(last) >= TimeDelta::seconds(30));
+            if due {
+                state.last_handoff_recheck = Some(now);
+            }
+            due
+        };
+        if recheck_handoffs {
+            changed.extend(self.recover_project_context_holds(&mut b, &waiting).await?);
+        }
 
         // Items waiting for a worker: requeued when one can take them,
         // climbing their ladder once the wait is past its TTL (section 7).
@@ -1856,7 +1869,7 @@ impl Controller {
     }
 
     /// Pin project code to the newest verified ancestor chain, otherwise repository HEAD.
-    async fn plan_workspace(
+    pub(super) async fn plan_workspace(
         &self,
         item: &WorkItem,
         run: &str,
