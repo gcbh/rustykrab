@@ -940,8 +940,8 @@ impl Controller {
     /// (section 5), as evidence rows to add, or the verdict and why when
     /// the result claims more than the evidence shows:
     ///
-    /// - a `code` item's commit and changed paths, against the run's
-    ///   workspace ([`workspace::verify`]); a `code` result that claims a
+    /// - a repository-scoped item's commit and changed paths, against its
+    ///   workspace ([`workspace::verify`]); any result that claims a
     ///   commit or paths with no workspace to check them against claims
     ///   beyond the evidence;
     /// - every check it names, against the commands its adapter recorded
