@@ -660,7 +660,8 @@ Native Max runtimes check both login and subscription usage. Claude's built-in
 `/usage` command reports session, weekly and model-specific allowance consumption
 without model inference; RustyKrab reads it at registration and on the existing
 30-second native refresh. Exhausted applicable windows keep a worker unavailable
-until the advertised reset. Systems shows each observed window, reset and freshness;
+until a fresh native reading confirms capacity after the advertised reset.
+Systems shows each observed window, reset and freshness;
 unknown or failed reads are explicit. Native authentication remains inside Claude
 CLI. Older CLI versions without a recognized native usage result report unknown
 capacity. Observations are memory-only, with a new native probe on daemon startup.
@@ -705,10 +706,11 @@ harness; execution workers use native Claude tools in managed worktrees.
 The turn bridge currently supports text/tool history, not image input.
 
 The monitor shows the verified Max subscription, a hashed account identifier,
-and observed quota cooldowns. Login status does not expose remaining quota.
-A native usage-limit result makes the runtime unavailable for five minutes,
-then eligible for another attempt; that is a retry delay, not a subscription
-reset prediction. Observations are local to the running process.
+and observed allowance consumption and resets. Login and usage are separate
+checks: valid authentication does not make an exhausted account available.
+Native rejections retain the reported reset; a usage-limit error without a
+recognized reset uses a five-minute retry delay and triggers a new usage read.
+Observations are local to the running process.
 
 ### Delegating to a peer node
 
