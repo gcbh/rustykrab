@@ -198,3 +198,8 @@ JSON discards retired kind/worker_kind selectors; in-process workflow builders
 retain their internal operation markers. Reviewed templates compare exact
 objectives, criteria, tools, scope and budgets without obsolete category pins.
 No new persistence schema is required.
+
+Repository scope permits inspection without edits. When no Git changes are
+claimed, a clean worktree at its starting commit records `repository_unchanged`
+evidence rather than requiring an invented commit. Unreported edits and false
+commit/path claims still fail verification.

@@ -986,6 +986,9 @@ impl Controller {
                     .await
                     .map_err(|e| Error::Internal(format!("verification task failed: {e}")))?;
                     match verdict {
+                        Ok(CodeVerdict::Unchanged { base }) => {
+                            proofs.push(("repository_unchanged".into(), base, Some(BY_GIT.into())));
+                        }
                         Ok(CodeVerdict::Verified {
                             commit,
                             changed_paths,

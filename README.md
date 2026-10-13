@@ -939,3 +939,8 @@ runs while old receipts remain immutable. `/monitor.html` shows delivered
 context revisions, code bases and inherited agents. See
 [project handoff operation](docs/agent-monitoring.md#continuing-a-project-with-another-runtime)
 for bounds and missing/divergent-history handling.
+
+Repository scope permits inspection without edits. When no Git changes are
+claimed, a clean worktree at its starting commit records `repository_unchanged`
+evidence rather than requiring an invented commit. Unreported edits and false
+commit/path claims still fail verification.

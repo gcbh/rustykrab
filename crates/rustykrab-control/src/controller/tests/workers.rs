@@ -22,6 +22,8 @@ use crate::workspace::REPO_PREFIX;
 /// What a coding worker claims about the change it makes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Claim {
+    /// Inspection with no repository edits or Git claims.
+    Inspection,
     /// The commit it made and the path it changed.
     Honest,
     /// A path it did not change.
@@ -108,6 +110,10 @@ impl Worker for Coder {
                 summary: "changed the helper".to_string(),
                 ..ResultReport::default()
             };
+            if claim == Claim::Inspection {
+                report.summary = "Inspected the repository without edits".into();
+                return Ok(report);
+            }
             if claim != Claim::NoSuchCommit {
                 std::fs::write(ws.path.join("src/lib.rs"), "pub fn helper() {}\n").unwrap();
                 if claim == Claim::KeepsItsOwnTracker {
@@ -173,6 +179,27 @@ fn code_draft(title: &str, repo: &Repo, kind: WorkerKind) -> WorkItemDraft {
     d.worker_kind = kind;
     d.writable_resources = vec![format!("{REPO_PREFIX}{}", repo.path().display())];
     d
+}
+
+#[tokio::test]
+async fn a_repository_analysis_task_completes_without_inventing_a_commit() {
+    let repo = Repo::new();
+    let root = tempfile::tempdir().unwrap();
+    let inspector = Coder::new("inspector", WorkerKind::Local, &repo, Claim::Inspection);
+    let h = Harness::with_fleet(config(&root), vec![inspector]);
+    let mut task = code_draft("Inspect the repository", &repo, WorkerKind::Any);
+    task.kind = Some(WorkKind::Task);
+    task.done_when = "Report the analysis; no file edits are needed".into();
+    let id = h.file_one(task).await;
+    h.drain().await;
+    assert_eq!(h.status(&id).await, Status::Done);
+    assert!(h.rungs(&id).await.is_empty());
+    let evidence = h.store().work_evidence_list(&id).await.unwrap();
+    assert!(evidence
+        .iter()
+        .any(|e| e.kind == "repository_unchanged" && e.verified_by.as_deref() == Some("git")));
+    assert!(!evidence.iter().any(|e| e.kind == "commit"));
+    assert_eq!(run_git(repo.path(), &["status", "--short"]), "");
 }
 
 #[tokio::test]

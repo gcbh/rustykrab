@@ -1687,7 +1687,6 @@ async fn s17(ctx: &Ctx) -> Result<()> {
     let tag = tag(17);
     let repo = FixtureRepo::create()?;
     let stand_in = ClaudeCodeStandIn::create()?;
-    register_claude_code(ctx, "pinch-s17", &repo, &stand_in).await?;
     let first = file(
         ctx,
         code_draft("Document the status helper", &tag, W_CODE_LOCAL, &repo),
@@ -1712,6 +1711,17 @@ async fn s17(ctx: &Ctx) -> Result<()> {
         code_draft("Document the helper's errors", &tag, W_CODE_BAD, &repo),
     )
     .await?;
+    // Make the fallback available after the two local attempts have started.
+    // Unrelated busy work must not make this fixture depend on a backend pin.
+    wait_for(ctx, &second, "two local verification attempts", |v| {
+        events(v)
+            .iter()
+            .filter(|e| moved_to(e) == Some(Status::Leased))
+            .count()
+            >= 2
+    })
+    .await?;
+    register_claude_code(ctx, "pinch-s17", &repo, &stand_in).await?;
     let escalated = wait_status(ctx, &second, Status::Done).await?;
     let failed_checks = events(&escalated)
         .iter()

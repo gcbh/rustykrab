@@ -340,3 +340,8 @@ and preserve audit history. Repository scope selects isolation and git proof,
 and explicit read-only requirements select the enforced sandbox. Planning,
 permissions, dependencies and genuine execution-failure handling remain in the
 same controller. No second scheduler, credential store or durable ledger is added.
+
+Repository scope permits inspection without edits. When no Git changes are
+claimed, a clean worktree at its starting commit records `repository_unchanged`
+evidence rather than requiring an invented commit. Unreported edits and false
+commit/path claims still fail verification.
