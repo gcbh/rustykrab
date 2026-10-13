@@ -240,7 +240,11 @@ quota reads; execution remains an owned headless CLI process.
 `Brief.project_context` carries a provider-neutral project snapshot and durable
 work/question history across `Worker`. It is data on the existing seam, not a
 provider-specific memory interface. Peer reattachment keeps the frozen revision;
-a new worker run loads the current revision and verified project code chain.
+a new worker run loads the current revision and verified project code history.
+The existing workspace helper integrates conflict-free branches into a retained
+base without updating the repository checkout. Controller handoff holds are
+revalidated periodically through the existing sweep and question transaction;
+this adds no worker kind, model call, table or public trait.
 
 
 Project dreaming extends EvaluationHandle with defaulted observational status

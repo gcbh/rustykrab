@@ -536,7 +536,13 @@ async fn the_ladders_internal_item_inherits_the_failing_items_repo_worker_and_co
 #[tokio::test]
 async fn the_ladder_reuses_an_internal_item_only_in_the_same_repository() {
     let h = Harness::with(
-        ControllerConfig::default(),
+        ControllerConfig {
+            approval: crate::graph::ApprovalPolicy {
+                hold_discovered: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
         StaticCatalog::default(),
         &["pinch"],
     );
@@ -577,7 +583,14 @@ async fn the_ladder_reuses_an_internal_item_only_in_the_same_repository() {
 #[tokio::test]
 async fn a_reused_internal_item_names_every_failing_item_as_evidence() {
     let h = Harness::with(
-        ControllerConfig::default(),
+        // Keep prerequisites open while later work discovers the same cause.
+        ControllerConfig {
+            approval: crate::graph::ApprovalPolicy {
+                hold_discovered: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
         StaticCatalog::default(),
         &["pinch"],
     );

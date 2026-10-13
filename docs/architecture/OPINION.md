@@ -227,5 +227,7 @@ The existing worker boundary now carries durable project context and verified
 code ancestry; real git/SQLite tests exercise the loss path. Accumulated history
 hitting the 128 KiB prompt bound is resolved by task-scoped execution views
 (recorded in the outcome history). The exact current planning snapshot and any
-actual oversized execution slice still retain that bound. Automatic integration
-of divergent verified branches and promotion of unverified mid-run changes remain separate.
+actual oversized execution slice still retain that bound. The earlier gap for
+clean integration of divergent verified branches is closed by the handoff
+recovery follow-up in the outcome history. Actual merge conflicts and promotion
+of unverified mid-run changes remain separate; neither is silently accepted.

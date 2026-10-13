@@ -3,9 +3,11 @@ use std::collections::BTreeMap;
 
 use chrono::Utc;
 use rustykrab_core::questions::QuestionKind;
+use rustykrab_core::questions::QuestionStatus;
 use rustykrab_core::work::{BlockedReason, Evidence, Status, WorkItem};
 use rustykrab_core::Error;
 use rustykrab_projects::{ProjectId, ProjectStatus};
+use rustykrab_store::{QuestionRow, QuestionWrite, WorkOp};
 
 use super::batch::Batch;
 use super::questions::NewQuestion;
@@ -305,5 +307,86 @@ impl Controller {
             verified_by: Some(CONTROLLER.into()),
             at: Utc::now(),
         })
+    }
+
+    /// Technical handoff holds are revalidated after updates and repository
+    /// repairs. A resolved condition makes its question obsolete; it supplies
+    /// no user answer and never releases a separate decision or approval.
+    pub(super) async fn recover_project_context_holds(
+        &self,
+        batch: &mut Batch,
+        waiting: &[QuestionRow],
+    ) -> Result<Vec<String>, Error> {
+        let technical = |q: &QuestionRow| {
+            q.status == QuestionStatus::Open
+                && q.kind == QuestionKind::Decision
+                && q.rule == "project_context"
+                && q.asked_by == "controller"
+        };
+        let candidates: std::collections::BTreeSet<_> = waiting
+            .iter()
+            .filter(|q| technical(q))
+            .map(|q| q.item.clone())
+            .collect();
+        let mut changed = Vec::new();
+        for id in candidates {
+            let Some(item) = batch.snap.item(&id).cloned() else {
+                continue;
+            };
+            if item.status != Status::Blocked(BlockedReason::NeedsDecision)
+                || item.held_by.is_some()
+                || batch.snap.has_children(&id)
+                || waiting
+                    .iter()
+                    .any(|q| q.item == id && q.status == QuestionStatus::Open && !technical(q))
+                || (item.kind == rustykrab_core::work::WorkKind::Code
+                    && self.config.worktree_root.is_none())
+            {
+                continue;
+            }
+            let checked = async {
+                let mut context = self.project_context(&batch.snap, &item).await?;
+                self.plan_workspace(&item, "handoff-recheck", context.as_mut())
+                    .await
+                    .map_err(Error::Internal)?;
+                if let Some(context) = &context {
+                    Self::check_execution_context(context)?;
+                }
+                Ok::<_, Error>(())
+            }
+            .await;
+            if let Err(why) = checked {
+                tracing::debug!(item = %id, %why, "project handoff remains unresolved");
+                continue;
+            }
+            for question in waiting.iter().filter(|q| q.item == id && technical(q)) {
+                // The question sweep may already have superseded a legacy
+                // duplicate. Settling it twice would roll back the whole batch.
+                let settled = batch.ops.iter().any(|op| match op {
+                    WorkOp::Question(
+                        QuestionWrite::Settle { id, .. } | QuestionWrite::Supersede { id, .. },
+                    ) => id == &question.id,
+                    _ => false,
+                });
+                if settled {
+                    continue;
+                }
+                batch.ops.push(WorkOp::Question(QuestionWrite::Settle {
+                    id: question.id.clone(),
+                    status: QuestionStatus::Obsolete,
+                    answer: None,
+                    by: Some("controller".into()),
+                    decision: None,
+                    at: batch.now,
+                }));
+            }
+            changed.extend(batch.move_to(
+                &id,
+                Status::Queued,
+                "controller",
+                "Project handoff revalidated; technical hold resolved without a user decision",
+            ));
+        }
+        Ok(changed)
     }
 }

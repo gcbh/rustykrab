@@ -203,6 +203,15 @@ evaluation now reads the actual question record through `StoreQuestions`.
 
 ## Native subscription runtime follow-up (2026-10-02)
 
+Failure recovery uses the same work graph: named missing capabilities and
+recurring/unknown failure diagnoses create or reuse prerequisites instead of
+filing independent background improvements. Original work waits for the
+prerequisite; its next attempt carries the completed prerequisite's evidence.
+The deterministic scheduler propagates priority through unmet ordering edges
+and parent gates, with distinct waiter count as the next tie-breaker. Base
+priorities, authorization, worker eligibility and resource locks remain separate
+gates. This adds no queue, persistence table or model-controlled status field.
+
 The `claude-cli` model provider hands Rust model turns to a selected Max
 login with native tools disabled, then returns structured calls to the
 existing Rust harness. Native execution workers select a Max profile each
@@ -224,7 +233,9 @@ the same account share quota; profile count does not multiply subscriptions.
 
 Project continuity now crosses the same `Brief` boundary. The controller loads
 a durable project revision plus work/question history, freezes it with the lease
-and pins coding work to its project's verified commit chain. Native adapters
+and pins coding work to its project's verified commit history. Cleanly divergent
+history is integrated in retained Git objects; resolved technical handoff holds
+are periodically revalidated without supplying a human decision. Native adapters
 render it without depending on Claude/Codex chat state. Archive compaction keeps
 receipts and evidence, and the monitor shows the delivered revision and base.
 This changes no crate dependency and introduces no second scheduler or ledger.

@@ -1,7 +1,7 @@
 //! Real git + durable SQLite: runtime changes carry project intent and verified files.
 use super::{draft, Harness};
 use crate::{
-    controller::{Controller, ControllerConfig},
+    controller::{Clock, Controller, ControllerConfig},
     handoff::PROJECT_CONTEXT,
     worker::{Brief, Worker, WorkerCapabilities},
     workspace::{
@@ -17,6 +17,200 @@ use rustykrab_core::{
 };
 use rustykrab_projects::*;
 use std::sync::{Arc, Mutex};
+
+#[tokio::test]
+async fn repaired_handoffs_resume_old_size_holds_and_integrate_verified_history() {
+    let repo = Repo::new();
+    let root = tempfile::tempdir().unwrap();
+    let config = ControllerConfig {
+        worktree_root: Some(root.path().to_owned()),
+        ..Default::default()
+    };
+    let claude = Coder::new(WorkerKind::ClaudeCode, &repo);
+    let mut h = Harness::with_fleet(config.clone(), vec![claude]);
+    let project = project(&h, &repo).await;
+    let first = h
+        .file_one(code(&repo, WorkerKind::ClaudeCode, "first", None))
+        .await;
+    h.drain().await;
+    assert_eq!(h.status(&first).await, Status::Done);
+    std::fs::write(repo.path().join("upstream.txt"), "new repository work").unwrap();
+    let repository_head = commit_all(repo.path(), "upstream change");
+    let codex = Coder::new(WorkerKind::Codex, &repo);
+    h.ctl =
+        Controller::new(h.store().clone(), vec![codex.clone()], config).with_clock(h.clock.clone());
+    let next = h
+        .file_one(code(
+            &repo,
+            WorkerKind::Codex,
+            "continue",
+            Some(project.project.id),
+        ))
+        .await;
+    h.ctl.hold_context(&h.store().work_get(&next).await.unwrap().unwrap(),
+        "project context exceeds the handoff limit; narrow the execution slice before continuing".into()).await.unwrap();
+    // Old releases could insert the same technical question more than once.
+    let previous = h
+        .store()
+        .questions_list(&Default::default())
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|q| q.item == next)
+        .unwrap();
+    let mut batch = super::super::batch::Batch::new(h.ctl.load().await.unwrap(), h.clock.now());
+    h.ctl.record_question_sync(
+        &mut batch,
+        super::super::questions::NewQuestion::open(
+            &next,
+            previous.kind,
+            previous.text,
+            "project_context",
+        ),
+    );
+    h.ctl.commit(batch, &mut Default::default()).await.unwrap();
+    h.drain().await;
+    assert_eq!(h.status(&next).await, Status::Done);
+    assert_eq!(head(repo.path()).unwrap(), repository_head);
+    let brief = {
+        let briefs = codex.received.lock().unwrap();
+        assert_eq!(briefs.len(), 1);
+        briefs[0].clone()
+    };
+    let workspace = brief.workspace.as_ref().unwrap();
+    assert!(crate::workspace::is_ancestor(repo.path(), &repository_head, &workspace.base).unwrap());
+    let questions = h.store().questions_list(&Default::default()).await.unwrap();
+    let resolved: Vec<_> = questions.iter().filter(|q| q.item == next).collect();
+    assert_eq!(resolved.len(), 2);
+    for question in resolved {
+        assert_eq!(
+            question.status,
+            rustykrab_core::questions::QuestionStatus::Obsolete
+        );
+        assert!(
+            question.answer.is_none(),
+            "recovery must not invent a user decision"
+        );
+    }
+}
+
+#[tokio::test]
+async fn handoff_recovery_preserves_an_independent_user_decision() {
+    let repo = Repo::new();
+    let root = tempfile::tempdir().unwrap();
+    let coder = Coder::new(WorkerKind::Codex, &repo);
+    let h = Harness::with_fleet(
+        ControllerConfig {
+            worktree_root: Some(root.path().to_owned()),
+            ..Default::default()
+        },
+        vec![coder.clone()],
+    );
+    let project = project(&h, &repo).await;
+    let item = h
+        .file_one(code(
+            &repo,
+            WorkerKind::Codex,
+            "small slice",
+            Some(project.project.id),
+        ))
+        .await;
+    h.ctl
+        .hold_context(
+            &h.store().work_get(&item).await.unwrap().unwrap(),
+            "old handoff limit".into(),
+        )
+        .await
+        .unwrap();
+    let mut batch = super::super::batch::Batch::new(h.ctl.load().await.unwrap(), h.clock.now());
+    let question = super::super::questions::NewQuestion::open(
+        &item,
+        rustykrab_core::questions::QuestionKind::Decision,
+        "Which product behavior should this change implement?".into(),
+        "user_decision",
+    );
+    h.ctl.record_question(&mut batch, question).await.unwrap();
+    h.ctl.commit(batch, &mut Default::default()).await.unwrap();
+    h.drain().await;
+    assert_eq!(
+        h.status(&item).await,
+        Status::Blocked(BlockedReason::NeedsDecision)
+    );
+    assert!(coder.received.lock().unwrap().is_empty());
+    assert!(h
+        .store()
+        .questions_list(&Default::default())
+        .await
+        .unwrap()
+        .iter()
+        .all(|q| q.answer.is_none()));
+}
+
+#[tokio::test]
+async fn handoff_recovery_does_not_discard_oversized_current_requirements() {
+    let repo = Repo::new();
+    let root = tempfile::tempdir().unwrap();
+    let coder = Coder::new(WorkerKind::Codex, &repo);
+    let h = Harness::with_fleet(
+        ControllerConfig {
+            worktree_root: Some(root.path().to_owned()),
+            ..Default::default()
+        },
+        vec![coder.clone()],
+    );
+    let project = project(&h, &repo).await;
+    let node = *project.revision.nodes.keys().next().unwrap();
+    h.store()
+        .projects()
+        .apply(
+            &project.project.id,
+            &project.revision.id,
+            PlanChangeSet::new(
+                "large current requirement",
+                project.project.id,
+                project.revision.id.clone(),
+                "Keep every requirement",
+                RevisionAuthor::User,
+                Utc::now(),
+                vec![PlanChange::UpdateNode {
+                    node_id: node,
+                    patch: PlanNodePatch {
+                        body: Some("required ".repeat(20_000)),
+                        ..Default::default()
+                    },
+                    provenance: vec![provenance()],
+                }],
+            ),
+        )
+        .await
+        .unwrap();
+    let item = h
+        .file_one(code(
+            &repo,
+            WorkerKind::Codex,
+            "small slice",
+            Some(project.project.id),
+        ))
+        .await;
+    h.ctl
+        .hold_context(
+            &h.store().work_get(&item).await.unwrap().unwrap(),
+            "old handoff limit".into(),
+        )
+        .await
+        .unwrap();
+    h.drain().await;
+    assert_eq!(
+        h.status(&item).await,
+        Status::Blocked(BlockedReason::NeedsDecision)
+    );
+    assert!(coder.received.lock().unwrap().is_empty());
+    let questions = h.store().questions_list(&Default::default()).await.unwrap();
+    assert_eq!(
+        questions[0].status,
+        rustykrab_core::questions::QuestionStatus::Open
+    );
+}
 
 struct Coder {
     kind: WorkerKind,

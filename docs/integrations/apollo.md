@@ -146,6 +146,73 @@ POST /api/credential-requests/{id}/deny      → 204
 - `approve` applies the stored change server-side and is refused with `409`
   if the target secret changed after the request was filed.
 
+## Payment approvals — Planned
+
+Specified by `docs/plans/pending-payment-approvals-app-surfaces.md`
+(children 2 and 3); the server side is
+`crates/rustykrab-gateway/src/payment_routes.rs`. When the agent wants to pay
+for something it files a payment request; these routes let the app show it
+and send the user to the page where they approve it.
+
+```
+GET  /api/payment-requests            → [PaymentRequest]   (pending only)
+POST /api/payment-requests/{id}/link  → ApprovalLink
+```
+
+```jsonc
+// PaymentRequest — never includes a link, a token or any card field
+{
+  "id": "uuid",
+  "merchant": "string",               // as the agent read it from the checkout
+  "site": "https://shop.example.com", // origin the payment will be made on
+  "amount": "…",                      // see the note on encoding below
+  "currency": "USD",                  // ISO 4217
+  "description": "string|null",
+  "conversationId": "uuid|null",
+  "status": "pending",                // the only value this route returns
+  "createdAt": 1704067200000,
+  "duplicateConfirmed": false         // true: the user already said a repeat of an earlier payment is intended
+}
+```
+
+```jsonc
+// ApprovalLink — sent with Cache-Control: no-store
+{ "path": "/p/<token>", "expiresInMinutes": 15 }
+```
+
+- **The listing is read-only and shows `pending` requests only**, newest
+  first. A request that was held as a likely duplicate, authorized, declined,
+  superseded or expired is not listed; an unanswered request expires after
+  one hour. An empty array is the normal "nothing to approve" answer.
+- **No route here approves a payment**, and none accepts card details.
+  Listing a request or minting a link changes no status. Approval happens
+  only on the `/p/<token>` page, where the user types the card.
+- **Apollo opens `path` in a browser on the tailnet** (resolved against the
+  base URL it already uses — it is a relative path) and **never collects card
+  details itself**: no card field in the app, and no card data in any
+  `/api/*` request. The page is gated by the user's tailnet identity, not by
+  the bearer token, so it has to be opened on a device that is on the tailnet.
+- `path` is a live credential. Do not store it, log it or put it in a
+  transcript; mint one when the user taps the action and open it straight
+  away. `expiresInMinutes` is how long it stays usable — read it from the
+  response rather than assuming the value shown above.
+- Minting replaces any earlier link for the same request, including one
+  already sent to a chat surface: only the newest `path` opens.
+- After the user approves or declines on the page, the request drops out of
+  the listing and the conversation resumes on its own; Apollo just refetches.
+
+Errors, both routes:
+
+- `401` — missing or invalid bearer token.
+- `404` (`/link` only) — `id` is unknown, or the request is not `pending`
+  (held, already authorized, declined, superseded or expired). Treat it as
+  "no longer needs an answer" and refetch the listing.
+
+Until `payment_routes.rs` lands, the field names above are the plan's;
+its response struct is the authority if the two ever differ. The encoding of
+`amount` (decimal string or minor units) is fixed by that struct and not by
+this document.
+
 ## Device pairing — Planned (Phase 1)
 
 ```

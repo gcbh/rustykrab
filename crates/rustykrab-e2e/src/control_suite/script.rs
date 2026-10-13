@@ -36,6 +36,9 @@ pub(super) const W_SLOW: &str = "e2e-control worker: work for twenty seconds";
 /// A peer's run long enough to restart either daemon inside it (8).
 pub(super) const W_PEER_PAUSE: &str = "e2e-control worker: work for eight seconds on the peer";
 pub(super) const W_TIMEOUT: &str = "e2e-control worker: fail with a timeout";
+/// Match the generated repair objective, not failure text also carried by
+/// human notifications. W_TIMEOUT still wins on the original repair brief.
+pub(super) const W_RECURRING_FIX: &str = "the same failure recurred across items";
 pub(super) const W_UNRECOGNISED: &str =
     "e2e-control worker: fail in a way no classifier recognises";
 /// The raw failure [`W_UNRECOGNISED`] reports, and the trigger of the
@@ -313,6 +316,16 @@ pub(crate) fn agent_script_scenarios() -> Vec<Value> {
             ],
         ),
         script(
+            W_RECURRING_FIX,
+            vec![
+                succeeded(
+                    "Simulated the recurring cause repair.",
+                    ("message", "e2e-control-cause-resolution"),
+                ),
+                done("Finished the fixture prerequisite."),
+            ],
+        ),
+        script(
             W_UNRECOGNISED,
             vec![
                 report(json!({
@@ -500,6 +513,7 @@ mod tests {
             W_SLOW,
             W_PEER_PAUSE,
             W_TIMEOUT,
+            W_RECURRING_FIX,
             W_UNRECOGNISED,
             W_PROBE_FIX,
             W_DOC_ALPHA,
@@ -539,6 +553,10 @@ mod tests {
         assert!(TIDE_TABLE_BUILT.len() > W_TIDE.len());
         assert!(W_UNRECOGNISED.len() > W_PROBE_FIX.len());
         assert!(RAW_FAILURE.to_lowercase().contains(W_PROBE_FIX));
+        assert!(
+            W_TIMEOUT.len() > W_RECURRING_FIX.len(),
+            "the original must still fail after its prerequisite reports completion"
+        );
     }
 
     /// The scripted calls must parse as the shared vocabulary, or a
