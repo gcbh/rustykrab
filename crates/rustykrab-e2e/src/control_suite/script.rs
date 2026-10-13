@@ -36,6 +36,10 @@ pub(super) const W_SLOW: &str = "e2e-control worker: work for twenty seconds";
 /// A peer's run long enough to restart either daemon inside it (8).
 pub(super) const W_PEER_PAUSE: &str = "e2e-control worker: work for eight seconds on the peer";
 pub(super) const W_TIMEOUT: &str = "e2e-control worker: fail with a timeout";
+/// Recurring-failure work carries this detail rather than the original
+/// objective. The shorter trigger completes its simulated cause repair;
+/// W_TIMEOUT still wins on the original, including its repair briefs.
+pub(super) const W_TIMEOUT_CAUSE: &str = "upstream timed out after 30s";
 pub(super) const W_UNRECOGNISED: &str =
     "e2e-control worker: fail in a way no classifier recognises";
 /// The raw failure [`W_UNRECOGNISED`] reports, and the trigger of the
@@ -306,10 +310,20 @@ pub(crate) fn agent_script_scenarios() -> Vec<Value> {
                     "summary": "The booking service timed out.",
                     "error": {
                         "class": "tool", "subclass": "timeout",
-                        "detail": "upstream timed out after 30s",
+                        "detail": W_TIMEOUT_CAUSE,
                     },
                 })),
                 done("Timed out."),
+            ],
+        ),
+        script(
+            W_TIMEOUT_CAUSE,
+            vec![
+                succeeded(
+                    "Simulated the recurring timeout cause repair.",
+                    ("message", "e2e-control-timeout-resolution"),
+                ),
+                done("Finished the fixture prerequisite."),
             ],
         ),
         script(
@@ -500,6 +514,7 @@ mod tests {
             W_SLOW,
             W_PEER_PAUSE,
             W_TIMEOUT,
+            W_TIMEOUT_CAUSE,
             W_UNRECOGNISED,
             W_PROBE_FIX,
             W_DOC_ALPHA,
@@ -539,6 +554,10 @@ mod tests {
         assert!(TIDE_TABLE_BUILT.len() > W_TIDE.len());
         assert!(W_UNRECOGNISED.len() > W_PROBE_FIX.len());
         assert!(RAW_FAILURE.to_lowercase().contains(W_PROBE_FIX));
+        assert!(
+            W_TIMEOUT.len() > W_TIMEOUT_CAUSE.len(),
+            "the original must still fail after its prerequisite reports completion"
+        );
     }
 
     /// The scripted calls must parse as the shared vocabulary, or a

@@ -193,3 +193,9 @@ The review also corrected older prose that claimed an internal repair receives
 a controller-created code worktree. `plan_workspace` currently applies only to
 `WorkKind::Code`; internal work inherits repository scope and constraints. The
 new prerequisite behavior does not change that existing workspace boundary.
+
+Hosted E2E validation caught a missing stand-in response for recurring timeout
+repair work. Scenario 32 consequently waited on the new prerequisite instead
+of reaching its required failed sibling. The fixture now completes the
+simulated prerequisite while retaining the original failure trigger; the
+restart, cascade, lease and single-notification assertions remain required.
