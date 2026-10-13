@@ -162,7 +162,26 @@ fn assess(
         }
     }
     for w in workers {
-        if !w.live || !w.healthy {
+        let runtime = w.runtime.as_ref();
+        let exhausted_until = runtime
+            .and_then(|r| r["rate_limited_until"].as_str())
+            .and_then(|at| at.parse::<DateTime<Utc>>().ok())
+            .filter(|at| *at > now);
+        if let Some(until) = exhausted_until
+            .filter(|_| w.live && !w.healthy && runtime.is_some_and(|r| r["error"].is_null()))
+        {
+            out.push(alert(
+                "info",
+                "subscription_exhausted",
+                format!(
+                    "{} subscription is exhausted; next retry {}.",
+                    w.name,
+                    until.to_rfc3339()
+                ),
+                None,
+                Some(&w.name),
+            ));
+        } else if !w.live || !w.healthy {
             out.push(alert(
                 "warning",
                 "worker_unavailable",
@@ -178,6 +197,18 @@ fn assess(
                 "warning",
                 "worker_check_stale",
                 format!("{} has no recent worker health check.", w.name),
+                None,
+                Some(&w.name),
+            ));
+        }
+        if runtime.is_some_and(|r| !r["quota_error"].is_null()) {
+            out.push(alert(
+                "warning",
+                "subscription_usage_unknown",
+                format!(
+                    "{} subscription usage could not be refreshed; any retained reading is dated.",
+                    w.name
+                ),
                 None,
                 Some(&w.name),
             ));
@@ -524,6 +555,30 @@ fn exposition(reply: &MonitorReply) -> String {
                 "rustykrab_worker_last_check_seconds{{worker=\"{name}\"}} {}\n",
                 at.timestamp()
             ));
+        }
+        if let Some(runtime) = &worker.runtime {
+            let mut windows = Vec::new();
+            if let Some(values) = runtime["quota_windows"].as_object() {
+                windows.extend(values.iter().map(|(key, value)| (key.clone(), value)));
+            }
+            if let Some(buckets) = runtime["rate_limits"].as_object() {
+                for (bucket, value) in buckets {
+                    for key in ["primary", "secondary"] {
+                        if value[key].is_object() {
+                            windows.push((format!("{bucket}_{key}"), &value[key]));
+                        }
+                    }
+                }
+            }
+            for (key, window) in windows {
+                let key = label(&key);
+                if let Some(percent) = window["used_percent"].as_f64().filter(|v| v.is_finite()) {
+                    s.push_str(&format!("rustykrab_subscription_used_percent{{worker=\"{name}\",window=\"{key}\"}} {percent}\n"));
+                }
+                if let Some(reset) = window["resets_at"].as_i64() {
+                    s.push_str(&format!("rustykrab_subscription_reset_seconds{{worker=\"{name}\",window=\"{key}\"}} {reset}\n"));
+                }
+            }
         }
         for (class, record) in &worker.routing_record {
             let class = label(class);

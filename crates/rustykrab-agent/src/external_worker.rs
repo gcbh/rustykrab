@@ -500,6 +500,7 @@ impl ExternalWorker {
                     config.command.clone(),
                     config.claude_config_dir.clone(),
                 )
+                .with_model(config.model.as_deref())
             }),
             codex_runtime: config.require_chatgpt.then(|| {
                 rustykrab_providers::CodexChatGptRuntime::new(

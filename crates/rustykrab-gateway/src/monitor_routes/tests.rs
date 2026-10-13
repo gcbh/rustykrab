@@ -241,6 +241,78 @@ fn exposition_label_escaping_keeps_each_sample_on_one_line() {
 }
 
 #[tokio::test]
+async fn subscription_exhaustion_is_an_expected_wait_and_unknown_usage_is_explicit() {
+    let (base, client, store, control, task) = serve().await;
+    let mut reply: MonitorReply = client
+        .get(format!("{base}/api/monitor"))
+        .bearer_auth("test-monitor-token")
+        .header("Origin", &base)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let now = Utc::now();
+    let reset = now + TimeDelta::days(1);
+    let mut worker = WorkerView {
+        name: "max-personal".into(),
+        kind: "claude_code".into(),
+        live: true,
+        healthy: false,
+        health: "subscription exhausted".into(),
+        last_seen: Some(now),
+        cost_tier: 3,
+        concurrency: 1,
+        capabilities: Default::default(),
+        routing_record: Default::default(),
+        spec: None,
+        created_at: now,
+        runtime: Some(
+            json!({"subscription":"max","rate_limited_until":reset.to_rfc3339(),"quota_error":null,"quota_windows":{"seven_day":{"used_percent":100.0,"exhausted":true,"resets_at":reset.timestamp()}}}),
+        ),
+    };
+    let work = store.work_monitor_snapshot(1, 1).await.unwrap();
+    let alerts = assess(
+        control.loop_status().as_ref(),
+        &[worker.clone()],
+        &work,
+        now,
+    );
+    assert!(alerts
+        .iter()
+        .any(|a| a.code == "subscription_exhausted" && a.severity == "info"));
+    assert!(!alerts.iter().any(|a| a.code == "worker_unavailable"));
+    assert_eq!(
+        health_of(&alerts),
+        "healthy",
+        "Known subscription exhaustion is capacity, not a broken system"
+    );
+    reply.workers = vec![worker.clone()];
+    let metrics = exposition(&reply);
+    assert!(metrics.contains(
+        "rustykrab_subscription_used_percent{worker=\"max-personal\",window=\"seven_day\"} 100"
+    ));
+    assert!(metrics.contains(&format!(
+        "rustykrab_subscription_reset_seconds{{worker=\"max-personal\",window=\"seven_day\"}} {}",
+        reset.timestamp()
+    )));
+    worker.runtime.as_mut().unwrap()["quota_error"] = json!("Usage read failed");
+    assert!(assess(
+        control.loop_status().as_ref(),
+        &[worker.clone()],
+        &work,
+        now
+    )
+    .iter()
+    .any(|a| a.code == "subscription_usage_unknown"));
+    worker.runtime = Some(json!({"subscription":"max","quota_error":"Unavailable"}));
+    reply.workers = vec![worker];
+    assert!(!exposition(&reply).contains("rustykrab_subscription_used_percent"));
+    task.abort();
+}
+
+#[tokio::test]
 async fn lease_loss_wall_budget_and_expected_questions_are_reported_without_claiming_failure() {
     use rustykrab_core::work::{Lease, PlanOutcome, Status, WorkItemDraft};
     let (_, _, store, control, task) = serve().await;
