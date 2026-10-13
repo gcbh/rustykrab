@@ -112,6 +112,9 @@ impl ClaudeMaxRuntime {
 
     pub fn health_error(&self) -> Option<String> {
         let status = self.status();
+        if let Some(error) = status.error {
+            return Some(error);
+        }
         if let Some(until) = status.rate_limited_until {
             return Some(format!(
                 "Claude Max subscription unavailable until {} (usage cooldown)",
@@ -129,12 +132,10 @@ impl ClaudeMaxRuntime {
         {
             return Some("Claude subscription usage check has not completed".into());
         }
-        status.error.or_else(|| {
-            status
-                .subscription
-                .is_none()
-                .then(|| "Claude Max login has not been verified".into())
-        })
+        status
+            .subscription
+            .is_none()
+            .then(|| "Claude Max login has not been verified".into())
     }
 
     pub fn needs_refresh(&self) -> bool {
@@ -147,6 +148,9 @@ impl ClaudeMaxRuntime {
     }
 
     fn readiness(&self, checked: bool) -> Result<bool, Error> {
+        if let Some(error) = self.status().error {
+            return Err(Error::ModelAuthError(error));
+        }
         if let Some(until) = self.status().rate_limited_until {
             return Err(Error::ModelRateLimit(format!(
                 "Claude Max subscription unavailable until {}",
@@ -830,6 +834,26 @@ exit 93
             before.rate_limited_until
         );
         assert!(provider.runtime.status().quota_error.is_some());
+        // An authentication failure is distinct from capacity exhaustion;
+        // preserve the dated quota but do not mask the login problem.
+        std::fs::write(
+            dir.path().join("login.json"),
+            json!({"loggedIn":false}).to_string(),
+        )
+        .unwrap();
+        assert!(matches!(
+            provider.runtime.verify_login(true).await,
+            Err(Error::ModelAuthError(_))
+        ));
+        assert!(!provider
+            .runtime
+            .health_error()
+            .unwrap()
+            .contains("usage cooldown"));
+        assert_eq!(
+            provider.runtime.status().rate_limited_until,
+            before.rate_limited_until
+        );
         // A different account in the same profile cannot inherit this quota.
         std::fs::remove_file(dir.path().join("fail-usage")).unwrap();
         std::fs::write(
