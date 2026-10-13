@@ -2585,6 +2585,10 @@ fn ever_failed(view: &Value) -> bool {
 /// re-checked against the peer's task and re-attached, not resubmitted).
 /// Scenario 4 is the local half of the same rule.
 async fn s08(ctx: &Ctx) -> Result<()> {
+    // The peer is the available executor in this fixture. Backend selectors
+    // are retired and cannot force work away from another compatible resource.
+    let daemon = LocalWorkerOffDaemon::boot(ctx).await?;
+    let ctx = &daemon.ctx;
     let tag = tag(8);
     let port = crate::pick_free_port()?;
     let base = format!("http://127.0.0.1:{port}");
@@ -2598,7 +2602,6 @@ async fn s08(ctx: &Ctx) -> Result<()> {
 
     // Required tools active before the first prefill, a structured result.
     let mut task = draft("personal", "Check the harbour calendar", &tag, W_PROBE);
-    task["worker_kind"] = json!("peer");
     task["required_tools"] = json!(["caldav"]);
     let task = file(ctx, task).await?;
     let finished = wait_status(ctx, &task, Status::Done).await?;
@@ -2652,7 +2655,6 @@ async fn s08(ctx: &Ctx) -> Result<()> {
     // The peer restarts mid-run: its task returns to its queue and runs
     // again, and nothing is failed by the restart.
     let mut inbox = draft("personal", "Tidy the peer's inbox", &tag, W_PEER_PAUSE);
-    inbox["worker_kind"] = json!("peer");
     inbox["required_tools"] = json!(["caldav"]);
     let inbox = file(ctx, inbox).await?;
     peer.wait_running(&inbox).await?;
@@ -2671,7 +2673,6 @@ async fn s08(ctx: &Ctx) -> Result<()> {
     // The controller restarts mid-run: the lease is re-checked against the
     // peer's task, which still runs, and the controller re-attaches to it.
     let mut photos = draft("personal", "Sort the peer's photos", &tag, W_PEER_PAUSE);
-    photos["worker_kind"] = json!("peer");
     photos["required_tools"] = json!(["caldav"]);
     let photos = file(ctx, photos).await?;
     peer.wait_running(&photos).await?;
