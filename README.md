@@ -656,6 +656,25 @@ the resolved values, and they are not surfaced through any tool.
 
 ### Claude Max CLI runtimes
 
+Native Max runtimes check both login and subscription usage. Claude's built-in
+`/usage` command reports session, weekly and model-specific allowance consumption
+without model inference; RustyKrab reads it at registration and on the existing
+30-second native refresh. Exhausted applicable windows keep a worker unavailable
+until the advertised reset. Systems shows each observed window, reset and freshness;
+unknown or failed reads are explicit. Native authentication remains inside Claude
+CLI. Older CLI versions without a recognized native usage result report unknown
+capacity. Observations are memory-only, with a new native probe on daemon startup.
+
+For a direct read-only diagnosis using the same Rust observer:
+
+```sh
+cargo run -p rustykrab-providers --example subscription_status -- /path/to/claude /absolute/profile opus
+```
+
+The example exits nonzero for an unavailable login or exhausted subscription.
+Pass `-` as the profile to use Claude's default login.
+
+
 For a fleet using Claude subscriptions, select the native CLI provider for
 planning/chat and disable local execution:
 

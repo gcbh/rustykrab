@@ -307,3 +307,13 @@ tick, fleet and verification paths carry future matching work; automatic starts
 record the permission id. This connects user delegation to execution while
 preserving decisions, blockers and result evidence on the work item. It does
 not add a dreaming incident detector or infer authority from similar text.
+
+## Subscription usage observations (base 5bb3ed7)
+
+The native Claude runtime now verifies capacity with the CLI-owned, zero-inference
+/usage command as well as authentication. Its existing health boundary prevents
+leases on exhausted accounts until the advertised reset; failed reads expose
+unknown capacity and preserve dated exhaustion within the running process.
+Codex retains its native account/rate-limit reader. The gateway projects both
+providers' sanitized observations into Systems and metrics. There is no new
+credential reader, scheduler, persistence table or crate dependency.

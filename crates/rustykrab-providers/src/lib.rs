@@ -1,6 +1,7 @@
 mod anthropic;
 mod backoff;
 mod claude_cli;
+mod claude_usage;
 mod codex_cli;
 mod line_buffer;
 mod ollama;
@@ -15,5 +16,6 @@ pub use scripted::{Scenario, Script, ScriptStep, ScriptToolCall, ScriptedProvide
 pub use tool_block::log_tool_block;
 
 pub use claude_cli::{ClaudeCliProvider, ClaudeMaxRuntime, ClaudeMaxStatus};
+pub use claude_usage::ClaudeQuotaWindow;
 
 pub use codex_cli::{CodexChatGptRuntime, CodexChatGptStatus, CodexQuotaBucket, CodexQuotaWindow};

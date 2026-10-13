@@ -189,6 +189,26 @@
       }
     } catch (e) { if (g === generation) $('briefingRows').replaceChildren(node('p', 'Briefings unavailable: ' + e.message, 'note')); }
   }
+  function renderSubscription(card, kind, runtime) {
+    card.append(node('p', 'Subscription: ' + (runtime.subscription || 'unverified') + (runtime.account_fingerprint ? ' · Account ' + runtime.account_fingerprint : '')));
+    card.append(node('p', (kind === 'codex' ? 'Codex profile: ' : 'Claude profile: ') + (runtime.codex_home || runtime.config_dir || 'default login')));
+    for (const [bucket, limits] of Object.entries(runtime.rate_limits || {})) {
+      for (const key of ['primary', 'secondary']) {
+        const window = limits[key];
+        if (!window || !Number.isFinite(window.used_percent)) continue;
+        card.append(node('p', bucket + ' · ' + (window.window_minutes ? num(window.window_minutes) + ' min' : key) + ': ' + num(window.used_percent) + '% used' + (window.resets_at ? ' · Resets ' + new Date(window.resets_at * 1000).toLocaleString() : '')));
+      }
+    }
+    for (const [key, window] of Object.entries(runtime.quota_windows || {})) {
+      const measured = Number.isFinite(window.used_percent) ? num(window.used_percent) + '% used' : 'usage unknown';
+      const reset = window.resets_at ? ' · Resets ' + new Date(window.resets_at * 1000).toLocaleString() : '';
+      card.append(node('p', (window.label || key) + ': ' + measured + (window.exhausted ? ' · Exhausted' : '') + reset));
+    }
+    if (kind === 'claude_code' && !runtime.quota_checked_at) card.append(node('p', 'Subscription usage has not been observed.', 'note'));
+    if (runtime.quota_checked_at) card.append(node('p', 'Quota checked ' + age(runtime.quota_checked_at), 'note'));
+    if (runtime.quota_error) card.append(node('p', runtime.quota_error, 'note'));
+    if (runtime.rate_limited_until) card.append(node('p', 'Usage limit observed · Next retry ' + new Date(runtime.rate_limited_until).toLocaleString(), 'note'));
+  }
   function render(reply) {
     const w = reply.work, counts = w.counts, c = reply.controller;
     renderDreaming(reply.dreaming);
@@ -241,21 +261,7 @@
       title.append(node('span', a.name), badge(!a.live || !a.healthy ? 'unavailable' : activeCount ? 'active' : 'idle', !a.live || !a.healthy ? 'degraded' : activeCount ? 'running' : 'idle'));
       card.append(title, node('p', human(a.kind) + ' · ' + a.health), node('p', 'Last check ' + age(a.last_seen)), node('p', num(activeCount) + ' active assignments · Capacity ' + num(a.concurrency)));
       if (a.capabilities?.models?.length) card.append(node('p', 'Runtime: ' + a.capabilities.models.join(', ')));
-      if (a.runtime) {
-        const runtime = a.runtime;
-        card.append(node('p', 'Subscription: ' + (runtime.subscription || 'unverified') + (runtime.account_fingerprint ? ' · Account ' + runtime.account_fingerprint : '')));
-        card.append(node('p', (a.kind === 'codex' ? 'Codex profile: ' : 'Claude profile: ') + (runtime.codex_home || runtime.config_dir || 'default login')));
-        for (const [bucket, limits] of Object.entries(runtime.rate_limits || {})) {
-          for (const key of ['primary', 'secondary']) {
-            const window = limits[key];
-            if (!window || !Number.isFinite(window.used_percent)) continue;
-            card.append(node('p', bucket + ' · ' + (window.window_minutes ? num(window.window_minutes) + ' min' : key) + ': ' + num(window.used_percent) + '% used' + (window.resets_at ? ' · Resets ' + new Date(window.resets_at * 1000).toLocaleString() : '')));
-          }
-        }
-        if (runtime.quota_checked_at) card.append(node('p', 'Quota checked ' + age(runtime.quota_checked_at), 'note'));
-        if (runtime.quota_error) card.append(node('p', runtime.quota_error, 'note'));
-        if (runtime.rate_limited_until) card.append(node('p', 'Usage limit observed · Next retry ' + new Date(runtime.rate_limited_until).toLocaleString(), 'note'));
-      }
+      if (a.runtime) renderSubscription(card, a.kind, a.runtime);
       for (const row of live) {
         const assignment = node('div', undefined, 'assignment');
         assignment.append(itemButton(row.item.id, row.item.title), node('p', human(status(row.item)) + ' · Heartbeat ' + age(row.lease.heartbeat_at)));

@@ -38,6 +38,7 @@ jobs:
       - run: node scripts/test_monitor_links.mjs
       - run: node scripts/test_work_discussions.mjs
       - run: node scripts/test_work_preferences.mjs
+      - run: node scripts/test_subscription_monitor.mjs
       - run: cargo test --workspace
 
   docs:

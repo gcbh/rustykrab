@@ -1,5 +1,5 @@
 //! Subscription-authenticated Claude CLI. No API credentials leave the CLI.
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Mutex;
@@ -17,6 +17,8 @@ use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
+use crate::claude_usage::{blocked_until, parse_usage, rate_limit_event, ClaudeQuotaWindow};
+
 const BASE_ENV: [&str; 9] = [
     "PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "TERM", "TMPDIR", "SHELL",
 ];
@@ -24,18 +26,27 @@ const AUTH_TTL: Duration = Duration::from_secs(30);
 const QUOTA_BACKOFF: Duration = Duration::from_secs(300);
 
 /// Observed login and quota state, without an email or credential.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct ClaudeMaxStatus {
     pub subscription: Option<String>,
     pub account_fingerprint: Option<String>,
     pub config_dir: Option<PathBuf>,
     pub rate_limited_until: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default)]
+    pub quota_windows: BTreeMap<String, ClaudeQuotaWindow>,
+    #[serde(default)]
+    pub quota_checked_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default)]
+    pub quota_error: Option<String>,
     pub error: Option<String>,
 }
 
 #[derive(Default)]
 struct LoginCache {
     checked: Option<Instant>,
+    quota_checked: Option<Instant>,
+    /// An inference rejection must survive a successful login/usage read.
+    observed_until: Option<chrono::DateTime<chrono::Utc>>,
     status: ClaudeMaxStatus,
 }
 
@@ -44,6 +55,7 @@ struct LoginCache {
 pub struct ClaudeMaxRuntime {
     pub command: PathBuf,
     pub config_dir: Option<PathBuf>,
+    model: Option<String>,
     cache: Mutex<LoginCache>,
 }
 
@@ -52,8 +64,16 @@ impl ClaudeMaxRuntime {
         Self {
             command,
             config_dir,
+            model: None,
             cache: Mutex::new(LoginCache::default()),
         }
+    }
+
+    /// Match model-specific subscription windows to this executor's model.
+    /// Unknown/default model selection conservatively honors every window.
+    pub fn with_model(mut self, model: Option<&str>) -> Self {
+        self.model = model.map(str::to_owned);
+        self
     }
 
     /// Clear inherited billing/provider overrides, even those a caller added.
@@ -81,24 +101,41 @@ impl ClaudeMaxRuntime {
             .rate_limited_until
             .is_some_and(|until| until <= chrono::Utc::now())
         {
-            status.rate_limited_until = None;
+            status.rate_limited_until = blocked_until(
+                &status.quota_windows,
+                self.model.as_deref(),
+                chrono::Utc::now(),
+            );
         }
         status
     }
 
     pub fn health_error(&self) -> Option<String> {
         let status = self.status();
-        if status.rate_limited_until.is_some() {
-            return Some(
-                "Claude Max usage limit observed; retrying after a five-minute cooldown".into(),
-            );
+        if let Some(error) = status.error {
+            return Some(error);
         }
-        status.error.or_else(|| {
-            status
-                .subscription
+        if let Some(until) = status.rate_limited_until {
+            return Some(format!(
+                "Claude Max subscription unavailable until {} (usage cooldown)",
+                until.to_rfc3339()
+            ));
+        }
+        if status.error.is_none()
+            && status.subscription.is_some()
+            && self
+                .cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .quota_checked
                 .is_none()
-                .then(|| "Claude Max login has not been verified".into())
-        })
+        {
+            return Some("Claude subscription usage check has not completed".into());
+        }
+        status
+            .subscription
+            .is_none()
+            .then(|| "Claude Max login has not been verified".into())
     }
 
     pub fn needs_refresh(&self) -> bool {
@@ -111,10 +148,14 @@ impl ClaudeMaxRuntime {
     }
 
     fn readiness(&self, checked: bool) -> Result<bool, Error> {
-        if self.status().rate_limited_until.is_some() {
-            return Err(Error::ModelRateLimit(
-                "Claude Max usage limit observed; retrying after a five-minute cooldown".into(),
-            ));
+        if let Some(error) = self.status().error {
+            return Err(Error::ModelAuthError(error));
+        }
+        if let Some(until) = self.status().rate_limited_until {
+            return Err(Error::ModelRateLimit(format!(
+                "Claude Max subscription unavailable until {}",
+                until.to_rfc3339()
+            )));
         }
         self.health_error()
             .map_or(Ok(checked), |why| Err(Error::ModelAuthError(why)))
@@ -154,13 +195,13 @@ impl ClaudeMaxRuntime {
             cache.checked = Some(Instant::now());
             match result {
                 Ok((subscription, fingerprint)) => {
-                    if cache
-                        .status
-                        .account_fingerprint
-                        .as_ref()
-                        .is_some_and(|previous| previous != &fingerprint)
-                    {
+                    if cache.status.account_fingerprint.as_ref() != Some(&fingerprint) {
                         cache.status.rate_limited_until = None;
+                        cache.status.quota_windows.clear();
+                        cache.status.quota_checked_at = None;
+                        cache.status.quota_error = None;
+                        cache.quota_checked = None;
+                        cache.observed_until = None;
                     }
                     cache.status.subscription = Some(subscription);
                     cache.status.account_fingerprint = Some(fingerprint);
@@ -168,30 +209,115 @@ impl ClaudeMaxRuntime {
                 }
                 Err(why) => {
                     cache.status.subscription = None;
-                    cache.status.account_fingerprint = None;
                     cache.status.error = Some(why);
+                }
+            }
+        }
+        // Auth succeeds even when the subscription has no remaining capacity.
+        // Inspect the CLI's own local usage command before declaring readiness.
+        let probe = {
+            let cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+            cache.status.subscription.is_some()
+                && !cache
+                    .quota_checked
+                    .is_some_and(|at| at.elapsed() < AUTH_TTL)
+        };
+        if probe {
+            let usage = self.read_usage().await;
+            let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+            cache.quota_checked = Some(Instant::now());
+            match usage {
+                Ok(windows) => {
+                    let now = chrono::Utc::now();
+                    cache.status.rate_limited_until =
+                        blocked_until(&windows, self.model.as_deref(), now)
+                            .max(cache.observed_until.filter(|at| *at > now));
+                    cache.status.quota_windows = windows;
+                    cache.status.quota_checked_at = Some(now);
+                    cache.status.quota_error = None;
+                }
+                Err(why) => {
+                    // Retain the last known exhaustion through a transient
+                    // failure. Unknown capacity is never presented as zero used.
+                    cache.status.quota_error = Some(why);
                 }
             }
         }
         self.readiness(true)
     }
 
-    pub fn observe_quota(&self, output: &[u8]) -> bool {
-        let limited = serde_json::from_slice::<Value>(output)
-            .is_ok_and(|event| is_quota_result(&event))
-            || String::from_utf8_lossy(output).lines().any(|line| {
-                serde_json::from_str::<Value>(line).is_ok_and(|event| is_quota_result(&event))
-            });
-        if limited {
-            self.cache
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .status
-                .rate_limited_until = Some(
-                chrono::Utc::now() + chrono::TimeDelta::seconds(QUOTA_BACKOFF.as_secs() as i64),
-            );
+    async fn read_usage(&self) -> Result<BTreeMap<String, ClaudeQuotaWindow>, String> {
+        let mut cmd = Command::new(&self.command);
+        self.isolate(&mut cmd);
+        // Native human-readable dates omit a year and include a timezone.
+        // Pin the probe's timezone/locale instead of guessing the host's offset.
+        cmd.env("TZ", "UTC")
+            .env("LANG", "C")
+            .env("LC_ALL", "C")
+            .current_dir(self.config_dir.clone().unwrap_or_else(std::env::temp_dir))
+            .args([
+                "-p",
+                "/usage",
+                "--output-format",
+                "json",
+                "--tools",
+                "",
+                "--strict-mcp-config",
+                "--mcp-config",
+                "{\"mcpServers\":{}}",
+                "--setting-sources",
+                "",
+                "--no-session-persistence",
+                "--safe-mode",
+                "--max-turns",
+                "1",
+            ])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        let output = tokio::time::timeout(Duration::from_secs(15), cmd.output())
+            .await
+            .map_err(|_| "Claude subscription usage probe timed out")?
+            .map_err(|_| "Claude subscription usage probe could not start")?;
+        if !output.status.success() {
+            return Err("Claude subscription usage probe failed".into());
         }
-        limited
+        let value: Value = serde_json::from_slice(&output.stdout)
+            .map_err(|_| "Claude subscription usage probe returned unreadable data")?;
+        parse_usage(&value, chrono::Utc::now())
+    }
+
+    pub fn observe_quota(&self, output: &[u8]) -> bool {
+        let events = serde_json::from_slice::<Value>(output)
+            .map(|v| vec![v])
+            .unwrap_or_else(|_| {
+                String::from_utf8_lossy(output)
+                    .lines()
+                    .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                    .collect()
+            });
+        let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        let now = chrono::Utc::now();
+        let mut rejected = false;
+        for event in events {
+            if let Some((key, window)) = rate_limit_event(&event) {
+                rejected |= window.exhausted && window.applies(&key, self.model.as_deref());
+                cache.status.quota_windows.insert(key, window);
+                cache.status.quota_checked_at = Some(now);
+            }
+            rejected |= is_quota_result(&event);
+        }
+        let until = blocked_until(&cache.status.quota_windows, self.model.as_deref(), now);
+        if rejected {
+            cache.observed_until = until.or(Some(
+                now + chrono::TimeDelta::seconds(QUOTA_BACKOFF.as_secs() as i64),
+            ));
+            // Re-read /usage on the next auth refresh to obtain any reset the
+            // inference's error envelope did not provide.
+            cache.quota_checked = None;
+        }
+        cache.status.rate_limited_until = until.max(cache.observed_until.filter(|at| *at > now));
+        rejected
     }
 }
 
@@ -244,7 +370,7 @@ impl ClaudeCliProvider {
         input_budget: usize,
     ) -> Self {
         Self {
-            runtime: ClaudeMaxRuntime::new(command, config_dir),
+            runtime: ClaudeMaxRuntime::new(command, config_dir).with_model(Some(&model)),
             model,
             work_dir,
             timeout,
@@ -503,6 +629,7 @@ mod tests {
             br#"{"type":"result","is_error":true,"result":"You've hit your weekly limit"}"#
         ));
         runtime.cache.lock().unwrap().status.subscription = Some("max".into());
+        runtime.cache.lock().unwrap().quota_checked = Some(Instant::now());
         assert!(runtime.health_error().unwrap().contains("cooldown"));
         runtime.cache.lock().unwrap().status.rate_limited_until =
             Some(chrono::Utc::now() - chrono::TimeDelta::seconds(1));
@@ -634,5 +761,174 @@ printf '%s\n' '{inference}'
             ModelCheck::Missing(_)
         ));
         assert!(provider.runtime.status().rate_limited_until.is_some());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_usage_blocks_before_inference_and_survives_failed_reads_and_login_switch() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let cli = dir.path().join("native-cli");
+        std::fs::write(&cli, r#"#!/bin/sh
+if [ "$1" = auth ]; then cat "$CLAUDE_CONFIG_DIR/login.json"; exit 0; fi
+if [ "$1" = -p ] && [ "$2" = /usage ]; then
+ [ "$TZ" = UTC ] || exit 91
+ [ -z "$ANTHROPIC_API_KEY$ANTHROPIC_AUTH_TOKEN$ANTHROPIC_BASE_URL$CLAUDE_CODE_OAUTH_TOKEN" ] || exit 92
+ [ ! -f "$CLAUDE_CONFIG_DIR/fail-usage" ] || exit 1
+ cat "$CLAUDE_CONFIG_DIR/usage.json"; exit 0
+fi
+touch "$CLAUDE_CONFIG_DIR/inference-started"
+exit 93
+"#).unwrap();
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let login = |email: &str| json!({"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty","subscriptionType":"max","email":email});
+        std::fs::write(
+            dir.path().join("login.json"),
+            login("one@example.invalid").to_string(),
+        )
+        .unwrap();
+        let reset = chrono::Utc::now() + chrono::TimeDelta::days(1);
+        let text = format!(
+            "Current session: 15% used\nCurrent week (all models): 100% used · resets {} (UTC)",
+            reset.format("%b %-d at %-I:%M%P")
+        );
+        let usage = |text: &str| json!({"type":"result","local_command":"usage","is_error":false,"num_turns":0,"duration_api_ms":0,"result":text});
+        std::fs::write(dir.path().join("usage.json"), usage(&text).to_string()).unwrap();
+        let provider = ClaudeCliProvider::new(
+            cli,
+            Some(dir.path().into()),
+            "opus".into(),
+            dir.path().into(),
+            Duration::from_secs(3),
+            10_000,
+        );
+        assert!(matches!(
+            provider.check_model().await,
+            ModelCheck::Missing(_)
+        ));
+        assert!(matches!(
+            provider
+                .chat(
+                    &[Message::stamped(
+                        Role::User,
+                        MessageContent::Text("Proceed".into())
+                    )],
+                    &[]
+                )
+                .await,
+            Err(Error::ModelRateLimit(_))
+        ));
+        assert!(!dir.path().join("inference-started").exists());
+        let before = provider.runtime.status();
+        assert_eq!(before.quota_windows["seven_day"].used_percent, Some(100.0));
+        assert!((before.rate_limited_until.unwrap() - chrono::Utc::now()).num_hours() >= 23);
+        // A failed usage read cannot erase known exhaustion.
+        std::fs::write(dir.path().join("fail-usage"), "").unwrap();
+        provider.runtime.cache.lock().unwrap().quota_checked = None;
+        assert!(matches!(
+            provider.runtime.verify_login(true).await,
+            Err(Error::ModelRateLimit(_))
+        ));
+        assert_eq!(
+            provider.runtime.status().rate_limited_until,
+            before.rate_limited_until
+        );
+        assert!(provider.runtime.status().quota_error.is_some());
+        // An authentication failure is distinct from capacity exhaustion;
+        // preserve the dated quota but do not mask the login problem.
+        std::fs::write(
+            dir.path().join("login.json"),
+            json!({"loggedIn":false}).to_string(),
+        )
+        .unwrap();
+        assert!(matches!(
+            provider.runtime.verify_login(true).await,
+            Err(Error::ModelAuthError(_))
+        ));
+        assert!(!provider
+            .runtime
+            .health_error()
+            .unwrap()
+            .contains("usage cooldown"));
+        assert_eq!(
+            provider.runtime.status().rate_limited_until,
+            before.rate_limited_until
+        );
+        // A different account in the same profile cannot inherit this quota.
+        std::fs::remove_file(dir.path().join("fail-usage")).unwrap();
+        std::fs::write(
+            dir.path().join("login.json"),
+            login("two@example.invalid").to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("usage.json"),
+            usage("Current session: 0% used\nCurrent week (all models): 0% used").to_string(),
+        )
+        .unwrap();
+        provider.runtime.verify_login(true).await.unwrap();
+        let after = provider.runtime.status();
+        assert_ne!(before.account_fingerprint, after.account_fingerprint);
+        assert!(after.rate_limited_until.is_none() && after.quota_error.is_none());
+    }
+
+    #[test]
+    fn native_rate_limit_reset_is_retained_and_warning_events_do_not_disable_worker() {
+        let runtime = ClaudeMaxRuntime::new("claude".into(), None).with_model(Some("opus"));
+        runtime.cache.lock().unwrap().status.subscription = Some("max".into());
+        runtime.cache.lock().unwrap().quota_checked = Some(Instant::now());
+        let reset = (chrono::Utc::now() + chrono::TimeDelta::days(1)).timestamp();
+        let event = |status: &str| {
+            json!({"type":"rate_limit_event","rate_limit_info":{"status":status,"rateLimitType":"seven_day","resetsAt":reset,"utilization":0.95}}).to_string()
+        };
+        assert!(!runtime.observe_quota(event("allowed_warning").as_bytes()));
+        assert!(runtime.health_error().is_none());
+        assert!(runtime.observe_quota(event("rejected").as_bytes()));
+        assert_eq!(
+            runtime.status().rate_limited_until.unwrap().timestamp(),
+            reset
+        );
+        assert!(runtime
+            .observe_quota(br#"{"type":"result","is_error":true,"result":"Usage limit reached"}"#));
+        assert_eq!(
+            runtime.status().rate_limited_until.unwrap().timestamp(),
+            reset
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn verified_login_is_not_ready_while_the_first_usage_read_is_pending() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let cli = dir.path().join("cli");
+        std::fs::write(&cli,r#"#!/bin/sh
+if [ "$1" = auth ]; then
+ printf '%s\n' '{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty","subscriptionType":"max","email":"pending@example.invalid"}'
+ exit 0
+fi
+touch "$CLAUDE_CONFIG_DIR/usage-started"
+while [ ! -f "$CLAUDE_CONFIG_DIR/release" ]; do sleep 0.01; done
+printf '%s\n' '{"type":"result","local_command":"usage","is_error":false,"num_turns":0,"duration_api_ms":0,"result":"Current session: 0% used\nCurrent week (all models): 0% used"}'
+"#).unwrap();
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let runtime = std::sync::Arc::new(ClaudeMaxRuntime::new(cli, Some(dir.path().into())));
+        let probe = runtime.clone();
+        let task = tokio::spawn(async move { probe.verify_login(true).await });
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !dir.path().join("usage-started").exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(runtime.status().subscription.as_deref(), Some("max"));
+        assert!(runtime
+            .health_error()
+            .unwrap()
+            .contains("has not completed"));
+        std::fs::write(dir.path().join("release"), "").unwrap();
+        task.await.unwrap().unwrap();
+        assert!(runtime.health_error().is_none());
     }
 }
