@@ -31,7 +31,15 @@ pub(super) fn blocked_until(
         .iter()
         .filter(|(key, w)| w.exhausted && w.applies(key, model))
         .filter_map(|(_, w)| match w.resets_at {
-            Some(at) => DateTime::from_timestamp(at, 0).filter(|at| *at > now),
+            Some(at) => DateTime::from_timestamp(at, 0).map(|at| {
+                // Native text has minute-resolution dates. A rounded or stale
+                // reset passing is not proof that quota has become available.
+                if at > now {
+                    at
+                } else {
+                    now + chrono::TimeDelta::minutes(5)
+                }
+            }),
             None => Some(now + chrono::TimeDelta::minutes(5)),
         })
         .max()
@@ -208,7 +216,12 @@ mod tests {
             blocked_until(&windows, Some("opus"), now()),
             Some("2026-10-14T22:59:00Z".parse().unwrap())
         );
-        assert!(blocked_until(&windows, None, "2026-10-14T23:01:00Z".parse().unwrap()).is_none());
+        assert!(blocked_until(&windows, None, "2026-10-14T23:01:00Z".parse().unwrap()).is_some());
+        let mut refreshed = windows.clone();
+        let weekly = refreshed.get_mut("seven_day").unwrap();
+        weekly.used_percent = Some(0.0);
+        weekly.exhausted = false;
+        assert!(blocked_until(&refreshed, None, "2026-10-14T23:01:00Z".parse().unwrap()).is_none());
         let serialized = serde_json::to_string(&windows).unwrap();
         assert!(!serialized.contains("local sessions"));
     }

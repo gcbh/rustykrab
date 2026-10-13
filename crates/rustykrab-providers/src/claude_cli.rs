@@ -101,7 +101,11 @@ impl ClaudeMaxRuntime {
             .rate_limited_until
             .is_some_and(|until| until <= chrono::Utc::now())
         {
-            status.rate_limited_until = None;
+            status.rate_limited_until = blocked_until(
+                &status.quota_windows,
+                self.model.as_deref(),
+                chrono::Utc::now(),
+            );
         }
         status
     }
