@@ -330,8 +330,8 @@ pub fn prune_older_than(root: &Path, older_than: Duration) -> Vec<PathBuf> {
     removed
 }
 
-/// Choose the newest commit only when all candidates form one ancestry chain.
-/// Incomparable verified branches need integration; silently choosing loses work.
+/// Preserve every verified candidate, integrating independent branches when Git
+/// can merge them without conflicts. Neither HEAD nor the checkout is changed.
 pub fn continuation_base(repo: &Path, head: &str, commits: &[String]) -> Result<String, String> {
     let mut base = head.to_owned();
     for commit in commits {
@@ -348,10 +348,110 @@ pub fn continuation_base(repo: &Path, head: &str, commits: &[String]) -> Result<
         if is_ancestor(repo, &base, &commit)? {
             base = commit;
         } else if !is_ancestor(repo, &commit, &base)? {
-            return Err(format!("project history diverges at {base} and {commit}; integrate these branches before continuing"));
+            base = integrate_base(repo, &base, &commit)?;
         }
     }
     Ok(base)
+}
+
+/// Keep a clean integration reachable independently of a lease or worker run.
+/// The cache key pins both parents; a cached commit must still match the merge
+/// tree and parents. Conflict resolution remains explicit, never guessed.
+fn integrate_base(repo: &Path, base: &str, commit: &str) -> Result<String, String> {
+    // Configured merge drivers can run repository-controlled commands. Disable
+    // them and renormalization: preparation may create Git objects, never run
+    // project code. A driver-dependent merge remains a visible conflict.
+    let drivers = git(
+        repo,
+        &[
+            "config",
+            "--name-only",
+            "--get-regexp",
+            r"^merge\..*\.driver$",
+        ],
+    )?;
+    if !drivers.status.success() && drivers.status.code() != Some(1) {
+        return Err(format!(
+            "cannot inspect project merge drivers: {}",
+            stderr(&drivers)
+        ));
+    }
+    let mut options = vec!["-c".to_string(), "merge.renormalize=false".to_string()];
+    if drivers.status.success() {
+        for key in stdout(&drivers).lines() {
+            options.extend(["-c".into(), format!("{key}=false")]);
+        }
+    }
+    options.extend([
+        "merge-tree".into(),
+        "--write-tree".into(),
+        base.into(),
+        commit.into(),
+    ]);
+    let merged = git(
+        repo,
+        &options.iter().map(String::as_str).collect::<Vec<_>>(),
+    )?;
+    if !merged.status.success() {
+        return Err(format!(
+            "project history diverges at {base} and {commit}; automatic integration has conflicts: {}",
+            if merged.status.code() == Some(1) {
+                stdout(&merged)
+            } else {
+                stderr(&merged)
+            }
+        ));
+    }
+    let tree = stdout(&merged)
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .to_owned();
+    let reference = format!("refs/rustykrab/handoffs/{base}/{commit}");
+    let cached = git(repo, &["rev-parse", "--verify", "--quiet", &reference])?;
+    if cached.status.success() {
+        let cached = stdout(&cached);
+        let identity = git(repo, &["show", "-s", "--format=%T%n%P", &cached])?;
+        if identity.status.success() && stdout(&identity) == format!("{tree}\n{base} {commit}") {
+            return Ok(cached);
+        }
+        return Err(format!(
+            "project integration reference {reference} does not match its verified parents"
+        ));
+    }
+    let message = format!("Integrate verified project history {base} and {commit}");
+    let created = git(
+        repo,
+        &[
+            "-c",
+            "user.name=RustyKrab",
+            "-c",
+            "user.email=rustykrab@localhost",
+            "commit-tree",
+            &tree,
+            "-p",
+            base,
+            "-p",
+            commit,
+            "-m",
+            &message,
+        ],
+    )?;
+    if !created.status.success() {
+        return Err(format!(
+            "cannot record project integration: {}",
+            stderr(&created)
+        ));
+    }
+    let integration = stdout(&created);
+    require(
+        git(
+            repo,
+            &["update-ref", &reference, &integration, &"0".repeat(40)],
+        )?,
+        "retain project integration",
+    )?;
+    Ok(integration)
 }
 
 pub fn is_ancestor(repo: &Path, ancestor: &str, descendant: &str) -> Result<bool, String> {
@@ -653,7 +753,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_continuation_preserves_all_verified_commits_or_refuses_divergence() {
+    fn a_continuation_integrates_independent_verified_commits_without_moving_head() {
         let repo = Repo::new();
         let root = tempfile::tempdir().unwrap();
         let ws = workspace(&repo, root.path());
@@ -668,14 +768,86 @@ pub(crate) mod tests {
         );
         std::fs::write(repo.path().join("other.txt"), "other").unwrap();
         let divergent = commit_all(repo.path(), "other branch");
-        assert!(
-            continuation_base(repo.path(), &ws.base, &[first, divergent])
-                .unwrap_err()
-                .contains("diverges")
+        let candidates = [second.clone(), divergent.clone()];
+        let integrated = continuation_base(repo.path(), &divergent, &candidates).unwrap();
+        assert!(is_ancestor(repo.path(), &second, &integrated).unwrap());
+        assert!(is_ancestor(repo.path(), &divergent, &integrated).unwrap());
+        assert_eq!(head(repo.path()).unwrap(), divergent);
+        assert_eq!(run_git(repo.path(), &["status", "--short"]), "");
+        assert_eq!(
+            continuation_base(repo.path(), &divergent, &candidates).unwrap(),
+            integrated,
+            "rechecking the same history reuses the retained integration"
+        );
+        assert_eq!(
+            run_git(repo.path(), &["show", &format!("{integrated}:first.txt")]),
+            "first"
+        );
+        assert_eq!(
+            run_git(repo.path(), &["show", &format!("{integrated}:second.txt")]),
+            "second"
+        );
+        assert_eq!(
+            run_git(repo.path(), &["show", &format!("{integrated}:other.txt")]),
+            "other"
         );
         assert!(continuation_base(repo.path(), &ws.base, &["f".repeat(40)])
             .unwrap_err()
             .contains("no longer available"));
+        ws.remove().unwrap();
+    }
+
+    #[test]
+    fn conflicting_verified_history_stays_unresolved_without_changing_the_checkout() {
+        let repo = Repo::new();
+        let root = tempfile::tempdir().unwrap();
+        let ws = workspace(&repo, root.path());
+        ws.create().unwrap();
+        std::fs::write(ws.path.join("src/lib.rs"), "pub fn left() {}\n").unwrap();
+        let left = commit_all(&ws.path, "left");
+        std::fs::write(repo.path().join("src/lib.rs"), "pub fn right() {}\n").unwrap();
+        let right = commit_all(repo.path(), "right");
+        let why = continuation_base(repo.path(), &right, &[left]).unwrap_err();
+        assert!(why.contains("automatic integration has conflicts"), "{why}");
+        assert_eq!(head(repo.path()).unwrap(), right);
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("src/lib.rs")).unwrap(),
+            "pub fn right() {}\n"
+        );
+        assert_eq!(run_git(repo.path(), &["status", "--short"]), "");
+        ws.remove().unwrap();
+    }
+
+    #[test]
+    fn automatic_integration_never_runs_configured_merge_drivers() {
+        let repo = Repo::new();
+        let root = tempfile::tempdir().unwrap();
+        let marker = root.path().join("driver-ran");
+        std::fs::write(
+            repo.path().join(".gitattributes"),
+            "src/lib.rs merge=probe\n",
+        )
+        .unwrap();
+        commit_all(repo.path(), "merge attribute");
+        run_git(
+            repo.path(),
+            &[
+                "config",
+                "merge.probe.driver",
+                &format!("touch '{}' && true", marker.display()),
+            ],
+        );
+        let ws = workspace(&repo, root.path());
+        ws.create().unwrap();
+        std::fs::write(ws.path.join("src/lib.rs"), "pub fn left() {}\n").unwrap();
+        let left = commit_all(&ws.path, "left");
+        std::fs::write(repo.path().join("src/lib.rs"), "pub fn right() {}\n").unwrap();
+        let right = commit_all(repo.path(), "right");
+        assert!(continuation_base(repo.path(), &right, &[left]).is_err());
+        assert!(
+            !marker.exists(),
+            "repository merge driver must never execute"
+        );
         ws.remove().unwrap();
     }
 

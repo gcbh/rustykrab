@@ -152,3 +152,55 @@ and required tools/MCP, trigger and preconditions. Controller tests demonstrate
 one-time approvals, changed scopes, daily limits and revocation remain held while
 matching automatic proposals use an audited policy actor. These tests establish
 permission behavior, not the usefulness of future self-generated work.
+
+## Project-handoff recovery (base f1affb8)
+
+An October 13 read-only audit found 34 open legacy whole-history size questions
+and 10 open branch-divergence questions in the active manager store. The size
+projection fix had shipped, but the sweep never revalidated its old holds.
+One verified documentation commit on an independent branch prevented all later
+project coding work from starting; answering continue repeated the question.
+
+The workspace helper now retains a conflict-free integration of the verified
+parents without touching repository HEAD or the checkout. The sweep rechecks
+controller-owned technical handoffs every 30 seconds and obsoletes resolved
+questions without inventing user answers. Real-Git/SQLite regression tests cover
+history preservation and replay, legacy-hold recovery, retained oversized current
+requirements and independent user decisions. Actual conflicts and missing commits
+remain unresolved. No table, execution backend or permission grant is added.
+
+
+## Failure prerequisites and inherited urgency (2026-10-13)
+
+Against local handoff-recovery base `c4c7d27`, an order-3 internal item was
+background work: it could be reused but the failing original immediately
+continued the ladder. Ready selection used only each item's stored priority.
+The follow-up creates or reuses the internal prerequisite and validates its
+blocking edge atomically; the original waits until completion and resumes with
+the prerequisite's evidence. Unknown failures first request diagnosis, while
+known recurring failures request a cause repair.
+
+Priority is derived transitively from interested open dependents and parent
+gates, with distinct waiter count breaking ties. Stored priorities are unchanged;
+closing or disabling a waiter removes its donation. Real-store controller
+regressions cover creation, reuse, concurrent failures, restart persistence,
+self-dependency rejection and scheduling ahead of unrelated work. Pure graph
+regressions cover transitive urgency, distinct diamond fan-in, parent gates,
+inactive donors and corrupt-cycle termination. This is local regression
+evidence; it does not claim a production deployment.
+
+The review also corrected older prose that claimed an internal repair receives
+a controller-created code worktree. `plan_workspace` currently applies only to
+`WorkKind::Code`; internal work inherits repository scope and constraints. The
+new prerequisite behavior does not change that existing workspace boundary.
+
+Hosted E2E validation caught a missing stand-in response for recurring timeout
+repair work. Scenario 32 consequently waited on the new prerequisite instead
+of reaching its required failed sibling. The fixture now completes the
+simulated prerequisite while retaining the original failure trigger; the
+restart, cascade, lease and single-notification assertions remain required.
+
+A raw-timeout fixture trigger also matched notification text outside a worker
+run, replacing the expected human message. The final trigger matches the
+generated recurring-repair objective; the isolated restart/cascade/notification
+scenario passes with its original assertions.

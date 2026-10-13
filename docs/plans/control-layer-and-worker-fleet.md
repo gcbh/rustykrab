@@ -968,10 +968,25 @@ rung; the controller does, from the error class (section 9).
 | 2a | Acquire a capability | `needs_tool` where the tool exists: load it. Credential, consent, install, compute: file a `capability` item with the matching trigger and park the work | one capability item per gap |
 | 2b | Build a capability | No tool exists for the need: file a `capability` item of kind build (a tool, skill, MCP adapter, or worker adapter), execute it through the delivery pipeline, then resume the original item | one build per gap, bounded cost |
 | 2c | Request more capability | The gap is capacity (context, model size, a coding agent, GPU on a peer): file a request routed by policy, e.g. escalate the worker kind, add a peer, or ask the user to enable a resource | one request per gap |
-| 3 | Improve the system | The failure recurs with the same fingerprint, or could not be classified: file an `internal` item (section 9 and 10) and continue with the best available rung | rate-limited |
+| 3 | Resolve the cause or diagnosis | The failure recurs with the same fingerprint, or could not be classified: reuse or create an `internal` prerequisite (section 9 and 10), wait for it, then retry with its evidence | bounded by rung budget and resolution depth |
 | 4 | Surface | Only when a decision is outside delegated judgment, only the user can supply the need, or the budgets above are spent | always allowed |
 
 Rules:
+
+- Resolution work is created when absent and shared when the same failure
+  fingerprint and repository already have an open executable prerequisite,
+  regardless of its work kind or display title. Unknown errors
+  request a diagnosis, not an invented cause fix. A validated blocking edge
+  makes the original wait; rejection continues its remaining ladder. Recursive
+  diagnosis creation uses the graph depth cap, and all filings retain normal
+  validation and approval policy.
+- Scheduling uses effective priority: prerequisites inherit the highest base
+  priority of interested open dependents, transitively through unmet ordering
+  edges and parent gates. Distinct waiter count breaks equal-priority ties before
+  age and id. Stored priorities are unchanged; boosts disappear when their
+  waiters close, expire, are held for approval or are no longer due. This does
+  not preempt running work or bypass readiness, worker eligibility or resource
+  locks.
 
 - Second-order moves are first-class work. "Build the tool" and "request the
   capability" are `capability` items with their own lifecycle and

@@ -18,7 +18,7 @@
 //!    then readiness (time triggers), roll-ups and parent verification are
 //!    settled.
 //! 2. **Reconcile** (step 5 and section 5): each finished run is verified
-//!    (a `code` result against git), its evidence attached and its typed
+//!    (repository-scoped work and Git claims against git), its evidence attached and its typed
 //!    transition, cascade, `discovered` filings and ladder rungs written in
 //!    one transaction; the producing worker's routing record is written
 //!    after it. A run the host ended on its way down
@@ -27,12 +27,12 @@
 //!    rung climbed and no repair counted.
 //! 3. **Select, match, lease and run** (steps 1 to 4), skipped while the
 //!    controller is draining ([`ControlHandle::set_draining`]): ready leaves by
-//!    priority, the single-writer rule over every active item, the
+//!    effective priority inherited from open dependents, then the number of
+//!    distinct waiters, the single-writer rule over every active item, the
 //!    local-model rule of 12.1 (one run per local model, and none while
 //!    [`ModelActivity`] says an interactive turn holds it), the cheapest
-//!    tier of healthy workers that cover the item and that routing
-//!    qualifies for its class (waiting for that tier when it is busy); the
-//!    lease carries the fan-in inputs of 4.3 and 6.3 and, for a `code`
+//!    available compatible resource by cost, without category gates; the
+//!    lease carries the fan-in inputs of 4.3 and 6.3 and, for a repository-scoped
 //!    item, its workspace, and the run is spawned under tokio. A run that
 //!    ends or is stopped has its spend recorded (`spend.rs`).
 //! 4. **Aging** (4.6), when nothing is running.
@@ -427,6 +427,8 @@ struct State {
     spent: Option<HashMap<WorkItemId, Spend>>,
     /// When the last aging pass ran, for `aging_max_gap`.
     last_aged: Option<DateTime<Utc>>,
+    /// Avoid rebuilding every parked project's history on every loop tick.
+    last_handoff_recheck: Option<DateTime<Utc>>,
     /// When the last tick that completed finished.
     last_tick: Option<DateTime<Utc>>,
     /// When the last failed tick gave up, and its error class.
@@ -496,6 +498,7 @@ impl Controller {
                 learned: Vec::new(),
                 spent: None,
                 last_aged: None,
+                last_handoff_recheck: None,
                 last_tick: None,
                 last_failure: None,
                 consecutive_failures: 0,

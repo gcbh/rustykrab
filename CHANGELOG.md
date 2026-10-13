@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [6.5.0] - 2026-10-13
+
+- feat: create and prioritize failure prerequisites (#686)
+
 ## [6.4.11] - 2026-10-13
 
 - docs: align Claude quota guidance with native usage checks (#685)

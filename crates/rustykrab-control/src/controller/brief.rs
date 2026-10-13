@@ -2,7 +2,7 @@
 //! and its fan-in block.
 //!
 //! The inputs block copies, from each item in `inputs_from` and each
-//! `capability` item the ladder parked the item behind (section 8: the
+//! `capability` or `internal` prerequisite the ladder parked the item behind (section 8: the
 //! original resumes with what the build produced), pointers only:
 //! its verified evidence refs and artifact refs, its closed status, one
 //! line of its result summary and, for a failed input, its error. A parent
@@ -67,7 +67,7 @@ impl Controller {
         let max = self.config.caps.max_inputs as usize;
         let budget = self.config.caps.max_input_tokens as usize;
         let mut spent = 0usize;
-        // The capability items the ladder parked this item behind are
+        // The capability and resolution items the ladder parked this item behind are
         // inputs too, once done: the resumed run starts from what the
         // build or acquisition reported (section 8).
         let capabilities: Vec<WorkItemId> = snap
@@ -75,8 +75,13 @@ impl Controller {
             .filter(|e| e.kind == EdgeKind::Blocks)
             .filter(|e| !item.inputs_from.contains(&e.depends_on))
             .filter(|e| {
-                snap.item(&e.depends_on)
-                    .is_some_and(|u| u.kind == WorkKind::Capability && u.status == Status::Done)
+                snap.item(&e.depends_on).is_some_and(|u| {
+                    (matches!(u.kind, WorkKind::Capability | WorkKind::Internal)
+                        || u.artifact_refs
+                            .iter()
+                            .any(|r| r.kind == "failure_fingerprint"))
+                        && u.status == Status::Done
+                })
             })
             .map(|e| e.depends_on.clone())
             .collect();

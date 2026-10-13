@@ -39,7 +39,7 @@ use super::questions::NewQuestion;
 use super::{Controller, Finished, Run, RunResult};
 
 /// Moves the ladder may make on one failure before it must surface: the
-/// improve and skipped-switch rungs continue the climb, the rest end it.
+/// rejected-prerequisite and skipped-switch rungs continue the climb.
 const MAX_CLIMB: usize = 16;
 
 /// Who verified a claim: git for a commit and its paths, the host's
@@ -534,6 +534,19 @@ impl Controller {
         let waiting = self.waiting_questions().await?;
         self.sweep_questions(&mut b, &waiting).await?;
         changed.extend(self.wake_on_credentials(&mut b, &waiting));
+        let recheck_handoffs = {
+            let mut state = self.state();
+            let due = state
+                .last_handoff_recheck
+                .is_none_or(|last| now.signed_duration_since(last) >= TimeDelta::seconds(30));
+            if due {
+                state.last_handoff_recheck = Some(now);
+            }
+            due
+        };
+        if recheck_handoffs {
+            changed.extend(self.recover_project_context_holds(&mut b, &waiting).await?);
+        }
 
         // Availability is queue waiting, never a failed attempt. Recover
         // historical holds without requiring a resource to be available yet.
@@ -1340,11 +1353,35 @@ impl Controller {
             }
             match decision {
                 Decision::Improve { .. } => {
-                    let outcome = match self.file_internal(b, item, &error) {
-                        Ok(filed) => format!("filed internal item {filed}"),
-                        Err(why) => format!("internal item not filed: {why}"),
-                    };
-                    self.rung(b, &id, &mut state, rung, &error, outcome);
+                    // Release the finished run before attaching a prerequisite.
+                    // Graph validation rejects self-dependencies and cycles.
+                    let changed = b.move_to(
+                        &id,
+                        Status::Queued,
+                        "controller",
+                        "waiting for failure resolution",
+                    );
+                    match self.file_internal(b, item, &error) {
+                        Ok(filed) => {
+                            self.rung(
+                                b,
+                                &id,
+                                &mut state,
+                                rung,
+                                &error,
+                                format!("waiting on resolution item {filed}"),
+                            );
+                            return Ok(changed.into_iter().chain([filed]).collect());
+                        }
+                        Err(why) => self.rung(
+                            b,
+                            &id,
+                            &mut state,
+                            rung,
+                            &error,
+                            format!("resolution item not filed: {why}"),
+                        ),
+                    }
                 }
                 Decision::SwitchWorker
                     if !self.has_alternative(item, class.as_deref(), &excluded, floor) =>
@@ -1687,9 +1724,14 @@ impl Controller {
             .filter(|i| i.status == Status::Ready && !snap.has_children(&i.id))
             .cloned()
             .collect();
+        let priorities = graph::scheduling_priorities(&snap, self.clock.now());
         ready.sort_by(|a, b| {
-            b.priority
-                .cmp(&a.priority)
+            let a_rank = &priorities[&a.id];
+            let b_rank = &priorities[&b.id];
+            b_rank
+                .priority
+                .cmp(&a_rank.priority)
+                .then_with(|| b_rank.waiters.cmp(&a_rank.waiters))
                 .then_with(|| a.created_at.cmp(&b.created_at))
                 .then_with(|| a.id.cmp(&b.id))
         });
@@ -1849,7 +1891,7 @@ impl Controller {
     }
 
     /// Pin project code to the newest verified ancestor chain, otherwise repository HEAD.
-    async fn plan_workspace(
+    pub(super) async fn plan_workspace(
         &self,
         item: &WorkItem,
         run: &str,

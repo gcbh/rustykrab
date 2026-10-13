@@ -14,8 +14,9 @@
 //! 2. Order 3, `improve`, when the fingerprint has recurred to the promotion
 //!    threshold or the error is `unknown`, once per fingerprint and within
 //!    the item's improvement budget. It files an `internal` item and does not
-//!    stop the ladder: the next call returns the rung it would otherwise
-//!    have chosen.
+//!    finish the original item: the controller creates or reuses a prerequisite
+//!    and waits for it. After it lands, another failure continues from the
+//!    remaining rungs; a rejected prerequisite continues the climb immediately.
 //! 3. A need only the user can meet counts as order 4 (6.4): plan B if the
 //!    item has one, else the item parks in its typed blocked state and the
 //!    parent asks. It is never re-planned around.

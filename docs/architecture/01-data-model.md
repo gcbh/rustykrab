@@ -564,6 +564,17 @@ is the truth; `trigger_at` copies its `at(time)` instant for the timer sweep.
 Every time is RFC 3339 UTC with nanoseconds at a fixed width, so text order is
 time order and a round trip is exact.
 
+`priority` is the item's base priority. The scheduler derives effective urgency
+from unmet `blocks`/`waits_for` edges and parent gates on each pass: prerequisites
+inherit the highest priority of interested open work, with the number of distinct
+waiters breaking ties before creation time. It does not rewrite the base column;
+closed, expired, future-triggered and approval-held donors contribute nothing.
+Closing the last interested waiter removes its boost without a cleanup write.
+Failure-resolution `internal` items carry a `failure_fingerprint` artifact for
+stable reuse within the same repository; the title remains a legacy fallback.
+The `resolution_depth` artifact carries the bounded depth of diagnosis creation.
+Creation/reuse and the blocking edge pass the existing validator atomically.
+
 **Edges are rows, not JSON.** The primary key of `work_item_deps` answers
 "what does this item wait on"; `idx_work_item_deps_upstream` answers "what
 depends on this item", which every transition asks. Re-pointing (a plan B
@@ -914,6 +925,12 @@ worker's summary. `workspace` records pin the corresponding verified code base.
 Receipts, questions and verified evidence outlive archive compaction. A new run
 joins those records to immutable project revisions and live/archive statuses;
 only done work's git-verified commits become continuation candidates.
+
+Cleanly merged continuation candidates are retained as namespaced Git refs,
+not new work rows or a claim that the combined code passed checks. The existing
+workspace receipt pins that integration base. Revalidation settles a repaired
+controller handoff question as obsolete (no answer or delegated decision) and
+queues its work in the same work transaction; other open decisions remain held.
 
 Unfinished-attempt records point to controller-owned run/workspace evidence and
 classified errors, not model-written workspace artifacts. Monitor, verifier and

@@ -327,8 +327,8 @@ async fn scenario_14_an_unclassifiable_failure_files_an_internal_item_with_its_e
         .artifact_refs
         .iter()
         .any(|r| r.kind == "item" && r.value == x));
-    // Order 3 files the improvement and the ladder goes on: a repair.
-    assert_eq!(h.rungs(&x).await, vec![Rung::Improve, Rung::Repair]);
+    // Order 3 is now a prerequisite: retry only after the diagnosis lands.
+    assert_eq!(h.rungs(&x).await, vec![Rung::Improve]);
 
     h.drain().await;
     assert_eq!(h.status(&x).await, Status::Done);
@@ -379,6 +379,8 @@ async fn scenario_14_the_internal_items_rule_lands_after_replay_and_classifies_t
     }
     let x = h.file_one(draft("x", "Reconcile the ledger")).await;
     h.step().await;
+    // The prioritized prerequisite would otherwise start in this same tick.
+    h.ctl.set_draining(true);
     h.step().await;
     assert_eq!(
         first_error(&h.events(&x).await).class,
@@ -393,6 +395,7 @@ async fn scenario_14_the_internal_items_rule_lands_after_replay_and_classifies_t
     h.script
         .push(&fix.title, landing("process: nothing like this"));
     h.script.push(&fix.title, landing("process: e2e-zqx-17"));
+    h.ctl.set_draining(false);
     h.drain().await;
     assert_eq!(h.status(&fix.id).await, Status::Done);
     let refused = first_error(&h.events(&fix.id).await);

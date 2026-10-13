@@ -707,11 +707,9 @@ impl Controller {
             .unwrap_or_else(|| accepted.root.clone()))
     }
 
-    /// Order 3 (sections 8 and 9): the `internal` item for `error`, with
-    /// the failing item as evidence. It runs where the failing item ran:
-    /// it takes that item's `repo:` resources, worker constraint and
-    /// constraints ([`inherit_internal`]). An open one for the same
-    /// fingerprint in the same repository is reused.
+    /// Order 3: create or reuse the failure's prerequisite, with a validated
+    /// blocking edge and the failing item as evidence. An open repair for the
+    /// same fingerprint and repository is shared by every waiting item.
     pub(super) fn file_internal(
         &self,
         b: &mut Batch,
@@ -722,8 +720,93 @@ impl Controller {
             kind: "item".to_string(),
             value: item.id.clone(),
         }];
-        let draft = inherit_internal(item, &internal_item_draft(error, evidence));
-        self.file_system_item(b, draft, item.origin_conversation_id.clone())
+        let mut draft = inherit_internal(item, &internal_item_draft(error, evidence));
+        let repos = repos_of(&draft.writable_resources);
+        let existing =
+            b.snap
+                .items()
+                .iter()
+                .find(|i| {
+                    i.kind != WorkKind::Proposal
+                        && !i.status.is_closed()
+                        && (i.artifact_refs.iter().any(|r| {
+                            r.kind == "failure_fingerprint" && r.value == error.fingerprint
+                        }) || (i.kind == WorkKind::Internal && i.title == draft.title))
+                        && repos_of(&i.writable_resources) == repos
+                })
+                .cloned();
+        if existing.is_none() {
+            let depth = item
+                .artifact_refs
+                .iter()
+                .filter(|r| r.kind == "resolution_depth")
+                .map(|r| {
+                    r.value
+                        .parse::<u32>()
+                        .map_err(|_| "invalid resolution depth".to_string())
+                })
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .max()
+                .unwrap_or(0);
+            if depth >= self.config.caps.max_depth {
+                return Err(
+                    "failure-resolution depth limit reached; continue the remaining ladder".into(),
+                );
+            }
+            draft.artifact_refs.push(ArtifactRef {
+                kind: "resolution_depth".into(),
+                value: (depth + 1).to_string(),
+            });
+        }
+        let tmp = "resolution".to_string();
+        draft.tmp = Some(tmp.clone());
+        let upstream = existing.as_ref().map_or_else(
+            || ItemRef::Tmp { tmp: tmp.clone() },
+            |i| ItemRef::Id(i.id.clone()),
+        );
+        let plan = WorkPlan {
+            root: upstream.clone(),
+            items: if existing.is_some() {
+                Vec::new()
+            } else {
+                vec![draft.clone()]
+            },
+            edges: vec![PlanEdge {
+                item: ItemRef::Id(item.id.clone()),
+                kind: EdgeKind::Blocks,
+                depends_on: upstream,
+            }],
+            rationale: format!(
+                "Resolve failure {} before retrying {}",
+                error.fingerprint, item.id
+            ),
+        };
+        let provenance = Provenance {
+            conversation_id: item.origin_conversation_id.clone(),
+            filed_by_item: Some(item.id.clone()),
+            actor: "controller".into(),
+        };
+        let accepted = self
+            .file_into(b, &plan, &provenance, FilingSource::Ladder)
+            .map_err(|r| describe_rejection(&r))?;
+        let id = accepted.root.clone();
+        if let Some(existing) = existing {
+            for artifact in draft
+                .artifact_refs
+                .into_iter()
+                .filter(|r| !existing.artifact_refs.contains(r))
+            {
+                if let Some(row) = b.snap.item_mut(&id) {
+                    row.artifact_refs.push(artifact.clone());
+                }
+                b.ops.push(WorkOp::AddArtifactRef {
+                    item: id.clone(),
+                    artifact,
+                });
+            }
+        }
+        Ok(id)
     }
 
     /// A controller defect found at resume (6.7 and section 9): stored
@@ -1155,10 +1238,9 @@ fn inherit_from(filer: &WorkItem, draft: &WorkItemDraft) -> WorkItemDraft {
 }
 
 /// The ladder's `internal` item for a failure of `failing`: its repository
-/// and worker as [`inherit_from`] gives a discovered draft, and the failing
-/// item's constraints after its own, so a worker runs it in a worktree of
-/// the same repository under the same rules instead of in an empty
-/// scratch directory.
+/// scope as [`inherit_from`] gives a discovered draft, and the failing
+/// item's constraints after its own, retaining the repository scope and rules
+/// in worker eligibility and the repair instructions.
 fn inherit_internal(failing: &WorkItem, draft: &WorkItemDraft) -> WorkItemDraft {
     inherit_from(failing, draft)
 }
