@@ -199,3 +199,8 @@ repair work. Scenario 32 consequently waited on the new prerequisite instead
 of reaching its required failed sibling. The fixture now completes the
 simulated prerequisite while retaining the original failure trigger; the
 restart, cascade, lease and single-notification assertions remain required.
+
+A raw-timeout fixture trigger also matched notification text outside a worker
+run, replacing the expected human message. The final trigger matches the
+generated recurring-repair objective; the isolated restart/cascade/notification
+scenario passes with its original assertions.
