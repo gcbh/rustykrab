@@ -305,7 +305,7 @@ mod tests {
     }
 
     #[test]
-    fn the_import_passes_the_validator_as_the_delivery_import_only() {
+    fn the_import_uses_normal_validation_without_category_restrictions() {
         let plan = plan_of(&manifest(false), Budget::default());
         let snap = Snapshot::new(Vec::new(), Vec::new());
         let ctx = FilingContext::new(FilingSource::DeliveryImport, Utc::now());
@@ -315,8 +315,10 @@ mod tests {
         }
         let planner = FilingContext::new(FilingSource::Planner, Utc::now());
         match validate(&snap, &plan, &planner) {
-            Validation::Rejected(r) => assert!(r.has(RejectionReason::KindNotAllowed)),
-            Validation::Accepted(_) => panic!("a planner filed a code graph"),
+            Validation::Accepted(accepted) => assert_eq!(accepted.items.len(), 6),
+            Validation::Rejected(rejection) => {
+                panic!("a legacy label restricted filing: {rejection:?}")
+            }
         }
     }
 

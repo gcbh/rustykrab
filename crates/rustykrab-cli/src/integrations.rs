@@ -5,9 +5,11 @@ use rustykrab_agent::{LocalWorker, ProcessSandbox, RunTranscripts};
 use rustykrab_control::worker::{Brief, RunUsage, Worker, WorkerCapabilities};
 use rustykrab_core::model::ModelProvider;
 use rustykrab_core::types::ToolSchema;
+#[cfg(test)]
+use rustykrab_core::work::WorkKind;
 use rustykrab_core::work::{
     ArtifactRef, ErrorClass, ErrorSubclass, PlanOutcome, ResultReport, WorkError, WorkItem,
-    WorkItemDraft, WorkItemId, WorkKind, WorkPlan, WorkerKind,
+    WorkItemDraft, WorkItemId, WorkPlan, WorkerKind,
 };
 use rustykrab_core::{AgentDefinition, Error, Result, SandboxRequirements, Tool};
 use rustykrab_tools::work_backend::{
@@ -428,11 +430,9 @@ impl Worker for IntegrationWorker {
         caps
     }
     fn accepts(&self, item: &WorkItem) -> bool {
-        matches!(item.kind, WorkKind::Personal | WorkKind::Research)
-            && item
-                .required_tools
-                .iter()
-                .any(|name| EXECUTION_TOOLS.contains(&name.as_str()))
+        item.required_tools
+            .iter()
+            .any(|name| EXECUTION_TOOLS.contains(&name.as_str()))
             && item
                 .writable_resources
                 .iter()

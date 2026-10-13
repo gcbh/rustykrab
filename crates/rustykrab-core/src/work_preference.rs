@@ -64,7 +64,17 @@ impl WorkTemplate {
     pub fn matches(&self, candidate: &Self) -> bool {
         let mut candidate = candidate.clone();
         candidate.example_item = self.example_item.clone();
-        self == &candidate
+        let mut reviewed = self.clone();
+        // Legacy task labels and backend pins have no execution semantics.
+        // Approval still requires the same objective, tools, resources,
+        // constraints, budget and internal lifecycle facets.
+        for template in [&mut reviewed, &mut candidate] {
+            if !matches!(template.kind, WorkKind::Proposal | WorkKind::Capability) {
+                template.kind = WorkKind::Task;
+            }
+            template.worker_kind = WorkerKind::Any;
+        }
+        reviewed == candidate
     }
 }
 

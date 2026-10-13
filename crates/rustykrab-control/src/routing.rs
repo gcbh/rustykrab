@@ -37,9 +37,7 @@ use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use rustykrab_core::work::{
-    ArtifactRef, CapabilityMode, WorkItem, WorkItemId, WorkKind, WorkerKind,
-};
+use rustykrab_core::work::{ArtifactRef, CapabilityMode, WorkItem, WorkItemId, WorkerKind};
 use rustykrab_core::Error;
 use rustykrab_store::ClassRecord;
 use serde::{Deserialize, Serialize};
@@ -110,12 +108,12 @@ pub fn built_tool(mode: Option<CapabilityMode>, refs: &[ArtifactRef]) -> Option<
 /// The routed class `item` belongs to, if any. `mode` is a capability
 /// item's facet; an item without one is not a build.
 pub fn work_class(item: &WorkItem, mode: Option<CapabilityMode>) -> Option<String> {
-    match item.kind {
-        WorkKind::Code => Some(CODE.to_string()),
-        WorkKind::Capability if mode == Some(CapabilityMode::Build) => {
-            Some(CAPABILITY_BUILD.to_string())
-        }
-        _ => None,
+    if mode == Some(CapabilityMode::Build) {
+        Some(CAPABILITY_BUILD.to_string())
+    } else if crate::workspace::Workspace::repo_of(&item.writable_resources).is_some() {
+        Some(CODE.to_string())
+    } else {
+        None
     }
 }
 
@@ -311,7 +309,7 @@ impl Routing for RecordRouting {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustykrab_core::work::ResultReport;
+    use rustykrab_core::work::{ResultReport, WorkKind};
     use rustykrab_core::Error;
     use rustykrab_store::Store;
 
@@ -388,7 +386,14 @@ mod tests {
 
     #[test]
     fn the_mode_is_the_facets_and_the_need_is_the_refs() {
-        let code = item(WorkKind::Code, vec![]);
+        let mut code = item(WorkKind::Code, vec![]);
+        assert_eq!(
+            work_class(&code, None),
+            None,
+            "labels do not define work classes"
+        );
+        code.kind = WorkKind::Task;
+        code.writable_resources = vec!["repo:/fixture".into()];
         assert_eq!(work_class(&code, None).as_deref(), Some(CODE));
         assert_eq!(work_class(&item(WorkKind::Personal, vec![]), None), None);
         let need = CapabilityRef {

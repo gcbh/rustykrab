@@ -40,6 +40,7 @@ use rustykrab_control::Provenance;
 use rustykrab_core::types::Conversation;
 use rustykrab_core::work::{
     ArtifactRef, Budget, Evidence, PlanOutcome, Status, Trigger, WorkItem, WorkItemDraft, WorkKind,
+    WorkerKind,
 };
 use rustykrab_gateway::AppState;
 use rustykrab_skills::SkillRegistry;
@@ -274,14 +275,14 @@ async fn file(
         value: job.id.clone(),
     });
     let draft = WorkItemDraft {
-        kind: Some(execution.kind.unwrap_or(WorkKind::Personal)),
+        kind: Some(WorkKind::Task),
         title: format!("Scheduled: {}", one_line(&job.task, 80)),
         objective: job.task.trim().to_string(),
         done_when: execution.done_when.unwrap_or_else(|| {
             "The scheduled task is done, and the result summary holds the full deliverable.".into()
         }),
         artifact_refs: refs,
-        worker_kind: execution.worker_kind,
+        worker_kind: WorkerKind::Any,
         required_tools: execution.required_tools,
         required_mcp_servers: execution.required_mcp_servers,
         writable_resources: execution.writable_resources,

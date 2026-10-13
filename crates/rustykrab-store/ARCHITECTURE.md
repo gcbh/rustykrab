@@ -341,20 +341,11 @@ holds the class's default), and where they live:
   cheaper. The registry writes it when a worker registers, from the spec's
   `cost_tier` or the kind's default (local 0, peer 1, codex 2,
   claude_code 3).
-- **A class's default tier** is the `routing_defaults` table (`class` PK,
-  `tier`, `set_by`, `reason`, `set_at`): the lowest cost tier that takes
-  the class without an earned record. The controller seeds it at start
-  with its policy's prior (`code` 0, `capability:build` 2; `set_by =
-  'policy'`, and a class already recorded keeps its row) and reads it back;
-  it never decides a move. An accepted routing proposal moves one: the
-  controller's review decision applies the proposal's `routing_default`
-  artifact through `WorkerStore::set_default_tier`, naming the proposal in
-  `set_by`, and routing reads the new tier at once. A worker
-  holds a class's default when its `cost_tier` is the lowest among live,
-  healthy workers at or above that tier (that is who a new item of the
-  class goes to first); a worker below the tier takes the class only once
-  its record has earned it (three verified results, its last one
-  verified).
+- **Historical class defaults** remain in `routing_defaults` (`class` PK,
+  `tier`, `set_by`, `reason`, `set_at`) and the evaluation/review APIs. Accepted
+  routing proposals still record their moves. The dispatcher no longer uses
+  defaults or earned records as eligibility gates: it selects the cheapest
+  available executor that covers the task's operations and authorized scope.
 
 **Delegated tasks** (`tasks.rs`, and control-layer plan sections 5 and 13
 for Phase 5). The durable queue a peer's delegations wait in, drained by one
@@ -572,3 +563,12 @@ reuse judgment_policies.checks under scope work_template; once examples and
 automatic rules share provenance, notes, timestamps and durable revocation.
 No table, index or foreign key is added. Invalid checklist decoding remains
 inert. Preference reads include revoked records for dataset export/history.
+
+## Availability and historical labels
+
+The existing kind text column supports the generic task label without a table
+rebuild. Old labels, backend selectors, events and questions remain audit data.
+The controller requeues open legacy availability holds and marks synthetic
+questions obsolete through existing WorkOps. Zero-token availability rejections
+retain diagnostic events but do not create execution-spend rows. No new table,
+index, foreign key or persistent queue is added.

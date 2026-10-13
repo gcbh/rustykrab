@@ -18,7 +18,7 @@
 //!    then readiness (time triggers), roll-ups and parent verification are
 //!    settled.
 //! 2. **Reconcile** (step 5 and section 5): each finished run is verified
-//!    (a `code` result against git), its evidence attached and its typed
+//!    (repository-scoped work and Git claims against git), its evidence attached and its typed
 //!    transition, cascade, `discovered` filings and ladder rungs written in
 //!    one transaction; the producing worker's routing record is written
 //!    after it. A run the host ended on its way down
@@ -31,9 +31,8 @@
 //!    distinct waiters, the single-writer rule over every active item, the
 //!    local-model rule of 12.1 (one run per local model, and none while
 //!    [`ModelActivity`] says an interactive turn holds it), the cheapest
-//!    tier of healthy workers that cover the item and that routing
-//!    qualifies for its class (waiting for that tier when it is busy); the
-//!    lease carries the fan-in inputs of 4.3 and 6.3 and, for a `code`
+//!    available compatible resource by cost, without category gates; the
+//!    lease carries the fan-in inputs of 4.3 and 6.3 and, for a repository-scoped
 //!    item, its workspace, and the run is spawned under tokio. A run that
 //!    ends or is stopped has its spend recorded (`spend.rs`).
 //! 4. **Aging** (4.6), when nothing is running.
@@ -64,11 +63,11 @@ mod planning;
 mod preferences;
 mod project_context;
 mod questions;
+mod queue_waits;
 mod reattach;
 mod review;
 mod spend;
 mod tick;
-mod unavailable;
 
 pub use credentials::{credential_key, stored_under, CredentialLinks, StoredCredentials};
 pub use planning::stalled_parents;
@@ -338,10 +337,6 @@ pub struct ControllerConfig {
     /// Re-plan at the parent when a chain fails or stalls (6.4), when a
     /// `planner` worker is registered.
     pub replan: bool,
-    /// How long an item no healthy worker can take waits for the registry
-    /// in `blocked(worker_unavailable)` before its ladder climbs (section
-    /// 7). Thirty minutes, the lease TTL, until Phase 0 measures it.
-    pub worker_wait: TimeDelta,
 }
 
 impl Default for ControllerConfig {
@@ -373,7 +368,6 @@ impl Default for ControllerConfig {
                 rungs: RungBudgets::default(),
             },
             replan: true,
-            worker_wait: TimeDelta::minutes(30),
         }
     }
 }
@@ -413,6 +407,8 @@ struct Finished {
 struct State {
     runs: HashMap<WorkItemId, Run>,
     finished: HashMap<WorkItemId, Finished>,
+    /// Brief provider outage backoff; work remains ready and spends no rung.
+    availability_backoff: HashMap<String, DateTime<Utc>>,
     recurrence: Recurrence,
     /// The first tick has run: resume checks are done.
     resumed: bool,
@@ -493,6 +489,7 @@ impl Controller {
             state: Mutex::new(State {
                 runs: HashMap::new(),
                 finished: HashMap::new(),
+                availability_backoff: HashMap::new(),
                 recurrence,
                 resumed: false,
                 approved: HashMap::new(),

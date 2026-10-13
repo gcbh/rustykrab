@@ -71,9 +71,11 @@ pub enum CodeVerdict {
         commit: String,
         changed_paths: Vec<String>,
     },
+    /// The worktree remains clean at its starting commit; no edits required.
+    Unchanged { base: String },
     /// The claim says more, or other, than the evidence shows.
     Mismatch(String),
-    /// Nothing was committed and nothing was claimed.
+    /// The workspace needed to check the claim is missing.
     Incomplete(String),
 }
 
@@ -199,10 +201,35 @@ pub fn verify(ws: &Workspace, claim: CodeClaim<'_>) -> Result<CodeVerdict, Strin
         None => match tip.as_ref().filter(|t| **t != ws.base) {
             Some(t) => t.clone(),
             None if claimed.is_empty() => {
-                return Ok(CodeVerdict::Incomplete(format!(
-                    "nothing was committed on {} and nothing was claimed",
-                    ws.branch
-                )))
+                if tip.as_deref() != Some(ws.base.as_str()) {
+                    return Ok(CodeVerdict::Incomplete(format!(
+                        "the run's branch {} is unavailable",
+                        ws.branch
+                    )));
+                }
+                let status = git(
+                    &ws.path,
+                    &[
+                        "-c",
+                        "core.fsmonitor=false",
+                        "status",
+                        "--porcelain=v1",
+                        "--untracked-files=all",
+                    ],
+                )?;
+                if !status.status.success() {
+                    return Err(format!("worktree status failed: {}", stderr(&status)));
+                }
+                return Ok(if stdout(&status).is_empty() {
+                    CodeVerdict::Unchanged {
+                        base: ws.base.clone(),
+                    }
+                } else {
+                    CodeVerdict::Mismatch(
+                        "no Git changes claimed, but the worktree contains uncommitted edits"
+                            .into(),
+                    )
+                });
             }
             None => {
                 return Ok(CodeVerdict::Mismatch(format!(
@@ -717,7 +744,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn nothing_committed_is_incomplete_or_a_mismatch() {
+    fn an_unchanged_repository_needs_no_commit_but_unreported_edits_fail() {
         let repo = Repo::new();
         let root = tempfile::tempdir().unwrap();
         let ws = workspace(&repo, root.path());
@@ -731,7 +758,7 @@ pub(crate) mod tests {
                 }
             )
             .unwrap(),
-            CodeVerdict::Incomplete(_)
+            CodeVerdict::Unchanged { .. }
         ));
         let lib = vec!["src/lib.rs".to_string()];
         assert!(matches!(
@@ -750,6 +777,18 @@ pub(crate) mod tests {
             Some(PathBuf::from("/src/app"))
         );
         assert_eq!(Workspace::repo_of(&["calendar".into()]), None);
+        std::fs::write(ws.path.join("unreported.txt"), "changed").unwrap();
+        assert!(matches!(
+            verify(
+                &ws,
+                CodeClaim {
+                    commit: None,
+                    changed_paths: &[]
+                }
+            )
+            .unwrap(),
+            CodeVerdict::Mismatch(_)
+        ));
     }
 
     #[test]

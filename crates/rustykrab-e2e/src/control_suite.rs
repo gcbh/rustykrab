@@ -356,7 +356,7 @@ async fn agent_monitor(ctx: &Ctx) -> Result<()> {
 
 // ── Phase 1: work items and the controller skeleton ──────────────────
 
-/// Scenario 1: A personal task is filed, leased to a local worker with its toolset
+/// Scenario 1: A task is filed, leased to a local worker with its toolset
 /// pre-activated, completed, and reported through Telegram with an execution pointer.
 async fn s01(ctx: &Ctx) -> Result<()> {
     let progress = EventStream::open(ctx).await?;
@@ -365,8 +365,8 @@ async fn s01(ctx: &Ctx) -> Result<()> {
     let filed = wait_titled(ctx, S01_TITLE).await?;
     let task = id(&filed);
     ensure!(
-        body(&filed)["kind"] == "personal",
-        "the task is filed as personal: {}",
+        body(&filed)["kind"] == "task",
+        "the task is filed without an enforced category: {}",
         body(&filed)["kind"]
     );
     ensure!(
@@ -593,30 +593,27 @@ async fn s19(ctx: &Ctx) -> Result<()> {
         "children over the root's budget are rejected with over_budget: {:?}",
         reasons(&over)
     );
-    let fix = vec![step("fix", "Fix the errand app", "code", 5_000)];
-    let code = rejected(plan(ctx, under(fix, vec![])).await?)?;
-    ensure!(
-        reasons(&code).contains(&RejectionReason::KindNotAllowed),
-        "a code item in a planned graph is rejected with kind_not_allowed: {:?}",
-        reasons(&code)
-    );
     ensure!(
         children(ctx, &root).await?.is_empty(),
         "nothing from a rejected graph was stored"
     );
     let rejections =
         Value::Array(events_of(&item(ctx, &root).await?, EventKind::Rejection)).to_string();
-    for reason in [
-        RejectionReason::TooManyItems,
-        RejectionReason::OverBudget,
-        RejectionReason::KindNotAllowed,
-    ] {
+    for reason in [RejectionReason::TooManyItems, RejectionReason::OverBudget] {
         ensure!(
             rejections.contains(reason.as_str()),
             "the {} rejection is an event dreaming can count: {rejections}",
             reason.as_str()
         );
     }
+    let fix = vec![step("fix", "Fix the errand app", "code", 5_000)];
+    accepted(plan(ctx, under(fix, vec![])).await?)?;
+    let fixed = children(ctx, &root).await?;
+    ensure!(fixed.len() == 1, "the accepted graph has one child");
+    ensure!(
+        body(&item(ctx, &fixed[0]).await?)["kind"] == "task",
+        "a legacy category cannot reject an otherwise valid planned task"
+    );
 
     let mut parcels = draft("personal", "Post the parcels", &tag, W_SUCCEED);
     parcels["trigger"] = not_yet();
@@ -1690,7 +1687,6 @@ async fn s17(ctx: &Ctx) -> Result<()> {
     let tag = tag(17);
     let repo = FixtureRepo::create()?;
     let stand_in = ClaudeCodeStandIn::create()?;
-    register_claude_code(ctx, "pinch-s17", &repo, &stand_in).await?;
     let first = file(
         ctx,
         code_draft("Document the status helper", &tag, W_CODE_LOCAL, &repo),
@@ -1715,6 +1711,17 @@ async fn s17(ctx: &Ctx) -> Result<()> {
         code_draft("Document the helper's errors", &tag, W_CODE_BAD, &repo),
     )
     .await?;
+    // Make the fallback available after the two local attempts have started.
+    // Unrelated busy work must not make this fixture depend on a backend pin.
+    wait_for(ctx, &second, "two local verification attempts", |v| {
+        events(v)
+            .iter()
+            .filter(|e| moved_to(e) == Some(Status::Leased))
+            .count()
+            >= 2
+    })
+    .await?;
+    register_claude_code(ctx, "pinch-s17", &repo, &stand_in).await?;
     let escalated = wait_status(ctx, &second, Status::Done).await?;
     let failed_checks = events(&escalated)
         .iter()
@@ -2588,6 +2595,10 @@ fn ever_failed(view: &Value) -> bool {
 /// re-checked against the peer's task and re-attached, not resubmitted).
 /// Scenario 4 is the local half of the same rule.
 async fn s08(ctx: &Ctx) -> Result<()> {
+    // The peer is the available executor in this fixture. Backend selectors
+    // are retired and cannot force work away from another compatible resource.
+    let daemon = LocalWorkerOffDaemon::boot(ctx).await?;
+    let ctx = &daemon.ctx;
     let tag = tag(8);
     let port = crate::pick_free_port()?;
     let base = format!("http://127.0.0.1:{port}");
@@ -2601,7 +2612,6 @@ async fn s08(ctx: &Ctx) -> Result<()> {
 
     // Required tools active before the first prefill, a structured result.
     let mut task = draft("personal", "Check the harbour calendar", &tag, W_PROBE);
-    task["worker_kind"] = json!("peer");
     task["required_tools"] = json!(["caldav"]);
     let task = file(ctx, task).await?;
     let finished = wait_status(ctx, &task, Status::Done).await?;
@@ -2655,7 +2665,7 @@ async fn s08(ctx: &Ctx) -> Result<()> {
     // The peer restarts mid-run: its task returns to its queue and runs
     // again, and nothing is failed by the restart.
     let mut inbox = draft("personal", "Tidy the peer's inbox", &tag, W_PEER_PAUSE);
-    inbox["worker_kind"] = json!("peer");
+    inbox["required_tools"] = json!(["caldav"]);
     let inbox = file(ctx, inbox).await?;
     peer.wait_running(&inbox).await?;
     peer.crash_and_restart(ctx).await?;
@@ -2673,7 +2683,7 @@ async fn s08(ctx: &Ctx) -> Result<()> {
     // The controller restarts mid-run: the lease is re-checked against the
     // peer's task, which still runs, and the controller re-attaches to it.
     let mut photos = draft("personal", "Sort the peer's photos", &tag, W_PEER_PAUSE);
-    photos["worker_kind"] = json!("peer");
+    photos["required_tools"] = json!(["caldav"]);
     let photos = file(ctx, photos).await?;
     peer.wait_running(&photos).await?;
     ctx.restart_daemon().await?;
@@ -2949,6 +2959,8 @@ async fn s27(ctx: &Ctx) -> Result<()> {
         &tag,
         "Proposal",
     );
+    proposal["subject"] = json!("tool:caldav");
+    proposal["review_tier"] = json!("standard");
     proposal["edges"] = json!([{ "kind": "waits_for", "depends_on": dentist }]);
     proposal["inputs_from"] = json!([dentist]);
     let proposal_id = file(ctx, proposal).await?;

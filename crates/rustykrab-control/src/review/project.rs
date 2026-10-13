@@ -135,6 +135,7 @@ pub fn local_ref(id: &str) -> String {
 /// it is a build is treated as an acquisition, the conservative reading.
 pub fn is_projectable(item: &WorkItem, facets: Option<&WorkFacets>) -> bool {
     match item.kind {
+        WorkKind::Task => crate::workspace::Workspace::repo_of(&item.writable_resources).is_some(),
         WorkKind::Code | WorkKind::Proposal | WorkKind::Internal => true,
         WorkKind::Capability => facets.and_then(|f| f.capability) == Some(CapabilityMode::Build),
         WorkKind::Personal | WorkKind::Research => false,

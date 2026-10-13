@@ -215,7 +215,7 @@ async fn only_a_proposal_takes_a_review_decision() {
 }
 
 #[tokio::test]
-async fn a_capability_items_mode_lands_with_it() {
+async fn explicit_modes_and_review_subjects_invoke_their_workflows() {
     let h = Harness::new(&[]);
     let mut build = draft("b", "Build a tide table tool");
     build.kind = Some(WorkKind::Capability);
@@ -229,11 +229,18 @@ async fn a_capability_items_mode_lands_with_it() {
             .and_then(|f| f.capability),
         Some(CapabilityMode::Build)
     );
-    // A personal item carries no facets whatever its draft says.
+    // An explicit review subject invokes review even with an ordinary label.
     let mut errand = draft("p", "Book the dentist");
     errand.subject = Some("controller".to_string());
     let plain = h.file_one(errand).await;
-    assert_eq!(h.store().work_facets_get(&plain).await.unwrap(), None);
+    let facets = h.store().work_facets_get(&plain).await.unwrap().unwrap();
+    assert_eq!(facets.subject.as_deref(), Some("controller"));
+    assert_eq!(facets.review_tier, Some(ReviewTier::Highest));
+    assert_eq!(h.item(&plain).await.kind, WorkKind::Proposal);
+    assert_eq!(
+        h.item(&plain).await.status,
+        Status::Blocked(BlockedReason::NeedsConsent)
+    );
 }
 
 // ── the review surface, end to end over a fake surface ─────────────────
@@ -469,7 +476,7 @@ async fn accepting_project_proposal_preserves_its_native_runtime_and_repository(
         .await
         .unwrap();
     let code = h.item(&result.code_item.unwrap()).await;
-    assert_eq!(code.worker_kind, WorkerKind::Codex);
+    assert_eq!(code.worker_kind, WorkerKind::Any);
     assert_eq!(
         code.writable_resources,
         ["repo:/tmp/project-review-fixture"]

@@ -360,13 +360,15 @@ case "$prompt" in
     ;;
 esac
 commit="null"
+paths="[]"
 if git rev-parse --git-dir >/dev/null 2>&1; then
   echo "// touched by the e2e claude_code stand-in" >> src/lib.rs
   git add src/lib.rs
   git -c user.name=e2e -c user.email=e2e@rustykrab.invalid commit -q --no-gpg-sign -m "e2e: stand-in change"
   commit="\"$(git rev-parse HEAD)\""
+  paths=$(printf '["%s"]' "$claimed")
 fi
-contract=$(printf '{"summary":"%s","artifacts":[],"changed_paths":["%s"],"commit":%s,"checks_run":[],"known_limits":[],"blocked":null,"error":null,"questions":[],"discovered":%s}' "$summary" "$claimed" "$commit" "$discovered")
+contract=$(printf '{"summary":"%s","artifacts":[],"changed_paths":%s,"commit":%s,"checks_run":[],"known_limits":[],"blocked":null,"error":null,"questions":[],"discovered":%s}' "$summary" "$paths" "$commit" "$discovered")
 escaped=$(printf '%s' "$contract" | sed 's/\\/\\\\/g; s/"/\\"/g')
 printf '{"type":"result","subtype":"success","is_error":false,"result":"%s"}\n' "$escaped"
 "##;

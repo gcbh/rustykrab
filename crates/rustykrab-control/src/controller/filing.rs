@@ -1198,9 +1198,8 @@ impl Controller {
 }
 
 /// A discovered draft as filed under `filer`: one naming no `repo:`
-/// resource takes the filer's, and one with no worker constraint takes the
-/// filer's, so a code follow-up keeps its repository and its worker. A
-/// draft that sets either keeps its own.
+/// resource takes the filer's. Constraints remain scoped to the follow-up;
+/// retired backend selectors are discarded.
 fn inherit_from(filer: &WorkItem, draft: &WorkItemDraft) -> WorkItemDraft {
     let mut d = draft.clone();
     if !d.writable_resources.iter().any(|r| is_repo(r)) {
@@ -1212,9 +1211,7 @@ fn inherit_from(filer: &WorkItem, draft: &WorkItemDraft) -> WorkItemDraft {
                 .cloned(),
         );
     }
-    if d.worker_kind == WorkerKind::Any {
-        d.worker_kind = filer.worker_kind;
-    }
+    d.worker_kind = WorkerKind::Any;
     // The filer's rules hold for its follow-ups too: a follow-up that did
     // not inherit them ran with none (2026-09-28), outside the worktree
     // rule its filer was given. A rule that turns out too narrow for the
@@ -1241,7 +1238,7 @@ fn inherit_from(filer: &WorkItem, draft: &WorkItemDraft) -> WorkItemDraft {
 }
 
 /// The ladder's `internal` item for a failure of `failing`: its repository
-/// and worker as [`inherit_from`] gives a discovered draft, and the failing
+/// scope as [`inherit_from`] gives a discovered draft, and the failing
 /// item's constraints after its own, retaining the repository scope and rules
 /// in worker eligibility and the repair instructions.
 fn inherit_internal(failing: &WorkItem, draft: &WorkItemDraft) -> WorkItemDraft {

@@ -27,7 +27,7 @@ use super::order::Arcs;
 use super::ready::{edge_summary, verdict, Verdict};
 use super::supersede::{supersede_in, supersede_refusals};
 use super::{Effects, Link, Snapshot, Transition};
-use crate::workspace::{Workspace, REPO_PREFIX};
+use crate::workspace::Workspace;
 
 // ── inputs ─────────────────────────────────────────────────────────────
 
@@ -170,9 +170,6 @@ pub struct FilingContext {
     pub scope: Option<WorkItemId>,
     /// Ids the caller may see. `None`: every item in the snapshot.
     pub visible: Option<BTreeSet<WorkItemId>>,
-    /// Whether `code` items may be filed: by default everything but a
-    /// planner's graph and the ladder's capability items.
-    pub allow_code: bool,
     pub sequential_split: SplitMode,
     /// Filings that superseded something under this root inside the rate
     /// window. A filing that supersedes anything counts one.
@@ -199,8 +196,7 @@ pub struct FilingContext {
 
 impl FilingContext {
     /// Defaults: the plan's placeholder caps, no scope beyond the root,
-    /// everything visible, `code` only for the delivery import and an
-    /// accepted proposal,
+    /// everything visible, no category restrictions,
     /// sequential execution slices allowed, two supersede filings per window,
     /// no approval triggers.
     pub fn new(source: FilingSource, now: DateTime<Utc>) -> FilingContext {
@@ -210,17 +206,6 @@ impl FilingContext {
             caps: GraphCaps::default(),
             scope: None,
             visible: None,
-            // A planner's graph never holds code (section 6.1); a single
-            // `work_file` draft, a worker's discovered follow-up and an
-            // accepted proposal may (sections 5, 10 and 15, scenarios 2,
-            // 17 and 31), as may the delivery import.
-            allow_code: matches!(
-                source,
-                FilingSource::DeliveryImport
-                    | FilingSource::WorkFile
-                    | FilingSource::Discovered
-                    | FilingSource::Proposal
-            ),
             sequential_split: SplitMode::Allow,
             supersedes_in_window: 0,
             supersede_limit: 2,
@@ -431,7 +416,6 @@ pub fn review_scope_violation(draft: &rustykrab_core::work::WorkItemDraft) -> Op
 /// |---|---|
 /// | every ref is a temp id of this call or an item the caller may see; temp ids unique | `unknown_ref`, `duplicate_tmp` |
 /// | each draft has a title, objective and `done_when`, sets no field its path may not (`plan: true` outside `work_file`), names a usable budget, and a target has one replacement | `invalid_item` |
-/// | no `code` item unless the path allows it | `kind_not_allowed` |
 /// | the root, existing parents and supersede targets sit under the caller's scope | `out_of_scope` |
 /// | no cycle over every edge kind and parent link, a parent depending on each child and each child inheriting its parent's ordering edges; no ordering edge between an item and its own ancestor or descendant | `cycle` |
 /// | parent-tree depth and open items under the root within the caps | `depth_exceeded`, `too_many_items` |
@@ -480,7 +464,6 @@ pub fn validate(snap: &Snapshot, plan: &WorkPlan, ctx: &FilingContext) -> Valida
     // Drafts.
     let kinds = run.resolve_kinds(&parents);
     run.check_drafts(&kinds);
-    run.check_repos(&kinds, &parents);
 
     // Scope.
     let scope: Option<WorkItemId> = ctx
@@ -816,38 +799,22 @@ impl<'a> Run<'a> {
         out
     }
 
-    /// A draft without a kind takes its parent's; a top-level one is
-    /// `personal`.
-    fn resolve_kinds(&self, parents: &[Option<WorkItemId>]) -> Vec<WorkKind> {
-        let position: HashMap<&str, usize> = self
-            .ids
+    /// New ordinary work has no execution category. Preserve explicit legacy
+    /// labels/internal lifecycle markers only as historical metadata.
+    fn resolve_kinds(&self, _parents: &[Option<WorkItemId>]) -> Vec<WorkKind> {
+        self.plan
+            .items
             .iter()
-            .enumerate()
-            .map(|(i, id)| (id.as_str(), i))
-            .collect();
-        let n = self.plan.items.len();
-        (0..n)
-            .map(|i| {
-                let mut at = i;
-                for _ in 0..=n {
-                    if let Some(kind) = self.plan.items[at].kind {
-                        return kind;
-                    }
-                    match &parents[at] {
-                        Some(p) => match position.get(p.as_str()) {
-                            Some(&j) => at = j,
-                            None => {
-                                return self
-                                    .snap
-                                    .item(p)
-                                    .map(|x| x.kind)
-                                    .unwrap_or(WorkKind::Personal)
-                            }
-                        },
-                        None => return WorkKind::Personal,
-                    }
+            .map(|draft| {
+                // A review subject invokes the durable proposal workflow;
+                // it is not an executor category supplied by the caller.
+                if draft.subject.is_some() {
+                    WorkKind::Proposal
+                } else if draft.capability.is_some() {
+                    WorkKind::Capability
+                } else {
+                    draft.kind.unwrap_or(WorkKind::Task)
                 }
-                WorkKind::Personal
             })
             .collect()
     }
@@ -920,42 +887,6 @@ impl<'a> Run<'a> {
                     );
                 }
             }
-            if kinds[i] == WorkKind::Code && !self.ctx.allow_code {
-                self.fail(
-                    RejectionReason::KindNotAllowed,
-                    vec![label],
-                    "code graphs come only from the delivery compiler",
-                );
-            }
-        }
-    }
-
-    /// A `code` leaf constrained to a worker that edits a checkout
-    /// (`claude_code`, `codex`) must name its repository as a `repo:`
-    /// writable resource: without one the worker gets an empty directory
-    /// and nothing to change. A draft that parents others in this plan is
-    /// never leased, so it is not held to this.
-    fn check_repos(&mut self, kinds: &[WorkKind], parents: &[Option<WorkItemId>]) {
-        let plan = self.plan;
-        for (i, draft) in plan.items.iter().enumerate() {
-            let is_parent = parents.iter().any(|p| p.as_ref() == Some(&self.ids[i]));
-            if kinds[i] != WorkKind::Code
-                || is_parent
-                || !draft.worker_kind.needs_checkout()
-                || Workspace::repo_of(&draft.writable_resources).is_some()
-            {
-                continue;
-            }
-            let label = self.label(&self.ids[i]);
-            self.fail(
-                RejectionReason::NoRepository,
-                vec![label],
-                format!(
-                    "a code item for a {} worker needs its repository as a {REPO_PREFIX}<path> \
-                     writable resource",
-                    draft.worker_kind.as_str()
-                ),
-            );
         }
     }
 
@@ -1012,7 +943,7 @@ impl<'a> Run<'a> {
             artifact_refs: d.artifact_refs.clone(),
             required_tools: d.required_tools.clone(),
             required_mcp_servers: d.required_mcp_servers.clone(),
-            worker_kind: d.worker_kind,
+            worker_kind: WorkerKind::Any,
             writable_resources: d.writable_resources.clone(),
             parent,
             inputs_from,
@@ -1642,13 +1573,11 @@ impl<'a> Run<'a> {
                 .filter(|e| e.kind.is_ordering())
                 .count()
                 == 1;
-            let adds_nothing = down.kind == up.kind
-                && (down.trigger == Trigger::Now || down.trigger == up.trigger)
+            let adds_nothing = (down.trigger == Trigger::Now || down.trigger == up.trigger)
                 && down
                     .preconditions
                     .iter()
                     .all(|p| up.preconditions.contains(p))
-                && (down.worker_kind == WorkerKind::Any || down.worker_kind == up.worker_kind)
                 && down
                     .writable_resources
                     .iter()
@@ -1756,7 +1685,7 @@ fn approve(
         }
         if let Some(slices) = &policy.authorized_slices {
             let inside = work.ancestors(&item.id).iter().any(|a| slices.contains(a));
-            if item.kind == WorkKind::Code && !inside {
+            if Workspace::repo_of(&item.writable_resources).is_some() && !inside {
                 triggers.push(ApprovalTrigger::CodeOutsideSlice {
                     item: item.id.clone(),
                 });

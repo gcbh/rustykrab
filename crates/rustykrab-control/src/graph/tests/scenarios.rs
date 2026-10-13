@@ -226,15 +226,12 @@ fn scenario_19_children_over_the_root_budget_are_rejected() {
 }
 
 #[test]
-fn scenario_19_code_item_in_a_planner_graph_is_not_allowed() {
-    let s = planned_root();
+fn scenario_19_legacy_labels_do_not_restrict_filing_paths() {
+    let mut s = planned_root();
     let mut c = draft("c");
     c.kind = Some(WorkKind::Code);
     let p = plan(id("P"), vec![c], vec![]);
-    let r = reject(&s, &p, &ctx(FilingSource::Planner));
-    assert_eq!(names(&r), vec!["kind_not_allowed"]);
-    assert_eq!(r.failed[0].offending, vec![tmp("c")]);
-    // The delivery import is the one path a code item enters by.
+    accept(&mut s, &p, &ctx(FilingSource::Planner));
     let mut s = planned_root();
     accept(&mut s, &p, &ctx(FilingSource::DeliveryImport));
 }
@@ -802,7 +799,7 @@ fn scenario_26_an_imported_slice_orders_by_layer_and_dependency() {
         &ctx(FilingSource::Planner),
     );
     assert!(r.has(RejectionReason::SingleWriterConflict));
-    assert!(r.has(RejectionReason::KindNotAllowed));
+    assert!(!r.has(RejectionReason::KindNotAllowed));
 }
 
 #[test]

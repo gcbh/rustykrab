@@ -339,7 +339,7 @@ impl Controller {
                 || waiting
                     .iter()
                     .any(|q| q.item == id && q.status == QuestionStatus::Open && !technical(q))
-                || (item.kind == rustykrab_core::work::WorkKind::Code
+                || (Workspace::repo_of(&item.writable_resources).is_some()
                     && self.config.worktree_root.is_none())
             {
                 continue;

@@ -28,11 +28,13 @@ pub type WorkItemId = String;
 
 // ── kinds ──────────────────────────────────────────────────────────────
 
-/// What a work item is for. Decides which workers qualify and which verifier
-/// applies (plan section 4).
+/// Historical labels and internal lifecycle markers. Ordinary work is `Task`;
+/// labels never constrain executor selection. Repository scope determines git
+/// isolation and verification, independently of a label.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkKind {
+    Task,
     Personal,
     Code,
     Research,
@@ -46,7 +48,8 @@ pub enum WorkKind {
 }
 
 impl WorkKind {
-    pub const ALL: [WorkKind; 6] = [
+    pub const ALL: [WorkKind; 7] = [
+        WorkKind::Task,
         WorkKind::Personal,
         WorkKind::Code,
         WorkKind::Research,
@@ -57,6 +60,7 @@ impl WorkKind {
 
     pub fn as_str(&self) -> &'static str {
         match self {
+            WorkKind::Task => "task",
             WorkKind::Personal => "personal",
             WorkKind::Code => "code",
             WorkKind::Research => "research",
@@ -71,9 +75,8 @@ impl WorkKind {
     }
 }
 
-/// Which worker kinds may take an item. `Any` is the default; a narrower
-/// value is a constraint the user or policy set, never one the controller
-/// infers from the item's kind (section 5).
+/// Executor backend identity. Legacy task pins deserialize for compatibility
+/// but are ignored: tasks route by required tools and authorized resources.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkerKind {
@@ -1005,6 +1008,7 @@ pub struct WorkItemDraft {
     /// Client-side id, unique within a `work_plan` call.
     #[serde(default)]
     pub tmp: Option<String>,
+    #[serde(default, deserialize_with = "ignore_task_category")]
     pub kind: Option<WorkKind>,
     pub title: String,
     pub objective: String,
@@ -1019,7 +1023,7 @@ pub struct WorkItemDraft {
     pub required_tools: Vec<String>,
     #[serde(default)]
     pub required_mcp_servers: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "ignore_task_backend")]
     pub worker_kind: WorkerKind,
     #[serde(default)]
     pub writable_resources: Vec<String>,
@@ -1059,6 +1063,20 @@ pub struct WorkItemDraft {
     pub review_tier: Option<ReviewTier>,
 }
 
+fn ignore_task_category<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<WorkKind>, D::Error> {
+    serde::de::IgnoredAny::deserialize(deserializer)?;
+    Ok(None)
+}
+
+fn ignore_task_backend<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<WorkerKind, D::Error> {
+    serde::de::IgnoredAny::deserialize(deserializer)?;
+    Ok(WorkerKind::Any)
+}
+
 /// Resource requirements frozen with a schedule, then validated by the same
 /// controller as conversational work at every firing. No credential or executable
 /// command lives here: registered adapters own execution.
@@ -1094,10 +1112,10 @@ impl CronExecution {
 
         if !matches!(
             self.kind,
-            None | Some(WorkKind::Personal | WorkKind::Research | WorkKind::Code)
+            None | Some(WorkKind::Task | WorkKind::Personal | WorkKind::Research | WorkKind::Code)
         ) {
             return Err(crate::Error::Config(
-                "scheduled execution kind must be personal, research or code".into(),
+                "scheduled execution cannot invoke an internal lifecycle operation".into(),
             ));
         }
         let bytes = serde_json::to_vec(self).map_err(|e| crate::Error::Config(e.to_string()))?;

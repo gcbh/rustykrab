@@ -191,12 +191,6 @@ fn out_of_scope() -> Rejection {
     )
 }
 
-fn kind_not_allowed() -> Rejection {
-    let mut a = draft("a");
-    a.kind = Some(WorkKind::Code);
-    reject(&base(), &under_p(vec![a]), &planner())
-}
-
 fn already_planned() -> Rejection {
     let mut c = planner();
     c.already_planned = true;
@@ -208,24 +202,6 @@ fn rate_limited() -> Rejection {
     c.supersedes_in_window = 1;
     c.supersede_limit = 1;
     reject(&base(), &under_p(vec![superseding("a", "wait1")]), &c)
-}
-
-/// A code item for each checkout-editing worker kind, with no `repo:`.
-fn no_repository() -> Rejection {
-    let mut c = planner();
-    c.allow_code = true;
-    let code = |t: &str, kind: WorkerKind| {
-        let mut d = draft(t);
-        d.kind = Some(WorkKind::Code);
-        d.worker_kind = kind;
-        d.writable_resources = vec![format!("calendar:{t}")];
-        d
-    };
-    let items = vec![
-        code("claude", WorkerKind::ClaudeCode),
-        code("codex", WorkerKind::Codex),
-    ];
-    reject(&base(), &under_p(items), &c)
 }
 
 fn only(r: &Rejection, reason: RejectionReason) -> Vec<Vec<ItemRef>> {
@@ -441,14 +417,6 @@ fn rejects_out_of_scope() {
 }
 
 #[test]
-fn rejects_kind_not_allowed() {
-    assert_eq!(
-        only(&kind_not_allowed(), RejectionReason::KindNotAllowed),
-        vec![vec![tmp("a")]]
-    );
-}
-
-#[test]
 fn rejects_already_planned() {
     assert_eq!(
         only(&already_planned(), RejectionReason::AlreadyPlanned),
@@ -465,29 +433,22 @@ fn rejects_rate_limited() {
 }
 
 #[test]
-fn rejects_no_repository() {
-    let r = no_repository();
-    assert_eq!(
-        only(&r, RejectionReason::NoRepository),
-        vec![vec![tmp("claude")], vec![tmp("codex")]]
-    );
-    assert!(r.failed[0].detail.contains("repo:"), "{r:#?}");
-
-    // With a repository, for a worker needing no checkout, or with no
-    // worker constraint at all, the same code item files.
-    let mut c = planner();
-    c.allow_code = true;
-    let mut with_repo = draft("with_repo");
-    with_repo.kind = Some(WorkKind::Code);
-    with_repo.worker_kind = WorkerKind::ClaudeCode;
-    with_repo.writable_resources = vec!["repo:/src/app".into()];
-    let mut local = draft("local");
-    local.kind = Some(WorkKind::Code);
-    local.worker_kind = WorkerKind::Local;
-    let mut any = draft("any");
-    any.kind = Some(WorkKind::Code);
-    let mut s = base();
-    accept(&mut s, &under_p(vec![with_repo, local, any]), &c);
+fn legacy_task_labels_and_backend_pins_do_not_restrict_filing() {
+    let mut state = base();
+    let drafts = [WorkerKind::Local, WorkerKind::Codex, WorkerKind::ClaudeCode]
+        .iter()
+        .enumerate()
+        .map(|(i, kind)| {
+            let mut item = draft(&format!("task-{i}"));
+            item.kind = Some(WorkKind::Code);
+            item.worker_kind = *kind;
+            item
+        })
+        .collect();
+    let accepted = accept(&mut state, &under_p(drafts), &planner());
+    for id in accepted.ids.values() {
+        assert_eq!(state.item(id).unwrap().worker_kind, WorkerKind::Any);
+    }
 }
 
 #[test]
@@ -508,10 +469,8 @@ fn every_rejection_reason_is_reachable() {
         supersedes_active(),
         supersedes_closed(),
         out_of_scope(),
-        kind_not_allowed(),
         already_planned(),
         rate_limited(),
-        no_repository(),
     ];
     let reached: BTreeSet<&str> = all.iter().flat_map(names).collect();
     let expected: BTreeSet<&str> = [
@@ -530,10 +489,8 @@ fn every_rejection_reason_is_reachable() {
         RejectionReason::SupersedesActive,
         RejectionReason::SupersedesClosed,
         RejectionReason::OutOfScope,
-        RejectionReason::KindNotAllowed,
         RejectionReason::AlreadyPlanned,
         RejectionReason::RateLimited,
-        RejectionReason::NoRepository,
     ]
     .iter()
     .map(|r| r.as_str())
@@ -584,7 +541,6 @@ fn validation_returns_every_failed_check_at_once() {
             "duplicate_tmp",
             "unknown_ref",
             "invalid_item",
-            "kind_not_allowed",
             "cycle",
             "input_unordered",
             "single_writer_conflict",

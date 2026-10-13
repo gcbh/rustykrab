@@ -123,6 +123,12 @@ impl Tool for WorkPlanTool {
     }
 
     async fn execute(&self, args: Value) -> Result<Value> {
+        let mut args = args;
+        if let Some(items) = args.get_mut("items").and_then(Value::as_array_mut) {
+            for item in items {
+                crate::work_file::strip_draft_categories(item);
+            }
+        }
         let schema = self.schema();
         validate_tool_args(&schema.parameters, &args).map_err(Error::ToolExecution)?;
         let Some(obj) = args.as_object() else {
