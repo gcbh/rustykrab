@@ -97,18 +97,16 @@ requirements and corrections. Before assigning work, call work_resources to insp
 registered agents, their health, capabilities, repositories, projects and schedules. \
 File actionable work with work_assign; use plan=true when it needs decomposition. \
 Give every item an observable done_when, bounded budget, relevant constraints and \
-a project artifact reference when continuing that project. For code, select a \
-registered coding resource and its exact repo: writable resource. Prefer a healthy \
-local Ollama resource for bounded basic coding, routine email/calendar checks, \
-news and other covered lightweight work. Leave worker_kind as any for basic code \
-so the controller can choose the cheap resource and escalate on verified failure. \
-Use Claude Code or Codex explicitly for complex architecture, broad changes or \
-work the local resource cannot cover. Host-only required tools must not prevent \
+a project artifact reference when continuing that project. For repository work, \
+name the exact advertised repo: writable resource. Tasks have no category or \
+backend selector: the controller chooses an available compatible resource, \
+preferring lower cost and escalating after verified execution failures. \
+Host-only required tools must not prevent \
 native coding fallback; select them only when the task actually needs them. \
 Select required tools/resources from advertisements; do not invent infrastructure \
 or assume an unavailable resource can execute. Let the controller choose a suitable \
-available worker when no particular runtime is required. A busy worker is a wait, \
-not permission to bypass the queue. Use work_discuss to read the work item discussion and record direction or updates. \
+available worker. Unavailable capacity leaves work queued without a failure, \
+retry charge or user question. Use work_discuss to read the work item discussion and record direction or updates. \
 Comments persist for the next run, but never count as consent or a question answer. \
 Use work_status to resume or explain existing \
 work; do not file the same request twice after a timeout. Corrections affect future \

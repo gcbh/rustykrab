@@ -93,20 +93,25 @@ impl Controller {
             iterations: usage.map_or(0, |u| u.iterations),
             at: Utc::now(),
         };
-        if let Err(e) = self.store.work_spend_record(spend.clone()).await {
-            tracing::warn!(item = %item, error = %e, "run spend not recorded");
-            return;
-        }
-        {
-            let mut state = self.state();
-            if let Some(spent) = state.spent.as_mut() {
-                let total = spent.entry(item.to_string()).or_default();
-                *total = total.plus(Spend {
-                    runs: 1,
-                    tokens: spend.tokens,
-                    wall_ms: spend.wall_ms,
-                    iterations: u64::from(spend.iterations),
-                });
+        // A rejected/unavailable provider with no token usage did no work.
+        // Preserve its diagnostic event, but do not consume execution budgets.
+        let charge = how != "resource_wait" || spend.tokens > 0;
+        if charge {
+            if let Err(e) = self.store.work_spend_record(spend.clone()).await {
+                tracing::warn!(item = %item, error = %e, "run spend not recorded");
+                return;
+            }
+            {
+                let mut state = self.state();
+                if let Some(spent) = state.spent.as_mut() {
+                    let total = spent.entry(item.to_string()).or_default();
+                    *total = total.plus(Spend {
+                        runs: 1,
+                        tokens: spend.tokens,
+                        wall_ms: spend.wall_ms,
+                        iterations: u64::from(spend.iterations),
+                    });
+                }
             }
         }
         let counts = match usage {

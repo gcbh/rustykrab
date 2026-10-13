@@ -63,11 +63,11 @@ mod planning;
 mod preferences;
 mod project_context;
 mod questions;
+mod queue_waits;
 mod reattach;
 mod review;
 mod spend;
 mod tick;
-mod unavailable;
 
 pub use credentials::{credential_key, stored_under, CredentialLinks, StoredCredentials};
 pub use planning::stalled_parents;
@@ -337,10 +337,6 @@ pub struct ControllerConfig {
     /// Re-plan at the parent when a chain fails or stalls (6.4), when a
     /// `planner` worker is registered.
     pub replan: bool,
-    /// How long an item no healthy worker can take waits for the registry
-    /// in `blocked(worker_unavailable)` before its ladder climbs (section
-    /// 7). Thirty minutes, the lease TTL, until Phase 0 measures it.
-    pub worker_wait: TimeDelta,
 }
 
 impl Default for ControllerConfig {
@@ -372,7 +368,6 @@ impl Default for ControllerConfig {
                 rungs: RungBudgets::default(),
             },
             replan: true,
-            worker_wait: TimeDelta::minutes(30),
         }
     }
 }
@@ -412,6 +407,8 @@ struct Finished {
 struct State {
     runs: HashMap<WorkItemId, Run>,
     finished: HashMap<WorkItemId, Finished>,
+    /// Brief provider outage backoff; work remains ready and spends no rung.
+    availability_backoff: HashMap<String, DateTime<Utc>>,
     recurrence: Recurrence,
     /// The first tick has run: resume checks are done.
     resumed: bool,
@@ -490,6 +487,7 @@ impl Controller {
             state: Mutex::new(State {
                 runs: HashMap::new(),
                 finished: HashMap::new(),
+                availability_backoff: HashMap::new(),
                 recurrence,
                 resumed: false,
                 approved: HashMap::new(),

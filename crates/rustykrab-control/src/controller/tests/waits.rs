@@ -328,38 +328,44 @@ async fn an_on_credential_trigger_fires_for_a_credential_stored_by_any_path() {
     assert_eq!(h.status(&x).await, Status::Done);
 }
 
-// ── worker_unavailable waits for the registry, with a TTL ──────────────
+// ── availability stays queued ─────────────────────────────────────────
 
 #[tokio::test]
-async fn an_item_no_healthy_worker_can_take_waits_and_resumes_when_one_is_back() {
+async fn unavailable_work_waits_without_timeout_budget_spend_or_questions() {
     let up = Arc::new(AtomicBool::new(false));
     let h = toggle_harness(WorkerKind::Local, Arc::clone(&up));
     let x = h.file_one(draft("x", "Sort the photos")).await;
     h.tick().await;
-    assert_eq!(
-        h.status(&x).await,
-        Status::Blocked(BlockedReason::WorkerUnavailable)
-    );
-    assert_eq!(h.rungs(&x).await, vec![Rung::Request]);
-    assert!(h.outbox().await.is_empty(), "a wait is not news");
-
-    // Inside the TTL it keeps waiting.
-    h.clock.advance(TimeDelta::minutes(10));
+    assert_eq!(h.status(&x).await, Status::Ready);
+    h.clock.advance(TimeDelta::days(45));
     h.tick().await;
-    assert_eq!(
-        h.status(&x).await,
-        Status::Blocked(BlockedReason::WorkerUnavailable)
-    );
-    assert_eq!(h.rungs(&x).await, vec![Rung::Request]);
+    assert_eq!(h.status(&x).await, Status::Ready);
+    assert!(h.rungs(&x).await.is_empty());
+    assert!(questions_of(&h, &x).await.is_empty());
+    assert!(h.outbox().await.is_empty());
+    assert_eq!(h.ctl.spent_of(&x), rustykrab_store::Spend::default());
+    assert!(h.script.briefs().is_empty());
 
     up.store(true, Ordering::SeqCst);
     h.drain().await;
-    assert_eq!(h.status(&x).await, Status::Done);
-    assert_eq!(h.rungs(&x).await, vec![Rung::Request]);
+    let completed = h
+        .store()
+        .work_get(&x)
+        .await
+        .unwrap()
+        .map(|item| item.status)
+        .or(h
+            .store()
+            .work_archive_get(&x)
+            .await
+            .unwrap()
+            .map(|item| item.status));
+    assert_eq!(completed, Some(Status::Done));
+    assert!(h.rungs(&x).await.is_empty());
 }
 
 #[tokio::test]
-async fn a_busy_worker_is_a_wait_for_capacity_not_for_the_registry() {
+async fn a_busy_worker_keeps_other_work_queued() {
     let h = Harness::new(&["pinch"]);
     let gate = Arc::new(Notify::new());
     h.script.push(
@@ -371,7 +377,7 @@ async fn a_busy_worker_is_a_wait_for_capacity_not_for_the_registry() {
     h.tick().await;
     h.tick().await;
     assert_eq!(h.status(&a).await, Status::Running);
-    assert_eq!(h.status(&b).await, Status::Ready, "waits for pinch's slot");
+    assert_eq!(h.status(&b).await, Status::Ready);
     gate.notify_one();
     h.drain().await;
     assert_eq!(h.status(&b).await, Status::Done);
@@ -379,68 +385,142 @@ async fn a_busy_worker_is_a_wait_for_capacity_not_for_the_registry() {
 }
 
 #[tokio::test]
-async fn a_wait_past_its_ttl_climbs_to_the_plan_b() {
-    let h = Harness::new(&["pinch"]);
-    let mut a = draft("a", "Refactor the parser");
-    a.worker_kind = WorkerKind::Codex;
-    let mut b = draft("b", "Note the refactor for later");
+async fn waiting_does_not_fail_a_parent_or_release_its_plan_b() {
+    let up = Arc::new(AtomicBool::new(false));
+    let h = toggle_harness(WorkerKind::Local, Arc::clone(&up));
+    let a = draft("a", "Refactor the parser");
+    let mut b = draft("b", "Alternative implementation");
     b.edges = vec![on(EdgeKind::ConditionalOnFailure, "a")];
     let ids = h
         .file(plan(vec![draft("P", "Parser work"), a, b]))
         .await
         .ids;
     h.tick().await;
-    assert_eq!(
-        h.status(&ids["a"]).await,
-        Status::Blocked(BlockedReason::WorkerUnavailable)
-    );
-    h.clock
-        .advance(h.config.worker_wait + TimeDelta::minutes(1));
-    h.drain().await;
-    assert_eq!(h.status(&ids["a"]).await, Status::Failed);
-    assert_eq!(h.rungs(&ids["a"]).await, vec![Rung::Request, Rung::PlanB]);
-    assert_eq!(h.status(&ids["b"]).await, Status::Done);
+    h.clock.advance(TimeDelta::days(2));
+    h.tick().await;
+    assert_eq!(h.status(&ids["a"]).await, Status::Ready);
+    assert_eq!(h.status(&ids["b"]).await, Status::Queued);
+    assert!(!h.status(&ids["P"]).await.is_closed());
+    assert!(h.rungs(&ids["a"]).await.is_empty());
+    assert!(h.rungs(&ids["P"]).await.is_empty());
+    assert!(questions_of(&h, &ids["a"]).await.is_empty());
+
+    up.store(true, Ordering::SeqCst);
+    let tick = h.tick().await;
+    assert!(tick.leased.contains(&ids["a"]));
+    assert_eq!(h.status(&ids["a"]).await, Status::Running);
+    assert_eq!(h.status(&ids["b"]).await, Status::Queued);
 }
 
 #[tokio::test]
-async fn a_wait_past_its_ttl_surfaces_once_and_a_worker_that_appears_still_resumes_it() {
-    let up = Arc::new(AtomicBool::new(false));
-    let h = toggle_harness(WorkerKind::Codex, Arc::clone(&up));
-    let mut d = draft("x", "Port the build");
+async fn legacy_backend_pins_do_not_prevent_an_available_executor() {
+    let h = toggle_harness(WorkerKind::Local, Arc::new(AtomicBool::new(true)));
+    let mut d = draft("x", "Review the result");
     d.worker_kind = WorkerKind::Codex;
     let x = h.file_one(d).await;
-    h.tick().await;
-    h.clock
-        .advance(h.config.worker_wait + TimeDelta::minutes(1));
-    h.drain().await;
-    assert_eq!(
-        h.status(&x).await,
-        Status::Blocked(BlockedReason::WorkerUnavailable)
-    );
-    assert_eq!(h.rungs(&x).await, vec![Rung::Request, Rung::Surface]);
-    let outbox = h.outbox().await;
-    assert_eq!(outbox.len(), 1, "{outbox:#?}");
-    assert!(
-        outbox[0].body.contains("a codex worker"),
-        "{}",
-        outbox[0].body
-    );
-    let asked = questions_of(&h, &x).await;
-    assert_eq!(asked.len(), 1);
-    assert_eq!(asked[0].status, QuestionStatus::Open);
-
-    // Surfaced once: no second climb, no second message.
-    h.clock.advance(TimeDelta::hours(2));
-    h.drain().await;
-    assert_eq!(h.rungs(&x).await, vec![Rung::Request, Rung::Surface]);
-    assert_eq!(h.outbox().await.len(), 1);
-
-    // The worker comes back: the item runs and its question is moot.
-    up.store(true, Ordering::SeqCst);
     h.drain().await;
     assert_eq!(h.status(&x).await, Status::Done);
-    let asked = questions_of(&h, &x).await;
-    assert_eq!(asked[0].status, QuestionStatus::Obsolete);
+    assert_eq!(h.item(&x).await.worker_kind, WorkerKind::Any);
+    assert!(!h.script.briefs().is_empty());
+}
+
+#[tokio::test]
+async fn an_outage_after_dispatch_returns_to_the_queue_without_spending_retries() {
+    let h = toggle_harness(WorkerKind::Local, Arc::new(AtomicBool::new(true)));
+    h.script.push(
+        "Wait for provider",
+        Step::Fail(Error::ModelRateLimit("quota exhausted".into())),
+    );
+    let x = h.file_one(draft("x", "Wait for provider")).await;
+    h.tick().await;
+    tokio::task::yield_now().await;
+    h.tick().await;
+    assert_eq!(h.status(&x).await, Status::Ready);
+    assert!(h.rungs(&x).await.is_empty());
+    assert!(questions_of(&h, &x).await.is_empty());
+    assert_eq!(h.ctl.spent_of(&x), rustykrab_store::Spend::default());
+    assert_eq!(h.script.briefs_for("Wait for provider").len(), 1);
+
+    h.clock.advance(TimeDelta::seconds(31));
+    h.drain().await;
+    assert_eq!(h.status(&x).await, Status::Done);
+    assert!(h.rungs(&x).await.is_empty());
+}
+
+#[tokio::test]
+async fn legacy_availability_holds_are_requeued_even_before_capacity_returns() {
+    use crate::controller::batch::Batch;
+    use crate::controller::questions::NewQuestion;
+    let h = toggle_harness(WorkerKind::Local, Arc::new(AtomicBool::new(false)));
+    let x = h.file_one(draft("x", "Previously parked work")).await;
+    let mut b = Batch::new(h.ctl.load().await.unwrap(), h.clock.now());
+    b.move_to(
+        &x,
+        Status::Blocked(BlockedReason::WorkerUnavailable),
+        "controller",
+        "legacy availability hold",
+    );
+    h.ctl
+        .record_question(
+            &mut b,
+            NewQuestion::open(
+                &x,
+                QuestionKind::Decision,
+                "Needs capacity: a worker".into(),
+                "surfaced",
+            ),
+        )
+        .await
+        .unwrap();
+    b.settle(vec![x.clone()]);
+    h.ctl
+        .commit(b, &mut std::collections::HashSet::new())
+        .await
+        .unwrap();
+
+    let mut error = failure(ErrorSubclass::Compute, "needs capacity: a worker")
+        .error
+        .unwrap();
+    error.observed_by = "capability_check".into();
+    h.store()
+        .work_event_append(&WorkEvent {
+            item: x.clone(),
+            at: h.clock.now(),
+            kind: EventKind::Rung,
+            from: None,
+            to: None,
+            actor: "controller".into(),
+            reason: Some(crate::ladder::encode_rung_event(
+                &rustykrab_core::work::RungEvent {
+                    rung: Rung::Request,
+                    at: h.clock.now(),
+                    error: Some(error),
+                    outcome: "waiting for a worker".into(),
+                },
+            )),
+            upstream: None,
+            origin: None,
+            evidence_ref: None,
+        })
+        .await
+        .unwrap();
+
+    h.tick().await;
+    assert_eq!(h.status(&x).await, Status::Ready);
+    assert!(
+        h.rungs(&x).await.is_empty(),
+        "old availability charges are retired"
+    );
+    let questions = questions_of(&h, &x).await;
+    assert_eq!(questions.len(), 1);
+    assert_eq!(questions[0].status, QuestionStatus::Obsolete);
+    assert!(
+        h.events(&x)
+            .await
+            .iter()
+            .any(|event| event.kind == EventKind::Rung),
+        "audit history remains"
+    );
 }
 
 #[tokio::test]

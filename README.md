@@ -654,6 +654,19 @@ $ rustykrab-cli   # restart the daemon
 The resolver runs entirely inside the connector — the model never sees
 the resolved values, and they are not surfaced through any tool.
 
+### Tasks and resource availability
+
+File work with an objective, completion criteria, required tools and authorized
+resources. No task category or agent-type selector is required. Old selectors
+are ignored. RustyKrab chooses the cheapest available compatible resource; an
+occupied cheaper resource does not prevent another compatible one from running.
+
+When no resource is available, work remains Queued without spending retries,
+creating a failure, asking a capacity question or timing out. It resumes
+automatically when a suitable resource is free. Older worker-unavailable holds
+are requeued and their synthetic questions retired. Genuine execution failures,
+explicit deadlines and permission requirements keep their normal behavior.
+
 ### Claude Max CLI runtimes
 
 Native Max runtimes check both login and subscription usage. Claude's built-in

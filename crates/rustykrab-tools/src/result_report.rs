@@ -650,6 +650,12 @@ impl Tool for ResultReportTool {
     }
 
     async fn execute(&self, args: Value) -> Result<Value> {
+        let mut args = args;
+        if let Some(items) = args.get_mut("discovered").and_then(Value::as_array_mut) {
+            for item in items {
+                crate::work_file::strip_draft_categories(item);
+            }
+        }
         let schema = self.schema();
         validate_tool_args(&schema.parameters, &args).map_err(Error::ToolExecution)?;
 
@@ -715,7 +721,7 @@ impl Tool for ResultReportTool {
 mod tests {
     use super::*;
     use crate::work_backend::{StubWorkBackend, WorkCall, WorkRunContext, WORK_RUN_CONTEXT};
-    use rustykrab_core::work::{ItemRef, WorkKind};
+    use rustykrab_core::work::ItemRef;
     use rustykrab_core::ToolErrorKind;
 
     fn tool(stub: &Arc<StubWorkBackend>) -> ResultReportTool {
@@ -915,7 +921,7 @@ mod tests {
         assert_eq!(report.commit.as_deref(), Some("1d1608b"));
         assert_eq!(report.questions[0].options, vec!["yes", "no"]);
         assert_eq!(report.discovered.len(), 2);
-        assert_eq!(report.discovered[0].kind, Some(WorkKind::Personal));
+        assert_eq!(report.discovered[0].kind, None);
         assert_eq!(
             report.discovered[1].edges[0].depends_on,
             ItemRef::Tmp { tmp: "a".into() },
@@ -1089,7 +1095,6 @@ mod tests {
             "invalid_item: summary: is empty",
             "commit: must be a commit SHA",
             "status: not yours to set",
-            "kind_not_allowed: discovered[0].kind",
             "duplicate_tmp: discovered[1].tmp",
             "discovered[1].title: is empty",
             "unknown_ref: discovered[1].edges[0].depends_on",

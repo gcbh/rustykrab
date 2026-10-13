@@ -117,9 +117,7 @@ impl Tool for CronTool {
                         "description":"Optional durable resource requirements for every firing. Use registered tools and repo resources; the controller allocates a suitable worker. Include a project artifact reference to continue its context.",
                         "properties": {
                             "budget":{"type":"object","required":["iterations","tokens","wall_seconds","repairs"],"additionalProperties":false,"properties":{"iterations":{"type":"integer","minimum":1},"tokens":{"type":"integer","minimum":1},"wall_seconds":{"type":"integer","minimum":1},"repairs":{"type":"integer","minimum":0}}},
-                            "kind":{"enum":["personal","research","code"]},
                             "done_when":{"type":"string"},
-                            "worker_kind":{"enum":["any","local","claude_code","codex","peer"]},
                             "required_tools":{"type":"array","items":{"type":"string"}},
                             "required_mcp_servers":{"type":"array","items":{"type":"string"}},
                             "writable_resources":{"type":"array","items":{"type":"string"}},

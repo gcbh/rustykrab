@@ -79,6 +79,13 @@ impl Worker for Coder {
         }
     }
 
+    fn accepts(&self, item: &rustykrab_core::work::WorkItem) -> bool {
+        self.repos.iter().any(|repo| {
+            item.writable_resources
+                .contains(&format!("{REPO_PREFIX}{repo}"))
+        })
+    }
+
     fn usage(&self, _run: &str) -> Option<RunUsage> {
         Some(RunUsage {
             tokens: 1_000,
@@ -267,10 +274,7 @@ async fn a_code_item_without_a_repository_never_goes_to_a_coding_worker() {
     bare.writable_resources.clear();
     let unleased = h.file_one(bare).await;
     h.drain().await;
-    assert_eq!(
-        h.status(&unleased).await,
-        Status::Blocked(rustykrab_core::work::BlockedReason::WorkerUnavailable)
-    );
+    assert_eq!(h.status(&unleased).await, Status::Ready);
     assert_eq!((claude.runs(), codex.runs()), (0, 0));
 
     // The same item with its repository leases and gets its worktree.
@@ -285,10 +289,7 @@ async fn a_code_item_without_a_repository_never_goes_to_a_coding_worker() {
         .find_map(|w| w.briefs.lock().unwrap().first().cloned())
         .expect("a brief");
     assert_eq!(brief.workspace.expect("a workspace").repo, repo.path());
-    assert_eq!(
-        h.status(&unleased).await,
-        Status::Blocked(rustykrab_core::work::BlockedReason::WorkerUnavailable)
-    );
+    assert_eq!(h.status(&unleased).await, Status::Ready);
 }
 
 #[tokio::test]
@@ -402,7 +403,7 @@ async fn scenario_31_one_discovered_draft_is_filed_and_the_workers_tracker_stays
     }
     assert_eq!(filed.len(), 1, "exactly one item from the one draft");
     assert_eq!(filed[0].kind, WorkKind::Code);
-    assert_eq!(filed[0].worker_kind, WorkerKind::ClaudeCode);
+    assert_eq!(filed[0].worker_kind, WorkerKind::Any);
     assert_eq!(
         filed[0].writable_resources,
         vec![format!("{REPO_PREFIX}{}", repo.path().display())]
@@ -487,6 +488,42 @@ struct Any {
     briefs: Mutex<Vec<Brief>>,
 }
 
+#[tokio::test]
+async fn a_busy_cheaper_resource_does_not_keep_other_compatible_resources_idle() {
+    let script = Arc::new(super::Script::default());
+    let gate = Arc::new(tokio::sync::Notify::new());
+    script.push(
+        "First analysis",
+        super::Step::Wait(gate.clone(), Box::new(super::done("First analysis"))),
+    );
+    let local = Arc::new(super::Scripted {
+        name: "snapper".into(),
+        concurrency: 1,
+        script: script.clone(),
+    });
+    let native = Arc::new(Any {
+        name: "pinch",
+        kind: WorkerKind::ClaudeCode,
+        briefs: Mutex::new(Vec::new()),
+    });
+    let h = Harness::with_fleet(ControllerConfig::default(), vec![local, native.clone()]);
+    let first = h.file_one(draft("first", "First analysis")).await;
+    let second = h.file_one(draft("second", "Second analysis")).await;
+    h.drain().await;
+    assert_eq!(h.status(&first).await, Status::Running);
+    assert_eq!(h.status(&second).await, Status::Done);
+    assert!(native
+        .briefs
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|brief| brief.item == second));
+    gate.notify_one();
+    h.drain().await;
+    assert_eq!(h.status(&first).await, Status::Done);
+    assert!(h.rungs(&second).await.is_empty());
+}
+
 #[async_trait]
 impl Worker for Any {
     fn name(&self) -> &str {
@@ -543,13 +580,19 @@ async fn a_capability_items_facet_decides_its_class_and_its_briefs_mode() {
         h.file_one(d).await;
     }
     h.drain().await;
-    let built = claude.briefs.lock().unwrap().clone();
-    let acquired = local.briefs.lock().unwrap().clone();
-    assert_eq!(built.len(), 1, "the build went up a tier");
-    assert_eq!(built[0].title, "Build the converter");
-    assert_eq!(built[0].capability, Some(CapabilityMode::Build));
-    assert_eq!(acquired.len(), 1, "the acquisition stayed cheapest");
-    assert_eq!(acquired[0].capability, Some(CapabilityMode::Acquire));
+    let mut briefs = local.briefs.lock().unwrap().clone();
+    briefs.extend(claude.briefs.lock().unwrap().clone());
+    assert_eq!(
+        briefs.len(),
+        2,
+        "available resources can run either lifecycle operation"
+    );
+    assert!(briefs
+        .iter()
+        .any(|brief| brief.capability == Some(CapabilityMode::Build)));
+    assert!(briefs
+        .iter()
+        .any(|brief| brief.capability == Some(CapabilityMode::Acquire)));
 }
 
 /// Section 10: moving a class's default tier is a routing proposal, and
@@ -604,6 +647,14 @@ async fn an_accepted_routing_proposal_moves_the_default_tier() {
     let task = h.file_one(helper).await;
     h.step().await;
     h.step().await;
-    assert!(local.briefs.lock().unwrap().is_empty());
-    assert!(claude.briefs.lock().unwrap().iter().any(|b| b.item == task));
+    assert!(local
+        .briefs
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|brief| brief.item == task));
+    assert!(
+        claude.briefs.lock().unwrap().is_empty(),
+        "legacy category tiers cannot force a backend"
+    );
 }

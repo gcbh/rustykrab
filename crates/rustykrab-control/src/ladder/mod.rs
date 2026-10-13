@@ -41,8 +41,8 @@ pub use summary::summary;
 
 use chrono::{DateTime, Utc};
 use rustykrab_core::work::{
-    BlockedReason, ErrorClass, EventKind, Rung, RungBudgets, RungEvent, Trigger, WorkError,
-    WorkEvent,
+    BlockedReason, ErrorClass, ErrorSubclass, EventKind, Rung, RungBudgets, RungEvent, Trigger,
+    WorkError, WorkEvent,
 };
 use serde::{Deserialize, Serialize};
 
@@ -75,7 +75,18 @@ pub fn rung_event(event: &WorkEvent) -> Option<RungEvent> {
     if event.kind != EventKind::Rung {
         return None;
     }
-    serde_json::from_str(event.reason.as_deref()?).ok()
+    let rung: RungEvent = serde_json::from_str(event.reason.as_deref()?).ok()?;
+    // Retain old availability events as audit history, but they are not
+    // execution failures and must no longer consume ladder budgets.
+    if rung.error.as_ref().is_some_and(|error| {
+        error.class == ErrorClass::CapabilityGap
+            && error.subclass == ErrorSubclass::Compute
+            && error.observed_by == "capability_check"
+            && error.detail.starts_with("needs capacity: a ")
+    }) {
+        return None;
+    }
+    Some(rung)
 }
 
 /// An item's ladder as its events record it, oldest rung first.

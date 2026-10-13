@@ -317,3 +317,15 @@ unknown capacity and preserve dated exhaustion within the running process.
 Codex retains its native account/rate-limit reader. The gateway projects both
 providers' sanitized observations into Systems and metrics. There is no new
 credential reader, scheduler, persistence table or crate dependency.
+
+## Ordinary task dispatch and resource waiting
+
+The controller allocates plain tasks by actual tool and write capabilities and
+free resource capacity. Task/agent category pins, filing-path category exclusions
+and class qualification gates are retired. Cost is a preference among currently
+available resources. Unavailable work remains in the durable ready queue without
+failure escalation or an availability timeout; old availability holds recover
+and preserve audit history. Repository scope selects isolation and git proof,
+and explicit read-only requirements select the enforced sandbox. Planning,
+permissions, dependencies and genuine execution-failure handling remain in the
+same controller. No second scheduler, credential store or durable ledger is added.

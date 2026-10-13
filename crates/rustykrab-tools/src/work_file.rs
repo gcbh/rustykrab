@@ -41,7 +41,14 @@ pub(crate) const POINTER_MAX: usize = 500;
 pub(crate) const PRIORITY_MIN: i64 = -100;
 pub(crate) const PRIORITY_MAX: i64 = 100;
 
-const WORK_KINDS: [&str; 4] = ["personal", "research", "capability", "internal"];
+const WORK_KINDS: [&str; 6] = [
+    "task",
+    "personal",
+    "code",
+    "research",
+    "capability",
+    "internal",
+];
 const WORKER_KINDS: [&str; 5] = ["any", "local", "peer", "claude_code", "codex"];
 pub(crate) const ARTIFACT_KINDS: [&str; 7] = [
     "message", "path", "url", "commit", "item", "project", "other",
@@ -71,6 +78,15 @@ const DRAFT_KEYS: [&str; 19] = [
     "priority",
     "plan",
 ];
+
+/// Ignore retired category/backend selectors from old callers. They are not
+/// advertised and cannot affect task filing or execution.
+pub(crate) fn strip_draft_categories(value: &mut Value) {
+    if let Some(object) = value.as_object_mut() {
+        object.remove("kind");
+        object.remove("worker_kind");
+    }
+}
 
 // ── problems ────────────────────────────────────────────────────────────
 
@@ -550,16 +566,6 @@ pub(crate) fn parse_draft(
     let kind = match take_opt_text(obj, "kind", path, NAME_MAX, out) {
         None => None,
         Some(raw) => match WorkKind::parse(&raw) {
-            Some(WorkKind::Code) if matches!(mode, DraftMode::Manager) => Some(WorkKind::Code),
-            Some(WorkKind::Code) => {
-                out.push(Problem {
-                    reason: RejectionReason::KindNotAllowed,
-                    detail: format!(
-                        "{path}kind: `code` work enters only through the delivery path"
-                    ),
-                });
-                None
-            }
             Some(WorkKind::Proposal) => {
                 out.push(Problem {
                     reason: RejectionReason::KindNotAllowed,
@@ -579,7 +585,7 @@ pub(crate) fn parse_draft(
         },
     };
 
-    let worker_kind = match take_opt_text(obj, "worker_kind", path, NAME_MAX, out) {
+    let _legacy_worker_kind = match take_opt_text(obj, "worker_kind", path, NAME_MAX, out) {
         None => WorkerKind::Any,
         Some(raw) => WorkerKind::parse(&raw).unwrap_or_else(|| {
             out.push(Problem::invalid(
@@ -590,6 +596,7 @@ pub(crate) fn parse_draft(
             WorkerKind::Any
         }),
     };
+    let worker_kind = WorkerKind::Any;
 
     let constraints = take_text_list(obj, "constraints", path, LIST_MAX, ENTRY_MAX, out);
     let decisions_made = take_text_list(obj, "decisions_made", path, LIST_MAX, ENTRY_MAX, out);
@@ -850,10 +857,6 @@ pub(crate) fn draft_properties(nested: bool) -> Map<String, Value> {
         json!({ "type": "string", "description": format!("The check that proves it done (max {DONE_WHEN_MAX} chars).") }),
     );
     p.insert(
-        "kind".into(),
-        json!({ "type": "string", "enum": WORK_KINDS, "description": "Default personal." }),
-    );
-    p.insert(
         "constraints".into(),
         strings("One explicit constraint per entry."),
     );
@@ -884,10 +887,6 @@ pub(crate) fn draft_properties(nested: bool) -> Map<String, Value> {
     p.insert(
         "required_mcp_servers".into(),
         strings("MCP servers the work needs."),
-    );
-    p.insert(
-        "worker_kind".into(),
-        json!({ "type": "string", "enum": WORKER_KINDS, "description": "Only when a user or policy requires it. Default any." }),
     );
     p.insert(
         "writable_resources".into(),
@@ -1027,7 +1026,7 @@ impl WorkFileTool {
     }
 
     /// Only the host exposes this tool to the interactive manager. Execution
-    /// workers keep work_file and cannot widen its code-filing contract.
+    /// workers keep work_file under their existing scope and budget ceilings.
     pub fn manager(backend: Arc<dyn WorkBackend>) -> Self {
         Self {
             backend,
@@ -1176,7 +1175,6 @@ impl Tool for WorkFileTool {
         let mut properties = draft_properties(false);
         if self.manager {
             properties.insert("budget".into(), json!({"type":"object","required":["iterations","tokens","wall_seconds","repairs"],"additionalProperties":false,"properties":{"iterations":{"type":"integer","minimum":1},"tokens":{"type":"integer","minimum":1},"wall_seconds":{"type":"integer","minimum":1},"repairs":{"type":"integer","minimum":0}},"description":"Explicit finite execution envelope; controller approval and caps still apply."}));
-            properties.insert("kind".into(),json!({"type":"string","enum":["personal","research","code","capability","internal"]}));
         }
         ToolSchema {
             name: self.name().to_string(),
@@ -1191,6 +1189,8 @@ impl Tool for WorkFileTool {
     }
 
     async fn execute(&self, args: Value) -> Result<Value> {
+        let mut args = args;
+        strip_draft_categories(&mut args);
         let schema = self.schema();
         validate_tool_args(&schema.parameters, &args).map_err(Error::ToolExecution)?;
 
@@ -1311,6 +1311,9 @@ mod tests {
         assert_eq!(p["required"], json!(["title", "objective", "done_when"]));
         let props = p["properties"].as_object().unwrap();
         for key in DRAFT_KEYS {
+            if matches!(key, "kind" | "worker_kind") {
+                continue;
+            }
             assert!(props.contains_key(key), "missing {key}");
         }
         for host in [
@@ -1325,10 +1328,8 @@ mod tests {
                 "{host} must not be model-settable"
             );
         }
-        assert!(!p["properties"]["kind"]["enum"]
-            .as_array()
-            .unwrap()
-            .contains(&json!("code")));
+        assert!(!props.contains_key("kind"));
+        assert!(!props.contains_key("worker_kind"));
     }
 
     #[tokio::test]
@@ -1373,7 +1374,7 @@ mod tests {
         let filed = files(&stub);
         assert_eq!(filed.len(), 1);
         let d = &filed[0].0;
-        assert_eq!(d.kind, Some(WorkKind::Research));
+        assert_eq!(d.kind, None);
         assert_eq!(d.constraints, vec!["UK carriers only"], "deduplicated");
         assert_eq!(
             d.parent,
@@ -1393,7 +1394,7 @@ mod tests {
         assert!(d.expires_at.is_some());
         assert_eq!(d.priority, 5);
         assert!(d.plan);
-        assert_eq!(d.worker_kind, WorkerKind::Local);
+        assert_eq!(d.worker_kind, WorkerKind::Any);
         assert!(d.budget.is_none() && d.tmp.is_none() && d.preconditions.is_empty());
     }
 
@@ -1414,12 +1415,13 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("priority"), "{err}");
 
-        let err = t
-            .execute(with(good(), "kind", json!("code")))
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("'research'"), "{err}");
         assert!(stub.calls().is_empty());
+        t.execute(with(good(), "kind", json!("obsolete arbitrary category")))
+            .await
+            .unwrap();
+        let draft = &files(&stub)[0].0;
+        assert_eq!(draft.kind, None);
+        assert_eq!(draft.worker_kind, WorkerKind::Any);
     }
 
     #[tokio::test]
@@ -1672,10 +1674,10 @@ mod manager_assignment_tests {
         let manager = WorkFileTool::manager(backend.clone());
         assert_eq!(manager.name(), "work_assign");
         manager.execute(args.clone()).await.unwrap();
-        assert!(backend.calls().iter().any(|c| matches!(c,WorkCall::File { draft,.. } if draft.kind==Some(WorkKind::Code) && draft.worker_kind==rustykrab_core::work::WorkerKind::Codex && draft.budget.is_some_and(|b| b.tokens == 7000))));
+        assert!(backend.calls().iter().any(|c| matches!(c,WorkCall::File { draft,.. } if draft.kind.is_none() && draft.worker_kind==rustykrab_core::work::WorkerKind::Any && draft.budget.is_some_and(|b| b.tokens == 7000))));
         let worker = WorkFileTool::new(backend.clone());
         let before = backend.calls().len();
-        assert!(worker.execute(args).await.is_err());
+        assert_eq!(worker.execute(args).await.unwrap()["outcome"], "rejected");
         assert_eq!(backend.calls().len(), before);
         let before = backend.calls().len();
         let rejected = manager

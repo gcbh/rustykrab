@@ -513,7 +513,7 @@ async fn the_ladders_internal_item_inherits_the_failing_items_repo_worker_and_co
         vec!["repo:/src/app".to_string()],
         "only the repository is inherited, not the failing item's other resources"
     );
-    assert_eq!(item.worker_kind, WorkerKind::Local);
+    assert_eq!(item.worker_kind, WorkerKind::Any);
     assert!(
         item.constraints
             .contains(&"Change only files under src/parser/.".to_string()),
@@ -727,7 +727,7 @@ async fn a_discovered_draft_runs_after_an_open_sibling_writing_its_inherited_rep
 async fn a_discovered_draft_with_no_worker_constraint_inherits_the_filers() {
     let (_h, kids) =
         discovered_under_a_repo_item(vec![code_follow_up("f", "Document the helper")]).await;
-    assert_eq!(kids["Document the helper"].worker_kind, WorkerKind::Local);
+    assert_eq!(kids["Document the helper"].worker_kind, WorkerKind::Any);
 }
 
 #[tokio::test]
@@ -758,7 +758,7 @@ async fn a_discovered_draft_that_sets_its_repo_and_worker_keeps_them() {
         filed.writable_resources,
         vec!["repo:/src/other".to_string()]
     );
-    assert_eq!(filed.worker_kind, WorkerKind::ClaudeCode);
+    assert_eq!(filed.worker_kind, WorkerKind::Any);
 }
 
 #[tokio::test]
@@ -927,6 +927,7 @@ async fn a_rejection_under_an_existing_root_is_an_event_on_the_root() {
     let r = h.file_one(root).await;
     let mut code = draft("k", "Fix the errand app");
     code.kind = Some(WorkKind::Code);
+    code.objective.clear();
     let outcome = ControlHandle::file_plan(
         &h.ctl,
         WorkPlan {
@@ -949,7 +950,7 @@ async fn a_rejection_under_an_existing_root_is_an_event_on_the_root() {
         .filter_map(|e| e.reason)
         .collect();
     assert_eq!(rejections.len(), 1, "{rejections:?}");
-    assert!(rejections[0].contains("kind_not_allowed"), "{rejections:?}");
+    assert!(rejections[0].contains("invalid_item"), "{rejections:?}");
 }
 
 /// Section 7: an unconfigured MCP server is a `needs_tool` wait, not a

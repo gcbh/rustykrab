@@ -504,6 +504,7 @@ fn code_outside_an_authorized_slice_is_held_and_is_an_approval_point() {
         let mut d = draft(k);
         d.kind = Some(WorkKind::Code);
         d.parent = Some(id(parent));
+        d.writable_resources = vec!["repo:/fixture".into()];
         d
     };
     let p = plan(
@@ -512,7 +513,6 @@ fn code_outside_an_authorized_slice_is_held_and_is_an_approval_point() {
         vec![pe(tmp("outside"), EdgeKind::Blocks, tmp("inside"))],
     );
     let mut c = ctx(FilingSource::Proposal);
-    c.allow_code = true;
     c.approval = ApprovalPolicy {
         authorized_slices: Some(BTreeSet::from(["S".to_string()])),
         ..ApprovalPolicy::default()
